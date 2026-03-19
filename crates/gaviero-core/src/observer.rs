@@ -22,8 +22,11 @@ pub trait AcpObserver: Send + Sync {
     /// Called when a text chunk arrives from the streaming response.
     fn on_stream_chunk(&self, text: &str);
 
-    /// Called when the agent starts executing a tool.
+    /// Called when the agent starts executing a tool (enriched summary with details).
     fn on_tool_call_started(&self, tool_name: &str);
+
+    /// Called to update the streaming status label (shown in the spinner).
+    fn on_streaming_status(&self, status: &str);
 
     /// Called when a message (user/assistant/system) is complete.
     fn on_message_complete(&self, role: &str, content: &str);
