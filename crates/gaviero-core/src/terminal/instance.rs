@@ -159,6 +159,11 @@ impl TerminalInstance {
         self.parser.screen()
     }
 
+    /// Mutable access to the vt100 screen (for scrollback control).
+    pub fn screen_mut(&mut self) -> &mut vt100::Screen {
+        self.parser.screen_mut()
+    }
+
     /// Mark the instance as not dirty (after rendering).
     pub fn clear_dirty(&mut self) {
         self.is_dirty = false;
