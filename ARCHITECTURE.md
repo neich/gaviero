@@ -678,16 +678,3 @@ These are architectural invariants. Do not violate them.
 8. **AutoAccept in swarm** — `WriteMode::AutoAccept` during swarm execution. User reviews aggregate result post-merge.
 9. **No plugins** — Features compiled in. Configuration via settings files only.
 10. **anyhow::Result** — All fallible operations. Custom error types only for structured validation data (`ScopeError`, `CycleError`).
-
----
-
-## 17. Milestone Roadmap
-
-| Milestone | Scope | Key Deliverables |
-|---|---|---|
-| **M0** | Shell + Editor | Workspace model, event system, editor core (buffer, highlighting, view), file tree, tabs, status bar |
-| **M1** | Write Gate + Diff | DiffEngine, WriteProposal, enrich_hunks, WriteGatePipeline (3 modes), TUI diff overlay |
-| **M2** | ACP + Agent Chat | AcpSession (subprocess), NDJSON protocol, AcpPipeline (prompt enrichment, file block detection), chat panel. No memory. |
-| **M3** | Swarm + CLI + Memory | SwarmPipeline (tiers, parallel execution, merge), AgentBus, MemoryStore (ONNX + SQLite), `Gaviero-cli` binary |
-| **M4** | Git + Terminal | Git panel (staging, commit, branches), embedded terminal (PTY + vt100) |
-| **M5** | Polish | Panel resizing, session persistence, search, configurable keybinds, performance optimization |
