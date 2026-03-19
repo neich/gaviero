@@ -1,0 +1,32 @@
+[highlights]
+"comment"            = { fg = "#7f848e" }
+"string"             = { fg = "#98c379" }
+"constant.numeric"   = { fg = "#d19a66" }
+"constant.builtin"   = { fg = "#d19a66", bold = true }
+"keyword"            = { fg = "#c678dd" }
+"keyword.function"   = { fg = "#c678dd" }
+"function"           = { fg = "#61afef" }
+"function.call"      = { fg = "#61afef" }
+"type"               = { fg = "#e5c07b" }
+"variable"           = { fg = "#abb2bf" }
+"operator"           = { fg = "#c8ccd4" }
+"punctuation"        = { fg = "#9da5b4" }
+# Markdown
+"markup.heading"     = { fg = "#61afef", bold = true }
+"markup.bold"        = { fg = "#e5c07b", bold = true }
+"markup.italic"      = { fg = "#c678dd" }
+"markup.link"        = { fg = "#61afef" }
+"markup.link.url"    = { fg = "#98c379" }
+"markup.code"        = { fg = "#98c379" }
+"markup.code.block"  = { fg = "#7f848e" }
+"markup.list"        = { fg = "#d19a66" }
+"markup.quote"       = { fg = "#7f848e" }
+
+[ui]
+"line_number"        = { fg = "#636d83" }
+"line_number.active" = { fg = "#abb2bf" }
+"cursor"             = { bg = "#528bff" }
+"selection"          = { bg = "#4d78cc" }
+"diff.added"         = { bg = "#2d4a30" }
+"diff.removed"       = { bg = "#4a2d2d" }
+"status_bar"         = { fg = "#d7dae0", bg = "#2c313a" }

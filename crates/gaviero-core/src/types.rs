@@ -1,0 +1,198 @@
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+// ── FileScope ────────────────────────────────────────────────────
+
+/// Defines which paths an agent is allowed to write to.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FileScope {
+    pub owned_paths: Vec<String>,
+    pub read_only_paths: Vec<String>,
+    /// Interface contracts: symbol → signature/description.
+    /// Used by the merge resolver to detect breaking changes.
+    pub interface_contracts: HashMap<String, String>,
+}
+
+impl FileScope {
+    /// Check if a path is within this scope's owned paths.
+    /// Directory entries (ending with `/`) use prefix matching;
+    /// file entries use exact matching.
+    /// Paths are normalized: leading `./` is stripped, whitespace is trimmed.
+    pub fn is_owned(&self, path: &str) -> bool {
+        let normalized = normalize_path(path);
+        self.owned_paths.iter().any(|owned| {
+            let owned = normalize_path(owned);
+            if owned.ends_with('/') {
+                normalized.starts_with(&owned) || normalized == owned.trim_end_matches('/')
+            } else {
+                normalized == owned
+            }
+        })
+    }
+
+    /// Render the scope as a markdown clause for inclusion in prompts.
+    pub fn to_prompt_clause(&self) -> String {
+        let mut out = String::new();
+        if !self.owned_paths.is_empty() {
+            out.push_str("**Owned paths** (read/write):\n");
+            for p in &self.owned_paths {
+                out.push_str(&format!("- `{}`\n", p));
+            }
+        }
+        if !self.read_only_paths.is_empty() {
+            out.push_str("**Read-only paths**:\n");
+            for p in &self.read_only_paths {
+                out.push_str(&format!("- `{}`\n", p));
+            }
+        }
+        if !self.interface_contracts.is_empty() {
+            out.push_str("**Interface contracts**:\n");
+            for (symbol, signature) in &self.interface_contracts {
+                out.push_str(&format!("- `{}`: {}\n", symbol, signature));
+            }
+        }
+        out
+    }
+}
+
+/// Normalize a file path for comparison: trim whitespace and strip leading `./`.
+pub fn normalize_path(path: &str) -> String {
+    let p = path.trim();
+    let p = p.strip_prefix("./").unwrap_or(p);
+    p.to_string()
+}
+
+// ── Diff types ───────────────────────────────────────────────────
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DiffHunk {
+    pub original_range: (usize, usize), // (start_line, end_line) 0-indexed
+    pub proposed_range: (usize, usize),
+    pub original_text: String,
+    pub proposed_text: String,
+    pub hunk_type: HunkType,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum HunkType {
+    Added,
+    Removed,
+    Modified,
+}
+
+#[derive(Clone, Debug)]
+pub struct NodeInfo {
+    pub kind: String,
+    pub name: Option<String>,
+    pub range: (usize, usize), // (start_line, end_line)
+}
+
+#[derive(Clone, Debug)]
+pub struct StructuralHunk {
+    pub diff_hunk: DiffHunk,
+    pub enclosing_node: Option<NodeInfo>,
+    pub description: String,
+    pub status: HunkStatus,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum HunkStatus {
+    Pending,
+    Accepted,
+    Rejected,
+}
+
+// ── WriteProposal ────────────────────────────────────────────────
+
+/// A proposed set of changes to a single file.
+#[derive(Clone, Debug)]
+pub struct WriteProposal {
+    pub id: u64,
+    pub source: String, // agent or component that produced this proposal
+    pub file_path: PathBuf,
+    pub original_content: String,
+    pub proposed_content: String,
+    pub structural_hunks: Vec<StructuralHunk>,
+    pub status: ProposalStatus,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProposalStatus {
+    Pending,
+    PartiallyAccepted,
+    Accepted,
+    Rejected,
+}
+
+// ── SymbolKind ───────────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum SymbolKind {
+    Function,
+    Class,
+    Struct,
+    Enum,
+    Interface,
+    Method,
+    Const,
+    Trait,
+    Module,
+}
+
+// ── Tests ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_file_scope_exact_match() {
+        let scope = FileScope {
+            owned_paths: vec!["src/main.rs".into()],
+            read_only_paths: vec![],
+            interface_contracts: HashMap::new(),
+        };
+        assert!(scope.is_owned("src/main.rs"));
+        assert!(scope.is_owned("./src/main.rs"));
+        assert!(!scope.is_owned("src/lib.rs"));
+    }
+
+    #[test]
+    fn test_file_scope_directory_match() {
+        let scope = FileScope {
+            owned_paths: vec!["src/editor/".into()],
+            read_only_paths: vec![],
+            interface_contracts: HashMap::new(),
+        };
+        assert!(scope.is_owned("src/editor/buffer.rs"));
+        assert!(scope.is_owned("./src/editor/view.rs"));
+        assert!(scope.is_owned("src/editor")); // exact dir name without trailing /
+        assert!(!scope.is_owned("src/panels/file_tree.rs"));
+    }
+
+    #[test]
+    fn test_file_scope_normalization() {
+        let scope = FileScope {
+            owned_paths: vec!["./src/lib.rs".into()],
+            read_only_paths: vec![],
+            interface_contracts: HashMap::new(),
+        };
+        assert!(scope.is_owned("src/lib.rs"));
+        assert!(scope.is_owned("  src/lib.rs  "));
+    }
+
+    #[test]
+    fn test_to_prompt_clause() {
+        let scope = FileScope {
+            owned_paths: vec!["src/".into()],
+            read_only_paths: vec!["Cargo.toml".into()],
+            interface_contracts: HashMap::from([("api::Client".into(), "pub fn connect(&self) -> Result<()>".into())]),
+        };
+        let clause = scope.to_prompt_clause();
+        assert!(clause.contains("Owned paths"));
+        assert!(clause.contains("`src/`"));
+        assert!(clause.contains("Read-only"));
+        assert!(clause.contains("Interface contracts"));
+    }
+}
