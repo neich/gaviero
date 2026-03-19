@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+use gaviero_core::memory::MemoryStore;
 use gaviero_core::terminal::TerminalEvent;
 use gaviero_core::types::WriteProposal;
 
@@ -30,6 +32,7 @@ pub enum Event {
     // ACP agent events (conv_id identifies which conversation)
     StreamChunk { conv_id: String, text: String },
     ToolCallStarted { conv_id: String, tool_name: String },
+    StreamingStatus { conv_id: String, status: String },
     MessageComplete { conv_id: String, role: String, content: String },
 
     /// A file proposal was deferred (batch review mode) — show compact summary in chat.
@@ -57,6 +60,9 @@ pub enum Event {
     SwarmTierStarted { current: usize, total: usize },
     SwarmCompleted(Box<gaviero_core::swarm::models::SwarmResult>),
     SwarmMergeConflict { branch: String, files: Vec<String> },
+
+    // Memory
+    MemoryReady(Arc<MemoryStore>),
 
     // Internal
     Tick,
