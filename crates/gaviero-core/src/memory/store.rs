@@ -36,6 +36,14 @@ pub struct MemoryStore {
     embedder: Arc<dyn Embedder>,
 }
 
+impl std::fmt::Debug for MemoryStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryStore")
+            .field("model", &self.embedder.model_id())
+            .finish()
+    }
+}
+
 impl MemoryStore {
     /// Open or create a memory store at the given path.
     pub fn open(db_path: &Path, embedder: Arc<dyn Embedder>) -> Result<Self> {
@@ -220,6 +228,30 @@ impl MemoryStore {
         results.truncate(limit);
 
         Ok(results)
+    }
+
+    /// Search across namespaces and format results as a prompt-ready string.
+    ///
+    /// Returns an empty string on error or if no results are found.
+    pub async fn search_context(
+        &self,
+        namespaces: &[String],
+        query: &str,
+        limit: usize,
+    ) -> String {
+        match self.search_multi(namespaces, query, limit).await {
+            Ok(results) if !results.is_empty() => {
+                let mut ctx = String::from("[Memory context]:\n");
+                for r in &results {
+                    ctx.push_str(&format!(
+                        "- [{}] {} (score: {:.2})\n",
+                        r.entry.namespace, r.entry.content, r.score
+                    ));
+                }
+                ctx
+            }
+            _ => String::new(),
+        }
     }
 
     /// Get a specific memory by namespace and key.
