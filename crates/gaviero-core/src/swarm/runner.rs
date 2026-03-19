@@ -66,18 +66,9 @@ impl AgentRunner {
 
         // Add memory context if available (searches across all read namespaces)
         if let Some(ref memory) = self.memory {
-            match memory.search_multi(&self.read_namespaces, &work_unit.description, 5).await {
-                Ok(results) if !results.is_empty() => {
-                    let mut ctx = String::from("[Memory context]:\n");
-                    for r in &results {
-                        ctx.push_str(&format!(
-                            "- [{}] {} (score: {:.2})\n",
-                            r.entry.namespace, r.entry.content, r.score
-                        ));
-                    }
-                    prompt_parts.push(ctx);
-                }
-                _ => {}
+            let ctx = memory.search_context(&self.read_namespaces, &work_unit.description, 5).await;
+            if !ctx.is_empty() {
+                prompt_parts.push(ctx);
             }
         }
 
