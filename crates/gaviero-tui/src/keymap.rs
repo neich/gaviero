@@ -174,6 +174,7 @@ impl Keymap {
             KeyCode::Backspace => Action::Backspace,
             KeyCode::Delete => Action::Delete,
             KeyCode::Enter if alt => Action::AltEnter,
+            KeyCode::Enter if shift => Action::AltEnter,
             KeyCode::Enter => Action::Enter,
             KeyCode::Char(c) if !ctrl && !alt => Action::InsertChar(c),
 
