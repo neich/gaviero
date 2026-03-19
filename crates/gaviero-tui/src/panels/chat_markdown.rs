@@ -189,17 +189,14 @@ pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<
             }
         }
 
-        // File proposal markers: [wrote ...] and [writing ...]
-        // Style with dim cyan to visually distinguish from regular text
-        if (trimmed.starts_with("[wrote ") || trimmed.starts_with("[writing "))
-            && trimmed.ends_with(']')
-        {
-            let file_marker_style = Style::default()
-                .fg(theme::INFO_CYAN)
-                .add_modifier(Modifier::DIM);
+        // Tool call and file proposal markers: [Read ...], [Write ...], [wrote ...], etc.
+        // Style with dim color to visually distinguish from regular text
+        if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.contains("](") {
+            let marker_style = Style::default()
+                .fg(theme::TOOL_DIM);
             output.push(ChatLine {
-                style: file_marker_style,
-                text: trimmed.to_string(),
+                style: marker_style,
+                text: format!("  {}", trimmed),
             });
             i += 1;
             continue;
