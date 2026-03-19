@@ -145,12 +145,22 @@ impl AcpPipeline {
                         }
                     }
                     StreamEvent::ToolUseStart { tool_name, .. } => {
-                        self.observer.on_tool_call_started(&tool_name);
+                        // Update streaming status for the spinner label.
+                        // The enriched tool call (with details) will be sent
+                        // from AssistantMessage when the full input is known.
+                        self.observer.on_streaming_status(&format!("Using {}...", tool_name));
                     }
                     StreamEvent::AssistantMessage { text, tool_uses } => {
                         // Use the complete message text if we didn't get deltas
                         if full_text.is_empty() && !text.is_empty() {
                             full_text = text;
+                        }
+
+                        // Enrich tool calls with details from the input JSON.
+                        // This replaces the bare names sent by ToolUseStart.
+                        for tu in &tool_uses {
+                            let summary = format_tool_summary(&tu.name, &tu.input, &self.workspace_root);
+                            self.observer.on_tool_call_started(&summary);
                         }
 
                         // Snapshot files BEFORE the CLI executes Write/Edit tools.
@@ -373,6 +383,68 @@ impl AcpPipeline {
         }
 
         Ok(())
+    }
+}
+
+/// Format a one-line summary for a tool call, extracting key info from the input JSON.
+fn format_tool_summary(tool_name: &str, input: &serde_json::Value, workspace_root: &Path) -> String {
+    let get_str = |key: &str| input.get(key).and_then(|v| v.as_str());
+
+    // Try to make paths relative for display
+    let rel_path = |p: &str| -> String {
+        let path = Path::new(p);
+        path.strip_prefix(workspace_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string()
+    };
+
+    match tool_name {
+        "Read" => {
+            if let Some(fp) = get_str("file_path") {
+                format!("Read {}", rel_path(fp))
+            } else {
+                "Read".into()
+            }
+        }
+        "Write" => {
+            if let Some(fp) = get_str("file_path") {
+                format!("Write {}", rel_path(fp))
+            } else {
+                "Write".into()
+            }
+        }
+        "Edit" | "MultiEdit" => {
+            if let Some(fp) = get_str("file_path") {
+                format!("{} {}", tool_name, rel_path(fp))
+            } else {
+                tool_name.into()
+            }
+        }
+        "Grep" => {
+            let pattern = get_str("pattern").unwrap_or("?");
+            if let Some(path) = get_str("path") {
+                format!("Grep '{}' in {}", pattern, rel_path(path))
+            } else {
+                format!("Grep '{}'", pattern)
+            }
+        }
+        "Glob" => {
+            if let Some(pattern) = get_str("pattern") {
+                format!("Glob {}", pattern)
+            } else {
+                "Glob".into()
+            }
+        }
+        "Bash" => {
+            if let Some(cmd) = get_str("command") {
+                let short: String = cmd.chars().take(60).collect();
+                if cmd.len() > 60 { format!("Bash: {}...", short) } else { format!("Bash: {}", short) }
+            } else {
+                "Bash".into()
+            }
+        }
+        _ => tool_name.into(),
     }
 }
 
