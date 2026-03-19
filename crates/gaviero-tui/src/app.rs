@@ -719,17 +719,38 @@ impl App {
             }
         }
 
-        // Terminal resize: Alt+Up/Down when terminal is visible
+        // Terminal resize: Alt+Up/Down when terminal is focused
         if self.panel_visible.terminal {
             match action {
                 Action::MoveLineUp if self.focus == Focus::Terminal => {
-                    // Grow terminal (decrease top percentage → increase terminal share)
                     self.terminal_split_percent = (self.terminal_split_percent + theme::TERMINAL_RESIZE_STEP).min(theme::TERMINAL_MAX_PERCENT);
                     return;
                 }
                 Action::MoveLineDown if self.focus == Focus::Terminal => {
-                    // Shrink terminal
                     self.terminal_split_percent = self.terminal_split_percent.saturating_sub(theme::TERMINAL_RESIZE_STEP).max(theme::TERMINAL_MIN_PERCENT);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // Chat input area resize: Alt+Up/Down when side panel is focused
+        if self.focus == Focus::SidePanel {
+            match action {
+                Action::MoveLineUp => {
+                    // Grow input area
+                    let current = self.chat_state.input_area_rows.max(3);
+                    self.chat_state.input_area_rows = (current + 1).min(30);
+                    return;
+                }
+                Action::MoveLineDown => {
+                    // Shrink input area (0 = auto-size)
+                    let current = self.chat_state.input_area_rows;
+                    if current <= 3 {
+                        self.chat_state.input_area_rows = 0; // back to auto
+                    } else {
+                        self.chat_state.input_area_rows = current - 1;
+                    }
                     return;
                 }
                 _ => {}
@@ -1073,22 +1094,49 @@ impl App {
                 self.refresh_chat_autocomplete();
             }
             Action::Delete => self.chat_state.delete(),
+            Action::Undo => self.chat_state.input_undo(),
+            Action::Redo => self.chat_state.input_redo(),
+            Action::SelectAll => self.chat_state.input_select_all(),
+            Action::DeleteWordBack => {
+                self.chat_state.delete_word_back();
+                self.refresh_chat_autocomplete();
+            }
             Action::CursorLeft => self.chat_state.move_left(),
             Action::CursorRight => self.chat_state.move_right(),
             Action::Home => self.chat_state.move_home(),
             Action::End => self.chat_state.move_end(),
             Action::CursorUp => {
-                if self.chat_state.history_index.is_some() || self.chat_state.input.is_empty() {
-                    // Browse history
+                // Compute the visual line widths for the input area
+                let prompt_len = 2; // "> "
+                let panel_w = self.layout.side_panel_area.map(|a| a.width).unwrap_or(40).saturating_sub(2) as usize; // -2 for borders
+                let first_w = panel_w.saturating_sub(prompt_len);
+                let has_visual_lines = !self.chat_state.input.is_empty()
+                    && (self.chat_state.input_is_multiline()
+                        || self.chat_state.input_wraps_visually(first_w, panel_w));
+
+                if has_visual_lines {
+                    if !self.chat_state.move_up_visual(first_w, panel_w) {
+                        self.chat_state.scroll_offset = self.chat_state.scroll_offset.saturating_sub(1);
+                    }
+                } else if self.chat_state.history_index.is_some() || self.chat_state.input.is_empty() {
                     self.chat_state.history_up();
                 } else {
-                    // Scroll messages
                     self.chat_state.scroll_offset = self.chat_state.scroll_offset.saturating_sub(1);
                 }
             }
             Action::CursorDown => {
-                if self.chat_state.history_index.is_some() {
-                    // Browse history forward
+                let prompt_len = 2;
+                let panel_w = self.layout.side_panel_area.map(|a| a.width).unwrap_or(40).saturating_sub(2) as usize;
+                let first_w = panel_w.saturating_sub(prompt_len);
+                let has_visual_lines = !self.chat_state.input.is_empty()
+                    && (self.chat_state.input_is_multiline()
+                        || self.chat_state.input_wraps_visually(first_w, panel_w));
+
+                if has_visual_lines {
+                    if !self.chat_state.move_down_visual(first_w, panel_w) {
+                        self.chat_state.scroll_offset += 1;
+                    }
+                } else if self.chat_state.history_index.is_some() {
                     self.chat_state.history_down();
                 } else {
                     self.chat_state.scroll_offset += 1;
@@ -1714,12 +1762,10 @@ impl App {
             }
         }
 
-        // Fall back to text paste into input
+        // Fall back to text paste into input (preserves newlines)
         let text = self.get_clipboard();
         if !text.is_empty() {
-            for ch in text.chars() {
-                self.chat_state.insert_char(ch);
-            }
+            self.chat_state.insert_str(&text);
             self.refresh_chat_autocomplete();
         }
     }
@@ -3147,15 +3193,8 @@ impl App {
                 }
             }
             Focus::SidePanel => {
-                // Paste into chat input
-                for ch in text.chars() {
-                    if ch == '\n' {
-                        // Don't send — just insert newline in input
-                        self.chat_state.insert_char('\n');
-                    } else {
-                        self.chat_state.insert_char(ch);
-                    }
-                }
+                // Paste into chat input (preserves newlines)
+                self.chat_state.insert_str(text);
             }
             _ => {}
         }

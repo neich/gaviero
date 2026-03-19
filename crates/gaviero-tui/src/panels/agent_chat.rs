@@ -142,7 +142,16 @@ pub struct AgentChatState {
     pub active_conv: usize,
 
     pub input: String,
+    /// Cursor position as a char index (not byte offset).
     pub input_cursor: usize,
+    /// User-resized input area height (0 = auto-size from content).
+    pub input_area_rows: u16,
+    /// Selection anchor (char index). When Some, selection spans from anchor to input_cursor.
+    pub input_sel_anchor: Option<usize>,
+    /// Undo stack: (text_snapshot, cursor_pos) before each edit.
+    input_undo_stack: Vec<(String, usize)>,
+    /// Redo stack: (text_snapshot, cursor_pos) for undone edits.
+    input_redo_stack: Vec<(String, usize)>,
     pub scroll_offset: usize,
     /// Current position in history (None = new input, Some(idx) = browsing user messages).
     pub history_index: Option<usize>,
@@ -167,7 +176,8 @@ pub struct AgentChatState {
     pub tick_count: u64,
 
     /// Cached rendered line texts (set during render) for mouse text selection.
-    pub rendered_lines_cache: Vec<String>,
+    /// Each entry is (text, message_index) where message_index groups lines from the same message.
+    pub rendered_lines_cache: Vec<(String, Option<usize>)>,
     /// Cached conversation area rect (set during render).
     pub conv_area_cache: Option<Rect>,
     /// Text selection anchor: (rendered_line_index, char_index).
@@ -196,6 +206,10 @@ impl AgentChatState {
             active_conv: 0,
             input: String::new(),
             input_cursor: 0,
+            input_area_rows: 0,
+            input_sel_anchor: None,
+            input_undo_stack: Vec::new(),
+            input_redo_stack: Vec::new(),
             scroll_offset: 0,
             history_index: None,
             history_stash: String::new(),
@@ -514,7 +528,7 @@ impl AgentChatState {
     pub fn start_rename(&mut self) {
         let title = self.conversations[self.active_conv].title.clone();
         self.input = title;
-        self.input_cursor = self.input.len();
+        self.input_cursor = self.input.chars().count();
         self.renaming = true;
     }
 
@@ -630,64 +644,372 @@ impl AgentChatState {
 
     // ── Input editing ──────────────────────────────────────────
 
+    // ── Cursor helpers ──────────────────────────────────────────
+    // `input_cursor` is a CHAR INDEX (not byte offset).
+    // Use `cursor_byte_offset()` when you need the byte position for String ops.
+
+    /// Convert the char-index cursor to a byte offset into self.input.
+    fn cursor_byte_offset(&self) -> usize {
+        self.input.char_indices()
+            .nth(self.input_cursor)
+            .map(|(b, _)| b)
+            .unwrap_or(self.input.len())
+    }
+
+    /// Total char count of the input.
+    fn input_char_count(&self) -> usize {
+        self.input.chars().count()
+    }
+
+    // ── Editing operations ──────────────────────────────────────
+
     pub fn insert_char(&mut self, ch: char) {
-        self.input.insert(self.input_cursor, ch);
-        self.input_cursor += ch.len_utf8();
+        self.push_undo();
+        self.delete_input_selection(); // replace selection if active
+        let byte_pos = self.cursor_byte_offset();
+        self.input.insert(byte_pos, ch);
+        self.input_cursor += 1;
+        self.update_autocomplete();
+    }
+
+    /// Insert a string at the cursor position (for paste operations).
+    pub fn insert_str(&mut self, text: &str) {
+        self.push_undo();
+        self.delete_input_selection();
+        let byte_pos = self.cursor_byte_offset();
+        self.input.insert_str(byte_pos, text);
+        self.input_cursor += text.chars().count();
         self.update_autocomplete();
     }
 
     pub fn backspace(&mut self) {
-        if self.input_cursor > 0 {
-            let prev = self.input[..self.input_cursor]
-                .chars()
-                .last()
-                .map(|c| c.len_utf8())
-                .unwrap_or(0);
-            self.input.drain(self.input_cursor - prev..self.input_cursor);
-            self.input_cursor -= prev;
+        if self.has_input_selection() {
+            self.push_undo();
+            self.delete_input_selection();
+            self.update_autocomplete();
+        } else if self.input_cursor > 0 {
+            self.push_undo();
+            self.input_cursor -= 1;
+            let byte_pos = self.cursor_byte_offset();
+            let ch_len = self.input[byte_pos..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
+            self.input.drain(byte_pos..byte_pos + ch_len);
             self.update_autocomplete();
         }
     }
 
     pub fn delete(&mut self) {
-        if self.input_cursor < self.input.len() {
-            let next = self.input[self.input_cursor..]
-                .chars()
-                .next()
-                .map(|c| c.len_utf8())
-                .unwrap_or(0);
-            self.input.drain(self.input_cursor..self.input_cursor + next);
+        if self.has_input_selection() {
+            self.push_undo();
+            self.delete_input_selection();
+        } else if self.input_cursor < self.input_char_count() {
+            self.push_undo();
+            let byte_pos = self.cursor_byte_offset();
+            let ch_len = self.input[byte_pos..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
+            self.input.drain(byte_pos..byte_pos + ch_len);
         }
     }
 
     pub fn move_left(&mut self) {
+        self.clear_input_selection();
         if self.input_cursor > 0 {
-            let prev = self.input[..self.input_cursor]
-                .chars()
-                .last()
-                .map(|c| c.len_utf8())
-                .unwrap_or(0);
-            self.input_cursor -= prev;
+            self.input_cursor -= 1;
         }
     }
 
     pub fn move_right(&mut self) {
-        if self.input_cursor < self.input.len() {
-            let next = self.input[self.input_cursor..]
-                .chars()
-                .next()
-                .map(|c| c.len_utf8())
-                .unwrap_or(0);
-            self.input_cursor += next;
+        self.clear_input_selection();
+        if self.input_cursor < self.input_char_count() {
+            self.input_cursor += 1;
         }
     }
 
+    /// Move cursor up one logical line in multi-line input. Returns false if already on first line.
+    #[allow(dead_code)]
+    pub fn move_up(&mut self) -> bool {
+        let before = &self.input[..self.input_cursor];
+        // Find the start of the current line
+        let cur_line_start = before.rfind('\n').map(|p| p + 1).unwrap_or(0);
+        if cur_line_start == 0 {
+            return false; // already on first line
+        }
+        let col = self.input_cursor - cur_line_start;
+        // Find the start of the previous line
+        let prev_line_start = self.input[..cur_line_start - 1]
+            .rfind('\n')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        let prev_line_len = cur_line_start - 1 - prev_line_start;
+        self.input_cursor = prev_line_start + col.min(prev_line_len);
+        true
+    }
+
+    /// Move cursor down one logical line in multi-line input. Returns false if already on last line.
+    #[allow(dead_code)]
+    pub fn move_down(&mut self) -> bool {
+        let before = &self.input[..self.input_cursor];
+        let cur_line_start = before.rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let col = self.input_cursor - cur_line_start;
+        // Find the end of the current line (next \n)
+        let next_nl = self.input[self.input_cursor..].find('\n');
+        let Some(offset) = next_nl else {
+            return false; // already on last line
+        };
+        let next_line_start = self.input_cursor + offset + 1;
+        let next_line_end = self.input[next_line_start..]
+            .find('\n')
+            .map(|p| next_line_start + p)
+            .unwrap_or(self.input.len());
+        let next_line_len = next_line_end - next_line_start;
+        self.input_cursor = next_line_start + col.min(next_line_len);
+        true
+    }
+
+    /// Whether the input contains multiple lines (has newline characters).
+    pub fn input_is_multiline(&self) -> bool {
+        self.input.contains('\n')
+    }
+
+    /// Whether the input would visually wrap given the available width.
+    pub fn input_wraps_visually(&self, first_line_width: usize, full_width: usize) -> bool {
+        if self.input.is_empty() || full_width == 0 {
+            return false;
+        }
+        // Check if any logical line exceeds its available width
+        for (i, line) in self.input.split('\n').enumerate() {
+            let avail = if i == 0 { first_line_width } else { full_width };
+            if line.chars().count() > avail {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Move cursor up one visual line given the rendering widths.
+    /// Returns false if already on the first visual line.
+    pub fn move_up_visual(&mut self, first_line_width: usize, full_width: usize) -> bool {
+        let lines = self.build_visual_lines(first_line_width, full_width);
+        let cursor_char_pos = self.input_cursor;
+        let (cur_vline, cur_col) = self.find_cursor_in_visual_lines(&lines, cursor_char_pos);
+        if cur_vline == 0 {
+            return false;
+        }
+        let (prev_start, prev_len) = lines[cur_vline - 1];
+        let new_char_pos = prev_start + cur_col.min(prev_len);
+        self.input_cursor = self.char_pos_to_byte(new_char_pos);
+        true
+    }
+
+    /// Move cursor down one visual line given the rendering widths.
+    /// Returns false if already on the last visual line.
+    pub fn move_down_visual(&mut self, first_line_width: usize, full_width: usize) -> bool {
+        let lines = self.build_visual_lines(first_line_width, full_width);
+        let cursor_char_pos = self.input_cursor;
+        let (cur_vline, cur_col) = self.find_cursor_in_visual_lines(&lines, cursor_char_pos);
+        if cur_vline >= lines.len() - 1 {
+            return false;
+        }
+        let (next_start, next_len) = lines[cur_vline + 1];
+        let new_char_pos = next_start + cur_col.min(next_len);
+        self.input_cursor = self.char_pos_to_byte(new_char_pos);
+        true
+    }
+
+    /// Build visual lines as (start_char_idx, char_count) for the current input.
+    fn build_visual_lines(&self, first_line_width: usize, full_width: usize) -> Vec<(usize, usize)> {
+        let mut lines = Vec::new();
+        let mut pos = 0;
+        for (logical_idx, logical_line) in self.input.split('\n').enumerate() {
+            let line_char_count = logical_line.chars().count();
+            let avail = if lines.is_empty() { first_line_width } else { full_width };
+            if line_char_count == 0 {
+                lines.push((pos, 0));
+            } else {
+                let mut col = 0;
+                let first_visual = lines.len();
+                while col < line_char_count {
+                    let w = if lines.is_empty() { first_line_width }
+                            else if lines.len() == first_visual { avail }
+                            else { full_width };
+                    let w = w.max(1);
+                    let take = w.min(line_char_count - col);
+                    lines.push((pos + col, take));
+                    col += take;
+                }
+            }
+            pos += line_char_count;
+            if logical_idx < self.input.matches('\n').count() {
+                pos += 1;
+            }
+        }
+        if lines.is_empty() {
+            lines.push((0, 0));
+        }
+        lines
+    }
+
+    /// Find which visual line the cursor is on and the column within it.
+    fn find_cursor_in_visual_lines(&self, lines: &[(usize, usize)], cursor_char_pos: usize) -> (usize, usize) {
+        for (i, &(start, len)) in lines.iter().enumerate() {
+            if cursor_char_pos >= start && cursor_char_pos <= start + len {
+                if cursor_char_pos < start + len || i == lines.len() - 1 {
+                    return (i, cursor_char_pos - start);
+                }
+            }
+            if i + 1 < lines.len() && cursor_char_pos == lines[i + 1].0 {
+                return (i + 1, 0);
+            }
+        }
+        if let Some(&(start, _)) = lines.last() {
+            (lines.len() - 1, cursor_char_pos.saturating_sub(start))
+        } else {
+            (0, 0)
+        }
+    }
+
+    /// Convert a char position to a byte offset in the input string.
+    fn char_pos_to_byte(&self, char_pos: usize) -> usize {
+        self.input.char_indices()
+            .nth(char_pos)
+            .map(|(byte, _)| byte)
+            .unwrap_or(self.input.len())
+    }
+
     pub fn move_home(&mut self) {
+        self.clear_input_selection();
         self.input_cursor = 0;
     }
 
     pub fn move_end(&mut self) {
-        self.input_cursor = self.input.len();
+        self.clear_input_selection();
+        self.input_cursor = self.input_char_count();
+    }
+
+    // ── Selection ───────────────────────────────────────────────
+
+    /// Whether the input has an active selection.
+    pub fn has_input_selection(&self) -> bool {
+        self.input_sel_anchor.is_some() && self.input_sel_anchor != Some(self.input_cursor)
+    }
+
+    /// Get the selection range as (start_char, end_char), normalized.
+    pub fn input_selection_range(&self) -> Option<(usize, usize)> {
+        let anchor = self.input_sel_anchor?;
+        if anchor == self.input_cursor {
+            return None;
+        }
+        Some(if anchor < self.input_cursor {
+            (anchor, self.input_cursor)
+        } else {
+            (self.input_cursor, anchor)
+        })
+    }
+
+    /// Delete the selected text. Returns true if something was deleted.
+    pub fn delete_input_selection(&mut self) -> bool {
+        let Some((start, end)) = self.input_selection_range() else {
+            return false;
+        };
+        let byte_start = self.char_pos_to_byte(start);
+        let byte_end = self.char_pos_to_byte(end);
+        self.input.drain(byte_start..byte_end);
+        self.input_cursor = start;
+        self.input_sel_anchor = None;
+        true
+    }
+
+    /// Select all input text.
+    pub fn input_select_all(&mut self) {
+        self.input_sel_anchor = Some(0);
+        self.input_cursor = self.input_char_count();
+    }
+
+    /// Clear selection without moving cursor.
+    fn clear_input_selection(&mut self) {
+        self.input_sel_anchor = None;
+    }
+
+    // ── Undo / Redo ─────────────────────────────────────────────
+
+    const MAX_UNDO: usize = 50;
+
+    /// Save current state to undo stack before an edit.
+    fn push_undo(&mut self) {
+        self.input_undo_stack.push((self.input.clone(), self.input_cursor));
+        if self.input_undo_stack.len() > Self::MAX_UNDO {
+            self.input_undo_stack.remove(0);
+        }
+        self.input_redo_stack.clear();
+    }
+
+    /// Undo the last edit.
+    pub fn input_undo(&mut self) {
+        if let Some((text, cursor)) = self.input_undo_stack.pop() {
+            self.input_redo_stack.push((self.input.clone(), self.input_cursor));
+            self.input = text;
+            self.input_cursor = cursor;
+            self.input_sel_anchor = None;
+        }
+    }
+
+    /// Redo the last undone edit.
+    pub fn input_redo(&mut self) {
+        if let Some((text, cursor)) = self.input_redo_stack.pop() {
+            self.input_undo_stack.push((self.input.clone(), self.input_cursor));
+            self.input = text;
+            self.input_cursor = cursor;
+            self.input_sel_anchor = None;
+        }
+    }
+
+    // ── Word movement ───────────────────────────────────────────
+
+    /// Move cursor left by one word.
+    pub fn move_word_left(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut pos = self.input_cursor;
+        // Skip non-word chars (whitespace, punctuation)
+        while pos > 0 && !chars[pos - 1].is_alphanumeric() && chars[pos - 1] != '_' {
+            pos -= 1;
+        }
+        // Skip word chars
+        while pos > 0 && (chars[pos - 1].is_alphanumeric() || chars[pos - 1] == '_') {
+            pos -= 1;
+        }
+        self.input_cursor = pos;
+    }
+
+    /// Move cursor right by one word.
+    #[allow(dead_code)]
+    pub fn move_word_right(&mut self) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let len = chars.len();
+        let mut pos = self.input_cursor;
+        // Skip word chars
+        while pos < len && (chars[pos].is_alphanumeric() || chars[pos] == '_') {
+            pos += 1;
+        }
+        // Skip non-word chars
+        while pos < len && !chars[pos].is_alphanumeric() && chars[pos] != '_' {
+            pos += 1;
+        }
+        self.input_cursor = pos;
+    }
+
+    /// Delete the word before the cursor.
+    pub fn delete_word_back(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        self.push_undo();
+        let start = self.input_cursor;
+        self.move_word_left();
+        let end = start;
+        let byte_start = self.char_pos_to_byte(self.input_cursor);
+        let byte_end = self.char_pos_to_byte(end);
+        self.input.drain(byte_start..byte_end);
     }
 
     /// Take the input text (for sending), clear the input field.
@@ -731,7 +1053,7 @@ impl AgentChatState {
             }
             _ => {}
         }
-        self.input_cursor = self.input.len();
+        self.input_cursor = self.input.chars().count();
     }
 
     /// Navigate history downward (newer). Called when Down is pressed while browsing history.
@@ -746,7 +1068,7 @@ impl AgentChatState {
             self.history_index = None;
             self.input = std::mem::take(&mut self.history_stash);
         }
-        self.input_cursor = self.input.len();
+        self.input_cursor = self.input.chars().count();
     }
 
     // ── Browse mode (copy from chat) ──────────────────────────
@@ -781,11 +1103,11 @@ impl AgentChatState {
             // Clamp to last line
             let last = self.rendered_lines_cache.len().saturating_sub(1);
             let char_count = self.rendered_lines_cache.get(last)
-                .map(|l| l.chars().count()).unwrap_or(0);
+                .map(|(l, _)| l.chars().count()).unwrap_or(0);
             return Some((last, char_count));
         }
         let target_col = col.saturating_sub(area.x) as usize;
-        let line = &self.rendered_lines_cache[line_idx];
+        let line = &self.rendered_lines_cache[line_idx].0;
         let mut current_col = 0usize;
         let mut char_idx = 0usize;
         for ch in line.chars() {
@@ -855,25 +1177,45 @@ impl AgentChatState {
     }
 
     /// Extract the selected text from the cached rendered lines.
+    /// Lines from the same message that are word-wrap continuations are joined
+    /// with spaces; actual message boundaries use newlines.
     pub fn selected_chat_text(&self) -> Option<String> {
         let (sl, sc, el, ec) = self.text_selection_range()?;
         if sl == el && sc == ec {
             return None;
         }
         let mut result = String::new();
+        let mut prev_msg_idx: Option<usize> = None;
         for line_idx in sl..=el {
             if line_idx >= self.rendered_lines_cache.len() {
                 break;
             }
-            let line = &self.rendered_lines_cache[line_idx];
+            let (ref line, msg_idx) = self.rendered_lines_cache[line_idx];
             let chars: Vec<char> = line.chars().collect();
             let start_c = if line_idx == sl { sc.min(chars.len()) } else { 0 };
             let end_c = if line_idx == el { ec.min(chars.len()) } else { chars.len() };
+
             if line_idx > sl {
-                result.push('\n');
+                // Same message = word-wrap continuation → join with space
+                // Different message or separator line (None) → newline
+                let same_msg = match (prev_msg_idx, msg_idx) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => false,
+                };
+                if same_msg {
+                    // Don't add space if the previous line ended with a space
+                    // or this line starts with a space
+                    if !result.ends_with(' ') && !chars.get(start_c).map_or(true, |c| *c == ' ') {
+                        result.push(' ');
+                    }
+                } else {
+                    result.push('\n');
+                }
             }
+
             let selected: String = chars[start_c..end_c].iter().collect();
             result.push_str(&selected);
+            prev_msg_idx = msg_idx;
         }
         if result.is_empty() { None } else { Some(result) }
     }
@@ -905,7 +1247,8 @@ impl AgentChatState {
 
     /// Check if cursor is inside an @reference and update autocomplete state.
     fn update_autocomplete(&mut self) {
-        let before_cursor = &self.input[..self.input_cursor];
+        let byte_pos = self.cursor_byte_offset();
+        let before_cursor = &self.input[..byte_pos];
 
         // Find the last '@' before cursor that isn't preceded by a non-whitespace char
         let at_pos = before_cursor.rfind('@');
@@ -973,12 +1316,13 @@ impl AgentChatState {
         let at_pos = self.autocomplete.at_pos;
 
         // Replace @query with @path
-        let after_cursor = self.input[self.input_cursor..].to_string();
+        let cursor_byte = self.cursor_byte_offset();
+        let after_cursor = self.input[cursor_byte..].to_string();
         self.input.truncate(at_pos);
         self.input.push('@');
         self.input.push_str(&path);
         self.input.push(' ');
-        self.input_cursor = self.input.len();
+        self.input_cursor = self.input.chars().count();
         self.input.push_str(&after_cursor);
 
         self.autocomplete.reset();
@@ -1336,8 +1680,18 @@ impl AgentChatState {
         };
         self.render_conv_tabs(tab_area, buf);
 
-        // Split remaining: conversation area + [attachments] + input area (bottom, 3 lines)
-        let input_height: u16 = 3;
+        // Split remaining: conversation area + [attachments] + input area (bottom)
+        // Input height: user override if set, otherwise auto-grow from newlines
+        let max_input = (inner.height / 2).max(3);
+        let auto_height = {
+            let newline_count = self.input.chars().filter(|&c| c == '\n').count() as u16;
+            (newline_count + 2).clamp(3, max_input)
+        };
+        let input_height: u16 = if self.input_area_rows > 0 {
+            self.input_area_rows.clamp(3, max_input)
+        } else {
+            auto_height
+        };
         let attach_height: u16 = if self.attachments.is_empty() { 0 } else { 1 };
         let remaining_y = inner.y + 1;
         let remaining_h = inner.height.saturating_sub(1);
@@ -1537,8 +1891,8 @@ impl AgentChatState {
             lines.push((stream_style, format!("{} {}{}", frame, label, elapsed_str), None));
         }
 
-        // Cache rendered line texts for mouse text selection
-        self.rendered_lines_cache = lines.iter().map(|(_, text, _)| text.clone()).collect();
+        // Cache rendered line texts + message index for mouse text selection
+        self.rendered_lines_cache = lines.iter().map(|(_, text, mi)| (text.clone(), *mi)).collect();
 
         // In browse mode, scroll to keep the browsed message visible
         let total = lines.len();
@@ -1554,8 +1908,8 @@ impl AgentChatState {
                     self.scroll_offset = last.saturating_sub(viewport - 1);
                 }
             }
-        } else if self.scroll_offset == usize::MAX || self.scroll_offset + viewport > total {
-            // Auto-scroll to bottom
+        } else if self.scroll_offset == usize::MAX || self.scroll_offset + viewport >= total {
+            // Auto-scroll to bottom: trigger when at or near the bottom
             self.scroll_offset = total.saturating_sub(viewport);
         }
 
@@ -1699,33 +2053,75 @@ impl AgentChatState {
                 }
             }
         } else if text_width > 0 {
-            // Wrap input into lines: first line has `text_width` chars,
-            // subsequent lines have full `area.width` chars.
+            // Build visual lines from input, respecting actual newlines (\n)
+            // and wrapping long lines within the available width.
+            // Each visual line: (start_char_idx, len_chars, is_first_visual_line)
             let input_chars: Vec<char> = self.input.chars().collect();
-            let cursor_char_pos = self.input[..self.input_cursor].chars().count();
+            let cursor_char_pos = self.input_cursor;
+            let full_width = area.width as usize;
 
-            // Build wrapped lines with (start_char_idx, line_width)
             let mut lines: Vec<(usize, usize)> = Vec::new();
             let mut pos = 0;
-            // First line: starts after prompt
-            let first_line_width = text_width;
-            lines.push((0, first_line_width));
-            pos += first_line_width.min(input_chars.len());
-            // Subsequent lines: full width
-            let full_width = area.width as usize;
-            while pos < input_chars.len() {
-                lines.push((pos, full_width));
-                pos += full_width;
+
+            // Split by actual newlines first, then wrap each logical line
+            for (logical_idx, logical_line) in self.input.split('\n').enumerate() {
+                let line_char_count = logical_line.chars().count();
+                let avail = if lines.is_empty() { text_width } else { full_width };
+
+                if line_char_count == 0 {
+                    // Empty line (just a newline)
+                    lines.push((pos, 0));
+                } else {
+                    // Wrap this logical line into visual lines
+                    let mut col = 0;
+                    let first_visual = lines.len();
+                    while col < line_char_count {
+                        let w = if lines.len() == 0 { text_width }
+                                else if lines.len() == first_visual { avail }
+                                else { full_width };
+                        let take = w.min(line_char_count - col);
+                        lines.push((pos + col, take));
+                        col += take;
+                    }
+                }
+                // +1 for the '\n' character between logical lines
+                pos += line_char_count;
+                if logical_idx < self.input.split('\n').count() - 1 {
+                    pos += 1; // skip the \n char
+                }
             }
 
-            // Find which line the cursor is on
+            // Ensure at least one line
+            if lines.is_empty() {
+                lines.push((0, 0));
+            }
+
+            // Find which visual line the cursor is on
             let mut cursor_line = 0;
-            let mut cursor_col = cursor_char_pos;
-            for (i, &(start, width)) in lines.iter().enumerate() {
-                if cursor_char_pos < start + width || i == lines.len() - 1 {
-                    cursor_line = i;
-                    cursor_col = cursor_char_pos.saturating_sub(start);
+            let mut cursor_col = 0;
+            for (i, &(start, len)) in lines.iter().enumerate() {
+                if cursor_char_pos >= start && cursor_char_pos <= start + len {
+                    // Check if this is the right line (cursor could be at the boundary)
+                    if cursor_char_pos < start + len || i == lines.len() - 1 {
+                        cursor_line = i;
+                        cursor_col = cursor_char_pos - start;
+                        break;
+                    }
+                }
+                // If cursor is exactly at the start of the next line
+                if i + 1 < lines.len() && cursor_char_pos == lines[i + 1].0 {
+                    cursor_line = i + 1;
+                    cursor_col = 0;
                     break;
+                }
+            }
+            // Fallback: if cursor is past all lines (e.g., at very end)
+            if cursor_char_pos > 0 && cursor_line == 0 && cursor_col == 0 {
+                if let Some(&(start, _)) = lines.last() {
+                    if cursor_char_pos >= start {
+                        cursor_line = lines.len() - 1;
+                        cursor_col = cursor_char_pos - start;
+                    }
                 }
             }
 
@@ -1742,15 +2138,27 @@ impl AgentChatState {
                 if line_idx >= lines.len() {
                     break;
                 }
-                let (start, width) = lines[line_idx];
+                let (start, len) = lines[line_idx];
                 let y = area.y + row as u16;
                 let x_start = if line_idx == 0 { x } else { area.x };
-                let end = (start + width).min(input_chars.len());
 
-                for (i, &ch) in input_chars[start..end].iter().enumerate() {
-                    let cx = x_start + i as u16;
-                    if cx < area.x + area.width && cx < buf.area().right() && y < buf.area().bottom() {
-                        buf[(cx, y)].set_char(ch).set_style(style);
+                // Get selection range for highlighting
+                let sel_range = self.input_selection_range();
+
+                for i in 0..len {
+                    let ch_idx = start + i;
+                    if ch_idx < input_chars.len() {
+                        let ch = input_chars[ch_idx];
+                        if ch == '\n' { continue; }
+                        let cx = x_start + i as u16;
+                        if cx < area.x + area.width && cx < buf.area().right() && y < buf.area().bottom() {
+                            let ch_style = if sel_range.map_or(false, |(s, e)| ch_idx >= s && ch_idx < e) {
+                                Style::default().fg(fg).bg(theme::SELECTION_BG)
+                            } else {
+                                style
+                            };
+                            buf[(cx, y)].set_char(ch).set_style(ch_style);
+                        }
                     }
                 }
             }
