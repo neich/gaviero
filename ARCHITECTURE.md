@@ -27,11 +27,11 @@
 
 | Crate | Role | Key dependencies |
 |---|---|---|
-| `Gaviero-core` | Logic: write gate, diff, tree-sitter, ACP, swarm, memory, git | tokio, tree-sitter (0.24) + 13 langs, git2, rusqlite, ort, similar, ropey |
-| `Gaviero-tui` | TUI editor binary | Gaviero-core, ratatui (0.30), crossterm (0.28), portable-pty, vt100, notify |
+| `Gaviero-core` | Logic: write gate, diff, tree-sitter, ACP, swarm, memory, git, terminal | tokio, tree-sitter (0.24) + 16 langs, git2, rusqlite, ort, similar, ropey, portable-pty, vt100 |
+| `Gaviero-tui` | TUI editor binary | Gaviero-core, ratatui (0.30), crossterm (0.29), notify, arboard, png |
 | `Gaviero-cli` | Headless swarm runner | Gaviero-core, clap, tokio |
 
-Tree-sitter types are re-exported from `Gaviero-core::lib.rs` (`Language`, `Tree`, `Parser`, `Query`, `QueryCursor`). Downstream crates never depend on `tree-sitter` directly.
+Tree-sitter types are re-exported from `Gaviero-core::lib.rs` (`Language`, `Tree`, `Parser`, `Query`, `QueryCursor`, `InputEdit`, `Node`, `Point`). Downstream crates never depend on `tree-sitter` directly.
 
 ---
 
@@ -40,22 +40,22 @@ Tree-sitter types are re-exported from `Gaviero-core::lib.rs` (`Language`, `Tree
 ### Gaviero-core/src/
 
 ```
-lib.rs                      Re-exports, module declarations
-types.rs                    FileScope, DiffHunk, HunkType, WriteProposal, StructuralHunk, NodeInfo
+lib.rs                      Re-exports, module declarations (14 public modules)
+types.rs                    FileScope, DiffHunk, HunkType, WriteProposal, StructuralHunk, NodeInfo, SymbolKind
 workspace.rs                Workspace model, WorkspaceFolder, settings cascade
 session_state.rs            SessionState, TabState, PanelState, StoredConversation
-tree_sitter.rs              Language registry (13 langs), enrich_hunks(), extract_outline()
+tree_sitter.rs              Language registry (16 langs), enrich_hunks(), language_name_for_extension()
 diff_engine.rs              compute_hunks() — similar crate wrapper
 write_gate.rs               WriteGatePipeline, WriteMode, proposal management
 observer.rs                 WriteGateObserver, AcpObserver, SwarmObserver trait definitions
 git.rs                      GitRepo (git2 wrapper), WorktreeManager, FileStatus
 query_loader.rs             Tree-sitter .scm file discovery (env var → exe dir → cwd → bundled)
 acp/
-  session.rs                AcpSession: spawn Claude subprocess, NDJSON read/write
-  protocol.rs               StreamEvent enum, NDJSON parsing
+  session.rs                AcpSession, AgentOptions: spawn Claude subprocess, NDJSON read/write
+  protocol.rs               StreamEvent enum, ToolUseInfo, NDJSON parsing
   client.rs                 AcpPipeline: prompt enrichment, file block detection, proposal routing
 swarm/
-  models.rs                 WorkUnit, AgentManifest, AgentStatus, SwarmResult, MergeResult
+  models.rs                 WorkUnit, AgentBackend, AgentManifest, AgentStatus, SwarmResult, MergeResult
   validation.rs             validate_scopes() (overlap detection), dependency_tiers() (Kahn's)
   runner.rs                 AgentRunner: single WorkUnit execution
   pipeline.rs               SwarmPipeline: tier orchestration, parallel execution, merge
@@ -69,42 +69,59 @@ memory/
   schema.rs                 SQL DDL, migrations (memories table)
   model_manager.rs          ONNX model download + caching (~/.cache/Gaviero/models/)
 indent/
-  mod.rs                    compute_indent() entry point
+  mod.rs                    compute_indent() entry point, IndentResult, IndentHeuristic
   treesitter.rs             Tree-sitter-based indent
   heuristic.rs              Hybrid indent (relative delta)
   bracket.rs                Bracket-counting fallback
   captures.rs               Tree-sitter capture processing
   predicates.rs             Indent rule predicates
   config.rs                 Indent configuration
+  utils.rs                  Shared indent utilities
+terminal/
+  mod.rs                    Exports, Manager → Instance hierarchy
+  types.rs                  TerminalId, ShellState, CommandRecord
+  config.rs                 ShellConfig, ShellType, TerminalConfig
+  instance.rs               TerminalInstance: individual PTY tab
+  manager.rs                TerminalManager: lifecycle, multi-instance coordination
+  pty.rs                    Pseudo-terminal allocation and I/O
+  session.rs                Terminal session state persistence
+  event.rs                  TerminalEvent types
+  osc.rs                    OSC 133 sequence parsing (prompt/command detection)
+  context.rs                Terminal context (cwd, env)
+  history.rs                Command history tracking
+  shell_integration.rs      Shell integration protocol
 ```
 
 ### Gaviero-tui/src/
 
 ```
-main.rs                     Entry point, terminal setup, event loop
-app.rs                      App state, layout rendering, focus management
-event.rs                    Event enum, EventLoop, observer implementations
-keymap.rs                   Keybinding definitions
-theme.rs                    Theme (TOML) → ratatui::Style mapping
+main.rs                     Entry point, terminal setup, event loop, panic handler
+app.rs                      App state, layout rendering, focus management (~4500 lines)
+event.rs                    Event enum, EventLoop (crossterm/watcher/tick/terminal bridge)
+keymap.rs                   Keybinding definitions, Action enum (80+ variants)
+theme.rs                    Color constants (One Dark), timing constants (poll/tick)
 editor/
-  buffer.rs                 Ropey buffer, Cursor, Transaction, undo/redo
-  view.rs                   Editor rendering: gutter, syntax highlights, scroll, cursor
-  diff_overlay.rs           Diff review mode: inline hunks, accept/reject per hunk
-  highlight.rs              Tree-sitter highlight query runner → Vec<StyledSpan>
-  markdown.rs               Markdown rendering for chat display
+  mod.rs                    Module re-exports
+  buffer.rs                 Ropey buffer, Cursor, Transaction, undo/redo, FormatLevel
+  view.rs                   EditorView widget: gutter, syntax highlights, scroll, cursor
+  diff_overlay.rs           Diff review mode: DiffSource, DiffReviewState, accept/reject per hunk
+  highlight.rs              HighlightConfig, tree-sitter highlight query runner → Vec<StyledSpan>
+  markdown.rs               Markdown document rendering and editing
 panels/
+  mod.rs                    Module re-exports
   file_tree.rs              Multi-root file browser, git + proposal decorations
-  agent_chat.rs             Chat input, streaming response, conversation management
+  agent_chat.rs             AgentChatState, Conversation, attachments, @file autocomplete, batch review
+  chat_markdown.rs          ChatLine: markdown rendering for chat messages
   swarm_dashboard.rs        Agent status table with tier/phase labels
-  git_panel.rs              Staging area, commit, branch selection
-  terminal.rs               Embedded PTY (portable-pty + vt100 + tui-term)
+  git_panel.rs              GitPanelState, staging area, commit, branch picker
+  terminal.rs               Terminal rendering (tui-term), TerminalSelectionState
   status_bar.rs             Mode, file, branch, agent status indicators
-  search.rs                 File/project search
+  search.rs                 SearchPanelState, file/project search
 widgets/
-  tabs.rs                   Tab bar with close indicators
+  mod.rs                    Module re-exports
+  tabs.rs                   TabBar widget with close indicators
   scrollbar.rs              Custom scrollbar widget
-  input.rs                  Multi-line text input
-  borders.rs                Resizable split borders
+  render_utils.rs           Shared rendering utilities
 ```
 
 ### Gaviero-cli/src/
@@ -202,13 +219,15 @@ A single `tokio::sync::mpsc::unbounded_channel<Event>` carries all external even
 | Crossterm reader | `Key`, `Mouse`, `Paste`, `Resize` | Blocking thread → channel |
 | File watcher (notify) | `FileChanged`, `FileTreeChanged` | Callback → channel |
 | Tick timer | `Tick` (~33ms, ~30fps) | tokio::interval → channel |
+| Terminal bridge | `Terminal(TerminalEvent)` | TerminalManager mpsc → event channel |
 | WriteGateObserver | `ProposalCreated`, `ProposalUpdated`, `ProposalFinalized` | Observer trait impl |
-| AcpObserver | `StreamChunk`, `ToolCallStarted`, `MessageComplete` | Observer trait impl |
+| AcpObserver | `StreamChunk`, `ToolCallStarted`, `StreamingStatus`, `MessageComplete`, `FileProposalDeferred`, `AcpTaskCompleted` | Observer trait impl |
 | SwarmObserver | `SwarmPhaseChanged`, `SwarmAgentStateChanged`, `SwarmTierStarted`, `SwarmMergeConflict`, `SwarmCompleted` | Observer trait impl |
+| Memory init | `MemoryReady` | Background spawn → channel |
 
 ### Observer Bridge Pattern
 
-Three observer traits in `Gaviero-core::observer` define callbacks that core pipelines invoke. The TUI crate implements each trait with a struct holding a clone of the event sender:
+Three observer traits in `Gaviero-core::observer` define callbacks that core pipelines invoke. `AcpObserver` includes five callbacks: `on_stream_chunk`, `on_tool_call_started`, `on_streaming_status`, `on_message_complete`, and `on_proposal_deferred` (for batch review). The TUI crate implements each trait with a struct holding a clone of the event sender:
 
 ```
                     Gaviero-core                         Gaviero-tui
@@ -502,9 +521,9 @@ CREATE TABLE memories (
 
 ### Language Registry
 
-13 languages supported: Rust, Java, JavaScript, TypeScript, HTML, CSS, JSON, Bash, TOML, C, C++, LaTeX, (SQL/YAML via deps).
+16 languages supported: Rust, Java, JavaScript, TypeScript, HTML, CSS, JSON, Bash, TOML, C, C++, LaTeX, Python, YAML, Kotlin. Markdown is recognized for `language_name_for_extension()` but has no tree-sitter parser.
 
-`language_for_extension(ext)` maps file extensions to `tree_sitter::Language` objects. Unknown extensions degrade gracefully — no parsing, plain diffs.
+`language_for_extension(ext)` maps file extensions to `tree_sitter::Language` objects (22 extension mappings → 16 languages). `language_name_for_extension(ext)` maps to canonical language name strings. Unknown extensions degrade gracefully — no parsing, plain diffs.
 
 ### Structural Enrichment
 
@@ -528,7 +547,50 @@ CREATE TABLE memories (
 
 ---
 
-## 13. TUI Layout
+## 13. Terminal Subsystem
+
+The `terminal/` module in `Gaviero-core` implements a Manager → Instance architecture for embedded shell sessions.
+
+### Architecture
+
+```
+┌─────────────────────────────────────────┐
+│            TerminalManager              │
+│  ┌──────────────┐  ┌──────────────┐    │
+│  │TerminalInst 0│  │TerminalInst 1│ …  │
+│  │  ┌─────────┐ │  │  ┌─────────┐ │    │
+│  │  │   PTY   │ │  │  │   PTY   │ │    │
+│  │  │ (child) │ │  │  │ (child) │ │    │
+│  │  └─────────┘ │  │  └─────────┘ │    │
+│  └──────────────┘  └──────────────┘    │
+│                                         │
+│  event_tx ──► mpsc::Receiver<TerminalEvent> ──► TUI EventLoop bridge
+└─────────────────────────────────────────┘
+```
+
+### Components
+
+| Module | Role |
+|---|---|
+| `types.rs` | `TerminalId`, `ShellState` (Idle, Running, Exited), `CommandRecord` |
+| `config.rs` | `ShellConfig`, `ShellType` (Bash, Zsh, Fish, Custom), `TerminalConfig` |
+| `instance.rs` | `TerminalInstance`: owns one PTY child, vt100 parser, output buffer |
+| `manager.rs` | `TerminalManager`: creates/destroys instances, routes input, provides event channel |
+| `pty.rs` | PTY allocation via `portable-pty`, reader/writer split, background output reader |
+| `session.rs` | Session state persistence (cwd, env, scroll position) |
+| `event.rs` | `TerminalEvent` enum (Output, Exited, Bell, TitleChanged) |
+| `osc.rs` | OSC 133 sequence parsing — detects prompt start/end and command boundaries |
+| `context.rs` | Terminal context (working directory, environment variables) |
+| `history.rs` | Command history tracking per instance |
+| `shell_integration.rs` | Shell integration protocol for enhanced prompt detection |
+
+### Data Flow
+
+PTY output is read continuously by a background task per instance, parsed through vt100, and forwarded as `TerminalEvent::Output` to the `TerminalManager` event channel. The TUI `EventLoop::spawn_terminal_bridge()` forwards these events into the unified `Event` channel.
+
+---
+
+## 14. TUI Layout
 
 Fixed 5-region layout (no floating windows):
 
@@ -567,13 +629,17 @@ Six presets (number keys 1-6) configure column widths:
 
 `SidePanelMode`: `AgentChat` (default), `SwarmDashboard`, `GitPanel`. Toggled via keybinds.
 
+### Left Panel Modes
+
+`LeftPanelMode`: `FileTree` (default), `Search`, `Review`. Toggled via keybinds.
+
 ### Terminal Panel
 
-Embedded shell via `portable-pty` (PTY allocation) + `vt100` (escape sequence parsing) + `tui-term` (rendering). Independent session with environment isolation (per-instance `HISTFILE`, stripped IDE env vars).
+Multi-instance embedded shell managed by `TerminalManager` (gaviero-core) with `tui-term` rendering (gaviero-tui). Each instance gets its own PTY via `portable-pty`, `vt100` for escape sequence parsing, and environment isolation (per-instance `HISTFILE`, stripped IDE env vars). OSC 133 parsing enables prompt/command boundary detection. Supports text selection via mouse drag (`TerminalSelectionState`).
 
 ---
 
-## 14. Concurrency Model
+## 15. Concurrency Model
 
 ### Runtime
 
@@ -605,13 +671,15 @@ Semaphore                    // parallel agent count bound
 | Crossterm event reader | App lifetime | Blocking thread via `tokio::task::spawn_blocking` |
 | File watcher | App lifetime | `notify` crate callback → channel |
 | Tick timer | App lifetime | `tokio::time::interval` |
+| Terminal event bridge | App lifetime | Forwards `TerminalEvent` from `TerminalManager` into unified `Event` channel |
+| Memory initializer | App startup | `tokio::spawn`, sends `MemoryReady` on completion |
 | ACP session reader | Per-conversation | `tokio::spawn`, drops when session ends |
-| Terminal PTY reader | Per-terminal | `tokio::spawn`, reads PTY output continuously |
+| Terminal PTY reader | Per-terminal instance | `tokio::spawn`, reads PTY output continuously |
 | Swarm tier executor | Per-swarm run | `tokio::spawn` per agent, bounded by Semaphore |
 
 ---
 
-## 15. Configuration
+## 16. Configuration
 
 ### Settings Cascade
 
@@ -656,7 +724,7 @@ diff.removed       = "fg=#f48771"
 
 ### Query Files
 
-`queries/{language}/highlights.scm` and `queries/{language}/indents.scm` — tree-sitter S-expression queries sourced from Helix (MIT). 13 language pairs.
+`queries/{language}/highlights.scm` and `queries/{language}/indents.scm` — tree-sitter S-expression queries sourced from Helix (MIT). 16 language directories. Python, YAML, and Kotlin currently have `highlights.scm` only (no `indents.scm`); the remaining 13 languages have both.
 
 ### Session Persistence
 
@@ -664,7 +732,7 @@ diff.removed       = "fg=#f48771"
 
 ---
 
-## 16. Hard Constraints
+## 17. Hard Constraints
 
 These are architectural invariants. Do not violate them.
 

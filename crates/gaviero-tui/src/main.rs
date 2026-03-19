@@ -119,6 +119,24 @@ async fn main() -> Result<()> {
 
     app.restore_session();
 
+    // Spawn background memory initialization (non-blocking)
+    {
+        let tx = event_loop.tx();
+        tokio::task::spawn(async move {
+            match tokio::task::spawn_blocking(|| gaviero_core::memory::init(None)).await {
+                Ok(Ok(store)) => {
+                    let _ = tx.send(event::Event::MemoryReady(store));
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Memory initialization failed: {}", e);
+                }
+                Err(e) => {
+                    tracing::warn!("Memory initialization panicked: {}", e);
+                }
+            }
+        });
+    }
+
     // Main loop
     loop {
         if app.needs_full_redraw {

@@ -1,8 +1,10 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 
+use gaviero_core::memory::MemoryStore;
 use gaviero_core::observer::{AcpObserver, SwarmObserver};
 use gaviero_core::swarm::models::{AgentStatus, SwarmResult, WorkUnit};
 
@@ -64,6 +66,9 @@ impl AcpObserver for CliAcpObserver {
     fn on_proposal_deferred(&self, path: &std::path::Path, _old_content: Option<&str>, _new_content: &str) {
         eprintln!("  [deferred] {}", path.display());
     }
+    fn on_streaming_status(&self, _status: &str) {
+        // CLI doesn't show streaming status
+    }
 }
 
 /// CLI observer for swarm events.
@@ -120,6 +125,23 @@ async fn main() -> Result<()> {
 
     eprintln!("[namespace] write={}, read=[{}]", write_ns, read_nss.join(", "));
 
+    // Initialize memory store (graceful if it fails — offline, corrupt model, etc.)
+    let memory: Option<Arc<MemoryStore>> =
+        match tokio::task::spawn_blocking(|| gaviero_core::memory::init(None)).await {
+            Ok(Ok(store)) => {
+                eprintln!("[memory] ready");
+                Some(store)
+            }
+            Ok(Err(e)) => {
+                eprintln!("[memory] disabled: {}", e);
+                None
+            }
+            Err(e) => {
+                eprintln!("[memory] init panicked: {}", e);
+                None
+            }
+        };
+
     // Parse work units
     let work_units = if let Some(ref task) = cli.task {
         vec![WorkUnit {
@@ -149,12 +171,13 @@ async fn main() -> Result<()> {
         model: cli.model.clone(),
         use_worktrees: cli.max_parallel > 1,
         read_namespaces: read_nss,
+        write_namespace: write_ns,
     };
 
     let result = gaviero_core::swarm::pipeline::execute(
         work_units,
         &config,
-        None, // memory
+        memory,
         &swarm_observer,
         |_agent_id| Box::new(CliAcpObserver) as Box<dyn gaviero_core::observer::AcpObserver>,
     ).await?;

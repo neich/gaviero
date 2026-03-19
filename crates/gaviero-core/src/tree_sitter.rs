@@ -17,6 +17,7 @@ pub fn language_for_extension(ext: &str) -> Option<tree_sitter::Language> {
         "tex" | "sty" | "cls" | "bib" => Some(codebook_tree_sitter_latex::LANGUAGE.into()),
         "py" | "pyi" => Some(tree_sitter_python::LANGUAGE.into()),
         "yml" | "yaml" => Some(tree_sitter_yaml::LANGUAGE.into()),
+        "kt" | "kts" => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
         _ => None,
     }
 }
@@ -38,6 +39,7 @@ pub fn language_name_for_extension(ext: &str) -> Option<&'static str> {
         "tex" | "sty" | "cls" | "bib" => Some("latex"),
         "py" | "pyi" => Some("python"),
         "yml" | "yaml" => Some("yaml"),
+        "kt" | "kts" => Some("kotlin"),
         "md" | "markdown" => Some("markdown"),
         _ => None,
     }
@@ -62,6 +64,8 @@ const ENCLOSING_NODE_KINDS: &[&str] = &[
     "module",
     "mod_item",
     "const_item",
+    "object_declaration",
+    "companion_object",
 ];
 
 /// Enrich diff hunks with structural (AST) context from the original file.

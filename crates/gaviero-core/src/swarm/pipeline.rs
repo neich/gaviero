@@ -25,6 +25,7 @@ pub struct SwarmConfig {
     pub model: String,
     pub use_worktrees: bool,
     pub read_namespaces: Vec<String>,
+    pub write_namespace: String,
 }
 
 /// Execute a swarm of work units.
@@ -109,6 +110,8 @@ pub async fn execute(
                         &manifest.work_unit_id,
                         &format!("completed: {}", manifest.summary.as_deref().unwrap_or("")),
                     );
+                    // Store result to memory
+                    store_agent_result(&memory, &config.write_namespace, &manifest, unit).await;
                 }
                 all_manifests.push(manifest);
                 if failed {
@@ -165,6 +168,10 @@ pub async fn execute(
                                 &manifest.work_unit_id,
                                 &format!("completed: {}", manifest.summary.as_deref().unwrap_or("")),
                             );
+                            // Store result to memory
+                            if let Some(unit) = unit_map.get(manifest.work_unit_id.as_str()) {
+                                store_agent_result(&memory, &config.write_namespace, &manifest, unit).await;
+                            }
                         }
                         all_manifests.push(manifest);
                     }
@@ -274,6 +281,29 @@ async fn run_single_agent(
     manifest.branch = Some(format!("gaviero/{}", unit.id));
 
     Ok(manifest)
+}
+
+/// Store an agent's execution result to memory (best-effort, never fails the pipeline).
+async fn store_agent_result(
+    memory: &Option<Arc<MemoryStore>>,
+    write_ns: &str,
+    manifest: &AgentManifest,
+    unit: &WorkUnit,
+) {
+    let Some(mem) = memory else { return };
+    let key = format!("agents:{}", manifest.work_unit_id);
+    let files: Vec<String> = manifest.modified_files.iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    let content = format!(
+        "Task: {}\nModified: {}\nSummary: {}",
+        unit.description,
+        files.join(", "),
+        manifest.summary.as_deref().unwrap_or("none"),
+    );
+    if let Err(e) = mem.store(write_ns, &key, &content, None).await {
+        tracing::warn!("Failed to store agent result to memory: {}", e);
+    }
 }
 
 /// No-op write gate observer for parallel agents (AutoAccept mode).

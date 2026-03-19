@@ -21,6 +21,7 @@ use crate::theme::{self, Theme};
 use crate::widgets::tabs::TabBar;
 
 use gaviero_core::acp::client::AcpPipeline;
+use gaviero_core::memory::MemoryStore;
 use gaviero_core::observer::{AcpObserver, WriteGateObserver};
 use gaviero_core::session_state::{self, SessionState, TabState};
 use gaviero_core::types::WriteProposal;
@@ -239,6 +240,12 @@ impl AcpObserver for TuiAcpObserver {
             tool_name: tool_name.to_string(),
         });
     }
+    fn on_streaming_status(&self, status: &str) {
+        let _ = self.tx.send(Event::StreamingStatus {
+            conv_id: self.conv_id.clone(),
+            status: status.to_string(),
+        });
+    }
     fn on_message_complete(&self, role: &str, content: &str) {
         let _ = self.tx.send(Event::MessageComplete {
             conv_id: self.conv_id.clone(),
@@ -433,6 +440,9 @@ pub struct App {
     pub chat_state: AgentChatState,
     acp_tasks: HashMap<String, tokio::task::JoinHandle<()>>,
 
+    // Memory
+    pub memory: Option<Arc<MemoryStore>>,
+
     // Git panel (M4)
     pub git_panel: crate::panels::git_panel::GitPanelState,
     pub git_repo: Option<gaviero_core::git::GitRepo>,
@@ -554,6 +564,7 @@ impl App {
                 cs
             },
             acp_tasks: HashMap::new(),
+            memory: None,
             git_panel: crate::panels::git_panel::GitPanelState::new(),
             git_repo,
             terminal_manager: gaviero_core::terminal::TerminalManager::new(
@@ -579,7 +590,10 @@ impl App {
                                 let bytes = key_event_to_bytes(&key);
                                 if !bytes.is_empty() {
                                     self.terminal_selection.clear();
-                                    self.terminal_manager.active_instance_mut().unwrap().write_input(&bytes);
+                                    let inst = self.terminal_manager.active_instance_mut().unwrap();
+                                    // Reset scrollback to live view when user types
+                                    inst.screen_mut().set_scrollback(0);
+                                    inst.write_input(&bytes);
                                 }
                             }
                             return;
@@ -636,6 +650,11 @@ impl App {
             Event::ToolCallStarted { conv_id, tool_name } => {
                 self.chat_state.add_tool_call_to(&conv_id, &tool_name);
             }
+            Event::StreamingStatus { conv_id, status } => {
+                if let Some(idx) = self.chat_state.find_conv_idx(&conv_id) {
+                    self.chat_state.conversations[idx].streaming_status = status;
+                }
+            }
             Event::MessageComplete { conv_id, role, content } => {
                 self.chat_state.finalize_message_to(&conv_id, &role, &content);
                 // Collapse <file> blocks in the assistant message for cleaner display
@@ -689,6 +708,11 @@ impl App {
                 ));
             }
 
+            Event::MemoryReady(store) => {
+                self.memory = Some(store);
+                self.status_message = Some(("Memory ready".to_string(), std::time::Instant::now()));
+            }
+
             Event::Terminal(term_event) => {
                 if matches!(&term_event, gaviero_core::terminal::TerminalEvent::PtyOutput { .. }) {
                     self.terminal_selection.clear();
@@ -728,6 +752,29 @@ impl App {
                 }
                 Action::MoveLineDown if self.focus == Focus::Terminal => {
                     self.terminal_split_percent = self.terminal_split_percent.saturating_sub(theme::TERMINAL_RESIZE_STEP).max(theme::TERMINAL_MIN_PERCENT);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // Terminal scrollback: Shift+PageUp/PageDown when terminal is focused
+        if self.focus == Focus::Terminal {
+            match action {
+                Action::PageUp => {
+                    if let Some(inst) = self.terminal_manager.active_instance_mut() {
+                        let current = inst.screen().scrollback();
+                        let page = inst.screen().size().0 as usize; // rows
+                        inst.screen_mut().set_scrollback(current + page);
+                    }
+                    return;
+                }
+                Action::PageDown => {
+                    if let Some(inst) = self.terminal_manager.active_instance_mut() {
+                        let current = inst.screen().scrollback();
+                        let page = inst.screen().size().0 as usize;
+                        inst.screen_mut().set_scrollback(current.saturating_sub(page));
+                    }
                     return;
                 }
                 _ => {}
@@ -921,6 +968,20 @@ impl App {
                             };
                         }
                     }
+                    Focus::Terminal => {
+                        // Scroll terminal history
+                        if let Some(inst) = self.terminal_manager.active_instance_mut() {
+                            let current = inst.screen().scrollback();
+                            let delta: usize = 1;
+                            match action {
+                                Action::ShiftUp => inst.screen_mut().set_scrollback(current + delta),
+                                Action::ShiftDown => {
+                                    inst.screen_mut().set_scrollback(current.saturating_sub(delta));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     _ => {} // Editor handles in its own match block (select_up/down)
                 }
             }
@@ -1070,6 +1131,8 @@ impl App {
                     // Handle commands that need app-level access
                     if self.chat_state.input.trim().starts_with("/swarm") {
                         self.handle_swarm_command();
+                    } else if self.chat_state.input.trim().starts_with("/remember") {
+                        self.handle_remember_command();
                     } else if self.chat_state.input.trim().starts_with("/attach") {
                         self.handle_attach_command();
                     } else if self.chat_state.input.trim().starts_with("/detach") {
@@ -1454,6 +1517,9 @@ impl App {
             max_tokens,
         };
 
+        let memory = self.memory.clone();
+        let read_ns = self.chat_state.agent_settings.read_namespaces.clone();
+
         let conv_id_clone = conv_id.clone();
         let task = tokio::spawn(async move {
             // Switch write gate to Deferred mode so file proposals are collected, not applied
@@ -1463,12 +1529,20 @@ impl App {
                 gate.set_mode(WriteMode::Deferred);
             }
 
+            // Enrich prompt with memory context (if memory is available)
+            let enriched_prompt = if let Some(ref mem) = memory {
+                let ctx = mem.search_context(&read_ns, &prompt, 5).await;
+                if ctx.is_empty() { prompt.clone() } else { format!("{}\n\n{}", ctx, prompt) }
+            } else {
+                prompt.clone()
+            };
+
             let observer = TuiAcpObserver {
                 tx: tx.clone(),
                 conv_id: conv_id_clone.clone(),
             };
             let pipeline = AcpPipeline::new(wg.clone(), Box::new(observer), model, root, "claude-chat", options);
-            if let Err(e) = pipeline.send_prompt(&prompt, &file_refs, &context, &cli_file_attachments).await {
+            if let Err(e) = pipeline.send_prompt(&enriched_prompt, &file_refs, &context, &cli_file_attachments).await {
                 tracing::error!("send_prompt error: {}", e);
                 let _ = tx.send(Event::MessageComplete {
                     conv_id: conv_id.clone(),
@@ -1539,11 +1613,19 @@ impl App {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
         let model = self.chat_state.effective_model().to_string();
-        let _write_ns = self.chat_state.agent_settings.write_namespace.clone();
+        let write_ns = self.chat_state.agent_settings.write_namespace.clone();
         let read_ns = self.chat_state.agent_settings.read_namespaces.clone();
+        let memory = self.memory.clone();
 
         tokio::spawn(async move {
             use gaviero_core::swarm::{pipeline, planner};
+
+            // Search memory for planning context
+            let memory_ctx = if let Some(ref mem) = memory {
+                mem.search_context(&read_ns, &task_desc, 5).await
+            } else {
+                String::new()
+            };
 
             // Step 1: Plan the task
             let file_list = list_workspace_files(&root, 200);
@@ -1552,7 +1634,7 @@ impl App {
                 &root,
                 &model,
                 &file_list,
-                "",  // no memory context for planning (could be added)
+                &memory_ctx,
             ).await {
                 Ok(units) => units,
                 Err(e) => {
@@ -1576,6 +1658,7 @@ impl App {
                 model: model.clone(),
                 use_worktrees: unit_count > 1,
                 read_namespaces: read_ns,
+                write_namespace: write_ns,
             };
 
             let observer = TuiSwarmObserver { tx: tx.clone() };
@@ -1587,7 +1670,7 @@ impl App {
                 })
             };
 
-            match pipeline::execute(work_units, &config, None, &observer, make_obs).await {
+            match pipeline::execute(work_units, &config, memory, &observer, make_obs).await {
                 Ok(result) => {
                     let _ = tx.send(Event::SwarmCompleted(Box::new(result)));
                 }
@@ -1597,6 +1680,61 @@ impl App {
                         conv_id: String::new(),
                         role: "system".to_string(),
                         content: format!("Swarm execution failed: {}", e),
+                    });
+                }
+            }
+        });
+    }
+
+    /// Handle `/remember <text>` command — store text to semantic memory.
+    fn handle_remember_command(&mut self) {
+        let input = self.chat_state.take_input();
+        let text = input.trim().strip_prefix("/remember").unwrap_or("").trim();
+
+        if text.is_empty() {
+            self.chat_state.add_system_message(
+                "Usage: /remember <text to remember>\n\
+                 Stores text to semantic memory for future retrieval.",
+            );
+            return;
+        }
+
+        self.chat_state.add_user_message(&input);
+
+        let Some(ref memory) = self.memory else {
+            self.chat_state.add_system_message(
+                "Memory is not available (initialization may still be in progress).",
+            );
+            return;
+        };
+
+        let mem = memory.clone();
+        let ns = self.chat_state.agent_settings.write_namespace.clone();
+        let content = text.to_string();
+        let key = format!(
+            "user:{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        );
+        let tx = self.event_tx.clone();
+        let conv_id = self.chat_state.conversations[self.chat_state.active_conv].id.clone();
+
+        tokio::spawn(async move {
+            match mem.store(&ns, &key, &content, None).await {
+                Ok(_) => {
+                    let _ = tx.send(Event::MessageComplete {
+                        conv_id,
+                        role: "system".to_string(),
+                        content: format!("Remembered: \"{}\"", content),
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(Event::MessageComplete {
+                        conv_id,
+                        role: "system".to_string(),
+                        content: format!("Failed to store memory: {}", e),
                     });
                 }
             }
@@ -2997,6 +3135,14 @@ impl App {
                         buf.scroll.top_line = buf.scroll.top_line.saturating_sub(3);
                     }
                 }
+                if let Some(area) = self.layout.terminal_area {
+                    if area.contains((col, row).into()) {
+                        if let Some(inst) = self.terminal_manager.active_instance_mut() {
+                            let current = inst.screen().scrollback();
+                            inst.screen_mut().set_scrollback(current + 3);
+                        }
+                    }
+                }
             }
             MouseEventKind::ScrollDown => {
                 if let Some(area) = self.layout.file_tree_area {
@@ -3027,6 +3173,14 @@ impl App {
                     } else if let Some(buf) = self.buffers.get_mut(self.active_buffer) {
                         let max = buf.line_count().saturating_sub(1);
                         buf.scroll.top_line = (buf.scroll.top_line + 3).min(max);
+                    }
+                }
+                if let Some(area) = self.layout.terminal_area {
+                    if area.contains((col, row).into()) {
+                        if let Some(inst) = self.terminal_manager.active_instance_mut() {
+                            let current = inst.screen().scrollback();
+                            inst.screen_mut().set_scrollback(current.saturating_sub(3));
+                        }
                     }
                 }
             }
@@ -3356,6 +3510,7 @@ impl App {
                     if !self.highlight_configs.contains_key(lang_name) {
                         match load_highlight_config(language.clone(), lang_name) {
                             Ok(config) => {
+                                tracing::info!("Loaded highlight config for {}", lang_name);
                                 self.highlight_configs.insert(lang_name.clone(), config);
                             }
                             Err(e) => {

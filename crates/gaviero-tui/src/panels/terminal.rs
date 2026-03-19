@@ -146,6 +146,7 @@ pub fn render_terminal_with_border(
     selection: &TerminalSelectionState,
 ) {
     // Border line at top
+    let scrollback = screen.scrollback();
     let border_fg = if focused {
         theme::FOCUS_BORDER
     } else {
@@ -153,7 +154,12 @@ pub fn render_terminal_with_border(
     };
     let border_style = ratatui::style::Style::default().fg(border_fg);
     if area.height > 0 {
-        let title = " Terminal ";
+        let title = if scrollback > 0 {
+            format!(" Terminal [scroll: -{}] ", scrollback)
+        } else {
+            " Terminal ".to_string()
+        };
+        let title = &title;
         for col in 0..area.width {
             let cx = area.x + col;
             let ch = if col == 0 {
@@ -300,8 +306,11 @@ pub fn is_terminal_escape_key(key: &KeyEvent) -> bool {
         // Shift+arrows — intra-panel navigation
         | (KeyCode::Left, false, false, true)        // Shift+Left — prev terminal tab
         | (KeyCode::Right, false, false, true)       // Shift+Right — next terminal tab
-        | (KeyCode::Up, false, false, true)          // Shift+Up — (reserved)
-        | (KeyCode::Down, false, false, true)        // Shift+Down — (reserved)
+        | (KeyCode::Up, false, false, true)          // Shift+Up — scroll back
+        | (KeyCode::Down, false, false, true)        // Shift+Down — scroll forward
+        // Shift+PageUp/PageDown — page scroll in terminal
+        | (KeyCode::PageUp, false, false, true)      // Shift+PageUp — page scroll back
+        | (KeyCode::PageDown, false, false, true)    // Shift+PageDown — page scroll forward
         // Alt+Up/Down — terminal resize
         | (KeyCode::Up, false, true, false)          // Alt+Up — grow terminal
         | (KeyCode::Down, false, true, false)        // Alt+Down — shrink terminal

@@ -1434,7 +1434,7 @@ impl AgentChatState {
 
     // ── Conversation-ID-targeted methods (for parallel streaming) ──
 
-    fn find_conv_idx(&self, conv_id: &str) -> Option<usize> {
+    pub fn find_conv_idx(&self, conv_id: &str) -> Option<usize> {
         self.conversations.iter().position(|c| c.id == conv_id)
     }
 
@@ -1459,17 +1459,21 @@ impl AgentChatState {
 
     pub fn add_tool_call_to(&mut self, conv_id: &str, tool_name: &str) {
         let Some(idx) = self.find_conv_idx(conv_id) else { return };
-        self.conversations[idx].streaming_status = format!("Using {}...", tool_name);
         let msgs = &mut self.conversations[idx].messages;
+
+        // Inline tool call markers into the message content so they appear
+        // in chronological order alongside text (not grouped at the end).
+        let marker = format!("\n[{}]", tool_name);
         if let Some(last) = msgs.last_mut() {
             if last.role == ChatRole::Assistant {
+                last.content.push_str(&marker);
                 last.tool_calls.push(tool_name.to_string());
                 return;
             }
         }
         msgs.push(ChatMessage {
             role: ChatRole::Assistant,
-            content: String::new(),
+            content: marker,
             tool_calls: vec![tool_name.to_string()],
         });
     }
@@ -1838,12 +1842,6 @@ impl AgentChatState {
                 ),
             };
 
-            // Render tool calls
-            for tc in &msg.tool_calls {
-                let tool_style = Style::default().fg(theme::TOOL_DIM);
-                lines.push((tool_style, format!("  [{}...]", tc), Some(msg_idx)));
-            }
-
             // Filter <file> blocks from display (both complete and in-progress)
             let display_content = filter_file_blocks_for_display(&msg.content);
 
@@ -1908,8 +1906,12 @@ impl AgentChatState {
                     self.scroll_offset = last.saturating_sub(viewport - 1);
                 }
             }
+        } else if self.active_conv_streaming() {
+            // During streaming, ALWAYS keep the bottom visible so the user
+            // sees the latest output (text, tool calls, or spinner).
+            self.scroll_offset = total.saturating_sub(viewport);
         } else if self.scroll_offset == usize::MAX || self.scroll_offset + viewport >= total {
-            // Auto-scroll to bottom: trigger when at or near the bottom
+            // Auto-scroll to bottom when already near the end
             self.scroll_offset = total.saturating_sub(viewport);
         }
 

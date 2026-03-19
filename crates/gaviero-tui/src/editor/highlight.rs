@@ -48,6 +48,7 @@ fn bundled_highlight_query(lang: &str, _file: &str) -> Result<String> {
         "latex" => Ok(include_str!("../../../../queries/latex/highlights.scm").to_string()),
         "python" => Ok(include_str!("../../../../queries/python/highlights.scm").to_string()),
         "yaml" => Ok(include_str!("../../../../queries/yaml/highlights.scm").to_string()),
+        "kotlin" => Ok(include_str!("../../../../queries/kotlin/highlights.scm").to_string()),
         _ => bail!("no bundled highlights.scm for {}", lang),
     }
 }
@@ -179,5 +180,25 @@ mod tests {
         let theme = Theme::builtin_default();
         let spans = run_highlights(&tree, &rope, &config, &theme, 0..source.len());
         assert!(!spans.is_empty(), "should produce highlight spans for YAML code");
+    }
+
+    #[test]
+    fn test_kotlin_highlight_pipeline() {
+        use crate::theme::Theme;
+
+        let lang = gaviero_core::tree_sitter::language_for_extension("kt")
+            .expect("should have kotlin language");
+        let config = load_highlight_config(lang.clone(), "kotlin")
+            .expect("should load kotlin highlights");
+
+        let mut parser = gaviero_core::Parser::new();
+        parser.set_language(&lang).unwrap();
+        let source = "package com.example\n\nfun main() {\n    val x = 42\n    println(\"hello\")\n}\n\nclass Foo(val name: String)\n";
+        let rope = ropey::Rope::from_str(source);
+        let tree = parser.parse(source, None).unwrap();
+
+        let theme = Theme::builtin_default();
+        let spans = run_highlights(&tree, &rope, &config, &theme, 0..source.len());
+        assert!(!spans.is_empty(), "should produce highlight spans for Kotlin code");
     }
 }
