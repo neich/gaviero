@@ -128,8 +128,11 @@ pub fn enrich_hunks(
         .collect()
 }
 
-/// Walk up the tree from a given line to find the nearest enclosing named node.
-fn find_enclosing_node(
+/// Walk up the tree from a given line to find the nearest enclosing named node
+/// (function, class, struct, enum, trait, impl, method).
+///
+/// Used by: `enrich_hunks()`, `StructuralVerifier` (verification pipeline).
+pub fn find_enclosing_node(
     tree: &tree_sitter::Tree,
     source: &[u8],
     line: usize,

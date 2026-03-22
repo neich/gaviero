@@ -5,12 +5,15 @@ use std::path::PathBuf;
 // ── FileScope ────────────────────────────────────────────────────
 
 /// Defines which paths an agent is allowed to write to.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct FileScope {
+    #[serde(default)]
     pub owned_paths: Vec<String>,
+    #[serde(default)]
     pub read_only_paths: Vec<String>,
     /// Interface contracts: symbol → signature/description.
     /// Used by the merge resolver to detect breaking changes.
+    #[serde(default)]
     pub interface_contracts: HashMap<String, String>,
 }
 
@@ -140,6 +143,63 @@ pub enum SymbolKind {
     Module,
 }
 
+// ── Tier Routing ────────────────────────────────────────────────
+
+/// Model tier for task routing in the coordinated swarm pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelTier {
+    /// Coordinator: planning, decomposition, verification strategy (Opus)
+    Coordinator,
+    /// Complex multi-file semantic reasoning (Sonnet)
+    Reasoning,
+    /// Focused single-file execution (Haiku)
+    Execution,
+    /// Mechanical rote changes — optional, local LLM
+    Mechanical,
+}
+
+impl Default for ModelTier {
+    fn default() -> Self {
+        Self::Execution
+    }
+}
+
+/// Privacy classification for routing decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivacyLevel {
+    /// Can be sent to any API-based model
+    Public,
+    /// Must stay on local model only
+    LocalOnly,
+}
+
+impl Default for PrivacyLevel {
+    fn default() -> Self {
+        Self::Public
+    }
+}
+
+/// Coordinator-produced task with tier annotation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TierAnnotation {
+    pub tier: ModelTier,
+    pub privacy: PrivacyLevel,
+    pub estimated_context_tokens: u32,
+    pub rationale: String,
+}
+
+/// Metadata stored alongside memory entries for versioning and provenance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntryMetadata {
+    pub privacy: PrivacyLevel,
+    /// Schema version for stored entries (current: 1).
+    pub format_version: u8,
+    /// Origin of the entry (e.g., "swarm_pipeline", "remember_command").
+    pub source: String,
+}
+
 // ── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -180,6 +240,45 @@ mod tests {
         };
         assert!(scope.is_owned("src/lib.rs"));
         assert!(scope.is_owned("  src/lib.rs  "));
+    }
+
+    #[test]
+    fn test_model_tier_serde_roundtrip() {
+        let tier = ModelTier::Mechanical;
+        let json = serde_json::to_string(&tier).unwrap();
+        assert_eq!(json, "\"mechanical\"");
+        let back: ModelTier = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, tier);
+    }
+
+    #[test]
+    fn test_model_tier_as_hash_key() {
+        let mut map = HashMap::new();
+        map.insert(ModelTier::Reasoning, "sonnet");
+        map.insert(ModelTier::Execution, "haiku");
+        assert_eq!(map[&ModelTier::Reasoning], "sonnet");
+    }
+
+    #[test]
+    fn test_privacy_level_serde_roundtrip() {
+        let lvl = PrivacyLevel::LocalOnly;
+        let json = serde_json::to_string(&lvl).unwrap();
+        assert_eq!(json, "\"local_only\"");
+        let back: PrivacyLevel = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, lvl);
+    }
+
+    #[test]
+    fn test_entry_metadata_serde() {
+        let meta = EntryMetadata {
+            privacy: PrivacyLevel::Public,
+            format_version: 1,
+            source: "swarm_pipeline".into(),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: EntryMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.format_version, 1);
+        assert_eq!(back.privacy, PrivacyLevel::Public);
     }
 
     #[test]

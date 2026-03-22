@@ -46,6 +46,11 @@ struct Cli {
     /// Output format: text or json.
     #[arg(long, default_value = "text")]
     format: String,
+
+    /// Use coordinated tier routing (Opus plans, Sonnet/Haiku/local execute).
+    /// Requires --task. Opus decomposes the task into a tier-annotated DAG.
+    #[arg(long)]
+    coordinated: bool,
 }
 
 /// CLI observer that prints agent events to stderr.
@@ -89,6 +94,18 @@ impl SwarmObserver for CliSwarmObserver {
     }
     fn on_completed(&self, result: &SwarmResult) {
         eprintln!("[completed] success={}", result.success);
+    }
+    fn on_coordination_started(&self, prompt: &str) {
+        eprintln!("[coordinator] planning: {}...", &prompt[..prompt.len().min(80)]);
+    }
+    fn on_coordination_complete(&self, dag: &gaviero_core::swarm::coordinator::TaskDAG) {
+        eprintln!("[coordinator] planned {} units: {}", dag.units.len(), dag.plan_summary);
+    }
+    fn on_tier_dispatch(&self, unit_id: &str, tier: gaviero_core::types::ModelTier, backend: &str) {
+        eprintln!("[dispatch] {}  tier={:?}  backend={}", unit_id, tier, backend);
+    }
+    fn on_cost_update(&self, estimate: &gaviero_core::swarm::verify::CostEstimate) {
+        eprintln!("[cost] ~${:.4}", estimate.estimated_usd);
     }
 }
 
@@ -155,6 +172,12 @@ async fn main() -> Result<()> {
             depends_on: Vec::new(),
             backend: Default::default(),
             model: Some(cli.model.clone()),
+            tier: Default::default(),
+            privacy: Default::default(),
+            coordinator_instructions: String::new(),
+            estimated_tokens: 0,
+            max_retries: 1,
+            escalation_tier: None,
         }]
     } else if let Some(ref json) = cli.work_units {
         serde_json::from_str::<Vec<WorkUnit>>(json)
@@ -174,13 +197,33 @@ async fn main() -> Result<()> {
         write_namespace: write_ns,
     };
 
-    let result = gaviero_core::swarm::pipeline::execute(
-        work_units,
-        &config,
-        memory,
-        &swarm_observer,
-        |_agent_id| Box::new(CliAcpObserver) as Box<dyn gaviero_core::observer::AcpObserver>,
-    ).await?;
+    let result = if cli.coordinated {
+        let task = cli.task.as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--coordinated requires --task"))?;
+        let tier_config = gaviero_core::swarm::router::TierConfig::default();
+        let coord_config = gaviero_core::swarm::coordinator::CoordinatorConfig {
+            model: "opus".into(),
+            ..Default::default()
+        };
+        eprintln!("[mode] coordinated (Opus → Sonnet/Haiku tier routing)");
+        gaviero_core::swarm::pipeline::execute_coordinated(
+            task,
+            &config,
+            tier_config,
+            coord_config,
+            memory,
+            &swarm_observer,
+            |_agent_id| Box::new(CliAcpObserver) as Box<dyn gaviero_core::observer::AcpObserver>,
+        ).await?
+    } else {
+        gaviero_core::swarm::pipeline::execute(
+            work_units,
+            &config,
+            memory,
+            &swarm_observer,
+            |_agent_id| Box::new(CliAcpObserver) as Box<dyn gaviero_core::observer::AcpObserver>,
+        ).await?
+    };
 
     // Output results
     match cli.format.as_str() {

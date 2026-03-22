@@ -150,6 +150,10 @@ impl AcpPipeline {
                         // from AssistantMessage when the full input is known.
                         self.observer.on_streaming_status(&format!("Using {}...", tool_name));
                     }
+                    StreamEvent::ToolInputDelta(_) => {
+                        // Tool input JSON fragments — ignored here.
+                        // The AcpPipeline extracts tool details from AssistantMessage instead.
+                    }
                     StreamEvent::AssistantMessage { text, tool_uses } => {
                         // Use the complete message text if we didn't get deltas
                         if full_text.is_empty() && !text.is_empty() {

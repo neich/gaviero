@@ -191,6 +191,12 @@ mod tests {
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             backend: Default::default(),
             model: None,
+            tier: Default::default(),
+            privacy: Default::default(),
+            coordinator_instructions: String::new(),
+            estimated_tokens: 0,
+            max_retries: 1,
+            escalation_tier: None,
         }
     }
 

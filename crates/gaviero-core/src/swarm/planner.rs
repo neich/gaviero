@@ -144,12 +144,15 @@ fn build_planner_prompt(file_list: &[String], memory_context: &str) -> String {
     prompt
 }
 
-/// Extract a JSON array from a response that may contain markdown fences.
-fn extract_json(response: &str) -> Result<String> {
+/// Extract a JSON string from a response that may contain markdown fences.
+///
+/// Looks for JSON arrays (starting with `[`) or objects (starting with `{`)
+/// either directly or inside markdown code fences.
+pub(crate) fn extract_json(response: &str) -> Result<String> {
     let trimmed = response.trim();
 
-    // Try parsing directly
-    if trimmed.starts_with('[') {
+    // Try parsing directly (array or object)
+    if trimmed.starts_with('[') || trimmed.starts_with('{') {
         return Ok(trimmed.to_string());
     }
 
@@ -166,13 +169,13 @@ fn extract_json(response: &str) -> Result<String> {
         let after = &trimmed[start + 3..];
         if let Some(end) = after.find("```") {
             let inner = after[..end].trim();
-            if inner.starts_with('[') {
+            if inner.starts_with('[') || inner.starts_with('{') {
                 return Ok(inner.to_string());
             }
         }
     }
 
-    anyhow::bail!("could not extract JSON array from response")
+    anyhow::bail!("could not extract JSON from response")
 }
 
 #[cfg(test)]
