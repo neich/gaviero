@@ -368,6 +368,36 @@ impl WorktreeManager {
         }
     }
 
+    /// Check if this repo supports worktrees (is a git repo with at least one commit).
+    pub fn can_use_worktrees(&self) -> bool {
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&self.repo_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Get the current HEAD commit SHA (full hash).
+    fn head_commit(&self) -> Result<String> {
+        let output = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&self.repo_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .context("running git rev-parse HEAD")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("git rev-parse HEAD failed: {}", stderr.trim());
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
     /// Provision a new worktree for an agent.
     ///
     /// Creates a new branch from HEAD and a worktree directory.
@@ -377,41 +407,56 @@ impl WorktreeManager {
         let name = format!("gaviero-{}", agent_id);
         let wt_path = self.worktree_base.join(&name);
 
+        // Resolve HEAD to a concrete commit SHA (avoids "invalid reference: HEAD")
+        let commit = self.head_commit()
+            .context("repo must have at least one commit for worktree isolation")?;
+
         // Ensure base directory exists
         std::fs::create_dir_all(&self.worktree_base)
             .with_context(|| format!("creating worktree base dir: {}", self.worktree_base.display()))?;
 
-        // Remove stale worktree if it exists
+        // Clean up stale state from previous runs
         if wt_path.exists() {
             let _ = self.remove_worktree(&name);
+            if wt_path.exists() {
+                let _ = std::fs::remove_dir_all(&wt_path);
+            }
         }
 
-        // Create worktree with a new branch
-        let status = Command::new("git")
-            .args(["worktree", "add", "-b", &branch])
-            .arg(&wt_path)
-            .arg("HEAD")
+        // Prune stale worktree references (dead paths from crashed runs)
+        let _ = Command::new("git")
+            .args(["worktree", "prune"])
             .current_dir(&self.repo_dir)
             .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        // Delete stale branch if it exists (from a previous run)
+        let _ = Command::new("git")
+            .args(["branch", "-D", &branch])
+            .current_dir(&self.repo_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        // Create worktree with a new branch based on the resolved commit
+        let output = Command::new("git")
+            .args(["worktree", "add", "-b", &branch])
+            .arg(&wt_path)
+            .arg(&commit)
+            .current_dir(&self.repo_dir)
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .status()
+            .output()
             .context("running git worktree add")?;
 
-        if !status.success() {
-            // Branch might already exist — try without -b
-            let status2 = Command::new("git")
-                .args(["worktree", "add"])
-                .arg(&wt_path)
-                .arg(&branch)
-                .current_dir(&self.repo_dir)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::piped())
-                .status()
-                .context("running git worktree add (existing branch)")?;
-
-            if !status2.success() {
-                bail!("failed to create worktree for agent '{}'", agent_id);
-            }
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "failed to create worktree for '{}': {}",
+                agent_id,
+                stderr.trim(),
+            );
         }
 
         let handle = WorktreeHandle {
