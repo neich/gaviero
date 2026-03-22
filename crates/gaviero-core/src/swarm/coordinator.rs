@@ -825,30 +825,41 @@ fn paths_overlap_normalized(a: &str, b: &str) -> bool {
 
 fn build_coordinator_prompt(file_list: &[String], memory_context: &str) -> String {
     let mut prompt = String::from(
-        "You are a code architect decomposing a development task into parallelizable \
-         subtasks. For each subtask, assign:\n\n\
+        "You are a code architect decomposing a development task into PARALLELIZABLE \
+         subtasks for a multi-agent swarm.\n\n\
+         PARALLELISM IS CRITICAL:\n\
+         - Maximize independent units that can run simultaneously\n\
+         - Minimize dependency chains — prefer WIDE SHALLOW trees over deep linear chains\n\
+         - Only add depends_on when a unit TRULY needs the output of another\n\
+         - Units that touch different files/modules can usually run in parallel\n\
+         - Aim for at most 3-4 dependency tiers, even for large tasks\n\
+         - Bad: A→B→C→D→E (serial, 5 tiers). Good: A,B,C in parallel → D,E in parallel (2 tiers)\n\n\
+         TASK SIZING:\n\
+         - Each unit should be a FOCUSED task completable in 1-3 minutes\n\
+         - Prefer many small units over few large ones\n\
+         - Each unit should touch at most 3-5 files\n\
+         - The coordinator_instructions should be precise and self-contained\n\n\
+         For each subtask, assign:\n\n\
+         - id: short identifier (e.g., \"auth-models\", \"api-routes\")\n\
+         - description: one-line summary\n\
          - tier: \"reasoning\" | \"execution\" | \"mechanical\"\n\
            - reasoning: multi-file semantic changes, interface redesigns, complex logic\n\
            - execution: single-file focused changes, test writing, error handling\n\
            - mechanical: renames, import updates, call-site propagation, formatting\n\n\
-         - privacy: \"public\" | \"local_only\"\n\
-           - local_only: if the file path matches privacy patterns or contains sensitive data\n\n\
-         - depends_on: IDs of subtasks that must complete first\n\
+         - depends_on: IDs of subtasks that MUST complete first (minimize these!)\n\
          - scope: {{ owned_paths: [...], read_only_paths: [...] }}\n\
            CRITICAL: owned_paths must be DISJOINT across all units.\n\
            Each file may appear in at most ONE unit's owned_paths.\n\
-           If multiple units need to modify the same file, assign it to the\n\
-           earliest unit and have later units depend on it.\n\
-           Common shared files (main.rs, mod.rs, Cargo.toml, build files)\n\
-           should belong to a dedicated setup unit or the unit that logically\n\
-           owns them. Other units use read_only_paths for files they read.\n\
-         - coordinator_instructions: precise instructions for the executing agent\n\
-         - estimated_tokens: approximate context needed (file contents + instructions)\n\n\
+           If multiple units need the same file, assign it to one unit and\n\
+           use read_only_paths for the others.\n\
+         - coordinator_instructions: 2-3 sentence instructions (keep brief! the agent has tools to explore)\n\
+         - estimated_tokens: approximate context needed\n\n\
+         KEEP JSON COMPACT: Use short IDs. Keep coordinator_instructions to 2-3 sentences max.\n\
+         The agent has Read/Glob/Grep tools and can explore the codebase itself.\n\n\
          Select a verification_strategy:\n\
+         - \"combined\" (DEFAULT): structural + diff review + tests\n\
          - \"structural_only\": when ALL subtasks are mechanical\n\
-         - \"diff_review\": behavioral changes but no test suite\n\
-         - \"test_suite\": when a test suite exists and structural + tests suffice\n\
-         - \"combined\" (DEFAULT): for complex refactors or mixed tiers\n\n\
+         - \"test_suite\": when a test suite exists and structural + tests suffice\n\n\
          Output a JSON object with: plan_summary, units, verification_strategy.\n\n",
     );
 
