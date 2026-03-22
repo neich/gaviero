@@ -1,7 +1,14 @@
 pub mod bus;
+pub mod calibration;
+pub mod context;
+pub mod coordinator;
 pub mod merge;
 pub mod models;
+pub mod ollama;
 pub mod pipeline;
 pub mod planner;
+pub mod privacy;
+pub mod router;
 pub mod runner;
 pub mod validation;
+pub mod verify;
