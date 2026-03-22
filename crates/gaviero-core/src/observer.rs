@@ -1,7 +1,9 @@
 use std::path::Path;
 
+use crate::swarm::coordinator::TaskDAG;
 use crate::swarm::models::{AgentStatus, SwarmResult};
-use crate::types::WriteProposal;
+use crate::swarm::verify::{CostEstimate, EscalationRecord, VerificationStep};
+use crate::types::{ModelTier, WriteProposal};
 
 /// Observer trait for write gate lifecycle events.
 /// The TUI implements this to receive notifications and update the UI.
@@ -53,4 +55,37 @@ pub trait SwarmObserver: Send + Sync {
 
     /// Called when the swarm execution completes.
     fn on_completed(&self, result: &SwarmResult);
+
+    // ── Coordination lifecycle (default no-op for backward compat) ──
+
+    /// Called when the coordinator starts planning.
+    fn on_coordination_started(&self, _prompt: &str) {}
+
+    /// Called when the coordinator finishes producing a TaskDAG.
+    fn on_coordination_complete(&self, _dag: &TaskDAG) {}
+
+    /// Called when a work unit is dispatched to a specific tier/backend.
+    fn on_tier_dispatch(&self, _unit_id: &str, _tier: ModelTier, _backend: &str) {}
+
+    /// Called when a work unit is escalated to a higher tier.
+    fn on_escalation(&self, _record: &EscalationRecord) {}
+
+    // ── Verification lifecycle ──────────────────────────────────────
+
+    /// Called when verification starts.
+    fn on_verification_started(&self, _strategy: &str) {}
+
+    /// Called when a verification step starts.
+    fn on_verification_step_started(&self, _step: &VerificationStep) {}
+
+    /// Called when a verification step completes.
+    fn on_verification_step_complete(&self, _step: &VerificationStep, _passed: bool) {}
+
+    /// Called when verification completes.
+    fn on_verification_complete(&self, _passed: bool) {}
+
+    // ── Cost tracking ───────────────────────────────────────────────
+
+    /// Called with updated cost estimates during execution.
+    fn on_cost_update(&self, _estimate: &CostEstimate) {}
 }
