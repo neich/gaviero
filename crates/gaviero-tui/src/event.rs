@@ -61,6 +61,16 @@ pub enum Event {
     SwarmCompleted(Box<gaviero_core::swarm::models::SwarmResult>),
     SwarmMergeConflict { branch: String, files: Vec<String> },
 
+    // Coordination lifecycle events
+    SwarmCoordinationStarted(String),
+    SwarmCoordinationComplete { unit_count: usize, summary: String },
+    SwarmTierDispatch {
+        unit_id: String,
+        tier: gaviero_core::types::ModelTier,
+        backend: String,
+    },
+    SwarmCostUpdate(gaviero_core::swarm::verify::CostEstimate),
+
     // Memory
     MemoryReady(Arc<MemoryStore>),
 
