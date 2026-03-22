@@ -31,6 +31,8 @@ pub enum StreamEvent {
         tool_name: String,
         tool_use_id: String,
     },
+    /// Incremental tool input JSON (type: "input_json_delta").
+    ToolInputDelta(String),
 
     /// Complete assistant message (type: "assistant").
     AssistantMessage {
@@ -100,6 +102,13 @@ pub fn parse_stream_line(line: &str) -> Result<StreamEvent> {
                     if delta_type == "text_delta" {
                         Ok(StreamEvent::ContentDelta(
                             required_str(&delta, "text")?,
+                        ))
+                    } else if delta_type == "input_json_delta" {
+                        Ok(StreamEvent::ToolInputDelta(
+                            delta.get("partial_json")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
                         ))
                     } else {
                         Ok(StreamEvent::Unknown(v))
