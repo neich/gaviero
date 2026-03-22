@@ -2,16 +2,22 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::FileScope;
+use crate::types::{FileScope, ModelTier, PrivacyLevel};
 
 /// A unit of work for an agent in the swarm.
+///
+/// All fields except `id` have serde defaults or aliases to tolerate
+/// varying JSON shapes from LLM coordinators.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkUnit {
     /// Unique identifier for this work unit.
+    #[serde(alias = "name")]
     pub id: String,
     /// Human-readable description of the task.
+    #[serde(default, alias = "task", alias = "title", alias = "summary")]
     pub description: String,
     /// File scope defining which paths this agent can write to.
+    #[serde(default)]
     pub scope: FileScope,
     /// IDs of work units that must complete before this one starts.
     #[serde(default)]
@@ -19,8 +25,36 @@ pub struct WorkUnit {
     /// Which agent backend to use.
     #[serde(default)]
     pub backend: AgentBackend,
-    /// Optional model override (e.g. "opus", "sonnet").
+    /// Per-unit model override. When `Some(_)`, bypasses `TierRouter` for
+    /// this unit — the agent runs on the specified model directly.
+    /// When `None`, the `TierRouter` resolves the model from `tier`.
+    #[serde(default)]
     pub model: Option<String>,
+
+    // ── Tier routing fields ──────────────────────────────────────
+
+    /// Model tier assigned by the coordinator.
+    #[serde(default)]
+    pub tier: ModelTier,
+    /// Privacy classification — routing constraint.
+    #[serde(default)]
+    pub privacy: PrivacyLevel,
+    /// Coordinator's decomposed instructions for this subtask.
+    #[serde(default)]
+    pub coordinator_instructions: String,
+    /// Context budget hint (estimated tokens for this unit).
+    #[serde(default)]
+    pub estimated_tokens: u32,
+    /// Max retries before escalation (default: 1).
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u8,
+    /// Tier to escalate to on failure.
+    #[serde(default)]
+    pub escalation_tier: Option<ModelTier>,
+}
+
+fn default_max_retries() -> u8 {
+    1
 }
 
 /// The backend used to execute an agent's work.
@@ -30,6 +64,11 @@ pub enum AgentBackend {
     #[default]
     ClaudeCode,
     Codex,
+    GeminiCli,
+    Ollama {
+        model: String,
+        base_url: String,
+    },
     Custom(String),
 }
 
