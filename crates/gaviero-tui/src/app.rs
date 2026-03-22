@@ -51,6 +51,8 @@ pub enum LeftPanelMode {
     FileTree,
     Search,
     Review,
+    /// Git working-directory changes browser (cyclable via F7).
+    Changes,
 }
 
 // ── Batch Review ─────────────────────────────────────────────────
@@ -123,6 +125,30 @@ fn build_simple_diff<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<(DiffKind, Str
 
     result.reverse();
     result
+}
+
+// ── Git Changes Panel ───────────────────────────────────────────
+
+/// A single changed file from `git status`.
+#[derive(Clone, Debug)]
+pub struct ChangesEntry {
+    pub rel_path: String,
+    pub abs_path: PathBuf,
+    pub status_char: char,
+    pub additions: usize,
+    pub deletions: usize,
+}
+
+/// State for the git-changes left-panel mode.
+pub struct ChangesState {
+    pub entries: Vec<ChangesEntry>,
+    pub selected_index: usize,
+    pub scroll_offset: usize,
+    /// Scroll offset for the diff view in the editor panel.
+    pub diff_scroll: usize,
+    /// Cached diff lines for the currently selected file.
+    cached_diff: Vec<(DiffKind, String)>,
+    cached_diff_index: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -217,6 +243,25 @@ impl gaviero_core::observer::SwarmObserver for TuiSwarmObserver {
     }
     fn on_completed(&self, result: &gaviero_core::swarm::models::SwarmResult) {
         let _ = self.tx.send(Event::SwarmCompleted(Box::new(result.clone())));
+    }
+    fn on_coordination_started(&self, prompt: &str) {
+        let _ = self.tx.send(Event::SwarmCoordinationStarted(prompt.to_string()));
+    }
+    fn on_coordination_complete(&self, dag: &gaviero_core::swarm::coordinator::TaskDAG) {
+        let _ = self.tx.send(Event::SwarmCoordinationComplete {
+            unit_count: dag.units.len(),
+            summary: dag.plan_summary.clone(),
+        });
+    }
+    fn on_tier_dispatch(&self, unit_id: &str, tier: gaviero_core::types::ModelTier, backend: &str) {
+        let _ = self.tx.send(Event::SwarmTierDispatch {
+            unit_id: unit_id.to_string(),
+            tier,
+            backend: backend.to_string(),
+        });
+    }
+    fn on_cost_update(&self, estimate: &gaviero_core::swarm::verify::CostEstimate) {
+        let _ = self.tx.send(Event::SwarmCostUpdate(estimate.clone()));
     }
 }
 
@@ -435,6 +480,8 @@ pub struct App {
     pub diff_review: Option<DiffReviewState>,
     /// Batch review state — entered after agent response with deferred writes.
     pub batch_review: Option<BatchReviewState>,
+    /// Git changes panel state — populated when cycling to Changes mode via F7.
+    pub changes_state: Option<ChangesState>,
 
     // Agent chat
     pub chat_state: AgentChatState,
@@ -552,6 +599,7 @@ impl App {
             write_gate,
             diff_review: None,
             batch_review: None,
+            changes_state: None,
             chat_state: {
                 let mut cs = AgentChatState::new();
                 cs.agent_settings = crate::panels::agent_chat::AgentSettings {
@@ -643,33 +691,63 @@ impl App {
                 self.refresh_file_tree();
             }
 
-            // ACP agent events — routed to the correct conversation
+            // ACP agent events — swarm agents route to dashboard, others to chat
             Event::StreamChunk { conv_id, text } => {
-                self.chat_state.append_stream_chunk_to(&conv_id, &text);
+                if let Some(agent_id) = conv_id.strip_prefix("swarm-") {
+                    self.swarm_dashboard.append_stream_chunk(agent_id, &text);
+                } else {
+                    self.chat_state.append_stream_chunk_to(&conv_id, &text);
+                }
             }
             Event::ToolCallStarted { conv_id, tool_name } => {
-                self.chat_state.add_tool_call_to(&conv_id, &tool_name);
+                if let Some(agent_id) = conv_id.strip_prefix("swarm-") {
+                    self.swarm_dashboard.add_tool_call(agent_id, &tool_name);
+                } else {
+                    self.chat_state.add_tool_call_to(&conv_id, &tool_name);
+                }
             }
             Event::StreamingStatus { conv_id, status } => {
-                if let Some(idx) = self.chat_state.find_conv_idx(&conv_id) {
+                if let Some(agent_id) = conv_id.strip_prefix("swarm-") {
+                    self.swarm_dashboard.set_streaming_status(agent_id, &status);
+                } else if let Some(idx) = self.chat_state.find_conv_idx(&conv_id) {
                     self.chat_state.conversations[idx].streaming_status = status;
                 }
             }
             Event::MessageComplete { conv_id, role, content } => {
-                self.chat_state.finalize_message_to(&conv_id, &role, &content);
-                // Collapse <file> blocks in the assistant message for cleaner display
-                if role == "assistant" {
-                    self.chat_state.collapse_file_blocks_in(&conv_id);
+                if conv_id.is_empty() {
+                    // Swarm/background task messages without a conversation —
+                    // route to chat as a system message so they're visible.
+                    self.chat_state.add_system_message(&content);
+                    // Also show in the dashboard if a swarm run failed
+                    if self.swarm_dashboard.phase == "failed" {
+                        self.swarm_dashboard.status_message = content.clone();
+                    }
+                    tracing::warn!("Swarm message: {}", content);
+                } else {
+                    self.chat_state.finalize_message_to(&conv_id, &role, &content);
+                    // Collapse <file> blocks in the assistant message for cleaner display
+                    if role == "assistant" {
+                        self.chat_state.collapse_file_blocks_in(&conv_id);
+                    }
                 }
             }
 
-            // Deferred file proposal — show compact summary in chat
+            // Deferred file proposal — swarm agents to dashboard, others to chat
             Event::FileProposalDeferred { conv_id, path, additions, deletions } => {
                 tracing::debug!(
                     "Deferred proposal: {} (+{} -{})",
                     path.display(), additions, deletions
                 );
-                self.chat_state.append_deferred_summary(&conv_id, &path, additions, deletions);
+                if let Some(agent_id) = conv_id.strip_prefix("swarm-") {
+                    self.swarm_dashboard.add_file_change(
+                        agent_id,
+                        &path.to_string_lossy(),
+                        additions,
+                        deletions,
+                    );
+                } else {
+                    self.chat_state.append_deferred_summary(&conv_id, &path, additions, deletions);
+                }
             }
 
             // ACP task completed with deferred proposals — enter batch review
@@ -691,6 +769,17 @@ impl App {
             // Swarm events
             Event::SwarmPhaseChanged(phase) => {
                 self.swarm_dashboard.set_phase(&phase);
+                // Clear status message when transitioning to active phases
+                if phase == "running" || phase == "merging" || phase == "verifying" {
+                    self.swarm_dashboard.status_message.clear();
+                } else if phase == "validating" {
+                    self.swarm_dashboard.status_message = "Validating scopes and dependencies...".into();
+                } else if phase == "failed" {
+                    // Set a placeholder — the actual error arrives via MessageComplete right after
+                    if self.swarm_dashboard.status_message.is_empty() {
+                        self.swarm_dashboard.status_message = "Run failed — waiting for error details...".into();
+                    }
+                }
             }
             Event::SwarmAgentStateChanged { id, status, detail } => {
                 self.swarm_dashboard.update_agent(&id, &status, &detail);
@@ -699,6 +788,8 @@ impl App {
                 self.swarm_dashboard.set_tier(current, total);
             }
             Event::SwarmCompleted(result) => {
+                self.swarm_dashboard.set_phase("completed");
+                self.swarm_dashboard.status_message.clear();
                 self.swarm_dashboard.set_result(*result);
             }
             Event::SwarmMergeConflict { branch, files } => {
@@ -706,6 +797,22 @@ impl App {
                     format!("Merge conflict in {}: {}", branch, files.join(", ")),
                     std::time::Instant::now(),
                 ));
+            }
+
+            // Coordination lifecycle events
+            Event::SwarmCoordinationStarted(_prompt) => {
+                self.swarm_dashboard.set_phase("coordinating");
+                self.swarm_dashboard.status_message = "Opus is decomposing the task...".into();
+            }
+            Event::SwarmCoordinationComplete { unit_count, summary: _ } => {
+                self.swarm_dashboard.set_phase(&format!("planned ({} agents)", unit_count));
+                self.swarm_dashboard.status_message = format!("Plan ready: {} agents, starting execution...", unit_count);
+            }
+            Event::SwarmTierDispatch { unit_id, tier, backend } => {
+                self.swarm_dashboard.set_tier_dispatch(&unit_id, tier, &backend);
+            }
+            Event::SwarmCostUpdate(estimate) => {
+                self.swarm_dashboard.set_cost(estimate.estimated_usd);
             }
 
             Event::MemoryReady(store) => {
@@ -921,9 +1028,13 @@ impl App {
                         if self.left_panel != LeftPanelMode::Review {
                             self.left_panel = match self.left_panel {
                                 LeftPanelMode::Search => LeftPanelMode::FileTree,
-                                LeftPanelMode::FileTree => LeftPanelMode::Search,
+                                LeftPanelMode::FileTree => LeftPanelMode::Changes,
+                                LeftPanelMode::Changes => LeftPanelMode::Search,
                                 LeftPanelMode::Review => LeftPanelMode::Review,
                             };
+                            if self.left_panel == LeftPanelMode::Changes {
+                                self.refresh_git_changes();
+                            }
                         }
                     }
                     Focus::SidePanel => self.chat_state.prev_conversation(),
@@ -937,9 +1048,13 @@ impl App {
                         if self.left_panel != LeftPanelMode::Review {
                             self.left_panel = match self.left_panel {
                                 LeftPanelMode::FileTree => LeftPanelMode::Search,
-                                LeftPanelMode::Search => LeftPanelMode::FileTree,
+                                LeftPanelMode::Search => LeftPanelMode::Changes,
+                                LeftPanelMode::Changes => LeftPanelMode::FileTree,
                                 LeftPanelMode::Review => LeftPanelMode::Review,
                             };
+                            if self.left_panel == LeftPanelMode::Changes {
+                                self.refresh_git_changes();
+                            }
                         }
                     }
                     Focus::SidePanel => self.chat_state.next_conversation(),
@@ -963,9 +1078,13 @@ impl App {
                         if self.left_panel != LeftPanelMode::Review {
                             self.left_panel = match self.left_panel {
                                 LeftPanelMode::FileTree => LeftPanelMode::Search,
-                                LeftPanelMode::Search => LeftPanelMode::FileTree,
+                                LeftPanelMode::Search => LeftPanelMode::Changes,
+                                LeftPanelMode::Changes => LeftPanelMode::FileTree,
                                 LeftPanelMode::Review => LeftPanelMode::Review,
                             };
+                            if self.left_panel == LeftPanelMode::Changes {
+                                self.refresh_git_changes();
+                            }
                         }
                     }
                     Focus::Terminal => {
@@ -1004,9 +1123,13 @@ impl App {
                 if self.left_panel != LeftPanelMode::Review {
                     self.left_panel = match self.left_panel {
                         LeftPanelMode::FileTree => LeftPanelMode::Search,
-                        LeftPanelMode::Search => LeftPanelMode::FileTree,
+                        LeftPanelMode::Search => LeftPanelMode::Changes,
+                        LeftPanelMode::Changes => LeftPanelMode::FileTree,
                         LeftPanelMode::Review => LeftPanelMode::Review,
                     };
+                    if self.left_panel == LeftPanelMode::Changes {
+                        self.refresh_git_changes();
+                    }
                 }
             }
 
@@ -1015,6 +1138,7 @@ impl App {
                     LeftPanelMode::FileTree => self.handle_file_tree_action(action),
                     LeftPanelMode::Search => self.handle_search_action(action),
                     LeftPanelMode::Review => {} // handled by handle_batch_review_action above
+                    LeftPanelMode::Changes => { self.handle_changes_action(&action); }
                 }
             }
             _ if self.focus == Focus::Editor => {
@@ -1026,7 +1150,7 @@ impl App {
             _ if self.focus == Focus::SidePanel => match self.side_panel {
                 SidePanelMode::AgentChat => self.handle_chat_action(action),
                 SidePanelMode::GitPanel => self.handle_git_panel_action(action),
-                SidePanelMode::SwarmDashboard => {} // display-only
+                SidePanelMode::SwarmDashboard => self.handle_swarm_dashboard_action(action)
             },
             _ => {}
         }
@@ -1129,7 +1253,9 @@ impl App {
                     self.chat_state.scroll_offset = usize::MAX;
 
                     // Handle commands that need app-level access
-                    if self.chat_state.input.trim().starts_with("/swarm") {
+                    if self.chat_state.input.trim().starts_with("/cswarm") {
+                        self.handle_coordinated_swarm_command();
+                    } else if self.chat_state.input.trim().starts_with("/swarm") {
                         self.handle_swarm_command();
                     } else if self.chat_state.input.trim().starts_with("/remember") {
                         self.handle_remember_command();
@@ -1238,6 +1364,124 @@ impl App {
     }
 
     // ── Git panel actions ────────────────────────────────────
+
+    fn handle_swarm_dashboard_action(&mut self, action: Action) {
+        use crate::panels::swarm_dashboard::DashboardFocus;
+
+        let dash = &mut self.swarm_dashboard;
+        match action {
+            // Tab toggles focus between Table and Detail
+            Action::InsertChar('\t') => {
+                dash.cycle_focus();
+            }
+
+            // Up/Down are focus-aware
+            Action::CursorUp => match dash.focus {
+                DashboardFocus::Table => {
+                    if dash.selected > 0 {
+                        dash.selected -= 1;
+                        dash.detail_scroll = 0;
+                        dash.detail_auto_scroll = true;
+                        if dash.selected < dash.scroll_offset {
+                            dash.scroll_offset = dash.selected;
+                        }
+                    }
+                }
+                DashboardFocus::Detail => {
+                    dash.detail_auto_scroll = false;
+                    dash.detail_scroll = dash.detail_scroll.saturating_sub(1);
+                }
+            },
+            Action::CursorDown => match dash.focus {
+                DashboardFocus::Table => {
+                    if dash.selected + 1 < dash.agents.len() {
+                        dash.selected += 1;
+                        dash.detail_scroll = 0;
+                        dash.detail_auto_scroll = true;
+                        // Keep selected visible in table viewport
+                        let viewport = dash.table_rect.height as usize;
+                        if viewport > 0 && dash.selected >= dash.scroll_offset + viewport {
+                            dash.scroll_offset = dash.selected - viewport + 1;
+                        }
+                    }
+                }
+                DashboardFocus::Detail => {
+                    if let Some(agent) = dash.agents.get(dash.selected) {
+                        let total = crate::panels::swarm_dashboard::count_display_lines(&agent.activity);
+                        dash.detail_scroll = (dash.detail_scroll + 1).min(total.saturating_sub(1));
+                    }
+                }
+            },
+
+            // PageUp/PageDown — always scroll the focused pane by page
+            Action::PageUp => match dash.focus {
+                DashboardFocus::Table => {
+                    dash.selected = dash.selected.saturating_sub(10);
+                    if dash.selected < dash.scroll_offset {
+                        dash.scroll_offset = dash.selected;
+                    }
+                    dash.detail_scroll = 0;
+                    dash.detail_auto_scroll = true;
+                }
+                DashboardFocus::Detail => {
+                    dash.detail_auto_scroll = false;
+                    dash.detail_scroll = dash.detail_scroll.saturating_sub(10);
+                }
+            },
+            Action::PageDown => match dash.focus {
+                DashboardFocus::Table => {
+                    let max = dash.agents.len().saturating_sub(1);
+                    dash.selected = (dash.selected + 10).min(max);
+                    let viewport = dash.table_rect.height as usize;
+                    if viewport > 0 && dash.selected >= dash.scroll_offset + viewport {
+                        dash.scroll_offset = dash.selected - viewport + 1;
+                    }
+                    dash.detail_scroll = 0;
+                    dash.detail_auto_scroll = true;
+                }
+                DashboardFocus::Detail => {
+                    if let Some(agent) = dash.agents.get(dash.selected) {
+                        let total = crate::panels::swarm_dashboard::count_display_lines(&agent.activity);
+                        dash.detail_scroll = (dash.detail_scroll + 10).min(total.saturating_sub(1));
+                    }
+                }
+            },
+
+            // Home/End
+            Action::Home => {
+                match dash.focus {
+                    DashboardFocus::Table => {
+                        dash.selected = 0;
+                        dash.scroll_offset = 0;
+                    }
+                    DashboardFocus::Detail => {
+                        dash.detail_scroll = 0;
+                        dash.detail_auto_scroll = false;
+                    }
+                }
+            }
+            Action::End => {
+                match dash.focus {
+                    DashboardFocus::Table => {
+                        dash.selected = dash.agents.len().saturating_sub(1);
+                        let viewport = dash.table_rect.height as usize;
+                        if viewport > 0 && dash.selected >= viewport {
+                            dash.scroll_offset = dash.selected - viewport + 1;
+                        }
+                    }
+                    DashboardFocus::Detail => {
+                        dash.detail_auto_scroll = true;
+                    }
+                }
+            }
+
+            // Toggle auto-scroll (detail pane)
+            Action::InsertChar('f') => {
+                dash.detail_auto_scroll = !dash.detail_auto_scroll;
+            }
+            _ => {}
+        }
+    }
 
     fn handle_git_panel_action(&mut self, action: Action) {
         use crate::panels::git_panel::GitRegion;
@@ -1603,10 +1847,11 @@ impl App {
             task_desc
         ));
 
-        // Switch to swarm dashboard
+        // Switch to swarm dashboard, reset for new run
         self.side_panel = SidePanelMode::SwarmDashboard;
         self.panel_visible.side_panel = true;
-        self.swarm_dashboard.set_phase("planning");
+        self.swarm_dashboard.reset("planning");
+        self.swarm_dashboard.status_message = format!("Planning task: {}...", task_desc.chars().take(60).collect::<String>());
 
         let tx = self.event_tx.clone();
         let root = self.workspace.roots().first()
@@ -1680,6 +1925,93 @@ impl App {
                         conv_id: String::new(),
                         role: "system".to_string(),
                         content: format!("Swarm execution failed: {}", e),
+                    });
+                }
+            }
+        });
+    }
+
+    /// Handle `/cswarm <task>` — coordinated tier-routed swarm (Opus → Sonnet/Haiku).
+    fn handle_coordinated_swarm_command(&mut self) {
+        let input = self.chat_state.take_input();
+        let task_desc = input
+            .trim()
+            .strip_prefix("/cswarm")
+            .unwrap_or("")
+            .trim()
+            .to_string();
+
+        if task_desc.is_empty() {
+            self.chat_state.add_system_message(
+                "Usage: /cswarm <task description>\n\
+                 Coordinated tier-routed swarm: Opus plans, Sonnet/Haiku execute.\n\
+                 Example: /cswarm Refactor the auth module to use the strategy pattern",
+            );
+            return;
+        }
+
+        self.chat_state.add_user_message(&format!("/cswarm {}", task_desc));
+        self.chat_state.add_system_message(&format!(
+            "Coordinated swarm: {}\nOpus will plan tier-annotated subtasks.\n\
+             Switch to SWARM panel (Ctrl+Shift+P) to monitor.",
+            task_desc
+        ));
+
+        self.side_panel = SidePanelMode::SwarmDashboard;
+        self.panel_visible.side_panel = true;
+        self.swarm_dashboard.reset("coordinating");
+        self.swarm_dashboard.status_message = format!("Opus planning: {}...", task_desc.chars().take(60).collect::<String>());
+
+        let tx = self.event_tx.clone();
+        let root = self.workspace.roots().first()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let write_ns = self.chat_state.agent_settings.write_namespace.clone();
+        let read_ns = self.chat_state.agent_settings.read_namespaces.clone();
+        let memory = self.memory.clone();
+
+        tokio::spawn(async move {
+            use gaviero_core::swarm::{pipeline, coordinator, router};
+
+            let config = pipeline::SwarmConfig {
+                max_parallel: 4,
+                workspace_root: root.clone(),
+                model: "opus".into(),
+                use_worktrees: true,
+                read_namespaces: read_ns,
+                write_namespace: write_ns,
+            };
+
+            let tier_config = router::TierConfig::default();
+            let coord_config = coordinator::CoordinatorConfig::default();
+
+            let observer = TuiSwarmObserver { tx: tx.clone() };
+            let tx2 = tx.clone();
+            let make_obs = move |agent_id: &str| -> Box<dyn gaviero_core::observer::AcpObserver> {
+                Box::new(TuiAcpObserver {
+                    tx: tx2.clone(),
+                    conv_id: format!("swarm-{}", agent_id),
+                })
+            };
+
+            match pipeline::execute_coordinated(
+                &task_desc,
+                &config,
+                tier_config,
+                coord_config,
+                memory,
+                &observer,
+                make_obs,
+            ).await {
+                Ok(result) => {
+                    let _ = tx.send(Event::SwarmCompleted(Box::new(result)));
+                }
+                Err(e) => {
+                    let _ = tx.send(Event::SwarmPhaseChanged("failed".to_string()));
+                    let _ = tx.send(Event::MessageComplete {
+                        conv_id: String::new(),
+                        role: "system".to_string(),
+                        content: format!("Coordinated swarm failed: {}", e),
                     });
                 }
             }
@@ -2522,6 +2854,349 @@ impl App {
         }
     }
 
+    // ── Git Changes panel ────────────────────────────────────────
+
+    /// Populate changes_state from `git status` + working-tree diffs.
+    fn refresh_git_changes(&mut self) {
+        let root = match self.workspace.roots().first() {
+            Some(r) => r.to_path_buf(),
+            None => {
+                self.changes_state = None;
+                return;
+            }
+        };
+        let repo = match gaviero_core::git::GitRepo::open(&root) {
+            Ok(r) => r,
+            Err(_) => {
+                self.changes_state = None;
+                return;
+            }
+        };
+        let entries = match repo.file_status() {
+            Ok(e) => e,
+            Err(_) => {
+                self.changes_state = None;
+                return;
+            }
+        };
+
+        let workdir = repo.workdir().unwrap_or(&root).to_path_buf();
+
+        let git_entries: Vec<ChangesEntry> = entries
+            .into_iter()
+            .filter(|e| !e.staged) // show working tree changes
+            .map(|e| {
+                let abs_path = workdir.join(&e.path);
+                let old_content = repo.head_file_content(&e.path).unwrap_or_default();
+                let new_content =
+                    std::fs::read_to_string(&abs_path).unwrap_or_default();
+
+                let old_lines: Vec<&str> = old_content.lines().collect();
+                let new_lines: Vec<&str> = new_content.lines().collect();
+                let diff = build_simple_diff(&old_lines, &new_lines);
+                let additions = diff.iter().filter(|(k, _)| matches!(k, DiffKind::Added)).count();
+                let deletions = diff.iter().filter(|(k, _)| matches!(k, DiffKind::Removed)).count();
+
+                ChangesEntry {
+                    rel_path: e.path,
+                    abs_path,
+                    status_char: e.status.marker(),
+                    additions,
+                    deletions,
+                }
+            })
+            .collect();
+
+        if git_entries.is_empty() {
+            self.changes_state = None;
+            return;
+        }
+
+        self.changes_state = Some(ChangesState {
+            entries: git_entries,
+            selected_index: 0,
+            scroll_offset: 0,
+            diff_scroll: 0,
+            cached_diff: Vec::new(),
+            cached_diff_index: usize::MAX,
+        });
+    }
+
+    /// Handle a keyboard action while in Changes mode. Returns true if consumed.
+    fn handle_changes_action(&mut self, action: &Action) -> bool {
+        let cs = match &mut self.changes_state {
+            Some(s) => s,
+            None => return false,
+        };
+
+        match action {
+            Action::CursorDown | Action::InsertChar('j') => {
+                if cs.selected_index + 1 < cs.entries.len() {
+                    cs.selected_index += 1;
+                    cs.diff_scroll = 0;
+                }
+                true
+            }
+            Action::CursorUp | Action::InsertChar('k') => {
+                if cs.selected_index > 0 {
+                    cs.selected_index -= 1;
+                    cs.diff_scroll = 0;
+                }
+                true
+            }
+            Action::InsertChar('J') | Action::PageDown => {
+                cs.diff_scroll += theme::DIFF_PAGE_SCROLL;
+                true
+            }
+            Action::InsertChar('K') | Action::PageUp => {
+                cs.diff_scroll = cs.diff_scroll.saturating_sub(theme::DIFF_PAGE_SCROLL);
+                true
+            }
+            Action::Enter => {
+                // Open selected file in the editor
+                if let Some(entry) = cs.entries.get(cs.selected_index) {
+                    let path = entry.abs_path.clone();
+                    self.open_file(&path);
+                    self.left_panel = LeftPanelMode::FileTree;
+                    self.focus = Focus::Editor;
+                }
+                true
+            }
+            Action::Quit => {
+                // Esc: go back to FileTree
+                self.left_panel = LeftPanelMode::FileTree;
+                self.changes_state = None;
+                true
+            }
+            Action::InsertChar('R') => {
+                // Refresh changes from git
+                self.refresh_git_changes();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Render the git changes file list in the left panel.
+    fn render_changes_file_list(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
+        use ratatui::style::Modifier;
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Block, Borders, Widget};
+
+        let border_style = if focused {
+            Style::default().fg(theme::FOCUS_BORDER)
+        } else {
+            Style::default().fg(theme::TEXT_DIM)
+        };
+
+        let block = Block::default()
+            .borders(Borders::RIGHT)
+            .border_style(border_style);
+        let inner = block.inner(area);
+        block.render(area, frame.buffer_mut());
+
+        let cs = match &mut self.changes_state {
+            Some(s) => s,
+            None => {
+                // Empty state
+                let msg = " No changes";
+                let y = inner.y;
+                if y < inner.bottom() {
+                    for (i, ch) in msg.chars().enumerate() {
+                        let x = inner.x + i as u16;
+                        if x < inner.right() {
+                            frame.buffer_mut()[(x, y)]
+                                .set_char(ch)
+                                .set_style(Style::default().fg(theme::TEXT_DIM));
+                        }
+                    }
+                }
+                return;
+            }
+        };
+
+        let visible = inner.height as usize;
+
+        // Auto-scroll to keep selected_index visible
+        if visible > 0 {
+            if cs.selected_index < cs.scroll_offset {
+                cs.scroll_offset = cs.selected_index;
+            } else if cs.selected_index >= cs.scroll_offset + visible {
+                cs.scroll_offset = cs.selected_index - visible + 1;
+            }
+        }
+
+        let scroll = cs.scroll_offset;
+
+        for (row, (i, entry)) in cs.entries.iter().enumerate()
+            .skip(scroll)
+            .take(visible)
+            .enumerate()
+        {
+            let _ = row;
+            let y = inner.y + row as u16;
+            if y >= inner.bottom() { break; }
+
+            let is_selected = i == cs.selected_index;
+
+            let filename = std::path::Path::new(&entry.rel_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("?");
+
+            let status_style = match entry.status_char {
+                'M' => Style::default().fg(theme::WARNING),
+                'A' | '?' => Style::default().fg(theme::SUCCESS),
+                'D' => Style::default().fg(theme::ERROR),
+                _ => Style::default().fg(theme::TEXT_DIM),
+            };
+
+            let name_style = if is_selected {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(theme::SELECTION_BG)
+            } else {
+                Style::default().fg(theme::TEXT_FG)
+            };
+
+            let adds = format!(" +{}", entry.additions);
+            let dels = format!(" -{}", entry.deletions);
+
+            let spans = vec![
+                Span::styled(format!(" {} ", entry.status_char), status_style),
+                Span::styled(filename.to_string(), name_style),
+                Span::styled(adds, Style::default().fg(theme::SUCCESS)),
+                Span::styled(dels, Style::default().fg(theme::ERROR)),
+            ];
+
+            let line = Line::from(spans);
+            let line_area = Rect { x: inner.x, y, width: inner.width, height: 1 };
+
+            if is_selected {
+                for x in inner.x..inner.right() {
+                    frame.buffer_mut()[(x, y)].set_bg(theme::SELECTION_BG);
+                }
+            }
+
+            Widget::render(line, line_area, frame.buffer_mut());
+        }
+
+        // Scrollbar
+        crate::widgets::scrollbar::render_scrollbar(
+            inner,
+            frame.buffer_mut(),
+            cs.entries.len(),
+            visible,
+            scroll,
+        );
+    }
+
+    /// Render the git changes diff in the editor area.
+    fn render_changes_diff(&mut self, frame: &mut Frame, area: Rect) {
+        use ratatui::style::Modifier;
+
+        let cs = match &mut self.changes_state {
+            Some(s) => s,
+            None => return,
+        };
+
+        let entry = match cs.entries.get(cs.selected_index) {
+            Some(e) => e,
+            None => return,
+        };
+
+        // Recompute diff only when selection changes
+        if cs.cached_diff_index != cs.selected_index {
+            let root = self.workspace.roots().first().map(|r| r.to_path_buf());
+            let old_content = root
+                .as_ref()
+                .and_then(|r| gaviero_core::git::GitRepo::open(r).ok())
+                .and_then(|repo| repo.head_file_content(&entry.rel_path).ok())
+                .unwrap_or_default();
+            let new_content =
+                std::fs::read_to_string(&entry.abs_path).unwrap_or_default();
+
+            let old_lines: Vec<&str> = old_content.lines().collect();
+            let new_lines: Vec<&str> = new_content.lines().collect();
+            cs.cached_diff = build_simple_diff(&old_lines, &new_lines);
+            cs.cached_diff_index = cs.selected_index;
+        }
+
+        let diff_lines = &cs.cached_diff;
+
+        let gutter_w = theme::DIFF_GUTTER_WIDTH;
+        let max_scroll = diff_lines.len().saturating_sub(1);
+        if cs.diff_scroll > max_scroll {
+            cs.diff_scroll = max_scroll;
+        }
+        let scroll = cs.diff_scroll;
+
+        // Show file path as header
+        let header = format!(" {} ", entry.rel_path);
+        let header_style = Style::default()
+            .fg(theme::FOCUS_BORDER)
+            .add_modifier(Modifier::BOLD);
+        for (i, ch) in header.chars().enumerate() {
+            let x = area.x + i as u16;
+            if x < area.right() && area.y < area.bottom() {
+                frame.buffer_mut()[(x, area.y)]
+                    .set_char(ch)
+                    .set_style(header_style);
+            }
+        }
+
+        // Render diff lines starting from row 1 (after header)
+        let content_height = area.height.saturating_sub(1) as usize;
+        for row in 0..content_height {
+            let line_idx = scroll + row;
+            if line_idx >= diff_lines.len() {
+                break;
+            }
+
+            let y = area.y + 1 + row as u16;
+            if y >= area.bottom() { break; }
+
+            let (kind, text) = &diff_lines[line_idx];
+
+            let (gutter_str, gutter_style, line_style) = match kind {
+                DiffKind::Added => (
+                    " + │ ",
+                    Style::default().fg(theme::SUCCESS).add_modifier(Modifier::BOLD),
+                    Style::default().fg(theme::SUCCESS).bg(theme::DIFF_ADD_LINE_BG),
+                ),
+                DiffKind::Removed => (
+                    " - │ ",
+                    Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD),
+                    Style::default().fg(theme::ERROR).bg(theme::DIFF_REM_LINE_BG),
+                ),
+                DiffKind::Context => (
+                    "   │ ",
+                    Style::default().fg(theme::TEXT_DIM),
+                    Style::default().fg(theme::TEXT_FG),
+                ),
+            };
+
+            for (i, ch) in gutter_str.chars().enumerate() {
+                let x = area.x + i as u16;
+                if x < area.right() {
+                    frame.buffer_mut()[(x, y)]
+                        .set_char(ch)
+                        .set_style(gutter_style);
+                }
+            }
+
+            for (i, ch) in text.chars().enumerate() {
+                let x = area.x + gutter_w + i as u16;
+                if x < area.right() {
+                    frame.buffer_mut()[(x, y)]
+                        .set_char(ch)
+                        .set_style(line_style);
+                }
+            }
+        }
+    }
+
     // ── Editor actions ───────────────────────────────────────────
 
     fn handle_editor_action(&mut self, action: Action) {
@@ -2990,6 +3665,15 @@ impl App {
                                     }
                                 }
                             }
+                            LeftPanelMode::Changes => {
+                                if let Some(ref mut cs) = self.changes_state {
+                                    let idx = cs.scroll_offset + relative_row;
+                                    if idx < cs.entries.len() {
+                                        cs.selected_index = idx;
+                                        cs.diff_scroll = 0;
+                                    }
+                                }
+                            }
                         }
                         return;
                     }
@@ -3034,6 +3718,26 @@ impl App {
                 if let Some(area) = self.layout.side_panel_area {
                     if area.contains((col, row).into()) {
                         self.focus = Focus::SidePanel;
+
+                        // Swarm dashboard: click on table row selects agent, click on detail focuses it
+                        if self.side_panel == SidePanelMode::SwarmDashboard {
+                            use crate::panels::swarm_dashboard::DashboardFocus;
+                            let dash = &mut self.swarm_dashboard;
+                            let pos = ratatui::layout::Position::new(col, row);
+                            if dash.table_rect.contains(pos) {
+                                dash.focus = DashboardFocus::Table;
+                                let clicked_row = (row - dash.table_rect.y) as usize;
+                                let idx = dash.scroll_offset + clicked_row;
+                                if idx < dash.agents.len() {
+                                    dash.selected = idx;
+                                    dash.detail_scroll = 0;
+                                    dash.detail_auto_scroll = true;
+                                }
+                            } else if dash.detail_rect.contains(pos) {
+                                dash.focus = DashboardFocus::Detail;
+                            }
+                            return;
+                        }
 
                         // Check if click is on chat conversation tabs (first row inside left border)
                         if self.side_panel == SidePanelMode::AgentChat && row == area.y {
@@ -3117,18 +3821,41 @@ impl App {
                                     br.scroll_offset = br.scroll_offset.saturating_sub(3);
                                 }
                             }
+                            LeftPanelMode::Changes => {
+                                if let Some(ref mut cs) = self.changes_state {
+                                    cs.scroll_offset = cs.scroll_offset.saturating_sub(3);
+                                }
+                            }
                         }
                     }
                 }
                 if let Some(area) = self.layout.side_panel_area {
                     if area.contains((col, row).into()) {
-                        self.chat_state.scroll_offset =
-                            self.chat_state.scroll_offset.saturating_sub(3);
+                        match self.side_panel {
+                            SidePanelMode::SwarmDashboard => {
+                                let dash = &mut self.swarm_dashboard;
+                                let pos = ratatui::layout::Position::new(col, row);
+                                if dash.table_rect.contains(pos) {
+                                    dash.scroll_offset = dash.scroll_offset.saturating_sub(1);
+                                } else if dash.detail_rect.contains(pos) {
+                                    dash.detail_auto_scroll = false;
+                                    dash.detail_scroll = dash.detail_scroll.saturating_sub(3);
+                                }
+                            }
+                            _ => {
+                                self.chat_state.scroll_offset =
+                                    self.chat_state.scroll_offset.saturating_sub(3);
+                            }
+                        }
                     }
                 }
                 if self.layout.editor_area.contains((col, row).into()) {
                     if let Some(ref mut br) = self.batch_review {
                         br.diff_scroll = br.diff_scroll.saturating_sub(3);
+                    } else if let Some(ref mut cs) = self.changes_state {
+                        if self.left_panel == LeftPanelMode::Changes {
+                            cs.diff_scroll = cs.diff_scroll.saturating_sub(3);
+                        }
                     } else if let Some(ref mut review) = self.diff_review {
                         review.scroll_top = review.scroll_top.saturating_sub(3);
                     } else if let Some(buf) = self.buffers.get_mut(self.active_buffer) {
@@ -3156,18 +3883,45 @@ impl App {
                                     br.scroll_offset = (br.scroll_offset + 3).min(max);
                                 }
                             }
+                            LeftPanelMode::Changes => {
+                                if let Some(ref mut cs) = self.changes_state {
+                                    let max = cs.entries.len().saturating_sub(1);
+                                    cs.scroll_offset = (cs.scroll_offset + 3).min(max);
+                                }
+                            }
                         }
                     }
                 }
                 if let Some(area) = self.layout.side_panel_area {
                     if area.contains((col, row).into()) {
-                        self.chat_state.scroll_offset =
-                            self.chat_state.scroll_offset.saturating_add(3);
+                        match self.side_panel {
+                            SidePanelMode::SwarmDashboard => {
+                                let dash = &mut self.swarm_dashboard;
+                                let pos = ratatui::layout::Position::new(col, row);
+                                if dash.table_rect.contains(pos) {
+                                    let max = dash.agents.len().saturating_sub(1);
+                                    dash.scroll_offset = (dash.scroll_offset + 1).min(max);
+                                } else if dash.detail_rect.contains(pos) {
+                                    if let Some(agent) = dash.agents.get(dash.selected) {
+                                        let total = crate::panels::swarm_dashboard::count_display_lines(&agent.activity);
+                                        dash.detail_scroll = (dash.detail_scroll + 3).min(total.saturating_sub(1));
+                                    }
+                                }
+                            }
+                            _ => {
+                                self.chat_state.scroll_offset =
+                                    self.chat_state.scroll_offset.saturating_add(3);
+                            }
+                        }
                     }
                 }
                 if self.layout.editor_area.contains((col, row).into()) {
                     if let Some(ref mut br) = self.batch_review {
                         br.diff_scroll += 3;
+                    } else if self.left_panel == LeftPanelMode::Changes {
+                        if let Some(ref mut cs) = self.changes_state {
+                            cs.diff_scroll += 3;
+                        }
                     } else if let Some(ref mut review) = self.diff_review {
                         review.scroll_top += 3;
                     } else if let Some(buf) = self.buffers.get_mut(self.active_buffer) {
@@ -3306,6 +4060,16 @@ impl App {
                             let row_in_track = row.saturating_sub(area.y) as usize;
                             let fraction = row_in_track as f64 / track_height.saturating_sub(1).max(1) as f64;
                             br.scroll_offset = (fraction * max_scroll as f64).round().min(max_scroll as f64) as usize;
+                        }
+                    }
+                    LeftPanelMode::Changes => {
+                        if let Some(ref mut cs) = self.changes_state {
+                            let total = cs.entries.len();
+                            if total <= track_height { return; }
+                            let max_scroll = total.saturating_sub(track_height);
+                            let row_in_track = row.saturating_sub(area.y) as usize;
+                            let fraction = row_in_track as f64 / track_height.saturating_sub(1).max(1) as f64;
+                            cs.scroll_offset = (fraction * max_scroll as f64).round().min(max_scroll as f64) as usize;
                         }
                     }
                 }
@@ -3725,6 +4489,7 @@ impl App {
                 LeftPanelMode::FileTree => "EXPLORER",
                 LeftPanelMode::Search => "SEARCH",
                 LeftPanelMode::Review => "REVIEW",
+                LeftPanelMode::Changes => "CHANGES",
             };
             let content_area = Self::render_panel_header(frame, full_area, title, left_focused);
             self.layout.file_tree_area = Some(content_area);
@@ -3741,6 +4506,9 @@ impl App {
                 }
                 LeftPanelMode::Review => {
                     self.render_review_file_list(frame, content_area, left_focused);
+                }
+                LeftPanelMode::Changes => {
+                    self.render_changes_file_list(frame, content_area, left_focused);
                 }
             }
 
@@ -3836,6 +4604,9 @@ impl App {
                     LeftPanelMode::Review => {
                         self.render_review_file_list(frame, content, true);
                     }
+                    LeftPanelMode::Changes => {
+                        self.render_changes_file_list(frame, content, true);
+                    }
                 }
             }
             Focus::Editor => {
@@ -3869,6 +4640,12 @@ impl App {
         // If in batch review mode, render the batch diff viewer
         if self.batch_review.is_some() {
             self.render_batch_review_diff(frame, area);
+            return;
+        }
+
+        // If in Changes mode, render the git diff viewer
+        if self.left_panel == LeftPanelMode::Changes && self.changes_state.is_some() {
+            self.render_changes_diff(frame, area);
             return;
         }
 
@@ -4068,6 +4845,7 @@ impl App {
                 LeftPanelMode::FileTree => "TREE",
                 LeftPanelMode::Search => "FIND",
                 LeftPanelMode::Review => "REVIEW",
+                LeftPanelMode::Changes => "CHANGES",
             },
             Focus::SidePanel => "CHAT",
             Focus::Terminal => "TERM",
@@ -4104,6 +4882,10 @@ impl App {
                     LeftPanelMode::Search => {
                         let count = self.search_panel.results.len();
                         format!("{} results  Enter: open  Esc: back to tree  F7: tree", count)
+                    }
+                    LeftPanelMode::Changes => {
+                        let n = self.changes_state.as_ref().map(|cs| cs.entries.len()).unwrap_or(0);
+                        format!("{} changed files  ↑↓: navigate  Enter: open  R: refresh  Esc: back  F7: cycle", n)
                     }
                 },
                 Focus::SidePanel => {
