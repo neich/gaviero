@@ -24,6 +24,37 @@ pub mod settings {
     pub const MEMORY_NAMESPACE: &str = "memory.namespace";
     /// Additional namespaces to search when reading (the write namespace is always included).
     pub const MEMORY_READ_NAMESPACES: &str = "memory.readNamespaces";
+
+    // Coordinator settings (tier routing)
+    pub const COORDINATOR_MODEL: &str = "agent.coordinator.model";
+    pub const COORDINATOR_MAX_CONTEXT_TOKENS: &str = "agent.coordinator.maxContextTokens";
+
+    // Tier settings
+    pub const TIER_REASONING_MODEL: &str = "agent.tiers.reasoning.model";
+    pub const TIER_REASONING_MAX_PARALLEL: &str = "agent.tiers.reasoning.maxParallel";
+    pub const TIER_EXECUTION_MODEL: &str = "agent.tiers.execution.model";
+    pub const TIER_EXECUTION_MAX_PARALLEL: &str = "agent.tiers.execution.maxParallel";
+    pub const TIER_MECHANICAL_ENABLED: &str = "agent.tiers.mechanical.enabled";
+    pub const TIER_MECHANICAL_BACKEND: &str = "agent.tiers.mechanical.backend";
+    pub const TIER_MECHANICAL_MODEL: &str = "agent.tiers.mechanical.ollamaModel";
+    pub const TIER_MECHANICAL_BASE_URL: &str = "agent.tiers.mechanical.ollamaBaseUrl";
+    pub const TIER_MECHANICAL_MAX_PARALLEL: &str = "agent.tiers.mechanical.maxParallel";
+
+    // Routing settings
+    pub const ROUTING_PRIVACY_PATTERNS: &str = "agent.routing.privacyPatterns";
+    pub const ROUTING_ESCALATION_ENABLED: &str = "agent.routing.escalationEnabled";
+    pub const ROUTING_COST_BUDGET: &str = "agent.routing.costBudget";
+
+    // Verification settings
+    pub const VERIFICATION_DEFAULT_STRATEGY: &str = "agent.verification.defaultStrategy";
+    pub const VERIFICATION_TEST_COMMAND: &str = "agent.verification.testSuite.command";
+    pub const VERIFICATION_TEST_TIMEOUT: &str = "agent.verification.testSuite.timeout";
+
+    // Memory enrichment settings
+    pub const MEMORY_ENRICH_COORDINATOR: &str = "agent.memory.enrichCoordinator";
+    pub const MEMORY_ENRICH_AGENTS: &str = "agent.memory.enrichAgents";
+    pub const MEMORY_COORDINATOR_LIMIT: &str = "agent.memory.coordinatorMemoryLimit";
+    pub const MEMORY_AGENT_LIMIT: &str = "agent.memory.agentMemoryLimit";
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
