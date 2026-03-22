@@ -489,7 +489,11 @@ pub async fn execute_coordinated(
     };
 
     // Phase 2: EXECUTE
-    observer.on_phase_changed("running");
+    let tier_summary: Vec<String> = tiers.iter().enumerate()
+        .map(|(i, t)| format!("T{}: {} agents", i, t.len()))
+        .collect();
+    tracing::info!("Execution plan: {} tiers [{}]", tiers.len(), tier_summary.join(", "));
+    observer.on_phase_changed(&format!("running ({} tiers)", tiers.len()));
 
     for (tier_idx, tier) in tiers.iter().enumerate() {
         observer.on_tier_started(tier_idx + 1, tiers.len());
@@ -587,7 +591,24 @@ pub async fn execute_coordinated(
                 ));
                 let runner = AgentRunner::new(write_gate, agent_root, mem.clone())
                     .with_read_namespaces(ns);
-                let manifest = runner.run_with_model(&unit, obs, None, &model).await?;
+
+                // 10-minute timeout per agent to prevent blocking
+                let agent_future = runner.run_with_model(&unit, obs, None, &model);
+                let manifest = match tokio::time::timeout(
+                    std::time::Duration::from_secs(600),
+                    agent_future,
+                ).await {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        return Ok(AgentManifest {
+                            work_unit_id: unit.id.clone(),
+                            status: AgentStatus::Failed("timed out after 10 minutes".into()),
+                            modified_files: vec![],
+                            branch: None,
+                            summary: Some("Agent timed out".into()),
+                        });
+                    }
+                };
 
                 // Store result to memory (privacy-aware)
                 store_agent_result(&mem, &write_ns, &manifest, &unit, &run_id_clone).await;

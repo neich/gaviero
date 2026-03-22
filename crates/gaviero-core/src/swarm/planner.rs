@@ -153,14 +153,19 @@ pub(crate) fn extract_json(response: &str) -> Result<String> {
 
     // Try parsing directly (array or object)
     if trimmed.starts_with('[') || trimmed.starts_with('{') {
-        return Ok(trimmed.to_string());
+        return Ok(repair_truncated_json(trimmed));
     }
 
     // Look for ```json ... ``` block
     if let Some(start) = trimmed.find("```json") {
         let after = &trimmed[start + 7..];
         if let Some(end) = after.find("```") {
-            return Ok(after[..end].trim().to_string());
+            return Ok(repair_truncated_json(after[..end].trim()));
+        }
+        // No closing ``` — response was truncated. Use everything after ```json
+        let inner = after.trim();
+        if inner.starts_with('[') || inner.starts_with('{') {
+            return Ok(repair_truncated_json(inner));
         }
     }
 
@@ -170,12 +175,146 @@ pub(crate) fn extract_json(response: &str) -> Result<String> {
         if let Some(end) = after.find("```") {
             let inner = after[..end].trim();
             if inner.starts_with('[') || inner.starts_with('{') {
-                return Ok(inner.to_string());
+                return Ok(repair_truncated_json(inner));
             }
+        }
+        // No closing ``` — truncated
+        let inner = after.trim();
+        if inner.starts_with('[') || inner.starts_with('{') {
+            return Ok(repair_truncated_json(inner));
         }
     }
 
+    // Last resort: find the first { or [ in the response
+    if let Some(pos) = trimmed.find('{') {
+        return Ok(repair_truncated_json(&trimmed[pos..]));
+    }
+    if let Some(pos) = trimmed.find('[') {
+        return Ok(repair_truncated_json(&trimmed[pos..]));
+    }
+
     anyhow::bail!("could not extract JSON from response")
+}
+
+/// Attempt to repair truncated JSON by closing unclosed brackets and braces.
+///
+/// LLM responses frequently get cut off mid-JSON when the output token limit
+/// is reached. This function iteratively tries to make the JSON parseable by:
+/// 1. Closing unclosed strings
+/// 2. Removing trailing incomplete key-value pairs
+/// 3. Closing unclosed brackets/braces
+fn repair_truncated_json(json: &str) -> String {
+    // If it already parses, return as-is
+    if serde_json::from_str::<serde_json::Value>(json).is_ok() {
+        return json.to_string();
+    }
+
+    // Strategy: scan to find open/close state, then fix up the tail
+    let mut in_string = false;
+    let mut escape_next = false;
+    let mut stack: Vec<char> = Vec::new();
+    let bytes = json.as_bytes();
+
+    for &b in bytes {
+        let ch = b as char;
+        if escape_next { escape_next = false; continue; }
+        if ch == '\\' && in_string { escape_next = true; continue; }
+        if ch == '"' { in_string = !in_string; continue; }
+        if in_string { continue; }
+        match ch {
+            '{' => stack.push('{'),
+            '[' => stack.push('['),
+            '}' => { stack.pop(); }
+            ']' => { stack.pop(); }
+            _ => {}
+        }
+    }
+
+    // If no unclosed delimiters, it's complete (maybe a value issue)
+    if stack.is_empty() && !in_string {
+        return json.to_string();
+    }
+
+    let mut result = json.to_string();
+
+    // If we ended inside a string, close it
+    if in_string {
+        result.push('"');
+    }
+
+    // Iteratively trim the tail and try to close delimiters until it parses
+    // This handles cases like: {"key": "trunc  →  {"key": "trunc"}
+    // and: {"a": [{"id": "x", "val": "tru  →  {"a": [{"id": "x", "val": "tru"}]}
+    for _ in 0..5 {
+        let candidate = close_json(&result);
+        if serde_json::from_str::<serde_json::Value>(&candidate).is_ok() {
+            tracing::info!("Repaired truncated JSON ({} → {} bytes)", json.len(), candidate.len());
+            return candidate;
+        }
+
+        // Trim back: remove from the last comma or colon to try a smaller valid subset
+        let trimmed = result.trim_end();
+        if let Some(pos) = trimmed.rfind(|c: char| c == ',' || c == ':') {
+            result = trimmed[..pos].to_string();
+        } else {
+            break;
+        }
+    }
+
+    // Final attempt: just close everything on the current state
+    let candidate = close_json(&result);
+    if serde_json::from_str::<serde_json::Value>(&candidate).is_ok() {
+        return candidate;
+    }
+
+    // Give up — return original (will fail in caller with clear error)
+    tracing::warn!("Could not repair truncated JSON ({} bytes)", json.len());
+    json.to_string()
+}
+
+/// Close all unclosed strings, brackets, and braces in a JSON fragment.
+fn close_json(json: &str) -> String {
+    let mut result = json.to_string();
+
+    // Scan for state
+    let mut in_string = false;
+    let mut escape_next = false;
+    let mut stack: Vec<char> = Vec::new();
+
+    for ch in result.chars() {
+        if escape_next { escape_next = false; continue; }
+        if ch == '\\' && in_string { escape_next = true; continue; }
+        if ch == '"' { in_string = !in_string; continue; }
+        if in_string { continue; }
+        match ch {
+            '{' => stack.push('{'),
+            '[' => stack.push('['),
+            '}' => { stack.pop(); }
+            ']' => { stack.pop(); }
+            _ => {}
+        }
+    }
+
+    if in_string {
+        result.push('"');
+    }
+
+    // Remove trailing comma after closing string
+    let trimmed = result.trim_end();
+    if trimmed.ends_with(',') {
+        result = trimmed[..trimmed.len() - 1].to_string();
+    }
+
+    // Close in reverse order
+    for &opener in stack.iter().rev() {
+        match opener {
+            '{' => result.push('}'),
+            '[' => result.push(']'),
+            _ => {}
+        }
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -198,5 +337,73 @@ mod tests {
     fn test_extract_json_no_json() {
         let input = "No JSON here.";
         assert!(extract_json(input).is_err());
+    }
+
+    // ── JSON repair tests ───────────────────────────────────────
+
+    #[test]
+    fn test_repair_valid_json_unchanged() {
+        let input = r#"{"a": 1, "b": [2, 3]}"#;
+        assert_eq!(repair_truncated_json(input), input);
+    }
+
+    #[test]
+    fn test_repair_missing_closing_brace() {
+        let input = r#"{"a": 1, "b": 2"#;
+        let repaired = repair_truncated_json(input);
+        assert!(serde_json::from_str::<serde_json::Value>(&repaired).is_ok());
+    }
+
+    #[test]
+    fn test_repair_truncated_array() {
+        let input = r#"{"units": [{"id": "a"}, {"id": "b""#;
+        let repaired = repair_truncated_json(input);
+        let v: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        assert!(v.get("units").unwrap().as_array().unwrap().len() >= 1);
+    }
+
+    #[test]
+    fn test_repair_truncated_string() {
+        let input = r#"{"plan": "Some long desc"#;
+        let repaired = repair_truncated_json(input);
+        assert!(serde_json::from_str::<serde_json::Value>(&repaired).is_ok());
+    }
+
+    #[test]
+    fn test_repair_trailing_comma() {
+        let input = r#"{"a": 1,"#;
+        let repaired = repair_truncated_json(input);
+        assert!(serde_json::from_str::<serde_json::Value>(&repaired).is_ok());
+    }
+
+    #[test]
+    fn test_repair_nested_truncation() {
+        let input = r#"{"units": [{"id": "a", "scope": {"owned_paths": ["src/"#;
+        let repaired = repair_truncated_json(input);
+        assert!(serde_json::from_str::<serde_json::Value>(&repaired).is_ok());
+    }
+
+    #[test]
+    fn test_extract_json_truncated_fenced() {
+        // Truncated ```json block without closing ```
+        let input = "Here's the plan:\n```json\n{\"id\": \"a\", \"data\": [1, 2";
+        let result = extract_json(input).unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(&result).is_ok());
+    }
+
+    #[test]
+    fn test_repair_realistic_truncation() {
+        // Simulates a coordinator response cut mid-unit
+        let input = r#"{
+            "plan_summary": "Migrate to Rust",
+            "units": [
+                {"id": "U0", "description": "Setup", "tier": "mechanical"},
+                {"id": "U1", "description": "Models", "tier": "reasoning", "depends_on": ["U0"]},
+                {"id": "U2", "description": "Routes", "coordinator_instructions": "Implement the API rou"#;
+        let repaired = repair_truncated_json(input);
+        let v: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        let units = v.get("units").unwrap().as_array().unwrap();
+        // Should have at least the first 2 complete units
+        assert!(units.len() >= 2);
     }
 }
