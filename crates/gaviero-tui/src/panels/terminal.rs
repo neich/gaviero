@@ -298,6 +298,7 @@ pub fn is_terminal_escape_key(key: &KeyEvent) -> bool {
         | (KeyCode::Char('q'), true, false, false)  // Ctrl+q — quit
         | (KeyCode::Char('w'), true, false, false)  // Ctrl+W — close terminal tab
         | (KeyCode::F(8), false, false, false)       // F8 — new terminal tab
+        | (KeyCode::Char('t'), false, true, false)    // Alt+T — new terminal tab
         // Ctrl+arrows — inter-panel navigation (always escapes terminal)
         | (KeyCode::Up, true, false, false)          // Ctrl+Up — focus editor
         | (KeyCode::Down, true, false, false)        // Ctrl+Down — focus terminal
