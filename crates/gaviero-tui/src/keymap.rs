@@ -99,6 +99,7 @@ impl Keymap {
             KeyCode::Char('p') if ctrl => Action::ToggleSidePanel,
             KeyCode::F(4) => Action::ToggleTerminal,
             KeyCode::F(8) => Action::NewTerminal,
+            KeyCode::Char('t') if alt => Action::NewTerminal,
             KeyCode::Char('t') if ctrl => Action::NewTab,
             KeyCode::Char('w') if ctrl => Action::CloseTab,
             KeyCode::Char('s') if ctrl => Action::Save,
