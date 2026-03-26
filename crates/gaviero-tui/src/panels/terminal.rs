@@ -222,7 +222,7 @@ fn render_cursor(screen: &vt100::Screen, area: Rect, buf: &mut RataBuf, y_offset
     let cy = area.y + y_offset + cursor_row;
     if cx < buf.area().right() && cy < buf.area().bottom() {
         let cursor_style = ratatui::style::Style::default()
-            .fg(ratatui::style::Color::Black)
+            .fg(theme::CURSOR_INVERT_FG)
             .bg(theme::TEXT_FG);
         buf[(cx, cy)].set_style(cursor_style);
     }

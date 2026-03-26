@@ -1250,7 +1250,7 @@ impl App {
                     }
 
                     // Always scroll to bottom when user submits input
-                    self.chat_state.scroll_offset = usize::MAX;
+                    self.chat_state.scroll_pinned_to_bottom = true;
 
                     // Handle commands that need app-level access
                     if self.chat_state.input.trim().starts_with("/cswarm") {
@@ -1369,6 +1369,16 @@ impl App {
         use crate::panels::swarm_dashboard::DashboardFocus;
 
         let dash = &mut self.swarm_dashboard;
+        let agent_count = dash.agents.len();
+
+        // Helper: reset detail pane when table selection changes
+        macro_rules! reset_detail {
+            ($dash:expr) => {
+                $dash.detail_scroll = 0;
+                $dash.detail_auto_scroll = true;
+            };
+        }
+
         match action {
             // Tab toggles focus between Table and Detail
             Action::InsertChar('\t') => {
@@ -1378,14 +1388,9 @@ impl App {
             // Up/Down are focus-aware
             Action::CursorUp => match dash.focus {
                 DashboardFocus::Table => {
-                    if dash.selected > 0 {
-                        dash.selected -= 1;
-                        dash.detail_scroll = 0;
-                        dash.detail_auto_scroll = true;
-                        if dash.selected < dash.scroll_offset {
-                            dash.scroll_offset = dash.selected;
-                        }
-                    }
+                    let prev = dash.scroll.selected;
+                    dash.scroll.move_up();
+                    if dash.scroll.selected != prev { reset_detail!(dash); }
                 }
                 DashboardFocus::Detail => {
                     dash.detail_auto_scroll = false;
@@ -1394,19 +1399,12 @@ impl App {
             },
             Action::CursorDown => match dash.focus {
                 DashboardFocus::Table => {
-                    if dash.selected + 1 < dash.agents.len() {
-                        dash.selected += 1;
-                        dash.detail_scroll = 0;
-                        dash.detail_auto_scroll = true;
-                        // Keep selected visible in table viewport
-                        let viewport = dash.table_rect.height as usize;
-                        if viewport > 0 && dash.selected >= dash.scroll_offset + viewport {
-                            dash.scroll_offset = dash.selected - viewport + 1;
-                        }
-                    }
+                    let prev = dash.scroll.selected;
+                    dash.scroll.move_down(agent_count);
+                    if dash.scroll.selected != prev { reset_detail!(dash); }
                 }
                 DashboardFocus::Detail => {
-                    if let Some(agent) = dash.agents.get(dash.selected) {
+                    if let Some(agent) = dash.agents.get(dash.scroll.selected) {
                         let total = crate::panels::swarm_dashboard::count_display_lines(&agent.activity);
                         dash.detail_scroll = (dash.detail_scroll + 1).min(total.saturating_sub(1));
                     }
@@ -1416,12 +1414,9 @@ impl App {
             // PageUp/PageDown — always scroll the focused pane by page
             Action::PageUp => match dash.focus {
                 DashboardFocus::Table => {
-                    dash.selected = dash.selected.saturating_sub(10);
-                    if dash.selected < dash.scroll_offset {
-                        dash.scroll_offset = dash.selected;
-                    }
-                    dash.detail_scroll = 0;
-                    dash.detail_auto_scroll = true;
+                    dash.scroll.selected = dash.scroll.selected.saturating_sub(10);
+                    dash.scroll.ensure_visible();
+                    reset_detail!(dash);
                 }
                 DashboardFocus::Detail => {
                     dash.detail_auto_scroll = false;
@@ -1430,17 +1425,12 @@ impl App {
             },
             Action::PageDown => match dash.focus {
                 DashboardFocus::Table => {
-                    let max = dash.agents.len().saturating_sub(1);
-                    dash.selected = (dash.selected + 10).min(max);
-                    let viewport = dash.table_rect.height as usize;
-                    if viewport > 0 && dash.selected >= dash.scroll_offset + viewport {
-                        dash.scroll_offset = dash.selected - viewport + 1;
-                    }
-                    dash.detail_scroll = 0;
-                    dash.detail_auto_scroll = true;
+                    dash.scroll.selected = (dash.scroll.selected + 10).min(agent_count.saturating_sub(1));
+                    dash.scroll.ensure_visible();
+                    reset_detail!(dash);
                 }
                 DashboardFocus::Detail => {
-                    if let Some(agent) = dash.agents.get(dash.selected) {
+                    if let Some(agent) = dash.agents.get(dash.scroll.selected) {
                         let total = crate::panels::swarm_dashboard::count_display_lines(&agent.activity);
                         dash.detail_scroll = (dash.detail_scroll + 10).min(total.saturating_sub(1));
                     }
@@ -1451,8 +1441,7 @@ impl App {
             Action::Home => {
                 match dash.focus {
                     DashboardFocus::Table => {
-                        dash.selected = 0;
-                        dash.scroll_offset = 0;
+                        dash.scroll.reset();
                     }
                     DashboardFocus::Detail => {
                         dash.detail_scroll = 0;
@@ -1463,11 +1452,8 @@ impl App {
             Action::End => {
                 match dash.focus {
                     DashboardFocus::Table => {
-                        dash.selected = dash.agents.len().saturating_sub(1);
-                        let viewport = dash.table_rect.height as usize;
-                        if viewport > 0 && dash.selected >= viewport {
-                            dash.scroll_offset = dash.selected - viewport + 1;
-                        }
+                        dash.scroll.selected = agent_count.saturating_sub(1);
+                        dash.scroll.ensure_visible();
                     }
                     DashboardFocus::Detail => {
                         dash.detail_auto_scroll = true;
@@ -3247,8 +3233,6 @@ impl App {
                     Action::CursorRight => buf.move_cursor_right(),
                     Action::ShiftUp => buf.select_up(),
                     Action::ShiftDown => buf.select_down(),
-                    Action::SelectLeft => buf.select_left(),
-                    Action::SelectRight => buf.select_right(),
                     Action::PageUp => buf.page_up(vp_h),
                     Action::PageDown => buf.page_down(vp_h),
                     Action::Home => buf.move_cursor_home(),
@@ -3321,8 +3305,11 @@ impl App {
 
     fn handle_search_action(&mut self, action: Action) {
         match action {
-            Action::CursorDown | Action::InsertChar('j') => self.search_panel.move_down(),
-            Action::CursorUp | Action::InsertChar('k') => self.search_panel.move_up(),
+            Action::CursorDown | Action::InsertChar('j') => {
+                let count = self.search_panel.results.len();
+                self.search_panel.scroll.move_down(count);
+            }
+            Action::CursorUp | Action::InsertChar('k') => self.search_panel.scroll.move_up(),
             Action::Enter => {
                 // Open the selected result
                 if let Some(result) = self.search_panel.selected_result().cloned() {
@@ -3380,7 +3367,7 @@ impl App {
 
     /// Determine the target directory for a new file/folder based on selected entry.
     fn selected_dir(&self) -> Option<std::path::PathBuf> {
-        let entry = self.file_tree.entries.get(self.file_tree.selected)?;
+        let entry = self.file_tree.entries.get(self.file_tree.scroll.selected)?;
         if entry.is_dir {
             Some(entry.path.clone())
         } else {
@@ -3395,7 +3382,7 @@ impl App {
 
         // For rename, pre-fill with current name
         if matches!(kind, TreeDialogKind::Rename) {
-            if let Some(entry) = self.file_tree.entries.get(self.file_tree.selected) {
+            if let Some(entry) = self.file_tree.entries.get(self.file_tree.scroll.selected) {
                 dialog.original_path = Some(entry.path.clone());
                 dialog.input = entry.name.clone();
                 dialog.cursor = dialog.input.len();
@@ -3404,7 +3391,7 @@ impl App {
 
         // For delete, store the path
         if matches!(kind, TreeDialogKind::Delete) {
-            if let Some(entry) = self.file_tree.entries.get(self.file_tree.selected) {
+            if let Some(entry) = self.file_tree.entries.get(self.file_tree.scroll.selected) {
                 dialog.original_path = Some(entry.path.clone());
                 dialog.input = entry.name.clone();
             }
@@ -3551,7 +3538,7 @@ impl App {
     fn select_path_in_tree(&mut self, path: &std::path::Path) {
         for (i, entry) in self.file_tree.entries.iter().enumerate() {
             if entry.path == path {
-                self.file_tree.selected = i;
+                self.file_tree.scroll.selected = i;
                 return;
             }
         }
@@ -3562,10 +3549,10 @@ impl App {
         let git_allow = parse_git_allow_list(&self.workspace);
         let roots: Vec<&std::path::Path> = self.workspace.roots();
         let expanded = self.file_tree.expanded_paths();
-        let selected = self.file_tree.selected;
+        let selected = self.file_tree.scroll.selected;
         self.file_tree = FileTreeState::from_roots(&roots, &excludes, &git_allow);
         self.file_tree.restore_expanded(&expanded);
-        self.file_tree.selected = selected.min(self.file_tree.entries.len().saturating_sub(1));
+        self.file_tree.scroll.selected = selected.min(self.file_tree.entries.len().saturating_sub(1));
     }
 
     // ── Mouse handling ───────────────────────────────────────────
@@ -3633,9 +3620,9 @@ impl App {
                             }
                             LeftPanelMode::Search => {
                                 // +1 to skip the header line
-                                let idx = self.search_panel.scroll_offset + relative_row.saturating_sub(1);
+                                let idx = self.search_panel.scroll.offset + relative_row.saturating_sub(1);
                                 if idx < self.search_panel.results.len() {
-                                    self.search_panel.selected = idx;
+                                    self.search_panel.scroll.selected = idx;
                                     // Open the result
                                     let result = self.search_panel.results[idx].clone();
                                     let root = self.workspace.roots().first()
@@ -3727,9 +3714,9 @@ impl App {
                             if dash.table_rect.contains(pos) {
                                 dash.focus = DashboardFocus::Table;
                                 let clicked_row = (row - dash.table_rect.y) as usize;
-                                let idx = dash.scroll_offset + clicked_row;
+                                let idx = dash.scroll.offset + clicked_row;
                                 if idx < dash.agents.len() {
-                                    dash.selected = idx;
+                                    dash.scroll.selected = idx;
                                     dash.detail_scroll = 0;
                                     dash.detail_auto_scroll = true;
                                 }
@@ -3815,7 +3802,7 @@ impl App {
                     if area.contains((col, row).into()) {
                         match self.left_panel {
                             LeftPanelMode::FileTree => self.file_tree.scroll_up(3),
-                            LeftPanelMode::Search => self.search_panel.scroll_up(3),
+                            LeftPanelMode::Search => self.search_panel.scroll.scroll_up(3),
                             LeftPanelMode::Review => {
                                 if let Some(ref mut br) = self.batch_review {
                                     br.scroll_offset = br.scroll_offset.saturating_sub(3);
@@ -3836,7 +3823,7 @@ impl App {
                                 let dash = &mut self.swarm_dashboard;
                                 let pos = ratatui::layout::Position::new(col, row);
                                 if dash.table_rect.contains(pos) {
-                                    dash.scroll_offset = dash.scroll_offset.saturating_sub(1);
+                                    dash.scroll.scroll_up(1);
                                 } else if dash.detail_rect.contains(pos) {
                                     dash.detail_auto_scroll = false;
                                     dash.detail_scroll = dash.detail_scroll.saturating_sub(3);
@@ -3876,7 +3863,10 @@ impl App {
                     if area.contains((col, row).into()) {
                         match self.left_panel {
                             LeftPanelMode::FileTree => self.file_tree.scroll_down(3),
-                            LeftPanelMode::Search => self.search_panel.scroll_down(3),
+                            LeftPanelMode::Search => {
+                                let count = self.search_panel.results.len();
+                                self.search_panel.scroll.scroll_down(3, count);
+                            }
                             LeftPanelMode::Review => {
                                 if let Some(ref mut br) = self.batch_review {
                                     let max = br.proposals.len().saturating_sub(1);
@@ -3899,10 +3889,9 @@ impl App {
                                 let dash = &mut self.swarm_dashboard;
                                 let pos = ratatui::layout::Position::new(col, row);
                                 if dash.table_rect.contains(pos) {
-                                    let max = dash.agents.len().saturating_sub(1);
-                                    dash.scroll_offset = (dash.scroll_offset + 1).min(max);
+                                    dash.scroll.scroll_down(1, dash.agents.len());
                                 } else if dash.detail_rect.contains(pos) {
-                                    if let Some(agent) = dash.agents.get(dash.selected) {
+                                    if let Some(agent) = dash.agents.get(dash.scroll.selected) {
                                         let total = crate::panels::swarm_dashboard::count_display_lines(&agent.activity);
                                         dash.detail_scroll = (dash.detail_scroll + 3).min(total.saturating_sub(1));
                                     }
@@ -4041,7 +4030,7 @@ impl App {
                         let max_scroll = total.saturating_sub(track_height);
                         let row_in_track = row.saturating_sub(area.y) as usize;
                         let fraction = row_in_track as f64 / track_height.saturating_sub(1).max(1) as f64;
-                        self.file_tree.scroll_offset = (fraction * max_scroll as f64).round().min(max_scroll as f64) as usize;
+                        self.file_tree.scroll.offset = (fraction * max_scroll as f64).round().min(max_scroll as f64) as usize;
                     }
                     LeftPanelMode::Search => {
                         let total = self.search_panel.results.len();
@@ -4050,7 +4039,7 @@ impl App {
                         let max_scroll = total.saturating_sub(viewport);
                         let row_in_track = row.saturating_sub(area.y) as usize;
                         let fraction = row_in_track as f64 / track_height.saturating_sub(1).max(1) as f64;
-                        self.search_panel.scroll_offset = (fraction * max_scroll as f64).round().min(max_scroll as f64) as usize;
+                        self.search_panel.scroll.offset = (fraction * max_scroll as f64).round().min(max_scroll as f64) as usize;
                     }
                     LeftPanelMode::Review => {
                         if let Some(ref mut br) = self.batch_review {
@@ -4172,10 +4161,11 @@ impl App {
         }
 
         // Advance to next result (wrap around)
-        self.search_panel.selected = (self.search_panel.selected + 1) % self.search_panel.results.len();
-        self.search_panel.ensure_visible();
+        let count = self.search_panel.results.len();
+        self.search_panel.scroll.selected = (self.search_panel.scroll.selected + 1) % count;
+        self.search_panel.scroll.ensure_visible();
 
-        let result = self.search_panel.results[self.search_panel.selected].clone();
+        let result = self.search_panel.results[self.search_panel.scroll.selected].clone();
         let root = self.workspace.roots().first()
             .map(|p| p.to_path_buf())
             .unwrap_or_default();
@@ -4196,7 +4186,7 @@ impl App {
             }
         }
 
-        let idx = self.search_panel.selected + 1;
+        let idx = self.search_panel.scroll.selected + 1;
         let total = self.search_panel.results.len();
         self.status_message = Some((
             format!("Result {}/{}: {}:{}", idx, total, result.path.display(), result.line_number),
@@ -4934,9 +4924,9 @@ impl App {
         };
 
         let (bg, fg) = if focused {
-            (Color::Rgb(55, 100, 180), Color::Rgb(230, 235, 245))
+            (theme::FOCUSED_SELECTION_BG, theme::PANEL_HEADER_FOCUSED_FG)
         } else {
-            (theme::CODE_BLOCK_BG, Color::Rgb(120, 128, 145))
+            (theme::CODE_BLOCK_BG, theme::PANEL_HEADER_UNFOCUSED_FG)
         };
         let style = Style::default().fg(fg).bg(bg);
 
@@ -5112,7 +5102,7 @@ impl App {
         // Restore tree expanded state
         self.file_tree.restore_expanded(&state.tree_expanded);
         if state.tree_selected < self.file_tree.entries.len() {
-            self.file_tree.selected = state.tree_selected;
+            self.file_tree.scroll.selected = state.tree_selected;
         }
 
         // Restore open tabs
@@ -5186,7 +5176,7 @@ impl App {
                 terminal: self.panel_visible.terminal,
             },
             tree_expanded: self.file_tree.expanded_paths(),
-            tree_selected: self.file_tree.selected,
+            tree_selected: self.file_tree.scroll.selected,
             active_preset: self.active_preset,
             terminal_split_percent: Some(self.terminal_split_percent),
             terminal_session: Some(self.terminal_manager.save_state()),

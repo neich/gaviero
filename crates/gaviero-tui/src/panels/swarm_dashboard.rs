@@ -5,6 +5,7 @@ use ratatui::{
 };
 
 use crate::theme;
+use crate::widgets::scroll_state::ScrollState;
 use crate::widgets::scrollbar::render_scrollbar;
 use gaviero_core::swarm::models::{AgentStatus, SwarmResult};
 use gaviero_core::types::ModelTier;
@@ -70,8 +71,7 @@ pub enum DashboardFocus {
 /// State for the swarm dashboard panel.
 pub struct SwarmDashboardState {
     pub agents: Vec<AgentEntry>,
-    pub selected: usize,
-    pub scroll_offset: usize,
+    pub scroll: ScrollState,
     pub phase: String,
     pub tier_current: usize,
     pub tier_total: usize,
@@ -96,8 +96,7 @@ impl SwarmDashboardState {
     pub fn new() -> Self {
         Self {
             agents: Vec::new(),
-            selected: 0,
-            scroll_offset: 0,
+            scroll: ScrollState::new(),
             phase: "idle".to_string(),
             tier_current: 0,
             tier_total: 0,
@@ -115,8 +114,7 @@ impl SwarmDashboardState {
     /// Reset all state for a new swarm run.
     pub fn reset(&mut self, phase: &str) {
         self.agents.clear();
-        self.selected = 0;
-        self.scroll_offset = 0;
+        self.scroll.reset();
         self.phase = phase.to_string();
         self.tier_current = 0;
         self.tier_total = 0;
@@ -276,7 +274,7 @@ impl SwarmDashboardState {
     pub fn render(&mut self, area: Rect, buf: &mut Buffer, focused: bool) {
         let bg = theme::PANEL_BG;
         let sel_bg = if focused {
-            Color::Rgb(55, 100, 180)
+            theme::FOCUSED_SELECTION_BG
         } else {
             theme::DARK_BG
         };
@@ -334,6 +332,8 @@ impl SwarmDashboardState {
             theme::DARK_BG
         };
 
+        self.scroll.set_viewport(table_area.height as usize);
+        self.scroll.ensure_visible();
         self.render_agent_table(table_area, buf, bg, table_sel_bg);
         self.render_separator(area.x, sep_y, area.width, buf, bg);
 
@@ -415,7 +415,7 @@ impl SwarmDashboardState {
         let viewport = area.height as usize;
 
         for row in 0..viewport {
-            let idx = self.scroll_offset + row;
+            let idx = self.scroll.offset + row;
             if idx >= self.agents.len() {
                 break;
             }
@@ -425,7 +425,7 @@ impl SwarmDashboardState {
             }
 
             let agent = &self.agents[idx];
-            let is_selected = idx == self.selected;
+            let is_selected = idx == self.scroll.selected;
             let row_bg = if is_selected { sel_bg } else { bg };
 
             // Clear row
@@ -446,10 +446,10 @@ impl SwarmDashboardState {
             let mut col = area.x + 3;
             if let Some(tier) = &agent.model_tier {
                 let (badge, badge_color) = match tier {
-                    ModelTier::Coordinator => ("C", Color::Rgb(180, 120, 220)),
-                    ModelTier::Reasoning => ("R", Color::Rgb(80, 160, 230)),
-                    ModelTier::Execution => ("E", Color::Rgb(80, 200, 120)),
-                    ModelTier::Mechanical => ("M", Color::Rgb(220, 200, 80)),
+                    ModelTier::Coordinator => ("C", theme::TIER_COORDINATOR),
+                    ModelTier::Reasoning => ("R", theme::TIER_REASONING),
+                    ModelTier::Execution => ("E", theme::TIER_EXECUTION),
+                    ModelTier::Mechanical => ("M", theme::TIER_MECHANICAL),
                 };
                 render_text(buf, col, y, col + 2, badge, Style::default().fg(badge_color).bg(row_bg).add_modifier(Modifier::BOLD));
                 col += 2;
@@ -484,7 +484,7 @@ impl SwarmDashboardState {
         if y >= buf.area().bottom() {
             return;
         }
-        let agent_name = self.agents.get(self.selected)
+        let agent_name = self.agents.get(self.scroll.selected)
             .map(|a| a.id.as_str())
             .unwrap_or("(none)");
 
@@ -523,7 +523,7 @@ impl SwarmDashboardState {
     }
 
     fn render_detail_pane(&self, area: Rect, buf: &mut Buffer, bg: Color) {
-        let Some(agent) = self.agents.get(self.selected) else { return };
+        let Some(agent) = self.agents.get(self.scroll.selected) else { return };
 
         if agent.activity.is_empty() {
             let msg = " Waiting for activity...";
@@ -561,14 +561,14 @@ impl SwarmDashboardState {
             let (kind, text) = &display_lines[idx];
             let style = match kind {
                 ActivityKind::ToolCall => Style::default()
-                    .fg(Color::Rgb(80, 200, 220))
+                    .fg(theme::ACTIVITY_TOOL_CALL)
                     .bg(bg)
                     .add_modifier(Modifier::BOLD),
                 ActivityKind::FileChange => Style::default()
                     .fg(theme::SUCCESS)
                     .bg(bg),
                 ActivityKind::Status => Style::default()
-                    .fg(Color::Rgb(200, 180, 80))
+                    .fg(theme::ACTIVITY_STATUS)
                     .bg(bg),
                 ActivityKind::Text => Style::default()
                     .fg(theme::TEXT_FG)

@@ -153,6 +153,8 @@ pub struct AgentChatState {
     /// Redo stack: (text_snapshot, cursor_pos) for undone edits.
     input_redo_stack: Vec<(String, usize)>,
     pub scroll_offset: usize,
+    /// When true, the next render pass will snap scroll to the bottom.
+    pub scroll_pinned_to_bottom: bool,
     /// Current position in history (None = new input, Some(idx) = browsing user messages).
     pub history_index: Option<usize>,
     /// Stashed current input when browsing history.
@@ -211,6 +213,7 @@ impl AgentChatState {
             input_undo_stack: Vec::new(),
             input_redo_stack: Vec::new(),
             scroll_offset: 0,
+            scroll_pinned_to_bottom: false,
             history_index: None,
             history_stash: String::new(),
             autocomplete: FileAutocomplete::new(),
@@ -598,7 +601,7 @@ impl AgentChatState {
     pub fn switch_conversation(&mut self, idx: usize) {
         if idx < self.conversations.len() {
             self.active_conv = idx;
-            self.scroll_offset = usize::MAX; // scroll to bottom
+            self.scroll_pinned_to_bottom = true; // scroll to bottom
         }
     }
 
@@ -606,7 +609,7 @@ impl AgentChatState {
     pub fn next_conversation(&mut self) {
         if !self.conversations.is_empty() {
             self.active_conv = (self.active_conv + 1) % self.conversations.len();
-            self.scroll_offset = usize::MAX;
+            self.scroll_pinned_to_bottom = true;
             self.history_index = None;
             self.history_stash.clear();
         }
@@ -620,7 +623,7 @@ impl AgentChatState {
             } else {
                 self.active_conv - 1
             };
-            self.scroll_offset = usize::MAX;
+            self.scroll_pinned_to_bottom = true;
             self.history_index = None;
             self.history_stash.clear();
         }
@@ -1427,7 +1430,7 @@ impl AgentChatState {
 
     fn scroll_to_bottom(&mut self) {
         // Will be recalculated during render
-        self.scroll_offset = usize::MAX;
+        self.scroll_pinned_to_bottom = true;
         // Exit browse mode so auto-scroll takes precedence during streaming
         self.browse_mode = false;
     }
@@ -1600,7 +1603,7 @@ impl AgentChatState {
             self.new_conversation();
         }
 
-        self.scroll_offset = usize::MAX;
+        self.scroll_pinned_to_bottom = true;
         self.history_index = None;
         self.history_stash.clear();
     }
@@ -1910,9 +1913,10 @@ impl AgentChatState {
             // During streaming, ALWAYS keep the bottom visible so the user
             // sees the latest output (text, tool calls, or spinner).
             self.scroll_offset = total.saturating_sub(viewport);
-        } else if self.scroll_offset == usize::MAX || self.scroll_offset + viewport >= total {
-            // Auto-scroll to bottom when already near the end
+        } else if self.scroll_pinned_to_bottom || self.scroll_offset + viewport >= total {
+            // Auto-scroll to bottom when pinned or already near the end
             self.scroll_offset = total.saturating_sub(viewport);
+            self.scroll_pinned_to_bottom = false;
         }
 
         // Render visible lines

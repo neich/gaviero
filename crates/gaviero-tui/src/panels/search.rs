@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use crate::theme;
+use crate::widgets::scroll_state::ScrollState;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
 };
 
 /// A single search result: file path + line number + matching line text.
@@ -19,8 +20,7 @@ pub struct SearchResult {
 pub struct SearchPanelState {
     pub query: String,
     pub results: Vec<SearchResult>,
-    pub selected: usize,
-    pub scroll_offset: usize,
+    pub scroll: ScrollState,
     pub searching: bool,
 }
 
@@ -29,8 +29,7 @@ impl SearchPanelState {
         Self {
             query: String::new(),
             results: Vec::new(),
-            selected: 0,
-            scroll_offset: 0,
+            scroll: ScrollState::new(),
             searching: false,
         }
     }
@@ -39,8 +38,7 @@ impl SearchPanelState {
     pub fn search(&mut self, query: &str, roots: &[&Path], excludes: &[String]) {
         self.query = query.to_string();
         self.results.clear();
-        self.selected = 0;
-        self.scroll_offset = 0;
+        self.scroll.reset();
         self.searching = true;
 
         // Search synchronously through workspace files
@@ -102,42 +100,14 @@ impl SearchPanelState {
 
     /// Get the selected result.
     pub fn selected_result(&self) -> Option<&SearchResult> {
-        self.results.get(self.selected)
+        self.results.get(self.scroll.selected)
     }
 
-    pub fn move_up(&mut self) {
-        if self.selected > 0 {
-            self.selected -= 1;
-            self.ensure_visible();
-        }
-    }
-
-    pub fn move_down(&mut self) {
-        if self.selected + 1 < self.results.len() {
-            self.selected += 1;
-            self.ensure_visible();
-        }
-    }
-
-    pub fn scroll_up(&mut self, n: usize) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(n);
-    }
-
-    pub fn scroll_down(&mut self, n: usize) {
-        self.scroll_offset += n;
-    }
-
-    pub fn ensure_visible(&mut self) {
-        if self.selected < self.scroll_offset {
-            self.scroll_offset = self.selected;
-        }
-    }
-
-    pub fn render(&self, area: Rect, buf: &mut Buffer, focused: bool) {
+    pub fn render(&mut self, area: Rect, buf: &mut Buffer, focused: bool) {
         let bg = theme::PANEL_BG;
         let fg = theme::TEXT_FG;
         let sel_bg = if focused {
-            Color::Rgb(55, 100, 180)
+            theme::FOCUSED_SELECTION_BG
         } else {
             theme::DARK_BG
         };
@@ -184,19 +154,18 @@ impl SearchPanelState {
         // Results
         let results_start = area.y + 1;
         let viewport = (area.height as usize).saturating_sub(1);
+        self.scroll.set_viewport(viewport);
+        self.scroll.ensure_visible();
 
-        for row in 0..viewport {
-            let idx = self.scroll_offset + row;
-            if idx >= self.results.len() {
-                break;
-            }
+        for idx in self.scroll.visible_range(self.results.len(), viewport) {
+            let row = idx - self.scroll.offset;
             let y = results_start + row as u16;
             if y >= area.bottom() {
                 break;
             }
 
             let result = &self.results[idx];
-            let is_selected = idx == self.selected;
+            let is_selected = idx == self.scroll.selected;
 
             let line_bg = if is_selected { sel_bg } else { bg };
 
@@ -247,7 +216,7 @@ impl SearchPanelState {
             buf,
             self.results.len(),
             viewport,
-            self.scroll_offset,
+            self.scroll.offset,
         );
     }
 }

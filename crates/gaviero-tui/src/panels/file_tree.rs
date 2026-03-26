@@ -1,13 +1,14 @@
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Widget},
 };
 use std::path::{Path, PathBuf};
 
 use crate::theme;
+use crate::widgets::scroll_state::ScrollState;
 
 #[derive(Debug)]
 pub struct FileTreeEntry {
@@ -22,8 +23,7 @@ pub struct FileTreeEntry {
 #[derive(Debug)]
 pub struct FileTreeState {
     pub entries: Vec<FileTreeEntry>,
-    pub selected: usize,
-    pub scroll_offset: usize,
+    pub scroll: ScrollState,
     pub exclude_patterns: Vec<String>,
     pub git_allow_list: Vec<String>,
 }
@@ -51,8 +51,7 @@ impl FileTreeState {
 
         let mut state = Self {
             entries,
-            selected: 0,
-            scroll_offset: 0,
+            scroll: ScrollState::new(),
             exclude_patterns: exclude_patterns.to_vec(),
             git_allow_list: git_allow_list.to_vec(),
         };
@@ -177,19 +176,17 @@ impl FileTreeState {
 
     /// Navigate down.
     pub fn move_down(&mut self) {
-        if self.selected < self.visible_count().saturating_sub(1) {
-            self.selected += 1;
-        }
+        self.scroll.move_down(self.entries.len());
     }
 
     /// Navigate up.
     pub fn move_up(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
+        self.scroll.move_up();
     }
 
     /// Toggle expand/collapse on the selected entry.
     pub fn toggle_expand(&mut self) {
-        let idx = self.selected;
+        let idx = self.scroll.selected;
         if idx >= self.entries.len() {
             tracing::debug!("toggle_expand: idx {} out of range ({})", idx, self.entries.len());
             return;
@@ -221,13 +218,13 @@ impl FileTreeState {
 
     /// Get the path of the selected entry (for opening files).
     pub fn selected_path(&self) -> Option<&Path> {
-        self.entries.get(self.selected).map(|e| e.path.as_path())
+        self.entries.get(self.scroll.selected).map(|e| e.path.as_path())
     }
 
     /// Is the selected entry a file?
     pub fn selected_is_file(&self) -> bool {
         self.entries
-            .get(self.selected)
+            .get(self.scroll.selected)
             .map(|e| !e.is_dir)
             .unwrap_or(false)
     }
@@ -248,35 +245,18 @@ impl FileTreeState {
 
     /// Click on a row (relative to the panel top, accounting for scroll).
     pub fn click_row(&mut self, row: usize) {
-        // Account for block border (1 row for top border if present, but we use RIGHT border only)
-        let idx = self.scroll_offset + row;
-        if idx < self.entries.len() {
-            self.selected = idx;
-        }
+        let idx = self.scroll.offset + row;
+        self.scroll.select(idx, self.entries.len());
     }
 
     /// Scroll up by n entries.
     pub fn scroll_up(&mut self, n: usize) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(n);
+        self.scroll.scroll_up(n);
     }
 
     /// Scroll down by n entries.
     pub fn scroll_down(&mut self, n: usize) {
-        let max = self.entries.len().saturating_sub(1);
-        self.scroll_offset = (self.scroll_offset + n).min(max);
-    }
-
-    /// Ensure the selected entry is visible in the viewport.
-    fn ensure_selected_visible(&mut self, viewport_height: usize) {
-        if viewport_height == 0 {
-            return;
-        }
-        if self.selected < self.scroll_offset {
-            self.scroll_offset = self.selected;
-        }
-        if self.selected >= self.scroll_offset + viewport_height {
-            self.scroll_offset = self.selected - viewport_height + 1;
-        }
+        self.scroll.scroll_down(n, self.entries.len());
     }
 
     /// Return paths of all currently expanded directories (for state persistence).
@@ -309,10 +289,6 @@ impl FileTreeState {
         }
     }
 
-    fn visible_count(&self) -> usize {
-        self.entries.len()
-    }
-
     /// Render the file tree into the given area.
     /// NOTE: takes &mut self to auto-scroll the selection into view.
     pub fn render(&mut self, area: Rect, buf: &mut Buffer, focused: bool) {
@@ -329,11 +305,13 @@ impl FileTreeState {
         block.render(area, buf);
 
         // Auto-scroll to keep selection visible
-        self.ensure_selected_visible(inner.height as usize);
+        let viewport = inner.height as usize;
+        self.scroll.set_viewport(viewport);
+        self.scroll.ensure_visible();
 
         let visible_entries = self.entries.iter().enumerate()
-            .skip(self.scroll_offset)
-            .take(inner.height as usize);
+            .skip(self.scroll.offset)
+            .take(viewport);
 
         for (row, (i, entry)) in visible_entries.enumerate() {
             let y = inner.y + row as u16;
@@ -344,10 +322,10 @@ impl FileTreeState {
                 " "
             };
 
-            let is_selected = i == self.selected;
+            let is_selected = i == self.scroll.selected;
             let style = if is_selected {
                 Style::default()
-                    .fg(Color::White)
+                    .fg(theme::SELECTED_BRIGHT)
                     .add_modifier(Modifier::BOLD)
                     .bg(theme::SELECTION_BG)
             } else if entry.is_dir {
@@ -373,8 +351,8 @@ impl FileTreeState {
             inner,
             buf,
             self.entries.len(),
-            inner.height as usize,
-            self.scroll_offset,
+            viewport,
+            self.scroll.offset,
         );
     }
 }

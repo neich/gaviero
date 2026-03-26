@@ -26,8 +26,6 @@ pub enum Action {
     CursorDown,
     CursorLeft,
     CursorRight,
-    #[allow(dead_code)] SelectLeft,
-    #[allow(dead_code)] SelectRight,
     PageUp,
     PageDown,
     Home,
