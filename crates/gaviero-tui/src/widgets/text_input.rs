@@ -193,7 +193,6 @@ impl TextInput {
     }
 
     /// Move cursor right by one word.
-    #[allow(dead_code)]
     pub fn move_word_right(&mut self) {
         let chars: Vec<char> = self.text.chars().collect();
         let len = chars.len();
@@ -220,6 +219,56 @@ impl TextInput {
         let byte_start = self.cursor_byte_offset();
         let byte_end = self.char_to_byte(old_cursor);
         self.text.drain(byte_start..byte_end);
+    }
+
+    // ── Selection extension ────────────────────────────────────
+
+    /// Extend selection one char to the left.
+    pub fn select_left(&mut self) {
+        self.ensure_anchor();
+        if self.cursor > 0 {
+            self.cursor -= 1;
+        }
+    }
+
+    /// Extend selection one char to the right.
+    pub fn select_right(&mut self) {
+        self.ensure_anchor();
+        if self.cursor < self.char_count() {
+            self.cursor += 1;
+        }
+    }
+
+    /// Extend selection one word to the left.
+    pub fn select_word_left(&mut self) {
+        self.ensure_anchor();
+        if self.cursor == 0 {
+            return;
+        }
+        let chars: Vec<char> = self.text.chars().collect();
+        let mut pos = self.cursor;
+        while pos > 0 && !chars[pos - 1].is_alphanumeric() && chars[pos - 1] != '_' {
+            pos -= 1;
+        }
+        while pos > 0 && (chars[pos - 1].is_alphanumeric() || chars[pos - 1] == '_') {
+            pos -= 1;
+        }
+        self.cursor = pos;
+    }
+
+    /// Extend selection one word to the right.
+    pub fn select_word_right(&mut self) {
+        self.ensure_anchor();
+        let chars: Vec<char> = self.text.chars().collect();
+        let len = chars.len();
+        let mut pos = self.cursor;
+        while pos < len && (chars[pos].is_alphanumeric() || chars[pos] == '_') {
+            pos += 1;
+        }
+        while pos < len && !chars[pos].is_alphanumeric() && chars[pos] != '_' {
+            pos += 1;
+        }
+        self.cursor = pos;
     }
 
     // ── Selection ───────────────────────────────────────────────

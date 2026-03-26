@@ -293,28 +293,31 @@ pub fn is_terminal_escape_key(key: &KeyEvent) -> bool {
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     matches!(
         (key.code, ctrl, alt, shift),
-        (KeyCode::F(4), false, false, false)       // F4 — toggle terminal
-        | (KeyCode::Char('\\'), true, false, false) // Ctrl+\ — cycle focus
-        | (KeyCode::Char('q'), true, false, false)  // Ctrl+q — quit
-        | (KeyCode::Char('w'), true, false, false)  // Ctrl+W — close terminal tab
-        | (KeyCode::F(8), false, false, false)       // F8 — new terminal tab
-        | (KeyCode::Char('t'), false, true, false)    // Alt+T — new terminal tab
-        // Ctrl+arrows — inter-panel navigation (always escapes terminal)
-        | (KeyCode::Up, true, false, false)          // Ctrl+Up — focus editor
-        | (KeyCode::Down, true, false, false)        // Ctrl+Down — focus terminal
-        | (KeyCode::Left, true, false, false)        // Ctrl+Left — focus file tree
-        | (KeyCode::Right, true, false, false)       // Ctrl+Right — focus side panel
-        // Shift+arrows — intra-panel navigation
-        | (KeyCode::Left, false, false, true)        // Shift+Left — prev terminal tab
-        | (KeyCode::Right, false, false, true)       // Shift+Right — next terminal tab
-        | (KeyCode::Up, false, false, true)          // Shift+Up — scroll back
-        | (KeyCode::Down, false, false, true)        // Shift+Down — scroll forward
-        // Shift+PageUp/PageDown — page scroll in terminal
-        | (KeyCode::PageUp, false, false, true)      // Shift+PageUp — page scroll back
-        | (KeyCode::PageDown, false, false, true)    // Shift+PageDown — page scroll forward
+        // Panel visibility toggles
+        (KeyCode::F(4), false, false, false)         // F4 — toggle terminal
+        | (KeyCode::Char('j'), true, false, false)   // Ctrl+J — toggle terminal
+        | (KeyCode::Char('q'), true, false, false)    // Ctrl+Q — quit
+        | (KeyCode::Char('w'), true, false, false)    // Ctrl+W — close terminal tab
+        | (KeyCode::Char('b'), true, false, false)    // Ctrl+B — toggle file tree
+        | (KeyCode::Char('p'), true, false, false)    // Ctrl+P — toggle side panel
+        // Alt+Number — panel focus (always escapes terminal)
+        | (KeyCode::Char('1'), false, true, false)    // Alt+1 — focus left panel
+        | (KeyCode::Char('2'), false, true, false)    // Alt+2 — focus editor
+        | (KeyCode::Char('3'), false, true, false)    // Alt+3 — focus side panel
+        | (KeyCode::Char('4'), false, true, false)    // Alt+4 — focus terminal
+        // Alt+Letter — panel mode switching (escapes terminal)
+        | (KeyCode::Char('e'), false, true, false)    // Alt+E — explorer
+        | (KeyCode::Char('f'), false, true, false)    // Alt+F — find
+        | (KeyCode::Char('c'), false, true, false)    // Alt+C — changes
+        | (KeyCode::Char('a'), false, true, false)    // Alt+A — agent chat
+        | (KeyCode::Char('w'), false, true, false)    // Alt+W — swarm dashboard
+        | (KeyCode::Char('g'), false, true, false)    // Alt+G — git panel
         // Alt+Up/Down — terminal resize
-        | (KeyCode::Up, false, true, false)          // Alt+Up — grow terminal
-        | (KeyCode::Down, false, true, false)        // Alt+Down — shrink terminal
+        | (KeyCode::Up, false, true, false)           // Alt+Up — grow terminal
+        | (KeyCode::Down, false, true, false)         // Alt+Down — shrink terminal
+        // Shift+PageUp/PageDown — page scroll in terminal
+        | (KeyCode::PageUp, false, false, true)       // Shift+PageUp — page scroll back
+        | (KeyCode::PageDown, false, false, true)     // Shift+PageDown — page scroll forward
     )
 }
 

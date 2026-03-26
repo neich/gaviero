@@ -21,15 +21,14 @@ Gaviero is a self-contained terminal editor. You can use it for everyday editing
 
 | Key | What it does |
 |---|---|
+| Alt+1 / Alt+2 / Alt+3 / Alt+4 | Focus left panel / editor / side panel / terminal |
 | Ctrl+b | Show/hide file tree |
 | Ctrl+p | Show/hide side panel |
-| F4 | Show/hide terminal |
-| Ctrl+\\ | Cycle focus between panels |
-| Ctrl+Arrow | Move focus directionally |
+| Ctrl+j / F4 | Show/hide terminal |
 | Ctrl+t / Ctrl+w | New tab / close tab |
 | Alt+[ / Alt+] | Cycle tabs |
 | F11 | Toggle fullscreen for current panel |
-| Ctrl+0..9 | Switch layout preset |
+| Alt+Shift+1..6 | Switch layout preset |
 
 ### Editing
 
@@ -39,6 +38,9 @@ Gaviero is a self-contained terminal editor. You can use it for everyday editing
 | Ctrl+z / Ctrl+y | Undo / Redo |
 | Ctrl+c / Ctrl+x / Ctrl+v | Copy / Cut / Paste |
 | Ctrl+a | Select all |
+| Ctrl+Left / Ctrl+Right | Word movement |
+| Shift+Arrow | Extend selection |
+| Ctrl+Shift+Left / Ctrl+Shift+Right | Extend selection by word |
 | Ctrl+k | Delete line |
 | Ctrl+d | Duplicate line |
 | Alt+Up / Alt+Down | Move line up/down |
@@ -54,21 +56,25 @@ Gaviero is a self-contained terminal editor. You can use it for everyday editing
 
 ### Side panels
 
-Switch between side panels with Ctrl+1/2/3:
+Switch between side panels with Alt+letter:
 
 | Key | Panel |
 |---|---|
-| Ctrl+1 | Agent Chat |
-| Ctrl+2 | Swarm Dashboard |
-| Ctrl+3 | Git |
+| Alt+a | Agent Chat |
+| Alt+w | Swarm Dashboard |
+| Alt+g | Git |
 
 ### Left panel modes
 
-The left column cycles between views with Shift+Left/Right or F7:
+Switch between left panel views with Alt+letter:
 
-- **File tree** — browse and open files, create/rename/delete (n/N/F2/d)
-- **Search** — interactive workspace search with live results
-- **Changes** — git-style changed file list with inline diffs
+| Key | Mode |
+|---|---|
+| Alt+e | Explorer (file tree) |
+| Alt+f | Find (workspace search) |
+| Alt+c | Changes (git diff list) |
+
+Each shortcut shows the left panel if hidden, switches to the requested mode, and focuses it.
 
 ### Git panel
 
@@ -83,7 +89,7 @@ The git panel (Ctrl+3) provides staging, committing, and branch management witho
 
 ### Embedded terminal
 
-F4 opens a terminal panel at the bottom. F8 or Alt+T creates additional terminal tabs. The terminal is a full PTY — run builds, tests, git commands, or anything else without switching windows.
+Ctrl+J (or F4) opens a terminal panel at the bottom. The terminal is a full PTY — run builds, tests, git commands, or anything else without switching windows.
 
 ## Working with AI agents
 
