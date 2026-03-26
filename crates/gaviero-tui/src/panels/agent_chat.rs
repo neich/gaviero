@@ -181,6 +181,8 @@ pub struct AgentChatState {
     pub text_sel_end: Option<(usize, usize)>,
     /// Whether mouse is currently dragging to select chat text.
     pub chat_dragging: bool,
+    /// When true, the user has manually scrolled during streaming, so auto-scroll is paused.
+    pub user_scrolled_during_stream: bool,
 }
 
 impl AgentChatState {
@@ -217,6 +219,7 @@ impl AgentChatState {
             conv_area_cache: None,
             text_sel_anchor: None,
             text_sel_end: None,
+            user_scrolled_during_stream: false,
             chat_dragging: false,
         }
     }
@@ -1217,6 +1220,8 @@ impl AgentChatState {
         self.scroll_pinned_to_bottom = true;
         // Exit browse mode so auto-scroll takes precedence during streaming
         self.browse_mode = false;
+        // Re-enable auto-scroll during streaming
+        self.user_scrolled_during_stream = false;
     }
 
     // ── Conversation-ID-targeted methods (for parallel streaming) ──
@@ -1693,10 +1698,17 @@ impl AgentChatState {
                     self.scroll_offset = last.saturating_sub(viewport - 1);
                 }
             }
-        } else if self.active_conv_streaming() {
-            // During streaming, ALWAYS keep the bottom visible so the user
-            // sees the latest output (text, tool calls, or spinner).
+        } else if self.active_conv_streaming() && !self.user_scrolled_during_stream {
+            // During streaming, keep the bottom visible unless the user
+            // manually scrolled away to read earlier output.
             self.scroll_offset = total.saturating_sub(viewport);
+        } else if self.active_conv_streaming() && self.user_scrolled_during_stream {
+            // User scrolled away during streaming — if they've scrolled back
+            // near the bottom, re-engage auto-scroll.
+            if self.scroll_offset + viewport >= total {
+                self.user_scrolled_during_stream = false;
+                self.scroll_offset = total.saturating_sub(viewport);
+            }
         } else if self.scroll_pinned_to_bottom || self.scroll_offset + viewport >= total {
             // Auto-scroll to bottom when pinned or already near the end
             self.scroll_offset = total.saturating_sub(viewport);
