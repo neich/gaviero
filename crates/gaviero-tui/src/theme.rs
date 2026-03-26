@@ -74,6 +74,28 @@ pub const DIFF_REM_LINE_BG: Color = Color::Rgb(50, 30, 30);
 pub const NUMERIC_ORANGE: Color = Color::Rgb(209, 154, 102);
 /// Medium gray for secondary labels.
 pub const MEDIUM_GRAY: Color = Color::Rgb(140, 145, 155);
+/// Focused list-item selection background.
+pub const FOCUSED_SELECTION_BG: Color = Color::Rgb(55, 100, 180);
+/// Swarm tier badge: Coordinator.
+pub const TIER_COORDINATOR: Color = Color::Rgb(180, 120, 220);
+/// Swarm tier badge: Reasoning.
+pub const TIER_REASONING: Color = Color::Rgb(80, 160, 230);
+/// Swarm tier badge: Execution.
+pub const TIER_EXECUTION: Color = Color::Rgb(80, 200, 120);
+/// Swarm tier badge: Mechanical.
+pub const TIER_MECHANICAL: Color = Color::Rgb(220, 200, 80);
+/// Activity line: tool call.
+pub const ACTIVITY_TOOL_CALL: Color = Color::Rgb(80, 200, 220);
+/// Activity line: status change.
+pub const ACTIVITY_STATUS: Color = Color::Rgb(200, 180, 80);
+/// Terminal cursor foreground (inverted).
+pub const CURSOR_INVERT_FG: Color = Color::Black;
+/// Selected item bright text.
+pub const SELECTED_BRIGHT: Color = Color::White;
+/// Focused panel header bright foreground.
+pub const PANEL_HEADER_FOCUSED_FG: Color = Color::Rgb(230, 235, 245);
+/// Unfocused panel header dimmed foreground.
+pub const PANEL_HEADER_UNFOCUSED_FG: Color = Color::Rgb(120, 128, 145);
 
 // ── Magic Number Constants ──────────────────────────────────────
 
