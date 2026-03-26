@@ -5,7 +5,11 @@
 
 use anyhow::{Context, Result};
 
-/// Ollama HTTP client for local model execution.
+/// Ollama HTTP client for local model execution (non-streaming).
+///
+/// **Deprecated:** Use [`super::backend::ollama::OllamaStreamBackend`] which
+/// implements the [`super::backend::AgentBackend`] trait with streaming support.
+#[deprecated(note = "Use backend::ollama::OllamaStreamBackend instead")]
 #[derive(Debug, Clone)]
 pub struct OllamaBackend {
     base_url: String,
