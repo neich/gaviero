@@ -191,8 +191,10 @@ enum ScrollbarTarget {
 struct LayoutAreas {
     tab_area: Rect,
     file_tree_area: Option<Rect>,
+    left_header_area: Option<Rect>,
     editor_area: Rect,
     side_panel_area: Option<Rect>,
+    side_header_area: Option<Rect>,
     terminal_area: Option<Rect>,
     status_area: Rect,
 }
@@ -351,7 +353,7 @@ impl TreeDialog {
             TreeDialogKind::NewFile => "New file: ",
             TreeDialogKind::NewFolder => "New folder: ",
             TreeDialogKind::Rename => "Rename to: ",
-            TreeDialogKind::Delete => "Delete? (y/N): ",
+            TreeDialogKind::Delete => "Delete (y/n)? ",
         }
     }
 
@@ -1283,44 +1285,61 @@ impl App {
             Action::Home => self.chat_state.text_input.move_home(),
             Action::End => self.chat_state.text_input.move_end(),
             Action::CursorUp => {
-                // Compute the visual line widths for the input area
-                let prompt_len = 2; // "> "
-                let panel_w = self.layout.side_panel_area.map(|a| a.width).unwrap_or(40).saturating_sub(2) as usize; // -2 for borders
-                let first_w = panel_w.saturating_sub(prompt_len);
-                let has_visual_lines = !self.chat_state.text_input.text.is_empty()
-                    && (self.chat_state.input_is_multiline()
-                        || self.chat_state.input_wraps_visually(first_w, panel_w));
+                let streaming = self.chat_state.active_conv_streaming();
+                if streaming {
+                    // During streaming, Up/Down always scroll the chat history
+                    self.chat_state.scroll_offset = self.chat_state.scroll_offset.saturating_sub(1);
+                    self.chat_state.user_scrolled_during_stream = true;
+                } else {
+                    // Compute the visual line widths for the input area
+                    let prompt_len = 2; // "> "
+                    let panel_w = self.layout.side_panel_area.map(|a| a.width).unwrap_or(40).saturating_sub(2) as usize; // -2 for borders
+                    let first_w = panel_w.saturating_sub(prompt_len);
+                    let has_visual_lines = !self.chat_state.text_input.text.is_empty()
+                        && (self.chat_state.input_is_multiline()
+                            || self.chat_state.input_wraps_visually(first_w, panel_w));
 
-                if has_visual_lines {
-                    if !self.chat_state.move_up_visual(first_w, panel_w) {
+                    if has_visual_lines {
+                        if !self.chat_state.move_up_visual(first_w, panel_w) {
+                            self.chat_state.scroll_offset = self.chat_state.scroll_offset.saturating_sub(1);
+                        }
+                    } else if self.chat_state.history_index.is_some() || self.chat_state.text_input.text.is_empty() {
+                        self.chat_state.history_up();
+                    } else {
                         self.chat_state.scroll_offset = self.chat_state.scroll_offset.saturating_sub(1);
                     }
-                } else if self.chat_state.history_index.is_some() || self.chat_state.text_input.text.is_empty() {
-                    self.chat_state.history_up();
-                } else {
-                    self.chat_state.scroll_offset = self.chat_state.scroll_offset.saturating_sub(1);
                 }
             }
             Action::CursorDown => {
-                let prompt_len = 2;
-                let panel_w = self.layout.side_panel_area.map(|a| a.width).unwrap_or(40).saturating_sub(2) as usize;
-                let first_w = panel_w.saturating_sub(prompt_len);
-                let has_visual_lines = !self.chat_state.text_input.text.is_empty()
-                    && (self.chat_state.input_is_multiline()
-                        || self.chat_state.input_wraps_visually(first_w, panel_w));
+                let streaming = self.chat_state.active_conv_streaming();
+                if streaming {
+                    self.chat_state.scroll_offset += 1;
+                    // Don't mark user_scrolled — scrolling down towards bottom
+                    // is consistent with wanting to follow output
+                } else {
+                    let prompt_len = 2;
+                    let panel_w = self.layout.side_panel_area.map(|a| a.width).unwrap_or(40).saturating_sub(2) as usize;
+                    let first_w = panel_w.saturating_sub(prompt_len);
+                    let has_visual_lines = !self.chat_state.text_input.text.is_empty()
+                        && (self.chat_state.input_is_multiline()
+                            || self.chat_state.input_wraps_visually(first_w, panel_w));
 
-                if has_visual_lines {
-                    if !self.chat_state.move_down_visual(first_w, panel_w) {
+                    if has_visual_lines {
+                        if !self.chat_state.move_down_visual(first_w, panel_w) {
+                            self.chat_state.scroll_offset += 1;
+                        }
+                    } else if self.chat_state.history_index.is_some() {
+                        self.chat_state.history_down();
+                    } else {
                         self.chat_state.scroll_offset += 1;
                     }
-                } else if self.chat_state.history_index.is_some() {
-                    self.chat_state.history_down();
-                } else {
-                    self.chat_state.scroll_offset += 1;
                 }
             }
             Action::PageUp => {
                 self.chat_state.scroll_offset = self.chat_state.scroll_offset.saturating_sub(20);
+                if self.chat_state.active_conv_streaming() {
+                    self.chat_state.user_scrolled_during_stream = true;
+                }
             }
             Action::PageDown => {
                 self.chat_state.scroll_offset = self.chat_state.scroll_offset.saturating_add(20);
@@ -3583,11 +3602,10 @@ impl App {
             }
         }
 
-        // For delete, store the path
+        // For delete, store the path (no text input needed, uses y/n confirmation)
         if matches!(kind, TreeDialogKind::Delete) {
             if let Some(entry) = self.file_tree.entries.get(self.file_tree.scroll.selected) {
                 dialog.original_path = Some(entry.path.clone());
-                dialog.input = entry.name.clone();
             }
         }
 
@@ -3596,6 +3614,20 @@ impl App {
 
     fn handle_dialog_key(&mut self, key: &crossterm::event::KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
+
+        // Delete confirmation uses simple y/n keys, no text editing
+        if self.tree_dialog.as_ref().is_some_and(|d| matches!(d.kind, TreeDialogKind::Delete)) {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.confirm_tree_dialog();
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.tree_dialog = None;
+                }
+                _ => {}
+            }
+            return;
+        }
 
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
@@ -3704,9 +3736,7 @@ impl App {
                 }
             }
             TreeDialogKind::Delete => {
-                // Only proceed on 'y'
-                let answer = dialog.input.trim().to_lowercase();
-                if answer != "y" && answer != "yes" { return; }
+                // Confirmation already handled by handle_dialog_key (y/n)
                 if let Some(path) = dialog.original_path {
                     let result = if path.is_dir() {
                         std::fs::remove_dir_all(&path)
@@ -3781,6 +3811,45 @@ impl App {
                             }
                             return;
                         }
+                    }
+                }
+
+                // ── Header arrow click: cycle left panel mode ──
+                if let Some(hdr) = self.layout.left_header_area {
+                    if hdr.contains((col, row).into()) {
+                        // Click on the arrow region (last 3 columns) cycles panel
+                        let arrow_zone = hdr.x + hdr.width.saturating_sub(3);
+                        if col >= arrow_zone {
+                            self.focus = Focus::FileTree;
+                            self.left_panel = match self.left_panel {
+                                LeftPanelMode::FileTree => LeftPanelMode::Search,
+                                LeftPanelMode::Search => LeftPanelMode::Review,
+                                LeftPanelMode::Review => LeftPanelMode::Changes,
+                                LeftPanelMode::Changes => LeftPanelMode::FileTree,
+                            };
+                            return;
+                        }
+                        // Click elsewhere on header just focuses the panel
+                        self.focus = Focus::FileTree;
+                        return;
+                    }
+                }
+
+                // ── Header arrow click: cycle side panel mode ──
+                if let Some(hdr) = self.layout.side_header_area {
+                    if hdr.contains((col, row).into()) {
+                        let arrow_zone = hdr.x + hdr.width.saturating_sub(3);
+                        if col >= arrow_zone {
+                            self.focus = Focus::SidePanel;
+                            self.side_panel = match self.side_panel {
+                                SidePanelMode::AgentChat => SidePanelMode::SwarmDashboard,
+                                SidePanelMode::SwarmDashboard => SidePanelMode::GitPanel,
+                                SidePanelMode::GitPanel => SidePanelMode::AgentChat,
+                            };
+                            return;
+                        }
+                        self.focus = Focus::SidePanel;
+                        return;
                     }
                 }
 
@@ -4676,6 +4745,7 @@ impl App {
         let mut panel_idx = 0;
 
         self.layout.file_tree_area = None;
+        self.layout.left_header_area = None;
         if self.panel_visible.file_tree {
             let full_area = h_layout[panel_idx];
             let left_focused = self.focus == Focus::FileTree;
@@ -4685,7 +4755,8 @@ impl App {
                 LeftPanelMode::Review => "REVIEW",
                 LeftPanelMode::Changes => "CHANGES",
             };
-            let content_area = Self::render_panel_header(frame, full_area, title, left_focused);
+            let (header_area, content_area) = Self::render_panel_header(frame, full_area, title, left_focused, true);
+            self.layout.left_header_area = Some(header_area);
             self.layout.file_tree_area = Some(content_area);
 
             match self.left_panel {
@@ -4716,7 +4787,7 @@ impl App {
         let editor_title = self.buffers.get(self.active_buffer)
             .map(|b| b.display_name().to_string())
             .unwrap_or_else(|| "EDITOR".to_string());
-        let editor_content = Self::render_panel_header(frame, editor_full_area, &editor_title, editor_focused);
+        let (_editor_header, editor_content) = Self::render_panel_header(frame, editor_full_area, &editor_title, editor_focused, false);
 
         // If markdown preview is visible, split editor area horizontally
         let (actual_editor_area, preview_area) = if self.preview_visible && self.is_current_buffer_markdown() {
@@ -4739,6 +4810,7 @@ impl App {
         panel_idx += 1;
 
         self.layout.side_panel_area = None;
+        self.layout.side_header_area = None;
         if self.panel_visible.side_panel && panel_idx < h_layout.len() {
             let full_area = h_layout[panel_idx];
             let side_focused = self.focus == Focus::SidePanel;
@@ -4747,7 +4819,8 @@ impl App {
                 SidePanelMode::SwarmDashboard => "SWARM",
                 SidePanelMode::GitPanel => "GIT",
             };
-            let content_area = Self::render_panel_header(frame, full_area, side_title, side_focused);
+            let (side_header, content_area) = Self::render_panel_header(frame, full_area, side_title, side_focused, true);
+            self.layout.side_header_area = Some(side_header);
             self.layout.side_panel_area = Some(content_area);
             self.render_side_panel(frame, content_area);
         }
@@ -4780,7 +4853,7 @@ impl App {
             title.to_string()
         };
 
-        let content = Self::render_panel_header(frame, area, &title, true);
+        let (_header, content) = Self::render_panel_header(frame, area, &title, true, false);
 
         match panel {
             Focus::FileTree => {
@@ -5024,19 +5097,31 @@ impl App {
             }
         }
 
-        // Input text
+        // Input text (or static filename for delete confirmation)
         let input_start_x = x;
-        for ch in dialog.input.chars() {
+        let is_delete = matches!(dialog.kind, TreeDialogKind::Delete);
+        let display_text = if is_delete {
+            // Show the filename as non-editable text
+            dialog.original_path.as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or(&dialog.input)
+        } else {
+            &dialog.input
+        };
+        for ch in display_text.chars() {
             if x < dialog_area.x + dialog_area.width {
                 frame.buffer_mut()[(x, input_y)].set_char(ch).set_style(bg_style);
                 x += 1;
             }
         }
 
-        // Position cursor in dialog
-        let cursor_x = input_start_x + dialog.input[..dialog.cursor].chars().count() as u16;
-        if cursor_x < dialog_area.x + dialog_area.width && input_y < frame.area().bottom() {
-            frame.set_cursor_position((cursor_x, input_y));
+        // Position cursor in dialog (not for delete confirmation)
+        if !is_delete {
+            let cursor_x = input_start_x + dialog.input[..dialog.cursor].chars().count() as u16;
+            if cursor_x < dialog_area.x + dialog_area.width && input_y < frame.area().bottom() {
+                frame.set_cursor_position((cursor_x, input_y));
+            }
         }
     }
 
@@ -5194,16 +5279,19 @@ impl App {
         status.render(area, frame.buffer_mut());
     }
 
-    /// Render a 1-line panel header. Returns the remaining area below the header.
+    /// Render a 1-line panel header. Returns `(header_area, content_area)`.
     /// Active panel gets a bright colored bar; inactive gets a subtle dark bar.
+    /// When `show_cycle_arrow` is true, a clickable "▸" arrow is drawn on the
+    /// right side of the header to allow cycling through sub-panels.
     fn render_panel_header(
         frame: &mut Frame,
         area: Rect,
         title: &str,
         focused: bool,
-    ) -> Rect {
+        show_cycle_arrow: bool,
+    ) -> (Rect, Rect) {
         if area.height < 2 {
-            return area;
+            return (Rect::default(), area);
         }
 
         let header_area = Rect {
@@ -5244,7 +5332,18 @@ impl App {
             }
         }
 
-        content_area
+        // Draw cycle arrow on the right side
+        if show_cycle_arrow && header_area.width >= 4 {
+            let arrow_x = header_area.x + header_area.width - 2;
+            if arrow_x < buf.area().right() && header_area.y < buf.area().bottom() {
+                let arrow_style = Style::default()
+                    .fg(if focused { theme::PANEL_HEADER_FOCUSED_FG } else { theme::PANEL_HEADER_UNFOCUSED_FG })
+                    .bg(bg);
+                buf[(arrow_x, header_area.y)].set_char('▸').set_style(arrow_style);
+            }
+        }
+
+        (header_area, content_area)
     }
 
     fn render_terminal(&mut self, frame: &mut Frame, area: Rect) {
