@@ -98,7 +98,7 @@ terminal/
 main.rs                     Entry point, terminal setup, event loop, panic handler
 app.rs                      App state, layout rendering, focus management, find bar (~5000 lines)
 event.rs                    Event enum, EventLoop (crossterm/watcher/tick/terminal bridge)
-keymap.rs                   Keybinding definitions, Action enum (80+ variants, incl. FindInBuffer)
+keymap.rs                   Keybinding definitions, Action enum; Ctrl=editor, Alt=workspace layering
 theme.rs                    Centralized color constants (One Dark), timing constants (poll/tick)
 editor/
   mod.rs                    Module re-exports
@@ -615,11 +615,13 @@ Fixed 5-region layout (no floating windows):
 
 ### Focus Model
 
-`Focus` enum: `Editor | FileTree | SidePanel | Terminal`. Tab cycles focus. Each panel handles its own keybindings when focused.
+`Focus` enum: `Editor | FileTree | SidePanel | Terminal`. Panel focus is switched via Alt+Number (Alt+1 through Alt+4). If the target panel is hidden, it becomes visible and receives focus. Each panel handles its own keybindings when focused.
+
+The keybinding scheme uses clean modifier layering: **Ctrl = editor/text** (word movement, selection, save, find, undo), **Alt = workspace** (panel focus, panel modes, tab cycling, line movement), **Shift = selection extension** (char/line), **F-keys = global toggles**. This avoids conflicts with standard editor conventions.
 
 ### Layout Presets
 
-Six presets (number keys 1-6) configure column widths:
+Six presets (Alt+Shift+1 through Alt+Shift+6) configure column widths:
 
 | Preset | File Tree | Editor | Side Panel |
 |---|---|---|---|
@@ -629,11 +631,11 @@ Six presets (number keys 1-6) configure column widths:
 
 ### Side Panel Modes
 
-`SidePanelMode`: `AgentChat` (default), `SwarmDashboard`, `GitPanel`. Toggled via keybinds.
+`SidePanelMode`: `AgentChat` (default), `SwarmDashboard`, `GitPanel`. Switched via Alt+A/W/G respectively; each shortcut shows the side panel if hidden and focuses it.
 
 ### Left Panel Modes
 
-`LeftPanelMode`: `FileTree` (default), `Search`, `Changes`, `Review`. Toggled via Shift+Left/Right or F7.
+`LeftPanelMode`: `FileTree` (default), `Search`, `Changes`, `Review`. Switched via Alt+E/F/C respectively; each shortcut shows the left panel if hidden and focuses it. Review mode is only entered programmatically (agent proposals) and cannot be cycled into.
 
 ### Terminal Panel
 
@@ -655,7 +657,7 @@ Two shared structs in `widgets/` eliminate duplicated logic across panels:
 **`TextInput`** (`text_input.rs`) — char-indexed text buffer with selection, undo/redo, word movement:
 - `insert_char()`, `insert_str()`, `backspace()`, `delete()` — editing with auto-undo and selection replacement
 - `move_left/right/home/end()`, `move_word_left/right()` — cursor movement
-- `select_all()`, `selection_range()`, `delete_selection()` — selection
+- `select_left/right()`, `select_word_left/right()`, `select_all()`, `selection_range()`, `delete_selection()` — selection
 - `undo()`, `redo()` — 50-entry undo stack
 - Used by: `agent_chat` (chat input), `git_panel` (commit message), `search` (query input), `app` (find bar)
 
@@ -676,7 +678,7 @@ Two focus modes controlled by `editing: bool`:
 - **Input mode** (`editing=true`): Keystrokes update the query, search runs on every keystroke (search-as-you-type). Down/Enter moves focus to results.
 - **Results mode** (`editing=false`): Up/Down navigate results. Enter opens the selected file at the matching line. Typing switches back to input mode.
 
-Switching to the search panel (F7, Shift+Left/Right) auto-focuses the input. F3 from the editor populates the input with the selection and focuses results.
+Switching to the search panel (Alt+F) auto-focuses the input. F3 from the editor populates the input with the selection and focuses results.
 
 ### Editor Find Bar
 
