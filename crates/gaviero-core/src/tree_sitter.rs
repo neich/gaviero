@@ -1,48 +1,46 @@
 use crate::types::{DiffHunk, HunkStatus, HunkType, NodeInfo, StructuralHunk};
 
+// ── Language registry ──────────────────────────────────────────
+//
+// Single source of truth for extension → (name, grammar) mapping.
+// Each entry: (extensions, canonical name, grammar constructor or None).
+
+type GrammarFn = fn() -> tree_sitter::Language;
+
+const LANGUAGE_REGISTRY: &[(&[&str], &str, Option<GrammarFn>)] = &[
+    (&["rs"], "rust", Some(|| tree_sitter_rust::LANGUAGE.into())),
+    (&["java"], "java", Some(|| tree_sitter_java::LANGUAGE.into())),
+    (&["js", "mjs", "cjs"], "javascript", Some(|| tree_sitter_javascript::LANGUAGE.into())),
+    (&["ts", "tsx"], "typescript", Some(|| tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())),
+    (&["html", "htm"], "html", Some(|| tree_sitter_html::LANGUAGE.into())),
+    (&["css"], "css", Some(|| tree_sitter_css::LANGUAGE.into())),
+    (&["json"], "json", Some(|| tree_sitter_json::LANGUAGE.into())),
+    (&["sh", "bash"], "bash", Some(|| tree_sitter_bash::LANGUAGE.into())),
+    (&["toml"], "toml", Some(|| tree_sitter_toml_ng::LANGUAGE.into())),
+    (&["c", "h"], "c", Some(|| tree_sitter_c::LANGUAGE.into())),
+    (&["cpp", "hpp", "cc", "cxx"], "cpp", Some(|| tree_sitter_cpp::LANGUAGE.into())),
+    (&["tex", "sty", "cls", "bib"], "latex", Some(|| codebook_tree_sitter_latex::LANGUAGE.into())),
+    (&["py", "pyi"], "python", Some(|| tree_sitter_python::LANGUAGE.into())),
+    (&["yml", "yaml"], "yaml", Some(|| tree_sitter_yaml::LANGUAGE.into())),
+    (&["kt", "kts"], "kotlin", Some(|| tree_sitter_kotlin_ng::LANGUAGE.into())),
+    (&["md", "markdown"], "markdown", None),
+];
+
+fn lookup_extension(ext: &str) -> Option<(&'static str, Option<GrammarFn>)> {
+    LANGUAGE_REGISTRY
+        .iter()
+        .find(|(exts, _, _)| exts.contains(&ext))
+        .map(|(_, name, grammar)| (*name, *grammar))
+}
+
 /// Return the tree-sitter Language for a given file extension.
 pub fn language_for_extension(ext: &str) -> Option<tree_sitter::Language> {
-    match ext {
-        "rs" => Some(tree_sitter_rust::LANGUAGE.into()),
-        "java" => Some(tree_sitter_java::LANGUAGE.into()),
-        "js" | "mjs" | "cjs" => Some(tree_sitter_javascript::LANGUAGE.into()),
-        "ts" | "tsx" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
-        "html" | "htm" => Some(tree_sitter_html::LANGUAGE.into()),
-        "css" => Some(tree_sitter_css::LANGUAGE.into()),
-        "json" => Some(tree_sitter_json::LANGUAGE.into()),
-        "sh" | "bash" => Some(tree_sitter_bash::LANGUAGE.into()),
-        "toml" => Some(tree_sitter_toml_ng::LANGUAGE.into()),
-        "c" | "h" => Some(tree_sitter_c::LANGUAGE.into()),
-        "cpp" | "hpp" | "cc" | "cxx" => Some(tree_sitter_cpp::LANGUAGE.into()),
-        "tex" | "sty" | "cls" | "bib" => Some(codebook_tree_sitter_latex::LANGUAGE.into()),
-        "py" | "pyi" => Some(tree_sitter_python::LANGUAGE.into()),
-        "yml" | "yaml" => Some(tree_sitter_yaml::LANGUAGE.into()),
-        "kt" | "kts" => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
-        _ => None,
-    }
+    lookup_extension(ext).and_then(|(_, grammar)| grammar.map(|f| f()))
 }
 
 /// Return the language name string for a given file extension.
 pub fn language_name_for_extension(ext: &str) -> Option<&'static str> {
-    match ext {
-        "rs" => Some("rust"),
-        "java" => Some("java"),
-        "js" | "mjs" | "cjs" => Some("javascript"),
-        "ts" | "tsx" => Some("typescript"),
-        "html" | "htm" => Some("html"),
-        "css" => Some("css"),
-        "json" => Some("json"),
-        "sh" | "bash" => Some("bash"),
-        "toml" => Some("toml"),
-        "c" | "h" => Some("c"),
-        "cpp" | "hpp" | "cc" | "cxx" => Some("cpp"),
-        "tex" | "sty" | "cls" | "bib" => Some("latex"),
-        "py" | "pyi" => Some("python"),
-        "yml" | "yaml" => Some("yaml"),
-        "kt" | "kts" => Some("kotlin"),
-        "md" | "markdown" => Some("markdown"),
-        _ => None,
-    }
+    lookup_extension(ext).map(|(name, _)| name)
 }
 
 // ── Structural enrichment ────────────────────────────────────────
