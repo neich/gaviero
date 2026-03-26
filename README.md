@@ -1,91 +1,60 @@
 # Gaviero
 
-A terminal code editor for AI agent orchestration. Gaviero lets you run swarms of Claude AI agents to perform complex coding tasks — with full human oversight through an interactive diff review workflow.
+A terminal code editor built for working with AI coding agents. Gaviero gives you a full editing environment — file tree, syntax highlighting, git integration, embedded terminal — alongside a conversation panel where you chat with Claude agents that can read and modify your code. Every change an agent proposes passes through an interactive review before it touches disk.
 
-Built entirely in Rust.
+There is also a headless CLI for running agent tasks from scripts or CI.
 
-## Features
-
-- **Interactive TUI editor** with syntax highlighting (14 languages), undo/redo, tabs, search, and configurable layouts
-- **Write Gate** — every AI-proposed change goes through an approval pipeline where you accept or reject individual hunks before anything touches disk
-- **Agent chat** — converse with a Claude agent directly in the side panel; it can read your project files but only writes through the Write Gate
-- **Swarm orchestration** — coordinate multiple parallel agents with dependency management, isolated git worktrees, and automatic conflict resolution
-- **Embedded terminal** — full shell inside the editor with environment isolation
-- **File scoping** — agents can only access or modify the paths you explicitly permit
-- **Semantic memory** — agents build and search a shared knowledge base using ONNX embeddings and SQLite
-- **Git integration** — staging, commits, branch switching, and merge conflict resolution without leaving the editor
-- **Headless CLI** — run swarms from scripts or CI without the TUI
-
-## Requirements
-
-- Rust 2024 edition
-- Linux or POSIX-compliant terminal
-- A Claude API key (for agent features)
-
-## Installation
+## Quick start
 
 ```
 cargo build --release
+./target/release/gaviero ~/my-project
 ```
 
-This produces two binaries in `target/release/`:
+The editor opens with the file tree on the left, your code in the center, and an agent chat panel on the right.
 
-| Binary | Purpose |
+## The editor
+
+Gaviero is a self-contained terminal editor. You can use it for everyday editing without ever touching the AI features.
+
+### Navigation
+
+| Key | What it does |
 |---|---|
-| `gaviero` | TUI editor |
-| `gaviero-cli` | Headless swarm runner |
-
-## Getting started
-
-Open a project directory:
-
-```
-gaviero ~/my-project
-```
-
-Or a multi-folder workspace:
-
-```
-gaviero ~/my-project/.gaviero-workspace
-```
-
-The editor opens with a file tree on the left, the code editor in the center, and a collapsible side panel on the right for agent chat, swarm dashboard, or git operations.
-
-## Editor keybindings
-
-### General
-
-| Key | Action |
-|---|---|
-| Ctrl+q | Quit |
-| Ctrl+s | Save |
-| Ctrl+z / Ctrl+y | Undo / Redo |
-| Ctrl+c / Ctrl+x / Ctrl+v | Copy / Cut / Paste |
-| Ctrl+b | Toggle file tree |
-| Ctrl+p | Toggle side panel |
-| F4 | Toggle terminal |
-| Ctrl+t | New tab |
-| Ctrl+w | Close tab |
+| Ctrl+b | Show/hide file tree |
+| Ctrl+p | Show/hide side panel |
+| F4 | Show/hide terminal |
+| Ctrl+\\ | Cycle focus between panels |
+| Ctrl+Arrow | Move focus directionally |
+| Ctrl+t / Ctrl+w | New tab / close tab |
 | Alt+[ / Alt+] | Cycle tabs |
-| Ctrl+\ | Cycle focus between panels |
-| Ctrl+arrow keys | Move focus directionally |
-| Ctrl+0 to Ctrl+9 | Layout presets |
-| F3 | Search workspace |
-| F2 | Rename |
-| F5 | Format |
+| F11 | Toggle fullscreen for current panel |
+| Ctrl+0..9 | Switch layout preset |
 
 ### Editing
 
-| Key | Action |
+| Key | What it does |
 |---|---|
+| Ctrl+s | Save |
+| Ctrl+z / Ctrl+y | Undo / Redo |
+| Ctrl+c / Ctrl+x / Ctrl+v | Copy / Cut / Paste |
+| Ctrl+a | Select all |
 | Ctrl+k | Delete line |
 | Ctrl+d | Duplicate line |
-| Alt+Up / Alt+Down | Move line up / down |
-| Ctrl+e | Go to line end |
-| Ctrl+h | Delete word backward |
-| Ctrl+Delete | Delete to line end |
+| Alt+Up / Alt+Down | Move line up/down |
+| Ctrl+h or Ctrl+Backspace | Delete word backward |
+| Ctrl+Delete | Delete to end of line |
+| F5 | Format buffer |
 
-### Side panel modes
+### Finding text
+
+**In the current file** — press **Ctrl+F**. A find bar appears at the top of the editor. Type your query and the editor highlights all matches and jumps to the first one. Press **Enter** or **F3** to cycle through matches, **Up** to go backward. Press **Esc** to close.
+
+**Across the workspace** — press **F3** (without the find bar open) to search the word under the cursor across all project files. Or switch to the **Search** panel (Shift+Right from the file tree, or F7) and type directly into the search input. Results update as you type. Press Enter on a result to open the file at that line.
+
+### Side panels
+
+Switch between side panels with Ctrl+1/2/3:
 
 | Key | Panel |
 |---|---|
@@ -93,103 +62,193 @@ The editor opens with a file tree on the left, the code editor in the center, an
 | Ctrl+2 | Swarm Dashboard |
 | Ctrl+3 | Git |
 
-### Diff review (when reviewing agent proposals)
+### Left panel modes
+
+The left column cycles between views with Shift+Left/Right or F7:
+
+- **File tree** — browse and open files, create/rename/delete (n/N/F2/d)
+- **Search** — interactive workspace search with live results
+- **Changes** — git-style changed file list with inline diffs
+
+### Git panel
+
+The git panel (Ctrl+3) provides staging, committing, and branch management without leaving the editor:
+
+- **s** / **u** — stage / unstage the selected file
+- **c** — commit with the message in the input field
+- **a** — amend the last commit
+- **b** — open branch picker with filtering
+- **d** — discard changes
+- Enter on a file shows its diff in the editor
+
+### Embedded terminal
+
+F4 opens a terminal panel at the bottom. F8 or Alt+T creates additional terminal tabs. The terminal is a full PTY — run builds, tests, git commands, or anything else without switching windows.
+
+## Working with AI agents
+
+### Agent chat
+
+Open the side panel (Ctrl+p if hidden, then Ctrl+1) and type a message. The agent can read your project files but cannot write directly — every proposed change goes through the Write Gate.
+
+Useful commands you can type in the chat:
+
+| Command | What it does |
+|---|---|
+| `/model <name>` | Switch Claude model |
+| `/compact` | Trim conversation history |
+| `/remember <text>` | Store a fact in semantic memory |
+| `/attach <path>` | Attach a file to the conversation |
+| `/detach <path>` | Remove an attachment |
+
+### The Write Gate
+
+When an agent proposes file changes, the editor opens a diff overlay showing each affected function or block. You review and accept or reject individual hunks:
 
 | Key | Action |
 |---|---|
 | ]h / [h | Next / previous hunk |
 | a / r | Accept / reject current hunk |
 | A / R | Accept / reject all hunks |
-| f | Finalize changes |
+| f | Finalize — write accepted changes to disk |
 | q | Exit review |
+
+Each hunk shows its enclosing AST node (function name, struct, class) so you know exactly what's being changed.
+
+### Swarm mode
+
+For larger tasks, you can coordinate multiple agents working in parallel:
+
+```
+/cswarm refactor the authentication module to use JWT tokens
+```
+
+The coordinator (Opus) decomposes the task into a dependency graph, assigns each subtask to an agent with a specific file scope and a model tier, and executes them tier by tier. Each agent works in its own git worktree. After all agents finish, branches are merged automatically, with Claude resolving any conflicts.
+
+Model routing is automatic — the coordinator annotates each subtask with a tier and the router selects the model:
+
+| Tier | Model | Used for |
+|---|---|---|
+| Coordinator | Opus | Planning, decomposition, verification |
+| Reasoning | Sonnet | Complex multi-file semantic changes |
+| Execution | Haiku | Focused single-file tasks |
+| Mechanical | Ollama (local) | Rote/trivial changes (falls back to Haiku) |
+
+Individual work units can override the tier with an explicit `model` field.
+
+The **Swarm Dashboard** (Ctrl+2) shows real-time status: which agents are running, their output, elapsed time, and cost.
+
+You can also define work units manually:
+
+```
+/swarm [{"id":"auth","description":"...","scope":{"owned_paths":["src/auth/"]}}]
+```
+
+### Semantic memory
+
+Agents can store and retrieve knowledge across sessions. Memory is backed by ONNX embeddings and SQLite:
+
+```
+/remember the authentication module uses bcrypt for password hashing
+```
+
+Memory namespaces are configured per-project in `.gaviero/settings.json`.
 
 ## Headless CLI
 
-Run agent tasks without the TUI:
+Run agent tasks without the editor:
+
+```
+gaviero-cli --repo ~/my-project --task "fix all compilation errors" --auto-accept
+```
+
+For coordinated multi-agent tasks:
 
 ```
 gaviero-cli --repo ~/my-project \
-  --task "fix all compilation errors in src/" \
-  --max-parallel 4 \
-  --model sonnet \
-  --auto-accept \
-  --format json
+  --task "add comprehensive test coverage for the API layer" \
+  --coordinated \
+  --max-parallel 4
 ```
 
-### CLI options
+In coordinated mode, model selection is automatic — Opus plans the task, then each subtask is routed to the appropriate model tier (see [Swarm mode](#swarm-mode)). The `--model` flag only applies to non-coordinated single-agent runs.
+
+### CLI flags
 
 | Flag | Description |
 |---|---|
 | `--repo PATH` | Workspace root (default: current directory) |
-| `--task TEXT` | Single task description |
-| `--work-units JSON` | Array of WorkUnit definitions for multi-agent tasks |
-| `--auto-accept` | Accept all scope-valid changes without review |
-| `--max-parallel N` | Number of parallel agents (default: 1) |
-| `--model NAME` | Claude model to use (default: sonnet) |
+| `--task TEXT` | Task description (creates one agent) |
+| `--work-units JSON` | WorkUnit array for multi-agent tasks |
+| `--coordinated` | Use Opus to plan, then tier-routed execution (ignores `--model`) |
+| `--auto-accept` | Skip interactive review |
+| `--max-parallel N` | Parallel agent limit (default: 1) |
+| `--model NAME` | Claude model for single-agent mode (default: sonnet) |
 | `--namespace NS` | Memory write namespace |
 | `--read-ns NS` | Additional read namespaces (repeatable) |
-| `--format text\|json` | Output format (default: text) |
+| `--format text\|json` | Output format |
 
 ## Configuration
 
-Settings are resolved in cascade order — first match wins:
+Settings cascade in priority order:
 
 1. `.gaviero/settings.json` in the project directory
-2. `settings` block inside a `.gaviero-workspace` file
-3. `~/.config/gaviero/settings.json` for user-level defaults
+2. `settings` block in a `.gaviero-workspace` file
+3. `~/.config/gaviero/settings.json` (user-level)
 4. Built-in defaults
 
-### Key settings
+### Common settings
 
-| Setting | Description |
-|---|---|
-| `editor.tabSize` | Tab width (default: 4) |
-| `editor.insertSpaces` | Use spaces instead of tabs |
-| `editor.formatOnSave` | Auto-format on save |
-| `files.exclude` | Glob patterns for files to hide |
-| `agent.model` | Claude model name |
-| `agent.effort` | Agent effort level |
-| `agent.maxTokens` | Max tokens per agent response |
-| `memory.namespace` | Memory namespace for this project |
-| `memory.readNamespaces` | Additional namespaces agents can search |
-| `panels.fileTree.width` | File tree panel width |
-| `panels.terminal.splitPercent` | Terminal split ratio |
+```json
+{
+  "editor": { "tabSize": 4, "insertSpaces": true },
+  "files": { "exclude": { "target": true, "node_modules": true } },
+  "agent": { "model": "sonnet", "maxTokens": 16384 },
+  "memory": { "namespace": "my-project" },
+  "panels": { "fileTree": { "width": 25 }, "terminal": { "splitPercent": 30 } }
+}
+```
 
-Language-specific overrides are supported using bracket syntax (e.g. `[rust]`, `[javascript]`).
+Language-specific overrides use bracket syntax: `"[rust]": { "editor.tabSize": 4 }`.
 
 ### Workspace files
 
-For multi-folder projects, create a `.gaviero-workspace` file listing folders and shared settings. Pass it as the argument to `gaviero`.
+For multi-folder projects, create a `.gaviero-workspace` file:
+
+```json
+{
+  "folders": [
+    { "path": "/home/user/frontend", "name": "Frontend" },
+    { "path": "/home/user/backend", "name": "Backend" }
+  ],
+  "settings": { "agent": { "model": "sonnet" } }
+}
+```
 
 ### Themes
 
-Color schemes are defined in TOML files under `themes/`. The default theme is one-dark inspired. Theme files map syntax highlight groups (keyword, string, comment, etc.) to colors and attributes.
+Color schemes live in `themes/` as TOML files. The default theme is One Dark inspired.
 
-## How the Write Gate works
+## Architecture at a glance
 
-The Write Gate is the core safety mechanism. When an agent proposes a file change:
+Gaviero is a Cargo workspace with three crates:
 
-1. The proposal is queued with a structural diff (showing which functions or blocks are affected)
-2. The editor opens a diff overlay where you navigate individual hunks
-3. You accept or reject each hunk independently
-4. Only accepted changes are written to disk
+| Crate | Role |
+|---|---|
+| `gaviero-core` | All logic: write gate, diffs, tree-sitter (16 languages), agent subprocess management, swarm orchestration, git (via git2), semantic memory, terminal PTY |
+| `gaviero-tui` | Terminal UI: ratatui + crossterm rendering, panels, input handling |
+| `gaviero-cli` | Headless runner: clap argument parsing, stdout observers |
 
-In swarm mode, changes auto-accept during execution but you review the aggregate result after all agents finish and branches are merged.
+Core never depends on any UI crate. The TUI communicates with core pipelines through observer traits and a single event channel.
 
-## Swarm orchestration
+For full architectural details, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
-Swarms coordinate multiple agents working on related tasks:
+## Requirements
 
-1. **Validate** — check that no two agents claim overlapping file ownership
-2. **Execute** — run agents tier-by-tier (parallel within a tier, sequential between tiers), each in its own git worktree
-3. **Merge** — bring all branches together with automatic conflict resolution
-
-Agents communicate through a message bus and share context via the semantic memory system.
-
-## Supported languages
-
-Syntax highlighting and structural analysis: Rust, Python, JavaScript, TypeScript, Java, C, C++, HTML, CSS, JSON, TOML, Bash, LaTeX, YAML.
+- Rust (2024 edition)
+- Linux or POSIX terminal
+- Claude API key (for agent features — the editor works fine without one)
 
 ## License
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+Apache License 2.0. See [LICENSE](LICENSE).
