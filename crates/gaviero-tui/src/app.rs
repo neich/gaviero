@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use crossterm::event::{MouseButton, MouseEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::Frame;
 
 use crate::editor::buffer::Buffer;
@@ -470,6 +470,10 @@ pub struct App {
     // File tree dialog (new file/folder, rename, delete)
     tree_dialog: Option<TreeDialog>,
 
+    // Editor find bar (Ctrl+F)
+    pub find_bar_active: bool,
+    pub find_input: crate::widgets::text_input::TextInput,
+
     // Markdown preview
     pub preview_visible: bool,
     pub preview_scroll: usize,
@@ -594,6 +598,8 @@ impl App {
             last_click: None,
             status_message: None,
             tree_dialog: None,
+            find_bar_active: false,
+            find_input: crate::widgets::text_input::TextInput::new(),
             preview_visible: false,
             preview_scroll: 0,
             write_gate,
@@ -654,6 +660,16 @@ impl App {
                     self.handle_dialog_key(&key);
                     return;
                 }
+
+                // Esc closes the find bar if active
+                if self.find_bar_active && key.code == crossterm::event::KeyCode::Esc {
+                    self.find_bar_active = false;
+                    if let Some(buf) = self.buffers.get_mut(self.active_buffer) {
+                        buf.set_search_highlight(None);
+                    }
+                    return;
+                }
+
                 let action = Keymap::resolve(&key);
                 self.handle_action(action);
             }
@@ -1124,7 +1140,24 @@ impl App {
             }
             Action::ToggleFullscreen => self.toggle_fullscreen(),
             Action::SwitchLayout(n) => self.switch_layout(n),
-            Action::SearchInWorkspace => self.search_selected_in_workspace(),
+            Action::FindInBuffer => {
+                self.find_bar_active = true;
+                self.find_input.select_all();
+                self.focus = Focus::Editor;
+                return;
+            }
+            Action::SearchInWorkspace => {
+                // F3: if find bar is active, go to next match; otherwise workspace search
+                if self.find_bar_active {
+                    if let Some(buf) = self.buffers.get_mut(self.active_buffer) {
+                        buf.find_next_match();
+                    }
+                    self.ensure_editor_cursor_visible();
+                    return;
+                }
+                self.search_selected_in_workspace();
+                return;
+            }
             Action::CycleLeftPanel => {
                 if self.left_panel != LeftPanelMode::Review {
                     self.left_panel = match self.left_panel {
@@ -1149,6 +1182,9 @@ impl App {
                     LeftPanelMode::Review => {} // handled by handle_batch_review_action above
                     LeftPanelMode::Changes => { self.handle_changes_action(&action); }
                 }
+            }
+            _ if self.focus == Focus::Editor && self.find_bar_active => {
+                self.handle_find_bar_action(action);
             }
             _ if self.focus == Focus::Editor => {
                 // Block normal editing when in review mode
@@ -3187,6 +3223,97 @@ impl App {
         }
     }
 
+    // ── Find bar (Ctrl+F) ────────────────────────────────────────
+
+    fn handle_find_bar_action(&mut self, action: Action) {
+        match action {
+            Action::InsertChar(ch) => {
+                self.find_input.insert_char(ch);
+                self.update_find_highlight();
+            }
+            Action::Backspace => {
+                self.find_input.backspace();
+                self.update_find_highlight();
+            }
+            Action::Delete => {
+                self.find_input.delete();
+                self.update_find_highlight();
+            }
+            Action::DeleteWordBack => {
+                self.find_input.delete_word_back();
+                self.update_find_highlight();
+            }
+            Action::CursorLeft => self.find_input.move_left(),
+            Action::CursorRight => self.find_input.move_right(),
+            Action::Home => self.find_input.move_home(),
+            Action::End => self.find_input.move_end(),
+            Action::SelectAll => self.find_input.select_all(),
+            Action::Paste => {
+                let text = self.get_clipboard();
+                if !text.is_empty() {
+                    self.find_input.insert_str(&text);
+                    self.update_find_highlight();
+                }
+            }
+            Action::Enter | Action::CursorDown => {
+                // Enter / Down: go to next match
+                if let Some(buf) = self.buffers.get_mut(self.active_buffer) {
+                    buf.find_next_match();
+                }
+                self.ensure_editor_cursor_visible();
+            }
+            Action::CursorUp => {
+                // Up: go to previous match
+                if let Some(buf) = self.buffers.get_mut(self.active_buffer) {
+                    buf.find_prev_match();
+                }
+                self.ensure_editor_cursor_visible();
+            }
+            Action::Quit => {
+                // Escape: close find bar, clear highlights
+                self.find_bar_active = false;
+                if let Some(buf) = self.buffers.get_mut(self.active_buffer) {
+                    buf.set_search_highlight(None);
+                }
+            }
+            Action::FindInBuffer => {
+                // Ctrl+F again: close
+                self.find_bar_active = false;
+                if let Some(buf) = self.buffers.get_mut(self.active_buffer) {
+                    buf.set_search_highlight(None);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Update the editor's search highlight from the find bar input, and jump
+    /// to the first match at or after the cursor.
+    fn update_find_highlight(&mut self) {
+        let query = self.find_input.text.clone();
+        if let Some(buf) = self.buffers.get_mut(self.active_buffer) {
+            if query.is_empty() {
+                buf.set_search_highlight(None);
+            } else {
+                buf.set_search_highlight(Some(query));
+                buf.find_next_match();
+            }
+        }
+        self.ensure_editor_cursor_visible();
+    }
+
+    /// Make sure the editor cursor is within the visible viewport.
+    fn ensure_editor_cursor_visible(&mut self) {
+        let area = self.layout.editor_area;
+        if let Some(buf) = self.buffers.get_mut(self.active_buffer) {
+            let line_count = buf.line_count();
+            let gutter_w = gutter_width(line_count) as usize;
+            let vp_h = area.height as usize;
+            let vp_w = (area.width as usize).saturating_sub(gutter_w);
+            buf.ensure_cursor_visible(vp_h, vp_w);
+        }
+    }
+
     // ── Editor actions ───────────────────────────────────────────
 
     fn handle_editor_action(&mut self, action: Action) {
@@ -4763,6 +4890,20 @@ impl App {
             return;
         }
 
+        // ── Find bar ─────────────────────────────────────────
+        let editor_area = if self.find_bar_active {
+            self.render_find_bar(frame, area);
+            // Shrink editor area to make room for the find bar at top
+            Rect {
+                x: area.x,
+                y: area.y + 1,
+                width: area.width,
+                height: area.height.saturating_sub(1),
+            }
+        } else {
+            area
+        };
+
         let buf = &self.buffers[self.active_buffer];
         let highlight_config = buf
             .lang_name
@@ -4770,7 +4911,81 @@ impl App {
             .and_then(|name| self.highlight_configs.get(name));
 
         let view = EditorView::new(buf, &self.theme, highlight_config, self.focus == Focus::Editor);
-        view.render(area, frame.buffer_mut());
+        view.render(editor_area, frame.buffer_mut());
+    }
+
+    /// Render the find bar at the top of the editor area.
+    fn render_find_bar(&self, frame: &mut Frame, area: Rect) {
+        let bar_y = area.y;
+        let buf = frame.buffer_mut();
+        let bg = theme::INPUT_BG;
+        let fg = theme::TEXT_FG;
+        let label_fg = theme::FOCUS_BORDER;
+
+        // Clear the bar row
+        for x in area.x..area.right() {
+            if bar_y < buf.area().bottom() {
+                buf[(x, bar_y)].set_char(' ').set_style(Style::default().bg(bg));
+            }
+        }
+
+        // Label: " Find: "
+        let label = " Find: ";
+        let label_style = Style::default().fg(label_fg).bg(bg).add_modifier(Modifier::BOLD);
+        let mut x = area.x;
+        for ch in label.chars() {
+            if x < area.right() && bar_y < buf.area().bottom() {
+                buf[(x, bar_y)].set_char(ch).set_style(label_style);
+            }
+            x += 1;
+        }
+        let text_start = x;
+
+        // Input text
+        let input_style = Style::default().fg(fg).bg(bg);
+        for ch in self.find_input.text.chars() {
+            if x >= area.right() { break; }
+            if bar_y < buf.area().bottom() {
+                buf[(x, bar_y)].set_char(ch).set_style(input_style);
+            }
+            x += 1;
+        }
+
+        // Cursor
+        if self.find_bar_active {
+            let cursor_x = text_start + self.find_input.cursor as u16;
+            if cursor_x < area.right() && bar_y < buf.area().bottom() {
+                let cursor_style = Style::default().fg(bg).bg(fg);
+                buf[(cursor_x, bar_y)].set_style(cursor_style);
+            }
+        }
+
+        // Match count indicator (right-aligned)
+        if let Some(editor_buf) = self.buffers.get(self.active_buffer) {
+            let total = editor_buf.search_match_count();
+            if total > 0 {
+                let current = editor_buf.current_match_index();
+                let indicator = format!(" {}/{} ", current, total);
+                let ind_style = Style::default().fg(theme::TEXT_DIM).bg(bg);
+                let ind_start = area.right().saturating_sub(indicator.len() as u16);
+                for (i, ch) in indicator.chars().enumerate() {
+                    let ix = ind_start + i as u16;
+                    if ix < area.right() && bar_y < buf.area().bottom() {
+                        buf[(ix, bar_y)].set_char(ch).set_style(ind_style);
+                    }
+                }
+            } else if !self.find_input.is_empty() {
+                let indicator = " No matches ";
+                let ind_style = Style::default().fg(theme::ERROR).bg(bg);
+                let ind_start = area.right().saturating_sub(indicator.len() as u16);
+                for (i, ch) in indicator.chars().enumerate() {
+                    let ix = ind_start + i as u16;
+                    if ix < area.right() && bar_y < buf.area().bottom() {
+                        buf[(ix, bar_y)].set_char(ch).set_style(ind_style);
+                    }
+                }
+            }
+        }
     }
 
     fn render_tree_dialog(&self, frame: &mut Frame, tree_area: Rect, dialog: &TreeDialog) {

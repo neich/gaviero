@@ -592,12 +592,14 @@ impl Buffer {
 
     /// Ensure the cursor is visible in the viewport.
     pub fn ensure_cursor_visible(&mut self, viewport_height: usize, viewport_width: usize) {
-        // Vertical
-        if self.cursor.line < self.scroll.top_line {
-            self.scroll.top_line = self.cursor.line;
+        // Vertical — keep at least MARGIN lines of context above/below cursor
+        const VERTICAL_SCROLL_MARGIN: usize = 3;
+        let margin = VERTICAL_SCROLL_MARGIN.min(viewport_height / 2);
+        if self.cursor.line < self.scroll.top_line + margin {
+            self.scroll.top_line = self.cursor.line.saturating_sub(margin);
         }
-        if self.cursor.line >= self.scroll.top_line + viewport_height {
-            self.scroll.top_line = self.cursor.line - viewport_height + 1;
+        if self.cursor.line + margin >= self.scroll.top_line + viewport_height {
+            self.scroll.top_line = (self.cursor.line + margin + 1).saturating_sub(viewport_height);
         }
 
         // Horizontal scroll margin — keep cursor this far from the edge
@@ -1402,6 +1404,84 @@ impl Buffer {
                 from = start + 1;
             }
         }
+    }
+
+    /// Jump the cursor to the next search match after the current position.
+    /// Wraps around to the first match if past the last one.
+    /// Returns true if the cursor moved.
+    pub fn find_next_match(&mut self) -> bool {
+        if self.search_matches.is_empty() {
+            return false;
+        }
+        let (cl, cc) = (self.cursor.line, self.cursor.col);
+        // Find the first match strictly after the cursor position
+        let next = self.search_matches.iter().find(|&&(l, c, _)| {
+            l > cl || (l == cl && c > cc)
+        });
+        let (line, col) = match next {
+            Some(&(l, c, _)) => (l, c),
+            None => {
+                // Wrap to first match
+                let (l, c, _) = self.search_matches[0];
+                (l, c)
+            }
+        };
+        self.cursor.line = line;
+        self.cursor.col = col;
+        self.cursor.anchor = None;
+        // Scroll adjustment happens in the main loop via ensure_cursor_visible()
+        true
+    }
+
+    /// Jump the cursor to the previous search match before the current position.
+    /// Wraps around to the last match if before the first one.
+    /// Returns true if the cursor moved.
+    pub fn find_prev_match(&mut self) -> bool {
+        if self.search_matches.is_empty() {
+            return false;
+        }
+        let (cl, cc) = (self.cursor.line, self.cursor.col);
+        // Find the last match strictly before the cursor position
+        let prev = self.search_matches.iter().rev().find(|&&(l, c, _)| {
+            l < cl || (l == cl && c < cc)
+        });
+        let (line, col) = match prev {
+            Some(&(l, c, _)) => (l, c),
+            None => {
+                // Wrap to last match
+                let (l, c, _) = *self.search_matches.last().unwrap();
+                (l, c)
+            }
+        };
+        self.cursor.line = line;
+        self.cursor.col = col;
+        self.cursor.anchor = None;
+        true
+    }
+
+    /// Count total search matches (for "N of M" display).
+    pub fn search_match_count(&self) -> usize {
+        self.search_matches.len()
+    }
+
+    /// Return the 1-based index of the current match (the one at or just before
+    /// the cursor), or 0 if no matches.
+    pub fn current_match_index(&self) -> usize {
+        if self.search_matches.is_empty() {
+            return 0;
+        }
+        let (cl, cc) = (self.cursor.line, self.cursor.col);
+        for (i, &(l, c, _)) in self.search_matches.iter().enumerate() {
+            if l > cl || (l == cl && c >= cc) {
+                // If cursor is exactly on this match, return it (1-based)
+                if l == cl && c == cc {
+                    return i + 1;
+                }
+                // Otherwise the current match is the previous one (or wrap)
+                return if i == 0 { self.search_matches.len() } else { i };
+            }
+        }
+        self.search_matches.len()
     }
 
     /// Notify the tree-sitter tree about an edit so incremental parsing

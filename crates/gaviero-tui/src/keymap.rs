@@ -43,6 +43,7 @@ pub enum Action {
     DeleteWordBack,
     FormatBuffer,
     CycleFormatLevel,
+    FindInBuffer,
     SearchInWorkspace,
     CycleLeftPanel,
     ShiftLeft,
@@ -102,8 +103,9 @@ impl Keymap {
             KeyCode::Char('w') if ctrl => Action::CloseTab,
             KeyCode::Char('s') if ctrl => Action::Save,
             KeyCode::Char('p') if alt => Action::TogglePreview,
+            KeyCode::Char('f') if ctrl => Action::FindInBuffer,
             KeyCode::F(3) => Action::SearchInWorkspace,
-            KeyCode::Char('f') if ctrl => Action::ToggleFullscreen,
+            KeyCode::F(11) => Action::ToggleFullscreen,
 
             // Side panel mode switching (Ctrl+1/2/3)
             KeyCode::Char('1') if ctrl => Action::SidePanelChat,
