@@ -58,6 +58,10 @@ fn default_max_retries() -> u8 {
 }
 
 /// The backend used to execute an agent's work.
+///
+/// **Deprecated:** Use [`super::backend::BackendConfig`] and the [`super::backend::AgentBackend`]
+/// trait instead. This enum is retained for serde backward compatibility.
+#[deprecated(note = "Use backend::BackendConfig and the AgentBackend trait instead")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentBackend {
