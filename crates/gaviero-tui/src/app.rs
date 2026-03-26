@@ -1169,11 +1169,11 @@ impl App {
                 Action::Quit => self.chat_state.cancel_rename(),
                 Action::InsertChar(ch) => self.chat_state.insert_char(ch),
                 Action::Backspace => self.chat_state.backspace(),
-                Action::Delete => self.chat_state.delete(),
-                Action::CursorLeft => self.chat_state.move_left(),
-                Action::CursorRight => self.chat_state.move_right(),
-                Action::Home => self.chat_state.move_home(),
-                Action::End => self.chat_state.move_end(),
+                Action::Delete => self.chat_state.text_input.delete(),
+                Action::CursorLeft => self.chat_state.text_input.move_left(),
+                Action::CursorRight => self.chat_state.text_input.move_right(),
+                Action::Home => self.chat_state.text_input.move_home(),
+                Action::End => self.chat_state.text_input.move_end(),
                 _ => {}
             }
             return;
@@ -1239,7 +1239,7 @@ impl App {
             }
 
             Action::Enter => {
-                if !self.chat_state.input.is_empty() && !self.chat_state.active_conv_streaming() {
+                if !self.chat_state.text_input.text.is_empty() && !self.chat_state.active_conv_streaming() {
                     // Block agent calls while in batch review mode
                     if self.batch_review.is_some() {
                         self.status_message = Some((
@@ -1253,15 +1253,15 @@ impl App {
                     self.chat_state.scroll_pinned_to_bottom = true;
 
                     // Handle commands that need app-level access
-                    if self.chat_state.input.trim().starts_with("/cswarm") {
+                    if self.chat_state.text_input.text.trim().starts_with("/cswarm") {
                         self.handle_coordinated_swarm_command();
-                    } else if self.chat_state.input.trim().starts_with("/swarm") {
+                    } else if self.chat_state.text_input.text.trim().starts_with("/swarm") {
                         self.handle_swarm_command();
-                    } else if self.chat_state.input.trim().starts_with("/remember") {
+                    } else if self.chat_state.text_input.text.trim().starts_with("/remember") {
                         self.handle_remember_command();
-                    } else if self.chat_state.input.trim().starts_with("/attach") {
+                    } else if self.chat_state.text_input.text.trim().starts_with("/attach") {
                         self.handle_attach_command();
-                    } else if self.chat_state.input.trim().starts_with("/detach") {
+                    } else if self.chat_state.text_input.text.trim().starts_with("/detach") {
                         self.handle_detach_command();
                     } else if !self.chat_state.process_slash_command() {
                         self.send_chat_message();
@@ -1282,24 +1282,24 @@ impl App {
                 self.chat_state.backspace();
                 self.refresh_chat_autocomplete();
             }
-            Action::Delete => self.chat_state.delete(),
-            Action::Undo => self.chat_state.input_undo(),
-            Action::Redo => self.chat_state.input_redo(),
-            Action::SelectAll => self.chat_state.input_select_all(),
+            Action::Delete => self.chat_state.text_input.delete(),
+            Action::Undo => self.chat_state.text_input.undo(),
+            Action::Redo => self.chat_state.text_input.redo(),
+            Action::SelectAll => self.chat_state.text_input.select_all(),
             Action::DeleteWordBack => {
                 self.chat_state.delete_word_back();
                 self.refresh_chat_autocomplete();
             }
-            Action::CursorLeft => self.chat_state.move_left(),
-            Action::CursorRight => self.chat_state.move_right(),
-            Action::Home => self.chat_state.move_home(),
-            Action::End => self.chat_state.move_end(),
+            Action::CursorLeft => self.chat_state.text_input.move_left(),
+            Action::CursorRight => self.chat_state.text_input.move_right(),
+            Action::Home => self.chat_state.text_input.move_home(),
+            Action::End => self.chat_state.text_input.move_end(),
             Action::CursorUp => {
                 // Compute the visual line widths for the input area
                 let prompt_len = 2; // "> "
                 let panel_w = self.layout.side_panel_area.map(|a| a.width).unwrap_or(40).saturating_sub(2) as usize; // -2 for borders
                 let first_w = panel_w.saturating_sub(prompt_len);
-                let has_visual_lines = !self.chat_state.input.is_empty()
+                let has_visual_lines = !self.chat_state.text_input.text.is_empty()
                     && (self.chat_state.input_is_multiline()
                         || self.chat_state.input_wraps_visually(first_w, panel_w));
 
@@ -1307,7 +1307,7 @@ impl App {
                     if !self.chat_state.move_up_visual(first_w, panel_w) {
                         self.chat_state.scroll_offset = self.chat_state.scroll_offset.saturating_sub(1);
                     }
-                } else if self.chat_state.history_index.is_some() || self.chat_state.input.is_empty() {
+                } else if self.chat_state.history_index.is_some() || self.chat_state.text_input.text.is_empty() {
                     self.chat_state.history_up();
                 } else {
                     self.chat_state.scroll_offset = self.chat_state.scroll_offset.saturating_sub(1);
@@ -1317,7 +1317,7 @@ impl App {
                 let prompt_len = 2;
                 let panel_w = self.layout.side_panel_area.map(|a| a.width).unwrap_or(40).saturating_sub(2) as usize;
                 let first_w = panel_w.saturating_sub(prompt_len);
-                let has_visual_lines = !self.chat_state.input.is_empty()
+                let has_visual_lines = !self.chat_state.text_input.text.is_empty()
                     && (self.chat_state.input_is_multiline()
                         || self.chat_state.input_wraps_visually(first_w, panel_w));
 
@@ -1338,9 +1338,8 @@ impl App {
                 self.chat_state.scroll_offset = self.chat_state.scroll_offset.saturating_add(20);
             }
             Action::Quit => {
-                if !self.chat_state.input.is_empty() {
-                    self.chat_state.input.clear();
-                    self.chat_state.input_cursor = 0;
+                if !self.chat_state.text_input.text.is_empty() {
+                    self.chat_state.text_input.clear();
                     self.chat_state.autocomplete.reset();
                 } else {
                     self.focus = Focus::Editor;
