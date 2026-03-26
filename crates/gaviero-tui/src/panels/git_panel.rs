@@ -10,6 +10,7 @@ use gaviero_core::git::{BranchEntry, FileStatus, FileStatusEntry, GitRepo};
 
 use crate::theme;
 use crate::theme::Theme;
+use crate::widgets::text_input::TextInput;
 
 // ── Types ──────────────────────────────────────────────────
 
@@ -32,8 +33,7 @@ pub struct GitPanelState {
     pub region: GitRegion,
     pub unstaged_selected: usize,
     pub staged_selected: usize,
-    pub commit_input: String,
-    pub commit_cursor: usize,
+    pub commit_input: TextInput,
     pub error_message: Option<String>,
 
     // Branch picker
@@ -52,8 +52,7 @@ impl GitPanelState {
             region: GitRegion::Unstaged,
             unstaged_selected: 0,
             staged_selected: 0,
-            commit_input: String::new(),
-            commit_cursor: 0,
+            commit_input: TextInput::new(),
             error_message: None,
             branch_picker_open: false,
             branch_filter: String::new(),
@@ -140,45 +139,6 @@ impl GitPanelState {
                 }
             }
             GitRegion::CommitInput => {}
-        }
-    }
-
-    // ── Commit input editing ───────────────────────────────
-
-    pub fn insert_char(&mut self, ch: char) {
-        self.commit_input.insert(self.commit_cursor, ch);
-        self.commit_cursor += ch.len_utf8();
-    }
-
-    pub fn backspace(&mut self) {
-        if self.commit_cursor > 0 {
-            let prev = self.commit_input[..self.commit_cursor]
-                .char_indices()
-                .last()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            self.commit_input.drain(prev..self.commit_cursor);
-            self.commit_cursor = prev;
-        }
-    }
-
-    pub fn commit_move_left(&mut self) {
-        if self.commit_cursor > 0 {
-            self.commit_cursor = self.commit_input[..self.commit_cursor]
-                .char_indices()
-                .last()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-        }
-    }
-
-    pub fn commit_move_right(&mut self) {
-        if self.commit_cursor < self.commit_input.len() {
-            self.commit_cursor = self.commit_input[self.commit_cursor..]
-                .char_indices()
-                .nth(1)
-                .map(|(i, _)| self.commit_cursor + i)
-                .unwrap_or(self.commit_input.len());
         }
     }
 
@@ -402,7 +362,7 @@ impl GitPanelState {
 
             // Commit message text
             let text_x = area.x + prompt.len() as u16;
-            if self.commit_input.is_empty() && !is_commit_focused {
+            if self.commit_input.text.is_empty() && !is_commit_focused {
                 let hint = "commit message...";
                 let hint_style = Style::default().fg(dim_fg).bg(input_bg);
                 for (i, ch) in hint.chars().enumerate() {
@@ -412,7 +372,7 @@ impl GitPanelState {
                     }
                 }
             } else {
-                for (i, ch) in self.commit_input.chars().enumerate() {
+                for (i, ch) in self.commit_input.text.chars().enumerate() {
                     let cx = text_x + i as u16;
                     if cx < area.x + area.width && cx < buf.area().right() && input_y < buf.area().bottom() {
                         buf[(cx, input_y)].set_char(ch).set_style(input_style);
@@ -422,7 +382,7 @@ impl GitPanelState {
 
             // Cursor
             if focused && is_commit_focused {
-                let cursor_char_pos = self.commit_input[..self.commit_cursor].chars().count();
+                let cursor_char_pos = self.commit_input.cursor;
                 let cursor_x = text_x + cursor_char_pos as u16;
                 if cursor_x < area.x + area.width && cursor_x < buf.area().right() && input_y < buf.area().bottom() {
                     let cursor_style = Style::default().fg(input_bg).bg(theme::TEXT_FG);
