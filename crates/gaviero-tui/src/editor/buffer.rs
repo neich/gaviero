@@ -551,6 +551,7 @@ impl Buffer {
         }
     }
 
+    #[allow(dead_code)]
     pub fn select_left(&mut self) {
         self.ensure_anchor();
         if self.cursor.col > 0 {
@@ -561,6 +562,7 @@ impl Buffer {
         }
     }
 
+    #[allow(dead_code)]
     pub fn select_right(&mut self) {
         self.ensure_anchor();
         let line_len = self.line_len(self.cursor.line);
