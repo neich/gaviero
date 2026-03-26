@@ -38,6 +38,7 @@ pub enum Focus {
     Terminal,
 }
 
+#[allow(dead_code)]
 enum FocusDirection {
     Left,
     Right,
@@ -955,17 +956,17 @@ impl App {
                 self.side_panel = SidePanelMode::SwarmDashboard;
                 self.focus = Focus::SidePanel;
             }
-            Action::SidePanelChat => {
+            Action::SetSideModeChat => {
                 self.panel_visible.side_panel = true;
                 self.side_panel = SidePanelMode::AgentChat;
                 self.focus = Focus::SidePanel;
             }
-            Action::SidePanelSwarm => {
+            Action::SetSideModeSwarm => {
                 self.panel_visible.side_panel = true;
                 self.side_panel = SidePanelMode::SwarmDashboard;
                 self.focus = Focus::SidePanel;
             }
-            Action::SidePanelGit => {
+            Action::SetSideModeGit => {
                 self.panel_visible.side_panel = true;
                 self.side_panel = SidePanelMode::GitPanel;
                 self.focus = Focus::SidePanel;
@@ -1018,11 +1019,28 @@ impl App {
                     self.focus = Focus::Editor;
                 }
             }
-            Action::CycleFocus => self.cycle_focus(),
-            Action::FocusLeft => self.focus_direction(FocusDirection::Left),
-            Action::FocusRight => self.focus_direction(FocusDirection::Right),
-            Action::FocusUp => self.focus_direction(FocusDirection::Up),
-            Action::FocusDown => self.focus_direction(FocusDirection::Down),
+            Action::FocusLeftPanel => {
+                if !self.panel_visible.file_tree {
+                    self.panel_visible.file_tree = true;
+                }
+                self.focus = Focus::FileTree;
+            }
+            Action::FocusEditor => {
+                self.focus = Focus::Editor;
+            }
+            Action::FocusSidePanel => {
+                if !self.panel_visible.side_panel {
+                    self.panel_visible.side_panel = true;
+                }
+                self.focus = Focus::SidePanel;
+            }
+            Action::FocusTerminal => {
+                if !self.panel_visible.terminal {
+                    self.panel_visible.terminal = true;
+                    self.spawn_active_terminal();
+                }
+                self.focus = Focus::Terminal;
+            }
             Action::CycleTabForward => {
                 if self.focus == Focus::SidePanel {
                     self.chat_state.next_conversation();
@@ -1037,94 +1055,29 @@ impl App {
                     self.cycle_tab(-1);
                 }
             }
-            Action::ShiftLeft => {
-                match self.focus {
-                    Focus::FileTree => {
-                        // Don't cycle away from Review mode — must use f/Esc
-                        if self.left_panel != LeftPanelMode::Review {
-                            self.left_panel = match self.left_panel {
-                                LeftPanelMode::Search => LeftPanelMode::FileTree,
-                                LeftPanelMode::FileTree => LeftPanelMode::Changes,
-                                LeftPanelMode::Changes => LeftPanelMode::Search,
-                                LeftPanelMode::Review => LeftPanelMode::Review,
-                            };
-                            if self.left_panel == LeftPanelMode::Changes {
-                                self.refresh_git_changes();
-                            }
-                            if self.left_panel == LeftPanelMode::Search {
-                                self.search_panel.focus_input();
-                            }
-                        }
-                    }
-                    Focus::SidePanel => self.chat_state.prev_conversation(),
-                    Focus::Terminal => self.terminal_manager.cycle_tab(-1),
-                    _ => self.cycle_tab(-1),
+            // Left panel mode switching (Alt+E/F/C)
+            Action::SetLeftModeExplorer => {
+                if !self.panel_visible.file_tree {
+                    self.panel_visible.file_tree = true;
                 }
+                self.left_panel = LeftPanelMode::FileTree;
+                self.focus = Focus::FileTree;
             }
-            Action::ShiftRight => {
-                match self.focus {
-                    Focus::FileTree => {
-                        if self.left_panel != LeftPanelMode::Review {
-                            self.left_panel = match self.left_panel {
-                                LeftPanelMode::FileTree => LeftPanelMode::Search,
-                                LeftPanelMode::Search => LeftPanelMode::Changes,
-                                LeftPanelMode::Changes => LeftPanelMode::FileTree,
-                                LeftPanelMode::Review => LeftPanelMode::Review,
-                            };
-                            if self.left_panel == LeftPanelMode::Changes {
-                                self.refresh_git_changes();
-                            }
-                            if self.left_panel == LeftPanelMode::Search {
-                                self.search_panel.focus_input();
-                            }
-                        }
-                    }
-                    Focus::SidePanel => self.chat_state.next_conversation(),
-                    Focus::Terminal => self.terminal_manager.cycle_tab(1),
-                    _ => self.cycle_tab(1),
+            Action::SetLeftModeFind => {
+                if !self.panel_visible.file_tree {
+                    self.panel_visible.file_tree = true;
                 }
+                self.left_panel = LeftPanelMode::Search;
+                self.focus = Focus::FileTree;
+                self.search_panel.focus_input();
             }
-            Action::ShiftUp | Action::ShiftDown => {
-                match self.focus {
-                    Focus::SidePanel => {
-                        self.side_panel = match self.side_panel {
-                            SidePanelMode::AgentChat => SidePanelMode::SwarmDashboard,
-                            SidePanelMode::SwarmDashboard => SidePanelMode::GitPanel,
-                            SidePanelMode::GitPanel => SidePanelMode::AgentChat,
-                        };
-                        if self.side_panel == SidePanelMode::GitPanel {
-                            self.refresh_git_panel();
-                        }
-                    }
-                    Focus::FileTree => {
-                        if self.left_panel != LeftPanelMode::Review {
-                            self.left_panel = match self.left_panel {
-                                LeftPanelMode::FileTree => LeftPanelMode::Search,
-                                LeftPanelMode::Search => LeftPanelMode::Changes,
-                                LeftPanelMode::Changes => LeftPanelMode::FileTree,
-                                LeftPanelMode::Review => LeftPanelMode::Review,
-                            };
-                            if self.left_panel == LeftPanelMode::Changes {
-                                self.refresh_git_changes();
-                            }
-                        }
-                    }
-                    Focus::Terminal => {
-                        // Scroll terminal history
-                        if let Some(inst) = self.terminal_manager.active_instance_mut() {
-                            let current = inst.screen().scrollback();
-                            let delta: usize = 1;
-                            match action {
-                                Action::ShiftUp => inst.screen_mut().set_scrollback(current + delta),
-                                Action::ShiftDown => {
-                                    inst.screen_mut().set_scrollback(current.saturating_sub(delta));
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    _ => {} // Editor handles in its own match block (select_up/down)
+            Action::SetLeftModeChanges => {
+                if !self.panel_visible.file_tree {
+                    self.panel_visible.file_tree = true;
                 }
+                self.left_panel = LeftPanelMode::Changes;
+                self.focus = Focus::FileTree;
+                self.refresh_git_changes();
             }
             Action::CloseTab => {
                 if self.focus == Focus::Terminal {
@@ -1157,22 +1110,6 @@ impl App {
                 }
                 self.search_selected_in_workspace();
                 return;
-            }
-            Action::CycleLeftPanel => {
-                if self.left_panel != LeftPanelMode::Review {
-                    self.left_panel = match self.left_panel {
-                        LeftPanelMode::FileTree => LeftPanelMode::Search,
-                        LeftPanelMode::Search => LeftPanelMode::Changes,
-                        LeftPanelMode::Changes => LeftPanelMode::FileTree,
-                        LeftPanelMode::Review => LeftPanelMode::Review,
-                    };
-                    if self.left_panel == LeftPanelMode::Changes {
-                        self.refresh_git_changes();
-                    }
-                    if self.left_panel == LeftPanelMode::Search {
-                        self.search_panel.focus_input();
-                    }
-                }
             }
 
             _ if self.focus == Focus::FileTree => {
@@ -1337,6 +1274,12 @@ impl App {
             }
             Action::CursorLeft => self.chat_state.text_input.move_left(),
             Action::CursorRight => self.chat_state.text_input.move_right(),
+            Action::WordLeft => self.chat_state.text_input.move_word_left(),
+            Action::WordRight => self.chat_state.text_input.move_word_right(),
+            Action::SelectLeft => self.chat_state.text_input.select_left(),
+            Action::SelectRight => self.chat_state.text_input.select_right(),
+            Action::SelectWordLeft => self.chat_state.text_input.select_word_left(),
+            Action::SelectWordRight => self.chat_state.text_input.select_word_right(),
             Action::Home => self.chat_state.text_input.move_home(),
             Action::End => self.chat_state.text_input.move_end(),
             Action::CursorUp => {
@@ -1624,6 +1567,24 @@ impl App {
             }
             Action::CursorRight if self.git_panel.region == GitRegion::CommitInput => {
                 self.git_panel.commit_input.move_right();
+            }
+            Action::WordLeft if self.git_panel.region == GitRegion::CommitInput => {
+                self.git_panel.commit_input.move_word_left();
+            }
+            Action::WordRight if self.git_panel.region == GitRegion::CommitInput => {
+                self.git_panel.commit_input.move_word_right();
+            }
+            Action::SelectLeft if self.git_panel.region == GitRegion::CommitInput => {
+                self.git_panel.commit_input.select_left();
+            }
+            Action::SelectRight if self.git_panel.region == GitRegion::CommitInput => {
+                self.git_panel.commit_input.select_right();
+            }
+            Action::SelectWordLeft if self.git_panel.region == GitRegion::CommitInput => {
+                self.git_panel.commit_input.select_word_left();
+            }
+            Action::SelectWordRight if self.git_panel.region == GitRegion::CommitInput => {
+                self.git_panel.commit_input.select_word_right();
             }
             Action::Enter if self.git_panel.region == GitRegion::CommitInput => {
                 // Enter in commit input → commit
@@ -3245,6 +3206,12 @@ impl App {
             }
             Action::CursorLeft => self.find_input.move_left(),
             Action::CursorRight => self.find_input.move_right(),
+            Action::WordLeft => self.find_input.move_word_left(),
+            Action::WordRight => self.find_input.move_word_right(),
+            Action::SelectLeft => self.find_input.select_left(),
+            Action::SelectRight => self.find_input.select_right(),
+            Action::SelectWordLeft => self.find_input.select_word_left(),
+            Action::SelectWordRight => self.find_input.select_word_right(),
             Action::Home => self.find_input.move_home(),
             Action::End => self.find_input.move_end(),
             Action::SelectAll => self.find_input.select_all(),
@@ -3362,8 +3329,14 @@ impl App {
                     Action::CursorDown => buf.move_cursor_down(),
                     Action::CursorLeft => buf.move_cursor_left(),
                     Action::CursorRight => buf.move_cursor_right(),
-                    Action::ShiftUp => buf.select_up(),
-                    Action::ShiftDown => buf.select_down(),
+                    Action::WordLeft => buf.move_word_left(),
+                    Action::WordRight => buf.move_word_right(),
+                    Action::SelectLeft => buf.select_left(),
+                    Action::SelectRight => buf.select_right(),
+                    Action::SelectUp => buf.select_up(),
+                    Action::SelectDown => buf.select_down(),
+                    Action::SelectWordLeft => buf.select_word_left(),
+                    Action::SelectWordRight => buf.select_word_right(),
                     Action::PageUp => buf.page_up(vp_h),
                     Action::PageDown => buf.page_down(vp_h),
                     Action::Home => buf.move_cursor_home(),
@@ -3456,6 +3429,12 @@ impl App {
                 }
                 Action::CursorLeft => self.search_panel.input.move_left(),
                 Action::CursorRight => self.search_panel.input.move_right(),
+                Action::WordLeft => self.search_panel.input.move_word_left(),
+                Action::WordRight => self.search_panel.input.move_word_right(),
+                Action::SelectLeft => self.search_panel.input.select_left(),
+                Action::SelectRight => self.search_panel.input.select_right(),
+                Action::SelectWordLeft => self.search_panel.input.select_word_left(),
+                Action::SelectWordRight => self.search_panel.input.select_word_right(),
                 Action::Home => self.search_panel.input.move_home(),
                 Action::End => self.search_panel.input.move_end(),
                 Action::SelectAll => self.search_panel.input.select_all(),
