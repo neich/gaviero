@@ -551,7 +551,6 @@ impl Buffer {
         }
     }
 
-    #[allow(dead_code)]
     pub fn select_left(&mut self) {
         self.ensure_anchor();
         if self.cursor.col > 0 {
@@ -562,7 +561,6 @@ impl Buffer {
         }
     }
 
-    #[allow(dead_code)]
     pub fn select_right(&mut self) {
         self.ensure_anchor();
         let line_len = self.line_len(self.cursor.line);
@@ -572,6 +570,84 @@ impl Buffer {
             self.cursor.line += 1;
             self.cursor.col = 0;
         }
+    }
+
+    // ── Word movement ─────────────────────────────────────────
+
+    /// Move cursor left by one word (skip whitespace, then word chars).
+    pub fn move_word_left(&mut self) {
+        let pos = self.cursor_char_pos();
+        if pos == 0 {
+            return;
+        }
+        let mut start = pos;
+        // Skip whitespace/non-word chars
+        while start > 0 && !is_word_char(self.text.char(start - 1)) {
+            start -= 1;
+        }
+        // Skip word chars
+        while start > 0 && is_word_char(self.text.char(start - 1)) {
+            start -= 1;
+        }
+        self.cursor.line = self.text.char_to_line(start);
+        let line_start = self.text.line_to_char(self.cursor.line);
+        self.cursor.col = start - line_start;
+        self.cursor.anchor = None;
+    }
+
+    /// Move cursor right by one word (skip word chars, then non-word chars).
+    pub fn move_word_right(&mut self) {
+        let pos = self.cursor_char_pos();
+        let total = self.text.len_chars();
+        let mut end = pos;
+        // Skip word chars
+        while end < total && is_word_char(self.text.char(end)) {
+            end += 1;
+        }
+        // Skip non-word chars
+        while end < total && !is_word_char(self.text.char(end)) {
+            end += 1;
+        }
+        self.cursor.line = self.text.char_to_line(end);
+        let line_start = self.text.line_to_char(self.cursor.line);
+        self.cursor.col = end - line_start;
+        self.cursor.anchor = None;
+    }
+
+    /// Select (extend selection) left by one word.
+    pub fn select_word_left(&mut self) {
+        self.ensure_anchor();
+        let pos = self.cursor_char_pos();
+        if pos == 0 {
+            return;
+        }
+        let mut start = pos;
+        while start > 0 && !is_word_char(self.text.char(start - 1)) {
+            start -= 1;
+        }
+        while start > 0 && is_word_char(self.text.char(start - 1)) {
+            start -= 1;
+        }
+        self.cursor.line = self.text.char_to_line(start);
+        let line_start = self.text.line_to_char(self.cursor.line);
+        self.cursor.col = start - line_start;
+    }
+
+    /// Select (extend selection) right by one word.
+    pub fn select_word_right(&mut self) {
+        self.ensure_anchor();
+        let pos = self.cursor_char_pos();
+        let total = self.text.len_chars();
+        let mut end = pos;
+        while end < total && is_word_char(self.text.char(end)) {
+            end += 1;
+        }
+        while end < total && !is_word_char(self.text.char(end)) {
+            end += 1;
+        }
+        self.cursor.line = self.text.char_to_line(end);
+        let line_start = self.text.line_to_char(self.cursor.line);
+        self.cursor.col = end - line_start;
     }
 
     /// Page up/down — move cursor and viewport by viewport_height lines.
