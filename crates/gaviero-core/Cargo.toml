@@ -37,6 +37,11 @@ tree-sitter-python = "0.25"
 tree-sitter-yaml = "0.7"
 tree-sitter-kotlin-ng = "1.1.0"
 reqwest = { workspace = true }
+async-trait = "0.1"
+futures = "0.3"
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["io"] }
 
 [dev-dependencies]
 tempfile = "3"
+wiremock = "0.6"

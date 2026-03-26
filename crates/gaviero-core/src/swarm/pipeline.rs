@@ -11,8 +11,7 @@ use tokio::sync::{Mutex, Semaphore};
 use super::bus::AgentBus;
 use super::coordinator::{Coordinator, CoordinatorConfig};
 use super::models::{AgentManifest, AgentStatus, MergeResult, SwarmResult, WorkUnit};
-use super::router::{ResolvedBackend, TierConfig, TierRouter};
-use super::runner::AgentRunner;
+use super::router::{TierConfig, TierRouter};
 use super::validation;
 use super::verify::CostEstimate;
 use super::merge;
@@ -172,15 +171,26 @@ pub async fn execute(
                     root.clone()
                 };
 
+                // Resolve backend for this unit
+                let backend = super::backend::claude_code::ClaudeCodeBackend::new(
+                    unit.model.as_deref().unwrap_or("sonnet"),
+                );
+
                 handles.push(tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
 
                     let write_gate = Arc::new(Mutex::new(
                         WriteGatePipeline::new(WriteMode::AutoAccept, Box::new(NoopWriteGateObserver)),
                     ));
-                    let runner = AgentRunner::new(write_gate, agent_root, mem)
-                        .with_read_namespaces(ns);
-                    runner.run(&unit, obs, None).await
+                    super::backend::runner::run_backend(
+                        &backend,
+                        &unit,
+                        write_gate,
+                        &agent_root,
+                        mem.as_deref(),
+                        &ns,
+                        obs.as_ref(),
+                    ).await
                 }));
             }
 
@@ -330,13 +340,33 @@ async fn run_single_agent(
         workspace_root.clone()
     };
 
+    // Resolve backend from model override or default to Claude Code
+    let backend = super::backend::claude_code::ClaudeCodeBackend::new(
+        unit.model.as_deref().unwrap_or("sonnet"),
+    );
+
     let write_gate = Arc::new(Mutex::new(
         WriteGatePipeline::new(WriteMode::AutoAccept, Box::new(NoopWriteGateObserver)),
     ));
-    let runner = AgentRunner::new(write_gate, agent_root, memory)
-        .with_read_namespaces(read_namespaces.to_vec());
 
-    let mut manifest = runner.run(unit, acp_observer, Some(swarm_observer)).await?;
+    swarm_observer.on_agent_state_changed(&unit.id, &AgentStatus::Running, "starting");
+
+    let mut manifest = super::backend::runner::run_backend(
+        &backend,
+        unit,
+        write_gate,
+        &agent_root,
+        memory.as_deref(),
+        read_namespaces,
+        acp_observer.as_ref(),
+    )
+    .await?;
+
+    swarm_observer.on_agent_state_changed(
+        &unit.id,
+        &manifest.status,
+        manifest.summary.as_deref().unwrap_or(""),
+    );
 
     // Record branch name if using worktrees
     manifest.branch = Some(format!("gaviero/{}", unit.id));
@@ -506,11 +536,9 @@ pub async fn execute_coordinated(
                     &AgentStatus::Pending,
                     &unit.description,
                 );
-                let resolved = router.resolve(unit);
-                let backend_str = match &resolved {
-                    ResolvedBackend::Claude { model } => model.clone(),
-                    ResolvedBackend::Ollama { model, .. } => format!("ollama:{}", model),
-                    ResolvedBackend::Blocked { reason } => format!("blocked:{}", reason),
+                let backend_str = match router.resolve_backend(unit) {
+                    Ok(b) => b.name().to_string(),
+                    Err(reason) => format!("blocked:{}", reason),
                 };
                 observer.on_tier_dispatch(unit_id, unit.tier, &backend_str);
             }
@@ -522,22 +550,6 @@ pub async fn execute_coordinated(
             let unit = (*unit_map.get(unit_id.as_str())
                 .with_context(|| format!("work unit '{}' not found", unit_id))?)
                 .clone();
-
-            let resolved = router.resolve(&unit);
-            let backend_desc = format!("{:?}", resolved);
-            observer.on_tier_dispatch(&unit.id, unit.tier, &backend_desc);
-
-            // Blocked units skip execution
-            if let ResolvedBackend::Blocked { reason } = &resolved {
-                all_manifests.push(AgentManifest {
-                    work_unit_id: unit.id.clone(),
-                    status: AgentStatus::Failed(format!("Blocked: {}", reason)),
-                    modified_files: vec![],
-                    branch: None,
-                    summary: Some(format!("Blocked: {}", reason)),
-                });
-                continue;
-            }
 
             // Select the appropriate per-model-tier semaphore
             let sem = match unit.tier {
@@ -577,10 +589,19 @@ pub async fn execute_coordinated(
                 root.clone()
             };
 
-            // Resolve model string for AcpSession
-            let model = match &resolved {
-                ResolvedBackend::Claude { model } => model.clone(),
-                _ => "sonnet".into(), // fallback, Ollama handled in Phase 3
+            // Resolve to a trait-object backend
+            let backend = match router.resolve_backend(&unit) {
+                Ok(b) => b,
+                Err(reason) => {
+                    all_manifests.push(AgentManifest {
+                        work_unit_id: unit.id.clone(),
+                        status: AgentStatus::Failed(format!("Blocked: {}", reason)),
+                        modified_files: vec![],
+                        branch: None,
+                        summary: Some(format!("Blocked: {}", reason)),
+                    });
+                    continue;
+                }
             };
 
             handles.push(tokio::spawn(async move {
@@ -589,11 +610,17 @@ pub async fn execute_coordinated(
                 let write_gate = Arc::new(Mutex::new(
                     WriteGatePipeline::new(WriteMode::AutoAccept, Box::new(NoopWriteGateObserver)),
                 ));
-                let runner = AgentRunner::new(write_gate, agent_root, mem.clone())
-                    .with_read_namespaces(ns);
 
                 // 10-minute timeout per agent to prevent blocking
-                let agent_future = runner.run_with_model(&unit, obs, None, &model);
+                let agent_future = super::backend::runner::run_backend(
+                    backend.as_ref(),
+                    &unit,
+                    write_gate,
+                    &agent_root,
+                    mem.as_deref(),
+                    &ns,
+                    obs.as_ref(),
+                );
                 let manifest = match tokio::time::timeout(
                     std::time::Duration::from_secs(600),
                     agent_future,

@@ -14,7 +14,9 @@ use crate::write_gate::WriteGatePipeline;
 
 /// Runs a single work unit by spawning an ACP agent session.
 ///
-/// In M3a this writes directly to the workspace (no git worktree).
+/// **Deprecated:** Use [`super::backend::runner::run_backend`] with a
+/// [`super::backend::AgentBackend`] trait object instead.
+#[deprecated(note = "Use backend::runner::run_backend with trait objects instead")]
 pub struct AgentRunner {
     write_gate: Arc<Mutex<WriteGatePipeline>>,
     workspace_root: PathBuf,

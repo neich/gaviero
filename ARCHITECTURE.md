@@ -42,9 +42,9 @@ Tree-sitter types are re-exported from `Gaviero-core::lib.rs` (`Language`, `Tree
 ```
 lib.rs                      Re-exports, module declarations (14 public modules)
 types.rs                    FileScope, DiffHunk, HunkType, WriteProposal, StructuralHunk, NodeInfo, SymbolKind
-workspace.rs                Workspace model, WorkspaceFolder, settings cascade
+workspace.rs                Workspace model, WorkspaceFolder, settings cascade (cached)
 session_state.rs            SessionState, TabState, PanelState, StoredConversation
-tree_sitter.rs              Language registry (16 langs), enrich_hunks(), language_name_for_extension()
+tree_sitter.rs              Unified LANGUAGE_REGISTRY (16 langs), enrich_hunks(), language_for/name_for_extension()
 diff_engine.rs              compute_hunks() — similar crate wrapper
 write_gate.rs               WriteGatePipeline, WriteMode, proposal management
 observer.rs                 WriteGateObserver, AcpObserver, SwarmObserver trait definitions
@@ -96,31 +96,33 @@ terminal/
 
 ```
 main.rs                     Entry point, terminal setup, event loop, panic handler
-app.rs                      App state, layout rendering, focus management (~4500 lines)
+app.rs                      App state, layout rendering, focus management, find bar (~5000 lines)
 event.rs                    Event enum, EventLoop (crossterm/watcher/tick/terminal bridge)
-keymap.rs                   Keybinding definitions, Action enum (80+ variants)
-theme.rs                    Color constants (One Dark), timing constants (poll/tick)
+keymap.rs                   Keybinding definitions, Action enum (80+ variants, incl. FindInBuffer)
+theme.rs                    Centralized color constants (One Dark), timing constants (poll/tick)
 editor/
   mod.rs                    Module re-exports
-  buffer.rs                 Ropey buffer, Cursor, Transaction, undo/redo, FormatLevel
-  view.rs                   EditorView widget: gutter, syntax highlights, scroll, cursor
+  buffer.rs                 Ropey buffer, Cursor, Transaction, undo/redo, FormatLevel, find_next/prev_match
+  view.rs                   EditorView widget: gutter, syntax highlights, scroll, cursor, search highlight
   diff_overlay.rs           Diff review mode: DiffSource, DiffReviewState, accept/reject per hunk
   highlight.rs              HighlightConfig, tree-sitter highlight query runner → Vec<StyledSpan>
   markdown.rs               Markdown document rendering and editing
 panels/
   mod.rs                    Module re-exports
-  file_tree.rs              Multi-root file browser, git + proposal decorations
-  agent_chat.rs             AgentChatState, Conversation, attachments, @file autocomplete, batch review
+  file_tree.rs              Multi-root file browser, git + proposal decorations (uses ScrollState)
+  agent_chat.rs             AgentChatState, Conversation, attachments, @file autocomplete (uses TextInput)
   chat_markdown.rs          ChatLine: markdown rendering for chat messages
-  swarm_dashboard.rs        Agent status table with tier/phase labels
-  git_panel.rs              GitPanelState, staging area, commit, branch picker
+  swarm_dashboard.rs        Agent status table with tier/phase labels (uses ScrollState)
+  git_panel.rs              GitPanelState, staging area, commit (uses TextInput), branch picker
   terminal.rs               Terminal rendering (tui-term), TerminalSelectionState
   status_bar.rs             Mode, file, branch, agent status indicators
-  search.rs                 SearchPanelState, file/project search
+  search.rs                 SearchPanelState, interactive input + live results (uses TextInput, ScrollState)
 widgets/
   mod.rs                    Module re-exports
   tabs.rs                   TabBar widget with close indicators
   scrollbar.rs              Custom scrollbar widget
+  scroll_state.rs           ScrollState: shared scroll offset + selection for list panels
+  text_input.rs             TextInput: shared text editing with cursor, selection, undo/redo, word movement
   render_utils.rs           Shared rendering utilities
 ```
 
@@ -523,7 +525,7 @@ CREATE TABLE memories (
 
 16 languages supported: Rust, Java, JavaScript, TypeScript, HTML, CSS, JSON, Bash, TOML, C, C++, LaTeX, Python, YAML, Kotlin. Markdown is recognized for `language_name_for_extension()` but has no tree-sitter parser.
 
-`language_for_extension(ext)` maps file extensions to `tree_sitter::Language` objects (22 extension mappings → 16 languages). `language_name_for_extension(ext)` maps to canonical language name strings. Unknown extensions degrade gracefully — no parsing, plain diffs.
+A single `LANGUAGE_REGISTRY` table (array of `(extensions, name, Option<GrammarFn>)`) is the source of truth for all extension → language mappings. Both `language_for_extension(ext)` and `language_name_for_extension(ext)` delegate to `lookup_extension()` which queries this table. Unknown extensions degrade gracefully — no parsing, plain diffs.
 
 ### Structural Enrichment
 
@@ -631,11 +633,70 @@ Six presets (number keys 1-6) configure column widths:
 
 ### Left Panel Modes
 
-`LeftPanelMode`: `FileTree` (default), `Search`, `Review`. Toggled via keybinds.
+`LeftPanelMode`: `FileTree` (default), `Search`, `Changes`, `Review`. Toggled via Shift+Left/Right or F7.
 
 ### Terminal Panel
 
 Multi-instance embedded shell managed by `TerminalManager` (gaviero-core) with `tui-term` rendering (gaviero-tui). Each instance gets its own PTY via `portable-pty`, `vt100` for escape sequence parsing, and environment isolation (per-instance `HISTFILE`, stripped IDE env vars). OSC 133 parsing enables prompt/command boundary detection. Supports text selection via mouse drag (`TerminalSelectionState`).
+
+### Shared Panel Widgets
+
+Two shared structs in `widgets/` eliminate duplicated logic across panels:
+
+**`ScrollState`** (`scroll_state.rs`) — scroll offset + single-item selection with cached viewport:
+- `move_up()`, `move_down(item_count)` — selection with auto-scroll
+- `page_up()`, `page_down(item_count)` — page-size jumps
+- `scroll_up(n)`, `scroll_down(n, item_count)` — viewport-only scroll (mouse wheel)
+- `ensure_visible()` — clamp scroll so selected item is in viewport
+- `visible_range(item_count, viewport)` — iterator range for rendering
+- `set_viewport(h)` caches viewport height so event handlers don't need it
+- Used by: `file_tree`, `search`, `swarm_dashboard` (agent table)
+
+**`TextInput`** (`text_input.rs`) — char-indexed text buffer with selection, undo/redo, word movement:
+- `insert_char()`, `insert_str()`, `backspace()`, `delete()` — editing with auto-undo and selection replacement
+- `move_left/right/home/end()`, `move_word_left/right()` — cursor movement
+- `select_all()`, `selection_range()`, `delete_selection()` — selection
+- `undo()`, `redo()` — 50-entry undo stack
+- Used by: `agent_chat` (chat input), `git_panel` (commit message), `search` (query input), `app` (find bar)
+
+### Search Panel
+
+The search panel (`panels/search.rs`) provides interactive workspace-wide text search:
+
+```
+┌─────────────────────┐
+│ > query text|        │  ← TextInput with cursor (row 0)
+│ 42 results           │  ← Summary (row 1)
+│ src/foo.rs:12 match  │  ← Scrollable results (row 2+)
+│ src/bar.rs:7  match  │
+└─────────────────────┘
+```
+
+Two focus modes controlled by `editing: bool`:
+- **Input mode** (`editing=true`): Keystrokes update the query, search runs on every keystroke (search-as-you-type). Down/Enter moves focus to results.
+- **Results mode** (`editing=false`): Up/Down navigate results. Enter opens the selected file at the matching line. Typing switches back to input mode.
+
+Switching to the search panel (F7, Shift+Left/Right) auto-focuses the input. F3 from the editor populates the input with the selection and focuses results.
+
+### Editor Find Bar
+
+`Ctrl+F` opens an inline find bar at the top of the editor area:
+
+```
+┌──────────────────────────────────────┐
+│ Find: query text|           3/42     │  ← Find bar (1 row, shrinks editor)
+├──────────────────────────────────────┤
+│  1 │ ... editor content ...          │
+│  2 │ ... with search HIGHLIGHTS ...  │
+└──────────────────────────────────────┘
+```
+
+- Search-as-you-type: each keystroke calls `Buffer::set_search_highlight()` (pre-computes all match positions) then `find_next_match()` to jump the cursor
+- `Enter`/`Down` → next match, `Up` → previous match, `F3` → next match (works globally)
+- `Esc` or `Ctrl+F` again → closes find bar and clears highlights
+- Match count indicator shows `N/M` (current/total) or "No matches"
+- `find_next_match()` / `find_prev_match()` on `Buffer` navigate matches with wrap-around
+- Editor scrolls with a 3-line vertical margin around the cursor (`VERTICAL_SCROLL_MARGIN`)
 
 ---
 
@@ -685,10 +746,12 @@ Semaphore                    // parallel agent count bound
 
 Resolution order (first match wins):
 
-1. `{folder}/.Gaviero/settings.json` — per-folder override
+1. `{folder}/.Gaviero/settings.json` — per-folder override (cached)
 2. `.Gaviero-workspace` → `"settings"` — workspace-level
-3. `~/.config/Gaviero/settings.json` — user-level
+3. `~/.config/Gaviero/settings.json` — user-level (cached)
 4. Hardcoded Rust defaults — fallback
+
+Per-folder and user-level settings files are parsed at startup and cached in `Workspace::folder_settings_cache` / `user_settings_cache`. `resolve_setting()` never reads disk — it queries the in-memory cache. Call `reload_settings_cache()` after file-watcher events to pick up external edits.
 
 For language-specific keys: if the current file is `.rs`, check `"[rust].{key}"` before `"{key}"` at each cascade level.
 

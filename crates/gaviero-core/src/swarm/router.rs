@@ -113,6 +113,29 @@ impl TierRouter {
         }
     }
 
+    /// Resolve a WorkUnit to a trait-object backend.
+    ///
+    /// Calls `resolve()` internally, then maps `ResolvedBackend` variants
+    /// to concrete `AgentBackend` trait implementations.
+    pub fn resolve_backend(
+        &self,
+        unit: &WorkUnit,
+    ) -> Result<Box<dyn super::backend::AgentBackend>, String> {
+        match self.resolve(unit) {
+            ResolvedBackend::Claude { model } => {
+                Ok(Box::new(
+                    super::backend::claude_code::ClaudeCodeBackend::new(&model),
+                ))
+            }
+            ResolvedBackend::Ollama { model, base_url } => {
+                Ok(Box::new(
+                    super::backend::ollama::OllamaStreamBackend::new(&base_url, &model),
+                ))
+            }
+            ResolvedBackend::Blocked { reason } => Err(reason),
+        }
+    }
+
     /// Handle escalation after subtask failure.
     ///
     /// Returns `None` if the unit has no escalation tier (max tier reached).
@@ -331,5 +354,35 @@ mod tests {
             router.resolve(&unit),
             ResolvedBackend::Claude { model: "opus".into() }
         );
+    }
+
+    // Test 21: resolve_backend returns correct trait objects
+    #[test]
+    fn test_resolve_backend_returns_trait_objects() {
+        let router = TierRouter::new(TierConfig::default(), false);
+
+        // Reasoning tier → claude backend
+        let unit = test_unit(ModelTier::Reasoning, PrivacyLevel::Public, None);
+        let backend = router.resolve_backend(&unit).unwrap();
+        assert!(backend.name().contains("claude"));
+
+        // Coordinator → claude:opus
+        let unit = test_unit(ModelTier::Coordinator, PrivacyLevel::Public, None);
+        let backend = router.resolve_backend(&unit).unwrap();
+        assert!(backend.name().contains("claude"));
+        assert!(backend.name().contains("opus"));
+
+        // Mechanical with Ollama enabled → ollama backend
+        let mut config = TierConfig::default();
+        config.mechanical.enabled = true;
+        let router = TierRouter::new(config, true);
+        let unit = test_unit(ModelTier::Mechanical, PrivacyLevel::Public, None);
+        let backend = router.resolve_backend(&unit).unwrap();
+        assert!(backend.name().contains("ollama"));
+
+        // Blocked → returns Err
+        let router = TierRouter::new(TierConfig::default(), false);
+        let unit = test_unit(ModelTier::Execution, PrivacyLevel::LocalOnly, None);
+        assert!(router.resolve_backend(&unit).is_err());
     }
 }
