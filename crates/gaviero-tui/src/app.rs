@@ -1536,10 +1536,9 @@ impl App {
                 // Commit staged files
                 if !self.git_panel.commit_input.is_empty() {
                     if let Some(repo) = &self.git_repo {
-                        match repo.commit(&self.git_panel.commit_input) {
+                        match repo.commit(&self.git_panel.commit_input.text) {
                             Ok(_) => {
                                 self.git_panel.commit_input.clear();
-                                self.git_panel.commit_cursor = 0;
                                 self.git_panel.refresh(repo);
                                 self.refresh_file_tree();
                             }
@@ -1556,10 +1555,9 @@ impl App {
                 // Amend last commit
                 if !self.git_panel.commit_input.is_empty() {
                     if let Some(repo) = &self.git_repo {
-                        match repo.amend(&self.git_panel.commit_input) {
+                        match repo.amend(&self.git_panel.commit_input.text) {
                             Ok(_) => {
                                 self.git_panel.commit_input.clear();
-                                self.git_panel.commit_cursor = 0;
                                 self.git_panel.refresh(repo);
                             }
                             Err(e) => {
@@ -1572,25 +1570,24 @@ impl App {
 
             // In CommitInput region, type commit message
             Action::InsertChar(ch) if self.git_panel.region == GitRegion::CommitInput => {
-                self.git_panel.insert_char(ch);
+                self.git_panel.commit_input.insert_char(ch);
             }
             Action::Backspace if self.git_panel.region == GitRegion::CommitInput => {
-                self.git_panel.backspace();
+                self.git_panel.commit_input.backspace();
             }
             Action::CursorLeft if self.git_panel.region == GitRegion::CommitInput => {
-                self.git_panel.commit_move_left();
+                self.git_panel.commit_input.move_left();
             }
             Action::CursorRight if self.git_panel.region == GitRegion::CommitInput => {
-                self.git_panel.commit_move_right();
+                self.git_panel.commit_input.move_right();
             }
             Action::Enter if self.git_panel.region == GitRegion::CommitInput => {
                 // Enter in commit input → commit
                 if !self.git_panel.commit_input.is_empty() {
                     if let Some(repo) = &self.git_repo {
-                        match repo.commit(&self.git_panel.commit_input) {
+                        match repo.commit(&self.git_panel.commit_input.text) {
                             Ok(_) => {
                                 self.git_panel.commit_input.clear();
-                                self.git_panel.commit_cursor = 0;
                                 self.git_panel.refresh(repo);
                                 self.refresh_file_tree();
                             }
@@ -1641,7 +1638,6 @@ impl App {
                     self.git_panel.close_branch_picker();
                 } else if self.git_panel.region == GitRegion::CommitInput && !self.git_panel.commit_input.is_empty() {
                     self.git_panel.commit_input.clear();
-                    self.git_panel.commit_cursor = 0;
                 } else {
                     self.focus = Focus::Editor;
                 }
