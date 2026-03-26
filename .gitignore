@@ -17,3 +17,4 @@ Thumbs.db
 # Environment
 .env
 .gaviero
+tmp/
