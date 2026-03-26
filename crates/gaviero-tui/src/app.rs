@@ -1035,6 +1035,9 @@ impl App {
                             if self.left_panel == LeftPanelMode::Changes {
                                 self.refresh_git_changes();
                             }
+                            if self.left_panel == LeftPanelMode::Search {
+                                self.search_panel.focus_input();
+                            }
                         }
                     }
                     Focus::SidePanel => self.chat_state.prev_conversation(),
@@ -1054,6 +1057,9 @@ impl App {
                             };
                             if self.left_panel == LeftPanelMode::Changes {
                                 self.refresh_git_changes();
+                            }
+                            if self.left_panel == LeftPanelMode::Search {
+                                self.search_panel.focus_input();
                             }
                         }
                     }
@@ -1129,6 +1135,9 @@ impl App {
                     };
                     if self.left_panel == LeftPanelMode::Changes {
                         self.refresh_git_changes();
+                    }
+                    if self.left_panel == LeftPanelMode::Search {
+                        self.search_panel.focus_input();
                     }
                 }
             }
@@ -3299,40 +3308,124 @@ impl App {
     }
 
     fn handle_search_action(&mut self, action: Action) {
-        match action {
-            Action::CursorDown | Action::InsertChar('j') => {
-                let count = self.search_panel.results.len();
-                self.search_panel.scroll.move_down(count);
-            }
-            Action::CursorUp | Action::InsertChar('k') => self.search_panel.scroll.move_up(),
-            Action::Enter => {
-                // Open the selected result
-                if let Some(result) = self.search_panel.selected_result().cloned() {
-                    let root = self.workspace.roots().first()
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_default();
-                    let abs_path = root.join(&result.path);
-                    if abs_path.exists() {
-                        self.open_file(&abs_path);
-                        self.focus = Focus::Editor;
-                        // Jump to the matching line
-                        if let Some(buf) = self.buffers.get_mut(self.active_buffer) {
-                            let target_line = result.line_number.saturating_sub(1);
-                            let max_line = buf.line_count().saturating_sub(1);
-                            buf.cursor.line = target_line.min(max_line);
-                            buf.cursor.col = 0;
-                            buf.cursor.anchor = None;
-                            // Center the line in viewport
-                            buf.scroll.top_line = target_line.saturating_sub(10);
-                        }
+        if self.search_panel.editing {
+            // ── Input mode: typing updates the query ────────────
+            match action {
+                Action::InsertChar(ch) => {
+                    self.search_panel.input.insert_char(ch);
+                    self.run_search_from_input();
+                }
+                Action::Backspace => {
+                    self.search_panel.input.backspace();
+                    self.run_search_from_input();
+                }
+                Action::Delete => {
+                    self.search_panel.input.delete();
+                    self.run_search_from_input();
+                }
+                Action::DeleteWordBack => {
+                    self.search_panel.input.delete_word_back();
+                    self.run_search_from_input();
+                }
+                Action::CursorLeft => self.search_panel.input.move_left(),
+                Action::CursorRight => self.search_panel.input.move_right(),
+                Action::Home => self.search_panel.input.move_home(),
+                Action::End => self.search_panel.input.move_end(),
+                Action::SelectAll => self.search_panel.input.select_all(),
+                Action::Paste => {
+                    let text = self.get_clipboard();
+                    if !text.is_empty() {
+                        self.search_panel.input.insert_str(&text);
+                        self.run_search_from_input();
                     }
                 }
+                Action::CursorDown | Action::Enter => {
+                    // Move focus to results list (if there are results)
+                    if !self.search_panel.results.is_empty() {
+                        self.search_panel.editing = false;
+                    }
+                    if action == Action::Enter {
+                        self.open_selected_search_result();
+                    }
+                }
+                Action::Quit => {
+                    if !self.search_panel.input.is_empty() {
+                        // First Esc clears the input
+                        self.search_panel.input.clear();
+                        self.search_panel.results.clear();
+                        self.search_panel.query.clear();
+                        self.search_panel.scroll.reset();
+                    } else {
+                        // Second Esc goes back to file tree
+                        self.left_panel = LeftPanelMode::FileTree;
+                    }
+                }
+                _ => {}
             }
-            Action::Quit => {
-                // Escape switches back to file tree
-                self.left_panel = LeftPanelMode::FileTree;
+        } else {
+            // ── Results mode: navigate and open ─────────────────
+            match action {
+                Action::CursorDown => {
+                    let count = self.search_panel.results.len();
+                    self.search_panel.scroll.move_down(count);
+                }
+                Action::CursorUp => {
+                    if self.search_panel.scroll.selected == 0 {
+                        // At top of results → go back to input
+                        self.search_panel.editing = true;
+                    } else {
+                        self.search_panel.scroll.move_up();
+                    }
+                }
+                Action::Enter => {
+                    self.open_selected_search_result();
+                }
+                Action::InsertChar(ch) => {
+                    // Start typing → switch back to input mode
+                    self.search_panel.editing = true;
+                    self.search_panel.input.insert_char(ch);
+                    self.run_search_from_input();
+                }
+                Action::Backspace => {
+                    self.search_panel.editing = true;
+                    self.search_panel.input.backspace();
+                    self.run_search_from_input();
+                }
+                Action::Quit => {
+                    // Escape from results goes back to input
+                    self.search_panel.editing = true;
+                }
+                _ => {}
             }
-            _ => {}
+        }
+    }
+
+    /// Run search using the current input text.
+    fn run_search_from_input(&mut self) {
+        let roots = self.workspace.roots();
+        let excludes: Vec<String> = self.file_tree.exclude_patterns.clone();
+        self.search_panel.search_from_input(&roots, &excludes);
+    }
+
+    /// Open the currently selected search result in the editor.
+    fn open_selected_search_result(&mut self) {
+        if let Some(result) = self.search_panel.selected_result().cloned() {
+            let root = self.workspace.roots().first()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_default();
+            let abs_path = root.join(&result.path);
+            if abs_path.exists() {
+                self.open_file(&abs_path);
+                self.focus = Focus::Editor;
+                if let Some(buf) = self.buffers.get_mut(self.active_buffer) {
+                    let target_line = result.line_number.saturating_sub(1);
+                    let max_line = buf.line_count().saturating_sub(1);
+                    buf.cursor.line = target_line.min(max_line);
+                    buf.cursor.col = 0;
+                    buf.cursor.anchor = None;
+                    buf.scroll.top_line = target_line.saturating_sub(10);
+                }
+            }
         }
     }
 
@@ -3614,8 +3707,13 @@ impl App {
                                 }
                             }
                             LeftPanelMode::Search => {
-                                // +1 to skip the header line
-                                let idx = self.search_panel.scroll.offset + relative_row.saturating_sub(1);
+                                if relative_row == 0 {
+                                    // Click on input row → focus input
+                                    self.search_panel.editing = true;
+                                    return;
+                                }
+                                // +2 to skip input + summary lines
+                                let idx = self.search_panel.scroll.offset + relative_row.saturating_sub(2);
                                 if idx < self.search_panel.results.len() {
                                     self.search_panel.scroll.selected = idx;
                                     // Open the result
@@ -4029,7 +4127,7 @@ impl App {
                     }
                     LeftPanelMode::Search => {
                         let total = self.search_panel.results.len();
-                        let viewport = track_height.saturating_sub(1); // header row
+                        let viewport = track_height.saturating_sub(2); // input + summary rows
                         if total <= viewport { return; }
                         let max_scroll = total.saturating_sub(viewport);
                         let row_in_track = row.saturating_sub(area.y) as usize;
@@ -4128,6 +4226,11 @@ impl App {
         if query.trim().is_empty() {
             return;
         }
+
+        // Populate the input field with the query
+        self.search_panel.input.clear();
+        self.search_panel.input.insert_str(&query);
+        self.search_panel.editing = false; // focus results for navigation
 
         let roots = self.workspace.roots();
         let excludes: Vec<String> = self.file_tree.exclude_patterns.clone();
@@ -4865,8 +4968,12 @@ impl App {
                         format!("REVIEW ({} files)  f: apply all  Esc: discard  ↑↓: navigate", n)
                     }
                     LeftPanelMode::Search => {
-                        let count = self.search_panel.results.len();
-                        format!("{} results  Enter: open  Esc: back to tree  F7: tree", count)
+                        if self.search_panel.editing {
+                            "Type to search  ↓/Enter: results  Esc: clear/back".to_string()
+                        } else {
+                            let count = self.search_panel.results.len();
+                            format!("{} results  Enter: open  ↑: input  Esc: input  F7: cycle", count)
+                        }
                     }
                     LeftPanelMode::Changes => {
                         let n = self.changes_state.as_ref().map(|cs| cs.entries.len()).unwrap_or(0);

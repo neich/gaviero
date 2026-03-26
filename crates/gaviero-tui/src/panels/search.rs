@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::theme;
 use crate::widgets::scroll_state::ScrollState;
+use crate::widgets::text_input::TextInput;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -18,20 +19,34 @@ pub struct SearchResult {
 
 /// State for the workspace search panel.
 pub struct SearchPanelState {
+    /// The interactive input field at the top of the panel.
+    pub input: TextInput,
+    /// The query that produced the current result set (may lag behind `input`
+    /// while a debounce timer is pending).
     pub query: String,
     pub results: Vec<SearchResult>,
     pub scroll: ScrollState,
     pub searching: bool,
+    /// When true the text input has keyboard focus; when false the results
+    /// list does (arrow keys navigate results).
+    pub editing: bool,
 }
 
 impl SearchPanelState {
     pub fn new() -> Self {
         Self {
+            input: TextInput::new(),
             query: String::new(),
             results: Vec::new(),
             scroll: ScrollState::new(),
             searching: false,
+            editing: true,
         }
+    }
+
+    /// Focus the input field (called when switching to the search panel).
+    pub fn focus_input(&mut self) {
+        self.editing = true;
     }
 
     /// Start a new search. Clears previous results.
@@ -41,11 +56,18 @@ impl SearchPanelState {
         self.scroll.reset();
         self.searching = true;
 
-        // Search synchronously through workspace files
-        for root in roots {
-            self.search_dir(root, root, excludes);
+        if !query.trim().is_empty() {
+            for root in roots {
+                self.search_dir(root, root, excludes);
+            }
         }
         self.searching = false;
+    }
+
+    /// Run a search using the current input text. Called on every keystroke.
+    pub fn search_from_input(&mut self, roots: &[&Path], excludes: &[String]) {
+        let query = self.input.text.clone();
+        self.search(&query, roots, excludes);
     }
 
     fn search_dir(&mut self, root: &Path, dir: &Path, excludes: &[String]) {
@@ -106,7 +128,7 @@ impl SearchPanelState {
     pub fn render(&mut self, area: Rect, buf: &mut Buffer, focused: bool) {
         let bg = theme::PANEL_BG;
         let fg = theme::TEXT_FG;
-        let sel_bg = if focused {
+        let sel_bg = if focused && !self.editing {
             theme::FOCUSED_SELECTION_BG
         } else {
             theme::DARK_BG
@@ -119,41 +141,97 @@ impl SearchPanelState {
             }
         }
 
-        if self.results.is_empty() {
-            let msg = if self.query.is_empty() {
-                "No search query"
-            } else if self.searching {
-                "Searching..."
+        // ── Input field (row 0) ─────────────────────────────────
+        let input_y = area.y;
+        let input_bg = if focused && self.editing { theme::INPUT_BG } else { bg };
+        let prompt = " \u{1F50D} "; // 🔍 magnifying glass + space
+        let prompt_style = Style::default().fg(theme::TEXT_DIM).bg(input_bg);
+
+        // Clear input row
+        for x in area.x..area.right() {
+            if input_y < buf.area().bottom() {
+                buf[(x, input_y)].set_char(' ').set_style(Style::default().bg(input_bg));
+            }
+        }
+
+        // Draw prompt
+        let mut x = area.x;
+        for ch in prompt.chars() {
+            if x < area.right() && input_y < buf.area().bottom() {
+                buf[(x, input_y)].set_char(ch).set_style(prompt_style);
+                x += ch.len_utf8() as u16; // emoji takes 1 cell in our buffer but let's advance properly
+            }
+        }
+        // The emoji is wide; use a simpler prompt for reliable column math
+        let prompt_cols: u16 = 3; // " > "
+        x = area.x;
+        // Re-render with a simple text prompt for reliable positioning
+        let prompt = " > ";
+        for ch in prompt.chars() {
+            if x < area.right() && input_y < buf.area().bottom() {
+                buf[(x, input_y)].set_char(ch).set_style(prompt_style);
+            }
+            x += 1;
+        }
+        let text_x = area.x + prompt_cols;
+
+        // Draw input text or placeholder
+        if self.input.is_empty() && !(focused && self.editing) {
+            let hint = "type to search...";
+            let hint_style = Style::default().fg(theme::TEXT_DIM).bg(input_bg);
+            let mut hx = text_x;
+            for ch in hint.chars() {
+                if hx >= area.right() { break; }
+                if input_y < buf.area().bottom() {
+                    buf[(hx, input_y)].set_char(ch).set_style(hint_style);
+                }
+                hx += 1;
+            }
+        } else {
+            let input_style = Style::default().fg(fg).bg(input_bg);
+            let mut ix = text_x;
+            for ch in self.input.text.chars() {
+                if ix >= area.right() { break; }
+                if input_y < buf.area().bottom() {
+                    buf[(ix, input_y)].set_char(ch).set_style(input_style);
+                }
+                ix += 1;
+            }
+        }
+
+        // Cursor
+        if focused && self.editing {
+            let cursor_x = text_x + self.input.cursor as u16;
+            if cursor_x < area.right() && input_y < buf.area().bottom() {
+                let cursor_style = Style::default().fg(input_bg).bg(theme::TEXT_FG);
+                buf[(cursor_x, input_y)].set_style(cursor_style);
+            }
+        }
+
+        // ── Summary line (row 1) ────────────────────────────────
+        let summary_y = area.y + 1;
+        if summary_y < area.bottom() {
+            let summary = if self.query.is_empty() {
+                String::new()
+            } else if self.results.is_empty() {
+                format!(" No results for '{}'", self.query)
             } else {
-                "No results"
+                format!(" {} results", self.results.len())
             };
-            let style = Style::default().fg(theme::TEXT_DIM).bg(bg);
-            let y = area.y;
-            for (i, ch) in msg.chars().enumerate() {
-                let x = area.x + 1 + i as u16;
-                if x < area.right() {
-                    buf[(x, y)].set_char(ch).set_style(style);
+            let summary_style = Style::default()
+                .fg(if self.results.is_empty() { theme::TEXT_DIM } else { theme::WARNING })
+                .bg(bg);
+            for (i, ch) in summary.chars().enumerate() {
+                let sx = area.x + i as u16;
+                if sx < area.right() && summary_y < buf.area().bottom() {
+                    buf[(sx, summary_y)].set_char(ch).set_style(summary_style);
                 }
             }
-            return;
         }
 
-        // Header: "N results for 'query'"
-        let header = format!(" {} results for '{}'", self.results.len(), self.query);
-        let header_style = Style::default()
-            .fg(theme::WARNING)
-            .bg(bg)
-            .add_modifier(Modifier::BOLD);
-        for (i, ch) in header.chars().enumerate() {
-            let x = area.x + i as u16;
-            if x < area.right() && area.y < area.bottom() {
-                buf[(x, area.y)].set_char(ch).set_style(header_style);
-            }
-        }
-
-        // Results
-        let results_start = area.y + 1;
-        let viewport = (area.height as usize).saturating_sub(1);
+        // ── Results list (row 2+) ───────────────────────────────
+        let results_start = area.y + 2;
+        let viewport = (area.height as usize).saturating_sub(2);
         self.scroll.set_viewport(viewport);
         self.scroll.ensure_visible();
 
@@ -181,42 +259,50 @@ impl SearchPanelState {
             let text_style = Style::default().fg(fg).bg(line_bg);
 
             // Clear row
-            for x in area.x..area.right() {
-                buf[(x, y)].set_char(' ').set_style(Style::default().bg(line_bg));
+            for rx in area.x..area.right() {
+                buf[(rx, y)].set_char(' ').set_style(Style::default().bg(line_bg));
             }
 
             // Render path
-            let mut x = area.x;
+            let mut rx = area.x;
             for ch in path_str.chars() {
-                if x < area.right() {
-                    buf[(x, y)].set_char(ch).set_style(path_style);
-                    x += 1;
+                if rx < area.right() {
+                    buf[(rx, y)].set_char(ch).set_style(path_style);
+                    rx += 1;
                 }
             }
 
             // Separator
-            if x + 2 < area.right() {
-                buf[(x, y)].set_char(' ').set_style(text_style);
-                x += 1;
+            if rx + 2 < area.right() {
+                buf[(rx, y)].set_char(' ').set_style(text_style);
+                rx += 1;
             }
 
             // Render line text (truncated)
             for ch in result.line_text.chars() {
-                if x >= area.right() {
+                if rx >= area.right() {
                     break;
                 }
-                buf[(x, y)].set_char(ch).set_style(text_style);
-                x += 1;
+                buf[(rx, y)].set_char(ch).set_style(text_style);
+                rx += 1;
             }
         }
 
         // Scrollbar
-        crate::widgets::scrollbar::render_scrollbar(
-            area,
-            buf,
-            self.results.len(),
-            viewport,
-            self.scroll.offset,
-        );
+        if viewport > 0 {
+            let scrollbar_area = Rect {
+                x: area.x,
+                y: results_start,
+                width: area.width,
+                height: viewport as u16,
+            };
+            crate::widgets::scrollbar::render_scrollbar(
+                scrollbar_area,
+                buf,
+                self.results.len(),
+                viewport,
+                self.scroll.offset,
+            );
+        }
     }
 }
