@@ -16,6 +16,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::collapse_file_blocks;
 use crate::theme;
 use crate::theme::Theme;
+use crate::widgets::text_input::TextInput;
 
 // ── Data types ──────────────────────────────────────────────────
 
@@ -141,17 +142,9 @@ pub struct AgentChatState {
     /// Index of the active conversation.
     pub active_conv: usize,
 
-    pub input: String,
-    /// Cursor position as a char index (not byte offset).
-    pub input_cursor: usize,
+    pub text_input: TextInput,
     /// User-resized input area height (0 = auto-size from content).
     pub input_area_rows: u16,
-    /// Selection anchor (char index). When Some, selection spans from anchor to input_cursor.
-    pub input_sel_anchor: Option<usize>,
-    /// Undo stack: (text_snapshot, cursor_pos) before each edit.
-    input_undo_stack: Vec<(String, usize)>,
-    /// Redo stack: (text_snapshot, cursor_pos) for undone edits.
-    input_redo_stack: Vec<(String, usize)>,
     pub scroll_offset: usize,
     /// When true, the next render pass will snap scroll to the bottom.
     pub scroll_pinned_to_bottom: bool,
@@ -206,12 +199,8 @@ impl AgentChatState {
         Self {
             conversations: vec![conv],
             active_conv: 0,
-            input: String::new(),
-            input_cursor: 0,
+            text_input: TextInput::new(),
             input_area_rows: 0,
-            input_sel_anchor: None,
-            input_undo_stack: Vec::new(),
-            input_redo_stack: Vec::new(),
             scroll_offset: 0,
             scroll_pinned_to_bottom: false,
             history_index: None,
@@ -286,7 +275,7 @@ impl AgentChatState {
 
     /// Process slash commands in input. Returns true if a command was handled.
     pub fn process_slash_command(&mut self) -> bool {
-        let input = self.input.trim().to_string();
+        let input = self.text_input.text.trim().to_string();
         if !input.starts_with('/') {
             return false;
         }
@@ -323,8 +312,8 @@ impl AgentChatState {
                         Some(model.to_string());
                     self.add_system_message(&format!("Model set to: {}", model));
                 }
-                self.input.clear();
-                self.input_cursor = 0;
+                self.text_input.text.clear();
+                self.text_input.cursor = 0;
                 true
             }
             "/thinking" | "/effort" => {
@@ -345,8 +334,8 @@ impl AgentChatState {
                             self.add_system_message(
                                 "Invalid effort level. Use: off, low, medium, high, max"
                             );
-                            self.input.clear();
-                            self.input_cursor = 0;
+                            self.text_input.text.clear();
+                            self.text_input.cursor = 0;
                             return true;
                         }
                     };
@@ -354,8 +343,8 @@ impl AgentChatState {
                         Some(level.to_string());
                     self.add_system_message(&format!("Effort level set to: {}", level));
                 }
-                self.input.clear();
-                self.input_cursor = 0;
+                self.text_input.text.clear();
+                self.text_input.cursor = 0;
                 true
             }
             "/compact" => {
@@ -393,8 +382,8 @@ impl AgentChatState {
                     ));
                     let _ = chars; // used via pct
                 }
-                self.input.clear();
-                self.input_cursor = 0;
+                self.text_input.text.clear();
+                self.text_input.cursor = 0;
                 true
             }
             "/context" => {
@@ -405,8 +394,8 @@ impl AgentChatState {
                     "Context estimate: ~{} tokens (~{}% of {} limit)",
                     tokens_est, pct, limit
                 ));
-                self.input.clear();
-                self.input_cursor = 0;
+                self.text_input.text.clear();
+                self.text_input.cursor = 0;
                 true
             }
             "/namespace" | "/ns" => {
@@ -429,8 +418,8 @@ impl AgentChatState {
                         arg
                     ));
                 }
-                self.input.clear();
-                self.input_cursor = 0;
+                self.text_input.text.clear();
+                self.text_input.cursor = 0;
                 true
             }
             "/help" => {
@@ -456,14 +445,14 @@ impl AgentChatState {
                      Use @filename to reference workspace files in your prompt.\n\
                      Use /attach to attach files from outside the workspace."
                 );
-                self.input.clear();
-                self.input_cursor = 0;
+                self.text_input.text.clear();
+                self.text_input.cursor = 0;
                 true
             }
             _ => {
                 self.add_system_message(&format!("Unknown command: {}. Type /help for available commands.", cmd));
-                self.input.clear();
-                self.input_cursor = 0;
+                self.text_input.text.clear();
+                self.text_input.cursor = 0;
                 true
             }
         }
@@ -530,26 +519,26 @@ impl AgentChatState {
     /// Start renaming the active conversation. Puts current title into the input field.
     pub fn start_rename(&mut self) {
         let title = self.conversations[self.active_conv].title.clone();
-        self.input = title;
-        self.input_cursor = self.input.chars().count();
+        self.text_input.text =title;
+        self.text_input.cursor = self.text_input.char_count();
         self.renaming = true;
     }
 
     /// Confirm the rename — apply input as the new title.
     pub fn confirm_rename(&mut self) {
-        let new_title = self.input.trim().to_string();
+        let new_title = self.text_input.text.trim().to_string();
         if !new_title.is_empty() {
             self.conversations[self.active_conv].title = new_title;
         }
-        self.input.clear();
-        self.input_cursor = 0;
+        self.text_input.text.clear();
+        self.text_input.cursor = 0;
         self.renaming = false;
     }
 
     /// Cancel the rename — restore input field.
     pub fn cancel_rename(&mut self) {
-        self.input.clear();
-        self.input_cursor = 0;
+        self.text_input.text.clear();
+        self.text_input.cursor = 0;
         self.renaming = false;
     }
 
@@ -568,8 +557,8 @@ impl AgentChatState {
         self.conversations.push(conv);
         self.active_conv = self.conversations.len() - 1;
         self.scroll_offset = 0;
-        self.input.clear();
-        self.input_cursor = 0;
+        self.text_input.text.clear();
+        self.text_input.cursor = 0;
     }
 
     /// Hit-test chat conversation tabs. Returns `Some(index)` for a tab click,
@@ -647,138 +636,84 @@ impl AgentChatState {
 
     // ── Input editing ──────────────────────────────────────────
 
-    // ── Cursor helpers ──────────────────────────────────────────
-    // `input_cursor` is a CHAR INDEX (not byte offset).
-    // Use `cursor_byte_offset()` when you need the byte position for String ops.
-
-    /// Convert the char-index cursor to a byte offset into self.input.
-    fn cursor_byte_offset(&self) -> usize {
-        self.input.char_indices()
-            .nth(self.input_cursor)
-            .map(|(b, _)| b)
-            .unwrap_or(self.input.len())
-    }
-
-    /// Total char count of the input.
-    fn input_char_count(&self) -> usize {
-        self.input.chars().count()
-    }
-
-    // ── Editing operations ──────────────────────────────────────
+    // ── Editing (delegates to TextInput + autocomplete) ────────
 
     pub fn insert_char(&mut self, ch: char) {
-        self.push_undo();
-        self.delete_input_selection(); // replace selection if active
-        let byte_pos = self.cursor_byte_offset();
-        self.input.insert(byte_pos, ch);
-        self.input_cursor += 1;
+        self.text_input.insert_char(ch);
         self.update_autocomplete();
     }
 
-    /// Insert a string at the cursor position (for paste operations).
     pub fn insert_str(&mut self, text: &str) {
-        self.push_undo();
-        self.delete_input_selection();
-        let byte_pos = self.cursor_byte_offset();
-        self.input.insert_str(byte_pos, text);
-        self.input_cursor += text.chars().count();
+        self.text_input.insert_str(text);
         self.update_autocomplete();
     }
 
     pub fn backspace(&mut self) {
-        if self.has_input_selection() {
-            self.push_undo();
-            self.delete_input_selection();
-            self.update_autocomplete();
-        } else if self.input_cursor > 0 {
-            self.push_undo();
-            self.input_cursor -= 1;
-            let byte_pos = self.cursor_byte_offset();
-            let ch_len = self.input[byte_pos..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
-            self.input.drain(byte_pos..byte_pos + ch_len);
-            self.update_autocomplete();
-        }
+        self.text_input.backspace();
+        self.update_autocomplete();
     }
 
-    pub fn delete(&mut self) {
-        if self.has_input_selection() {
-            self.push_undo();
-            self.delete_input_selection();
-        } else if self.input_cursor < self.input_char_count() {
-            self.push_undo();
-            let byte_pos = self.cursor_byte_offset();
-            let ch_len = self.input[byte_pos..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
-            self.input.drain(byte_pos..byte_pos + ch_len);
-        }
+    pub fn delete_word_back(&mut self) {
+        self.text_input.delete_word_back();
+        self.update_autocomplete();
     }
 
-    pub fn move_left(&mut self) {
-        self.clear_input_selection();
-        if self.input_cursor > 0 {
-            self.input_cursor -= 1;
-        }
-    }
-
-    pub fn move_right(&mut self) {
-        self.clear_input_selection();
-        if self.input_cursor < self.input_char_count() {
-            self.input_cursor += 1;
-        }
-    }
+    // ── Multi-line cursor movement (chat-specific) ──────────────
 
     /// Move cursor up one logical line in multi-line input. Returns false if already on first line.
     #[allow(dead_code)]
     pub fn move_up(&mut self) -> bool {
-        let before = &self.input[..self.input_cursor];
-        // Find the start of the current line
+        let byte_off = self.text_input.cursor_byte_offset();
+        let before = &self.text_input.text[..byte_off];
         let cur_line_start = before.rfind('\n').map(|p| p + 1).unwrap_or(0);
         if cur_line_start == 0 {
-            return false; // already on first line
+            return false;
         }
-        let col = self.input_cursor - cur_line_start;
-        // Find the start of the previous line
-        let prev_line_start = self.input[..cur_line_start - 1]
+        let col = byte_off - cur_line_start;
+        let prev_line_start = self.text_input.text[..cur_line_start - 1]
             .rfind('\n')
             .map(|p| p + 1)
             .unwrap_or(0);
         let prev_line_len = cur_line_start - 1 - prev_line_start;
-        self.input_cursor = prev_line_start + col.min(prev_line_len);
+        // Convert byte position back to char index
+        let target_byte = prev_line_start + col.min(prev_line_len);
+        self.text_input.cursor = self.text_input.text[..target_byte].chars().count();
         true
     }
 
     /// Move cursor down one logical line in multi-line input. Returns false if already on last line.
     #[allow(dead_code)]
     pub fn move_down(&mut self) -> bool {
-        let before = &self.input[..self.input_cursor];
+        let byte_off = self.text_input.cursor_byte_offset();
+        let before = &self.text_input.text[..byte_off];
         let cur_line_start = before.rfind('\n').map(|p| p + 1).unwrap_or(0);
-        let col = self.input_cursor - cur_line_start;
-        // Find the end of the current line (next \n)
-        let next_nl = self.input[self.input_cursor..].find('\n');
+        let col = byte_off - cur_line_start;
+        let next_nl = self.text_input.text[byte_off..].find('\n');
         let Some(offset) = next_nl else {
-            return false; // already on last line
+            return false;
         };
-        let next_line_start = self.input_cursor + offset + 1;
-        let next_line_end = self.input[next_line_start..]
+        let next_line_start = byte_off + offset + 1;
+        let next_line_end = self.text_input.text[next_line_start..]
             .find('\n')
             .map(|p| next_line_start + p)
-            .unwrap_or(self.input.len());
+            .unwrap_or(self.text_input.text.len());
         let next_line_len = next_line_end - next_line_start;
-        self.input_cursor = next_line_start + col.min(next_line_len);
+        let target_byte = next_line_start + col.min(next_line_len);
+        self.text_input.cursor = self.text_input.text[..target_byte].chars().count();
         true
     }
 
     /// Whether the input contains multiple lines (has newline characters).
     pub fn input_is_multiline(&self) -> bool {
-        self.input.contains('\n')
+        self.text_input.text.contains('\n')
     }
 
     /// Whether the input would visually wrap given the available width.
     pub fn input_wraps_visually(&self, first_line_width: usize, full_width: usize) -> bool {
-        if self.input.is_empty() || full_width == 0 {
+        if self.text_input.text.is_empty() || full_width == 0 {
             return false;
         }
-        // Check if any logical line exceeds its available width
-        for (i, line) in self.input.split('\n').enumerate() {
+        for (i, line) in self.text_input.text.split('\n').enumerate() {
             let avail = if i == 0 { first_line_width } else { full_width };
             if line.chars().count() > avail {
                 return true;
@@ -788,32 +723,28 @@ impl AgentChatState {
     }
 
     /// Move cursor up one visual line given the rendering widths.
-    /// Returns false if already on the first visual line.
     pub fn move_up_visual(&mut self, first_line_width: usize, full_width: usize) -> bool {
         let lines = self.build_visual_lines(first_line_width, full_width);
-        let cursor_char_pos = self.input_cursor;
-        let (cur_vline, cur_col) = self.find_cursor_in_visual_lines(&lines, cursor_char_pos);
+        let cursor_char_pos = self.text_input.cursor;
+        let (cur_vline, cur_col) = Self::find_cursor_in_visual_lines(&lines, cursor_char_pos);
         if cur_vline == 0 {
             return false;
         }
         let (prev_start, prev_len) = lines[cur_vline - 1];
-        let new_char_pos = prev_start + cur_col.min(prev_len);
-        self.input_cursor = self.char_pos_to_byte(new_char_pos);
+        self.text_input.cursor = prev_start + cur_col.min(prev_len);
         true
     }
 
     /// Move cursor down one visual line given the rendering widths.
-    /// Returns false if already on the last visual line.
     pub fn move_down_visual(&mut self, first_line_width: usize, full_width: usize) -> bool {
         let lines = self.build_visual_lines(first_line_width, full_width);
-        let cursor_char_pos = self.input_cursor;
-        let (cur_vline, cur_col) = self.find_cursor_in_visual_lines(&lines, cursor_char_pos);
+        let cursor_char_pos = self.text_input.cursor;
+        let (cur_vline, cur_col) = Self::find_cursor_in_visual_lines(&lines, cursor_char_pos);
         if cur_vline >= lines.len() - 1 {
             return false;
         }
         let (next_start, next_len) = lines[cur_vline + 1];
-        let new_char_pos = next_start + cur_col.min(next_len);
-        self.input_cursor = self.char_pos_to_byte(new_char_pos);
+        self.text_input.cursor = next_start + cur_col.min(next_len);
         true
     }
 
@@ -821,7 +752,7 @@ impl AgentChatState {
     fn build_visual_lines(&self, first_line_width: usize, full_width: usize) -> Vec<(usize, usize)> {
         let mut lines = Vec::new();
         let mut pos = 0;
-        for (logical_idx, logical_line) in self.input.split('\n').enumerate() {
+        for (logical_idx, logical_line) in self.text_input.text.split('\n').enumerate() {
             let line_char_count = logical_line.chars().count();
             let avail = if lines.is_empty() { first_line_width } else { full_width };
             if line_char_count == 0 {
@@ -840,7 +771,7 @@ impl AgentChatState {
                 }
             }
             pos += line_char_count;
-            if logical_idx < self.input.matches('\n').count() {
+            if logical_idx < self.text_input.text.matches('\n').count() {
                 pos += 1;
             }
         }
@@ -851,7 +782,7 @@ impl AgentChatState {
     }
 
     /// Find which visual line the cursor is on and the column within it.
-    fn find_cursor_in_visual_lines(&self, lines: &[(usize, usize)], cursor_char_pos: usize) -> (usize, usize) {
+    fn find_cursor_in_visual_lines(lines: &[(usize, usize)], cursor_char_pos: usize) -> (usize, usize) {
         for (i, &(start, len)) in lines.iter().enumerate() {
             if cursor_char_pos >= start && cursor_char_pos <= start + len {
                 if cursor_char_pos < start + len || i == lines.len() - 1 {
@@ -869,159 +800,12 @@ impl AgentChatState {
         }
     }
 
-    /// Convert a char position to a byte offset in the input string.
-    fn char_pos_to_byte(&self, char_pos: usize) -> usize {
-        self.input.char_indices()
-            .nth(char_pos)
-            .map(|(byte, _)| byte)
-            .unwrap_or(self.input.len())
-    }
-
-    pub fn move_home(&mut self) {
-        self.clear_input_selection();
-        self.input_cursor = 0;
-    }
-
-    pub fn move_end(&mut self) {
-        self.clear_input_selection();
-        self.input_cursor = self.input_char_count();
-    }
-
-    // ── Selection ───────────────────────────────────────────────
-
-    /// Whether the input has an active selection.
-    pub fn has_input_selection(&self) -> bool {
-        self.input_sel_anchor.is_some() && self.input_sel_anchor != Some(self.input_cursor)
-    }
-
-    /// Get the selection range as (start_char, end_char), normalized.
-    pub fn input_selection_range(&self) -> Option<(usize, usize)> {
-        let anchor = self.input_sel_anchor?;
-        if anchor == self.input_cursor {
-            return None;
-        }
-        Some(if anchor < self.input_cursor {
-            (anchor, self.input_cursor)
-        } else {
-            (self.input_cursor, anchor)
-        })
-    }
-
-    /// Delete the selected text. Returns true if something was deleted.
-    pub fn delete_input_selection(&mut self) -> bool {
-        let Some((start, end)) = self.input_selection_range() else {
-            return false;
-        };
-        let byte_start = self.char_pos_to_byte(start);
-        let byte_end = self.char_pos_to_byte(end);
-        self.input.drain(byte_start..byte_end);
-        self.input_cursor = start;
-        self.input_sel_anchor = None;
-        true
-    }
-
-    /// Select all input text.
-    pub fn input_select_all(&mut self) {
-        self.input_sel_anchor = Some(0);
-        self.input_cursor = self.input_char_count();
-    }
-
-    /// Clear selection without moving cursor.
-    fn clear_input_selection(&mut self) {
-        self.input_sel_anchor = None;
-    }
-
-    // ── Undo / Redo ─────────────────────────────────────────────
-
-    const MAX_UNDO: usize = 50;
-
-    /// Save current state to undo stack before an edit.
-    fn push_undo(&mut self) {
-        self.input_undo_stack.push((self.input.clone(), self.input_cursor));
-        if self.input_undo_stack.len() > Self::MAX_UNDO {
-            self.input_undo_stack.remove(0);
-        }
-        self.input_redo_stack.clear();
-    }
-
-    /// Undo the last edit.
-    pub fn input_undo(&mut self) {
-        if let Some((text, cursor)) = self.input_undo_stack.pop() {
-            self.input_redo_stack.push((self.input.clone(), self.input_cursor));
-            self.input = text;
-            self.input_cursor = cursor;
-            self.input_sel_anchor = None;
-        }
-    }
-
-    /// Redo the last undone edit.
-    pub fn input_redo(&mut self) {
-        if let Some((text, cursor)) = self.input_redo_stack.pop() {
-            self.input_undo_stack.push((self.input.clone(), self.input_cursor));
-            self.input = text;
-            self.input_cursor = cursor;
-            self.input_sel_anchor = None;
-        }
-    }
-
-    // ── Word movement ───────────────────────────────────────────
-
-    /// Move cursor left by one word.
-    pub fn move_word_left(&mut self) {
-        if self.input_cursor == 0 {
-            return;
-        }
-        let chars: Vec<char> = self.input.chars().collect();
-        let mut pos = self.input_cursor;
-        // Skip non-word chars (whitespace, punctuation)
-        while pos > 0 && !chars[pos - 1].is_alphanumeric() && chars[pos - 1] != '_' {
-            pos -= 1;
-        }
-        // Skip word chars
-        while pos > 0 && (chars[pos - 1].is_alphanumeric() || chars[pos - 1] == '_') {
-            pos -= 1;
-        }
-        self.input_cursor = pos;
-    }
-
-    /// Move cursor right by one word.
-    #[allow(dead_code)]
-    pub fn move_word_right(&mut self) {
-        let chars: Vec<char> = self.input.chars().collect();
-        let len = chars.len();
-        let mut pos = self.input_cursor;
-        // Skip word chars
-        while pos < len && (chars[pos].is_alphanumeric() || chars[pos] == '_') {
-            pos += 1;
-        }
-        // Skip non-word chars
-        while pos < len && !chars[pos].is_alphanumeric() && chars[pos] != '_' {
-            pos += 1;
-        }
-        self.input_cursor = pos;
-    }
-
-    /// Delete the word before the cursor.
-    pub fn delete_word_back(&mut self) {
-        if self.input_cursor == 0 {
-            return;
-        }
-        self.push_undo();
-        let start = self.input_cursor;
-        self.move_word_left();
-        let end = start;
-        let byte_start = self.char_pos_to_byte(self.input_cursor);
-        let byte_end = self.char_pos_to_byte(end);
-        self.input.drain(byte_start..byte_end);
-    }
-
     /// Take the input text (for sending), clear the input field.
     pub fn take_input(&mut self) -> String {
-        let text = self.input.clone();
+        let text = self.text_input.text.clone();
         self.history_index = None;
         self.history_stash.clear();
-        self.input.clear();
-        self.input_cursor = 0;
+        self.text_input.clear();
         self.autocomplete.reset();
         text
     }
@@ -1044,19 +828,19 @@ impl AgentChatState {
         }
         match self.history_index {
             None => {
-                self.history_stash = self.input.clone();
+                self.history_stash = self.text_input.text.clone();
                 let idx = user_msgs.len() - 1;
                 self.history_index = Some(idx);
-                self.input = user_msgs[idx].clone();
+                self.text_input.text =user_msgs[idx].clone();
             }
             Some(idx) if idx > 0 => {
                 let new_idx = idx - 1;
                 self.history_index = Some(new_idx);
-                self.input = user_msgs[new_idx].clone();
+                self.text_input.text =user_msgs[new_idx].clone();
             }
             _ => {}
         }
-        self.input_cursor = self.input.chars().count();
+        self.text_input.cursor = self.text_input.char_count();
     }
 
     /// Navigate history downward (newer). Called when Down is pressed while browsing history.
@@ -1066,12 +850,12 @@ impl AgentChatState {
         if idx + 1 < user_msgs.len() {
             let new_idx = idx + 1;
             self.history_index = Some(new_idx);
-            self.input = user_msgs[new_idx].clone();
+            self.text_input.text =user_msgs[new_idx].clone();
         } else {
             self.history_index = None;
-            self.input = std::mem::take(&mut self.history_stash);
+            self.text_input.text =std::mem::take(&mut self.history_stash);
         }
-        self.input_cursor = self.input.chars().count();
+        self.text_input.cursor = self.text_input.char_count();
     }
 
     // ── Browse mode (copy from chat) ──────────────────────────
@@ -1250,8 +1034,8 @@ impl AgentChatState {
 
     /// Check if cursor is inside an @reference and update autocomplete state.
     fn update_autocomplete(&mut self) {
-        let byte_pos = self.cursor_byte_offset();
-        let before_cursor = &self.input[..byte_pos];
+        let byte_pos = self.text_input.cursor_byte_offset();
+        let before_cursor = &self.text_input.text[..byte_pos];
 
         // Find the last '@' before cursor that isn't preceded by a non-whitespace char
         let at_pos = before_cursor.rfind('@');
@@ -1259,7 +1043,7 @@ impl AgentChatState {
             Some(pos) => {
                 // Check that @ is at start or preceded by whitespace
                 if pos > 0 {
-                    let prev_byte = self.input.as_bytes()[pos - 1];
+                    let prev_byte = self.text_input.text.as_bytes()[pos - 1];
                     if prev_byte != b' ' && prev_byte != b'\n' && prev_byte != b'\t' {
                         self.autocomplete.reset();
                         return;
@@ -1319,14 +1103,14 @@ impl AgentChatState {
         let at_pos = self.autocomplete.at_pos;
 
         // Replace @query with @path
-        let cursor_byte = self.cursor_byte_offset();
-        let after_cursor = self.input[cursor_byte..].to_string();
-        self.input.truncate(at_pos);
-        self.input.push('@');
-        self.input.push_str(&path);
-        self.input.push(' ');
-        self.input_cursor = self.input.chars().count();
-        self.input.push_str(&after_cursor);
+        let cursor_byte = self.text_input.cursor_byte_offset();
+        let after_cursor = self.text_input.text[cursor_byte..].to_string();
+        self.text_input.text.truncate(at_pos);
+        self.text_input.text.push('@');
+        self.text_input.text.push_str(&path);
+        self.text_input.text.push(' ');
+        self.text_input.cursor = self.text_input.char_count();
+        self.text_input.text.push_str(&after_cursor);
 
         self.autocomplete.reset();
     }
@@ -1691,7 +1475,7 @@ impl AgentChatState {
         // Input height: user override if set, otherwise auto-grow from newlines
         let max_input = (inner.height / 2).max(3);
         let auto_height = {
-            let newline_count = self.input.chars().filter(|&c| c == '\n').count() as u16;
+            let newline_count = self.text_input.text.chars().filter(|&c| c == '\n').count() as u16;
             (newline_count + 2).clamp(3, max_input)
         };
         let input_height: u16 = if self.input_area_rows > 0 {
@@ -2039,7 +1823,7 @@ impl AgentChatState {
         let text_width = (area.width as usize).saturating_sub(prompt_len);
         let total_rows = area.height as usize;
 
-        if self.input.is_empty() && !self.active_conv_streaming() {
+        if self.text_input.text.is_empty() && !self.active_conv_streaming() {
             // Hint text
             let hint = "Type a message, Enter to send";
             let hint_style = Style::default()
@@ -2062,15 +1846,15 @@ impl AgentChatState {
             // Build visual lines from input, respecting actual newlines (\n)
             // and wrapping long lines within the available width.
             // Each visual line: (start_char_idx, len_chars, is_first_visual_line)
-            let input_chars: Vec<char> = self.input.chars().collect();
-            let cursor_char_pos = self.input_cursor;
+            let input_chars: Vec<char> = self.text_input.text.chars().collect();
+            let cursor_char_pos = self.text_input.cursor;
             let full_width = area.width as usize;
 
             let mut lines: Vec<(usize, usize)> = Vec::new();
             let mut pos = 0;
 
             // Split by actual newlines first, then wrap each logical line
-            for (logical_idx, logical_line) in self.input.split('\n').enumerate() {
+            for (logical_idx, logical_line) in self.text_input.text.split('\n').enumerate() {
                 let line_char_count = logical_line.chars().count();
                 let avail = if lines.is_empty() { text_width } else { full_width };
 
@@ -2092,7 +1876,7 @@ impl AgentChatState {
                 }
                 // +1 for the '\n' character between logical lines
                 pos += line_char_count;
-                if logical_idx < self.input.split('\n').count() - 1 {
+                if logical_idx < self.text_input.text.split('\n').count() - 1 {
                     pos += 1; // skip the \n char
                 }
             }
@@ -2149,7 +1933,7 @@ impl AgentChatState {
                 let x_start = if line_idx == 0 { x } else { area.x };
 
                 // Get selection range for highlighting
-                let sel_range = self.input_selection_range();
+                let sel_range = self.text_input.selection_range();
 
                 for i in 0..len {
                     let ch_idx = start + i;
