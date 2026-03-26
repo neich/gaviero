@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Well-known setting keys. Use these constants instead of raw strings
@@ -84,6 +85,10 @@ pub struct Workspace {
     folders: Vec<WorkspaceFolder>,
     workspace_settings: serde_json::Value,
     workspace_path: Option<PathBuf>,
+    /// Cached per-folder `.gaviero/settings.json` contents (keyed by folder root).
+    folder_settings_cache: HashMap<PathBuf, serde_json::Value>,
+    /// Cached user-level `~/.config/gaviero/settings.json`.
+    user_settings_cache: Option<serde_json::Value>,
 }
 
 impl Workspace {
@@ -94,11 +99,15 @@ impl Workspace {
         let file: WorkspaceFile =
             serde_json::from_str(&content).context("parsing .gaviero-workspace file")?;
 
-        Ok(Self {
+        let mut ws = Self {
             folders: file.folders,
             workspace_settings: file.settings,
             workspace_path: Some(path.to_path_buf()),
-        })
+            folder_settings_cache: HashMap::new(),
+            user_settings_cache: None,
+        };
+        ws.reload_settings_cache();
+        Ok(ws)
     }
 
     /// Create a temporary single-root workspace (no file on disk).
@@ -127,14 +136,18 @@ impl Workspace {
             Err(_) => serde_json::Value::Object(serde_json::Map::new()),
         };
 
-        Self {
+        let mut ws = Self {
             folders: vec![WorkspaceFolder {
                 path,
                 name: Some(name),
             }],
             workspace_settings,
             workspace_path: None,
-        }
+            folder_settings_cache: HashMap::new(),
+            user_settings_cache: None,
+        };
+        ws.reload_settings_cache();
+        ws
     }
 
     /// Ensure `.gaviero/settings.json` exists for all workspace roots.
@@ -214,9 +227,11 @@ impl Workspace {
 
             tracing::info!("created default settings at {}", settings_path.display());
 
-            // Reload into workspace_settings so the current session uses them
+            // Reload into workspace_settings and cache so the current session uses them
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                self.workspace_settings = val;
+                self.workspace_settings = val.clone();
+                self.folder_settings_cache
+                    .insert(folder.path.clone(), val);
             }
         }
     }
@@ -251,22 +266,41 @@ impl Workspace {
         Ok(())
     }
 
+    /// Reload cached settings from disk. Call when the file watcher reports
+    /// changes to any `settings.json` file.
+    pub fn reload_settings_cache(&mut self) {
+        // Cache per-folder settings
+        self.folder_settings_cache.clear();
+        for folder in &self.folders {
+            let settings_path = folder.path.join(".gaviero").join("settings.json");
+            if let Ok(content) = std::fs::read_to_string(&settings_path)
+                && let Ok(val) = serde_json::from_str::<serde_json::Value>(&content)
+            {
+                self.folder_settings_cache.insert(folder.path.clone(), val);
+            }
+        }
+
+        // Cache user-level settings
+        self.user_settings_cache = dirs::config_dir().and_then(|config_dir| {
+            let user_settings_path = config_dir.join("gaviero").join("settings.json");
+            std::fs::read_to_string(&user_settings_path)
+                .ok()
+                .and_then(|content| serde_json::from_str(&content).ok())
+        });
+    }
+
     /// Resolve a setting using the cascade:
     /// 1. Per-folder `.gaviero/settings.json` (if root provided)
     /// 2. Workspace-level settings
     /// 3. User-level `~/.config/gaviero/settings.json`
     /// 4. Hardcoded defaults
     pub fn resolve_setting(&self, key: &str, root: Option<&Path>) -> serde_json::Value {
-        // 1. Per-folder settings
-        if let Some(root) = root {
-            let folder_settings_path = root.join(".gaviero").join("settings.json");
-            if let Ok(content) = std::fs::read_to_string(&folder_settings_path) {
-                if let Ok(settings) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if let Some(val) = dot_get(&settings, key) {
-                        return val.clone();
-                    }
-                }
-            }
+        // 1. Per-folder settings (from cache)
+        if let Some(root) = root
+            && let Some(settings) = self.folder_settings_cache.get(root)
+            && let Some(val) = dot_get(settings, key)
+        {
+            return val.clone();
         }
 
         // 2. Workspace-level settings
@@ -274,16 +308,10 @@ impl Workspace {
             return val.clone();
         }
 
-        // 3. User-level settings
-        if let Some(config_dir) = dirs::config_dir() {
-            let user_settings_path = config_dir.join("gaviero").join("settings.json");
-            if let Ok(content) = std::fs::read_to_string(&user_settings_path) {
-                if let Ok(settings) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if let Some(val) = dot_get(&settings, key) {
-                        return val.clone();
-                    }
-                }
-            }
+        // 3. User-level settings (from cache)
+        if let Some(ref settings) = self.user_settings_cache
+            && let Some(val) = dot_get(settings, key)
+        {
         }
 
         // 4. Hardcoded defaults
@@ -427,6 +455,8 @@ mod tests {
                 "editor": { "tabSize": 2 }
             }),
             workspace_path: None,
+            folder_settings_cache: HashMap::new(),
+            user_settings_cache: None,
         };
         assert_eq!(ws.resolve_setting("editor.tabSize", None), serde_json::json!(2));
     }
@@ -449,13 +479,19 @@ mod tests {
         )
         .unwrap();
 
-        let ws = Workspace {
-            folders: vec![],
+        let mut ws = Workspace {
+            folders: vec![WorkspaceFolder {
+                path: root.to_path_buf(),
+                name: None,
+            }],
             workspace_settings: serde_json::json!({
                 "editor": { "tabSize": 2 }
             }),
             workspace_path: None,
+            folder_settings_cache: HashMap::new(),
+            user_settings_cache: None,
         };
+        ws.reload_settings_cache();
         assert_eq!(
             ws.resolve_setting("editor.tabSize", Some(root)),
             serde_json::json!(8)
