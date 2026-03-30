@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 gaviero-core = { path = "../gaviero-core" }
+gaviero-dsl = { path = "../gaviero-dsl" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
