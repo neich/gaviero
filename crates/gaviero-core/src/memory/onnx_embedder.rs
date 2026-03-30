@@ -9,15 +9,20 @@ use tokenizers::Tokenizer;
 use super::embedder::Embedder;
 use super::model_manager::{ModelInfo, ModelManager};
 
-/// ONNX-based text embedder using E5 or similar models.
+/// ONNX-based text embedder using E5, nomic-embed-text, or similar models.
 ///
 /// Uses interior mutability (Mutex) because `ort::Session::run()` requires `&mut self`
 /// but the `Embedder` trait uses `&self` for Send + Sync compatibility.
+///
+/// Supports optional task prefixes for models that require them (e.g.,
+/// nomic-embed-text-v1.5 uses "search_query: " and "search_document: ").
 pub struct OnnxEmbedder {
     session: Mutex<Session>,
     tokenizer: Tokenizer,
     dimensions: usize,
     model_id: String,
+    prefix_query: Option<String>,
+    prefix_document: Option<String>,
 }
 
 impl OnnxEmbedder {
@@ -26,7 +31,27 @@ impl OnnxEmbedder {
     pub fn from_model(model: &ModelInfo) -> Result<Self> {
         let manager = ModelManager::new();
         manager.ensure_downloaded(model)?;
-        Self::load(&manager.onnx_path(model), &manager.tokenizer_path(model), model.dimensions, model.id)
+        let mut embedder = Self::load(
+            &manager.onnx_path(model),
+            &manager.tokenizer_path(model),
+            model.dimensions,
+            model.id,
+        )?;
+
+        // Set task prefixes based on model
+        match model.id {
+            "nomic-embed-text-v1.5" => {
+                embedder.prefix_query = Some("search_query: ".to_string());
+                embedder.prefix_document = Some("search_document: ".to_string());
+            }
+            "e5-small-v2" => {
+                embedder.prefix_query = Some("query: ".to_string());
+                embedder.prefix_document = Some("passage: ".to_string());
+            }
+            _ => {}
+        }
+
+        Ok(embedder)
     }
 
     /// Load an ONNX model and tokenizer from paths.
@@ -51,6 +76,8 @@ impl OnnxEmbedder {
             tokenizer,
             dimensions,
             model_id: model_id.to_string(),
+            prefix_query: None,
+            prefix_document: None,
         })
     }
 
@@ -123,6 +150,9 @@ impl OnnxEmbedder {
                 }
             }
 
+            // Truncate to target dimensions (Matryoshka support)
+            sum.truncate(self.dimensions);
+
             // L2 normalize
             let norm: f32 = sum.iter().map(|v| v * v).sum::<f32>().sqrt();
             if norm > 0.0 {
@@ -141,6 +171,24 @@ impl OnnxEmbedder {
 impl Embedder for OnnxEmbedder {
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let results = self.run_inference(&[text])?;
+        results.into_iter().next().context("empty inference result")
+    }
+
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        let prefixed = match &self.prefix_query {
+            Some(prefix) => format!("{prefix}{text}"),
+            None => text.to_string(),
+        };
+        let results = self.run_inference(&[&prefixed])?;
+        results.into_iter().next().context("empty inference result")
+    }
+
+    fn embed_document(&self, text: &str) -> Result<Vec<f32>> {
+        let prefixed = match &self.prefix_document {
+            Some(prefix) => format!("{prefix}{text}"),
+            None => text.to_string(),
+        };
+        let results = self.run_inference(&[&prefixed])?;
         results.into_iter().next().context("empty inference result")
     }
 
@@ -171,5 +219,22 @@ mod tests {
         // Verify L2 normalization
         let norm: f32 = embedding.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    #[ignore] // Requires ONNX model to be downloaded
+    fn test_nomic_embedder() {
+        let embedder = OnnxEmbedder::from_model(&super::super::model_manager::NOMIC_EMBED_TEXT_V1_5)
+            .expect("Failed to load nomic model");
+
+        // Test query embedding
+        let query_emb = embedder.embed_query("What is Rust?").unwrap();
+        assert_eq!(query_emb.len(), 768);
+        let norm: f32 = query_emb.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 0.01);
+
+        // Test document embedding
+        let doc_emb = embedder.embed_document("Rust is a systems programming language").unwrap();
+        assert_eq!(doc_emb.len(), 768);
     }
 }
