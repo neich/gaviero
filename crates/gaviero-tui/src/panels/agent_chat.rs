@@ -436,6 +436,9 @@ impl AgentChatState {
                      /detach <name|all> — Remove attachment(s)\n\
                      /compact [N]       — Keep last N messages (default 6), discard older\n\
                      /context           — Show estimated context usage\n\
+                     /run <path>        — Execute a .gaviero DSL script\n\
+                     /swarm <task>      — Plan and execute a multi-agent swarm\n\
+                     /cswarm <task>     — Coordinated swarm (Opus plans, Sonnet/Haiku execute)\n\
                      /help              — Show this help\n\n\
                      Keyboard shortcuts:\n\
                      F2                 — Rename active conversation tab\n\
