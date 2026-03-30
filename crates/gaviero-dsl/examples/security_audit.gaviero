@@ -1,0 +1,116 @@
+// Workflow: Security Audit with Verification Tests
+//
+// Scans for vulnerabilities, applies fixes, then writes and
+// runs security-focused tests to prove the fixes hold.
+
+client opus {
+    tier reasoning
+    model "claude-opus-4-6"
+}
+
+client sonnet {
+    tier execution
+    model "claude-sonnet-4-6"
+}
+
+agent scan {
+    description "Scan codebase for security vulnerabilities"
+    client opus
+    scope {
+        owned    ["docs/security_findings.md"]
+        read_only ["src/" "Cargo.toml" "Cargo.lock"]
+    }
+    prompt #"
+        Perform a security audit. Check for:
+        - SQL injection (raw query construction)
+        - Command injection (shell_exec, Command::new with user input)
+        - Path traversal (unchecked user paths joined to fs roots)
+        - Unsafe blocks without safety comments
+        - Dependencies with known CVEs (check Cargo.lock versions)
+        - Hardcoded secrets or API keys
+
+        For each finding, write to docs/security_findings.md:
+        - File and line number
+        - Severity: critical / high / medium / low
+        - Description and exploit scenario
+        - Recommended fix
+    "#
+}
+
+agent fix_vulnerabilities {
+    description "Apply security fixes for critical and high findings"
+    client sonnet
+    depends_on [scan]
+    scope {
+        owned    ["src/"]
+        read_only ["docs/security_findings.md" "tests/"]
+    }
+    prompt #"
+        Read docs/security_findings.md.
+        Fix all CRITICAL and HIGH severity findings:
+        - Sanitize inputs at trust boundaries
+        - Use parameterized queries instead of string concatenation
+        - Validate paths before filesystem operations
+        - Add safety comments to unavoidable unsafe blocks
+
+        Do NOT fix MEDIUM/LOW findings (separate task).
+        Run `cargo test` after each fix to avoid regressions.
+    "#
+    max_retries 2
+}
+
+agent write_security_tests {
+    description "Write tests that prove vulnerabilities are fixed"
+    client sonnet
+    depends_on [fix_vulnerabilities]
+    scope {
+        owned    ["tests/security/"]
+        read_only ["src/" "docs/security_findings.md"]
+    }
+    prompt #"
+        For each CRITICAL/HIGH finding in docs/security_findings.md,
+        write a regression test that:
+        1. Reproduces the original attack vector
+        2. Asserts the fix prevents the exploit
+
+        Examples:
+        - Path traversal: test that "../../../etc/passwd" is rejected
+        - Injection: test that "; rm -rf /" in input is sanitized
+        - Overflow: test boundary values don't panic
+
+        Put tests in tests/security/ as integration tests.
+        Run `cargo test` to verify they pass.
+    "#
+}
+
+agent final_verification {
+    description "Run full test suite including new security tests"
+    client sonnet
+    depends_on [write_security_tests]
+    scope {
+        owned    ["docs/security_report.md"]
+        read_only ["src/" "tests/" "docs/security_findings.md"]
+    }
+    prompt #"
+        Run the complete test suite:
+          cargo test --workspace
+
+        Write docs/security_report.md:
+        ## Findings addressed
+        - List each critical/high finding and its fix
+
+        ## Security tests added
+        - List each new test and what it validates
+
+        ## Test results
+        - Total: N passed, M failed
+        - Security tests: all pass / failures listed
+
+        ## Remaining work
+        - Medium/low findings not yet addressed
+    "#
+}
+
+workflow security_audit {
+    steps [scan fix_vulnerabilities write_security_tests final_verification]
+}
