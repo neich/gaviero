@@ -1,0 +1,77 @@
+// Workflow: Bug fix with mandatory test verification
+//
+// Three-stage pipeline: diagnose the bug, fix it, then verify
+// the fix passes tests. Each agent has scoped file access to
+// prevent accidental changes outside its responsibility.
+
+client opus {
+    tier coordinator
+    model "claude-opus-4-6"
+    privacy public
+}
+
+client sonnet {
+    tier execution
+    model "claude-sonnet-4-6"
+}
+
+agent diagnose {
+    description "Analyze the bug report and identify root cause"
+    client opus
+    scope {
+        read_only ["src/" "tests/" "Cargo.toml"]
+    }
+    prompt #"
+        You are a senior Rust developer investigating a bug.
+        Read the failing test(s) and trace back to the root cause.
+        Write a diagnosis document listing:
+        1. Which test(s) fail and the exact assertion/panic
+        2. The call chain from the test to the defective code
+        3. The minimal fix strategy (what to change and why)
+        Output your findings to docs/diagnosis.md.
+    "#
+    max_retries 2
+}
+
+agent fix {
+    description "Apply the minimal code fix identified by diagnosis"
+    client sonnet
+    depends_on [diagnose]
+    scope {
+        owned    ["src/"]
+        read_only ["docs/diagnosis.md" "tests/"]
+    }
+    prompt #"
+        Read docs/diagnosis.md for the root-cause analysis.
+        Apply the MINIMAL fix — change only what is necessary.
+        Do not refactor surrounding code, add features, or
+        modify tests. The existing tests must pass as-is.
+    "#
+}
+
+agent verify {
+    description "Run the full test suite and confirm the fix"
+    client sonnet
+    depends_on [fix]
+    scope {
+        owned    ["docs/verification.md"]
+        read_only ["src/" "tests/"]
+    }
+    prompt #"
+        Run `cargo test` on the full project.
+        If ALL tests pass, write docs/verification.md confirming:
+        - Which tests were previously failing
+        - Confirmation they now pass
+        - Any warnings or regressions observed
+
+        If tests STILL FAIL, write docs/verification.md with:
+        - The failing test output
+        - What the fix missed
+        - Suggested next steps
+    "#
+    max_retries 3
+}
+
+workflow bugfix {
+    steps [diagnose fix verify]
+}
