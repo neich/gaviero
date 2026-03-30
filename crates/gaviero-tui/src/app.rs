@@ -1247,6 +1247,8 @@ impl App {
                         self.handle_attach_command();
                     } else if self.chat_state.text_input.text.trim().starts_with("/detach") {
                         self.handle_detach_command();
+                    } else if self.chat_state.text_input.text.trim().starts_with("/run") {
+                        self.handle_run_script_command();
                     } else if !self.chat_state.process_slash_command() {
                         self.send_chat_message();
                     }
@@ -1931,6 +1933,118 @@ impl App {
                         conv_id: String::new(),
                         role: "system".to_string(),
                         content: format!("Swarm execution failed: {}", e),
+                    });
+                }
+            }
+        });
+    }
+
+    /// Handle `/run <path.gaviero>` — compile and execute a DSL script.
+    fn handle_run_script_command(&mut self) {
+        let input = self.chat_state.take_input();
+        let script_path = input
+            .trim()
+            .strip_prefix("/run")
+            .unwrap_or("")
+            .trim()
+            .to_string();
+
+        if script_path.is_empty() {
+            self.chat_state.add_system_message(
+                "Usage: /run <path.gaviero>\n\
+                 Compiles and executes a .gaviero DSL script.\n\
+                 Example: /run workflows/security_audit.gaviero",
+            );
+            return;
+        }
+
+        // Resolve path relative to workspace root
+        let root = self.workspace.roots().first()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let resolved = if std::path::Path::new(&script_path).is_absolute() {
+            std::path::PathBuf::from(&script_path)
+        } else {
+            root.join(&script_path)
+        };
+
+        // Read the script file
+        let source = match std::fs::read_to_string(&resolved) {
+            Ok(s) => s,
+            Err(e) => {
+                self.chat_state.add_system_message(
+                    &format!("Cannot read {}: {}", resolved.display(), e),
+                );
+                return;
+            }
+        };
+
+        // Compile synchronously (fast, no LLM call)
+        let filename = resolved.display().to_string();
+        let work_units = match gaviero_dsl::compile(&source, &filename, None) {
+            Ok(units) => units,
+            Err(report) => {
+                self.chat_state.add_system_message(
+                    &format!("DSL compilation failed:\n{}", report),
+                );
+                return;
+            }
+        };
+
+        let unit_count = work_units.len();
+        self.chat_state.add_user_message(&format!("/run {}", script_path));
+        self.chat_state.add_system_message(&format!(
+            "Compiled {} → {} agent(s). Executing...\n\
+             Switch to SWARM panel (Ctrl+Shift+P) to monitor progress.",
+            script_path, unit_count
+        ));
+
+        // Switch to swarm dashboard
+        self.side_panel = SidePanelMode::SwarmDashboard;
+        self.panel_visible.side_panel = true;
+        self.swarm_dashboard.reset("compiled");
+        self.swarm_dashboard.status_message = format!(
+            "Script: {} ({} agents)",
+            script_path, unit_count
+        );
+
+        let tx = self.event_tx.clone();
+        let model = self.chat_state.effective_model().to_string();
+        let write_ns = self.chat_state.agent_settings.write_namespace.clone();
+        let read_ns = self.chat_state.agent_settings.read_namespaces.clone();
+        let memory = self.memory.clone();
+
+        tokio::spawn(async move {
+            use gaviero_core::swarm::pipeline;
+
+            let config = pipeline::SwarmConfig {
+                max_parallel: unit_count.min(4),
+                workspace_root: root,
+                model,
+                use_worktrees: unit_count > 1,
+                read_namespaces: read_ns,
+                write_namespace: write_ns,
+            };
+
+            let observer = TuiSwarmObserver { tx: tx.clone() };
+            let tx2 = tx.clone();
+            let make_obs = move |agent_id: &str| -> Box<dyn gaviero_core::observer::AcpObserver> {
+                Box::new(TuiAcpObserver {
+                    tx: tx2.clone(),
+                    conv_id: format!("swarm-{}", agent_id),
+                })
+            };
+
+            match pipeline::execute(work_units, &config, memory, &observer, make_obs).await {
+                Ok(result) => {
+                    let _ = tx.send(Event::SwarmCompleted(Box::new(result)));
+                }
+                Err(e) => {
+                    let _ = tx.send(Event::SwarmPhaseChanged("failed".to_string()));
+                    let _ = tx.send(Event::MessageComplete {
+                        conv_id: String::new(),
+                        role: "system".to_string(),
+                        content: format!("Script execution failed: {}", e),
                     });
                 }
             }
