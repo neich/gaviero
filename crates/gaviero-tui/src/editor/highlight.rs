@@ -49,6 +49,7 @@ fn bundled_highlight_query(lang: &str, _file: &str) -> Result<String> {
         "python" => Ok(include_str!("../../../../queries/python/highlights.scm").to_string()),
         "yaml" => Ok(include_str!("../../../../queries/yaml/highlights.scm").to_string()),
         "kotlin" => Ok(include_str!("../../../../queries/kotlin/highlights.scm").to_string()),
+        "gaviero" => Ok(include_str!("../../../../queries/gaviero/highlights.scm").to_string()),
         _ => bail!("no bundled highlights.scm for {}", lang),
     }
 }
