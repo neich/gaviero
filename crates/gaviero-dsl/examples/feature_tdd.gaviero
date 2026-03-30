@@ -1,0 +1,84 @@
+// Workflow: Test-Driven Feature Development
+//
+// TDD approach: write tests first, then implement until they pass.
+// A final verification agent runs the full suite to catch regressions.
+
+client opus {
+    tier coordinator
+    model "claude-opus-4-6"
+}
+
+client sonnet {
+    tier execution
+    model "claude-sonnet-4-6"
+}
+
+agent write_tests {
+    description "Write tests for the new feature before implementation"
+    client opus
+    scope {
+        owned    ["tests/"]
+        read_only ["src/" "Cargo.toml"]
+    }
+    prompt #"
+        You are writing tests FIRST (TDD red phase).
+        Based on the feature requirements, write comprehensive tests:
+        - Unit tests for each new function/method
+        - Integration tests for the public API surface
+        - Edge cases: empty input, invalid input, boundary values
+
+        The tests MUST compile but SHOULD FAIL (no implementation yet).
+        Use `todo!()` stubs in src/ if needed for compilation.
+        Write tests in the appropriate test module(s).
+    "#
+}
+
+agent implement {
+    description "Implement the feature to make all tests pass"
+    client sonnet
+    depends_on [write_tests]
+    scope {
+        owned    ["src/"]
+        read_only ["tests/" "Cargo.toml"]
+    }
+    prompt #"
+        Implement the feature so that ALL tests written by the
+        previous agent pass. Follow existing code patterns.
+
+        Rules:
+        - Do NOT modify the tests — they define the contract
+        - Remove any `todo!()` stubs and replace with real code
+        - Run `cargo test` to verify each change
+        - Keep the implementation minimal and correct
+    "#
+    max_retries 2
+}
+
+agent verify_no_regressions {
+    description "Run full test suite and confirm zero regressions"
+    client sonnet
+    depends_on [implement]
+    scope {
+        owned    ["docs/test_report.md"]
+        read_only ["src/" "tests/"]
+    }
+    prompt #"
+        Run `cargo test` with verbose output.
+        Write docs/test_report.md with:
+
+        ## New tests
+        List each new test and whether it passes.
+
+        ## Existing tests
+        Confirm ALL pre-existing tests still pass.
+
+        ## Summary
+        PASS: all N tests pass, 0 failures
+        or
+        FAIL: list failures with output
+    "#
+}
+
+workflow tdd_feature {
+    steps [write_tests implement verify_no_regressions]
+}

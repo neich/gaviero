@@ -23,6 +23,10 @@ struct Cli {
     #[arg(long, conflicts_with = "task")]
     work_units: Option<String>,
 
+    /// Path to a .gaviero DSL script file.
+    #[arg(long, conflicts_with_all = ["task", "work_units"])]
+    script: Option<PathBuf>,
+
     /// Auto-accept all changes (no interactive review).
     #[arg(long)]
     auto_accept: bool,
@@ -160,7 +164,17 @@ async fn main() -> Result<()> {
         };
 
     // Parse work units
-    let work_units = if let Some(ref task) = cli.task {
+    #[allow(deprecated)] // AgentBackend::default() is deprecated but still required by WorkUnit
+    let work_units = if let Some(ref script_path) = cli.script {
+        let source = std::fs::read_to_string(script_path)
+            .with_context(|| format!("reading script: {}", script_path.display()))?;
+        let filename = script_path.display().to_string();
+        gaviero_dsl::compile(&source, &filename, None)
+            .map_err(|report| {
+                eprintln!("{:?}", report);
+                anyhow::anyhow!("DSL compilation failed")
+            })?
+    } else if let Some(ref task) = cli.task {
         vec![WorkUnit {
             id: "task-0".to_string(),
             description: task.clone(),
@@ -183,7 +197,7 @@ async fn main() -> Result<()> {
         serde_json::from_str::<Vec<WorkUnit>>(json)
             .context("parsing --work-units JSON")?
     } else {
-        anyhow::bail!("Either --task or --work-units is required");
+        anyhow::bail!("Either --task, --work-units, or --script is required");
     };
 
     // Execute via swarm pipeline
@@ -198,6 +212,9 @@ async fn main() -> Result<()> {
     };
 
     let result = if cli.coordinated {
+        if cli.script.is_some() {
+            anyhow::bail!("--coordinated requires --task, not --script");
+        }
         let task = cli.task.as_deref()
             .ok_or_else(|| anyhow::anyhow!("--coordinated requires --task"))?;
         let tier_config = gaviero_core::swarm::router::TierConfig::default();

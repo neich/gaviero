@@ -1,0 +1,91 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Gaviero",
+  "scopeName": "source.gaviero",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#raw-strings" },
+    { "include": "#strings" },
+    { "include": "#declarations" },
+    { "include": "#field-keywords" },
+    { "include": "#tier-values" },
+    { "include": "#privacy-values" },
+    { "include": "#numbers" },
+    { "include": "#punctuation" }
+  ],
+  "repository": {
+    "comments": {
+      "name": "comment.line.double-slash.gaviero",
+      "match": "//.*$"
+    },
+    "raw-strings": {
+      "name": "string.quoted.other.raw.gaviero",
+      "begin": "#\"",
+      "end": "\"#",
+      "patterns": [
+        {
+          "name": "constant.character.escape.gaviero",
+          "match": "\\{\\{|\\}\\}"
+        }
+      ]
+    },
+    "strings": {
+      "name": "string.quoted.double.gaviero",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.gaviero",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "declarations": {
+      "patterns": [
+        {
+          "match": "\\b(client|agent|workflow)\\s+([a-zA-Z_][a-zA-Z0-9_-]*)",
+          "captures": {
+            "1": { "name": "keyword.declaration.gaviero" },
+            "2": { "name": "entity.name.type.gaviero" }
+          }
+        }
+      ]
+    },
+    "field-keywords": {
+      "match": "\\b(tier|model|privacy|scope|owned|read_only|depends_on|prompt|description|max_retries|steps|max_parallel)\\b",
+      "name": "keyword.other.field.gaviero"
+    },
+    "tier-values": {
+      "match": "\\b(coordinator|reasoning|execution|mechanical)\\b",
+      "name": "constant.language.tier.gaviero"
+    },
+    "privacy-values": {
+      "match": "\\b(public|local_only)\\b",
+      "name": "constant.language.privacy.gaviero"
+    },
+    "numbers": {
+      "name": "constant.numeric.integer.gaviero",
+      "match": "\\b[0-9]+\\b"
+    },
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "punctuation.section.block.begin.gaviero",
+          "match": "\\{"
+        },
+        {
+          "name": "punctuation.section.block.end.gaviero",
+          "match": "\\}"
+        },
+        {
+          "name": "punctuation.section.brackets.begin.gaviero",
+          "match": "\\["
+        },
+        {
+          "name": "punctuation.section.brackets.end.gaviero",
+          "match": "\\]"
+        }
+      ]
+    }
+  }
+}

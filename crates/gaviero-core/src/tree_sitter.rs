@@ -23,6 +23,7 @@ const LANGUAGE_REGISTRY: &[(&[&str], &str, Option<GrammarFn>)] = &[
     (&["py", "pyi"], "python", Some(|| tree_sitter_python::LANGUAGE.into())),
     (&["yml", "yaml"], "yaml", Some(|| tree_sitter_yaml::LANGUAGE.into())),
     (&["kt", "kts"], "kotlin", Some(|| tree_sitter_kotlin_ng::LANGUAGE.into())),
+    (&["gaviero"], "gaviero", Some(|| tree_sitter_gaviero::LANGUAGE.into())),
     (&["md", "markdown"], "markdown", None),
 ];
 

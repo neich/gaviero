@@ -1,0 +1,9 @@
+{
+  "name": "tree-sitter-gaviero",
+  "version": "0.1.0",
+  "description": "Tree-sitter grammar for the Gaviero DSL",
+  "main": "bindings/node",
+  "devDependencies": {
+    "tree-sitter-cli": "^0.24.0"
+  }
+}

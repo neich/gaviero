@@ -1,0 +1,13 @@
+=====
+Raw string prompt
+=====
+
+agent x { prompt #"hello world"# }
+
+-----
+
+(source_file
+  (agent_declaration
+    (identifier)
+    (agent_field
+      (raw_string))))

@@ -1,0 +1,28 @@
+{
+  "name": "gaviero-lang",
+  "displayName": "Gaviero DSL",
+  "description": "Syntax highlighting for Gaviero (.gaviero) workflow scripts",
+  "version": "0.1.0",
+  "publisher": "gaviero",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "gaviero",
+        "aliases": ["Gaviero", "gaviero"],
+        "extensions": [".gaviero"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "gaviero",
+        "scopeName": "source.gaviero",
+        "path": "./syntaxes/gaviero.tmLanguage.json"
+      }
+    ]
+  }
+}

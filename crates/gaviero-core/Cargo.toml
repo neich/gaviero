@@ -36,6 +36,7 @@ codebook-tree-sitter-latex = "0.6"
 tree-sitter-python = "0.25"
 tree-sitter-yaml = "0.7"
 tree-sitter-kotlin-ng = "1.1.0"
+tree-sitter-gaviero = { path = "../tree-sitter-gaviero" }
 reqwest = { workspace = true }
 async-trait = "0.1"
 futures = "0.3"

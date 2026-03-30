@@ -1,0 +1,57 @@
+pub mod ast;
+pub mod compiler;
+pub mod error;
+pub mod lexer;
+pub mod parser;
+
+pub use error::{DslError, DslErrors};
+
+use gaviero_core::swarm::models::WorkUnit;
+
+/// Compile a `.gaviero` DSL script into a list of [`WorkUnit`]s.
+///
+/// # Parameters
+/// - `source`: The raw script text.
+/// - `filename`: Used in error messages to identify the file.
+/// - `workflow`: Optional workflow name to select from the script.
+///   - `None` and exactly one workflow declared → use it.
+///   - `None` and no workflow declared → run all agents in declaration order.
+///   - `None` and multiple workflows → error; specify one.
+///
+/// # Errors
+/// Returns a [`miette::Report`] with colorful source diagnostics if lexing,
+/// parsing, or compilation fails.
+pub fn compile(
+    source: &str,
+    filename: &str,
+    workflow: Option<&str>,
+) -> Result<Vec<WorkUnit>, miette::Report> {
+    use miette::NamedSource;
+
+    // Phase 1: Lex
+    let (tokens, lex_errors) = lexer::lex(source);
+    if !lex_errors.is_empty() {
+        let errors = lex_errors
+            .into_iter()
+            .map(|span| DslError::Lex {
+                src: NamedSource::new(filename, source.to_string()),
+                span: (span.start, span.end.saturating_sub(span.start).max(1)).into(),
+            })
+            .collect::<Vec<_>>();
+        return Err(miette::Report::new(DslErrors::new(errors)));
+    }
+
+    // Phase 2: Parse
+    let (ast, parse_errors) = parser::parse(&tokens, source, filename);
+    if !parse_errors.is_empty() {
+        return Err(miette::Report::new(DslErrors::new(parse_errors)));
+    }
+    let ast = match ast {
+        Some(a) => a,
+        None => return Err(miette::Report::msg("parsing produced no output")),
+    };
+
+    // Phase 3: Compile
+    compiler::compile_ast(&ast, source, filename, workflow)
+        .map_err(|e| miette::Report::new(e))
+}

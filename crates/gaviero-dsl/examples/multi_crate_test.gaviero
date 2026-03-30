@@ -1,0 +1,67 @@
+// Workflow: Multi-Crate Change with Cross-Crate Test Verification
+//
+// Modifies a library crate and its downstream consumers,
+// then verifies tests pass across the entire workspace.
+
+client sonnet {
+    tier execution
+    model "claude-sonnet-4-6"
+}
+
+agent change_core {
+    description "Apply changes to the core library crate"
+    client sonnet
+    scope {
+        owned    ["crates/gaviero-core/src/"]
+        read_only ["crates/gaviero-core/Cargo.toml" "crates/gaviero-tui/src/" "crates/gaviero-cli/src/"]
+    }
+    prompt #"
+        Apply the requested change to gaviero-core.
+        Before modifying any public API:
+        1. Grep for all call sites in gaviero-tui and gaviero-cli
+        2. Ensure the change is backward-compatible, or note
+           what downstream changes will be needed
+        3. Run `cargo check -p gaviero-core` after changes
+    "#
+}
+
+agent update_consumers {
+    description "Update downstream crates that depend on core changes"
+    client sonnet
+    depends_on [change_core]
+    scope {
+        owned    ["crates/gaviero-cli/src/" "crates/gaviero-tui/src/"]
+        read_only ["crates/gaviero-core/src/"]
+    }
+    prompt #"
+        Run `cargo check --workspace` to find compilation errors.
+        Fix all errors in gaviero-cli and gaviero-tui caused by
+        the core changes. Do not change gaviero-core.
+    "#
+}
+
+agent workspace_test {
+    description "Run full workspace test suite"
+    client sonnet
+    depends_on [update_consumers]
+    scope {
+        owned    ["docs/test_results.md"]
+        read_only ["crates/"]
+    }
+    prompt #"
+        Run the FULL workspace test suite:
+          cargo test --workspace
+
+        Write docs/test_results.md with:
+        - Per-crate test counts (pass/fail)
+        - Any new warnings from clippy
+        - Final verdict: PASS or FAIL
+
+        If any crate's tests fail, list the exact failures.
+    "#
+    max_retries 2
+}
+
+workflow cross_crate_change {
+    steps [change_core update_consumers workspace_test]
+}

@@ -1,0 +1,107 @@
+// Workflow: Safe Refactoring with Test Guardrails
+//
+// Pattern: snapshot tests -> refactor -> verify tests still pass.
+// Two parallel analysis agents feed into the refactor agent.
+
+client opus {
+    tier coordinator
+    model "claude-opus-4-6"
+}
+
+client sonnet {
+    tier execution
+    model "claude-sonnet-4-6"
+}
+
+client haiku {
+    tier mechanical
+    model "claude-haiku-4-5"
+    privacy local_only
+}
+
+agent analyze_coverage {
+    description "Map test coverage before refactoring"
+    client haiku
+    scope {
+        owned    ["docs/coverage_map.md"]
+        read_only ["src/" "tests/"]
+    }
+    prompt #"
+        Analyze the existing test suite:
+        1. List every test function and what source code it exercises
+        2. Identify source functions/methods with NO test coverage
+        3. Rate overall coverage: high / medium / low per module
+
+        Write the coverage map to docs/coverage_map.md.
+        This will guide the refactoring agent on what is safe to change.
+    "#
+}
+
+agent analyze_structure {
+    description "Identify refactoring targets and risks"
+    client opus
+    scope {
+        owned    ["docs/refactor_plan.md"]
+        read_only ["src/" "tests/"]
+    }
+    prompt #"
+        Analyze the codebase for refactoring opportunities:
+        - Functions longer than 50 lines
+        - Duplicated logic across modules
+        - Complex match arms that could be simplified
+        - Public API that could be narrowed
+
+        For each target, assess:
+        - Risk: does it have test coverage? (check docs/coverage_map.md)
+        - Scope: how many callers depend on it?
+        - Priority: code smell severity
+
+        Write docs/refactor_plan.md with ranked targets.
+    "#
+    depends_on [analyze_coverage]
+}
+
+agent refactor {
+    description "Apply refactoring changes"
+    client sonnet
+    depends_on [analyze_structure]
+    scope {
+        owned    ["src/"]
+        read_only ["docs/refactor_plan.md" "docs/coverage_map.md" "tests/"]
+    }
+    prompt #"
+        Apply the refactoring plan from docs/refactor_plan.md.
+
+        CRITICAL RULES:
+        - Only refactor items marked as COVERED by tests
+        - Do NOT change public API signatures
+        - Do NOT modify tests
+        - Run `cargo test` after each change
+        - If a test breaks, REVERT that change and move on
+    "#
+    max_retries 2
+}
+
+agent verify {
+    description "Run full test suite and diff check"
+    client sonnet
+    depends_on [refactor]
+    scope {
+        owned    ["docs/refactor_report.md"]
+        read_only ["src/" "tests/"]
+    }
+    prompt #"
+        Final verification:
+        1. Run `cargo test` — all tests must pass
+        2. Run `cargo clippy` — no new warnings
+        3. Summarize: which refactorings were applied, which skipped
+
+        Write docs/refactor_report.md with results.
+        If ANY test fails, mark the report as FAILED.
+    "#
+}
+
+workflow safe_refactor {
+    steps [analyze_coverage analyze_structure refactor verify]
+    max_parallel 2
+}
