@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/gaviero-core", "crates/gaviero-tui", "crates/gaviero-cli"]
+members = ["crates/gaviero-core", "crates/gaviero-tui", "crates/gaviero-cli", "crates/gaviero-dsl", "crates/tree-sitter-gaviero"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -12,3 +12,7 @@ tracing-subscriber = "0.3"
 dirs = "6"
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
+logos = "0.14"
+chumsky = "0.12"
+miette = { version = "7", features = ["fancy"] }
+thiserror = "2"
