@@ -312,6 +312,7 @@ impl Workspace {
         if let Some(ref settings) = self.user_settings_cache
             && let Some(val) = dot_get(settings, key)
         {
+            return val.clone();
         }
 
         // 4. Hardcoded defaults
