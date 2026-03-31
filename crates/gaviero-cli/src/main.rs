@@ -165,17 +165,18 @@ async fn main() -> Result<()> {
 
     // Parse work units
     #[allow(deprecated)] // AgentBackend::default() is deprecated but still required by WorkUnit
-    let work_units = if let Some(ref script_path) = cli.script {
+    let (work_units, script_max_parallel) = if let Some(ref script_path) = cli.script {
         let source = std::fs::read_to_string(script_path)
             .with_context(|| format!("reading script: {}", script_path.display()))?;
         let filename = script_path.display().to_string();
-        gaviero_dsl::compile(&source, &filename, None)
+        let compiled = gaviero_dsl::compile(&source, &filename, None)
             .map_err(|report| {
                 eprintln!("{:?}", report);
                 anyhow::anyhow!("DSL compilation failed")
-            })?
+            })?;
+        (compiled.work_units, compiled.max_parallel)
     } else if let Some(ref task) = cli.task {
-        vec![WorkUnit {
+        let units = vec![WorkUnit {
             id: "task-0".to_string(),
             description: task.clone(),
             scope: gaviero_core::types::FileScope {
@@ -192,21 +193,29 @@ async fn main() -> Result<()> {
             estimated_tokens: 0,
             max_retries: 1,
             escalation_tier: None,
-        }]
+            read_namespaces: None,
+            write_namespace: None,
+            memory_importance: None,
+            staleness_sources: Vec::new(),
+        }];
+        (units, None)
     } else if let Some(ref json) = cli.work_units {
-        serde_json::from_str::<Vec<WorkUnit>>(json)
-            .context("parsing --work-units JSON")?
+        let units = serde_json::from_str::<Vec<WorkUnit>>(json)
+            .context("parsing --work-units JSON")?;
+        (units, None)
     } else {
         anyhow::bail!("Either --task, --work-units, or --script is required");
     };
 
     // Execute via swarm pipeline
+    // Script's max_parallel overrides the CLI flag when declared.
+    let effective_max_parallel = script_max_parallel.unwrap_or(cli.max_parallel);
     let swarm_observer = CliSwarmObserver;
     let config = gaviero_core::swarm::pipeline::SwarmConfig {
-        max_parallel: cli.max_parallel,
+        max_parallel: effective_max_parallel,
         workspace_root: repo,
         model: cli.model.clone(),
-        use_worktrees: cli.max_parallel > 1,
+        use_worktrees: effective_max_parallel > 1,
         read_namespaces: read_nss,
         write_namespace: write_ns,
     };
