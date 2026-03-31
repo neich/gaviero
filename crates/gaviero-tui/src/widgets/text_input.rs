@@ -292,6 +292,7 @@ impl TextInput {
     }
 
     /// Delete the selected text. Returns true if something was deleted.
+    #[allow(dead_code)]
     pub fn delete_selection(&mut self) -> bool {
         if !self.has_selection() {
             return false;
@@ -307,6 +308,7 @@ impl TextInput {
     }
 
     /// Clear selection without moving cursor.
+    #[allow(dead_code)]
     pub fn clear_selection(&mut self) {
         self.sel_anchor = None;
     }
