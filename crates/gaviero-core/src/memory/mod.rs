@@ -3,15 +3,17 @@ pub mod schema;
 pub mod onnx_embedder;
 pub mod store;
 pub mod model_manager;
+pub mod code_graph;
+pub mod consolidation;
 
 pub use embedder::Embedder;
-pub use store::MemoryStore;
+pub use store::{MemoryStore, StoreOptions};
 pub use model_manager::ModelManager;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Initialize a MemoryStore with the default ONNX embedder.
+/// Initialize a MemoryStore with the default ONNX embedder (nomic-embed-text-v1.5).
 ///
 /// This is blocking (model download + ONNX session load) — callers should wrap
 /// in `tokio::task::spawn_blocking`.
@@ -28,7 +30,7 @@ pub fn init(db_path: Option<&Path>) -> anyhow::Result<Arc<MemoryStore>> {
     }
 
     let embedder = Arc::new(
-        onnx_embedder::OnnxEmbedder::from_model(&model_manager::E5_SMALL_V2)?
+        onnx_embedder::OnnxEmbedder::from_model(&model_manager::NOMIC_EMBED_TEXT_V1_5)?
     ) as Arc<dyn Embedder>;
 
     let store = MemoryStore::open(&db, embedder)?;

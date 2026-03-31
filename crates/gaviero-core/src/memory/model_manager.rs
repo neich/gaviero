@@ -17,6 +17,13 @@ pub const E5_SMALL_V2: ModelInfo = ModelInfo {
     dimensions: 384,
 };
 
+pub const NOMIC_EMBED_TEXT_V1_5: ModelInfo = ModelInfo {
+    id: "nomic-embed-text-v1.5",
+    onnx_url: "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/main/onnx/model.onnx",
+    tokenizer_url: "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/main/tokenizer.json",
+    dimensions: 768,
+};
+
 /// Manages download and caching of embedding model files.
 pub struct ModelManager {
     cache_dir: PathBuf,

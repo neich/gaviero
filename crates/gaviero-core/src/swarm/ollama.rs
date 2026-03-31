@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Ollama backend: local LLM execution via the Ollama HTTP API.
 //!
 //! This module talks to Ollama's `/api/generate` endpoint.
