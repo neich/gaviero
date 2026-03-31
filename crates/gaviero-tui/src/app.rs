@@ -1981,8 +1981,8 @@ impl App {
 
         // Compile synchronously (fast, no LLM call)
         let filename = resolved.display().to_string();
-        let work_units = match gaviero_dsl::compile(&source, &filename, None) {
-            Ok(units) => units,
+        let compiled = match gaviero_dsl::compile(&source, &filename, None) {
+            Ok(c) => c,
             Err(report) => {
                 self.chat_state.add_system_message(
                     &format!("DSL compilation failed:\n{}", report),
@@ -1991,6 +1991,8 @@ impl App {
             }
         };
 
+        let work_units = compiled.work_units;
+        let script_max_parallel = compiled.max_parallel;
         let unit_count = work_units.len();
         self.chat_state.add_user_message(&format!("/run {}", script_path));
         self.chat_state.add_system_message(&format!(
@@ -2017,11 +2019,15 @@ impl App {
         tokio::spawn(async move {
             use gaviero_core::swarm::pipeline;
 
+            // Script's max_parallel overrides the TUI default when declared.
+            let effective_max_parallel = script_max_parallel
+                .unwrap_or_else(|| unit_count.min(4));
+
             let config = pipeline::SwarmConfig {
-                max_parallel: unit_count.min(4),
+                max_parallel: effective_max_parallel,
                 workspace_root: root,
                 model,
-                use_worktrees: unit_count > 1,
+                use_worktrees: effective_max_parallel > 1,
                 read_namespaces: read_ns,
                 write_namespace: write_ns,
             };
@@ -4676,6 +4682,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     fn cycle_focus(&mut self) {
         let visible = self.visible_panels();
         if visible.is_empty() {
@@ -4694,6 +4701,7 @@ impl App {
     ///   Left/Right moves between columns within the current row.
     ///   Down from any upper panel → Terminal.
     ///   Up from Terminal → Editor (center column).
+    #[allow(dead_code)]
     fn focus_direction(&mut self, dir: FocusDirection) {
         match dir {
             FocusDirection::Left => {
@@ -4723,6 +4731,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     fn visible_panels(&self) -> Vec<Focus> {
         let mut panels = vec![Focus::Editor];
         if self.panel_visible.file_tree {
