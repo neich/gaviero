@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Coordinator: Opus-powered task decomposition with tier annotations.
 //!
 //! The coordinator replaces the existing planner for coordinated swarm runs.
@@ -591,6 +592,10 @@ fn parse_work_unit_lenient(v: &serde_json::Value) -> Result<WorkUnit> {
         estimated_tokens,
         max_retries,
         escalation_tier,
+        read_namespaces: None,
+        write_namespace: None,
+        memory_importance: None,
+        staleness_sources: Vec::new(),
     })
 }
 
