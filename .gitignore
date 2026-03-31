@@ -18,3 +18,5 @@ Thumbs.db
 .env
 .gaviero
 tmp/
+*.so
+.claude/
