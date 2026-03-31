@@ -6,7 +6,7 @@ use crate::widgets::text_input::TextInput;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Modifier, Style},
+    style::Style,
 };
 
 /// A single search result: file path + line number + matching line text.

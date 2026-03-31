@@ -10,9 +10,21 @@ use gaviero_core::types::{FileScope, ModelTier, PrivacyLevel};
 use crate::ast::*;
 use crate::error::{DslError, DslErrors};
 
+// ── Public types ───────────────────────────────────────────────────────────
+
+/// Output of a successful DSL compilation.
+#[derive(Debug)]
+pub struct CompiledScript {
+    /// Work units ready for [`gaviero_core::swarm::pipeline::execute`].
+    pub work_units: Vec<WorkUnit>,
+    /// The workflow's `max_parallel` value, if one was declared.
+    /// Callers should use this to override any default `SwarmConfig.max_parallel`.
+    pub max_parallel: Option<usize>,
+}
+
 // ── AST → WorkUnit compilation ─────────────────────────────────────────────
 
-/// Compile a parsed [`Script`] into a list of [`WorkUnit`]s ready for
+/// Compile a parsed [`Script`] into a [`CompiledScript`] ready for
 /// [`gaviero_core::swarm::pipeline::execute`].
 ///
 /// `workflow` selects which `workflow { steps [...] }` declaration to use
@@ -23,7 +35,7 @@ pub fn compile_ast(
     source: &str,
     filename: &str,
     workflow: Option<&str>,
-) -> Result<Vec<WorkUnit>, DslErrors> {
+) -> Result<CompiledScript, DslErrors> {
     let src = || NamedSource::new(filename, source.to_string());
 
     // ── Phase 1: index declarations ───────────────────────────────
@@ -71,38 +83,45 @@ pub fn compile_ast(
 
     // ── Phase 2: determine agent execution order ──────────────────
 
-    let agent_order: Vec<&AgentDecl> = if let Some(wf_name) = workflow {
-        // Explicit workflow named
-        let wf = workflow_map.get(wf_name).ok_or_else(|| {
-            DslErrors::single(DslError::Compile {
+    // Returns (agents, max_parallel, workflow_memory)
+    let (agent_order, workflow_max_parallel, workflow_memory): (Vec<&AgentDecl>, Option<usize>, Option<&MemoryBlock>) =
+        if let Some(wf_name) = workflow {
+            // Explicit workflow named
+            let wf = workflow_map.get(wf_name).ok_or_else(|| {
+                DslErrors::single(DslError::Compile {
+                    src: src(),
+                    span: (0, 1).into(),
+                    reason: format!("workflow `{}` is not defined", wf_name),
+                })
+            })?;
+            let agents = ordered_agents_from_workflow(wf, &agent_map, source, filename)?;
+            let mp = wf.max_parallel.as_ref().map(|(n, _)| *n);
+            (agents, mp, wf.memory.as_ref())
+        } else if workflow_map.len() == 1 {
+            // Exactly one workflow — use it implicitly
+            let wf = workflow_map.values().next().unwrap();
+            let agents = ordered_agents_from_workflow(wf, &agent_map, source, filename)?;
+            let mp = wf.max_parallel.as_ref().map(|(n, _)| *n);
+            (agents, mp, wf.memory.as_ref())
+        } else if workflow_map.is_empty() {
+            // No workflow — run all agents in declaration order
+            let agents = script
+                .items
+                .iter()
+                .filter_map(|i| if let Item::Agent(a) = i { Some(a) } else { None })
+                .collect();
+            (agents, None, None)
+        } else {
+            // Multiple workflows with no selector — ambiguous
+            return Err(DslErrors::single(DslError::Compile {
                 src: src(),
                 span: (0, 1).into(),
-                reason: format!("workflow `{}` is not defined", wf_name),
-            })
-        })?;
-        ordered_agents_from_workflow(wf, &agent_map, source, filename)?
-    } else if workflow_map.len() == 1 {
-        // Exactly one workflow — use it implicitly
-        let wf = workflow_map.values().next().unwrap();
-        ordered_agents_from_workflow(wf, &agent_map, source, filename)?
-    } else if workflow_map.is_empty() {
-        // No workflow — run all agents in declaration order
-        script
-            .items
-            .iter()
-            .filter_map(|i| if let Item::Agent(a) = i { Some(a) } else { None })
-            .collect()
-    } else {
-        // Multiple workflows with no selector — ambiguous
-        return Err(DslErrors::single(DslError::Compile {
-            src: src(),
-            span: (0, 1).into(),
-            reason: format!(
-                "multiple workflows defined ({}); pass --workflow <name> to select one",
-                workflow_map.keys().cloned().collect::<Vec<_>>().join(", ")
-            ),
-        }));
-    };
+                reason: format!(
+                    "multiple workflows defined ({}); pass --workflow <name> to select one",
+                    workflow_map.keys().cloned().collect::<Vec<_>>().join(", ")
+                ),
+            }));
+        };
 
     // ── Phase 3: compile each agent to WorkUnit ───────────────────
 
@@ -110,7 +129,7 @@ pub fn compile_ast(
     let mut compile_errors: Vec<DslError> = Vec::new();
 
     for decl in agent_order {
-        match compile_agent(decl, &client_map, source, filename) {
+        match compile_agent(decl, &client_map, workflow_memory, source, filename) {
             Ok(wu) => work_units.push(wu),
             Err(e) => compile_errors.push(e),
         }
@@ -159,7 +178,7 @@ pub fn compile_ast(
         }));
     }
 
-    Ok(work_units)
+    Ok(CompiledScript { work_units, max_parallel: workflow_max_parallel })
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -259,6 +278,7 @@ fn ordered_agents_from_workflow<'a>(
 fn compile_agent(
     decl: &AgentDecl,
     client_map: &HashMap<&str, &ClientDecl>,
+    workflow_memory: Option<&MemoryBlock>,
     source: &str,
     filename: &str,
 ) -> Result<WorkUnit, DslError> {
@@ -314,6 +334,37 @@ fn compile_agent(
 
     let max_retries = decl.max_retries.as_ref().map(|(n, _)| *n).unwrap_or(1);
 
+    // ── Memory merge logic ────────────────────────────────────────
+    //
+    // read_ns: additive — workflow namespaces prepended, agent namespaces
+    //          appended, duplicates removed (order preserved).
+    // write_ns: agent overrides workflow; None if neither declares one.
+    // importance: agent-only; None → store uses default (0.5).
+    // staleness_sources: agent-only.
+    let read_namespaces: Option<Vec<String>> = {
+        let mut merged: Vec<String> = workflow_memory
+            .map(|m| m.read_ns.clone())
+            .unwrap_or_default();
+        for ns in decl.memory.as_ref().map(|m| m.read_ns.clone()).unwrap_or_default() {
+            if !merged.contains(&ns) {
+                merged.push(ns);
+            }
+        }
+        if merged.is_empty() { None } else { Some(merged) }
+    };
+
+    let write_namespace: Option<String> = decl.memory
+        .as_ref()
+        .and_then(|m| m.write_ns.clone())
+        .or_else(|| workflow_memory.and_then(|m| m.write_ns.clone()));
+
+    let memory_importance: Option<f32> = decl.memory.as_ref().and_then(|m| m.importance);
+
+    let staleness_sources: Vec<String> = decl.memory
+        .as_ref()
+        .map(|m| m.staleness_sources.clone())
+        .unwrap_or_default();
+
     Ok(WorkUnit {
         id: decl.name.clone(),
         description,
@@ -327,6 +378,10 @@ fn compile_agent(
         estimated_tokens: 0,
         max_retries,
         escalation_tier: None,
+        read_namespaces,
+        write_namespace,
+        memory_importance,
+        staleness_sources,
     })
 }
 
@@ -356,7 +411,7 @@ mod tests {
         let (tokens, _) = lexer::lex(src);
         let (ast, errs) = parser::parse(&tokens, src, "test.gaviero");
         assert!(errs.is_empty(), "parse errors: {:?}", errs);
-        compile_ast(&ast.unwrap(), src, "test.gaviero", None)
+        compile_ast(&ast.unwrap(), src, "test.gaviero", None).map(|c| c.work_units)
     }
 
     const FULL_EXAMPLE: &str = r##"
@@ -442,7 +497,8 @@ mod tests {
         "#;
         let (tokens, _) = lexer::lex(src);
         let (ast, _) = parser::parse(&tokens, src, "t");
-        let units = compile_ast(&ast.unwrap(), src, "t", Some("only_a")).unwrap();
+        let compiled = compile_ast(&ast.unwrap(), src, "t", Some("only_a")).unwrap();
+        let units = compiled.work_units;
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].id, "a");
     }
@@ -501,6 +557,82 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{:?}", result.unwrap_err());
         assert!(msg.contains("cycle"), "self-dep should be a cycle: {}", msg);
+    }
+
+    #[test]
+    fn workflow_max_parallel_propagated() {
+        let src = r#"
+            agent a { description "first" }
+            workflow w { steps [a] max_parallel 3 }
+        "#;
+        let (tokens, _) = lexer::lex(src);
+        let (ast, _) = parser::parse(&tokens, src, "t");
+        let compiled = compile_ast(&ast.unwrap(), src, "t", None).unwrap();
+        assert_eq!(compiled.max_parallel, Some(3));
+    }
+
+    #[test]
+    fn memory_merge_additive_read_ns() {
+        let src = r#"
+            agent a {
+                memory {
+                    read_ns ["agent-ns"]
+                    write_ns "agent-out"
+                }
+            }
+            workflow w {
+                steps [a]
+                memory {
+                    read_ns ["workflow-ns"]
+                    write_ns "wf-out"
+                }
+            }
+        "#;
+        let units = compile_str(src).unwrap();
+        // read_ns: workflow first, agent second
+        let ns = units[0].read_namespaces.as_ref().unwrap();
+        assert_eq!(ns[0], "workflow-ns");
+        assert_eq!(ns[1], "agent-ns");
+        // write_ns: agent overrides workflow
+        assert_eq!(units[0].write_namespace.as_deref(), Some("agent-out"));
+    }
+
+    #[test]
+    fn memory_merge_workflow_write_ns_fallback() {
+        let src = r#"
+            agent a { description "t" }
+            workflow w {
+                steps [a]
+                memory { write_ns "wf-default" }
+            }
+        "#;
+        let units = compile_str(src).unwrap();
+        assert_eq!(units[0].write_namespace.as_deref(), Some("wf-default"));
+    }
+
+    #[test]
+    fn memory_importance_and_staleness() {
+        let src = r#"
+            agent scan {
+                memory {
+                    importance 0.8
+                    staleness_sources ["src/" "Cargo.toml"]
+                }
+            }
+        "#;
+        let units = compile_str(src).unwrap();
+        assert!(matches!(units[0].memory_importance, Some(v) if (v - 0.8).abs() < 1e-5));
+        assert_eq!(units[0].staleness_sources, vec!["src/", "Cargo.toml"]);
+    }
+
+    #[test]
+    fn memory_none_when_not_declared() {
+        let src = r#"agent a { description "task" }"#;
+        let units = compile_str(src).unwrap();
+        assert!(units[0].read_namespaces.is_none());
+        assert!(units[0].write_namespace.is_none());
+        assert!(units[0].memory_importance.is_none());
+        assert!(units[0].staleness_sources.is_empty());
     }
 
     #[test]

@@ -40,8 +40,9 @@ const FULL_EXAMPLE: &str = r##"
 
 #[test]
 fn full_example_compiles_to_two_units() {
-    let units = compile(FULL_EXAMPLE, "test.gaviero", None)
+    let compiled = compile(FULL_EXAMPLE, "test.gaviero", None)
         .expect("should compile without errors");
+    let units = compiled.work_units;
 
     assert_eq!(units.len(), 2, "expected 2 work units");
 
@@ -68,6 +69,13 @@ fn full_example_compiles_to_two_units() {
 }
 
 #[test]
+fn full_example_max_parallel_propagated() {
+    let compiled = compile(FULL_EXAMPLE, "test.gaviero", None)
+        .expect("should compile without errors");
+    assert_eq!(compiled.max_parallel, Some(2));
+}
+
+#[test]
 fn lex_error_is_reported() {
     let src = "agent @ bad { }";
     let err = compile(src, "test.gaviero", None);
@@ -90,7 +98,7 @@ fn no_workflow_runs_all_agents() {
         agent a { description "first" }
         agent b { description "second" }
     "#;
-    let units = compile(src, "test.gaviero", None).unwrap();
+    let units = compile(src, "test.gaviero", None).unwrap().work_units;
     assert_eq!(units.len(), 2);
     assert_eq!(units[0].id, "a");
     assert_eq!(units[1].id, "b");
@@ -104,7 +112,7 @@ fn workflow_name_selector() {
         workflow just_b { steps [b] }
         workflow both   { steps [a b] }
     "#;
-    let units = compile(src, "test.gaviero", Some("just_b")).unwrap();
+    let units = compile(src, "test.gaviero", Some("just_b")).unwrap().work_units;
     assert_eq!(units.len(), 1);
     assert_eq!(units[0].id, "b");
 }
@@ -140,6 +148,7 @@ fn compile_example(filename: &str) -> Vec<gaviero_core::swarm::models::WorkUnit>
         .unwrap_or_else(|e| panic!("reading {}: {}", path, e));
     compile(&source, filename, None)
         .unwrap_or_else(|e| panic!("compiling {}:\n{:?}", filename, e))
+        .work_units
 }
 
 #[test]
@@ -199,4 +208,35 @@ fn example_security_audit() {
     assert_eq!(units[0].tier, ModelTier::Reasoning);
     // write_security_tests owns the tests/security/ directory
     assert!(units[2].scope.owned_paths.contains(&"tests/security/".to_string()));
+}
+
+#[test]
+fn example_security_audit_memory() {
+    let units = compile_example("security_audit_memory.gaviero");
+    assert_eq!(units.len(), 4);
+    assert_eq!(units[0].id, "scan");
+
+    // scan: read_ns merges workflow ["shared","security-policies"] + agent ["prior-audits"]
+    let ns = units[0].read_namespaces.as_ref().expect("scan should have read_namespaces");
+    assert!(ns.contains(&"shared".to_string()), "missing workflow ns 'shared': {:?}", ns);
+    assert!(ns.contains(&"security-policies".to_string()), "missing workflow ns 'security-policies': {:?}", ns);
+    assert!(ns.contains(&"prior-audits".to_string()), "missing agent ns 'prior-audits': {:?}", ns);
+    // workflow ns must come before agent ns
+    assert!(ns.iter().position(|s| s == "shared") < ns.iter().position(|s| s == "prior-audits"));
+
+    // scan: agent write_ns overrides workflow write_ns
+    assert_eq!(units[0].write_namespace.as_deref(), Some("scan-findings"));
+
+    // scan: importance and staleness_sources
+    assert!(matches!(units[0].memory_importance, Some(v) if (v - 0.9).abs() < 1e-4));
+    assert_eq!(units[0].staleness_sources, vec!["src/"]);
+
+    // verify: no agent-specific memory, but inherits workflow read_ns + write_ns
+    assert_eq!(units[3].id, "verify");
+    let verify_ns = units[3].read_namespaces.as_ref().expect("verify should inherit workflow ns");
+    assert!(verify_ns.contains(&"shared".to_string()));
+    assert!(verify_ns.contains(&"security-policies".to_string()));
+    // verify has its own read_ns from memory block
+    assert!(verify_ns.contains(&"scan-findings".to_string()));
+    assert_eq!(units[3].write_namespace.as_deref(), Some("verification-results"));
 }

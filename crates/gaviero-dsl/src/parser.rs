@@ -23,6 +23,7 @@ enum AgentField {
     DependsOn(Vec<(String, Span)>, Span),
     Prompt(String, Span),
     MaxRetries(u8, Span),
+    Memory(MemoryBlock),
 }
 
 #[derive(Debug)]
@@ -35,6 +36,15 @@ enum ScopeField {
 enum WorkflowField {
     Steps(Vec<(String, Span)>, Span),
     MaxParallel(usize, Span),
+    Memory(MemoryBlock),
+}
+
+#[derive(Debug)]
+enum MemoryField {
+    ReadNs(Vec<String>),
+    WriteNs(String),
+    Importance(f32),
+    StalenessSources(Vec<String>),
 }
 
 // ── Parser builder ─────────────────────────────────────────────────────────
@@ -65,6 +75,7 @@ where
     };
 
     let integer = select! { Token::Int(n) => n };
+    let float_lit = select! { Token::Float(v) => v };
 
     // ── String list: [ "a" "b" ... ] ─────────────────────────────
 
@@ -153,6 +164,46 @@ where
             ScopeBlock { owned, read_only, span: e.span() }
         });
 
+    // ── memory block ──────────────────────────────────────────────
+
+    let memory_field = choice((
+        just(Token::KwReadNs)
+            .ignore_then(str_list.clone())
+            .map(MemoryField::ReadNs),
+        just(Token::KwWriteNs)
+            .ignore_then(string.clone())
+            .map(MemoryField::WriteNs),
+        just(Token::KwImportance)
+            .ignore_then(float_lit)
+            .map(MemoryField::Importance),
+        just(Token::KwStalenessSources)
+            .ignore_then(str_list.clone())
+            .map(MemoryField::StalenessSources),
+    ));
+
+    let memory_block = just(Token::KwMemory)
+        .ignore_then(
+            memory_field
+                .repeated()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::LBrace), just(Token::RBrace)),
+        )
+        .map_with(|fields, e| {
+            let mut read_ns = Vec::new();
+            let mut write_ns = None;
+            let mut importance = None;
+            let mut staleness_sources = Vec::new();
+            for f in fields {
+                match f {
+                    MemoryField::ReadNs(v) => read_ns.extend(v),
+                    MemoryField::WriteNs(s) => { write_ns.get_or_insert(s); }
+                    MemoryField::Importance(v) => { importance.get_or_insert(v); }
+                    MemoryField::StalenessSources(v) => staleness_sources.extend(v),
+                }
+            }
+            MemoryBlock { read_ns, write_ns, importance, staleness_sources, span: e.span() }
+        });
+
     // ── agent declaration ─────────────────────────────────────────
 
     let agent_field = choice((
@@ -172,6 +223,7 @@ where
         just(Token::KwMaxRetries)
             .ignore_then(integer.map_with(|n, e| (n, e.span())))
             .map(|(n, s)| AgentField::MaxRetries(n.min(255) as u8, s)),
+        memory_block.clone().map(AgentField::Memory),
     ));
 
     let agent_decl = just(Token::KwAgent)
@@ -189,6 +241,7 @@ where
             let mut depends_on = None;
             let mut prompt = None;
             let mut max_retries = None;
+            let mut memory = None;
             for f in fields {
                 match f {
                     AgentField::Description(v, s) => {
@@ -209,9 +262,12 @@ where
                     AgentField::MaxRetries(n, s) => {
                         max_retries.get_or_insert((n, s));
                     }
+                    AgentField::Memory(b) => {
+                        memory.get_or_insert(b);
+                    }
                 }
             }
-            AgentDecl { name, name_span, description, client, scope, depends_on, prompt, max_retries, span: e.span() }
+            AgentDecl { name, name_span, description, client, scope, depends_on, prompt, max_retries, memory, span: e.span() }
         });
 
     // ── workflow declaration ──────────────────────────────────────
@@ -223,6 +279,7 @@ where
         just(Token::KwMaxParallel)
             .ignore_then(integer.map_with(|n, e| (n, e.span())))
             .map(|(n, s)| WorkflowField::MaxParallel(n as usize, s)),
+        memory_block.map(WorkflowField::Memory),
     ));
 
     let workflow_decl = just(Token::KwWorkflow)
@@ -236,6 +293,7 @@ where
         .map_with(|((name, name_span), fields), e| {
             let mut steps = None;
             let mut max_parallel = None;
+            let mut memory = None;
             for f in fields {
                 match f {
                     WorkflowField::Steps(v, s) => {
@@ -244,9 +302,12 @@ where
                     WorkflowField::MaxParallel(n, s) => {
                         max_parallel.get_or_insert((n, s));
                     }
+                    WorkflowField::Memory(b) => {
+                        memory.get_or_insert(b);
+                    }
                 }
             }
-            WorkflowDecl { name, name_span, steps, max_parallel, span: e.span() }
+            WorkflowDecl { name, name_span, steps, max_parallel, memory, span: e.span() }
         });
 
     // ── top-level ─────────────────────────────────────────────────
@@ -411,5 +472,53 @@ mod tests {
         let src = "agent bad { description \"x\" ";
         let (_, errs) = parse_str(src);
         assert!(!errs.is_empty(), "expected parse error");
+    }
+
+    #[test]
+    fn agent_with_memory_block_minimal() {
+        let src = r#"agent x { memory { write_ns "findings" } }"#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        if let Item::Agent(a) = &ast.unwrap().items[0] {
+            let mem = a.memory.as_ref().expect("memory block");
+            assert_eq!(mem.write_ns.as_deref(), Some("findings"));
+            assert!(mem.read_ns.is_empty());
+            assert!(mem.importance.is_none());
+        }
+    }
+
+    #[test]
+    fn agent_with_memory_block_full() {
+        let src = r#"
+            agent scan {
+                memory {
+                    read_ns ["prior-audits" "shared"]
+                    write_ns "scan-findings"
+                    importance 0.9
+                    staleness_sources ["src/"]
+                }
+            }
+        "#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        if let Item::Agent(a) = &ast.unwrap().items[0] {
+            let mem = a.memory.as_ref().expect("memory block");
+            assert_eq!(mem.read_ns, vec!["prior-audits", "shared"]);
+            assert_eq!(mem.write_ns.as_deref(), Some("scan-findings"));
+            assert!(matches!(mem.importance, Some(v) if (v - 0.9).abs() < 1e-5));
+            assert_eq!(mem.staleness_sources, vec!["src/"]);
+        }
+    }
+
+    #[test]
+    fn workflow_with_memory_block() {
+        let src = r#"workflow wf { steps [a] memory { read_ns ["shared"] write_ns "wf-out" } }"#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        if let Item::Workflow(w) = &ast.unwrap().items[0] {
+            let mem = w.memory.as_ref().expect("memory block");
+            assert_eq!(mem.read_ns, vec!["shared"]);
+            assert_eq!(mem.write_ns.as_deref(), Some("wf-out"));
+        }
     }
 }

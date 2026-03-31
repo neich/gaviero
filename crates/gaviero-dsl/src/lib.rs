@@ -4,11 +4,10 @@ pub mod error;
 pub mod lexer;
 pub mod parser;
 
+pub use compiler::CompiledScript;
 pub use error::{DslError, DslErrors};
 
-use gaviero_core::swarm::models::WorkUnit;
-
-/// Compile a `.gaviero` DSL script into a list of [`WorkUnit`]s.
+/// Compile a `.gaviero` DSL script into a [`CompiledScript`].
 ///
 /// # Parameters
 /// - `source`: The raw script text.
@@ -25,7 +24,7 @@ pub fn compile(
     source: &str,
     filename: &str,
     workflow: Option<&str>,
-) -> Result<Vec<WorkUnit>, miette::Report> {
+) -> Result<CompiledScript, miette::Report> {
     use miette::NamedSource;
 
     // Phase 1: Lex
