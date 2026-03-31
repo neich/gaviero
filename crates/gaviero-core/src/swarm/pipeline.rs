@@ -16,7 +16,8 @@ use super::validation;
 use super::verify::CostEstimate;
 use super::merge;
 use crate::git::WorktreeManager;
-use crate::memory::MemoryStore;
+use crate::memory::{MemoryStore, StoreOptions};
+use crate::memory::store::file_hash;
 use crate::observer::{AcpObserver, SwarmObserver};
 use crate::types::{EntryMetadata, PrivacyLevel};
 use crate::write_gate::{WriteGatePipeline, WriteMode};
@@ -113,12 +114,19 @@ pub async fn execute(
                     &unit.description,
                 );
 
+                invalidate_stale_sources(&memory, unit, &config.workspace_root).await;
+
+                let effective_read_ns: Vec<String> = unit.read_namespaces
+                    .as_deref()
+                    .unwrap_or(config.read_namespaces.as_slice())
+                    .to_vec();
+
                 let manifest = run_single_agent(
                     unit,
                     &config.workspace_root,
                     worktree_mgr.as_mut(),
                     memory.clone(),
-                    &config.read_namespaces,
+                    &effective_read_ns,
                     observer,
                     make_observer(unit_id),
                 ).await?;
@@ -132,7 +140,9 @@ pub async fn execute(
                         &format!("completed: {}", manifest.summary.as_deref().unwrap_or("")),
                     );
                     // Store result to memory
-                    store_agent_result(&memory, &config.write_namespace, &manifest, unit, &run_id).await;
+                    let effective_write_ns = unit.write_namespace.as_deref()
+                        .unwrap_or(&config.write_namespace);
+                    store_agent_result(&memory, effective_write_ns, &manifest, unit, &run_id, &config.workspace_root).await;
                 }
                 all_manifests.push(manifest);
                 if failed {
@@ -160,7 +170,10 @@ pub async fn execute(
                 let sem = semaphore.clone();
                 let root = config.workspace_root.clone();
                 let mem = memory.clone();
-                let ns = config.read_namespaces.clone();
+                let ns: Vec<String> = unit.read_namespaces
+                    .as_deref()
+                    .unwrap_or(config.read_namespaces.as_slice())
+                    .to_vec();
                 let obs = make_observer(unit_id);
 
                 // Provision worktree if enabled
@@ -178,6 +191,8 @@ pub async fn execute(
 
                 handles.push(tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
+
+                    invalidate_stale_sources(&mem, &unit, &root).await;
 
                     let write_gate = Arc::new(Mutex::new(
                         WriteGatePipeline::new(WriteMode::AutoAccept, Box::new(NoopWriteGateObserver)),
@@ -211,7 +226,9 @@ pub async fn execute(
                             );
                             // Store result to memory
                             if let Some(unit) = unit_map.get(manifest.work_unit_id.as_str()) {
-                                store_agent_result(&memory, &config.write_namespace, &manifest, unit, &run_id).await;
+                                let effective_write_ns = unit.write_namespace.as_deref()
+                                    .unwrap_or(&config.write_namespace);
+                                store_agent_result(&memory, effective_write_ns, &manifest, unit, &run_id, &config.workspace_root).await;
                             }
                         }
                         all_manifests.push(manifest);
@@ -376,16 +393,32 @@ async fn run_single_agent(
 
 /// Store an agent's execution result to memory (best-effort, never fails the pipeline).
 ///
-/// Uses `store_with_privacy` to tag entries with the unit's privacy level.
-/// The `run_id` is included in the key pattern for cross-run continuity.
+/// Writes one aggregate entry for the agent's run, plus one sentinel entry per
+/// `staleness_source` path recording the current file hash. On the next run,
+/// `invalidate_stale_sources` checks these hashes and marks changed entries stale.
 async fn store_agent_result(
     memory: &Option<Arc<MemoryStore>>,
     write_ns: &str,
     manifest: &AgentManifest,
     unit: &WorkUnit,
     run_id: &str,
+    workspace_root: &std::path::Path,
 ) {
     let Some(mem) = memory else { return };
+
+    let privacy = match unit.privacy {
+        PrivacyLevel::LocalOnly => "local_only",
+        PrivacyLevel::Public => "public",
+    };
+    let importance = unit.memory_importance.unwrap_or(0.5);
+    let metadata = EntryMetadata {
+        privacy: unit.privacy,
+        format_version: 1,
+        source: "swarm_pipeline".into(),
+    };
+    let metadata_json = serde_json::to_string(&metadata).ok();
+
+    // 1. Aggregate entry (summary of the whole agent run)
     let key = format!("agents:{}:{}", run_id, manifest.work_unit_id);
     let files: Vec<String> = manifest.modified_files.iter()
         .map(|p| p.display().to_string())
@@ -397,24 +430,38 @@ async fn store_agent_result(
         files.join(", "),
         manifest.summary.as_deref().unwrap_or("none"),
     );
-    let privacy = match unit.privacy {
-        PrivacyLevel::LocalOnly => "local_only",
-        PrivacyLevel::Public => "public",
+    let opts = StoreOptions {
+        privacy: privacy.to_string(),
+        importance,
+        metadata: metadata_json.clone(),
+        source_file: None,
+        source_hash: None,
     };
-    let metadata = EntryMetadata {
-        privacy: unit.privacy,
-        format_version: 1,
-        source: "swarm_pipeline".into(),
-    };
-    let metadata_json = serde_json::to_string(&metadata).ok();
-    if let Err(e) = mem.store_with_privacy(
-        write_ns,
-        &key,
-        &content,
-        privacy,
-        metadata_json.as_deref(),
-    ).await {
+    if let Err(e) = mem.store_with_options(write_ns, &key, &content, &opts).await {
         tracing::warn!("Failed to store agent result to memory: {}", e);
+    }
+
+    // 2. Per-staleness-source sentinel entries
+    // Storing the current file hash lets `check_staleness` detect changes on the next run.
+    for source_path in &unit.staleness_sources {
+        let abs = workspace_root.join(source_path);
+        let abs_str = abs.to_string_lossy().to_string();
+        let hash = match file_hash(&abs) {
+            Ok(h) => h,
+            Err(_) => continue, // path may not exist yet; skip silently
+        };
+        let src_key = format!("agents:{}:{}:src:{}", run_id, manifest.work_unit_id, source_path);
+        let src_content = format!("Source snapshot: {} (hash: {})", source_path, hash);
+        let src_opts = StoreOptions {
+            privacy: privacy.to_string(),
+            importance,
+            metadata: metadata_json.clone(),
+            source_file: Some(abs_str),  // absolute path — matches check_staleness input
+            source_hash: Some(hash),
+        };
+        if let Err(e) = mem.store_with_options(write_ns, &src_key, &src_content, &src_opts).await {
+            tracing::warn!("Failed to store source snapshot for {}: {}", source_path, e);
+        }
     }
 }
 
@@ -560,10 +607,14 @@ pub async fn execute_coordinated(
 
             let root = config.workspace_root.clone();
             let mem = memory.clone();
-            let ns = config.read_namespaces.clone();
+            let ns: Vec<String> = unit.read_namespaces
+                .as_deref()
+                .unwrap_or(config.read_namespaces.as_slice())
+                .to_vec();
             let obs = make_observer(unit_id);
             let run_id_clone = run_id.clone();
-            let write_ns = config.write_namespace.clone();
+            let write_ns = unit.write_namespace.clone()
+                .unwrap_or_else(|| config.write_namespace.clone());
 
             let agent_root = if let Some(ref mut mgr) = worktree_mgr {
                 match mgr.provision(&unit.id) {
@@ -638,7 +689,7 @@ pub async fn execute_coordinated(
                 };
 
                 // Store result to memory (privacy-aware)
-                store_agent_result(&mem, &write_ns, &manifest, &unit, &run_id_clone).await;
+                store_agent_result(&mem, &write_ns, &manifest, &unit, &run_id_clone, &root).await;
 
                 Ok::<_, anyhow::Error>(manifest)
             }));
@@ -835,6 +886,44 @@ fn collect_files_recursive(root: &PathBuf, dir: &PathBuf, files: &mut Vec<String
             collect_files_recursive(root, &path, files, depth + 1);
         } else if let Ok(rel) = path.strip_prefix(root) {
             files.push(rel.to_string_lossy().to_string());
+        }
+    }
+}
+
+/// Invalidate stale memory entries for a work unit's `staleness_sources`.
+///
+/// Called immediately before each agent runs. Any memory entry whose
+/// `source_file` hash has changed since it was stored gets `importance = 0.0`,
+/// making it effectively invisible to semantic search.
+///
+/// Best-effort: errors are logged but never propagate to the caller.
+async fn invalidate_stale_sources(
+    memory: &Option<Arc<MemoryStore>>,
+    unit: &WorkUnit,
+    workspace_root: &std::path::Path,
+) {
+    let Some(mem) = memory else { return };
+    if unit.staleness_sources.is_empty() { return };
+
+    let paths: Vec<std::path::PathBuf> = unit.staleness_sources.iter()
+        .map(|s| workspace_root.join(s))
+        .collect();
+
+    match mem.check_staleness(&paths).await {
+        Ok(stale) if !stale.is_empty() => {
+            let ids: Vec<i64> = stale.iter().map(|(id, _, _, _)| *id).collect();
+            tracing::info!(
+                "Invalidating {} stale memory entries before running agent '{}'",
+                ids.len(),
+                unit.id
+            );
+            if let Err(e) = mem.mark_stale(&ids).await {
+                tracing::warn!("mark_stale failed for agent '{}': {}", unit.id, e);
+            }
+        }
+        Ok(_) => {} // nothing stale
+        Err(e) => {
+            tracing::warn!("check_staleness failed for agent '{}': {}", unit.id, e);
         }
     }
 }
