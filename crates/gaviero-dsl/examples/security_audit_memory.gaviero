@@ -1,0 +1,149 @@
+// Security audit workflow demonstrating the memory {} block.
+//
+// Features shown:
+//   - workflow-level memory defaults (read_ns, write_ns)
+//   - per-agent memory overrides (write_ns overrides workflow default)
+//   - additive read_ns merge (workflow ns + agent-specific ns)
+//   - importance weighting
+//   - staleness_sources for automatic cache invalidation
+//   - privacy interaction (local_only client writes are filtered from public agents)
+
+// ── Clients ──────────────────────────────────────────────────────────────────
+
+client opus {
+    tier coordinator
+    model "claude-opus-4-6"
+    privacy public
+}
+
+client sonnet {
+    tier reasoning
+    model "claude-sonnet-4-6"
+    privacy public
+}
+
+client haiku {
+    tier execution
+    model "claude-haiku-4-5-20251001"
+    privacy public
+}
+
+// local_only: results written with privacy=local_only are invisible to
+// public-tier agents reading the same namespace via search_context_filtered.
+client local {
+    tier mechanical
+    privacy local_only
+}
+
+// ── Agents ───────────────────────────────────────────────────────────────────
+
+agent scan {
+    description "Scan codebase for security vulnerabilities"
+    client opus
+    scope {
+        owned    ["docs/security_findings.md"]
+        read_only ["src/" "Cargo.toml" "Cargo.lock"]
+    }
+    memory {
+        // read_ns merges with workflow defaults: ["shared" "security-policies" "prior-audits"]
+        read_ns            ["prior-audits"]
+        // agent write_ns overrides workflow write_ns "security-audit"
+        write_ns           "scan-findings"
+        // high importance: scan results are critical for downstream agents
+        importance         0.9
+        // invalidate cached scan results if src/ changes between runs
+        staleness_sources  ["src/"]
+    }
+    prompt #"
+Scan the codebase for security vulnerabilities. Check for:
+- SQL injection, XSS, CSRF vulnerabilities
+- Insecure dependencies (check Cargo.lock)
+- Hardcoded secrets or credentials
+- Unsafe Rust patterns
+
+Document all findings in docs/security_findings.md.
+Use memory context for any prior audit results.
+"#
+    max_retries 2
+}
+
+agent fix {
+    description "Fix identified vulnerabilities"
+    client sonnet
+    depends_on [scan]
+    scope {
+        owned    ["src/"]
+        read_only ["docs/security_findings.md"]
+    }
+    memory {
+        // reads from scan's dedicated namespace + workflow defaults
+        read_ns  ["scan-findings"]
+        write_ns "fix-results"
+        importance 0.8
+        staleness_sources ["src/"]
+    }
+    prompt #"
+Fix the security vulnerabilities documented in docs/security_findings.md.
+The memory context will contain the scan agent's findings — use it as your
+primary reference. Apply minimal, targeted fixes without refactoring.
+"#
+    max_retries 2
+}
+
+agent write_tests {
+    description "Write security regression tests"
+    client haiku
+    depends_on [fix]
+    scope {
+        owned    ["tests/security/"]
+        read_only ["src/" "docs/security_findings.md"]
+    }
+    memory {
+        read_ns  ["scan-findings" "fix-results"]
+        write_ns "test-results"
+        importance 0.7
+    }
+    prompt #"
+Write regression tests in tests/security/ for every vulnerability fixed.
+Reference the scan findings and fix results from memory context.
+Each test should verify that the specific vulnerability no longer exists.
+"#
+}
+
+agent verify {
+    description "Verify all fixes and tests pass"
+    client sonnet
+    depends_on [write_tests]
+    scope {
+        read_only ["src/" "tests/" "docs/security_findings.md"]
+    }
+    memory {
+        // verify reads all outputs from upstream agents
+        read_ns  ["scan-findings" "fix-results" "test-results"]
+        write_ns "verification-results"
+        importance 0.6
+    }
+    prompt #"
+Verify that:
+1. All vulnerabilities in docs/security_findings.md have been fixed
+2. All regression tests pass (check tests/security/)
+3. No new vulnerabilities were introduced
+
+Report pass/fail for each finding. Use memory context for the full audit trail.
+"#
+    max_retries 2
+}
+
+// ── Workflow ──────────────────────────────────────────────────────────────────
+
+workflow security_audit {
+    steps [scan fix write_tests verify]
+    max_parallel 2
+    memory {
+        // All agents inherit these as baseline read namespaces.
+        // Each agent's own read_ns is appended to this list.
+        read_ns  ["shared" "security-policies"]
+        // Default write namespace — overridden per-agent above.
+        write_ns "security-audit"
+    }
+}
