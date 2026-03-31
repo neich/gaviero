@@ -84,6 +84,7 @@ pub enum Action {
     SelectAll,
 
     // Terminal tabs
+    #[allow(dead_code)]
     NewTerminal,
     CloseTerminal,
 
