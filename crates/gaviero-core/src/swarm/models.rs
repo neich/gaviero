@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,28 @@ pub struct WorkUnit {
     /// Tier to escalate to on failure.
     #[serde(default)]
     pub escalation_tier: Option<ModelTier>,
+
+    // ── Memory routing fields (from DSL `memory {}` block) ───────
+
+    /// Memory namespaces to read from for this agent's context.
+    /// `None` means inherit `SwarmConfig.read_namespaces`.
+    #[serde(default)]
+    pub read_namespaces: Option<Vec<String>>,
+
+    /// Memory namespace to write this agent's results into.
+    /// `None` means inherit `SwarmConfig.write_namespace`.
+    #[serde(default)]
+    pub write_namespace: Option<String>,
+
+    /// Importance weight for memories written by this agent (0.0–1.0).
+    /// `None` → memory store default (0.5).
+    #[serde(default)]
+    pub memory_importance: Option<f32>,
+
+    /// Relative paths (from workspace root) whose hashes are checked before
+    /// this agent runs; stale entries are invalidated automatically.
+    #[serde(default)]
+    pub staleness_sources: Vec<String>,
 }
 
 fn default_max_retries() -> u8 {
