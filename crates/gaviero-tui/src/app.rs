@@ -798,6 +798,12 @@ impl App {
                     if self.swarm_dashboard.status_message.is_empty() {
                         self.swarm_dashboard.status_message = "Run failed — waiting for error details...".into();
                     }
+                } else if phase == "reverted" {
+                    self.swarm_dashboard.result = None; // prevent double-undo
+                    self.swarm_dashboard.diff_agent = None;
+                    self.swarm_dashboard.status_message = "Swarm reverted to pre-run state.".into();
+                } else if phase.starts_with("revert failed") || phase.starts_with("revert panicked") {
+                    self.swarm_dashboard.status_message = format!("Undo failed: {}", &phase["revert ".len()..]);
                 }
             }
             Event::SwarmAgentStateChanged { id, status, detail } => {
@@ -932,7 +938,18 @@ impl App {
 
         match action {
             Action::Quit => {
-                if self.diff_review.is_some() {
+                // Dismiss swarm diff overlay first
+                if self.focus == Focus::SidePanel
+                    && matches!(self.side_panel, SidePanelMode::SwarmDashboard)
+                    && self.swarm_dashboard.diff_agent.is_some()
+                {
+                    self.swarm_dashboard.close_diff();
+                } else if self.focus == Focus::SidePanel
+                    && matches!(self.side_panel, SidePanelMode::SwarmDashboard)
+                    && self.swarm_dashboard.pending_undo_confirm
+                {
+                    self.swarm_dashboard.pending_undo_confirm = false;
+                } else if self.diff_review.is_some() {
                     // q in review mode dismisses the overlay
                     self.diff_review = None;
                 } else {
@@ -1239,6 +1256,8 @@ impl App {
                     // Handle commands that need app-level access
                     if self.chat_state.text_input.text.trim().starts_with("/cswarm") {
                         self.handle_coordinated_swarm_command();
+                    } else if self.chat_state.text_input.text.trim() == "/undo-swarm" {
+                        self.handle_undo_swarm_command();
                     } else if self.chat_state.text_input.text.trim().starts_with("/swarm") {
                         self.handle_swarm_command();
                     } else if self.chat_state.text_input.text.trim().starts_with("/remember") {
@@ -1376,6 +1395,70 @@ impl App {
     fn handle_swarm_dashboard_action(&mut self, action: Action) {
         use crate::panels::swarm_dashboard::DashboardFocus;
 
+        // ── Actions that need access to multiple self fields ──────────────
+        // These are handled before the `dash` reborrow to avoid borrow conflicts.
+
+        match action {
+            Action::Enter => {
+                if self.swarm_dashboard.diff_agent.is_some() {
+                    self.swarm_dashboard.close_diff();
+                    return;
+                }
+                let branch = self.swarm_dashboard.agents
+                    .get(self.swarm_dashboard.scroll.selected)
+                    .and_then(|a| a.branch.clone());
+                let agent_id = self.swarm_dashboard.agents
+                    .get(self.swarm_dashboard.scroll.selected)
+                    .map(|a| a.id.clone());
+                if let (Some(branch), Some(agent_id)) = (branch, agent_id) {
+                    let root = self.workspace.roots().first()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| std::path::PathBuf::from("."));
+                    let pre_sha = self.swarm_dashboard.result.as_ref()
+                        .map(|r| r.pre_swarm_sha.clone())
+                        .unwrap_or_default();
+                    let diff_text = gaviero_core::git::diff_branch_vs_sha(&root, &pre_sha, &branch)
+                        .unwrap_or_default();
+                    self.swarm_dashboard.show_diff(agent_id, diff_text);
+                }
+                return;
+            }
+            Action::InsertChar('u') => {
+                let can_undo = self.swarm_dashboard.result.as_ref()
+                    .map(|r| !r.pre_swarm_sha.is_empty())
+                    .unwrap_or(false);
+                if !can_undo { return; }
+
+                if self.swarm_dashboard.pending_undo_confirm {
+                    self.swarm_dashboard.pending_undo_confirm = false;
+                    let result = match self.swarm_dashboard.result.clone() {
+                        Some(r) => r,
+                        None => return,
+                    };
+                    let root = self.workspace.roots().first()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| std::path::PathBuf::from("."));
+                    let tx = self.event_tx.clone();
+                    tokio::task::spawn(async move {
+                        let revert_result = tokio::task::spawn_blocking(move || {
+                            gaviero_core::swarm::pipeline::revert_swarm(&root, &result)
+                        }).await;
+                        match revert_result {
+                            Ok(Ok(())) => { let _ = tx.send(Event::SwarmPhaseChanged("reverted".to_string())); }
+                            Ok(Err(e)) => { let _ = tx.send(Event::SwarmPhaseChanged(format!("revert failed: {}", e))); }
+                            Err(e) => { let _ = tx.send(Event::SwarmPhaseChanged(format!("revert panicked: {}", e))); }
+                        }
+                    });
+                } else {
+                    self.swarm_dashboard.pending_undo_confirm = true;
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        // ── Remaining actions using `dash` shorthand ───────────────────────
+
         let dash = &mut self.swarm_dashboard;
         let agent_count = dash.agents.len();
 
@@ -1393,31 +1476,43 @@ impl App {
                 dash.cycle_focus();
             }
 
-            // Up/Down are focus-aware
-            Action::CursorUp => match dash.focus {
-                DashboardFocus::Table => {
-                    let prev = dash.scroll.selected;
-                    dash.scroll.move_up();
-                    if dash.scroll.selected != prev { reset_detail!(dash); }
-                }
-                DashboardFocus::Detail => {
-                    dash.detail_auto_scroll = false;
-                    dash.detail_scroll = dash.detail_scroll.saturating_sub(1);
-                }
-            },
-            Action::CursorDown => match dash.focus {
-                DashboardFocus::Table => {
-                    let prev = dash.scroll.selected;
-                    dash.scroll.move_down(agent_count);
-                    if dash.scroll.selected != prev { reset_detail!(dash); }
-                }
-                DashboardFocus::Detail => {
-                    if let Some(agent) = dash.agents.get(dash.scroll.selected) {
-                        let total = crate::panels::swarm_dashboard::count_display_lines(&agent.activity);
-                        dash.detail_scroll = (dash.detail_scroll + 1).min(total.saturating_sub(1));
+            // Up/Down are focus-aware; when diff overlay is open, scroll the diff
+            Action::CursorUp | Action::InsertChar('k') => {
+                if let Some(ref mut diff) = dash.diff_agent {
+                    diff.scroll = diff.scroll.saturating_sub(1);
+                } else {
+                    match dash.focus {
+                        DashboardFocus::Table => {
+                            let prev = dash.scroll.selected;
+                            dash.scroll.move_up();
+                            if dash.scroll.selected != prev { reset_detail!(dash); }
+                        }
+                        DashboardFocus::Detail => {
+                            dash.detail_auto_scroll = false;
+                            dash.detail_scroll = dash.detail_scroll.saturating_sub(1);
+                        }
                     }
                 }
-            },
+            }
+            Action::CursorDown | Action::InsertChar('j') => {
+                if let Some(ref mut diff) = dash.diff_agent {
+                    diff.scroll = diff.scroll.saturating_add(1);
+                } else {
+                    match dash.focus {
+                        DashboardFocus::Table => {
+                            let prev = dash.scroll.selected;
+                            dash.scroll.move_down(agent_count);
+                            if dash.scroll.selected != prev { reset_detail!(dash); }
+                        }
+                        DashboardFocus::Detail => {
+                            if let Some(agent) = dash.agents.get(dash.scroll.selected) {
+                                let total = crate::panels::swarm_dashboard::count_display_lines(&agent.activity);
+                                dash.detail_scroll = (dash.detail_scroll + 1).min(total.saturating_sub(1));
+                            }
+                        }
+                    }
+                }
+            }
 
             // PageUp/PageDown — always scroll the focused pane by page
             Action::PageUp => match dash.focus {
@@ -1696,13 +1791,23 @@ impl App {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-        // Collect file paths from the file tree entries (already loaded)
+        // Detect whether we are completing the path argument of a /run command.
+        // The text before the '@' (trimmed) will equal "/run" in that case.
+        let at_pos = self.chat_state.autocomplete.at_pos;
+        let is_run_path_context = {
+            let text = &self.chat_state.text_input.text;
+            at_pos <= text.len() && text[..at_pos].trim() == "/run"
+        };
+
+        // Collect file paths from the file tree entries (already loaded).
+        // In run-path context, restrict to .gaviero files only.
         let files: Vec<String> = self.file_tree.entries.iter()
             .filter(|e| !e.is_dir)
             .filter_map(|e| {
                 e.path.strip_prefix(&root).ok()
                     .map(|p| p.to_string_lossy().to_string())
             })
+            .filter(|f| !is_run_path_context || f.ends_with(".gaviero"))
             .collect();
 
         self.chat_state.update_autocomplete_matches(&files);
@@ -1781,9 +1886,19 @@ impl App {
                 gate.set_mode(WriteMode::Deferred);
             }
 
-            // Enrich prompt with memory context (if memory is available)
+            // Enrich prompt with memory context (if memory is available).
+            // Cap at 5s to avoid delaying the prompt if the memory server is slow.
             let enriched_prompt = if let Some(ref mem) = memory {
-                let ctx = mem.search_context(&read_ns, &prompt, 5).await;
+                let ctx = match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    mem.search_context(&read_ns, &prompt, 5),
+                ).await {
+                    Ok(ctx) => ctx,
+                    Err(_) => {
+                        tracing::warn!("Memory search timed out after 5s, proceeding without context");
+                        String::new()
+                    }
+                };
                 if ctx.is_empty() { prompt.clone() } else { format!("{}\n\n{}", ctx, prompt) }
             } else {
                 prompt.clone()
@@ -1939,21 +2054,32 @@ impl App {
         });
     }
 
-    /// Handle `/run <path.gaviero>` — compile and execute a DSL script.
+    /// Handle `/run <path.gaviero> [prompt]` — compile and execute a DSL script.
     fn handle_run_script_command(&mut self) {
         let input = self.chat_state.take_input();
-        let script_path = input
-            .trim()
-            .strip_prefix("/run")
-            .unwrap_or("")
-            .trim()
-            .to_string();
+        let rest = input.trim().strip_prefix("/run").unwrap_or("").trim();
+
+        // Split: first whitespace-delimited token is the path, rest is the runtime prompt.
+        let (raw_path_token, runtime_prompt) = match rest.find(|c: char| c.is_ascii_whitespace()) {
+            Some(idx) => {
+                let path_tok = &rest[..idx];
+                let remainder = rest[idx..].trim();
+                let rp = if remainder.is_empty() { None } else { Some(remainder.to_string()) };
+                (path_tok, rp)
+            }
+            None => (rest, None),
+        };
+
+        // Strip optional '@' prefix (used by autocomplete).
+        let script_path = raw_path_token.strip_prefix('@').unwrap_or(raw_path_token).to_string();
 
         if script_path.is_empty() {
             self.chat_state.add_system_message(
-                "Usage: /run <path.gaviero>\n\
+                "Usage: /run <path.gaviero> [prompt]\n\
                  Compiles and executes a .gaviero DSL script.\n\
-                 Example: /run workflows/security_audit.gaviero",
+                 Use {{PROMPT}} in agent prompts for runtime substitution.\n\
+                 Example: /run workflows/security_audit.gaviero\n\
+                 Example: /run @workflows/tdd.gaviero implement OAuth login",
             );
             return;
         }
@@ -1981,7 +2107,7 @@ impl App {
 
         // Compile synchronously (fast, no LLM call)
         let filename = resolved.display().to_string();
-        let compiled = match gaviero_dsl::compile(&source, &filename, None) {
+        let compiled = match gaviero_dsl::compile(&source, &filename, None, runtime_prompt.as_deref()) {
             Ok(c) => c,
             Err(report) => {
                 self.chat_state.add_system_message(
@@ -1994,7 +2120,11 @@ impl App {
         let work_units = compiled.work_units;
         let script_max_parallel = compiled.max_parallel;
         let unit_count = work_units.len();
-        self.chat_state.add_user_message(&format!("/run {}", script_path));
+        let display_cmd = match &runtime_prompt {
+            Some(rp) => format!("/run {} {}", script_path, rp),
+            None => format!("/run {}", script_path),
+        };
+        self.chat_state.add_user_message(&display_cmd);
         self.chat_state.add_system_message(&format!(
             "Compiled {} → {} agent(s). Executing...\n\
              Switch to SWARM panel (Ctrl+Shift+P) to monitor progress.",
@@ -2092,6 +2222,31 @@ impl App {
         let root = self.workspace.roots().first()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        // Inline @file references so the coordinator receives file contents directly.
+        // Subagents run in isolated git worktrees and cannot access files outside of
+        // tracked paths (e.g. tmp/ dirs). Inlining ensures the coordinator can embed
+        // relevant content into coordinator_instructions without requiring file access.
+        let task_desc = {
+            use crate::panels::agent_chat::parse_file_references;
+            let refs = parse_file_references(&task_desc);
+            let mut enriched = task_desc.clone();
+            for rel_path in &refs {
+                let abs_path = root.join(rel_path);
+                if let Ok(content) = std::fs::read_to_string(&abs_path) {
+                    let tag = format!("@{}", rel_path);
+                    let replacement = format!(
+                        "\n[File: {}]\n{}\n[End of file: {}]",
+                        rel_path, content, rel_path
+                    );
+                    enriched = enriched.replace(&tag, &replacement);
+                    tracing::debug!("Inlined @{} into cswarm prompt ({} bytes)", rel_path, content.len());
+                } else {
+                    tracing::warn!("Could not read @{} for cswarm prompt", rel_path);
+                }
+            }
+            enriched
+        };
         let write_ns = self.chat_state.agent_settings.write_namespace.clone();
         let read_ns = self.chat_state.agent_settings.read_namespaces.clone();
         let memory = self.memory.clone();
@@ -2142,6 +2297,31 @@ impl App {
                 }
             }
         });
+    }
+
+    /// Handle `/undo-swarm` — navigate to swarm dashboard and arm undo confirmation.
+    fn handle_undo_swarm_command(&mut self) {
+        self.chat_state.take_input();
+
+        let has_result = self.swarm_dashboard.result.as_ref()
+            .map(|r| !r.pre_swarm_sha.is_empty())
+            .unwrap_or(false);
+
+        if !has_result {
+            self.chat_state.add_system_message(
+                "No undoable swarm result found. Run /cswarm first."
+            );
+            return;
+        }
+
+        // Switch to swarm dashboard and arm confirmation
+        self.side_panel = SidePanelMode::SwarmDashboard;
+        self.panel_visible.side_panel = true;
+        self.focus = Focus::SidePanel;
+        self.swarm_dashboard.pending_undo_confirm = true;
+        self.chat_state.add_system_message(
+            "Swarm dashboard: press u to confirm undo all changes, Esc to cancel."
+        );
     }
 
     /// Handle `/remember <text>` command — store text to semantic memory.
@@ -2428,7 +2608,10 @@ impl App {
                 } else {
                     0
                 };
-                return (ft_w.max(1), sp_w.max(1));
+                // Only clamp to minimum 1 for panels that are actually visible
+                let ft_w = if preset.file_tree_pct > 0 { ft_w.max(1) } else { 0 };
+                let sp_w = if preset.side_panel_pct > 0 { sp_w.max(1) } else { 0 };
+                return (ft_w, sp_w);
             }
         }
         (self.file_tree_width, self.side_panel_width)
@@ -5817,33 +6000,46 @@ fn parse_git_allow_list(workspace: &Workspace) -> Vec<String> {
 /// Parse layout presets from `panels.layouts` setting.
 /// Format: `{ "0": [15, 70, 15], "1": [0, 100, 0], ... }`
 /// Each value is `[fileTree%, editor%, sidePanel%]`.
+///
+/// Built-in defaults (used when the setting is absent or incomplete):
+///   0 → standard     [15, 70, 15]
+///   1 → editor focus [15, 85,  0]
+///   2 → full editor  [ 0,100,  0]
+///   3 → code+notes   [ 0, 60, 40]
+///   4 → wide tree    [25, 75,  0]
+///   5 → three-column [20, 55, 25]
 fn parse_layout_presets(workspace: &Workspace) -> Vec<LayoutPreset> {
+    const DEFAULTS: &[(u16, u16, u16)] = &[
+        (15, 70, 15),
+        (15, 85,  0),
+        ( 0,100,  0),
+        ( 0, 60, 40),
+        (25, 75,  0),
+        (20, 55, 25),
+    ];
+
     let val = workspace.resolve_setting("panels.layouts", None);
     tracing::info!("Layout presets setting: {}", val);
-    let mut presets = Vec::new();
+    let mut presets: Vec<LayoutPreset> = DEFAULTS
+        .iter()
+        .map(|&(ft, ed, sp)| LayoutPreset { file_tree_pct: ft, editor_pct: ed, side_panel_pct: sp })
+        .collect();
 
     if let Some(obj) = val.as_object() {
-        // Collect keys 0-9 in order
-        for i in 0..10u8 {
-            let key = i.to_string();
+        // Settings keys are 1-based ("1"–"6" etc.) matching the digit the user presses.
+        // SwitchLayout(n) uses 0-based index, so key "k" → index k-1.
+        for k in 1..=9u8 {
+            let key = k.to_string();
             if let Some(arr) = obj.get(&key).and_then(|v| v.as_array()) {
                 if arr.len() >= 3 {
                     let ft = arr[0].as_u64().unwrap_or(0) as u16;
                     let ed = arr[1].as_u64().unwrap_or(100) as u16;
                     let sp = arr[2].as_u64().unwrap_or(0) as u16;
-                    // Ensure index matches
-                    while presets.len() < i as usize {
-                        presets.push(LayoutPreset {
-                            file_tree_pct: 0,
-                            editor_pct: 100,
-                            side_panel_pct: 0,
-                        });
+                    let idx = (k - 1) as usize;
+                    while presets.len() <= idx {
+                        presets.push(LayoutPreset { file_tree_pct: 0, editor_pct: 100, side_panel_pct: 0 });
                     }
-                    presets.push(LayoutPreset {
-                        file_tree_pct: ft,
-                        editor_pct: ed,
-                        side_panel_pct: sp,
-                    });
+                    presets[idx] = LayoutPreset { file_tree_pct: ft, editor_pct: ed, side_panel_pct: sp };
                 }
             }
         }
