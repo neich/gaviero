@@ -137,7 +137,11 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Main loop
+    // Main loop — drain all pending events before each render to reduce latency.
+    // Without draining, each event triggers a full redraw; during streaming bursts
+    // this means the MessageComplete event sits behind many intermediate events,
+    // each causing an unnecessary render. Draining processes them all at once,
+    // so the UI jumps straight to the final state.
     loop {
         if app.needs_full_redraw {
             terminal.clear()?;
@@ -145,8 +149,19 @@ async fn main() -> Result<()> {
         }
         terminal.draw(|frame| app.render(frame))?;
 
+        // Block until at least one event arrives
         if let Some(event) = event_rx.recv().await {
             app.handle_event(event);
+        }
+
+        // Drain any additional events that arrived while we were rendering/handling.
+        // Cap at 64 to avoid starving the renderer if events come faster than we
+        // can process them (e.g., rapid file-watcher events).
+        for _ in 0..64 {
+            match event_rx.try_recv() {
+                Ok(event) => app.handle_event(event),
+                Err(_) => break,
+            }
         }
 
         if app.should_quit {

@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::observer::AcpObserver;
@@ -15,6 +16,15 @@ use super::session::{AcpSession, AgentOptions};
 
 /// Maximum characters to include per message when sending conversation history.
 const HISTORY_TRUNCATION_CHARS: usize = 2000;
+
+/// How long to wait for the next stream event before sending a keepalive status.
+/// Claude tool calls (Read, Grep on large repos) can take a while, so this should
+/// be generous enough to avoid false positives but short enough to reassure the user.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum time to wait for the subprocess to exit after the stream ends.
+/// After this, the process is killed to avoid blocking the pipeline indefinitely.
+const PROCESS_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 const DEFAULT_SYSTEM_PROMPT: &str = r#"You are a coding assistant working inside the gaviero editor.
 
@@ -114,16 +124,69 @@ impl AcpPipeline {
         // Accumulate the full response text; detect <file> blocks incrementally
         let mut full_text = String::new();
         let mut file_scan_pos: usize = 0; // how far we've scanned for complete blocks
+        let mut in_thinking = false;
 
         // Track files that Write/Edit tools will modify — snapshot BEFORE CLI executes them.
         // Key: absolute path, Value: original content at the time of snapshot.
         let mut file_snapshots: HashMap<PathBuf, String> = HashMap::new();
 
-        // Process streaming events
+        // Process streaming events with idle timeout.
+        // During tool execution, Claude CLI emits no events — the idle timeout
+        // detects this and sends keepalive status updates so the UI stays responsive.
+        let mut idle_count: u32 = 0;
         loop {
-            match session.next_event().await {
+            let next = tokio::time::timeout(
+                STREAM_IDLE_TIMEOUT,
+                session.next_event(),
+            )
+            .await;
+
+            match next {
+                // Timeout — no event received within STREAM_IDLE_TIMEOUT
+                Err(_elapsed) => {
+                    idle_count += 1;
+                    let elapsed_secs = idle_count * STREAM_IDLE_TIMEOUT.as_secs() as u32;
+                    // Check if the subprocess is still alive
+                    if session.try_wait_exited() {
+                        tracing::warn!("Claude subprocess exited during idle wait");
+                        let stderr = session.stderr_output().await;
+                        let msg = if stderr.is_empty() {
+                            "Claude process exited unexpectedly during tool execution.\n\
+                             Check ~/.cache/gaviero/gaviero.log for details."
+                                .to_string()
+                        } else {
+                            format!("Claude CLI error during tool execution:\n{}", stderr)
+                        };
+                        self.observer.on_message_complete("system", &msg);
+                        break;
+                    }
+                    // Process still alive — send keepalive status
+                    self.observer.on_streaming_status(
+                        &format!("Working... ({}s elapsed, tools running)", elapsed_secs),
+                    );
+                    tracing::debug!(
+                        "Stream idle for {}s, subprocess still alive — sending keepalive",
+                        elapsed_secs
+                    );
+                    continue;
+                }
+                // Got a result from next_event()
+                Ok(result) => {
+                    idle_count = 0; // reset on any activity
+                    match result {
                 Ok(Some(event)) => match event {
+                    StreamEvent::ThinkingDelta(text) => {
+                        if !in_thinking {
+                            self.observer.on_stream_chunk("<think>\n");
+                            in_thinking = true;
+                        }
+                        self.observer.on_stream_chunk(&text);
+                    }
                     StreamEvent::ContentDelta(text) => {
+                        if in_thinking {
+                            self.observer.on_stream_chunk("\n</think>\n");
+                            in_thinking = false;
+                        }
                         full_text.push_str(&text);
                         self.observer.on_stream_chunk(&text);
 
@@ -217,7 +280,17 @@ impl AcpPipeline {
                     } else {
                         // Include stderr/unparsed stdout + exit status for diagnostics.
                         // Wait for process to exit first so stderr drain task can finish.
-                        let exit_status = session.wait().await.ok();
+                        let exit_status = match tokio::time::timeout(
+                            PROCESS_WAIT_TIMEOUT,
+                            session.wait(),
+                        ).await {
+                            Ok(status) => status.ok(),
+                            Err(_) => {
+                                tracing::warn!("Process wait timed out on EOF, killing");
+                                session.kill();
+                                None
+                            }
+                        };
                         tokio::task::yield_now().await;
                         let stderr = session.stderr_output().await;
                         let exit_info = match exit_status {
@@ -243,6 +316,13 @@ impl AcpPipeline {
                     break;
                 }
             }
+                }
+            }
+        }
+
+        // Close any open thinking block
+        if in_thinking {
+            self.observer.on_stream_chunk("\n</think>\n");
         }
 
         // Catch any <file> blocks that completed after the last ContentDelta (fallback)
@@ -253,17 +333,37 @@ impl AcpPipeline {
             }
         }
 
-        // Wait for subprocess to finish (tools have now been executed)
-        let _ = session.wait().await;
+        // Wait for subprocess to finish (tools have now been executed).
+        // Use a timeout to avoid blocking indefinitely if the process hangs.
+        self.observer.on_streaming_status("Finalizing...");
+        match tokio::time::timeout(PROCESS_WAIT_TIMEOUT, session.wait()).await {
+            Ok(Ok(status)) => {
+                tracing::info!("Claude subprocess exited: {}", status);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Error waiting for claude subprocess: {}", e);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "Claude subprocess did not exit within {}s, killing",
+                    PROCESS_WAIT_TIMEOUT.as_secs()
+                );
+                session.kill();
+            }
+        }
 
         // Create proposals from snapshotted files — compare original vs current disk content.
         // The CLI has already written the files, so we diff snapshot vs disk.
         if !file_snapshots.is_empty() {
+            let total = file_snapshots.len();
             tracing::info!(
                 "Processing {} file snapshots for tool-based proposals",
-                file_snapshots.len()
+                total
             );
-            for (abs_path, original) in &file_snapshots {
+            self.observer.on_streaming_status(
+                &format!("Processing {} file change{}...", total, if total == 1 { "" } else { "s" }),
+            );
+            for (i, (abs_path, original)) in file_snapshots.iter().enumerate() {
                 let current = tokio::fs::read_to_string(&abs_path)
                     .await
                     .unwrap_or_default();
@@ -275,6 +375,12 @@ impl AcpPipeline {
                     "File changed by tool: {} (orig={} bytes, new={} bytes)",
                     abs_path.display(), original.len(), current.len()
                 );
+
+                if total > 1 {
+                    self.observer.on_streaming_status(
+                        &format!("Processing file {}/{}...", i + 1, total),
+                    );
+                }
 
                 // Revert the file to its original content on disk.
                 // The proposal stores both versions; review mode will re-apply if accepted.

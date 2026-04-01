@@ -101,6 +101,7 @@ pub async fn run_backend(
     let mut full_text = String::new();
     let mut had_error = false;
     let mut error_msg = String::new();
+    let mut in_thinking = false;
 
     while let Some(event_result) = stream.next().await {
         let event = match event_result {
@@ -114,11 +115,19 @@ pub async fn run_backend(
 
         match event {
             UnifiedStreamEvent::TextDelta(text) => {
+                if in_thinking {
+                    observer.on_stream_chunk("\n</think>\n");
+                    in_thinking = false;
+                }
                 full_text.push_str(&text);
                 observer.on_stream_chunk(&text);
             }
-            UnifiedStreamEvent::ThinkingDelta(_) => {
-                // Thinking text is not forwarded to observer for now
+            UnifiedStreamEvent::ThinkingDelta(text) => {
+                if !in_thinking {
+                    observer.on_stream_chunk("<think>\n");
+                    in_thinking = true;
+                }
+                observer.on_stream_chunk(&text);
             }
             UnifiedStreamEvent::ToolCallStart { name, .. } => {
                 observer.on_tool_call_started(&name);
@@ -160,6 +169,11 @@ pub async fn run_backend(
                 break;
             }
         }
+    }
+
+    // Close any open thinking block
+    if in_thinking {
+        observer.on_stream_chunk("\n</think>\n");
     }
 
     // 5. Build manifest

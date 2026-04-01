@@ -439,6 +439,7 @@ impl AgentChatState {
                      /run <path>        — Execute a .gaviero DSL script\n\
                      /swarm <task>      — Plan and execute a multi-agent swarm\n\
                      /cswarm <task>     — Coordinated swarm (Opus plans, Sonnet/Haiku execute)\n\
+                     /undo-swarm        — Revert all changes from the last /cswarm run\n\
                      /help              — Show this help\n\n\
                      Keyboard shortcuts:\n\
                      F2                 — Rename active conversation tab\n\

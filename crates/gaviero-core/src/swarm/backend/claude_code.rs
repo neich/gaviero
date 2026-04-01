@@ -239,6 +239,9 @@ pub fn map_acp_event(
                 out.push(UnifiedStreamEvent::Done(StopReason::EndTurn));
             }
         }
+        StreamEvent::ThinkingDelta(text) => {
+            out.push(UnifiedStreamEvent::ThinkingDelta(text.clone()));
+        }
         StreamEvent::SystemInit { .. } => {
             // Filtered out — not meaningful for the unified stream
         }

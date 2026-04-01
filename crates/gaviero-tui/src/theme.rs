@@ -50,6 +50,8 @@ pub const INPUT_BG: Color = Color::Rgb(44, 49, 58);
 pub const BROWSE_BG: Color = Color::Rgb(55, 62, 75);
 /// Tool call / muted label text.
 pub const TOOL_DIM: Color = Color::Rgb(127, 132, 142);
+/// Reasoning / thinking text (lighter to emphasize chain-of-thought).
+pub const REASONING_FG: Color = Color::Rgb(190, 185, 210);
 /// Code / string literal green.
 pub const CODE_GREEN: Color = Color::Rgb(152, 195, 121);
 /// Subtle border / rule color.

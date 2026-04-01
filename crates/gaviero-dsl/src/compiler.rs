@@ -35,6 +35,7 @@ pub fn compile_ast(
     source: &str,
     filename: &str,
     workflow: Option<&str>,
+    runtime_prompt: Option<&str>,
 ) -> Result<CompiledScript, DslErrors> {
     let src = || NamedSource::new(filename, source.to_string());
 
@@ -129,7 +130,7 @@ pub fn compile_ast(
     let mut compile_errors: Vec<DslError> = Vec::new();
 
     for decl in agent_order {
-        match compile_agent(decl, &client_map, workflow_memory, source, filename) {
+        match compile_agent(decl, &client_map, workflow_memory, source, filename, runtime_prompt) {
             Ok(wu) => work_units.push(wu),
             Err(e) => compile_errors.push(e),
         }
@@ -281,6 +282,7 @@ fn compile_agent(
     workflow_memory: Option<&MemoryBlock>,
     source: &str,
     filename: &str,
+    runtime_prompt: Option<&str>,
 ) -> Result<WorkUnit, DslError> {
     let src = || NamedSource::new(filename, source.to_string());
 
@@ -320,17 +322,18 @@ fn compile_agent(
         .map(|(deps, _)| deps.iter().map(|(s, _)| s.clone()).collect())
         .unwrap_or_default();
 
-    let description = decl
-        .description
-        .as_ref()
-        .map(|(s, _)| s.clone())
-        .unwrap_or_else(|| decl.name.clone());
+    let description = match (&decl.description, runtime_prompt) {
+        (Some((s, _)), Some(rp)) => s.replace("{{PROMPT}}", rp),
+        (Some((s, _)), None) => s.clone(),
+        (None, _) => decl.name.clone(),
+    };
 
-    let coordinator_instructions = decl
-        .prompt
-        .as_ref()
-        .map(|(s, _)| s.clone())
-        .unwrap_or_default();
+    let coordinator_instructions = match (&decl.prompt, runtime_prompt) {
+        (Some((s, _)), Some(rp)) => s.replace("{{PROMPT}}", rp),
+        (Some((s, _)), None) => s.clone(),
+        (None, Some(rp)) => rp.to_string(),
+        (None, None) => String::new(),
+    };
 
     let max_retries = decl.max_retries.as_ref().map(|(n, _)| *n).unwrap_or(1);
 
@@ -411,7 +414,7 @@ mod tests {
         let (tokens, _) = lexer::lex(src);
         let (ast, errs) = parser::parse(&tokens, src, "test.gaviero");
         assert!(errs.is_empty(), "parse errors: {:?}", errs);
-        compile_ast(&ast.unwrap(), src, "test.gaviero", None).map(|c| c.work_units)
+        compile_ast(&ast.unwrap(), src, "test.gaviero", None, None).map(|c| c.work_units)
     }
 
     const FULL_EXAMPLE: &str = r##"
@@ -497,7 +500,7 @@ mod tests {
         "#;
         let (tokens, _) = lexer::lex(src);
         let (ast, _) = parser::parse(&tokens, src, "t");
-        let compiled = compile_ast(&ast.unwrap(), src, "t", Some("only_a")).unwrap();
+        let compiled = compile_ast(&ast.unwrap(), src, "t", Some("only_a"), None).unwrap();
         let units = compiled.work_units;
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].id, "a");
@@ -508,7 +511,7 @@ mod tests {
         let src = r#"agent a { } workflow w { steps [a ghost] }"#;
         let (tokens, _) = lexer::lex(src);
         let (ast, _) = parser::parse(&tokens, src, "t");
-        let result = compile_ast(&ast.unwrap(), src, "t", None);
+        let result = compile_ast(&ast.unwrap(), src, "t", None, None);
         assert!(result.is_err());
         let msg = format!("{:?}", result.unwrap_err());
         assert!(msg.contains("ghost"), "{}", msg);
@@ -567,7 +570,7 @@ mod tests {
         "#;
         let (tokens, _) = lexer::lex(src);
         let (ast, _) = parser::parse(&tokens, src, "t");
-        let compiled = compile_ast(&ast.unwrap(), src, "t", None).unwrap();
+        let compiled = compile_ast(&ast.unwrap(), src, "t", None, None).unwrap();
         assert_eq!(compiled.max_parallel, Some(3));
     }
 
@@ -646,5 +649,54 @@ mod tests {
             let offset: usize = span.offset();
             assert!(offset > 0, "span should point at the bad dep, not file start");
         }
+    }
+
+    fn compile_str_with_prompt<'a>(src: &'a str, runtime_prompt: Option<&'a str>) -> Result<Vec<WorkUnit>, DslErrors> {
+        let (tokens, _) = lexer::lex(src);
+        let (ast, errs) = parser::parse(&tokens, src, "test.gaviero");
+        assert!(errs.is_empty(), "parse errors: {:?}", errs);
+        compile_ast(&ast.unwrap(), src, "test.gaviero", None, runtime_prompt).map(|c| c.work_units)
+    }
+
+    #[test]
+    fn runtime_prompt_substituted_in_coordinator_instructions() {
+        let src = r##"agent x { prompt #"Task: {{PROMPT}}"# }"##;
+        let units = compile_str_with_prompt(src, Some("implement login")).unwrap();
+        assert_eq!(units[0].coordinator_instructions, "Task: implement login");
+    }
+
+    #[test]
+    fn runtime_prompt_fixed_prompt_unchanged() {
+        let src = r##"agent x { prompt #"Fixed task: do the thing"# }"##;
+        let units = compile_str_with_prompt(src, Some("ignored")).unwrap();
+        assert_eq!(units[0].coordinator_instructions, "Fixed task: do the thing");
+    }
+
+    #[test]
+    fn runtime_prompt_fallback_no_prompt_field() {
+        let src = r#"agent x { description "t" }"#;
+        let units = compile_str_with_prompt(src, Some("do the thing")).unwrap();
+        assert_eq!(units[0].coordinator_instructions, "do the thing");
+    }
+
+    #[test]
+    fn runtime_prompt_none_no_prompt_field_empty() {
+        let src = r#"agent x { description "t" }"#;
+        let units = compile_str_with_prompt(src, None).unwrap();
+        assert_eq!(units[0].coordinator_instructions, "");
+    }
+
+    #[test]
+    fn runtime_prompt_substituted_in_description() {
+        let src = r#"agent x { description "Process {{PROMPT}}" }"#;
+        let units = compile_str_with_prompt(src, Some("files")).unwrap();
+        assert_eq!(units[0].description, "Process files");
+    }
+
+    #[test]
+    fn runtime_prompt_multiple_placeholder_occurrences() {
+        let src = r##"agent x { prompt #"{{PROMPT}} and also {{PROMPT}}"# }"##;
+        let units = compile_str_with_prompt(src, Some("X")).unwrap();
+        assert_eq!(units[0].coordinator_instructions, "X and also X");
     }
 }

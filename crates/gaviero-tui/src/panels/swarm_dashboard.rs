@@ -35,6 +35,25 @@ pub enum ActivityKind {
 /// Max activity lines stored per agent.
 const MAX_ACTIVITY_LINES: usize = 500;
 
+// ── Diff overlay types ──────────────────────────────────────────
+
+/// Rendering category for a unified-diff line.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DiffLineKind {
+    Added,
+    Removed,
+    Context,
+    Header,
+}
+
+/// State for the per-agent diff overlay shown when the user presses Enter.
+#[derive(Debug, Clone)]
+pub struct SwarmAgentDiffState {
+    pub agent_id: String,
+    pub lines: Vec<(DiffLineKind, String)>,
+    pub scroll: usize,
+}
+
 // ── Agent entry ─────────────────────────────────────────────────
 
 /// An entry in the swarm dashboard table.
@@ -90,6 +109,10 @@ pub struct SwarmDashboardState {
     pub table_rect: Rect,
     /// Layout rect for the detail pane (set during render, used for mouse hit-testing).
     pub detail_rect: Rect,
+    /// When Some, the detail pane shows a read-only diff overlay for this agent.
+    pub diff_agent: Option<SwarmAgentDiffState>,
+    /// When true, a confirmation prompt is shown before undoing the swarm.
+    pub pending_undo_confirm: bool,
 }
 
 impl SwarmDashboardState {
@@ -108,6 +131,8 @@ impl SwarmDashboardState {
             focus: DashboardFocus::Table,
             table_rect: Rect::default(),
             detail_rect: Rect::default(),
+            diff_agent: None,
+            pending_undo_confirm: false,
         }
     }
 
@@ -124,6 +149,22 @@ impl SwarmDashboardState {
         self.detail_scroll = 0;
         self.detail_auto_scroll = true;
         self.focus = DashboardFocus::Table;
+        self.diff_agent = None;
+        self.pending_undo_confirm = false;
+    }
+
+    /// Open the diff overlay for `agent_id` using the provided unified diff text.
+    pub fn show_diff(&mut self, agent_id: String, diff_text: String) {
+        self.diff_agent = Some(SwarmAgentDiffState {
+            agent_id,
+            lines: parse_diff(&diff_text),
+            scroll: 0,
+        });
+    }
+
+    /// Close the diff overlay.
+    pub fn close_diff(&mut self) {
+        self.diff_agent = None;
     }
 
     /// Toggle focus between Table and Detail.
@@ -523,13 +564,31 @@ impl SwarmDashboardState {
     }
 
     fn render_detail_pane(&self, area: Rect, buf: &mut Buffer, bg: Color) {
+        // Diff overlay takes priority
+        if let Some(ref diff) = self.diff_agent {
+            self.render_diff_overlay(area, buf, bg, diff);
+            // If undo confirm is also pending, show it at the bottom of the diff
+            if self.pending_undo_confirm {
+                render_undo_confirm_line(area, buf, bg);
+            }
+            return;
+        }
+
+        // Undo confirmation prompt (shown at bottom of detail pane)
+        let detail_area = if self.pending_undo_confirm && area.height > 1 {
+            render_undo_confirm_line(area, buf, bg);
+            Rect { height: area.height - 1, ..area }
+        } else {
+            area
+        };
+
         let Some(agent) = self.agents.get(self.scroll.selected) else { return };
 
         if agent.activity.is_empty() {
             let msg = " Waiting for activity...";
             let style = Style::default().fg(theme::TEXT_DIM).bg(bg);
-            if area.y < area.bottom() {
-                render_text(buf, area.x, area.y, area.right(), msg, style);
+            if detail_area.y < detail_area.bottom() {
+                render_text(buf, detail_area.x, detail_area.y, detail_area.right(), msg, style);
             }
             return;
         }
@@ -537,7 +596,7 @@ impl SwarmDashboardState {
         // Flatten activity into display lines (split on newlines)
         let display_lines = flatten_activity(&agent.activity);
         let total = display_lines.len();
-        let viewport = area.height as usize;
+        let viewport = detail_area.height as usize;
 
         // Auto-scroll: show the bottom
         let scroll = if self.detail_auto_scroll {
@@ -547,14 +606,14 @@ impl SwarmDashboardState {
         };
 
         // Render visible lines
-        let content_width = area.width.saturating_sub(1); // -1 for scrollbar
+        let content_width = detail_area.width.saturating_sub(1); // -1 for scrollbar
         for row in 0..viewport {
             let idx = scroll + row;
             if idx >= total {
                 break;
             }
-            let y = area.y + row as u16;
-            if y >= area.bottom() {
+            let y = detail_area.y + row as u16;
+            if y >= detail_area.bottom() {
                 break;
             }
 
@@ -577,12 +636,56 @@ impl SwarmDashboardState {
 
             // Truncate text to content width
             let display: String = text.chars().take(content_width as usize).collect();
-            render_text(buf, area.x + 1, y, area.x + content_width, &display, style);
+            render_text(buf, detail_area.x + 1, y, detail_area.x + content_width, &display, style);
         }
 
         // Scrollbar
         if total > viewport {
-            render_scrollbar(area, buf, total, viewport, scroll);
+            render_scrollbar(detail_area, buf, total, viewport, scroll);
+        }
+    }
+
+    fn render_diff_overlay(&self, area: Rect, buf: &mut Buffer, bg: Color, diff: &SwarmAgentDiffState) {
+        if area.height == 0 { return; }
+
+        // Header line
+        let header = format!(" [diff] {}   Esc: back  j/k: scroll", diff.agent_id);
+        let header_style = Style::default().fg(theme::ACCENT).bg(bg).add_modifier(Modifier::BOLD);
+        render_text(buf, area.x, area.y, area.right(), &header, header_style);
+
+        if area.height <= 1 { return; }
+        let content_area = Rect { y: area.y + 1, height: area.height - 1, ..area };
+
+        if diff.lines.is_empty() {
+            let style = Style::default().fg(theme::TEXT_DIM).bg(bg);
+            render_text(buf, content_area.x + 1, content_area.y, content_area.right(), " (no diff available)", style);
+            return;
+        }
+
+        let total = diff.lines.len();
+        let viewport = content_area.height as usize;
+        let scroll = diff.scroll.min(total.saturating_sub(viewport));
+        let content_width = content_area.width.saturating_sub(1);
+
+        for row in 0..viewport {
+            let idx = scroll + row;
+            if idx >= total { break; }
+            let y = content_area.y + row as u16;
+            if y >= content_area.bottom() { break; }
+
+            let (kind, text) = &diff.lines[idx];
+            let style = match kind {
+                DiffLineKind::Added => Style::default().fg(Color::Green).bg(bg),
+                DiffLineKind::Removed => Style::default().fg(Color::Red).bg(bg),
+                DiffLineKind::Header => Style::default().fg(Color::Yellow).bg(bg).add_modifier(Modifier::BOLD),
+                DiffLineKind::Context => Style::default().fg(theme::TEXT_DIM).bg(bg),
+            };
+            let display: String = text.chars().take(content_width as usize).collect();
+            render_text(buf, content_area.x + 1, y, content_area.x + content_width, &display, style);
+        }
+
+        if total > viewport {
+            render_scrollbar(content_area, buf, total, viewport, scroll);
         }
     }
 }
@@ -615,6 +718,37 @@ fn flatten_activity(activity: &[ActivityLine]) -> Vec<(ActivityKind, String)> {
         }
     }
     lines
+}
+
+/// Parse a unified diff string into classified lines for rendering.
+pub fn parse_diff(text: &str) -> Vec<(DiffLineKind, String)> {
+    text.lines()
+        .map(|line| {
+            let kind = if line.starts_with("+++") || line.starts_with("---")
+                || line.starts_with("diff ") || line.starts_with("index ")
+                || line.starts_with("@@") || line.starts_with("new file")
+                || line.starts_with("deleted file")
+            {
+                DiffLineKind::Header
+            } else if line.starts_with('+') {
+                DiffLineKind::Added
+            } else if line.starts_with('-') {
+                DiffLineKind::Removed
+            } else {
+                DiffLineKind::Context
+            };
+            (kind, line.to_string())
+        })
+        .collect()
+}
+
+/// Render the undo confirmation message at the bottom of `area`.
+fn render_undo_confirm_line(area: Rect, buf: &mut Buffer, bg: Color) {
+    let y = area.bottom().saturating_sub(1);
+    if y < area.y { return; }
+    let msg = " Press u again to confirm UNDO ALL swarm changes. Esc to cancel.";
+    let style = Style::default().fg(Color::Yellow).bg(bg).add_modifier(Modifier::BOLD);
+    render_text(buf, area.x, y, area.right(), msg, style);
 }
 
 /// Format elapsed time for an agent.

@@ -165,6 +165,15 @@ impl AcpSession {
         }
     }
 
+    /// Check if the subprocess has already exited (non-blocking).
+    /// Returns `true` if the process has exited, `false` if still running.
+    pub fn try_wait_exited(&mut self) -> bool {
+        match self.child.try_wait() {
+            Ok(Some(_)) => true,
+            _ => false,
+        }
+    }
+
     /// Kill the subprocess (for cancellation).
     pub fn kill(&mut self) {
         let _ = self.child.start_kill();

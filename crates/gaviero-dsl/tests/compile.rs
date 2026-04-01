@@ -40,7 +40,7 @@ const FULL_EXAMPLE: &str = r##"
 
 #[test]
 fn full_example_compiles_to_two_units() {
-    let compiled = compile(FULL_EXAMPLE, "test.gaviero", None)
+    let compiled = compile(FULL_EXAMPLE, "test.gaviero", None, None)
         .expect("should compile without errors");
     let units = compiled.work_units;
 
@@ -70,7 +70,7 @@ fn full_example_compiles_to_two_units() {
 
 #[test]
 fn full_example_max_parallel_propagated() {
-    let compiled = compile(FULL_EXAMPLE, "test.gaviero", None)
+    let compiled = compile(FULL_EXAMPLE, "test.gaviero", None, None)
         .expect("should compile without errors");
     assert_eq!(compiled.max_parallel, Some(2));
 }
@@ -78,7 +78,7 @@ fn full_example_max_parallel_propagated() {
 #[test]
 fn lex_error_is_reported() {
     let src = "agent @ bad { }";
-    let err = compile(src, "test.gaviero", None);
+    let err = compile(src, "test.gaviero", None, None);
     assert!(err.is_err(), "expected error for invalid character");
     let report = format!("{:?}", err.unwrap_err());
     assert!(report.contains("unexpected"), "report: {}", report);
@@ -87,7 +87,7 @@ fn lex_error_is_reported() {
 #[test]
 fn undefined_client_error() {
     let src = r#"agent x { client ghost }"#;
-    let err = compile(src, "test.gaviero", None).unwrap_err();
+    let err = compile(src, "test.gaviero", None, None).unwrap_err();
     let report = format!("{:?}", err);
     assert!(report.contains("ghost"), "report: {}", report);
 }
@@ -98,7 +98,7 @@ fn no_workflow_runs_all_agents() {
         agent a { description "first" }
         agent b { description "second" }
     "#;
-    let units = compile(src, "test.gaviero", None).unwrap().work_units;
+    let units = compile(src, "test.gaviero", None, None).unwrap().work_units;
     assert_eq!(units.len(), 2);
     assert_eq!(units[0].id, "a");
     assert_eq!(units[1].id, "b");
@@ -112,7 +112,7 @@ fn workflow_name_selector() {
         workflow just_b { steps [b] }
         workflow both   { steps [a b] }
     "#;
-    let units = compile(src, "test.gaviero", Some("just_b")).unwrap().work_units;
+    let units = compile(src, "test.gaviero", Some("just_b"), None).unwrap().work_units;
     assert_eq!(units.len(), 1);
     assert_eq!(units[0].id, "b");
 }
@@ -120,7 +120,7 @@ fn workflow_name_selector() {
 #[test]
 fn parse_error_missing_closing_brace() {
     let src = r#"agent x { description "hello" "#;
-    let err = compile(src, "test.gaviero", None).unwrap_err();
+    let err = compile(src, "test.gaviero", None, None).unwrap_err();
     let report = format!("{:?}", err);
     assert!(!report.is_empty());
 }
@@ -131,7 +131,7 @@ fn dependency_cycle_detected() {
         agent a { depends_on [b] }
         agent b { depends_on [a] }
     "#;
-    let err = compile(src, "test.gaviero", None).unwrap_err();
+    let err = compile(src, "test.gaviero", None, None).unwrap_err();
     let report = format!("{:?}", err);
     assert!(report.contains("cycle"), "expected cycle: {}", report);
 }
@@ -146,7 +146,7 @@ fn compile_example(filename: &str) -> Vec<gaviero_core::swarm::models::WorkUnit>
     );
     let source = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("reading {}: {}", path, e));
-    compile(&source, filename, None)
+    compile(&source, filename, None, None)
         .unwrap_or_else(|e| panic!("compiling {}:\n{:?}", filename, e))
         .work_units
 }
