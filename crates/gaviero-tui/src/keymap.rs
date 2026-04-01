@@ -74,7 +74,7 @@ pub enum Action {
 
     // Layout
     ToggleFullscreen,
-    SwitchLayout(u8), // 0-5 via Alt+Shift+1..6
+    SwitchLayout(u8), // 0-5 via Alt+5..9 and Alt+0
     Rename,
 
     // Clipboard
@@ -139,8 +139,16 @@ impl Keymap {
             KeyCode::Char('w') if alt => Action::SetSideModeSwarm,
             KeyCode::Char('g') if alt => Action::SetSideModeGit,
 
-            // ── Layout presets: Alt+Shift+1..6 ───────────────────
-            KeyCode::Char(c @ '1'..='6') if alt && shift => Action::SwitchLayout((c as u8) - b'1'),
+            // ── Layout presets: Alt+5..9 and Alt+0 ───────────────
+            // Unshifted digits with Alt: keyboard-layout independent, not
+            // grabbed by any common DE, consistent with Alt+1..4 panel focus.
+            // Alt+5=layout1, Alt+6=layout2, ..., Alt+9=layout5, Alt+0=layout6
+            KeyCode::Char('5') if alt && !ctrl => Action::SwitchLayout(0),
+            KeyCode::Char('6') if alt && !ctrl => Action::SwitchLayout(1),
+            KeyCode::Char('7') if alt && !ctrl => Action::SwitchLayout(2),
+            KeyCode::Char('8') if alt && !ctrl => Action::SwitchLayout(3),
+            KeyCode::Char('9') if alt && !ctrl => Action::SwitchLayout(4),
+            KeyCode::Char('0') if alt && !ctrl => Action::SwitchLayout(5),
 
             // ── Tab cycling: Alt+[/] ─────────────────────────────
             KeyCode::Char(']') if alt => Action::CycleTabForward,
@@ -306,14 +314,23 @@ mod tests {
     }
 
     #[test]
-    fn test_layout_preset_alt_shift() {
+    fn test_layout_preset_alt_digit() {
         assert_eq!(
-            Keymap::resolve(&key(KeyCode::Char('1'), KeyModifiers::ALT | KeyModifiers::SHIFT)),
+            Keymap::resolve(&key(KeyCode::Char('5'), KeyModifiers::ALT)),
             Action::SwitchLayout(0)
         );
         assert_eq!(
-            Keymap::resolve(&key(KeyCode::Char('6'), KeyModifiers::ALT | KeyModifiers::SHIFT)),
+            Keymap::resolve(&key(KeyCode::Char('9'), KeyModifiers::ALT)),
+            Action::SwitchLayout(4)
+        );
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::Char('0'), KeyModifiers::ALT)),
             Action::SwitchLayout(5)
+        );
+        // Must not fire without Alt
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::Char('5'), KeyModifiers::NONE)),
+            Action::InsertChar('5')
         );
     }
 }
