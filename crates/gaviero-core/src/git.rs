@@ -327,6 +327,70 @@ impl GitRepo {
     }
 }
 
+// ── Free git CLI helpers ───────────────────────────────────
+
+/// Return the full SHA of HEAD in `repo_dir`.
+pub fn current_head_sha(repo_dir: &Path) -> Result<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_dir)
+        .output()
+        .context("git rev-parse HEAD")?;
+    anyhow::ensure!(out.status.success(), "git rev-parse HEAD failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Return the list of files changed in the most recent commit at `repo_dir`.
+pub fn files_changed_in_commit(repo_dir: &Path) -> Result<Vec<PathBuf>> {
+    let out = Command::new("git")
+        .args(["diff-tree", "--no-commit-id", "-r", "--name-only", "HEAD"])
+        .current_dir(repo_dir)
+        .output()
+        .context("git diff-tree")?;
+    anyhow::ensure!(out.status.success(), "git diff-tree failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(PathBuf::from)
+        .collect())
+}
+
+/// Return the unified diff of `branch` relative to `base_sha`.
+///
+/// Works even after the worktree for `branch` has been torn down, since the
+/// branch ref still exists in the repository.
+pub fn diff_branch_vs_sha(repo_dir: &Path, base_sha: &str, branch: &str) -> Result<String> {
+    let out = Command::new("git")
+        .args(["diff", base_sha, branch])
+        .current_dir(repo_dir)
+        .output()
+        .context("git diff")?;
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Hard-reset `repo_dir` to `sha` (`git reset --hard <sha>`).
+pub fn reset_hard(repo_dir: &Path, sha: &str) -> Result<()> {
+    let status = Command::new("git")
+        .args(["reset", "--hard", sha])
+        .current_dir(repo_dir)
+        .status()
+        .context("git reset --hard")?;
+    anyhow::ensure!(status.success(), "git reset --hard {} failed", sha);
+    Ok(())
+}
+
+/// Delete a local branch by name. Errors are silently ignored (branch may not exist).
+pub fn delete_branch(repo_dir: &Path, branch: &str) -> Result<()> {
+    Command::new("git")
+        .args(["branch", "-D", branch])
+        .current_dir(repo_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("git branch -D")?;
+    Ok(())
+}
+
 /// Manages git worktrees for parallel agent execution.
 ///
 /// Each agent gets its own worktree with a dedicated branch, allowing
