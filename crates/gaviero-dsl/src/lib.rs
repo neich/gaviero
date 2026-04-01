@@ -16,6 +16,10 @@ pub use error::{DslError, DslErrors};
 ///   - `None` and exactly one workflow declared → use it.
 ///   - `None` and no workflow declared → run all agents in declaration order.
 ///   - `None` and multiple workflows → error; specify one.
+/// - `runtime_prompt`: Optional string substituted for every `{{PROMPT}}` placeholder
+///   found in agent `prompt` or `description` fields. If an agent has no `prompt` field
+///   and `runtime_prompt` is `Some(_)`, the runtime prompt is used as the agent's full
+///   instructions.
 ///
 /// # Errors
 /// Returns a [`miette::Report`] with colorful source diagnostics if lexing,
@@ -24,6 +28,7 @@ pub fn compile(
     source: &str,
     filename: &str,
     workflow: Option<&str>,
+    runtime_prompt: Option<&str>,
 ) -> Result<CompiledScript, miette::Report> {
     use miette::NamedSource;
 
@@ -51,6 +56,6 @@ pub fn compile(
     };
 
     // Phase 3: Compile
-    compiler::compile_ast(&ast, source, filename, workflow)
+    compiler::compile_ast(&ast, source, filename, workflow, runtime_prompt)
         .map_err(|e| miette::Report::new(e))
 }
