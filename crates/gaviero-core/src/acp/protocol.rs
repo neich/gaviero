@@ -26,6 +26,9 @@ pub enum StreamEvent {
     /// Streaming text chunk from the assistant response.
     ContentDelta(String),
 
+    /// Streaming thinking/reasoning chunk from extended thinking.
+    ThinkingDelta(String),
+
     /// Agent started a tool call.
     ToolUseStart {
         tool_name: String,
@@ -102,6 +105,10 @@ pub fn parse_stream_line(line: &str) -> Result<StreamEvent> {
                     if delta_type == "text_delta" {
                         Ok(StreamEvent::ContentDelta(
                             required_str(&delta, "text")?,
+                        ))
+                    } else if delta_type == "thinking_delta" {
+                        Ok(StreamEvent::ThinkingDelta(
+                            required_str(&delta, "thinking")?,
                         ))
                     } else if delta_type == "input_json_delta" {
                         Ok(StreamEvent::ToolInputDelta(
