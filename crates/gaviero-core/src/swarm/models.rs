@@ -133,6 +133,10 @@ pub struct SwarmResult {
     pub merge_results: Vec<MergeResult>,
     /// Whether the overall execution succeeded.
     pub success: bool,
+    /// HEAD SHA captured before any merges. Used by `revert_swarm` to reset
+    /// the repo to its pre-swarm state. Empty string for non-worktree runs.
+    #[serde(default)]
+    pub pre_swarm_sha: String,
 }
 
 /// Result of merging an agent's changes.
