@@ -169,7 +169,7 @@ async fn main() -> Result<()> {
         let source = std::fs::read_to_string(script_path)
             .with_context(|| format!("reading script: {}", script_path.display()))?;
         let filename = script_path.display().to_string();
-        let compiled = gaviero_dsl::compile(&source, &filename, None)
+        let compiled = gaviero_dsl::compile(&source, &filename, None, None)
             .map_err(|report| {
                 eprintln!("{:?}", report);
                 anyhow::anyhow!("DSL compilation failed")
