@@ -41,10 +41,58 @@ pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<
     let table_header_style = Style::default()
         .fg(theme::TEXT_BRIGHT)
         .add_modifier(Modifier::BOLD);
+    let reasoning_style = Style::default()
+        .fg(theme::REASONING_FG)
+        .add_modifier(Modifier::ITALIC);
+    let mut in_thinking_block = false;
 
     while i < src_lines.len() {
         let line = src_lines[i];
         let trimmed = line.trim();
+
+        // Thinking / reasoning block tags: <think> ... </think>
+        if trimmed == "<think>" || trimmed.starts_with("<think>") {
+            in_thinking_block = true;
+            // If there's content after <think> on the same line, render it
+            let after_tag = trimmed.strip_prefix("<think>").unwrap_or("");
+            let after_tag = after_tag.strip_suffix("</think>").unwrap_or(after_tag);
+            if !after_tag.is_empty() {
+                let cleaned = strip_inline_markers(after_tag.trim());
+                for wl in crate::widgets::render_utils::word_wrap(&format!("  {}", cleaned), width) {
+                    output.push(ChatLine { style: reasoning_style, text: wl });
+                }
+            }
+            if trimmed.ends_with("</think>") {
+                in_thinking_block = false;
+            }
+            i += 1;
+            continue;
+        }
+        if trimmed == "</think>" || trimmed.ends_with("</think>") {
+            // Render any text before the closing tag
+            let before_tag = trimmed.strip_suffix("</think>").unwrap_or("");
+            if !before_tag.is_empty() {
+                let cleaned = strip_inline_markers(before_tag.trim());
+                for wl in crate::widgets::render_utils::word_wrap(&format!("  {}", cleaned), width) {
+                    output.push(ChatLine { style: reasoning_style, text: wl });
+                }
+            }
+            in_thinking_block = false;
+            i += 1;
+            continue;
+        }
+        if in_thinking_block {
+            if trimmed.is_empty() {
+                output.push(ChatLine { style: reasoning_style, text: String::new() });
+            } else {
+                let cleaned = strip_inline_markers(trimmed);
+                for wl in crate::widgets::render_utils::word_wrap(&format!("  {}", cleaned), width) {
+                    output.push(ChatLine { style: reasoning_style, text: wl });
+                }
+            }
+            i += 1;
+            continue;
+        }
 
         // Code block fences
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
