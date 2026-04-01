@@ -212,6 +212,8 @@ pub enum EscalationReason {
     StructuralParseError,
     DiffReviewRejection { issues: Vec<ReviewIssue> },
     TestFailure { test_names: Vec<String> },
+    /// Agent failed during execution (timeout, backend error, panic).
+    AgentFailure { reason: String },
 }
 
 // ── Cost ────────────────────────────────────────────────────────
