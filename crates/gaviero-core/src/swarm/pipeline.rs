@@ -13,7 +13,7 @@ use super::coordinator::{Coordinator, CoordinatorConfig};
 use super::models::{AgentManifest, AgentStatus, MergeResult, SwarmResult, WorkUnit};
 use super::router::{TierConfig, TierRouter};
 use super::validation;
-use super::verify::CostEstimate;
+use super::verify::{CostEstimate, EscalationRecord, EscalationReason};
 use super::merge;
 use crate::git::WorktreeManager;
 use crate::memory::{MemoryStore, StoreOptions};
@@ -51,6 +51,13 @@ pub async fn execute(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis());
+
+    // Capture HEAD SHA before any merges (for revert support)
+    let pre_swarm_sha = if config.use_worktrees {
+        crate::git::current_head_sha(&config.workspace_root).unwrap_or_default()
+    } else {
+        String::new()
+    };
 
     observer.on_phase_changed("validating");
 
@@ -177,6 +184,7 @@ pub async fn execute(
                 let obs = make_observer(unit_id);
 
                 // Provision worktree if enabled
+                let in_worktree = worktree_mgr.is_some();
                 let agent_root = if let Some(ref mut mgr) = worktree_mgr {
                     let handle = mgr.provision(&unit.id)?;
                     handle.path.clone()
@@ -197,7 +205,7 @@ pub async fn execute(
                     let write_gate = Arc::new(Mutex::new(
                         WriteGatePipeline::new(WriteMode::AutoAccept, Box::new(NoopWriteGateObserver)),
                     ));
-                    super::backend::runner::run_backend(
+                    let mut manifest = super::backend::runner::run_backend(
                         &backend,
                         &unit,
                         write_gate,
@@ -205,7 +213,17 @@ pub async fn execute(
                         mem.as_deref(),
                         &ns,
                         obs.as_ref(),
-                    ).await
+                    ).await?;
+
+                    if in_worktree && matches!(manifest.status, AgentStatus::Completed) {
+                        let summary = manifest.summary.as_deref().unwrap_or("task complete").to_string();
+                        let changed = commit_agent_changes(&agent_root, &unit.id, &summary)
+                            .unwrap_or_else(|e| { tracing::warn!("Failed to commit worktree changes for {}: {}", unit.id, e); vec![] });
+                        manifest.modified_files = changed;
+                        manifest.branch = Some(format!("gaviero/{}", unit.id));
+                    }
+
+                    Ok::<_, anyhow::Error>(manifest)
                 }));
             }
 
@@ -332,6 +350,7 @@ pub async fn execute(
         manifests: all_manifests,
         merge_results: all_merges,
         success,
+        pre_swarm_sha,
     };
 
     observer.on_phase_changed("completed");
@@ -350,6 +369,7 @@ async fn run_single_agent(
     swarm_observer: &dyn SwarmObserver,
     acp_observer: Box<dyn AcpObserver>,
 ) -> Result<AgentManifest> {
+    let in_worktree = worktree_mgr.is_some();
     let agent_root = if let Some(mgr) = worktree_mgr {
         let handle = mgr.provision(&unit.id)?;
         handle.path.clone()
@@ -385,10 +405,59 @@ async fn run_single_agent(
         manifest.summary.as_deref().unwrap_or(""),
     );
 
-    // Record branch name if using worktrees
-    manifest.branch = Some(format!("gaviero/{}", unit.id));
+    // Commit changes and record branch name if running in a worktree
+    if in_worktree && matches!(manifest.status, AgentStatus::Completed) {
+        let summary = manifest.summary.as_deref().unwrap_or("task complete").to_string();
+        let changed = commit_agent_changes(&agent_root, &unit.id, &summary)
+            .unwrap_or_else(|e| { tracing::warn!("Failed to commit worktree changes for {}: {}", unit.id, e); vec![] });
+        manifest.modified_files = changed;
+        manifest.branch = Some(format!("gaviero/{}", unit.id));
+    }
 
     Ok(manifest)
+}
+
+/// Commit all changes in a worktree after an agent completes.
+///
+/// Stages everything with `git add -A` then commits. Returns the list of files
+/// changed in the commit, or an empty vec if the working tree was already clean.
+fn commit_agent_changes(worktree_path: &std::path::Path, agent_id: &str, summary: &str) -> Result<Vec<std::path::PathBuf>> {
+    use std::process::Command;
+
+    // Check for changes
+    let status = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(worktree_path)
+        .output()
+        .context("git status in worktree")?;
+
+    if status.stdout.is_empty() {
+        return Ok(vec![]); // Nothing to commit
+    }
+
+    // Stage all changes
+    let add = Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(worktree_path)
+        .status()
+        .context("git add in worktree")?;
+    anyhow::ensure!(add.success(), "git add failed in worktree {}", worktree_path.display());
+
+    // Commit
+    let msg = format!(
+        "gaviero: agent {} — {}",
+        agent_id,
+        if summary.is_empty() { "task complete" } else { summary }
+    );
+    let commit = Command::new("git")
+        .args(["commit", "-m", &msg])
+        .current_dir(worktree_path)
+        .status()
+        .context("git commit in worktree")?;
+    anyhow::ensure!(commit.success(), "git commit failed in worktree {}", worktree_path.display());
+
+    let files = crate::git::files_changed_in_commit(worktree_path).unwrap_or_default();
+    Ok(files)
 }
 
 /// Store an agent's execution result to memory (best-effort, never fails the pipeline).
@@ -486,6 +555,13 @@ pub async fn execute_coordinated(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis());
+
+    // Capture HEAD SHA before any merges (for revert support)
+    let pre_swarm_sha = if config.use_worktrees {
+        crate::git::current_head_sha(&config.workspace_root).unwrap_or_default()
+    } else {
+        String::new()
+    };
 
     // Phase 0: PLAN — coordinator produces TaskDAG
     observer.on_coordination_started(prompt);
@@ -616,6 +692,7 @@ pub async fn execute_coordinated(
             let write_ns = unit.write_namespace.clone()
                 .unwrap_or_else(|| config.write_namespace.clone());
 
+            let in_worktree = worktree_mgr.is_some();
             let agent_root = if let Some(ref mut mgr) = worktree_mgr {
                 match mgr.provision(&unit.id) {
                     Ok(handle) => handle.path.clone(),
@@ -672,7 +749,7 @@ pub async fn execute_coordinated(
                     &ns,
                     obs.as_ref(),
                 );
-                let manifest = match tokio::time::timeout(
+                let mut manifest = match tokio::time::timeout(
                     std::time::Duration::from_secs(600),
                     agent_future,
                 ).await {
@@ -687,6 +764,14 @@ pub async fn execute_coordinated(
                         });
                     }
                 };
+
+                if in_worktree && matches!(manifest.status, AgentStatus::Completed) {
+                    let summary = manifest.summary.as_deref().unwrap_or("task complete").to_string();
+                    let changed = commit_agent_changes(&agent_root, &unit.id, &summary)
+                        .unwrap_or_else(|e| { tracing::warn!("Failed to commit worktree changes for {}: {}", unit.id, e); vec![] });
+                    manifest.modified_files = changed;
+                    manifest.branch = Some(format!("gaviero/{}", unit.id));
+                }
 
                 // Store result to memory (privacy-aware)
                 store_agent_result(&mem, &write_ns, &manifest, &unit, &run_id_clone, &root).await;
@@ -751,6 +836,168 @@ pub async fn execute_coordinated(
                     }
                 }
             }
+        }
+
+        // --- Retry failed agents with escalation ---
+        let tier_failed_indices: Vec<usize> = (0..all_manifests.len())
+            .filter(|&i| {
+                let m = &all_manifests[i];
+                tier.contains(&m.work_unit_id) && matches!(m.status, AgentStatus::Failed(_))
+            })
+            .collect();
+
+        for &idx in &tier_failed_indices {
+            let failed_id = all_manifests[idx].work_unit_id.clone();
+            let failure_reason = match &all_manifests[idx].status {
+                AgentStatus::Failed(msg) => msg.clone(),
+                _ => "unknown".into(),
+            };
+            let original_unit = *unit_map.get(failed_id.as_str())
+                .with_context(|| format!("work unit '{}' not found for retry", failed_id))?;
+
+            let mut retry_unit = original_unit.clone();
+            let mut attempts_left = retry_unit.max_retries;
+
+            while attempts_left > 0 {
+                let Some(escalation_tier) = retry_unit.escalation_tier else {
+                    break; // No escalation path available
+                };
+
+                let from_tier = retry_unit.tier;
+                retry_unit.tier = escalation_tier;
+                retry_unit.escalation_tier = next_escalation_tier(escalation_tier);
+
+                let backend = match router.resolve_backend(&retry_unit) {
+                    Ok(b) => b,
+                    Err(reason) => {
+                        tracing::warn!(
+                            "Retry escalation blocked for '{}': {}",
+                            failed_id, reason
+                        );
+                        break;
+                    }
+                };
+
+                observer.on_escalation(&EscalationRecord {
+                    unit_id: failed_id.clone(),
+                    reason: EscalationReason::AgentFailure {
+                        reason: failure_reason.clone(),
+                    },
+                    from_tier,
+                    to_tier: escalation_tier,
+                    succeeded: false,
+                });
+                observer.on_agent_state_changed(
+                    &failed_id,
+                    &AgentStatus::Running,
+                    &format!("retrying (escalated {:?} → {:?})", from_tier, escalation_tier),
+                );
+
+                let retry_root = config.workspace_root.clone();
+                let write_gate = Arc::new(Mutex::new(
+                    WriteGatePipeline::new(WriteMode::AutoAccept, Box::new(NoopWriteGateObserver)),
+                ));
+                let retry_obs = make_observer(&failed_id);
+                let retry_ns: Vec<String> = retry_unit.read_namespaces
+                    .as_deref()
+                    .unwrap_or(config.read_namespaces.as_slice())
+                    .to_vec();
+
+                let retry_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(600),
+                    super::backend::runner::run_backend(
+                        backend.as_ref(),
+                        &retry_unit,
+                        write_gate,
+                        &retry_root,
+                        memory.as_deref(),
+                        &retry_ns,
+                        retry_obs.as_ref(),
+                    ),
+                ).await;
+
+                let retry_manifest = match retry_result {
+                    Ok(Ok(m)) => m,
+                    Ok(Err(e)) => AgentManifest {
+                        work_unit_id: failed_id.clone(),
+                        status: AgentStatus::Failed(format!("{:#}", e)),
+                        modified_files: vec![],
+                        branch: None,
+                        summary: Some("Retry error".into()),
+                    },
+                    Err(_) => AgentManifest {
+                        work_unit_id: failed_id.clone(),
+                        status: AgentStatus::Failed("retry timed out".into()),
+                        modified_files: vec![],
+                        branch: None,
+                        summary: Some("Retry timed out".into()),
+                    },
+                };
+
+                observer.on_agent_state_changed(
+                    &failed_id,
+                    &retry_manifest.status,
+                    retry_manifest.summary.as_deref().unwrap_or(""),
+                );
+
+                if matches!(retry_manifest.status, AgentStatus::Completed) {
+                    observer.on_escalation(&EscalationRecord {
+                        unit_id: failed_id.clone(),
+                        reason: EscalationReason::AgentFailure {
+                            reason: failure_reason.clone(),
+                        },
+                        from_tier,
+                        to_tier: escalation_tier,
+                        succeeded: true,
+                    });
+                    let b = bus.lock().await;
+                    b.broadcast(
+                        &retry_manifest.work_unit_id,
+                        &format!("completed (retry): {}", retry_manifest.summary.as_deref().unwrap_or("")),
+                    );
+                    let effective_write_ns = retry_unit.write_namespace.as_deref()
+                        .unwrap_or(&config.write_namespace);
+                    store_agent_result(&memory, effective_write_ns, &retry_manifest, &retry_unit, &run_id, &config.workspace_root).await;
+                    all_manifests[idx] = retry_manifest;
+                    break;
+                }
+
+                attempts_left -= 1;
+            }
+        }
+
+        // Abort if any agent in this tier is still failed after retries
+        let still_failed: Vec<String> = all_manifests.iter()
+            .filter(|m| tier.contains(&m.work_unit_id) && matches!(m.status, AgentStatus::Failed(_)))
+            .map(|m| {
+                let err = match &m.status {
+                    AgentStatus::Failed(msg) => msg.as_str(),
+                    _ => "unknown",
+                };
+                format!("'{}': {}", m.work_unit_id, err)
+            })
+            .collect();
+
+        if !still_failed.is_empty() {
+            tracing::error!(
+                "Aborting coordination: {} agent(s) failed after retries: {}",
+                still_failed.len(),
+                still_failed.join(", ")
+            );
+            observer.on_phase_changed("aborted");
+
+            if let Some(ref mut mgr) = worktree_mgr {
+                mgr.teardown_all();
+            }
+
+            let result = SwarmResult {
+                manifests: all_manifests,
+                merge_results: vec![],
+                success: false,
+                pre_swarm_sha: pre_swarm_sha.clone(),
+            };
+            observer.on_completed(&result);
+            return Ok(result);
         }
 
         // Update cost estimate
@@ -855,12 +1102,36 @@ pub async fn execute_coordinated(
         manifests: all_manifests,
         merge_results: all_merges,
         success,
+        pre_swarm_sha,
     };
 
     observer.on_phase_changed("completed");
     observer.on_completed(&result);
 
     Ok(result)
+}
+
+/// Undo a swarm run by hard-resetting the repo to its pre-swarm state.
+///
+/// Deletes all agent branches that were part of `result`, then runs
+/// `git reset --hard <pre_swarm_sha>`. This is destructive but recoverable
+/// via `git reflog`.
+pub fn revert_swarm(workspace_root: &std::path::Path, result: &super::models::SwarmResult) -> Result<()> {
+    if result.pre_swarm_sha.is_empty() {
+        anyhow::bail!("no pre-swarm SHA recorded — cannot revert (was this a non-worktree run?)");
+    }
+
+    // Delete agent branches first so they don't linger after the reset
+    for manifest in &result.manifests {
+        if let Some(ref branch) = manifest.branch {
+            if let Err(e) = crate::git::delete_branch(workspace_root, branch) {
+                tracing::warn!("Could not delete branch {}: {}", branch, e);
+            }
+        }
+    }
+
+    crate::git::reset_hard(workspace_root, &result.pre_swarm_sha)?;
+    Ok(())
 }
 
 /// Collect a list of files in the workspace for coordinator context.
@@ -925,6 +1196,18 @@ async fn invalidate_stale_sources(
         Err(e) => {
             tracing::warn!("check_staleness failed for agent '{}': {}", unit.id, e);
         }
+    }
+}
+
+/// Determine the next escalation tier in the chain.
+///
+/// Mechanical → Execution → Reasoning → None (ceiling reached).
+fn next_escalation_tier(tier: crate::types::ModelTier) -> Option<crate::types::ModelTier> {
+    use crate::types::ModelTier;
+    match tier {
+        ModelTier::Mechanical => Some(ModelTier::Execution),
+        ModelTier::Execution => Some(ModelTier::Reasoning),
+        _ => None,
     }
 }
 
