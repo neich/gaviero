@@ -218,38 +218,55 @@ async fn main() -> Result<()> {
         use_worktrees: effective_max_parallel > 1,
         read_namespaces: read_nss,
         write_namespace: write_ns,
+        context_files: vec![],
     };
 
-    let result = if cli.coordinated {
+    // --coordinated: produce a DSL plan file for review, then exit.
+    // The user reviews the file and runs it with: gaviero --script <path>
+    if cli.coordinated {
         if cli.script.is_some() {
             anyhow::bail!("--coordinated requires --task, not --script");
         }
         let task = cli.task.as_deref()
             .ok_or_else(|| anyhow::anyhow!("--coordinated requires --task"))?;
-        let tier_config = gaviero_core::swarm::router::TierConfig::default();
         let coord_config = gaviero_core::swarm::coordinator::CoordinatorConfig {
             model: "opus".into(),
             ..Default::default()
         };
-        eprintln!("[mode] coordinated (Opus → Sonnet/Haiku tier routing)");
-        gaviero_core::swarm::pipeline::execute_coordinated(
+        eprintln!("[mode] coordinated — planning DSL (Opus)");
+        let dsl_text = gaviero_core::swarm::pipeline::plan_coordinated(
             task,
             &config,
-            tier_config,
             coord_config,
             memory,
             &swarm_observer,
             |_agent_id| Box::new(CliAcpObserver) as Box<dyn gaviero_core::observer::AcpObserver>,
-        ).await?
-    } else {
-        gaviero_core::swarm::pipeline::execute(
-            work_units,
-            &config,
-            memory,
-            &swarm_observer,
-            |_agent_id| Box::new(CliAcpObserver) as Box<dyn gaviero_core::observer::AcpObserver>,
-        ).await?
-    };
+        ).await?;
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let plan_path = config.workspace_root.join("tmp").join(format!("gaviero_plan_{}.gaviero", timestamp));
+        std::fs::create_dir_all(plan_path.parent().unwrap())
+            .context("creating tmp/ directory")?;
+        std::fs::write(&plan_path, &dsl_text)
+            .context("writing plan file")?;
+
+        eprintln!("[plan] saved to {}", plan_path.display());
+        eprintln!("[plan] review it, then run with:");
+        eprintln!("         gaviero --script {}", plan_path.display());
+        println!("{}", plan_path.display());
+        return Ok(());
+    }
+
+    let result = gaviero_core::swarm::pipeline::execute(
+        work_units,
+        &config,
+        memory,
+        &swarm_observer,
+        |_agent_id| Box::new(CliAcpObserver) as Box<dyn gaviero_core::observer::AcpObserver>,
+    ).await?;
 
     // Output results
     match cli.format.as_str() {

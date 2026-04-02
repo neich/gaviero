@@ -839,6 +839,24 @@ impl App {
             Event::SwarmCostUpdate(estimate) => {
                 self.swarm_dashboard.set_cost(estimate.estimated_usd);
             }
+            Event::SwarmDslPlanReady(plan_path) => {
+                self.swarm_dashboard.set_phase("plan ready");
+                let workspace_root = self.workspace.roots().first()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let rel = plan_path
+                    .strip_prefix(&workspace_root)
+                    .unwrap_or(&plan_path)
+                    .display()
+                    .to_string();
+                self.swarm_dashboard.status_message = format!("Plan saved: {} — review and /run it", rel);
+                self.chat_state.add_system_message(&format!(
+                    "Plan saved to `{}`.\nReview it (it's open in the editor), then run it with:\n  /run {}",
+                    rel, rel,
+                ));
+                self.open_file(&plan_path);
+                self.focus = Focus::Editor;
+            }
 
             Event::MemoryReady(store) => {
                 self.memory = Some(store);
@@ -2027,6 +2045,7 @@ impl App {
                 use_worktrees: unit_count > 1,
                 read_namespaces: read_ns,
                 write_namespace: write_ns,
+                context_files: vec![],
             };
 
             let observer = TuiSwarmObserver { tx: tx.clone() };
@@ -2160,6 +2179,7 @@ impl App {
                 use_worktrees: effective_max_parallel > 1,
                 read_namespaces: read_ns,
                 write_namespace: write_ns,
+                context_files: vec![],
             };
 
             let observer = TuiSwarmObserver { tx: tx.clone() };
@@ -2208,7 +2228,7 @@ impl App {
 
         self.chat_state.add_user_message(&format!("/cswarm {}", task_desc));
         self.chat_state.add_system_message(&format!(
-            "Coordinated swarm: {}\nOpus will plan tier-annotated subtasks.\n\
+            "Coordinated swarm: {}\nOpus will produce a .gaviero plan file for review.\n\
              Switch to SWARM panel (Ctrl+Shift+P) to monitor.",
             task_desc
         ));
@@ -2216,7 +2236,7 @@ impl App {
         self.side_panel = SidePanelMode::SwarmDashboard;
         self.panel_visible.side_panel = true;
         self.swarm_dashboard.reset("coordinating");
-        self.swarm_dashboard.status_message = format!("Opus planning: {}...", task_desc.chars().take(60).collect::<String>());
+        self.swarm_dashboard.status_message = format!("Opus planning (DSL): {}...", task_desc.chars().take(60).collect::<String>());
 
         let tx = self.event_tx.clone();
         let root = self.workspace.roots().first()
@@ -2227,10 +2247,13 @@ impl App {
         // Subagents run in isolated git worktrees and cannot access files outside of
         // tracked paths (e.g. tmp/ dirs). Inlining ensures the coordinator can embed
         // relevant content into coordinator_instructions without requiring file access.
-        let task_desc = {
+        // Also collect context_files so the same content can be physically injected into
+        // each worktree, allowing agents to use the Read tool on them directly.
+        let (task_desc, context_files) = {
             use crate::panels::agent_chat::parse_file_references;
             let refs = parse_file_references(&task_desc);
             let mut enriched = task_desc.clone();
+            let mut ctx_files: Vec<(String, String)> = Vec::new();
             for rel_path in &refs {
                 let abs_path = root.join(rel_path);
                 if let Ok(content) = std::fs::read_to_string(&abs_path) {
@@ -2240,19 +2263,20 @@ impl App {
                         rel_path, content, rel_path
                     );
                     enriched = enriched.replace(&tag, &replacement);
-                    tracing::debug!("Inlined @{} into cswarm prompt ({} bytes)", rel_path, content.len());
+                    ctx_files.push((rel_path.clone(), content));
+                    tracing::debug!("Inlined @{} into cswarm prompt ({} bytes)", rel_path, ctx_files.last().unwrap().1.len());
                 } else {
                     tracing::warn!("Could not read @{} for cswarm prompt", rel_path);
                 }
             }
-            enriched
+            (enriched, ctx_files)
         };
         let write_ns = self.chat_state.agent_settings.write_namespace.clone();
         let read_ns = self.chat_state.agent_settings.read_namespaces.clone();
         let memory = self.memory.clone();
 
         tokio::spawn(async move {
-            use gaviero_core::swarm::{pipeline, coordinator, router};
+            use gaviero_core::swarm::{pipeline, coordinator};
 
             let config = pipeline::SwarmConfig {
                 max_parallel: 4,
@@ -2261,9 +2285,9 @@ impl App {
                 use_worktrees: true,
                 read_namespaces: read_ns,
                 write_namespace: write_ns,
+                context_files,
             };
 
-            let tier_config = router::TierConfig::default();
             let coord_config = coordinator::CoordinatorConfig::default();
 
             let observer = TuiSwarmObserver { tx: tx.clone() };
@@ -2275,24 +2299,49 @@ impl App {
                 })
             };
 
-            match pipeline::execute_coordinated(
+            match pipeline::plan_coordinated(
                 &task_desc,
                 &config,
-                tier_config,
                 coord_config,
                 memory,
                 &observer,
                 make_obs,
             ).await {
-                Ok(result) => {
-                    let _ = tx.send(Event::SwarmCompleted(Box::new(result)));
+                Ok(dsl_text) => {
+                    // Write DSL to tmp/ so user can review/edit before running
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let plan_filename = format!("gaviero_plan_{}.gaviero", timestamp);
+                    let plan_path = root.join("tmp").join(&plan_filename);
+                    if let Err(e) = std::fs::create_dir_all(plan_path.parent().unwrap()) {
+                        let _ = tx.send(Event::MessageComplete {
+                            conv_id: String::new(),
+                            role: "system".to_string(),
+                            content: format!("Failed to create tmp/ directory: {}", e),
+                        });
+                        return;
+                    }
+                    match std::fs::write(&plan_path, &dsl_text) {
+                        Ok(()) => {
+                            let _ = tx.send(Event::SwarmDslPlanReady(plan_path));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Event::MessageComplete {
+                                conv_id: String::new(),
+                                role: "system".to_string(),
+                                content: format!("Failed to write plan file: {}", e),
+                            });
+                        }
+                    }
                 }
                 Err(e) => {
                     let _ = tx.send(Event::SwarmPhaseChanged("failed".to_string()));
                     let _ = tx.send(Event::MessageComplete {
                         conv_id: String::new(),
                         role: "system".to_string(),
-                        content: format!("Coordinated swarm failed: {}", e),
+                        content: format!("Coordinated swarm planning failed: {}", e),
                     });
                 }
             }

@@ -2,6 +2,8 @@
 
 A declarative language for composing multi-agent AI workflows. You write `.gaviero` files describing `client` backends, `agent` tasks, and `workflow` orchestration; the compiler produces a sequence of `WorkUnit` structures that Gaviero's swarm engine executes.
 
+`.gaviero` files are also the output format of coordinated planning. When you run `/cswarm <task>` in the TUI or `gaviero-cli --coordinated --task "..."`, Opus decomposes the task into a `.gaviero` file saved to `tmp/` for your review before any agents run.
+
 ---
 
 ## Quick example
@@ -54,6 +56,56 @@ workflow document_then_build {
 ```
 
 `implementer` starts only after `researcher` completes successfully. See [Running a workflow](#running-a-workflow) for how to execute this file.
+
+---
+
+## Coordinated planning — AI-generated workflows
+
+The easiest way to get a `.gaviero` file is to let Opus write it for you. Describe the task in plain language; Opus decomposes it into agents with explicit scopes, dependencies, and model assignments. The result is saved to `tmp/` for you to inspect and edit before any agent runs.
+
+### TUI
+
+```
+/cswarm Add OAuth2 login: design the API, implement handlers, write tests
+```
+
+Opus generates the workflow, saves it to `tmp/gaviero_plan_<timestamp>.gaviero`, and opens the file in the editor. Review the plan — check that scopes make sense, that files annotated `// (will be created)` are intentional, edit any agent prompts — then run it:
+
+```
+/run tmp/gaviero_plan_1234567890.gaviero
+```
+
+### CLI
+
+```
+gaviero-cli --repo . --coordinated \
+  --task "Add OAuth2 login: design the API, implement handlers, write tests"
+```
+
+Outputs the plan path to stdout and instructions to stderr:
+
+```
+[mode] coordinated — planning DSL (Opus)
+[plan] saved to tmp/gaviero_plan_1234567890.gaviero
+[plan] review it, then run with:
+         gaviero --script tmp/gaviero_plan_1234567890.gaviero
+tmp/gaviero_plan_1234567890.gaviero
+```
+
+### Why review before running?
+
+When Opus plans a task it may reference files that don't exist yet — files agents will create during execution. In the generated DSL these are annotated with `// (will be created)`:
+
+```gaviero
+agent implement_cpu_sim {
+    scope {
+        owned ["src/cpu_sim/simulator_cpu.hpp"]  // (will be created)
+    }
+    ...
+}
+```
+
+Seeing this before dispatch lets you confirm the path is correct, fix it, or restructure dependencies — instead of discovering the problem as a silent agent failure mid-run.
 
 ---
 
@@ -161,6 +213,8 @@ Controls which files the agent may read and write.
 - If `scope` is omitted entirely, the agent defaults to `owned ["."]` — full workspace write access.
 
 Paths are relative to the workspace root. Glob patterns are accepted.
+
+**Scope in generated plans:** When Opus generates a `.gaviero` file, each agent's `owned` paths are guaranteed to be disjoint from every other agent's `owned` paths. A file annotated `// (will be created)` does not exist yet in the workspace — it will be created by the agent during execution.
 
 ### `prompt`
 

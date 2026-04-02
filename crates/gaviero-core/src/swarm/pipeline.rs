@@ -30,6 +30,10 @@ pub struct SwarmConfig {
     pub use_worktrees: bool,
     pub read_namespaces: Vec<String>,
     pub write_namespace: String,
+    /// Extra files to inject into each agent's worktree after provisioning.
+    /// Populated from `@file` references in the user prompt that are not git-tracked
+    /// (e.g. `tmp/` plan documents). Each entry is `(rel_path, content)`.
+    pub context_files: Vec<(String, String)>,
 }
 
 /// Execute a swarm of work units.
@@ -132,6 +136,7 @@ pub async fn execute(
                     unit,
                     &config.workspace_root,
                     worktree_mgr.as_mut(),
+                    &config.context_files,
                     memory.clone(),
                     &effective_read_ns,
                     observer,
@@ -364,6 +369,7 @@ async fn run_single_agent(
     unit: &WorkUnit,
     workspace_root: &PathBuf,
     worktree_mgr: Option<&mut WorktreeManager>,
+    context_files: &[(String, String)],
     memory: Option<Arc<MemoryStore>>,
     read_namespaces: &[String],
     swarm_observer: &dyn SwarmObserver,
@@ -372,7 +378,13 @@ async fn run_single_agent(
     let in_worktree = worktree_mgr.is_some();
     let agent_root = if let Some(mgr) = worktree_mgr {
         let handle = mgr.provision(&unit.id)?;
-        handle.path.clone()
+        let path = handle.path.clone();
+        if !context_files.is_empty() {
+            if let Err(e) = mgr.inject_context_files(&unit.id, context_files) {
+                tracing::warn!("Failed to inject context files for {}: {}", unit.id, e);
+            }
+        }
+        path
     } else {
         workspace_root.clone()
     };
@@ -534,14 +546,71 @@ async fn store_agent_result(
     }
 }
 
+/// Plan a coordinated swarm: Opus produces a `.gaviero` DSL file for user review.
+///
+/// This is the preferred entry point for coordinated runs. Unlike
+/// `execute_coordinated()`, this function does NOT execute any agents.
+/// It returns the raw DSL text that the caller should:
+/// 1. Write to `tmp/gaviero_plan_<timestamp>.gaviero`
+/// 2. Present to the user for review/editing
+/// 3. Compile with `gaviero_dsl::compile()` and pass to `execute()`
+///
+/// This design eliminates the fragile JSON → WorkUnit parsing path and makes
+/// the coordinator's plan visible and auditable before any agent runs.
+pub async fn plan_coordinated(
+    prompt: &str,
+    config: &SwarmConfig,
+    coordinator_config: CoordinatorConfig,
+    memory: Option<Arc<MemoryStore>>,
+    observer: &dyn SwarmObserver,
+    make_observer: impl Fn(&str) -> Box<dyn AcpObserver>,
+) -> Result<String> {
+    observer.on_coordination_started(prompt);
+    observer.on_agent_state_changed("coordinator", &AgentStatus::Running, "Opus planning (DSL)...");
+    observer.on_tier_dispatch("coordinator", crate::types::ModelTier::Coordinator, &config.model);
+
+    let file_list = collect_file_list(&config.workspace_root)?;
+    let coordinator = Coordinator::new(memory, coordinator_config);
+    let coord_observer = make_observer("coordinator");
+
+    match coordinator.plan_as_dsl(
+        prompt,
+        &config.workspace_root,
+        &file_list,
+        &config.read_namespaces,
+        Some(coord_observer),
+    ).await {
+        Ok(dsl) => {
+            observer.on_agent_state_changed(
+                "coordinator",
+                &AgentStatus::Completed,
+                "DSL plan ready — review before executing",
+            );
+            Ok(dsl)
+        }
+        Err(e) => {
+            observer.on_agent_state_changed(
+                "coordinator",
+                &AgentStatus::Failed(e.to_string()),
+                &e.to_string(),
+            );
+            Err(e)
+        }
+    }
+}
+
 /// Execute a coordinated swarm with tier routing.
 ///
-/// This is the new entry point for the tier routing architecture.
-/// The coordinator produces a TaskDAG, then the pipeline dispatches
-/// each unit to the appropriate backend via `TierRouter`.
+/// # Deprecated
+///
+/// Use [`plan_coordinated`] + [`execute`] instead. This function combines
+/// planning and execution in one shot with no user review step, which makes
+/// phantom file references (files the coordinator expects agents to create)
+/// invisible until they cause silent agent failures.
 ///
 /// The existing `execute()` remains for backward compatibility with
 /// non-coordinated swarm runs.
+#[deprecated(since = "0.1.0", note = "use plan_coordinated() + execute() instead")]
 pub async fn execute_coordinated(
     prompt: &str,
     config: &SwarmConfig,
@@ -695,7 +764,16 @@ pub async fn execute_coordinated(
             let in_worktree = worktree_mgr.is_some();
             let agent_root = if let Some(ref mut mgr) = worktree_mgr {
                 match mgr.provision(&unit.id) {
-                    Ok(handle) => handle.path.clone(),
+                    Ok(handle) => {
+                        let path = handle.path.clone();
+                        // Inject @file context files so agents can Read them via their tools
+                        if !config.context_files.is_empty() {
+                            if let Err(e) = mgr.inject_context_files(&unit.id, &config.context_files) {
+                                tracing::warn!("Failed to inject context files for {}: {}", unit.id, e);
+                            }
+                        }
+                        path
+                    }
                     Err(e) => {
                         let err_msg = format!("worktree provision failed: {}", e);
                         observer.on_agent_state_changed(
@@ -893,7 +971,31 @@ pub async fn execute_coordinated(
                     &format!("retrying (escalated {:?} → {:?})", from_tier, escalation_tier),
                 );
 
-                let retry_root = config.workspace_root.clone();
+                // Retry must run in an isolated worktree, not the shared workspace.
+                // Re-provision the worktree (provision() cleans up any stale state from
+                // the failed attempt), inject context files, then commit on success.
+                let retry_id = format!("{}-retry", failed_id);
+                let retry_root = if let Some(ref mut mgr) = worktree_mgr {
+                    match mgr.provision(&retry_id) {
+                        Ok(handle) => {
+                            let path = handle.path.clone();
+                            if !config.context_files.is_empty() {
+                                if let Err(e) = mgr.inject_context_files(&retry_id, &config.context_files) {
+                                    tracing::warn!("Failed to inject context files for retry {}: {}", retry_id, e);
+                                }
+                            }
+                            path
+                        }
+                        Err(e) => {
+                            tracing::warn!("Worktree provision failed for retry '{}': {}; falling back to workspace", retry_id, e);
+                            config.workspace_root.clone()
+                        }
+                    }
+                } else {
+                    config.workspace_root.clone()
+                };
+                let in_retry_worktree = worktree_mgr.is_some();
+
                 let write_gate = Arc::new(Mutex::new(
                     WriteGatePipeline::new(WriteMode::AutoAccept, Box::new(NoopWriteGateObserver)),
                 ));
@@ -916,7 +1018,7 @@ pub async fn execute_coordinated(
                     ),
                 ).await;
 
-                let retry_manifest = match retry_result {
+                let mut retry_manifest = match retry_result {
                     Ok(Ok(m)) => m,
                     Ok(Err(e)) => AgentManifest {
                         work_unit_id: failed_id.clone(),
@@ -941,6 +1043,14 @@ pub async fn execute_coordinated(
                 );
 
                 if matches!(retry_manifest.status, AgentStatus::Completed) {
+                    // Commit the retry worktree and assign the branch for later merging
+                    if in_retry_worktree {
+                        let summary = retry_manifest.summary.as_deref().unwrap_or("retry complete").to_string();
+                        let changed = commit_agent_changes(&retry_root, &failed_id, &summary)
+                            .unwrap_or_else(|e| { tracing::warn!("Failed to commit retry worktree for {}: {}", failed_id, e); vec![] });
+                        retry_manifest.modified_files = changed;
+                        retry_manifest.branch = Some(format!("gaviero/{}", failed_id));
+                    }
                     observer.on_escalation(&EscalationRecord {
                         unit_id: failed_id.clone(),
                         reason: EscalationReason::AgentFailure {
@@ -1000,54 +1110,35 @@ pub async fn execute_coordinated(
             return Ok(result);
         }
 
+        // Per-tier merge: immediately after each tier completes, merge its branches back
+        // into the main workspace. This lets the NEXT tier's worktrees be provisioned
+        // from an up-to-date HEAD that includes this tier's changes — essential for
+        // multi-phase plans where later agents depend on files created by earlier agents.
+        if config.use_worktrees {
+            observer.on_phase_changed(&format!("merging tier {}", tier_idx + 1));
+            let tier_completed_branches: Vec<(String, String)> = all_manifests
+                .iter()
+                .filter(|m| {
+                    tier.contains(&m.work_unit_id)
+                        && m.branch.is_some()
+                        && matches!(m.status, AgentStatus::Completed)
+                })
+                .map(|m| (m.work_unit_id.clone(), m.branch.clone().unwrap()))
+                .collect();
+
+            for (unit_id, branch) in &tier_completed_branches {
+                let merge_result = merge_one_branch(&config.workspace_root, branch, observer).await;
+                // Backfill work_unit_id (merge_one_branch uses branch name as fallback)
+                all_merges.push(MergeResult {
+                    work_unit_id: unit_id.clone(),
+                    ..merge_result
+                });
+            }
+        }
+
         // Update cost estimate
         cost_estimate.estimated_usd += 0.01 * tier.len() as f64; // placeholder
         observer.on_cost_update(&cost_estimate);
-    }
-
-    // Phase 3: MERGE
-    if config.use_worktrees {
-        observer.on_phase_changed("merging");
-
-        for manifest in &all_manifests {
-            if let Some(ref branch) = manifest.branch {
-                if matches!(manifest.status, AgentStatus::Completed) {
-                    let mut result = merge::merge_branch(&config.workspace_root, branch)?;
-                    if !result.success && !result.conflicts.is_empty() {
-                        let files: Vec<String> = result.conflicts
-                            .iter()
-                            .map(|c| c.file.to_string_lossy().to_string())
-                            .collect();
-                        observer.on_merge_conflict(branch, &files);
-
-                        observer.on_phase_changed("resolving conflicts");
-                        let resolved = merge::auto_resolve_conflicts(
-                            &config.workspace_root,
-                            branch,
-                            &result.conflicts,
-                            "opus", // Use Opus for conflict resolution in coordinated mode
-                        ).await;
-
-                        match resolved {
-                            Ok(resolved_conflicts) => {
-                                let all_ok = resolved_conflicts.iter().all(|c| c.resolved);
-                                result.conflicts = resolved_conflicts;
-                                result.success = all_ok;
-                                if !all_ok {
-                                    tracing::warn!("some conflicts could not be auto-resolved for {}", branch);
-                                    merge::abort_merge(&config.workspace_root)?;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("auto-resolve failed for {}: {}", branch, e);
-                                merge::abort_merge(&config.workspace_root)?;
-                            }
-                        }
-                    }
-                    all_merges.push(result);
-                }
-            }
-        }
     }
 
     // Phase 4: VERIFY
@@ -1111,6 +1202,63 @@ pub async fn execute_coordinated(
     Ok(result)
 }
 
+/// Merge one agent branch into the workspace, attempting auto-resolution on conflict.
+///
+/// Returns a `MergeResult`. Errors from `abort_merge` are logged but not propagated
+/// so the caller can continue with remaining branches.
+async fn merge_one_branch(
+    workspace_root: &PathBuf,
+    branch: &str,
+    observer: &dyn SwarmObserver,
+) -> MergeResult {
+    let mut result = match merge::merge_branch(workspace_root, branch) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("merge_branch failed for {}: {}", branch, e);
+            return MergeResult {
+                work_unit_id: branch.to_string(),
+                success: false,
+                conflicts: vec![],
+            };
+        }
+    };
+
+    if !result.success && !result.conflicts.is_empty() {
+        let files: Vec<String> = result
+            .conflicts
+            .iter()
+            .map(|c| c.file.to_string_lossy().to_string())
+            .collect();
+        observer.on_merge_conflict(branch, &files);
+        observer.on_phase_changed("resolving conflicts");
+
+        let resolved = merge::auto_resolve_conflicts(
+            workspace_root,
+            branch,
+            &result.conflicts,
+            "opus",
+        )
+        .await;
+
+        match resolved {
+            Ok(resolved_conflicts) => {
+                let all_ok = resolved_conflicts.iter().all(|c| c.resolved);
+                result.conflicts = resolved_conflicts;
+                result.success = all_ok;
+                if !all_ok {
+                    tracing::warn!("some conflicts could not be auto-resolved for {}", branch);
+                    let _ = merge::abort_merge(workspace_root);
+                }
+            }
+            Err(e) => {
+                tracing::error!("auto-resolve failed for {}: {}", branch, e);
+                let _ = merge::abort_merge(workspace_root);
+            }
+        }
+    }
+    result
+}
+
 /// Undo a swarm run by hard-resetting the repo to its pre-swarm state.
 ///
 /// Deletes all agent branches that were part of `result`, then runs
@@ -1134,31 +1282,31 @@ pub fn revert_swarm(workspace_root: &std::path::Path, result: &super::models::Sw
     Ok(())
 }
 
-/// Collect a list of files in the workspace for coordinator context.
+/// Collect a list of git-tracked files in the workspace for coordinator context.
+///
+/// Uses `git ls-files` so the coordinator only sees files that actually exist in
+/// agent worktrees (which are plain git checkouts). Gitignored and untracked files
+/// are excluded, preventing the coordinator from telling agents to read files they
+/// cannot access.
 fn collect_file_list(workspace_root: &PathBuf) -> Result<Vec<String>> {
-    let mut files = Vec::new();
-    collect_files_recursive(workspace_root, workspace_root, &mut files, 0);
-    Ok(files)
-}
+    let output = std::process::Command::new("git")
+        .args(["ls-files"])
+        .current_dir(workspace_root)
+        .output()
+        .context("failed to run git ls-files")?;
 
-fn collect_files_recursive(root: &PathBuf, dir: &PathBuf, files: &mut Vec<String>, depth: usize) {
-    if depth > 10 || files.len() > 500 {
-        return;
+    if !output.status.success() {
+        // Not a git repo or other error — fall back to empty list rather than fail
+        tracing::warn!("git ls-files failed in {:?}, coordinator will have no file list", workspace_root);
+        return Ok(Vec::new());
     }
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        // Skip hidden dirs and common non-source dirs
-        if name.starts_with('.') || name == "target" || name == "node_modules" {
-            continue;
-        }
-        if path.is_dir() {
-            collect_files_recursive(root, &path, files, depth + 1);
-        } else if let Ok(rel) = path.strip_prefix(root) {
-            files.push(rel.to_string_lossy().to_string());
-        }
-    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect())
 }
 
 /// Invalidate stale memory entries for a work unit's `staleness_sources`.

@@ -567,6 +567,39 @@ impl WorktreeManager {
     pub fn active_worktrees(&self) -> &[WorktreeHandle] {
         &self.active
     }
+
+    /// Inject extra files into an agent's worktree after provisioning.
+    ///
+    /// Used for `@file`-referenced context files that are not git-tracked (e.g. tmp/ plan
+    /// documents). Each `(rel_path, content)` pair is written to `<worktree>/<rel_path>`,
+    /// creating parent directories as needed. This lets the subagent use the `Read` tool
+    /// to access the file exactly as the coordinator can.
+    pub fn inject_context_files(
+        &self,
+        agent_id: &str,
+        files: &[(String, String)],
+    ) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let worktree_name = format!("gaviero-{}", agent_id);
+        let handle = self
+            .active
+            .iter()
+            .find(|h| h.name == worktree_name)
+            .with_context(|| format!("no active worktree for agent '{}'", agent_id))?;
+
+        for (rel_path, content) in files {
+            let abs = handle.path.join(rel_path);
+            if let Some(parent) = abs.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating dirs for context file {}", rel_path))?;
+            }
+            std::fs::write(&abs, content)
+                .with_context(|| format!("writing context file {}", rel_path))?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for WorktreeManager {

@@ -70,6 +70,9 @@ pub enum Event {
         backend: String,
     },
     SwarmCostUpdate(gaviero_core::swarm::verify::CostEstimate),
+    /// Coordinator produced a `.gaviero` DSL plan file ready for user review.
+    /// The path is absolute. The user should review/edit it, then `/run` it.
+    SwarmDslPlanReady(PathBuf),
 
     // Memory
     MemoryReady(Arc<MemoryStore>),
