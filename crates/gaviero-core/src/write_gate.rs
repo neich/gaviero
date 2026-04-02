@@ -55,7 +55,7 @@ impl WriteGatePipeline {
     pub fn is_scope_allowed(&self, agent_id: &str, path: &str) -> bool {
         match self.agent_scopes.get(agent_id) {
             Some(scope) => scope.is_owned(path),
-            None => true, // No scope registered = unrestricted
+            None => false, // No scope registered = deny (fail-closed)
         }
     }
 
