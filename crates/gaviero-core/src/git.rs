@@ -373,6 +373,8 @@ pub fn reset_hard(repo_dir: &Path, sha: &str) -> Result<()> {
     let status = Command::new("git")
         .args(["reset", "--hard", sha])
         .current_dir(repo_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .context("git reset --hard")?;
     anyhow::ensure!(status.success(), "git reset --hard {} failed", sha);
