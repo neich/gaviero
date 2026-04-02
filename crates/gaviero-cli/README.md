@@ -10,6 +10,7 @@ Headless AI agent task runner for Gaviero. Executes agent workflows against a lo
 gaviero-cli [OPTIONS] --task <TEXT>
 gaviero-cli [OPTIONS] --script <FILE.gaviero>
 gaviero-cli [OPTIONS] --work-units <JSON>
+gaviero-cli [OPTIONS] --coordinated --task <TEXT>
 ```
 
 ---
@@ -22,12 +23,12 @@ gaviero-cli [OPTIONS] --work-units <JSON>
 | `--task TEXT` | string | — | Single task description. Runs one agent with full repo write access. |
 | `--script PATH` | file | — | Path to a `.gaviero` DSL script. |
 | `--work-units JSON` | JSON | — | JSON array of `WorkUnit` objects (advanced). |
-| `--model STRING` | string | `"sonnet"` | Model to use in `--task` mode. Ignored in `--coordinated` and `--script` (model is set per-agent in the DSL). |
+| `--model STRING` | string | `"sonnet"` | Model to use in `--task` mode. Ignored in `--script` (model is set per-agent in the DSL). |
 | `--auto-accept` | flag | off | Skip interactive review of proposed file changes. |
 | `--max-parallel N` | int | `1` | Maximum concurrent agents. Overridden by `max_parallel` if declared in the workflow. |
 | `--namespace STRING` | string | — | Write namespace for this run's memory output (see [Memory](#memory)). |
 | `--read-ns STRING` | string | — | Extra namespace to read from. Repeatable: `--read-ns ns1 --read-ns ns2`. |
-| `--coordinated` | flag | off | Coordinator mode: Opus decomposes the task into a tier-routed DAG. Requires `--task`. |
+| `--coordinated` | flag | off | Coordinator mode: Opus decomposes the task into a `.gaviero` plan file for review. Requires `--task`. See [Coordinated mode](#coordinated-mode---coordinated). |
 | `--format text\|json` | string | `text` | Output format for results. |
 
 ### Mutual exclusivity
@@ -134,7 +135,7 @@ Progress information is written to stderr so it does not pollute stdout:
 
 ## Coordinated mode (`--coordinated`)
 
-Requires `--task`. In coordinated mode, Claude Opus first decomposes the task into a dependency-ordered DAG of work units, each annotated with a model tier. The units are then dispatched to the appropriate model for execution.
+Requires `--task`. In coordinated mode, Claude Opus decomposes the task into a `.gaviero` DSL file and saves it to `tmp/` for your review. **No agents execute until you run the plan file yourself.**
 
 ```
 gaviero-cli --repo . --coordinated \
@@ -142,22 +143,68 @@ gaviero-cli --repo . --coordinated \
           write tests, and update the documentation"
 ```
 
-Typical stderr output:
+Stderr output:
 
 ```
-[mode] coordinated (Opus → Sonnet/Haiku tier routing)
-[coordinator] planning: Add OAuth2 login flow: design the API, implement t...
-[coordinator] planned 4 units: design-api, implement-handlers, write-tests, update-docs
-[dispatch] design-api     tier=Planning  backend=opus
-[dispatch] implement-handlers  tier=Compute  backend=sonnet
-[dispatch] write-tests    tier=Compute  backend=sonnet
-[dispatch] update-docs    tier=Mechanical  backend=haiku
-[tier] 1/3
-...
-[completed] success=true
+[mode] coordinated — planning DSL (Opus)
+[coordinator] planning: Add OAuth2 login flow...
+[coordinator] DSL plan ready — review before executing
+[plan] saved to tmp/gaviero_plan_1234567890.gaviero
+[plan] review it, then run with:
+         gaviero --script tmp/gaviero_plan_1234567890.gaviero
 ```
 
-The `--model` flag is ignored in coordinated mode — the coordinator always uses Opus, and execution tiers use Sonnet/Haiku as appropriate.
+Stdout:
+
+```
+tmp/gaviero_plan_1234567890.gaviero
+```
+
+Stdout contains only the plan path so it can be captured and piped.
+
+### Why a review step?
+
+When Opus plans a complex task it may reference files that will be created by agents during execution — they do not exist yet at planning time. In the generated DSL these are annotated:
+
+```gaviero
+agent implement_cpu_sim {
+    scope {
+        owned ["src/cpu_sim/simulator_cpu.hpp"]  // (will be created)
+    }
+    ...
+}
+```
+
+Seeing the full plan before dispatch lets you confirm paths are correct, fix scope assignments, adjust agent prompts, or restructure dependencies — instead of discovering problems as silent agent failures mid-run.
+
+### Running the plan
+
+After reviewing (and optionally editing) the generated file:
+
+```
+gaviero-cli --repo . --script tmp/gaviero_plan_1234567890.gaviero
+```
+
+Or in the TUI:
+
+```
+/run tmp/gaviero_plan_1234567890.gaviero
+```
+
+### Capturing the plan path in scripts
+
+Since stdout contains only the plan path, you can capture it directly:
+
+```bash
+plan=$(gaviero-cli --repo . --coordinated \
+  --task "Refactor the auth module to use the strategy pattern")
+
+# Inspect the plan
+cat "$plan"
+
+# Edit if needed, then execute
+gaviero-cli --repo . --auto-accept --script "$plan"
+```
 
 ---
 
@@ -262,18 +309,24 @@ gaviero-cli --repo . \
   --script workflows/feature_tdd.gaviero
 ```
 
-### Coordinated task with memory for a large feature
+### Coordinated planning with memory context
 
-Opus plans the work, execution agents read shared context written by prior runs:
+Opus plans the work with awareness of prior runs; the plan is saved for review before execution:
 
 ```
-gaviero-cli --repo . \
+# Step 1: generate the plan (does not execute agents)
+plan=$(gaviero-cli --repo . \
   --coordinated \
   --namespace feature-billing \
   --read-ns project-architecture \
   --task "Implement the billing module: design the data model, implement the service layer,
-          write integration tests, and update the API documentation. Read project architecture
-          from memory context before starting."
+          write integration tests, and update the API documentation.")
+
+# Step 2: review the plan
+cat "$plan"
+
+# Step 3: execute when satisfied
+gaviero-cli --repo . --script "$plan"
 ```
 
 The `project-architecture` namespace might have been populated by an earlier architecture survey run.
@@ -302,6 +355,24 @@ if [ "$success" != "true" ]; then
   echo "$result" | jq '.manifests[] | select(.status != "Completed")'
   exit 1
 fi
+```
+
+### CI pipeline with coordinated planning
+
+Generate and immediately execute a coordinated plan non-interactively:
+
+```bash
+#!/bin/bash
+set -e
+
+plan=$(gaviero-cli --repo . --coordinated \
+  --task "Fix all failing tests and add coverage for uncovered error paths")
+
+echo "Generated plan: $plan"
+cat "$plan"
+
+# Execute — --auto-accept skips interactive review of proposed file changes
+gaviero-cli --repo . --auto-accept --script "$plan"
 ```
 
 ### Building a multi-run knowledge base
@@ -347,7 +418,7 @@ gaviero-cli --repo . \
 
 | Code | Meaning |
 |---|---|
-| `0` | All agents completed successfully |
+| `0` | All agents completed successfully, or (in `--coordinated`) plan file written successfully |
 | `1` | One or more agents failed, or a startup error occurred |
 
 ---
@@ -355,6 +426,7 @@ gaviero-cli --repo . \
 ## Notes
 
 - All progress output goes to **stderr**; result output goes to **stdout**. This makes it safe to pipe stdout without mixing diagnostic noise.
+- In `--coordinated` mode stdout contains only the plan file path. Use `cat "$plan"` to inspect it.
 - `--auto-accept` skips the interactive file-change review that the TUI normally shows. Use it in CI or when you trust the agent's output.
 - The memory store is initialized from `~/.cache/gaviero/`. If initialization fails (missing model files, permissions), the run continues without memory — you will see `[memory] disabled: <reason>` in stderr.
 - When `max_parallel > 1` (either from `--max-parallel` or from the workflow's `max_parallel`), each agent runs in a separate git worktree to prevent filesystem conflicts. Worktrees are cleaned up after the run.
