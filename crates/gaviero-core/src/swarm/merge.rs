@@ -82,6 +82,8 @@ pub fn abort_merge(repo_dir: &Path) -> Result<()> {
     Command::new("git")
         .args(["merge", "--abort"])
         .current_dir(repo_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .context("running git merge --abort")?;
     Ok(())
@@ -104,6 +106,8 @@ pub fn resolve_conflict(repo_dir: &Path, file: &Path, resolved_content: &str) ->
         .args(["add"])
         .arg(file)
         .current_dir(repo_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .context("staging resolved file")?;
     Ok(())
