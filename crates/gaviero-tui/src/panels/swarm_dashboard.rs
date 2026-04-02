@@ -258,16 +258,20 @@ impl SwarmDashboardState {
     pub fn append_stream_chunk(&mut self, agent_id: &str, text: &str) {
         let Some(entry) = self.agents.iter_mut().find(|a| a.id == agent_id) else { return };
 
+        // Strip ANSI escape sequences — raw escape codes written char-by-char into
+        // the ratatui cell buffer corrupt neighbouring panels.
+        let clean = strip_ansi(text);
+
         // Coalesce with last Text line
         if let Some(last) = entry.activity.last_mut() {
             if last.kind == ActivityKind::Text {
-                last.text.push_str(text);
+                last.text.push_str(&clean);
                 return;
             }
         }
         entry.activity.push(ActivityLine {
             kind: ActivityKind::Text,
-            text: text.to_string(),
+            text: clean,
         });
         cap_activity(&mut entry.activity);
     }
@@ -593,8 +597,10 @@ impl SwarmDashboardState {
             return;
         }
 
-        // Flatten activity into display lines (split on newlines)
-        let display_lines = flatten_activity(&agent.activity);
+        // Flatten activity + word-wrap to the available width.
+        // Each element in display_lines is exactly one rendered row.
+        let content_width = detail_area.width.saturating_sub(1) as usize; // -1 for scrollbar
+        let display_lines = flatten_and_wrap_activity(&agent.activity, content_width);
         let total = display_lines.len();
         let viewport = detail_area.height as usize;
 
@@ -606,7 +612,6 @@ impl SwarmDashboardState {
         };
 
         // Render visible lines
-        let content_width = detail_area.width.saturating_sub(1); // -1 for scrollbar
         for row in 0..viewport {
             let idx = scroll + row;
             if idx >= total {
@@ -634,9 +639,7 @@ impl SwarmDashboardState {
                     .bg(bg),
             };
 
-            // Truncate text to content width
-            let display: String = text.chars().take(content_width as usize).collect();
-            render_text(buf, detail_area.x + 1, y, detail_area.x + content_width, &display, style);
+            render_text(buf, detail_area.x + 1, y, detail_area.x + content_width as u16, text, style);
         }
 
         // Scrollbar
@@ -662,10 +665,19 @@ impl SwarmDashboardState {
             return;
         }
 
-        let total = diff.lines.len();
+        let content_width = content_area.width.saturating_sub(1) as usize; // -1 for scrollbar
+        // Word-wrap diff lines so nothing is clipped
+        let wrapped_lines: Vec<(DiffLineKind, String)> = diff.lines.iter()
+            .flat_map(|(kind, text)| {
+                word_wrap_line(text, content_width)
+                    .into_iter()
+                    .map(move |l| (kind.clone(), l))
+            })
+            .collect();
+
+        let total = wrapped_lines.len();
         let viewport = content_area.height as usize;
         let scroll = diff.scroll.min(total.saturating_sub(viewport));
-        let content_width = content_area.width.saturating_sub(1);
 
         for row in 0..viewport {
             let idx = scroll + row;
@@ -673,15 +685,14 @@ impl SwarmDashboardState {
             let y = content_area.y + row as u16;
             if y >= content_area.bottom() { break; }
 
-            let (kind, text) = &diff.lines[idx];
+            let (kind, text) = &wrapped_lines[idx];
             let style = match kind {
                 DiffLineKind::Added => Style::default().fg(Color::Green).bg(bg),
                 DiffLineKind::Removed => Style::default().fg(Color::Red).bg(bg),
                 DiffLineKind::Header => Style::default().fg(Color::Yellow).bg(bg).add_modifier(Modifier::BOLD),
                 DiffLineKind::Context => Style::default().fg(theme::TEXT_DIM).bg(bg),
             };
-            let display: String = text.chars().take(content_width as usize).collect();
-            render_text(buf, content_area.x + 1, y, content_area.x + content_width, &display, style);
+            render_text(buf, content_area.x + 1, y, content_area.x + content_width as u16, text, style);
         }
 
         if total > viewport {
@@ -708,16 +719,169 @@ pub fn count_display_lines(activity: &[ActivityLine]) -> usize {
         .sum()
 }
 
-fn flatten_activity(activity: &[ActivityLine]) -> Vec<(ActivityKind, String)> {
+/// Flatten activity lines AND word-wrap each one to `width` columns.
+/// The returned vec has one entry per rendered row, suitable for direct indexing
+/// in the scroll/viewport calculation.
+fn flatten_and_wrap_activity(activity: &[ActivityLine], width: usize) -> Vec<(ActivityKind, String)> {
     let mut lines = Vec::new();
     for entry in activity {
         for line in entry.text.split('\n') {
             if !line.is_empty() {
-                lines.push((entry.kind.clone(), line.to_string()));
+                for wrapped in word_wrap_line(line, width) {
+                    lines.push((entry.kind.clone(), wrapped));
+                }
             }
         }
     }
     lines
+}
+
+/// Word-wrap a single line to at most `width` characters per output line.
+/// Splits on whitespace boundaries; force-breaks words longer than `width`.
+/// Leading whitespace (indentation) is preserved on continuation lines.
+fn word_wrap_line(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let char_count = text.chars().count();
+    if char_count <= width {
+        return vec![text.to_string()];
+    }
+
+    // Detect leading indent so continuation lines are indented too
+    let indent_chars = text.chars().take_while(|c| *c == ' ').count();
+    let indent: String = " ".repeat(indent_chars);
+    let wrap_width = width.max(1);
+
+    let mut result: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_len = 0usize;
+
+    for word in text.split_ascii_whitespace() {
+        if current_len == 0 {
+            // First word on this row — start with indent
+            let pfx = if result.is_empty() {
+                // first line preserves the original indent (already in text)
+                indent_chars
+            } else {
+                indent_chars
+            };
+            let _ = pfx; // indent is added explicitly below
+            if result.is_empty() {
+                current.push_str(&indent);
+                current_len = indent_chars;
+            } else {
+                current.push_str(&indent);
+                current_len = indent_chars;
+            }
+        }
+
+        let available = wrap_width.saturating_sub(current_len);
+
+        if word.chars().count() <= available {
+            // Word fits — add a space separator unless we're at the indent start
+            if current_len > indent_chars {
+                current.push(' ');
+                current_len += 1;
+            }
+            current.push_str(word);
+            current_len += word.chars().count();
+        } else if current_len == indent_chars {
+            // Word is longer than the whole line — force-break it
+            let mut remaining = word;
+            while !remaining.is_empty() {
+                let take = (wrap_width - current_len).max(1);
+                // take by chars, not bytes
+                let split_at = remaining
+                    .char_indices()
+                    .nth(take)
+                    .map(|(i, _)| i)
+                    .unwrap_or(remaining.len());
+                current.push_str(&remaining[..split_at]);
+                remaining = &remaining[split_at..];
+                if !remaining.is_empty() {
+                    result.push(std::mem::replace(&mut current, indent.clone()));
+                    current_len = indent_chars;
+                } else {
+                    current_len += take;
+                }
+            }
+        } else {
+            // Word doesn't fit — flush current line, start fresh
+            result.push(std::mem::replace(&mut current, indent.clone()));
+            current_len = indent_chars;
+
+            // Now add the word (may itself need force-breaking)
+            let word_len = word.chars().count();
+            let line_available = wrap_width - current_len;
+            if word_len <= line_available {
+                current.push_str(word);
+                current_len += word_len;
+            } else {
+                // Force-break long word
+                let mut remaining = word;
+                while !remaining.is_empty() {
+                    let take = (wrap_width - current_len).max(1);
+                    let split_at = remaining
+                        .char_indices()
+                        .nth(take)
+                        .map(|(i, _)| i)
+                        .unwrap_or(remaining.len());
+                    current.push_str(&remaining[..split_at]);
+                    remaining = &remaining[split_at..];
+                    if !remaining.is_empty() {
+                        result.push(std::mem::replace(&mut current, indent.clone()));
+                        current_len = indent_chars;
+                    } else {
+                        current_len += take;
+                    }
+                }
+            }
+        }
+    }
+
+    if !current.trim().is_empty() {
+        result.push(current);
+    } else if result.is_empty() {
+        result.push(text.to_string());
+    }
+    result
+}
+
+/// Strip ANSI/VT100 escape sequences from a string.
+/// Prevents raw escape chars from corrupting the ratatui cell buffer when
+/// rendered character-by-character via `render_text`.
+pub fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            // Skip until end of escape sequence (a letter or `m`/`J`/`K` etc.)
+            match chars.peek() {
+                Some('[') => {
+                    chars.next(); // consume '['
+                    // consume until alphabetic char
+                    for c in chars.by_ref() {
+                        if c.is_ascii_alphabetic() { break; }
+                    }
+                }
+                Some(']') => {
+                    chars.next(); // consume ']'
+                    // OSC sequence — ends at BEL (\x07) or ST (\x1b\\)
+                    for c in chars.by_ref() {
+                        if c == '\x07' || c == '\x1b' { break; }
+                    }
+                }
+                _ => {
+                    // Single-char escape — skip next char
+                    chars.next();
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// Parse a unified diff string into classified lines for rendering.
