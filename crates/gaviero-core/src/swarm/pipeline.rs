@@ -451,11 +451,13 @@ fn commit_agent_changes(worktree_path: &std::path::Path, agent_id: &str, summary
     let add = Command::new("git")
         .args(["add", "-A"])
         .current_dir(worktree_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .context("git add in worktree")?;
     anyhow::ensure!(add.success(), "git add failed in worktree {}", worktree_path.display());
 
-    // Commit
+    // Commit — silence stdout/stderr so git's progress output doesn't corrupt the TUI
     let msg = format!(
         "gaviero: agent {} — {}",
         agent_id,
@@ -464,6 +466,8 @@ fn commit_agent_changes(worktree_path: &std::path::Path, agent_id: &str, summary
     let commit = Command::new("git")
         .args(["commit", "-m", &msg])
         .current_dir(worktree_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .context("git commit in worktree")?;
     anyhow::ensure!(commit.success(), "git commit failed in worktree {}", worktree_path.display());
