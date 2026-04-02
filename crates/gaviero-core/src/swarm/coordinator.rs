@@ -253,6 +253,104 @@ impl Coordinator {
         Ok(dag)
     }
 
+    /// Produce a `.gaviero` DSL file from a user prompt + repo context + memory.
+    ///
+    /// This replaces `plan()` as the primary coordinator entry point. Instead of
+    /// emitting fragile JSON, Opus produces a human-readable, compiler-validated
+    /// `.gaviero` DSL file. The caller is responsible for writing this to disk,
+    /// presenting it for user review, and compiling it with `gaviero_dsl::compile()`.
+    ///
+    /// Returning `Result<String>` (raw DSL text) instead of a parsed struct
+    /// eliminates all lenient JSON parsing and associated silent failure modes.
+    pub async fn plan_as_dsl(
+        &self,
+        prompt: &str,
+        workspace_root: &Path,
+        file_list: &[String],
+        read_namespaces: &[String],
+        observer: Option<Box<dyn crate::observer::AcpObserver>>,
+    ) -> Result<String> {
+        let memory_context = if let Some(ref mem) = self.memory {
+            mem.search_context_filtered(
+                read_namespaces,
+                prompt,
+                10,
+                PrivacyFilter::ExcludeLocalOnly,
+            )
+            .await
+        } else {
+            String::new()
+        };
+
+        let system_prompt = build_coordinator_dsl_prompt(file_list, &memory_context);
+        let user_prompt = format!(
+            "Decompose this task into a `.gaviero` DSL workflow:\n\n{}",
+            prompt
+        );
+
+        let options = crate::acp::session::AgentOptions::default();
+        let mut session = AcpSession::spawn(
+            &self.config.model,
+            workspace_root,
+            &user_prompt,
+            &system_prompt,
+            &["Read", "Glob", "Grep"],
+            &options,
+            &[],
+        )?;
+
+        let mut response = String::new();
+        loop {
+            match session.next_event().await {
+                Ok(Some(crate::acp::protocol::StreamEvent::ContentDelta(text))) => {
+                    response.push_str(&text);
+                }
+                Ok(Some(crate::acp::protocol::StreamEvent::ToolUseStart { tool_name, .. })) => {
+                    if let Some(obs) = observer.as_ref() {
+                        obs.on_streaming_status(&format!("{}...", tool_name));
+                    }
+                }
+                Ok(Some(crate::acp::protocol::StreamEvent::ToolInputDelta(_))) => {}
+                Ok(Some(crate::acp::protocol::StreamEvent::AssistantMessage { text, tool_uses })) => {
+                    if let Some(obs) = observer.as_ref() {
+                        for tu in &tool_uses {
+                            let detail = extract_tool_detail(&tu.name, &tu.input.to_string());
+                            obs.on_tool_call_started(&detail);
+                        }
+                        if tool_uses.is_empty() {
+                            obs.on_streaming_status("Building DSL plan...");
+                        }
+                    }
+                    if response.is_empty() && !text.is_empty() {
+                        response = text;
+                    }
+                }
+                Ok(Some(crate::acp::protocol::StreamEvent::ResultEvent {
+                    result_text, ..
+                })) => {
+                    if response.is_empty() {
+                        response = result_text;
+                    }
+                    break;
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::warn!("Stream error during DSL coordination: {}", e);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let _ = session.wait().await;
+
+        // Strip markdown code fences if Opus wrapped the DSL in ```gaviero ... ```
+        let dsl = strip_code_fence(&response);
+        if dsl.trim().is_empty() {
+            anyhow::bail!("coordinator returned empty DSL response");
+        }
+        Ok(dsl.to_string())
+    }
+
     /// Validate the coordinator's output beyond JSON parsing.
     pub fn validate_dag(&self, dag: &TaskDAG) -> Result<()> {
         let units = &dag.units;
@@ -828,6 +926,96 @@ fn paths_overlap_normalized(a: &str, b: &str) -> bool {
     false
 }
 
+/// Build the system prompt for DSL-output coordination.
+///
+/// Instead of JSON, the coordinator produces a `.gaviero` file that:
+/// 1. Can be inspected and edited by the user before execution
+/// 2. Is validated by the DSL compiler (miette errors on bad syntax)
+/// 3. Explicitly shows which files will be created vs. which exist
+fn build_coordinator_dsl_prompt(file_list: &[String], memory_context: &str) -> String {
+    let mut prompt = String::from(
+        "You are a code architect decomposing a development task into a `.gaviero` DSL workflow.\n\n\
+         OUTPUT FORMAT — you MUST respond with ONLY a valid `.gaviero` file, no prose:\n\n\
+         ```\n\
+         // Optional comment\n\
+         client <name> { tier <tier>  model \"<model-id>\" }\n\
+         // tier is one of: coordinator | reasoning | execution | mechanical\n\n\
+         agent <id> {\n\
+             description \"<one-line summary>\"\n\
+             client <client-name>\n\
+             scope {\n\
+                 owned    [\"path/\" \"file.rs\"]   // files this agent may write\n\
+                 read_only [\"other/\"]             // files this agent may only read\n\
+             }\n\
+             depends_on [<other-agent-id> ...]    // omit if no dependencies\n\
+             prompt #\"\n\
+                 <self-contained task specification>\n\
+             \"#\n\
+             max_retries <n>   // optional, default 1\n\
+         }\n\n\
+         workflow main {\n\
+             steps [<agent-ids in any order — DAG handles ordering>]\n\
+             max_parallel <n>   // optional\n\
+         }\n\
+         ```\n\n\
+         SCOPE RULES:\n\
+         - owned_paths MUST be disjoint across all agents — each file in at most ONE agent's owned list\n\
+         - If a file does not yet exist in the workspace, add a comment `// (will be created)` after its path\n\
+         - read_only paths may overlap freely\n\n\
+         PARALLELISM:\n\
+         - Maximize agents that can run simultaneously (same tier with no depends_on)\n\
+         - Only add depends_on when an agent TRULY needs another's output\n\
+         - Prefer wide shallow DAGs (2-3 tiers) over deep linear chains\n\n\
+         TIER ASSIGNMENT:\n\
+         - reasoning: multi-file semantic changes, interface redesigns, complex logic\n\
+         - execution: single-file focused changes, test writing, error handling\n\
+         - mechanical: renames, import updates, call-site propagation, formatting\n\n\
+         CLIENT NAMES to use:\n\
+         - `opus` for reasoning-tier agents (model \"claude-opus-4-6\")\n\
+         - `sonnet` for execution-tier agents (model \"claude-sonnet-4-6\")\n\
+         - `haiku` for mechanical-tier agents (model \"claude-haiku-4-5-20251001\")\n\n\
+         PROMPT CONTENT:\n\
+         - Each agent's prompt must be SELF-CONTAINED — include all context needed\n\
+         - Agents run in isolated git worktrees; they cannot access tmp/ or gitignored files\n\
+         - If task requires content from an inlined [File: path]...[End of file: path] block,\n\
+           copy the COMPLETE relevant sections verbatim into the prompt block\n\n\
+         Respond with ONLY the `.gaviero` file. No explanation, no prose.\n\n",
+    );
+
+    if !file_list.is_empty() {
+        prompt.push_str("Workspace files:\n");
+        for f in file_list.iter().take(200) {
+            prompt.push_str(&format!("  {}\n", f));
+        }
+        prompt.push('\n');
+    }
+
+    if !memory_context.is_empty() {
+        prompt.push_str("MEMORY CONTEXT:\n");
+        prompt.push_str(memory_context);
+        prompt.push('\n');
+    }
+
+    prompt
+}
+
+/// Strip markdown code fences if Opus wrapped the DSL in ```gaviero ... ``` or ``` ... ```.
+fn strip_code_fence(text: &str) -> &str {
+    let trimmed = text.trim();
+    // Check for ```gaviero or ``` at start
+    let after_open = trimmed
+        .strip_prefix("```gaviero")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .map(|s| s.trim_start_matches('\n'));
+    if let Some(inner) = after_open {
+        // Remove trailing ```
+        if let Some(end) = inner.rfind("```") {
+            return inner[..end].trim_end();
+        }
+    }
+    trimmed
+}
+
 fn build_coordinator_prompt(file_list: &[String], memory_context: &str) -> String {
     let mut prompt = String::from(
         "You are a code architect decomposing a development task into PARALLELIZABLE \
@@ -857,10 +1045,19 @@ fn build_coordinator_prompt(file_list: &[String], memory_context: &str) -> Strin
            Each file may appear in at most ONE unit's owned_paths.\n\
            If multiple units need the same file, assign it to one unit and\n\
            use read_only_paths for the others.\n\
-         - coordinator_instructions: 2-3 sentence instructions (keep brief! the agent has tools to explore)\n\
+         - coordinator_instructions: Self-contained task specification for the subagent.\n\
+           For simple mechanical tasks: 1-2 sentences is fine.\n\
+           For complex implementation tasks: include ALL context the agent needs — full excerpts,\n\
+           data structures, interfaces, expected outputs, constraints — as many paragraphs as needed.\n\
+           Subagents run in isolated git worktrees and can only access git-tracked files with their\n\
+           Read/Glob/Grep tools. They CANNOT access gitignored or tmp/ files.\n\
+           If the task requires content from an inlined [File: path]...[End of file: path] block,\n\
+           copy the COMPLETE relevant sections verbatim into coordinator_instructions.\n\
+           Do NOT summarize or truncate — agents that lack context will produce empty results.\n\
          - estimated_tokens: approximate context needed\n\n\
-         KEEP JSON COMPACT: Use short IDs. Keep coordinator_instructions to 2-3 sentences max.\n\
-         The agent has Read/Glob/Grep tools and can explore the codebase itself.\n\n\
+         INLINED FILES: [File: path]...[End of file: path] blocks are available to YOU (coordinator)\n\
+         but NOT to subagents. NEVER tell a subagent to read such a file by path.\n\
+         Always embed the full relevant content directly in coordinator_instructions.\n\n\
          Select a verification_strategy:\n\
          - \"combined\" (DEFAULT): structural + diff review + tests\n\
          - \"structural_only\": when ALL subtasks are mechanical\n\
