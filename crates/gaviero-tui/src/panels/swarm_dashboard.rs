@@ -247,6 +247,15 @@ impl SwarmDashboardState {
                     .iter()
                     .map(|p| p.to_string_lossy().to_string())
                     .collect();
+                // Update detail to reflect the real committed file count (the earlier
+                // on_agent_state_changed fires before the worktree commit, so it always
+                // shows "Modified 0 files").
+                let n = entry.modified_files.len();
+                entry.detail = if n > 0 {
+                    format!("Modified {} file{}", n, if n == 1 { "" } else { "s" })
+                } else {
+                    manifest.summary.clone().unwrap_or_else(|| entry.detail.clone())
+                };
             }
         }
         self.result = Some(result);
@@ -507,19 +516,40 @@ impl SwarmDashboardState {
 
             // Elapsed time (right-aligned)
             let elapsed_str = format_elapsed(agent);
+            // "↵ diff" hint for the selected completed agent that has a branch
+            let hint_str = if is_selected
+                && matches!(agent.status, AgentStatus::Completed)
+                && agent.branch.is_some()
+            {
+                " ↵ diff"
+            } else {
+                ""
+            };
+            let hint_width = hint_str.len() as u16;
+
             if !elapsed_str.is_empty() {
-                let elapsed_x = area.right().saturating_sub(elapsed_str.len() as u16 + 1);
+                let elapsed_x = area.right().saturating_sub(elapsed_str.len() as u16 + 1 + hint_width);
                 if elapsed_x > col {
-                    render_text(buf, elapsed_x, y, area.right(), &elapsed_str,
-                        Style::default().fg(theme::TEXT_DIM).bg(row_bg));
+                    render_text(buf, elapsed_x, y, elapsed_x + elapsed_str.len() as u16,
+                        &elapsed_str, Style::default().fg(theme::TEXT_DIM).bg(row_bg));
                 }
-                // Detail fills between col and elapsed
-                let detail = truncate_detail(agent, (elapsed_x.saturating_sub(col).saturating_sub(1)) as usize);
-                render_text(buf, col, y, elapsed_x.saturating_sub(1), &detail,
+                if !hint_str.is_empty() {
+                    let hint_x = area.right().saturating_sub(hint_width);
+                    render_text(buf, hint_x, y, area.right(), hint_str,
+                        Style::default().fg(theme::ACCENT).bg(row_bg));
+                }
+                let detail_end = elapsed_x.saturating_sub(1);
+                let detail = truncate_detail(agent, (detail_end.saturating_sub(col)) as usize);
+                render_text(buf, col, y, detail_end, &detail,
                     Style::default().fg(theme::MEDIUM_GRAY).bg(row_bg));
             } else {
-                let detail = truncate_detail(agent, (area.right().saturating_sub(col)) as usize);
-                render_text(buf, col, y, area.right(), &detail,
+                let right_edge = area.right().saturating_sub(hint_width);
+                if !hint_str.is_empty() {
+                    render_text(buf, right_edge, y, area.right(), hint_str,
+                        Style::default().fg(theme::ACCENT).bg(row_bg));
+                }
+                let detail = truncate_detail(agent, (right_edge.saturating_sub(col)) as usize);
+                render_text(buf, col, y, right_edge, &detail,
                     Style::default().fg(theme::MEDIUM_GRAY).bg(row_bg));
             }
         }
@@ -711,12 +741,10 @@ fn cap_activity(activity: &mut Vec<ActivityLine>) {
     }
 }
 
-/// Flatten activity lines by splitting on newlines for rendering.
-/// Count the number of display lines in an activity log (splitting on newlines).
-pub fn count_display_lines(activity: &[ActivityLine]) -> usize {
-    activity.iter()
-        .map(|a| a.text.split('\n').filter(|l| !l.is_empty()).count().max(1))
-        .sum()
+/// Count the number of rendered rows for `activity` when word-wrapped to `width` columns.
+/// This matches exactly what `flatten_and_wrap_activity` produces, so scroll limits stay in sync.
+pub fn count_display_lines(activity: &[ActivityLine], width: usize) -> usize {
+    flatten_and_wrap_activity(activity, width).len()
 }
 
 /// Flatten activity lines AND word-wrap each one to `width` columns.
