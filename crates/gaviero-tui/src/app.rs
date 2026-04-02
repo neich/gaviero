@@ -1422,22 +1422,33 @@ impl App {
                     self.swarm_dashboard.close_diff();
                     return;
                 }
-                let branch = self.swarm_dashboard.agents
-                    .get(self.swarm_dashboard.scroll.selected)
-                    .and_then(|a| a.branch.clone());
-                let agent_id = self.swarm_dashboard.agents
-                    .get(self.swarm_dashboard.scroll.selected)
-                    .map(|a| a.id.clone());
-                if let (Some(branch), Some(agent_id)) = (branch, agent_id) {
-                    let root = self.workspace.roots().first()
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_else(|| std::path::PathBuf::from("."));
-                    let pre_sha = self.swarm_dashboard.result.as_ref()
-                        .map(|r| r.pre_swarm_sha.clone())
-                        .unwrap_or_default();
-                    let diff_text = gaviero_core::git::diff_branch_vs_sha(&root, &pre_sha, &branch)
-                        .unwrap_or_default();
-                    self.swarm_dashboard.show_diff(agent_id, diff_text);
+                let agent = self.swarm_dashboard.agents
+                    .get(self.swarm_dashboard.scroll.selected);
+                let branch = agent.and_then(|a| a.branch.clone());
+                let agent_id = agent.map(|a| a.id.clone());
+                let is_completed = agent.map(|a| matches!(a.status, gaviero_core::swarm::models::AgentStatus::Completed)).unwrap_or(false);
+
+                if !is_completed {
+                    return;
+                }
+                match (branch, agent_id) {
+                    (Some(branch), Some(agent_id)) => {
+                        let root = self.workspace.roots().first()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_else(|| std::path::PathBuf::from("."));
+                        let pre_sha = self.swarm_dashboard.result.as_ref()
+                            .map(|r| r.pre_swarm_sha.clone())
+                            .unwrap_or_default();
+                        let diff_text = gaviero_core::git::diff_branch_vs_sha(&root, &pre_sha, &branch)
+                            .unwrap_or_default();
+                        self.swarm_dashboard.show_diff(agent_id, diff_text);
+                    }
+                    (_, Some(id)) => {
+                        self.swarm_dashboard.status_message = format!(
+                            "No diff available for '{}' (agent ran without worktree isolation)", id
+                        );
+                    }
+                    _ => {}
                 }
                 return;
             }
@@ -1524,7 +1535,8 @@ impl App {
                         }
                         DashboardFocus::Detail => {
                             if let Some(agent) = dash.agents.get(dash.scroll.selected) {
-                                let total = crate::panels::swarm_dashboard::count_display_lines(&agent.activity);
+                                let w = dash.detail_rect.width.saturating_sub(1) as usize;
+                                let total = crate::panels::swarm_dashboard::count_display_lines(&agent.activity, w);
                                 dash.detail_scroll = (dash.detail_scroll + 1).min(total.saturating_sub(1));
                             }
                         }
@@ -1552,7 +1564,8 @@ impl App {
                 }
                 DashboardFocus::Detail => {
                     if let Some(agent) = dash.agents.get(dash.scroll.selected) {
-                        let total = crate::panels::swarm_dashboard::count_display_lines(&agent.activity);
+                        let w = dash.detail_rect.width.saturating_sub(1) as usize;
+                        let total = crate::panels::swarm_dashboard::count_display_lines(&agent.activity, w);
                         dash.detail_scroll = (dash.detail_scroll + 10).min(total.saturating_sub(1));
                     }
                 }
@@ -2114,7 +2127,7 @@ impl App {
         };
 
         // Read the script file
-        let source = match std::fs::read_to_string(&resolved) {
+        let raw = match std::fs::read_to_string(&resolved) {
             Ok(s) => s,
             Err(e) => {
                 self.chat_state.add_system_message(
@@ -2123,6 +2136,10 @@ impl App {
                 return;
             }
         };
+
+        // If the file is markdown-wrapped (LLM output with ```gaviero fences),
+        // extract just the DSL block so the lexer doesn't choke on prose.
+        let source = extract_gaviero_block(&raw);
 
         // Compile synchronously (fast, no LLM call)
         let filename = resolved.display().to_string();
@@ -4512,7 +4529,8 @@ impl App {
                                     dash.scroll.scroll_down(1, dash.agents.len());
                                 } else if dash.detail_rect.contains(pos) {
                                     if let Some(agent) = dash.agents.get(dash.scroll.selected) {
-                                        let total = crate::panels::swarm_dashboard::count_display_lines(&agent.activity);
+                                        let w = dash.detail_rect.width.saturating_sub(1) as usize;
+                                        let total = crate::panels::swarm_dashboard::count_display_lines(&agent.activity, w);
                                         dash.detail_scroll = (dash.detail_scroll + 3).min(total.saturating_sub(1));
                                     }
                                 }
@@ -6156,4 +6174,28 @@ fn list_workspace_files(root: &std::path::Path, limit: usize) -> Vec<String> {
         walk(root, "", &mut files, limit);
     }
     files
+}
+
+/// If `src` is markdown-wrapped (i.e. the LLM emitted ```gaviero fences around the
+/// DSL), extract and return only the content of the first such block.  If no fences
+/// are found, return the original string unchanged.
+///
+/// Uses the *last* bare ``` line as the closing fence, because DSL prompt strings
+/// can contain inner ```cpp / ``` blocks that would otherwise truncate the extraction.
+fn extract_gaviero_block(src: &str) -> String {
+    let lines: Vec<&str> = src.lines().collect();
+    let fence_start = lines.iter().position(|l| {
+        let t = l.trim();
+        t == "```gaviero" || t.starts_with("```gaviero ")
+    });
+    if let Some(start_idx) = fence_start {
+        let content_start = start_idx + 1;
+        // Use the *last* bare ``` in the file as the closing fence so that inner
+        // code blocks inside prompt strings don't cause early termination.
+        if let Some(rel_end) = lines[content_start..].iter().rposition(|l| l.trim() == "```") {
+            let content = lines[content_start..content_start + rel_end].join("\n");
+            return content;
+        }
+    }
+    src.to_string()
 }
