@@ -52,10 +52,14 @@ impl WriteGatePipeline {
     }
 
     /// Check if an agent is allowed to write to a path.
+    ///
+    /// Scopes are restriction lists used by swarm agents to limit which files
+    /// they can touch. A normal (non-swarm) prompt has no registered scope, which
+    /// means no restrictions — all paths are allowed.
     pub fn is_scope_allowed(&self, agent_id: &str, path: &str) -> bool {
         match self.agent_scopes.get(agent_id) {
             Some(scope) => scope.is_owned(path),
-            None => false, // No scope registered = deny (fail-closed)
+            None => true, // No scope registered = no restrictions (swarm agents always register one)
         }
     }
 
