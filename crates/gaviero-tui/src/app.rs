@@ -1340,7 +1340,12 @@ impl App {
 
                     if has_visual_lines {
                         if !self.chat_state.move_up_visual(first_w, panel_w) {
-                            self.chat_state.scroll_offset = self.chat_state.scroll_offset.saturating_sub(1);
+                            // Reached top of visual text — same logic as single-line case
+                            if self.chat_state.history_index.is_some() || self.chat_state.text_input.text.is_empty() {
+                                self.chat_state.history_up();
+                            } else {
+                                self.chat_state.scroll_offset = self.chat_state.scroll_offset.saturating_sub(1);
+                            }
                         }
                     } else if self.chat_state.history_index.is_some() || self.chat_state.text_input.text.is_empty() {
                         self.chat_state.history_up();
@@ -1365,7 +1370,12 @@ impl App {
 
                     if has_visual_lines {
                         if !self.chat_state.move_down_visual(first_w, panel_w) {
-                            self.chat_state.scroll_offset += 1;
+                            // Reached bottom of visual text — same logic as single-line case
+                            if self.chat_state.history_index.is_some() {
+                                self.chat_state.history_down();
+                            } else {
+                                self.chat_state.scroll_offset += 1;
+                            }
                         }
                     } else if self.chat_state.history_index.is_some() {
                         self.chat_state.history_down();
