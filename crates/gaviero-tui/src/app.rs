@@ -38,13 +38,6 @@ pub enum Focus {
     Terminal,
 }
 
-#[allow(dead_code)]
-enum FocusDirection {
-    Left,
-    Right,
-    Up,
-    Down,
-}
 
 /// What the left panel shows.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2061,6 +2054,7 @@ impl App {
             let _ = tx.send(Event::SwarmPhaseChanged(format!("planned ({} agents)", unit_count)));
 
             // Step 2: Execute
+            let plan = gaviero_core::swarm::plan::CompiledPlan::from_work_units(work_units, None);
             let config = pipeline::SwarmConfig {
                 max_parallel: unit_count.min(4), // cap at 4 parallel agents
                 workspace_root: root,
@@ -2080,7 +2074,7 @@ impl App {
                 })
             };
 
-            match pipeline::execute(work_units, &config, memory, &observer, make_obs).await {
+            match pipeline::execute(&plan, &config, None, memory, &observer, make_obs).await {
                 Ok(result) => {
                     let _ = tx.send(Event::SwarmCompleted(Box::new(result)));
                 }
@@ -2163,9 +2157,7 @@ impl App {
             }
         };
 
-        let work_units = compiled.work_units;
-        let script_max_parallel = compiled.max_parallel;
-        let unit_count = work_units.len();
+        let unit_count = compiled.graph.node_count();
         let display_cmd = match &runtime_prompt {
             Some(rp) => format!("/run {} {}", script_path, rp),
             None => format!("/run {}", script_path),
@@ -2196,7 +2188,7 @@ impl App {
             use gaviero_core::swarm::pipeline;
 
             // Script's max_parallel overrides the TUI default when declared.
-            let effective_max_parallel = script_max_parallel
+            let effective_max_parallel = compiled.max_parallel
                 .unwrap_or_else(|| unit_count.min(4));
 
             let config = pipeline::SwarmConfig {
@@ -2218,7 +2210,7 @@ impl App {
                 })
             };
 
-            match pipeline::execute(work_units, &config, memory, &observer, make_obs).await {
+            match pipeline::execute(&compiled, &config, None, memory, &observer, make_obs).await {
                 Ok(result) => {
                     let _ = tx.send(Event::SwarmCompleted(Box::new(result)));
                 }
@@ -4940,70 +4932,6 @@ impl App {
                 tracing::error!("Failed to open file {}: {}", path.display(), e);
             }
         }
-    }
-
-    #[allow(dead_code)]
-    fn cycle_focus(&mut self) {
-        let visible = self.visible_panels();
-        if visible.is_empty() {
-            return;
-        }
-        let current_idx = visible.iter().position(|&f| f == self.focus).unwrap_or(0);
-        let next_idx = (current_idx + 1) % visible.len();
-        self.focus = visible[next_idx];
-    }
-
-    /// Move focus directionally based on the spatial layout:
-    ///
-    ///   [FileTree | Editor | SidePanel]   ← upper row
-    ///   [        Terminal               ]  ← lower row (full width)
-    ///
-    ///   Left/Right moves between columns within the current row.
-    ///   Down from any upper panel → Terminal.
-    ///   Up from Terminal → Editor (center column).
-    #[allow(dead_code)]
-    fn focus_direction(&mut self, dir: FocusDirection) {
-        match dir {
-            FocusDirection::Left => {
-                self.focus = match self.focus {
-                    Focus::Editor | Focus::Terminal if self.panel_visible.file_tree => Focus::FileTree,
-                    Focus::SidePanel => Focus::Editor,
-                    _ => self.focus,
-                };
-            }
-            FocusDirection::Right => {
-                self.focus = match self.focus {
-                    Focus::FileTree => Focus::Editor,
-                    Focus::Editor | Focus::Terminal if self.panel_visible.side_panel => Focus::SidePanel,
-                    _ => self.focus,
-                };
-            }
-            FocusDirection::Up => {
-                if self.focus == Focus::Terminal {
-                    self.focus = Focus::Editor;
-                }
-            }
-            FocusDirection::Down => {
-                if self.focus != Focus::Terminal && self.panel_visible.terminal {
-                    self.focus = Focus::Terminal;
-                }
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    fn visible_panels(&self) -> Vec<Focus> {
-        let mut panels = vec![Focus::Editor];
-        if self.panel_visible.file_tree {
-            panels.push(Focus::FileTree);
-        }
-        if self.panel_visible.side_panel {
-            panels.push(Focus::SidePanel);
-        }
-        if self.panel_visible.terminal {
-            panels.push(Focus::Terminal);
-        }
-        panels
     }
 
     fn cycle_tab(&mut self, delta: i32) {
