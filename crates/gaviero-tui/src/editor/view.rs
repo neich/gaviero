@@ -228,7 +228,10 @@ impl<'a> EditorView<'a> {
         let top = self.buffer.scroll.top_line;
         let left = self.buffer.scroll.left_col;
 
-        if cursor_line < top || cursor_line >= top + code_area.height as usize {
+        if cursor_line >= self.buffer.line_count()
+            || cursor_line < top
+            || cursor_line >= top + code_area.height as usize
+        {
             return;
         }
 
