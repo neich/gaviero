@@ -123,7 +123,10 @@ impl Workspace {
         let settings_path = path.join(".gaviero").join("settings.json");
         let workspace_settings = match std::fs::read_to_string(&settings_path) {
             Ok(content) => match serde_json::from_str(&content) {
-                Ok(val) => val,
+                Ok(val) => {
+                    tracing::info!("Loaded settings from {}", settings_path.display());
+                    val
+                }
                 Err(e) => {
                     tracing::warn!(
                         "Invalid JSON in {}: {} — all settings will use defaults",
@@ -133,7 +136,14 @@ impl Workspace {
                     serde_json::Value::Object(serde_json::Map::new())
                 }
             },
-            Err(_) => serde_json::Value::Object(serde_json::Map::new()),
+            Err(e) => {
+                tracing::warn!(
+                    "Settings not found at {} ({}): all settings will use defaults",
+                    settings_path.display(),
+                    e
+                );
+                serde_json::Value::Object(serde_json::Map::new())
+            }
         };
 
         let mut ws = Self {
