@@ -109,6 +109,106 @@ pub async fn execute(
         anyhow::bail!("scope validation failed: {}", msg);
     }
 
+    // ── Single-agent fast path ────────────────────────────────────────────────
+    // One work unit → bypass worktrees, bus, and merge; run directly through
+    // the IterationEngine so strategy / retry / model-escalation all apply.
+    if work_units.len() == 1 {
+        let unit = work_units.into_iter().next().unwrap();
+
+        // Resume support: skip if already completed.
+        if exec_state.status(&unit.id) == NodeStatus::Completed {
+            tracing::info!("Single-agent resume: '{}' already complete", unit.id);
+            let manifest = AgentManifest {
+                work_unit_id: unit.id.clone(),
+                status: AgentStatus::Completed,
+                modified_files: vec![],
+                branch: None,
+                summary: Some("already completed (resume)".into()),
+                cost_usd: 0.0,
+            };
+            let swarm_result = SwarmResult {
+                manifests: vec![manifest],
+                merge_results: vec![],
+                success: true,
+                pre_swarm_sha,
+            };
+            observer.on_phase_changed("completed");
+            observer.on_completed(&swarm_result);
+            return Ok(swarm_result);
+        }
+
+        observer.on_phase_changed("running");
+        observer.on_agent_state_changed(&unit.id, &AgentStatus::Running, "starting");
+
+        let backend = super::backend::claude_code::ClaudeCodeBackend::new(
+            unit.model.as_deref().unwrap_or("sonnet"),
+        );
+        let write_gate = Arc::new(Mutex::new(
+            WriteGatePipeline::new(WriteMode::AutoAccept, Box::new(NoopWriteGateObserver)),
+        ));
+        let single_validation: Option<Arc<crate::validation_gate::ValidationPipeline>> =
+            if config.workspace_root.join("Cargo.toml").exists() {
+                Some(Arc::new(crate::validation_gate::ValidationPipeline::default_for_rust()))
+            } else {
+                Some(Arc::new(crate::validation_gate::ValidationPipeline::fast_only()))
+            };
+        let single_repo_map: Arc<Option<crate::repo_map::RepoMap>> = Arc::new(
+            crate::repo_map::RepoMap::build(&config.workspace_root)
+                .map_err(|e| { tracing::debug!("repo_map build skipped: {}", e); e })
+                .ok(),
+        );
+
+        let engine = crate::iteration::IterationEngine::new(plan.iteration_config.clone());
+        let effective_read_ns: Vec<String> = unit.read_namespaces
+            .as_deref()
+            .unwrap_or(config.read_namespaces.as_slice())
+            .to_vec();
+        let acp_obs = make_observer(&unit.id);
+
+        invalidate_stale_sources(&memory, &unit, &config.workspace_root).await;
+
+        let iter_result = engine
+            .run(
+                &backend,
+                unit.clone(),
+                write_gate,
+                &config.workspace_root,
+                memory.as_deref(),
+                &effective_read_ns,
+                acp_obs.as_ref(),
+                single_validation.as_deref(),
+                None,
+                (*single_repo_map).as_ref(),
+            )
+            .await;
+
+        let manifest = iter_result.manifest;
+        let success = matches!(manifest.status, AgentStatus::Completed);
+        observer.on_agent_state_changed(
+            &manifest.work_unit_id,
+            &manifest.status,
+            manifest.summary.as_deref().unwrap_or(""),
+        );
+
+        if success {
+            let effective_write_ns = unit.write_namespace.as_deref()
+                .unwrap_or(&config.write_namespace);
+            store_agent_result(&memory, effective_write_ns, &manifest, &unit, &run_id, &config.workspace_root).await;
+        }
+        exec_state.record_result(&unit.id, manifest.clone());
+        let _ = exec_state.save(&plan_hash);
+
+        let swarm_result = SwarmResult {
+            manifests: vec![manifest],
+            merge_results: vec![],
+            success,
+            pre_swarm_sha,
+        };
+        observer.on_phase_changed("completed");
+        observer.on_completed(&swarm_result);
+        return Ok(swarm_result);
+    }
+
     // 2. Compute dependency tiers
     let tiers = validation::dependency_tiers(&work_units)
         .map_err(|e| anyhow::anyhow!("dependency cycle: {}", e))?;
@@ -131,6 +231,13 @@ pub async fn execute(
         } else {
             Some(Arc::new(crate::validation_gate::ValidationPipeline::fast_only()))
         };
+
+    // Build repo map once for context optimization (best-effort; failures are non-fatal)
+    let repo_map: Arc<Option<crate::repo_map::RepoMap>> = Arc::new(
+        crate::repo_map::RepoMap::build(&config.workspace_root)
+            .map_err(|e| { tracing::debug!("repo_map build skipped: {}", e); e })
+            .ok()
+    );
 
     // Inter-agent communication bus (available for future coordination)
     let bus = Arc::new(tokio::sync::Mutex::new(AgentBus::new()));
@@ -199,6 +306,7 @@ pub async fn execute(
                     git_coordinator: git_coordinator.clone(),
                     validation: validation_pipeline.clone(),
                     board: Some(shared_board.clone()),
+                    repo_map: repo_map.clone(),
                 };
                 let manifest = run_single_agent(
                     unit,
@@ -259,6 +367,7 @@ pub async fn execute(
                 let git_coord = git_coordinator.clone();
                 let val_pipeline = validation_pipeline.clone();
                 let board_ref = Some(shared_board.clone());
+                let rm = repo_map.clone();
 
                 // Provision worktree if enabled
                 let in_worktree = worktree_mgr.is_some();
@@ -292,6 +401,7 @@ pub async fn execute(
                         obs.as_ref(),
                         val_pipeline.as_deref(),
                         board_ref.as_deref(),
+                        (*rm).as_ref(),
                     ).await?;
 
                     if in_worktree && matches!(manifest.status, AgentStatus::Completed) {
@@ -456,6 +566,7 @@ struct AgentRunContext<'a> {
     git_coordinator: Arc<GitCoordinator>,
     validation: Option<Arc<crate::validation_gate::ValidationPipeline>>,
     board: Option<Arc<SharedBoard>>,
+    repo_map: Arc<Option<crate::repo_map::RepoMap>>,
 }
 
 /// Run a single agent, optionally in a worktree.
@@ -473,6 +584,7 @@ async fn run_single_agent(
     let git_coordinator = ctx.git_coordinator.clone();
     let validation = ctx.validation.clone();
     let board = ctx.board.clone();
+    let repo_map = ctx.repo_map.clone();
     let in_worktree = worktree_mgr.is_some();
     let agent_root = if let Some(mgr) = worktree_mgr {
         let handle = mgr.provision(&unit.id)?;
@@ -508,6 +620,7 @@ async fn run_single_agent(
         acp_observer.as_ref(),
         validation.as_deref(),
         board.as_deref(),
+        (*repo_map).as_ref(),
     )
     .await?;
 
@@ -675,7 +788,7 @@ pub async fn plan_coordinated(
 ) -> Result<String> {
     observer.on_coordination_started(prompt);
     observer.on_agent_state_changed("coordinator", &AgentStatus::Running, "Opus planning (DSL)...");
-    observer.on_tier_dispatch("coordinator", crate::types::ModelTier::Coordinator, &config.model);
+    observer.on_tier_dispatch("coordinator", crate::types::ModelTier::Expensive, &config.model);
 
     let file_list = collect_file_list(&config.workspace_root)?;
     let coordinator = Coordinator::new(memory, coordinator_config);
@@ -854,13 +967,12 @@ async fn invalidate_stale_sources(
 
 /// Determine the next escalation tier in the chain.
 ///
-/// Mechanical → Execution → Reasoning → None (ceiling reached).
+/// Cheap → Expensive → None (ceiling reached).
 fn next_escalation_tier(tier: crate::types::ModelTier) -> Option<crate::types::ModelTier> {
     use crate::types::ModelTier;
     match tier {
-        ModelTier::Mechanical => Some(ModelTier::Execution),
-        ModelTier::Execution => Some(ModelTier::Reasoning),
-        _ => None,
+        ModelTier::Cheap => Some(ModelTier::Expensive),
+        ModelTier::Expensive => None,
     }
 }
 
