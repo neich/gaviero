@@ -1,352 +1,215 @@
 # gaviero-dsl — Architecture
 
-`gaviero-dsl` is a compiler for the `.gaviero` domain-specific language. It transforms declarative workflow scripts into a `CompiledPlan` — an immutable petgraph DAG of `WorkUnit` nodes — ready for execution by `gaviero-core`'s swarm pipeline. It is used by `gaviero-cli` (via `--script`) and `gaviero-tui` (via `/run`), and is also the output target of the coordinated planner: when Opus generates a plan via `plan_as_dsl()`, it emits a `.gaviero` file compiled by this crate.
-
----
-
-## Module map
-
-| Module | Purpose |
-|---|---|
-| `lib` | Public API: single `compile()` function; re-exports `CompiledPlan`, deprecated `CompiledScript` alias |
-| `lexer` | Tokenise source text using `logos`; produce `Vec<(Token, Span)>` |
-| `parser` | Parse token stream using `chumsky`; produce `Script` AST |
-| `ast` | AST node types: `Script`, `ClientDecl`, `AgentDecl`, `WorkflowDecl`, `ScopeBlock`, `MemoryBlock` |
-| `compiler` | 5-phase semantic analysis; emits `CompiledPlan` |
-| `error` | `DslError` and `DslErrors` types; `miette`-powered source diagnostics |
+A compiler for the `.gaviero` domain-specific language. Transforms declarative workflow scripts into a `CompiledPlan` — an immutable petgraph DAG of `WorkUnit` nodes — ready for execution by `gaviero-core`'s swarm pipeline.
 
 ---
 
 ## Compilation pipeline
 
 ```
-Source text (&str)
-      │
-      ▼
-┌─────────────┐
-│   lexer     │  logos tokenisation
-│  lex()      │──────────────────────→  Vec<(Token, SimpleSpan)>
-└─────────────┘                         + Vec<SimpleSpan>  (lex errors)
-      │
-      ▼
-┌─────────────┐
-│   parser    │  chumsky combinator
-│  parse()    │──────────────────────→  Script { items: Vec<Item> }
-└─────────────┘                         + Vec<ParseError>
-      │
-      ▼
-┌─────────────┐
-│  compiler   │  5-phase semantic
-│ compile()   │──────────────────────→  CompiledPlan {
-└─────────────┘                             graph: DiGraph<PlanNode, DependencyEdge>,
-                                            max_parallel: Option<usize>,
-                                            source_file: Option<PathBuf>,
-                                        }
+source text (.gaviero)
+       │
+       ▼ logos tokeniser (zero-copy, derive macros)
+Vec<(Token, Span)>  +  lex errors
+       │
+       ▼ chumsky parser (combinators, error recovery)
+Script { items: Vec<Item> }  +  parse errors
+       │
+       ▼ compiler (5-phase semantic analysis)
+CompiledPlan { graph: DiGraph<PlanNode, DependencyEdge>, iteration_config, … }
+       │
+       errors reported via miette (annotated source spans)
 ```
 
-Any errors at any stage are collected, wrapped in `DslErrors`, and surfaced as a `miette::Report` with source-span highlighting.
-
-`CompiledPlan` is defined in `gaviero_core::swarm::plan` and re-exported here. `CompiledScript` (the old `{ work_units: Vec<WorkUnit>, max_parallel }` struct) is a `#[deprecated]` backward-compat alias for `CompiledPlan` — new code should use `CompiledPlan` directly.
+All errors are collected before reporting (multiple errors per pass). The parser can produce a partial AST alongside errors for improved diagnostics.
 
 ---
 
-## Stage 1 — Lexer (`lexer.rs`)
+## Module map
 
-**Tool:** `logos` (byte-pattern tokenisation, zero-copy)
-
-### Token catalogue
-
-| Category | Tokens |
-|---|---|
-| Declaration keywords | `client`, `agent`, `workflow` |
-| Field keywords | `tier`, `model`, `privacy`, `scope`, `owned`, `read_only`, `depends_on`, `prompt`, `description`, `max_retries`, `steps`, `max_parallel`, `memory`, `read_ns`, `write_ns`, `importance`, `staleness_sources` |
-| Tier values | `coordinator`, `reasoning`, `execution`, `mechanical` |
-| Privacy values | `public`, `local_only` |
-| Punctuation | `{`, `}`, `[`, `]` |
-| Literals | `Str(String)` — `"…"`, `RawStr(String)` — `#"…"#`, `Int(u64)`, `Float(f32)`, `Ident(String)` |
-
-Whitespace and `// line comments` are silently skipped.
-
-**Raw strings (`#"…"#`):** A custom `logos` callback scans forward for the closing sentinel `"#`. Backslashes inside raw strings are literal — no escape processing. Leading and trailing whitespace is trimmed during compilation (not lexing).
-
-**Public function:**
-```rust
-pub fn lex(source: &str) -> (Vec<(Token, SimpleSpan)>, Vec<SimpleSpan>)
 ```
-Returns tokens with spans and lex-error spans. Lex errors are non-fatal; the parser receives the token stream minus unrecognised characters.
-
----
-
-## Stage 2 — Parser (`parser.rs`)
-
-**Tool:** `chumsky` (combinator parsing over `logos` token stream)
-
-### Internal field enums
-
-The parser uses private field enums to collect block fields before constructing AST nodes:
-
-| Enum | Fields |
-|---|---|
-| `ClientField` | `Tier`, `Model`, `Privacy` |
-| `AgentField` | `Description`, `Client`, `Scope`, `DependsOn`, `Prompt`, `MaxRetries`, `Memory` |
-| `ScopeField` | `Owned`, `ReadOnly` |
-| `WorkflowField` | `Steps`, `MaxParallel`, `Memory` |
-| `MemoryField` | `ReadNs`, `WriteNs`, `Importance`, `StalenessSources` |
-
-**First-occurrence semantics:** Each field parser uses `.get_or_insert()` — the first occurrence of a field in a block wins. Later duplicates are silently ignored. This matches typical LLM-generated output where fields may appear out of order or be accidentally repeated.
-
-**List syntax:** Both string lists (`["a" "b"]`) and identifier lists (`[foo bar]`) are space-separated inside `[…]` — no commas. More forgiving of LLM output than comma-separated syntax.
-
-### Parser output
-
-```rust
-pub struct Script {
-    pub items: Vec<Item>,
-}
-
-pub enum Item {
-    Client(ClientDecl),
-    Agent(AgentDecl),
-    Workflow(WorkflowDecl),
-}
+gaviero-dsl/src/
+├── lib.rs           pub fn compile(source, filename, workflow, runtime_prompt) → Result<CompiledPlan>
+├── lexer.rs         Token enum (logos derive), lex() function
+├── ast.rs           Script, Item, ClientDecl, AgentDecl, WorkflowDecl, ScopeBlock, MemoryBlock,
+│                    VerifyBlock, TierLit, PrivacyLit, StrategyLit
+├── parser.rs        parse() — chumsky combinators; grammar defined inline as functions
+├── compiler.rs      compile_ast() — 5-phase analysis; build_iteration_config(), build_verification_config()
+└── error.rs         DslError (Lex/Parse/Compile variants), DslErrors (miette wrapper)
 ```
 
 ---
 
-## Stage 3 — AST (`ast.rs`)
+## Token inventory (`lexer.rs`)
 
-All AST types carry optional fields (the parser never fails on missing fields; the compiler enforces required fields with semantic errors).
+### Declaration keywords
+`client`, `agent`, `workflow`
 
-### `ClientDecl`
+### Field keywords
+`tier`, `model`, `privacy`, `scope`, `owned`, `read_only`, `depends_on`, `prompt`, `description`, `max_retries`, `steps`, `max_parallel`, `memory`, `read_ns`, `write_ns`, `importance`, `staleness_sources`, `strategy`, `test_first`, `attempts`, `escalate_after`, `verify`, `compile`, `clippy`, `test`
 
-| Field | Type | Notes |
-|---|---|---|
-| `name` | `String` | Identifier; must be unique in file |
-| `tier` | `Option<TierLit>` | Routing hint; defaults to `Execution` |
-| `model` | `Option<String>` | Model string, e.g. `"claude-opus-4-6"` |
-| `privacy` | `Option<PrivacyLit>` | `Public` or `LocalOnly`; defaults to `Public` |
+### Tier value tokens
+`coordinator`, `reasoning`, `execution`, `mechanical` (deprecated — compile to `Cheap`/`Expensive`)  
+`cheap`, `expensive` (canonical)
 
-### `AgentDecl`
+### Privacy tokens
+`public`, `local_only`
 
-| Field | Type | Notes |
-|---|---|---|
-| `name` | `String` | Identifier; unique in file; becomes `WorkUnit.id` |
-| `description` | `Option<String>` | Displayed in dashboards; falls back to `name` |
-| `client` | `Option<String>` | Reference to `ClientDecl` by name |
-| `scope` | `Option<ScopeBlock>` | Defaults to `owned ["."]` if absent |
-| `depends_on` | `Option<Vec<String>>` | Dependency edges; validated in compiler phase 4 |
-| `prompt` | `Option<String>` | Becomes `WorkUnit.coordinator_instructions` |
-| `max_retries` | `Option<u8>` | Defaults to `1` (single attempt) |
-| `memory` | `Option<MemoryBlock>` | Merged with workflow-level memory block |
+### Strategy tokens
+`single_pass`, `refine`  
+`BestOfN` — lexed as `Ident("best_of_3")`; the parser regex-matches `^best_of_(\d+)$` and extracts `n`.
 
-### `WorkflowDecl`
+### Literals
+- `Str(String)` — `"double quoted"` (backslash escapes processed)
+- `RawStr(String)` — `#"raw multiline"#` (no escape processing, leading/trailing whitespace trimmed)
+- `Int(u64)` — non-negative integers
+- `Float(f32)` — decimal literals (`0.9`, `1.0`)
+- `Ident(String)` — identifiers: `[a-zA-Z][a-zA-Z0-9_-]*`
 
-| Field | Type | Notes |
-|---|---|---|
-| `name` | `String` | Identifier |
-| `steps` | `Option<Vec<String>>` | Ordered agent names (DAG ordering done by compiler) |
-| `max_parallel` | `Option<usize>` | Overrides `--max-parallel` CLI flag |
-| `memory` | `Option<MemoryBlock>` | Workflow-level defaults, merged with per-agent blocks |
+### Whitespace + comments
+Both silently skipped. Line comments only (`// …`). No block comments.
 
-### `ScopeBlock`
-
-| Field | Type |
-|---|---|
-| `owned` | `Option<Vec<String>>` |
-| `read_only` | `Option<Vec<String>>` |
-
-Maps to `FileScope { owned_paths, read_only_paths, interface_contracts: {} }`.
-
-### `MemoryBlock`
-
-| Field | Scope | Notes |
-|---|---|---|
-| `read_ns` | agent + workflow | Additive: workflow list prepended to agent list |
-| `write_ns` | agent + workflow | Agent overrides workflow; no fallback = no writes |
-| `importance` | agent only | `0.0–1.0`; defaults to `0.5` |
-| `staleness_sources` | agent only | Relative paths; hash-checked before each run |
-
-### Value literals
-
-```rust
-enum TierLit  { Coordinator, Reasoning, Execution, Mechanical }
-enum PrivacyLit { Public, LocalOnly }
-```
+**Ordering invariant:** `test_first` must be lexed before `test` to prevent logos from matching the shorter prefix.
 
 ---
 
-## Stage 4 — Compiler (`compiler.rs`)
+## AST node types (`ast.rs`)
 
-### 5 phases
+```
+Script
+└── items: Vec<Item>
+    ├── ClientDecl { name, tier?, model?, privacy? }
+    ├── AgentDecl  { name, description?, client?, scope?, depends_on?, prompt?,
+    │                max_retries?, memory? }
+    │   └── ScopeBlock  { owned: Vec<String>, read_only: Vec<String> }
+    │   └── MemoryBlock { read_ns, write_ns?, importance?, staleness_sources }
+    └── WorkflowDecl { name, steps?, max_parallel?, memory?,
+                       strategy?, test_first?, max_retries?, attempts?,
+                       escalate_after?, verify? }
+        └── VerifyBlock { compile: bool, clippy: bool, test: bool }
 
-**Phase 1 — Index declarations**
-- Build `HashMap<name, ClientDecl>`, `HashMap<name, AgentDecl>`, `HashMap<name, WorkflowDecl>`
-- Collect duplicate-name errors (do not halt; report all)
+TierLit    = Cheap | Expensive | Coordinator* | Reasoning* | Execution* | Mechanical*
+             (* deprecated aliases)
+PrivacyLit = Public | LocalOnly
+StrategyLit = SinglePass | Refine | BestOfN(u32)
+```
 
-**Phase 2 — Determine execution order**
+All nodes carry a `Span` for error reporting. Field-level spans enable precise diagnostic highlighting.
+
+---
+
+## Compiler: 5 phases (`compiler.rs`)
+
+### Phase 1 — Index declarations
+Build `HashMap<name, ClientDecl>`, `HashMap<name, AgentDecl>`, `HashMap<name, WorkflowDecl>`. Collect duplicate-name errors without halting.
+
+### Phase 2 — Determine execution order
+Select which agents to compile and in what order:
 
 | Condition | Behaviour |
 |---|---|
-| `--workflow <name>` provided | Use named workflow's `steps` list |
+| `workflow` arg provided | Extract `steps` list from named workflow |
 | Exactly one workflow | Use it implicitly |
-| No workflows | Run all agents in declaration order |
+| No workflows | All agents in declaration order |
 | Multiple workflows, no selector | Compile error listing available names |
 
-Extracts `max_parallel` and workflow-level `memory` block.
+### Phase 3 — Compile each agent → WorkUnit
+For each agent:
+1. Resolve `client` reference → extract tier (mapped), model string, privacy level
+2. Build `FileScope` from `scope` block (default: `owned = ["."]`)
+3. Substitute `{{PROMPT}}` in description and prompt fields
+4. Merge memory namespaces (additive `read_ns`; agent `write_ns` overrides workflow)
+5. Emit complexity warning (stderr) when >1 independent agent
 
-**Phase 3 — Compile each agent to `WorkUnit`**
-
-For each agent in execution order, `compile_agent()`:
-1. Resolve `client` reference → extract `tier`, `model`, `privacy`
-2. Build `FileScope` from `scope` block; default `owned_paths = ["."]` if absent
-3. Substitute `{{PROMPT}}` placeholder in description/prompt with `runtime_prompt` if provided
-4. Merge memory namespaces (see below)
-5. Construct `WorkUnit` with all resolved fields
-
-**Phase 4 — Validate dependency references**
-- Every string in `depends_on` must be a defined agent name
-- Report `undefined agent` error with source span for each violation
-
-**Phase 5 — Build `CompiledPlan` (DAG)**
-- Construct a petgraph `DiGraph<PlanNode, DependencyEdge>` via `CompiledPlan::from_work_units(work_units)`
-  - Each `WorkUnit` becomes a `PlanNode` (index node in the graph)
-  - Each `depends_on` edge becomes a `DependencyEdge::Data` directed edge from dependency → dependant
-- DFS cycle detection: halt with cycle path on first cycle found
-- Return `CompiledPlan { graph, max_parallel, source_file }`
-
-`CompiledPlan::work_units_ordered()` (called by the swarm pipeline) runs Kahn's algorithm over the DiGraph for stable topological ordering.
-
-### Memory merge rule
-
+**Tier mapping:**
 ```
-effective_read_ns  = dedup(workflow.read_ns ++ agent.read_ns)
-effective_write_ns = agent.write_ns ?? workflow.write_ns ?? None
+Cheap | Execution | Mechanical  →  ModelTier::Cheap
+Expensive | Coordinator | Reasoning  →  ModelTier::Expensive
 ```
 
-`importance` and `staleness_sources` are agent-only; no workflow defaults exist.
+### Phase 4 — Validate dependency references
+Every name in each agent's `depends_on` list must exist in the agent map. Collect all undefined-ref errors.
 
-### `{{PROMPT}}` substitution
+### Phase 5 — Build DAG + cycle detection
+Insert `PlanNode` per `WorkUnit` into petgraph `DiGraph`. Add directed edges for `depends_on` relationships. DFS cycle detection: halt with the cycle path on first cycle found.
 
-If `runtime_prompt` is supplied to `compile()`, any occurrence of the literal string `{{PROMPT}}` in an agent's `description` or `prompt` field is replaced with the runtime value. If an agent has no `prompt` field and `runtime_prompt` is `Some(_)`, the runtime prompt is used as the agent's full instruction set.
-
-### WorkUnit field mapping
-
-| WorkUnit field | Source |
-|---|---|
-| `id` | `AgentDecl.name` |
-| `description` | `AgentDecl.description` or `name` |
-| `scope` | `AgentDecl.scope` → `FileScope` |
-| `depends_on` | `AgentDecl.depends_on` |
-| `tier` | `ClientDecl.tier` → `ModelTier` |
-| `privacy` | `ClientDecl.privacy` → `PrivacyLevel` |
-| `model` | `ClientDecl.model` |
-| `coordinator_instructions` | `AgentDecl.prompt` (after `{{PROMPT}}` substitution) |
-| `max_retries` | `AgentDecl.max_retries` (default `1`) |
-| `read_namespaces` | merged `effective_read_ns` (None if empty) |
-| `write_namespace` | `effective_write_ns` |
-| `memory_importance` | `MemoryBlock.importance` (None → store default `0.5`) |
-| `staleness_sources` | `MemoryBlock.staleness_sources` |
-| `estimated_tokens` | `0` (filled by swarm pipeline) |
-| `escalation_tier` | `None` (swarm assigns on failure) |
-| `backend` | `AgentBackend::default()` |
-
----
-
-## Error reporting (`error.rs`)
-
-**Tool:** `miette` — annotated source diagnostics with coloured terminal output
-
-### Error types
-
-| Variant | Fields | When |
-|---|---|---|
-| `Lex` | `src: NamedSource`, `span: SourceSpan` | Unexpected character in source |
-| `Parse` | `src`, `span`, `reason: String` | Grammar rule did not match |
-| `Compile` | `src`, `span`, `reason: String` | Semantic violation (duplicate name, undefined ref, cycle) |
-
-### `DslErrors` container
-
-```rust
-#[derive(Error, Diagnostic)]
-pub struct DslErrors {
-    #[related]
-    pub errors: Vec<DslError>,
+### Iteration config building
+```
+IterationConfig {
+    strategy:       wf.strategy     ?? Refine
+    max_retries:    wf.max_retries  ?? 5
+    max_attempts:   wf.attempts     ?? 1
+    test_first:     wf.test_first   ?? false
+    escalate_after: wf.escalate_after ?? 3
 }
-// message: "{N} DSL error(s)"
 ```
 
-`#[related]` causes `miette` to render all errors together with source snippets.
-
-### Example output
-
+### Verification config building
 ```
-× 2 DSL error(s)
-
-  × undefined agent 'typo_agent'
-   ╭─[workflow.gaviero:14:17]
-14 │     depends_on [typo_agent]
-   ·                ^^^^^^^^^^^
-   ╰────
-
-  × dependency cycle detected: a -> b -> a
-   ╭─[workflow.gaviero:8:5]
- 8 │     depends_on [b]
-   ·     ^^^^^^^^^^^^^^
-   ╰────
+VerificationConfig {
+    compile: wf.verify.compile ?? false
+    clippy:  wf.verify.clippy  ?? false
+    test:    wf.verify.test    ?? false
+}
 ```
 
 ---
 
-## Public API
+## Parser properties (`parser.rs`)
+
+- **First-occurrence semantics** — duplicate fields silently ignored; first wins.
+- **No commas in lists** — syntax is `[item item …]`.
+- **Keyword-as-ident** — `verify`, `compile`, `test`, `strategy` may be used as agent/workflow names where the grammar is unambiguous.
+- **Recoverable** — chumsky collects multiple errors per pass; parser can emit partial AST.
+
+---
+
+## Error types (`error.rs`)
 
 ```rust
-/// Compile a .gaviero source file to a `CompiledPlan` DAG.
-///
-/// - `source`         — full file contents
-/// - `filename`       — used in error messages (e.g. "my_workflow.gaviero")
-/// - `workflow`       — optional workflow name selector (required when > 1 workflow present)
-/// - `runtime_prompt` — replaces `{{PROMPT}}` in agent descriptions/prompts;
-///                      used as the full prompt for agents with no `prompt` field
+enum DslError {
+    Lex     { src: NamedSource, span: SourceSpan },
+    Parse   { src: NamedSource, span: SourceSpan, reason: String },
+    Compile { src: NamedSource, span: SourceSpan, reason: String },
+}
+```
+
+Common compile errors:
+- `duplicate client name 'foo'`
+- `undefined client 'bar'`
+- `agent 'a' depends_on 'ghost' which is not defined`
+- `dependency cycle detected: a -> b -> a`
+- `multiple workflows defined (x, y); pass --workflow <name>`
+
+---
+
+## Public API surface (`lib.rs`)
+
+```rust
 pub fn compile(
-    source: &str,
-    filename: &str,
-    workflow: Option<&str>,
-    runtime_prompt: Option<&str>,
+    source:         &str,
+    filename:       &str,
+    workflow:       Option<&str>,        // None = auto-select
+    runtime_prompt: Option<&str>,        // substituted for {{PROMPT}}
 ) -> Result<CompiledPlan, miette::Report>
 
-// Deprecated backward-compat alias — use CompiledPlan directly
-#[deprecated]
-pub type CompiledScript = CompiledPlan;
+// Also re-exported:
+pub use gaviero_core::swarm::plan::CompiledPlan;
+pub mod ast;
+pub mod parser;
+pub mod lexer;
+pub mod compiler;
+pub mod error;
 ```
 
 ---
 
 ## Key dependencies
 
-| Crate | Purpose |
+| Crate | Role |
 |---|---|
-| `logos` | Regex-free tokenisation via derive macros |
-| `chumsky` | Parser combinator with error recovery |
-| `miette` | Rich diagnostic error reporting with source spans |
-| `gaviero-core` | `WorkUnit`, `FileScope`, `ModelTier`, `PrivacyLevel`, `CompiledPlan` |
-| `serde` | `CompiledPlan` serialisation (for CLI JSON output) |
-
----
-
-## Design decisions
-
-1. **`logos` + `chumsky`.** `logos` produces tokens at near-zero allocation cost. `chumsky` gives composable error recovery — the parser reports multiple errors in a single pass rather than aborting on the first failure.
-
-2. **Raw strings for prompts.** `#"…"#` avoids escape-sequence confusion in multiline agent instructions. LLM-generated DSL can contain quotes, backslashes, and code snippets without escaping.
-
-3. **First-occurrence semantics.** Silently ignoring duplicate fields is more robust for LLM-generated DSL where the model may repeat a field with corrections. Human authors see the effect immediately since compilation is fast.
-
-4. **Separate `TierLit` / `PrivacyLit` from core enums.** The AST uses its own value literals so the DSL crate's parser does not need to import core types. The compiler maps them to `ModelTier` / `PrivacyLevel` at the end of phase 3.
-
-5. **Memory merge at compile time.** Merging workflow defaults into agent `read_ns` during compilation (not at runtime) means each `WorkUnit` is self-contained; the swarm pipeline never needs to look up workflow context.
-
-6. **`{{PROMPT}}` substitution.** Enables a single generic script (e.g. `run_task.gaviero`) to accept an external task description without file mutation, making it suitable for piping from shell scripts.
-
-7. **Multiple workflows → explicit selector.** Rather than picking an arbitrary workflow, the compiler fails with a helpful error listing all available names. This is intentional — silent default selection would surprise users who add a second workflow for testing.
-
-8. **DAG output over flat `Vec<WorkUnit>`.** `CompiledPlan` wraps a petgraph `DiGraph` rather than a plain vector. This enables: (a) topological ordering at compile time via Kahn's algorithm; (b) tier computation as a pure graph traversal; (c) cycle detection during compilation rather than at runtime; (d) the `--resume` path to skip specific nodes by graph index. The flat `CompiledScript` type was the initial design; the DAG representation is the current standard.
+| `logos` | Zero-copy tokenisation via derive macros |
+| `chumsky` | Parser combinators with error recovery |
+| `miette` | Annotated source diagnostics with coloured spans |
+| `thiserror` | Error type derive |
+| `gaviero-core` | `WorkUnit`, `FileScope`, `ModelTier`, `CompiledPlan`, `IterationConfig`, `VerificationConfig` |
