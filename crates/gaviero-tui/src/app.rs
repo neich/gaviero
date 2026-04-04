@@ -2656,10 +2656,14 @@ impl App {
         self.panel_visible.file_tree = preset.file_tree_pct > 0;
         self.panel_visible.side_panel = preset.side_panel_pct > 0;
 
-        // Update widths based on terminal size — we'll use percentages in render
-        // Store the percentages; the render method will use them
-        // For simplicity, convert percentages to approximate fixed widths
-        // based on a reference terminal width (we'll recalculate in render)
+        let label = format!(
+            "Layout {} (tree {}%  editor {}%  side {}%)",
+            idx + 1,
+            preset.file_tree_pct,
+            preset.editor_pct,
+            preset.side_panel_pct,
+        );
+        self.status_message = Some((label, std::time::Instant::now()));
     }
 
     /// Get the effective layout constraints, honoring active preset.
@@ -5818,9 +5822,10 @@ impl App {
                 self.open_file(path);
                 // Restore cursor/scroll for the just-opened buffer
                 if let Some(buf) = self.buffers.last_mut() {
-                    buf.cursor.line = tab.cursor_line;
+                    let max_line = buf.text.len_lines().saturating_sub(1);
+                    buf.cursor.line = tab.cursor_line.min(max_line);
                     buf.cursor.col = tab.cursor_col;
-                    buf.scroll.top_line = tab.scroll_top;
+                    buf.scroll.top_line = tab.scroll_top.min(max_line);
                 }
             }
         }
