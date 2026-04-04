@@ -12,15 +12,12 @@ use crate::types::ModelTier;
 /// Per-tier accuracy statistics for a single run.
 #[derive(Debug, Clone, Default)]
 pub struct TierStats {
-    pub mechanical_total: usize,
-    pub mechanical_succeeded: usize,
-    pub mechanical_escalated: usize,
-    pub execution_total: usize,
-    pub execution_succeeded: usize,
-    pub execution_escalated: usize,
-    pub reasoning_total: usize,
-    pub reasoning_succeeded: usize,
-    pub reasoning_escalated: usize,
+    pub cheap_total: usize,
+    pub cheap_succeeded: usize,
+    pub cheap_escalated: usize,
+    pub expensive_total: usize,
+    pub expensive_succeeded: usize,
+    pub expensive_escalated: usize,
 }
 
 impl TierStats {
@@ -35,22 +32,16 @@ impl TierStats {
             let succeeded = matches!(manifest.status, AgentStatus::Completed);
 
             match unit.tier {
-                ModelTier::Mechanical => {
-                    stats.mechanical_total += 1;
+                ModelTier::Cheap => {
+                    stats.cheap_total += 1;
                     if succeeded {
-                        stats.mechanical_succeeded += 1;
+                        stats.cheap_succeeded += 1;
                     }
                 }
-                ModelTier::Execution => {
-                    stats.execution_total += 1;
+                ModelTier::Expensive => {
+                    stats.expensive_total += 1;
                     if succeeded {
-                        stats.execution_succeeded += 1;
-                    }
-                }
-                ModelTier::Reasoning | ModelTier::Coordinator => {
-                    stats.reasoning_total += 1;
-                    if succeeded {
-                        stats.reasoning_succeeded += 1;
+                        stats.expensive_succeeded += 1;
                     }
                 }
             }
@@ -63,22 +54,19 @@ impl TierStats {
     pub fn to_summary(&self, run_id: &str) -> String {
         format!(
             "Tier accuracy for run {}: \
-             mechanical={}/{} (escalations: {}), \
-             execution={}/{} (escalations: {}), \
-             reasoning={}/{} (escalations: {})",
+             cheap={}/{} (escalations: {}), \
+             expensive={}/{} (escalations: {})",
             run_id,
-            self.mechanical_succeeded, self.mechanical_total, self.mechanical_escalated,
-            self.execution_succeeded, self.execution_total, self.execution_escalated,
-            self.reasoning_succeeded, self.reasoning_total, self.reasoning_escalated,
+            self.cheap_succeeded, self.cheap_total, self.cheap_escalated,
+            self.expensive_succeeded, self.expensive_total, self.expensive_escalated,
         )
     }
 
     /// Success rate for a given tier (0.0 - 1.0, or None if no data).
     pub fn success_rate(&self, tier: ModelTier) -> Option<f64> {
         let (succeeded, total) = match tier {
-            ModelTier::Mechanical => (self.mechanical_succeeded, self.mechanical_total),
-            ModelTier::Execution => (self.execution_succeeded, self.execution_total),
-            ModelTier::Reasoning | ModelTier::Coordinator => (self.reasoning_succeeded, self.reasoning_total),
+            ModelTier::Cheap => (self.cheap_succeeded, self.cheap_total),
+            ModelTier::Expensive => (self.expensive_succeeded, self.expensive_total),
         };
         if total == 0 { None } else { Some(succeeded as f64 / total as f64) }
     }
@@ -199,10 +187,10 @@ mod tests {
     #[test]
     fn test_tier_stats_from_results() {
         let units = vec![
-            make_unit("a", ModelTier::Reasoning),
-            make_unit("b", ModelTier::Execution),
-            make_unit("c", ModelTier::Execution),
-            make_unit("d", ModelTier::Mechanical),
+            make_unit("a", ModelTier::Expensive),
+            make_unit("b", ModelTier::Cheap),
+            make_unit("c", ModelTier::Cheap),
+            make_unit("d", ModelTier::Cheap),
         ];
         let manifests = vec![
             make_manifest("a", AgentStatus::Completed),
@@ -212,49 +200,43 @@ mod tests {
         ];
 
         let stats = TierStats::from_results(&manifests, &units);
-        assert_eq!(stats.reasoning_total, 1);
-        assert_eq!(stats.reasoning_succeeded, 1);
-        assert_eq!(stats.execution_total, 2);
-        assert_eq!(stats.execution_succeeded, 1);
-        assert_eq!(stats.mechanical_total, 1);
-        assert_eq!(stats.mechanical_succeeded, 1);
+        assert_eq!(stats.expensive_total, 1);
+        assert_eq!(stats.expensive_succeeded, 1);
+        assert_eq!(stats.cheap_total, 3);
+        assert_eq!(stats.cheap_succeeded, 2);
     }
 
     #[test]
     fn test_success_rate() {
         let mut stats = TierStats::default();
-        stats.execution_total = 10;
-        stats.execution_succeeded = 8;
+        stats.cheap_total = 10;
+        stats.cheap_succeeded = 8;
 
-        assert_eq!(stats.success_rate(ModelTier::Execution), Some(0.8));
-        assert_eq!(stats.success_rate(ModelTier::Mechanical), None);
+        assert_eq!(stats.success_rate(ModelTier::Cheap), Some(0.8));
+        assert_eq!(stats.success_rate(ModelTier::Expensive), None);
     }
 
     #[test]
     fn test_to_summary() {
         let stats = TierStats {
-            mechanical_total: 5,
-            mechanical_succeeded: 4,
-            mechanical_escalated: 1,
-            execution_total: 3,
-            execution_succeeded: 3,
-            execution_escalated: 0,
-            reasoning_total: 1,
-            reasoning_succeeded: 1,
-            reasoning_escalated: 0,
+            cheap_total: 8,
+            cheap_succeeded: 7,
+            cheap_escalated: 1,
+            expensive_total: 1,
+            expensive_succeeded: 1,
+            expensive_escalated: 0,
         };
         let summary = stats.to_summary("run42");
         assert!(summary.contains("run42"));
-        assert!(summary.contains("mechanical=4/5"));
-        assert!(summary.contains("execution=3/3"));
+        assert!(summary.contains("cheap=7/8"));
+        assert!(summary.contains("expensive=1/1"));
     }
 
     #[test]
     fn test_empty_stats() {
         let stats = TierStats::from_results(&[], &[]);
-        assert_eq!(stats.mechanical_total, 0);
-        assert_eq!(stats.execution_total, 0);
-        assert_eq!(stats.reasoning_total, 0);
+        assert_eq!(stats.cheap_total, 0);
+        assert_eq!(stats.expensive_total, 0);
     }
 
     #[tokio::test]
