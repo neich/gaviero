@@ -1,108 +1,354 @@
 # gaviero-cli
 
-Headless AI agent task runner for Gaviero. Executes agent workflows against a local repository from the command line — no TUI required. Suitable for CI pipelines, scripted automation, and one-off tasks.
+Headless AI agent task runner. Executes agent workflows against a local repository from the command line — no TUI required. Suitable for CI pipelines, scripted automation, and one-off tasks.
 
 ---
 
 ## Synopsis
 
+```bash
+gaviero-cli [OPTIONS] (--task "<task>" | --work-units '<json>' | --script <file.gaviero>)
 ```
-gaviero-cli [OPTIONS] --task <TEXT>
-gaviero-cli [OPTIONS] --script <FILE.gaviero>
-gaviero-cli [OPTIONS] --work-units <JSON>
-gaviero-cli [OPTIONS] --coordinated --task <TEXT>
-```
-
----
-
-## Flags reference
-
-| Flag | Type | Default | Description |
-|---|---|---|---|
-| `--repo PATH` | path | `.` | Workspace root. All relative file paths in agents are resolved against this directory. |
-| `--task TEXT` | string | — | Single task description. Runs one agent with full repo write access. |
-| `--script PATH` | file | — | Path to a `.gaviero` DSL script. |
-| `--work-units JSON` | JSON | — | JSON array of `WorkUnit` objects (advanced). |
-| `--model STRING` | string | `"sonnet"` | Model to use in `--task` mode. Ignored in `--script` (model is set per-agent in the DSL). |
-| `--auto-accept` | flag | off | Skip interactive review of proposed file changes. |
-| `--max-parallel N` | int | `1` | Maximum concurrent agents. Overridden by `max_parallel` if declared in the workflow. |
-| `--namespace STRING` | string | — | Write namespace for this run's memory output (see [Memory](#memory)). |
-| `--read-ns STRING` | string | — | Extra namespace to read from. Repeatable: `--read-ns ns1 --read-ns ns2`. |
-| `--coordinated` | flag | off | Coordinator mode: Opus decomposes the task into a `.gaviero` plan file for review. Requires `--task`. See [Coordinated mode](#coordinated-mode---coordinated). |
-| `--resume` | flag | off | Load the execution checkpoint for this plan and skip nodes that already completed. Useful for resuming after a partial failure. |
-| `--trace PATH` | file | — | Write a structured JSON execution trace to `PATH`. Records per-node timing, cost, status, and validation events. Intended for CI diagnostics and post-run analysis. |
-| `--format text\|json` | string | `text` | Output format for results. |
-
-### Mutual exclusivity
-
-`--task`, `--script`, and `--work-units` are mutually exclusive. Exactly one must be provided.
 
 ---
 
 ## Input modes
 
-### `--task` — single agent
+### `--task` — single task
 
-The simplest mode. Provide a natural-language task description; a single agent is created with full read/write access to `--repo`.
+Creates one agent with full workspace scope. The simplest way to run Gaviero. Defaults to `strategy refine` with `max_retries 5`.
 
-```
-gaviero-cli --repo . --task "Add input validation to the login form in src/auth.rs"
-```
-
-The agent uses the model specified by `--model` (default: `sonnet`). To use a more capable model:
-
-```
-gaviero-cli --repo . --model opus --task "Design the data model for the new billing system"
+```bash
+gaviero-cli --task "Add input validation to the login endpoint"
 ```
 
-### `--script` — DSL workflow
+### `--script` — DSL workflow file
 
-Run a pre-written `.gaviero` file. The DSL lets you declare multiple agents, file scopes, dependencies, memory blocks, and parallelism. See the [gaviero-dsl README](../gaviero-dsl/README.md) for the full language reference.
+Compile and execute a `.gaviero` workflow. Supports multi-agent plans, dependencies, memory, and iteration strategies.
 
+```bash
+gaviero-cli --script workflows/refactor.gaviero
 ```
-gaviero-cli --repo . --script workflows/feature_tdd.gaviero
+
+### `--work-units` — JSON array
+
+Pass `WorkUnit` objects directly. For programmatic callers.
+
+```bash
+gaviero-cli --work-units '[{"id":"t1","description":"...","scope":{"owned_paths":["src/"],...}}]'
 ```
 
-The `max_parallel` field in the workflow block overrides `--max-parallel` when both are specified.
+---
 
-### `--work-units` — JSON (advanced)
+## All flags
 
-Pass a raw JSON array of `WorkUnit` objects. This is intended for programmatic invocation when you are generating work units from external tooling.
+| Flag | Default | Description |
+|---|---|---|
+| `--repo <path>` | `.` | Workspace root |
+| `--model sonnet\|opus\|haiku` | `sonnet` | Model for `--task` mode |
+| `--max-parallel <n>` | `1` | Max concurrent agents (enables worktrees when > 1) |
+| `--namespace <name>` | (from settings) | Write memory namespace |
+| `--read-ns <name>` | (from settings) | Add a read namespace (repeatable) |
+| `--format text\|json` | `text` | Output format |
+| `--max-retries <n>` | `5` | Inner validation-feedback retries per attempt |
+| `--attempts <n>` | `1` | Independent attempts (BestOfN when > 1) |
+| `--test-first` | off | Generate failing tests before editing (TDD) |
+| `--no-iterate` | off | Single pass only — disables retry loop |
+| `--coordinated` | off | Opus planning mode: generate DSL file for review |
+| `--resume` | off | Skip already-completed agents from a prior run |
+| `--auto-accept` | off | Accept all file changes without review |
+| `--trace <file>` | off | Write DEBUG-level JSON trace log |
 
+---
+
+## Use cases
+
+### 1. Quick one-off bug fix
+
+The default mode. The agent iterates with validation feedback until the code compiles and passes lints.
+
+```bash
+gaviero-cli --task "Fix the null pointer in UserService.getById when user does not exist"
 ```
-gaviero-cli --repo . --work-units '[
-  {
-    "id": "wu-1",
-    "description": "Refactor the config loader",
-    "scope": { "owned_paths": ["src/config/"], "read_only": [] },
-    "depends_on": [],
-    "model": "sonnet"
-  }
-]'
+
+To also run the test suite on each iteration:
+
+```bash
+gaviero-cli --task "Fix the null pointer in UserService.getById" \
+  --script <(echo 'agent a { description "{{PROMPT}}" } workflow w { steps [a] verify { test true } }') \
+  --task "..."
+```
+
+Or, more practically, use a script file:
+
+```bash
+gaviero-cli --script bugfix.gaviero \
+  --task "null pointer in UserService.getById when user does not exist"
+```
+
+---
+
+### 2. TDD bug fix — generate failing tests first
+
+The `--test-first` flag makes the agent write a test that reproduces the bug before touching any source code. The iteration loop then drives toward the test passing.
+
+```bash
+gaviero-cli --task "tokens are not invalidated on logout" \
+  --test-first \
+  --max-retries 8
+```
+
+What happens:
+1. Agent writes a test that calls logout and verifies token invalidation — test fails against current code
+2. Compiler gate checks the test compiles
+3. Agent modifies source code
+4. `cargo check` → `cargo clippy` → `cargo test` run after each edit
+5. On failure the error is fed back; agent retries up to 8 times
+
+---
+
+### 3. Best-of-N sampling for risky changes
+
+Run multiple independent attempts and keep the one that passes all verification gates. Good when there are several valid refactoring approaches and you want the engine to pick the best.
+
+```bash
+# 3 independent attempts; return first to pass all gates (or best by file count)
+gaviero-cli --task "Replace the manual error mapping in the parser with thiserror" \
+  --attempts 3 \
+  --max-retries 4
+```
+
+With an explicit script that also enables test verification:
+
+```bash
+gaviero-cli --script refactor_safe.gaviero \
+  --task "extract connection pool into its own module" \
+  --attempts 3
+```
+
+---
+
+### 4. New feature with full TDD pipeline
+
+Combine `--test-first` with a liberal retry budget and test verification:
+
+```bash
+gaviero-cli --task "Add subscription billing with proration support" \
+  --test-first \
+  --max-retries 10 \
+  --attempts 2 \
+  --model haiku
+```
+
+Or with a tailored script that uses a spec agent + implement agent:
+
+```bash
+gaviero-cli --script feature_tdd.gaviero \
+  --task "subscription billing with proration support"
+```
+
+---
+
+### 5. Read-only analysis or security audit
+
+Use `--no-iterate` for analysis tasks where the agent writes a report rather than modifying source. One thorough pass is enough.
+
+```bash
+gaviero-cli --task "Audit the authentication layer for injection vulnerabilities. Write findings to docs/security-audit.md" \
+  --no-iterate \
+  --model opus
+```
+
+Or with a dedicated script that constrains scope:
+
+```bash
+gaviero-cli --script security_audit.gaviero
+```
+
+---
+
+### 6. Coordinated multi-agent planning
+
+For large tasks where you want to review the agent decomposition before anything runs:
+
+```bash
+# Step 1: Opus decomposes the task into a .gaviero plan
+plan=$(gaviero-cli --coordinated \
+  --task "Migrate the authentication layer from JWT to session-based auth")
+
+# Step 2: Review the plan
+cat "$plan"
+$EDITOR "$plan"
+
+# Step 3: Execute when satisfied
+gaviero-cli --script "$plan" --max-parallel 3
+```
+
+stdout prints only the plan path, so the `$()` capture works cleanly in scripts.
+
+---
+
+### 7. CI pipeline integration
+
+Minimum viable CI step. JSON output makes it easy to parse results.
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+# Run with test verification; fail CI if agent fails
+result=$(gaviero-cli \
+  --script ci_fix.gaviero \
+  --task "${CI_TASK:-}" \
+  --format json \
+  --trace ci-trace-$(date +%s).json)
+
+echo "$result" | jq -r '.manifests[] | "\(.work_unit_id): \(.status)"'
+
+success=$(echo "$result" | jq -r '.success')
+if [ "$success" != "true" ]; then
+  echo "Gaviero: one or more agents failed" >&2
+  exit 1
+fi
+```
+
+A suitable `ci_fix.gaviero`:
+
+```gaviero
+client haiku { tier cheap model "claude-haiku-4-5-20251001" }
+
+agent fix {
+    description "{{PROMPT}}"
+    client haiku
+    scope { owned ["."] }
+    prompt "{{PROMPT}}"
+    max_retries 5
+}
+
+workflow ci {
+    steps    [fix]
+    strategy refine
+    verify   { compile true clippy true test true }
+}
+```
+
+---
+
+### 8. Resuming an interrupted run
+
+Large multi-agent scripts checkpoint after every completed agent. If the run is interrupted (network issue, timeout, Ctrl+C), restart with `--resume`:
+
+```bash
+# First run — interrupted after 2/5 agents
+gaviero-cli --script big_plan.gaviero --max-parallel 3
+
+# Resume — skips the 2 already-completed agents
+gaviero-cli --script big_plan.gaviero --max-parallel 3 --resume
+```
+
+Checkpoints are stored in `.gaviero/state/<plan-hash>.json`.
+
+---
+
+### 9. Local-only mode (no API, Ollama)
+
+For privacy-sensitive code that must not leave the machine:
+
+```bash
+# Requires a running Ollama instance and a local_only client in the script
+gaviero-cli --script local_refactor.gaviero \
+  --task "extract the database connection pool" \
+  --repo /path/to/private/repo
+```
+
+Use `privacy local_only` in the client declaration to prevent the engine from falling back to an API model.
+
+---
+
+### 10. Memory-assisted repeated runs
+
+Run the same task repeatedly over time. Each run stores its results; subsequent runs read prior context automatically.
+
+```bash
+# First run: stores findings to "auth-audits" namespace
+gaviero-cli --task "Document all authentication edge cases" \
+  --namespace auth-audits
+
+# Later run: reads prior findings, produces incremental update
+gaviero-cli --task "Update authentication edge case docs with new OAuth flow" \
+  --namespace auth-audits \
+  --read-ns auth-audits
+```
+
+---
+
+## Iteration flags
+
+These override any `strategy` or `max_retries` declared in the `.gaviero` script:
+
+```bash
+# Retry up to 10 times per task
+gaviero-cli --task "..." --max-retries 10
+
+# Run 3 independent attempts and keep the best result
+gaviero-cli --task "..." --attempts 3
+
+# Generate failing tests first (TDD workflow)
+gaviero-cli --task "..." --test-first --max-retries 5
+
+# Disable retry loop (one shot, fast)
+gaviero-cli --task "..." --no-iterate
+```
+
+---
+
+## Resume
+
+If a run is interrupted, `--resume` reloads the checkpoint and skips completed agents:
+
+```bash
+gaviero-cli --script big_plan.gaviero --resume
+```
+
+Checkpoints are saved to `.gaviero/state/<plan-hash>.json` after each completed agent.
+
+---
+
+## Multi-agent parallel execution
+
+Set `--max-parallel > 1` to run independent agents concurrently. Each agent gets an isolated git worktree; branches are merged with automatic conflict resolution on completion.
+
+```bash
+gaviero-cli --script parallel_plan.gaviero --max-parallel 4
+```
+
+---
+
+## Memory namespaces
+
+Gaviero maintains per-project semantic memory. Agents read prior results to inform their work.
+
+```bash
+# Write to a specific namespace
+gaviero-cli --task "Document the auth module" --namespace auth-docs
+
+# Read from multiple namespaces
+gaviero-cli --task "..." --namespace main --read-ns auth-docs --read-ns api-docs
 ```
 
 ---
 
 ## Output
 
-### Text format (default)
+### Text (default)
 
-One line per agent with status and modified files:
+One line per agent on **stdout**. Status messages on **stderr**.
 
 ```
 task-0: OK (src/auth.rs, tests/auth_test.rs)
-task-1: FAIL: timeout exceeded (src/config.rs)
 ```
 
-Status values: `OK` on success, `FAIL: <reason>` on failure.
-
-### JSON format
-
-Full machine-readable result including all per-agent details:
-
-```
-gaviero-cli --repo . --task "..." --format json
-```
+### JSON (`--format json`)
 
 ```json
 {
@@ -111,307 +357,12 @@ gaviero-cli --repo . --task "..." --format json
     {
       "work_unit_id": "task-0",
       "status": "Completed",
-      "modified_files": ["src/auth.rs", "tests/auth_test.rs"]
+      "modified_files": ["src/auth.rs", "tests/auth_test.rs"],
+      "summary": "Added validation to login endpoint",
+      "cost_usd": 0.0023
     }
   ]
 }
-```
-
-Useful for CI pipelines that need to parse results programmatically.
-
-### Stderr diagnostics
-
-Progress information is written to stderr so it does not pollute stdout:
-
-```
-[namespace] write=my-project, read=[my-project]
-[memory] ready
-[phase] running
-[agent:task-0] Running "..."
-  [tool] write_file
-  [done]
-[completed] success=true
-```
-
----
-
-## Coordinated mode (`--coordinated`)
-
-Requires `--task`. In coordinated mode, Claude Opus decomposes the task into a `.gaviero` DSL file and saves it to `tmp/` for your review. **No agents execute until you run the plan file yourself.**
-
-```
-gaviero-cli --repo . --coordinated \
-  --task "Add OAuth2 login flow: design the API, implement the backend handlers,
-          write tests, and update the documentation"
-```
-
-Stderr output:
-
-```
-[mode] coordinated — planning DSL (Opus)
-[coordinator] planning: Add OAuth2 login flow...
-[coordinator] DSL plan ready — review before executing
-[plan] saved to tmp/gaviero_plan_1234567890.gaviero
-[plan] review it, then run with:
-         gaviero --script tmp/gaviero_plan_1234567890.gaviero
-```
-
-Stdout:
-
-```
-tmp/gaviero_plan_1234567890.gaviero
-```
-
-Stdout contains only the plan path so it can be captured and piped.
-
-### Why a review step?
-
-When Opus plans a complex task it may reference files that will be created by agents during execution — they do not exist yet at planning time. In the generated DSL these are annotated:
-
-```gaviero
-agent implement_cpu_sim {
-    scope {
-        owned ["src/cpu_sim/simulator_cpu.hpp"]  // (will be created)
-    }
-    ...
-}
-```
-
-Seeing the full plan before dispatch lets you confirm paths are correct, fix scope assignments, adjust agent prompts, or restructure dependencies — instead of discovering problems as silent agent failures mid-run.
-
-### Running the plan
-
-After reviewing (and optionally editing) the generated file:
-
-```
-gaviero-cli --repo . --script tmp/gaviero_plan_1234567890.gaviero
-```
-
-Or in the TUI:
-
-```
-/run tmp/gaviero_plan_1234567890.gaviero
-```
-
-### Capturing the plan path in scripts
-
-Since stdout contains only the plan path, you can capture it directly:
-
-```bash
-plan=$(gaviero-cli --repo . --coordinated \
-  --task "Refactor the auth module to use the strategy pattern")
-
-# Inspect the plan
-cat "$plan"
-
-# Edit if needed, then execute
-gaviero-cli --repo . --auto-accept --script "$plan"
-```
-
----
-
-## Memory
-
-Gaviero maintains a persistent semantic memory store. Each run can write results to a named **namespace** and read context from one or more namespaces. This lets agents build on prior work across runs.
-
-The CLI prints the active namespace configuration at startup:
-
-```
-[namespace] write=my-project, read=[my-project]
-[memory] ready
-```
-
-### Namespace resolution (priority order)
-
-**Write namespace** (where this run's results are stored):
-1. `--namespace` flag
-2. Workspace settings
-3. Folder name (fallback)
-
-**Read namespaces** (where context is retrieved from):
-1. Workspace settings base list
-2. `--read-ns` flags (deduplicated)
-3. The write namespace is always prepended so the run can read its own prior output
-
-### Accumulating knowledge across runs
-
-Run the same task repeatedly and each run will see the previous run's findings:
-
-```
-# First run — memory is empty, agent starts fresh
-gaviero-cli --repo . --namespace audit-log \
-  --task "Survey the codebase for test coverage gaps. Write a summary to docs/coverage.md."
-
-# Second run — agent reads prior findings, reports on changes
-gaviero-cli --repo . --namespace audit-log \
-  --task "Survey the codebase for test coverage gaps. Write a summary to docs/coverage.md.
-          Compare with prior findings from memory context and note improvements or regressions."
-
-# Third run and beyond — trends accumulate over time
-gaviero-cli --repo . --namespace audit-log \
-  --task "Continue the coverage survey. Report the trend over the last three surveys."
-```
-
-### Reading from multiple namespaces
-
-Use `--read-ns` to pull in context from namespaces written by other workflows:
-
-```
-# A security scan that reads both prior security findings and general project context
-gaviero-cli --repo . \
-  --namespace security-scan \
-  --read-ns prior-security-findings \
-  --read-ns project-overview \
-  --task "Scan src/ for security vulnerabilities. Cross-reference with prior findings in
-          memory context. Document new issues and confirm resolved ones."
-```
-
-### Namespaces with DSL scripts
-
-When using `--script`, the `.gaviero` file controls namespaces per-agent via `memory {}` blocks. The `--namespace` and `--read-ns` flags act as additional overrides layered on top of the settings baseline, before the script's own namespace declarations take effect.
-
----
-
-## Examples
-
-### Fix a failing test
-
-```
-gaviero-cli --repo . --task "The test auth::tests::login_with_invalid_password is failing.
-  Diagnose the root cause and fix it without modifying the test itself."
-```
-
-### Generate documentation
-
-```
-gaviero-cli --repo . --model sonnet \
-  --task "Generate a Markdown API reference for all public functions in src/api/.
-          Write it to docs/api_reference.md."
-```
-
-### Code review with persistent memory
-
-Each run adds to `code-review` namespace. The agent can track recurring issues over time:
-
-```
-gaviero-cli --repo . \
-  --namespace code-review \
-  --task "Review the changes in the current git diff for: code quality, missing error handling,
-          and test coverage. Compare with prior review findings from memory context.
-          Write a report to docs/review.md listing new issues and any recurring patterns."
-```
-
-### Run a DSL workflow with custom namespace
-
-Override the write namespace at run time without editing the `.gaviero` file:
-
-```
-gaviero-cli --repo . \
-  --namespace feature-auth-2024 \
-  --script workflows/feature_tdd.gaviero
-```
-
-### Coordinated planning with memory context
-
-Opus plans the work with awareness of prior runs; the plan is saved for review before execution:
-
-```
-# Step 1: generate the plan (does not execute agents)
-plan=$(gaviero-cli --repo . \
-  --coordinated \
-  --namespace feature-billing \
-  --read-ns project-architecture \
-  --task "Implement the billing module: design the data model, implement the service layer,
-          write integration tests, and update the API documentation.")
-
-# Step 2: review the plan
-cat "$plan"
-
-# Step 3: execute when satisfied
-gaviero-cli --repo . --script "$plan"
-```
-
-The `project-architecture` namespace might have been populated by an earlier architecture survey run.
-
-### Parallel DSL workflow
-
-When a `.gaviero` script declares `max_parallel`, agents that have no mutual dependency run concurrently:
-
-```
-gaviero-cli --repo . --script workflows/refactor_safe.gaviero
-```
-
-The `max_parallel` value from the workflow block is used automatically. Worktrees are created per agent to prevent filesystem conflicts.
-
-### CI pipeline with JSON output
-
-Capture structured results for downstream processing:
-
-```
-result=$(gaviero-cli --repo . --format json --auto-accept \
-  --script workflows/security_audit.gaviero)
-
-success=$(echo "$result" | jq '.success')
-if [ "$success" != "true" ]; then
-  echo "Security audit failed"
-  echo "$result" | jq '.manifests[] | select(.status != "Completed")'
-  exit 1
-fi
-```
-
-### CI pipeline with coordinated planning
-
-Generate and immediately execute a coordinated plan non-interactively:
-
-```bash
-#!/bin/bash
-set -e
-
-plan=$(gaviero-cli --repo . --coordinated \
-  --task "Fix all failing tests and add coverage for uncovered error paths")
-
-echo "Generated plan: $plan"
-cat "$plan"
-
-# Execute — --auto-accept skips interactive review of proposed file changes
-gaviero-cli --repo . --auto-accept --script "$plan"
-```
-
-### Building a multi-run knowledge base
-
-Different workflows each write to their own namespace. A final synthesis step reads from all of them:
-
-```bash
-# Step 1: architecture survey
-gaviero-cli --repo . --namespace arch-survey \
-  --task "Document the overall system architecture, module boundaries, and data flow.
-          Write to docs/architecture.md."
-
-# Step 2: security scan (reads architecture context)
-gaviero-cli --repo . \
-  --namespace security-scan \
-  --read-ns arch-survey \
-  --task "Scan the codebase for security vulnerabilities. Use the architecture context from
-          memory to understand trust boundaries. Write findings to docs/security.md."
-
-# Step 3: performance audit (reads both)
-gaviero-cli --repo . \
-  --namespace perf-audit \
-  --read-ns arch-survey \
-  --read-ns security-scan \
-  --task "Audit the codebase for performance bottlenecks. Use the architecture and security
-          context from memory to prioritize hot paths and avoid touching sensitive areas.
-          Write findings to docs/performance.md."
-
-# Step 4: synthesis (reads all three namespaces)
-gaviero-cli --repo . \
-  --namespace final-report \
-  --read-ns arch-survey \
-  --read-ns security-scan \
-  --read-ns perf-audit \
-  --task "Synthesize the architecture, security, and performance findings from memory into
-          a single executive report. Highlight the top 10 issues across all dimensions.
-          Write to docs/executive_report.md."
 ```
 
 ---
@@ -420,15 +371,5 @@ gaviero-cli --repo . \
 
 | Code | Meaning |
 |---|---|
-| `0` | All agents completed successfully, or (in `--coordinated`) plan file written successfully |
-| `1` | One or more agents failed, or a startup error occurred |
-
----
-
-## Notes
-
-- All progress output goes to **stderr**; result output goes to **stdout**. This makes it safe to pipe stdout without mixing diagnostic noise.
-- In `--coordinated` mode stdout contains only the plan file path. Use `cat "$plan"` to inspect it.
-- `--auto-accept` skips the interactive file-change review that the TUI normally shows. Use it in CI or when you trust the agent's output.
-- The memory store is initialized from `~/.cache/gaviero/`. If initialization fails (missing model files, permissions), the run continues without memory — you will see `[memory] disabled: <reason>` in stderr.
-- When `max_parallel > 1` (either from `--max-parallel` or from the workflow's `max_parallel`), each agent runs in a separate git worktree to prevent filesystem conflicts. Worktrees are cleaned up after the run.
+| `0` | All agents completed successfully |
+| `1` | One or more agents failed or a merge conflict was not resolved |
