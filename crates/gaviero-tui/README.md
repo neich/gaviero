@@ -7,19 +7,258 @@ A terminal code editor with integrated AI agents and multi-agent swarm execution
 ## Layout
 
 ```
-┌─────────────┬──────────────────────────────────────┬───────────────────┐
-│ Left panel  │  Editor (tabbed)                     │  Side panel       │
-│             │                                      │                   │
-│  File tree  │  code.rs   main.rs   README.md  +   │  Agent chat       │
-│  Search     │                                      │  Swarm dashboard  │
-│  Review     │  ... file content ...                │  Git panel        │
-│  Changes    │                                      │                   │
-├─────────────┴──────────────────────────────────────┴───────────────────┤
-│ Terminal (toggleable, resizable)                                        │
-└─────────────────────────────────────────────────────────────────────────┘
+┌─────────────┬────────────────────────────┬──────────────────────┐
+│  Left panel │        Editor (tabs)        │     Side panel       │
+│             │                            │                      │
+│  File tree  │  syntax highlighting       │  Agent chat          │
+│  Search     │  gutter + scrollbar        │  Swarm dashboard     │
+│  Review     │  hunk overlay (diff)       │  Git panel           │
+│  Changes    │  markdown preview          │                      │
+├─────────────┴────────────────────────────┴──────────────────────┤
+│  Embedded terminal (PTY)                                        │
+├─────────────────────────────────────────────────────────────────┤
+│  Status bar                                                     │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-Each panel has multiple modes. Switch modes with `Alt+<key>` shortcuts or cycle with the arrows shown in panel headers. The three columns resize via six built-in layout presets (`Alt+5` – `Alt+0`).
+Panels can be toggled, resized, and hidden. Six layout presets are available via `Alt+5`–`Alt+0`.
+
+---
+
+## Starting
+
+```bash
+gaviero                    # open in current directory
+gaviero /path/to/repo      # open at specific path
+```
+
+---
+
+## Workflow walkthroughs
+
+### 1. Fix a bug (single agent, iterative refinement)
+
+1. Open the chat panel — `Alt+A`
+2. (Optional) Attach the relevant file — type `@src/auth.rs` or use `/attach src/auth.rs`
+3. Type your request and press `Enter`:
+   ```
+   Fix the null pointer crash in UserService.getById when the user does not exist
+   ```
+4. The agent streams its reasoning and edits. Tool calls appear in the activity log (`  [tool] Read`).
+5. When the agent proposes file changes, the left panel switches to **Review** mode automatically.
+6. Navigate hunks with `]h` / `[h`, accept with `a`, reject with `r`.
+7. Press `f` to finalize (write accepted changes to disk).
+8. Switch to the terminal (`Ctrl+J`), run `cargo test` to verify.
+
+The agent can be given more retry budget by typing a follow-up message if the first attempt is incomplete.
+
+---
+
+### 2. TDD bug fix — generate failing tests first
+
+1. Open chat — `Alt+A`
+2. Send:
+   ```
+   Write a test that reproduces this bug: tokens are not invalidated on logout.
+   The test must fail against the current code. Do not modify any source files yet.
+   ```
+3. Review the proposed test file — accept it with `A` then `f`.
+4. Confirm the test fails: switch to terminal (`Ctrl+J`), run `cargo test`.
+5. Send a follow-up:
+   ```
+   Now fix the code so the test passes. Do not modify the test file.
+   ```
+6. Review proposed changes hunk-by-hunk, accept, finalize.
+7. Run `cargo test` again to confirm green.
+
+Alternatively use `/run` with a dedicated script (see §Run a workflow script below).
+
+---
+
+### 3. New feature with coordinated planning (`/cswarm`)
+
+Use this when you want Opus to decompose a large task into a multi-agent plan before anything runs.
+
+1. Open chat — `Alt+A`
+2. Type:
+   ```
+   /cswarm Add subscription billing with proration support
+   ```
+3. Opus decomposes the task. The generated `.gaviero` file opens in the editor automatically.
+4. Read the plan. Edit agent prompts, scopes, or `depends_on` edges directly in the editor.
+5. Save — `Ctrl+S`.
+6. Execute:
+   ```
+   /run tmp/gaviero_plan_<timestamp>.gaviero
+   ```
+7. Switch to the swarm dashboard — `Alt+W` — to watch agents run.
+8. When complete, each agent's proposed changes appear in the review panel. Accept or reject per-hunk.
+
+---
+
+### 4. Immediate multi-agent swarm (`/swarm`)
+
+Skip the planning review step and run agents immediately from a natural-language task description.
+
+1. Open chat — `Alt+A`
+2. Type:
+   ```
+   /swarm Rename ModelTier variants: Execution→Cheap, Coordinator→Expensive, across all crates
+   ```
+3. The swarm dashboard opens (`Alt+W`) showing each agent's status.
+4. Watch the activity log: tool calls, file writes, validation results.
+5. When all agents complete, merge results are applied automatically (with conflict resolution if needed).
+6. Proposed changes open in the review panel — accept with `A`, finalize with `f`.
+
+---
+
+### 5. Run a workflow script (`/run`)
+
+For repeatable workflows defined in `.gaviero` files:
+
+1. Open the file tree — `Alt+E`, `Alt+1`
+2. Navigate to `workflows/bugfix.gaviero`, press `Enter` to open it in the editor
+3. Switch to chat — `Alt+A`
+4. Type:
+   ```
+   /run workflows/bugfix.gaviero
+   ```
+   Or with a runtime prompt substituted for `{{PROMPT}}`:
+   ```
+   /run workflows/bugfix.gaviero fix null pointer in UserService.getById
+   ```
+5. The iteration engine runs the workflow. Validation feedback (compile, clippy, test) appears in the swarm dashboard.
+6. Review proposed changes when complete.
+
+---
+
+### 6. Security audit (read-only, no changes)
+
+1. Open chat — `Alt+A`
+2. Type:
+   ```
+   /run workflows/security_audit.gaviero
+   ```
+   Or directly:
+   ```
+   Audit src/auth/ for injection vulnerabilities and write findings to docs/security-audit.md
+   ```
+   (Since the agent only writes to `docs/`, the review step is minimal.)
+3. When the agent finishes, `docs/security-audit.md` opens in a new tab.
+4. Accept the report with `A` then `f`.
+
+To store audit findings in memory for future runs:
+```
+/remember The auth module uses RS256 JWT with 1-hour expiry, refresh tokens stored in Redis
+```
+
+---
+
+### 7. Memory-assisted development
+
+Agents automatically query memory before each task. You can also store context manually:
+
+```
+/remember The billing module uses Stripe webhooks for all payment events — never poll the API directly
+```
+
+```
+/remember UserService.getById returns Option<User>, not Result — callers must handle None
+```
+
+On the next agent turn, these facts appear in the prompt context. Memory persists across sessions and is scoped per workspace.
+
+To override which namespace agents write to:
+```
+/namespace auth-team
+```
+
+Then after a coding session:
+```
+/remember Implemented RS256 key rotation — keys stored in secrets.env, rotated every 30 days
+```
+
+---
+
+### 8. Reviewing and editing a coordinated plan
+
+After `/cswarm` generates a plan, the `.gaviero` file opens in the editor. Common edits before running:
+
+**Change a prompt:** Find the `prompt` field and edit it directly.
+
+**Narrow scope:** Change `owned ["."]` to `owned ["src/billing/"]` to prevent an agent from touching unrelated files.
+
+**Add verification:**
+```gaviero
+workflow my_plan {
+    steps [agent-a agent-b]
+    verify { compile true test true }   // add this
+}
+```
+
+**Change strategy to best-of-3 for a risky agent:**
+```gaviero
+workflow my_plan {
+    steps    [risky-agent]
+    strategy best_of_3
+    max_retries 4
+}
+```
+
+**Merge two agents into one** if the plan is over-decomposed: delete one `agent` block and fold its `prompt` into the remaining agent.
+
+Save and `/run` the edited file.
+
+---
+
+### 9. Diff review workflow in detail
+
+When an agent proposes changes, the left panel switches to **Review** mode. The editor shows the diff inline (added lines green, removed lines red).
+
+```
+Left panel (Review):          Editor (diff view):
+─────────────────────         ──────────────────────────────
+src/auth.rs  +12 -3           fn get_user(id: u64) -> Option<User> {
+tests/auth_test.rs  +45 -0  -     let user = db.find(id);
+                            -     user
+                            +     db.find(id).or_else(|| {
+                            +         tracing::warn!(id, "user not found");
+                            +         None
+                            +     })
+                              }
+```
+
+| Key | Action |
+|---|---|
+| `]h` / `[h` | Jump to next / previous hunk |
+| `a` | Accept current hunk (stage for write) |
+| `r` | Reject current hunk (discard change) |
+| `A` | Accept all hunks in current file |
+| `R` | Reject all hunks in current file |
+| `f` | Finalize — write all accepted hunks to disk |
+| `q` | Dismiss — discard all proposals (no disk write) |
+| `↑↓` / `j k` | Scroll within current hunk |
+| `PageUp/Down` | Scroll by page |
+
+The status bar shows `[accepted/total hunks]` during review.
+
+---
+
+### 10. Git commit after agent edits
+
+After accepting and finalizing agent changes:
+
+1. Switch to git panel — `Alt+G`
+2. All modified files appear under **Unstaged** (M/A/D/R)
+3. Press `s` on a file (or `S` for all) to stage it
+4. Type a commit message in the input field
+5. Press `Enter` to commit
+
+Or use the embedded terminal (`Ctrl+J`):
+```bash
+git add -p        # interactive staging
+git commit -m "fix: invalidate tokens on logout"
+```
 
 ---
 
@@ -34,15 +273,12 @@ Each panel has multiple modes. Switch modes with `Alt+<key>` shortcuts or cycle 
 | `Ctrl+B` | Toggle file tree |
 | `Ctrl+P` | Toggle side panel |
 | `Ctrl+J` / `F4` | Toggle terminal |
-| `Ctrl+T` | New editor tab |
-| `Ctrl+W` | Close editor tab |
+| `Ctrl+T` | New tab |
+| `Ctrl+W` | Close tab |
 | `Alt+[` / `Alt+]` | Previous / next tab |
 | `Ctrl+F` | Find in buffer |
-| `F5` | Format buffer (at current level) |
-| `F6` | Cycle format level (Compact → Normal → Expanded) |
-| `Alt+P` | Toggle markdown preview |
 
-### Panel focus
+### Focus
 
 | Key | Panel |
 |---|---|
@@ -57,7 +293,7 @@ Each panel has multiple modes. Switch modes with `Alt+<key>` shortcuts or cycle 
 |---|---|
 | `Alt+E` | File tree |
 | `Alt+F` / `F3` | Search |
-| `Alt+C` | Working-directory changes |
+| `Alt+C` | Changes (git working tree) |
 
 ### Side panel mode
 
@@ -69,22 +305,16 @@ Each panel has multiple modes. Switch modes with `Alt+<key>` shortcuts or cycle 
 
 ### Layout presets
 
-| Key | Widths (tree / editor / side) |
+| Key | Layout |
 |---|---|
-| `Alt+5` | 15 / 70 / 15 — standard |
-| `Alt+6` | 15 / 85 / 0 — editor focus |
-| `Alt+7` | 0 / 100 / 0 — full editor |
-| `Alt+8` | 0 / 60 / 40 — code + notes |
-| `Alt+9` | 25 / 75 / 0 — wide tree |
-| `Alt+0` | 20 / 55 / 25 — three columns |
+| `Alt+5` | Standard (tree 15% / editor 70% / side 15%) |
+| `Alt+6` | Editor focus (tree 15% / editor 85%) |
+| `Alt+7` | Full editor (editor 100%) |
+| `Alt+8` | Code + notes (editor 60% / side 40%) |
+| `Alt+9` | Wide tree (tree 25% / editor 75%) |
+| `Alt+0` | Three columns (tree 20% / editor 55% / side 25%) |
 
----
-
-## Editor
-
-Multi-tab editor with syntax highlighting (tree-sitter), undo/redo, word-aware movement, and clipboard support.
-
-### Editing keys
+### Editing
 
 | Key | Action |
 |---|---|
@@ -95,158 +325,101 @@ Multi-tab editor with syntax highlighting (tree-sitter), undo/redo, word-aware m
 | `Ctrl+D` | Duplicate line |
 | `Alt+↑` / `Alt+↓` | Move line up / down |
 | `Ctrl+←` / `Ctrl+→` | Move by word |
-| `Ctrl+Shift+←` / `Ctrl+Shift+→` | Select word |
-| `Shift+↑↓←→` | Extend selection |
-| `Ctrl+E` | Jump to line end |
-| `Ctrl+H` | Delete word backward |
-| `Ctrl+Backspace` | Delete word back |
-| `Ctrl+Delete` | Delete to end of line |
-| `Home` / `End` | Line start / end |
-| `PageUp` / `PageDown` | Scroll by page |
-
-### Format levels
-
-Press `F6` to cycle the format level, then `F5` to apply:
-
-| Level | Effect |
-|---|---|
-| **Compact** | Fix indentation only; preserve existing single-line constructs |
-| **Normal** | Fix indentation and normalize spacing; break long lines |
-| **Expanded** | Full reformat via external tool (rustfmt, prettier, etc.) |
-
-### Markdown preview
-
-`Alt+P` opens a rendered preview pane next to the editor for `.md` files, including thinking blocks from AI responses.
+| `Shift+arrows` | Extend selection |
+| `F5` | Format at current level |
+| `F6` | Cycle format level |
+| `Alt+P` | Toggle markdown preview |
 
 ---
 
-## Left panel
+## Slash commands
 
-### File tree (`Alt+E`)
+| Command | Action |
+|---|---|
+| `/model <name>` | Override model for this conversation (sonnet/opus/haiku) |
+| `/effort <level>` | Override effort level (off/low/high) |
+| `/namespace <name>` | Override write namespace |
+| `/swarm <task>` | Run a multi-agent swarm immediately |
+| `/cswarm <task>` | Coordinated swarm: Opus plans first, DSL file opens for review |
+| `/run <file.gaviero>` | Compile and execute a workflow script |
+| `/run <file.gaviero> <prompt>` | Run script with `{{PROMPT}}` substitution |
+| `/undo-swarm` | Revert the last swarm run (git reset to pre-swarm SHA) |
+| `/attach <path>` | Attach file to next message |
+| `/detach <name>\|all` | Remove attachment |
+| `/remember <text>` | Store text to persistent memory |
+| `/help` | Show all commands |
 
-Browse and manage the workspace directory structure.
+---
+
+## Swarm dashboard
+
+Visible when a `/swarm` or `/cswarm` command is running (switch with `Alt+W`).
+
+Shows:
+- Agent table with status, tier, backend, and elapsed time per agent
+- Per-agent activity log (tool calls, status changes, file writes)
+- Phase indicator (planning → executing → merging)
+- Cost estimate
+
+Press `Enter` on a completed agent to view its proposed diff inline.
+
+---
+
+## File tree
+
+Switch to focus with `Alt+1` (when in FileTree mode).
 
 | Key | Action |
 |---|---|
 | `↑` / `↓` | Navigate |
-| `Enter` / `←` / `→` | Open file or expand/collapse directory |
-| `Space` | Toggle directory expansion |
-| `n` | New file (prompts for name) |
+| `Enter` | Open file or toggle directory |
+| `Space` | Toggle directory expand |
+| `n` | New file |
 | `N` | New folder |
 | `r` | Rename |
-| `d` / `Delete` | Delete (confirm with `y`) |
-
-Single-child directory chains are compacted into one entry. `.gitignore`-style exclusions apply.
-
-### Search (`Alt+F` or `F3`)
-
-Live full-text search across all workspace files.
-
-- Type to search — results update as you type (debounced)
-- Results show `file:line — matching content`
-- `Down` / `Enter` — move focus to results
-- `↑` / `Esc` — return to input
-- `Enter` on a result — open the file at that line
-
-### Changes (`Alt+C`)
-
-Working-directory git changes browser. Shows unstaged and staged files with status markers (`M` modified, `A` added, `D` deleted, `R` renamed). Open any file's diff from here.
-
-### Review mode
-
-When an agent produces multi-file proposals, the left panel switches to **Review** mode automatically — a list of all proposed files with `+lines/-lines` summaries. Navigate with `↑↓`, accept or reject individual files, then apply accepted changes.
+| `d` / `Delete` | Delete |
 
 ---
 
-## Side panel
+## Memory
 
-### Agent chat (`Alt+A`)
+Gaviero maintains persistent semantic memory per project. Agents automatically read from and write to configured namespaces. You can store notes directly from chat:
 
-Streaming AI conversation panel. Type at the bottom, `Alt+Enter` or `Shift+Enter` to send.
+```
+/remember The auth module uses JWT with RS256 keys stored in .env
+/remember All database queries go through the Repository trait — never use raw SQL
+```
 
-**Slash commands:**
-
-| Command | Description |
-|---|---|
-| `/swarm <task>` | Multi-agent swarm: plan and execute in parallel |
-| `/cswarm <task>` | Coordinated swarm: Opus generates a `.gaviero` plan file for review, then you run it with `/run` |
-| `/run <file.gaviero>` | Compile and execute a DSL script |
-| `/undo-swarm` | Revert the last swarm run |
-| `/remember <text>` | Store text to persistent semantic memory |
-| `/attach [path]` | Attach a file to the conversation (supports `@` autocomplete) |
-| `/detach <name>\|all` | Remove an attachment |
-| `/help` | Show available commands |
-
-**File references:** Type `@` in the input to get an autocomplete popup for workspace files. The selected path is inlined into your message as context for the agent.
-
-**Model selector:** The chat header shows the active model (Opus / Sonnet / Haiku) and effort level. Context percentage indicates how much of the model's context window is in use.
-
-### Swarm dashboard (`Alt+W`)
-
-Real-time monitor for multi-agent swarm runs.
-
-- Shows each agent's status (Pending / Running / Completed / Failed)
-- Displays phase progression (coordinating → executing → merging)
-- For `/cswarm`: shows the path of the generated `.gaviero` plan file
-- Press `Enter` on a completed agent to review its diff
-- `/undo-swarm` to revert the entire run to the pre-swarm git state
-
-### Git panel (`Alt+G`)
-
-In-TUI git operations: stage, unstage, discard, commit, and amend without leaving the editor.
-
-- Three regions: Unstaged / Staged / Commit message
-- `Tab` to cycle between regions
-- Stage and unstage files, view diffs, write commit message
-- Branch display with `/` to open branch picker (filterable)
-
----
-
-## Diff review
-
-When an agent proposes file changes, a diff overlay appears in the editor. All writes are gated — nothing is written to disk until you accept.
-
-| Key | Action |
-|---|---|
-| `]h` | Next hunk |
-| `[h` | Previous hunk |
-| `a` | Accept current hunk |
-| `r` | Reject current hunk |
-| `A` | Accept all hunks |
-| `R` | Reject all hunks |
-| `f` | Finalize — write all accepted hunks to disk |
-| `q` | Dismiss — discard all proposed changes |
-| `↑↓` / `j k` | Scroll line by line |
-| `PageUp` / `PageDown` | Scroll by page |
-
-The overlay shows added lines in green, removed lines in red, and context in gray. The gutter shows which function or struct each hunk belongs to. The status bar displays `[accepted/total]` and navigation hints.
-
-**Batch review:** When an agent changes multiple files, the left panel enters Review mode (file list with summaries). The same `a`/`r`/`f` keys apply per-file. `Ctrl+←/→` switches focus between the file list and the diff.
-
----
-
-## Terminal (`Ctrl+J` or `F4`)
-
-Full PTY terminal embedded at the bottom of the window.
-
-| Key | Action |
-|---|---|
-| `Ctrl+J` / `F4` | Show / hide terminal |
-| `Alt+↑` / `Alt+↓` | Resize terminal split |
-| `Shift+PageUp` / `Shift+PageDown` | Scroll terminal scrollback |
-| `Alt+1` – `Alt+4` | Switch focus back to TUI panels |
-
-Supports vt100 colour, mouse selection (click-drag), and multiple terminal tabs. All keys pass through to the shell while the terminal is focused.
+Memory persists across sessions and is scoped per workspace namespace.
 
 ---
 
 ## Session persistence
 
-Gaviero restores the following state on restart:
-
-- Open tabs, active tab, and cursor / scroll position per tab
+On exit, Gaviero saves:
+- Open tabs and cursor/scroll positions
 - Panel visibility and active modes
 - File tree expanded directories
 - Terminal split size
 - Active layout preset
 - Chat conversations (per workspace)
+
+All restored on next launch.
+
+---
+
+## Configuration
+
+Settings are read from `.gaviero/settings.toml` in the workspace root. Created automatically on first run. Key settings:
+
+```toml
+[agent]
+namespace = "my-project"      # default write namespace
+read_namespaces = ["shared"]  # additional read namespaces
+
+[editor]
+exclude_patterns = ["node_modules/", "target/", ".git/"]
+
+[theme]
+file = "themes/default.toml"  # colour theme path
+```
