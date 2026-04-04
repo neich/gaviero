@@ -1,3 +1,4 @@
+use gaviero_core::iteration::Strategy;
 use gaviero_core::types::ModelTier;
 use gaviero_dsl::compile;
 
@@ -48,7 +49,7 @@ fn full_example_compiles_to_two_units() {
 
     // researcher
     assert_eq!(units[0].id, "researcher");
-    assert_eq!(units[0].tier, ModelTier::Coordinator);
+    assert_eq!(units[0].tier, ModelTier::Expensive);
     assert_eq!(units[0].model, Some("claude-opus-4-6".to_string()));
     assert!(
         units[0].coordinator_instructions.contains("architecture document"),
@@ -62,7 +63,7 @@ fn full_example_compiles_to_two_units() {
 
     // implementer
     assert_eq!(units[1].id, "implementer");
-    assert_eq!(units[1].tier, ModelTier::Execution);
+    assert_eq!(units[1].tier, ModelTier::Cheap);
     assert_eq!(units[1].model, Some("claude-sonnet-4-6".to_string()));
     assert_eq!(units[1].depends_on, vec!["researcher"]);
     assert_eq!(units[1].scope.owned_paths, vec!["src/feature/"]);
@@ -136,6 +137,132 @@ fn dependency_cycle_detected() {
     assert!(report.contains("cycle"), "expected cycle: {}", report);
 }
 
+// ── Iteration strategy tests ──────────────────────────────────────
+
+#[test]
+fn strategy_refine_propagated() {
+    let src = r#"
+        agent a { description "task" }
+        workflow w { steps [a] strategy refine }
+    "#;
+    let compiled = compile(src, "test.gaviero", None, None).expect("should compile");
+    assert!(
+        matches!(compiled.iteration_config.strategy, Strategy::Refine),
+        "expected Refine strategy"
+    );
+}
+
+#[test]
+fn strategy_single_pass_propagated() {
+    let src = r#"
+        agent a { description "task" }
+        workflow w { steps [a] strategy single_pass }
+    "#;
+    let compiled = compile(src, "test.gaviero", None, None).expect("should compile");
+    assert!(
+        matches!(compiled.iteration_config.strategy, Strategy::SinglePass),
+        "expected SinglePass strategy"
+    );
+}
+
+#[test]
+fn strategy_best_of_n_propagated() {
+    let src = r#"
+        agent a { description "task" }
+        workflow w { steps [a] strategy best_of_3 }
+    "#;
+    let compiled = compile(src, "test.gaviero", None, None).expect("should compile");
+    assert!(
+        matches!(compiled.iteration_config.strategy, Strategy::BestOfN { n: 3 }),
+        "expected BestOfN(3) strategy, got {:?}",
+        compiled.iteration_config.strategy
+    );
+}
+
+#[test]
+fn test_first_true_propagated() {
+    let src = r#"
+        agent a { description "task" }
+        workflow w { steps [a] test_first true }
+    "#;
+    let compiled = compile(src, "test.gaviero", None, None).expect("should compile");
+    assert!(compiled.iteration_config.test_first, "expected test_first = true");
+}
+
+#[test]
+fn max_retries_workflow_level_propagated() {
+    let src = r#"
+        agent a { description "task" }
+        workflow w { steps [a] max_retries 3 }
+    "#;
+    let compiled = compile(src, "test.gaviero", None, None).expect("should compile");
+    assert_eq!(compiled.iteration_config.max_retries, 3);
+}
+
+#[test]
+fn verify_block_propagated() {
+    let src = r#"
+        agent a { description "task" }
+        workflow w {
+            steps [a]
+            verify { compile true clippy true test false }
+        }
+    "#;
+    let compiled = compile(src, "test.gaviero", None, None).expect("should compile");
+    assert!(compiled.verification_config.compile);
+    assert!(compiled.verification_config.clippy);
+    assert!(!compiled.verification_config.test);
+}
+
+#[test]
+fn verify_block_all_true() {
+    let src = r#"
+        agent a { description "task" }
+        workflow w {
+            steps [a]
+            verify { compile true clippy true test true }
+        }
+    "#;
+    let compiled = compile(src, "test.gaviero", None, None).expect("should compile");
+    assert!(compiled.verification_config.compile);
+    assert!(compiled.verification_config.clippy);
+    assert!(compiled.verification_config.test);
+}
+
+#[test]
+fn iteration_config_defaults_when_no_workflow() {
+    let src = r#"agent a { description "task" }"#;
+    let compiled = compile(src, "test.gaviero", None, None).expect("should compile");
+    // No workflow → defaults
+    assert!(matches!(compiled.iteration_config.strategy, Strategy::Refine));
+    assert!(!compiled.iteration_config.test_first);
+    assert_eq!(compiled.iteration_config.max_retries, 5);
+    assert!(!compiled.verification_config.compile);
+    assert!(!compiled.verification_config.clippy);
+    assert!(!compiled.verification_config.test);
+}
+
+#[test]
+fn escalate_after_propagated() {
+    let src = r#"
+        agent a { description "task" }
+        workflow w { steps [a] escalate_after 5 }
+    "#;
+    let compiled = compile(src, "test.gaviero", None, None).expect("should compile");
+    assert_eq!(compiled.iteration_config.escalate_after, 5);
+}
+
+#[test]
+fn attempts_propagated() {
+    let src = r#"
+        agent a { description "task" }
+        workflow w { steps [a] attempts 4 strategy best_of_4 }
+    "#;
+    let compiled = compile(src, "test.gaviero", None, None).expect("should compile");
+    assert_eq!(compiled.iteration_config.max_attempts, 4);
+    assert!(matches!(compiled.iteration_config.strategy, Strategy::BestOfN { n: 4 }));
+}
+
 // ── Example file compilation tests ──────────────────────────────
 
 fn compile_example(filename: &str) -> Vec<gaviero_core::swarm::models::WorkUnit> {
@@ -162,8 +289,8 @@ fn example_bugfix_with_tests() {
     // verify depends on fix, fix depends on diagnose
     assert_eq!(units[1].depends_on, vec!["diagnose"]);
     assert_eq!(units[2].depends_on, vec!["fix"]);
-    // diagnose uses coordinator tier (opus)
-    assert_eq!(units[0].tier, ModelTier::Coordinator);
+    // diagnose uses coordinator tier (opus) → maps to Expensive
+    assert_eq!(units[0].tier, ModelTier::Expensive);
     // verify has max_retries 3
     assert_eq!(units[2].max_retries, 3);
 }
@@ -186,8 +313,8 @@ fn example_refactor_safe() {
     assert_eq!(units[3].id, "verify");
     // analyze_structure depends on analyze_coverage
     assert_eq!(units[1].depends_on, vec!["analyze_coverage"]);
-    // haiku tier for coverage agent
-    assert_eq!(units[0].tier, ModelTier::Mechanical);
+    // haiku tier for coverage agent (mechanical → Cheap)
+    assert_eq!(units[0].tier, ModelTier::Cheap);
 }
 
 #[test]
@@ -205,8 +332,8 @@ fn example_security_audit() {
     assert_eq!(units.len(), 4);
     assert_eq!(units[0].id, "scan");
     assert_eq!(units[3].id, "final_verification");
-    // scan uses reasoning tier
-    assert_eq!(units[0].tier, ModelTier::Reasoning);
+    // scan uses reasoning tier → maps to Expensive
+    assert_eq!(units[0].tier, ModelTier::Expensive);
     // write_security_tests owns the tests/security/ directory
     assert!(units[2].scope.owned_paths.contains(&"tests/security/".to_string()));
 }
