@@ -81,7 +81,7 @@ impl Consolidator {
     /// - Finds near-duplicate entries (similarity 0.7-0.85)
     /// - Merges them using LLM if available, otherwise keeps both
     /// - Prunes entries with retrieval score below threshold
-    pub async fn sweep(&self, _namespace: &str) -> Result<ConsolidationReport> {
+    pub(crate) async fn sweep(&self, _namespace: &str) -> Result<ConsolidationReport> {
         let mut report = ConsolidationReport::default();
 
         // TODO: Implement full sweep with pairwise similarity comparison
@@ -102,7 +102,7 @@ impl Consolidator {
     ///
     /// Finds sequences of episodic entries (same task_id) older than max_age_days,
     /// summarizes each into a single entry, and deletes the originals.
-    pub async fn summarize_episodes(
+    pub(crate) async fn summarize_episodes(
         &self,
         _namespace: &str,
         _max_age_days: u32,
