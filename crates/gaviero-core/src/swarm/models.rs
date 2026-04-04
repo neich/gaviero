@@ -122,6 +122,9 @@ pub struct AgentManifest {
     pub branch: Option<String>,
     /// Optional summary of changes.
     pub summary: Option<String>,
+    /// Estimated cost of this agent's run in USD (populated when usage data available).
+    #[serde(default)]
+    pub cost_usd: f64,
 }
 
 /// Overall result of a swarm execution.
