@@ -78,14 +78,18 @@ pub const NUMERIC_ORANGE: Color = Color::Rgb(209, 154, 102);
 pub const MEDIUM_GRAY: Color = Color::Rgb(140, 145, 155);
 /// Focused list-item selection background.
 pub const FOCUSED_SELECTION_BG: Color = Color::Rgb(55, 100, 180);
-/// Swarm tier badge: Coordinator.
+/// Swarm tier badge: Coordinator (legacy).
 pub const TIER_COORDINATOR: Color = Color::Rgb(180, 120, 220);
-/// Swarm tier badge: Reasoning.
+/// Swarm tier badge: Reasoning (legacy).
 pub const TIER_REASONING: Color = Color::Rgb(80, 160, 230);
-/// Swarm tier badge: Execution.
+/// Swarm tier badge: Execution (legacy).
 pub const TIER_EXECUTION: Color = Color::Rgb(80, 200, 120);
-/// Swarm tier badge: Mechanical.
+/// Swarm tier badge: Mechanical (legacy).
 pub const TIER_MECHANICAL: Color = Color::Rgb(220, 200, 80);
+/// Swarm tier badge: Cheap (Haiku / local).
+pub const TIER_CHEAP: Color = Color::Rgb(80, 200, 120);
+/// Swarm tier badge: Expensive (Sonnet / Opus).
+pub const TIER_EXPENSIVE: Color = Color::Rgb(80, 160, 230);
 /// Activity line: tool call.
 pub const ACTIVITY_TOOL_CALL: Color = Color::Rgb(80, 200, 220);
 /// Activity line: status change.

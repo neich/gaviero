@@ -1,524 +1,272 @@
 # gaviero-core — Architecture
 
-`gaviero-core` is the shared execution engine for Gaviero. It owns all domain logic: workspace configuration, agent I/O (ACP), write-gated proposal review, multi-agent swarm orchestration, semantic memory, git integration, scope enforcement, syntax analysis, and context-budget planning. The `gaviero-tui` and `gaviero-cli` binaries are thin shells that implement observer traits and call into this library.
+The foundational library. All domain logic lives here. `gaviero-cli`, `gaviero-tui`, and `gaviero-dsl` are thin layers that depend on this crate; none of them contain execution, validation, or memory logic.
 
 ---
 
 ## Module map
 
-| Module | Purpose |
-|---|---|
-| `types` | Canonical shared types: `WorkUnit`, `WriteProposal`, `FileScope`, `ModelTier`, `PrivacyLevel`, `StructuralHunk`, `normalize_path()` |
-| `workspace` | Settings cascade (user → workspace → folder); resolves model names, namespaces, layout |
-| `session_state` | Persisted UI state (open tabs, pane layout, file-tree expansion, terminal session) |
-| `observer` | Three observer traits (`WriteGateObserver`, `AcpObserver`, `SwarmObserver`) — the coupling surface between core and frontends |
-| `diff_engine` | Line-based diff via `similar`; produces `StructuralHunk` vectors with context lines |
-| `tree_sitter` | Language detection; enriches diff hunks with enclosing AST nodes (function/class names) |
-| `indent/` | Auto-indent engine: tree-sitter query path first, bracket-count fallback |
-| `query_loader` | Loads tree-sitter highlight and indent query files from disk |
-| `acp/` | Agent Communication Protocol: spawn `claude` subprocess, stream NDJSON events, route proposals through WriteGate |
-| `write_gate` | Proposal lifecycle: stage → hunk accept/reject → assemble → write to disk; scope enforcement |
-| `scope_enforcer` | File-access control enforcement: owned-path checks and hard block-list for credentials/secrets |
-| `validation_gate/` | Inline validation pipeline: tree-sitter (fast) + cargo check (slow); produces corrective prompts for agent retry |
-| `repo_map/` | Personalized PageRank over tree-sitter symbol graph; produces `ContextPlan` for prompt budget allocation |
-| `terminal/` | PTY management, vt100 emulation, shell integration, terminal history |
-| `swarm/` | Multi-agent orchestration: coordinator, pipeline, tier routing, backends, verification, merge |
-| `memory/` | Semantic memory: SQLite + sqlite-vec, ONNX embeddings, namespace isolation, privacy filtering, consolidation |
-| `git` | Git repo operations via `git2`; worktree lifecycle via CLI |
-
----
-
-## Core type hierarchy
-
 ```
-WorkUnit
-├─ id: String
-├─ description: String
-├─ scope: FileScope { owned_paths, read_only_paths, interface_contracts }
-├─ depends_on: Vec<String>           ← dependency graph edges
-├─ tier: ModelTier                   ← Coordinator | Reasoning | Execution | Mechanical
-├─ privacy: PrivacyLevel             ← Public | LocalOnly
-├─ coordinator_instructions: String  ← decomposed task text
-├─ model: Option<String>             ← override; None → TierRouter picks
-├─ read_namespaces / write_namespace ← memory routing
-├─ max_retries: u8
-├─ escalation_tier: Option<ModelTier>
-├─ staleness_sources: Vec<String>    ← file paths; hash-checked before each run
-└─ memory_importance: Option<f32>    ← 0.0–1.0; default 0.5
-
-WriteProposal
-├─ id: u64
-├─ source: String                    ← agent ID
-├─ file_path: PathBuf
-├─ original_content: String
-├─ proposed_content: String
-├─ structural_hunks: Vec<StructuralHunk>
-│   └─ DiffHunk + enclosing_node_name + description + status: HunkStatus
-└─ status: ProposalStatus            ← Pending | PartiallyAccepted | Accepted | Rejected
-
-SwarmResult
-├─ manifests: Vec<AgentManifest>
-│   └─ work_unit_id, status: AgentStatus, modified_files, branch, summary, cost_usd
-├─ merge_results: Vec<MergeResult>
-│   └─ success, conflicts: Vec<MergeConflict>
-├─ success: bool
-└─ pre_swarm_sha: String             ← HEAD before run (for undo-swarm)
-```
-
----
-
-## Observer pattern
-
-Three traits in `observer.rs` decouple core execution from frontend rendering. Frontends implement the traits and pass boxed implementations into core functions. Observers must never block — they only fire-and-forget into an event channel.
-
-### `WriteGateObserver`
-
-| Method | When fired |
-|---|---|
-| `on_proposal_created(proposal)` | New diff ready; proposal is boxed and sent to frontend |
-| `on_proposal_updated(id)` | A hunk status changed (accept/reject) |
-| `on_proposal_finalized(path)` | Final content written to disk |
-
-### `AcpObserver`
-
-| Method | When fired |
-|---|---|
-| `on_stream_chunk(conv_id, text)` | Response text delta from Claude subprocess |
-| `on_tool_call_started(conv_id, tool)` | Agent issued Read / Grep / Write / Edit |
-| `on_streaming_status(conv_id, status)` | Spinner text (e.g. "Building plan…") |
-| `on_message_complete(conv_id, role, content)` | Agent turn complete |
-| `on_proposal_deferred(conv_id, path, +, -)` | File diff deferred for batch review |
-| `on_validation_result(conv_id, gate, result)` | Gate pass/fail notification |
-| `on_validation_retry(conv_id, attempt)` | Retry after validation failure |
-
-### `SwarmObserver`
-
-| Method | When fired |
-|---|---|
-| `on_phase_changed(phase)` | "validating" / "running" / "merging" |
-| `on_agent_state_changed(id, status, detail)` | Pending → Running → Completed / Failed |
-| `on_tier_started(current, total)` | New dependency tier begins |
-| `on_merge_conflict(branch, files)` | Merge conflict detected |
-| `on_coordination_started(prompt)` | Coordinator Opus call begins |
-| `on_coordination_complete(unit_count, summary)` | DSL plan ready |
-| `on_tier_dispatch(unit_id, tier, backend)` | Agent assigned to backend |
-| `on_cost_update(estimate)` | Token / cost estimate updated |
-| `on_completed(result)` | `SwarmResult` ready |
-
----
-
-## ACP subsystem (`acp/`)
-
-ACP (Agent Communication Protocol) is a subprocess-based agent interface. It spawns the `claude` CLI and streams NDJSON events over stdout.
-
-### Components
-
-**`AcpSession` (`session.rs`)** — low-level subprocess wrapper:
-- Spawns: `claude --print --output-format stream-json --model <model> --add-dir <cwd>`
-- Writes prompt via stdin, then closes stdin
-- `next_event() → Result<Option<StreamEvent>>` reads NDJSON lines one by one
-
-**`StreamEvent` (`protocol.rs`)** — parsed NDJSON events:
-
-| Variant | Meaning |
-|---|---|
-| `SystemInit { session_id, model }` | Subprocess ready |
-| `ContentDelta(text)` | Streaming response chunk |
-| `ThinkingDelta(text)` | Extended thinking chunk |
-| `ToolUseStart { tool_name, tool_use_id }` | Agent is about to call a tool |
-| `ToolInputDelta(json)` | Partial tool input (streaming) |
-| `AssistantMessage { text, tool_uses }` | Complete assistant turn |
-| `ResultEvent { result_text, cost_usd, duration_ms, .. }` | Final result + metrics |
-| `Unknown(json)` | Unrecognised event — logged and skipped |
-
-**`AcpPipeline` (`client.rs`)** — high-level agent runner:
-```
-send_prompt(prompt, history, attachments, observer, write_gate)
-  → enrich prompt (conversation history, referenced file contents)
-  → spawn AcpSession (allowed tools: Read, Glob, Grep, Write, Edit, MultiEdit)
-  → stream events → observer callbacks
-  → parse <file path="...">content</file> blocks → WriteGatePipeline::propose()
+gaviero-core/src/
+├── lib.rs                 re-exports tree-sitter types; declares all pub modules
+├── types.rs               primitive domain types (see Key types below)
+├── observer.rs            event-listener traits (WriteGateObserver, AcpObserver, SwarmObserver)
+│
+├── swarm/                 orchestration layer
+│   ├── models.rs          WorkUnit, AgentManifest, SwarmResult, AgentStatus
+│   ├── plan.rs            CompiledPlan, PlanNode, DependencyEdge, VerificationConfig
+│   ├── pipeline.rs        execute(), plan_coordinated() — top-level entry points
+│   ├── coordinator.rs     Coordinator, TaskDAG — Opus-powered task decomposition
+│   ├── router.rs          TierRouter — maps (tier, privacy) → backend name
+│   ├── board.rs           SharedBoard — inter-agent discovery postings
+│   ├── bus.rs             AgentBus — inter-tier message passing
+│   ├── validation.rs      validate_scopes(), dependency_tiers()
+│   ├── execution_state.rs ExecutionState — checkpoint/resume (disk-backed JSON)
+│   ├── merge.rs           merge_branch(), auto_resolve_conflicts()
+│   ├── calibration.rs     TierStats, cost modelling
+│   └── backend/
+│       ├── mod.rs         AgentBackend trait, UnifiedStreamEvent, CompletionRequest
+│       ├── runner.rs      run_backend() — inner execution + retry loop
+│       ├── claude_code.rs ClaudeCodeBackend (subprocess via ACP)
+│       ├── ollama.rs      OllamaStreamBackend (HTTP)
+│       └── mock.rs        MockBackend (deterministic test fixture)
+│
+├── iteration/             outer execution strategy loop
+│   ├── mod.rs             IterationEngine, IterationConfig, Strategy, IterationResult
+│   ├── convergence.rs     ConvergenceDetector — stall detection across attempts
+│   └── test_generator.rs  TestGenerator — TDD red-phase test file generation
+│
+├── validation_gate/       post-edit correctness gates
+│   ├── mod.rs             ValidationPipeline, ValidationGate trait, ValidationResult
+│   ├── tree_sitter_gate.rs fast syntax check (per-write)
+│   └── cargo_gate.rs      slow semantic check (cargo check, per-checkpoint)
+│
+├── write_gate/
+│   └── mod.rs             WriteGatePipeline, WriteMode (Interactive/AutoAccept/Deferred/RejectAll)
+│
+├── acp/                   ACP subprocess communication with Claude CLI
+│   ├── session.rs         AcpSession — spawns `claude`, reads NDJSON stream
+│   └── protocol.rs        StreamEvent (raw ACP) → UnifiedStreamEvent mapping
+│
+├── memory/                semantic memory store
+│   ├── mod.rs             init(), MemoryStore public API
+│   ├── store.rs           SQLite + sqlite-vec; store/search/mark_stale
+│   ├── embedder.rs        Embedder trait
+│   ├── onnx_embedder.rs   OnnxEmbedder (nomic-embed-text-v1.5, local ONNX)
+│   └── schema.rs          DB schema migrations
+│
+├── repo_map/              PageRank-based context budget planner
+│   ├── mod.rs             RepoMap::build(), rank_for_agent() → ContextPlan
+│   ├── builder.rs         walks workspace, extracts file nodes + tree-sitter symbols
+│   └── page_rank.rs       personalized PageRank over reference graph
+│
+├── scope_enforcer.rs      path-level read/write permission checks + hardcoded block-list
+├── git.rs                 GitRepo, WorktreeManager, GitCoordinator (serialises .git/ ops)
+├── tree_sitter.rs         15-language registry, enrich_hunks(), find_enclosing_node()
+├── diff_engine.rs         compute_hunks() — LCS-based diff → Vec<DiffHunk>
+├── workspace.rs           Workspace, settings load/save, namespace resolution
+├── session_state.rs       persisted editor state (tabs, cursor, layout)
+├── terminal/              PTY lifecycle (portable-pty + vt100)
+├── query_loader.rs        tree-sitter query file loader
+└── indent.rs              indentation utilities
 ```
 
 ---
 
-## WriteGate pipeline (`write_gate.rs`)
+## Key types
 
-All agent-proposed file writes flow through `WriteGatePipeline`. Nothing reaches disk until the user (or `AutoAccept` mode) finalises the proposal.
+### Execution units
 
-### WriteMode
+| Type | Module | Description |
+|---|---|---|
+| `WorkUnit` | `swarm/models.rs` | One agent task: scope, model, privacy, memory routing, retry budget, instructions. |
+| `AgentManifest` | `swarm/models.rs` | Result of one agent run: status, modified files, branch name, cost_usd. |
+| `SwarmResult` | `swarm/models.rs` | Aggregate: all manifests + merge results + pre-run git SHA. |
+| `CompiledPlan` | `swarm/plan.rs` | Immutable petgraph DAG of `PlanNode` + `IterationConfig` + `VerificationConfig`. |
+| `IterationResult` | `iteration/mod.rs` | Output of `IterationEngine::run()`: best manifest, attempt count, pass flag. |
 
-| Mode | Behaviour |
+### Configuration
+
+| Type | Module | Description |
+|---|---|---|
+| `ModelTier` | `types.rs` | `Cheap` (Haiku/local) \| `Expensive` (Sonnet/Opus). |
+| `PrivacyLevel` | `types.rs` | `Public` (any API) \| `LocalOnly` (Ollama only). |
+| `IterationConfig` | `iteration/mod.rs` | Strategy, retry budget, cheap/expensive model names, escalation threshold. |
+| `VerificationConfig` | `swarm/plan.rs` | Boolean flags: compile, clippy, test. |
+| `Strategy` | `iteration/mod.rs` | `SinglePass` \| `Refine` \| `BestOfN { n }`. |
+| `SwarmConfig` | `swarm/pipeline.rs` | Runtime options: workspace root, model, max parallel, namespace lists. |
+
+### File handling
+
+| Type | Module | Description |
+|---|---|---|
+| `FileScope` | `types.rs` | `owned_paths` (rw) and `read_only_paths` per agent. `to_prompt_clause()` serialises for prompts. |
+| `WriteProposal` | `types.rs` | One proposed file change: original, proposed content, structural hunks, acceptance status. |
+| `StructuralHunk` | `types.rs` | `DiffHunk` + enclosing tree-sitter node (function/class context). |
+| `DiffHunk` | `types.rs` | Line ranges + text for one diff region. HunkType: Added/Removed/Modified. |
+
+### Observer traits (`observer.rs`)
+
+| Trait | Methods |
 |---|---|
-| `Interactive` | Proposals queued; observer notified; user accepts/rejects hunks in UI |
-| `AutoAccept` | All hunks auto-accepted; content written immediately |
-| `RejectAll` | All proposals silently discarded |
-| `Deferred` | Proposals accumulated; no observer; released as batch on `take_pending_proposals()` |
-
-### Proposal lifecycle
-
-```
-Agent emits <file> block
-  → AcpPipeline calls WriteGatePipeline::build_proposal()
-      ├─ diff_engine::compute_hunks(original, proposed)
-      ├─ tree_sitter::enrich_hunks()  ← adds enclosing function/class
-      └─ returns WriteProposal (all hunks Pending)
-  → propose(proposal)
-      ├─ scope check: is_scope_allowed(agent_id, path)  ← fail-closed if no scope
-      └─ route by WriteMode
-
-User interacts (Interactive / batch):
-  accept_hunk(id, index)   → HunkStatus::Accepted
-  reject_hunk(id, index)   → HunkStatus::Rejected
-  accept_all(id) / reject_all(id)
-  accept_node(id, node)    → accept all hunks in named enclosing node
-
-Finalise:
-  assemble_final_content(id)
-    → iterate original lines
-    → splice in accepted hunks only
-    → rejected / pending hunks keep original text
-  write to disk → observer.on_proposal_finalized(path)
-```
+| `WriteGateObserver` | `on_proposal_created`, `on_proposal_updated`, `on_proposal_finalized` |
+| `AcpObserver` | `on_stream_chunk`, `on_tool_call_started`, `on_streaming_status`, `on_message_complete`, `on_proposal_deferred`, `on_validation_result`, `on_validation_retry` |
+| `SwarmObserver` | `on_phase_changed`, `on_agent_state_changed`, `on_tier_started`, `on_merge_conflict`, `on_completed`, `on_coordination_started`, `on_coordination_complete`, `on_tier_dispatch`, `on_cost_update` |
 
 ---
 
-## Scope enforcement (`scope_enforcer.rs`)
+## Execution flow
 
-`ScopeEnforcer` is a separate gate from `WriteGatePipeline.is_scope_allowed()`. It enforces per-agent `FileScope` declarations and applies a hard block-list regardless of agent scope.
+```
+CompiledPlan
+    │
+    └─► swarm::pipeline::execute()
+            │
+            ├─ validate_scopes()              overlap detection
+            │
+            ├─ [1 unit] ─► single-agent fast path ─────────────────────────┐
+            │               skip worktrees, bus, merge; go straight to      │
+            │               IterationEngine                                 │
+            │                                                               │
+            ├─ [N units] dependency_tiers()   topological sort              │
+            │   FOR EACH TIER (parallel, semaphore-bounded):                │
+            │     FOR EACH WorkUnit → run_single_agent()                    │
+            │                                                               ◄┘
+            ▼
+    IterationEngine::run()                  outer strategy loop
+        │
+        ├─ [test_first] TestGenerator::generate()
+        │     run_backend() with TDD prompt → writes test files
+        │
+        └─ FOR attempt in 0..n_attempts:
+               escalate model if attempt ≥ escalate_after
+               │
+               └─► run_backend()            inner execution + retry loop
+                       │
+                       ├─ build_prompt()
+                       │     memory context (semantic search across namespaces)
+                       │     file scope clause
+                       │     repo_map outline (PageRank-ranked file summaries)
+                       │     shared_board discoveries (from earlier tiers)
+                       │     corrective feedback (on retry N)
+                       │
+                       ├─ backend.stream_completion(request)
+                       │     → Stream<UnifiedStreamEvent>
+                       │       TextDelta | ToolCallStart/End | FileBlock | Usage | Done
+                       │
+                       ├─ FOR EACH FileBlock:
+                       │     write_gate.insert_proposal()
+                       │       AutoAccept → write immediately
+                       │       Interactive/Deferred → queue for review
+                       │
+                       └─ ValidationPipeline::run(modified_files)
+                             TreeSitterGate (fast, always)
+                             CargoCheckGate (slow, optional)
+                             PASS → done
+                             FAIL → corrective_prompt → retry (up to max_retries)
+```
 
-### Hard block-list (always denied)
-
-`.env*`, `id_*`, `.ssh/`, `.aws/`, `.netrc`, `secrets.*`, and similar credential paths.
-
-### Methods
-
-| Method | Behaviour |
-|---|---|
-| `check_write(agent_id, path)` | Blocks: sensitive block-list paths; paths outside `owned_paths`; unregistered agents (fail-closed) |
-| `check_read(agent_id, path)` | Allows sensitive reads only if path is explicitly in `read_only_paths`; blocks otherwise |
-
-`ScopeViolation` carries the path and reason string for error reporting.
+After all tiers: if `use_worktrees`, merge agent branches into main. Conflicts auto-resolved via Claude.
 
 ---
 
-## Validation gate pipeline (`validation_gate/`)
+## Subsystem details
 
-Inline validation runs after each agent write turn. Gates are chained — first failure short-circuits remaining gates.
-
-### `ValidationGate` trait
+### AgentBackend (`swarm/backend/mod.rs`)
 
 ```rust
-trait ValidationGate {
+trait AgentBackend: Send + Sync {
     fn name(&self) -> &str;
-    fn is_fast(&self) -> bool;    // fast gates run after every write; slow gates run at checkpoints
-    fn validate(&self, path: &Path, content: &str) -> ValidationResult;
+    async fn stream_completion(&self, req: CompletionRequest)
+        -> Result<Pin<Box<dyn Stream<Item = UnifiedStreamEvent>>>>;
 }
 ```
 
-### Built-in gates
+`UnifiedStreamEvent` variants: `TextDelta(String)`, `ThinkingDelta(String)`, `ToolCallStart { id, name }`, `ToolCallDelta { id, args_chunk }`, `ToolCallEnd { id }`, `FileBlock { path, content }`, `Usage(TokenUsage)`, `Error(String)`, `Done(StopReason)`.
 
-| Gate | Speed | What it checks |
-|---|---|---|
-| `TreeSitterGate` | Fast | Syntax validity via tree-sitter parse; runs after every write turn |
-| `CargoCheckGate` | Slow | Type-checks the full crate via `cargo check`; runs at tier checkpoints |
+Implementations: `ClaudeCodeBackend` (ACP subprocess), `OllamaStreamBackend` (HTTP), `MockBackend` (test fixture with scripted event list).
 
-### `corrective_prompt(gate_name, result) → String`
-
-Formats a validation failure into an agent-readable correction instruction. The runner appends this to the next prompt turn, enabling the agent to self-correct without external intervention.
-
-### `ValidationResult`
-
-`Pass` | `Fail { message, suggestion }` | `Skip` (gate not applicable to file type)
-
----
-
-## Repo map (`repo_map/`)
-
-Builds a file-relevance ranking from the workspace to allocate the agent's context budget efficiently.
-
-### Algorithm
-
-1. **Builder** (`builder.rs`): scans workspace files, extracts top-level symbols via tree-sitter; produces `Vec<FileNode { path, token_estimate, symbols }>`
-2. **PageRank** (`page_rank.rs`): personalized PageRank seeded on agent-owned files; ranks all files by relevance
-3. **ContextPlan**: fills token budget — owned files as `full_content`, high-rank files as `signatures`, remainder as `list`
-
-### `ContextPlan` output modes
-
-| Mode | Content injected into prompt |
-|---|---|
-| `full_content` | Complete file text (agent's owned files) |
-| `signatures` | Top-level symbol names and line numbers only |
-| `list` | File path only |
-
----
-
-## Memory system (`memory/`)
-
-Persistent semantic store backed by SQLite + `sqlite-vec` vector extension.
-
-### Storage schema (v3)
-
-| Table | Contents |
-|---|---|
-| `memories` | `(id, namespace, key, content, embedding BLOB, privacy, importance REAL, access_count, created_at, updated_at)` |
-| `vec0_memories_embeddings` | Virtual table over `memories.embedding`; provides cosine distance search |
-| `episodes` | Episodic memory events (session summaries) |
-| `code_graph` | Codebase structure cache (extracted symbols, call graph) |
-
-### Embedding model
-
-- **ONNX Runtime** (`ort` crate) + **nomic-embed-text-v1.5** (768-dimensional)
-- Downloaded to `~/.cache/gaviero/` on first use via `model_manager.rs`
-- `Embedder` trait: `embed(text: &str) → Vec<f32>`
-- Retrieval score: `recency × importance × cosine_similarity` (Stanford Generative Agents formula)
-
-### Key operations
+### ValidationPipeline (`validation_gate/mod.rs`)
 
 ```rust
-store.store(namespace, key, content) → i64
-store.store_with_options(..., privacy, importance, source_file, source_hash)
-store.search(namespaces, query, limit) → Vec<SearchResult { entry, score }>
-store.search_context_filtered(namespaces, query, limit, PrivacyFilter::ExcludeLocalOnly)
-    → String  // Markdown-formatted context block for agent prompts
-store.get(namespace, key) → Option<MemoryEntry>
+enum ValidationResult { Pass, Fail { message: String, suggestion: Option<String> }, Skip }
 ```
 
-### Privacy filtering
+`ValidationPipeline::default_for_rust()` = TreeSitterGate + CargoCheckGate.  
+`ValidationPipeline::fast_only()` = TreeSitterGate only (used in test generation).  
+Gates run sequentially; first `Fail` stops the pipeline and is fed back to the agent as a corrective prompt.
 
-Entries written by `LocalOnly` agents are tagged. `PrivacyFilter::ExcludeLocalOnly` strips them from search results before sending context to cloud-hosted models.
+### WriteGatePipeline (`write_gate/mod.rs`)
 
-### Staleness detection
+Modes: `AutoAccept` (write immediately) | `Interactive` (per-hunk review) | `Deferred` (batch accumulate) | `RejectAll`.
 
-Agents declare `staleness_sources: Vec<String>`. Before each run, `pipeline::invalidate_stale_sources()` hashes each listed file. If any hash differs from the stored snapshot, cached memory entries for that agent are invalidated and the agent runs fresh.
+Scope enforcement: every write path checked against `agent_scopes` registry (populated via `register_agent_scope`). Writes outside `owned_paths` or into the hardcoded block-list (`.env`, `.ssh/`, `id_rsa`, `.aws/`, `credentials`, …) are rejected.
 
-### Consolidation (`consolidation.rs`)
+### IterationEngine (`iteration/mod.rs`)
 
-`Consolidator` deduplicates near-duplicate entries on write:
+Strategy controls the outer loop:
+- `SinglePass` — 1 attempt, inner `max_retries = 1`
+- `Refine` — 1 attempt, inner `max_retries` from config (default 5)
+- `BestOfN { n }` — up to n attempts; returns first success or the one with the most modified files; `ConvergenceDetector` stops early after 2 non-improving consecutive attempts
 
-| Similarity | Action |
-|---|---|
-| > 0.85 | Reinforce existing (increment `access_count`) |
-| 0.70 – 0.85 | Flag for LLM merge (background `sweep()`) |
-| < 0.70 | Insert as new entry |
+Model escalation: attempts `< escalate_after` → `cheap_model`; attempts `≥ escalate_after` → `expensive_model`.
+
+### MemoryStore (`memory/mod.rs`)
+
+SQLite + `sqlite-vec`. Per-entry metadata: namespace, privacy level, importance (0.0–1.0), source file path + hash (for staleness).
+
+Key operations:
+- `store_with_options(ns, key, content, opts)` — embed + insert
+- `search_context_filtered(namespaces, query, limit, privacy)` → ranked results
+- `check_staleness(paths)` — compares stored source hash vs current file hash
+- `mark_stale(ids)` — sets importance=0.0 (invisible to search)
+
+Embedder: `nomic-embed-text-v1.5` via ONNX Runtime, runs locally with no API call.
+
+### RepoMap (`repo_map/mod.rs`)
+
+`RepoMap::build(workspace_root)` → walks git-tracked files, extracts symbols (tree-sitter), builds reference graph.
+
+`rank_for_agent(owned_paths, token_budget)` → `ContextPlan { repo_outline, full_content, signatures, token_estimate }`.  
+`repo_outline` (ranked file summaries) is prepended to agent prompts to provide codebase context within token budget.
+
+### SharedBoard (`swarm/board.rs`)
+
+Agents post tagged findings during execution. Detected by parsing `[discovery: <tag>] <content>` patterns in agent text output. Downstream agents (later dependency tiers) receive filtered board content in their prompt.
+
+### AcpSession (`acp/session.rs`)
+
+Spawns `claude` CLI as a subprocess. Writes a JSON request on stdin; reads NDJSON `StreamEvent` lines on stdout. Translates to `UnifiedStreamEvent` for the backend abstraction layer.
 
 ---
 
-## Swarm subsystem (`swarm/`)
-
-### Submodule map
-
-| Submodule | Purpose |
-|---|---|
-| `pipeline` | Top-level `execute()` and `plan_coordinated()` entry points |
-| `coordinator` | Opus call → `plan_as_dsl()` emits `.gaviero` DSL text (primary); `plan()` JSON TaskDAG path (deprecated) |
-| `plan` | `CompiledPlan`: immutable petgraph `DiGraph<PlanNode, DependencyEdge>`; `work_units_ordered()` topological sort |
-| `models` | `WorkUnit`, `AgentManifest`, `SwarmResult`, `AgentStatus`, `MergeResult` |
-| `router` | `TierRouter`: `(tier, privacy, ollama_available)` → `(backend, model)` |
-| `backend/` | `AgentBackend` trait + `ClaudeCode`, `Ollama`, `Mock` implementations; `runner.rs` |
-| `verify/` | `VerificationStrategy` enum + `StructuralOnly`, `DiffReview`, `TestSuite`, `Combined` |
-| `merge` | Git merge per-agent branch; Claude-assisted conflict resolution |
-| `validation` | Scope overlap checks (`validate_scopes`), dependency cycle detection (`dependency_tiers`) |
-| `board` | `SharedBoard`: inter-agent discovery sharing via `[discovery: <tag>]` annotations |
-| `execution_state` | `ExecutionState`: per-node `NodeStatus` tracking; checkpoint/resume support |
-| `replanner` | `Replanner`: evaluates mid-run failures; decides continue / retry / revise / abort |
-| `calibration` | Token / cost estimation; per-tier accuracy stats stored to memory |
-| `privacy` | `PrivacyScanner`: glob-based path overrides for routing; safety net over coordinator decisions |
-| `bus` | `AgentBus`: inter-agent message passing (future use) |
-| `context` | Enrich agent prompt with workspace file list + memory context |
-
-### Coordinator (`coordinator.rs`)
-
-**Primary path: `plan_as_dsl()`**
+## Dependency graph (modules)
 
 ```
-plan_as_dsl(prompt, config, memory, observer)
-  → Opus call with workspace file list + privacy-filtered memory context
-  → streams text → observer.on_stream_chunk()
-  → returns .gaviero DSL text (String)
-  → caller writes to tmp/, user reviews, user calls /run → compile()
-```
+pipeline.rs
+  → models.rs, plan.rs, coordinator.rs
+  → iteration/mod.rs → backend/runner.rs ← write_gate, validation_gate, repo_map, memory, board
+  → merge.rs → acp/session.rs, git.rs
+  → execution_state.rs, git.rs (WorktreeManager), memory/store.rs
 
-The coordinator generates a `.gaviero` file. The user reviews scopes and dependencies before any agent executes. This makes phantom file references visible and fixable before dispatch.
-
-**Deprecated path: `plan()` JSON TaskDAG** — still compiles but is not exercised by current CLI/TUI code.
-
-### Execution flow (`pipeline.rs`)
-
-```
-plan_coordinated(prompt, config, memory) → .gaviero DSL text  ← preferred entry
-  → Coordinator::plan_as_dsl()
-  → write to tmp/gaviero_plan_<ts>.gaviero
-  → return path; user reviews; user calls /run
-
-execute(work_units, config, memory, observer)
-  1. validate_scopes(units)            ← error on owned-path overlaps
-  2. dependency_tiers(units)           ← topological sort → Vec<Vec<String>>
-  3. for each tier (sequential):
-       for each unit in tier (parallel, semaphore-limited):
-         a. provision git worktree      ← optional; falls back to shared workspace
-         b. invalidate_stale_sources()  ← hash check staleness_sources
-         c. enrich_context()            ← repo_map + memory search
-         d. TierRouter::resolve(unit)   ← pick backend + model
-         e. runner::run(unit, backend)  ← spawn AcpSession → collect proposals
-              ├─ ScopeEnforcer checks each write
-              ├─ ValidationGate runs after each write turn
-              ├─ corrective_prompt() injected on failure → retry
-              └─ SharedBoard::post_discoveries() after each turn
-         f. commit agent branch
-         g. ExecutionState::record_result()  ← checkpoint to disk
-       merge all tier branches → collect MergeResult
-  4. return SwarmResult { manifests, merge_results, success, pre_swarm_sha }
-```
-
-**Resume support**: `ExecutionState` is serialized to `.gaviero/state/{plan_hash}.json` after each node completes. With `--resume`, `execute()` loads this file and skips nodes whose status is already `Completed`.
-
-### Shared board (`swarm/board.rs`)
-
-Inter-agent discovery sharing within a swarm run.
-
-- **`SharedBoard`**: in-memory `RwLock`-protected list of `SharedEntry { from_agent, content, tags }`
-- **Discovery syntax** parsed from agent output: `[discovery: <tag>] <content>`
-  - `<tag>` is a path-like label (e.g. `src/auth.rs`, `performance`) used for relevance filtering
-- **`format_for_prompt(tags)`**: filters entries by tag/path overlap with the requesting agent's scope; formats as a section for prompt injection
-- Enables downstream agents to benefit from upstream findings without explicit file dependencies
-
-### Execution state (`swarm/execution_state.rs`)
-
-```
-NodeStatus: Pending | Blocked | Ready | Running | Completed | SoftFailure | HardFailure | Skipped
-
-ExecutionState
-├─ plan_hash: String               ← deterministic hash of CompiledPlan
-├─ nodes: HashMap<id, NodeState>
-│   └─ status, attempt_count, manifest, validation_issues, cost_usd, started_at, finished_at
-└─ checkpoint path: .gaviero/state/{plan_hash}.json
-
-Methods:
-  set_status(id, status)
-  record_result(id, manifest)
-  all_terminal() → bool
-  load(path) → Result<ExecutionState>   ← for --resume
-```
-
-### Privacy scanner (`swarm/privacy.rs`)
-
-`PrivacyScanner` evaluates `PrivacyLevel` from glob patterns configured in workspace settings.
-
-- `classify(work_unit)` → `PrivacyLevel`: matches unit's owned/read-only paths against sensitive-file glob patterns
-- `apply_overrides(units)`: mutates units in-place, upgrading to `LocalOnly` when any path matches
-- Acts as a safety net: coordinator routing decisions are never purely trusted; pattern-based overrides take precedence
-
-### TierRouter decision table (`swarm/router.rs`)
-
-| Tier | Privacy | Ollama | Result |
-|---|---|---|---|
-| any | LocalOnly | available | Ollama (mechanical config) |
-| any | LocalOnly | unavailable | Blocked |
-| Coordinator | Public | — | Claude `opus` |
-| Reasoning | Public | — | Claude `reasoning_model` (config) |
-| Execution | Public | — | Claude `execution_model` (config) |
-| Mechanical | Public | available | Ollama |
-| Mechanical | Public | unavailable | Blocked |
-| any | — | model override set | Override model (privacy-checked) |
-
----
-
-## Integration: what core exports
-
-`lib.rs` re-exports the following as the public API surface for `gaviero-tui` and `gaviero-cli`:
-
-```rust
-pub mod workspace       → Workspace { load(), single_folder(), resolve_setting() }
-pub mod types           → WorkUnit, WriteProposal, FileScope, ModelTier, PrivacyLevel, …
-pub mod observer        → WriteGateObserver, AcpObserver, SwarmObserver
-pub mod write_gate      → WriteGatePipeline, WriteMode
-pub mod scope_enforcer  → ScopeEnforcer, ScopeViolation
-pub mod session_state   → SessionState
-pub mod diff_engine     → compute_hunks()
-pub mod tree_sitter     → language_for_extension(), enrich_hunks()
-pub mod git             → GitRepo, WorktreeManager, current_head_sha()
-pub mod memory          → MemoryStore, init() [async init helper]
-pub mod terminal        → TerminalManager, TerminalInstance, TerminalEvent
-pub mod acp             → AcpPipeline, AcpSession, AgentOptions
-pub mod swarm::pipeline → execute(), plan_coordinated()
-pub mod swarm::models   → WorkUnit, AgentManifest, SwarmResult, SwarmConfig
-pub mod swarm::plan     → CompiledPlan, PlanNode, DependencyEdge
-pub mod swarm::coordinator → CoordinatorConfig
-pub mod swarm::router   → TierConfig
-```
-
-### Typical consumer setup sequence
-
-```rust
-// 1. Workspace + settings
-let ws = Workspace::single_folder(".")?;
-let model = ws.resolve_setting("agent.model", Some(root))?;
-
-// 2. Memory (optional; degrades gracefully if ONNX unavailable)
-let memory = memory::init(None).await.ok().map(Arc::new);
-
-// 3. Observer (implement traits, forward to UI channel)
-struct MyObserver { tx: mpsc::UnboundedSender<MyEvent> }
-impl SwarmObserver for MyObserver { … }
-
-// 4. Execute
-let result = swarm::pipeline::execute(
-    work_units,
-    &SwarmConfig { workspace_root, model, use_worktrees: true, … },
-    memory,
-    &observer,
-    |unit_id| Box::new(my_acp_observer(unit_id)),
-).await?;
+write_gate → types.rs, diff_engine.rs, tree_sitter.rs, observer.rs
+validation_gate → tree_sitter.rs, types.rs
+repo_map → tree_sitter.rs, query_loader.rs
+memory → onnx_embedder.rs (ONNX), store.rs (SQLite)
+scope_enforcer → types.rs
+acp/session.rs → (external: `claude` CLI binary)
+git.rs → (external: git2 crate + `git` CLI)
+types.rs, observer.rs → no internal deps
 ```
 
 ---
 
-## Key dependencies
+## Design invariants
 
-| Crate | Purpose |
-|---|---|
-| `tokio` | Async runtime; `spawn`, `Semaphore`, `Mutex` |
-| `git2` | Git repo operations (status, branch, commit) |
-| `similar` | Text diff (grouped hunks with context lines) |
-| `tree-sitter` + 16 grammars | Syntax parsing for hunk enrichment, validation, auto-indent, repo_map |
-| `petgraph` | Dependency graph (`CompiledPlan` DiGraph) and cycle detection |
-| `rusqlite` + `sqlite-vec` | Memory store and vector search |
-| `ort` (ONNX Runtime) | Embedding inference (nomic-embed-text-v1.5) |
-| `tokenizers` | Tokenisation for ONNX model |
-| `portable-pty` | PTY spawning for terminal emulation |
-| `vt100` | VT100 screen emulation |
-| `serde` / `serde_json` | Serialisation for NDJSON, config, session state |
-| `reqwest` | HTTP client (Ollama backend) |
-| `anyhow` | Error propagation |
-| `tracing` | Structured logging |
-
----
-
-## Design decisions
-
-1. **Core as pure library.** All domain logic lives in `gaviero-core`; binaries hold no logic. Enables testing core behaviour without a UI.
-
-2. **Observer-driven decoupling.** Three observer traits with default no-op implementations allow frontends to subscribe only to the events they care about, without polling or shared mutable state.
-
-3. **Fail-closed write gate.** Agents with no registered scope are denied all writes (`None → false`). Prevents unintended file mutations from agents that bypass scope registration.
-
-4. **Fail-closed scope enforcer.** Hard block-list denies writes to credential paths regardless of scope declarations. Agents can never be tricked into overwriting `.env`, SSH keys, or AWS credentials.
-
-5. **Deferred write mode.** During streaming, proposals accumulate in `Deferred` mode. The full batch is released for review only after the agent turn completes, preventing mid-stream UI jank.
-
-6. **DSL-first coordination.** `plan_coordinated()` produces a `.gaviero` text file rather than executing agents immediately. The user reviews the plan before dispatch, making phantom file references visible and fixable.
-
-7. **Worktree isolation.** Each agent runs in a dedicated git worktree when `use_worktrees = true`. Isolation prevents cross-agent file conflicts during parallel execution.
-
-8. **Privacy-layered memory.** `LocalOnly` entries are never included in context sent to cloud models. Enforced at retrieval time, not at storage time.
-
-9. **Staleness-driven cache invalidation.** Source file hashes are stored alongside memory entries. Hash changes trigger re-execution rather than serving stale context.
-
-10. **Inline validation with corrective prompts.** Validation gates run after each agent write turn. Failures produce structured corrective prompts injected into the agent's next turn, enabling self-correction without external intervention.
-
-11. **SharedBoard for zero-dependency discovery sharing.** Agents post tagged discoveries during their run. Downstream agents in the same tier or later tiers receive filtered findings in their prompts — without requiring explicit file dependencies in the DAG.
-
-12. **ExecutionState checkpointing.** Per-node state is written to disk after each completion. `--resume` loads the checkpoint and skips completed nodes, enabling partial recovery from mid-run failures.
-
-13. **16+ language support.** Tree-sitter grammars cover Rust, Python, TypeScript, JavaScript, Java, C, C++, Go, Ruby, Kotlin, Swift, Scala, Haskell, Lua, TOML, and more. Language is detected from file extension.
+1. **Provider-agnostic backend.** `AgentBackend` + `UnifiedStreamEvent` decouple orchestration from Claude/Ollama specifics.
+2. **Observer-only coupling to UI.** Core never imports TUI/CLI types. Events flow out via trait objects.
+3. **Single-agent fast path.** If `work_units.len() == 1`, `execute()` bypasses worktrees, bus, and merge, going directly to `IterationEngine`.
+4. **Fail-safe memory.** Memory init failure is non-fatal; all call sites accept `Option<&MemoryStore>`.
+5. **Scope + privacy layering.** `ScopeEnforcer` enforces file-path rules; `PrivacyScanner` enforces model-selection rules.
+6. **Checkpoint/resume.** `ExecutionState` serialises to `.gaviero/state/<plan-hash>.json` after every node.
+7. **Async throughout.** Tokio runtime; no blocking calls on async threads; `GitCoordinator` serialises `git` CLI ops to avoid `.git/index.lock` races.

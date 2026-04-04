@@ -103,6 +103,22 @@ struct Cli {
     #[arg(long)]
     resume: bool,
 
+    /// Maximum inner-loop retries per attempt (iteration mode).
+    #[arg(long, default_value = "5")]
+    max_retries: u32,
+
+    /// Number of independent attempts for BestOfN strategy.
+    #[arg(long, default_value = "1")]
+    attempts: u32,
+
+    /// Generate failing tests before the edit loop (TDD red phase).
+    #[arg(long)]
+    test_first: bool,
+
+    /// Disable iteration — single pass only (overrides --max-retries).
+    #[arg(long)]
+    no_iterate: bool,
+
     /// Write structured JSON trace logs to this file (enables DEBUG-level tracing).
     #[arg(long)]
     trace: Option<PathBuf>,
@@ -236,7 +252,7 @@ async fn main() -> Result<()> {
         };
 
     // Parse work units
-    let plan = if let Some(ref script_path) = cli.script {
+    let mut plan = if let Some(ref script_path) = cli.script {
         let source = std::fs::read_to_string(script_path)
             .with_context(|| format!("reading script: {}", script_path.display()))?;
         let filename = script_path.display().to_string();
@@ -277,6 +293,18 @@ async fn main() -> Result<()> {
     } else {
         anyhow::bail!("Either --task, --work-units, or --script is required");
     };
+
+    // Apply iteration CLI flags (override DSL / defaults).
+    {
+        use gaviero_core::iteration::Strategy;
+        if cli.no_iterate {
+            plan.iteration_config.strategy = Strategy::SinglePass;
+        } else if cli.attempts > 1 {
+            plan.iteration_config.strategy = Strategy::BestOfN { n: cli.attempts };
+        }
+        plan.iteration_config.max_retries = cli.max_retries;
+        plan.iteration_config.test_first = cli.test_first;
+    }
 
     // Execute via swarm pipeline
     // plan.max_parallel overrides the CLI flag when declared.

@@ -37,6 +37,19 @@ enum WorkflowField {
     Steps(Vec<(String, Span)>, Span),
     MaxParallel(usize, Span),
     Memory(MemoryBlock),
+    Strategy(StrategyLit, Span),
+    TestFirst(bool, Span),
+    MaxRetries(u32, Span),
+    Attempts(u32, Span),
+    EscalateAfter(u32, Span),
+    Verify(VerifyBlock),
+}
+
+#[derive(Debug)]
+enum VerifyField {
+    Compile(bool),
+    Clippy(bool),
+    Test(bool),
 }
 
 #[derive(Debug)]
@@ -55,7 +68,24 @@ where
 {
     // ── Primitives ───────────────────────────────────────────────
 
-    let ident = select! { Token::Ident(s) => s };
+    // Some keywords are also common agent/workflow names (e.g. "verify", "compile",
+    // "test"). We allow them as identifiers in name positions (after `agent`,
+    // `workflow`, `client`, inside `steps []`, `depends_on []`) so that existing
+    // example files continue to work.
+    let ident = select! {
+        Token::Ident(s) => s,
+        // contextual keywords allowed as names
+        Token::KwVerify     => "verify".to_owned(),
+        Token::KwCompile    => "compile".to_owned(),
+        Token::KwClippy     => "clippy".to_owned(),
+        Token::KwTest       => "test".to_owned(),
+        Token::KwStrategy   => "strategy".to_owned(),
+        Token::KwTestFirst  => "test_first".to_owned(),
+        Token::KwAttempts   => "attempts".to_owned(),
+        Token::KwEscalateAfter => "escalate_after".to_owned(),
+        Token::StratSinglePass => "single_pass".to_owned(),
+        Token::StratRefine  => "refine".to_owned(),
+    };
 
     let string = select! {
         Token::Str(s)    => s,
@@ -67,6 +97,8 @@ where
         Token::TierReasoning   => TierLit::Reasoning,
         Token::TierExecution   => TierLit::Execution,
         Token::TierMechanical  => TierLit::Mechanical,
+        Token::TierCheap       => TierLit::Cheap,
+        Token::TierExpensive   => TierLit::Expensive,
     };
 
     let privacy_lit = select! {
@@ -204,6 +236,67 @@ where
             MemoryBlock { read_ns, write_ns, importance, staleness_sources, span: e.span() }
         });
 
+    // ── bool literal (true/false as Ident) ───────────────────────
+
+    let bool_lit = select! {
+        Token::Ident(s) if s == "true"  => true,
+        Token::Ident(s) if s == "false" => false,
+    };
+
+    // ── strategy literal ──────────────────────────────────────────
+
+    let strategy_lit = choice((
+        just(Token::StratSinglePass).map(|_| StrategyLit::SinglePass),
+        just(Token::StratRefine).map(|_| StrategyLit::Refine),
+        // best_of_N: lex as Ident("best_of_N"), parse the trailing number.
+        // The guard ensures we only match tokens of the form "best_of_<digits>".
+        select! {
+            Token::Ident(s) if s.starts_with("best_of_") && s["best_of_".len()..].parse::<u32>().is_ok() => {
+                s["best_of_".len()..].parse::<u32>().unwrap()
+            }
+        }.map(StrategyLit::BestOfN),
+    ));
+
+    // ── verify block ──────────────────────────────────────────────
+
+    let verify_field = {
+        let b1 = bool_lit.clone();
+        let b2 = bool_lit.clone();
+        let b3 = bool_lit.clone();
+        choice((
+            just(Token::KwCompile)
+                .ignore_then(b1)
+                .map(VerifyField::Compile),
+            just(Token::KwClippy)
+                .ignore_then(b2)
+                .map(VerifyField::Clippy),
+            just(Token::KwTest)
+                .ignore_then(b3)
+                .map(VerifyField::Test),
+        ))
+    };
+
+    let verify_block = just(Token::KwVerify)
+        .ignore_then(
+            verify_field
+                .repeated()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::LBrace), just(Token::RBrace)),
+        )
+        .map_with(|fields, e| {
+            let mut compile = false;
+            let mut clippy = false;
+            let mut test = false;
+            for f in fields {
+                match f {
+                    VerifyField::Compile(v) => compile = v,
+                    VerifyField::Clippy(v) => clippy = v,
+                    VerifyField::Test(v) => test = v,
+                }
+            }
+            VerifyBlock { compile, clippy, test, span: e.span() }
+        });
+
     // ── agent declaration ─────────────────────────────────────────
 
     let agent_field = choice((
@@ -280,6 +373,22 @@ where
             .ignore_then(integer.map_with(|n, e| (n, e.span())))
             .map(|(n, s)| WorkflowField::MaxParallel(n as usize, s)),
         memory_block.map(WorkflowField::Memory),
+        just(Token::KwStrategy)
+            .ignore_then(strategy_lit.map_with(|v, e| (v, e.span())))
+            .map(|(v, s)| WorkflowField::Strategy(v, s)),
+        just(Token::KwTestFirst)
+            .ignore_then(bool_lit.map_with(|v, e| (v, e.span())))
+            .map(|(v, s)| WorkflowField::TestFirst(v, s)),
+        just(Token::KwMaxRetries)
+            .ignore_then(integer.map_with(|n, e| (n, e.span())))
+            .map(|(n, s)| WorkflowField::MaxRetries(n as u32, s)),
+        just(Token::KwAttempts)
+            .ignore_then(integer.map_with(|n, e| (n, e.span())))
+            .map(|(n, s)| WorkflowField::Attempts(n as u32, s)),
+        just(Token::KwEscalateAfter)
+            .ignore_then(integer.map_with(|n, e| (n, e.span())))
+            .map(|(n, s)| WorkflowField::EscalateAfter(n as u32, s)),
+        verify_block.map(WorkflowField::Verify),
     ));
 
     let workflow_decl = just(Token::KwWorkflow)
@@ -294,6 +403,12 @@ where
             let mut steps = None;
             let mut max_parallel = None;
             let mut memory = None;
+            let mut strategy = None;
+            let mut test_first = None;
+            let mut max_retries = None;
+            let mut attempts = None;
+            let mut escalate_after = None;
+            let mut verify = None;
             for f in fields {
                 match f {
                     WorkflowField::Steps(v, s) => {
@@ -305,9 +420,40 @@ where
                     WorkflowField::Memory(b) => {
                         memory.get_or_insert(b);
                     }
+                    WorkflowField::Strategy(v, s) => {
+                        strategy.get_or_insert((v, s));
+                    }
+                    WorkflowField::TestFirst(v, s) => {
+                        test_first.get_or_insert((v, s));
+                    }
+                    WorkflowField::MaxRetries(n, s) => {
+                        max_retries.get_or_insert((n, s));
+                    }
+                    WorkflowField::Attempts(n, s) => {
+                        attempts.get_or_insert((n, s));
+                    }
+                    WorkflowField::EscalateAfter(n, s) => {
+                        escalate_after.get_or_insert((n, s));
+                    }
+                    WorkflowField::Verify(b) => {
+                        verify.get_or_insert(b);
+                    }
                 }
             }
-            WorkflowDecl { name, name_span, steps, max_parallel, memory, span: e.span() }
+            WorkflowDecl {
+                name,
+                name_span,
+                steps,
+                max_parallel,
+                memory,
+                strategy,
+                test_first,
+                max_retries,
+                attempts,
+                escalate_after,
+                verify,
+                span: e.span(),
+            }
         });
 
     // ── top-level ─────────────────────────────────────────────────

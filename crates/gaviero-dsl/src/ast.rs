@@ -104,6 +104,26 @@ pub struct MemoryBlock {
     pub span: Span,
 }
 
+// ── iteration literals ────────────────────────────────────────────────────
+
+/// Parsed strategy literal in a `workflow` block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StrategyLit {
+    SinglePass,
+    Refine,
+    /// `best_of_N` where N is parsed from an identifier like `best_of_3`.
+    BestOfN(u32),
+}
+
+/// The `verify { ... }` block inside a `workflow` declaration.
+#[derive(Debug, Clone)]
+pub struct VerifyBlock {
+    pub compile: bool,
+    pub clippy: bool,
+    pub test: bool,
+    pub span: Span,
+}
+
 // ── workflow ──────────────────────────────────────────────────────────────
 
 /// Declares an optional execution plan (ordered steps, concurrency cap).
@@ -112,6 +132,12 @@ pub struct MemoryBlock {
 /// workflow feature_dev {
 ///     steps [researcher, implementer]
 ///     max_parallel 2
+///     strategy refine
+///     test_first true
+///     max_retries 5
+///     attempts 1
+///     escalate_after 3
+///     verify { compile true clippy true test false }
 /// }
 /// ```
 #[derive(Debug, Clone)]
@@ -121,6 +147,12 @@ pub struct WorkflowDecl {
     pub steps: Option<(Vec<(String, Span)>, Span)>,
     pub max_parallel: Option<(usize, Span)>,
     pub memory: Option<MemoryBlock>,
+    pub strategy: Option<(StrategyLit, Span)>,
+    pub test_first: Option<(bool, Span)>,
+    pub max_retries: Option<(u32, Span)>,
+    pub attempts: Option<(u32, Span)>,
+    pub escalate_after: Option<(u32, Span)>,
+    pub verify: Option<VerifyBlock>,
     pub span: Span,
 }
 
@@ -128,6 +160,10 @@ pub struct WorkflowDecl {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TierLit {
+    // New canonical values
+    Cheap,
+    Expensive,
+    // Deprecated aliases (kept for backward compat — map to Cheap/Expensive in compiler)
     Coordinator,
     Reasoning,
     Execution,

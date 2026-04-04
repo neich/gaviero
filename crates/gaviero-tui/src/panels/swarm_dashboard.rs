@@ -500,10 +500,8 @@ impl SwarmDashboardState {
             let mut col = area.x + 3;
             if let Some(tier) = &agent.model_tier {
                 let (badge, badge_color) = match tier {
-                    ModelTier::Coordinator => ("C", theme::TIER_COORDINATOR),
-                    ModelTier::Reasoning => ("R", theme::TIER_REASONING),
-                    ModelTier::Execution => ("E", theme::TIER_EXECUTION),
-                    ModelTier::Mechanical => ("M", theme::TIER_MECHANICAL),
+                    ModelTier::Cheap => ("C", theme::TIER_CHEAP),
+                    ModelTier::Expensive => ("E", theme::TIER_EXPENSIVE),
                 };
                 render_text(buf, col, y, col + 2, badge, Style::default().fg(badge_color).bg(row_bg).add_modifier(Modifier::BOLD));
                 col += 2;

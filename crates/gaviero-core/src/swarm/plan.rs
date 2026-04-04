@@ -17,6 +17,17 @@ use petgraph::Direction;
 use serde::{Deserialize, Serialize};
 
 use super::models::WorkUnit;
+use crate::iteration::IterationConfig;
+
+// ── VerificationConfig ───────────────────────────────────────
+
+/// Controls which post-edit verification checks are run.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct VerificationConfig {
+    pub compile: bool,
+    pub clippy: bool,
+    pub test: bool,
+}
 
 // ── Graph types ──────────────────────────────────────────────
 
@@ -61,6 +72,10 @@ pub struct CompiledPlan {
     pub max_parallel: Option<usize>,
     /// The source `.gaviero` file (for checkpoint naming and `--resume`).
     pub source_file: Option<PathBuf>,
+    /// Iteration strategy configuration declared in the workflow block.
+    pub iteration_config: IterationConfig,
+    /// Post-edit verification checks declared in the workflow block.
+    pub verification_config: VerificationConfig,
 }
 
 impl CompiledPlan {
@@ -154,6 +169,8 @@ impl CompiledPlan {
             graph,
             max_parallel,
             source_file: None,
+            iteration_config: IterationConfig::default(),
+            verification_config: VerificationConfig::default(),
         }
     }
 

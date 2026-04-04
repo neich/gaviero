@@ -45,7 +45,7 @@ pub enum VerificationStrategy {
 impl Default for VerificationStrategy {
     fn default() -> Self {
         Self::Combined {
-            review_tiers: vec![ModelTier::Mechanical, ModelTier::Execution],
+            review_tiers: vec![ModelTier::Cheap],
             test_command: None,
         }
     }
@@ -236,14 +236,14 @@ mod tests {
     #[test]
     fn test_verification_strategy_serde() {
         let strategy = VerificationStrategy::Combined {
-            review_tiers: vec![ModelTier::Mechanical],
+            review_tiers: vec![ModelTier::Cheap],
             test_command: Some("cargo test".into()),
         };
         let json = serde_json::to_string(&strategy).unwrap();
         let back: VerificationStrategy = serde_json::from_str(&json).unwrap();
         match back {
             VerificationStrategy::Combined { review_tiers, test_command } => {
-                assert_eq!(review_tiers, vec![ModelTier::Mechanical]);
+                assert_eq!(review_tiers, vec![ModelTier::Cheap]);
                 assert_eq!(test_command.as_deref(), Some("cargo test"));
             }
             _ => panic!("wrong variant"),

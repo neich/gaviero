@@ -174,7 +174,39 @@ pub fn compile_ast(
         }));
     }
 
-    Ok(CompiledPlan::from_work_units(work_units, workflow_max_parallel))
+    // ── Phase 6: build iteration / verification configs ───────────
+
+    // Warn when all agents are independent (no depends_on); single-agent with
+    // strategy refine may be a better choice.
+    let independent_count = work_units.iter().filter(|u| u.depends_on.is_empty()).count();
+    if work_units.len() > 1 && independent_count == work_units.len() {
+        eprintln!(
+            "⚠ This workflow has {} independent agents. Consider using a single agent with `strategy refine`.",
+            work_units.len()
+        );
+    }
+
+    // Resolve which workflow was selected (if any).
+    let selected_workflow: Option<&WorkflowDecl> = if let Some(wf_name) = workflow {
+        workflow_map.get(wf_name).copied()
+    } else if workflow_map.len() == 1 {
+        workflow_map.values().next().copied()
+    } else {
+        None
+    };
+
+    let iteration_config = selected_workflow
+        .map(build_iteration_config)
+        .unwrap_or_default();
+
+    let verification_config = selected_workflow
+        .map(build_verification_config)
+        .unwrap_or_default();
+
+    let mut plan = CompiledPlan::from_work_units(work_units, workflow_max_parallel);
+    plan.iteration_config = iteration_config;
+    plan.verification_config = verification_config;
+    Ok(plan)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -385,10 +417,11 @@ fn compile_agent(
 
 fn map_tier(t: TierLit) -> ModelTier {
     match t {
-        TierLit::Coordinator => ModelTier::Coordinator,
-        TierLit::Reasoning => ModelTier::Reasoning,
-        TierLit::Execution => ModelTier::Execution,
-        TierLit::Mechanical => ModelTier::Mechanical,
+        TierLit::Cheap => ModelTier::Cheap,
+        TierLit::Expensive => ModelTier::Expensive,
+        // Deprecated aliases
+        TierLit::Coordinator | TierLit::Reasoning => ModelTier::Expensive,
+        TierLit::Execution | TierLit::Mechanical => ModelTier::Cheap,
     }
 }
 
@@ -397,6 +430,42 @@ fn map_privacy(p: PrivacyLit) -> PrivacyLevel {
         PrivacyLit::Public => PrivacyLevel::Public,
         PrivacyLit::LocalOnly => PrivacyLevel::LocalOnly,
     }
+}
+
+fn build_iteration_config(wf: &WorkflowDecl) -> gaviero_core::iteration::IterationConfig {
+    use gaviero_core::iteration::{IterationConfig, Strategy};
+    let strategy = wf
+        .strategy
+        .as_ref()
+        .map(|(s, _)| match s {
+            StrategyLit::SinglePass => Strategy::SinglePass,
+            StrategyLit::Refine => Strategy::Refine,
+            StrategyLit::BestOfN(n) => Strategy::BestOfN { n: *n },
+        })
+        .unwrap_or_default();
+    let max_retries = wf.max_retries.as_ref().map(|(n, _)| *n).unwrap_or(5);
+    let max_attempts = wf.attempts.as_ref().map(|(n, _)| *n).unwrap_or(1);
+    let test_first = wf.test_first.as_ref().map(|(b, _)| *b).unwrap_or(false);
+    let escalate_after = wf.escalate_after.as_ref().map(|(n, _)| *n).unwrap_or(3);
+    IterationConfig {
+        strategy,
+        max_retries,
+        max_attempts,
+        test_first,
+        escalate_after,
+        ..IterationConfig::default()
+    }
+}
+
+fn build_verification_config(wf: &WorkflowDecl) -> gaviero_core::swarm::plan::VerificationConfig {
+    wf.verify
+        .as_ref()
+        .map(|v| gaviero_core::swarm::plan::VerificationConfig {
+            compile: v.compile,
+            clippy: v.clippy,
+            test: v.test,
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -442,7 +511,7 @@ mod tests {
         assert_eq!(units.len(), 2);
 
         assert_eq!(units[0].id, "researcher");
-        assert_eq!(units[0].tier, ModelTier::Coordinator);
+        assert_eq!(units[0].tier, ModelTier::Expensive);
         assert_eq!(units[0].model, Some("claude-opus-4-6".to_string()));
         assert!(units[0].coordinator_instructions.contains("architecture document"));
         assert_eq!(units[0].max_retries, 2);
@@ -450,7 +519,7 @@ mod tests {
         assert_eq!(units[0].scope.read_only_paths, vec!["src/**"]);
 
         assert_eq!(units[1].id, "implementer");
-        assert_eq!(units[1].tier, ModelTier::Execution);
+        assert_eq!(units[1].tier, ModelTier::Cheap);
         assert_eq!(units[1].depends_on, vec!["researcher"]);
         assert!(units[1].coordinator_instructions.contains("architecture document"));
     }
@@ -476,7 +545,7 @@ mod tests {
     fn agent_no_client_uses_defaults() {
         let src = r#"agent simple { description "task" }"#;
         let units = compile_str(src).expect("should compile");
-        assert_eq!(units[0].tier, ModelTier::default());
+        assert_eq!(units[0].tier, ModelTier::Cheap); // Cheap is now the default
         assert_eq!(units[0].model, None);
     }
 
