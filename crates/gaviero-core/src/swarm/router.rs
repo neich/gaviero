@@ -6,35 +6,35 @@ use super::models::WorkUnit;
 /// Configuration for tier-based model routing.
 #[derive(Debug, Clone)]
 pub struct TierConfig {
-    pub reasoning_model: String,
-    pub reasoning_max_parallel: usize,
-    pub execution_model: String,
-    pub execution_max_parallel: usize,
-    pub mechanical: MechanicalConfig,
+    pub cheap_model: String,
+    pub cheap_max_parallel: usize,
+    pub expensive_model: String,
+    pub expensive_max_parallel: usize,
+    pub local: LocalConfig,
 }
 
 impl Default for TierConfig {
     fn default() -> Self {
         Self {
-            reasoning_model: "sonnet".into(),
-            reasoning_max_parallel: 3,
-            execution_model: "haiku".into(),
-            execution_max_parallel: 6,
-            mechanical: MechanicalConfig::default(),
+            cheap_model: "haiku".into(),
+            cheap_max_parallel: 6,
+            expensive_model: "sonnet".into(),
+            expensive_max_parallel: 3,
+            local: LocalConfig::default(),
         }
     }
 }
 
-/// Configuration for the optional mechanical (local) tier.
+/// Configuration for the optional local (Ollama) backend.
 #[derive(Debug, Clone)]
-pub struct MechanicalConfig {
+pub struct LocalConfig {
     pub enabled: bool,
     pub model: String,
     pub base_url: String,
     pub max_parallel: usize,
 }
 
-impl Default for MechanicalConfig {
+impl Default for LocalConfig {
     fn default() -> Self {
         Self {
             enabled: false,
@@ -131,10 +131,10 @@ impl TierRouter {
         // Privacy check: LocalOnly units cannot use API models
         if unit.privacy == PrivacyLevel::LocalOnly {
             // Allow only if the override points to the local backend
-            if model == self.config.mechanical.model {
+            if model == self.config.local.model {
                 return ResolvedBackend::Ollama {
                     model: model.to_string(),
-                    base_url: self.config.mechanical.base_url.clone(),
+                    base_url: self.config.local.base_url.clone(),
                 };
             }
             return ResolvedBackend::Blocked {
@@ -174,29 +174,23 @@ fn routing_match(
     match (tier, privacy, ollama_available) {
         // Privacy-sensitive: force local regardless of tier
         (_, PrivacyLevel::LocalOnly, true) => ResolvedBackend::Ollama {
-            model: config.mechanical.model.clone(),
-            base_url: config.mechanical.base_url.clone(),
+            model: config.local.model.clone(),
+            base_url: config.local.base_url.clone(),
         },
         (_, PrivacyLevel::LocalOnly, false) => ResolvedBackend::Blocked {
             reason: "local model required but Ollama unavailable".into(),
         },
-
-        // Normal routing by tier
-        (ModelTier::Coordinator, _, _) => ResolvedBackend::Claude { model: "opus".into() },
-        (ModelTier::Reasoning, _, _) => ResolvedBackend::Claude {
-            model: config.reasoning_model.clone(),
+        // Cheap: use cheap_model (Haiku or local if configured)
+        (ModelTier::Cheap, _, true) if config.local.enabled => ResolvedBackend::Ollama {
+            model: config.local.model.clone(),
+            base_url: config.local.base_url.clone(),
         },
-        (ModelTier::Execution, _, _) => ResolvedBackend::Claude {
-            model: config.execution_model.clone(),
+        (ModelTier::Cheap, _, _) => ResolvedBackend::Claude {
+            model: config.cheap_model.clone(),
         },
-
-        // Mechanical: local if available and enabled, else fall back to execution model
-        (ModelTier::Mechanical, _, true) if config.mechanical.enabled => ResolvedBackend::Ollama {
-            model: config.mechanical.model.clone(),
-            base_url: config.mechanical.base_url.clone(),
-        },
-        (ModelTier::Mechanical, _, _) => ResolvedBackend::Claude {
-            model: config.execution_model.clone(),
+        // Expensive: always API
+        (ModelTier::Expensive, _, _) => ResolvedBackend::Claude {
+            model: config.expensive_model.clone(),
         },
     }
 }
@@ -253,7 +247,7 @@ mod tests {
     #[test]
     fn test_model_override_bypasses_tier() {
         let router = TierRouter::new(TierConfig::default(), false);
-        let unit = test_unit(ModelTier::Mechanical, PrivacyLevel::Public, Some("opus"));
+        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, Some("opus"));
         assert_eq!(
             router.resolve(&unit),
             ResolvedBackend::Claude { model: "opus".into() }
@@ -263,21 +257,21 @@ mod tests {
     #[test]
     fn test_local_only_blocks_without_ollama() {
         let router = TierRouter::new(TierConfig::default(), false);
-        let unit = test_unit(ModelTier::Execution, PrivacyLevel::LocalOnly, None);
+        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::LocalOnly, None);
         assert!(matches!(router.resolve(&unit), ResolvedBackend::Blocked { .. }));
     }
 
     #[test]
     fn test_local_only_routes_to_ollama() {
         let router = TierRouter::new(TierConfig::default(), true);
-        let unit = test_unit(ModelTier::Execution, PrivacyLevel::LocalOnly, None);
+        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::LocalOnly, None);
         assert!(matches!(router.resolve(&unit), ResolvedBackend::Ollama { .. }));
     }
 
     #[test]
-    fn test_reasoning_tier_routes_to_sonnet() {
+    fn test_expensive_tier_routes_to_sonnet() {
         let router = TierRouter::new(TierConfig::default(), false);
-        let unit = test_unit(ModelTier::Reasoning, PrivacyLevel::Public, None);
+        let unit = test_unit(ModelTier::Expensive, PrivacyLevel::Public, None);
         assert_eq!(
             router.resolve(&unit),
             ResolvedBackend::Claude { model: "sonnet".into() }
@@ -285,9 +279,9 @@ mod tests {
     }
 
     #[test]
-    fn test_execution_tier_routes_to_haiku() {
+    fn test_cheap_tier_routes_to_haiku() {
         let router = TierRouter::new(TierConfig::default(), false);
-        let unit = test_unit(ModelTier::Execution, PrivacyLevel::Public, None);
+        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
         assert_eq!(
             router.resolve(&unit),
             ResolvedBackend::Claude { model: "haiku".into() }
@@ -295,9 +289,9 @@ mod tests {
     }
 
     #[test]
-    fn test_mechanical_falls_back_to_haiku_when_disabled() {
+    fn test_cheap_falls_back_to_haiku_when_local_disabled() {
         let router = TierRouter::new(TierConfig::default(), false);
-        let unit = test_unit(ModelTier::Mechanical, PrivacyLevel::Public, None);
+        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
         assert_eq!(
             router.resolve(&unit),
             ResolvedBackend::Claude { model: "haiku".into() }
@@ -305,50 +299,44 @@ mod tests {
     }
 
     #[test]
-    fn test_mechanical_routes_to_ollama_when_enabled() {
+    fn test_cheap_routes_to_ollama_when_enabled() {
         let mut config = TierConfig::default();
-        config.mechanical.enabled = true;
+        config.local.enabled = true;
         let router = TierRouter::new(config, true);
-        let unit = test_unit(ModelTier::Mechanical, PrivacyLevel::Public, None);
+        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
         assert!(matches!(router.resolve(&unit), ResolvedBackend::Ollama { .. }));
     }
 
     #[test]
     fn test_local_only_model_override_blocked() {
         let router = TierRouter::new(TierConfig::default(), true);
-        let unit = test_unit(ModelTier::Execution, PrivacyLevel::LocalOnly, Some("sonnet"));
+        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::LocalOnly, Some("sonnet"));
         assert!(matches!(router.resolve(&unit), ResolvedBackend::Blocked { .. }));
     }
 
     #[test]
     fn test_escalation_chain() {
         let router = TierRouter::new(TierConfig::default(), false);
-        let mut unit = test_unit(ModelTier::Mechanical, PrivacyLevel::Public, None);
+        let mut unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
 
-        // Mechanical → Execution
-        unit.escalation_tier = Some(ModelTier::Execution);
-        let esc = router.escalate(&unit).unwrap();
-        assert_eq!(esc, ResolvedBackend::Claude { model: "haiku".into() });
-
-        // Execution → Reasoning
-        unit.tier = ModelTier::Execution;
-        unit.escalation_tier = Some(ModelTier::Reasoning);
+        // Cheap → Expensive
+        unit.escalation_tier = Some(ModelTier::Expensive);
         let esc = router.escalate(&unit).unwrap();
         assert_eq!(esc, ResolvedBackend::Claude { model: "sonnet".into() });
 
-        // Reasoning → None (no escalation)
-        unit.tier = ModelTier::Reasoning;
+        // Expensive → None (no escalation)
+        unit.tier = ModelTier::Expensive;
         unit.escalation_tier = None;
         assert!(router.escalate(&unit).is_none());
     }
 
     #[test]
-    fn test_coordinator_tier() {
+    fn test_expensive_tier_routes_to_sonnet_via_resolve() {
         let router = TierRouter::new(TierConfig::default(), false);
-        let unit = test_unit(ModelTier::Coordinator, PrivacyLevel::Public, None);
+        let unit = test_unit(ModelTier::Expensive, PrivacyLevel::Public, None);
         assert_eq!(
             router.resolve(&unit),
-            ResolvedBackend::Claude { model: "opus".into() }
+            ResolvedBackend::Claude { model: "sonnet".into() }
         );
     }
 
@@ -357,28 +345,28 @@ mod tests {
     fn test_resolve_backend_returns_trait_objects() {
         let router = TierRouter::new(TierConfig::default(), false);
 
-        // Reasoning tier → claude backend
-        let unit = test_unit(ModelTier::Reasoning, PrivacyLevel::Public, None);
+        // Expensive tier → claude backend
+        let unit = test_unit(ModelTier::Expensive, PrivacyLevel::Public, None);
         let backend = router.resolve_backend(&unit).unwrap();
         assert!(backend.name().contains("claude"));
 
-        // Coordinator → claude:opus
-        let unit = test_unit(ModelTier::Coordinator, PrivacyLevel::Public, None);
+        // Expensive → claude:sonnet
+        let unit = test_unit(ModelTier::Expensive, PrivacyLevel::Public, None);
         let backend = router.resolve_backend(&unit).unwrap();
         assert!(backend.name().contains("claude"));
-        assert!(backend.name().contains("opus"));
+        assert!(backend.name().contains("sonnet"));
 
-        // Mechanical with Ollama enabled → ollama backend
+        // Cheap with Ollama enabled → ollama backend
         let mut config = TierConfig::default();
-        config.mechanical.enabled = true;
+        config.local.enabled = true;
         let router = TierRouter::new(config, true);
-        let unit = test_unit(ModelTier::Mechanical, PrivacyLevel::Public, None);
+        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
         let backend = router.resolve_backend(&unit).unwrap();
         assert!(backend.name().contains("ollama"));
 
         // Blocked → returns Err
         let router = TierRouter::new(TierConfig::default(), false);
-        let unit = test_unit(ModelTier::Execution, PrivacyLevel::LocalOnly, None);
+        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::LocalOnly, None);
         assert!(router.resolve_backend(&unit).is_err());
     }
 }
