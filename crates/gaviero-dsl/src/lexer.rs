@@ -51,6 +51,24 @@ pub enum Token {
     KwImportance,
     #[token("staleness_sources")]
     KwStalenessSources,
+    #[token("strategy")]
+    KwStrategy,
+    #[token("test_first")]
+    KwTestFirst,
+    #[token("attempts")]
+    KwAttempts,
+    #[token("escalate_after")]
+    KwEscalateAfter,
+    #[token("verify")]
+    KwVerify,
+    // Note: compile/clippy/test must come before Ident so keywords win.
+    // test_first must come before test (longer-match wins).
+    #[token("compile")]
+    KwCompile,
+    #[token("clippy")]
+    KwClippy,
+    #[token("test")]
+    KwTest,
 
     // ── Tier value keywords ──────────────────────────────────────
     #[token("coordinator")]
@@ -61,12 +79,22 @@ pub enum Token {
     TierExecution,
     #[token("mechanical")]
     TierMechanical,
+    #[token("cheap")]
+    TierCheap,
+    #[token("expensive")]
+    TierExpensive,
 
     // ── Privacy value keywords ───────────────────────────────────
     #[token("public")]
     PrivPublic,
     #[token("local_only")]
     PrivLocalOnly,
+
+    // ── Strategy value keywords ──────────────────────────────────
+    #[token("single_pass")]
+    StratSinglePass,
+    #[token("refine")]
+    StratRefine,
 
     // ── Punctuation ──────────────────────────────────────────────
     #[token("{")]
@@ -128,10 +156,22 @@ impl fmt::Display for Token {
             Token::KwWriteNs => write!(f, "write_ns"),
             Token::KwImportance => write!(f, "importance"),
             Token::KwStalenessSources => write!(f, "staleness_sources"),
+            Token::KwStrategy => write!(f, "strategy"),
+            Token::KwTestFirst => write!(f, "test_first"),
+            Token::KwAttempts => write!(f, "attempts"),
+            Token::KwEscalateAfter => write!(f, "escalate_after"),
+            Token::KwVerify => write!(f, "verify"),
+            Token::KwCompile => write!(f, "compile"),
+            Token::KwClippy => write!(f, "clippy"),
+            Token::KwTest => write!(f, "test"),
+            Token::StratSinglePass => write!(f, "single_pass"),
+            Token::StratRefine => write!(f, "refine"),
             Token::TierCoordinator => write!(f, "coordinator"),
             Token::TierReasoning => write!(f, "reasoning"),
             Token::TierExecution => write!(f, "execution"),
             Token::TierMechanical => write!(f, "mechanical"),
+            Token::TierCheap => write!(f, "cheap"),
+            Token::TierExpensive => write!(f, "expensive"),
             Token::PrivPublic => write!(f, "public"),
             Token::PrivLocalOnly => write!(f, "local_only"),
             Token::LBrace => write!(f, "{{"),
@@ -200,12 +240,14 @@ mod tests {
 
     #[test]
     fn tier_and_privacy_values() {
-        let (toks, errs) = lex("coordinator reasoning execution mechanical public local_only");
+        let (toks, errs) = lex("coordinator reasoning execution mechanical cheap expensive public local_only");
         assert!(errs.is_empty());
         assert!(matches!(toks[0].0, Token::TierCoordinator));
         assert!(matches!(toks[3].0, Token::TierMechanical));
-        assert!(matches!(toks[4].0, Token::PrivPublic));
-        assert!(matches!(toks[5].0, Token::PrivLocalOnly));
+        assert!(matches!(toks[4].0, Token::TierCheap));
+        assert!(matches!(toks[5].0, Token::TierExpensive));
+        assert!(matches!(toks[6].0, Token::PrivPublic));
+        assert!(matches!(toks[7].0, Token::PrivLocalOnly));
     }
 
     #[test]
@@ -276,5 +318,40 @@ mod tests {
     fn unknown_char_produces_error() {
         let (_, errs) = lex("agent @ bad");
         assert!(!errs.is_empty(), "expected lex error for '@'");
+    }
+
+    #[test]
+    fn iteration_keywords() {
+        let src = "strategy test_first attempts escalate_after verify compile clippy test single_pass refine";
+        let (toks, errs) = lex(src);
+        assert!(errs.is_empty(), "unexpected lex errors: {:?}", errs);
+        assert!(matches!(toks[0].0, Token::KwStrategy));
+        assert!(matches!(toks[1].0, Token::KwTestFirst));
+        assert!(matches!(toks[2].0, Token::KwAttempts));
+        assert!(matches!(toks[3].0, Token::KwEscalateAfter));
+        assert!(matches!(toks[4].0, Token::KwVerify));
+        assert!(matches!(toks[5].0, Token::KwCompile));
+        assert!(matches!(toks[6].0, Token::KwClippy));
+        assert!(matches!(toks[7].0, Token::KwTest));
+        assert!(matches!(toks[8].0, Token::StratSinglePass));
+        assert!(matches!(toks[9].0, Token::StratRefine));
+    }
+
+    #[test]
+    fn test_first_before_test_no_conflict() {
+        // test_first should not lex as KwTest + Ident("first")
+        let (toks, errs) = lex("test_first");
+        assert!(errs.is_empty());
+        assert_eq!(toks.len(), 1);
+        assert!(matches!(toks[0].0, Token::KwTestFirst));
+    }
+
+    #[test]
+    fn best_of_n_lexes_as_ident() {
+        // best_of_3 has no dedicated token — it should lex as Ident
+        let (toks, errs) = lex("best_of_3");
+        assert!(errs.is_empty());
+        assert_eq!(toks.len(), 1);
+        assert!(matches!(&toks[0].0, Token::Ident(s) if s == "best_of_3"));
     }
 }
