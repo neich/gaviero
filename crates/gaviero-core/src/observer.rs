@@ -36,6 +36,14 @@ pub trait AcpObserver: Send + Sync {
     /// Called when a file proposal is deferred (batch review mode).
     /// The TUI uses this to show a compact inline diff summary during streaming.
     fn on_proposal_deferred(&self, path: &Path, old_content: Option<&str>, new_content: &str);
+
+    // ── Inline validation (default no-op) ──────────────────────────
+
+    /// Called after each validation gate runs on a modified file.
+    fn on_validation_result(&self, _gate: &str, _passed: bool, _message: Option<&str>) {}
+
+    /// Called when a validation failure triggers an agent retry.
+    fn on_validation_retry(&self, _attempt: u8, _max_retries: u8) {}
 }
 
 /// Observer trait for swarm orchestration events.
