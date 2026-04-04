@@ -194,10 +194,8 @@ impl Coordinator {
             summary.push_str(&format!("{} tasks:\n", dag.units.len()));
             for unit in &dag.units {
                 let tier_label = match unit.tier {
-                    ModelTier::Coordinator => "C",
-                    ModelTier::Reasoning => "R",
-                    ModelTier::Execution => "E",
-                    ModelTier::Mechanical => "M",
+                    ModelTier::Cheap => "C",
+                    ModelTier::Expensive => "E",
                 };
                 let deps = if unit.depends_on.is_empty() {
                     String::new()
@@ -398,7 +396,7 @@ impl Coordinator {
                 failed_units.push(FailedUnit {
                     id: unit_id,
                     failure_reason: entry.entry.content.clone(),
-                    tier_at_failure: ModelTier::Execution, // Approximate
+                    tier_at_failure: ModelTier::Cheap, // Approximate
                 });
             }
         }
@@ -634,7 +632,7 @@ fn parse_work_unit_lenient(v: &serde_json::Value) -> Result<WorkUnit> {
     let tier = obj.get("tier")
         .and_then(|v| v.as_str())
         .map(parse_model_tier)
-        .unwrap_or(ModelTier::Execution);
+        .unwrap_or(ModelTier::Cheap);
 
     // privacy — string like "public", "local_only"
     let privacy = obj.get("privacy")
@@ -749,7 +747,7 @@ fn parse_verification_strategy(v: &serde_json::Value) -> VerificationStrategy {
             let review_tiers = obj.get("review_tiers")
                 .and_then(|v| v.as_array())
                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(parse_model_tier)).collect())
-                .unwrap_or_else(|| vec![ModelTier::Mechanical, ModelTier::Execution]);
+                .unwrap_or_else(|| vec![ModelTier::Cheap]);
             let test_command = obj.get("test_command")
                 .or_else(|| obj.get("command"))
                 .and_then(|v| v.as_str())
@@ -805,11 +803,9 @@ fn parse_string_array(v: &serde_json::Value) -> Option<Vec<String>> {
 
 fn parse_model_tier(s: &str) -> ModelTier {
     match s.to_lowercase().as_str() {
-        "coordinator" | "coord" | "c" => ModelTier::Coordinator,
-        "reasoning" | "reason" | "r" => ModelTier::Reasoning,
-        "execution" | "exec" | "e" => ModelTier::Execution,
-        "mechanical" | "mech" | "m" => ModelTier::Mechanical,
-        _ => ModelTier::Execution,
+        "expensive" | "coordinator" | "coord" | "c" | "reasoning" | "reason" | "r" => ModelTier::Expensive,
+        "cheap" | "execution" | "exec" | "e" | "mechanical" | "mech" | "m" => ModelTier::Cheap,
+        _ => ModelTier::Cheap,
     }
 }
 
@@ -1081,12 +1077,12 @@ mod tests {
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             backend: Default::default(),
             model: None,
-            tier: ModelTier::Execution,
+            tier: ModelTier::Cheap,
             privacy: PrivacyLevel::Public,
             coordinator_instructions: String::new(),
             estimated_tokens: 4000,
             max_retries: 1,
-            escalation_tier: Some(ModelTier::Reasoning),
+            escalation_tier: Some(ModelTier::Expensive),
             read_namespaces: None,
             write_namespace: None,
             memory_importance: None,
@@ -1189,7 +1185,7 @@ mod tests {
             units: vec![make_unit("a", &[])],
             dependency_graph: vec![],
             verification_strategy: VerificationStrategy::Combined {
-                review_tiers: vec![ModelTier::Mechanical],
+                review_tiers: vec![ModelTier::Cheap],
                 test_command: Some("cargo test".into()),
             },
             continued_from: None,
@@ -1216,7 +1212,7 @@ mod tests {
         assert_eq!(dag.plan_summary, "Refactor auth");
         assert_eq!(dag.units.len(), 2);
         assert_eq!(dag.units[0].id, "auth");
-        assert_eq!(dag.units[0].tier, ModelTier::Reasoning);
+        assert_eq!(dag.units[0].tier, ModelTier::Expensive); // reasoning → Expensive
         assert_eq!(dag.units[1].depends_on, vec!["auth"]);
     }
 
@@ -1307,12 +1303,12 @@ mod tests {
 
     #[test]
     fn test_lenient_tier_parsing() {
-        assert_eq!(parse_model_tier("reasoning"), ModelTier::Reasoning);
-        assert_eq!(parse_model_tier("Reasoning"), ModelTier::Reasoning);
-        assert_eq!(parse_model_tier("EXECUTION"), ModelTier::Execution);
-        assert_eq!(parse_model_tier("mechanical"), ModelTier::Mechanical);
-        assert_eq!(parse_model_tier("mech"), ModelTier::Mechanical);
-        assert_eq!(parse_model_tier("unknown"), ModelTier::Execution); // fallback
+        assert_eq!(parse_model_tier("reasoning"), ModelTier::Expensive);
+        assert_eq!(parse_model_tier("Reasoning"), ModelTier::Expensive);
+        assert_eq!(parse_model_tier("EXECUTION"), ModelTier::Cheap);
+        assert_eq!(parse_model_tier("mechanical"), ModelTier::Cheap);
+        assert_eq!(parse_model_tier("mech"), ModelTier::Cheap);
+        assert_eq!(parse_model_tier("unknown"), ModelTier::Cheap); // fallback
     }
 
     #[test]
