@@ -8,6 +8,48 @@ use gaviero_core::memory::MemoryStore;
 use gaviero_core::observer::{AcpObserver, SwarmObserver};
 use gaviero_core::swarm::models::{AgentStatus, SwarmResult, WorkUnit};
 
+/// Claude model to use for `--task` and `--work-units` modes.
+#[derive(clap::ValueEnum, Clone, Debug, Default)]
+enum CliModel {
+    #[default]
+    Sonnet,
+    Opus,
+    Haiku,
+}
+
+impl CliModel {
+    fn as_str(&self) -> &'static str {
+        match self {
+            CliModel::Sonnet => "sonnet",
+            CliModel::Opus => "opus",
+            CliModel::Haiku => "haiku",
+        }
+    }
+}
+
+impl std::fmt::Display for CliModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OutputFormat::Text => f.write_str("text"),
+            OutputFormat::Json => f.write_str("json"),
+        }
+    }
+}
+
+/// Output format for results.
+#[derive(clap::ValueEnum, Clone, Debug, Default)]
+enum OutputFormat {
+    #[default]
+    Text,
+    Json,
+}
+
 #[derive(Parser)]
 #[command(name = "gaviero-cli", about = "Headless AI agent task runner")]
 struct Cli {
@@ -36,8 +78,8 @@ struct Cli {
     max_parallel: usize,
 
     /// Claude model to use.
-    #[arg(long, default_value = "sonnet")]
-    model: String,
+    #[arg(long, default_value_t = CliModel::Sonnet)]
+    model: CliModel,
 
     /// Override the write namespace (default: from settings or folder name).
     #[arg(long)]
@@ -47,14 +89,23 @@ struct Cli {
     #[arg(long = "read-ns")]
     read_ns: Vec<String>,
 
-    /// Output format: text or json.
-    #[arg(long, default_value = "text")]
-    format: String,
+    /// Output format.
+    #[arg(long, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
 
     /// Use coordinated tier routing (Opus plans, Sonnet/Haiku/local execute).
     /// Requires --task. Opus decomposes the task into a tier-annotated DAG.
     #[arg(long)]
     coordinated: bool,
+
+    /// Resume a previous run that was interrupted. Loads the checkpoint from
+    /// `.gaviero/state/<plan-hash>.json` and skips already-completed nodes.
+    #[arg(long)]
+    resume: bool,
+
+    /// Write structured JSON trace logs to this file (enables DEBUG-level tracing).
+    #[arg(long)]
+    trace: Option<PathBuf>,
 }
 
 /// CLI observer that prints agent events to stderr.
@@ -77,6 +128,16 @@ impl AcpObserver for CliAcpObserver {
     }
     fn on_streaming_status(&self, _status: &str) {
         // CLI doesn't show streaming status
+    }
+    fn on_validation_result(&self, gate: &str, passed: bool, message: Option<&str>) {
+        if passed {
+            eprintln!("  [validation] {}: pass", gate);
+        } else {
+            eprintln!("  [validation] {}: fail — {}", gate, message.unwrap_or(""));
+        }
+    }
+    fn on_validation_retry(&self, attempt: u8, max_retries: u8) {
+        eprintln!("  [retry] attempt {}/{} — feeding error to agent", attempt, max_retries);
     }
 }
 
@@ -115,12 +176,23 @@ impl SwarmObserver for CliSwarmObserver {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_max_level(tracing::Level::WARN)
-        .init();
-
     let cli = Cli::parse();
+
+    // Initialize tracing: JSON to file when --trace is set, human-readable to stderr otherwise
+    if let Some(ref trace_path) = cli.trace {
+        let file = std::fs::File::create(trace_path)
+            .with_context(|| format!("creating trace file: {}", trace_path.display()))?;
+        tracing_subscriber::fmt()
+            .json()
+            .with_writer(file)
+            .with_max_level(tracing::Level::DEBUG)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_max_level(tracing::Level::WARN)
+            .init();
+    }
 
     let repo = std::fs::canonicalize(&cli.repo)
         .with_context(|| format!("resolving repo path: {}", cli.repo.display()))?;
@@ -164,17 +236,15 @@ async fn main() -> Result<()> {
         };
 
     // Parse work units
-    #[allow(deprecated)] // AgentBackend::default() is deprecated but still required by WorkUnit
-    let (work_units, script_max_parallel) = if let Some(ref script_path) = cli.script {
+    let plan = if let Some(ref script_path) = cli.script {
         let source = std::fs::read_to_string(script_path)
             .with_context(|| format!("reading script: {}", script_path.display()))?;
         let filename = script_path.display().to_string();
-        let compiled = gaviero_dsl::compile(&source, &filename, None, None)
+        gaviero_dsl::compile(&source, &filename, None, None)
             .map_err(|report| {
                 eprintln!("{:?}", report);
                 anyhow::anyhow!("DSL compilation failed")
-            })?;
-        (compiled.work_units, compiled.max_parallel)
+            })?
     } else if let Some(ref task) = cli.task {
         let units = vec![WorkUnit {
             id: "task-0".to_string(),
@@ -185,8 +255,9 @@ async fn main() -> Result<()> {
                 interface_contracts: std::collections::HashMap::new(),
             },
             depends_on: Vec::new(),
+            #[allow(deprecated)]
             backend: Default::default(),
-            model: Some(cli.model.clone()),
+            model: Some(cli.model.as_str().to_string()),
             tier: Default::default(),
             privacy: Default::default(),
             coordinator_instructions: String::new(),
@@ -198,24 +269,23 @@ async fn main() -> Result<()> {
             memory_importance: None,
             staleness_sources: Vec::new(),
         }];
-        (units, None)
+        gaviero_core::swarm::plan::CompiledPlan::from_work_units(units, None)
     } else if let Some(ref json) = cli.work_units {
         let units = serde_json::from_str::<Vec<WorkUnit>>(json)
             .context("parsing --work-units JSON")?;
-        (units, None)
+        gaviero_core::swarm::plan::CompiledPlan::from_work_units(units, None)
     } else {
         anyhow::bail!("Either --task, --work-units, or --script is required");
     };
 
     // Execute via swarm pipeline
-    // Script's max_parallel overrides the CLI flag when declared.
-    let effective_max_parallel = script_max_parallel.unwrap_or(cli.max_parallel);
+    // plan.max_parallel overrides the CLI flag when declared.
     let swarm_observer = CliSwarmObserver;
     let config = gaviero_core::swarm::pipeline::SwarmConfig {
-        max_parallel: effective_max_parallel,
+        max_parallel: cli.max_parallel,
         workspace_root: repo,
-        model: cli.model.clone(),
-        use_worktrees: effective_max_parallel > 1,
+        model: cli.model.as_str().to_string(),
+        use_worktrees: cli.max_parallel > 1,
         read_namespaces: read_nss,
         write_namespace: write_ns,
         context_files: vec![],
@@ -260,20 +330,46 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Load checkpoint for --resume
+    let initial_state = if cli.resume {
+        let hash = plan.hash();
+        match gaviero_core::swarm::execution_state::ExecutionState::load(&hash) {
+            Ok(Some(state)) => {
+                let completed = state.node_states.values()
+                    .filter(|s| s.status == gaviero_core::swarm::execution_state::NodeStatus::Completed)
+                    .count();
+                eprintln!("[resume] loaded checkpoint: {}/{} nodes already completed",
+                    completed, state.node_states.len());
+                Some(state)
+            }
+            Ok(None) => {
+                eprintln!("[resume] no checkpoint found for this plan (starting fresh)");
+                None
+            }
+            Err(e) => {
+                eprintln!("[resume] failed to load checkpoint: {} (starting fresh)", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let result = gaviero_core::swarm::pipeline::execute(
-        work_units,
+        &plan,
         &config,
+        initial_state,
         memory,
         &swarm_observer,
         |_agent_id| Box::new(CliAcpObserver) as Box<dyn gaviero_core::observer::AcpObserver>,
     ).await?;
 
     // Output results
-    match cli.format.as_str() {
-        "json" => {
+    match cli.format {
+        OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        _ => {
+        OutputFormat::Text => {
             for m in &result.manifests {
                 let status_str = match &m.status {
                     AgentStatus::Completed => "OK".to_string(),
