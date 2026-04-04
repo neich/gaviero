@@ -241,7 +241,7 @@ async fn run_combined(
                         unit_id: unit.id.clone(),
                         reason: EscalationReason::StructuralParseError,
                         from_tier: unit.tier,
-                        to_tier: unit.escalation_tier.unwrap_or(ModelTier::Reasoning),
+                        to_tier: unit.escalation_tier.unwrap_or(ModelTier::Expensive),
                         succeeded: false, // Not attempted in this pass
                     });
                 }
@@ -297,8 +297,8 @@ async fn run_combined(
                             escalations.push(EscalationRecord {
                                 unit_id: unit_review.unit_id.clone(),
                                 reason: EscalationReason::DiffReviewRejection { issues: error_issues },
-                                from_tier: ModelTier::Mechanical, // Approximate
-                                to_tier: ModelTier::Execution,
+                                from_tier: ModelTier::Cheap, // Approximate
+                                to_tier: ModelTier::Expensive,
                                 succeeded: false,
                             });
                         }
@@ -347,8 +347,8 @@ async fn run_combined(
                     escalations.push(EscalationRecord {
                         unit_id: "unknown".into(), // Attribution requires file matching
                         reason: EscalationReason::TestFailure { test_names },
-                        from_tier: ModelTier::Execution,
-                        to_tier: ModelTier::Reasoning,
+                        from_tier: ModelTier::Cheap,
+                        to_tier: ModelTier::Expensive,
                         succeeded: false,
                     });
                 }
@@ -455,7 +455,7 @@ mod tests {
             coordinator_instructions: String::new(),
             estimated_tokens: 0,
             max_retries: 1,
-            escalation_tier: Some(ModelTier::Reasoning),
+            escalation_tier: Some(ModelTier::Expensive),
             read_namespaces: None,
             write_namespace: None,
             memory_importance: None,
@@ -508,7 +508,7 @@ mod tests {
         let file = dir.path().join("bad.rs");
         std::fs::write(&file, "fn broken( {\n").unwrap();
 
-        let units = vec![make_unit("a", ModelTier::Execution)];
+        let units = vec![make_unit("a", ModelTier::Cheap)];
         let manifests = vec![AgentManifest {
             work_unit_id: "a".into(),
             status: AgentStatus::Completed,
@@ -520,7 +520,7 @@ mod tests {
 
         let obs = mock_observer();
         let report = run_combined(
-            &[ModelTier::Mechanical],
+            &[ModelTier::Cheap],
             Some("cargo test"),
             &manifests,
             &units,
@@ -543,7 +543,7 @@ mod tests {
         let file = dir.path().join("good.rs");
         std::fs::write(&file, "fn main() {}\n").unwrap();
 
-        let units = vec![make_unit("a", ModelTier::Execution)];
+        let units = vec![make_unit("a", ModelTier::Cheap)];
         let manifests = vec![AgentManifest {
             work_unit_id: "a".into(),
             status: AgentStatus::Completed,
@@ -572,7 +572,7 @@ mod tests {
 
     #[test]
     fn test_find_unit_for_file_by_manifest() {
-        let units = vec![make_unit("a", ModelTier::Execution)];
+        let units = vec![make_unit("a", ModelTier::Cheap)];
         let manifests = vec![AgentManifest {
             work_unit_id: "a".into(),
             status: AgentStatus::Completed,
@@ -589,7 +589,7 @@ mod tests {
 
     #[test]
     fn test_find_unit_for_file_by_scope() {
-        let units = vec![make_unit("a", ModelTier::Execution)];
+        let units = vec![make_unit("a", ModelTier::Cheap)];
         let manifests = vec![];
 
         let found = find_unit_for_file(&units, &manifests, Path::new("src/a.rs"));
