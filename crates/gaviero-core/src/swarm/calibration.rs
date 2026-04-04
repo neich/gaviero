@@ -178,6 +178,10 @@ mod tests {
             estimated_tokens: 0,
             max_retries: 1,
             escalation_tier: None,
+            read_namespaces: None,
+            write_namespace: None,
+            memory_importance: None,
+            staleness_sources: vec![],
         }
     }
 
@@ -188,6 +192,7 @@ mod tests {
             modified_files: vec![],
             branch: None,
             summary: None,
+            cost_usd: 0.0,
         }
     }
 
