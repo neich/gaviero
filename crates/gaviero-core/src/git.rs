@@ -610,6 +610,45 @@ impl Drop for WorktreeManager {
     }
 }
 
+// ── Git Coordinator ──────────────────────────────────────────
+
+/// Serializes concurrent git metadata operations (add, commit, etc.) across
+/// worktrees that share the same `.git` directory.
+///
+/// File I/O within worktree working directories is unrestricted — only git
+/// state mutations need this lock. Wrap `commit_agent_changes` calls with
+/// `lock_git` to prevent `.git/index.lock` races under parallel swarms.
+pub struct GitCoordinator {
+    lock: tokio::sync::Mutex<()>,
+}
+
+impl GitCoordinator {
+    pub fn new() -> Self {
+        Self {
+            lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// Acquire the global git lock, run `f` synchronously, then release.
+    ///
+    /// `f` should be a short-lived synchronous closure (a few git CLI calls).
+    /// Do not use this for long-running agent execution — only for the commit
+    /// step at the end of each agent.
+    pub async fn lock_git<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce() -> T,
+    {
+        let _guard = self.lock.lock().await;
+        f()
+    }
+}
+
+impl Default for GitCoordinator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

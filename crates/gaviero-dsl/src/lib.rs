@@ -4,10 +4,14 @@ pub mod error;
 pub mod lexer;
 pub mod parser;
 
+// Re-export `CompiledPlan` as the primary output type.
+pub use gaviero_core::swarm::plan::CompiledPlan;
+// Backward-compat alias — existing code using `CompiledScript` keeps compiling.
+#[allow(deprecated)]
 pub use compiler::CompiledScript;
 pub use error::{DslError, DslErrors};
 
-/// Compile a `.gaviero` DSL script into a [`CompiledScript`].
+/// Compile a `.gaviero` DSL script into a [`CompiledPlan`].
 ///
 /// # Parameters
 /// - `source`: The raw script text.
@@ -29,7 +33,7 @@ pub fn compile(
     filename: &str,
     workflow: Option<&str>,
     runtime_prompt: Option<&str>,
-) -> Result<CompiledScript, miette::Report> {
+) -> Result<CompiledPlan, miette::Report> {
     use miette::NamedSource;
 
     // Phase 1: Lex

@@ -29,6 +29,8 @@ gaviero-cli [OPTIONS] --coordinated --task <TEXT>
 | `--namespace STRING` | string | — | Write namespace for this run's memory output (see [Memory](#memory)). |
 | `--read-ns STRING` | string | — | Extra namespace to read from. Repeatable: `--read-ns ns1 --read-ns ns2`. |
 | `--coordinated` | flag | off | Coordinator mode: Opus decomposes the task into a `.gaviero` plan file for review. Requires `--task`. See [Coordinated mode](#coordinated-mode---coordinated). |
+| `--resume` | flag | off | Load the execution checkpoint for this plan and skip nodes that already completed. Useful for resuming after a partial failure. |
+| `--trace PATH` | file | — | Write a structured JSON execution trace to `PATH`. Records per-node timing, cost, status, and validation events. Intended for CI diagnostics and post-run analysis. |
 | `--format text\|json` | string | `text` | Output format for results. |
 
 ### Mutual exclusivity

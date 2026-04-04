@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use miette::NamedSource;
 
 use gaviero_core::swarm::models::{AgentBackend, WorkUnit};
+use gaviero_core::swarm::plan::CompiledPlan;
 use gaviero_core::types::{FileScope, ModelTier, PrivacyLevel};
 
 use crate::ast::*;
@@ -12,15 +13,9 @@ use crate::error::{DslError, DslErrors};
 
 // ── Public types ───────────────────────────────────────────────────────────
 
-/// Output of a successful DSL compilation.
-#[derive(Debug)]
-pub struct CompiledScript {
-    /// Work units ready for [`gaviero_core::swarm::pipeline::execute`].
-    pub work_units: Vec<WorkUnit>,
-    /// The workflow's `max_parallel` value, if one was declared.
-    /// Callers should use this to override any default `SwarmConfig.max_parallel`.
-    pub max_parallel: Option<usize>,
-}
+/// Backward-compatible alias. New code should use `CompiledPlan` directly.
+#[deprecated(note = "Use `CompiledPlan` from `gaviero_core::swarm::plan` instead")]
+pub type CompiledScript = CompiledPlan;
 
 // ── AST → WorkUnit compilation ─────────────────────────────────────────────
 
@@ -36,7 +31,7 @@ pub fn compile_ast(
     filename: &str,
     workflow: Option<&str>,
     runtime_prompt: Option<&str>,
-) -> Result<CompiledScript, DslErrors> {
+) -> Result<CompiledPlan, DslErrors> {
     let src = || NamedSource::new(filename, source.to_string());
 
     // ── Phase 1: index declarations ───────────────────────────────
@@ -179,7 +174,7 @@ pub fn compile_ast(
         }));
     }
 
-    Ok(CompiledScript { work_units, max_parallel: workflow_max_parallel })
+    Ok(CompiledPlan::from_work_units(work_units, workflow_max_parallel))
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -414,7 +409,8 @@ mod tests {
         let (tokens, _) = lexer::lex(src);
         let (ast, errs) = parser::parse(&tokens, src, "test.gaviero");
         assert!(errs.is_empty(), "parse errors: {:?}", errs);
-        compile_ast(&ast.unwrap(), src, "test.gaviero", None, None).map(|c| c.work_units)
+        compile_ast(&ast.unwrap(), src, "test.gaviero", None, None)
+            .map(|c| c.work_units_ordered().expect("toposort in tests"))
     }
 
     const FULL_EXAMPLE: &str = r##"
@@ -501,7 +497,7 @@ mod tests {
         let (tokens, _) = lexer::lex(src);
         let (ast, _) = parser::parse(&tokens, src, "t");
         let compiled = compile_ast(&ast.unwrap(), src, "t", Some("only_a"), None).unwrap();
-        let units = compiled.work_units;
+        let units = compiled.work_units_ordered().expect("toposort in tests");
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].id, "a");
     }
@@ -655,7 +651,8 @@ mod tests {
         let (tokens, _) = lexer::lex(src);
         let (ast, errs) = parser::parse(&tokens, src, "test.gaviero");
         assert!(errs.is_empty(), "parse errors: {:?}", errs);
-        compile_ast(&ast.unwrap(), src, "test.gaviero", None, runtime_prompt).map(|c| c.work_units)
+        compile_ast(&ast.unwrap(), src, "test.gaviero", None, runtime_prompt)
+            .map(|c| c.work_units_ordered().expect("toposort in tests"))
     }
 
     #[test]

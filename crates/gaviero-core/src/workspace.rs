@@ -283,9 +283,18 @@ impl Workspace {
         // Cache user-level settings
         self.user_settings_cache = dirs::config_dir().and_then(|config_dir| {
             let user_settings_path = config_dir.join("gaviero").join("settings.json");
-            std::fs::read_to_string(&user_settings_path)
-                .ok()
-                .and_then(|content| serde_json::from_str(&content).ok())
+            let content = std::fs::read_to_string(&user_settings_path).ok()?;
+            match serde_json::from_str(&content) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(
+                        "failed to parse user settings {}: {}",
+                        user_settings_path.display(),
+                        e
+                    );
+                    None
+                }
+            }
         });
     }
 

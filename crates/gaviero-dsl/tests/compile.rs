@@ -42,7 +42,7 @@ const FULL_EXAMPLE: &str = r##"
 fn full_example_compiles_to_two_units() {
     let compiled = compile(FULL_EXAMPLE, "test.gaviero", None, None)
         .expect("should compile without errors");
-    let units = compiled.work_units;
+    let units = compiled.work_units_ordered().expect("toposort");
 
     assert_eq!(units.len(), 2, "expected 2 work units");
 
@@ -98,7 +98,7 @@ fn no_workflow_runs_all_agents() {
         agent a { description "first" }
         agent b { description "second" }
     "#;
-    let units = compile(src, "test.gaviero", None, None).unwrap().work_units;
+    let units = compile(src, "test.gaviero", None, None).unwrap().work_units_ordered().expect("toposort");
     assert_eq!(units.len(), 2);
     assert_eq!(units[0].id, "a");
     assert_eq!(units[1].id, "b");
@@ -112,7 +112,7 @@ fn workflow_name_selector() {
         workflow just_b { steps [b] }
         workflow both   { steps [a b] }
     "#;
-    let units = compile(src, "test.gaviero", Some("just_b"), None).unwrap().work_units;
+    let units = compile(src, "test.gaviero", Some("just_b"), None).unwrap().work_units_ordered().expect("toposort");
     assert_eq!(units.len(), 1);
     assert_eq!(units[0].id, "b");
 }
@@ -148,7 +148,8 @@ fn compile_example(filename: &str) -> Vec<gaviero_core::swarm::models::WorkUnit>
         .unwrap_or_else(|e| panic!("reading {}: {}", path, e));
     compile(&source, filename, None, None)
         .unwrap_or_else(|e| panic!("compiling {}:\n{:?}", filename, e))
-        .work_units
+        .work_units_ordered()
+        .expect("toposort")
 }
 
 #[test]

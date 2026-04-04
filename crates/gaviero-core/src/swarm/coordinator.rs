@@ -161,50 +161,13 @@ impl Coordinator {
         // Collect full response, forwarding tool calls to observer.
         // Tool details (file paths, patterns) come from AssistantMessage.tool_uses,
         // NOT from ToolInputDelta (which the CLI may not emit).
-        let mut response = String::new();
-        loop {
-            match session.next_event().await {
-                Ok(Some(crate::acp::protocol::StreamEvent::ContentDelta(text))) => {
-                    response.push_str(&text);
-                }
-                Ok(Some(crate::acp::protocol::StreamEvent::ToolUseStart { tool_name, .. })) => {
-                    // Show bare tool name immediately as a status hint
-                    if let Some(obs) = observer.as_ref() {
-                        obs.on_streaming_status(&format!("{}...", tool_name));
-                    }
-                }
-                Ok(Some(crate::acp::protocol::StreamEvent::ToolInputDelta(_))) => {}
-                Ok(Some(crate::acp::protocol::StreamEvent::AssistantMessage { text, tool_uses })) => {
-                    // Emit enriched tool calls with file paths / patterns
-                    if let Some(obs) = observer.as_ref() {
-                        for tu in &tool_uses {
-                            let detail = extract_tool_detail(&tu.name, &tu.input.to_string());
-                            obs.on_tool_call_started(&detail);
-                        }
-                        if tool_uses.is_empty() {
-                            obs.on_streaming_status("Building plan...");
-                        }
-                    }
-                    if response.is_empty() && !text.is_empty() {
-                        response = text;
-                    }
-                }
-                Ok(Some(crate::acp::protocol::StreamEvent::ResultEvent {
-                    result_text, ..
-                })) => {
-                    if response.is_empty() {
-                        response = result_text;
-                    }
-                    break;
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    tracing::warn!("Stream error during coordination: {}", e);
-                    break;
-                }
-                _ => {}
-            }
-        }
+        let response = run_coordinator_session(
+            &mut session,
+            observer.as_deref(),
+            "Building plan...",
+            "coordination",
+        )
+        .await;
         let _ = session.wait().await;
 
         // Parse the JSON response leniently (LLMs produce varying shapes)
@@ -299,48 +262,13 @@ impl Coordinator {
             &[],
         )?;
 
-        let mut response = String::new();
-        loop {
-            match session.next_event().await {
-                Ok(Some(crate::acp::protocol::StreamEvent::ContentDelta(text))) => {
-                    response.push_str(&text);
-                }
-                Ok(Some(crate::acp::protocol::StreamEvent::ToolUseStart { tool_name, .. })) => {
-                    if let Some(obs) = observer.as_ref() {
-                        obs.on_streaming_status(&format!("{}...", tool_name));
-                    }
-                }
-                Ok(Some(crate::acp::protocol::StreamEvent::ToolInputDelta(_))) => {}
-                Ok(Some(crate::acp::protocol::StreamEvent::AssistantMessage { text, tool_uses })) => {
-                    if let Some(obs) = observer.as_ref() {
-                        for tu in &tool_uses {
-                            let detail = extract_tool_detail(&tu.name, &tu.input.to_string());
-                            obs.on_tool_call_started(&detail);
-                        }
-                        if tool_uses.is_empty() {
-                            obs.on_streaming_status("Building DSL plan...");
-                        }
-                    }
-                    if response.is_empty() && !text.is_empty() {
-                        response = text;
-                    }
-                }
-                Ok(Some(crate::acp::protocol::StreamEvent::ResultEvent {
-                    result_text, ..
-                })) => {
-                    if response.is_empty() {
-                        response = result_text;
-                    }
-                    break;
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    tracing::warn!("Stream error during DSL coordination: {}", e);
-                    break;
-                }
-                _ => {}
-            }
-        }
+        let response = run_coordinator_session(
+            &mut session,
+            observer.as_deref(),
+            "Building DSL plan...",
+            "DSL coordination",
+        )
+        .await;
         let _ = session.wait().await;
 
         // Strip markdown code fences if Opus wrapped the DSL in ```gaviero ... ```
@@ -494,7 +422,60 @@ impl Coordinator {
     }
 }
 
-/// Extract a run ID from a prompt like "/retry run:abc123".
+/// Drive a coordinator ACP session to completion, collecting the full response text.
+///
+/// Forwards tool-use status and call details to `observer` when present.
+/// `building_status` is the status string shown when no tool is active.
+/// `error_context` labels the warning log on stream errors.
+async fn run_coordinator_session(
+    session: &mut AcpSession,
+    observer: Option<&dyn crate::observer::AcpObserver>,
+    building_status: &str,
+    error_context: &str,
+) -> String {
+    let mut response = String::new();
+    loop {
+        match session.next_event().await {
+            Ok(Some(crate::acp::protocol::StreamEvent::ContentDelta(text))) => {
+                response.push_str(&text);
+            }
+            Ok(Some(crate::acp::protocol::StreamEvent::ToolUseStart { tool_name, .. })) => {
+                if let Some(obs) = observer {
+                    obs.on_streaming_status(&format!("{}...", tool_name));
+                }
+            }
+            Ok(Some(crate::acp::protocol::StreamEvent::ToolInputDelta(_))) => {}
+            Ok(Some(crate::acp::protocol::StreamEvent::AssistantMessage { text, tool_uses })) => {
+                if let Some(obs) = observer {
+                    for tu in &tool_uses {
+                        let detail = extract_tool_detail(&tu.name, &tu.input.to_string());
+                        obs.on_tool_call_started(&detail);
+                    }
+                    if tool_uses.is_empty() {
+                        obs.on_streaming_status(building_status);
+                    }
+                }
+                if response.is_empty() && !text.is_empty() {
+                    response = text;
+                }
+            }
+            Ok(Some(crate::acp::protocol::StreamEvent::ResultEvent { result_text, .. })) => {
+                if response.is_empty() {
+                    response = result_text;
+                }
+                break;
+            }
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!("Stream error during {}: {}", error_context, e);
+                break;
+            }
+            _ => {}
+        }
+    }
+    response
+}
+
 /// Extract a human-readable detail string from tool input JSON.
 pub(crate) fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
     // Try full JSON parse first
@@ -1106,6 +1087,10 @@ mod tests {
             estimated_tokens: 4000,
             max_retries: 1,
             escalation_tier: Some(ModelTier::Reasoning),
+            read_namespaces: None,
+            write_namespace: None,
+            memory_importance: None,
+            staleness_sources: vec![],
         }
     }
 

@@ -12,6 +12,8 @@ use tokio::sync::Mutex;
 
 use crate::memory::MemoryStore;
 use crate::observer::AcpObserver;
+use crate::swarm::board::{parse_discoveries, SharedBoard};
+use crate::validation_gate::ValidationPipeline;
 use crate::write_gate::WriteGatePipeline;
 
 use super::super::models::{AgentManifest, AgentStatus, WorkUnit};
@@ -19,8 +21,13 @@ use super::{AgentBackend, CompletionRequest, UnifiedStreamEvent};
 
 /// Run a work unit through any `AgentBackend`, producing an `AgentManifest`.
 ///
-/// This consolidates the logic from the old `AgentRunner::run_with_model()`
-/// and `AgentRunner::run_ollama()` into a single code path.
+/// When `validation` is provided, runs the validation pipeline after each agent
+/// turn. On failure the error is fed back as a corrective prompt and the agent
+/// retries up to `work_unit.max_retries` additional times.
+#[tracing::instrument(
+    skip(backend, write_gate, memory, observer, validation, board),
+    fields(agent_id = %work_unit.id, tier = ?work_unit.tier)
+)]
 pub async fn run_backend(
     backend: &dyn AgentBackend,
     work_unit: &WorkUnit,
@@ -29,30 +36,262 @@ pub async fn run_backend(
     memory: Option<&MemoryStore>,
     read_namespaces: &[String],
     observer: &dyn AcpObserver,
+    validation: Option<&ValidationPipeline>,
+    board: Option<&SharedBoard>,
 ) -> Result<AgentManifest> {
     let agent_id = format!("agent-{}", work_unit.id);
 
-    // 1. Register scope with write gate
+    // 1. Register scope with write gate (once — persists across retries)
     {
         let mut gate = write_gate.lock().await;
         gate.register_agent_scope(&agent_id, &work_unit.scope);
     }
 
-    // 2. Build prompt (memory + scope + task)
-    let mut prompt_parts = Vec::new();
+    // 2. Build base prompt (memory + scope + task)
+    let mut base_prompt = build_prompt(work_unit, memory, read_namespaces).await;
+
+    // Prepend any relevant discoveries from other agents
+    if let Some(b) = board {
+        let discoveries = b.format_for_prompt(&work_unit.scope.owned_paths).await;
+        if !discoveries.is_empty() {
+            base_prompt = format!("{}\n\n{}", discoveries, base_prompt);
+        }
+    }
+
+    // 3. Retry loop
+    let max_attempts = (work_unit.max_retries as usize) + 1;
+    // Union of all files written across all attempts (deduped)
+    let mut all_modified: std::collections::HashSet<std::path::PathBuf> = Default::default();
+    // Corrective suffix appended to the base prompt on retries
+    let mut corrective: Option<String> = None;
+
+    for attempt in 0..max_attempts {
+        let prompt = match &corrective {
+            None => base_prompt.clone(),
+            Some(fix) => format!("{}\n\n{}", base_prompt, fix),
+        };
+
+        let request = CompletionRequest {
+            prompt,
+            system_prompt: None,
+            workspace_root: workspace_root.to_path_buf(),
+            allowed_tools: vec![
+                "Read".into(),
+                "Glob".into(),
+                "Grep".into(),
+                "Write".into(),
+                "Edit".into(),
+                "MultiEdit".into(),
+            ],
+            file_attachments: vec![],
+            conversation_history: vec![],
+            file_refs: vec![],
+        };
+
+        // Stream completion
+        let stream_result = backend.stream_completion(request).await;
+        let mut stream = match stream_result {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(AgentManifest {
+                    work_unit_id: work_unit.id.clone(),
+                    status: AgentStatus::Failed(e.to_string()),
+                    modified_files: vec![],
+                    branch: None,
+                    summary: Some(format!("Backend error: {}", e)),
+                    cost_usd: 0.0,
+                });
+            }
+        };
+
+        // Consume stream
+        let mut attempt_modified: Vec<std::path::PathBuf> = Vec::new();
+        let mut full_text = String::new();
+        let mut had_error = false;
+        let mut error_msg = String::new();
+        let mut in_thinking = false;
+
+        while let Some(event_result) = stream.next().await {
+            let event = match event_result {
+                Ok(ev) => ev,
+                Err(e) => {
+                    had_error = true;
+                    error_msg = e.to_string();
+                    break;
+                }
+            };
+
+            match event {
+                UnifiedStreamEvent::TextDelta(text) => {
+                    if in_thinking {
+                        observer.on_stream_chunk("\n</think>\n");
+                        in_thinking = false;
+                    }
+                    full_text.push_str(&text);
+                    observer.on_stream_chunk(&text);
+                }
+                UnifiedStreamEvent::ThinkingDelta(text) => {
+                    if !in_thinking {
+                        observer.on_stream_chunk("<think>\n");
+                        in_thinking = true;
+                    }
+                    observer.on_stream_chunk(&text);
+                }
+                UnifiedStreamEvent::ToolCallStart { name, .. } => {
+                    observer.on_tool_call_started(&name);
+                    observer.on_streaming_status(&format!("Using {}...", name));
+                }
+                UnifiedStreamEvent::ToolCallDelta { .. } => {}
+                UnifiedStreamEvent::ToolCallEnd { .. } => {}
+                UnifiedStreamEvent::FileBlock { path, content } => {
+                    match propose_write(&agent_id, &path, &content, workspace_root, &write_gate, observer)
+                        .await
+                    {
+                        Ok(true) => {
+                            attempt_modified.push(workspace_root.join(&path));
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to create proposal for {}: {}",
+                                path.display(),
+                                e
+                            );
+                        }
+                    }
+                }
+                UnifiedStreamEvent::Usage(_) => {}
+                UnifiedStreamEvent::Error(msg) => {
+                    had_error = true;
+                    error_msg = msg;
+                }
+                UnifiedStreamEvent::Done(_) => {
+                    break;
+                }
+            }
+        }
+
+        if in_thinking {
+            observer.on_stream_chunk("\n</think>\n");
+        }
+
+        if had_error {
+            // Propagate hard errors immediately
+            return Ok(AgentManifest {
+                work_unit_id: work_unit.id.clone(),
+                status: AgentStatus::Failed(error_msg.clone()),
+                modified_files: all_modified.into_iter().collect(),
+                branch: None,
+                summary: Some(error_msg),
+                cost_usd: 0.0,
+            });
+        }
+
+        if !full_text.is_empty() {
+            observer.on_message_complete("assistant", &full_text);
+
+            // Parse and post discoveries to the shared board
+            if let Some(b) = board {
+                for entry in parse_discoveries(&work_unit.id, &full_text) {
+                    b.post(entry).await;
+                }
+            }
+        }
+
+        all_modified.extend(attempt_modified.iter().cloned());
+
+        // 4. Inline validation
+        if let Some(vp) = validation {
+            let files: Vec<std::path::PathBuf> = all_modified.iter().cloned().collect();
+            if !files.is_empty() {
+                let next_attempt = attempt + 1;
+                let can_retry = next_attempt < max_attempts;
+
+                let failure = vp
+                    .run_reporting(&files, workspace_root, false, |gate, passed| {
+                        observer.on_validation_result(gate, passed, None);
+                    })
+                    .await;
+
+                if let Some((gate_name, result)) = failure {
+                    let message = result.message().unwrap_or("validation failed").to_string();
+                    observer.on_validation_result(gate_name, false, Some(&message));
+
+                    if can_retry {
+                        observer.on_validation_retry(next_attempt as u8, work_unit.max_retries);
+                        // Build corrective prompt using the first failed file as context
+                        let failed_file = files.first().map(|p| p.as_path())
+                            .unwrap_or(std::path::Path::new("unknown"));
+                        corrective = Some(crate::validation_gate::corrective_prompt(
+                            gate_name,
+                            failed_file,
+                            &message,
+                        ));
+                        continue; // retry
+                    }
+                    // Exhausted retries — soft failure: agent output exists but is flagged
+                    tracing::warn!(
+                        "Agent {} exhausted retries ({} attempts), marking SoftFailure",
+                        work_unit.id,
+                        max_attempts
+                    );
+                    return Ok(AgentManifest {
+                        work_unit_id: work_unit.id.clone(),
+                        status: AgentStatus::Failed(format!(
+                            "validation failed after {} retries: {}",
+                            max_attempts, message
+                        )),
+                        modified_files: all_modified.into_iter().collect(),
+                        branch: None,
+                        summary: Some(format!("Validation failed ({}): {}", gate_name, message)),
+                        cost_usd: 0.0,
+                    });
+                }
+            }
+        }
+
+        // Validation passed (or no validator) — done
+        return Ok(AgentManifest {
+            work_unit_id: work_unit.id.clone(),
+            status: AgentStatus::Completed,
+            modified_files: all_modified.into_iter().collect(),
+            branch: None,
+            summary: Some(format!("Modified {} files", attempt_modified.len())),
+            cost_usd: 0.0,
+        });
+    }
+
+    // Should be unreachable (loop always returns), but provide a fallback
+    Ok(AgentManifest {
+        work_unit_id: work_unit.id.clone(),
+        status: AgentStatus::Completed,
+        modified_files: all_modified.into_iter().collect(),
+        branch: None,
+        summary: Some("completed".into()),
+        cost_usd: 0.0,
+    })
+}
+
+/// Build the base prompt (memory context + scope clause + task description).
+async fn build_prompt(
+    work_unit: &WorkUnit,
+    memory: Option<&MemoryStore>,
+    read_namespaces: &[String],
+) -> String {
+    let mut parts = Vec::new();
 
     if let Some(mem) = memory {
         let ctx = mem
             .search_context(read_namespaces, &work_unit.description, 5)
             .await;
         if !ctx.is_empty() {
-            prompt_parts.push(ctx);
+            parts.push(ctx);
         }
     }
 
     let scope_clause = work_unit.scope.to_prompt_clause();
     if !scope_clause.is_empty() {
-        prompt_parts.push(format!("[File scope]:\n{}", scope_clause));
+        parts.push(format!("[File scope]:\n{}", scope_clause));
     }
 
     let task_text = if work_unit.coordinator_instructions.is_empty() {
@@ -60,145 +299,9 @@ pub async fn run_backend(
     } else {
         &work_unit.coordinator_instructions
     };
-    prompt_parts.push(task_text.clone());
+    parts.push(task_text.clone());
 
-    let full_prompt = prompt_parts.join("\n\n");
-
-    let request = CompletionRequest {
-        prompt: full_prompt,
-        system_prompt: None,
-        workspace_root: workspace_root.to_path_buf(),
-        allowed_tools: vec![
-            "Read".into(),
-            "Glob".into(),
-            "Grep".into(),
-            "Write".into(),
-            "Edit".into(),
-            "MultiEdit".into(),
-        ],
-        file_attachments: vec![],
-        conversation_history: vec![],
-        file_refs: vec![],
-    };
-
-    // 3. Stream completion
-    let stream_result = backend.stream_completion(request).await;
-    let mut stream = match stream_result {
-        Ok(s) => s,
-        Err(e) => {
-            return Ok(AgentManifest {
-                work_unit_id: work_unit.id.clone(),
-                status: AgentStatus::Failed(e.to_string()),
-                modified_files: vec![],
-                branch: None,
-                summary: Some(format!("Backend error: {}", e)),
-            });
-        }
-    };
-
-    // 4. Consume stream
-    let mut modified_files = Vec::new();
-    let mut full_text = String::new();
-    let mut had_error = false;
-    let mut error_msg = String::new();
-    let mut in_thinking = false;
-
-    while let Some(event_result) = stream.next().await {
-        let event = match event_result {
-            Ok(ev) => ev,
-            Err(e) => {
-                had_error = true;
-                error_msg = e.to_string();
-                break;
-            }
-        };
-
-        match event {
-            UnifiedStreamEvent::TextDelta(text) => {
-                if in_thinking {
-                    observer.on_stream_chunk("\n</think>\n");
-                    in_thinking = false;
-                }
-                full_text.push_str(&text);
-                observer.on_stream_chunk(&text);
-            }
-            UnifiedStreamEvent::ThinkingDelta(text) => {
-                if !in_thinking {
-                    observer.on_stream_chunk("<think>\n");
-                    in_thinking = true;
-                }
-                observer.on_stream_chunk(&text);
-            }
-            UnifiedStreamEvent::ToolCallStart { name, .. } => {
-                observer.on_tool_call_started(&name);
-                observer.on_streaming_status(&format!("Using {}...", name));
-            }
-            UnifiedStreamEvent::ToolCallDelta { .. } => {
-                // Tool input fragments — ignored
-            }
-            UnifiedStreamEvent::ToolCallEnd { .. } => {
-                // Tool call complete
-            }
-            UnifiedStreamEvent::FileBlock { path, content } => {
-                match propose_write(&agent_id, &path, &content, workspace_root, &write_gate, observer)
-                    .await
-                {
-                    Ok(true) => {
-                        modified_files.push(workspace_root.join(&path));
-                    }
-                    Ok(false) => {
-                        // Proposal was skipped (scope rejected, duplicate, or unchanged)
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to create proposal for {}: {}",
-                            path.display(),
-                            e
-                        );
-                    }
-                }
-            }
-            UnifiedStreamEvent::Usage(_) => {
-                // Token usage — could be logged/tracked in the future
-            }
-            UnifiedStreamEvent::Error(msg) => {
-                had_error = true;
-                error_msg = msg;
-            }
-            UnifiedStreamEvent::Done(_) => {
-                break;
-            }
-        }
-    }
-
-    // Close any open thinking block
-    if in_thinking {
-        observer.on_stream_chunk("\n</think>\n");
-    }
-
-    // 5. Build manifest
-    let (status, summary) = if had_error {
-        (
-            AgentStatus::Failed(error_msg.clone()),
-            Some(error_msg),
-        )
-    } else {
-        if !full_text.is_empty() {
-            observer.on_message_complete("assistant", &full_text);
-        }
-        (
-            AgentStatus::Completed,
-            Some(format!("Modified {} files", modified_files.len())),
-        )
-    };
-
-    Ok(AgentManifest {
-        work_unit_id: work_unit.id.clone(),
-        status,
-        modified_files,
-        branch: None,
-        summary,
-    })
+    parts.join("\n\n")
 }
 
 /// Create a write proposal through the Write Gate.
@@ -357,6 +460,10 @@ mod tests {
             estimated_tokens: 0,
             max_retries: 1,
             escalation_tier: None,
+            read_namespaces: None,
+            write_namespace: None,
+            memory_importance: None,
+            staleness_sources: vec![],
         }
     }
 
@@ -391,6 +498,8 @@ mod tests {
             None,
             &["default".to_string()],
             &observer,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -425,6 +534,8 @@ mod tests {
             None,
             &["default".to_string()],
             &observer,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -468,6 +579,8 @@ mod tests {
             None,
             &["default".to_string()],
             &observer,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -515,6 +628,8 @@ mod tests {
             None,
             &["default".to_string()],
             &observer,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -544,6 +659,8 @@ mod tests {
             None,
             &["default".to_string()],
             &observer,
+            None,
+            None,
         )
         .await
         .unwrap();
