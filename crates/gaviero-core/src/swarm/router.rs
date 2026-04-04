@@ -79,38 +79,7 @@ impl TierRouter {
             return self.resolve_model_override(unit, model);
         }
 
-        match (unit.tier, unit.privacy, self.ollama_available) {
-            // Privacy-sensitive: force local regardless of tier
-            (_, PrivacyLevel::LocalOnly, true) => ResolvedBackend::Ollama {
-                model: self.config.mechanical.model.clone(),
-                base_url: self.config.mechanical.base_url.clone(),
-            },
-            (_, PrivacyLevel::LocalOnly, false) => ResolvedBackend::Blocked {
-                reason: "local model required but Ollama unavailable".into(),
-            },
-
-            // Normal routing by tier
-            (ModelTier::Coordinator, _, _) => ResolvedBackend::Claude {
-                model: "opus".into(),
-            },
-            (ModelTier::Reasoning, _, _) => ResolvedBackend::Claude {
-                model: self.config.reasoning_model.clone(),
-            },
-            (ModelTier::Execution, _, _) => ResolvedBackend::Claude {
-                model: self.config.execution_model.clone(),
-            },
-
-            // Mechanical: local if available and enabled, else fall back to execution model
-            (ModelTier::Mechanical, _, true) if self.config.mechanical.enabled => {
-                ResolvedBackend::Ollama {
-                    model: self.config.mechanical.model.clone(),
-                    base_url: self.config.mechanical.base_url.clone(),
-                }
-            }
-            (ModelTier::Mechanical, _, _) => ResolvedBackend::Claude {
-                model: self.config.execution_model.clone(),
-            },
-        }
+        routing_match(unit.tier, unit.privacy, self.ollama_available, &self.config)
     }
 
     /// Resolve a WorkUnit to a trait-object backend.
@@ -144,33 +113,17 @@ impl TierRouter {
         Some(self.resolve_tier(escalation_tier, unit.privacy))
     }
 
+    /// Resolve a specific tier + privacy combination directly.
+    ///
+    /// Used by the escalation path in the retry loop where the caller already
+    /// knows the escalation tier and just needs a concrete backend.
+    pub fn resolve_from_tier(&self, tier: ModelTier, privacy: PrivacyLevel) -> ResolvedBackend {
+        self.resolve_tier(tier, privacy)
+    }
+
     /// Resolve a specific tier + privacy combination.
     fn resolve_tier(&self, tier: ModelTier, privacy: PrivacyLevel) -> ResolvedBackend {
-        match (tier, privacy, self.ollama_available) {
-            (_, PrivacyLevel::LocalOnly, true) => ResolvedBackend::Ollama {
-                model: self.config.mechanical.model.clone(),
-                base_url: self.config.mechanical.base_url.clone(),
-            },
-            (_, PrivacyLevel::LocalOnly, false) => ResolvedBackend::Blocked {
-                reason: "local model required but Ollama unavailable".into(),
-            },
-            (ModelTier::Coordinator, _, _) => ResolvedBackend::Claude { model: "opus".into() },
-            (ModelTier::Reasoning, _, _) => ResolvedBackend::Claude {
-                model: self.config.reasoning_model.clone(),
-            },
-            (ModelTier::Execution, _, _) => ResolvedBackend::Claude {
-                model: self.config.execution_model.clone(),
-            },
-            (ModelTier::Mechanical, _, true) if self.config.mechanical.enabled => {
-                ResolvedBackend::Ollama {
-                    model: self.config.mechanical.model.clone(),
-                    base_url: self.config.mechanical.base_url.clone(),
-                }
-            }
-            (ModelTier::Mechanical, _, _) => ResolvedBackend::Claude {
-                model: self.config.execution_model.clone(),
-            },
-        }
+        routing_match(tier, privacy, self.ollama_available, &self.config)
     }
 
     /// Resolve a model override, checking privacy constraints.
@@ -206,6 +159,45 @@ impl TierRouter {
 
     pub fn config(&self) -> &TierConfig {
         &self.config
+    }
+}
+
+/// Core routing logic: maps (tier, privacy, ollama_available) to a concrete backend.
+///
+/// Extracted to avoid duplication between `resolve()` and `resolve_tier()`.
+fn routing_match(
+    tier: ModelTier,
+    privacy: PrivacyLevel,
+    ollama_available: bool,
+    config: &TierConfig,
+) -> ResolvedBackend {
+    match (tier, privacy, ollama_available) {
+        // Privacy-sensitive: force local regardless of tier
+        (_, PrivacyLevel::LocalOnly, true) => ResolvedBackend::Ollama {
+            model: config.mechanical.model.clone(),
+            base_url: config.mechanical.base_url.clone(),
+        },
+        (_, PrivacyLevel::LocalOnly, false) => ResolvedBackend::Blocked {
+            reason: "local model required but Ollama unavailable".into(),
+        },
+
+        // Normal routing by tier
+        (ModelTier::Coordinator, _, _) => ResolvedBackend::Claude { model: "opus".into() },
+        (ModelTier::Reasoning, _, _) => ResolvedBackend::Claude {
+            model: config.reasoning_model.clone(),
+        },
+        (ModelTier::Execution, _, _) => ResolvedBackend::Claude {
+            model: config.execution_model.clone(),
+        },
+
+        // Mechanical: local if available and enabled, else fall back to execution model
+        (ModelTier::Mechanical, _, true) if config.mechanical.enabled => ResolvedBackend::Ollama {
+            model: config.mechanical.model.clone(),
+            base_url: config.mechanical.base_url.clone(),
+        },
+        (ModelTier::Mechanical, _, _) => ResolvedBackend::Claude {
+            model: config.execution_model.clone(),
+        },
     }
 }
 
@@ -251,6 +243,10 @@ mod tests {
             estimated_tokens: 0,
             max_retries: 1,
             escalation_tier: None,
+            read_namespaces: None,
+            write_namespace: None,
+            memory_importance: None,
+            staleness_sources: vec![],
         }
     }
 
