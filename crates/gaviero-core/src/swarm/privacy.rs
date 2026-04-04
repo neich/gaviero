@@ -159,6 +159,10 @@ mod tests {
             estimated_tokens: 0,
             max_retries: 1,
             escalation_tier: None,
+            read_namespaces: None,
+            write_namespace: None,
+            memory_importance: None,
+            staleness_sources: vec![],
         }
     }
 
