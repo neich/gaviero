@@ -456,6 +456,10 @@ mod tests {
             estimated_tokens: 0,
             max_retries: 1,
             escalation_tier: Some(ModelTier::Reasoning),
+            read_namespaces: None,
+            write_namespace: None,
+            memory_importance: None,
+            staleness_sources: vec![],
         }
     }
 
@@ -511,6 +515,7 @@ mod tests {
             modified_files: vec![PathBuf::from("bad.rs")],
             branch: None,
             summary: None,
+            cost_usd: 0.0,
         }];
 
         let obs = mock_observer();
@@ -545,6 +550,7 @@ mod tests {
             modified_files: vec![PathBuf::from("good.rs")],
             branch: None,
             summary: None,
+            cost_usd: 0.0,
         }];
 
         let obs = mock_observer();
@@ -573,6 +579,7 @@ mod tests {
             modified_files: vec![PathBuf::from("src/a.rs")],
             branch: None,
             summary: None,
+            cost_usd: 0.0,
         }];
 
         let found = find_unit_for_file(&units, &manifests, Path::new("src/a.rs"));
