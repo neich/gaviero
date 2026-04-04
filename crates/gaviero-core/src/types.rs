@@ -146,23 +146,14 @@ pub enum SymbolKind {
 // ── Tier Routing ────────────────────────────────────────────────
 
 /// Model tier for task routing in the coordinated swarm pipeline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelTier {
-    /// Coordinator: planning, decomposition, verification strategy (Opus)
-    Coordinator,
-    /// Complex multi-file semantic reasoning (Sonnet)
-    Reasoning,
-    /// Focused single-file execution (Haiku)
-    Execution,
-    /// Mechanical rote changes — optional, local LLM
-    Mechanical,
-}
-
-impl Default for ModelTier {
-    fn default() -> Self {
-        Self::Execution
-    }
+    /// Cheap tier: Haiku / local models. For iteration, test-gen, routine edits.
+    #[default]
+    Cheap,
+    /// Expensive tier: Sonnet / Opus. For analysis, complex reasoning, escalation.
+    Expensive,
 }
 
 /// Privacy classification for routing decisions.
@@ -244,9 +235,9 @@ mod tests {
 
     #[test]
     fn test_model_tier_serde_roundtrip() {
-        let tier = ModelTier::Mechanical;
+        let tier = ModelTier::Cheap;
         let json = serde_json::to_string(&tier).unwrap();
-        assert_eq!(json, "\"mechanical\"");
+        assert_eq!(json, "\"cheap\"");
         let back: ModelTier = serde_json::from_str(&json).unwrap();
         assert_eq!(back, tier);
     }
@@ -254,9 +245,9 @@ mod tests {
     #[test]
     fn test_model_tier_as_hash_key() {
         let mut map = HashMap::new();
-        map.insert(ModelTier::Reasoning, "sonnet");
-        map.insert(ModelTier::Execution, "haiku");
-        assert_eq!(map[&ModelTier::Reasoning], "sonnet");
+        map.insert(ModelTier::Expensive, "sonnet");
+        map.insert(ModelTier::Cheap, "haiku");
+        assert_eq!(map[&ModelTier::Expensive], "sonnet");
     }
 
     #[test]
