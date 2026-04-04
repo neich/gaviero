@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 
 use crate::memory::MemoryStore;
 use crate::observer::AcpObserver;
+use crate::repo_map::RepoMap;
 use crate::swarm::board::{parse_discoveries, SharedBoard};
 use crate::validation_gate::ValidationPipeline;
 use crate::write_gate::WriteGatePipeline;
@@ -24,8 +25,11 @@ use super::{AgentBackend, CompletionRequest, UnifiedStreamEvent};
 /// When `validation` is provided, runs the validation pipeline after each agent
 /// turn. On failure the error is fed back as a corrective prompt and the agent
 /// retries up to `work_unit.max_retries` additional times.
+///
+/// When `repo_map` is provided, a ranked context outline is prepended to the
+/// agent's base prompt so that even cheap-tier models have optimal scope.
 #[tracing::instrument(
-    skip(backend, write_gate, memory, observer, validation, board),
+    skip(backend, write_gate, memory, observer, validation, board, repo_map),
     fields(agent_id = %work_unit.id, tier = ?work_unit.tier)
 )]
 pub async fn run_backend(
@@ -38,6 +42,7 @@ pub async fn run_backend(
     observer: &dyn AcpObserver,
     validation: Option<&ValidationPipeline>,
     board: Option<&SharedBoard>,
+    repo_map: Option<&RepoMap>,
 ) -> Result<AgentManifest> {
     let agent_id = format!("agent-{}", work_unit.id);
 
@@ -47,8 +52,8 @@ pub async fn run_backend(
         gate.register_agent_scope(&agent_id, &work_unit.scope);
     }
 
-    // 2. Build base prompt (memory + scope + task)
-    let mut base_prompt = build_prompt(work_unit, memory, read_namespaces).await;
+    // 2. Build base prompt (memory + scope + task + optional repo context)
+    let mut base_prompt = build_prompt(work_unit, memory, read_namespaces, repo_map).await;
 
     // Prepend any relevant discoveries from other agents
     if let Some(b) = board {
@@ -272,13 +277,22 @@ pub async fn run_backend(
     })
 }
 
-/// Build the base prompt (memory context + scope clause + task description).
+/// Build the base prompt (repo context + memory context + scope clause + task description).
 async fn build_prompt(
     work_unit: &WorkUnit,
     memory: Option<&MemoryStore>,
     read_namespaces: &[String],
+    repo_map: Option<&RepoMap>,
 ) -> String {
     let mut parts = Vec::new();
+
+    // Repo map context (prepended first for maximum LLM attention)
+    if let Some(rm) = repo_map {
+        let ctx = rm.rank_for_agent(&work_unit.scope.owned_paths, 8_000);
+        if !ctx.repo_outline.is_empty() {
+            parts.push(ctx.repo_outline);
+        }
+    }
 
     if let Some(mem) = memory {
         let ctx = mem
@@ -454,7 +468,7 @@ mod tests {
             depends_on: vec![],
             backend: Default::default(),
             model: None,
-            tier: crate::types::ModelTier::Execution,
+            tier: crate::types::ModelTier::Cheap,
             privacy: crate::types::PrivacyLevel::Public,
             coordinator_instructions: String::new(),
             estimated_tokens: 0,
@@ -500,6 +514,7 @@ mod tests {
             &observer,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -534,6 +549,7 @@ mod tests {
             None,
             &["default".to_string()],
             &observer,
+            None,
             None,
             None,
         )
@@ -579,6 +595,7 @@ mod tests {
             None,
             &["default".to_string()],
             &observer,
+            None,
             None,
             None,
         )
@@ -630,6 +647,7 @@ mod tests {
             &observer,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -659,6 +677,7 @@ mod tests {
             None,
             &["default".to_string()],
             &observer,
+            None,
             None,
             None,
         )
