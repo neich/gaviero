@@ -1,4 +1,7 @@
 pub mod types;
+pub mod validation_gate;
+pub mod scope_enforcer;
+pub mod repo_map;
 pub mod workspace;
 pub mod session_state;
 pub mod tree_sitter;
