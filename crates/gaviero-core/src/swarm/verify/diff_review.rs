@@ -29,7 +29,7 @@ impl Default for DiffReviewConfig {
             review_model: "sonnet".into(),
             max_diff_tokens: 16384,
             batch_strategy: BatchStrategy::PerDependencyTier,
-            review_tiers: vec![ModelTier::Mechanical, ModelTier::Execution],
+            review_tiers: vec![ModelTier::Cheap],
         }
     }
 }
@@ -373,13 +373,13 @@ mod tests {
     fn test_batch_per_unit() {
         let d1 = ReviewableDiff {
             unit_id: "a".into(),
-            tier: ModelTier::Mechanical,
+            tier: ModelTier::Cheap,
             coordinator_instructions: String::new(),
             file_diffs: vec![],
         };
         let d2 = ReviewableDiff {
             unit_id: "b".into(),
-            tier: ModelTier::Execution,
+            tier: ModelTier::Cheap,
             coordinator_instructions: String::new(),
             file_diffs: vec![],
         };
@@ -393,13 +393,13 @@ mod tests {
     fn test_batch_aggregate() {
         let d1 = ReviewableDiff {
             unit_id: "a".into(),
-            tier: ModelTier::Mechanical,
+            tier: ModelTier::Cheap,
             coordinator_instructions: String::new(),
             file_diffs: vec![],
         };
         let d2 = ReviewableDiff {
             unit_id: "b".into(),
-            tier: ModelTier::Execution,
+            tier: ModelTier::Expensive,
             coordinator_instructions: String::new(),
             file_diffs: vec![],
         };
@@ -413,32 +413,32 @@ mod tests {
     fn test_batch_per_dependency_tier() {
         let d1 = ReviewableDiff {
             unit_id: "a".into(),
-            tier: ModelTier::Mechanical,
+            tier: ModelTier::Cheap,
             coordinator_instructions: String::new(),
             file_diffs: vec![],
         };
         let d2 = ReviewableDiff {
             unit_id: "b".into(),
-            tier: ModelTier::Mechanical,
+            tier: ModelTier::Cheap,
             coordinator_instructions: String::new(),
             file_diffs: vec![],
         };
         let d3 = ReviewableDiff {
             unit_id: "c".into(),
-            tier: ModelTier::Execution,
+            tier: ModelTier::Expensive,
             coordinator_instructions: String::new(),
             file_diffs: vec![],
         };
         let refs: Vec<&ReviewableDiff> = vec![&d1, &d2, &d3];
         let batches = batch_diffs(&refs, &BatchStrategy::PerDependencyTier);
-        assert_eq!(batches.len(), 2); // mechanical group + execution group
+        assert_eq!(batches.len(), 2); // cheap group + expensive group
     }
 
     #[test]
     fn test_build_review_prompt_contains_sections() {
         let diff = ReviewableDiff {
             unit_id: "test-unit".into(),
-            tier: ModelTier::Mechanical,
+            tier: ModelTier::Cheap,
             coordinator_instructions: "Rename foo to bar".into(),
             file_diffs: vec![FileDiff {
                 path: PathBuf::from("src/lib.rs"),
