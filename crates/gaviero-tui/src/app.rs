@@ -3773,11 +3773,11 @@ impl App {
         let text = buf.selected_text();
         if text.is_empty() { return; }
         let n = text.chars().count();
-        let system_ok = self.set_clipboard(&text);
-        let msg = if system_ok {
-            format!("Copied {} char{}", n, if n == 1 { "" } else { "s" })
-        } else {
-            format!("Copied {} char{} (system clipboard unavailable)", n, if n == 1 { "" } else { "s" })
+        let suffix = if n == 1 { "" } else { "s" };
+        let msg = match self.set_clipboard(&text) {
+            ClipboardResult::System  => format!("Copied {} char{}", n, suffix),
+            ClipboardResult::Osc52   => format!("Copied {} char{} (via terminal)", n, suffix),
+            ClipboardResult::Unavailable => format!("Copied {} char{} (internal only — terminal does not support OSC 52)", n, suffix),
         };
         self.status_message = Some((msg, std::time::Instant::now()));
     }
@@ -3787,11 +3787,11 @@ impl App {
         let text = buf.delete_selection();
         if text.is_empty() { return; }
         let n = text.chars().count();
-        let system_ok = self.set_clipboard(&text);
-        let msg = if system_ok {
-            format!("Cut {} char{}", n, if n == 1 { "" } else { "s" })
-        } else {
-            format!("Cut {} char{} (system clipboard unavailable)", n, if n == 1 { "" } else { "s" })
+        let suffix = if n == 1 { "" } else { "s" };
+        let msg = match self.set_clipboard(&text) {
+            ClipboardResult::System  => format!("Cut {} char{}", n, suffix),
+            ClipboardResult::Osc52   => format!("Cut {} char{} (via terminal)", n, suffix),
+            ClipboardResult::Unavailable => format!("Cut {} char{} (internal only — terminal does not support OSC 52)", n, suffix),
         };
         self.status_message = Some((msg, std::time::Instant::now()));
     }
@@ -3805,16 +3805,21 @@ impl App {
     }
 
     /// Sets text on both the internal clipboard and the system clipboard.
-    /// Returns `true` if the system clipboard was updated successfully.
-    fn set_clipboard(&mut self, text: &str) -> bool {
+    /// Tries arboard first, then OSC 52 (for SSH sessions), then falls back to internal only.
+    fn set_clipboard(&mut self, text: &str) -> ClipboardResult {
         self.internal_clipboard = text.to_string();
         if let Some(cb) = &mut self.clipboard {
             if cb.set_text(text).is_ok() {
-                return true;
+                return ClipboardResult::System;
             }
-            tracing::warn!("Failed to set system clipboard text");
+            tracing::warn!("arboard set_text failed, falling back to OSC 52");
         }
-        false
+        // OSC 52 fallback: works over SSH when the terminal emulator supports it
+        if osc52_copy(text) {
+            ClipboardResult::Osc52
+        } else {
+            ClipboardResult::Unavailable
+        }
     }
 
     fn get_clipboard(&mut self) -> String {
@@ -5953,6 +5958,28 @@ impl App {
             }
         }
     }
+}
+
+/// Result of a clipboard write attempt.
+enum ClipboardResult {
+    /// Written to the OS/display-server clipboard via arboard.
+    System,
+    /// Written via OSC 52 escape sequence (SSH-friendly, terminal must support it).
+    Osc52,
+    /// Neither arboard nor OSC 52 worked; text is in the internal clipboard only.
+    Unavailable,
+}
+
+/// Write `text` to the terminal emulator's clipboard via the OSC 52 escape sequence.
+/// Returns `true` on success.  Works over SSH when the terminal supports OSC 52
+/// (kitty, iTerm2, WezTerm, alacritty, etc.).
+fn osc52_copy(text: &str) -> bool {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    // OSC 52 ; c ; <base64> ST
+    let seq = format!("\x1b]52;c;{}\x07", encoded);
+    use std::io::Write as _;
+    std::io::stdout().write_all(seq.as_bytes()).and_then(|_| std::io::stdout().flush()).is_ok()
 }
 
 fn gutter_width(line_count: usize) -> u16 {
