@@ -930,6 +930,25 @@ impl App {
             }
         }
 
+        // Terminal paste: Ctrl+V when terminal is focused — send internal clipboard with bracketed-paste wrappers
+        if self.focus == Focus::Terminal {
+            if let Action::Paste = action {
+                let text = self.get_clipboard();
+                if !text.is_empty() {
+                    if let Some(inst) = self.terminal_manager.active_instance_mut() {
+                        if inst.spawned {
+                            // Bracketed paste: \x1b[200~ ... \x1b[201~
+                            let mut payload = b"\x1b[200~".to_vec();
+                            payload.extend_from_slice(text.as_bytes());
+                            payload.extend_from_slice(b"\x1b[201~");
+                            inst.write_input(&payload);
+                        }
+                    }
+                }
+                return;
+            }
+        }
+
         // Chat input area resize: Alt+Up/Down when side panel is focused
         if self.focus == Focus::SidePanel {
             match action {
