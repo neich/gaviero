@@ -6012,20 +6012,16 @@ fn parse_git_allow_list(workspace: &Workspace) -> Vec<String> {
 /// Each value is `[fileTree%, editor%, sidePanel%]`.
 ///
 /// Built-in defaults (used when the setting is absent or incomplete):
-///   0 → standard     [15, 70, 15]
-///   1 → editor focus [15, 85,  0]
+///   0 → standard     [15, 60, 25]
+///   1 → chat focused [15, 40, 45]
 ///   2 → full editor  [ 0,100,  0]
 ///   3 → code+notes   [ 0, 60, 40]
-///   4 → wide tree    [25, 75,  0]
-///   5 → three-column [20, 55, 25]
 fn parse_layout_presets(workspace: &Workspace) -> Vec<LayoutPreset> {
     const DEFAULTS: &[(u16, u16, u16)] = &[
-        (15, 70, 15),
-        (15, 85,  0),
+        (15, 60, 25),
+        (15, 40, 45),
         ( 0,100,  0),
-        ( 0, 60, 40),
-        (25, 75,  0),
-        (20, 55, 25),
+        ( 0, 60, 40)
     ];
 
     let val = workspace.resolve_setting("panels.layouts", None);
