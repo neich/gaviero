@@ -4648,12 +4648,32 @@ impl App {
                 if self.terminal_selection.dragging {
                     if let Some(area) = self.layout.terminal_area {
                         let content_y_start = area.y + 1;
-                        if row >= content_y_start && row < area.y + area.height {
+                        let content_height = area.height.saturating_sub(1);
+                        let last_content_row = area.y + area.height - 1;
+
+                        if row < content_y_start {
+                            // Mouse above panel — scroll back one line and pin selection to top
+                            if let Some(inst) = self.terminal_manager.active_instance_mut() {
+                                let current = inst.screen().scrollback();
+                                inst.screen_mut().set_scrollback(current + 1);
+                            }
+                            let vt_col = col.saturating_sub(area.x);
+                            self.terminal_selection.extend(0, vt_col);
+                        } else if row > last_content_row {
+                            // Mouse below panel — scroll forward one line and pin selection to bottom
+                            if let Some(inst) = self.terminal_manager.active_instance_mut() {
+                                let current = inst.screen().scrollback();
+                                inst.screen_mut().set_scrollback(current.saturating_sub(1));
+                            }
+                            let vt_col = col.saturating_sub(area.x);
+                            self.terminal_selection.extend(content_height.saturating_sub(1), vt_col);
+                        } else {
+                            // Normal drag inside panel
                             let vt_row = row - content_y_start;
                             let vt_col = col.saturating_sub(area.x);
                             self.terminal_selection.extend(vt_row, vt_col);
-                            self.needs_full_redraw = true;
                         }
+                        // No needs_full_redraw — normal per-frame redraw is sufficient and avoids flicker
                     }
                     return;
                 }
