@@ -1028,6 +1028,16 @@ impl App {
                 self.refresh_git_panel();
             }
             Action::ToggleTerminal => {
+                // Ctrl+J is bound to ToggleTerminal, but many terminals also send Ctrl+J
+                // (LF = 0x0A) for Shift+Enter. Redirect to newline when the chat input has focus.
+                if self.focus == Focus::SidePanel
+                    && matches!(self.side_panel, SidePanelMode::AgentChat)
+                {
+                    if !self.chat_state.active_conv_streaming() {
+                        self.chat_state.insert_char('\n');
+                    }
+                    return;
+                }
                 self.panel_visible.terminal = !self.panel_visible.terminal;
                 if self.panel_visible.terminal {
                     self.spawn_active_terminal();
