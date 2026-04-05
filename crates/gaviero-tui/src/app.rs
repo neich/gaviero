@@ -587,7 +587,13 @@ impl App {
             active_preset: None,
             fullscreen_panel: None,
             pre_fullscreen: None,
-            clipboard: arboard::Clipboard::new().ok(),
+            clipboard: match arboard::Clipboard::new() {
+                Ok(cb) => Some(cb),
+                Err(e) => {
+                    tracing::warn!("System clipboard unavailable: {}", e);
+                    None
+                }
+            },
             internal_clipboard: String::new(),
             mouse_dragging: false,
             scrollbar_dragging: None,
@@ -3766,14 +3772,28 @@ impl App {
         let Some(buf) = self.buffers.get(self.active_buffer) else { return };
         let text = buf.selected_text();
         if text.is_empty() { return; }
-        self.set_clipboard(&text);
+        let n = text.chars().count();
+        let system_ok = self.set_clipboard(&text);
+        let msg = if system_ok {
+            format!("Copied {} char{}", n, if n == 1 { "" } else { "s" })
+        } else {
+            format!("Copied {} char{} (system clipboard unavailable)", n, if n == 1 { "" } else { "s" })
+        };
+        self.status_message = Some((msg, std::time::Instant::now()));
     }
 
     fn clipboard_cut(&mut self) {
         let Some(buf) = self.buffers.get_mut(self.active_buffer) else { return };
         let text = buf.delete_selection();
         if text.is_empty() { return; }
-        self.set_clipboard(&text);
+        let n = text.chars().count();
+        let system_ok = self.set_clipboard(&text);
+        let msg = if system_ok {
+            format!("Cut {} char{}", n, if n == 1 { "" } else { "s" })
+        } else {
+            format!("Cut {} char{} (system clipboard unavailable)", n, if n == 1 { "" } else { "s" })
+        };
+        self.status_message = Some((msg, std::time::Instant::now()));
     }
 
     fn clipboard_paste(&mut self) {
@@ -3784,11 +3804,17 @@ impl App {
         }
     }
 
-    fn set_clipboard(&mut self, text: &str) {
+    /// Sets text on both the internal clipboard and the system clipboard.
+    /// Returns `true` if the system clipboard was updated successfully.
+    fn set_clipboard(&mut self, text: &str) -> bool {
         self.internal_clipboard = text.to_string();
         if let Some(cb) = &mut self.clipboard {
-            let _ = cb.set_text(text);
+            if cb.set_text(text).is_ok() {
+                return true;
+            }
+            tracing::warn!("Failed to set system clipboard text");
         }
+        false
     }
 
     fn get_clipboard(&mut self) -> String {
