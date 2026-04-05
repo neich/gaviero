@@ -318,6 +318,8 @@ pub fn is_terminal_escape_key(key: &KeyEvent) -> bool {
         // Shift+PageUp/PageDown — page scroll in terminal
         | (KeyCode::PageUp, false, false, true)       // Shift+PageUp — page scroll back
         | (KeyCode::PageDown, false, false, true)     // Shift+PageDown — page scroll forward
+        // Ctrl+V — paste from clipboard (handled by app, not forwarded raw to PTY)
+        | (KeyCode::Char('v'), true, false, false)
     )
 }
 
