@@ -15,6 +15,11 @@ pub struct StyledSpan {
     pub start_byte: usize,
     pub end_byte: usize,
     pub style: Style,
+    /// Number of dot-segments in the capture group name (e.g. "string" = 0,
+    /// "string.special.key" = 2). Used as a tiebreaker in sorting: lower
+    /// priority (less specific) comes first, so the last — most specific —
+    /// span wins in the rendering loop.
+    pub priority: usize,
 }
 
 /// Load highlight queries for a language.
@@ -77,18 +82,23 @@ pub fn run_highlights(
             let group = &config.group_names[capture.index as usize];
             if let Some(style) = theme.highlight_style(group) {
                 let node = capture.node;
+                // Priority = number of dot-separators in the group name.
+                // "string" → 0, "string.special" → 1, "string.special.key" → 2.
+                let priority = group.chars().filter(|&c| c == '.').count();
                 spans.push(StyledSpan {
                     start_byte: node.start_byte(),
                     end_byte: node.end_byte(),
                     style,
+                    priority,
                 });
             }
         }
     }
 
-    // Sort: by start_byte ascending, then by span width descending.
-    // Wider (less specific) spans come first so narrower (more specific)
-    // spans override them in the "last match wins" rendering loop.
+    // Sort: by start_byte ascending, then by span width descending (wider =
+    // less specific = first), then by priority ascending (less specific first).
+    // The rendering loop applies spans in order and the LAST match wins, so
+    // more-specific spans (higher priority, narrower) end up last and win.
     spans.sort_by(|a, b| {
         a.start_byte.cmp(&b.start_byte)
             .then_with(|| {
@@ -96,6 +106,7 @@ pub fn run_highlights(
                 let b_width = b.end_byte - b.start_byte;
                 b_width.cmp(&a_width) // wider first
             })
+            .then_with(|| a.priority.cmp(&b.priority)) // less specific first
     });
 
     // Append error spans AFTER the sorted syntax spans so they render last
@@ -125,6 +136,7 @@ fn collect_error_spans(
             start_byte: node.start_byte(),
             end_byte: node.end_byte(),
             style,
+            priority: usize::MAX, // always wins over syntax highlights
         });
         // Don't descend — the whole subtree is already covered by this span
         return;
@@ -237,5 +249,60 @@ mod tests {
         let theme = Theme::builtin_default();
         let spans = run_highlights(&tree, &rope, &config, &theme, 0..source.len());
         assert!(!spans.is_empty(), "should produce highlight spans for Kotlin code");
+    }
+
+    #[test]
+    fn test_json_highlight_pipeline() {
+        use crate::theme::Theme;
+
+        let lang = gaviero_core::tree_sitter::language_for_extension("json")
+            .expect("should have json language");
+        let config = load_highlight_config(lang.clone(), "json")
+            .expect("should load json highlights");
+
+        let mut parser = gaviero_core::Parser::new();
+        parser.set_language(&lang).unwrap();
+        let source = "{\n  \"name\": \"Alice\",\n  \"age\": 30,\n  \"active\": true\n}\n";
+        let rope = ropey::Rope::from_str(source);
+        let tree = parser.parse(source, None).unwrap();
+
+        let theme = Theme::builtin_default();
+        let spans = run_highlights(&tree, &rope, &config, &theme, 0..source.len());
+        eprintln!("JSON spans ({}):", spans.len());
+        for s in &spans {
+            let text = &source[s.start_byte..s.end_byte];
+            eprintln!("  {:?}..{:?} {:?} => {:?}", s.start_byte, s.end_byte, text, s.style);
+        }
+
+        // String values (non-key strings) — green
+        let string_val_spans: Vec<_> = spans.iter()
+            .filter(|s| s.style.fg == Some(ratatui::style::Color::Rgb(152, 195, 121)))
+            .collect();
+        assert!(!string_val_spans.is_empty(), "should produce green spans for JSON string values");
+
+        // Keys must be more specific (red/pink) and must come AFTER generic string (green)
+        // so that they win in the last-wins rendering loop.
+        let key_spans: Vec<_> = spans.iter()
+            .filter(|s| s.style.fg == Some(ratatui::style::Color::Rgb(224, 108, 117)))
+            .collect();
+        assert!(!key_spans.is_empty(), "should produce red spans for JSON keys");
+        // For each key span there must be a green span at the same range that
+        // comes BEFORE it in the list (so the red span wins).
+        for key_span in &key_spans {
+            let green_before = spans.iter()
+                .position(|s| s.start_byte == key_span.start_byte
+                    && s.end_byte == key_span.end_byte
+                    && s.style.fg == Some(ratatui::style::Color::Rgb(152, 195, 121)))
+                .and_then(|gi| spans.iter().position(|s| std::ptr::eq(s, *key_span)).map(|ki| gi < ki));
+            assert_eq!(green_before, Some(true),
+                "red key span at {}..{} must follow its green string span so red wins",
+                key_span.start_byte, key_span.end_byte);
+        }
+
+        // Numbers — orange
+        let number_spans: Vec<_> = spans.iter()
+            .filter(|s| s.style.fg == Some(ratatui::style::Color::Rgb(209, 154, 102)))
+            .collect();
+        assert!(!number_spans.is_empty(), "should produce orange spans for JSON numbers");
     }
 }

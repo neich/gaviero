@@ -38,6 +38,7 @@ pub fn highlight_markdown(source: &str, theme: &Theme, byte_range: std::ops::Ran
                 if block_end >= byte_range.start && code_block_start < byte_range.end {
                     if let Some(style) = theme.highlight_style("markup.code.block") {
                         spans.push(StyledSpan {
+                            priority: 0,
                             start_byte: code_block_start,
                             end_byte: block_end,
                             style,
@@ -60,6 +61,7 @@ pub fn highlight_markdown(source: &str, theme: &Theme, byte_range: std::ops::Ran
     if in_code_block && len >= byte_range.start && code_block_start < byte_range.end {
         if let Some(style) = theme.highlight_style("markup.code.block") {
             spans.push(StyledSpan {
+                priority: 0,
                 start_byte: code_block_start,
                 end_byte: len,
                 style,
@@ -85,6 +87,7 @@ fn highlight_markdown_line(line: &str, offset: usize, theme: &Theme, spans: &mut
         if hashes <= 6 && trimmed.get(hashes..hashes + 1).map_or(true, |c| c == " " || c.is_empty()) {
             if let Some(style) = theme.highlight_style("markup.heading") {
                 spans.push(StyledSpan {
+                    priority: 0,
                     start_byte: offset,
                     end_byte: offset + line.len(),
                     style,
@@ -98,6 +101,7 @@ fn highlight_markdown_line(line: &str, offset: usize, theme: &Theme, spans: &mut
     if trimmed.starts_with('>') {
         if let Some(style) = theme.highlight_style("markup.quote") {
             spans.push(StyledSpan {
+                priority: 0,
                 start_byte: offset,
                 end_byte: offset + line.len(),
                 style,
@@ -116,6 +120,7 @@ fn highlight_markdown_line(line: &str, offset: usize, theme: &Theme, spans: &mut
         let marker_start = line.len() - trimmed.len();
         if let Some(style) = theme.highlight_style("markup.list") {
             spans.push(StyledSpan {
+                priority: 0,
                 start_byte: offset + marker_start,
                 end_byte: offset + marker_start + marker_end,
                 style,
@@ -138,6 +143,7 @@ fn highlight_inline(line: &str, offset: usize, theme: &Theme, spans: &mut Vec<St
             if let Some(end) = find_closing(line, i + 1, b'`') {
                 if let Some(style) = theme.highlight_style("markup.code") {
                     spans.push(StyledSpan {
+                        priority: 0,
                         start_byte: offset + i,
                         end_byte: offset + end + 1,
                         style,
@@ -154,6 +160,7 @@ fn highlight_inline(line: &str, offset: usize, theme: &Theme, spans: &mut Vec<St
             if let Some(end) = find_double_closing(line, i + 2, marker) {
                 if let Some(style) = theme.highlight_style("markup.bold") {
                     spans.push(StyledSpan {
+                        priority: 0,
                         start_byte: offset + i,
                         end_byte: offset + end + 2,
                         style,
@@ -170,6 +177,7 @@ fn highlight_inline(line: &str, offset: usize, theme: &Theme, spans: &mut Vec<St
             if let Some(end) = find_closing(line, i + 1, marker) {
                 if let Some(style) = theme.highlight_style("markup.italic") {
                     spans.push(StyledSpan {
+                        priority: 0,
                         start_byte: offset + i,
                         end_byte: offset + end + 1,
                         style,
@@ -187,6 +195,7 @@ fn highlight_inline(line: &str, offset: usize, theme: &Theme, spans: &mut Vec<St
                     if let Some(paren_end) = find_closing(line, bracket_end + 2, b')') {
                         if let Some(style) = theme.highlight_style("markup.link") {
                             spans.push(StyledSpan {
+                                priority: 0,
                                 start_byte: offset + i,
                                 end_byte: offset + bracket_end + 1,
                                 style,
@@ -194,6 +203,7 @@ fn highlight_inline(line: &str, offset: usize, theme: &Theme, spans: &mut Vec<St
                         }
                         if let Some(style) = theme.highlight_style("markup.link.url") {
                             spans.push(StyledSpan {
+                                priority: 0,
                                 start_byte: offset + bracket_end + 1,
                                 end_byte: offset + paren_end + 1,
                                 style,
