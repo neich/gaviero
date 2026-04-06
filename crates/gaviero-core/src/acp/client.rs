@@ -261,8 +261,15 @@ impl AcpPipeline {
                         ..
                     } => {
                         if is_error {
-                            self.observer
-                                .on_message_complete("system", &format!("Error: {}", result_text));
+                            let msg = if is_auth_error(&result_text) {
+                                format!(
+                                    "Error: {}\n\nTo re-authenticate, run `claude login` in a terminal, then retry.",
+                                    result_text
+                                )
+                            } else {
+                                format!("Error: {}", result_text)
+                            };
+                            self.observer.on_message_complete("system", &msg);
                         } else {
                             if full_text.is_empty() && !result_text.is_empty() {
                                 full_text = result_text.clone();
@@ -304,7 +311,15 @@ impl AcpPipeline {
                                 exit_info
                             )
                         } else {
-                            format!("Claude CLI error{}:\n{}", exit_info, stderr)
+                            let base = format!("Claude CLI error{}:\n{}", exit_info, stderr);
+                            if is_auth_error(&stderr) {
+                                format!(
+                                    "{}\n\nTo re-authenticate, run `claude login` in a terminal, then retry.",
+                                    base
+                                )
+                            } else {
+                                base
+                            }
                         };
                         self.observer.on_message_complete("system", &msg);
                     }
@@ -494,6 +509,17 @@ impl AcpPipeline {
 
         Ok(())
     }
+}
+
+/// Return true if the error text indicates an OAuth / authentication failure.
+fn is_auth_error(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    (lower.contains("oauth") || lower.contains("authentication") || lower.contains("unauthorized"))
+        && (lower.contains("expired") || lower.contains("invalid") || lower.contains("failed"))
+        || lower.contains("oauth token expired")
+        || lower.contains("not logged in")
+        || lower.contains("please log in")
+        || lower.contains("401")
 }
 
 /// Format a one-line summary for a tool call, extracting key info from the input JSON.
