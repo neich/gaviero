@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 
 use super::protocol::{StreamEvent, parse_stream_line};
@@ -20,6 +20,9 @@ pub struct AgentOptions {
     pub effort: String,
     /// Max output tokens (0 = use default). Reserved for future API-based backends.
     pub max_tokens: u32,
+    /// When true, pass `--dangerously-skip-permissions` so the subprocess never
+    /// pauses for permission prompts. Intended for single-prompt "yes to all" mode.
+    pub auto_approve: bool,
 }
 
 impl Default for AgentOptions {
@@ -27,6 +30,7 @@ impl Default for AgentOptions {
         Self {
             effort: "off".to_string(),
             max_tokens: 16384,
+            auto_approve: false,
         }
     }
 }
@@ -35,6 +39,9 @@ impl Default for AgentOptions {
 pub struct AcpSession {
     child: Child,
     stdout: BufReader<tokio::process::ChildStdout>,
+    /// Channel sender for lines written to the subprocess stdin.
+    /// Used to send permission responses without closing stdin.
+    stdin_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     line_buf: String,
     /// Captured stderr lines (shared with drain task).
     stderr_buf: Arc<tokio::sync::Mutex<Vec<String>>>,
@@ -70,6 +77,10 @@ impl AcpSession {
             cmd.arg("--effort").arg(&options.effort);
         }
 
+        if options.auto_approve {
+            cmd.arg("--dangerously-skip-permissions");
+        }
+
         if !system_prompt.is_empty() {
             cmd.arg("--append-system-prompt").arg(system_prompt);
         }
@@ -95,15 +106,26 @@ impl AcpSession {
 
         let mut child = cmd.spawn().context("spawning claude subprocess")?;
 
-        // Write prompt to stdin and close it
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
+        // Write prompt to stdin and keep stdin open for permission responses.
+        // A background task owns the ChildStdin and drains a channel so that
+        // `respond_permission()` can send responses without closing the pipe.
+        let stdin_tx = if let Some(mut stdin) = child.stdin.take() {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             let prompt_bytes = prompt.as_bytes().to_vec();
             tokio::spawn(async move {
                 let _ = stdin.write_all(&prompt_bytes).await;
+                // Keep stdin alive and forward any permission responses
+                while let Some(line) = rx.recv().await {
+                    let _ = stdin.write_all(line.as_bytes()).await;
+                    let _ = stdin.flush().await;
+                }
+                // Channel dropped → session done, close stdin
                 let _ = stdin.shutdown().await;
             });
-        }
+            Some(tx)
+        } else {
+            None
+        };
 
         let stdout = child
             .stdout
@@ -127,6 +149,7 @@ impl AcpSession {
         Ok(Self {
             child,
             stdout: BufReader::new(stdout),
+            stdin_tx,
             line_buf: String::new(),
             stderr_buf,
         })
@@ -177,6 +200,20 @@ impl AcpSession {
     /// Kill the subprocess (for cancellation).
     pub fn kill(&mut self) {
         let _ = self.child.start_kill();
+    }
+
+    /// Send a permission response back to the Claude subprocess via stdin.
+    ///
+    /// Called after the pipeline receives a `PermissionRequest` event and
+    /// the user approves or denies the action in the TUI.
+    pub fn respond_permission(&self, allow: bool, request_id: &str) {
+        let Some(ref tx) = self.stdin_tx else { return };
+        let decision = if allow { "allow" } else { "deny" };
+        let msg = format!(
+            "{{\"type\":\"permission_response\",\"decision\":\"{}\",\"permission_request_id\":\"{}\"}}\n",
+            decision, request_id
+        );
+        let _ = tx.send(msg);
     }
 
     /// Wait for the subprocess to exit and return its status.
