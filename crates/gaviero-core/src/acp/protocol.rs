@@ -53,6 +53,14 @@ pub enum StreamEvent {
         cost_usd: Option<f64>,
     },
 
+    /// Permission request — Claude wants to execute a tool and needs user approval.
+    /// The pipeline pauses until the user approves or denies via stdin.
+    PermissionRequest {
+        tool_name: String,
+        description: String,
+        request_id: String,
+    },
+
     /// Anything we don't specifically handle.
     Unknown(Value),
 }
@@ -190,6 +198,20 @@ pub fn parse_stream_line(line: &str) -> Result<StreamEvent> {
                 duration_ms,
                 cost_usd,
             })
+        }
+
+        // Permission request: Claude wants to run a tool and needs approval.
+        // {"type":"permission_request","tool_name":"Bash","description":"Run ...","id":"req_123"}
+        "permission_request" => {
+            let tool_name = opt_str(&v, "tool_name").to_string();
+            let description = opt_str(&v, "description").to_string();
+            // Accept either "id" or "permission_request_id" for robustness
+            let request_id = v.get("permission_request_id")
+                .or_else(|| v.get("id"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            Ok(StreamEvent::PermissionRequest { tool_name, description, request_id })
         }
 
         _ => Ok(StreamEvent::Unknown(v)),
