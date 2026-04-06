@@ -91,6 +91,24 @@ impl FileAutocomplete {
     }
 }
 
+/// A pending permission request from the agent subprocess.
+/// Held in `Conversation::pending_permission` while the user decides.
+pub struct PendingPermission {
+    pub tool_name: String,
+    pub description: String,
+    /// Send `true` to allow or `false`/drop to deny.
+    pub respond: tokio::sync::oneshot::Sender<bool>,
+}
+
+impl std::fmt::Debug for PendingPermission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingPermission")
+            .field("tool_name", &self.tool_name)
+            .field("description", &self.description)
+            .finish_non_exhaustive()
+    }
+}
+
 /// One conversation (tab) in the chat panel.
 #[derive(Debug)]
 pub struct Conversation {
@@ -109,6 +127,8 @@ pub struct Conversation {
     pub streaming_status: String,
     /// When streaming started, for elapsed time display.
     pub streaming_started_at: Option<Instant>,
+    /// Pending permission request waiting for user approval (y/n).
+    pub pending_permission: Option<PendingPermission>,
 }
 
 /// Global agent settings read from workspace settings.
@@ -183,6 +203,9 @@ pub struct AgentChatState {
     pub chat_dragging: bool,
     /// When true, the user has manually scrolled during streaming, so auto-scroll is paused.
     pub user_scrolled_during_stream: bool,
+    /// When true, the next prompt will be sent with `--dangerously-skip-permissions`.
+    /// Toggled with Alt+Y. Resets to false after the message is sent.
+    pub auto_approve_next: bool,
 }
 
 impl AgentChatState {
@@ -197,6 +220,7 @@ impl AgentChatState {
             is_streaming: false,
             streaming_status: String::new(),
             streaming_started_at: None,
+            pending_permission: None,
         };
         Self {
             conversations: vec![conv],
@@ -221,6 +245,7 @@ impl AgentChatState {
             text_sel_end: None,
             user_scrolled_during_stream: false,
             chat_dragging: false,
+            auto_approve_next: false,
         }
     }
 
@@ -237,6 +262,31 @@ impl AgentChatState {
     /// Is the active conversation currently streaming?
     pub fn active_conv_streaming(&self) -> bool {
         self.conversations[self.active_conv].is_streaming
+    }
+
+    /// Is the active conversation waiting for a permission decision?
+    pub fn active_conv_pending_permission(&self) -> bool {
+        self.conversations[self.active_conv].pending_permission.is_some()
+    }
+
+    /// Store a pending permission request on the named conversation.
+    pub fn set_pending_permission(&mut self, conv_id: &str, perm: PendingPermission) {
+        if let Some(idx) = self.find_conv_idx(conv_id) {
+            self.conversations[idx].pending_permission = Some(perm);
+        }
+    }
+
+    /// Respond to the active conversation's pending permission and clear it.
+    pub fn respond_active_permission(&mut self, allow: bool) {
+        let conv = &mut self.conversations[self.active_conv];
+        if let Some(perm) = conv.pending_permission.take() {
+            let _ = perm.respond.send(allow);
+        }
+    }
+
+    /// Toggle the auto-approve flag for the next prompt.
+    pub fn toggle_auto_approve(&mut self) {
+        self.auto_approve_next = !self.auto_approve_next;
     }
 
     /// Get the effective model for the active conversation.
@@ -560,6 +610,7 @@ impl AgentChatState {
             is_streaming: false,
             streaming_status: String::new(),
             streaming_started_at: None,
+            pending_permission: None,
         };
         self.conversations.push(conv);
         self.active_conv = self.conversations.len() - 1;
@@ -1380,6 +1431,7 @@ impl AgentChatState {
                     is_streaming: false,
                     streaming_status: String::new(),
                     streaming_started_at: None,
+                    pending_permission: None,
                 });
             }
         }
@@ -1814,11 +1866,59 @@ impl AgentChatState {
             }
         }
 
+        // Permission request overlay: replaces normal input area
+        if let Some(ref perm) = self.conversations[self.active_conv].pending_permission {
+            let warn_style = Style::default().fg(theme::WARNING).bg(bg).add_modifier(Modifier::BOLD);
+            let text_style = Style::default().fg(theme::TEXT_BRIGHT).bg(bg);
+            let key_style = Style::default().fg(theme::ACCENT).bg(bg).add_modifier(Modifier::BOLD);
+
+            // Line 0: header
+            let header = format!(" ⚠ Permission: {} ", perm.tool_name);
+            let mut cx = area.x;
+            for ch in header.chars() {
+                if cx < area.x + area.width && cx < buf.area().right() && area.y < buf.area().bottom() {
+                    buf[(cx, area.y)].set_char(ch).set_style(warn_style);
+                    cx += 1;
+                }
+            }
+
+            // Line 1: description (truncated to fit)
+            if area.height > 1 {
+                let desc_y = area.y + 1;
+                let max_w = area.width as usize;
+                let desc: String = perm.description.chars().take(max_w.saturating_sub(1)).collect();
+                let mut cx = area.x;
+                buf[(cx, desc_y)].set_char(' ').set_style(text_style);
+                cx += 1;
+                for ch in desc.chars() {
+                    if cx < area.x + area.width && cx < buf.area().right() && desc_y < buf.area().bottom() {
+                        buf[(cx, desc_y)].set_char(ch).set_style(text_style);
+                        cx += 1;
+                    }
+                }
+            }
+
+            // Last line: key hints
+            let hint_y = area.y + area.height.saturating_sub(1);
+            let keys = " [y] Allow  [n] Deny ";
+            let mut cx = area.x;
+            for ch in keys.chars() {
+                if cx < area.x + area.width && cx < buf.area().right() && hint_y < buf.area().bottom() {
+                    let s = if ch == 'y' || ch == 'n' { key_style } else { text_style };
+                    buf[(cx, hint_y)].set_char(ch).set_style(s);
+                    cx += 1;
+                }
+            }
+            return;
+        }
+
         // Minimal prompt: only show context for special modes
         let prompt: &str = if self.renaming {
             "Rename: "
         } else if self.active_conv_streaming() {
             "Ctrl+C to cancel"
+        } else if self.auto_approve_next {
+            "[auto-approve] > "
         } else {
             "> "
         };

@@ -67,6 +67,8 @@ pub enum Action {
 
     // Chat
     AltEnter,
+    /// Toggle "auto-approve all permissions" for the next prompt only.
+    ToggleAutoApprove,
 
     // Swarm (triggered by /swarm command, not a keybinding)
     #[allow(dead_code)]
@@ -138,6 +140,8 @@ impl Keymap {
             KeyCode::Char('a') if alt => Action::SetSideModeChat,
             KeyCode::Char('w') if alt => Action::SetSideModeSwarm,
             KeyCode::Char('g') if alt => Action::SetSideModeGit,
+            // Alt+Y: toggle auto-approve permissions for next prompt
+            KeyCode::Char('y') if alt => Action::ToggleAutoApprove,
 
             // ── Layout presets: Alt+5..9 and Alt+0 ───────────────
             // Unshifted digits with Alt: keyboard-layout independent, not

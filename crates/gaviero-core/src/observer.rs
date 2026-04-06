@@ -37,6 +37,22 @@ pub trait AcpObserver: Send + Sync {
     /// The TUI uses this to show a compact inline diff summary during streaming.
     fn on_proposal_deferred(&self, path: &Path, old_content: Option<&str>, new_content: &str);
 
+    /// Called when the agent subprocess needs user approval to run a tool.
+    ///
+    /// The pipeline blocks until the `respond` sender is used:
+    /// - `respond.send(true)` → allow the tool
+    /// - `respond.send(false)` (or drop) → deny the tool
+    ///
+    /// The default implementation auto-allows (preserves existing non-TUI behaviour).
+    fn on_permission_request(
+        &self,
+        _tool_name: &str,
+        _description: &str,
+        respond: tokio::sync::oneshot::Sender<bool>,
+    ) {
+        let _ = respond.send(true);
+    }
+
     // ── Inline validation (default no-op) ──────────────────────────
 
     /// Called after each validation gate runs on a modified file.

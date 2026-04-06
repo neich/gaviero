@@ -43,6 +43,16 @@ pub enum Event {
         deletions: usize,
     },
 
+    /// The agent subprocess needs user approval to run a tool.
+    /// The pipeline is suspended until the `respond` channel is used.
+    PermissionRequest {
+        conv_id: String,
+        tool_name: String,
+        description: String,
+        /// Send `true` to allow, `false` (or drop) to deny.
+        respond: tokio::sync::oneshot::Sender<bool>,
+    },
+
     /// All file proposals from an agent response are ready for batch review.
     /// Fired when streaming ends and there are pending deferred proposals.
     AcpTaskCompleted {

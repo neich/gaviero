@@ -278,6 +278,20 @@ impl AcpPipeline {
                         }
                         break;
                     }
+                    StreamEvent::PermissionRequest { tool_name, description, request_id } => {
+                        // Pause the pipeline: ask the observer (TUI) for a decision.
+                        // The session is not borrowed here so awaiting is safe.
+                        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+                        self.observer.on_permission_request(&tool_name, &description, tx);
+                        let allow = rx.await.unwrap_or(false);
+                        tracing::info!(
+                            "Permission request for '{}': {}",
+                            tool_name,
+                            if allow { "allowed" } else { "denied" }
+                        );
+                        session.respond_permission(allow, &request_id);
+                        idle_count = 0;
+                    }
                     StreamEvent::SystemInit { .. } => {}
                     StreamEvent::Unknown(_) => {}
                 },
