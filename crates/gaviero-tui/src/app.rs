@@ -287,6 +287,20 @@ impl AcpObserver for TuiAcpObserver {
             status: status.to_string(),
         });
     }
+    fn on_permission_request(
+        &self,
+        tool_name: &str,
+        description: &str,
+        respond: tokio::sync::oneshot::Sender<bool>,
+    ) {
+        let _ = self.tx.send(Event::PermissionRequest {
+            conv_id: self.conv_id.clone(),
+            tool_name: tool_name.to_string(),
+            description: description.to_string(),
+            respond,
+        });
+    }
+
     fn on_message_complete(&self, role: &str, content: &str) {
         let _ = self.tx.send(Event::MessageComplete {
             conv_id: self.conv_id.clone(),
@@ -784,6 +798,31 @@ impl App {
                 }
             }
 
+            // Permission request from agent subprocess — show approval dialog in chat
+            Event::PermissionRequest { conv_id, tool_name, description, respond } => {
+                if let Some(idx) = self.chat_state.find_conv_idx(&conv_id) {
+                    // Update streaming status to signal waiting for user
+                    self.chat_state.conversations[idx].streaming_status =
+                        format!("Waiting for permission: {}", tool_name);
+                    self.chat_state.set_pending_permission(
+                        &conv_id,
+                        crate::panels::agent_chat::PendingPermission {
+                            tool_name,
+                            description,
+                            respond,
+                        },
+                    );
+                    // Ensure the chat panel is visible so the user sees the dialog
+                    self.panel_visible.side_panel = true;
+                    if self.side_panel != SidePanelMode::AgentChat {
+                        self.side_panel = SidePanelMode::AgentChat;
+                    }
+                } else {
+                    // Unknown conversation — auto-deny
+                    let _ = respond.send(false);
+                }
+            }
+
             // Swarm events
             Event::SwarmPhaseChanged(phase) => {
                 self.swarm_dashboard.set_phase(&phase);
@@ -1226,6 +1265,20 @@ impl App {
             return;
         }
 
+        // Permission dialog: y = allow, n = deny, all other keys blocked
+        if self.chat_state.active_conv_pending_permission() {
+            match action {
+                Action::InsertChar('y') | Action::InsertChar('Y') => {
+                    self.chat_state.respond_active_permission(true);
+                }
+                Action::InsertChar('n') | Action::InsertChar('N') | Action::Quit => {
+                    self.chat_state.respond_active_permission(false);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Browse mode: navigate messages and copy
         if self.chat_state.browse_mode {
             match action {
@@ -1321,6 +1374,14 @@ impl App {
             }
             Action::AltEnter => {
                 self.chat_state.insert_char('\n');
+            }
+            Action::ToggleAutoApprove => {
+                self.chat_state.toggle_auto_approve();
+                let state = if self.chat_state.auto_approve_next { "ON" } else { "OFF" };
+                self.status_message = Some((
+                    format!("Auto-approve: {} (Alt+Y to toggle)", state),
+                    std::time::Instant::now(),
+                ));
             }
             Action::InsertChar(ch) => {
                 if !self.chat_state.active_conv_streaming() {
@@ -1937,10 +1998,14 @@ impl App {
         let model = self.chat_state.effective_model().to_string();
         let effort = self.chat_state.effective_effort().to_string();
         let max_tokens = self.chat_state.agent_settings.max_tokens;
+        // Take the auto-approve flag and reset it so it only applies to this one prompt
+        let auto_approve = self.chat_state.auto_approve_next;
+        self.chat_state.auto_approve_next = false;
 
         let options = gaviero_core::acp::session::AgentOptions {
             effort,
             max_tokens,
+            auto_approve,
         };
 
         let memory = self.memory.clone();
@@ -4456,7 +4521,6 @@ impl App {
                         if self.side_panel == SidePanelMode::AgentChat {
                             if let Some((line, ci)) = self.chat_state.screen_to_text_pos(col, row) {
                                 self.chat_state.start_text_selection(line, ci);
-                                self.needs_full_redraw = true;
                             } else {
                                 self.chat_state.clear_text_selection();
                             }
@@ -4476,7 +4540,6 @@ impl App {
                             let vt_row = row - content_y_start;
                             let vt_col = col.saturating_sub(area.x);
                             self.terminal_selection.start(vt_row, vt_col);
-                            self.needs_full_redraw = true;
                         }
                         return;
                     }
@@ -4640,7 +4703,7 @@ impl App {
                 if self.chat_state.chat_dragging {
                     if let Some((line, ci)) = self.chat_state.screen_to_text_pos(col, row) {
                         self.chat_state.extend_text_selection(line, ci);
-                        self.needs_full_redraw = true;
+                        // No needs_full_redraw — normal per-frame redraw is sufficient and avoids flicker
                     }
                     return;
                 }
@@ -4706,6 +4769,15 @@ impl App {
                     }
                     self.chat_state.chat_dragging = false;
                     // Keep selection highlight visible until next click
+                }
+                // Copy editor text selection to clipboard on mouse release (mirrors terminal/chat behaviour)
+                if self.mouse_dragging {
+                    if let Some(buf) = self.buffers.get(self.active_buffer) {
+                        let text = buf.selected_text();
+                        if !text.is_empty() {
+                            self.set_clipboard(&text);
+                        }
+                    }
                 }
                 self.mouse_dragging = false;
                 self.scrollbar_dragging = None;
