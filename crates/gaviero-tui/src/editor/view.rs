@@ -174,6 +174,9 @@ impl<'a> EditorView<'a> {
                     if span.style.add_modifier.contains(ratatui::style::Modifier::BOLD) {
                         style = style.add_modifier(ratatui::style::Modifier::BOLD);
                     }
+                    if span.style.add_modifier.contains(ratatui::style::Modifier::UNDERLINED) {
+                        style = style.add_modifier(ratatui::style::Modifier::UNDERLINED);
+                    }
                 }
             }
 

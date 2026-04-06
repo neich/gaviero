@@ -1,6 +1,8 @@
 [highlights]
 "comment"            = { fg = "#7f848e" }
 "string"             = { fg = "#98c379" }
+"string.special.key" = { fg = "#e06c75" }
+"number"             = { fg = "#d19a66" }
 "constant.numeric"   = { fg = "#d19a66" }
 "constant.builtin"   = { fg = "#d19a66", bold = true }
 "keyword"            = { fg = "#c678dd" }
