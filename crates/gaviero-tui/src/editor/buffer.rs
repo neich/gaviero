@@ -1135,53 +1135,62 @@ impl Buffer {
 
         self.delete_selection();
 
+        // Remember where the paste starts so we can place the cursor there after inserting.
+        // This makes the beginning of the pasted content immediately visible to the user.
+        let paste_start = self.cursor_char_pos();
+
         let lines: Vec<&str> = text.lines().collect();
         let trailing_newline = text.ends_with('\n');
 
         if lines.len() <= 1 {
             // Single line — insert as-is (trimming trailing newline)
             self.insert_text(lines.first().copied().unwrap_or(""));
-            return;
-        }
+        } else {
+            // Determine the base indent of the pasted text (from first non-empty line)
+            let paste_base_indent = lines.iter()
+                .find(|l| !l.trim().is_empty())
+                .map(|l| {
+                    let trimmed = l.trim_start();
+                    &l[..l.len() - trimmed.len()]
+                })
+                .unwrap_or("");
 
-        // Determine the base indent of the pasted text (from first non-empty line)
-        let paste_base_indent = lines.iter()
-            .find(|l| !l.trim().is_empty())
-            .map(|l| {
-                let trimmed = l.trim_start();
-                &l[..l.len() - trimmed.len()]
-            })
-            .unwrap_or("");
+            // The indent context at the cursor
+            let target_indent = self.current_line_indent();
 
-        // The indent context at the cursor
-        let target_indent = self.current_line_indent();
+            // Build the adjusted text
+            let mut result = String::new();
 
-        // Build the adjusted text
-        let mut result = String::new();
+            // First line: insert at cursor position (no indent adjustment)
+            result.push_str(lines[0]);
 
-        // First line: insert at cursor position (no indent adjustment)
-        result.push_str(lines[0]);
-
-        // Subsequent lines: replace base indent with target indent
-        for line in &lines[1..] {
-            result.push('\n');
-            if line.trim().is_empty() {
-                // Blank line — just add newline
-            } else if line.starts_with(paste_base_indent) {
-                // Replace the pasted base indent with target indent
-                result.push_str(&target_indent);
-                result.push_str(&line[paste_base_indent.len()..]);
-            } else {
-                // Line has less indent than base — insert as-is
-                result.push_str(line);
+            // Subsequent lines: replace base indent with target indent
+            for line in &lines[1..] {
+                result.push('\n');
+                if line.trim().is_empty() {
+                    // Blank line — just add newline
+                } else if line.starts_with(paste_base_indent) {
+                    // Replace the pasted base indent with target indent
+                    result.push_str(&target_indent);
+                    result.push_str(&line[paste_base_indent.len()..]);
+                } else {
+                    // Line has less indent than base — insert as-is
+                    result.push_str(line);
+                }
             }
+
+            if trailing_newline {
+                result.push('\n');
+            }
+
+            self.insert_text(&result);
         }
 
-        if trailing_newline {
-            result.push('\n');
-        }
-
-        self.insert_text(&result);
+        // Move cursor to the START of the pasted content so the user sees what was inserted.
+        self.cursor.line = self.text.char_to_line(paste_start);
+        let line_start = self.text.line_to_char(self.cursor.line);
+        self.cursor.col = paste_start - line_start;
+        self.cursor.anchor = None;
     }
 
     /// Delete the entire current line (Ctrl+K).
