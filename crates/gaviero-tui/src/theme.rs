@@ -219,6 +219,7 @@ impl Theme {
         let mut highlights = HashMap::new();
         highlights.insert("comment".into(), Style::default().fg(Color::Rgb(127, 132, 142)));
         highlights.insert("string".into(), Style::default().fg(Color::Rgb(152, 195, 121)));
+        highlights.insert("string.special.key".into(), Style::default().fg(Color::Rgb(224, 108, 117)));
         highlights.insert("constant.numeric".into(), Style::default().fg(Color::Rgb(209, 154, 102)));
         highlights.insert("constant.builtin".into(), Style::default().fg(Color::Rgb(209, 154, 102)).add_modifier(Modifier::BOLD));
         highlights.insert("keyword".into(), Style::default().fg(Color::Rgb(198, 120, 221)));
