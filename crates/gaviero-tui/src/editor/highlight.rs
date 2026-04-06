@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
-use gaviero_core::{Language, Query, QueryCursor, Tree};
-use ratatui::style::Style;
+use gaviero_core::{Language, Node, Query, QueryCursor, Tree};
+use ratatui::style::{Color, Modifier, Style};
 use streaming_iterator::StreamingIterator;
 
 use crate::theme::Theme;
@@ -97,7 +97,43 @@ pub fn run_highlights(
                 b_width.cmp(&a_width) // wider first
             })
     });
+
+    // Append error spans AFTER the sorted syntax spans so they render last
+    // and visually override normal colors (red + underline = parse error marker).
+    let error_style = Style::default()
+        .fg(Color::Rgb(224, 108, 117))
+        .add_modifier(Modifier::UNDERLINED);
+    collect_error_spans(tree.root_node(), &visible_range, &mut spans, error_style);
+
     spans
+}
+
+/// Recursively collect byte ranges of ERROR and MISSING nodes within the
+/// visible range and push a styled span for each into `out`.
+fn collect_error_spans(
+    node: Node<'_>,
+    visible_range: &std::ops::Range<usize>,
+    out: &mut Vec<StyledSpan>,
+    style: Style,
+) {
+    // Skip nodes entirely outside the visible viewport
+    if node.start_byte() >= visible_range.end || node.end_byte() <= visible_range.start {
+        return;
+    }
+    if node.is_error() || node.is_missing() {
+        out.push(StyledSpan {
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+            style,
+        });
+        // Don't descend — the whole subtree is already covered by this span
+        return;
+    }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            collect_error_spans(child, visible_range, out, style);
+        }
+    }
 }
 
 #[cfg(test)]
