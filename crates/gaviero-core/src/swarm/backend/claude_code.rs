@@ -248,6 +248,10 @@ pub fn map_acp_event(
         StreamEvent::Unknown(_) => {
             // Filtered out — forward-compatibility passthrough
         }
+        StreamEvent::PermissionRequest { .. } => {
+            // Swarm agents run with auto-approve; permission requests are not expected.
+            // If one arrives, it is silently ignored (the subprocess will time out and deny).
+        }
     }
 
     out
