@@ -122,38 +122,58 @@ struct Cli {
     /// Write structured JSON trace logs to this file (enables DEBUG-level tracing).
     #[arg(long)]
     trace: Option<PathBuf>,
+
+    /// Output path for the generated .gaviero DSL plan file (--coordinated only).
+    /// Defaults to tmp/gaviero_plan_<timestamp>.gaviero inside the repo.
+    #[arg(long, requires = "coordinated")]
+    output: Option<PathBuf>,
 }
 
-/// CLI observer that prints agent events to stderr.
-struct CliAcpObserver;
+/// CLI observer that prints agent events to stderr, mirroring agent chat output.
+struct CliAcpObserver {
+    /// Label printed in the agent header (e.g. "task-0").
+    agent_id: String,
+}
+
+impl CliAcpObserver {
+    fn new(agent_id: &str) -> Self {
+        Self { agent_id: agent_id.to_string() }
+    }
+}
 
 impl AcpObserver for CliAcpObserver {
-    fn on_stream_chunk(&self, _text: &str) {
-        // Suppress streaming output in CLI mode
+    fn on_stream_chunk(&self, text: &str) {
+        eprint!("{}", text);
     }
+
     fn on_tool_call_started(&self, tool_name: &str) {
-        eprintln!("  [tool] {}", tool_name);
+        eprintln!("\n  ⚙ {}", tool_name);
     }
+
     fn on_message_complete(&self, role: &str, _content: &str) {
         if role == "assistant" {
-            eprintln!("  [done]");
+            eprintln!(); // newline after streamed text
         }
     }
+
     fn on_proposal_deferred(&self, path: &std::path::Path, _old_content: Option<&str>, _new_content: &str) {
-        eprintln!("  [deferred] {}", path.display());
+        eprintln!("  ✎ {}", path.display());
     }
-    fn on_streaming_status(&self, _status: &str) {
-        // CLI doesn't show streaming status
+
+    fn on_streaming_status(&self, status: &str) {
+        eprintln!("  … {}", status);
     }
+
     fn on_validation_result(&self, gate: &str, passed: bool, message: Option<&str>) {
         if passed {
-            eprintln!("  [validation] {}: pass", gate);
+            eprintln!("  ✓ {}", gate);
         } else {
-            eprintln!("  [validation] {}: fail — {}", gate, message.unwrap_or(""));
+            eprintln!("  ✗ {} — {}", gate, message.unwrap_or(""));
         }
     }
+
     fn on_validation_retry(&self, attempt: u8, max_retries: u8) {
-        eprintln!("  [retry] attempt {}/{} — feeding error to agent", attempt, max_retries);
+        eprintln!("  ↺ retry {}/{}", attempt, max_retries);
     }
 }
 
@@ -165,7 +185,12 @@ impl SwarmObserver for CliSwarmObserver {
         eprintln!("[phase] {}", phase);
     }
     fn on_agent_state_changed(&self, work_unit_id: &str, status: &AgentStatus, detail: &str) {
-        eprintln!("[agent:{}] {:?} {}", work_unit_id, status, detail);
+        match status {
+            AgentStatus::Running => eprintln!("\n── agent: {} ─────────────────────────────", work_unit_id),
+            AgentStatus::Completed => eprintln!("── done: {} ──────────────────────────────", work_unit_id),
+            AgentStatus::Failed(_) => eprintln!("── failed: {} {}", work_unit_id, detail),
+            _ => eprintln!("[agent:{}] {:?} {}", work_unit_id, status, detail),
+        }
     }
     fn on_tier_started(&self, current: usize, total: usize) {
         eprintln!("[tier] {}/{}", current, total);
@@ -338,16 +363,22 @@ async fn main() -> Result<()> {
             coord_config,
             memory,
             &swarm_observer,
-            |_agent_id| Box::new(CliAcpObserver) as Box<dyn gaviero_core::observer::AcpObserver>,
+            |agent_id| Box::new(CliAcpObserver::new(agent_id)) as Box<dyn gaviero_core::observer::AcpObserver>,
         ).await?;
 
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let plan_path = config.workspace_root.join("tmp").join(format!("gaviero_plan_{}.gaviero", timestamp));
-        std::fs::create_dir_all(plan_path.parent().unwrap())
-            .context("creating tmp/ directory")?;
+        let plan_path = if let Some(ref out) = cli.output {
+            out.clone()
+        } else {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            config.workspace_root.join("tmp").join(format!("gaviero_plan_{}.gaviero", timestamp))
+        };
+        if let Some(parent) = plan_path.parent() {
+            std::fs::create_dir_all(parent)
+                .context("creating output directory")?;
+        }
         std::fs::write(&plan_path, &dsl_text)
             .context("writing plan file")?;
 
@@ -389,7 +420,7 @@ async fn main() -> Result<()> {
         initial_state,
         memory,
         &swarm_observer,
-        |_agent_id| Box::new(CliAcpObserver) as Box<dyn gaviero_core::observer::AcpObserver>,
+        |agent_id| Box::new(CliAcpObserver::new(agent_id)) as Box<dyn gaviero_core::observer::AcpObserver>,
     ).await?;
 
     // Output results
