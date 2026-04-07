@@ -479,6 +479,11 @@ async fn run_coordinator_session(
             }
         };
         match event_result {
+            Ok(Some(crate::acp::protocol::StreamEvent::ThinkingDelta(text))) => {
+                if let Some(obs) = observer {
+                    obs.on_stream_chunk(&text);
+                }
+            }
             Ok(Some(crate::acp::protocol::StreamEvent::ContentDelta(text))) => {
                 if let Some(obs) = observer {
                     obs.on_stream_chunk(&text);
@@ -487,7 +492,7 @@ async fn run_coordinator_session(
             }
             Ok(Some(crate::acp::protocol::StreamEvent::ToolUseStart { tool_name, .. })) => {
                 if let Some(obs) = observer {
-                    obs.on_streaming_status(&format!("{}...", tool_name));
+                    obs.on_tool_call_started(&format!("[{}]", tool_name));
                 }
             }
             Ok(Some(crate::acp::protocol::StreamEvent::ToolInputDelta(_))) => {}
@@ -496,9 +501,6 @@ async fn run_coordinator_session(
                     for tu in &tool_uses {
                         let detail = extract_tool_detail(&tu.name, &tu.input.to_string());
                         obs.on_tool_call_started(&detail);
-                    }
-                    if tool_uses.is_empty() {
-                        obs.on_streaming_status(building_status);
                     }
                 }
                 if response.is_empty() && !text.is_empty() {
