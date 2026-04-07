@@ -190,15 +190,41 @@ impl fmt::Display for Token {
 /// Callback for `#"..."#` raw strings.
 /// Scans forward from current position until the closing `"#` sentinel.
 /// Returns `Some(content)` on success, `None` on unterminated string (→ lex error).
+///
+/// A closing `"#` is valid when it appears at the START of a line — i.e. all
+/// characters between the preceding newline and `"#` are whitespace (spaces or
+/// tabs). This prevents early termination on `"#` sequences embedded in the
+/// middle of a line, such as Python f-strings like `f"""#!/bin/bash` (which
+/// contain the byte sequence `"#` within a non-whitespace prefix).
+///
+/// Single-line raw strings (`#"text"#` with no embedded newline) are also
+/// supported: when there is no newline before the `"#`, the content check is
+/// skipped and the first `"#` closes the string.
 fn lex_raw_string(lex: &mut logos::Lexer<Token>) -> Option<String> {
     let rest = lex.remainder();
-    match rest.find("\"#") {
-        Some(end) => {
-            lex.bump(end + 2); // consume content + closing `"#`
-            Some(rest[..end].trim().to_owned())
+
+    let mut search_pos = 0;
+    while let Some(rel) = rest[search_pos..].find("\"#") {
+        let abs = search_pos + rel;
+
+        // Determine what appears on the same line before this `"#`.
+        let line_start = rest[..abs].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let before_on_line = &rest[line_start..abs];
+
+        // Valid close when:
+        //   (a) preceded only by whitespace from the start of the line, OR
+        //   (b) no newline exists before `"#` (single-line raw string)
+        let is_line_start = before_on_line.chars().all(|c| c == ' ' || c == '\t');
+        let is_single_line = !rest[..abs].contains('\n');
+
+        if is_line_start || is_single_line {
+            lex.bump(abs + 2);
+            return Some(rest[..abs].trim().to_owned());
         }
-        None => None, // unterminated → logos produces an error token
+        search_pos = abs + 1;
     }
+
+    None // unterminated → logos produces an error token
 }
 
 // ── Public API ────────────────────────────────────────────────────────────
@@ -344,6 +370,21 @@ mod tests {
         assert!(errs.is_empty());
         assert_eq!(toks.len(), 1);
         assert!(matches!(toks[0].0, Token::KwTestFirst));
+    }
+
+    #[test]
+    fn raw_string_with_embedded_quote_hash() {
+        // Python f-string `f"""#!/bin/bash` contains `"#` mid-line.
+        // The raw string must NOT close early on that sequence.
+        let src = "#\"\n    script = f\"\"\"#!/bin/bash\n    echo done\n\"#";
+        let (toks, errs) = lex(src);
+        assert!(errs.is_empty(), "lex errors: {:?}", errs);
+        assert_eq!(toks.len(), 1);
+        if let Token::RawStr(s) = &toks[0].0 {
+            assert!(s.contains("#!/bin/bash"), "content should contain #!/bin/bash, got: {}", s);
+        } else {
+            panic!("expected RawStr, got {:?}", toks[0].0);
+        }
     }
 
     #[test]
