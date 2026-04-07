@@ -1,3 +1,4 @@
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -93,8 +94,8 @@ struct Cli {
     #[arg(long, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
 
-    /// Use coordinated tier routing (Opus plans, Sonnet/Haiku/local execute).
-    /// Requires --task. Opus decomposes the task into a tier-annotated DAG.
+    /// Use coordinated planning: --model controls the planner (default sonnet).
+    /// Requires --task. Produces a .gaviero DSL file for review before execution.
     #[arg(long)]
     coordinated: bool,
 
@@ -144,6 +145,7 @@ impl CliAcpObserver {
 impl AcpObserver for CliAcpObserver {
     fn on_stream_chunk(&self, text: &str) {
         eprint!("{}", text);
+        let _ = std::io::stderr().flush();
     }
 
     fn on_tool_call_started(&self, tool_name: &str) {
@@ -353,10 +355,10 @@ async fn main() -> Result<()> {
         let task = cli.task.as_deref()
             .ok_or_else(|| anyhow::anyhow!("--coordinated requires --task"))?;
         let coord_config = gaviero_core::swarm::coordinator::CoordinatorConfig {
-            model: "opus".into(),
+            model: cli.model.as_str().to_string(),
             ..Default::default()
         };
-        eprintln!("[mode] coordinated — planning DSL (Opus)");
+        eprintln!("[mode] coordinated — planning DSL ({})", cli.model);
         let dsl_text = gaviero_core::swarm::pipeline::plan_coordinated(
             task,
             &config,
@@ -367,7 +369,7 @@ async fn main() -> Result<()> {
         ).await?;
 
         let plan_path = if let Some(ref out) = cli.output {
-            out.clone()
+            if out.is_absolute() { out.clone() } else { config.workspace_root.join(out) }
         } else {
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -381,6 +383,23 @@ async fn main() -> Result<()> {
         }
         std::fs::write(&plan_path, &dsl_text)
             .context("writing plan file")?;
+
+        // Validate immediately so the user gets early feedback on syntax errors.
+        let plan_filename = plan_path.display().to_string();
+        match gaviero_dsl::compile(&dsl_text, &plan_filename, None, None) {
+            Ok(compiled) => {
+                let agent_count = compiled.graph.node_count();
+                let units = compiled.work_units_ordered().unwrap_or_default();
+                let tier_count = gaviero_core::swarm::validation::dependency_tiers(&units)
+                    .map(|t| t.len())
+                    .unwrap_or(1);
+                eprintln!("[plan] valid — {} agents, {} tiers", agent_count, tier_count);
+            }
+            Err(report) => {
+                eprintln!("{:?}", report);
+                eprintln!("[plan] DSL has errors — edit before running with --script");
+            }
+        }
 
         eprintln!("[plan] saved to {}", plan_path.display());
         eprintln!("[plan] review it, then run with:");
