@@ -264,7 +264,13 @@ impl Coordinator {
             &[],
         )?;
 
-        if let Some(o) = obs { o.on_streaming_status("Waiting for model response..."); }
+        let total_kb = (user_prompt.len() + system_prompt.len()) / 1024;
+        if let Some(o) = obs {
+            o.on_streaming_status(&format!(
+                "Waiting for model response... (~{}KB prompt, this may take a while)",
+                total_kb
+            ));
+        }
         let response = run_coordinator_session(
             &mut session,
             obs,

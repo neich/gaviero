@@ -114,6 +114,7 @@ impl AcpSession {
             let prompt_bytes = prompt.as_bytes().to_vec();
             tokio::spawn(async move {
                 let _ = stdin.write_all(&prompt_bytes).await;
+                let _ = stdin.flush().await; // ensure prompt reaches subprocess before we wait
                 // Keep stdin alive and forward any permission responses
                 while let Some(line) = rx.recv().await {
                     let _ = stdin.write_all(line.as_bytes()).await;
