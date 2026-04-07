@@ -67,7 +67,19 @@ const SKIP_DIRS: &[&str] = &[
 ];
 
 /// Build a `FileNode` for a single source file, or `None` if unreadable.
+/// Maximum file size to read for repo map (1 MB). Larger files (binary data,
+/// compiled artifacts, etc.) are skipped — they are not useful for context ranking.
+const MAX_FILE_BYTES: u64 = 1_000_000;
+
 fn build_node(abs_path: &Path, rel_path: PathBuf) -> Option<FileNode> {
+    // Skip files that are too large to be source code (binary data, build artifacts, etc.)
+    if let Ok(meta) = std::fs::metadata(abs_path) {
+        if meta.len() > MAX_FILE_BYTES {
+            tracing::debug!("repo_map: skipping large file ({} bytes): {}", meta.len(), abs_path.display());
+            return None;
+        }
+    }
+
     let content = match std::fs::read_to_string(abs_path) {
         Ok(c) => c,
         Err(e) => {
