@@ -253,7 +253,13 @@ impl Coordinator {
         );
 
         if let Some(o) = obs { o.on_streaming_status("Spawning coordinator agent..."); }
-        let options = crate::acp::session::AgentOptions::default();
+        // The coordinator only uses read-only tools (Read, Glob, Grep) so we
+        // auto-approve all permissions. This also lets the CLI start streaming
+        // immediately without waiting for explicit permission acknowledgements.
+        let options = crate::acp::session::AgentOptions {
+            auto_approve: true,
+            ..Default::default()
+        };
         let mut session = AcpSession::spawn(
             &self.config.model,
             workspace_root,
@@ -467,8 +473,16 @@ async fn run_coordinator_session(
                     break;
                 }
                 if let Some(obs) = observer {
+                    let stderr = session.stderr_output().await;
+                    let stderr_hint = if stderr.is_empty() {
+                        String::new()
+                    } else {
+                        // Show last stderr line as a hint
+                        let last = stderr.lines().last().unwrap_or("").trim().to_string();
+                        format!(" | stderr: {}", last)
+                    };
                     obs.on_streaming_status(
-                        &format!("Working... ({}s elapsed)", elapsed),
+                        &format!("Working... ({}s elapsed){}", elapsed, stderr_hint),
                     );
                 }
                 continue;
