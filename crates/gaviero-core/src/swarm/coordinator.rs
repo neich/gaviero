@@ -435,6 +435,9 @@ async fn run_coordinator_session(
     loop {
         match session.next_event().await {
             Ok(Some(crate::acp::protocol::StreamEvent::ContentDelta(text))) => {
+                if let Some(obs) = observer {
+                    obs.on_stream_chunk(&text);
+                }
                 response.push_str(&text);
             }
             Ok(Some(crate::acp::protocol::StreamEvent::ToolUseStart { tool_name, .. })) => {
@@ -468,8 +471,24 @@ async fn run_coordinator_session(
                 tracing::warn!("Stream error during {}: {}", error_context, e);
                 break;
             }
+            Ok(Some(crate::acp::protocol::StreamEvent::PermissionRequest {
+                tool_name,
+                request_id,
+                ..
+            })) => {
+                // The coordinator only allows Read/Glob/Grep, so this should
+                // never fire. Auto-approve defensively to prevent a hang.
+                tracing::warn!(
+                    "Unexpected PermissionRequest from coordinator for '{}' — auto-approving",
+                    tool_name
+                );
+                session.respond_permission(true, &request_id);
+            }
             _ => {}
         }
+    }
+    if let Some(obs) = observer {
+        obs.on_message_complete("assistant", &response);
     }
     response
 }
