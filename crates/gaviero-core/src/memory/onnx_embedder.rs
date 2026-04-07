@@ -114,12 +114,28 @@ impl OnnxEmbedder {
         let mask_tensor = TensorRef::from_array_view(&attention_mask)
             .map_err(|e| anyhow::anyhow!("creating attention_mask tensor: {e}"))?;
 
+        // Some models (e.g. nomic-embed-text-v1.5) require token_type_ids.
+        // Build it as all-zeros (standard for single-sequence encoding) and
+        // pass it only when the model declares it as an input.
+        let token_type_ids = Array2::<i64>::zeros((batch_size, max_len));
+        let type_tensor = TensorRef::from_array_view(&token_type_ids)
+            .map_err(|e| anyhow::anyhow!("creating token_type_ids tensor: {e}"))?;
+
         // Run ONNX inference (requires &mut session)
         let mut session = self.session.lock().map_err(|e| anyhow::anyhow!("session lock poisoned: {e}"))?;
-        let outputs = session.run(ort::inputs![
-            "input_ids" => ids_tensor,
-            "attention_mask" => mask_tensor,
-        ]).map_err(|e| anyhow::anyhow!("ONNX inference failed: {e}"))?;
+        let needs_token_type_ids = session.inputs().iter().any(|i| i.name() == "token_type_ids");
+        let outputs = if needs_token_type_ids {
+            session.run(ort::inputs![
+                "input_ids" => ids_tensor,
+                "attention_mask" => mask_tensor,
+                "token_type_ids" => type_tensor,
+            ])
+        } else {
+            session.run(ort::inputs![
+                "input_ids" => ids_tensor,
+                "attention_mask" => mask_tensor,
+            ])
+        }.map_err(|e| anyhow::anyhow!("ONNX inference failed: {e}"))?;
 
         // Extract output: [batch, seq_len, hidden_dim]
         let output_array = outputs[0]
