@@ -231,6 +231,9 @@ impl Coordinator {
         read_namespaces: &[String],
         observer: Option<Box<dyn crate::observer::AcpObserver>>,
     ) -> Result<String> {
+        let obs = observer.as_deref();
+
+        if let Some(o) = obs { o.on_streaming_status("Searching memory context..."); }
         let memory_context = if let Some(ref mem) = self.memory {
             mem.search_context_filtered(
                 read_namespaces,
@@ -249,6 +252,7 @@ impl Coordinator {
             prompt
         );
 
+        if let Some(o) = obs { o.on_streaming_status("Spawning coordinator agent..."); }
         let options = crate::acp::session::AgentOptions::default();
         let mut session = AcpSession::spawn(
             &self.config.model,
@@ -260,9 +264,10 @@ impl Coordinator {
             &[],
         )?;
 
+        if let Some(o) = obs { o.on_streaming_status("Waiting for model response..."); }
         let response = run_coordinator_session(
             &mut session,
-            observer.as_deref(),
+            obs,
             "Building DSL plan...",
             "DSL coordination",
         )
@@ -425,6 +430,9 @@ impl Coordinator {
 /// Forwards tool-use status and call details to `observer` when present.
 /// `building_status` is the status string shown when no tool is active.
 /// `error_context` labels the warning log on stream errors.
+/// How long to wait between stream events before emitting a keepalive status message.
+const COORDINATOR_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 async fn run_coordinator_session(
     session: &mut AcpSession,
     observer: Option<&dyn crate::observer::AcpObserver>,
@@ -432,8 +440,39 @@ async fn run_coordinator_session(
     error_context: &str,
 ) -> String {
     let mut response = String::new();
+    let mut idle_count: u32 = 0;
     loop {
-        match session.next_event().await {
+        let next = tokio::time::timeout(COORDINATOR_IDLE_TIMEOUT, session.next_event()).await;
+        let event_result = match next {
+            Err(_elapsed) => {
+                idle_count += 1;
+                let elapsed = idle_count * COORDINATOR_IDLE_TIMEOUT.as_secs() as u32;
+                if session.try_wait_exited() {
+                    tracing::warn!("Coordinator subprocess exited during idle wait");
+                    if let Some(obs) = observer {
+                        let stderr = session.stderr_output().await;
+                        let msg = if stderr.is_empty() {
+                            "Coordinator process exited unexpectedly.".to_string()
+                        } else {
+                            format!("Coordinator CLI error:\n{}", stderr)
+                        };
+                        obs.on_streaming_status(&msg);
+                    }
+                    break;
+                }
+                if let Some(obs) = observer {
+                    obs.on_streaming_status(
+                        &format!("Working... ({}s elapsed)", elapsed),
+                    );
+                }
+                continue;
+            }
+            Ok(result) => {
+                idle_count = 0;
+                result
+            }
+        };
+        match event_result {
             Ok(Some(crate::acp::protocol::StreamEvent::ContentDelta(text))) => {
                 if let Some(obs) = observer {
                     obs.on_stream_chunk(&text);
