@@ -1056,19 +1056,28 @@ fn build_coordinator_dsl_prompt(file_list: &[String], memory_context: &str) -> S
     prompt
 }
 
-/// Strip markdown code fences if Opus wrapped the DSL in ```gaviero ... ``` or ``` ... ```.
+/// Strip markdown code fences if the model wrapped the DSL in ```gaviero ... ``` or ``` ... ```.
+///
+/// The model may emit prose before the opening fence (e.g. "Here's the plan:\n```gaviero\n…").
+/// We find the first fence anywhere in the text, not just at the very start.
 fn strip_code_fence(text: &str) -> &str {
     let trimmed = text.trim();
-    // Check for ```gaviero or ``` at start
-    let after_open = trimmed
-        .strip_prefix("```gaviero")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .map(|s| s.trim_start_matches('\n'));
-    if let Some(inner) = after_open {
+
+    // Find the first opening fence (prefer the language-tagged one)
+    let fence_pos = trimmed
+        .find("```gaviero")
+        .or_else(|| trimmed.find("```"));
+
+    if let Some(pos) = fence_pos {
+        let after_fence = &trimmed[pos..];
+        // Skip past the opening fence line to the first newline
+        let inner_start = after_fence.find('\n').map(|p| p + 1).unwrap_or(after_fence.len());
+        let inner = &after_fence[inner_start..];
         // Remove trailing ```
         if let Some(end) = inner.rfind("```") {
             return inner[..end].trim_end();
         }
+        return inner.trim_end();
     }
     trimmed
 }
