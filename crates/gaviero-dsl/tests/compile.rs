@@ -368,3 +368,94 @@ fn example_security_audit_memory() {
     assert!(verify_ns.contains(&"scan-findings".to_string()));
     assert_eq!(units[3].write_namespace.as_deref(), Some("verification-results"));
 }
+
+fn compile_example_plan(filename: &str) -> gaviero_core::swarm::plan::CompiledPlan {
+    let path = format!(
+        "{}/examples/{}",
+        env!("CARGO_MANIFEST_DIR"),
+        filename
+    );
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("reading {}: {}", path, e));
+    compile(&source, filename, None, None)
+        .unwrap_or_else(|e| panic!("compiling {}:\n{:?}", filename, e))
+}
+
+// ── Template compilation tests ─────────────────────────────────────
+
+#[test]
+fn template_feature_iterative() {
+    let plan = compile_example_plan("feature_iterative.gaviero");
+    let units = plan.work_units_ordered().expect("toposort");
+    assert_eq!(units.len(), 4);
+    assert_eq!(units[0].id, "orchestrator");
+    assert_eq!(units[3].id, "summarize");
+    // Has a loop config
+    assert_eq!(plan.loop_configs.len(), 1);
+    assert_eq!(plan.loop_configs[0].agent_ids, vec!["implement", "write_tests"]);
+    assert_eq!(plan.loop_configs[0].max_iterations, 5);
+    // Orchestrator reads from memory
+    assert!(units[0].read_namespaces.as_ref().unwrap().contains(&"architecture".to_string()));
+    // Summarize writes to memory with custom content
+    assert_eq!(units[3].write_namespace.as_deref(), Some("feature-history"));
+    assert!(units[3].memory_write_content.is_some());
+}
+
+#[test]
+fn template_refactor_codebase() {
+    let plan = compile_example_plan("refactor_codebase.gaviero");
+    let units = plan.work_units_ordered().expect("toposort");
+    assert_eq!(units.len(), 4);
+    assert_eq!(units[0].id, "analyse");
+    assert_eq!(units[3].id, "record_changes");
+    // Has a loop config
+    assert_eq!(plan.loop_configs.len(), 1);
+    assert_eq!(plan.loop_configs[0].agent_ids, vec!["refactor", "fix_tests"]);
+    assert_eq!(plan.loop_configs[0].max_iterations, 8);
+    // Analyse has custom read_query
+    assert!(units[0].memory_read_query.is_some());
+    assert_eq!(units[0].memory_read_limit, Some(15));
+    // record_changes writes with custom template
+    assert!(units[3].memory_write_content.is_some());
+    assert_eq!(units[3].memory_importance, Some(0.9));
+}
+
+#[test]
+fn template_update_docs() {
+    let plan = compile_example_plan("update_docs.gaviero");
+    let units = plan.work_units_ordered().expect("toposort");
+    assert_eq!(units.len(), 5);
+    assert_eq!(units[0].id, "inventory");
+    // Three write agents depend on inventory
+    assert!(units[1].depends_on.contains(&"inventory".to_string()));
+    assert!(units[2].depends_on.contains(&"inventory".to_string()));
+    assert!(units[3].depends_on.contains(&"inventory".to_string()));
+    // record agent depends on all three writers
+    assert_eq!(units[4].id, "record_docs_update");
+    assert_eq!(units[4].depends_on.len(), 3);
+    // No loops
+    assert!(plan.loop_configs.is_empty());
+    // Max parallel 3
+    assert_eq!(plan.max_parallel, Some(3));
+}
+
+#[test]
+fn template_sync_memory() {
+    let plan = compile_example_plan("sync_memory.gaviero");
+    let units = plan.work_units_ordered().expect("toposort");
+    assert_eq!(units.len(), 4);
+    assert_eq!(units[0].id, "audit_codebase");
+    // Three reconcile agents depend on audit
+    assert!(units[1].depends_on.contains(&"audit_codebase".to_string()));
+    assert!(units[2].depends_on.contains(&"audit_codebase".to_string()));
+    assert!(units[3].depends_on.contains(&"audit_codebase".to_string()));
+    // audit reads with custom query and high limit
+    assert!(units[0].memory_read_query.is_some());
+    assert_eq!(units[0].memory_read_limit, Some(20));
+    // reconcile_architecture has staleness_sources
+    let arch_agent = units.iter().find(|u| u.id == "reconcile_architecture").unwrap();
+    assert!(!arch_agent.staleness_sources.is_empty());
+    assert!(arch_agent.memory_write_content.is_some());
+    // No loops
+    assert!(plan.loop_configs.is_empty());
+}
