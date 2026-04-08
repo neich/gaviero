@@ -1,0 +1,152 @@
+// Template: Implement a complex feature with iterative verification
+//
+// An orchestrator agent plans the approach, then an implement+test loop
+// iterates until compile and tests pass. A final orchestrator writes
+// a structured summary to memory for future context.
+//
+// Usage:
+//   gaviero-cli --script feature_iterative.gaviero \
+//     --task "add rate limiting middleware with per-user and per-endpoint quotas"
+
+client sonnet { tier cheap     model "claude-sonnet-4-6" }
+client opus   { tier expensive model "claude-opus-4-6" }
+
+// ── Phase 1: Plan ────────────────────────────────────────────────────────────
+
+agent orchestrator {
+    description "Decompose and plan: {{PROMPT}}"
+    client opus
+    scope {
+        read_only ["src/" "tests/" "Cargo.toml" "CLAUDE.md" "ARCHITECTURE.md"]
+    }
+    prompt #"
+        You are the orchestrator for a complex feature implementation.
+        Task: {{PROMPT}}
+
+        Analyse the codebase, read CLAUDE.md and ARCHITECTURE.md for project
+        conventions and architecture, and produce a structured plan:
+
+        1. List every file that must be created or modified
+        2. Define the public API surface (function signatures, types, traits)
+        3. Identify edge cases and error conditions
+        4. Specify the tests that will prove correctness
+        5. Note any cross-cutting concerns (logging, error handling, config)
+
+        Output the plan as a markdown document. This plan will guide the
+        implementation and test agents that follow.
+    "#
+    max_retries 1
+
+    memory {
+        read_ns    ["architecture" "feature-history"]
+        read_query "prior implementations and patterns for {{PROMPT}}"
+        read_limit 10
+    }
+}
+
+// ── Phase 2: Implement + Test loop ───────────────────────────────────────────
+
+agent implement {
+    description "Implement feature: {{PROMPT}}"
+    client sonnet
+    depends_on [orchestrator]
+    scope {
+        owned     ["src/"]
+        read_only ["tests/" "Cargo.toml" "ARCHITECTURE.md"]
+    }
+    prompt #"
+        Follow the orchestrator's plan to implement: {{PROMPT}}
+
+        Rules:
+        - Follow existing code patterns and project conventions
+        - Write clean, idiomatic code
+        - Add appropriate error handling
+        - Do NOT modify existing tests
+        - Create or update tests as needed for new code
+    "#
+    max_retries 3
+
+    memory {
+        read_ns    ["architecture" "feature-history"]
+        read_query "implementation patterns and prior failures for {{PROMPT}}"
+        read_limit 5
+    }
+}
+
+agent write_tests {
+    description "Write and fix tests for: {{PROMPT}}"
+    client sonnet
+    depends_on [implement]
+    scope {
+        owned     ["tests/" "src/"]
+        read_only ["Cargo.toml"]
+    }
+    prompt #"
+        Write comprehensive tests for the feature: {{PROMPT}}
+
+        Requirements:
+        - Unit tests for each new function/method
+        - Integration tests for the public API surface
+        - Edge cases: empty input, invalid input, boundary values
+        - Error path coverage
+        - All tests must compile and pass
+        - Fix any compilation errors in src/ if tests reveal issues
+    "#
+    max_retries 3
+}
+
+// ── Phase 3: Summary ─────────────────────────────────────────────────────────
+
+agent summarize {
+    description "Write memory summary for: {{PROMPT}}"
+    client opus
+    depends_on [write_tests]
+    scope {
+        read_only ["src/" "tests/"]
+    }
+    prompt #"
+        Review the implementation of: {{PROMPT}}
+
+        Write a concise technical summary covering:
+        - What was implemented (modules, types, functions)
+        - Key design decisions and trade-offs
+        - Public API surface
+        - Test coverage highlights
+        - Patterns used that future agents should know about
+
+        This summary will be stored in memory for future reference.
+    "#
+    max_retries 1
+
+    memory {
+        write_ns      "feature-history"
+        importance    0.9
+        write_content #"
+            Feature: {{DESCRIPTION}}
+            Files: {{FILES}}
+            Summary: {{SUMMARY}}
+        "#
+        staleness_sources ["src/"]
+    }
+}
+
+// ── Workflow ──────────────────────────────────────────────────────────────────
+
+workflow feature_iterative {
+    steps [
+        orchestrator
+        loop {
+            agents [implement write_tests]
+            max_iterations 5
+            until { compile true test true }
+        }
+        summarize
+    ]
+    max_parallel 1
+    verify { compile true clippy true test true }
+
+    memory {
+        read_ns  ["architecture"]
+        write_ns "feature-history"
+    }
+}
