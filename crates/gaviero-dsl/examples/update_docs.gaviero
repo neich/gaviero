@@ -1,0 +1,183 @@
+// Template: Update all project documentation files
+//
+// Reads the full codebase and rewrites CLAUDE.md, README.md, and
+// ARCHITECTURE.md for each crate/subproject. Works with multi-crate
+// workspaces — discovers all crates automatically.
+//
+// No verification loop needed: documentation changes don't break builds.
+//
+// Usage:
+//   gaviero-cli --script update_docs.gaviero
+
+client sonnet { tier cheap     model "claude-sonnet-4-6" }
+client opus   { tier expensive model "claude-opus-4-6" }
+
+// ── Phase 1: Inventory ───────────────────────────────────────────────────────
+
+agent inventory {
+    description "Inventory all crates and their current documentation state"
+    client opus
+    scope {
+        read_only [
+            "src/" "crates/" "Cargo.toml"
+            "CLAUDE.md" "README.md" "ARCHITECTURE.md"
+        ]
+    }
+    prompt #"
+        Scan the workspace and produce a structured inventory:
+
+        For each crate/subproject found:
+        1. Crate name and path
+        2. Purpose (inferred from code)
+        3. Current doc files present (CLAUDE.md, README.md, ARCHITECTURE.md)
+        4. What is outdated or missing in each doc file
+        5. Key modules, public types, and entry points
+
+        Also review the root-level documentation files.
+
+        Output a markdown report that the downstream agents will use as their
+        guide for what to write and where.
+    "#
+    max_retries 1
+
+    memory {
+        read_ns    ["architecture" "feature-history" "refactor-history"]
+        read_query "project structure, recent features, and recent refactors"
+        read_limit 15
+    }
+}
+
+// ── Phase 2: Write documentation ─────────────────────────────────────────────
+
+agent write_claude_md {
+    description "Rewrite CLAUDE.md files for all crates"
+    client opus
+    depends_on [inventory]
+    scope {
+        owned     [
+            "CLAUDE.md"
+            "crates/"
+        ]
+        read_only ["src/" "Cargo.toml"]
+    }
+    prompt #"
+        Using the inventory report, rewrite all CLAUDE.md files.
+
+        CLAUDE.md is the fixed context injected into every AI prompt.
+        It must contain:
+        - Build and test commands
+        - Project conventions (naming, error handling, logging patterns)
+        - Architecture overview (what goes where)
+        - Key rules (never do X, always do Y)
+        - Dependencies and their purposes
+        - Links to related ARCHITECTURE.md for deeper context
+
+        Write one CLAUDE.md per crate that has one, plus the root CLAUDE.md.
+        Be concise and imperative — this is read by AI agents, not humans.
+        Do NOT include information that can be derived from reading the code.
+    "#
+    max_retries 2
+}
+
+agent write_readme_md {
+    description "Rewrite README.md files for all crates"
+    client sonnet
+    depends_on [inventory]
+    scope {
+        owned     [
+            "README.md"
+            "crates/"
+        ]
+        read_only ["src/" "Cargo.toml"]
+    }
+    prompt #"
+        Using the inventory report, rewrite all README.md files.
+
+        README.md is the user-facing description of each crate/project.
+        It must contain:
+        - What it does (1-2 sentence summary)
+        - How to install / build / run
+        - Usage examples with code or CLI invocations
+        - Configuration options
+        - API overview (for libraries)
+        - License / contribution info (preserve existing if present)
+
+        Write one README.md per crate that has one, plus the root README.md.
+        Target human readers. Use clear headings and examples.
+    "#
+    max_retries 2
+}
+
+agent write_architecture_md {
+    description "Rewrite ARCHITECTURE.md files for all crates"
+    client opus
+    depends_on [inventory]
+    scope {
+        owned     [
+            "ARCHITECTURE.md"
+            "crates/"
+        ]
+        read_only ["src/" "Cargo.toml"]
+    }
+    prompt #"
+        Using the inventory report, rewrite all ARCHITECTURE.md files.
+
+        ARCHITECTURE.md is the deep technical description of a crate/project.
+        It must contain:
+        - Crate topology and dependency diagram
+        - Module map with one-line descriptions
+        - Core abstractions (key types, traits, data structures)
+        - Data flow diagrams for major operations
+        - Concurrency model and lock discipline
+        - Error handling strategy
+        - Public API surface summary
+
+        Write one ARCHITECTURE.md per crate that has one, plus the root.
+        Be technically precise. Include ASCII diagrams where helpful.
+        Reference actual type names, function names, and file paths.
+    "#
+    max_retries 2
+}
+
+// ── Phase 3: Record ──────────────────────────────────────────────────────────
+
+agent record_docs_update {
+    description "Write documentation update summary to memory"
+    client sonnet
+    depends_on [write_claude_md write_readme_md write_architecture_md]
+    scope {
+        read_only ["CLAUDE.md" "README.md" "ARCHITECTURE.md" "crates/"]
+    }
+    prompt #"
+        Review all documentation files that were just updated.
+
+        Write a concise summary of:
+        - Which files were updated and what changed
+        - Any structural decisions made (e.g. new sections added)
+        - Anything that could not be documented due to missing information
+    "#
+    max_retries 1
+
+    memory {
+        write_ns      "architecture"
+        importance    0.8
+        write_content #"
+            Documentation update: {{SUMMARY}}
+            Files updated: {{FILES}}
+        "#
+    }
+}
+
+// ── Workflow ──────────────────────────────────────────────────────────────────
+
+workflow update_docs {
+    // write agents run in parallel — they own disjoint file sets
+    steps [inventory write_claude_md write_readme_md write_architecture_md record_docs_update]
+    max_parallel 3
+    strategy single_pass
+
+    memory {
+        read_ns  ["architecture" "feature-history" "refactor-history"]
+        write_ns "architecture"
+    }
+}
