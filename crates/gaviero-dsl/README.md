@@ -418,7 +418,68 @@ workflow incremental_audit {
 
 ---
 
-### 7. Local-only (no API) workflow — `local_refactor.gaviero`
+### 7. Iterative fix loop with explicit memory — `loop_fix.gaviero`
+
+An explicit loop reruns a block of agents until a condition is met. Combine with explicit memory control for precise knowledge accumulation.
+
+```gaviero
+client sonnet { tier cheap model "claude-sonnet-4-6" }
+
+agent implement {
+    description "Implement feature: {{PROMPT}}"
+    client sonnet
+    scope { owned ["src/"] read_only ["tests/"] }
+    prompt #"
+        Implement the following feature: {{PROMPT}}
+        Make all existing tests pass and add new tests if needed.
+    "#
+    max_retries 3
+
+    memory {
+        read_ns     ["prior-attempts"]
+        read_query  "previous implementation failures for {{PROMPT}}"
+        read_limit  10
+        write_ns    "prior-attempts"
+        write_content #"
+            Attempt by {{AGENT}}: {{SUMMARY}}
+            Files modified: {{FILES}}
+        "#
+        importance  0.8
+    }
+}
+
+agent verify {
+    description "Verify the implementation"
+    client sonnet
+    depends_on [implement]
+    scope { read_only ["src/" "tests/"] }
+    prompt "Review the implementation for correctness and edge cases."
+    max_retries 1
+}
+
+workflow iterative_fix {
+    steps [
+        loop {
+            agents [implement verify]
+            max_iterations 5
+            until { compile true test true }
+        }
+    ]
+    max_parallel 1
+}
+```
+
+Run:
+```bash
+gaviero-cli --script loop_fix.gaviero \
+  --task "add pagination to the user list endpoint"
+```
+
+The `loop` block re-runs `implement` and `verify` until `cargo check` and `cargo test` both pass, up to 5 iterations. Each attempt's summary is written to memory so the next iteration can learn from failures.
+
+---
+
+### 8. Local-only (no API) workflow — `local_refactor.gaviero`
 
 Uses Ollama for privacy-sensitive code. No data leaves the machine.
 
@@ -498,6 +559,13 @@ agent <name> {
         write_ns          "my-ns"             // namespace for storing results
         importance        0.8                 // memory importance weight (0.0–1.0)
         staleness_sources ["src/"]            // invalidate memory if these paths change
+        read_query        "custom search query"   // override auto-query (default: description)
+        read_limit        10                  // max search results (default: 5)
+        write_content #"                      // custom write template (default: auto-summary)
+            Agent: {{AGENT}}
+            Summary: {{SUMMARY}}
+            Files: {{FILES}}
+        "#
     }
 }
 ```
@@ -508,7 +576,16 @@ If `scope` is omitted the agent gets `owned = ["."]` (full workspace).
 
 ```gaviero
 workflow <name> {
-    steps        [agent-a agent-b agent-c]    // execution order (respects depends_on)
+    steps [
+        agent-a
+        agent-b
+        loop {                                        // explicit loop block
+            agents [agent-c agent-d]                  // agents to repeat
+            max_iterations 5                          // hard upper bound
+            until { compile true test true }           // exit condition
+        }
+        agent-e
+    ]
     max_parallel 2                            // max concurrent agents (default: 1)
 
     // Iteration strategy
@@ -557,6 +634,77 @@ workflow <name> {
 
 ---
 
+## Loops
+
+A `loop { }` block inside `steps [...]` repeats a sequence of agents until an exit condition is met or `max_iterations` is reached.
+
+```gaviero
+workflow fix_cycle {
+    steps [
+        analyze
+        loop {
+            agents [implement test_runner]
+            max_iterations 5
+            until { compile true test true }
+        }
+        deploy
+    ]
+}
+```
+
+### Exit conditions
+
+| Form | Behaviour |
+|---|---|
+| `until { compile true test true }` | Verify block — exits when the specified checks pass |
+| `until agent quality_gate` | Judge agent — runs a named agent that decides pass/fail |
+| `until command "cargo test --quiet"` | Shell command — exits when the command returns exit code 0 |
+
+All three forms support the same `loop` block syntax. `max_iterations` is always required as a safety bound.
+
+The first iteration runs as part of normal tier-based execution. Subsequent iterations re-run only the loop's agents, preserving cumulative progress from prior iterations.
+
+---
+
+## Explicit memory control
+
+The `memory { }` block supports optional fields for precise control over what an agent reads from and writes to memory:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `read_query` | string | agent description | Custom semantic search query. Supports `{{PROMPT}}` |
+| `read_limit` | integer | 5 | Maximum number of search results |
+| `write_content` | string | auto-generated summary | Template for written content |
+
+### Write content template variables
+
+| Variable | Replaced with |
+|---|---|
+| `{{SUMMARY}}` | The agent's full text output (all assistant messages). Optimise templates for embedding retrieval — use domain keywords, not prose |
+| `{{FILES}}` | Comma-separated list of modified files |
+| `{{AGENT}}` | The agent's name/ID |
+| `{{DESCRIPTION}}` | The agent's description field |
+
+Example:
+
+```gaviero
+agent researcher {
+    memory {
+        read_ns     ["shared"]
+        read_query  "architecture patterns in auth module"
+        read_limit  10
+        write_ns    "research-output"
+        write_content #"
+            Research by {{AGENT}}: {{SUMMARY}}
+            Files analyzed: {{FILES}}
+        "#
+        importance  0.9
+    }
+}
+```
+
+---
+
 ## Memory system
 
 ### Namespace merge rules
@@ -567,6 +715,9 @@ workflow <name> {
 | `write_ns` | Agent value overrides workflow value |
 | `importance` | Agent-only |
 | `staleness_sources` | Agent-only |
+| `read_query` | Agent-only; `{{PROMPT}}` substituted at compile time |
+| `read_limit` | Agent-only |
+| `write_content` | Agent-only; `{{PROMPT}}` substituted at compile time |
 
 ### Staleness
 
@@ -618,6 +769,10 @@ An agent is skipped if any of its dependencies failed (trigger rule: `AllSuccess
 | Float | `0.8` |
 | Boolean | `true` / `false` |
 | Comment | `// line comment` |
+| Loop block | `loop { agents [...] max_iterations N until ... }` |
+| Until (verify) | `until { compile true test true }` |
+| Until (agent) | `until agent <name>` |
+| Until (command) | `until command "shell command"` |
 
 ---
 

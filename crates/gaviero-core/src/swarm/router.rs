@@ -241,6 +241,9 @@ mod tests {
             write_namespace: None,
             memory_importance: None,
             staleness_sources: vec![],
+            memory_read_query: None,
+            memory_read_limit: None,
+            memory_write_content: None,
         }
     }
 

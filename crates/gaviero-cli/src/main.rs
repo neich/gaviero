@@ -311,6 +311,9 @@ async fn main() -> Result<()> {
             write_namespace: None,
             memory_importance: None,
             staleness_sources: Vec::new(),
+            memory_read_query: None,
+            memory_read_limit: None,
+            memory_write_content: None,
         }];
         gaviero_core::swarm::plan::CompiledPlan::from_work_units(units, None)
     } else if let Some(ref json) = cli.work_units {

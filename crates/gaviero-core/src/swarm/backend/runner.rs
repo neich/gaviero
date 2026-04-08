@@ -104,6 +104,7 @@ pub async fn run_backend(
                     modified_files: vec![],
                     branch: None,
                     summary: Some(format!("Backend error: {}", e)),
+                    output: None,
                     cost_usd: 0.0,
                 });
             }
@@ -188,6 +189,7 @@ pub async fn run_backend(
                 modified_files: all_modified.into_iter().collect(),
                 branch: None,
                 summary: Some(error_msg),
+                output: if full_text.is_empty() { None } else { Some(full_text.clone()) },
                 cost_usd: 0.0,
             });
         }
@@ -249,6 +251,7 @@ pub async fn run_backend(
                         modified_files: all_modified.into_iter().collect(),
                         branch: None,
                         summary: Some(format!("Validation failed ({}): {}", gate_name, message)),
+                        output: if full_text.is_empty() { None } else { Some(full_text.clone()) },
                         cost_usd: 0.0,
                     });
                 }
@@ -262,6 +265,7 @@ pub async fn run_backend(
             modified_files: all_modified.into_iter().collect(),
             branch: None,
             summary: Some(format!("Modified {} files", attempt_modified.len())),
+            output: if full_text.is_empty() { None } else { Some(full_text) },
             cost_usd: 0.0,
         });
     }
@@ -273,6 +277,7 @@ pub async fn run_backend(
         modified_files: all_modified.into_iter().collect(),
         branch: None,
         summary: Some("completed".into()),
+        output: None,
         cost_usd: 0.0,
     })
 }
@@ -295,9 +300,12 @@ async fn build_prompt(
     }
 
     if let Some(mem) = memory {
-        let ctx = mem
-            .search_context(read_namespaces, &work_unit.description, 5)
-            .await;
+        let query = work_unit
+            .memory_read_query
+            .as_deref()
+            .unwrap_or(&work_unit.description);
+        let limit = work_unit.memory_read_limit.unwrap_or(5);
+        let ctx = mem.search_context(read_namespaces, query, limit).await;
         if !ctx.is_empty() {
             parts.push(ctx);
         }
@@ -478,6 +486,9 @@ mod tests {
             write_namespace: None,
             memory_importance: None,
             staleness_sources: vec![],
+            memory_read_query: None,
+            memory_read_limit: None,
+            memory_write_content: None,
         }
     }
 

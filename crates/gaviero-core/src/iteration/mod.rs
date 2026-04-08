@@ -204,6 +204,7 @@ impl IterationEngine {
                     modified_files: vec![],
                     branch: None,
                     summary: Some(format!("{e}")),
+                    output: None,
                     cost_usd: 0.0,
                 },
             };
@@ -242,6 +243,7 @@ impl IterationEngine {
                     modified_files: vec![],
                     branch: None,
                     summary: None,
+                    output: None,
                     cost_usd: 0.0,
                 },
                 0,
@@ -300,6 +302,9 @@ mod tests {
             write_namespace: None,
             memory_importance: None,
             staleness_sources: vec![],
+            memory_read_query: None,
+            memory_read_limit: None,
+            memory_write_content: None,
         }
     }
 

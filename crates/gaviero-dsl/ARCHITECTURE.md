@@ -16,7 +16,7 @@ Vec<(Token, Span)>  +  lex errors
 Script { items: Vec<Item> }  +  parse errors
        │
        ▼ compiler (5-phase semantic analysis)
-CompiledPlan { graph: DiGraph<PlanNode, DependencyEdge>, iteration_config, … }
+CompiledPlan { graph: DiGraph<PlanNode, DependencyEdge>, iteration_config, loop_configs, … }
        │
        errors reported via miette (annotated source spans)
 ```
@@ -32,9 +32,10 @@ gaviero-dsl/src/
 ├── lib.rs           pub fn compile(source, filename, workflow, runtime_prompt) → Result<CompiledPlan>
 ├── lexer.rs         Token enum (logos derive), lex() function
 ├── ast.rs           Script, Item, ClientDecl, AgentDecl, WorkflowDecl, ScopeBlock, MemoryBlock,
-│                    VerifyBlock, TierLit, PrivacyLit, StrategyLit
+│                    VerifyBlock, StepItem, LoopBlock, UntilCondition, TierLit, PrivacyLit, StrategyLit
 ├── parser.rs        parse() — chumsky combinators; grammar defined inline as functions
-├── compiler.rs      compile_ast() — 5-phase analysis; build_iteration_config(), build_verification_config()
+├── compiler.rs      compile_ast() — 7-phase analysis; build_iteration_config(), build_verification_config(),
+│                    extract_loop_configs()
 └── error.rs         DslError (Lex/Parse/Compile variants), DslErrors (miette wrapper)
 ```
 
@@ -46,7 +47,10 @@ gaviero-dsl/src/
 `client`, `agent`, `workflow`
 
 ### Field keywords
-`tier`, `model`, `privacy`, `scope`, `owned`, `read_only`, `depends_on`, `prompt`, `description`, `max_retries`, `steps`, `max_parallel`, `memory`, `read_ns`, `write_ns`, `importance`, `staleness_sources`, `strategy`, `test_first`, `attempts`, `escalate_after`, `verify`, `compile`, `clippy`, `test`
+`tier`, `model`, `privacy`, `scope`, `owned`, `read_only`, `depends_on`, `prompt`, `description`, `max_retries`, `steps`, `max_parallel`, `memory`, `read_ns`, `write_ns`, `importance`, `staleness_sources`, `read_query`, `read_limit`, `write_content`, `strategy`, `test_first`, `attempts`, `escalate_after`, `verify`, `compile`, `clippy`, `test`
+
+### Loop keywords
+`loop`, `until`, `agents`, `max_iterations`, `command`
 
 ### Tier value tokens
 `coordinator`, `reasoning`, `execution`, `mechanical` (deprecated — compile to `Cheap`/`Expensive`)  
@@ -82,10 +86,20 @@ Script
     ├── AgentDecl  { name, description?, client?, scope?, depends_on?, prompt?,
     │                max_retries?, memory? }
     │   └── ScopeBlock  { owned: Vec<String>, read_only: Vec<String> }
-    │   └── MemoryBlock { read_ns, write_ns?, importance?, staleness_sources }
+    │   └── MemoryBlock { read_ns, write_ns?, importance?, staleness_sources,
+    │                      read_query?, read_limit?, write_content? }
     └── WorkflowDecl { name, steps?, max_parallel?, memory?,
                        strategy?, test_first?, max_retries?, attempts?,
                        escalate_after?, verify? }
+        └── steps: Vec<StepItem>
+            ├── StepItem::Agent(name)
+            └── StepItem::Loop(LoopBlock)
+                ├── agents: Vec<name>
+                ├── max_iterations: u32
+                └── until: UntilCondition
+                    ├── Verify(VerifyBlock)
+                    ├── Agent(name)
+                    └── Command(string)
         └── VerifyBlock { compile: bool, clippy: bool, test: bool }
 
 TierLit    = Cheap | Expensive | Coordinator* | Reasoning* | Execution* | Mechanical*
@@ -98,7 +112,7 @@ All nodes carry a `Span` for error reporting. Field-level spans enable precise d
 
 ---
 
-## Compiler: 5 phases (`compiler.rs`)
+## Compiler: 7 phases (`compiler.rs`)
 
 ### Phase 1 — Index declarations
 Build `HashMap<name, ClientDecl>`, `HashMap<name, AgentDecl>`, `HashMap<name, WorkflowDecl>`. Collect duplicate-name errors without halting.
@@ -117,9 +131,10 @@ Select which agents to compile and in what order:
 For each agent:
 1. Resolve `client` reference → extract tier (mapped), model string, privacy level
 2. Build `FileScope` from `scope` block (default: `owned = ["."]`)
-3. Substitute `{{PROMPT}}` in description and prompt fields
+3. Substitute `{{PROMPT}}` in description, prompt, `read_query`, and `write_content` fields
 4. Merge memory namespaces (additive `read_ns`; agent `write_ns` overrides workflow)
-5. Emit complexity warning (stderr) when >1 independent agent
+5. Map explicit memory control fields (`read_query`, `read_limit`, `write_content`)
+6. Emit complexity warning (stderr) when >1 independent agent
 
 **Tier mapping:**
 ```
@@ -132,6 +147,20 @@ Every name in each agent's `depends_on` list must exist in the agent map. Collec
 
 ### Phase 5 — Build DAG + cycle detection
 Insert `PlanNode` per `WorkUnit` into petgraph `DiGraph`. Add directed edges for `depends_on` relationships. DFS cycle detection: halt with the cycle path on first cycle found.
+
+### Phase 6 — Build iteration + verification configs
+(see below)
+
+### Phase 7 — Extract loop configs
+For each `StepItem::Loop` in the workflow's steps, build a `LoopConfig`:
+```
+LoopConfig {
+    agent_ids:      Vec<String>,         // work unit IDs in loop
+    until:          LoopUntilCondition,  // Verify | Agent | Command
+    max_iterations: u32,
+}
+```
+Attached to `CompiledPlan.loop_configs`. Used by the swarm pipeline to re-run loop agents until the exit condition is met.
 
 ### Iteration config building
 ```
@@ -159,7 +188,7 @@ VerificationConfig {
 
 - **First-occurrence semantics** — duplicate fields silently ignored; first wins.
 - **No commas in lists** — syntax is `[item item …]`.
-- **Keyword-as-ident** — `verify`, `compile`, `test`, `strategy` may be used as agent/workflow names where the grammar is unambiguous.
+- **Keyword-as-ident** — `verify`, `compile`, `test`, `strategy`, `loop`, `until`, `agents`, `command` may be used as agent/workflow names where the grammar is unambiguous.
 - **Recoverable** — chumsky collects multiple errors per pass; parser can emit partial AST.
 
 ---
@@ -212,4 +241,4 @@ pub mod error;
 | `chumsky` | Parser combinators with error recovery |
 | `miette` | Annotated source diagnostics with coloured spans |
 | `thiserror` | Error type derive |
-| `gaviero-core` | `WorkUnit`, `FileScope`, `ModelTier`, `CompiledPlan`, `IterationConfig`, `VerificationConfig` |
+| `gaviero-core` | `WorkUnit`, `FileScope`, `ModelTier`, `CompiledPlan`, `IterationConfig`, `VerificationConfig`, `LoopConfig`, `LoopUntilCondition` |

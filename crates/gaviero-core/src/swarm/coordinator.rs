@@ -753,6 +753,9 @@ fn parse_work_unit_lenient(v: &serde_json::Value) -> Result<WorkUnit> {
         write_namespace: None,
         memory_importance: None,
         staleness_sources: Vec::new(),
+        memory_read_query: None,
+        memory_read_limit: None,
+        memory_write_content: None,
     })
 }
 
@@ -1176,6 +1179,9 @@ mod tests {
             write_namespace: None,
             memory_importance: None,
             staleness_sources: vec![],
+            memory_read_query: None,
+            memory_read_limit: None,
+            memory_write_content: None,
         }
     }
 
