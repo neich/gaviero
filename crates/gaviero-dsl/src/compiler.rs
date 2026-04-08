@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use miette::NamedSource;
 
 use gaviero_core::swarm::models::{AgentBackend, WorkUnit};
-use gaviero_core::swarm::plan::CompiledPlan;
+use gaviero_core::swarm::plan::{CompiledPlan, LoopConfig, LoopUntilCondition};
 use gaviero_core::types::{FileScope, ModelTier, PrivacyLevel};
 
 use crate::ast::*;
@@ -203,9 +203,14 @@ pub fn compile_ast(
         .map(build_verification_config)
         .unwrap_or_default();
 
+    // ── Phase 7: extract LoopConfigs from workflow steps ────────
+
+    let loop_configs = extract_loop_configs(selected_workflow);
+
     let mut plan = CompiledPlan::from_work_units(work_units, workflow_max_parallel);
     plan.iteration_config = iteration_config;
     plan.verification_config = verification_config;
+    plan.loop_configs = loop_configs;
     Ok(plan)
 }
 
@@ -286,14 +291,23 @@ fn ordered_agents_from_workflow<'a>(
 
     let mut agents = Vec::new();
     let mut errors = Vec::new();
-    for (name, name_span) in steps {
-        match agent_map.get(name.as_str()) {
-            Some(a) => agents.push(*a),
-            None => errors.push(DslError::Compile {
-                src: src(),
-                span: (name_span.start, name_span.end.saturating_sub(name_span.start)).into(),
-                reason: format!("workflow step `{}` is not a defined agent", name),
-            }),
+
+    // Flatten StepItems: agent refs resolve directly, loop blocks contribute
+    // their inner agent list. The agents vec preserves declaration order.
+    for step in steps {
+        let refs: Vec<(&str, &Span)> = match step {
+            StepItem::Agent(name, span) => vec![(name.as_str(), span)],
+            StepItem::Loop(lb) => lb.agents.iter().map(|(n, s)| (n.as_str(), s)).collect(),
+        };
+        for (name, name_span) in refs {
+            match agent_map.get(name) {
+                Some(a) => agents.push(*a),
+                None => errors.push(DslError::Compile {
+                    src: src(),
+                    span: (name_span.start, name_span.end.saturating_sub(name_span.start)).into(),
+                    reason: format!("workflow step `{}` is not a defined agent", name),
+                }),
+            }
         }
     }
 
@@ -395,6 +409,28 @@ fn compile_agent(
         .map(|m| m.staleness_sources.clone())
         .unwrap_or_default();
 
+    // ── Explicit memory control fields ───────────────────────────
+    let memory_read_query: Option<String> = decl.memory
+        .as_ref()
+        .and_then(|m| m.read_query.as_ref())
+        .map(|(s, _)| match runtime_prompt {
+            Some(rp) => s.replace("{{PROMPT}}", rp),
+            None => s.clone(),
+        });
+
+    let memory_read_limit: Option<usize> = decl.memory
+        .as_ref()
+        .and_then(|m| m.read_limit.as_ref())
+        .map(|(n, _)| *n);
+
+    let memory_write_content: Option<String> = decl.memory
+        .as_ref()
+        .and_then(|m| m.write_content.as_ref())
+        .map(|(s, _)| match runtime_prompt {
+            Some(rp) => s.replace("{{PROMPT}}", rp),
+            None => s.clone(),
+        });
+
     Ok(WorkUnit {
         id: decl.name.clone(),
         description,
@@ -412,6 +448,9 @@ fn compile_agent(
         write_namespace,
         memory_importance,
         staleness_sources,
+        memory_read_query,
+        memory_read_limit,
+        memory_write_content,
     })
 }
 
@@ -466,6 +505,46 @@ fn build_verification_config(wf: &WorkflowDecl) -> gaviero_core::swarm::plan::Ve
             test: v.test,
         })
         .unwrap_or_default()
+}
+
+fn extract_loop_configs(wf: Option<&WorkflowDecl>) -> Vec<LoopConfig> {
+    let wf = match wf {
+        Some(w) => w,
+        None => return Vec::new(),
+    };
+    let steps = match &wf.steps {
+        Some((s, _)) => s,
+        None => return Vec::new(),
+    };
+
+    steps
+        .iter()
+        .filter_map(|step| {
+            if let StepItem::Loop(lb) = step {
+                Some(LoopConfig {
+                    agent_ids: lb.agents.iter().map(|(n, _)| n.clone()).collect(),
+                    until: map_until_condition(&lb.until),
+                    max_iterations: lb.max_iterations,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn map_until_condition(cond: &UntilCondition) -> LoopUntilCondition {
+    match cond {
+        UntilCondition::Verify(vb) => LoopUntilCondition::Verify(
+            gaviero_core::swarm::plan::VerificationConfig {
+                compile: vb.compile,
+                clippy: vb.clippy,
+                test: vb.test,
+            },
+        ),
+        UntilCondition::Agent(name, _) => LoopUntilCondition::Agent(name.clone()),
+        UntilCondition::Command(cmd, _) => LoopUntilCondition::Command(cmd.clone()),
+    }
 }
 
 #[cfg(test)]
@@ -764,5 +843,164 @@ mod tests {
         let src = r##"agent x { prompt #"{{PROMPT}} and also {{PROMPT}}"# }"##;
         let units = compile_str_with_prompt(src, Some("X")).unwrap();
         assert_eq!(units[0].coordinator_instructions, "X and also X");
+    }
+
+    #[test]
+    fn memory_read_query_and_limit_compiled() {
+        let src = r#"
+            agent x {
+                memory {
+                    read_query "custom search query"
+                    read_limit 10
+                }
+            }
+        "#;
+        let units = compile_str(src).unwrap();
+        assert_eq!(units[0].memory_read_query.as_deref(), Some("custom search query"));
+        assert_eq!(units[0].memory_read_limit, Some(10));
+    }
+
+    #[test]
+    fn memory_write_content_compiled() {
+        let src = r##"
+            agent x {
+                memory {
+                    write_ns "output"
+                    write_content #"Findings: {{SUMMARY}}"#
+                }
+            }
+        "##;
+        let units = compile_str(src).unwrap();
+        assert_eq!(units[0].write_namespace.as_deref(), Some("output"));
+        assert_eq!(units[0].memory_write_content.as_deref(), Some("Findings: {{SUMMARY}}"));
+    }
+
+    #[test]
+    fn memory_read_query_prompt_substitution() {
+        let src = r#"
+            agent x {
+                memory {
+                    read_query "find results for {{PROMPT}}"
+                }
+            }
+        "#;
+        let units = compile_str_with_prompt(src, Some("auth bugs")).unwrap();
+        assert_eq!(units[0].memory_read_query.as_deref(), Some("find results for auth bugs"));
+    }
+
+    #[test]
+    fn memory_fields_none_when_not_declared() {
+        let src = r#"agent x { description "t" }"#;
+        let units = compile_str(src).unwrap();
+        assert!(units[0].memory_read_query.is_none());
+        assert!(units[0].memory_read_limit.is_none());
+        assert!(units[0].memory_write_content.is_none());
+    }
+
+    // ── Loop tests ───────────────────────────────────────────────
+
+    fn compile_plan(src: &str) -> Result<CompiledPlan, DslErrors> {
+        let (tokens, _) = lexer::lex(src);
+        let (ast, errs) = parser::parse(&tokens, src, "test.gaviero");
+        assert!(errs.is_empty(), "parse errors: {:?}", errs);
+        compile_ast(&ast.unwrap(), src, "test.gaviero", None, None)
+    }
+
+    #[test]
+    fn loop_config_extracted_verify() {
+        let src = r#"
+            agent a { description "impl" }
+            agent b { description "test" }
+            workflow w {
+                steps [
+                    loop {
+                        agents [a b]
+                        max_iterations 5
+                        until { compile true test true }
+                    }
+                ]
+            }
+        "#;
+        let plan = compile_plan(src).unwrap();
+        assert_eq!(plan.loop_configs.len(), 1);
+        let lc = &plan.loop_configs[0];
+        assert_eq!(lc.agent_ids, vec!["a", "b"]);
+        assert_eq!(lc.max_iterations, 5);
+        assert!(matches!(&lc.until, LoopUntilCondition::Verify(v) if v.compile && v.test && !v.clippy));
+    }
+
+    #[test]
+    fn loop_config_extracted_command() {
+        let src = r#"
+            agent fixer { description "fix" }
+            workflow w {
+                steps [
+                    loop {
+                        agents [fixer]
+                        max_iterations 3
+                        until command "make test"
+                    }
+                ]
+            }
+        "#;
+        let plan = compile_plan(src).unwrap();
+        assert_eq!(plan.loop_configs.len(), 1);
+        assert!(matches!(&plan.loop_configs[0].until, LoopUntilCondition::Command(cmd) if cmd == "make test"));
+    }
+
+    #[test]
+    fn loop_config_extracted_agent() {
+        let src = r#"
+            agent impl_agent { description "implement" }
+            agent judge { description "evaluate quality" }
+            workflow w {
+                steps [
+                    loop {
+                        agents [impl_agent]
+                        max_iterations 3
+                        until agent judge
+                    }
+                ]
+            }
+        "#;
+        let plan = compile_plan(src).unwrap();
+        assert_eq!(plan.loop_configs.len(), 1);
+        assert!(matches!(&plan.loop_configs[0].until, LoopUntilCondition::Agent(name) if name == "judge"));
+    }
+
+    #[test]
+    fn no_loop_configs_when_no_loops() {
+        let src = r#"
+            agent a { description "t" }
+            workflow w { steps [a] }
+        "#;
+        let plan = compile_plan(src).unwrap();
+        assert!(plan.loop_configs.is_empty());
+    }
+
+    #[test]
+    fn loop_agents_included_in_work_units() {
+        let src = r#"
+            agent pre { description "pre-step" }
+            agent looped { description "in loop" }
+            agent post { description "post-step" }
+            workflow w {
+                steps [
+                    pre
+                    loop {
+                        agents [looped]
+                        max_iterations 3
+                        until { test true }
+                    }
+                    post
+                ]
+            }
+        "#;
+        let plan = compile_plan(src).unwrap();
+        let units = plan.work_units_ordered().unwrap();
+        let ids: Vec<&str> = units.iter().map(|u| u.id.as_str()).collect();
+        assert!(ids.contains(&"pre"));
+        assert!(ids.contains(&"looped"));
+        assert!(ids.contains(&"post"));
     }
 }
