@@ -1,0 +1,151 @@
+// Template: Full-codebase refactor with verification
+//
+// An orchestrator reads the entire codebase and plans the refactor.
+// Then a refactoring agent applies changes iteratively until verification
+// passes. A final agent updates memory with the structural changes made.
+//
+// Usage:
+//   gaviero-cli --script refactor_codebase.gaviero \
+//     --task "replace all anyhow::Result with typed error enums per module"
+
+client sonnet { tier cheap     model "claude-sonnet-4-6" }
+client opus   { tier expensive model "claude-opus-4-6" }
+
+// ── Phase 1: Analyse ─────────────────────────────────────────────────────────
+
+agent analyse {
+    description "Analyse codebase for refactor: {{PROMPT}}"
+    client opus
+    scope {
+        read_only ["src/" "tests/" "crates/" "Cargo.toml" "CLAUDE.md" "ARCHITECTURE.md"]
+    }
+    prompt #"
+        You are planning a codebase-wide refactor: {{PROMPT}}
+
+        Read the entire codebase, CLAUDE.md, and ARCHITECTURE.md.
+        Produce a detailed refactoring plan:
+
+        1. Inventory: list every file/module affected and why
+        2. Dependency order: which files must change first to avoid
+           intermediate breakage (leaf modules before their callers)
+        3. Public API impact: list any signature changes and their callers
+        4. Test impact: which tests will break and how to fix them
+        5. Risk areas: code that is tricky to refactor safely
+
+        Be exhaustive — the refactoring agent will follow this plan exactly.
+    "#
+    max_retries 1
+
+    memory {
+        read_ns    ["architecture" "refactor-history"]
+        read_query "codebase structure and prior refactoring patterns"
+        read_limit 15
+    }
+}
+
+// ── Phase 2: Refactor + Fix loop ─────────────────────────────────────────────
+
+agent refactor {
+    description "Apply refactor: {{PROMPT}}"
+    client sonnet
+    depends_on [analyse]
+    scope {
+        owned     ["src/" "crates/"]
+        read_only ["tests/" "Cargo.toml" "ARCHITECTURE.md"]
+    }
+    prompt #"
+        Apply the refactoring plan from the analyse agent: {{PROMPT}}
+
+        Rules:
+        - Follow the dependency order from the plan
+        - Make minimal, targeted changes — do not refactor beyond scope
+        - Preserve all existing behaviour (no semantic changes)
+        - Fix compilation errors as you go
+        - Do NOT modify test files — a separate agent handles that
+    "#
+    max_retries 5
+
+    memory {
+        read_ns    ["architecture" "refactor-history"]
+        read_query "patterns and pitfalls for {{PROMPT}}"
+        read_limit 5
+    }
+}
+
+agent fix_tests {
+    description "Update tests after refactor: {{PROMPT}}"
+    client sonnet
+    depends_on [refactor]
+    scope {
+        owned     ["tests/" "src/"]
+        read_only ["Cargo.toml"]
+    }
+    prompt #"
+        The codebase was refactored: {{PROMPT}}
+
+        Update all tests to match the refactored code:
+        - Fix broken imports and type references
+        - Update test assertions if return types changed
+        - Add new tests for any new error types or public API changes
+        - Do NOT delete tests unless the tested code was intentionally removed
+        - Fix any remaining compilation errors in src/ revealed by tests
+
+        All tests must compile and pass.
+    "#
+    max_retries 5
+}
+
+// ── Phase 3: Record changes ──────────────────────────────────────────────────
+
+agent record_changes {
+    description "Record refactor to memory: {{PROMPT}}"
+    client opus
+    depends_on [fix_tests]
+    scope {
+        read_only ["src/" "crates/" "tests/"]
+    }
+    prompt #"
+        Review the completed refactor: {{PROMPT}}
+
+        Write a summary for future agents covering:
+        - What changed structurally (renamed types, moved modules, new patterns)
+        - Migration patterns applied (before → after examples)
+        - Files and modules affected
+        - Any follow-up work remaining
+
+        This record helps future agents understand the current codebase state.
+    "#
+    max_retries 1
+
+    memory {
+        write_ns      "refactor-history"
+        importance    0.9
+        write_content #"
+            Refactor: {{DESCRIPTION}}
+            Files changed: {{FILES}}
+            Details: {{SUMMARY}}
+        "#
+        staleness_sources ["src/" "crates/"]
+    }
+}
+
+// ── Workflow ──────────────────────────────────────────────────────────────────
+
+workflow refactor_codebase {
+    steps [
+        analyse
+        loop {
+            agents [refactor fix_tests]
+            max_iterations 8
+            until { compile true test true }
+        }
+        record_changes
+    ]
+    max_parallel 1
+    verify { compile true clippy true test true }
+
+    memory {
+        read_ns  ["architecture" "refactor-history"]
+        write_ns "refactor-history"
+    }
+}
