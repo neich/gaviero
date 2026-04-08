@@ -702,7 +702,15 @@ impl AgentChatState {
     }
 
     pub fn insert_str(&mut self, text: &str) {
-        self.text_input.insert_str(text);
+        // Normalize line endings: \r in a ratatui buffer cell is sent as a
+        // literal carriage-return to the terminal, which jumps the cursor to
+        // column 0 and overwrites other TUI panels (Explorer, Editor).
+        if text.contains('\r') {
+            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+            self.text_input.insert_str(&normalized);
+        } else {
+            self.text_input.insert_str(text);
+        }
         self.update_autocomplete();
     }
 
@@ -2055,7 +2063,7 @@ impl AgentChatState {
                     let ch_idx = start + i;
                     if ch_idx < input_chars.len() {
                         let ch = input_chars[ch_idx];
-                        if ch == '\n' { continue; }
+                        if ch == '\n' || ch == '\r' { continue; }
                         let cx = x_start + i as u16;
                         if cx < area.x + area.width && cx < buf.area().right() && y < buf.area().bottom() {
                             let ch_style = if sel_range.map_or(false, |(s, e)| ch_idx >= s && ch_idx < e) {
