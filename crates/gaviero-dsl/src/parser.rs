@@ -34,7 +34,7 @@ enum ScopeField {
 
 #[derive(Debug)]
 enum WorkflowField {
-    Steps(Vec<(String, Span)>, Span),
+    Steps(Vec<StepItem>, Span),
     MaxParallel(usize, Span),
     Memory(MemoryBlock),
     Strategy(StrategyLit, Span),
@@ -53,11 +53,21 @@ enum VerifyField {
 }
 
 #[derive(Debug)]
+enum LoopField {
+    Agents(Vec<(String, Span)>),
+    Until(UntilCondition),
+    MaxIterations(u32),
+}
+
+#[derive(Debug)]
 enum MemoryField {
     ReadNs(Vec<String>),
     WriteNs(String),
     Importance(f32),
     StalenessSources(Vec<String>),
+    ReadQuery(String),
+    ReadLimit(usize),
+    WriteContent(String),
 }
 
 // ── Parser builder ─────────────────────────────────────────────────────────
@@ -85,6 +95,12 @@ where
         Token::KwEscalateAfter => "escalate_after".to_owned(),
         Token::StratSinglePass => "single_pass".to_owned(),
         Token::StratRefine  => "refine".to_owned(),
+        // loop-related contextual keywords
+        Token::KwLoop       => "loop".to_owned(),
+        Token::KwUntil      => "until".to_owned(),
+        Token::KwAgents     => "agents".to_owned(),
+        Token::KwMaxIterations => "max_iterations".to_owned(),
+        Token::KwCommand    => "command".to_owned(),
     };
 
     let string = select! {
@@ -211,6 +227,15 @@ where
         just(Token::KwStalenessSources)
             .ignore_then(str_list.clone())
             .map(MemoryField::StalenessSources),
+        just(Token::KwReadQuery)
+            .ignore_then(string.clone())
+            .map(MemoryField::ReadQuery),
+        just(Token::KwReadLimit)
+            .ignore_then(integer)
+            .map(|n| MemoryField::ReadLimit(n as usize)),
+        just(Token::KwWriteContent)
+            .ignore_then(string.clone())
+            .map(MemoryField::WriteContent),
     ));
 
     let memory_block = just(Token::KwMemory)
@@ -225,15 +250,21 @@ where
             let mut write_ns = None;
             let mut importance = None;
             let mut staleness_sources = Vec::new();
+            let mut read_query = None;
+            let mut read_limit = None;
+            let mut write_content = None;
             for f in fields {
                 match f {
                     MemoryField::ReadNs(v) => read_ns.extend(v),
                     MemoryField::WriteNs(s) => { write_ns.get_or_insert(s); }
                     MemoryField::Importance(v) => { importance.get_or_insert(v); }
                     MemoryField::StalenessSources(v) => staleness_sources.extend(v),
+                    MemoryField::ReadQuery(s) => { read_query.get_or_insert((s, e.span())); }
+                    MemoryField::ReadLimit(n) => { read_limit.get_or_insert((n, e.span())); }
+                    MemoryField::WriteContent(s) => { write_content.get_or_insert((s, e.span())); }
                 }
             }
-            MemoryBlock { read_ns, write_ns, importance, staleness_sources, span: e.span() }
+            MemoryBlock { read_ns, write_ns, importance, staleness_sources, read_query, read_limit, write_content, span: e.span() }
         });
 
     // ── bool literal (true/false as Ident) ───────────────────────
@@ -363,11 +394,104 @@ where
             AgentDecl { name, name_span, description, client, scope, depends_on, prompt, max_retries, memory, span: e.span() }
         });
 
+    // ── loop block (inside workflow steps) ─────────────────────────
+
+    // until condition: verify block | agent <name> | command "..."
+    let until_condition = {
+        let b1 = bool_lit.clone();
+        let b2 = bool_lit.clone();
+        let b3 = bool_lit.clone();
+        let until_verify_field = choice((
+            just(Token::KwCompile).ignore_then(b1).map(VerifyField::Compile),
+            just(Token::KwClippy).ignore_then(b2).map(VerifyField::Clippy),
+            just(Token::KwTest).ignore_then(b3).map(VerifyField::Test),
+        ));
+        let until_verify = until_verify_field
+            .repeated()
+            .collect::<Vec<_>>()
+            .delimited_by(just(Token::LBrace), just(Token::RBrace))
+            .map_with(|fields, e| {
+                let mut compile = false;
+                let mut clippy = false;
+                let mut test = false;
+                for f in fields {
+                    match f {
+                        VerifyField::Compile(v) => compile = v,
+                        VerifyField::Clippy(v) => clippy = v,
+                        VerifyField::Test(v) => test = v,
+                    }
+                }
+                UntilCondition::Verify(VerifyBlock { compile, clippy, test, span: e.span() })
+            });
+
+        let until_agent = just(Token::KwAgent)
+            .ignore_then(ident.map_with(|s, e| (s, e.span())))
+            .map(|(name, span)| UntilCondition::Agent(name, span));
+
+        let until_command = just(Token::KwCommand)
+            .ignore_then(string.map_with(|s, e| (s, e.span())))
+            .map(|(cmd, span)| UntilCondition::Command(cmd, span));
+
+        choice((until_verify, until_agent, until_command))
+    };
+
+    let loop_field = choice((
+        just(Token::KwAgents)
+            .ignore_then(ident_list.clone())
+            .map(LoopField::Agents),
+        just(Token::KwUntil)
+            .ignore_then(until_condition)
+            .map(LoopField::Until),
+        just(Token::KwMaxIterations)
+            .ignore_then(integer)
+            .map(|n| LoopField::MaxIterations(n as u32)),
+    ));
+
+    let loop_block = just(Token::KwLoop)
+        .ignore_then(
+            loop_field
+                .repeated()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::LBrace), just(Token::RBrace)),
+        )
+        .map_with(|fields, e| {
+            let mut agents = Vec::new();
+            let mut until = None;
+            let mut max_iterations = None;
+            for f in fields {
+                match f {
+                    LoopField::Agents(v) => agents = v,
+                    LoopField::Until(c) => { until.get_or_insert(c); }
+                    LoopField::MaxIterations(n) => { max_iterations.get_or_insert(n); }
+                }
+            }
+            LoopBlock {
+                agents,
+                until: until.unwrap_or(UntilCondition::Verify(VerifyBlock {
+                    compile: false, clippy: false, test: false, span: e.span(),
+                })),
+                max_iterations: max_iterations.unwrap_or(10),
+                span: e.span(),
+            }
+        });
+
+    // ── step item (agent ref or loop block) ──────────────────────
+
+    let step_item = choice((
+        loop_block.map(StepItem::Loop),
+        ident.map_with(|s, e| StepItem::Agent(s, e.span())),
+    ));
+
+    let step_list = step_item
+        .repeated()
+        .collect::<Vec<_>>()
+        .delimited_by(just(Token::LBracket), just(Token::RBracket));
+
     // ── workflow declaration ──────────────────────────────────────
 
     let workflow_field = choice((
         just(Token::KwSteps)
-            .ignore_then(ident_list.map_with(|v, e| (v, e.span())))
+            .ignore_then(step_list.map_with(|v, e| (v, e.span())))
             .map(|(v, s)| WorkflowField::Steps(v, s)),
         just(Token::KwMaxParallel)
             .ignore_then(integer.map_with(|n, e| (n, e.span())))
@@ -665,6 +789,193 @@ mod tests {
             let mem = w.memory.as_ref().expect("memory block");
             assert_eq!(mem.read_ns, vec!["shared"]);
             assert_eq!(mem.write_ns.as_deref(), Some("wf-out"));
+        }
+    }
+
+    #[test]
+    fn agent_memory_read_query_and_limit() {
+        let src = r#"
+            agent x {
+                memory {
+                    read_query "security vulnerabilities in auth"
+                    read_limit 10
+                }
+            }
+        "#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        if let Item::Agent(a) = &ast.unwrap().items[0] {
+            let mem = a.memory.as_ref().expect("memory block");
+            assert_eq!(mem.read_query.as_ref().map(|(s, _)| s.as_str()), Some("security vulnerabilities in auth"));
+            assert_eq!(mem.read_limit.as_ref().map(|(n, _)| *n), Some(10));
+        }
+    }
+
+    #[test]
+    fn agent_memory_write_content_template() {
+        let src = r##"
+            agent scan {
+                memory {
+                    write_ns "findings"
+                    write_content #"Findings: {{SUMMARY}} Files: {{FILES}}"#
+                }
+            }
+        "##;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        if let Item::Agent(a) = &ast.unwrap().items[0] {
+            let mem = a.memory.as_ref().expect("memory block");
+            assert_eq!(mem.write_ns.as_deref(), Some("findings"));
+            let (content, _) = mem.write_content.as_ref().expect("write_content");
+            assert!(content.contains("{{SUMMARY}}"));
+            assert!(content.contains("{{FILES}}"));
+        }
+    }
+
+    #[test]
+    fn agent_memory_all_new_fields_combined() {
+        let src = r##"
+            agent full {
+                memory {
+                    read_ns ["shared"]
+                    write_ns "output"
+                    importance 0.8
+                    read_query "prior analysis results"
+                    read_limit 15
+                    write_content #"Agent: {{AGENT}} Summary: {{SUMMARY}}"#
+                }
+            }
+        "##;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        if let Item::Agent(a) = &ast.unwrap().items[0] {
+            let mem = a.memory.as_ref().expect("memory block");
+            assert_eq!(mem.read_ns, vec!["shared"]);
+            assert_eq!(mem.write_ns.as_deref(), Some("output"));
+            assert!(matches!(mem.importance, Some(v) if (v - 0.8).abs() < 1e-5));
+            assert_eq!(mem.read_query.as_ref().map(|(s, _)| s.as_str()), Some("prior analysis results"));
+            assert_eq!(mem.read_limit.as_ref().map(|(n, _)| *n), Some(15));
+            assert!(mem.write_content.is_some());
+        }
+    }
+
+    // ── Loop tests ───────────────────────────────────────────────
+
+    #[test]
+    fn workflow_with_loop_verify_until() {
+        let src = r#"
+            agent a { description "impl" }
+            agent b { description "test" }
+            workflow w {
+                steps [
+                    a
+                    loop {
+                        agents [a b]
+                        max_iterations 5
+                        until { compile true test true }
+                    }
+                ]
+            }
+        "#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        if let Item::Workflow(w) = &ast.unwrap().items[2] {
+            let (steps, _) = w.steps.as_ref().unwrap();
+            assert_eq!(steps.len(), 2);
+            assert!(matches!(&steps[0], StepItem::Agent(name, _) if name == "a"));
+            if let StepItem::Loop(lb) = &steps[1] {
+                assert_eq!(lb.agents.len(), 2);
+                assert_eq!(lb.agents[0].0, "a");
+                assert_eq!(lb.agents[1].0, "b");
+                assert_eq!(lb.max_iterations, 5);
+                assert!(matches!(&lb.until, UntilCondition::Verify(vb) if vb.compile && vb.test));
+            } else {
+                panic!("expected Loop step");
+            }
+        }
+    }
+
+    #[test]
+    fn workflow_with_loop_agent_until() {
+        let src = r#"
+            agent impl_agent { description "implement" }
+            agent judge { description "evaluate" }
+            workflow w {
+                steps [
+                    loop {
+                        agents [impl_agent]
+                        max_iterations 3
+                        until agent judge
+                    }
+                ]
+            }
+        "#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        if let Item::Workflow(w) = &ast.unwrap().items[2] {
+            let (steps, _) = w.steps.as_ref().unwrap();
+            if let StepItem::Loop(lb) = &steps[0] {
+                assert!(matches!(&lb.until, UntilCondition::Agent(name, _) if name == "judge"));
+                assert_eq!(lb.max_iterations, 3);
+            } else {
+                panic!("expected Loop step");
+            }
+        }
+    }
+
+    #[test]
+    fn workflow_with_loop_command_until() {
+        let src = r#"
+            agent fixer { description "fix" }
+            workflow w {
+                steps [
+                    loop {
+                        agents [fixer]
+                        max_iterations 10
+                        until command "cargo test --quiet"
+                    }
+                ]
+            }
+        "#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        if let Item::Workflow(w) = &ast.unwrap().items[1] {
+            let (steps, _) = w.steps.as_ref().unwrap();
+            if let StepItem::Loop(lb) = &steps[0] {
+                assert!(matches!(&lb.until, UntilCondition::Command(cmd, _) if cmd == "cargo test --quiet"));
+                assert_eq!(lb.max_iterations, 10);
+            } else {
+                panic!("expected Loop step");
+            }
+        }
+    }
+
+    #[test]
+    fn workflow_mixed_steps_and_loops() {
+        let src = r#"
+            agent a { description "first" }
+            agent b { description "second" }
+            agent c { description "third" }
+            workflow w {
+                steps [
+                    a
+                    loop {
+                        agents [b]
+                        max_iterations 3
+                        until { test true }
+                    }
+                    c
+                ]
+            }
+        "#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        if let Item::Workflow(w) = &ast.unwrap().items[3] {
+            let (steps, _) = w.steps.as_ref().unwrap();
+            assert_eq!(steps.len(), 3);
+            assert!(matches!(&steps[0], StepItem::Agent(n, _) if n == "a"));
+            assert!(matches!(&steps[1], StepItem::Loop(_)));
+            assert!(matches!(&steps[2], StepItem::Agent(n, _) if n == "c"));
         }
     }
 }
