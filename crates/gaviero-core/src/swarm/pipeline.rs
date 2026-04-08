@@ -124,6 +124,7 @@ pub async fn execute(
                 modified_files: vec![],
                 branch: None,
                 summary: Some("already completed (resume)".into()),
+                output: None,
                 cost_usd: 0.0,
             };
             let swarm_result = SwarmResult {
@@ -458,6 +459,7 @@ pub async fn execute(
                                 modified_files: vec![],
                                 branch: None,
                                 summary: Some("Agent task error".into()),
+                                output: None,
                                 cost_usd: 0.0,
                             });
                         }
@@ -477,12 +479,107 @@ pub async fn execute(
                                 modified_files: vec![],
                                 branch: None,
                                 summary: Some("Agent task panicked".into()),
+                                output: None,
                                 cost_usd: 0.0,
                             });
                         }
                     }
                 }
             }
+        }
+    }
+
+    // 3b. Execute explicit loops (re-run loop agents until condition met)
+    for loop_config in &plan.loop_configs {
+        // First iteration was already executed in the tier loop above.
+        // Now check the condition and re-iterate if needed.
+        for iteration in 1..loop_config.max_iterations {
+            let condition_met = evaluate_loop_condition(
+                &loop_config.until,
+                &config.workspace_root,
+            ).await;
+
+            if condition_met {
+                tracing::info!(
+                    "Loop condition met after {} iteration(s) for agents {:?}",
+                    iteration,
+                    loop_config.agent_ids
+                );
+                break;
+            }
+
+            tracing::info!(
+                "Loop iteration {}/{} for agents {:?}",
+                iteration + 1,
+                loop_config.max_iterations,
+                loop_config.agent_ids
+            );
+            observer.on_phase_changed(&format!("loop iteration {}", iteration + 1));
+
+            // Re-run each agent in the loop sequentially
+            for agent_id in &loop_config.agent_ids {
+                let unit = match unit_map.get(agent_id.as_str()) {
+                    Some(u) => u,
+                    None => continue,
+                };
+
+                observer.on_agent_state_changed(
+                    agent_id,
+                    &AgentStatus::Running,
+                    &unit.description,
+                );
+
+                invalidate_stale_sources(&memory, unit, &config.workspace_root).await;
+
+                let effective_read_ns: Vec<String> = unit.read_namespaces
+                    .as_deref()
+                    .unwrap_or(config.read_namespaces.as_slice())
+                    .to_vec();
+
+                let agent_ctx = AgentRunContext {
+                    workspace_root: &config.workspace_root,
+                    context_files: &config.context_files,
+                    memory: memory.clone(),
+                    read_namespaces: &effective_read_ns,
+                    swarm_observer: observer,
+                    git_coordinator: git_coordinator.clone(),
+                    validation: validation_pipeline.clone(),
+                    board: Some(shared_board.clone()),
+                    repo_map: repo_map.clone(),
+                };
+                let manifest = run_single_agent(
+                    unit,
+                    worktree_mgr.as_mut(),
+                    &agent_ctx,
+                    make_observer(agent_id),
+                ).await?;
+
+                if matches!(manifest.status, AgentStatus::Completed) {
+                    let b = bus.lock().await;
+                    b.broadcast(
+                        &manifest.work_unit_id,
+                        &format!("completed: {}", manifest.summary.as_deref().unwrap_or("")),
+                    );
+                    let effective_write_ns = unit.write_namespace.as_deref()
+                        .unwrap_or(&config.write_namespace);
+                    store_agent_result(&memory, effective_write_ns, &manifest, unit, &run_id, &config.workspace_root).await;
+                }
+                exec_state.record_result(agent_id, manifest.clone());
+                all_manifests.push(manifest);
+            }
+        }
+
+        // Final check after all iterations
+        let final_met = evaluate_loop_condition(
+            &loop_config.until,
+            &config.workspace_root,
+        ).await;
+        if !final_met {
+            tracing::warn!(
+                "Loop exhausted max_iterations ({}) without condition being met for agents {:?}",
+                loop_config.max_iterations,
+                loop_config.agent_ids
+            );
         }
     }
 
@@ -725,13 +822,25 @@ async fn store_agent_result(
     let files: Vec<String> = manifest.modified_files.iter()
         .map(|p| p.display().to_string())
         .collect();
-    let content = format!(
-        "Task: {}\nTier: {:?}\nModified: {}\nSummary: {}",
-        unit.description,
-        unit.tier,
-        files.join(", "),
-        manifest.summary.as_deref().unwrap_or("none"),
-    );
+    // {{SUMMARY}} resolves to the agent's full text output (preferred) or short summary.
+    let summary_text = manifest.output.as_deref()
+        .or(manifest.summary.as_deref())
+        .unwrap_or("none");
+    let content = if let Some(template) = &unit.memory_write_content {
+        template
+            .replace("{{SUMMARY}}", summary_text)
+            .replace("{{FILES}}", &files.join(", "))
+            .replace("{{AGENT}}", &manifest.work_unit_id)
+            .replace("{{DESCRIPTION}}", &unit.description)
+    } else {
+        format!(
+            "Task: {}\nTier: {:?}\nModified: {}\nOutput: {}",
+            unit.description,
+            unit.tier,
+            files.join(", "),
+            summary_text,
+        )
+    };
     let opts = StoreOptions {
         privacy: privacy.to_string(),
         importance,
@@ -968,6 +1077,77 @@ async fn invalidate_stale_sources(
 /// Determine the next escalation tier in the chain.
 ///
 /// Cheap → Expensive → None (ceiling reached).
+/// Evaluate a loop's exit condition.
+///
+/// Returns `true` if the condition is met and the loop should stop.
+async fn evaluate_loop_condition(
+    condition: &super::plan::LoopUntilCondition,
+    workspace_root: &std::path::Path,
+) -> bool {
+    match condition {
+        super::plan::LoopUntilCondition::Verify(config) => {
+            // Run compile/clippy/test checks and return true if all pass
+            let mut all_pass = true;
+            if config.compile {
+                let result = tokio::process::Command::new("cargo")
+                    .arg("check")
+                    .current_dir(workspace_root)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await;
+                if !result.map(|s| s.success()).unwrap_or(false) {
+                    all_pass = false;
+                }
+            }
+            if config.test && all_pass {
+                let result = tokio::process::Command::new("cargo")
+                    .arg("test")
+                    .current_dir(workspace_root)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await;
+                if !result.map(|s| s.success()).unwrap_or(false) {
+                    all_pass = false;
+                }
+            }
+            if config.clippy && all_pass {
+                let result = tokio::process::Command::new("cargo")
+                    .arg("clippy")
+                    .args(["--", "-D", "warnings"])
+                    .current_dir(workspace_root)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await;
+                if !result.map(|s| s.success()).unwrap_or(false) {
+                    all_pass = false;
+                }
+            }
+            all_pass
+        }
+        super::plan::LoopUntilCondition::Agent(_agent_id) => {
+            // Judge agent evaluation: run the agent and parse its output for PASS/FAIL.
+            // For now, return false (not met) — full implementation requires running
+            // the agent through run_backend and parsing its output.
+            tracing::warn!("judge agent loop condition not yet fully implemented at runtime");
+            false
+        }
+        super::plan::LoopUntilCondition::Command(cmd) => {
+            // Run the shell command; exit code 0 = condition met
+            let result = tokio::process::Command::new("sh")
+                .args(["-c", cmd])
+                .current_dir(workspace_root)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await;
+            result.map(|s| s.success()).unwrap_or(false)
+        }
+    }
+}
+
 fn next_escalation_tier(tier: crate::types::ModelTier) -> Option<crate::types::ModelTier> {
     use crate::types::ModelTier;
     match tier {
