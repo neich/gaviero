@@ -51,6 +51,12 @@ pub enum Token {
     KwImportance,
     #[token("staleness_sources")]
     KwStalenessSources,
+    #[token("read_query")]
+    KwReadQuery,
+    #[token("read_limit")]
+    KwReadLimit,
+    #[token("write_content")]
+    KwWriteContent,
     #[token("strategy")]
     KwStrategy,
     #[token("test_first")]
@@ -69,6 +75,18 @@ pub enum Token {
     KwClippy,
     #[token("test")]
     KwTest,
+
+    // ── Loop keywords ───────────────────────────────────────────
+    #[token("loop")]
+    KwLoop,
+    #[token("until")]
+    KwUntil,
+    #[token("agents")]
+    KwAgents,
+    #[token("max_iterations")]
+    KwMaxIterations,
+    #[token("command")]
+    KwCommand,
 
     // ── Tier value keywords ──────────────────────────────────────
     #[token("coordinator")]
@@ -156,6 +174,9 @@ impl fmt::Display for Token {
             Token::KwWriteNs => write!(f, "write_ns"),
             Token::KwImportance => write!(f, "importance"),
             Token::KwStalenessSources => write!(f, "staleness_sources"),
+            Token::KwReadQuery => write!(f, "read_query"),
+            Token::KwReadLimit => write!(f, "read_limit"),
+            Token::KwWriteContent => write!(f, "write_content"),
             Token::KwStrategy => write!(f, "strategy"),
             Token::KwTestFirst => write!(f, "test_first"),
             Token::KwAttempts => write!(f, "attempts"),
@@ -164,6 +185,11 @@ impl fmt::Display for Token {
             Token::KwCompile => write!(f, "compile"),
             Token::KwClippy => write!(f, "clippy"),
             Token::KwTest => write!(f, "test"),
+            Token::KwLoop => write!(f, "loop"),
+            Token::KwUntil => write!(f, "until"),
+            Token::KwAgents => write!(f, "agents"),
+            Token::KwMaxIterations => write!(f, "max_iterations"),
+            Token::KwCommand => write!(f, "command"),
             Token::StratSinglePass => write!(f, "single_pass"),
             Token::StratRefine => write!(f, "refine"),
             Token::TierCoordinator => write!(f, "coordinator"),
@@ -331,13 +357,16 @@ mod tests {
 
     #[test]
     fn memory_keywords() {
-        let (toks, errs) = lex("memory read_ns write_ns importance staleness_sources");
+        let (toks, errs) = lex("memory read_ns write_ns importance staleness_sources read_query read_limit write_content");
         assert!(errs.is_empty(), "lex errors: {:?}", errs);
         assert!(matches!(toks[0].0, Token::KwMemory));
         assert!(matches!(toks[1].0, Token::KwReadNs));
         assert!(matches!(toks[2].0, Token::KwWriteNs));
         assert!(matches!(toks[3].0, Token::KwImportance));
         assert!(matches!(toks[4].0, Token::KwStalenessSources));
+        assert!(matches!(toks[5].0, Token::KwReadQuery));
+        assert!(matches!(toks[6].0, Token::KwReadLimit));
+        assert!(matches!(toks[7].0, Token::KwWriteContent));
     }
 
     #[test]
@@ -394,5 +423,16 @@ mod tests {
         assert!(errs.is_empty());
         assert_eq!(toks.len(), 1);
         assert!(matches!(&toks[0].0, Token::Ident(s) if s == "best_of_3"));
+    }
+
+    #[test]
+    fn loop_keywords() {
+        let (toks, errs) = lex("loop until agents max_iterations command");
+        assert!(errs.is_empty(), "lex errors: {:?}", errs);
+        assert!(matches!(toks[0].0, Token::KwLoop));
+        assert!(matches!(toks[1].0, Token::KwUntil));
+        assert!(matches!(toks[2].0, Token::KwAgents));
+        assert!(matches!(toks[3].0, Token::KwMaxIterations));
+        assert!(matches!(toks[4].0, Token::KwCommand));
     }
 }
