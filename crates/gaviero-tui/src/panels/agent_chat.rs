@@ -1813,6 +1813,10 @@ impl AgentChatState {
                 let mut cx = area.x;
                 let mut char_idx = 0usize;
                 for ch in text.chars() {
+                    if ch == '\r' {
+                        char_idx += 1;
+                        continue;
+                    }
                     let display_ch = if ch == '\t' { ' ' } else { ch };
                     let ch_width = UnicodeWidthChar::width(display_ch).unwrap_or(1) as u16;
                     let final_style = if self.is_char_selected(line_idx, char_idx) {
