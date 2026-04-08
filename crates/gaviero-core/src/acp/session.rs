@@ -106,44 +106,23 @@ impl AcpSession {
 
         let mut child = cmd.spawn().context("spawning claude subprocess")?;
 
-        // Write prompt to stdin.
+        // Write prompt to stdin then close it immediately.
         //
-        // `claude --print` waits for stdin EOF before processing — it reads the
-        // entire stdin as the prompt. We therefore MUST close stdin after writing.
+        // `claude --print` reads stdin until EOF before processing — keeping
+        // stdin open causes claude to block forever waiting for more input.
+        // We must send EOF right after the prompt regardless of auto_approve.
         //
-        // When auto_approve is true (coordinator, read-only sessions), we close
-        // stdin immediately after writing the prompt: no permission responses
-        // will ever be needed, and closing stdin unblocks the CLI.
-        //
-        // When auto_approve is false (write-enabled agents), permission responses
-        // must be sent back via stdin, so we keep it open via a background task.
-        let stdin_tx = if let Some(mut stdin) = child.stdin.take() {
+        // NOTE: permission responses via stdin are therefore not supported in
+        // --print mode; respond_permission() is a no-op (stdin_tx is always None).
+        if let Some(mut stdin) = child.stdin.take() {
             let prompt_bytes = prompt.as_bytes().to_vec();
-            if options.auto_approve {
-                // Close stdin after prompt — unblocks `claude --print`
-                tokio::spawn(async move {
-                    let _ = stdin.write_all(&prompt_bytes).await;
-                    let _ = stdin.flush().await;
-                    let _ = stdin.shutdown().await; // send EOF immediately
-                });
-                None // no channel needed; permission responses never sent
-            } else {
-                // Keep stdin open for permission responses
-                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                tokio::spawn(async move {
-                    let _ = stdin.write_all(&prompt_bytes).await;
-                    let _ = stdin.flush().await;
-                    while let Some(line) = rx.recv().await {
-                        let _ = stdin.write_all(line.as_bytes()).await;
-                        let _ = stdin.flush().await;
-                    }
-                    let _ = stdin.shutdown().await;
-                });
-                Some(tx)
-            }
-        } else {
-            None
-        };
+            tokio::spawn(async move {
+                let _ = stdin.write_all(&prompt_bytes).await;
+                let _ = stdin.flush().await;
+                let _ = stdin.shutdown().await; // send EOF — unblocks claude
+            });
+        }
+        let stdin_tx: Option<tokio::sync::mpsc::UnboundedSender<String>> = None;
 
         let stdout = child
             .stdout
