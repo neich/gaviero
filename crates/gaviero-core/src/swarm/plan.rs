@@ -58,6 +58,30 @@ pub enum TriggerRule {
     OneFailed,
 }
 
+// ── Loop config ─────────────────────────────────────────────
+
+/// Exit condition for an explicit loop in the execution plan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum LoopUntilCondition {
+    /// Verification checks pass (compile/clippy/test).
+    Verify(VerificationConfig),
+    /// A named judge agent returns pass/fail.
+    Agent(String),
+    /// A shell command exits with code 0.
+    Command(String),
+}
+
+/// Configuration for an explicit `loop { ... }` block in a workflow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoopConfig {
+    /// Work unit IDs that participate in this loop, in execution order.
+    pub agent_ids: Vec<String>,
+    /// Termination condition.
+    pub until: LoopUntilCondition,
+    /// Hard upper bound on iterations.
+    pub max_iterations: u32,
+}
+
 // ── CompiledPlan ─────────────────────────────────────────────
 
 /// Immutable execution plan produced by the DSL compiler.
@@ -76,6 +100,8 @@ pub struct CompiledPlan {
     pub iteration_config: IterationConfig,
     /// Post-edit verification checks declared in the workflow block.
     pub verification_config: VerificationConfig,
+    /// Explicit loop configurations within the workflow.
+    pub loop_configs: Vec<LoopConfig>,
 }
 
 impl CompiledPlan {
@@ -171,6 +197,7 @@ impl CompiledPlan {
             source_file: None,
             iteration_config: IterationConfig::default(),
             verification_config: VerificationConfig::default(),
+            loop_configs: Vec::new(),
         }
     }
 
