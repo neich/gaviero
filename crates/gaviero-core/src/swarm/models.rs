@@ -74,6 +74,22 @@ pub struct WorkUnit {
     /// this agent runs; stale entries are invalidated automatically.
     #[serde(default)]
     pub staleness_sources: Vec<String>,
+
+    // ── Explicit memory control (from DSL `memory {}` extensions) ──
+
+    /// Custom semantic search query for memory context.
+    /// When `Some`, replaces `description` as the search query in `build_prompt`.
+    #[serde(default)]
+    pub memory_read_query: Option<String>,
+
+    /// Custom search result limit. `None` → default (5).
+    #[serde(default)]
+    pub memory_read_limit: Option<usize>,
+
+    /// Template for memory write content. `None` → auto-generated summary.
+    /// Supports `{{SUMMARY}}`, `{{FILES}}`, `{{AGENT}}`, `{{DESCRIPTION}}`.
+    #[serde(default)]
+    pub memory_write_content: Option<String>,
 }
 
 fn default_max_retries() -> u8 {
@@ -120,8 +136,12 @@ pub struct AgentManifest {
     pub modified_files: Vec<PathBuf>,
     /// Optional branch name (used in M3b with git worktrees).
     pub branch: Option<String>,
-    /// Optional summary of changes.
+    /// Optional short summary of changes (for bus broadcasts and UI).
     pub summary: Option<String>,
+    /// Full agent text output (assistant messages concatenated).
+    /// Used by `{{SUMMARY}}` in memory `write_content` templates.
+    #[serde(default)]
+    pub output: Option<String>,
     /// Estimated cost of this agent's run in USD (populated when usage data available).
     #[serde(default)]
     pub cost_usd: f64,
