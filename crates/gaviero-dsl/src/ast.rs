@@ -101,6 +101,14 @@ pub struct MemoryBlock {
     /// Relative paths (from workspace root) whose file hashes are checked for
     /// staleness before this agent runs. Agent-only.
     pub staleness_sources: Vec<String>,
+    /// Custom semantic search query. When `Some`, replaces the agent's
+    /// `description` as the memory search query. Supports `{{PROMPT}}`.
+    pub read_query: Option<(String, Span)>,
+    /// Custom search result limit. Overrides the default of 5.
+    pub read_limit: Option<(usize, Span)>,
+    /// Template for the content written to memory after agent completes.
+    /// Supports `{{SUMMARY}}`, `{{FILES}}`, `{{AGENT}}`, `{{DESCRIPTION}}`.
+    pub write_content: Option<(String, Span)>,
     pub span: Span,
 }
 
@@ -124,27 +132,71 @@ pub struct VerifyBlock {
     pub span: Span,
 }
 
+// ── loop / step items ────────────────────────────────────────────────────
+
+/// A single step in a workflow's `steps [...]` list.
+#[derive(Debug, Clone)]
+pub enum StepItem {
+    /// A reference to a named agent.
+    Agent(String, Span),
+    /// An explicit loop over a sequence of agents.
+    Loop(LoopBlock),
+}
+
+/// Exit condition for a `loop` block.
+#[derive(Debug, Clone)]
+pub enum UntilCondition {
+    /// Reuses the verify grammar: `{ compile true test true clippy false }`.
+    Verify(VerifyBlock),
+    /// A named agent that acts as a judge — returns pass/fail.
+    Agent(String, Span),
+    /// A shell command — exit code 0 means condition met.
+    Command(String, Span),
+}
+
+/// The `loop { ... }` block inside a workflow's `steps` list.
+///
+/// ```text
+/// loop {
+///     agents [implement verify]
+///     max_iterations 5
+///     until { compile true test true }
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct LoopBlock {
+    /// Agents to execute each iteration, in order.
+    pub agents: Vec<(String, Span)>,
+    /// Termination condition.
+    pub until: UntilCondition,
+    /// Hard upper bound on iterations.
+    pub max_iterations: u32,
+    pub span: Span,
+}
+
 // ── workflow ──────────────────────────────────────────────────────────────
 
 /// Declares an optional execution plan (ordered steps, concurrency cap).
 ///
 /// ```text
 /// workflow feature_dev {
-///     steps [researcher, implementer]
+///     steps [
+///         researcher
+///         loop {
+///             agents [implementer verifier]
+///             max_iterations 5
+///             until { compile true test true }
+///         }
+///     ]
 ///     max_parallel 2
 ///     strategy refine
-///     test_first true
-///     max_retries 5
-///     attempts 1
-///     escalate_after 3
-///     verify { compile true clippy true test false }
 /// }
 /// ```
 #[derive(Debug, Clone)]
 pub struct WorkflowDecl {
     pub name: String,
     pub name_span: Span,
-    pub steps: Option<(Vec<(String, Span)>, Span)>,
+    pub steps: Option<(Vec<StepItem>, Span)>,
     pub max_parallel: Option<(usize, Span)>,
     pub memory: Option<MemoryBlock>,
     pub strategy: Option<(StrategyLit, Span)>,
