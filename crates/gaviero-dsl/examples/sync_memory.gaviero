@@ -1,0 +1,206 @@
+// Template: Synchronize project memories with current codebase state
+//
+// Reads the full codebase, all documentation files, and existing memories.
+// Updates outdated memories, invalidates superseded ones, and creates new
+// ones for undocumented knowledge. No files are modified — only memory.
+//
+// Run this periodically or after major changes to keep memory accurate.
+//
+// Usage:
+//   gaviero-cli --script sync_memory.gaviero
+
+client sonnet { tier cheap     model "claude-sonnet-4-6" }
+client opus   { tier expensive model "claude-opus-4-6" }
+
+// ── Phase 1: Audit current state ─────────────────────────────────────────────
+
+agent audit_codebase {
+    description "Audit codebase structure and extract key facts"
+    client opus
+    scope {
+        read_only [
+            "src/" "crates/" "tests/" "Cargo.toml"
+            "CLAUDE.md" "README.md" "ARCHITECTURE.md"
+        ]
+    }
+    prompt #"
+        Read the entire codebase, all documentation files (CLAUDE.md,
+        README.md, ARCHITECTURE.md — including per-crate variants), and
+        Cargo.toml for dependency information.
+
+        Produce a structured knowledge extraction:
+
+        ## Architecture
+        - Crate topology and module structure
+        - Key abstractions (types, traits, patterns)
+        - Data flows for major operations
+
+        ## Conventions
+        - Naming patterns
+        - Error handling approach
+        - Test patterns (unit, integration, location)
+        - Dependency usage patterns
+
+        ## Recent changes
+        - Modules that appear new or recently refactored
+        - Features that look partially implemented
+        - TODOs or FIXMEs found in code
+
+        ## Cross-cutting concerns
+        - Configuration approach
+        - Logging / tracing
+        - Concurrency model
+
+        Be factual and precise. Reference actual file paths and type names.
+        This extraction will be compared against existing memories.
+    "#
+    max_retries 1
+
+    memory {
+        read_ns    ["architecture" "feature-history" "refactor-history"]
+        read_query "all project architecture, conventions, and recent changes"
+        read_limit 20
+    }
+}
+
+// ── Phase 2: Reconcile memories ──────────────────────────────────────────────
+
+agent reconcile_architecture {
+    description "Update architecture memories"
+    client opus
+    depends_on [audit_codebase]
+    scope {
+        read_only ["src/" "crates/" "ARCHITECTURE.md"]
+    }
+    prompt #"
+        Compare the codebase audit against existing architecture memories.
+
+        For each piece of architectural knowledge:
+
+        1. If a memory is accurate and current → leave it (mention it as valid)
+        2. If a memory is outdated (code has changed) → write an updated version
+        3. If a memory is wrong or refers to deleted code → write a replacement
+           that reflects current state
+        4. If important architecture is not in memory → write a new entry
+
+        Focus on:
+        - Module structure and dependencies
+        - Key types and their relationships
+        - Data flow patterns
+        - Public API surfaces
+        - Integration points between crates
+
+        Your write_content must be factual, precise, and useful for AI agents
+        that will read these memories to understand the codebase.
+    "#
+    max_retries 2
+
+    memory {
+        read_ns       ["architecture"]
+        read_query    "project architecture, module structure, key types"
+        read_limit    20
+        write_ns      "architecture"
+        importance    0.9
+        write_content #"
+            Architecture sync: {{SUMMARY}}
+            Source: codebase audit
+            Scope: {{FILES}}
+        "#
+        staleness_sources ["src/" "crates/"]
+    }
+}
+
+agent reconcile_patterns {
+    description "Update coding patterns and conventions memories"
+    client sonnet
+    depends_on [audit_codebase]
+    scope {
+        read_only ["src/" "crates/" "tests/" "CLAUDE.md"]
+    }
+    prompt #"
+        Compare the codebase audit against existing pattern/convention memories.
+
+        For each coding pattern or convention:
+
+        1. If a memory accurately reflects current practice → skip
+        2. If a pattern has evolved → write an updated entry
+        3. If new patterns exist that are not in memory → write new entries
+
+        Focus on:
+        - Error handling patterns (types, propagation)
+        - Test patterns (how tests are structured, common helpers)
+        - Naming conventions
+        - Module organization patterns
+        - Common idioms used in this codebase
+
+        Entries should be written for AI consumption: precise, with examples
+        referencing actual file paths and function names.
+    "#
+    max_retries 2
+
+    memory {
+        read_ns       ["architecture" "feature-history"]
+        read_query    "coding patterns, conventions, test patterns, idioms"
+        read_limit    15
+        write_ns      "architecture"
+        importance    0.7
+        write_content #"
+            Patterns sync: {{SUMMARY}}
+            Source: codebase audit
+        "#
+    }
+}
+
+agent reconcile_history {
+    description "Prune and update feature/refactor history memories"
+    client sonnet
+    depends_on [audit_codebase]
+    scope {
+        read_only ["src/" "crates/" "tests/"]
+    }
+    prompt #"
+        Review existing feature-history and refactor-history memories
+        against the current codebase state.
+
+        For each historical memory:
+
+        1. If the described feature/refactor is still present and the
+           memory is accurate → skip (still valid context)
+        2. If the feature was further modified → write an updated entry
+           that reflects its current state
+        3. If the feature was removed or completely rewritten → write a
+           replacement noting the current state
+        4. If multiple old entries describe incremental steps toward the
+           same feature → write one consolidated entry
+
+        Goal: keep history memories useful without clutter. A future agent
+        reading these should quickly understand what was built and why,
+        not wade through stale intermediate states.
+    "#
+    max_retries 2
+
+    memory {
+        read_ns       ["feature-history" "refactor-history"]
+        read_query    "all feature implementations and refactoring history"
+        read_limit    20
+        write_ns      "feature-history"
+        importance    0.6
+        write_content #"
+            History sync: {{SUMMARY}}
+            Reconciled from: feature-history, refactor-history
+        "#
+    }
+}
+
+// ── Workflow ──────────────────────────────────────────────────────────────────
+
+workflow sync_memory {
+    // reconcile agents run in parallel — they write to different namespaces
+    steps [audit_codebase reconcile_architecture reconcile_patterns reconcile_history]
+    max_parallel 3
+    strategy single_pass
+
+    memory {
+        read_ns  ["architecture" "feature-history" "refactor-history"]
+    }
+}
