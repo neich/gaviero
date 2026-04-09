@@ -49,6 +49,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for data flows, abstractions, and module 
 - Embedding computation runs outside the SQLite Mutex — lock protects only DB I/O.
 - Swarm branches follow the pattern `gaviero/{work_unit_id}`.
 - Worktrees live in `.gaviero/worktrees/{id}/` and are cleaned up via `Drop`.
+- Memory writes always require an explicit `WriteScope` — the system never guesses scope level.
+- Scoped memory search cascades narrowest-to-widest with early termination at confidence threshold.
 
 ## MCP Servers
 
