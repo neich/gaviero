@@ -1035,63 +1035,6 @@ pub async fn plan_coordinated(
     }
 }
 
-/// Merge one agent branch into the workspace, attempting auto-resolution on conflict.
-///
-/// Returns a `MergeResult`. Errors from `abort_merge` are logged but not propagated
-/// so the caller can continue with remaining branches.
-async fn merge_one_branch(
-    workspace_root: &PathBuf,
-    branch: &str,
-    observer: &dyn SwarmObserver,
-) -> MergeResult {
-    let mut result = match merge::merge_branch(workspace_root, branch) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("merge_branch failed for {}: {}", branch, e);
-            return MergeResult {
-                work_unit_id: branch.to_string(),
-                success: false,
-                conflicts: vec![],
-            };
-        }
-    };
-
-    if !result.success && !result.conflicts.is_empty() {
-        let files: Vec<String> = result
-            .conflicts
-            .iter()
-            .map(|c| c.file.to_string_lossy().to_string())
-            .collect();
-        observer.on_merge_conflict(branch, &files);
-        observer.on_phase_changed("resolving conflicts");
-
-        let resolved = merge::auto_resolve_conflicts(
-            workspace_root,
-            branch,
-            &result.conflicts,
-            "opus",
-        )
-        .await;
-
-        match resolved {
-            Ok(resolved_conflicts) => {
-                let all_ok = resolved_conflicts.iter().all(|c| c.resolved);
-                result.conflicts = resolved_conflicts;
-                result.success = all_ok;
-                if !all_ok {
-                    tracing::warn!("some conflicts could not be auto-resolved for {}", branch);
-                    let _ = merge::abort_merge(workspace_root);
-                }
-            }
-            Err(e) => {
-                tracing::error!("auto-resolve failed for {}: {}", branch, e);
-                let _ = merge::abort_merge(workspace_root);
-            }
-        }
-    }
-    result
-}
-
 /// Undo a swarm run by hard-resetting the repo to its pre-swarm state.
 ///
 /// Deletes all agent branches that were part of `result`, then runs
@@ -1304,14 +1247,6 @@ async fn evaluate_loop_condition(
                 .await;
             result.map(|s| s.success()).unwrap_or(false)
         }
-    }
-}
-
-fn next_escalation_tier(tier: crate::types::ModelTier) -> Option<crate::types::ModelTier> {
-    use crate::types::ModelTier;
-    match tier {
-        ModelTier::Cheap => Some(ModelTier::Expensive),
-        ModelTier::Expensive => None,
     }
 }
 
