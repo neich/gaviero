@@ -717,6 +717,25 @@ pub async fn execute(
         mgr.teardown_all();
     }
 
+    // 6. Post-execution memory consolidation (best-effort)
+    if let Some(mem) = memory.as_ref() {
+        let consolidator = crate::memory::consolidation::Consolidator::new(Arc::clone(mem));
+        let repo_id = crate::memory::hash_path(&config.workspace_root);
+        match consolidator.consolidate_run(&run_id, &repo_id).await {
+            Ok(report) => {
+                tracing::info!(
+                    promoted = report.promoted,
+                    reinforced = report.reinforced,
+                    pruned = report.pruned,
+                    "memory consolidation complete"
+                );
+            }
+            Err(e) => {
+                tracing::warn!("memory consolidation failed: {}", e);
+            }
+        }
+    }
+
     let success = all_manifests.iter().all(|m| matches!(m.status, AgentStatus::Completed))
         && all_merges.iter().all(|m| m.success);
 
