@@ -152,13 +152,24 @@ You can also define work units manually:
 
 ### Semantic memory
 
-Agents can store and retrieve knowledge across sessions. Memory is backed by ONNX embeddings and SQLite:
+Agents can store and retrieve knowledge across sessions. Memory is backed by ONNX embeddings and SQLite, organized in a five-level scope hierarchy:
 
+```
+global        personal cross-workspace knowledge
+  └─ workspace    business-level project (.gaviero-workspace)
+       └─ repo        single git repository
+            └─ module     crate / package / subdirectory
+                 └─ run        single swarm execution (consolidated upward on completion)
+```
+
+Searches cascade from the narrowest scope outward, stopping early when confidence is high (RRF hybrid vector + keyword search). This means a module-level result beats a global one when it's more relevant.
+
+Store context from the chat panel:
 ```
 /remember the authentication module uses bcrypt for password hashing
 ```
 
-Memory namespaces are configured per-project in `.gaviero/settings.json`.
+Memory databases are stored at `<workspace>/.gaviero/memory.db` (workspace-local) and `~/.config/gaviero/memory.db` (global). Configuration is in `.gaviero/settings.json`.
 
 ## Headless CLI
 
