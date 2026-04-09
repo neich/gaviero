@@ -482,7 +482,7 @@ async fn run_coordinator_session(
                         format!(" | stderr: {}", last)
                     };
                     obs.on_streaming_status(
-                        &format!("Working... ({}s elapsed){}", elapsed, stderr_hint),
+                        &format!("{} ({}s elapsed){}", building_status, elapsed, stderr_hint),
                     );
                 }
                 continue;
