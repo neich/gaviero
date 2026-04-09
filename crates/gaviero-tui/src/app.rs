@@ -323,6 +323,18 @@ impl AcpObserver for TuiAcpObserver {
     }
 }
 
+// ── File move state (multi-step: source → dest → confirm) ───────
+
+#[derive(Debug, Clone)]
+pub enum MoveState {
+    /// Navigating to select the source file (Enter confirms it).
+    SelectingSource,
+    /// Source chosen; navigating to select a destination folder.
+    SelectingDest(std::path::PathBuf),
+    /// Both endpoints chosen; awaiting y/N confirmation.
+    Confirming(std::path::PathBuf, std::path::PathBuf),
+}
+
 // ── Inline dialog for file tree operations ──────────────────────
 
 #[derive(Debug, Clone)]
@@ -443,6 +455,8 @@ pub struct App {
     pub focus: Focus,
     pub panel_visible: PanelVisibility,
     pub should_quit: bool,
+    /// When true, a quit-confirmation dialog is shown (unsaved files or active agents).
+    quit_confirm: bool,
     /// When true, the main loop should call `terminal.clear()` before the next draw
     /// to force a full redraw and fix any terminal state corruption.
     pub needs_full_redraw: bool,
@@ -479,6 +493,8 @@ pub struct App {
 
     // File tree dialog (new file/folder, rename, delete)
     tree_dialog: Option<TreeDialog>,
+    // File move state (multi-step: select source → select dest → confirm)
+    move_state: Option<MoveState>,
 
     // Editor find bar (Ctrl+F)
     pub find_bar_active: bool,
@@ -588,6 +604,7 @@ impl App {
                 terminal: false,
             },
             should_quit: false,
+            quit_confirm: false,
             needs_full_redraw: false,
             event_tx,
             theme,
@@ -614,6 +631,7 @@ impl App {
             last_click: None,
             status_message: None,
             tree_dialog: None,
+            move_state: None,
             find_bar_active: false,
             find_input: crate::widgets::text_input::TextInput::new(),
             preview_visible: false,
@@ -671,9 +689,31 @@ impl App {
                     }
                 }
 
+                // If quit confirmation dialog is active, route raw keys there
+                if self.quit_confirm {
+                    match key.code {
+                        crossterm::event::KeyCode::Char('y') | crossterm::event::KeyCode::Char('Y') => {
+                            self.should_quit = true;
+                        }
+                        _ => {
+                            self.quit_confirm = false;
+                        }
+                    }
+                    return;
+                }
+
                 // If a tree dialog is active, route raw keys there
                 if self.tree_dialog.is_some() {
                     self.handle_dialog_key(&key);
+                    return;
+                }
+
+                // If a file move is in progress, route keys to the move handler
+                if self.move_state.is_some()
+                    && self.focus == Focus::FileTree
+                    && self.left_panel == LeftPanelMode::FileTree
+                {
+                    self.handle_move_key(&key);
                     return;
                 }
 
@@ -1028,7 +1068,7 @@ impl App {
                     // q in review mode dismisses the overlay
                     self.diff_review = None;
                 } else {
-                    self.should_quit = true;
+                    self.try_quit();
                 }
             }
             Action::ToggleFileTree => {
@@ -1186,6 +1226,10 @@ impl App {
             Action::CloseTab => {
                 if self.focus == Focus::Terminal {
                     self.handle_action(Action::CloseTerminal);
+                } else if self.focus == Focus::SidePanel
+                    && self.side_panel == SidePanelMode::AgentChat
+                {
+                    self.chat_state.close_conversation();
                 } else {
                     self.close_tab();
                 }
@@ -4069,11 +4113,12 @@ impl App {
                     self.file_tree.toggle_expand();
                 }
             }
-            // n = new file, N = new folder, r = rename, d = delete
+            // n = new file, N = new folder, r = rename, d = delete, m = move
             Action::InsertChar('n') => self.start_tree_dialog(TreeDialogKind::NewFile),
             Action::InsertChar('N') => self.start_tree_dialog(TreeDialogKind::NewFolder),
             Action::InsertChar('r') => self.start_tree_dialog(TreeDialogKind::Rename),
             Action::InsertChar('d') | Action::Delete => self.start_tree_dialog(TreeDialogKind::Delete),
+            Action::InsertChar('m') => self.start_move(),
             _ => {}
         }
     }
@@ -4110,6 +4155,176 @@ impl App {
         }
 
         self.tree_dialog = Some(dialog);
+    }
+
+    // ── File move (multi-step) ────────────────────────────────────
+
+    fn start_move(&mut self) {
+        self.move_state = Some(MoveState::SelectingSource);
+    }
+
+    fn handle_move_key(&mut self, key: &crossterm::event::KeyEvent) {
+        use crossterm::event::KeyCode;
+
+        match self.move_state.clone() {
+            None => {}
+
+            Some(MoveState::SelectingSource) => match key.code {
+                KeyCode::Esc => {
+                    self.move_state = None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.file_tree.move_up();
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.file_tree.move_down();
+                }
+                KeyCode::Enter => {
+                    if self.file_tree.selected_is_file() {
+                        if let Some(path) = self.file_tree.selected_path() {
+                            let src = path.to_path_buf();
+                            self.move_state = Some(MoveState::SelectingDest(src));
+                        }
+                    } else {
+                        // On a directory: expand/collapse for navigation
+                        self.file_tree.toggle_expand();
+                    }
+                }
+                _ => {}
+            },
+
+            Some(MoveState::SelectingDest(src)) => match key.code {
+                KeyCode::Esc => {
+                    self.move_state = None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.file_tree.move_up();
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.file_tree.move_down();
+                }
+                KeyCode::Enter => {
+                    if let Some(path) = self.file_tree.selected_path() {
+                        if path.is_dir() {
+                            let dest = path.to_path_buf();
+                            self.move_state = Some(MoveState::Confirming(src, dest));
+                        } else {
+                            self.file_tree.toggle_expand(); // no-op on files, safe
+                        }
+                    }
+                }
+                _ => {}
+            },
+
+            Some(MoveState::Confirming(src, dest)) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.execute_move(src, dest);
+                }
+                _ => {
+                    self.move_state = None;
+                }
+            },
+        }
+    }
+
+    fn execute_move(&mut self, src: std::path::PathBuf, dest_dir: std::path::PathBuf) {
+        let file_name = match src.file_name() {
+            Some(n) => n.to_os_string(),
+            None => {
+                self.status_message = Some(("Move failed: invalid source path".to_string(), std::time::Instant::now()));
+                self.move_state = None;
+                return;
+            }
+        };
+        let dest_path = dest_dir.join(&file_name);
+        match std::fs::rename(&src, &dest_path) {
+            Ok(()) => {
+                let name = file_name.to_string_lossy().into_owned();
+                self.status_message = Some((
+                    format!("Moved {} → {}", name, dest_dir.display()),
+                    std::time::Instant::now(),
+                ));
+            }
+            Err(e) => {
+                self.status_message = Some((format!("Move failed: {}", e), std::time::Instant::now()));
+            }
+        }
+        self.move_state = None;
+    }
+
+    fn render_move_panel_info(&self, frame: &mut Frame, tree_area: Rect) {
+        use ratatui::style::Modifier;
+
+        let dialog_height: u16 = 2;
+        if tree_area.height < dialog_height + 2 {
+            return;
+        }
+
+        let y = tree_area.bottom() - dialog_height;
+        let dialog_area = Rect {
+            x: tree_area.x,
+            y,
+            width: tree_area.width.saturating_sub(1),
+            height: dialog_height,
+        };
+
+        let bg_style = Style::default().fg(theme::TEXT_BRIGHT).bg(theme::INPUT_BG);
+
+        // Clear area
+        for row in 0..dialog_area.height {
+            for col in 0..dialog_area.width {
+                let cx = dialog_area.x + col;
+                let cy = dialog_area.y + row;
+                if cx < frame.area().right() && cy < frame.area().bottom() {
+                    frame.buffer_mut()[(cx, cy)].set_char(' ').set_style(bg_style);
+                }
+            }
+        }
+
+        // Separator
+        let sep_style = Style::default().fg(theme::WARNING).bg(theme::INPUT_BG);
+        for col in 0..dialog_area.width {
+            let cx = dialog_area.x + col;
+            if cx < frame.area().right() {
+                frame.buffer_mut()[(cx, y)].set_char('─').set_style(sep_style);
+            }
+        }
+
+        // Status line
+        let input_y = y + 1;
+        let label_style = Style::default()
+            .fg(theme::WARNING)
+            .bg(theme::INPUT_BG)
+            .add_modifier(Modifier::BOLD);
+        let dim_style = Style::default().fg(theme::TEXT_DIM).bg(theme::INPUT_BG);
+
+        let mut write_text = |text: &str, style: Style, start_x: &mut u16| {
+            for ch in text.chars() {
+                if *start_x < dialog_area.x + dialog_area.width {
+                    frame.buffer_mut()[(*start_x, input_y)].set_char(ch).set_style(style);
+                    *start_x += 1;
+                }
+            }
+        };
+
+        let mut x = dialog_area.x;
+        match &self.move_state {
+            Some(MoveState::SelectingSource) => {
+                write_text("MOVE  ", label_style, &mut x);
+                write_text("Navigate, Enter: select file  Esc: cancel", dim_style, &mut x);
+            }
+            Some(MoveState::SelectingDest(src)) => {
+                let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                write_text(&format!("MOVE {}  ", name), label_style, &mut x);
+                write_text("Navigate, Enter: select folder  Esc: cancel", dim_style, &mut x);
+            }
+            Some(MoveState::Confirming(src, dest)) => {
+                let s = src.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                let d = dest.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                write_text(&format!("Move {} → {}? (y/N)", s, d), label_style, &mut x);
+            }
+            None => {}
+        }
     }
 
     fn handle_dialog_key(&mut self, key: &crossterm::event::KeyEvent) {
@@ -5109,6 +5324,39 @@ impl App {
         }
     }
 
+    /// Check for unsaved files and active agents before quitting.
+    /// If anything needs attention, show the confirmation dialog instead.
+    fn try_quit(&mut self) {
+        use gaviero_core::swarm::models::AgentStatus;
+
+        let unsaved: Vec<String> = self
+            .buffers
+            .iter()
+            .filter(|b| b.modified)
+            .map(|b| b.display_name().to_string())
+            .collect();
+
+        let streaming_agents: usize = self
+            .chat_state
+            .conversations
+            .iter()
+            .filter(|c| c.is_streaming)
+            .count();
+
+        let running_swarm: usize = self
+            .swarm_dashboard
+            .agents
+            .iter()
+            .filter(|a| matches!(a.status, AgentStatus::Running))
+            .count();
+
+        if unsaved.is_empty() && streaming_agents == 0 && running_swarm == 0 {
+            self.should_quit = true;
+        } else {
+            self.quit_confirm = true;
+        }
+    }
+
     fn spawn_active_terminal(&mut self) {
         // If no tabs exist, create one (lazy)
         if self.terminal_manager.is_empty() {
@@ -5172,6 +5420,9 @@ impl App {
             if fs_panel == Focus::Editor {
                 self.update_cursor_position(frame, self.layout.editor_area);
             }
+            if self.quit_confirm {
+                self.render_quit_confirm(frame, size);
+            }
             return;
         }
 
@@ -5228,9 +5479,16 @@ impl App {
 
             match self.left_panel {
                 LeftPanelMode::FileTree => {
-                    self.file_tree.render(content_area, frame.buffer_mut(), left_focused);
+                    let move_src: Option<std::path::PathBuf> = match &self.move_state {
+                        Some(MoveState::SelectingDest(s)) | Some(MoveState::Confirming(s, _)) => Some(s.clone()),
+                        _ => None,
+                    };
+                    self.file_tree.render(content_area, frame.buffer_mut(), left_focused, move_src.as_deref());
                     if let Some(ref dialog) = self.tree_dialog {
                         self.render_tree_dialog(frame, content_area, dialog);
+                    }
+                    if self.move_state.is_some() {
+                        self.render_move_panel_info(frame, content_area);
                     }
                 }
                 LeftPanelMode::Search => {
@@ -5299,6 +5557,10 @@ impl App {
 
         self.render_status_bar(frame, status_area);
         self.update_cursor_position(frame, self.layout.editor_area);
+
+        if self.quit_confirm {
+            self.render_quit_confirm(frame, size);
+        }
     }
 
     fn render_fullscreen(&mut self, frame: &mut Frame, area: Rect, panel: Focus) {
@@ -5327,9 +5589,16 @@ impl App {
                 self.layout.file_tree_area = Some(content);
                 match self.left_panel {
                     LeftPanelMode::FileTree => {
-                        self.file_tree.render(content, frame.buffer_mut(), true);
+                        let move_src: Option<std::path::PathBuf> = match &self.move_state {
+                            Some(MoveState::SelectingDest(s)) | Some(MoveState::Confirming(s, _)) => Some(s.clone()),
+                            _ => None,
+                        };
+                        self.file_tree.render(content, frame.buffer_mut(), true, move_src.as_deref());
                         if let Some(ref dialog) = self.tree_dialog {
                             self.render_tree_dialog(frame, content, dialog);
+                        }
+                        if self.move_state.is_some() {
+                            self.render_move_panel_info(frame, content);
                         }
                     }
                     LeftPanelMode::Search => {
@@ -5708,7 +5977,21 @@ impl App {
         } else {
             match self.focus {
                 Focus::FileTree => match self.left_panel {
-                    LeftPanelMode::FileTree => "n: new file  N: new folder  r: rename  d: delete  Enter: open  F7: search".to_string(),
+                    LeftPanelMode::FileTree => match &self.move_state {
+                        Some(MoveState::SelectingSource) => {
+                            "MOVE  Navigate and Enter to select source file  Esc: cancel".to_string()
+                        }
+                        Some(MoveState::SelectingDest(src)) => {
+                            let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                            format!("MOVE {}  Navigate and Enter to select destination folder  Esc: cancel", name)
+                        }
+                        Some(MoveState::Confirming(src, dest)) => {
+                            let s = src.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                            let d = dest.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                            format!("Move {} → {}? (y/N)  any other key: cancel", s, d)
+                        }
+                        None => "n: new file  N: new folder  r: rename  d: delete  m: move  Enter: open  F7: search".to_string(),
+                    },
                     LeftPanelMode::Review => {
                         let n = self.batch_review.as_ref().map(|br| br.proposals.len()).unwrap_or(0);
                         format!("REVIEW ({} files)  f: apply all  Esc: discard  ↑↓: navigate", n)
@@ -6076,6 +6359,162 @@ impl App {
                 if x < editor_area.right() && y < editor_area.bottom() {
                     frame.set_cursor_position((x, y));
                 }
+            }
+        }
+    }
+
+    fn render_quit_confirm(&self, frame: &mut Frame, area: Rect) {
+        use gaviero_core::swarm::models::AgentStatus;
+
+        let unsaved: Vec<String> = self
+            .buffers
+            .iter()
+            .filter(|b| b.modified)
+            .map(|b| b.display_name().to_string())
+            .collect();
+
+        let streaming: Vec<String> = self
+            .chat_state
+            .conversations
+            .iter()
+            .filter(|c| c.is_streaming)
+            .map(|c| c.title.clone())
+            .collect();
+
+        let running_swarm: Vec<String> = self
+            .swarm_dashboard
+            .agents
+            .iter()
+            .filter(|a| matches!(a.status, AgentStatus::Running))
+            .map(|a| a.id.clone())
+            .collect();
+
+        // Build lines
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(String::new());
+        lines.push("  Quit gaviero?".to_string());
+        lines.push(String::new());
+        if !unsaved.is_empty() {
+            lines.push("  Unsaved files:".to_string());
+            for name in &unsaved {
+                lines.push(format!("    • {} [+]", name));
+            }
+            lines.push(String::new());
+        }
+        if !streaming.is_empty() {
+            lines.push("  Active agents (streaming):".to_string());
+            for name in &streaming {
+                lines.push(format!("    • {}", name));
+            }
+            lines.push(String::new());
+        }
+        if !running_swarm.is_empty() {
+            lines.push("  Running swarm agents:".to_string());
+            for id in &running_swarm {
+                lines.push(format!("    • {}", id));
+            }
+            lines.push(String::new());
+        }
+        lines.push("  [y] Quit anyway   [n / Esc] Cancel".to_string());
+        lines.push(String::new());
+
+        let dialog_w: u16 = lines.iter()
+            .map(|l| l.chars().count() as u16)
+            .max()
+            .unwrap_or(40)
+            .max(40) + 2;
+        let dialog_h = lines.len() as u16;
+
+        if area.width < dialog_w + 4 || area.height < dialog_h + 2 {
+            return;
+        }
+
+        let x = area.x + (area.width.saturating_sub(dialog_w)) / 2;
+        let y = area.y + (area.height.saturating_sub(dialog_h)) / 2;
+        let dialog_area = Rect { x, y, width: dialog_w, height: dialog_h };
+
+        let bg_style = Style::default().fg(theme::TEXT_BRIGHT).bg(theme::INPUT_BG);
+        let title_style = Style::default()
+            .fg(theme::FOCUS_BORDER)
+            .bg(theme::INPUT_BG)
+            .add_modifier(Modifier::BOLD);
+        let hint_style = Style::default().fg(theme::TEXT_DIM).bg(theme::INPUT_BG);
+
+        // Clear background
+        for row in 0..dialog_h {
+            for col in 0..dialog_w {
+                let cx = x + col;
+                let cy = y + row;
+                if cx < frame.area().right() && cy < frame.area().bottom() {
+                    frame.buffer_mut()[(cx, cy)].set_char(' ').set_style(bg_style);
+                }
+            }
+        }
+
+        // Draw border
+        for col in 0..dialog_w {
+            let cx = x + col;
+            if cx < frame.area().right() {
+                let ch = if col == 0 {
+                    '┌'
+                } else if col == dialog_w - 1 {
+                    '┐'
+                } else {
+                    '─'
+                };
+                if y < frame.area().bottom() {
+                    frame.buffer_mut()[(cx, y)].set_char(ch).set_style(title_style);
+                }
+                let bottom_y = y + dialog_h - 1;
+                let ch = if col == 0 {
+                    '└'
+                } else if col == dialog_w - 1 {
+                    '┘'
+                } else {
+                    '─'
+                };
+                if bottom_y < frame.area().bottom() {
+                    frame.buffer_mut()[(cx, bottom_y)].set_char(ch).set_style(title_style);
+                }
+            }
+        }
+        for row in 1..dialog_h.saturating_sub(1) {
+            let cy = y + row;
+            if cy < frame.area().bottom() {
+                if x < frame.area().right() {
+                    frame.buffer_mut()[(x, cy)].set_char('│').set_style(title_style);
+                }
+                let right_x = x + dialog_w - 1;
+                if right_x < frame.area().right() {
+                    frame.buffer_mut()[(right_x, cy)].set_char('│').set_style(title_style);
+                }
+            }
+        }
+
+        // Draw text lines (skip first/last border rows)
+        for (i, line) in lines.iter().enumerate() {
+            let cy = y + i as u16;
+            if cy >= frame.area().bottom() {
+                break;
+            }
+            let is_title = line.trim_start().starts_with("Quit");
+            let is_hint = line.contains('[');
+            let style = if is_title {
+                title_style
+            } else if is_hint {
+                hint_style
+            } else {
+                bg_style
+            };
+            let mut cx = x + 1;
+            for ch in line.chars() {
+                if cx >= x + dialog_w - 1 {
+                    break;
+                }
+                if cx < frame.area().right() {
+                    frame.buffer_mut()[(cx, cy)].set_char(ch).set_style(style);
+                }
+                cx += 1;
             }
         }
     }
