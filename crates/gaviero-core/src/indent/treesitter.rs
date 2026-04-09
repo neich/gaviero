@@ -10,6 +10,19 @@ use super::captures::{IndentCapture, IndentCaptureType, IndentScope, LineAccumul
 use super::predicates::{CaptureNodeInfo, PredicateArg, evaluate_single_predicate};
 use super::IndentResult;
 
+/// Map of node ID → list of (capture type, scope, column).
+pub type CaptureMap = std::collections::HashMap<usize, Vec<(IndentCaptureType, IndentScope, usize)>>;
+
+/// Build the capture map for the entire tree. Call once and pass to
+/// `indent_for_cursor` for each line to avoid re-running the query.
+pub fn build_document_capture_map(
+    tree: &Tree,
+    indent_query: &Query,
+    source: &[u8],
+) -> CaptureMap {
+    build_capture_map(indent_query, &tree.root_node(), source)
+}
+
 /// Compute indentation using tree-sitter indent queries.
 pub fn compute_treesitter_indent(
     doc: &ropey::Rope,
@@ -22,22 +35,30 @@ pub fn compute_treesitter_indent(
 ) -> IndentResult {
     let source = doc.to_string();
     let source_bytes = source.as_bytes();
+    let capture_map = build_capture_map(indent_query, &tree.root_node(), source_bytes);
+    indent_for_cursor(doc, tree, &capture_map, cursor_byte, _tab_width, indent_unit)
+}
+
+/// Compute indentation at a cursor position using a pre-built capture map.
+pub fn indent_for_cursor(
+    doc: &ropey::Rope,
+    tree: &Tree,
+    capture_map: &CaptureMap,
+    cursor_byte: usize,
+    _tab_width: u8,
+    indent_unit: &str,
+) -> IndentResult {
+    let source = doc.to_string();
     let root = tree.root_node();
 
     let cursor_byte = cursor_byte.min(source.len().saturating_sub(1));
     let cursor_line = doc.byte_to_line(cursor_byte.min(doc.len_bytes().saturating_sub(1)));
-    // The new line being inserted is the one AFTER the cursor line
     let new_line = cursor_line + 1;
 
-    // Build a set of node IDs that have indent/outdent captures
-    let capture_map = build_capture_map(indent_query, &root, source_bytes);
-
-    // Find deepest node at cursor position
     let Some(deepest) = root.descendant_for_byte_range(cursor_byte, cursor_byte) else {
         return super::bracket::compute_bracket_indent(doc, cursor_byte, _tab_width, indent_unit);
     };
 
-    // Walk from deepest node to root, collecting indent contributions
     let mut accumulator = LineAccumulator::new();
     let mut node = deepest;
 
@@ -48,7 +69,6 @@ pub fn compute_treesitter_indent(
 
         if let Some(captures) = capture_map.get(&node_id) {
             for (capture_type, scope, column) in captures {
-                // The new line must be within this node's line range
                 if new_line < node_start_line || new_line > node_end_line {
                     continue;
                 }
