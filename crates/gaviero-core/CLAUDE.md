@@ -26,7 +26,7 @@ Some tests require network (Ollama health checks, model downloads). These are `#
 | `query_loader` | Tree-sitter `.scm` query file discovery |
 | `acp/` | `AcpSession` (Claude subprocess), `AcpPipeline` (prompt enrichment + file block routing), `AcpSessionFactory` |
 | `swarm/` | Orchestration engine — see below |
-| `memory/` | `MemoryStore` (SQLite + vector search), `OnnxEmbedder`, `CodeGraph`, `Consolidator` |
+| `memory/` | Hierarchical scoped memory — see below |
 | `indent/` | `compute_indent()` — tree-sitter + hybrid + bracket strategies |
 | `terminal/` | `TerminalManager`, PTY handling, OSC 133 parsing |
 | `iteration/` | `IterationEngine` — retry loops with verification |
@@ -56,6 +56,23 @@ Some tests require network (Ollama health checks, model downloads). These are `#
 | `context.rs` | Repository context collection for prompts |
 | `replanner.rs` | Mid-execution replan decisions |
 
+## Memory Subsystem (`memory/`)
+
+5-level hierarchy: global → workspace → repo → module → run.
+
+| File | Purpose |
+|---|---|
+| `mod.rs` | `init()`, `init_workspace()`, `init_global()`, re-exports |
+| `store.rs` | `MemoryStore` — SQLite + sqlite-vec, scoped CRUD, cascading search |
+| `schema.rs` | Migrations (v1–v4), scope columns, content hash, FTS index |
+| `scope.rs` | `MemoryScope`, `WriteScope`, `ScopeFilter`, `Trust`, `MemoryType`, `WriteMeta`, `StoreResult` |
+| `scoring.rs` | `SearchConfig`, `ScoredMemory`, `score()`, `merge_rrf()`, `format_memories_for_prompt()` |
+| `consolidation.rs` | `Consolidator` — 3-phase pipeline: run triage → decay/prune → cross-scope promotion |
+| `embedder.rs` | `Embedder` trait (embed_query, embed_document, embed_batch) |
+| `onnx_embedder.rs` | `OnnxEmbedder` — ONNX Runtime inference (nomic-embed-text-v1.5) |
+| `model_manager.rs` | Model download + cache management |
+| `code_graph.rs` | `CodeGraph` — symbol-level dependency tracking |
+
 ## Key Dependencies
 
 - `tree-sitter 0.25` + 16 language grammars
@@ -70,6 +87,10 @@ Some tests require network (Ollama health checks, model downloads). These are `#
 - Lock discipline: never hold Mutex across I/O, parsing, or embedding. Brief HashMap ops only.
 - `AgentBackend` trait is object-safe for dynamic dispatch.
 - All verification steps implement `run_verification()` in `verify/combined.rs`.
-- Memory default model: e5-small-v2 (384 dimensions), brute-force cosine similarity.
+- Memory default model: nomic-embed-text-v1.5 (384 dimensions), brute-force cosine similarity.
+- Memory writes always require explicit `WriteScope` — never infer scope level.
+- Scoring formula: 50% similarity + 20% importance + 15% recency + 15% base, multiplied by scope weight and trust weight.
+- Cascading search goes narrowest-to-widest, stops early when confidence threshold (0.70) is exceeded.
+- Hybrid retrieval uses Reciprocal Rank Fusion (RRF) to merge vector (0.7 weight) and FTS (0.3 weight) results.
 
 See [ARCHITECTURE.md](../../ARCHITECTURE.md) for data flow diagrams.

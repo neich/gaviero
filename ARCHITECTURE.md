@@ -35,7 +35,7 @@
 
 | Crate | Role | Key dependencies |
 |---|---|---|
-| `gaviero-core` | Logic: write gate, diff, tree-sitter, ACP, swarm, memory, git, terminal, repo map, iteration, validation | tokio, tree-sitter 0.25 + 16 langs, git2, rusqlite + sqlite-vec, ort, petgraph, similar, ropey, portable-pty, vt100, reqwest, async-trait, futures |
+| `gaviero-core` | Logic: write gate, diff, tree-sitter, ACP, swarm, memory, git, terminal, repo map, iteration, validation | tokio, tree-sitter 0.25 + 16 langs, git2, rusqlite + sqlite-vec, ort, petgraph, similar, ropey, portable-pty, vt100, reqwest, async-trait, futures, sha2 |
 | `gaviero-tui` | TUI editor binary | gaviero-core, gaviero-dsl, ratatui 0.30, crossterm 0.29, notify, arboard, tui-term |
 | `gaviero-cli` | Headless swarm runner | gaviero-core, gaviero-dsl, clap, tokio |
 | `gaviero-dsl` | `.gaviero` DSL compiler | gaviero-core, logos, chumsky, miette, thiserror |
@@ -65,7 +65,8 @@ query_loader.rs             Tree-sitter .scm file discovery (env var → exe dir
 indent/                     compute_indent() entry point — tree-sitter, hybrid heuristic, bracket fallback
 terminal/                   TerminalManager → TerminalInstance → PTY (portable-pty + vt100)
 acp/                        AcpSession, AcpPipeline, AcpSessionFactory, NDJSON protocol
-memory/                     MemoryStore (SQLite + sqlite-vec), OnnxEmbedder, CodeGraph, Consolidator
+memory/                     MemoryStore (SQLite + sqlite-vec), OnnxEmbedder, CodeGraph, Consolidator,
+                            MemoryScope (5-level hierarchy), SearchConfig, ScoredMemory
 repo_map/                   RepoMap, FileNode, ContextPlan — PageRank-based context + GraphStore
 iteration/                  IterationEngine, Strategy, IterationConfig, ConvergenceDetector, TestGenerator
 validation_gate/            ValidationPipeline, ValidationGate trait, TreeSitterGate, CargoCheckGate
@@ -140,7 +141,7 @@ FileScope {
 }
 ```
 
-Used by: Write Gate (scope validation), Swarm (overlap detection), Agent Runner (prompt enrichment).
+Used by: Write Gate (scope validation), Swarm (overlap detection), Agent Runner (prompt enrichment), Memory (module path derivation).
 
 ### WorkUnit (`swarm/models.rs`)
 
@@ -345,7 +346,7 @@ Every agent file write passes through this pipeline.
     │   │   │       escalate model if attempt ≥ escalate_after
     │   │   │       └─► run_backend()
     │   │   │           ├─ build_prompt()
-    │   │   │           │   memory context (semantic search)
+    │   │   │           │   scoped memory context (cascading search)
     │   │   │           │   file scope clause
     │   │   │           │   repo_map outline (PageRank-ranked)
     │   │   │           │   shared_board discoveries
@@ -369,6 +370,14 @@ Every agent file write passes through this pipeline.
     │   StructuralOnly | DiffReview | TestSuite | Combined
     │   Escalation on failure → re-run failed agents at higher tier
     │
+    ├─ Phase 5: WORKTREE CLEANUP
+    │   WorktreeManager::teardown_all()
+    │
+    ├─ Phase 6: MEMORY CONSOLIDATION (best-effort)
+    │   Consolidator::consolidate_run(run_id, repo_id)
+    │     Promotes durable run memories to module/repo scope
+    │     Deletes ephemeral run-level memories
+    │
     └─ Return SwarmResult { manifests, merge_results, success, pre_swarm_sha }
 ```
 
@@ -378,23 +387,168 @@ When the plan contains `LoopConfig` entries, agents in the loop repeat until the
 
 ---
 
-## 7. Data Flow: Memory Search
+## 7. Memory System
+
+### Scope Hierarchy
+
+Five levels from broadest to narrowest:
 
 ```
-  Caller (run_backend / Coordinator / MergeResolver)
+global (0)             personal cross-workspace knowledge (~/.config/gaviero/memory.db)
+  └─ workspace (1)     business-level project (<workspace>/.gaviero/memory.db)
+       └─ repo (2)     single git repository
+            └─ module (3)  crate/package/subdirectory (FileScope.owned_paths)
+                 └─ run (4)   single swarm execution (ephemeral, consolidated upward)
+```
+
+### Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                         MemoryStore                              │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────┐  ┌────────────┐  │
+│  │ rusqlite │  │ Embedder │  │ Consolidator │  │  Scoring   │  │
+│  │Connection│  │  (ONNX)  │  │ (3-phase)    │  │  (RRF)     │  │
+│  │ (Mutex)  │  │          │  │              │  │            │  │
+│  └──────────┘  └──────────┘  └──────────────┘  └────────────┘  │
+│                                                                  │
+│  Tables:                                                         │
+│    memories (scope_level, scope_path, repo_id, module_path,     │
+│              run_id, content_hash, memory_type, trust, tag)     │
+│    vec_memories_scoped (embedding + scope_level partition)       │
+│    memories_fts (FTS5 full-text, porter+unicode61 tokenizer)    │
+│    memory_access_log (cross-scope promotion heuristics)         │
+│    episodes (agent run tracking)                                 │
+│    graph_state (code knowledge graph serialization)             │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Key Types
+
+| Type | Module | Description |
+|---|---|---|
+| `MemoryScope` | `memory/scope.rs` | Resolved scope chain from execution context: global_db, workspace_db, workspace_id, repo_id, module_path, run_id |
+| `WriteScope` | `memory/scope.rs` | Target scope for a write: `Global` \| `Workspace` \| `Repo{repo_id}` \| `Module{repo_id,module_path}` \| `Run{repo_id,run_id}` |
+| `ScopeFilter` | `memory/scope.rs` | Filter for a single scope level during cascading search |
+| `WriteMeta` | `memory/scope.rs` | Write metadata: memory_type, importance, trust, source, tag |
+| `Trust` | `memory/scope.rs` | `High` (user /remember, weight 1.2) \| `Medium` (agent, weight 1.0) \| `Low` (consolidated, weight 0.7) |
+| `MemoryType` | `memory/scope.rs` | `Factual` \| `Procedural` \| `Decision` \| `Pattern` \| `Gotcha` |
+| `StoreResult` | `memory/scope.rs` | `Inserted(id)` \| `Deduplicated(id)` \| `AlreadyCovered` |
+| `SearchConfig` | `memory/scoring.rs` | Query + max_results + per_level_limit + similarity/confidence thresholds + scope chain |
+| `ScoredMemory` | `memory/scoring.rs` | Memory entry with raw_similarity, fts_rank, and final_score |
+
+### Data Flow: Scoped Memory Search
+
+```
+  Caller (build_prompt / Coordinator / MergeResolver)
     │
-    │  memory.search_context_filtered(namespaces, query, limit, privacy)
+    │  memory.search_scoped(config: &SearchConfig)
     │
     ├─ 1. NO LOCK: embedder.embed(query_text) → Vec<f32>   [CPU-heavy, ONNX inference]
     │
-    ├─ 2. BRIEF LOCK: SELECT * FROM memories WHERE namespace IN (?)
-    │     Release lock
+    ├─ 2. CASCADE through scope levels (narrowest → widest):
+    │     FOR EACH level in scope.levels() [run → module → repo → workspace → global]:
+    │       │
+    │       ├─ BRIEF LOCK: vec_search_at_level(embedding, level, per_level_limit)
+    │       │   SELECT from vec_memories_scoped WHERE scope_level = ?
+    │       │   Release lock
+    │       │
+    │       ├─ [if use_fts] BRIEF LOCK: fts_search_at_level(query_text, level)
+    │       │   SELECT from memories_fts INNER JOIN memories
+    │       │   Release lock
+    │       │
+    │       ├─ NO LOCK: merge_rrf(vec_results, fts_results, k=60)
+    │       │   Reciprocal Rank Fusion: vector 70% weight + FTS 30% weight
+    │       │
+    │       ├─ NO LOCK: score each candidate:
+    │       │   final = (similarity*0.50 + importance*0.20 + recency*0.15 + 0.15)
+    │       │           × scope_weight × trust_weight × access_reinforcement
+    │       │
+    │       └─ EARLY TERMINATION: if best_score > confidence_threshold (0.70)
+    │          stop widening scope — narrow results are sufficient
     │
-    └─ 3. NO LOCK: cosine_similarity(query_vec, stored_vec) for each row
-         Sort by score, return top-K
+    ├─ 3. NO LOCK: deduplicate by content_hash across levels
+    │
+    └─ 4. Return top-K ScoredMemory entries, sorted by final_score desc
 ```
 
-Embedding computation (the expensive part) always runs outside the Mutex. The lock protects only SQLite I/O.
+### Data Flow: Scoped Memory Write
+
+```
+  Caller (agent observation, user /remember, consolidation promotion)
+    │
+    │  memory.store_scoped(scope: &WriteScope, content, meta: &WriteMeta)
+    │
+    ├─ 1. NO LOCK: embedder.embed(content) → Vec<f32>
+    │
+    ├─ 2. NO LOCK: content_hash = SHA-256(normalized(content))
+    │
+    ├─ 3. BRIEF LOCK: check dedup
+    │     SELECT FROM memories WHERE content_hash = ? AND scope_level <= ?
+    │     ├─ Exact match at same scope → reinforce (update importance, access_count)
+    │     │   → return StoreResult::Deduplicated(id)
+    │     ├─ Exact match at broader scope → skip
+    │     │   → return StoreResult::AlreadyCovered
+    │     └─ No match → INSERT with scope metadata
+    │        → return StoreResult::Inserted(id)
+    │
+    └─ 4. BRIEF LOCK: insert into vec_memories_scoped + memories_fts (via trigger)
+```
+
+### Consolidation Pipeline
+
+Runs after each swarm execution (Phase 6 in pipeline):
+
+```
+Consolidator::consolidate_run(run_id, repo_id)
+  │
+  ├─ Phase 1: RUN TRIAGE
+  │   query_by_run(run_id) → Vec<ScoredMemory>
+  │   FOR EACH run memory with importance >= 0.4:
+  │     store_scoped(Module or Repo scope, content, WriteMeta::consolidation())
+  │     → Inserted | Deduplicated | AlreadyCovered
+  │   delete_by_run(run_id) — remove all ephemeral run memories
+  │
+  ├─ Phase 2: IMPORTANCE DECAY + PRUNING
+  │   decay_and_prune()
+  │   Exponential decay: importance *= exp(-0.023 × days_since_access)
+  │   Half-life: 30 days. Prune entries below threshold.
+  │
+  └─ Phase 3: CROSS-SCOPE PROMOTION
+      find_promotion_candidates(min_cross_hits=3)
+      Module memories accessed by agents in 3+ different modules
+      → promote copy to Repo scope with 1.2× importance boost
+```
+
+### Schema Migrations
+
+| Version | Changes |
+|---|---|
+| v1 | `memories` table, namespace/key indexes |
+| v2 | `privacy` column for tier routing |
+| v3 | `importance`, `access_count`, `source_file/hash`, `vec_memories` (sqlite-vec), `episodes`, `graph_state`. Nullified embeddings for model change (384d→768d). |
+| v4 | Scope columns (`scope_level`, `scope_path`, `repo_id`, `module_path`, `run_id`, `content_hash`, `memory_type`, `trust`, `tag`). FTS5 index with sync triggers. `vec_memories_scoped` (scope-partitioned vectors). `memory_access_log`. Content hash backfill. Namespace→scope migration. |
+
+### Embedder
+
+- **Embedder trait:** `embed(text) → Vec<f32>`, `dimensions()`, `model_id()`
+- **OnnxEmbedder:** `ort` (ONNX Runtime) + `tokenizers`, mean pooling, L2 normalization
+- **Production model:** nomic-embed-text-v1.5 (768 dimensions)
+- **Vector search:** sqlite-vec `vec0` virtual table with cosine distance
+
+### Code Knowledge Graph (`memory/code_graph.rs`, `repo_map/store.rs`)
+
+SQLite-backed directed graph of code structure:
+- **Nodes:** `File`, `Function`, `Struct`, `Trait`, `Enum`, `Test` — with qualified names and file hashes
+- **Edges:** `Imports`, `Calls`, `Implements`, `TestedBy`, `Contains`
+- **Incremental builds:** `graph_builder.rs` compares file hashes, re-indexes only changed files
+- **Blast-radius queries:** recursive CTE finds all transitively affected files
+
+### Repo Map (`repo_map/`)
+
+`RepoMap::build(workspace_root)` → walks git-tracked files, extracts symbols (tree-sitter), builds reference graph.
+
+`rank_for_agent(owned_paths, token_budget)` → `ContextPlan { full_content, signatures, repo_outline, token_estimate }`. Personalized PageRank seeds from owned paths. Outline prepended to agent prompts.
 
 ---
 
@@ -522,43 +676,7 @@ Agents post tagged findings during execution. Detected by parsing `[discovery: <
 
 ---
 
-## 11. Memory System
-
-### Architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│                   MemoryStore                       │
-│  ┌───────────┐  ┌─────────┐  ┌───────────────────┐ │
-│  │ rusqlite  │  │Embedder │  │ Consolidator      │ │
-│  │ Connection│  │ (ONNX)  │  │ (dedup + merge)   │ │
-│  │ (Mutex)   │  │         │  │                   │ │
-│  └───────────┘  └─────────┘  └───────────────────┘ │
-└─────────────────────────────────────────────────────┘
-```
-
-- **Embedder trait:** `embed(text) → Vec<f32>`, `embed_batch(texts)`, `dimensions()`, `model_id()`
-- **OnnxEmbedder:** `ort` (ONNX Runtime) + `tokenizers`, mean pooling, L2 normalization
-- **Search:** brute-force cosine similarity (dot product on L2-normalized vectors). No ANN index.
-- **Consolidation:** on store, similarity thresholds trigger: >0.85 reinforce, 0.7–0.85 flag for merge, <0.7 normal insert
-
-### Code Knowledge Graph (`memory/code_graph.rs`, `repo_map/store.rs`)
-
-SQLite-backed directed graph of code structure:
-- **Nodes:** `File`, `Function`, `Struct`, `Trait`, `Enum`, `Test` — with qualified names and file hashes
-- **Edges:** `Imports`, `Calls`, `Implements`, `TestedBy`, `Contains`
-- **Incremental builds:** `graph_builder.rs` compares file hashes, re-indexes only changed files
-- **Blast-radius queries:** recursive CTE finds all transitively affected files
-
-### Repo Map (`repo_map/`)
-
-`RepoMap::build(workspace_root)` → walks git-tracked files, extracts symbols (tree-sitter), builds reference graph.
-
-`rank_for_agent(owned_paths, token_budget)` → `ContextPlan { full_content, signatures, repo_outline, token_estimate }`. Personalized PageRank seeds from owned paths. Outline prepended to agent prompts.
-
----
-
-## 12. Tree-Sitter Pipeline
+## 11. Tree-Sitter Pipeline
 
 ### Language Registry
 
@@ -578,7 +696,7 @@ SQLite-backed directed graph of code structure:
 
 ---
 
-## 13. Terminal Subsystem
+## 12. Terminal Subsystem
 
 ```
 ┌─────────────────────────────────────────┐
@@ -599,7 +717,7 @@ Manager → Instance → PTY (`portable-pty`). vt100 for escape sequence parsing
 
 ---
 
-## 14. TUI Layout
+## 13. TUI Layout
 
 ```
 ┌──────────────────────────────────────────────────┐
@@ -637,7 +755,7 @@ Manager → Instance → PTY (`portable-pty`). vt100 for escape sequence parsing
 
 ---
 
-## 15. Concurrency Model
+## 14. Concurrency Model
 
 ### Runtime
 
@@ -649,7 +767,7 @@ Single shared tokio runtime. All async work runs on this runtime.
 |---|---|
 | Never hold `WriteGatePipeline` Mutex across I/O or parsing | Prevents pipeline stalls |
 | Never hold `MemoryStore` Mutex across embedding computation | ONNX inference is CPU-heavy |
-| Pre-compute outside the lock, brief lock for state update | Minimizes contention |
+| Embedding computed before lock acquisition in all store/search paths | Minimizes contention |
 | Channels (mpsc, broadcast) for cross-task communication | Lock-free on the critical path |
 
 ### Shared State Pattern
@@ -664,7 +782,7 @@ Semaphore                    // parallel agent count bound
 
 ---
 
-## 16. Configuration
+## 15. Configuration
 
 ### Settings Cascade
 
@@ -680,7 +798,7 @@ Resolution order (first match wins):
 
 ---
 
-## 17. Error Handling Strategy
+## 16. Error Handling Strategy
 
 - **`anyhow::Result`** for all fallible operations throughout the codebase
 - Custom error types only for structured validation data: `DslError` (lexer/parser/compiler), `ScopeError`, `CycleError`
@@ -688,10 +806,11 @@ Resolution order (first match wins):
 - Validation gate failures feed back as corrective prompts (not panics)
 - Agent subprocess crashes → `AgentStatus::Failed(reason)` in manifest
 - Checkpoint saves after each node completion for crash recovery
+- Consolidation failures are best-effort: logged and continued
 
 ---
 
-## 18. Hard Constraints
+## 17. Hard Constraints
 
 These are architectural invariants. Do not violate them.
 
@@ -705,3 +824,5 @@ These are architectural invariants. Do not violate them.
 8. **Observer-only coupling to UI** — Core never imports TUI/CLI types. Events flow out via trait objects.
 9. **Provider-agnostic backend** — `AgentBackend` + `UnifiedStreamEvent` decouple orchestration from Claude/Ollama specifics.
 10. **No plugins** — Features compiled in. Configuration via settings files only.
+11. **Embedding outside lock** — CPU-heavy ONNX inference always completes before acquiring the SQLite Mutex.
+12. **Scope-aware memory writes** — Every `store_scoped()` call requires an explicit `WriteScope`. The system never guesses scope level.

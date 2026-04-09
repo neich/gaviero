@@ -46,7 +46,7 @@ The execution engine for Gaviero. All agent I/O, multi-agent swarm orchestration
 | `git` | `GitRepo`, `WorktreeManager` |
 | `indent` | `compute_indent()`, `IndentResult`, tree-sitter + hybrid strategies |
 | `query_loader` | Tree-sitter `.scm` file discovery |
-| `memory` | `MemoryStore`, `OnnxEmbedder`, `CodeGraph`, `Consolidator` |
+| `memory` | `MemoryStore`, `OnnxEmbedder`, `CodeGraph`, `Consolidator`, `MemoryScope`, `SearchConfig` |
 | `swarm` | `execute()`, `plan_coordinated()`, `Coordinator`, `TierRouter`, `PrivacyScanner` |
 | `terminal` | `TerminalManager`, `TerminalInstance`, OSC 133 parsing |
 
@@ -163,19 +163,42 @@ These queries are exposed in the DSL via the `context {}` block inside `agent` d
 
 ## Semantic memory
 
-```rust
-let store = memory::init(None).await?;
+Memory is organized in a five-level scope hierarchy. Searches cascade from the narrowest scope outward, stopping early when confidence is high.
 
-// Store a result
-store.store_with_options("my-ns", "key", "content", &opts).await?;
-
-// Search (returns ranked results)
-let results = store.search_context_filtered(
-    &["my-ns", "shared-ns"], "authentication pattern", 10, None
-).await?;
+```
+global (0)  →  workspace (1)  →  repo (2)  →  module (3)  →  run (4)
 ```
 
-Embeddings computed locally via ONNX Runtime (nomic-embed-text-v1.5). No network call for memory operations.
+```rust
+use gaviero_core::memory::{self, MemoryScope, WriteScope, SearchConfig, WriteMeta};
+
+// Open workspace-local store (.gaviero/memory.db)
+let store = memory::init_workspace(&workspace_root)?;
+
+// Open global store (~/.config/gaviero/memory.db)
+let store = memory::init_global()?;
+
+// Store with scope metadata
+let meta = WriteMeta {
+    scope: WriteScope::Module {
+        repo_root: workspace_root.clone(),
+        module_path: "crates/gaviero-core".into(),
+    },
+    importance: 0.8,
+    ..Default::default()
+};
+store.store_scoped("auth uses bcrypt for password hashing", &meta)?;
+
+// Cascading search — narrows from module → repo → workspace → global
+let scope = MemoryScope::for_module(&workspace_root, "crates/gaviero-core")?;
+let config = SearchConfig::new("authentication pattern", scope)
+    .with_max_results(10);
+let results = store.search_scoped(&config)?;
+```
+
+Retrieval scoring combines cosine similarity (50%), importance (20%), recency (15%), and scope proximity (15%) via Reciprocal Rank Fusion (RRF) over vector and FTS results. Embeddings are computed locally via ONNX Runtime (nomic-embed-text-v1.5) — no network calls for memory operations.
+
+The `Consolidator` runs after each swarm execution to triage run-scoped memories, apply importance decay (30-day half-life), and promote high-value entries to wider scopes.
 
 ---
 
