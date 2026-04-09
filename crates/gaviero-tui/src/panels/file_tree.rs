@@ -291,7 +291,8 @@ impl FileTreeState {
 
     /// Render the file tree into the given area.
     /// NOTE: takes &mut self to auto-scroll the selection into view.
-    pub fn render(&mut self, area: Rect, buf: &mut Buffer, focused: bool) {
+    /// `move_source` highlights the file being moved (SelectingDest / Confirming states).
+    pub fn render(&mut self, area: Rect, buf: &mut Buffer, focused: bool, move_source: Option<&std::path::Path>) {
         let border_style = if focused {
             Style::default().fg(theme::FOCUS_BORDER)
         } else {
@@ -323,11 +324,17 @@ impl FileTreeState {
             };
 
             let is_selected = i == self.scroll.selected;
+            let is_move_source = move_source.map(|s| s == entry.path).unwrap_or(false);
             let style = if is_selected {
                 Style::default()
                     .fg(theme::SELECTED_BRIGHT)
                     .add_modifier(Modifier::BOLD)
                     .bg(theme::SELECTION_BG)
+            } else if is_move_source {
+                Style::default()
+                    .fg(theme::WARNING)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(theme::INPUT_BG)
             } else if entry.is_dir {
                 Style::default().fg(theme::FOCUS_BORDER)
             } else {
