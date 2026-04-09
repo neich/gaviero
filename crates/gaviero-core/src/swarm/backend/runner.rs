@@ -312,6 +312,8 @@ async fn build_prompt(
             .as_deref()
             .unwrap_or(&work_unit.description);
         let limit = work_unit.memory_read_limit.unwrap_or(5);
+        // Use namespace-based search (legacy path; scoped search is used
+        // when MemoryScope is provided via the pipeline).
         let ctx = mem.search_context(read_namespaces, query, limit).await;
         if !ctx.is_empty() {
             parts.push(ctx);
