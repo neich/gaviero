@@ -11,3 +11,379 @@ agent x { prompt #"hello world"# }
     (identifier)
     (agent_field
       (raw_string))))
+
+=====
+Client with cheap tier
+=====
+
+client sonnet { tier cheap model "claude-sonnet-4-6" }
+
+-----
+
+(source_file
+  (client_declaration
+    (identifier)
+    (client_field
+      (tier_value))
+    (client_field
+      (string))))
+
+=====
+Client with expensive tier and privacy
+=====
+
+client opus { tier expensive model "claude-opus-4-6" privacy public }
+
+-----
+
+(source_file
+  (client_declaration
+    (identifier)
+    (client_field
+      (tier_value))
+    (client_field
+      (string))
+    (client_field
+      (privacy_value))))
+
+=====
+Agent with memory block
+=====
+
+agent scan {
+    description "Scan codebase"
+    client opus
+    memory {
+        read_ns ["shared" "audit"]
+        write_ns "findings"
+        importance 0.9
+        staleness_sources ["src/"]
+        read_query "security patterns"
+        read_limit 10
+        write_content #"Summary: done"#
+    }
+}
+
+-----
+
+(source_file
+  (agent_declaration
+    (identifier)
+    (agent_field
+      (string))
+    (agent_field
+      (identifier))
+    (agent_field
+      (memory_block
+        (memory_field
+          (string_list
+            (string)
+            (string)))
+        (memory_field
+          (string))
+        (memory_field
+          (float))
+        (memory_field
+          (string_list
+            (string)))
+        (memory_field
+          (string))
+        (memory_field
+          (integer))
+        (memory_field
+          (raw_string))))))
+
+=====
+Agent with context block
+=====
+
+agent fix {
+    description "Fix the bug"
+    client opus
+    context {
+        callers_of ["src/auth.rs"]
+        tests_for ["src/auth/"]
+        depth 2
+    }
+}
+
+-----
+
+(source_file
+  (agent_declaration
+    (identifier)
+    (agent_field
+      (string))
+    (agent_field
+      (identifier))
+    (agent_field
+      (context_block
+        (context_field
+          (string_list
+            (string)))
+        (context_field
+          (string_list
+            (string)))
+        (context_field
+          (integer))))))
+
+=====
+Scope with impact_scope
+=====
+
+agent impl {
+    scope {
+        owned ["src/"]
+        read_only ["tests/"]
+        impact_scope true
+    }
+}
+
+-----
+
+(source_file
+  (agent_declaration
+    (identifier)
+    (agent_field
+      (scope_block
+        (scope_field
+          (string_list
+            (string)))
+        (scope_field
+          (string_list
+            (string)))
+        (scope_field
+          (boolean))))))
+
+=====
+Workflow with verify block
+=====
+
+workflow build {
+    steps [a b]
+    verify {
+        compile true
+        clippy true
+        test false
+        impact_tests true
+    }
+}
+
+-----
+
+(source_file
+  (workflow_declaration
+    (identifier)
+    (workflow_field
+      (step_list
+        (identifier)
+        (identifier)))
+    (workflow_field
+      (verify_block
+        (verify_field
+          (boolean))
+        (verify_field
+          (boolean))
+        (verify_field
+          (boolean))
+        (verify_field
+          (boolean))))))
+
+=====
+Workflow with strategy and advanced fields
+=====
+
+workflow dev {
+    steps [impl]
+    strategy single_pass
+    test_first true
+    max_retries 3
+    attempts 2
+    escalate_after 1
+}
+
+-----
+
+(source_file
+  (workflow_declaration
+    (identifier)
+    (workflow_field
+      (step_list
+        (identifier)))
+    (workflow_field
+      (strategy_value))
+    (workflow_field
+      (boolean))
+    (workflow_field
+      (integer))
+    (workflow_field
+      (integer))
+    (workflow_field
+      (integer))))
+
+=====
+Workflow with best_of_N strategy
+=====
+
+workflow dev { strategy best_of_3 steps [a] }
+
+-----
+
+(source_file
+  (workflow_declaration
+    (identifier)
+    (workflow_field
+      (strategy_value
+        (identifier)))
+    (workflow_field
+      (step_list
+        (identifier)))))
+
+=====
+Loop with until verify
+=====
+
+workflow iter {
+    steps [
+        a
+        loop {
+            agents [impl verify]
+            max_iterations 5
+            until { compile true test true }
+        }
+        c
+    ]
+}
+
+-----
+
+(source_file
+  (workflow_declaration
+    (identifier)
+    (workflow_field
+      (step_list
+        (identifier)
+        (loop_block
+          (loop_field
+            (identifier_list
+              (identifier)
+              (identifier)))
+          (loop_field
+            (integer))
+          (loop_field
+            (until_clause
+              (until_verify
+                (verify_field
+                  (boolean))
+                (verify_field
+                  (boolean))))))
+        (identifier)))))
+
+=====
+Loop with until agent
+=====
+
+workflow j {
+    steps [
+        loop {
+            agents [impl]
+            max_iterations 3
+            until agent judge
+        }
+    ]
+}
+
+-----
+
+(source_file
+  (workflow_declaration
+    (identifier)
+    (workflow_field
+      (step_list
+        (loop_block
+          (loop_field
+            (identifier_list
+              (identifier)))
+          (loop_field
+            (integer))
+          (loop_field
+            (until_clause
+              (until_agent
+                (identifier)))))))))
+
+=====
+Loop with until command
+=====
+
+workflow t {
+    steps [
+        loop {
+            agents [impl]
+            max_iterations 3
+            until command "cargo test --quiet"
+        }
+    ]
+}
+
+-----
+
+(source_file
+  (workflow_declaration
+    (identifier)
+    (workflow_field
+      (step_list
+        (loop_block
+          (loop_field
+            (identifier_list
+              (identifier)))
+          (loop_field
+            (integer))
+          (loop_field
+            (until_clause
+              (until_command
+                (string)))))))))
+
+=====
+Workflow with memory block
+=====
+
+workflow sync {
+    steps [a]
+    memory {
+        read_ns ["arch" "history"]
+        write_ns "output"
+    }
+}
+
+-----
+
+(source_file
+  (workflow_declaration
+    (identifier)
+    (workflow_field
+      (step_list
+        (identifier)))
+    (workflow_field
+      (memory_block
+        (memory_field
+          (string_list
+            (string)
+            (string)))
+        (memory_field
+          (string))))))
+
+=====
+Comment handling
+=====
+
+// Top-level comment
+client c { tier cheap }
+
+-----
+
+(source_file
+  (comment)
+  (client_declaration
+    (identifier)
+    (client_field
+      (tier_value))))
