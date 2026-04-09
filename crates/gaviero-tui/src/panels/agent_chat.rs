@@ -619,6 +619,24 @@ impl AgentChatState {
         self.text_input.cursor = 0;
     }
 
+    /// Close the active conversation. If it's the last one, replace it with a fresh one.
+    pub fn close_conversation(&mut self) {
+        if self.conversations.len() <= 1 {
+            self.conversations.clear();
+            self.active_conv = 0;
+            self.new_conversation();
+            return;
+        }
+        self.conversations.remove(self.active_conv);
+        if self.active_conv >= self.conversations.len() {
+            self.active_conv = self.conversations.len() - 1;
+        }
+        self.scroll_offset = 0;
+        self.scroll_pinned_to_bottom = true;
+        self.text_input.text.clear();
+        self.text_input.cursor = 0;
+    }
+
     /// Hit-test chat conversation tabs. Returns `Some(index)` for a tab click,
     /// or `Some(self.conversations.len())` for the "+" button.
     pub fn conv_tab_at_x(&self, click_x: u16, area_x: u16) -> Option<usize> {
