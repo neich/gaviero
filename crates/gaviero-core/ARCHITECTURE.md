@@ -64,15 +64,17 @@ gaviero-core/src/
 │   ├── client.rs          AcpPipeline — prompt enrichment, file block detection, proposal routing
 │   └── factory.rs         AcpSessionFactory — session lifecycle (one_shot, persistent, kill_all)
 │
-├── memory/                semantic memory store
-│   ├── mod.rs             init(), MemoryStore public API
-│   ├── store.rs           SQLite + sqlite-vec; store/search/mark_stale, PrivacyFilter, StoreOptions
+├── memory/                hierarchical scoped memory store
+│   ├── mod.rs             init(), init_workspace(), init_global(), re-exports
+│   ├── store.rs           MemoryStore — SQLite + sqlite-vec, scoped/legacy CRUD, cascading search
+│   ├── schema.rs          DB migrations (v1–v4), scope columns, content hash, FTS5
+│   ├── scope.rs           MemoryScope, WriteScope, ScopeFilter, Trust, MemoryType, WriteMeta, StoreResult
+│   ├── scoring.rs         SearchConfig, ScoredMemory, score(), merge_rrf(), format_memories_for_prompt()
+│   ├── consolidation.rs   Consolidator — 3-phase pipeline: run triage → decay/prune → promotion
 │   ├── embedder.rs        Embedder trait
 │   ├── onnx_embedder.rs   OnnxEmbedder (ONNX Runtime, mean pooling, L2 normalization)
 │   ├── model_manager.rs   ONNX model download + caching (~/.cache/gaviero/models/)
-│   ├── schema.rs          DB schema migrations
-│   ├── code_graph.rs      CodeGraph: petgraph-based symbol graph, SQLite persistence
-│   └── consolidation.rs   Consolidator: dedup (>0.85), merge flagging (0.7-0.85), pruning
+│   └── code_graph.rs      CodeGraph: petgraph-based symbol graph, SQLite persistence
 │
 ├── repo_map/              PageRank-based context budget planner + code knowledge graph
 │   ├── mod.rs             RepoMap::build(), rank_for_agent() → ContextPlan; FileNode, Symbol
@@ -149,6 +151,20 @@ gaviero-core/src/
 | `StructuralHunk` | `types.rs` | `DiffHunk` + enclosing tree-sitter node (function/class) + status. |
 | `DiffHunk` | `types.rs` | Line ranges + text for one diff region. `HunkType`: Added/Removed/Modified. |
 
+### Memory types
+
+| Type | Module | Description |
+|---|---|---|
+| `MemoryScope` | `memory/scope.rs` | Resolved scope chain: global_db, workspace_db, workspace_id, repo_id, module_path, run_id. Built from `Workspace` + `WorkspaceFolder` + `FileScope`. |
+| `WriteScope` | `memory/scope.rs` | Target scope for writes: `Global` \| `Workspace` \| `Repo{repo_id}` \| `Module{repo_id,module_path}` \| `Run{repo_id,run_id}`. |
+| `ScopeFilter` | `memory/scope.rs` | Filter for a single level in cascading search. Enum variants mirror `WriteScope`. |
+| `WriteMeta` | `memory/scope.rs` | Write metadata: memory_type, importance (0.0–1.0), trust, source string, optional tag. |
+| `Trust` | `memory/scope.rs` | `High` (weight 1.2) \| `Medium` (weight 1.0) \| `Low` (weight 0.7). |
+| `MemoryType` | `memory/scope.rs` | `Factual` \| `Procedural` \| `Decision` \| `Pattern` \| `Gotcha`. |
+| `StoreResult` | `memory/scope.rs` | `Inserted(id)` \| `Deduplicated(id)` \| `AlreadyCovered`. |
+| `SearchConfig` | `memory/scoring.rs` | Query text + max_results + per_level_limit + similarity/confidence thresholds + use_fts flag + scope chain. |
+| `ScoredMemory` | `memory/scoring.rs` | Full memory entry with raw_similarity, fts_rank, final_score. |
+
 ### Observer traits (`observer.rs`)
 
 | Trait | Key Methods |
@@ -198,7 +214,7 @@ CompiledPlan
                └─► run_backend()            inner execution + retry loop
                        │
                        ├─ build_prompt()
-                       │     memory context (semantic search across namespaces)
+                       │     scoped memory context (cascading search)
                        │     file scope clause
                        │     repo_map outline (PageRank-ranked file summaries)
                        │     graph context (callers_of, tests_for queries)
@@ -221,7 +237,7 @@ CompiledPlan
                              FAIL → corrective_prompt → retry (up to max_retries)
 ```
 
-After all tiers: if `use_worktrees`, merge agent branches into main. Conflicts auto-resolved via Claude. Then optional Phase 4 verification per `VerificationStrategy`.
+After all tiers: if `use_worktrees`, merge agent branches into main. Conflicts auto-resolved via Claude. Then optional Phase 4 verification per `VerificationStrategy`. Phase 5 worktree cleanup. Phase 6 memory consolidation (best-effort).
 
 ---
 
@@ -283,19 +299,69 @@ Maps `(ModelTier, PrivacyLevel)` → `ResolvedBackend`:
 
 Glob-based safety net. Patterns like `**/clinical/**`, `.env*` force `PrivacyLevel::LocalOnly` on matching file paths. Overrides coordinator suggestions — privacy is never purely LLM-determined.
 
-### MemoryStore (`memory/`)
+### Memory System (`memory/`)
 
-SQLite + `sqlite-vec`. Per-entry metadata: namespace, privacy level, importance (0.0–1.0), source file path + hash (staleness).
+#### Scope Hierarchy
 
-Key operations:
-- `store_with_options(ns, key, content, opts)` — embed + insert
-- `search_context_filtered(namespaces, query, limit, privacy)` → ranked results
-- `check_staleness(paths)` — compares stored source hash vs current file hash
-- `mark_stale(ids)` — sets importance=0.0 (invisible to search)
+```
+global (0)    ~/.config/gaviero/memory.db   personal cross-workspace knowledge
+  └─ workspace (1)   <ws>/.gaviero/memory.db   project-level knowledge
+       └─ repo (2)                              single git repository
+            └─ module (3)                       crate/package/subdirectory
+                 └─ run (4)                     single swarm execution (ephemeral)
+```
 
-Consolidation on store: similarity >0.85 reinforces existing entry, 0.7–0.85 flags for LLM merge, <0.7 normal insert.
+`MemoryScope::from_context(workspace_root, folder, owned_paths, run_id)` resolves the available levels. `levels()` returns the cascade chain from narrowest to widest.
 
-Embedder: ONNX Runtime (`ort`) + `tokenizers`, runs locally with no API call. L2-normalized output vectors.
+#### Scoped Write Path
+
+`store_scoped(scope: &WriteScope, content, meta: &WriteMeta)`:
+1. Embed content (NO LOCK — CPU-heavy ONNX inference)
+2. Compute `content_hash = SHA-256(normalize(content))`
+3. BRIEF LOCK: check for exact content_hash at same or broader scope
+   - Same scope match → reinforce existing entry (`Deduplicated`)
+   - Broader scope match → skip (`AlreadyCovered`)
+   - No match → INSERT with full scope metadata (`Inserted`)
+4. BRIEF LOCK: insert into `vec_memories_scoped` + FTS (via trigger)
+
+#### Cascading Search
+
+`search_scoped(config: &SearchConfig)`:
+1. Embed query (NO LOCK)
+2. For each level in `scope.levels()` (run → module → repo → workspace → global):
+   - Vector search at level via `vec_memories_scoped`
+   - FTS keyword search at level via `memories_fts`
+   - Merge via Reciprocal Rank Fusion (vector 70% + FTS 30%, k=60)
+   - Score each candidate: `(sim*0.50 + importance*0.20 + recency*0.15 + 0.15) × scope_weight × trust_weight × access_reinforcement`
+   - **Early termination:** stop widening if best score > `confidence_threshold` (default 0.70)
+3. Deduplicate by `content_hash` across levels
+4. Return top-K `ScoredMemory`, sorted by `final_score` desc
+
+Scope weights: Run 1.8, Module 1.5, Repo 1.2, Workspace 1.0, Global 0.8.
+Trust weights: High 1.2, Medium 1.0, Low 0.7.
+Recency: exponential decay with 30-day half-life: `exp(-0.023 × days_since_access)`.
+Access reinforcement: `min(1.0 + access_count × 0.05, 2.0)`.
+
+#### Consolidation
+
+`Consolidator` runs after each swarm execution (Phase 6 of pipeline):
+
+- **Phase 1 — Run triage:** `consolidate_run(run_id, repo_id)`. Scans run-level memories. Promotes entries with `importance >= 0.4` to module/repo scope via `store_scoped()`. Deletes all run-level memories.
+- **Phase 2 — Decay + prune:** `decay_and_prune()`. Exponential importance decay based on time since last access. Prune entries below threshold.
+- **Phase 3 — Cross-scope promotion:** `promote_frequent_cross_scope(min_cross_hits=3)`. Module memories accessed by agents in 3+ different modules get promoted to repo scope with 1.2× importance boost.
+
+#### Schema (v1–v4)
+
+| Version | Changes |
+|---|---|
+| v1 | `memories` table (namespace, key, content, embedding, model_id, metadata) |
+| v2 | `privacy` column for tier routing |
+| v3 | `importance`, `access_count`, `source_file/hash`. `vec_memories` (sqlite-vec). `episodes`. `graph_state`. Model upgrade 384d→768d. |
+| v4 | Scope columns: `scope_level`, `scope_path`, `repo_id`, `module_path`, `run_id`, `content_hash`, `memory_type`, `trust`, `tag`. `memories_fts` (FTS5 + sync triggers). `vec_memories_scoped` (scope-partitioned vectors). `memory_access_log`. Content hash backfill. Namespace→scope migration. |
+
+#### Legacy API
+
+The original flat namespace API (`store()`, `search()`, `search_context_filtered()`) remains for backward compatibility. New code should use `store_scoped()` and `search_scoped()`.
 
 ### Code Knowledge Graph (`repo_map/store.rs`, `repo_map/edges.rs`, `repo_map/graph_builder.rs`)
 
@@ -360,6 +426,7 @@ pipeline.rs
   → execution_state.rs, git.rs (WorktreeManager), memory/store.rs
   → verify/ (structural, diff_review, test_runner, combined)
   → calibration.rs, replanner.rs
+  → memory/consolidation.rs (post-execution Phase 6)
 
 coordinator.rs → planner.rs (extract_json), validation.rs, verify/mod.rs
                 → acp/session.rs, memory/store.rs
@@ -371,7 +438,8 @@ context.rs → memory/store.rs
 write_gate → types.rs, diff_engine.rs, tree_sitter.rs, observer.rs, scope_enforcer.rs
 validation_gate → tree_sitter.rs, types.rs
 repo_map → tree_sitter.rs, query_loader.rs, store.rs (SQLite), edges.rs, graph_builder.rs
-memory → onnx_embedder.rs (ONNX), store.rs (SQLite), code_graph.rs, consolidation.rs
+memory → onnx_embedder.rs (ONNX), store.rs (SQLite), code_graph.rs, consolidation.rs,
+         scope.rs, scoring.rs, schema.rs
 scope_enforcer → types.rs
 acp/session.rs → (external: `claude` CLI binary)
 acp/factory.rs → acp/session.rs
@@ -379,6 +447,22 @@ acp/client.rs → write_gate, diff_engine, tree_sitter, observer, acp/session
 git.rs → (external: git2 crate)
 types.rs, observer.rs → no internal deps
 ```
+
+---
+
+## Concurrency model
+
+### Lock discipline
+
+| Resource | Guard | Rule |
+|---|---|---|
+| `MemoryStore.conn` | `Arc<tokio::sync::Mutex<Connection>>` | Never held across embedding (ONNX), only brief SQLite I/O |
+| `WriteGatePipeline` | `Arc<tokio::sync::Mutex<…>>` | Never held across diff computation, tree-sitter parsing, or disk I/O |
+| `GitCoordinator` | Internal serialisation | Serialises `.git/` operations to avoid `index.lock` races |
+
+### Pattern
+
+All store and search paths follow: **expensive computation first (no lock) → brief lock for DB I/O → release**. This applies to both embedding (ONNX inference) and content hashing (SHA-256).
 
 ---
 
@@ -392,3 +476,5 @@ types.rs, observer.rs → no internal deps
 6. **Checkpoint/resume.** `ExecutionState` serialises to `.gaviero/state/<plan-hash>.json` after every node.
 7. **Async throughout.** Tokio runtime; no blocking calls on async threads; `GitCoordinator` serialises `git` CLI ops to avoid `.git/index.lock` races.
 8. **Incremental graph.** Code knowledge graph re-indexes only changed files (SHA-256 hash comparison).
+9. **Explicit write scope.** Every `store_scoped()` requires a `WriteScope` — the system never infers scope level.
+10. **Best-effort consolidation.** Memory consolidation (Phase 6) failures are logged and do not fail the swarm run.
