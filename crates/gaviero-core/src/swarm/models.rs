@@ -90,6 +90,28 @@ pub struct WorkUnit {
     /// Supports `{{SUMMARY}}`, `{{FILES}}`, `{{AGENT}}`, `{{DESCRIPTION}}`.
     #[serde(default)]
     pub memory_write_content: Option<String>,
+
+    // ── Graph / impact fields (from DSL `scope` and `context` blocks) ──
+
+    /// When true, automatically expand `read_only_paths` with blast-radius files.
+    #[serde(default)]
+    pub impact_scope: bool,
+
+    /// Files whose callers should be queried from the code knowledge graph.
+    #[serde(default)]
+    pub context_callers_of: Vec<String>,
+
+    /// Paths whose test files should be queried from the code knowledge graph.
+    #[serde(default)]
+    pub context_tests_for: Vec<String>,
+
+    /// BFS depth limit for context graph queries (default: 2).
+    #[serde(default = "default_context_depth")]
+    pub context_depth: u32,
+}
+
+fn default_context_depth() -> u32 {
+    2
 }
 
 fn default_max_retries() -> u8 {

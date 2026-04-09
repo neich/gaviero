@@ -63,6 +63,29 @@ pub struct AgentDecl {
     pub prompt: Option<(String, Span)>,
     pub max_retries: Option<(u8, Span)>,
     pub memory: Option<MemoryBlock>,
+    pub context: Option<ContextBlock>,
+    pub span: Span,
+}
+
+/// The `context { ... }` block inside an agent declaration.
+///
+/// Explicit graph queries injected into the agent's prompt context.
+///
+/// ```text
+/// context {
+///     callers_of ["src/auth/session.rs"]
+///     tests_for  ["src/auth/"]
+///     depth      2
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct ContextBlock {
+    /// Files whose callers should be included in context.
+    pub callers_of: Vec<String>,
+    /// Paths whose test files should be included in context.
+    pub tests_for: Vec<String>,
+    /// BFS depth limit for graph traversal (default: 2).
+    pub depth: Option<(u32, Span)>,
     pub span: Span,
 }
 
@@ -71,6 +94,9 @@ pub struct AgentDecl {
 pub struct ScopeBlock {
     pub owned: Vec<String>,
     pub read_only: Vec<String>,
+    /// When true, automatically expand `read_only` with blast-radius files
+    /// computed from the code knowledge graph.
+    pub impact_scope: Option<(bool, Span)>,
     pub span: Span,
 }
 
@@ -129,6 +155,8 @@ pub struct VerifyBlock {
     pub compile: bool,
     pub clippy: bool,
     pub test: bool,
+    /// When true, run only tests affected by the blast radius of modified files.
+    pub impact_tests: bool,
     pub span: Span,
 }
 

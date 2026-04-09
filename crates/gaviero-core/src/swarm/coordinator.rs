@@ -756,6 +756,10 @@ fn parse_work_unit_lenient(v: &serde_json::Value) -> Result<WorkUnit> {
         memory_read_query: None,
         memory_read_limit: None,
         memory_write_content: None,
+        impact_scope: false,
+        context_callers_of: vec![],
+        context_tests_for: vec![],
+        context_depth: 2,
     })
 }
 
@@ -1182,6 +1186,10 @@ mod tests {
             memory_read_query: None,
             memory_read_limit: None,
             memory_write_content: None,
+            impact_scope: false,
+            context_callers_of: vec![],
+            context_tests_for: vec![],
+            context_depth: 2,
         }
     }
 

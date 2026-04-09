@@ -24,7 +24,7 @@ gaviero-cli --task "Add input validation to the login endpoint"
 
 ### `--script` — DSL workflow file
 
-Compile and execute a `.gaviero` workflow. Supports multi-agent plans, dependencies, memory, and iteration strategies.
+Compile and execute a `.gaviero` workflow. Supports multi-agent plans, dependencies, memory, graph-context queries, and iteration strategies.
 
 ```bash
 gaviero-cli --script workflows/refactor.gaviero
@@ -35,7 +35,7 @@ gaviero-cli --script workflows/refactor.gaviero
 Pass `WorkUnit` objects directly. For programmatic callers.
 
 ```bash
-gaviero-cli --work-units '[{"id":"t1","description":"...","scope":{"owned_paths":["src/"],...}}]'
+gaviero-cli --work-units '[{"id":"t1","description":"...","scope":{"owned_paths":["src/"]}}]'
 ```
 
 ---
@@ -54,7 +54,8 @@ gaviero-cli --work-units '[{"id":"t1","description":"...","scope":{"owned_paths"
 | `--attempts <n>` | `1` | Independent attempts (BestOfN when > 1) |
 | `--test-first` | off | Generate failing tests before editing (TDD) |
 | `--no-iterate` | off | Single pass only — disables retry loop |
-| `--coordinated` | off | Opus planning mode: generate DSL file for review |
+| `--coordinated` | off | Opus planning mode: generate DSL file for review, then exit |
+| `--output <path>` | `tmp/gaviero_plan_<ts>.gaviero` | Output path for generated plan (`--coordinated` only) |
 | `--resume` | off | Skip already-completed agents from a prior run |
 | `--auto-accept` | off | Accept all file changes without review |
 | `--trace <file>` | off | Write DEBUG-level JSON trace log |
@@ -71,15 +72,7 @@ The default mode. The agent iterates with validation feedback until the code com
 gaviero-cli --task "Fix the null pointer in UserService.getById when user does not exist"
 ```
 
-To also run the test suite on each iteration:
-
-```bash
-gaviero-cli --task "Fix the null pointer in UserService.getById" \
-  --script <(echo 'agent a { description "{{PROMPT}}" } workflow w { steps [a] verify { test true } }') \
-  --task "..."
-```
-
-Or, more practically, use a script file:
+Or with a script that also runs the test suite on each iteration:
 
 ```bash
 gaviero-cli --script bugfix.gaviero \
@@ -151,7 +144,7 @@ gaviero-cli --script feature_tdd.gaviero \
 
 ### 5. Read-only analysis or security audit
 
-Use `--no-iterate` for analysis tasks where the agent writes a report rather than modifying source. One thorough pass is enough.
+Use `--no-iterate` for analysis tasks where the agent writes a report rather than modifying source.
 
 ```bash
 gaviero-cli --task "Audit the authentication layer for injection vulnerabilities. Write findings to docs/security-audit.md" \
@@ -159,7 +152,7 @@ gaviero-cli --task "Audit the authentication layer for injection vulnerabilities
   --model opus
 ```
 
-Or with a dedicated script that constrains scope:
+Or with a dedicated script that constrains scope and queries the code graph:
 
 ```bash
 gaviero-cli --script security_audit.gaviero
@@ -184,19 +177,22 @@ $EDITOR "$plan"
 gaviero-cli --script "$plan" --max-parallel 3
 ```
 
-stdout prints only the plan path, so the `$()` capture works cleanly in scripts.
+`stdout` prints only the plan path, so the `$()` capture works cleanly in scripts. Use `--output` to control where the plan is written:
+
+```bash
+gaviero-cli --coordinated \
+  --task "Refactor the billing module" \
+  --output plans/billing_refactor.gaviero
+```
 
 ---
 
 ### 7. CI pipeline integration
 
-Minimum viable CI step. JSON output makes it easy to parse results.
-
 ```bash
 #!/bin/bash
 set -euo pipefail
 
-# Run with test verification; fail CI if agent fails
 result=$(gaviero-cli \
   --script ci_fix.gaviero \
   --task "${CI_TASK:-}" \
@@ -236,7 +232,7 @@ workflow ci {
 
 ### 8. Resuming an interrupted run
 
-Large multi-agent scripts checkpoint after every completed agent. If the run is interrupted (network issue, timeout, Ctrl+C), restart with `--resume`:
+Large multi-agent scripts checkpoint after every completed agent. If the run is interrupted, restart with `--resume`:
 
 ```bash
 # First run — interrupted after 2/5 agents
@@ -302,18 +298,6 @@ gaviero-cli --task "..." --no-iterate
 
 ---
 
-## Resume
-
-If a run is interrupted, `--resume` reloads the checkpoint and skips completed agents:
-
-```bash
-gaviero-cli --script big_plan.gaviero --resume
-```
-
-Checkpoints are saved to `.gaviero/state/<plan-hash>.json` after each completed agent.
-
----
-
 ## Multi-agent parallel execution
 
 Set `--max-parallel > 1` to run independent agents concurrently. Each agent gets an isolated git worktree; branches are merged with automatic conflict resolution on completion.
@@ -356,7 +340,7 @@ task-0: OK (src/auth.rs, tests/auth_test.rs)
   "manifests": [
     {
       "work_unit_id": "task-0",
-      "status": "Completed",
+      "status": "completed",
       "modified_files": ["src/auth.rs", "tests/auth_test.rs"],
       "summary": "Added validation to login endpoint",
       "cost_usd": 0.0023

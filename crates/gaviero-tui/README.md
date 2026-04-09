@@ -44,13 +44,11 @@ gaviero /path/to/repo      # open at specific path
    ```
    Fix the null pointer crash in UserService.getById when the user does not exist
    ```
-4. The agent streams its reasoning and edits. Tool calls appear in the activity log (`  [tool] Read`).
+4. The agent streams its reasoning and edits. Tool calls appear in the activity log.
 5. When the agent proposes file changes, the left panel switches to **Review** mode automatically.
 6. Navigate hunks with `]h` / `[h`, accept with `a`, reject with `r`.
 7. Press `f` to finalize (write accepted changes to disk).
 8. Switch to the terminal (`Ctrl+J`), run `cargo test` to verify.
-
-The agent can be given more retry budget by typing a follow-up message if the first attempt is incomplete.
 
 ---
 
@@ -85,7 +83,7 @@ Use this when you want Opus to decompose a large task into a multi-agent plan be
    /cswarm Add subscription billing with proration support
    ```
 3. Opus decomposes the task. The generated `.gaviero` file opens in the editor automatically.
-4. Read the plan. Edit agent prompts, scopes, or `depends_on` edges directly in the editor.
+4. Read the plan. Edit agent prompts, scopes, `depends_on` edges, or `context {}` blocks directly in the editor.
 5. Save — `Ctrl+S`.
 6. Execute:
    ```
@@ -143,7 +141,6 @@ For repeatable workflows defined in `.gaviero` files:
    ```
    Audit src/auth/ for injection vulnerabilities and write findings to docs/security-audit.md
    ```
-   (Since the agent only writes to `docs/`, the review step is minimal.)
 3. When the agent finishes, `docs/security-audit.md` opens in a new tab.
 4. Accept the report with `A` then `f`.
 
@@ -173,11 +170,6 @@ To override which namespace agents write to:
 /namespace auth-team
 ```
 
-Then after a coding session:
-```
-/remember Implemented RS256 key rotation — keys stored in secrets.env, rotated every 30 days
-```
-
 ---
 
 ### 8. Reviewing and editing a coordinated plan
@@ -188,11 +180,28 @@ After `/cswarm` generates a plan, the `.gaviero` file opens in the editor. Commo
 
 **Narrow scope:** Change `owned ["."]` to `owned ["src/billing/"]` to prevent an agent from touching unrelated files.
 
+**Enable blast-radius expansion:**
+```gaviero
+scope {
+    owned        ["src/billing/"]
+    impact_scope true     // auto-include files that call into owned paths
+}
+```
+
+**Add code-graph context queries:**
+```gaviero
+context {
+    callers_of ["src/billing/invoice.rs"]
+    tests_for  ["src/billing/"]
+    depth      2
+}
+```
+
 **Add verification:**
 ```gaviero
 workflow my_plan {
     steps [agent-a agent-b]
-    verify { compile true test true }   // add this
+    verify { compile true impact_tests true }
 }
 ```
 
@@ -204,8 +213,6 @@ workflow my_plan {
     max_retries 4
 }
 ```
-
-**Merge two agents into one** if the plan is over-decomposed: delete one `agent` block and fold its `prompt` into the remaining agent.
 
 Save and `/run` the edited file.
 

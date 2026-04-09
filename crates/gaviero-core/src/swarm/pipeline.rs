@@ -158,6 +158,21 @@ pub async fn execute(
                 .map_err(|e| { tracing::debug!("repo_map build skipped: {}", e); e })
                 .ok(),
         );
+        // Pre-compute impact analysis for the single agent
+        let single_impact_text: Option<String> = crate::repo_map::graph_builder::build_graph(&config.workspace_root)
+            .map(|(store, result)| {
+                tracing::info!(
+                    "code graph: {} nodes, {} edges ({} files changed, {} unchanged)",
+                    result.total_nodes, result.total_edges, result.files_changed, result.files_unchanged,
+                );
+                let owned: Vec<&str> = unit.scope.owned_paths.iter().map(|s| s.as_str()).collect();
+                if owned.is_empty() { return None; }
+                store.impact_radius(&owned, 3).ok().and_then(|impact| {
+                    if impact.affected_files.is_empty() { None }
+                    else { Some(crate::repo_map::store::GraphStore::format_impact_for_prompt(&impact)) }
+                })
+            })
+            .unwrap_or(None);
 
         let engine = crate::iteration::IterationEngine::new(plan.iteration_config.clone());
         let effective_read_ns: Vec<String> = unit.read_namespaces
@@ -180,6 +195,7 @@ pub async fn execute(
                 single_validation.as_deref(),
                 None,
                 (*single_repo_map).as_ref(),
+                single_impact_text.as_deref(),
             )
             .await;
 
@@ -239,6 +255,69 @@ pub async fn execute(
             .map_err(|e| { tracing::debug!("repo_map build skipped: {}", e); e })
             .ok()
     );
+
+    // Build code knowledge graph and pre-compute impact analysis + context queries per agent.
+    // GraphStore uses rusqlite (!Send), so we compute all texts upfront
+    // and share them as a Send-safe HashMap.
+    let impact_texts: Arc<std::collections::HashMap<String, String>> = Arc::new({
+        let mut map = std::collections::HashMap::new();
+        match crate::repo_map::graph_builder::build_graph(&config.workspace_root) {
+            Ok((store, result)) => {
+                tracing::info!(
+                    "code graph: {} nodes, {} edges ({} files changed, {} unchanged)",
+                    result.total_nodes, result.total_edges, result.files_changed, result.files_unchanged,
+                );
+                for wu in &work_units {
+                    let mut sections: Vec<String> = Vec::new();
+
+                    // Impact analysis from owned paths
+                    let owned: Vec<&str> = wu.scope.owned_paths.iter().map(|s| s.as_str()).collect();
+                    if !owned.is_empty() {
+                        let depth = if wu.impact_scope { wu.context_depth.max(3) as usize } else { 3 };
+                        if let Ok(impact) = store.impact_radius(&owned, depth) {
+                            if !impact.affected_files.is_empty() {
+                                sections.push(
+                                    crate::repo_map::store::GraphStore::format_impact_for_prompt(&impact),
+                                );
+                            }
+                        }
+                    }
+
+                    // Context block: callers_of queries
+                    if !wu.context_callers_of.is_empty() {
+                        let refs: Vec<&str> = wu.context_callers_of.iter().map(|s| s.as_str()).collect();
+                        if let Ok(impact) = store.impact_radius(&refs, wu.context_depth as usize) {
+                            let callers: Vec<&str> = impact.affected_files.iter()
+                                .filter(|f| !wu.context_callers_of.contains(f))
+                                .map(|s| s.as_str())
+                                .collect();
+                            if !callers.is_empty() {
+                                sections.push(format!("[Callers of {:?}]:\n{}", wu.context_callers_of, callers.join(", ")));
+                            }
+                        }
+                    }
+
+                    // Context block: tests_for queries
+                    if !wu.context_tests_for.is_empty() {
+                        let refs: Vec<&str> = wu.context_tests_for.iter().map(|s| s.as_str()).collect();
+                        if let Ok(impact) = store.impact_radius(&refs, wu.context_depth as usize) {
+                            if !impact.affected_tests.is_empty() {
+                                sections.push(format!("[Tests for {:?}]:\n{}", wu.context_tests_for, impact.affected_tests.join(", ")));
+                            }
+                        }
+                    }
+
+                    if !sections.is_empty() {
+                        map.insert(wu.id.clone(), sections.join("\n\n"));
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!("code graph build skipped: {}", e);
+            }
+        }
+        map
+    });
 
     // Inter-agent communication bus (available for future coordination)
     let bus = Arc::new(tokio::sync::Mutex::new(AgentBus::new()));
@@ -308,6 +387,7 @@ pub async fn execute(
                     validation: validation_pipeline.clone(),
                     board: Some(shared_board.clone()),
                     repo_map: repo_map.clone(),
+                    impact_texts: impact_texts.clone(),
                 };
                 let manifest = run_single_agent(
                     unit,
@@ -369,6 +449,7 @@ pub async fn execute(
                 let val_pipeline = validation_pipeline.clone();
                 let board_ref = Some(shared_board.clone());
                 let rm = repo_map.clone();
+                let agent_impact = impact_texts.get(unit_id).cloned();
 
                 // Provision worktree if enabled
                 let in_worktree = worktree_mgr.is_some();
@@ -403,6 +484,7 @@ pub async fn execute(
                         val_pipeline.as_deref(),
                         board_ref.as_deref(),
                         (*rm).as_ref(),
+                        agent_impact.as_deref(),
                     ).await?;
 
                     if in_worktree && matches!(manifest.status, AgentStatus::Completed) {
@@ -546,6 +628,7 @@ pub async fn execute(
                     validation: validation_pipeline.clone(),
                     board: Some(shared_board.clone()),
                     repo_map: repo_map.clone(),
+                    impact_texts: impact_texts.clone(),
                 };
                 let manifest = run_single_agent(
                     unit,
@@ -664,6 +747,8 @@ struct AgentRunContext<'a> {
     validation: Option<Arc<crate::validation_gate::ValidationPipeline>>,
     board: Option<Arc<SharedBoard>>,
     repo_map: Arc<Option<crate::repo_map::RepoMap>>,
+    /// Pre-computed impact analysis text per agent (from code knowledge graph).
+    impact_texts: Arc<std::collections::HashMap<String, String>>,
 }
 
 /// Run a single agent, optionally in a worktree.
@@ -682,6 +767,7 @@ async fn run_single_agent(
     let validation = ctx.validation.clone();
     let board = ctx.board.clone();
     let repo_map = ctx.repo_map.clone();
+    let impact_text = ctx.impact_texts.get(&unit.id).cloned();
     let in_worktree = worktree_mgr.is_some();
     let agent_root = if let Some(mgr) = worktree_mgr {
         let handle = mgr.provision(&unit.id)?;
@@ -718,6 +804,7 @@ async fn run_single_agent(
         validation.as_deref(),
         board.as_deref(),
         (*repo_map).as_ref(),
+        impact_text.as_deref(),
     )
     .await?;
 
@@ -1110,6 +1197,59 @@ async fn evaluate_loop_condition(
                     .await;
                 if !result.map(|s| s.success()).unwrap_or(false) {
                     all_pass = false;
+                }
+            }
+            if config.impact_tests && all_pass {
+                // Run only tests affected by the blast radius.
+                // Build the graph, find affected test files, run them.
+                match crate::repo_map::graph_builder::build_graph(workspace_root) {
+                    Ok((store, _)) => {
+                        // Use all source files as the "changed" set (conservative)
+                        let all_src: Vec<String> = store.all_file_hashes()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|(f, _)| !f.contains("test"))
+                            .map(|(f, _)| f)
+                            .collect();
+                        let refs: Vec<&str> = all_src.iter().map(|s| s.as_str()).collect();
+                        if let Ok(impact) = store.impact_radius(&refs, 3) {
+                            let test_modules: Vec<String> = impact.affected_tests.iter()
+                                .filter_map(|t| {
+                                    // Convert file path to test module name for cargo test filter
+                                    t.strip_suffix(".rs")
+                                        .map(|s| s.replace('/', "::"))
+                                })
+                                .collect();
+                            if !test_modules.is_empty() {
+                                for test_mod in &test_modules {
+                                    let result = tokio::process::Command::new("cargo")
+                                        .args(["test", test_mod])
+                                        .current_dir(workspace_root)
+                                        .stdout(std::process::Stdio::null())
+                                        .stderr(std::process::Stdio::null())
+                                        .status()
+                                        .await;
+                                    if !result.map(|s| s.success()).unwrap_or(false) {
+                                        all_pass = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("impact_tests: graph build failed, falling back to full test: {}", e);
+                        let result = tokio::process::Command::new("cargo")
+                            .arg("test")
+                            .current_dir(workspace_root)
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status()
+                            .await;
+                        if !result.map(|s| s.success()).unwrap_or(false) {
+                            all_pass = false;
+                        }
+                    }
                 }
             }
             if config.clippy && all_pass {

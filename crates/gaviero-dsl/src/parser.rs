@@ -24,12 +24,21 @@ enum AgentField {
     Prompt(String, Span),
     MaxRetries(u8, Span),
     Memory(MemoryBlock),
+    Context(ContextBlock),
+}
+
+#[derive(Debug)]
+enum ContextField {
+    CallersOf(Vec<String>),
+    TestsFor(Vec<String>),
+    Depth(u32),
 }
 
 #[derive(Debug)]
 enum ScopeField {
     Owned(Vec<String>),
     ReadOnly(Vec<String>),
+    ImpactScope(bool),
 }
 
 #[derive(Debug)]
@@ -50,6 +59,7 @@ enum VerifyField {
     Compile(bool),
     Clippy(bool),
     Test(bool),
+    ImpactTests(bool),
 }
 
 #[derive(Debug)]
@@ -101,6 +111,13 @@ where
         Token::KwAgents     => "agents".to_owned(),
         Token::KwMaxIterations => "max_iterations".to_owned(),
         Token::KwCommand    => "command".to_owned(),
+        // graph/impact contextual keywords
+        Token::KwImpactScope => "impact_scope".to_owned(),
+        Token::KwImpactTests => "impact_tests".to_owned(),
+        Token::KwContext    => "context".to_owned(),
+        Token::KwCallersOf  => "callers_of".to_owned(),
+        Token::KwTestsFor   => "tests_for".to_owned(),
+        Token::KwDepth      => "depth".to_owned(),
     };
 
     let string = select! {
@@ -191,6 +208,12 @@ where
         just(Token::KwReadOnly)
             .ignore_then(str_list.clone())
             .map(ScopeField::ReadOnly),
+        just(Token::KwImpactScope)
+            .ignore_then(select! {
+                Token::Ident(s) if s == "true"  => true,
+                Token::Ident(s) if s == "false" => false,
+            })
+            .map(ScopeField::ImpactScope),
     ));
 
     let scope_block = just(Token::KwScope)
@@ -203,13 +226,15 @@ where
         .map_with(|fields, e| {
             let mut owned = Vec::new();
             let mut read_only = Vec::new();
+            let mut impact_scope = None;
             for f in fields {
                 match f {
                     ScopeField::Owned(v) => owned.extend(v),
                     ScopeField::ReadOnly(v) => read_only.extend(v),
+                    ScopeField::ImpactScope(v) => { impact_scope.get_or_insert((v, e.span())); }
                 }
             }
-            ScopeBlock { owned, read_only, span: e.span() }
+            ScopeBlock { owned, read_only, impact_scope, span: e.span() }
         });
 
     // ── memory block ──────────────────────────────────────────────
@@ -294,6 +319,7 @@ where
         let b1 = bool_lit.clone();
         let b2 = bool_lit.clone();
         let b3 = bool_lit.clone();
+        let b4 = bool_lit.clone();
         choice((
             just(Token::KwCompile)
                 .ignore_then(b1)
@@ -304,6 +330,9 @@ where
             just(Token::KwTest)
                 .ignore_then(b3)
                 .map(VerifyField::Test),
+            just(Token::KwImpactTests)
+                .ignore_then(b4)
+                .map(VerifyField::ImpactTests),
         ))
     };
 
@@ -318,14 +347,51 @@ where
             let mut compile = false;
             let mut clippy = false;
             let mut test = false;
+            let mut impact_tests = false;
             for f in fields {
                 match f {
                     VerifyField::Compile(v) => compile = v,
                     VerifyField::Clippy(v) => clippy = v,
                     VerifyField::Test(v) => test = v,
+                    VerifyField::ImpactTests(v) => impact_tests = v,
                 }
             }
-            VerifyBlock { compile, clippy, test, span: e.span() }
+            VerifyBlock { compile, clippy, test, impact_tests, span: e.span() }
+        });
+
+    // ── context block ─────────────────────────────────────────────
+
+    let context_field = choice((
+        just(Token::KwCallersOf)
+            .ignore_then(str_list.clone())
+            .map(ContextField::CallersOf),
+        just(Token::KwTestsFor)
+            .ignore_then(str_list.clone())
+            .map(ContextField::TestsFor),
+        just(Token::KwDepth)
+            .ignore_then(integer)
+            .map(|n| ContextField::Depth(n as u32)),
+    ));
+
+    let context_block = just(Token::KwContext)
+        .ignore_then(
+            context_field
+                .repeated()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::LBrace), just(Token::RBrace)),
+        )
+        .map_with(|fields, e| {
+            let mut callers_of = Vec::new();
+            let mut tests_for = Vec::new();
+            let mut depth = None;
+            for f in fields {
+                match f {
+                    ContextField::CallersOf(v) => callers_of.extend(v),
+                    ContextField::TestsFor(v) => tests_for.extend(v),
+                    ContextField::Depth(n) => { depth.get_or_insert((n, e.span())); }
+                }
+            }
+            ContextBlock { callers_of, tests_for, depth, span: e.span() }
         });
 
     // ── agent declaration ─────────────────────────────────────────
@@ -348,6 +414,7 @@ where
             .ignore_then(integer.map_with(|n, e| (n, e.span())))
             .map(|(n, s)| AgentField::MaxRetries(n.min(255) as u8, s)),
         memory_block.clone().map(AgentField::Memory),
+        context_block.map(AgentField::Context),
     ));
 
     let agent_decl = just(Token::KwAgent)
@@ -366,6 +433,7 @@ where
             let mut prompt = None;
             let mut max_retries = None;
             let mut memory = None;
+            let mut context = None;
             for f in fields {
                 match f {
                     AgentField::Description(v, s) => {
@@ -389,9 +457,12 @@ where
                     AgentField::Memory(b) => {
                         memory.get_or_insert(b);
                     }
+                    AgentField::Context(b) => {
+                        context.get_or_insert(b);
+                    }
                 }
             }
-            AgentDecl { name, name_span, description, client, scope, depends_on, prompt, max_retries, memory, span: e.span() }
+            AgentDecl { name, name_span, description, client, scope, depends_on, prompt, max_retries, memory, context, span: e.span() }
         });
 
     // ── loop block (inside workflow steps) ─────────────────────────
@@ -401,10 +472,12 @@ where
         let b1 = bool_lit.clone();
         let b2 = bool_lit.clone();
         let b3 = bool_lit.clone();
+        let b4 = bool_lit.clone();
         let until_verify_field = choice((
             just(Token::KwCompile).ignore_then(b1).map(VerifyField::Compile),
             just(Token::KwClippy).ignore_then(b2).map(VerifyField::Clippy),
             just(Token::KwTest).ignore_then(b3).map(VerifyField::Test),
+            just(Token::KwImpactTests).ignore_then(b4).map(VerifyField::ImpactTests),
         ));
         let until_verify = until_verify_field
             .repeated()
@@ -414,14 +487,16 @@ where
                 let mut compile = false;
                 let mut clippy = false;
                 let mut test = false;
+                let mut impact_tests = false;
                 for f in fields {
                     match f {
                         VerifyField::Compile(v) => compile = v,
                         VerifyField::Clippy(v) => clippy = v,
                         VerifyField::Test(v) => test = v,
+                        VerifyField::ImpactTests(v) => impact_tests = v,
                     }
                 }
-                UntilCondition::Verify(VerifyBlock { compile, clippy, test, span: e.span() })
+                UntilCondition::Verify(VerifyBlock { compile, clippy, test, impact_tests, span: e.span() })
             });
 
         let until_agent = just(Token::KwAgent)
@@ -468,7 +543,7 @@ where
             LoopBlock {
                 agents,
                 until: until.unwrap_or(UntilCondition::Verify(VerifyBlock {
-                    compile: false, clippy: false, test: false, span: e.span(),
+                    compile: false, clippy: false, test: false, impact_tests: false, span: e.span(),
                 })),
                 max_iterations: max_iterations.unwrap_or(10),
                 span: e.span(),
@@ -976,6 +1051,118 @@ mod tests {
             assert!(matches!(&steps[0], StepItem::Agent(n, _) if n == "a"));
             assert!(matches!(&steps[1], StepItem::Loop(_)));
             assert!(matches!(&steps[2], StepItem::Agent(n, _) if n == "c"));
+        }
+    }
+
+    // ── Graph / impact tests ─────────────────────────────────────
+
+    #[test]
+    fn scope_with_impact_scope() {
+        let src = r#"
+            agent x {
+                scope {
+                    owned ["src/"]
+                    read_only ["docs/"]
+                    impact_scope true
+                }
+            }
+        "#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        if let Item::Agent(a) = &ast.unwrap().items[0] {
+            let scope = a.scope.as_ref().unwrap();
+            assert_eq!(scope.impact_scope.as_ref().map(|(v, _)| *v), Some(true));
+        }
+    }
+
+    #[test]
+    fn verify_with_impact_tests() {
+        let src = r#"
+            agent a { description "t" }
+            workflow w {
+                steps [a]
+                verify { compile true impact_tests true }
+            }
+        "#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        if let Item::Workflow(w) = &ast.unwrap().items[1] {
+            let v = w.verify.as_ref().unwrap();
+            assert!(v.compile);
+            assert!(v.impact_tests);
+            assert!(!v.test);
+        }
+    }
+
+    #[test]
+    fn loop_until_impact_tests() {
+        let src = r#"
+            agent a { description "impl" }
+            workflow w {
+                steps [
+                    loop {
+                        agents [a]
+                        max_iterations 3
+                        until { compile true impact_tests true }
+                    }
+                ]
+            }
+        "#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        if let Item::Workflow(w) = &ast.unwrap().items[1] {
+            let (steps, _) = w.steps.as_ref().unwrap();
+            if let StepItem::Loop(lb) = &steps[0] {
+                if let UntilCondition::Verify(vb) = &lb.until {
+                    assert!(vb.compile);
+                    assert!(vb.impact_tests);
+                } else {
+                    panic!("expected Verify until condition");
+                }
+            } else {
+                panic!("expected Loop step");
+            }
+        }
+    }
+
+    #[test]
+    fn agent_with_context_block() {
+        let src = r#"
+            agent x {
+                description "impl"
+                context {
+                    callers_of ["src/auth/session.rs"]
+                    tests_for  ["src/auth/"]
+                    depth      3
+                }
+            }
+        "#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        if let Item::Agent(a) = &ast.unwrap().items[0] {
+            let ctx = a.context.as_ref().expect("context block");
+            assert_eq!(ctx.callers_of, vec!["src/auth/session.rs"]);
+            assert_eq!(ctx.tests_for, vec!["src/auth/"]);
+            assert_eq!(ctx.depth.as_ref().map(|(n, _)| *n), Some(3));
+        }
+    }
+
+    #[test]
+    fn agent_context_block_minimal() {
+        let src = r#"
+            agent x {
+                context {
+                    callers_of ["src/lib.rs"]
+                }
+            }
+        "#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        if let Item::Agent(a) = &ast.unwrap().items[0] {
+            let ctx = a.context.as_ref().expect("context block");
+            assert_eq!(ctx.callers_of, vec!["src/lib.rs"]);
+            assert!(ctx.tests_for.is_empty());
+            assert!(ctx.depth.is_none());
         }
     }
 }

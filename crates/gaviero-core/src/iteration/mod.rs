@@ -134,6 +134,7 @@ impl IterationEngine {
         validation: Option<&ValidationPipeline>,
         board: Option<&SharedBoard>,
         repo_map: Option<&RepoMap>,
+        impact_text: Option<&str>,
     ) -> IterationResult {
         let n_attempts = match &self.config.strategy {
             Strategy::SinglePass => 1,
@@ -194,6 +195,7 @@ impl IterationEngine {
                 validation,
                 board,
                 repo_map,
+                impact_text,
             )
             .await
             {
@@ -305,6 +307,10 @@ mod tests {
             memory_read_query: None,
             memory_read_limit: None,
             memory_write_content: None,
+            impact_scope: false,
+            context_callers_of: vec![],
+            context_tests_for: vec![],
+            context_depth: 2,
         }
     }
 
@@ -353,6 +359,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await;
         assert_eq!(result.attempts_run, 1);
@@ -377,6 +384,7 @@ mod tests {
                 None,
                 &[],
                 &NoopObserver,
+                None,
                 None,
                 None,
                 None,

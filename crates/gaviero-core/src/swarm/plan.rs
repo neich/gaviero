@@ -27,6 +27,9 @@ pub struct VerificationConfig {
     pub compile: bool,
     pub clippy: bool,
     pub test: bool,
+    /// Run only tests affected by the blast radius of modified files.
+    #[serde(default)]
+    pub impact_tests: bool,
 }
 
 // ── Graph types ──────────────────────────────────────────────

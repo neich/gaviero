@@ -431,6 +431,29 @@ fn compile_agent(
             None => s.clone(),
         });
 
+    // ── Graph / impact fields ─────────────────────────────────────
+    let impact_scope = decl.scope
+        .as_ref()
+        .and_then(|s| s.impact_scope.as_ref())
+        .map(|(v, _)| *v)
+        .unwrap_or(false);
+
+    let context_callers_of: Vec<String> = decl.context
+        .as_ref()
+        .map(|c| c.callers_of.clone())
+        .unwrap_or_default();
+
+    let context_tests_for: Vec<String> = decl.context
+        .as_ref()
+        .map(|c| c.tests_for.clone())
+        .unwrap_or_default();
+
+    let context_depth: u32 = decl.context
+        .as_ref()
+        .and_then(|c| c.depth.as_ref())
+        .map(|(n, _)| *n)
+        .unwrap_or(2);
+
     Ok(WorkUnit {
         id: decl.name.clone(),
         description,
@@ -451,6 +474,10 @@ fn compile_agent(
         memory_read_query,
         memory_read_limit,
         memory_write_content,
+        impact_scope,
+        context_callers_of,
+        context_tests_for,
+        context_depth,
     })
 }
 
@@ -503,6 +530,7 @@ fn build_verification_config(wf: &WorkflowDecl) -> gaviero_core::swarm::plan::Ve
             compile: v.compile,
             clippy: v.clippy,
             test: v.test,
+            impact_tests: v.impact_tests,
         })
         .unwrap_or_default()
 }
@@ -540,6 +568,7 @@ fn map_until_condition(cond: &UntilCondition) -> LoopUntilCondition {
                 compile: vb.compile,
                 clippy: vb.clippy,
                 test: vb.test,
+                impact_tests: vb.impact_tests,
             },
         ),
         UntilCondition::Agent(name, _) => LoopUntilCondition::Agent(name.clone()),
@@ -1002,5 +1031,93 @@ mod tests {
         assert!(ids.contains(&"pre"));
         assert!(ids.contains(&"looped"));
         assert!(ids.contains(&"post"));
+    }
+
+    // ── Graph / impact tests ─────────────────────────────────────
+
+    #[test]
+    fn impact_scope_compiled() {
+        let src = r#"
+            agent x {
+                scope {
+                    owned ["src/"]
+                    impact_scope true
+                }
+            }
+        "#;
+        let units = compile_str(src).unwrap();
+        assert!(units[0].impact_scope);
+    }
+
+    #[test]
+    fn impact_scope_false_by_default() {
+        let src = r#"agent x { description "t" }"#;
+        let units = compile_str(src).unwrap();
+        assert!(!units[0].impact_scope);
+    }
+
+    #[test]
+    fn context_block_compiled() {
+        let src = r#"
+            agent x {
+                context {
+                    callers_of ["src/auth.rs"]
+                    tests_for  ["src/auth/"]
+                    depth      3
+                }
+            }
+        "#;
+        let units = compile_str(src).unwrap();
+        assert_eq!(units[0].context_callers_of, vec!["src/auth.rs"]);
+        assert_eq!(units[0].context_tests_for, vec!["src/auth/"]);
+        assert_eq!(units[0].context_depth, 3);
+    }
+
+    #[test]
+    fn context_defaults_when_not_declared() {
+        let src = r#"agent x { description "t" }"#;
+        let units = compile_str(src).unwrap();
+        assert!(units[0].context_callers_of.is_empty());
+        assert!(units[0].context_tests_for.is_empty());
+        assert_eq!(units[0].context_depth, 2);
+    }
+
+    #[test]
+    fn impact_tests_in_verify() {
+        let src = r#"
+            agent a { description "t" }
+            workflow w {
+                steps [a]
+                verify { compile true impact_tests true }
+            }
+        "#;
+        let plan = compile_plan(src).unwrap();
+        assert!(plan.verification_config.compile);
+        assert!(plan.verification_config.impact_tests);
+        assert!(!plan.verification_config.test);
+    }
+
+    #[test]
+    fn impact_tests_in_loop_until() {
+        let src = r#"
+            agent a { description "impl" }
+            workflow w {
+                steps [
+                    loop {
+                        agents [a]
+                        max_iterations 3
+                        until { compile true impact_tests true }
+                    }
+                ]
+            }
+        "#;
+        let plan = compile_plan(src).unwrap();
+        assert_eq!(plan.loop_configs.len(), 1);
+        if let LoopUntilCondition::Verify(v) = &plan.loop_configs[0].until {
+            assert!(v.compile);
+            assert!(v.impact_tests);
+        } else {
+            panic!("expected Verify");
+        }
     }
 }

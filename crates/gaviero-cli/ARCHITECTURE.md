@@ -8,7 +8,7 @@ A single-binary headless runner. Holds no domain logic: its job is to parse comm
 
 ```
 gaviero-cli/src/
-└── main.rs     ~420 lines — everything lives here
+└── main.rs     ~450 lines — everything lives here
 ```
 
 All execution, iteration, validation, memory, and swarm logic is in `gaviero-core`. All DSL compilation is in `gaviero-dsl`.
@@ -31,6 +31,7 @@ All execution, iteration, validation, memory, and swarm logic is in `gaviero-cor
 --format          text|json         output format (default: text)
 --coordinated     bool              Opus planning mode — writes DSL file, then exits
 --resume          bool              load execution checkpoint, skip completed nodes
+--output          Option<PathBuf>   output path for --coordinated DSL plan
 
 --max-retries     u32               inner-loop retries per attempt (default: 5)
 --attempts        u32               BestOfN attempt count when > 1 (default: 1)
@@ -38,9 +39,10 @@ All execution, iteration, validation, memory, and swarm logic is in `gaviero-cor
 --no-iterate      bool              force SinglePass strategy
 
 --trace           Option<PathBuf>   write DEBUG-level JSON trace log to this file
+--graph           bool              build/update code knowledge graph and exit
 ```
 
-Mutual exclusions (enforced by clap): `--task` conflicts with `--work-units` and `--script`. `--coordinated` requires `--task`.
+Mutual exclusions (enforced by clap): `--task` conflicts with `--work-units` and `--script`. `--coordinated` requires `--task`. `--output` requires `--coordinated`.
 
 ---
 
@@ -52,6 +54,11 @@ main()
   2. Canonicalise --repo
   3. Load Workspace (settings, namespace resolution)
   4. Init MemoryStore (graceful failure → memory = None)
+
+  [--graph path]
+     → build/update code knowledge graph (repo_map/graph_builder)
+     → print stats (files scanned/changed/removed, total nodes/edges)
+     → exit
 
   5. Build CompiledPlan (one of three input modes):
      --script      → gaviero_dsl::compile(source, file, None, None)
@@ -67,7 +74,7 @@ main()
 
   [--coordinated path]
      → pipeline::plan_coordinated()    (Opus generates DSL)
-     → write tmp/gaviero_plan_<ts>.gaviero
+     → write to --output path or tmp/gaviero_plan_<ts>.gaviero
      → print plan path to stdout
      → print review instructions to stderr
      → exit (no agent execution)
@@ -136,7 +143,7 @@ Implements the "plan → review → execute" two-step:
 
 1. `pipeline::plan_coordinated()` sends the task to Opus
 2. Opus decomposes the task and returns `.gaviero` DSL text
-3. DSL text written to `tmp/gaviero_plan_<unix-ts>.gaviero`
+3. DSL text written to `--output` path or `tmp/gaviero_plan_<unix-ts>.gaviero`
 4. **stdout:** plan path only (pipeable)
 5. **stderr:** human-readable review instructions
 6. **exits without running any agents**
@@ -180,6 +187,18 @@ Enables DEBUG-level structured JSON logging to the specified file. Use for CI po
 
 ---
 
+## Code knowledge graph (`--graph`)
+
+Builds or updates the SQLite-backed code knowledge graph via `repo_map/graph_builder.rs`. Prints stats:
+```
+files_scanned: 42, files_changed: 3, files_unchanged: 39
+files_removed: 0, total_nodes: 187, total_edges: 412
+```
+
+Useful after major codebase changes before running agent tasks that use `impact_scope` or `context` blocks.
+
+---
+
 ## Integration surface
 
 | Import | From |
@@ -192,14 +211,32 @@ Enables DEBUG-level structured JSON logging to the specified file. Use for CI po
 | `memory::init`, `MemoryStore` | gaviero-core |
 | `workspace::Workspace` | gaviero-core |
 | `observer::{SwarmObserver, AcpObserver}` | gaviero-core |
+| `repo_map::graph_builder` | gaviero-core |
 | `gaviero_dsl::compile` | gaviero-dsl |
+
+---
+
+## Concurrency model
+
+Single tokio runtime. All work is async. No threads spawned directly. Agent parallelism is managed by the swarm pipeline's `Semaphore`.
+
+---
+
+## Error handling strategy
+
+- `anyhow::Result` for all fallible operations
+- Memory init failure: logs warning, continues with `memory = None`
+- DSL compilation errors: printed via miette diagnostics, exit 1
+- Swarm execution errors: printed to stderr, exit 1
+- `--trace` logging failure: warns and continues without trace
 
 ---
 
 ## Design decisions
 
-1. **Single file.** 420-line `main.rs`. Complex logic belongs in `gaviero-core`; duplication here signals a missing abstraction in the library.
+1. **Single file.** ~450-line `main.rs`. Complex logic belongs in `gaviero-core`; duplication here signals a missing abstraction in the library.
 2. **stderr for telemetry, stdout for results.** Enables clean piping: `plan=$(gaviero-cli --coordinated --task "…")`.
 3. **Graceful memory degradation.** `memory::init()` failure logs a warning and proceeds with `memory = None`.
 4. **`make_obs` factory per agent.** `execute()` accepts a closure that produces one `AcpObserver` per agent ID. CLI always returns `Box::new(CliAcpObserver)`; the indirection allows future per-agent customisation.
 5. **Iteration flags override both DSL and defaults.** CLI flags are applied after plan compilation, so `--no-iterate` overrides even a `strategy refine` in a `.gaviero` file.
+6. **`--graph` is standalone.** Graph building exits immediately without agent execution, making it safe to run in CI pre-steps.

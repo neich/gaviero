@@ -29,7 +29,7 @@ use super::{AgentBackend, CompletionRequest, UnifiedStreamEvent};
 /// When `repo_map` is provided, a ranked context outline is prepended to the
 /// agent's base prompt so that even cheap-tier models have optimal scope.
 #[tracing::instrument(
-    skip(backend, write_gate, memory, observer, validation, board, repo_map),
+    skip(backend, write_gate, memory, observer, validation, board, repo_map, impact_text),
     fields(agent_id = %work_unit.id, tier = ?work_unit.tier)
 )]
 pub async fn run_backend(
@@ -43,6 +43,7 @@ pub async fn run_backend(
     validation: Option<&ValidationPipeline>,
     board: Option<&SharedBoard>,
     repo_map: Option<&RepoMap>,
+    impact_text: Option<&str>,
 ) -> Result<AgentManifest> {
     let agent_id = format!("agent-{}", work_unit.id);
 
@@ -52,8 +53,8 @@ pub async fn run_backend(
         gate.register_agent_scope(&agent_id, &work_unit.scope);
     }
 
-    // 2. Build base prompt (memory + scope + task + optional repo context)
-    let mut base_prompt = build_prompt(work_unit, memory, read_namespaces, repo_map).await;
+    // 2. Build base prompt (memory + scope + task + optional repo context + impact analysis)
+    let mut base_prompt = build_prompt(work_unit, memory, read_namespaces, repo_map, impact_text).await;
 
     // Prepend any relevant discoveries from other agents
     if let Some(b) = board {
@@ -282,12 +283,13 @@ pub async fn run_backend(
     })
 }
 
-/// Build the base prompt (repo context + memory context + scope clause + task description).
+/// Build the base prompt (repo context + impact analysis + memory context + scope clause + task description).
 async fn build_prompt(
     work_unit: &WorkUnit,
     memory: Option<&MemoryStore>,
     read_namespaces: &[String],
     repo_map: Option<&RepoMap>,
+    impact_text: Option<&str>,
 ) -> String {
     let mut parts = Vec::new();
 
@@ -297,6 +299,11 @@ async fn build_prompt(
         if !ctx.repo_outline.is_empty() {
             parts.push(ctx.repo_outline);
         }
+    }
+
+    // Impact analysis from code knowledge graph (pre-computed by pipeline)
+    if let Some(text) = impact_text {
+        parts.push(text.to_string());
     }
 
     if let Some(mem) = memory {
@@ -489,6 +496,10 @@ mod tests {
             memory_read_query: None,
             memory_read_limit: None,
             memory_write_content: None,
+            impact_scope: false,
+            context_callers_of: vec![],
+            context_tests_for: vec![],
+            context_depth: 2,
         }
     }
 
@@ -526,6 +537,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -560,6 +572,7 @@ mod tests {
             None,
             &["default".to_string()],
             &observer,
+            None,
             None,
             None,
             None,
@@ -606,6 +619,7 @@ mod tests {
             None,
             &["default".to_string()],
             &observer,
+            None,
             None,
             None,
             None,
@@ -659,6 +673,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -688,6 +703,7 @@ mod tests {
             None,
             &["default".to_string()],
             &observer,
+            None,
             None,
             None,
             None,

@@ -90,6 +90,10 @@ impl TestGenerator {
             memory_read_query: None,
             memory_read_limit: None,
             memory_write_content: None,
+            impact_scope: false,
+            context_callers_of: vec![],
+            context_tests_for: vec![],
+            context_depth: 2,
         };
 
         let manifest = match run_backend(
@@ -103,6 +107,7 @@ impl TestGenerator {
             None, // no validation during test generation itself
             None,
             None,
+            None, // no graph store for test generation
         )
         .await
         {

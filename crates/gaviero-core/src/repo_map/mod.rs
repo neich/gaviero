@@ -19,7 +19,10 @@ use std::path::{Path, PathBuf};
 use petgraph::graph::DiGraph;
 
 pub mod builder;
+pub mod edges;
+pub mod graph_builder;
 pub mod page_rank;
+pub mod store;
 
 // ── Graph types ──────────────────────────────────────────────
 

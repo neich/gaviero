@@ -128,6 +128,11 @@ struct Cli {
     /// Defaults to tmp/gaviero_plan_<timestamp>.gaviero inside the repo.
     #[arg(long, requires = "coordinated")]
     output: Option<PathBuf>,
+
+    /// Build or update the code knowledge graph, print stats, and exit.
+    /// Does not run any agents. Useful after major codebase changes.
+    #[arg(long)]
+    graph: bool,
 }
 
 /// CLI observer that prints agent events to stderr, mirroring agent chat output.
@@ -240,6 +245,22 @@ async fn main() -> Result<()> {
     let repo = std::fs::canonicalize(&cli.repo)
         .with_context(|| format!("resolving repo path: {}", cli.repo.display()))?;
 
+    // ── --graph: build/update code knowledge graph and exit ──────
+    if cli.graph {
+        eprintln!("[graph] building code knowledge graph for {}...", repo.display());
+        let (store, result) = gaviero_core::repo_map::graph_builder::build_graph(&repo)
+            .context("building code knowledge graph")?;
+        let (nodes, edges) = store.stats()?;
+        eprintln!("[graph] done");
+        eprintln!("  files scanned:   {}", result.files_scanned);
+        eprintln!("  files changed:   {}", result.files_changed);
+        eprintln!("  files unchanged: {}", result.files_unchanged);
+        eprintln!("  files removed:   {}", result.files_removed);
+        eprintln!("  total nodes:     {}", nodes);
+        eprintln!("  total edges:     {}", edges);
+        return Ok(());
+    }
+
     // Load workspace for settings
     let mut workspace = gaviero_core::workspace::Workspace::single_folder(repo.clone());
     workspace.ensure_settings();
@@ -314,6 +335,10 @@ async fn main() -> Result<()> {
             memory_read_query: None,
             memory_read_limit: None,
             memory_write_content: None,
+            impact_scope: false,
+            context_callers_of: vec![],
+            context_tests_for: vec![],
+            context_depth: 2,
         }];
         gaviero_core::swarm::plan::CompiledPlan::from_work_units(units, None)
     } else if let Some(ref json) = cli.work_units {

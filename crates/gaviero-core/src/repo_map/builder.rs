@@ -61,7 +61,7 @@ fn walk_dir(
     Ok(())
 }
 
-const SKIP_DIRS: &[&str] = &[
+pub const SKIP_DIRS: &[&str] = &[
     "target", "node_modules", ".git", ".cargo", ".cache",
     "dist", "build", "__pycache__",
 ];
