@@ -23,13 +23,13 @@ Binary name: `gaviero-cli`
 
 ## Key Flags
 
-- `--model <sonnet\|opus\|haiku>` — Claude model (default: sonnet)
+- `--model <sonnet|opus|haiku>` — Claude model (default: sonnet)
 - `--auto-accept` — skip interactive review
 - `--resume` — resume interrupted run from checkpoint
 - `--max-retries N` — inner-loop retries (iteration mode)
 - `--attempts N` — independent attempts (BestOfN strategy)
 - `--test-first` — TDD red phase: generate failing tests first
-- `--format <text\|json>` — output format
+- `--format <text|json>` — output format
 - `--namespace` / `--read-ns` — memory namespace control
 
 ## Structure
