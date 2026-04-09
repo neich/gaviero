@@ -74,6 +74,7 @@ fn bundled_indent_query(lang: &str) -> Result<String> {
         "toml" => Ok(include_str!("../../../../queries/toml/indents.scm").to_string()),
         "bash" => Ok(include_str!("../../../../queries/bash/indents.scm").to_string()),
         "latex" => Ok(include_str!("../../../../queries/latex/indents.scm").to_string()),
+        "gaviero" => Ok(include_str!("../../../../queries/gaviero/indents.scm").to_string()),
         _ => bail!("no bundled indents.scm for {}", lang),
     }
 }
@@ -98,6 +99,7 @@ mod tests {
             ("toml", "toml"),
             ("sh", "bash"),
             ("tex", "latex"),
+            ("gaviero", "gaviero"),
         ];
 
         let mut cache = IndentQueryCache::new();
