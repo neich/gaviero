@@ -47,12 +47,11 @@ impl std::fmt::Display for ScopeViolation {
 /// Enforces read/write scope for a single agent.
 pub struct ScopeEnforcer {
     scope: FileScope,
-    workspace_root: PathBuf,
 }
 
 impl ScopeEnforcer {
-    pub fn new(scope: FileScope, workspace_root: PathBuf) -> Self {
-        Self { scope, workspace_root }
+    pub fn new(scope: FileScope) -> Self {
+        Self { scope }
     }
 
     /// Check whether `path` may be written by this agent.
@@ -131,14 +130,11 @@ mod tests {
     use std::collections::HashMap;
 
     fn make_enforcer(owned: &[&str]) -> ScopeEnforcer {
-        ScopeEnforcer::new(
-            FileScope {
-                owned_paths: owned.iter().map(|s| s.to_string()).collect(),
-                read_only_paths: vec![],
-                interface_contracts: HashMap::new(),
-            },
-            PathBuf::from("/workspace"),
-        )
+        ScopeEnforcer::new(FileScope {
+            owned_paths: owned.iter().map(|s| s.to_string()).collect(),
+            read_only_paths: vec![],
+            interface_contracts: HashMap::new(),
+        })
     }
 
     #[test]
