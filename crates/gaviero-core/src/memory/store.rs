@@ -1,12 +1,18 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use tokio::sync::Mutex;
+use tracing;
 
 use super::embedder::Embedder;
 use super::schema;
+use super::scope::{
+    MemoryScope, MemoryType, ScopeFilter, StoreResult, Trust, WriteScope, WriteMeta,
+};
+use super::scoring::{self, ScoredMemory, SearchConfig};
 
 /// Privacy filter for memory search operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -616,6 +622,830 @@ impl MemoryStore {
         Ok(count)
     }
 
+    // ── Scoped write path ──────────────────────────────────────────
+
+    /// Store a memory at a specific scope level with SHA-256 dedup.
+    ///
+    /// Dedup rules:
+    /// - Same content_hash at same scope_path → reinforce (bump access_count).
+    /// - Same content_hash at a broader scope → skip (already covered).
+    /// - Same content_hash at a narrower scope → insert (may carry local nuance).
+    pub async fn store_scoped(
+        &self,
+        scope: &WriteScope,
+        content: &str,
+        meta: &WriteMeta,
+    ) -> Result<StoreResult> {
+        let hash = schema::content_hash(content);
+        let scope_level = scope.level_int();
+        let scope_path = scope.to_path_string();
+
+        // Compute embedding outside the lock
+        let embedding = self.embedder.embed_document(content)
+            .context("computing embedding for scoped store")?;
+        let embedding_blob = embedding_to_blob(&embedding);
+        let model_id = self.embedder.model_id().to_string();
+
+        let conn = self.conn.lock().await;
+
+        // Check for exact duplicate at same scope
+        let existing: Option<i64> = conn
+            .prepare(
+                "SELECT id FROM memories
+                 WHERE content_hash = ?1 AND scope_path = ?2"
+            )?
+            .query_row(rusqlite::params![hash, scope_path], |row| row.get(0))
+            .ok();
+
+        if let Some(id) = existing {
+            // Reinforce: bump access count and timestamp
+            conn.execute(
+                "UPDATE memories SET access_count = access_count + 1,
+                        last_accessed_at = datetime('now'),
+                        updated_at = datetime('now')
+                 WHERE id = ?1",
+                rusqlite::params![id],
+            )?;
+            tracing::debug!(id, "scoped store: deduplicated at same scope");
+            return Ok(StoreResult::Deduplicated(id));
+        }
+
+        // Check for duplicate at any broader scope
+        for level in (0..scope_level).rev() {
+            let covered: bool = conn
+                .prepare(
+                    "SELECT 1 FROM memories
+                     WHERE content_hash = ?1 AND scope_level = ?2
+                     LIMIT 1"
+                )?
+                .query_row(rusqlite::params![hash, level], |_| Ok(true))
+                .unwrap_or(false);
+            if covered {
+                tracing::debug!(level, "scoped store: already covered at broader scope");
+                return Ok(StoreResult::AlreadyCovered);
+            }
+        }
+
+        // Insert new memory
+        let namespace = meta.tag.as_deref().unwrap_or("default");
+        let key = format!("scoped:{}:{}", scope_path, &hash[..12]);
+
+        conn.execute(
+            "INSERT INTO memories (
+                namespace, key, content, embedding, model_id,
+                scope_level, scope_path, repo_id, module_path, run_id,
+                content_hash, memory_type, trust, tag,
+                importance, privacy
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 'public')",
+            rusqlite::params![
+                namespace,
+                key,
+                content,
+                embedding_blob,
+                model_id,
+                scope_level,
+                scope_path,
+                scope.repo_id(),
+                scope.module_path(),
+                match scope {
+                    WriteScope::Run { run_id, .. } => Some(run_id.as_str()),
+                    _ => None,
+                },
+                hash,
+                meta.memory_type.as_str(),
+                meta.trust.as_str(),
+                meta.tag.as_deref(),
+                meta.importance,
+            ],
+        )
+        .context("inserting scoped memory")?;
+
+        let id: i64 = conn.last_insert_rowid();
+
+        // Insert into scoped vec table
+        let _ = conn.execute(
+            "DELETE FROM vec_memories_scoped WHERE memory_id = ?1",
+            rusqlite::params![id],
+        );
+        conn.execute(
+            "INSERT INTO vec_memories_scoped(memory_id, embedding, scope_level)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![id, embedding_blob, scope_level],
+        )
+        .context("inserting into vec_memories_scoped")?;
+
+        // Also insert into legacy vec_memories for backward compat
+        let _ = conn.execute(
+            "DELETE FROM vec_memories WHERE memory_id = ?1",
+            rusqlite::params![id],
+        );
+        conn.execute(
+            "INSERT INTO vec_memories(memory_id, embedding) VALUES (?1, ?2)",
+            rusqlite::params![id, embedding_blob],
+        )
+        .context("inserting into legacy vec_memories")?;
+
+        tracing::debug!(id, scope_path, "scoped store: inserted new memory");
+        Ok(StoreResult::Inserted(id))
+    }
+
+    // ── Cascading scoped search ───────────────────────────────────
+
+    /// Cascading search across scope levels with early termination.
+    ///
+    /// Searches from narrowest to widest scope, accumulating results.
+    /// Stops widening when enough high-confidence results are found.
+    /// Uses hybrid vector + FTS search via RRF when `use_fts` is enabled.
+    pub async fn search_scoped(
+        &self,
+        config: &SearchConfig,
+    ) -> Result<Vec<ScoredMemory>> {
+        let query_embedding = self.embedder.embed_query(&config.query)
+            .context("computing query embedding for scoped search")?;
+        let query_blob = embedding_to_blob(&query_embedding);
+
+        let conn = self.conn.lock().await;
+        let now = chrono_now_utc();
+
+        let mut accumulated: Vec<ScoredMemory> = Vec::new();
+        let mut seen_hashes: HashSet<String> = HashSet::new();
+
+        for level in config.scope.levels() {
+            // Vector search within this scope level
+            let scope_level_int = level.level_int();
+            let vec_candidates = self.vec_search_at_level(
+                &conn,
+                &query_blob,
+                scope_level_int,
+                &level,
+                config.per_level_limit,
+            )?;
+
+            // Optional FTS search
+            let fts_candidates = if config.use_fts {
+                self.fts_search_at_level(
+                    &conn,
+                    &config.query,
+                    scope_level_int,
+                    &level,
+                    config.per_level_limit,
+                )?
+            } else {
+                Vec::new()
+            };
+
+            // Merge via RRF if both sources produced results
+            let candidate_ids: Vec<(i64, f32)> = if !fts_candidates.is_empty() && !vec_candidates.is_empty() {
+                let merged = scoring::merge_rrf(&vec_candidates, &fts_candidates, 60);
+                merged.into_iter().map(|(id, _rrf, sim)| (id, sim)).collect()
+            } else {
+                vec_candidates
+            };
+
+            // Score and accumulate
+            for (memory_id, raw_sim) in &candidate_ids {
+                if *raw_sim < config.similarity_threshold {
+                    continue;
+                }
+
+                // Load full memory record
+                let Some(mem) = self.load_scoped_memory(&conn, *memory_id, *raw_sim, &now, &level)? else {
+                    continue;
+                };
+
+                if seen_hashes.contains(&mem.content_hash) {
+                    continue;
+                }
+                seen_hashes.insert(mem.content_hash.clone());
+                accumulated.push(mem);
+            }
+
+            // Early termination check
+            if accumulated.len() >= config.max_results {
+                if let Some(best) = accumulated.iter().map(|m| m.final_score).reduce(f32::max) {
+                    if best >= config.confidence_threshold {
+                        tracing::debug!(
+                            best_score = best,
+                            level = scope_level_int,
+                            "cascading search: early termination"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Final ranking
+        accumulated.sort_by(|a, b| {
+            b.final_score.partial_cmp(&a.final_score).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        accumulated.truncate(config.max_results);
+
+        // Update access timestamps and log for promotion heuristics
+        if !accumulated.is_empty() {
+            let ids: Vec<i64> = accumulated.iter().map(|m| m.id).collect();
+            self.touch_accessed(&conn, &ids);
+            self.log_access(&conn, &ids, &config.scope);
+        }
+
+        Ok(accumulated)
+    }
+
+    /// Format scoped search results as a prompt-ready context string.
+    pub async fn search_scoped_context(
+        &self,
+        config: &SearchConfig,
+    ) -> String {
+        match self.search_scoped(config).await {
+            Ok(results) if !results.is_empty() => {
+                scoring::format_memories_for_prompt(&results)
+            }
+            _ => String::new(),
+        }
+    }
+
+    // ── Internal helpers for scoped search ─────────────────────────
+
+    /// Vector KNN search filtered to a scope level.
+    fn vec_search_at_level(
+        &self,
+        conn: &Connection,
+        query_blob: &[u8],
+        scope_level: i32,
+        level: &ScopeFilter,
+        limit: usize,
+    ) -> Result<Vec<(i64, f32)>> {
+        // Over-fetch to allow post-filtering by repo_id/module_path
+        let fetch_k = limit * 3;
+
+        let mut stmt = conn.prepare(
+            "SELECT v.memory_id, v.distance
+             FROM vec_memories_scoped v
+             WHERE v.embedding MATCH ?1 AND k = ?2 AND v.scope_level = ?3"
+        ).context("preparing scoped KNN")?;
+
+        let results: Vec<(i64, f32)> = stmt
+            .query_map(
+                rusqlite::params![query_blob, fetch_k as i64, scope_level],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f32>(1)?)),
+            )?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Post-filter by repo_id / module_path / run_id
+        let filtered = self.filter_by_scope(conn, results, level)?;
+        Ok(filtered.into_iter().take(limit).collect())
+    }
+
+    /// FTS search filtered to a scope level.
+    fn fts_search_at_level(
+        &self,
+        conn: &Connection,
+        query: &str,
+        scope_level: i32,
+        level: &ScopeFilter,
+        limit: usize,
+    ) -> Result<Vec<(i64, f64)>> {
+        let fetch_k = limit * 3;
+
+        let mut stmt = conn.prepare(
+            "SELECT f.rowid, f.rank
+             FROM memories_fts f
+             JOIN memories m ON m.id = f.rowid
+             WHERE memories_fts MATCH ?1
+             AND m.scope_level = ?2
+             ORDER BY f.rank
+             LIMIT ?3"
+        ).context("preparing FTS search")?;
+
+        let results: Vec<(i64, f64)> = stmt
+            .query_map(
+                rusqlite::params![query, scope_level, fetch_k as i64],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)),
+            )?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Post-filter
+        let filtered: Vec<(i64, f64)> = results
+            .into_iter()
+            .filter(|(id, _)| self.matches_scope_filter(conn, *id, level))
+            .take(limit)
+            .collect();
+
+        Ok(filtered)
+    }
+
+    /// Post-filter vector results by exact scope metadata.
+    fn filter_by_scope(
+        &self,
+        conn: &Connection,
+        results: Vec<(i64, f32)>,
+        level: &ScopeFilter,
+    ) -> Result<Vec<(i64, f32)>> {
+        let mut filtered = Vec::new();
+        for (id, distance) in results {
+            if self.matches_scope_filter(conn, id, level) {
+                // Convert L2 distance to cosine similarity
+                let similarity = (1.0 - distance * distance / 2.0).max(0.0);
+                filtered.push((id, similarity));
+            }
+        }
+        Ok(filtered)
+    }
+
+    /// Check if a memory matches the given scope filter.
+    fn matches_scope_filter(&self, conn: &Connection, memory_id: i64, level: &ScopeFilter) -> bool {
+        match level {
+            ScopeFilter::Global | ScopeFilter::Workspace => true,
+            ScopeFilter::Repo { repo_id } => {
+                conn.prepare("SELECT 1 FROM memories WHERE id = ?1 AND repo_id = ?2")
+                    .and_then(|mut s| s.query_row(rusqlite::params![memory_id, repo_id], |_| Ok(true)))
+                    .unwrap_or(false)
+            }
+            ScopeFilter::Module { repo_id, module_path } => {
+                conn.prepare(
+                    "SELECT 1 FROM memories WHERE id = ?1 AND repo_id = ?2 AND module_path = ?3"
+                )
+                .and_then(|mut s| {
+                    s.query_row(rusqlite::params![memory_id, repo_id, module_path], |_| Ok(true))
+                })
+                .unwrap_or(false)
+            }
+            ScopeFilter::Run { repo_id, run_id } => {
+                conn.prepare(
+                    "SELECT 1 FROM memories WHERE id = ?1 AND repo_id = ?2 AND run_id = ?3"
+                )
+                .and_then(|mut s| {
+                    s.query_row(rusqlite::params![memory_id, repo_id, run_id], |_| Ok(true))
+                })
+                .unwrap_or(false)
+            }
+        }
+    }
+
+    /// Load a full ScoredMemory from the database.
+    fn load_scoped_memory(
+        &self,
+        conn: &Connection,
+        memory_id: i64,
+        raw_similarity: f32,
+        now: &str,
+        level: &ScopeFilter,
+    ) -> Result<Option<ScoredMemory>> {
+        let result = conn.prepare(
+            "SELECT id, content, content_hash, scope_level, scope_path,
+                    repo_id, module_path, memory_type, trust, importance,
+                    access_count, created_at, updated_at, last_accessed_at,
+                    tag, namespace, key
+             FROM memories WHERE id = ?1"
+        )?.query_row(rusqlite::params![memory_id], |row| {
+            let accessed_at: Option<String> = row.get(13)?;
+            let updated_at: String = row.get(12)?;
+            let trust_str: String = row.get(8)?;
+            let type_str: String = row.get(7)?;
+            let importance: f32 = row.get(9)?;
+            let access_count: i32 = row.get(10)?;
+
+            let trust = Trust::parse_str(&trust_str);
+            let days = hours_since(&accessed_at, &updated_at, now) / 24.0;
+
+            let final_score = scoring::score(
+                raw_similarity,
+                importance,
+                days,
+                access_count,
+                trust,
+                level,
+            );
+
+            Ok(ScoredMemory {
+                id: row.get(0)?,
+                content: row.get(1)?,
+                content_hash: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                scope_level: row.get(3)?,
+                scope_path: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                repo_id: row.get(5)?,
+                module_path: row.get(6)?,
+                memory_type: MemoryType::parse_str(&type_str),
+                trust,
+                importance,
+                access_count,
+                created_at: row.get(11)?,
+                updated_at,
+                accessed_at,
+                tag: row.get(14)?,
+                namespace: row.get(15)?,
+                key: row.get(16)?,
+                raw_similarity,
+                fts_rank: None,
+                final_score,
+            })
+        });
+
+        match result {
+            Ok(m) => Ok(Some(m)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Bump access_count and last_accessed_at for returned results.
+    fn touch_accessed(&self, conn: &Connection, ids: &[i64]) {
+        for id in ids {
+            let _ = conn.execute(
+                "UPDATE memories SET access_count = access_count + 1,
+                        last_accessed_at = datetime('now')
+                 WHERE id = ?1",
+                rusqlite::params![id],
+            );
+        }
+    }
+
+    /// Log access for cross-scope promotion heuristics.
+    fn log_access(&self, conn: &Connection, ids: &[i64], scope: &MemoryScope) {
+        let repo_id = scope.repo_id.as_deref();
+        let module_path = scope.module_path.as_deref();
+
+        for id in ids {
+            let _ = conn.execute(
+                "INSERT INTO memory_access_log (memory_id, repo_id, module_path)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![id, repo_id, module_path],
+            );
+        }
+    }
+
+    // ── Scoped delete operations ──────────────────────────────────
+
+    /// Delete all memories at a scope and below.
+    pub async fn forget_scope(&self, scope: &WriteScope) -> Result<u64> {
+        let conn = self.conn.lock().await;
+        let scope_path = scope.to_path_string();
+
+        // Find all matching memories
+        let ids: Vec<i64> = conn
+            .prepare(
+                "SELECT id FROM memories WHERE scope_path = ?1 OR scope_path LIKE ?2"
+            )?
+            .query_map(
+                rusqlite::params![scope_path, format!("{}/%", scope_path)],
+                |row| row.get(0),
+            )?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Clean up vectors
+        for id in &ids {
+            let _ = conn.execute(
+                "DELETE FROM vec_memories_scoped WHERE memory_id = ?1",
+                rusqlite::params![id],
+            );
+            let _ = conn.execute(
+                "DELETE FROM vec_memories WHERE memory_id = ?1",
+                rusqlite::params![id],
+            );
+        }
+
+        // Delete access logs
+        for id in &ids {
+            let _ = conn.execute(
+                "DELETE FROM memory_access_log WHERE memory_id = ?1",
+                rusqlite::params![id],
+            );
+        }
+
+        // Delete memories
+        let count = conn.execute(
+            "DELETE FROM memories WHERE scope_path = ?1 OR scope_path LIKE ?2",
+            rusqlite::params![scope_path, format!("{}/%", scope_path)],
+        )?;
+
+        Ok(count as u64)
+    }
+
+    /// Delete all run-level memories for a specific run.
+    pub async fn delete_by_run(&self, run_id: &str) -> Result<u64> {
+        let conn = self.conn.lock().await;
+
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM memories WHERE run_id = ?1")?
+            .query_map(rusqlite::params![run_id], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for id in &ids {
+            let _ = conn.execute("DELETE FROM vec_memories_scoped WHERE memory_id = ?1", rusqlite::params![id]);
+            let _ = conn.execute("DELETE FROM vec_memories WHERE memory_id = ?1", rusqlite::params![id]);
+            let _ = conn.execute("DELETE FROM memory_access_log WHERE memory_id = ?1", rusqlite::params![id]);
+        }
+
+        let count = conn.execute(
+            "DELETE FROM memories WHERE run_id = ?1",
+            rusqlite::params![run_id],
+        )?;
+
+        Ok(count as u64)
+    }
+
+    /// Query all memories for a given run (for consolidation).
+    pub async fn query_by_run(&self, run_id: &str) -> Result<Vec<ScoredMemory>> {
+        let conn = self.conn.lock().await;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, content, content_hash, scope_level, scope_path,
+                    repo_id, module_path, memory_type, trust, importance,
+                    access_count, created_at, updated_at, last_accessed_at,
+                    tag, namespace, key
+             FROM memories WHERE run_id = ?1"
+        )?;
+
+        let results: Vec<ScoredMemory> = stmt
+            .query_map(rusqlite::params![run_id], |row| {
+                let accessed_at: Option<String> = row.get(13)?;
+                let updated_at: String = row.get(12)?;
+                let trust_str: String = row.get(8)?;
+                let type_str: String = row.get(7)?;
+
+                Ok(ScoredMemory {
+                    id: row.get(0)?,
+                    content: row.get(1)?,
+                    content_hash: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    scope_level: row.get(3)?,
+                    scope_path: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                    repo_id: row.get(5)?,
+                    module_path: row.get(6)?,
+                    memory_type: MemoryType::parse_str(&type_str),
+                    trust: Trust::parse_str(&trust_str),
+                    importance: row.get(9)?,
+                    access_count: row.get(10)?,
+                    created_at: row.get(11)?,
+                    updated_at: updated_at.clone(),
+                    accessed_at: accessed_at.clone(),
+                    tag: row.get(14)?,
+                    namespace: row.get(15)?,
+                    key: row.get(16)?,
+                    raw_similarity: 0.0,
+                    fts_rank: None,
+                    final_score: 0.0,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Query memories at a specific scope level (for consolidation diagnostics).
+    pub async fn search_at_level(
+        &self,
+        level: &ScopeFilter,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<ScoredMemory>> {
+        if query.is_empty() {
+            // Return all memories at this level
+            let conn = self.conn.lock().await;
+            return self.list_at_level(&conn, level, limit);
+        }
+
+        // Use the cascading search with a single-level scope
+        let scope = MemoryScope {
+            global_db: std::path::PathBuf::new(),
+            workspace_db: std::path::PathBuf::new(),
+            workspace_id: String::new(),
+            repo_id: level.repo_id().map(String::from),
+            module_path: level.module_path().map(String::from),
+            run_id: level.run_id().map(String::from),
+        };
+
+        let config = SearchConfig {
+            query: query.to_string(),
+            max_results: limit,
+            per_level_limit: limit,
+            similarity_threshold: 0.0,
+            confidence_threshold: 1.0, // don't terminate early
+            use_fts: true,
+            scope,
+        };
+
+        self.search_scoped(&config).await
+    }
+
+    /// List all memories at a level without embedding search.
+    fn list_at_level(
+        &self,
+        conn: &Connection,
+        level: &ScopeFilter,
+        limit: usize,
+    ) -> Result<Vec<ScoredMemory>> {
+        let (sql, params_vec): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match level {
+            ScopeFilter::Global => (
+                "SELECT id, content, content_hash, scope_level, scope_path,
+                        repo_id, module_path, memory_type, trust, importance,
+                        access_count, created_at, updated_at, last_accessed_at,
+                        tag, namespace, key
+                 FROM memories WHERE scope_level = 0 LIMIT ?1",
+                vec![Box::new(limit as i64)],
+            ),
+            ScopeFilter::Workspace => (
+                "SELECT id, content, content_hash, scope_level, scope_path,
+                        repo_id, module_path, memory_type, trust, importance,
+                        access_count, created_at, updated_at, last_accessed_at,
+                        tag, namespace, key
+                 FROM memories WHERE scope_level = 1 LIMIT ?1",
+                vec![Box::new(limit as i64)],
+            ),
+            ScopeFilter::Repo { repo_id } => (
+                "SELECT id, content, content_hash, scope_level, scope_path,
+                        repo_id, module_path, memory_type, trust, importance,
+                        access_count, created_at, updated_at, last_accessed_at,
+                        tag, namespace, key
+                 FROM memories WHERE scope_level = 2 AND repo_id = ?1 LIMIT ?2",
+                vec![Box::new(repo_id.clone()), Box::new(limit as i64)],
+            ),
+            ScopeFilter::Module { repo_id, module_path } => (
+                "SELECT id, content, content_hash, scope_level, scope_path,
+                        repo_id, module_path, memory_type, trust, importance,
+                        access_count, created_at, updated_at, last_accessed_at,
+                        tag, namespace, key
+                 FROM memories WHERE scope_level = 3 AND repo_id = ?1 AND module_path = ?2 LIMIT ?3",
+                vec![Box::new(repo_id.clone()), Box::new(module_path.clone()), Box::new(limit as i64)],
+            ),
+            ScopeFilter::Run { repo_id, run_id } => (
+                "SELECT id, content, content_hash, scope_level, scope_path,
+                        repo_id, module_path, memory_type, trust, importance,
+                        access_count, created_at, updated_at, last_accessed_at,
+                        tag, namespace, key
+                 FROM memories WHERE scope_level = 4 AND repo_id = ?1 AND run_id = ?2 LIMIT ?3",
+                vec![Box::new(repo_id.clone()), Box::new(run_id.clone()), Box::new(limit as i64)],
+            ),
+        };
+
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(sql)?;
+        let results: Vec<ScoredMemory> = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                let trust_str: String = row.get(8)?;
+                let type_str: String = row.get(7)?;
+                Ok(ScoredMemory {
+                    id: row.get(0)?,
+                    content: row.get(1)?,
+                    content_hash: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    scope_level: row.get(3)?,
+                    scope_path: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                    repo_id: row.get(5)?,
+                    module_path: row.get(6)?,
+                    memory_type: MemoryType::parse_str(&type_str),
+                    trust: Trust::parse_str(&trust_str),
+                    importance: row.get(9)?,
+                    access_count: row.get(10)?,
+                    created_at: row.get(11)?,
+                    updated_at: row.get(12)?,
+                    accessed_at: row.get(13)?,
+                    tag: row.get(14)?,
+                    namespace: row.get(15)?,
+                    key: row.get(16)?,
+                    raw_similarity: 0.0,
+                    fts_rank: None,
+                    final_score: 0.0,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(results)
+    }
+
+    // ── Maintenance ───────────────────────────────────────────────
+
+    /// Decay importance and prune stale entries.
+    ///
+    /// - Decays importance based on time since last access (30-day half-life).
+    /// - Prunes entries below min_importance that haven't been accessed in 90 days.
+    /// - Never auto-prunes human-authored (trust=high) entries.
+    pub async fn decay_and_prune(&self) -> Result<(usize, usize)> {
+        let conn = self.conn.lock().await;
+
+        let half_life_days = 30.0_f64;
+        let lambda = 2.0_f64.ln() / half_life_days;
+        let min_importance = 0.05;
+
+        // Decay importance in Rust (SQLite doesn't have exp())
+        let rows: Vec<(i64, f32, String)> = conn
+            .prepare(
+                "SELECT id, importance, COALESCE(last_accessed_at, updated_at)
+                 FROM memories WHERE scope_level >= 2"
+            )?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let now_str = chrono_now_utc();
+        let mut decayed = 0usize;
+        for (id, importance, ts) in &rows {
+            let days = hours_since(&Some(ts.clone()), ts, &now_str) / 24.0;
+            let decay_factor = (-lambda * days).exp() as f32;
+            let new_importance = importance * decay_factor;
+            if (new_importance - importance).abs() > 0.001 {
+                conn.execute(
+                    "UPDATE memories SET importance = ?1 WHERE id = ?2",
+                    rusqlite::params![new_importance, id],
+                )?;
+                decayed += 1;
+            }
+        }
+
+        // Prune
+        let prune_ids: Vec<i64> = conn
+            .prepare(
+                "SELECT id FROM memories
+                 WHERE importance < ?1
+                 AND COALESCE(last_accessed_at, updated_at) < datetime('now', '-90 days')
+                 AND trust != 'high'"
+            )?
+            .query_map(rusqlite::params![min_importance], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for id in &prune_ids {
+            let _ = conn.execute("DELETE FROM vec_memories_scoped WHERE memory_id = ?1", rusqlite::params![id]);
+            let _ = conn.execute("DELETE FROM vec_memories WHERE memory_id = ?1", rusqlite::params![id]);
+            let _ = conn.execute("DELETE FROM memory_access_log WHERE memory_id = ?1", rusqlite::params![id]);
+        }
+
+        let pruned = conn.execute(
+            "DELETE FROM memories
+             WHERE importance < ?1
+             AND COALESCE(last_accessed_at, updated_at) < datetime('now', '-90 days')
+             AND trust != 'high'",
+            rusqlite::params![min_importance],
+        )?;
+
+        // Clean orphaned vectors
+        let _ = conn.execute(
+            "DELETE FROM vec_memories_scoped WHERE memory_id NOT IN (SELECT id FROM memories)",
+            [],
+        );
+
+        Ok((decayed, pruned))
+    }
+
+    /// Find module-level memories accessed from other modules (promotion candidates).
+    pub async fn find_promotion_candidates(&self, min_cross_hits: i64) -> Result<Vec<ScoredMemory>> {
+        let conn = self.conn.lock().await;
+
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.content, m.content_hash, m.scope_level, m.scope_path,
+                    m.repo_id, m.module_path, m.memory_type, m.trust, m.importance,
+                    m.access_count, m.created_at, m.updated_at, m.last_accessed_at,
+                    m.tag, m.namespace, m.key,
+                    COUNT(DISTINCT a.module_path) as cross_module_hits
+             FROM memories m
+             JOIN memory_access_log a ON a.memory_id = m.id
+             WHERE m.scope_level = 3
+             AND a.module_path != m.module_path
+             GROUP BY m.id
+             HAVING cross_module_hits >= ?1"
+        )?;
+
+        let results: Vec<ScoredMemory> = stmt
+            .query_map(rusqlite::params![min_cross_hits], |row| {
+                let trust_str: String = row.get(8)?;
+                let type_str: String = row.get(7)?;
+                Ok(ScoredMemory {
+                    id: row.get(0)?,
+                    content: row.get(1)?,
+                    content_hash: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    scope_level: row.get(3)?,
+                    scope_path: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                    repo_id: row.get(5)?,
+                    module_path: row.get(6)?,
+                    memory_type: MemoryType::parse_str(&type_str),
+                    trust: Trust::parse_str(&trust_str),
+                    importance: row.get(9)?,
+                    access_count: row.get(10)?,
+                    created_at: row.get(11)?,
+                    updated_at: row.get(12)?,
+                    accessed_at: row.get(13)?,
+                    tag: row.get(14)?,
+                    namespace: row.get(15)?,
+                    key: row.get(16)?,
+                    raw_similarity: 0.0,
+                    fts_rank: None,
+                    final_score: 0.0,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(results)
+    }
+
+    // ── Legacy API (kept for backward compat) ─────────────────────
+
     /// Delete stale swarm-generated entries based on retention policy.
     ///
     /// Preserves all `user:*` entries (explicit `/remember` commands).
@@ -663,11 +1493,11 @@ impl MemoryStore {
         // Enforce max_runs: keep only the latest N run IDs
         if max_runs > 0 {
             let mut stmt = conn.prepare(
-                "SELECT DISTINCT substr(key, 8, instr(substr(key, 8), ':') - 1) as run_id,
+                "SELECT DISTINCT substr(key, 8, instr(substr(key, 8), ':') - 1) as parsed_run_id,
                         MIN(created_at) as first_seen
                  FROM memories
                  WHERE namespace = ?1 AND key LIKE 'agents:%'
-                 GROUP BY run_id
+                 GROUP BY parsed_run_id
                  ORDER BY first_seen DESC"
             )?;
 
@@ -675,6 +1505,7 @@ impl MemoryStore {
                 .query_map(rusqlite::params![namespace], |row| row.get::<_, String>(0))?
                 .filter_map(|r| r.ok())
                 .collect();
+
 
             if run_ids.len() > max_runs {
                 let old_runs = &run_ids[max_runs..];
@@ -1052,5 +1883,143 @@ mod tests {
         // Old, unimportant, irrelevant → low score
         let low = retrieval_score(720.0, 0.1, 0.1, 0);
         assert!(high > low);
+    }
+
+    // ── Scoped store tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_store_scoped_insert() {
+        let store = MemoryStore::in_memory(mock_embedder()).unwrap();
+        let scope = WriteScope::Repo { repo_id: "test_repo".into() };
+        let meta = WriteMeta::default();
+
+        let result = store.store_scoped(&scope, "hello scoped world", &meta).await.unwrap();
+        match result {
+            StoreResult::Inserted(id) => assert!(id > 0),
+            other => panic!("expected Inserted, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_store_scoped_dedup_same_scope() {
+        let store = MemoryStore::in_memory(mock_embedder()).unwrap();
+        let scope = WriteScope::Repo { repo_id: "r1".into() };
+        let meta = WriteMeta::default();
+
+        let r1 = store.store_scoped(&scope, "dedup test content", &meta).await.unwrap();
+        assert!(matches!(r1, StoreResult::Inserted(_)));
+
+        // Same content at same scope → deduplicate
+        let r2 = store.store_scoped(&scope, "dedup test content", &meta).await.unwrap();
+        assert!(matches!(r2, StoreResult::Deduplicated(_)));
+    }
+
+    #[tokio::test]
+    async fn test_store_scoped_broader_scope_covers() {
+        let store = MemoryStore::in_memory(mock_embedder()).unwrap();
+        let meta = WriteMeta::default();
+
+        // Store at repo level (scope_level=2)
+        let repo_scope = WriteScope::Repo { repo_id: "r1".into() };
+        store.store_scoped(&repo_scope, "shared knowledge", &meta).await.unwrap();
+
+        // Try to store same content at module level (scope_level=3, narrower)
+        // → broader scope (repo=2) already covers it, so skip
+        let module_scope = WriteScope::Module {
+            repo_id: "r1".into(),
+            module_path: "crates/core".into(),
+        };
+        let r2 = store.store_scoped(&module_scope, "shared knowledge", &meta).await.unwrap();
+        assert!(matches!(r2, StoreResult::AlreadyCovered));
+
+        // Store at workspace level (scope_level=1, broader than repo=2)
+        let ws_scope = WriteScope::Workspace;
+        store.store_scoped(&ws_scope, "workspace fact", &meta).await.unwrap();
+
+        // Same content at repo level should see it's already covered at broader scope
+        let r3 = store.store_scoped(&repo_scope, "workspace fact", &meta).await.unwrap();
+        assert!(matches!(r3, StoreResult::AlreadyCovered));
+    }
+
+    #[tokio::test]
+    async fn test_cascading_search_basic() {
+        let store = MemoryStore::in_memory(mock_embedder()).unwrap();
+        let meta = WriteMeta::default();
+
+        // Store memories at different scope levels
+        let repo_scope = WriteScope::Repo { repo_id: "r1".into() };
+        store.store_scoped(&repo_scope, "Rust programming patterns", &meta).await.unwrap();
+
+        let module_scope = WriteScope::Module {
+            repo_id: "r1".into(),
+            module_path: "crates/core".into(),
+        };
+        store.store_scoped(&module_scope, "Core module Rust conventions", &meta).await.unwrap();
+
+        // Build a scope that includes both levels
+        let scope = MemoryScope {
+            global_db: std::path::PathBuf::new(),
+            workspace_db: std::path::PathBuf::new(),
+            workspace_id: "ws1".into(),
+            repo_id: Some("r1".into()),
+            module_path: Some("crates/core".into()),
+            run_id: None,
+        };
+
+        let config = SearchConfig::new("Rust programming", scope).with_fts(false);
+        let results = store.search_scoped(&config).await.unwrap();
+
+        assert!(!results.is_empty(), "should find at least one result");
+        // Results should be scored — module-level should have higher scope weight
+    }
+
+    #[tokio::test]
+    async fn test_forget_scope() {
+        let store = MemoryStore::in_memory(mock_embedder()).unwrap();
+        let meta = WriteMeta::default();
+
+        let repo_scope = WriteScope::Repo { repo_id: "r1".into() };
+        store.store_scoped(&repo_scope, "repo memory 1", &meta).await.unwrap();
+        store.store_scoped(&repo_scope, "repo memory 2", &meta).await.unwrap();
+
+        let deleted = store.forget_scope(&repo_scope).await.unwrap();
+        assert_eq!(deleted, 2);
+    }
+
+    #[tokio::test]
+    async fn test_delete_by_run() {
+        let store = MemoryStore::in_memory(mock_embedder()).unwrap();
+
+        let run_scope = WriteScope::Run {
+            repo_id: "r1".into(),
+            run_id: "run_abc".into(),
+        };
+        let meta = WriteMeta::agent_observation("agent1");
+        store.store_scoped(&run_scope, "observation 1", &meta).await.unwrap();
+        store.store_scoped(&run_scope, "observation 2", &meta).await.unwrap();
+
+        let deleted = store.delete_by_run("run_abc").await.unwrap();
+        assert_eq!(deleted, 2);
+
+        // Verify empty
+        let remaining = store.query_by_run("run_abc").await.unwrap();
+        assert!(remaining.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_query_by_run() {
+        let store = MemoryStore::in_memory(mock_embedder()).unwrap();
+
+        let run_scope = WriteScope::Run {
+            repo_id: "r1".into(),
+            run_id: "run_xyz".into(),
+        };
+        let meta = WriteMeta::agent_observation("fixer");
+        store.store_scoped(&run_scope, "found issue in auth module", &meta).await.unwrap();
+        store.store_scoped(&run_scope, "fixed permissions check", &meta).await.unwrap();
+
+        let memories = store.query_by_run("run_xyz").await.unwrap();
+        assert_eq!(memories.len(), 2);
+        assert!(memories.iter().all(|m| m.scope_level == 4));
     }
 }
