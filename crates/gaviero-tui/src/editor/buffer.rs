@@ -774,8 +774,9 @@ impl Buffer {
             }
             _ => {}
         }
-        // Code: collapse brackets then reindent
-        let collapsed = collapse_multiline_constructs(content);
+        // Code: expand collapsed content, then re-collapse simple constructs, then reindent
+        let expanded = expand_single_line_constructs(content);
+        let collapsed = collapse_multiline_constructs(&expanded);
         if let (Some(_), Some(query_ref)) = (&self.tree, &self.indent_query) {
             if let Some(parser) = &mut self.parser {
                 if let Some(new_tree) = parser.parse(&collapsed, None) {
@@ -799,14 +800,18 @@ impl Buffer {
             }
             _ => {}
         }
-        // Code: reindent only (preserve line structure)
-        if let (Some(tree), Some(query)) = (&self.tree, &self.indent_query) {
-            let reindented = treesitter_reindent(content, tree, query, &self.indent_unit);
-            self.apply_formatted(content, &reindented, "re-indent")
-        } else {
-            let reindented = gaviero_core::indent::bracket::reindent_document(content, &self.indent_unit);
-            self.apply_formatted(content, &reindented, "re-indent")
+        // Code: expand collapsed constructs, then reindent
+        let expanded = expand_single_line_constructs(content);
+        if let Some(parser) = &mut self.parser {
+            if let Some(new_tree) = parser.parse(&expanded, None) {
+                if let Some(query) = &self.indent_query {
+                    let reindented = treesitter_reindent(&expanded, &new_tree, query, &self.indent_unit);
+                    return self.apply_formatted(content, &reindented, "re-indent");
+                }
+            }
         }
+        let reindented = gaviero_core::indent::bracket::reindent_document(&expanded, &self.indent_unit);
+        self.apply_formatted(content, &reindented, "re-indent")
     }
 
     /// Expanded (2): One element per line, everything expanded.
@@ -1130,8 +1135,10 @@ impl Buffer {
             return;
         }
 
-        // Normalize line endings: strip \r
-        let text = &text.replace('\r', "");
+        // Normalize line endings: \r\n → \n, standalone \r → \n
+        // Terminals often convert \n to \r in bracketed paste events,
+        // so standalone \r must become \n rather than being stripped.
+        let text = &text.replace("\r\n", "\n").replace('\r', "\n");
 
         self.delete_selection();
 
@@ -1709,6 +1716,124 @@ fn treesitter_reindent(
     }
 
     result
+}
+
+/// Expand single-line bracket constructs into multi-line form.
+///
+/// Inserts newlines after `{` / `[` and before `}` / `]` when
+/// non-trivial content follows/precedes them on the same line.
+/// This is the inverse of `collapse_multiline_constructs` and ensures
+/// that `treesitter_reindent` has proper line structure to work with.
+fn expand_single_line_constructs(content: &str) -> String {
+    let mut result = String::with_capacity(content.len() * 2);
+    let mut in_string = false;
+    let mut in_raw_string = false;
+    let mut in_line_comment = false;
+
+    let chars: Vec<char> = content.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        let ch = chars[i];
+
+        // Track raw strings: #"..."#
+        if !in_string && !in_line_comment && ch == '#' && i + 1 < len && chars[i + 1] == '"' {
+            in_raw_string = true;
+            result.push(ch);
+            i += 1;
+            result.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        if in_raw_string && ch == '"' && i + 1 < len && chars[i + 1] == '#' {
+            in_raw_string = false;
+            result.push(ch);
+            i += 1;
+            result.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        // Track regular strings
+        if !in_raw_string && !in_line_comment && ch == '"' {
+            in_string = !in_string;
+            result.push(ch);
+            i += 1;
+            continue;
+        }
+
+        // Track line comments
+        if !in_string && !in_raw_string && ch == '/' && i + 1 < len && chars[i + 1] == '/' {
+            in_line_comment = true;
+        }
+        if in_line_comment {
+            if ch == '\n' {
+                in_line_comment = false;
+            }
+            result.push(ch);
+            i += 1;
+            continue;
+        }
+
+        // Inside strings — pass through
+        if in_string || in_raw_string {
+            result.push(ch);
+            i += 1;
+            continue;
+        }
+
+        match ch {
+            '{' | '[' => {
+                result.push(ch);
+                // If there's non-whitespace content after the opener on this line,
+                // insert a newline
+                if has_content_before_eol(&chars, i + 1) {
+                    result.push('\n');
+                }
+            }
+            '}' | ']' => {
+                // If there's non-whitespace content before the closer on this line,
+                // insert a newline before it
+                if has_content_after_last_newline(&result) {
+                    result.push('\n');
+                }
+                result.push(ch);
+            }
+            _ => {
+                result.push(ch);
+            }
+        }
+
+        i += 1;
+    }
+
+    result
+}
+
+/// Check if there is non-whitespace content between position `start` and the next newline.
+fn has_content_before_eol(chars: &[char], start: usize) -> bool {
+    for j in start..chars.len() {
+        match chars[j] {
+            '\n' => return false,
+            c if c.is_whitespace() => continue,
+            _ => return true,
+        }
+    }
+    false
+}
+
+/// Check if there is non-whitespace content on the current line (after the last newline in result).
+fn has_content_after_last_newline(result: &str) -> bool {
+    for ch in result.chars().rev() {
+        match ch {
+            '\n' => return false,
+            c if c.is_whitespace() => continue,
+            _ => return true,
+        }
+    }
+    // No newline found — check if there's any content at all
+    result.chars().any(|c| !c.is_whitespace())
 }
 
 /// Collapse multi-line bracket constructs back to single lines.
