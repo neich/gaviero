@@ -6,8 +6,6 @@
 //! - `impl Trait for Type` → Implements edges
 //! - Test annotations → TestedBy edges
 
-use std::collections::HashMap;
-
 use super::store::{EdgeKind, GraphStore, NodeKind};
 
 /// A raw reference extracted from source code, before cross-file resolution.

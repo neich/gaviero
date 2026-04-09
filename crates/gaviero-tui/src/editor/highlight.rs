@@ -252,6 +252,38 @@ mod tests {
     }
 
     #[test]
+    fn test_gaviero_highlight_pipeline() {
+        use crate::theme::Theme;
+
+        let lang = gaviero_core::tree_sitter::language_for_extension("gaviero")
+            .expect("should have gaviero language");
+        let config = load_highlight_config(lang.clone(), "gaviero")
+            .expect("should load gaviero highlights");
+
+        let mut parser = gaviero_core::Parser::new();
+        parser.set_language(&lang).unwrap();
+        let source = "client opus { tier expensive model \"claude-opus-4-6\" }\n\nagent scan {\n    description \"Scan\"\n    client opus\n    memory {\n        read_ns [\"shared\"]\n        importance 0.9\n    }\n}\n";
+        let rope = ropey::Rope::from_str(source);
+        let tree = parser.parse(source, None).unwrap();
+
+        let theme = Theme::builtin_default();
+        let spans = run_highlights(&tree, &rope, &config, &theme, 0..source.len());
+        assert!(!spans.is_empty(), "should produce highlight spans for gaviero code");
+
+        // Keywords should be purple
+        let keyword_spans: Vec<_> = spans.iter()
+            .filter(|s| s.style.fg == Some(ratatui::style::Color::Rgb(198, 120, 221)))
+            .collect();
+        assert!(!keyword_spans.is_empty(), "should produce purple spans for gaviero keywords");
+
+        // Strings should be green
+        let string_spans: Vec<_> = spans.iter()
+            .filter(|s| s.style.fg == Some(ratatui::style::Color::Rgb(152, 195, 121)))
+            .collect();
+        assert!(!string_spans.is_empty(), "should produce green spans for gaviero strings");
+    }
+
+    #[test]
     fn test_json_highlight_pipeline() {
         use crate::theme::Theme;
 

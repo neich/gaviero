@@ -27,6 +27,10 @@
       "required": true,
       "types": [
         {
+          "type": "context_block",
+          "named": true
+        },
+        {
           "type": "identifier",
           "named": true
         },
@@ -36,6 +40,10 @@
         },
         {
           "type": "integer",
+          "named": true
+        },
+        {
+          "type": "memory_block",
           "named": true
         },
         {
@@ -52,6 +60,11 @@
         }
       ]
     }
+  },
+  {
+    "type": "boolean",
+    "named": true,
+    "fields": {}
   },
   {
     "type": "client_declaration",
@@ -100,6 +113,40 @@
     }
   },
   {
+    "type": "context_block",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "context_field",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "context_field",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "integer",
+          "named": true
+        },
+        {
+          "type": "string_list",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "identifier_list",
     "named": true,
     "fields": {},
@@ -109,6 +156,90 @@
       "types": [
         {
           "type": "identifier",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "loop_block",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "loop_field",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "loop_field",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier_list",
+          "named": true
+        },
+        {
+          "type": "integer",
+          "named": true
+        },
+        {
+          "type": "until_clause",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "memory_block",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "memory_field",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "memory_field",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "float",
+          "named": true
+        },
+        {
+          "type": "integer",
+          "named": true
+        },
+        {
+          "type": "raw_string",
+          "named": true
+        },
+        {
+          "type": "string",
+          "named": true
+        },
+        {
+          "type": "string_list",
           "named": true
         }
       ]
@@ -143,6 +274,10 @@
       "required": true,
       "types": [
         {
+          "type": "boolean",
+          "named": true
+        },
+        {
           "type": "string_list",
           "named": true
         }
@@ -174,6 +309,40 @@
     }
   },
   {
+    "type": "step_list",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "loop_block",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "strategy_value",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": false,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "string_list",
     "named": true,
     "fields": {},
@@ -196,6 +365,108 @@
     "type": "tier_value",
     "named": true,
     "fields": {}
+  },
+  {
+    "type": "until_agent",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "until_clause",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "until_agent",
+          "named": true
+        },
+        {
+          "type": "until_command",
+          "named": true
+        },
+        {
+          "type": "until_verify",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "until_command",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "raw_string",
+          "named": true
+        },
+        {
+          "type": "string",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "until_verify",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "verify_field",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "verify_block",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "verify_field",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "verify_field",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "boolean",
+          "named": true
+        }
+      ]
+    }
   },
   {
     "type": "workflow_declaration",
@@ -225,11 +496,27 @@
       "required": true,
       "types": [
         {
-          "type": "identifier_list",
+          "type": "boolean",
           "named": true
         },
         {
           "type": "integer",
+          "named": true
+        },
+        {
+          "type": "memory_block",
+          "named": true
+        },
+        {
+          "type": "step_list",
+          "named": true
+        },
+        {
+          "type": "strategy_value",
+          "named": true
+        },
+        {
+          "type": "verify_block",
           "named": true
         }
       ]
@@ -248,12 +535,44 @@
     "named": false
   },
   {
+    "type": "agents",
+    "named": false
+  },
+  {
+    "type": "attempts",
+    "named": false
+  },
+  {
+    "type": "callers_of",
+    "named": false
+  },
+  {
+    "type": "cheap",
+    "named": false
+  },
+  {
     "type": "client",
+    "named": false
+  },
+  {
+    "type": "clippy",
+    "named": false
+  },
+  {
+    "type": "command",
     "named": false
   },
   {
     "type": "comment",
     "named": true
+  },
+  {
+    "type": "compile",
+    "named": false
+  },
+  {
+    "type": "context",
+    "named": false
   },
   {
     "type": "coordinator",
@@ -264,7 +583,15 @@
     "named": false
   },
   {
+    "type": "depth",
+    "named": false
+  },
+  {
     "type": "description",
+    "named": false
+  },
+  {
+    "type": "escalate_after",
     "named": false
   },
   {
@@ -272,8 +599,32 @@
     "named": false
   },
   {
+    "type": "expensive",
+    "named": false
+  },
+  {
+    "type": "false",
+    "named": false
+  },
+  {
+    "type": "float",
+    "named": true
+  },
+  {
     "type": "identifier",
     "named": true
+  },
+  {
+    "type": "impact_scope",
+    "named": false
+  },
+  {
+    "type": "impact_tests",
+    "named": false
+  },
+  {
+    "type": "importance",
+    "named": false
   },
   {
     "type": "integer",
@@ -281,6 +632,14 @@
   },
   {
     "type": "local_only",
+    "named": false
+  },
+  {
+    "type": "loop",
+    "named": false
+  },
+  {
+    "type": "max_iterations",
     "named": false
   },
   {
@@ -293,6 +652,10 @@
   },
   {
     "type": "mechanical",
+    "named": false
+  },
+  {
+    "type": "memory",
     "named": false
   },
   {
@@ -320,7 +683,19 @@
     "named": true
   },
   {
+    "type": "read_limit",
+    "named": false
+  },
+  {
+    "type": "read_ns",
+    "named": false
+  },
+  {
     "type": "read_only",
+    "named": false
+  },
+  {
+    "type": "read_query",
     "named": false
   },
   {
@@ -328,7 +703,19 @@
     "named": false
   },
   {
+    "type": "refine",
+    "named": false
+  },
+  {
     "type": "scope",
+    "named": false
+  },
+  {
+    "type": "single_pass",
+    "named": false
+  },
+  {
+    "type": "staleness_sources",
     "named": false
   },
   {
@@ -336,15 +723,51 @@
     "named": false
   },
   {
+    "type": "strategy",
+    "named": false
+  },
+  {
     "type": "string",
     "named": true
+  },
+  {
+    "type": "test",
+    "named": false
+  },
+  {
+    "type": "test_first",
+    "named": false
+  },
+  {
+    "type": "tests_for",
+    "named": false
   },
   {
     "type": "tier",
     "named": false
   },
   {
+    "type": "true",
+    "named": false
+  },
+  {
+    "type": "until",
+    "named": false
+  },
+  {
+    "type": "verify",
+    "named": false
+  },
+  {
     "type": "workflow",
+    "named": false
+  },
+  {
+    "type": "write_content",
+    "named": false
+  },
+  {
+    "type": "write_ns",
     "named": false
   },
   {

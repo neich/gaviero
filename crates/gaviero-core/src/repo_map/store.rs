@@ -6,7 +6,7 @@
 //! Supports incremental updates via file-hash diffing and blast-radius queries
 //! via recursive CTE.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};

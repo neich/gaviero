@@ -17,7 +17,7 @@ use crate::observer::AcpObserver;
 use crate::swarm::backend::runner::run_backend;
 use crate::swarm::models::{AgentStatus, WorkUnit};
 use crate::types::{FileScope, ModelTier, PrivacyLevel};
-use crate::validation_gate::{ValidationGate, ValidationPipeline, ValidationResult};
+use crate::validation_gate::ValidationPipeline;
 use crate::write_gate::{WriteGatePipeline, WriteMode};
 
 // ── TestGenerator ─────────────────────────────────────────────────────────────

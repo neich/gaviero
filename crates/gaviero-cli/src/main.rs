@@ -136,14 +136,11 @@ struct Cli {
 }
 
 /// CLI observer that prints agent events to stderr, mirroring agent chat output.
-struct CliAcpObserver {
-    /// Label printed in the agent header (e.g. "task-0").
-    agent_id: String,
-}
+struct CliAcpObserver;
 
 impl CliAcpObserver {
-    fn new(agent_id: &str) -> Self {
-        Self { agent_id: agent_id.to_string() }
+    fn new() -> Self {
+        Self
     }
 }
 
@@ -393,7 +390,7 @@ async fn main() -> Result<()> {
             coord_config,
             memory,
             &swarm_observer,
-            |agent_id| Box::new(CliAcpObserver::new(agent_id)) as Box<dyn gaviero_core::observer::AcpObserver>,
+            |_| Box::new(CliAcpObserver::new()) as Box<dyn gaviero_core::observer::AcpObserver>,
         ).await?;
 
         let plan_path = if let Some(ref out) = cli.output {
@@ -467,7 +464,7 @@ async fn main() -> Result<()> {
         initial_state,
         memory,
         &swarm_observer,
-        |agent_id| Box::new(CliAcpObserver::new(agent_id)) as Box<dyn gaviero_core::observer::AcpObserver>,
+        |_| Box::new(CliAcpObserver::new()) as Box<dyn gaviero_core::observer::AcpObserver>,
     ).await?;
 
     // Output results
