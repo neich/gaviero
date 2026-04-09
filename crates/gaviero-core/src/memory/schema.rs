@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Increment when adding a new migration.
-const CURRENT_VERSION: u32 = 3;
+const CURRENT_VERSION: u32 = 4;
 
 /// Run all pending migrations on the given connection.
 ///
@@ -30,6 +30,9 @@ pub fn run_migrations(conn: &Connection, embedding_dims: usize) -> Result<()> {
     }
     if version < 3 {
         migrate_v3(conn, embedding_dims).context("migration v3")?;
+    }
+    if version < 4 {
+        migrate_v4(conn, embedding_dims).context("migration v4")?;
     }
 
     // Stamp the current version
@@ -195,6 +198,171 @@ fn migrate_v3(conn: &Connection, embedding_dims: usize) -> Result<()> {
     Ok(())
 }
 
+/// v4: Hierarchical scope columns, content_hash dedup, FTS5, access log, scoped vec table.
+///
+/// Adds scope hierarchy (global → workspace → repo → module → run) to the memories table.
+/// Creates FTS5 full-text index for hybrid vector + keyword search.
+/// Creates access log for cross-scope promotion heuristics.
+/// Creates a new scope-partitioned vec table alongside the existing one.
+fn migrate_v4(conn: &Connection, embedding_dims: usize) -> Result<()> {
+    let add_column_if_missing = |col: &str, typedef: &str| -> Result<()> {
+        let has_col: bool = conn
+            .prepare(&format!(
+                "SELECT * FROM pragma_table_info('memories') WHERE name = '{col}'"
+            ))
+            .and_then(|mut stmt| stmt.query_row([], |_| Ok(true)))
+            .unwrap_or(false);
+        if !has_col {
+            conn.execute_batch(&format!(
+                "ALTER TABLE memories ADD COLUMN {col} {typedef};"
+            ))
+            .with_context(|| format!("adding {col} column"))?;
+        }
+        Ok(())
+    };
+
+    // -- Scope hierarchy columns --
+    add_column_if_missing("scope_level", "INTEGER NOT NULL DEFAULT 2")?; // default = repo
+    add_column_if_missing("scope_path", "TEXT NOT NULL DEFAULT 'workspace'")?;
+    add_column_if_missing("repo_id", "TEXT")?;
+    add_column_if_missing("module_path", "TEXT")?;
+    add_column_if_missing("run_id", "TEXT")?;
+    add_column_if_missing("content_hash", "TEXT")?;
+    add_column_if_missing("memory_type", "TEXT NOT NULL DEFAULT 'factual'")?;
+    add_column_if_missing("trust", "TEXT NOT NULL DEFAULT 'medium'")?;
+    add_column_if_missing("tag", "TEXT")?;
+
+    // -- Indexes for scope queries --
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_memories_scope
+             ON memories(scope_level, repo_id, module_path);
+         CREATE INDEX IF NOT EXISTS idx_memories_content_hash
+             ON memories(content_hash);
+         CREATE INDEX IF NOT EXISTS idx_memories_type
+             ON memories(memory_type);
+         CREATE INDEX IF NOT EXISTS idx_memories_run
+             ON memories(run_id);"
+    )
+    .context("creating scope indexes")?;
+
+    // -- Populate content_hash for existing rows --
+    // We use SQLite's built-in hex() + sha256 (via Rust) to fill this.
+    // Since SQLite doesn't have SHA-256 built in, we do it in a loop.
+    {
+        let mut stmt = conn.prepare(
+            "SELECT id, content FROM memories WHERE content_hash IS NULL"
+        )?;
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut update = conn.prepare(
+            "UPDATE memories SET content_hash = ?1 WHERE id = ?2"
+        )?;
+        for (id, content) in &rows {
+            let hash = content_hash(content);
+            update.execute(rusqlite::params![hash, id])?;
+        }
+    }
+
+    // -- Migrate existing namespace → scope columns --
+    // Map old namespace conventions to scope levels:
+    //   "user:*"         → repo level, trust=high
+    //   "agents:*"       → run level
+    //   "verification:*" → run level
+    //   "tiers:*"        → run level
+    //   everything else  → repo level
+    // Existing convention: swarm memories use key patterns like "agents:run:agent",
+    // "verification:run", "tiers:run". User memories use "user:*".
+    // Match on both namespace and key patterns.
+    conn.execute_batch(
+        "UPDATE memories SET scope_level = 4, trust = 'medium'
+         WHERE (namespace LIKE 'agents:%' OR key LIKE 'agents:%') AND scope_level = 2;
+         UPDATE memories SET scope_level = 4, trust = 'medium'
+         WHERE (namespace LIKE 'verification:%' OR key LIKE 'verification:%') AND scope_level = 2;
+         UPDATE memories SET scope_level = 4, trust = 'medium'
+         WHERE (namespace LIKE 'tiers:%' OR key LIKE 'tiers:%') AND scope_level = 2;
+         UPDATE memories SET trust = 'high'
+         WHERE key LIKE 'user:%' AND trust = 'medium';"
+    )
+    .context("migrating namespace to scope")?;
+
+    // -- FTS5 full-text search (standalone, not content-synced) --
+    // Standalone FTS avoids trigger complexity with UPSERT/ON CONFLICT.
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+            content,
+            tokenize='porter unicode61'
+        );"
+    )
+    .context("creating FTS5 table")?;
+
+    // Populate FTS from existing data
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO memories_fts(rowid, content)
+         SELECT id, content FROM memories;"
+    )
+    .context("populating FTS5")?;
+
+    // FTS sync triggers — keep FTS in sync with memories table.
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS memories_fts_ai AFTER INSERT ON memories BEGIN
+            INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS memories_fts_ad AFTER DELETE ON memories BEGIN
+            DELETE FROM memories_fts WHERE rowid = old.id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS memories_fts_au AFTER UPDATE OF content ON memories BEGIN
+            DELETE FROM memories_fts WHERE rowid = old.id;
+            INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
+        END;"
+    )
+    .context("creating FTS sync triggers")?;
+
+    // -- Scope-partitioned vector table --
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories_scoped USING vec0(
+            memory_id   INTEGER PRIMARY KEY,
+            embedding   float[{embedding_dims}],
+            scope_level INTEGER
+        );"
+    ))
+    .context("creating scoped vec table")?;
+
+    // Copy existing vectors into scoped table with scope_level from memories
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO vec_memories_scoped(memory_id, embedding, scope_level)
+         SELECT v.memory_id, v.embedding, m.scope_level
+         FROM vec_memories v
+         JOIN memories m ON m.id = v.memory_id;"
+    )
+    .context("migrating vectors to scoped table")?;
+
+    // -- Access log for cross-scope promotion heuristics --
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS memory_access_log (
+            memory_id   INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+            repo_id     TEXT,
+            module_path TEXT,
+            accessed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_access_log_memory
+            ON memory_access_log(memory_id);"
+    )
+    .context("creating access log table")?;
+
+    Ok(())
+}
+
+/// Compute SHA-256 hash of normalized content for dedup.
+pub fn content_hash(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let normalized = content.trim().to_lowercase();
+    let digest = Sha256::digest(normalized.as_bytes());
+    format!("{:x}", digest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,5 +476,118 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_v4_scope_columns() {
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+
+        // Verify v4 columns exist
+        for col in &[
+            "scope_level", "scope_path", "repo_id", "module_path",
+            "run_id", "content_hash", "memory_type", "trust", "tag",
+        ] {
+            let has: bool = conn
+                .prepare(&format!(
+                    "SELECT * FROM pragma_table_info('memories') WHERE name = '{col}'"
+                ))
+                .and_then(|mut stmt| stmt.query_row([], |_| Ok(true)))
+                .unwrap_or(false);
+            assert!(has, "missing v4 column: {col}");
+        }
+
+        // Verify FTS5 table exists
+        let has_fts: bool = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='memories_fts'")
+            .and_then(|mut stmt| stmt.query_row([], |_| Ok(true)))
+            .unwrap_or(false);
+        assert!(has_fts, "memories_fts should exist");
+
+        // Verify scoped vec table exists
+        let has_vec_scoped: bool = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='vec_memories_scoped'")
+            .and_then(|mut stmt| stmt.query_row([], |_| Ok(true)))
+            .unwrap_or(false);
+        assert!(has_vec_scoped, "vec_memories_scoped should exist");
+
+        // Verify access log table exists
+        let has_access_log: bool = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='memory_access_log'")
+            .and_then(|mut stmt| stmt.query_row([], |_| Ok(true)))
+            .unwrap_or(false);
+        assert!(has_access_log, "memory_access_log should exist");
+    }
+
+    #[test]
+    fn test_v4_content_hash_backfill() {
+        let conn = setup_conn();
+        // Run through v3 first
+        migrate_v1(&conn).unwrap();
+        migrate_v2(&conn).unwrap();
+        migrate_v3(&conn, 8).unwrap();
+        conn.pragma_update(None, "user_version", 3u32).unwrap();
+
+        // Insert some data at v3 level (no content_hash column yet)
+        conn.execute(
+            "INSERT INTO memories (namespace, key, content) VALUES ('ns', 'k1', 'hello world')",
+            [],
+        )
+        .unwrap();
+
+        // Run v4 migration
+        run_migrations(&conn, 8).unwrap();
+
+        // Verify content_hash was backfilled
+        let hash: String = conn
+            .query_row(
+                "SELECT content_hash FROM memories WHERE key = 'k1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!hash.is_empty());
+        assert_eq!(hash, content_hash("hello world"));
+    }
+
+    #[test]
+    fn test_v4_namespace_to_scope_migration() {
+        let conn = setup_conn();
+        migrate_v1(&conn).unwrap();
+        migrate_v2(&conn).unwrap();
+        migrate_v3(&conn, 8).unwrap();
+        conn.pragma_update(None, "user_version", 3u32).unwrap();
+
+        // Insert agent-generated and user memories
+        conn.execute(
+            "INSERT INTO memories (namespace, key, content) VALUES ('default', 'agents:run1:fix', 'agent memory')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO memories (namespace, key, content) VALUES ('default', 'user:note', 'user memory')",
+            [],
+        ).unwrap();
+
+        run_migrations(&conn, 8).unwrap();
+
+        // Agent memory should be scope_level 4 (run)
+        let level: i32 = conn
+            .query_row(
+                "SELECT scope_level FROM memories WHERE key = 'agents:run1:fix'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(level, 4);
+
+        // User memory should have trust=high
+        let trust: String = conn
+            .query_row(
+                "SELECT trust FROM memories WHERE key = 'user:note'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(trust, "high");
     }
 }
