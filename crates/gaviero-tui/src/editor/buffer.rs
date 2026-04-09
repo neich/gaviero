@@ -758,8 +758,8 @@ impl Buffer {
         format!("Format level: {}", self.format_level.label())
     }
 
-    /// Compact (0): Maximum density. Collapse simple constructs to single lines.
-    /// JSON: inline everything possible. Code: collapse + reindent.
+    /// Compact (0): Maximum density. Blocks stay multi-line but short lists
+    /// are collapsed to single lines. JSON: inline everything possible.
     fn format_compact(&mut self, lang: &str, content: &str) -> String {
         match lang {
             "json" => {
@@ -774,23 +774,14 @@ impl Buffer {
             }
             _ => {}
         }
-        // Code: expand collapsed content, then re-collapse simple constructs, then reindent
-        let expanded = expand_single_line_constructs(content);
-        let collapsed = collapse_multiline_constructs(&expanded);
-        if let (Some(_), Some(query_ref)) = (&self.tree, &self.indent_query) {
-            if let Some(parser) = &mut self.parser {
-                if let Some(new_tree) = parser.parse(&collapsed, None) {
-                    let reindented = treesitter_reindent(&collapsed, &new_tree, query_ref, &self.indent_unit);
-                    return self.apply_formatted(content, &reindented, "compact");
-                }
-            }
-        }
-        let reindented = gaviero_core::indent::bracket::reindent_document(&collapsed, &self.indent_unit);
-        self.apply_formatted(content, &reindented, "compact")
+        let expanded = expand_single_line_constructs(content, ExpandMode::BracesOnly);
+        let split = self.split_fields_in_blocks(&expanded);
+        let split = if lang == "gaviero" { insert_declaration_separators(&split) } else { split };
+        let collapsed = collapse_multiline_constructs(&split);
+        self.reindent_and_apply(content, &collapsed, "compact")
     }
 
-    /// Normal (1): Expand objects/dicts to one key per line, but keep
-    /// short arrays/lists inline. Best balance of readability and density.
+    /// Normal (1): One field per line, short lists inline, everything else expanded.
     fn format_normal(&mut self, lang: &str, content: &str) -> String {
         match lang {
             "json" => {
@@ -800,22 +791,14 @@ impl Buffer {
             }
             _ => {}
         }
-        // Code: expand collapsed constructs, then reindent
-        let expanded = expand_single_line_constructs(content);
-        if let Some(parser) = &mut self.parser {
-            if let Some(new_tree) = parser.parse(&expanded, None) {
-                if let Some(query) = &self.indent_query {
-                    let reindented = treesitter_reindent(&expanded, &new_tree, query, &self.indent_unit);
-                    return self.apply_formatted(content, &reindented, "re-indent");
-                }
-            }
-        }
-        let reindented = gaviero_core::indent::bracket::reindent_document(&expanded, &self.indent_unit);
-        self.apply_formatted(content, &reindented, "re-indent")
+        let expanded = expand_single_line_constructs(content, ExpandMode::All);
+        let split = self.split_fields_in_blocks(&expanded);
+        let split = if lang == "gaviero" { insert_declaration_separators(&split) } else { split };
+        let collapsed = collapse_multiline_constructs(&split);
+        self.reindent_and_apply(content, &collapsed, "normal")
     }
 
-    /// Expanded (2): One element per line, everything expanded.
-    /// Full reformat via external tools or built-in pretty-printers.
+    /// Expanded (2): One element per line, everything expanded — no collapsing.
     fn format_expanded(&mut self, lang: &str, content: &str) -> String {
         // Try external tools first
         let external_result = match lang {
@@ -842,8 +825,35 @@ impl Buffer {
             }
             _ => {}
         }
-        // Fall back to normal
-        self.format_normal(lang, content)
+        let expanded = expand_single_line_constructs(content, ExpandMode::All);
+        let split = self.split_fields_in_blocks(&expanded);
+        let split = if lang == "gaviero" { insert_declaration_separators(&split) } else { split };
+        self.reindent_and_apply(content, &split, "expanded")
+    }
+
+    /// Parse content with tree-sitter and insert newlines between sibling
+    /// fields within block nodes that share a line.
+    fn split_fields_in_blocks(&mut self, content: &str) -> String {
+        if let Some(parser) = &mut self.parser {
+            if let Some(tree) = parser.parse(content, None) {
+                return split_block_fields(content, &tree);
+            }
+        }
+        content.to_string()
+    }
+
+    /// Parse the text with tree-sitter and reindent, falling back to bracket counting.
+    fn reindent_and_apply(&mut self, original: &str, text: &str, method: &str) -> String {
+        if let Some(parser) = &mut self.parser {
+            if let Some(new_tree) = parser.parse(text, None) {
+                if let Some(query) = &self.indent_query {
+                    let reindented = treesitter_reindent(text, &new_tree, query, &self.indent_unit);
+                    return self.apply_formatted(original, &reindented, method);
+                }
+            }
+        }
+        let reindented = gaviero_core::indent::bracket::reindent_document(text, &self.indent_unit);
+        self.apply_formatted(original, &reindented, method)
     }
 
     /// Try formatting with an external tool. Returns None if tool not found.
@@ -1659,8 +1669,8 @@ impl Buffer {
 /// Pretty-print JSON using serde_json.
 /// Reindent a document using tree-sitter indent queries.
 ///
-/// Computes the expected indent for each line using `compute_indent` in
-/// pure TreeSitter mode (not hybrid), and replaces wrong indentation.
+/// Computes the expected indent for each line using tree-sitter indent
+/// queries and replaces wrong indentation.
 /// Lines with correct indentation are left unchanged.
 fn treesitter_reindent(
     content: &str,
@@ -1673,6 +1683,11 @@ fn treesitter_reindent(
         return content.to_string();
     }
 
+    // Build capture map ONCE for the whole document instead of per-line.
+    let capture_map = gaviero_core::indent::treesitter::build_document_capture_map(
+        tree, query, content.as_bytes(),
+    );
+
     let mut result = String::with_capacity(content.len());
 
     for (i, line) in content.lines().enumerate() {
@@ -1684,16 +1699,26 @@ fn treesitter_reindent(
         }
 
         // Compute expected indent for this line by placing cursor at end of previous line
-        let expected_level = if i > 0 {
+        let raw_level = if i > 0 {
             let prev_line_text: String = rope.line(i - 1).into();
             let prev_trimmed_len = prev_line_text.trim_end_matches('\n').len();
             let cursor_byte = rope.line_to_byte(i - 1) + prev_trimmed_len;
-            let r = gaviero_core::indent::treesitter::compute_treesitter_indent(
-                &rope, tree, query, cursor_byte, true, 4, indent_unit,
+            let r = gaviero_core::indent::treesitter::indent_for_cursor(
+                &rope, tree, &capture_map, cursor_byte, 4, indent_unit,
             );
             r.level.max(0) as usize
         } else {
             0
+        };
+
+        // Closing delimiters belong one level up relative to block content.
+        // The cursor-on-previous-line heuristic doesn't see the `@outdent` on
+        // the closing token itself, so we subtract one level manually.
+        let first_char = trimmed.chars().next().unwrap_or(' ');
+        let expected_level = if matches!(first_char, '}' | ']') {
+            raw_level.saturating_sub(1)
+        } else {
+            raw_level
         };
 
         // Compare actual whitespace against expected
@@ -1718,13 +1743,131 @@ fn treesitter_reindent(
     result
 }
 
+/// Use the tree-sitter parse tree to insert newlines between sibling
+/// named children of block nodes that share a line. This ensures each
+/// field in a declaration block gets its own line.
+fn split_block_fields(content: &str, tree: &gaviero_core::Tree) -> String {
+    let mut splits: Vec<usize> = Vec::new();
+    collect_field_boundaries(tree.root_node(), &mut splits);
+
+    if splits.is_empty() {
+        return content.to_string();
+    }
+
+    splits.sort_unstable();
+    splits.dedup();
+
+    let bytes = content.as_bytes();
+    let mut result = String::with_capacity(content.len() + splits.len() * 2);
+    let mut last = 0;
+
+    for &pos in &splits {
+        // Trim trailing spaces before the split point
+        let mut trim_end = pos;
+        while trim_end > last && (bytes[trim_end - 1] == b' ' || bytes[trim_end - 1] == b'\t') {
+            trim_end -= 1;
+        }
+        result.push_str(&content[last..trim_end]);
+        result.push('\n');
+        last = pos;
+    }
+    result.push_str(&content[last..]);
+
+    result
+}
+
+/// Recursively walk the tree, collecting byte positions where a newline
+/// should be inserted before a named child that shares a line with its
+/// previous sibling inside a block node.
+fn collect_field_boundaries(node: gaviero_core::Node, splits: &mut Vec<usize>) {
+    // Block-like parents whose named children should each be on their own line.
+    let is_block = matches!(
+        node.kind(),
+        "client_declaration"
+            | "agent_declaration"
+            | "workflow_declaration"
+            | "scope_block"
+            | "memory_block"
+            | "verify_block"
+            | "context_block"
+            | "loop_block"
+            | "until_verify"
+    );
+
+    if is_block {
+        let count = node.named_child_count();
+        let mut prev_end_row = None;
+        for i in 0..count {
+            if let Some(child) = node.named_child(i) {
+                let start_row = child.start_position().row;
+                if let Some(prev_row) = prev_end_row {
+                    if start_row == prev_row {
+                        splits.push(child.start_byte());
+                    }
+                }
+                prev_end_row = Some(child.end_position().row);
+            }
+        }
+    }
+
+    // Recurse into all named children
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            collect_field_boundaries(child, splits);
+        }
+    }
+}
+
+/// Ensure a blank line appears before each top-level declaration keyword
+/// (`client`, `agent`, `workflow`) that follows other content.
+///
+/// Operates purely on text — must be called after block splitting so each
+/// declaration already starts on its own line.
+fn insert_declaration_separators(content: &str) -> String {
+    const DECL_KEYWORDS: &[&str] = &["client ", "agent ", "workflow "];
+    let mut result = String::with_capacity(content.len() + 64);
+    let mut first_content = true;
+    let mut prev_was_blank = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let is_decl = DECL_KEYWORDS.iter().any(|kw| trimmed.starts_with(kw));
+
+        if is_decl && !first_content && !prev_was_blank {
+            result.push('\n');
+        }
+
+        result.push_str(line);
+        result.push('\n');
+
+        prev_was_blank = trimmed.is_empty();
+        if !trimmed.is_empty() {
+            first_content = false;
+        }
+    }
+
+    if !content.ends_with('\n') && result.ends_with('\n') {
+        result.pop();
+    }
+
+    result
+}
+
+/// Controls which delimiters `expand_single_line_constructs` splits on.
+#[derive(Clone, Copy)]
+enum ExpandMode {
+    /// Expand only `{` / `}` — blocks become multi-line, lists stay inline.
+    BracesOnly,
+    /// Expand both `{` / `}` and `[` / `]` — everything becomes multi-line.
+    All,
+}
+
 /// Expand single-line bracket constructs into multi-line form.
 ///
-/// Inserts newlines after `{` / `[` and before `}` / `]` when
-/// non-trivial content follows/precedes them on the same line.
-/// This is the inverse of `collapse_multiline_constructs` and ensures
-/// that `treesitter_reindent` has proper line structure to work with.
-fn expand_single_line_constructs(content: &str) -> String {
+/// Inserts newlines after opening delimiters and before closing delimiters
+/// when non-trivial content follows/precedes them on the same line.
+/// The `mode` parameter controls whether only braces or also brackets are expanded.
+fn expand_single_line_constructs(content: &str, mode: ExpandMode) -> String {
     let mut result = String::with_capacity(content.len() * 2);
     let mut in_string = false;
     let mut in_raw_string = false;
@@ -1783,25 +1926,29 @@ fn expand_single_line_constructs(content: &str) -> String {
             continue;
         }
 
-        match ch {
-            '{' | '[' => {
-                result.push(ch);
-                // If there's non-whitespace content after the opener on this line,
-                // insert a newline
-                if has_content_before_eol(&chars, i + 1) {
-                    result.push('\n');
-                }
+        let is_expandable = match ch {
+            '{' | '}' => true,
+            '[' | ']' => matches!(mode, ExpandMode::All),
+            _ => false,
+        };
+
+        if !is_expandable {
+            result.push(ch);
+        } else if ch == '{' || ch == '[' {
+            result.push(ch);
+            if has_content_before_eol(&chars, i + 1) {
+                result.push('\n');
             }
-            '}' | ']' => {
-                // If there's non-whitespace content before the closer on this line,
-                // insert a newline before it
-                if has_content_after_last_newline(&result) {
-                    result.push('\n');
-                }
-                result.push(ch);
+        } else {
+            // '}' or ']'
+            if has_content_after_last_newline(&result) {
+                result.push('\n');
             }
-            _ => {
-                result.push(ch);
+            result.push(ch);
+            // If there is non-whitespace content after this closing delimiter on
+            // the same line, start a new line so the next token isn't glued to '}'.
+            if has_content_before_eol(&chars, i + 1) {
+                result.push('\n');
             }
         }
 
