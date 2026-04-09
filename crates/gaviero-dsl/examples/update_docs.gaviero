@@ -56,9 +56,12 @@ agent write_claude_md {
     scope {
         owned     [
             "CLAUDE.md"
-            "crates/"
+            "crates/gaviero-core/CLAUDE.md"
+            "crates/gaviero-dsl/CLAUDE.md"
+            "crates/gaviero-tui/CLAUDE.md"
+            "crates/gaviero-cli/CLAUDE.md"
         ]
-        read_only ["src/" "Cargo.toml"]
+        read_only ["src/" "crates/" "Cargo.toml"]
     }
     prompt #"
         Using the inventory report, rewrite all CLAUDE.md files.
@@ -86,9 +89,12 @@ agent write_readme_md {
     scope {
         owned     [
             "README.md"
-            "crates/"
+            "crates/gaviero-core/README.md"
+            "crates/gaviero-dsl/README.md"
+            "crates/gaviero-tui/README.md"
+            "crates/gaviero-cli/README.md"
         ]
-        read_only ["src/" "Cargo.toml"]
+        read_only ["src/" "crates/" "Cargo.toml"]
     }
     prompt #"
         Using the inventory report, rewrite all README.md files.
@@ -115,9 +121,12 @@ agent write_architecture_md {
     scope {
         owned     [
             "ARCHITECTURE.md"
-            "crates/"
+            "crates/gaviero-core/ARCHITECTURE.md"
+            "crates/gaviero-dsl/ARCHITECTURE.md"
+            "crates/gaviero-tui/ARCHITECTURE.md"
+            "crates/gaviero-cli/ARCHITECTURE.md"
         ]
-        read_only ["src/" "Cargo.toml"]
+        read_only ["src/" "crates/" "Cargo.toml"]
     }
     prompt #"
         Using the inventory report, rewrite all ARCHITECTURE.md files.

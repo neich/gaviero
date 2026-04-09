@@ -2,11 +2,11 @@
 
 A terminal code editor built for working with AI coding agents. Gaviero gives you a full editing environment — file tree, syntax highlighting, git integration, embedded terminal — alongside a conversation panel where you chat with Claude agents that can read and modify your code. Every change an agent proposes passes through an interactive review before it touches disk.
 
-There is also a headless CLI for running agent tasks from scripts or CI.
+There is also a headless CLI for running agent tasks from scripts or CI, and a declarative DSL for composing multi-agent workflows.
 
 ## Quick start
 
-```
+```bash
 cargo build --release
 ./target/release/gaviero ~/my-project
 ```
@@ -136,8 +136,8 @@ Model routing is automatic — the coordinator annotates each subtask with a tie
 | Tier | Model | Used for |
 |---|---|---|
 | Coordinator | Opus | Planning, decomposition, verification |
-| Reasoning | Sonnet | Complex multi-file semantic changes |
-| Execution | Haiku | Focused single-file tasks |
+| Expensive | Sonnet | Complex multi-file semantic changes |
+| Cheap | Haiku | Focused single-file tasks |
 | Mechanical | Ollama (local) | Rote/trivial changes (falls back to Haiku) |
 
 Individual work units can override the tier with an explicit `model` field.
@@ -164,13 +164,13 @@ Memory namespaces are configured per-project in `.gaviero/settings.json`.
 
 Run agent tasks without the editor:
 
-```
+```bash
 gaviero-cli --repo ~/my-project --task "fix all compilation errors" --auto-accept
 ```
 
 For coordinated multi-agent tasks:
 
-```
+```bash
 gaviero-cli --repo ~/my-project \
   --task "add comprehensive test coverage for the API layer" \
   --coordinated \
@@ -185,14 +185,68 @@ In coordinated mode, model selection is automatic — Opus plans the task, then 
 |---|---|
 | `--repo PATH` | Workspace root (default: current directory) |
 | `--task TEXT` | Task description (creates one agent) |
+| `--script FILE` | Compile and execute a `.gaviero` workflow file |
 | `--work-units JSON` | WorkUnit array for multi-agent tasks |
 | `--coordinated` | Use Opus to plan, then tier-routed execution (ignores `--model`) |
+| `--output PATH` | Output path for generated plan file (`--coordinated` only) |
 | `--auto-accept` | Skip interactive review |
 | `--max-parallel N` | Parallel agent limit (default: 1) |
 | `--model NAME` | Claude model for single-agent mode (default: sonnet) |
 | `--namespace NS` | Memory write namespace |
 | `--read-ns NS` | Additional read namespaces (repeatable) |
 | `--format text\|json` | Output format |
+| `--max-retries N` | Inner validation-feedback retries (default: 5) |
+| `--attempts N` | Independent attempts for BestOfN strategy (default: 1) |
+| `--test-first` | Generate failing tests before editing (TDD) |
+| `--no-iterate` | Single pass only — disables retry loop |
+| `--resume` | Skip already-completed agents from a prior run |
+| `--trace FILE` | Write DEBUG-level JSON trace log |
+
+## Workflow scripts
+
+Reusable multi-agent workflows are defined in `.gaviero` files using the Gaviero DSL. The DSL compiler produces execution plans that the swarm engine runs.
+
+```gaviero
+client sonnet { tier cheap  model "claude-sonnet-4-6" }
+client opus   { tier expensive model "claude-opus-4-6" }
+
+agent reviewer {
+    description "Review the PR and identify issues"
+    client opus
+    scope { read_only ["src/" "tests/"] }
+    prompt "Review the code changes and list all bugs and style issues."
+}
+
+agent fixer {
+    description "Fix all issues found by the reviewer"
+    client sonnet
+    depends_on [reviewer]
+    scope {
+        owned     ["src/" "tests/"]
+        impact_scope true     // auto-expand read_only with blast-radius files
+    }
+    context {
+        callers_of ["src/auth/session.rs"]   // include callers in context
+        tests_for  ["src/auth/"]             // include related test files
+        depth      2
+    }
+    prompt "Fix every issue in the reviewer's list."
+    max_retries 3
+}
+
+workflow review_and_fix {
+    steps [reviewer fixer]
+    verify {
+        compile true
+        clippy  true
+        impact_tests true   // run only tests affected by modified files
+    }
+}
+```
+
+Run with `gaviero-cli --script review.gaviero` or `/run review.gaviero` in the TUI.
+
+See [crates/gaviero-dsl/README.md](crates/gaviero-dsl/README.md) for the full language reference.
 
 ## Configuration
 
@@ -237,13 +291,15 @@ Color schemes live in `themes/` as TOML files. The default theme is One Dark ins
 
 ## Architecture at a glance
 
-Gaviero is a Cargo workspace with three crates:
+Gaviero is a Cargo workspace with five crates:
 
 | Crate | Role |
 |---|---|
-| `gaviero-core` | All logic: write gate, diffs, tree-sitter (16 languages), agent subprocess management, swarm orchestration, git (via git2), semantic memory, terminal PTY |
+| `gaviero-core` | All logic: write gate, diffs, tree-sitter (16 languages), agent subprocess management, swarm orchestration, repo map (PageRank context), semantic memory, git (via git2), terminal PTY |
 | `gaviero-tui` | Terminal UI: ratatui + crossterm rendering, panels, input handling |
 | `gaviero-cli` | Headless runner: clap argument parsing, stdout observers |
+| `gaviero-dsl` | Compiler for `.gaviero` workflow scripts → `CompiledPlan` DAGs |
+| `tree-sitter-gaviero` | Tree-sitter grammar bindings for `.gaviero` DSL files |
 
 Core never depends on any UI crate. The TUI communicates with core pipelines through observer traits and a single event channel.
 

@@ -88,6 +88,20 @@ pub enum Token {
     #[token("command")]
     KwCommand,
 
+    // ── Graph / impact keywords ─────────────────────────────────
+    #[token("impact_scope")]
+    KwImpactScope,
+    #[token("impact_tests")]
+    KwImpactTests,
+    #[token("context")]
+    KwContext,
+    #[token("callers_of")]
+    KwCallersOf,
+    #[token("tests_for")]
+    KwTestsFor,
+    #[token("depth")]
+    KwDepth,
+
     // ── Tier value keywords ──────────────────────────────────────
     #[token("coordinator")]
     TierCoordinator,
@@ -190,6 +204,12 @@ impl fmt::Display for Token {
             Token::KwAgents => write!(f, "agents"),
             Token::KwMaxIterations => write!(f, "max_iterations"),
             Token::KwCommand => write!(f, "command"),
+            Token::KwImpactScope => write!(f, "impact_scope"),
+            Token::KwImpactTests => write!(f, "impact_tests"),
+            Token::KwContext => write!(f, "context"),
+            Token::KwCallersOf => write!(f, "callers_of"),
+            Token::KwTestsFor => write!(f, "tests_for"),
+            Token::KwDepth => write!(f, "depth"),
             Token::StratSinglePass => write!(f, "single_pass"),
             Token::StratRefine => write!(f, "refine"),
             Token::TierCoordinator => write!(f, "coordinator"),
@@ -434,5 +454,17 @@ mod tests {
         assert!(matches!(toks[2].0, Token::KwAgents));
         assert!(matches!(toks[3].0, Token::KwMaxIterations));
         assert!(matches!(toks[4].0, Token::KwCommand));
+    }
+
+    #[test]
+    fn graph_keywords() {
+        let (toks, errs) = lex("impact_scope impact_tests context callers_of tests_for depth");
+        assert!(errs.is_empty(), "lex errors: {:?}", errs);
+        assert!(matches!(toks[0].0, Token::KwImpactScope));
+        assert!(matches!(toks[1].0, Token::KwImpactTests));
+        assert!(matches!(toks[2].0, Token::KwContext));
+        assert!(matches!(toks[3].0, Token::KwCallersOf));
+        assert!(matches!(toks[4].0, Token::KwTestsFor));
+        assert!(matches!(toks[5].0, Token::KwDepth));
     }
 }

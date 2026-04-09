@@ -2,7 +2,7 @@
 
 > Terminal code editor for AI agent orchestration, written in Rust 2024.
 
-**Binaries:** `Gaviero` (TUI editor), `Gaviero-cli` (headless swarm runner)
+**Binaries:** `gaviero` (TUI editor), `gaviero-cli` (headless swarm runner)
 **Platform:** Linux (primary), any POSIX with a modern terminal
 **Build:** `cargo build` from workspace root — no external tooling
 
@@ -12,205 +12,236 @@
 
 ```
                  ┌──────────────┐     ┌──────────────┐
-                 │  Gaviero-tui │     │  Gaviero-cli │
+                 │  gaviero-tui │     │  gaviero-cli │
                  │  (binary)    │     │  (binary)    │
                  └──────┬───────┘     └──────┬───────┘
                         │                    │
-                        ▼                    ▼
-                 ┌─────────────────────────────────┐
-                 │          Gaviero-core            │
-                 │          (library)               │
-                 └─────────────────────────────────┘
+                        ├────────┬───────────┤
+                        ▼        ▼           ▼
+                 ┌────────────┐  ┌────────────────┐
+                 │gaviero-core│  │  gaviero-dsl   │
+                 │  (library) │  │  (library)     │
+                 └──────┬─────┘  └───────┬────────┘
+                        │                │
+                        │◄───────────────┘  (dsl depends on core)
+                        │
+                 ┌──────┴──────────────┐
+                 │ tree-sitter-gaviero │
+                 │ (grammar crate)     │
+                 └─────────────────────┘
 ```
 
-**Separation rule:** All pipeline logic lives in `Gaviero-core`. The TUI crate contains only rendering and input handling. The CLI crate contains only argument parsing and observer implementations. Core can be tested without any UI dependency.
+**Separation rule:** All pipeline logic lives in `gaviero-core`. The TUI crate contains only rendering and input handling. The CLI crate contains only argument parsing and observer implementations. The DSL crate contains only `.gaviero` language compilation. Core can be tested without any UI dependency.
 
 | Crate | Role | Key dependencies |
 |---|---|---|
-| `Gaviero-core` | Logic: write gate, diff, tree-sitter, ACP, swarm, memory, git, terminal | tokio, tree-sitter (0.24) + 16 langs, git2, rusqlite, ort, similar, ropey, portable-pty, vt100 |
-| `Gaviero-tui` | TUI editor binary | Gaviero-core, ratatui (0.30), crossterm (0.29), notify, arboard, png |
-| `Gaviero-cli` | Headless swarm runner | Gaviero-core, clap, tokio |
+| `gaviero-core` | Logic: write gate, diff, tree-sitter, ACP, swarm, memory, git, terminal, repo map, iteration, validation | tokio, tree-sitter 0.25 + 16 langs, git2, rusqlite + sqlite-vec, ort, petgraph, similar, ropey, portable-pty, vt100, reqwest, async-trait, futures |
+| `gaviero-tui` | TUI editor binary | gaviero-core, gaviero-dsl, ratatui 0.30, crossterm 0.29, notify, arboard, tui-term |
+| `gaviero-cli` | Headless swarm runner | gaviero-core, gaviero-dsl, clap, tokio |
+| `gaviero-dsl` | `.gaviero` DSL compiler | gaviero-core, logos, chumsky, miette, thiserror |
+| `tree-sitter-gaviero` | Tree-sitter grammar for `.gaviero` syntax highlighting | tree-sitter (build-time C grammar compilation) |
 
-Tree-sitter types are re-exported from `Gaviero-core::lib.rs` (`Language`, `Tree`, `Parser`, `Query`, `QueryCursor`, `InputEdit`, `Node`, `Point`). Downstream crates never depend on `tree-sitter` directly.
+Tree-sitter types are re-exported from `gaviero-core::lib.rs` (`Language`, `Tree`, `Parser`, `Query`, `QueryCursor`, `InputEdit`, `Node`, `Point`). Downstream crates never depend on `tree-sitter` directly.
 
 ---
 
 ## 2. Module Map
 
-### Gaviero-core/src/
+### gaviero-core/src/ (18 public modules)
 
 ```
-lib.rs                      Re-exports, module declarations (14 public modules)
-types.rs                    FileScope, DiffHunk, HunkType, WriteProposal, StructuralHunk, NodeInfo, SymbolKind
+lib.rs                      Re-exports tree-sitter types; declares 18 pub modules
+types.rs                    FileScope, DiffHunk, HunkType, WriteProposal, StructuralHunk, NodeInfo,
+                            SymbolKind, ModelTier, PrivacyLevel, TierAnnotation, EntryMetadata
 workspace.rs                Workspace model, WorkspaceFolder, settings cascade (cached)
 session_state.rs            SessionState, TabState, PanelState, StoredConversation
-tree_sitter.rs              Unified LANGUAGE_REGISTRY (16 langs), enrich_hunks(), language_for/name_for_extension()
-diff_engine.rs              compute_hunks() — similar crate wrapper
+tree_sitter.rs              LANGUAGE_REGISTRY (16 langs), enrich_hunks(), language_for/name_for_extension()
+diff_engine.rs              compute_hunks() — similar crate wrapper → Vec<DiffHunk>
 write_gate.rs               WriteGatePipeline, WriteMode, proposal management
 observer.rs                 WriteGateObserver, AcpObserver, SwarmObserver trait definitions
-git.rs                      GitRepo (git2 wrapper), WorktreeManager, FileStatus
+scope_enforcer.rs           Path-level read/write permission checks + hardcoded block-list
+git.rs                      GitRepo (git2 wrapper), WorktreeManager, GitCoordinator, FileStatus
 query_loader.rs             Tree-sitter .scm file discovery (env var → exe dir → cwd → bundled)
-acp/
-  session.rs                AcpSession, AgentOptions: spawn Claude subprocess, NDJSON read/write
-  protocol.rs               StreamEvent enum, ToolUseInfo, NDJSON parsing
-  client.rs                 AcpPipeline: prompt enrichment, file block detection, proposal routing
-swarm/
-  models.rs                 WorkUnit, AgentBackend, AgentManifest, AgentStatus, SwarmResult, MergeResult
-  validation.rs             validate_scopes() (overlap detection), dependency_tiers() (Kahn's)
-  runner.rs                 AgentRunner: single WorkUnit execution
-  pipeline.rs               SwarmPipeline: tier orchestration, parallel execution, merge
-  merge.rs                  MergeResolver: git merge + Claude-powered conflict resolution
-  planner.rs                TaskPlanner: natural language → WorkUnit decomposition
-  bus.rs                    AgentBus: broadcast + targeted inter-agent messaging
-memory/
-  embedder.rs               Embedder trait (embed, embed_batch, dimensions, model_id)
-  onnx_embedder.rs          OnnxEmbedder: ort + tokenizers, mean pooling, L2 normalization
-  store.rs                  MemoryStore: async SQLite wrapper, brute-force cosine similarity
-  schema.rs                 SQL DDL, migrations (memories table)
-  model_manager.rs          ONNX model download + caching (~/.cache/Gaviero/models/)
-indent/
-  mod.rs                    compute_indent() entry point, IndentResult, IndentHeuristic
-  treesitter.rs             Tree-sitter-based indent
-  heuristic.rs              Hybrid indent (relative delta)
-  bracket.rs                Bracket-counting fallback
-  captures.rs               Tree-sitter capture processing
-  predicates.rs             Indent rule predicates
-  config.rs                 Indent configuration
-  utils.rs                  Shared indent utilities
-terminal/
-  mod.rs                    Exports, Manager → Instance hierarchy
-  types.rs                  TerminalId, ShellState, CommandRecord
-  config.rs                 ShellConfig, ShellType, TerminalConfig
-  instance.rs               TerminalInstance: individual PTY tab
-  manager.rs                TerminalManager: lifecycle, multi-instance coordination
-  pty.rs                    Pseudo-terminal allocation and I/O
-  session.rs                Terminal session state persistence
-  event.rs                  TerminalEvent types
-  osc.rs                    OSC 133 sequence parsing (prompt/command detection)
-  context.rs                Terminal context (cwd, env)
-  history.rs                Command history tracking
-  shell_integration.rs      Shell integration protocol
+indent/                     compute_indent() entry point — tree-sitter, hybrid heuristic, bracket fallback
+terminal/                   TerminalManager → TerminalInstance → PTY (portable-pty + vt100)
+acp/                        AcpSession, AcpPipeline, AcpSessionFactory, NDJSON protocol
+memory/                     MemoryStore (SQLite + sqlite-vec), OnnxEmbedder, CodeGraph, Consolidator
+repo_map/                   RepoMap, FileNode, ContextPlan — PageRank-based context + GraphStore
+iteration/                  IterationEngine, Strategy, IterationConfig, ConvergenceDetector, TestGenerator
+validation_gate/            ValidationPipeline, ValidationGate trait, TreeSitterGate, CargoCheckGate
+swarm/                      Pipeline, Coordinator, TierRouter, AgentBus, SharedBoard, verify/, backend/
 ```
 
-### Gaviero-tui/src/
+### gaviero-tui/src/
 
 ```
 main.rs                     Entry point, terminal setup, event loop, panic handler
 app.rs                      App state, layout rendering, focus management, find bar (~5000 lines)
-event.rs                    Event enum, EventLoop (crossterm/watcher/tick/terminal bridge)
-keymap.rs                   Keybinding definitions, Action enum; Ctrl=editor, Alt=workspace layering
-theme.rs                    Centralized color constants (One Dark), timing constants (poll/tick)
+event.rs                    Event enum (43+ variants), EventLoop (crossterm/watcher/tick/terminal bridge)
+keymap.rs                   KeyEvent → Action mapping; chord-prefix support
+theme.rs                    ~80 colour constants (One Dark), timing constants
+
 editor/
-  mod.rs                    Module re-exports
-  buffer.rs                 Ropey buffer, Cursor, Transaction, undo/redo, FormatLevel, find_next/prev_match
-  view.rs                   EditorView widget: gutter, syntax highlights, scroll, cursor, search highlight
+  buffer.rs                 Ropey buffer, Cursor, Transaction, undo/redo, find_next/prev_match
+  view.rs                   EditorView widget: gutter, syntax highlights, cursor, scrollbar
   diff_overlay.rs           Diff review mode: DiffSource, DiffReviewState, accept/reject per hunk
-  highlight.rs              HighlightConfig, tree-sitter highlight query runner → Vec<StyledSpan>
+  highlight.rs              Tree-sitter highlight query runner → Vec<StyledSpan>
   markdown.rs               Markdown document rendering and editing
+
 panels/
-  mod.rs                    Module re-exports
-  file_tree.rs              Multi-root file browser, git + proposal decorations (uses ScrollState)
-  agent_chat.rs             AgentChatState, Conversation, attachments, @file autocomplete (uses TextInput)
+  file_tree.rs              Multi-root file browser, git + proposal decorations
+  agent_chat.rs             AgentChatState, Conversation, attachments, @file autocomplete
   chat_markdown.rs          ChatLine: markdown rendering for chat messages
-  swarm_dashboard.rs        Agent status table with tier/phase labels (uses ScrollState)
-  git_panel.rs              GitPanelState, staging area, commit (uses TextInput), branch picker
+  swarm_dashboard.rs        Agent status table with tier/phase labels
+  git_panel.rs              GitPanelState, staging area, commit, branch picker
   terminal.rs               Terminal rendering (tui-term), TerminalSelectionState
   status_bar.rs             Mode, file, branch, agent status indicators
-  search.rs                 SearchPanelState, interactive input + live results (uses TextInput, ScrollState)
+  search.rs                 SearchPanelState, interactive input + live results
+
 widgets/
-  mod.rs                    Module re-exports
   tabs.rs                   TabBar widget with close indicators
   scrollbar.rs              Custom scrollbar widget
   scroll_state.rs           ScrollState: shared scroll offset + selection for list panels
-  text_input.rs             TextInput: shared text editing with cursor, selection, undo/redo, word movement
+  text_input.rs             TextInput: shared text editing with cursor, selection, undo/redo
   render_utils.rs           Shared rendering utilities
 ```
 
-### Gaviero-cli/src/
+### gaviero-cli/src/
 
 ```
-main.rs                     clap CLI, CliAcpObserver, CliSwarmObserver, SwarmPipeline launcher
+main.rs                     Cli struct (clap derive), CliAcpObserver, CliSwarmObserver, pipeline launcher
+```
+
+### gaviero-dsl/src/
+
+```
+lib.rs                      pub fn compile(source, filename, workflow, runtime_prompt) → Result<CompiledPlan>
+lexer.rs                    Token enum (logos derive), lex() function
+ast.rs                      Script, Item, ClientDecl, AgentDecl, WorkflowDecl, ContextBlock, ScopeBlock,
+                            MemoryBlock, VerifyBlock, LoopBlock, UntilCondition, StrategyLit, TierLit
+parser.rs                   parse() — chumsky combinators; grammar defined as functions
+compiler.rs                 compile_ast() — 7-phase semantic analysis
+error.rs                    DslError (Lex/Parse/Compile variants), DslErrors (miette wrapper)
 ```
 
 ---
 
 ## 3. Core Abstractions
 
-### FileScope
+### FileScope (`types.rs`)
 
 Defines an agent's permission boundary over the filesystem.
 
 ```
 FileScope {
-    owned_paths: Vec<PathBuf>     Files/dirs the agent may write
-    read_only: Vec<PathBuf>       Files/dirs the agent may read but not write
-    interface_contracts: Vec<String>  API contracts the agent must preserve
+    owned_paths: Vec<String>                   Files/dirs the agent may write
+    read_only_paths: Vec<String>               Files/dirs the agent may read only
+    interface_contracts: HashMap<String,String> API contracts the agent must preserve
 }
 ```
 
 Used by: Write Gate (scope validation), Swarm (overlap detection), Agent Runner (prompt enrichment).
 
-### WriteProposal
-
-A set of proposed file changes pending user review.
-
-```
-WriteProposal {
-    id: u64
-    source: String               Agent ID or "user"
-    path: PathBuf                Target file
-    hunks: Vec<StructuralHunk>   Diff hunks with AST context
-    status: ProposalStatus       Pending | PartiallyAccepted | Accepted | Rejected
-}
-```
-
-### DiffHunk / StructuralHunk
-
-```
-DiffHunk {
-    start_line, end_line: usize   0-indexed line range
-    original: String              Original text
-    proposed: String              New text
-    hunk_type: HunkType           Added | Removed | Modified
-}
-
-StructuralHunk = DiffHunk + {
-    enclosing_node: Option<NodeInfo>   AST context (e.g. "function parse_config")
-    description: String                Human-readable ("Modify lines 10-15 in function 'parse_config'")
-    status: HunkStatus                 Pending | Accepted | Rejected
-}
-```
-
-### WorkUnit
+### WorkUnit (`swarm/models.rs`)
 
 A single task assigned to one swarm agent.
 
 ```
 WorkUnit {
-    id: String
-    description: String
-    scope: FileScope
-    depends_on: Vec<String>       IDs of prerequisite WorkUnits
-    backend: AgentBackend         ClaudeCode | Codex | Custom
-    model: Option<String>         Per-unit model override
+    id: String                                 Unique identifier
+    description: String                        Task description
+    scope: FileScope                           Read/write boundaries
+    depends_on: Vec<String>                    Prerequisite WorkUnit IDs
+    backend: AgentBackend                      ClaudeCode | Ollama | Custom (deprecated enum)
+    model: Option<String>                      Per-unit model override
+    tier: ModelTier                             Cheap | Expensive
+    privacy: PrivacyLevel                      Public | LocalOnly
+    coordinator_instructions: String           Decomposed subtask instructions
+    max_retries: u8                             Max retries before escalation
+    escalation_tier: Option<ModelTier>         Tier to escalate to on failure
+
+    // Memory routing
+    read_namespaces: Option<Vec<String>>       Memory namespaces to read
+    write_namespace: Option<String>            Memory namespace to write to
+    memory_importance: Option<f32>             Importance weight (0.0–1.0)
+    staleness_sources: Vec<String>             Paths for staleness checks
+    memory_read_query: Option<String>          Custom memory search query
+    memory_read_limit: Option<usize>           Custom result limit
+    memory_write_content: Option<String>       Template for memory writes
+
+    // Graph / impact fields
+    impact_scope: bool                         Auto-expand read_only with blast-radius
+    context_callers_of: Vec<String>            Files for caller graph queries
+    context_tests_for: Vec<String>             Paths for test file queries
+    context_depth: u32                          BFS depth for graph queries (default: 2)
 }
 ```
 
-### SwarmResult
+### CompiledPlan (`swarm/plan.rs`)
 
-Aggregate outcome of a swarm execution.
+Immutable execution plan — the output of `gaviero_dsl::compile()` and input to `swarm::pipeline::execute()`.
 
 ```
-SwarmResult {
-    manifests: Vec<AgentManifest>    Per-agent results
-    merge_results: Vec<MergeResult>  Per-branch merge outcomes
-    success: bool
+CompiledPlan {
+    graph: DiGraph<PlanNode, DependencyEdge>   petgraph DAG
+    max_parallel: Option<usize>                 Concurrency cap
+    source_file: Option<PathBuf>               Source .gaviero file
+    iteration_config: IterationConfig          Strategy + retry + escalation config
+    verification_config: VerificationConfig    compile/clippy/test/impact_tests flags
+    loop_configs: Vec<LoopConfig>              Explicit loop configurations
 }
+```
+
+Key methods: `work_units_ordered()` (Kahn's topological sort), `from_work_units()` (flat list → DAG), `hash()` (stable checkpoint naming).
+
+### WriteProposal (`types.rs`)
+
+```
+WriteProposal {
+    id: u64                           Unique proposal ID
+    source: String                    Agent ID or "user"
+    file_path: PathBuf                Target file
+    original_content: String          Before
+    proposed_content: String          After
+    structural_hunks: Vec<StructuralHunk>   DiffHunk + AST context
+    status: ProposalStatus            Pending | PartiallyAccepted | Accepted | Rejected
+}
+```
+
+### AgentBackend trait (`swarm/backend/mod.rs`)
+
+```rust
+#[async_trait]
+trait AgentBackend: Send + Sync {
+    async fn stream_completion(&self, req: CompletionRequest)
+        -> Result<Pin<Box<dyn Stream<Item = Result<UnifiedStreamEvent>> + Send>>>;
+    fn capabilities(&self) -> Capabilities;
+    fn name(&self) -> &str;
+    async fn health_check(&self) -> Result<()>;
+}
+```
+
+`UnifiedStreamEvent` variants: `TextDelta`, `ThinkingDelta`, `ToolCallStart`, `ToolCallDelta`, `ToolCallEnd`, `FileBlock`, `Usage`, `Error`, `Done`.
+
+Implementations: `ClaudeCodeBackend` (ACP subprocess), `OllamaStreamBackend` (HTTP SSE), `MockBackend` (deterministic test fixture).
+
+### Observer traits (`observer.rs`)
+
+```
+WriteGateObserver — on_proposal_created, on_proposal_updated, on_proposal_finalized
+AcpObserver      — on_stream_chunk, on_tool_call_started, on_streaming_status,
+                   on_message_complete, on_proposal_deferred, on_permission_request,
+                   on_validation_result, on_validation_retry
+SwarmObserver    — on_phase_changed, on_agent_state_changed, on_tier_started,
+                   on_merge_conflict, on_completed, on_coordination_started,
+                   on_coordination_complete, on_tier_dispatch, on_escalation,
+                   on_verification_started/step_started/step_complete/complete,
+                   on_cost_update
 ```
 
 ---
 
-## 4. Event Architecture
+## 4. Event Architecture (TUI)
 
 A single `tokio::sync::mpsc::unbounded_channel<Event>` carries all external events to the TUI main loop. No background task mutates application state directly.
 
@@ -224,15 +255,13 @@ A single `tokio::sync::mpsc::unbounded_channel<Event>` carries all external even
 | Terminal bridge | `Terminal(TerminalEvent)` | TerminalManager mpsc → event channel |
 | WriteGateObserver | `ProposalCreated`, `ProposalUpdated`, `ProposalFinalized` | Observer trait impl |
 | AcpObserver | `StreamChunk`, `ToolCallStarted`, `StreamingStatus`, `MessageComplete`, `FileProposalDeferred`, `AcpTaskCompleted` | Observer trait impl |
-| SwarmObserver | `SwarmPhaseChanged`, `SwarmAgentStateChanged`, `SwarmTierStarted`, `SwarmMergeConflict`, `SwarmCompleted` | Observer trait impl |
+| SwarmObserver | `SwarmPhaseChanged`, `SwarmAgentStateChanged`, `SwarmTierStarted`, `SwarmMergeConflict`, `SwarmCompleted`, `SwarmCoordinationStarted`, `SwarmCoordinationComplete`, `SwarmTierDispatch`, `SwarmCostUpdate`, `SwarmDslPlanReady` | Observer trait impl |
 | Memory init | `MemoryReady` | Background spawn → channel |
 
 ### Observer Bridge Pattern
 
-Three observer traits in `Gaviero-core::observer` define callbacks that core pipelines invoke. `AcpObserver` includes five callbacks: `on_stream_chunk`, `on_tool_call_started`, `on_streaming_status`, `on_message_complete`, and `on_proposal_deferred` (for batch review). The TUI crate implements each trait with a struct holding a clone of the event sender:
-
 ```
-                    Gaviero-core                         Gaviero-tui
+                    gaviero-core                         gaviero-tui
               ┌─────────────────────┐            ┌──────────────────────┐
               │  WriteGateObserver  │◄───────────│  TuiWriteGateObserver│
               │  AcpObserver        │◄───────────│  TuiAcpObserver      │
@@ -252,6 +281,7 @@ loop {
     terminal.draw(|frame| app.render(frame));
     event = event_rx.recv().await;
     app.handle_event(event);
+    // drain up to 64 pending events before redrawing
     if app.should_quit { break; }
 }
 ```
@@ -260,12 +290,12 @@ loop {
 
 ## 5. Data Flow: Agent Write Proposal
 
-This is the central pipeline — every agent file write passes through it.
+Every agent file write passes through this pipeline.
 
 ```
-  Agent (AcpSession)
+  Agent (AcpSession / OllamaStream)
     │
-    │  <file path="src/foo.rs">...content...</file>   (detected in NDJSON stream)
+    │  <file path="src/foo.rs">...content...</file>   (detected in stream)
     │
     ▼
   AcpPipeline::propose_write(path, content)
@@ -282,59 +312,82 @@ This is the central pipeline — every agent file write passes through it.
     ├─ 3. BRIEF LOCK: write_gate.insert_proposal(proposal)
     │     ├─ Interactive → queue, fire on_proposal_created() → TUI shows diff overlay
     │     ├─ AutoAccept → accept all, return Some((path, content))
+    │     ├─ Deferred → accumulate for batch review
     │     └─ RejectAll  → discard silently
     │     Release lock
     │
     └─ 4. NO LOCK: if AutoAccept, write content to disk
 ```
 
-**Lock discipline:** The `WriteGatePipeline` Mutex is never held across I/O, tree-sitter parsing, or diff computation. Locks are held only for brief HashMap operations.
+**Lock discipline:** The `WriteGatePipeline` Mutex is never held across I/O, tree-sitter parsing, or diff computation.
 
 ---
 
 ## 6. Data Flow: Swarm Execution
 
 ```
-  SwarmPipeline::execute(work_units, config)
+  swarm::pipeline::execute(plan, config, checkpoint, memory, observer, make_obs)
     │
     ├─ Phase 1: VALIDATE
     │   validate_scopes() → check no owned_path overlaps (O(n^2) pairwise)
-    │   dependency_tiers() → Kahn's topological sort → Vec<Vec<WorkUnitId>>
+    │   work_units_ordered() → Kahn's topological sort from plan graph
+    │   dependency_tiers() → Vec<Vec<WorkUnit>> (parallel groups)
     │
     ├─ Phase 2: EXECUTE (per tier, sequentially)
     │   │
     │   │  Tier N: [A, B, C]  (can run in parallel)
     │   │
     │   ├─ For each WorkUnit (bounded by Semaphore):
-    │   │   ├─ Provision git worktree (branch: Gaviero/{id})
-    │   │   ├─ AgentRunner::run()
-    │   │   │   ├─ Enrich prompt with memory context + scope clause
-    │   │   │   ├─ Spawn AcpSession (WriteMode::AutoAccept)
-    │   │   │   ├─ Stream NDJSON → propose_write for each file block
-    │   │   │   └─ Return AgentManifest
-    │   │   └─ Broadcast completion to AgentBus
+    │   │   ├─ Provision git worktree (branch: gaviero/{id})
+    │   │   ├─ IterationEngine::run()
+    │   │   │   ├─ [test_first] TestGenerator::generate()
+    │   │   │   └─ FOR attempt in 0..n_attempts:
+    │   │   │       escalate model if attempt ≥ escalate_after
+    │   │   │       └─► run_backend()
+    │   │   │           ├─ build_prompt()
+    │   │   │           │   memory context (semantic search)
+    │   │   │           │   file scope clause
+    │   │   │           │   repo_map outline (PageRank-ranked)
+    │   │   │           │   shared_board discoveries
+    │   │   │           │   corrective feedback (on retry)
+    │   │   │           ├─ backend.stream_completion(request)
+    │   │   │           │   → Stream<UnifiedStreamEvent>
+    │   │   │           ├─ FOR EACH FileBlock: write_gate.insert_proposal()
+    │   │   │           └─ ValidationPipeline::run(modified_files)
+    │   │   │               TreeSitterGate → CargoCheckGate
+    │   │   │               PASS → done  |  FAIL → corrective → retry
+    │   │   └─ Broadcast to AgentBus + post to SharedBoard
     │   │
-    │   └─ Collect all manifests for tier
+    │   └─ Checkpoint ExecutionState to disk after each node
     │
-    └─ Phase 3: MERGE (if use_worktrees)
-        For each successful agent branch:
-          git merge --no-ff → main
-          On conflict: MergeResolver queries Claude for resolution
-        Return SwarmResult
+    ├─ Phase 3: MERGE (if use_worktrees)
+    │   For each successful agent branch:
+    │     git merge --no-ff → main
+    │     On conflict: MergeResolver queries Claude for resolution
+    │
+    ├─ Phase 4: VERIFY (optional, per VerificationStrategy)
+    │   StructuralOnly | DiffReview | TestSuite | Combined
+    │   Escalation on failure → re-run failed agents at higher tier
+    │
+    └─ Return SwarmResult { manifests, merge_results, success, pre_swarm_sha }
 ```
+
+### Loop execution
+
+When the plan contains `LoopConfig` entries, agents in the loop repeat until the `LoopUntilCondition` is met or `max_iterations` is reached. Conditions: `Verify` (compile/test pass), `Agent` (judge returns pass), `Command` (exit code 0).
 
 ---
 
 ## 7. Data Flow: Memory Search
 
 ```
-  Caller (AgentRunner / AcpPipeline / MergeResolver)
+  Caller (run_backend / Coordinator / MergeResolver)
     │
-    │  memory.search(namespace, query_text, limit)
+    │  memory.search_context_filtered(namespaces, query, limit, privacy)
     │
     ├─ 1. NO LOCK: embedder.embed(query_text) → Vec<f32>   [CPU-heavy, ONNX inference]
     │
-    ├─ 2. BRIEF LOCK: SELECT * FROM memories WHERE namespace = ?
+    ├─ 2. BRIEF LOCK: SELECT * FROM memories WHERE namespace IN (?)
     │     Release lock
     │
     └─ 3. NO LOCK: cosine_similarity(query_vec, stored_vec) for each row
@@ -353,6 +406,7 @@ Embedding computation (the expensive part) always runs outside the Mutex. The lo
 |---|---|---|
 | `Interactive` | Queue proposals for TUI review (accept/reject per hunk) | Normal editor usage |
 | `AutoAccept` | Accept all scope-valid writes immediately, write to disk | Swarm execution |
+| `Deferred` | Accumulate proposals for batch review after agent turn | TUI agent chat |
 | `RejectAll` | Silently discard all proposals | Safety fallback |
 
 ### Proposal Lifecycle
@@ -365,10 +419,6 @@ Created (Pending) ──► User reviews hunks ──► Accepted / PartiallyAcc
                                               content from accepted hunks,
                                               write to disk
 ```
-
-### TUI Diff Overlay Keybinds
-
-`]h`/`[h` navigate hunks, `a`/`r` accept/reject current hunk, `A`/`R` accept/reject all, `f` finalize, `q` exit review.
 
 ### Structural Awareness
 
@@ -390,9 +440,7 @@ claude --print --output-format stream-json \
        --add-dir <cwd>
 ```
 
-The prompt is written to stdin (then closed). Stdout emits NDJSON (one JSON object per line).
-
-### NDJSON Protocol (StreamEvent)
+### NDJSON Protocol (`acp/protocol.rs`)
 
 | Type | Content |
 |---|---|
@@ -402,17 +450,9 @@ The prompt is written to stdin (then closed). Stdout emits NDJSON (one JSON obje
 | `AssistantMessage` | Complete message `{ text, has_tool_use }` |
 | `ResultEvent` | Final result `{ is_error, result_text, duration_ms, cost_usd }` |
 
-### File Block Detection
+### AcpSessionFactory (`acp/factory.rs`)
 
-The system prompt instructs the agent to output complete file content as:
-
-```xml
-<file path="relative/path">
-...full file content...
-</file>
-```
-
-`AcpPipeline` scans the accumulated response text incrementally for complete `<file>` blocks, extracts path + content, and routes each through `propose_write()`.
+Manages session lifecycle: `one_shot()` for single prompts, `persistent()` for multi-turn conversations, `kill_all()` for cleanup. `SessionMode` distinguishes `OneShot` from `PersistentSession`.
 
 ### Tool Restriction
 
@@ -422,45 +462,63 @@ Agents receive only read-only tools (`Read`, `Glob`, `Grep`). No `Edit`, `Write`
 
 ## 10. Swarm Orchestration
 
-### Scope Validation
+### Scope Validation (`swarm/validation.rs`)
 
 `validate_scopes()` performs O(n^2) pairwise comparison of `owned_paths` across all WorkUnits. Two agents cannot own the same file or overlapping directory prefixes.
 
 ### Dependency Tiers
 
-`dependency_tiers()` applies Kahn's algorithm (topological sort) to the dependency graph defined by `WorkUnit.depends_on`. Returns `Vec<Vec<String>>` — each inner vec is a tier of units that can execute in parallel. Detects cycles → `CycleError`.
+`dependency_tiers()` applies Kahn's algorithm to the dependency graph. Returns `Vec<Vec<String>>` — each inner vec is a tier of units that can execute in parallel.
 
-```
-Example: A depends on nothing, B depends on A, C depends on A, D depends on B+C
+### Tier Router (`swarm/router.rs`)
 
-Tiers: [[A], [B, C], [D]]
-         │      │       │
-         ▼      ▼       ▼
-        Tier 0  Tier 1  Tier 2
-       (serial) (parallel) (serial)
-```
+`TierRouter` maps `(ModelTier, PrivacyLevel)` → `ResolvedBackend` using `TierConfig`:
+- `Cheap + Public` → Claude Haiku
+- `Expensive + Public` → Claude Sonnet/Opus
+- `LocalOnly` → Ollama (if enabled) or `Blocked`
 
-### Parallel Execution
+### Privacy Scanner (`swarm/privacy.rs`)
 
-Within a tier, agents run concurrently up to `config.max_parallel`, bounded by a `tokio::sync::Semaphore`.
+`PrivacyScanner` overrides coordinator-suggested privacy levels to `LocalOnly` when file paths match configured glob patterns. Safety net — privacy is never purely LLM-determined.
 
-### Git Worktree Isolation
+### Calibration (`swarm/calibration.rs`)
 
-When `use_worktrees = true`:
-- Each agent gets its own branch: `Gaviero/{work_unit_id}`
-- Each agent gets its own worktree: `.Gaviero/worktrees/{work_unit_id}/`
-- `WorktreeManager` guarantees cleanup via `Drop`
-- All git operations use the `git2` crate (never CLI)
+`TierStats` tracks per-tier success rates across runs. Stored to memory after each swarm run for future coordinator tier-assignment improvement.
 
-### Merge Resolution
+### Replanner (`swarm/replanner.rs`)
 
-After all tiers complete, branches merge into main via `git merge --no-ff`. Conflicts trigger `MergeResolver` which reads conflict markers, queries Claude for resolution, writes the clean file, stages, and commits.
+`Replanner` handles dynamic replanning after agent failures. `ReplanDecision`: `Continue`, `RetryFailed`, `RevisePlan(CompiledPlan)`, `Abort`.
 
-### Agent Bus
+### Verification (`swarm/verify/`)
 
-`AgentBus` provides inter-agent communication via tokio channels:
+Post-merge verification with four strategies:
+
+| Strategy | Description |
+|---|---|
+| `StructuralOnly` | Tree-sitter parse check for ERROR/MISSING nodes |
+| `DiffReview` | LLM reviews diffs (batched per-unit, per-tier, or aggregate) |
+| `TestSuite` | Run test command, optionally targeted to affected files |
+| `Combined` | All three in sequence with early termination + escalation |
+
+Reports: `StructuralReport`, `DiffReviewReport`, `TestReport`, `CombinedReport`.
+
+### Coordinator (`swarm/coordinator.rs`)
+
+Opus-powered task decomposition. Produces `TaskDAG { units, dependency_graph, verification_strategy }`. The coordinator queries memory for prior run calibration and repo context.
+
+### Shared Board (`swarm/board.rs`)
+
+Agents post tagged findings during execution. Detected by parsing `[discovery: <tag>] <content>` patterns. Downstream agents receive filtered board content.
+
+### Agent Bus (`swarm/bus.rs`)
+
+`AgentBus` provides inter-agent communication:
 - `broadcast(from, content)` → all agents via `broadcast::channel`
-- `send_to(from, to, content)` → targeted agent via per-agent `mpsc::UnboundedSender`
+- `send_to(from, to, content)` → targeted via per-agent `mpsc::UnboundedSender`
+
+### Checkpoint/Resume (`swarm/execution_state.rs`)
+
+`ExecutionState` tracks per-node `NodeStatus` (Pending → Blocked → Ready → Running → Completed | SoftFailure | HardFailure). Serialized to `.gaviero/state/{plan_hash}.json` after each node. `--resume` loads checkpoint and skips completed nodes.
 
 ---
 
@@ -469,53 +527,34 @@ After all tiers complete, branches merge into main via `git merge --no-ff`. Conf
 ### Architecture
 
 ```
-┌─────────────────────────────┐
-│        MemoryStore          │
-│  ┌───────────┐ ┌─────────┐ │
-│  │ rusqlite  │ │Embedder │ │
-│  │ Connection│ │ (ONNX)  │ │
-│  │ (Mutex)   │ │         │ │
-│  └───────────┘ └─────────┘ │
-└─────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│                   MemoryStore                       │
+│  ┌───────────┐  ┌─────────┐  ┌───────────────────┐ │
+│  │ rusqlite  │  │Embedder │  │ Consolidator      │ │
+│  │ Connection│  │ (ONNX)  │  │ (dedup + merge)   │ │
+│  │ (Mutex)   │  │         │  │                   │ │
+│  └───────────┘  └─────────┘  └───────────────────┘ │
+└─────────────────────────────────────────────────────┘
 ```
 
 - **Embedder trait:** `embed(text) → Vec<f32>`, `embed_batch(texts)`, `dimensions()`, `model_id()`
-- **OnnxEmbedder:** Uses `ort` (ONNX Runtime) + `tokenizers` crate. CUDA-first with CPU fallback. L2-normalized output vectors.
-- **Default model:** e5-small-v2 (384 dimensions). Alternative: EmbeddingGemma-300M (256-768 dims).
-- **Search:** Brute-force cosine similarity (dot product on L2-normalized vectors). No ANN index.
+- **OnnxEmbedder:** `ort` (ONNX Runtime) + `tokenizers`, mean pooling, L2 normalization
+- **Search:** brute-force cosine similarity (dot product on L2-normalized vectors). No ANN index.
+- **Consolidation:** on store, similarity thresholds trigger: >0.85 reinforce, 0.7–0.85 flag for merge, <0.7 normal insert
 
-### Schema
+### Code Knowledge Graph (`memory/code_graph.rs`, `repo_map/store.rs`)
 
-```sql
-CREATE TABLE memories (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    namespace  TEXT NOT NULL,
-    key        TEXT NOT NULL,
-    content    TEXT NOT NULL,
-    embedding  BLOB,
-    model_id   TEXT,
-    metadata   TEXT,
-    created_at TEXT DEFAULT (datetime('now')),
-    updated_at TEXT DEFAULT (datetime('now')),
-    UNIQUE(namespace, key)
-);
-```
+SQLite-backed directed graph of code structure:
+- **Nodes:** `File`, `Function`, `Struct`, `Trait`, `Enum`, `Test` — with qualified names and file hashes
+- **Edges:** `Imports`, `Calls`, `Implements`, `TestedBy`, `Contains`
+- **Incremental builds:** `graph_builder.rs` compares file hashes, re-indexes only changed files
+- **Blast-radius queries:** recursive CTE finds all transitively affected files
 
-### Namespace Conventions
+### Repo Map (`repo_map/`)
 
-| Namespace pattern | Purpose |
-|---|---|
-| `project:{name}` | Project-level facts, outlines |
-| `project:{name}:agents` | Agent execution summaries |
-| `project:{name}:sessions` | Conversation memories |
-| `global` | Cross-project knowledge |
+`RepoMap::build(workspace_root)` → walks git-tracked files, extracts symbols (tree-sitter), builds reference graph.
 
-### Integration Points
-
-- **SwarmPipeline** stores outlines and results after execution
-- **AcpPipeline** enriches prompts with semantic search results
-- **MergeResolver** queries interface contracts during conflict resolution
-- Memory is `Option<Arc<MemoryStore>>` — `None` before M3
+`rank_for_agent(owned_paths, token_budget)` → `ContextPlan { full_content, signatures, repo_outline, token_estimate }`. Personalized PageRank seeds from owned paths. Outline prepended to agent prompts.
 
 ---
 
@@ -523,37 +562,23 @@ CREATE TABLE memories (
 
 ### Language Registry
 
-16 languages supported: Rust, Java, JavaScript, TypeScript, HTML, CSS, JSON, Bash, TOML, C, C++, LaTeX, Python, YAML, Kotlin. Markdown is recognized for `language_name_for_extension()` but has no tree-sitter parser.
-
-A single `LANGUAGE_REGISTRY` table (array of `(extensions, name, Option<GrammarFn>)`) is the source of truth for all extension → language mappings. Both `language_for_extension(ext)` and `language_name_for_extension(ext)` delegate to `lookup_extension()` which queries this table. Unknown extensions degrade gracefully — no parsing, plain diffs.
+16 languages: Rust, Java, JavaScript, TypeScript, HTML, CSS, JSON, Bash, TOML, C, C++, LaTeX, Python, YAML, Kotlin, Gaviero DSL. A single `LANGUAGE_REGISTRY` table is the source of truth.
 
 ### Structural Enrichment
 
-`enrich_hunks(hunks, original, language) → Vec<StructuralHunk>`:
+`enrich_hunks(hunks, original, language) → Vec<StructuralHunk>`: parse original, walk AST to find enclosing named node per hunk (function, class, struct), extract identifier name, generate description.
 
-1. Parse `original` with tree-sitter
-2. For each hunk, walk up the AST from the hunk's line to find the enclosing named node (function, class, struct, enum, trait, impl, method)
-3. Extract the node's identifier name
-4. Generate human-readable description
+### Syntax Highlighting (TUI)
 
-### Syntax Highlighting
-
-`highlight.rs` (TUI crate) runs tree-sitter highlight queries against the buffer's cached AST. Queries are loaded from `queries/{lang}/highlights.scm` (sourced from Helix, MIT licensed). Only the visible viewport range is processed.
+`highlight.rs` runs tree-sitter highlight queries against the buffer's cached AST. Only the visible viewport range is processed. Queries from `queries/{lang}/highlights.scm` (Helix-sourced, MIT).
 
 ### Indentation Engine
 
-`indent/` module provides auto-indent via:
-1. **Tree-sitter queries** (`queries/{lang}/indents.scm`) — preferred when available
-2. **Hybrid heuristic** — relative delta from nearby line's actual indent
-3. **Bracket counting** — fallback for unsupported languages
+`indent/` module: tree-sitter queries → hybrid heuristic → bracket counting fallback.
 
 ---
 
 ## 13. Terminal Subsystem
-
-The `terminal/` module in `Gaviero-core` implements a Manager → Instance architecture for embedded shell sessions.
-
-### Architecture
 
 ```
 ┌─────────────────────────────────────────┐
@@ -566,43 +591,23 @@ The `terminal/` module in `Gaviero-core` implements a Manager → Instance archi
 │  │  └─────────┘ │  │  └─────────┘ │    │
 │  └──────────────┘  └──────────────┘    │
 │                                         │
-│  event_tx ──► mpsc::Receiver<TerminalEvent> ──► TUI EventLoop bridge
+│  event_tx ──► mpsc::Receiver ──► TUI EventLoop bridge
 └─────────────────────────────────────────┘
 ```
 
-### Components
-
-| Module | Role |
-|---|---|
-| `types.rs` | `TerminalId`, `ShellState` (Idle, Running, Exited), `CommandRecord` |
-| `config.rs` | `ShellConfig`, `ShellType` (Bash, Zsh, Fish, Custom), `TerminalConfig` |
-| `instance.rs` | `TerminalInstance`: owns one PTY child, vt100 parser, output buffer |
-| `manager.rs` | `TerminalManager`: creates/destroys instances, routes input, provides event channel |
-| `pty.rs` | PTY allocation via `portable-pty`, reader/writer split, background output reader |
-| `session.rs` | Session state persistence (cwd, env, scroll position) |
-| `event.rs` | `TerminalEvent` enum (Output, Exited, Bell, TitleChanged) |
-| `osc.rs` | OSC 133 sequence parsing — detects prompt start/end and command boundaries |
-| `context.rs` | Terminal context (working directory, environment variables) |
-| `history.rs` | Command history tracking per instance |
-| `shell_integration.rs` | Shell integration protocol for enhanced prompt detection |
-
-### Data Flow
-
-PTY output is read continuously by a background task per instance, parsed through vt100, and forwarded as `TerminalEvent::Output` to the `TerminalManager` event channel. The TUI `EventLoop::spawn_terminal_bridge()` forwards these events into the unified `Event` channel.
+Manager → Instance → PTY (`portable-pty`). vt100 for escape sequence parsing. OSC 133 for prompt/command boundary detection. Per-instance `HISTFILE`, environment isolation.
 
 ---
 
 ## 14. TUI Layout
-
-Fixed 5-region layout (no floating windows):
 
 ```
 ┌──────────────────────────────────────────────────┐
 │                    Tab Bar                        │
 ├────────┬──────────────────────────┬───────────────┤
 │        │                          │               │
-│  File  │        Editor            │  Side Panel   │
-│  Tree  │     (center, largest)    │ (Agent Chat / │
+│  Left  │        Editor            │  Side Panel   │
+│ Panel  │     (center, largest)    │ (Agent Chat / │
 │        │                          │  Swarm Dash / │
 │        │                          │  Git Panel)   │
 │        │                          │               │
@@ -615,90 +620,20 @@ Fixed 5-region layout (no floating windows):
 
 ### Focus Model
 
-`Focus` enum: `Editor | FileTree | SidePanel | Terminal`. Panel focus is switched via Alt+Number (Alt+1 through Alt+4). If the target panel is hidden, it becomes visible and receives focus. Each panel handles its own keybindings when focused.
-
-The keybinding scheme uses clean modifier layering: **Ctrl = editor/text** (word movement, selection, save, find, undo), **Alt = workspace** (panel focus, panel modes, tab cycling, line movement), **Shift = selection extension** (char/line), **F-keys = global toggles**. This avoids conflicts with standard editor conventions.
-
-### Layout Presets
-
-Six presets (Alt+Shift+1 through Alt+Shift+6) configure column widths:
-
-| Preset | File Tree | Editor | Side Panel |
-|---|---|---|---|
-| 1 (default) | 15% | 60% | 25% |
-| 2 (editor only) | 0% | 100% | 0% |
-| ... | varying proportions | | |
-
-### Side Panel Modes
-
-`SidePanelMode`: `AgentChat` (default), `SwarmDashboard`, `GitPanel`. Switched via Alt+A/W/G respectively; each shortcut shows the side panel if hidden and focuses it.
+`Focus` enum: `Editor | FileTree | SidePanel | Terminal`. Alt+Number switches focus. Ctrl = editor/text, Alt = workspace, Shift = selection extension.
 
 ### Left Panel Modes
 
-`LeftPanelMode`: `FileTree` (default), `Search`, `Changes`, `Review`. Switched via Alt+E/F/C respectively; each shortcut shows the left panel if hidden and focuses it. Review mode is only entered programmatically (agent proposals) and cannot be cycled into.
+`FileTree` (default), `Search`, `Changes`, `Review`. Review entered programmatically on agent proposals.
 
-### Terminal Panel
+### Side Panel Modes
 
-Multi-instance embedded shell managed by `TerminalManager` (gaviero-core) with `tui-term` rendering (gaviero-tui). Each instance gets its own PTY via `portable-pty`, `vt100` for escape sequence parsing, and environment isolation (per-instance `HISTFILE`, stripped IDE env vars). OSC 133 parsing enables prompt/command boundary detection. Supports text selection via mouse drag (`TerminalSelectionState`).
+`AgentChat` (default), `SwarmDashboard`, `GitPanel`. Alt+A/W/G respectively.
 
-### Shared Panel Widgets
+### Shared Widgets
 
-Two shared structs in `widgets/` eliminate duplicated logic across panels:
-
-**`ScrollState`** (`scroll_state.rs`) — scroll offset + single-item selection with cached viewport:
-- `move_up()`, `move_down(item_count)` — selection with auto-scroll
-- `page_up()`, `page_down(item_count)` — page-size jumps
-- `scroll_up(n)`, `scroll_down(n, item_count)` — viewport-only scroll (mouse wheel)
-- `ensure_visible()` — clamp scroll so selected item is in viewport
-- `visible_range(item_count, viewport)` — iterator range for rendering
-- `set_viewport(h)` caches viewport height so event handlers don't need it
-- Used by: `file_tree`, `search`, `swarm_dashboard` (agent table)
-
-**`TextInput`** (`text_input.rs`) — char-indexed text buffer with selection, undo/redo, word movement:
-- `insert_char()`, `insert_str()`, `backspace()`, `delete()` — editing with auto-undo and selection replacement
-- `move_left/right/home/end()`, `move_word_left/right()` — cursor movement
-- `select_left/right()`, `select_word_left/right()`, `select_all()`, `selection_range()`, `delete_selection()` — selection
-- `undo()`, `redo()` — 50-entry undo stack
-- Used by: `agent_chat` (chat input), `git_panel` (commit message), `search` (query input), `app` (find bar)
-
-### Search Panel
-
-The search panel (`panels/search.rs`) provides interactive workspace-wide text search:
-
-```
-┌─────────────────────┐
-│ > query text|        │  ← TextInput with cursor (row 0)
-│ 42 results           │  ← Summary (row 1)
-│ src/foo.rs:12 match  │  ← Scrollable results (row 2+)
-│ src/bar.rs:7  match  │
-└─────────────────────┘
-```
-
-Two focus modes controlled by `editing: bool`:
-- **Input mode** (`editing=true`): Keystrokes update the query, search runs on every keystroke (search-as-you-type). Down/Enter moves focus to results.
-- **Results mode** (`editing=false`): Up/Down navigate results. Enter opens the selected file at the matching line. Typing switches back to input mode.
-
-Switching to the search panel (Alt+F) auto-focuses the input. F3 from the editor populates the input with the selection and focuses results.
-
-### Editor Find Bar
-
-`Ctrl+F` opens an inline find bar at the top of the editor area:
-
-```
-┌──────────────────────────────────────┐
-│ Find: query text|           3/42     │  ← Find bar (1 row, shrinks editor)
-├──────────────────────────────────────┤
-│  1 │ ... editor content ...          │
-│  2 │ ... with search HIGHLIGHTS ...  │
-└──────────────────────────────────────┘
-```
-
-- Search-as-you-type: each keystroke calls `Buffer::set_search_highlight()` (pre-computes all match positions) then `find_next_match()` to jump the cursor
-- `Enter`/`Down` → next match, `Up` → previous match, `F3` → next match (works globally)
-- `Esc` or `Ctrl+F` again → closes find bar and clears highlights
-- Match count indicator shows `N/M` (current/total) or "No matches"
-- `find_next_match()` / `find_prev_match()` on `Buffer` navigate matches with wrap-around
-- Editor scrolls with a 3-line vertical margin around the cursor (`VERTICAL_SCROLL_MARGIN`)
+- **`ScrollState`:** scroll offset + selection with viewport caching — used by file_tree, search, swarm_dashboard
+- **`TextInput`:** char-indexed text buffer with selection, undo/redo, word movement — used by agent_chat, git_panel, search, find bar
 
 ---
 
@@ -706,39 +641,26 @@ Switching to the search panel (Alt+F) auto-focuses the input. F3 from the editor
 
 ### Runtime
 
-Single shared tokio runtime. All async work runs on this runtime. Initialized in `Gaviero-core/src/lib.rs`.
+Single shared tokio runtime. All async work runs on this runtime.
 
 ### Lock Discipline
 
 | Rule | Rationale |
 |---|---|
-| Never hold `WriteGatePipeline` Mutex across I/O or parsing | Prevents pipeline stalls under concurrent agent writes |
-| Never hold `MemoryStore` Mutex across embedding computation | ONNX inference is CPU-heavy (10-100ms) |
-| Prefer pre-computing outside the lock, then brief lock for state update | Minimizes contention |
-| Use channels (mpsc, broadcast) for cross-task communication | Lock-free on the critical path |
+| Never hold `WriteGatePipeline` Mutex across I/O or parsing | Prevents pipeline stalls |
+| Never hold `MemoryStore` Mutex across embedding computation | ONNX inference is CPU-heavy |
+| Pre-compute outside the lock, brief lock for state update | Minimizes contention |
+| Channels (mpsc, broadcast) for cross-task communication | Lock-free on the critical path |
 
 ### Shared State Pattern
 
 ```rust
-Arc<tokio::sync::Mutex<T>>  // for WriteGatePipeline, MemoryStore (SQLite connection)
-Arc<dyn Observer>            // observer trait objects sent across tasks
+Arc<tokio::sync::Mutex<T>>  // WriteGatePipeline, MemoryStore (SQLite)
+Arc<dyn Observer>            // observer trait objects across tasks
 mpsc::unbounded_channel      // event routing (single consumer: main loop)
 broadcast::channel           // agent bus (multi-consumer)
 Semaphore                    // parallel agent count bound
 ```
-
-### Spawned Background Tasks
-
-| Task | Lifetime | Mechanism |
-|---|---|---|
-| Crossterm event reader | App lifetime | Blocking thread via `tokio::task::spawn_blocking` |
-| File watcher | App lifetime | `notify` crate callback → channel |
-| Tick timer | App lifetime | `tokio::time::interval` |
-| Terminal event bridge | App lifetime | Forwards `TerminalEvent` from `TerminalManager` into unified `Event` channel |
-| Memory initializer | App startup | `tokio::spawn`, sends `MemoryReady` on completion |
-| ACP session reader | Per-conversation | `tokio::spawn`, drops when session ends |
-| Terminal PTY reader | Per-terminal instance | `tokio::spawn`, reads PTY output continuously |
-| Swarm tier executor | Per-swarm run | `tokio::spawn` per agent, bounded by Semaphore |
 
 ---
 
@@ -747,67 +669,39 @@ Semaphore                    // parallel agent count bound
 ### Settings Cascade
 
 Resolution order (first match wins):
-
-1. `{folder}/.Gaviero/settings.json` — per-folder override (cached)
-2. `.Gaviero-workspace` → `"settings"` — workspace-level
-3. `~/.config/Gaviero/settings.json` — user-level (cached)
-4. Hardcoded Rust defaults — fallback
-
-Per-folder and user-level settings files are parsed at startup and cached in `Workspace::folder_settings_cache` / `user_settings_cache`. `resolve_setting()` never reads disk — it queries the in-memory cache. Call `reload_settings_cache()` after file-watcher events to pick up external edits.
-
-For language-specific keys: if the current file is `.rs`, check `"[rust].{key}"` before `"{key}"` at each cascade level.
-
-### Well-Known Settings Keys
-
-| Category | Keys |
-|---|---|
-| Editor | `editor.tabSize`, `editor.insertSpaces`, `editor.formatOnSave` |
-| Files | `files.exclude` (glob patterns) |
-| Panels | `panels.fileTree.width`, `panels.sidePanel.width`, `panels.terminal.splitPercent` |
-| Git | `git.treeAllowList` |
-| Agent | `agent.model`, `agent.effort`, `agent.maxTokens` |
-| Memory | `memory.namespace`, `memory.readNamespaces` |
-
-### Theme Files
-
-`themes/default.toml` maps highlight groups and UI elements to colors + attributes:
-
-```toml
-[syntax]
-keyword = "fg=#569cd6 bold"
-string  = "fg=#ce9178"
-comment = "fg=#6a9955 italic"
-
-[ui]
-line_number        = "fg=#858585"
-line_number.active = "fg=#ffffff bold"
-cursor             = "bg=#ffffff fg=#000000"
-selection          = "bg=#264f78"
-diff.added         = "fg=#6a9955"
-diff.removed       = "fg=#f48771"
-```
-
-### Query Files
-
-`queries/{language}/highlights.scm` and `queries/{language}/indents.scm` — tree-sitter S-expression queries sourced from Helix (MIT). 16 language directories. Python, YAML, and Kotlin currently have `highlights.scm` only (no `indents.scm`); the remaining 13 languages have both.
+1. `{folder}/.gaviero/settings.json` — per-folder (cached)
+2. `.gaviero-workspace` → `"settings"` — workspace-level
+3. `~/.config/gaviero/settings.json` — user-level (cached)
+4. Hardcoded Rust defaults
 
 ### Session Persistence
 
-`SessionState` (open tabs, cursor positions, panel visibility, conversation history) persists to platform data directory, keyed by FNV-1a hash of workspace path. Restored on startup, saved on quit.
+`SessionState` (open tabs, cursor positions, panel visibility, conversation history) persists to platform data directory, keyed by FNV-1a hash of workspace path.
 
 ---
 
-## 17. Hard Constraints
+## 17. Error Handling Strategy
+
+- **`anyhow::Result`** for all fallible operations throughout the codebase
+- Custom error types only for structured validation data: `DslError` (lexer/parser/compiler), `ScopeError`, `CycleError`
+- Memory initialization failure is non-fatal: `Option<Arc<MemoryStore>>` everywhere
+- Validation gate failures feed back as corrective prompts (not panics)
+- Agent subprocess crashes → `AgentStatus::Failed(reason)` in manifest
+- Checkpoint saves after each node completion for crash recovery
+
+---
+
+## 18. Hard Constraints
 
 These are architectural invariants. Do not violate them.
 
 1. **Write Gate mandatory** — All agent file writes pass through `WriteGatePipeline`. No direct `fs::write` from agent code paths.
 2. **git2 only** — Git operations use the `git2` crate. Never shell out to `git`.
 3. **Tree-sitter for everything** — Structural analysis AND syntax highlighting. No regex-based highlighter.
-4. **Mutex-wrapped SQLite** — `MemoryStore` wraps `rusqlite::Connection` in `tokio::sync::Mutex`. All DB methods are async. Shared as `Arc<MemoryStore>`.
-5. **Single tokio runtime** — Initialized in `Gaviero-core/src/lib.rs`. All async work shares it.
-6. **Core/TUI separation** — Pipeline logic in core. Rendering + input in TUI. Test core without TUI.
-7. **Single event channel** — TUI receives all external events through one `mpsc::UnboundedReceiver<Event>`. No direct state mutation from background tasks.
-8. **AutoAccept in swarm** — `WriteMode::AutoAccept` during swarm execution. User reviews aggregate result post-merge.
-9. **No plugins** — Features compiled in. Configuration via settings files only.
-10. **anyhow::Result** — All fallible operations. Custom error types only for structured validation data (`ScopeError`, `CycleError`).
+4. **Mutex-wrapped SQLite** — `MemoryStore` wraps `rusqlite::Connection` in `tokio::sync::Mutex`. All DB methods are async.
+5. **Core/TUI separation** — Pipeline logic in core. Rendering + input in TUI. Test core without TUI.
+6. **Single event channel** — TUI receives all external events through one `mpsc::UnboundedReceiver<Event>`. No direct state mutation from background tasks.
+7. **AutoAccept in swarm** — `WriteMode::AutoAccept` during swarm execution. User reviews aggregate result post-merge.
+8. **Observer-only coupling to UI** — Core never imports TUI/CLI types. Events flow out via trait objects.
+9. **Provider-agnostic backend** — `AgentBackend` + `UnifiedStreamEvent` decouple orchestration from Claude/Ollama specifics.
+10. **No plugins** — Features compiled in. Configuration via settings files only.

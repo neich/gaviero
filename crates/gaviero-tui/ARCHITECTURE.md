@@ -9,27 +9,37 @@ The full-screen terminal UI binary. Holds no domain logic — all agent executio
 ```
 gaviero-tui/src/
 ├── main.rs              binary entry point: init terminal, build App, run event loop
-├── app.rs               App struct (god object) + handle_event() dispatch
-├── event.rs             Event enum (43 variants), EventLoop, background task spawners
+├── app.rs               App struct (god object) + handle_event() dispatch (~5000 lines)
+├── event.rs             Event enum (43+ variants), EventLoop, background task spawners
 ├── keymap.rs            KeyEvent → Action mapping; chord-prefix support
-├── theme.rs             ~80 colour constants; magic-number constants
+├── theme.rs             ~80 colour constants (One Dark); timing constants
+│
+├── editor/
+│   ├── mod.rs           module re-exports
+│   ├── buffer.rs        Buffer (Rope + tree-sitter + undo/redo), Cursor, Transaction
+│   ├── view.rs          EditorView::render() — gutter, syntax highlighting, cursor, scrollbar
+│   ├── diff_overlay.rs  Diff review mode: DiffSource, DiffReviewState, accept/reject per hunk
+│   ├── highlight.rs     HighlightConfig, tree-sitter highlight query runner → Vec<StyledSpan>
+│   └── markdown.rs      Markdown document rendering and editing
 │
 ├── panels/
-│   ├── agent_chat.rs    AgentChatState, Conversation, slash-command handling
+│   ├── mod.rs           module re-exports
+│   ├── agent_chat.rs    AgentChatState, Conversation, slash-command handling, @file autocomplete
 │   ├── swarm_dashboard.rs SwarmDashboardState, AgentEntry, activity log
-│   ├── file_tree.rs     FileTreeState, lazy-loaded tree, dialogs
+│   ├── file_tree.rs     FileTreeState, lazy-loaded tree, dialogs (new/rename/delete)
 │   ├── search.rs        SearchPanelState, live debounced workspace search
 │   ├── git_panel.rs     GitPanelState, stage/unstage/commit/branch-picker
 │   ├── status_bar.rs    context-sensitive bottom line renderer
-│   └── chat_markdown.rs markdown → ratatui StyledSpans renderer
-│
-├── editor/
-│   ├── buffer.rs        Buffer (Rope + tree-sitter + undo/redo)
-│   └── view.rs          EditorView::render() — gutter, syntax highlighting, cursor
+│   ├── chat_markdown.rs ChatLine: markdown → ratatui StyledSpans renderer
+│   └── terminal.rs      Terminal rendering (tui-term), TerminalSelectionState
 │
 └── widgets/
+    ├── mod.rs           module re-exports
+    ├── tabs.rs          TabBar widget with close indicators
     ├── scrollbar.rs     custom scrollbar widget
-    └── tabs.rs          tab bar widget
+    ├── scroll_state.rs  ScrollState: shared scroll offset + selection for list panels
+    ├── text_input.rs    TextInput: shared text editing with cursor, selection, undo/redo
+    └── render_utils.rs  Shared rendering utilities
 ```
 
 ---
@@ -145,7 +155,7 @@ on_agent_state_changed(id,s,d)  → Event::SwarmAgentStateChanged { id, status: 
 on_tier_started(cur, tot)       → Event::SwarmTierStarted { current: cur, total: tot }
 on_merge_conflict(b, files)     → Event::SwarmMergeConflict { branch: b, files }
 on_completed(result)            → Event::SwarmCompleted(Box::new(result))
-on_coordination_complete(n, s)  → Event::SwarmCoordinationComplete { unit_count: n, summary: s }
+on_coordination_complete(dag)   → Event::SwarmCoordinationComplete { unit_count, summary }
 on_tier_dispatch(id, tier, be)  → Event::SwarmTierDispatch { unit_id: id, tier, backend: be }
 on_cost_update(est)             → Event::SwarmCostUpdate(est)
 ```
@@ -246,6 +256,66 @@ App::render(frame)
 
 ---
 
+## Layout
+
+```
+┌──────────────────────────────────────────────────┐
+│                    Tab Bar                        │
+├────────┬──────────────────────────┬───────────────┤
+│        │                          │               │
+│  Left  │        Editor            │  Side Panel   │
+│ Panel  │     (center, largest)    │ (Agent Chat / │
+│        │                          │  Swarm Dash / │
+│        │                          │  Git Panel)   │
+│        │                          │               │
+├────────┴──────────────────────────┴───────────────┤
+│                    Terminal                        │
+├───────────────────────────────────────────────────┤
+│                   Status Bar                      │
+└───────────────────────────────────────────────────┘
+```
+
+### Focus model
+
+`Focus` enum: `Editor | FileTree | SidePanel | Terminal`. Panel focus switched via Alt+Number (Alt+1 through Alt+4). If the target panel is hidden, it becomes visible and receives focus.
+
+Keybinding layering: **Ctrl = editor/text** (word movement, selection, save, find, undo), **Alt = workspace** (panel focus, panel modes, tab cycling, line movement), **Shift = selection extension**, **F-keys = global toggles**.
+
+### Layout presets
+
+Six presets (Alt+Shift+1 through Alt+Shift+6) configure column widths:
+
+| Preset | File Tree | Editor | Side Panel |
+|---|---|---|---|
+| 1 (default) | 15% | 60% | 25% |
+| 2 (editor only) | 0% | 100% | 0% |
+| ... | varying proportions | | |
+
+---
+
+## Shared widgets
+
+### `ScrollState` (`widgets/scroll_state.rs`)
+
+Scroll offset + single-item selection with cached viewport:
+- `move_up()`, `move_down(item_count)` — selection with auto-scroll
+- `page_up()`, `page_down(item_count)` — page-size jumps
+- `scroll_up(n)`, `scroll_down(n, item_count)` — viewport-only scroll (mouse wheel)
+- `ensure_visible()` — clamp scroll so selected item is in viewport
+- `visible_range(item_count, viewport)` — iterator range for rendering
+- Used by: `file_tree`, `search`, `swarm_dashboard`
+
+### `TextInput` (`widgets/text_input.rs`)
+
+Char-indexed text buffer with selection, undo/redo, word movement:
+- `insert_char()`, `insert_str()`, `backspace()`, `delete()` — editing
+- `move_left/right/home/end()`, `move_word_left/right()` — cursor movement
+- `select_left/right()`, `select_word_left/right()`, `select_all()` — selection
+- `undo()`, `redo()` — 50-entry undo stack
+- Used by: `agent_chat`, `git_panel`, `search`, `app` (find bar)
+
+---
+
 ## Async task patterns
 
 ### Agent chat task
@@ -279,13 +349,44 @@ tokio::spawn(async move {
 
 ---
 
+## Search panel (`panels/search.rs`)
+
+```
+┌─────────────────────┐
+│ > query text|        │  ← TextInput with cursor (row 0)
+│ 42 results           │  ← Summary (row 1)
+│ src/foo.rs:12 match  │  ← Scrollable results (row 2+)
+│ src/bar.rs:7  match  │
+└─────────────────────┘
+```
+
+Two focus modes controlled by `editing: bool`:
+- **Input mode** (`editing=true`): keystrokes update the query, search runs on every keystroke. Down/Enter moves to results.
+- **Results mode** (`editing=false`): Up/Down navigate results. Enter opens file at matching line. Typing switches back.
+
+### Editor find bar
+
+`Ctrl+F` opens an inline find bar at the editor top. Search-as-you-type with match count indicator. `Enter`/`Down` → next match, `Up` → previous, `Esc` closes. `find_next_match()`/`find_prev_match()` on `Buffer` with wrap-around.
+
+---
+
 ## Theme constants (`theme.rs`)
 
 Centralised colour palette (~80 constants). All panels reference `theme::*` — no inline colour literals.
 
 Key groups: `PANEL_BG`, `FOCUS_BORDER`, `TEXT_FG/DIM/BRIGHT`, `ACCENT`, `WARNING/SUCCESS/ERROR`, `DIFF_ADDED_BG/REMOVED_BG`, `TIER_CHEAP/EXPENSIVE`, `ACTIVITY_TOOL_CALL/STATUS`.
 
-Magic-number constants: `CROSSTERM_POLL_MS = 50`, `TICK_INTERVAL_MS = 33` (30 fps), `TERMINAL_RESIZE_STEP = 5%`, `DIFF_PAGE_SCROLL = 10`.
+Constants: `CROSSTERM_POLL_MS = 50`, `TICK_INTERVAL_MS = 33` (30 fps), `TERMINAL_RESIZE_STEP = 5%`, `DIFF_PAGE_SCROLL = 10`.
+
+---
+
+## Concurrency model
+
+- **Single main thread** for all state mutations and rendering
+- **Background tasks** communicate exclusively via `mpsc::unbounded_channel<Event>`
+- **No `Arc<Mutex<App>>`** — god-object pattern avoids lock contention
+- **Write gate** is `Arc<Mutex<WriteGatePipeline>>` — the only shared mutable state accessed from both main thread and agent tasks
+- Lock discipline: never hold write gate mutex across I/O or tree-sitter parsing
 
 ---
 
@@ -296,6 +397,7 @@ Magic-number constants: `CROSSTERM_POLL_MS = 50`, `TICK_INTERVAL_MS = 33` (30 fp
 | `Workspace` | Settings load, namespace resolution |
 | `WriteGatePipeline`, `WriteMode` | Proposal staging, hunk review |
 | `AcpPipeline` | Single-agent chat execution |
+| `AcpSessionFactory` | Session lifecycle management |
 | `swarm::pipeline::{execute, plan_coordinated}` | Multi-agent orchestration |
 | `MemoryStore`, `memory::init` | Semantic memory |
 | `GitRepo` | Git operations panel |
@@ -314,3 +416,14 @@ Magic-number constants: `CROSSTERM_POLL_MS = 50`, `TICK_INTERVAL_MS = 33` (30 fp
 4. **Observer fire-and-forget.** Observer methods send into channel and return immediately. `ProposalCreated` boxes the proposal to avoid locking the write gate from the observer.
 5. **`SwarmDslPlanReady` auto-opens file.** Generated `.gaviero` file is immediately visible in the editor; user can edit before running.
 6. **Terminal focus pass-through.** When terminal is focused, raw key bytes go to PTY; only configured escape keys trigger TUI actions.
+7. **Event drain up to 64.** Prevents render-bound bottleneck during high-frequency streaming without unbounded latency.
+
+---
+
+## Error handling strategy
+
+- TUI wraps all fallible operations in `anyhow::Result`
+- Errors in background tasks are sent as `Event` variants and displayed in status bar or chat panel
+- Panic handler in `main.rs` restores terminal state before printing the backtrace
+- Memory init failure: logs warning, continues with `memory = None`
+- File watcher failure: logs warning, continues without live reload

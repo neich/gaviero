@@ -29,8 +29,14 @@ agent fixer {
     client sonnet
     depends_on [reviewer]
     scope {
-        owned    ["src/" "tests/"]
+        owned     ["src/" "tests/"]
         read_only ["docs/"]
+        impact_scope true     // auto-expand read_only with blast-radius files
+    }
+    context {
+        callers_of ["src/auth/session.rs"]   // include callers of these files
+        tests_for  ["src/auth/"]             // include associated test files
+        depth      2
     }
     prompt "Fix every issue in the reviewer's list. Do not change anything else."
     max_retries 3
@@ -38,7 +44,11 @@ agent fixer {
 
 workflow review_and_fix {
     steps [reviewer fixer]
-    verify { compile true clippy true }
+    verify {
+        compile      true
+        clippy       true
+        impact_tests true    // run only tests affected by modified files
+    }
 }
 ```
 
@@ -50,7 +60,7 @@ Run with `gaviero-cli --script review_and_fix.gaviero` or `/run review_and_fix.g
 
 ### 1. Bug fix with TDD — `bugfix_with_tests.gaviero`
 
-The canonical single-agent workflow. The agent generates failing tests first, then fixes the code until they pass. Use this for any well-scoped bug.
+The canonical single-agent workflow. The agent generates failing tests first, then fixes the code until they pass.
 
 ```gaviero
 client haiku { tier cheap model "claude-haiku-4-5-20251001" }
@@ -93,13 +103,13 @@ gaviero-cli --script bugfix_with_tests.gaviero \
   --task "tokens are not invalidated on logout"
 ```
 
-The `{{PROMPT}}` placeholder is replaced with the `--task` value at compile time. The agent generates a failing test first, then iterates until `cargo test` passes.
+The `{{PROMPT}}` placeholder is replaced with the `--task` value at compile time.
 
 ---
 
 ### 2. New feature with test-first TDD — `feature_tdd.gaviero`
 
-For larger features: Opus writes the specification as failing tests; Haiku implements until they pass; a final sonnet-tier agent validates edge cases.
+Opus writes the specification as failing tests; Haiku implements until they pass; a final Sonnet agent validates edge cases.
 
 ```gaviero
 client haiku   { tier cheap     model "claude-haiku-4-5-20251001" }
@@ -115,13 +125,8 @@ agent spec {
     }
     prompt #"
         Write comprehensive tests for the following feature: {{PROMPT}}
-
-        Requirements:
-        - Tests MUST fail against the current code (they describe desired state)
-        - Tests MUST compile
-        - Cover: happy path, edge cases, error cases
-        - Use the project's existing test framework
-        - Do NOT modify any source files
+        Tests MUST fail against the current code and MUST compile.
+        Do NOT modify any source files.
     "#
     max_retries 2
 }
@@ -133,6 +138,11 @@ agent implement {
     scope {
         owned    ["src/billing/"]
         read_only ["tests/billing/" "src/types.rs" "docs/"]
+        impact_scope true
+    }
+    context {
+        callers_of ["src/billing/"]
+        depth      2
     }
     prompt #"
         The tests in tests/billing/ describe the desired behaviour.
@@ -164,9 +174,10 @@ workflow tdd_feature {
     escalate_after 3
 
     verify {
-        compile true
-        clippy  true
-        test    true
+        compile      true
+        clippy       true
+        test         true
+        impact_tests true
     }
 
     memory {
@@ -186,7 +197,7 @@ gaviero-cli --script feature_tdd.gaviero \
 
 ### 3. Best-of-3 sampling for risky refactoring — `refactor_safe.gaviero`
 
-When the correct refactoring approach is ambiguous, generate three independent attempts and keep the one that passes all gates. Cheap to run; the engine picks the winner automatically.
+When the correct refactoring approach is ambiguous, generate three independent attempts and keep the one that passes all gates.
 
 ```gaviero
 client haiku { tier cheap model "claude-haiku-4-5-20251001" }
@@ -197,6 +208,7 @@ agent refactor {
     scope {
         owned    ["src/core/"]
         read_only ["tests/core/" "src/types.rs"]
+        impact_scope true
     }
     prompt #"
         Refactor the following: {{PROMPT}}
@@ -204,7 +216,6 @@ agent refactor {
         Constraints:
         - All existing tests must pass unchanged
         - No change to public API signatures
-        - No change to error types
         - Apply Rust idiomatic patterns (iterators, ? operator, etc.)
     "#
     max_retries 4
@@ -212,14 +223,15 @@ agent refactor {
 
 workflow refactor_safe {
     steps          [refactor]
-    strategy       best_of_3       // 3 independent attempts
-    max_retries    4               // retries per attempt
-    escalate_after 2               // switch to expensive after 2 failed retries
+    strategy       best_of_3
+    max_retries    4
+    escalate_after 2
 
     verify {
-        compile true
-        clippy  true
-        test    true
+        compile      true
+        clippy       true
+        test         true
+        impact_tests true
     }
 }
 ```
@@ -236,23 +248,19 @@ The engine runs three independent agents. If any attempt passes all verification
 
 ### 4. Multi-crate refactor with dependencies — `multi_crate.gaviero`
 
-Explicit multi-agent workflow. Each agent owns a disjoint scope; the integration agent runs after both finish.
+Explicit multi-agent workflow. Each agent owns a disjoint scope; an integration agent runs after both finish.
 
 ```gaviero
 client haiku  { tier cheap     model "claude-haiku-4-5-20251001" }
 client sonnet { tier cheap     model "claude-sonnet-4-6" }
 
-// Two parallel agents — independent scopes, no conflict
 agent core-types {
-    description "Rename ModelTier variants and update all usages in gaviero-core"
+    description "Rename ModelTier variants in gaviero-core"
     client haiku
-    scope {
-        owned ["crates/gaviero-core/src/"]
-    }
+    scope { owned ["crates/gaviero-core/src/"] }
     prompt #"
         Rename the ModelTier enum variants: Execution → Cheap, Coordinator → Expensive.
         Update every match arm, struct field, and test that references the old names.
-        The enum definition is in src/types.rs.
     "#
     max_retries 3
 }
@@ -261,18 +269,16 @@ agent dsl-update {
     description "Update DSL compiler to emit new ModelTier values"
     client haiku
     scope {
-        owned    ["crates/gaviero-dsl/src/"]
+        owned     ["crates/gaviero-dsl/src/"]
         read_only ["crates/gaviero-core/src/types.rs"]
     }
     prompt #"
-        Update the DSL compiler (src/compiler.rs) to map tier literals to the
-        renamed ModelTier variants: Cheap and Expensive.
-        The new enum definition will be in gaviero-core/src/types.rs.
+        Update the DSL compiler to map tier literals to the renamed ModelTier
+        variants: Cheap and Expensive.
     "#
     max_retries 3
 }
 
-// Integration agent runs after both complete
 agent integration-check {
     description "Fix any compilation errors across the whole workspace"
     client sonnet
@@ -283,15 +289,14 @@ agent integration-check {
     }
     prompt #"
         The ModelTier enum was renamed across two crates.
-        Run cargo check workspace and fix any remaining compilation errors.
-        Do not change logic — only fix name references.
+        Fix any remaining compilation errors. Do not change logic — only fix name references.
     "#
     max_retries 5
 }
 
 workflow multi_crate_rename {
     steps        [core-types dsl-update integration-check]
-    max_parallel 2          // core-types and dsl-update run concurrently
+    max_parallel 2
     strategy     refine
 
     verify { compile true clippy true test true }
@@ -307,7 +312,7 @@ gaviero-cli --script multi_crate.gaviero --max-parallel 2
 
 ### 5. Security audit — `security_audit.gaviero`
 
-Read-only audit that writes its findings to a markdown report and to memory. No source files modified.
+Read-only audit that writes its findings to a markdown report and to memory.
 
 ```gaviero
 client opus { tier expensive model "claude-opus-4-6" }
@@ -316,25 +321,18 @@ agent audit {
     description "Security audit of the authentication layer"
     client opus
     scope {
-        owned    ["docs/security-audit.md"]    // only the report is writable
+        owned    ["docs/security-audit.md"]
         read_only ["src/auth/" "src/middleware/" "tests/"]
+    }
+    context {
+        callers_of ["src/auth/session.rs" "src/middleware/auth.rs"]
+        depth      3
     }
     prompt #"
         Perform a security audit of the authentication implementation.
-
-        Review for:
-        - Injection vulnerabilities (SQL, command, path traversal)
-        - Authentication bypass risks
-        - Session management issues
-        - Insecure defaults or hardcoded secrets
-        - Missing input validation
-        - Timing attacks
-
-        Write findings to docs/security-audit.md using the format:
-        ## [CRITICAL|HIGH|MEDIUM|LOW] <title>
-        **File:** path/to/file.rs:line
-        **Description:** ...
-        **Recommendation:** ...
+        Review for: injection vulnerabilities, authentication bypass, session issues,
+        insecure defaults, missing validation, timing attacks.
+        Write findings to docs/security-audit.md.
     "#
     max_retries 1
 
@@ -347,7 +345,7 @@ agent audit {
 
 workflow security_audit {
     steps    [audit]
-    strategy single_pass    // one thorough pass is enough
+    strategy single_pass
 }
 ```
 
@@ -356,71 +354,11 @@ Run:
 gaviero-cli --script security_audit.gaviero --model opus
 ```
 
-The audit findings are stored to the `security-audits` memory namespace so future agents (and future audit runs) can access prior findings.
-
 ---
 
-### 6. Memory-accumulating multi-run workflow — `security_audit_memory.gaviero`
+### 6. Iterative fix loop — `loop_fix.gaviero`
 
-On first run the agent audits and stores findings. On subsequent runs it reads prior findings and focuses on new code paths.
-
-```gaviero
-client opus   { tier expensive model "claude-opus-4-6" }
-client sonnet { tier cheap     model "claude-sonnet-4-6" }
-
-agent triage {
-    description "Triage new code changes against prior audit findings"
-    client sonnet
-    scope {
-        read_only ["src/"]
-    }
-    prompt #"
-        Given the prior security audit findings in memory, identify which
-        recent changes to src/ introduce new risk or touch previously flagged areas.
-        Output a prioritised list of files to re-audit.
-    "#
-    max_retries 1
-
-    memory {
-        read_ns  ["security-audits"]
-        write_ns "security-triage"
-    }
-}
-
-agent deep-audit {
-    description "Deep audit of prioritised files"
-    client opus
-    depends_on [triage]
-    scope {
-        owned    ["docs/security-audit.md"]
-        read_only ["src/"]
-    }
-    prompt #"
-        Using the triage output, perform a deep security audit of the
-        prioritised files. Update docs/security-audit.md with new findings.
-        Prefix each finding with [NEW] or [UPDATED] if it supersedes a prior finding.
-    "#
-    max_retries 2
-
-    memory {
-        read_ns           ["security-audits" "security-triage"]
-        write_ns          "security-audits"
-        importance        0.9
-        staleness_sources ["src/auth/" "src/api/"]
-    }
-}
-
-workflow incremental_audit {
-    steps    [triage deep-audit]
-    strategy refine
-}
-```
-
----
-
-### 7. Iterative fix loop with explicit memory — `loop_fix.gaviero`
-
-An explicit loop reruns a block of agents until a condition is met. Combine with explicit memory control for precise knowledge accumulation.
+An explicit loop reruns a block of agents until a condition is met.
 
 ```gaviero
 client sonnet { tier cheap model "claude-sonnet-4-6" }
@@ -440,10 +378,6 @@ agent implement {
         read_query  "previous implementation failures for {{PROMPT}}"
         read_limit  10
         write_ns    "prior-attempts"
-        write_content #"
-            Attempt by {{AGENT}}: {{SUMMARY}}
-            Files modified: {{FILES}}
-        "#
         importance  0.8
     }
 }
@@ -475,11 +409,9 @@ gaviero-cli --script loop_fix.gaviero \
   --task "add pagination to the user list endpoint"
 ```
 
-The `loop` block re-runs `implement` and `verify` until `cargo check` and `cargo test` both pass, up to 5 iterations. Each attempt's summary is written to memory so the next iteration can learn from failures.
-
 ---
 
-### 8. Local-only (no API) workflow — `local_refactor.gaviero`
+### 7. Local-only (no API) workflow — `local_refactor.gaviero`
 
 Uses Ollama for privacy-sensitive code. No data leaves the machine.
 
@@ -487,15 +419,13 @@ Uses Ollama for privacy-sensitive code. No data leaves the machine.
 client local {
     tier     cheap
     model    "qwen2.5-coder:14b"
-    privacy  local_only          // forces Ollama, rejects any API backend
+    privacy  local_only
 }
 
 agent refactor {
     description "Refactor {{PROMPT}} using local model"
     client local
-    scope {
-        owned ["src/internal/"]
-    }
+    scope { owned ["src/internal/"] }
     prompt "Refactor: {{PROMPT}}. Keep the public API unchanged."
     max_retries 3
 }
@@ -505,12 +435,6 @@ workflow local_refactor {
     strategy refine
     verify   { compile true }
 }
-```
-
-Run:
-```bash
-gaviero-cli --script local_refactor.gaviero \
-  --task "extract the connection pool into its own module"
 ```
 
 Requires a running Ollama instance (`ollama serve`).
@@ -523,9 +447,9 @@ Requires a running Ollama instance (`ollama serve`).
 
 ```gaviero
 client <name> {
-    tier  cheap | expensive          // model tier (default: cheap)
-    model "<model-id>"               // override specific model
-    privacy public | local_only      // public: any API; local_only: Ollama only
+    tier    cheap | expensive          // model tier (default: cheap)
+    model   "<model-id>"               // override specific model
+    privacy public | local_only        // public: any API; local_only: Ollama only
 }
 ```
 
@@ -535,33 +459,41 @@ client <name> {
 |---|---|---|
 | `cheap` | `ModelTier::Cheap` | claude-haiku-4-5 |
 | `expensive` | `ModelTier::Expensive` | claude-sonnet-4-6 |
-| `coordinator`, `reasoning` | `Expensive` (deprecated) | |
-| `execution`, `mechanical` | `Cheap` (deprecated) | |
+| `coordinator`, `reasoning` | `Expensive` (deprecated aliases) | |
+| `execution`, `mechanical` | `Cheap` (deprecated aliases) | |
+
+---
 
 ### `agent` — Work unit
 
 ```gaviero
 agent <name> {
-    description "<task description>"          // shown in UI; {{PROMPT}} substitution
+    description "<task description>"         // shown in UI; {{PROMPT}} substitution
     client      <client-name>
     scope {
-        owned    ["path/" "file.rs"]          // agent can read and write these
-        read_only ["docs/" "other.md"]        // agent can read but not write
+        owned        ["path/" "file.rs"]     // agent can read and write these
+        read_only    ["docs/" "other.md"]    // agent can read but not write
+        impact_scope true                    // auto-expand read_only with blast-radius files
     }
-    depends_on  [agent-a agent-b]             // wait for these to complete first
+    context {                                // explicit code-graph queries (optional)
+        callers_of ["src/auth/session.rs"]  // include callers of these files in context
+        tests_for  ["src/auth/"]            // include test files associated with these paths
+        depth      2                         // BFS traversal depth (default: 2)
+    }
+    depends_on  [agent-a agent-b]            // wait for these to complete first
     prompt #"
         Multi-line raw string instructions.
         {{PROMPT}} is replaced with the --task / runtime_prompt value.
     "#
-    max_retries 3                             // inner validation-feedback cycles (default: 1)
+    max_retries 3                            // inner validation-feedback cycles (default: 1)
     memory {
-        read_ns           ["ns-1" "ns-2"]     // namespaces to search at run time
-        write_ns          "my-ns"             // namespace for storing results
-        importance        0.8                 // memory importance weight (0.0–1.0)
-        staleness_sources ["src/"]            // invalidate memory if these paths change
+        read_ns           ["ns-1" "ns-2"]    // namespaces to search at run time
+        write_ns          "my-ns"            // namespace for storing results
+        importance        0.8                // memory importance weight (0.0–1.0)
+        staleness_sources ["src/"]           // invalidate memory if these paths change
         read_query        "custom search query"   // override auto-query (default: description)
-        read_limit        10                  // max search results (default: 5)
-        write_content #"                      // custom write template (default: auto-summary)
+        read_limit        10                 // max search results (default: 5)
+        write_content #"                     // custom write template (default: auto-summary)
             Agent: {{AGENT}}
             Summary: {{SUMMARY}}
             Files: {{FILES}}
@@ -570,7 +502,9 @@ agent <name> {
 }
 ```
 
-If `scope` is omitted the agent gets `owned = ["."]` (full workspace).
+If `scope` is omitted the agent gets `owned = ["."]` (full workspace). `impact_scope` and `context {}` are optional — omit them for simple agents.
+
+---
 
 ### `workflow` — Orchestration
 
@@ -579,27 +513,28 @@ workflow <name> {
     steps [
         agent-a
         agent-b
-        loop {                                        // explicit loop block
-            agents [agent-c agent-d]                  // agents to repeat
-            max_iterations 5                          // hard upper bound
-            until { compile true test true }           // exit condition
+        loop {                                         // explicit loop block
+            agents [agent-c agent-d]                   // agents to repeat
+            max_iterations 5                           // hard upper bound
+            until { compile true test true }            // exit condition
         }
         agent-e
     ]
-    max_parallel 2                            // max concurrent agents (default: 1)
+    max_parallel 2                             // max concurrent agents (default: 1)
 
     // Iteration strategy
-    strategy     single_pass | refine | best_of_N   // default: refine
-    max_retries  5                            // inner retries per attempt (default: 5)
-    attempts     3                            // outer attempts for BestOfN (default: 1)
-    test_first   true                         // generate failing tests before editing
-    escalate_after 2                          // switch to expensive model after N failures
+    strategy     single_pass | refine | best_of_N    // default: refine
+    max_retries  5                             // inner retries per attempt (default: 5)
+    attempts     3                             // outer attempts for BestOfN (default: 1)
+    test_first   true                          // generate failing tests before editing
+    escalate_after 2                           // switch to expensive model after N failures
 
     // Post-edit verification
     verify {
-        compile true      // run cargo check / equivalent
-        clippy  true      // run cargo clippy
-        test    false     // run test suite
+        compile      true      // run cargo check / equivalent
+        clippy       true      // run cargo clippy
+        test         false     // run full test suite
+        impact_tests false     // run only tests affected by modified files
     }
 
     // Workflow-level memory defaults (merged with agent-level settings)
@@ -609,6 +544,41 @@ workflow <name> {
     }
 }
 ```
+
+---
+
+## `scope` fields
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `owned` | string list | `["."]` | Paths the agent may read and write |
+| `read_only` | string list | `[]` | Paths the agent may only read |
+| `impact_scope` | bool | `false` | When `true`, automatically expand `read_only` with blast-radius files computed from the code knowledge graph |
+
+---
+
+## `context` block
+
+The `context {}` block inside an agent declaration queries the code knowledge graph to inject additional files into the agent's prompt context beyond what the scope declares.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `callers_of` | string list | `[]` | Files whose callers (up to `depth` hops) are included in context |
+| `tests_for` | string list | `[]` | Paths whose associated test files are included in context |
+| `depth` | integer | `2` | BFS traversal depth for graph queries |
+
+---
+
+## `verify` fields
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `compile` | bool | `false` | Run `cargo check` (or equivalent) after each agent write |
+| `clippy` | bool | `false` | Run `cargo clippy` |
+| `test` | bool | `false` | Run the full test suite |
+| `impact_tests` | bool | `false` | Run only tests whose source files were modified (faster than `test true`) |
+
+`impact_tests` and `test` are independent; you can enable both, but typically only one is needed.
 
 ---
 
@@ -660,15 +630,11 @@ workflow fix_cycle {
 | `until agent quality_gate` | Judge agent — runs a named agent that decides pass/fail |
 | `until command "cargo test --quiet"` | Shell command — exits when the command returns exit code 0 |
 
-All three forms support the same `loop` block syntax. `max_iterations` is always required as a safety bound.
-
-The first iteration runs as part of normal tier-based execution. Subsequent iterations re-run only the loop's agents, preserving cumulative progress from prior iterations.
+`max_iterations` is always required as a safety bound.
 
 ---
 
 ## Explicit memory control
-
-The `memory { }` block supports optional fields for precise control over what an agent reads from and writes to memory:
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -680,32 +646,10 @@ The `memory { }` block supports optional fields for precise control over what an
 
 | Variable | Replaced with |
 |---|---|
-| `{{SUMMARY}}` | The agent's full text output (all assistant messages). Optimise templates for embedding retrieval — use domain keywords, not prose |
+| `{{SUMMARY}}` | The agent's full text output |
 | `{{FILES}}` | Comma-separated list of modified files |
 | `{{AGENT}}` | The agent's name/ID |
 | `{{DESCRIPTION}}` | The agent's description field |
-
-Example:
-
-```gaviero
-agent researcher {
-    memory {
-        read_ns     ["shared"]
-        read_query  "architecture patterns in auth module"
-        read_limit  10
-        write_ns    "research-output"
-        write_content #"
-            Research by {{AGENT}}: {{SUMMARY}}
-            Files analyzed: {{FILES}}
-        "#
-        importance  0.9
-    }
-}
-```
-
----
-
-## Memory system
 
 ### Namespace merge rules
 
@@ -715,31 +659,21 @@ agent researcher {
 | `write_ns` | Agent value overrides workflow value |
 | `importance` | Agent-only |
 | `staleness_sources` | Agent-only |
-| `read_query` | Agent-only; `{{PROMPT}}` substituted at compile time |
-| `read_limit` | Agent-only |
-| `write_content` | Agent-only; `{{PROMPT}}` substituted at compile time |
-
-### Staleness
-
-If `staleness_sources` lists a path (e.g., `"src/auth/"`), memory entries stored from a previous run are automatically invalidated when those files have changed since the entry was written. This prevents stale context from polluting future runs.
+| `read_query`, `read_limit`, `write_content` | Agent-only; `{{PROMPT}}` substituted at compile time |
 
 ---
 
 ## Execution without a workflow
 
-If the file contains **no workflow declaration**, all agents run in declaration order.
-
-If the file contains **exactly one workflow**, it is used automatically.
-
-If the file contains **multiple workflows**, pass `--workflow <name>` (CLI) to select one.
+- **No workflow declaration** — all agents run in declaration order.
+- **Exactly one workflow** — used automatically.
+- **Multiple workflows** — pass `--workflow <name>` (CLI) to select one.
 
 ---
 
 ## `{{PROMPT}}` substitution
 
-Any `description` or `prompt` field may contain `{{PROMPT}}`. This is replaced at compile time by the `runtime_prompt` argument — the value of `--task` on the CLI, or the message sent to `/run` in the TUI.
-
-This lets a single `.gaviero` file act as a reusable template:
+Any `description` or `prompt` field may contain `{{PROMPT}}`. Replaced at compile time by the `runtime_prompt` argument — the value of `--task` on the CLI, or the message sent to `/run` in the TUI.
 
 ```bash
 # Same script, different task each time
@@ -751,9 +685,7 @@ gaviero-cli --script bugfix.gaviero --task "race condition in connection pool sh
 
 ## Dependency edges
 
-`depends_on` creates a directed edge in the execution DAG. Agents with no dependencies run in parallel (subject to `max_parallel`). Cycles are detected at compile time.
-
-An agent is skipped if any of its dependencies failed (trigger rule: `AllSuccess`). Skipped agents appear in the result with status `Skipped`.
+`depends_on` creates a directed edge in the execution DAG. Agents with no dependencies run in parallel (subject to `max_parallel`). Cycles are detected at compile time. An agent is skipped if any dependency failed (`AllSuccess` trigger rule).
 
 ---
 
@@ -770,7 +702,7 @@ An agent is skipped if any of its dependencies failed (trigger rule: `AllSuccess
 | Boolean | `true` / `false` |
 | Comment | `// line comment` |
 | Loop block | `loop { agents [...] max_iterations N until ... }` |
-| Until (verify) | `until { compile true test true }` |
+| Until (verify) | `until { compile true test true impact_tests true }` |
 | Until (agent) | `until agent <name>` |
 | Until (command) | `until command "shell command"` |
 

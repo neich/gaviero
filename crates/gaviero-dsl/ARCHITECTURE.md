@@ -15,7 +15,7 @@ Vec<(Token, Span)>  +  lex errors
        ▼ chumsky parser (combinators, error recovery)
 Script { items: Vec<Item> }  +  parse errors
        │
-       ▼ compiler (5-phase semantic analysis)
+       ▼ compiler (7-phase semantic analysis)
 CompiledPlan { graph: DiGraph<PlanNode, DependencyEdge>, iteration_config, loop_configs, … }
        │
        errors reported via miette (annotated source spans)
@@ -31,11 +31,12 @@ All errors are collected before reporting (multiple errors per pass). The parser
 gaviero-dsl/src/
 ├── lib.rs           pub fn compile(source, filename, workflow, runtime_prompt) → Result<CompiledPlan>
 ├── lexer.rs         Token enum (logos derive), lex() function
-├── ast.rs           Script, Item, ClientDecl, AgentDecl, WorkflowDecl, ScopeBlock, MemoryBlock,
-│                    VerifyBlock, StepItem, LoopBlock, UntilCondition, TierLit, PrivacyLit, StrategyLit
+├── ast.rs           Script, Item, ClientDecl, AgentDecl, WorkflowDecl, ContextBlock, ScopeBlock,
+│                    MemoryBlock, VerifyBlock, LoopBlock, UntilCondition, StepItem, StrategyLit,
+│                    TierLit, PrivacyLit
 ├── parser.rs        parse() — chumsky combinators; grammar defined inline as functions
-├── compiler.rs      compile_ast() — 7-phase analysis; build_iteration_config(), build_verification_config(),
-│                    extract_loop_configs()
+├── compiler.rs      compile_ast() — 7-phase analysis; build_iteration_config(),
+│                    build_verification_config(), extract_loop_configs()
 └── error.rs         DslError (Lex/Parse/Compile variants), DslErrors (miette wrapper)
 ```
 
@@ -52,15 +53,18 @@ gaviero-dsl/src/
 ### Loop keywords
 `loop`, `until`, `agents`, `max_iterations`, `command`
 
+### Graph / impact keywords
+`impact_scope`, `impact_tests`, `context`, `callers_of`, `tests_for`, `depth`
+
 ### Tier value tokens
-`coordinator`, `reasoning`, `execution`, `mechanical` (deprecated — compile to `Cheap`/`Expensive`)  
+`coordinator`, `reasoning`, `execution`, `mechanical` (deprecated — compile to `Cheap`/`Expensive`)
 `cheap`, `expensive` (canonical)
 
 ### Privacy tokens
 `public`, `local_only`
 
 ### Strategy tokens
-`single_pass`, `refine`  
+`single_pass`, `refine`
 `BestOfN` — lexed as `Ident("best_of_3")`; the parser regex-matches `^best_of_(\d+)$` and extracts `n`.
 
 ### Literals
@@ -84,10 +88,11 @@ Script
 └── items: Vec<Item>
     ├── ClientDecl { name, tier?, model?, privacy? }
     ├── AgentDecl  { name, description?, client?, scope?, depends_on?, prompt?,
-    │                max_retries?, memory? }
-    │   └── ScopeBlock  { owned: Vec<String>, read_only: Vec<String> }
-    │   └── MemoryBlock { read_ns, write_ns?, importance?, staleness_sources,
-    │                      read_query?, read_limit?, write_content? }
+    │                max_retries?, memory?, context? }
+    │   └── ScopeBlock    { owned: Vec<String>, read_only: Vec<String>, impact_scope? }
+    │   └── ContextBlock  { callers_of: Vec<String>, tests_for: Vec<String>, depth? }
+    │   └── MemoryBlock   { read_ns, write_ns?, importance?, staleness_sources,
+    │                        read_query?, read_limit?, write_content? }
     └── WorkflowDecl { name, steps?, max_parallel?, memory?,
                        strategy?, test_first?, max_retries?, attempts?,
                        escalate_after?, verify? }
@@ -100,7 +105,7 @@ Script
                     ├── Verify(VerifyBlock)
                     ├── Agent(name)
                     └── Command(string)
-        └── VerifyBlock { compile: bool, clippy: bool, test: bool }
+        └── VerifyBlock { compile: bool, clippy: bool, test: bool, impact_tests: bool }
 
 TierLit    = Cheap | Expensive | Coordinator* | Reasoning* | Execution* | Mechanical*
              (* deprecated aliases)
@@ -108,7 +113,7 @@ PrivacyLit = Public | LocalOnly
 StrategyLit = SinglePass | Refine | BestOfN(u32)
 ```
 
-All nodes carry a `Span` for error reporting. Field-level spans enable precise diagnostic highlighting.
+All nodes carry a `Span` (chumsky `SimpleSpan`) for error reporting. Field-level spans enable precise diagnostic highlighting.
 
 ---
 
@@ -131,10 +136,12 @@ Select which agents to compile and in what order:
 For each agent:
 1. Resolve `client` reference → extract tier (mapped), model string, privacy level
 2. Build `FileScope` from `scope` block (default: `owned = ["."]`)
-3. Substitute `{{PROMPT}}` in description, prompt, `read_query`, and `write_content` fields
-4. Merge memory namespaces (additive `read_ns`; agent `write_ns` overrides workflow)
-5. Map explicit memory control fields (`read_query`, `read_limit`, `write_content`)
-6. Emit complexity warning (stderr) when >1 independent agent
+3. Map `impact_scope` from `ScopeBlock` → `WorkUnit.impact_scope`
+4. Compile `context` block → `WorkUnit.context_callers_of`, `context_tests_for`, `context_depth`
+5. Substitute `{{PROMPT}}` in description, prompt, `read_query`, and `write_content` fields
+6. Merge memory namespaces (additive `read_ns`; agent `write_ns` overrides workflow)
+7. Map explicit memory control fields (`read_query`, `read_limit`, `write_content`)
+8. Emit complexity warning (stderr) when >1 independent agent
 
 **Tier mapping:**
 ```
@@ -149,7 +156,27 @@ Every name in each agent's `depends_on` list must exist in the agent map. Collec
 Insert `PlanNode` per `WorkUnit` into petgraph `DiGraph`. Add directed edges for `depends_on` relationships. DFS cycle detection: halt with the cycle path on first cycle found.
 
 ### Phase 6 — Build iteration + verification configs
-(see below)
+
+**Iteration config:**
+```
+IterationConfig {
+    strategy:       wf.strategy     ?? Refine
+    max_retries:    wf.max_retries  ?? 5
+    max_attempts:   wf.attempts     ?? 1
+    test_first:     wf.test_first   ?? false
+    escalate_after: wf.escalate_after ?? 3
+}
+```
+
+**Verification config:**
+```
+VerificationConfig {
+    compile:      wf.verify.compile      ?? false
+    clippy:       wf.verify.clippy       ?? false
+    test:         wf.verify.test         ?? false
+    impact_tests: wf.verify.impact_tests ?? false
+}
+```
 
 ### Phase 7 — Extract loop configs
 For each `StepItem::Loop` in the workflow's steps, build a `LoopConfig`:
@@ -162,33 +189,13 @@ LoopConfig {
 ```
 Attached to `CompiledPlan.loop_configs`. Used by the swarm pipeline to re-run loop agents until the exit condition is met.
 
-### Iteration config building
-```
-IterationConfig {
-    strategy:       wf.strategy     ?? Refine
-    max_retries:    wf.max_retries  ?? 5
-    max_attempts:   wf.attempts     ?? 1
-    test_first:     wf.test_first   ?? false
-    escalate_after: wf.escalate_after ?? 3
-}
-```
-
-### Verification config building
-```
-VerificationConfig {
-    compile: wf.verify.compile ?? false
-    clippy:  wf.verify.clippy  ?? false
-    test:    wf.verify.test    ?? false
-}
-```
-
 ---
 
 ## Parser properties (`parser.rs`)
 
 - **First-occurrence semantics** — duplicate fields silently ignored; first wins.
 - **No commas in lists** — syntax is `[item item …]`.
-- **Keyword-as-ident** — `verify`, `compile`, `test`, `strategy`, `loop`, `until`, `agents`, `command` may be used as agent/workflow names where the grammar is unambiguous.
+- **Keyword-as-ident** — `verify`, `compile`, `test`, `strategy`, `loop`, `until`, `agents`, `command`, `context`, `depth` may be used as agent/workflow names where the grammar is unambiguous.
 - **Recoverable** — chumsky collects multiple errors per pass; parser can emit partial AST.
 
 ---
@@ -233,6 +240,51 @@ pub mod error;
 
 ---
 
+## Data flow diagram
+
+```
+.gaviero source
+    │
+    ▼
+lexer::lex()
+    │
+    ├── Tokens: KwClient, KwAgent, KwWorkflow, KwContext, KwImpactScope, ...
+    │           Str("..."), RawStr(#"..."#), Int(N), Float(F), Ident("name")
+    │           Punctuation: LBrace, RBrace, LBracket, RBracket
+    │
+    ▼
+parser::parse()
+    │
+    ├── Script { items: [ClientDecl, AgentDecl, WorkflowDecl, ...] }
+    │   Each AgentDecl may contain:
+    │     ScopeBlock   { owned, read_only, impact_scope }
+    │     ContextBlock { callers_of, tests_for, depth }
+    │     MemoryBlock  { read_ns, write_ns, importance, ... }
+    │
+    ▼
+compiler::compile_ast()
+    │
+    ├── Phase 1: Index all declarations by name
+    ├── Phase 2: Determine agent ordering (from workflow steps or declaration order)
+    ├── Phase 3: Resolve clients, build FileScope, compile context/memory blocks → WorkUnit
+    ├── Phase 4: Validate depends_on references
+    ├── Phase 5: Build petgraph DAG, detect cycles
+    ├── Phase 6: Build IterationConfig + VerificationConfig from workflow
+    ├── Phase 7: Extract LoopConfigs from workflow steps
+    │
+    ▼
+CompiledPlan {
+    graph: DiGraph<PlanNode, DependencyEdge>,
+    iteration_config,
+    verification_config,
+    loop_configs,
+    max_parallel,
+    source_file,
+}
+```
+
+---
+
 ## Key dependencies
 
 | Crate | Role |
@@ -241,4 +293,16 @@ pub mod error;
 | `chumsky` | Parser combinators with error recovery |
 | `miette` | Annotated source diagnostics with coloured spans |
 | `thiserror` | Error type derive |
-| `gaviero-core` | `WorkUnit`, `FileScope`, `ModelTier`, `CompiledPlan`, `IterationConfig`, `VerificationConfig`, `LoopConfig`, `LoopUntilCondition` |
+| `gaviero-core` | `WorkUnit`, `FileScope`, `ModelTier`, `PrivacyLevel`, `CompiledPlan`, `IterationConfig`, `VerificationConfig`, `LoopConfig`, `LoopUntilCondition` |
+
+---
+
+## Concurrency model
+
+None. The DSL compiler is entirely synchronous. `compile()` is called once at startup and returns a `CompiledPlan` that is then passed to async pipeline execution.
+
+---
+
+## Error handling strategy
+
+All three phases (lex, parse, compile) collect errors into `Vec<DslError>`. Errors are reported in aggregate via `DslErrors` (a `miette::Diagnostic` wrapper with source-span annotations). The compiler does not halt on the first error — it continues to find as many issues as possible per invocation.
