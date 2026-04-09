@@ -154,9 +154,9 @@ impl Keymap {
             KeyCode::Char('9') if alt && !ctrl => Action::SwitchLayout(4),
             KeyCode::Char('0') if alt && !ctrl => Action::SwitchLayout(5),
 
-            // ── Tab cycling: Alt+[/] ─────────────────────────────
-            KeyCode::Char(']') if alt => Action::CycleTabForward,
-            KeyCode::Char('[') if alt => Action::CycleTabBack,
+            // ── Tab cycling: Alt+O/I ─────────────────────────────
+            KeyCode::Char('o') if alt => Action::CycleTabForward,
+            KeyCode::Char('i') if alt => Action::CycleTabBack,
 
             // ── Preview toggle ───────────────────────────────────
             KeyCode::Char('p') if alt => Action::TogglePreview,
