@@ -335,6 +335,23 @@ pub enum MoveState {
     Confirming(std::path::PathBuf, std::path::PathBuf),
 }
 
+// ── First-run setup dialog ──────────────────────────────────────
+
+/// Which question the first-run dialog is currently showing.
+#[derive(Debug, Clone, PartialEq)]
+enum FirstRunStep {
+    AskSettings,
+    AskMemory,
+}
+
+/// State for the first-run setup dialog shown when `.gaviero/settings.json` is missing.
+#[derive(Debug, Clone)]
+struct FirstRunDialog {
+    step: FirstRunStep,
+    /// Answer to "create settings.json?" collected at step 1.
+    create_settings: bool,
+}
+
 // ── Inline dialog for file tree operations ──────────────────────
 
 #[derive(Debug, Clone)]
@@ -457,6 +474,8 @@ pub struct App {
     pub should_quit: bool,
     /// When true, a quit-confirmation dialog is shown (unsaved files or active agents).
     quit_confirm: bool,
+    /// First-run setup dialog shown when no `.gaviero/settings.json` is found.
+    first_run_dialog: Option<FirstRunDialog>,
     /// When true, the main loop should call `terminal.clear()` before the next draw
     /// to force a full redraw and fix any terminal state corruption.
     pub needs_full_redraw: bool,
@@ -537,6 +556,11 @@ impl App {
         let roots: Vec<&Path> = workspace.roots();
         let file_tree = FileTreeState::from_roots(&roots, &excludes, &git_allow);
 
+        // Detect first run: no .gaviero/settings.json for any workspace root.
+        let is_first_run = roots.first()
+            .map(|root| !root.join(".gaviero").join("settings.json").exists())
+            .unwrap_or(false);
+
         let theme = Theme::load(Path::new("themes/default.toml"))
             .unwrap_or_else(|_| Theme::builtin_default());
 
@@ -605,6 +629,11 @@ impl App {
             },
             should_quit: false,
             quit_confirm: false,
+            first_run_dialog: if is_first_run {
+                Some(FirstRunDialog { step: FirstRunStep::AskSettings, create_settings: false })
+            } else {
+                None
+            },
             needs_full_redraw: false,
             event_tx,
             theme,
@@ -687,6 +716,12 @@ impl App {
                             return;
                         }
                     }
+                }
+
+                // If first-run setup dialog is active, route raw keys there
+                if self.first_run_dialog.is_some() {
+                    self.handle_first_run_key(&key);
+                    return;
                 }
 
                 // If quit confirmation dialog is active, route raw keys there
@@ -939,6 +974,7 @@ impl App {
             Event::MemoryReady(store) => {
                 self.memory = Some(store);
                 self.status_message = Some(("Memory ready".to_string(), std::time::Instant::now()));
+                self.refresh_file_tree();
             }
 
             Event::Terminal(term_event) => {
@@ -5324,6 +5360,86 @@ impl App {
         }
     }
 
+    /// Handle a key press while the first-run setup dialog is active.
+    fn handle_first_run_key(&mut self, key: &crossterm::event::KeyEvent) {
+        let step = match &self.first_run_dialog {
+            Some(d) => d.step.clone(),
+            None => return,
+        };
+        match step {
+            FirstRunStep::AskSettings => match key.code {
+                crossterm::event::KeyCode::Char('y') | crossterm::event::KeyCode::Char('Y') => {
+                    if let Some(d) = &mut self.first_run_dialog {
+                        d.create_settings = true;
+                        d.step = FirstRunStep::AskMemory;
+                    }
+                }
+                crossterm::event::KeyCode::Char('n')
+                | crossterm::event::KeyCode::Char('N')
+                | crossterm::event::KeyCode::Esc => {
+                    if let Some(d) = &mut self.first_run_dialog {
+                        d.create_settings = false;
+                        d.step = FirstRunStep::AskMemory;
+                    }
+                }
+                _ => {}
+            },
+            FirstRunStep::AskMemory => match key.code {
+                crossterm::event::KeyCode::Char('y') | crossterm::event::KeyCode::Char('Y') => {
+                    self.apply_first_run(true);
+                }
+                crossterm::event::KeyCode::Char('n')
+                | crossterm::event::KeyCode::Char('N')
+                | crossterm::event::KeyCode::Esc => {
+                    self.apply_first_run(false);
+                }
+                _ => {}
+            },
+        }
+    }
+
+    /// Execute first-run actions based on collected answers, then dismiss the dialog.
+    fn apply_first_run(&mut self, init_memory: bool) {
+        let create_settings = self
+            .first_run_dialog
+            .as_ref()
+            .map(|d| d.create_settings)
+            .unwrap_or(false);
+        self.first_run_dialog = None;
+
+        if create_settings {
+            self.workspace.ensure_settings();
+            self.status_message = Some((
+                "Created .gaviero/settings.json".to_string(),
+                std::time::Instant::now(),
+            ));
+            self.refresh_file_tree();
+        }
+
+        if init_memory {
+            if let Some(root) = self.workspace.roots().first().map(|r| r.to_path_buf()) {
+                let tx = self.event_tx.clone();
+                tokio::spawn(async move {
+                    match tokio::task::spawn_blocking(move || {
+                        gaviero_core::memory::init_workspace(&root)
+                    })
+                    .await
+                    {
+                        Ok(Ok(store)) => {
+                            let _ = tx.send(Event::MemoryReady(store));
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!("Workspace memory init failed: {}", e);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Workspace memory init panicked: {}", e);
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     /// Check for unsaved files and active agents before quitting.
     /// If anything needs attention, show the confirmation dialog instead.
     fn try_quit(&mut self) {
@@ -5422,6 +5538,9 @@ impl App {
             }
             if self.quit_confirm {
                 self.render_quit_confirm(frame, size);
+            }
+            if self.first_run_dialog.is_some() {
+                self.render_first_run_dialog(frame, size);
             }
             return;
         }
@@ -5560,6 +5679,9 @@ impl App {
 
         if self.quit_confirm {
             self.render_quit_confirm(frame, size);
+        }
+        if self.first_run_dialog.is_some() {
+            self.render_first_run_dialog(frame, size);
         }
     }
 
@@ -6431,7 +6553,6 @@ impl App {
 
         let x = area.x + (area.width.saturating_sub(dialog_w)) / 2;
         let y = area.y + (area.height.saturating_sub(dialog_h)) / 2;
-        let dialog_area = Rect { x, y, width: dialog_w, height: dialog_h };
 
         let bg_style = Style::default().fg(theme::TEXT_BRIGHT).bg(theme::INPUT_BG);
         let title_style = Style::default()
@@ -6498,6 +6619,126 @@ impl App {
                 break;
             }
             let is_title = line.trim_start().starts_with("Quit");
+            let is_hint = line.contains('[');
+            let style = if is_title {
+                title_style
+            } else if is_hint {
+                hint_style
+            } else {
+                bg_style
+            };
+            let mut cx = x + 1;
+            for ch in line.chars() {
+                if cx >= x + dialog_w - 1 {
+                    break;
+                }
+                if cx < frame.area().right() {
+                    frame.buffer_mut()[(cx, cy)].set_char(ch).set_style(style);
+                }
+                cx += 1;
+            }
+        }
+    }
+
+    fn render_first_run_dialog(&self, frame: &mut Frame, area: Rect) {
+        let Some(dialog) = &self.first_run_dialog else {
+            return;
+        };
+
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(String::new());
+        lines.push("  First-time setup".to_string());
+        lines.push("  No .gaviero/ configuration found in this folder.".to_string());
+        lines.push(String::new());
+
+        match dialog.step {
+            FirstRunStep::AskSettings => {
+                lines.push("  Create initial settings.json?".to_string());
+                lines.push(String::new());
+                lines.push("  [y] Yes   [n / Esc] No".to_string());
+            }
+            FirstRunStep::AskMemory => {
+                lines.push(format!(
+                    "  settings.json: {}",
+                    if dialog.create_settings { "will be created" } else { "skipped" }
+                ));
+                lines.push(String::new());
+                lines.push("  Initialize knowledge graph (memory.db)?".to_string());
+                lines.push(String::new());
+                lines.push("  [y] Yes   [n / Esc] No".to_string());
+            }
+        }
+        lines.push(String::new());
+
+        let dialog_w: u16 = lines
+            .iter()
+            .map(|l| l.chars().count() as u16)
+            .max()
+            .unwrap_or(50)
+            .max(50)
+            + 2;
+        let dialog_h = lines.len() as u16;
+
+        if area.width < dialog_w + 4 || area.height < dialog_h + 2 {
+            return;
+        }
+
+        let x = area.x + (area.width.saturating_sub(dialog_w)) / 2;
+        let y = area.y + (area.height.saturating_sub(dialog_h)) / 2;
+
+        let bg_style = Style::default().fg(theme::TEXT_BRIGHT).bg(theme::INPUT_BG);
+        let title_style = Style::default()
+            .fg(theme::FOCUS_BORDER)
+            .bg(theme::INPUT_BG)
+            .add_modifier(Modifier::BOLD);
+        let hint_style = Style::default().fg(theme::TEXT_DIM).bg(theme::INPUT_BG);
+
+        // Clear background
+        for row in 0..dialog_h {
+            for col in 0..dialog_w {
+                let cx = x + col;
+                let cy = y + row;
+                if cx < frame.area().right() && cy < frame.area().bottom() {
+                    frame.buffer_mut()[(cx, cy)].set_char(' ').set_style(bg_style);
+                }
+            }
+        }
+
+        // Draw border
+        for col in 0..dialog_w {
+            let cx = x + col;
+            if cx < frame.area().right() {
+                let ch = if col == 0 { '┌' } else if col == dialog_w - 1 { '┐' } else { '─' };
+                if y < frame.area().bottom() {
+                    frame.buffer_mut()[(cx, y)].set_char(ch).set_style(title_style);
+                }
+                let bottom_y = y + dialog_h - 1;
+                let ch = if col == 0 { '└' } else if col == dialog_w - 1 { '┘' } else { '─' };
+                if bottom_y < frame.area().bottom() {
+                    frame.buffer_mut()[(cx, bottom_y)].set_char(ch).set_style(title_style);
+                }
+            }
+        }
+        for row in 1..dialog_h.saturating_sub(1) {
+            let cy = y + row;
+            if cy < frame.area().bottom() {
+                if x < frame.area().right() {
+                    frame.buffer_mut()[(x, cy)].set_char('│').set_style(title_style);
+                }
+                let right_x = x + dialog_w - 1;
+                if right_x < frame.area().right() {
+                    frame.buffer_mut()[(right_x, cy)].set_char('│').set_style(title_style);
+                }
+            }
+        }
+
+        // Draw text lines
+        for (i, line) in lines.iter().enumerate() {
+            let cy = y + i as u16;
+            if cy >= frame.area().bottom() {
+                break;
+            }
+            let is_title = line.trim_start().starts_with("First-time");
             let is_hint = line.contains('[');
             let style = if is_title {
                 title_style
