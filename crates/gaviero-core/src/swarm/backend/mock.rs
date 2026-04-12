@@ -118,6 +118,9 @@ mod tests {
             file_attachments: vec![],
             conversation_history: vec![],
             file_refs: vec![],
+            effort: None,
+            max_tokens: None,
+            auto_approve: true,
         };
 
         let mut stream = backend.stream_completion(req).await.unwrap();
@@ -141,6 +144,9 @@ mod tests {
             file_attachments: vec![],
             conversation_history: vec![],
             file_refs: vec![],
+            effort: None,
+            max_tokens: None,
+            auto_approve: true,
         };
 
         let mut stream = backend.stream_completion(req).await.unwrap();

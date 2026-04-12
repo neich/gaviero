@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use tokio::sync::{Mutex, Semaphore};
 
 use super::board::SharedBoard;
+use super::router::{TierConfig, TierRouter};
 use super::bus::AgentBus;
 use super::coordinator::{Coordinator, CoordinatorConfig};
 use super::execution_state::{ExecutionState, NodeStatus};
@@ -28,6 +29,7 @@ pub struct SwarmConfig {
     pub max_parallel: usize,
     pub workspace_root: PathBuf,
     pub model: String,
+    pub ollama_base_url: Option<String>,
     pub use_worktrees: bool,
     pub read_namespaces: Vec<String>,
     pub write_namespace: String,
@@ -67,6 +69,23 @@ pub async fn execute(
 
     // Override max_parallel from plan if declared
     let effective_max_parallel = plan.max_parallel.unwrap_or(config.max_parallel);
+    let mut tier_config = TierConfig::default();
+    let selected_local_model = config
+        .model
+        .strip_prefix("ollama:")
+        .or_else(|| config.model.strip_prefix("local:"))
+        .map(str::to_string);
+    if let Some(base_url) = config.ollama_base_url.as_ref() {
+        tier_config.local.base_url = base_url.clone();
+    }
+    if let Some(local_model) = selected_local_model.as_ref() {
+        tier_config.local.enabled = true;
+        tier_config.local.model = local_model.clone();
+        tier_config.cheap_model = local_model.clone();
+        tier_config.expensive_model = local_model.clone();
+    }
+    let tier_router = TierRouter::new(tier_config, selected_local_model.is_some());
+    let git_coordinator = Arc::new(GitCoordinator::new());
 
     // Execution state tracks per-node progress (populated as nodes complete)
     let mut exec_state = initial_state
@@ -141,12 +160,6 @@ pub async fn execute(
         observer.on_phase_changed("running");
         observer.on_agent_state_changed(&unit.id, &AgentStatus::Running, "starting");
 
-        let backend = super::backend::claude_code::ClaudeCodeBackend::new(
-            unit.model.as_deref().unwrap_or("sonnet"),
-        );
-        let write_gate = Arc::new(Mutex::new(
-            WriteGatePipeline::new(WriteMode::AutoAccept, Box::new(NoopWriteGateObserver)),
-        ));
         let single_validation: Option<Arc<crate::validation_gate::ValidationPipeline>> =
             if config.workspace_root.join("Cargo.toml").exists() {
                 Some(Arc::new(crate::validation_gate::ValidationPipeline::default_for_rust()))
@@ -174,40 +187,48 @@ pub async fn execute(
             })
             .unwrap_or(None);
 
-        let engine = crate::iteration::IterationEngine::new(plan.iteration_config.clone());
         let effective_read_ns: Vec<String> = unit.read_namespaces
             .as_deref()
             .unwrap_or(config.read_namespaces.as_slice())
             .to_vec();
-        let acp_obs = make_observer(&unit.id);
+        let agent_ctx = AgentRunContext {
+            workspace_root: &config.workspace_root,
+            context_files: &config.context_files,
+            memory: memory.clone(),
+            read_namespaces: &effective_read_ns,
+            swarm_observer: observer,
+            git_coordinator: git_coordinator.clone(),
+            validation: single_validation.clone(),
+            board: None,
+            repo_map: single_repo_map.clone(),
+            impact_texts: Arc::new({
+                let mut map = std::collections::HashMap::new();
+                if let Some(text) = single_impact_text.clone() {
+                    map.insert(unit.id.clone(), text);
+                }
+                map
+            }),
+        };
 
         invalidate_stale_sources(&memory, &unit, &config.workspace_root).await;
 
-        let iter_result = engine
-            .run(
-                &backend,
-                unit.clone(),
-                write_gate,
-                &config.workspace_root,
-                memory.as_deref(),
-                &effective_read_ns,
-                acp_obs.as_ref(),
-                single_validation.as_deref(),
-                None,
-                (*single_repo_map).as_ref(),
-                single_impact_text.as_deref(),
-            )
-            .await;
-
-        let manifest = iter_result.manifest;
-        let success = matches!(manifest.status, AgentStatus::Completed);
+        let manifest = run_single_agent(
+            &unit,
+            None,
+            &agent_ctx,
+            &tier_router,
+            &plan.iteration_config,
+            make_observer(&unit.id),
+        )
+        .await?;
+        let agent_completed = matches!(manifest.status, AgentStatus::Completed);
         observer.on_agent_state_changed(
             &manifest.work_unit_id,
             &manifest.status,
             manifest.summary.as_deref().unwrap_or(""),
         );
 
-        if success {
+        if agent_completed {
             let effective_write_ns = unit.write_namespace.as_deref()
                 .unwrap_or(&config.write_namespace);
             store_agent_result(&memory, effective_write_ns, &manifest, &unit, &run_id, &config.workspace_root).await;
@@ -215,10 +236,18 @@ pub async fn execute(
         exec_state.record_result(&unit.id, manifest.clone());
         let _ = exec_state.save(&plan_hash);
 
+        let verification_passed = run_post_execution_verification(
+            &plan.verification_config,
+            std::slice::from_ref(&manifest),
+            &config.workspace_root,
+            observer,
+        )
+        .await?;
+
         let swarm_result = SwarmResult {
             manifests: vec![manifest],
             merge_results: vec![],
-            success,
+            success: agent_completed && verification_passed,
             pre_swarm_sha,
         };
         observer.on_phase_changed("completed");
@@ -237,9 +266,6 @@ pub async fn execute(
     let mut all_manifests: Vec<AgentManifest> = Vec::new();
     let mut all_merges: Vec<MergeResult> = Vec::new();
     let semaphore = Arc::new(Semaphore::new(effective_max_parallel));
-
-    // Serialize concurrent git metadata operations (prevents .git/index.lock races)
-    let git_coordinator = Arc::new(GitCoordinator::new());
 
     // Build validation pipeline based on workspace type (shared across all agents via Arc)
     let validation_pipeline: Option<Arc<crate::validation_gate::ValidationPipeline>> =
@@ -393,6 +419,8 @@ pub async fn execute(
                     unit,
                     worktree_mgr.as_mut(),
                     &agent_ctx,
+                    &tier_router,
+                    &plan.iteration_config,
                     make_observer(unit_id),
                 ).await?;
 
@@ -450,6 +478,11 @@ pub async fn execute(
                 let board_ref = Some(shared_board.clone());
                 let rm = repo_map.clone();
                 let agent_impact = impact_texts.get(unit_id).cloned();
+                let router = tier_router.clone();
+                let iteration_config = plan.iteration_config.clone();
+                if let Ok(backend) = resolve_backend_for_unit(&router, &unit) {
+                    observer.on_tier_dispatch(unit_id, unit.tier, backend.name());
+                }
 
                 // Provision worktree if enabled
                 let in_worktree = worktree_mgr.is_some();
@@ -460,11 +493,6 @@ pub async fn execute(
                     root.clone()
                 };
 
-                // Resolve backend for this unit
-                let backend = super::backend::claude_code::ClaudeCodeBackend::new(
-                    unit.model.as_deref().unwrap_or("sonnet"),
-                );
-
                 handles.push(tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
 
@@ -473,19 +501,23 @@ pub async fn execute(
                     let write_gate = Arc::new(Mutex::new(
                         WriteGatePipeline::new(WriteMode::AutoAccept, Box::new(NoopWriteGateObserver)),
                     ));
-                    let mut manifest = super::backend::runner::run_backend(
-                        &backend,
-                        &unit,
-                        write_gate,
-                        &agent_root,
-                        mem.as_deref(),
-                        &ns,
-                        obs.as_ref(),
-                        val_pipeline.as_deref(),
-                        board_ref.as_deref(),
-                        (*rm).as_ref(),
-                        agent_impact.as_deref(),
-                    ).await?;
+                    let engine = crate::iteration::IterationEngine::new(iteration_config.clone());
+                    let mut manifest = engine
+                        .run_with_backend_factory(
+                            unit.clone(),
+                            write_gate,
+                            &agent_root,
+                            mem.as_deref(),
+                            &ns,
+                            obs.as_ref(),
+                            val_pipeline.as_deref(),
+                            board_ref.as_deref(),
+                            (*rm).as_ref(),
+                            agent_impact.as_deref(),
+                            |candidate| resolve_backend_for_unit(&router, candidate),
+                        )
+                        .await
+                        .manifest;
 
                     if in_worktree && matches!(manifest.status, AgentStatus::Completed) {
                         let summary = manifest.summary.as_deref().unwrap_or("task complete").to_string();
@@ -634,6 +666,8 @@ pub async fn execute(
                     unit,
                     worktree_mgr.as_mut(),
                     &agent_ctx,
+                    &tier_router,
+                    &plan.iteration_config,
                     make_observer(agent_id),
                 ).await?;
 
@@ -688,6 +722,7 @@ pub async fn execute(
                             branch,
                             &result.conflicts,
                             &config.model,
+                            config.ollama_base_url.as_deref(),
                         ).await;
 
                         match resolved {
@@ -736,8 +771,17 @@ pub async fn execute(
         }
     }
 
+    let verification_passed = run_post_execution_verification(
+        &plan.verification_config,
+        &all_manifests,
+        &config.workspace_root,
+        observer,
+    )
+    .await?;
+
     let success = all_manifests.iter().all(|m| matches!(m.status, AgentStatus::Completed))
-        && all_merges.iter().all(|m| m.success);
+        && all_merges.iter().all(|m| m.success)
+        && verification_passed;
 
     let result = SwarmResult {
         manifests: all_manifests,
@@ -775,6 +819,8 @@ async fn run_single_agent(
     unit: &WorkUnit,
     worktree_mgr: Option<&mut WorktreeManager>,
     ctx: &AgentRunContext<'_>,
+    tier_router: &TierRouter,
+    iteration_config: &crate::iteration::IterationConfig,
     acp_observer: Box<dyn AcpObserver>,
 ) -> Result<AgentManifest> {
     let workspace_root = ctx.workspace_root;
@@ -801,31 +847,33 @@ async fn run_single_agent(
         workspace_root.clone()
     };
 
-    // Resolve backend from model override or default to Claude Code
-    let backend = super::backend::claude_code::ClaudeCodeBackend::new(
-        unit.model.as_deref().unwrap_or("sonnet"),
-    );
-
     let write_gate = Arc::new(Mutex::new(
         WriteGatePipeline::new(WriteMode::AutoAccept, Box::new(NoopWriteGateObserver)),
     ));
+    let engine = crate::iteration::IterationEngine::new(iteration_config.clone());
 
     swarm_observer.on_agent_state_changed(&unit.id, &AgentStatus::Running, "starting");
 
-    let mut manifest = super::backend::runner::run_backend(
-        &backend,
-        unit,
-        write_gate,
-        &agent_root,
-        memory.as_deref(),
-        read_namespaces,
-        acp_observer.as_ref(),
-        validation.as_deref(),
-        board.as_deref(),
-        (*repo_map).as_ref(),
-        impact_text.as_deref(),
-    )
-    .await?;
+    let mut manifest = engine
+        .run_with_backend_factory(
+            unit.clone(),
+            write_gate,
+            &agent_root,
+            memory.as_deref(),
+            read_namespaces,
+            acp_observer.as_ref(),
+            validation.as_deref(),
+            board.as_deref(),
+            (*repo_map).as_ref(),
+            impact_text.as_deref(),
+            |candidate| {
+                let backend = resolve_backend_for_unit(tier_router, candidate)?;
+                swarm_observer.on_tier_dispatch(&candidate.id, candidate.tier, backend.name());
+                Ok(backend)
+            },
+        )
+        .await
+        .manifest;
 
     swarm_observer.on_agent_state_changed(
         &unit.id,
@@ -847,6 +895,146 @@ async fn run_single_agent(
     }
 
     Ok(manifest)
+}
+
+fn resolve_backend_for_unit(
+    router: &TierRouter,
+    unit: &WorkUnit,
+) -> Result<Box<dyn super::backend::AgentBackend>> {
+    router
+        .resolve_backend(unit)
+        .map_err(|reason| anyhow::anyhow!("backend resolution failed for '{}': {}", unit.id, reason))
+}
+
+async fn run_post_execution_verification(
+    config: &super::plan::VerificationConfig,
+    manifests: &[AgentManifest],
+    workspace_root: &std::path::Path,
+    observer: &dyn SwarmObserver,
+) -> Result<bool> {
+    if !config.compile && !config.clippy && !config.test && !config.impact_tests {
+        return Ok(true);
+    }
+
+    observer.on_phase_changed("verifying");
+    observer.on_verification_started("workflow_config");
+
+    let modified_files = collect_completed_modified_files(manifests);
+    let passed = run_verification_checks(config, workspace_root, Some(modified_files.as_slice())).await?;
+    if !passed {
+        observer.on_verification_complete(false);
+        return Ok(false);
+    }
+
+    observer.on_verification_complete(true);
+    Ok(true)
+}
+
+fn collect_completed_modified_files(manifests: &[AgentManifest]) -> Vec<std::path::PathBuf> {
+    manifests
+        .iter()
+        .filter(|m| matches!(m.status, AgentStatus::Completed))
+        .flat_map(|m| m.modified_files.iter().cloned())
+        .collect()
+}
+
+async fn run_verification_checks(
+    config: &super::plan::VerificationConfig,
+    workspace_root: &std::path::Path,
+    modified_files: Option<&[std::path::PathBuf]>,
+) -> Result<bool> {
+    if config.compile && !run_verification_command(workspace_root, "cargo", &["check"]).await {
+        return Ok(false);
+    }
+
+    if config.test && !run_test_verification(workspace_root, &[], false).await? {
+        return Ok(false);
+    }
+
+    if config.impact_tests {
+        let passed = if let Some(files) = modified_files {
+            run_test_verification(workspace_root, files, true).await?
+        } else {
+            run_conservative_impact_tests(workspace_root).await
+        };
+        if !passed {
+            return Ok(false);
+        }
+    }
+
+    if config.clippy
+        && !run_verification_command(workspace_root, "cargo", &["clippy", "--", "-D", "warnings"]).await
+    {
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+async fn run_verification_command(
+    workspace_root: &std::path::Path,
+    program: &str,
+    args: &[&str],
+) -> bool {
+    tokio::process::Command::new(program)
+        .args(args)
+        .current_dir(workspace_root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+async fn run_test_verification(
+    workspace_root: &std::path::Path,
+    modified_files: &[std::path::PathBuf],
+    targeted: bool,
+) -> Result<bool> {
+    let report = super::verify::test_runner::run(
+        &super::verify::test_runner::TestRunnerConfig {
+            command: None,
+            targeted,
+            ..Default::default()
+        },
+        modified_files,
+        workspace_root,
+    )
+    .await?;
+    Ok(report.passed)
+}
+
+async fn run_conservative_impact_tests(workspace_root: &std::path::Path) -> bool {
+    match crate::repo_map::graph_builder::build_graph(workspace_root) {
+        Ok((store, _)) => {
+            let all_src: Vec<String> = store
+                .all_file_hashes()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(f, _)| !f.contains("test"))
+                .map(|(f, _)| f)
+                .collect();
+            let refs: Vec<&str> = all_src.iter().map(|s| s.as_str()).collect();
+            if let Ok(impact) = store.impact_radius(&refs, 3) {
+                let test_modules: Vec<String> = impact
+                    .affected_tests
+                    .iter()
+                    .filter_map(|t| t.strip_suffix(".rs").map(|s| s.replace('/', "::")))
+                    .collect();
+                for test_mod in &test_modules {
+                    if !run_verification_command(workspace_root, "cargo", &["test", test_mod]).await {
+                        return false;
+                    }
+                }
+            }
+            true
+        }
+        Err(e) => {
+            tracing::warn!("impact_tests: graph build failed, falling back to full test: {}", e);
+            run_verification_command(workspace_root, "cargo", &["test"]).await
+        }
+    }
 }
 
 /// Commit all changes in a worktree after an agent completes.
@@ -1002,8 +1190,16 @@ pub async fn plan_coordinated(
     make_observer: impl Fn(&str) -> Box<dyn AcpObserver>,
 ) -> Result<String> {
     observer.on_coordination_started(prompt);
-    observer.on_agent_state_changed("coordinator", &AgentStatus::Running, "Opus planning (DSL)...");
-    observer.on_tier_dispatch("coordinator", crate::types::ModelTier::Expensive, &config.model);
+    observer.on_agent_state_changed(
+        "coordinator",
+        &AgentStatus::Running,
+        "Coordinator planning (DSL)...",
+    );
+    observer.on_tier_dispatch(
+        "coordinator",
+        crate::types::ModelTier::Expensive,
+        &coordinator_config.model,
+    );
 
     let file_list = collect_file_list(&config.workspace_root)?;
     let coordinator = Coordinator::new(memory, coordinator_config);
@@ -1058,6 +1254,71 @@ pub fn revert_swarm(workspace_root: &std::path::Path, result: &super::models::Sw
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{FileScope, ModelTier, PrivacyLevel};
+    use std::collections::HashMap;
+
+    fn test_unit(tier: ModelTier, privacy: PrivacyLevel, model: Option<&str>) -> WorkUnit {
+        WorkUnit {
+            id: "unit".into(),
+            description: "test task".into(),
+            scope: FileScope {
+                owned_paths: vec!["src/".into()],
+                read_only_paths: vec![],
+                interface_contracts: HashMap::new(),
+            },
+            depends_on: vec![],
+            #[allow(deprecated)]
+            backend: Default::default(),
+            model: model.map(|m| m.to_string()),
+            tier,
+            privacy,
+            coordinator_instructions: String::new(),
+            estimated_tokens: 0,
+            max_retries: 1,
+            escalation_tier: None,
+            read_namespaces: None,
+            write_namespace: None,
+            memory_importance: None,
+            staleness_sources: vec![],
+            memory_read_query: None,
+            memory_read_limit: None,
+            memory_write_content: None,
+            impact_scope: false,
+            context_callers_of: vec![],
+            context_tests_for: vec![],
+            context_depth: 2,
+        }
+    }
+
+    #[test]
+    fn backend_resolution_uses_router_models() {
+        let router = TierRouter::new(TierConfig::default(), false);
+        let backend = resolve_backend_for_unit(
+            &router,
+            &test_unit(ModelTier::Cheap, PrivacyLevel::Public, None),
+        )
+        .expect("cheap unit should resolve");
+
+        assert!(backend.name().contains("haiku"));
+    }
+
+    #[test]
+    fn backend_resolution_rejects_blocked_units() {
+        let router = TierRouter::new(TierConfig::default(), false);
+        let err = resolve_backend_for_unit(
+            &router,
+            &test_unit(ModelTier::Cheap, PrivacyLevel::LocalOnly, None),
+        )
+        .err()
+        .expect("local-only unit should be blocked without local backend");
+
+        assert!(err.to_string().contains("backend resolution failed"));
+    }
+}
+
 /// Collect a list of git-tracked files in the workspace for coordinator context.
 ///
 /// Uses `git ls-files` so the coordinator only sees files that actually exist in
@@ -1083,6 +1344,45 @@ fn collect_file_list(workspace_root: &PathBuf) -> Result<Vec<String>> {
         .filter(|l| !l.is_empty())
         .map(|l| l.to_string())
         .collect())
+}
+
+#[cfg(test)]
+mod collect_file_list_tests {
+    use super::collect_file_list;
+    use tempfile::tempdir;
+
+    #[test]
+    fn collect_file_list_returns_tracked_files_only() {
+        let dir = tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git init");
+
+        std::fs::write(dir.path().join("tracked.txt"), "tracked").unwrap();
+        std::fs::write(dir.path().join("untracked.txt"), "untracked").unwrap();
+
+        std::process::Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git add");
+
+        let files = collect_file_list(&dir.path().to_path_buf()).unwrap();
+
+        assert_eq!(files, vec!["tracked.txt"]);
+    }
+
+    #[test]
+    fn collect_file_list_falls_back_to_empty_for_non_git_directory() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("plain.txt"), "content").unwrap();
+
+        let files = collect_file_list(&dir.path().to_path_buf()).unwrap();
+
+        assert!(files.is_empty());
+    }
 }
 
 /// Invalidate stale memory entries for a work unit's `staleness_sources`.
@@ -1134,101 +1434,9 @@ async fn evaluate_loop_condition(
     workspace_root: &std::path::Path,
 ) -> bool {
     match condition {
-        super::plan::LoopUntilCondition::Verify(config) => {
-            // Run compile/clippy/test checks and return true if all pass
-            let mut all_pass = true;
-            if config.compile {
-                let result = tokio::process::Command::new("cargo")
-                    .arg("check")
-                    .current_dir(workspace_root)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .await;
-                if !result.map(|s| s.success()).unwrap_or(false) {
-                    all_pass = false;
-                }
-            }
-            if config.test && all_pass {
-                let result = tokio::process::Command::new("cargo")
-                    .arg("test")
-                    .current_dir(workspace_root)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .await;
-                if !result.map(|s| s.success()).unwrap_or(false) {
-                    all_pass = false;
-                }
-            }
-            if config.impact_tests && all_pass {
-                // Run only tests affected by the blast radius.
-                // Build the graph, find affected test files, run them.
-                match crate::repo_map::graph_builder::build_graph(workspace_root) {
-                    Ok((store, _)) => {
-                        // Use all source files as the "changed" set (conservative)
-                        let all_src: Vec<String> = store.all_file_hashes()
-                            .unwrap_or_default()
-                            .into_iter()
-                            .filter(|(f, _)| !f.contains("test"))
-                            .map(|(f, _)| f)
-                            .collect();
-                        let refs: Vec<&str> = all_src.iter().map(|s| s.as_str()).collect();
-                        if let Ok(impact) = store.impact_radius(&refs, 3) {
-                            let test_modules: Vec<String> = impact.affected_tests.iter()
-                                .filter_map(|t| {
-                                    // Convert file path to test module name for cargo test filter
-                                    t.strip_suffix(".rs")
-                                        .map(|s| s.replace('/', "::"))
-                                })
-                                .collect();
-                            if !test_modules.is_empty() {
-                                for test_mod in &test_modules {
-                                    let result = tokio::process::Command::new("cargo")
-                                        .args(["test", test_mod])
-                                        .current_dir(workspace_root)
-                                        .stdout(std::process::Stdio::null())
-                                        .stderr(std::process::Stdio::null())
-                                        .status()
-                                        .await;
-                                    if !result.map(|s| s.success()).unwrap_or(false) {
-                                        all_pass = false;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("impact_tests: graph build failed, falling back to full test: {}", e);
-                        let result = tokio::process::Command::new("cargo")
-                            .arg("test")
-                            .current_dir(workspace_root)
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .status()
-                            .await;
-                        if !result.map(|s| s.success()).unwrap_or(false) {
-                            all_pass = false;
-                        }
-                    }
-                }
-            }
-            if config.clippy && all_pass {
-                let result = tokio::process::Command::new("cargo")
-                    .arg("clippy")
-                    .args(["--", "-D", "warnings"])
-                    .current_dir(workspace_root)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .await;
-                if !result.map(|s| s.success()).unwrap_or(false) {
-                    all_pass = false;
-                }
-            }
-            all_pass
-        }
+        super::plan::LoopUntilCondition::Verify(config) => run_verification_checks(config, workspace_root, None)
+            .await
+            .unwrap_or(false),
         super::plan::LoopUntilCondition::Agent(_agent_id) => {
             // Judge agent evaluation: run the agent and parse its output for PASS/FAIL.
             // For now, return false (not met) — full implementation requires running

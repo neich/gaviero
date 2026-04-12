@@ -19,6 +19,7 @@ pub mod settings {
     pub const AGENT_MODEL: &str = "agent.model";
     pub const AGENT_EFFORT: &str = "agent.effort";
     pub const AGENT_MAX_TOKENS: &str = "agent.maxTokens";
+    pub const AGENT_OLLAMA_BASE_URL: &str = "agent.ollamaBaseUrl";
 
     // Memory settings
     /// The namespace to write memories to.

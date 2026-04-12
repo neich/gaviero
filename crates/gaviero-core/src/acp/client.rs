@@ -1,4 +1,4 @@
-//! AcpPipeline — sends prompts to Claude Code and routes file changes
+//! AcpPipeline — sends prompts to the configured provider and routes file changes
 //! through the Write Gate.
 
 use anyhow::{Context, Result};
@@ -9,13 +9,12 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::observer::AcpObserver;
+use crate::swarm::backend::AgentBackend as _;
+use crate::swarm::backend::{executor, shared, CompletionRequest};
 use crate::write_gate::WriteGatePipeline;
 
 use super::protocol::{StreamEvent, find_next_file_block, parse_file_blocks};
 use super::session::{AcpSession, AgentOptions};
-
-/// Maximum characters to include per message when sending conversation history.
-const HISTORY_TRUNCATION_CHARS: usize = 2000;
 
 /// How long to wait for the next stream event before sending a keepalive status.
 /// Claude tool calls (Read, Grep on large repos) can take a while, so this should
@@ -26,12 +25,8 @@ const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// After this, the process is killed to avoid blocking the pipeline indefinitely.
 const PROCESS_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
-const DEFAULT_SYSTEM_PROMPT: &str = r#"You are a coding assistant working inside the gaviero editor.
-
-Use the available tools (Read, Glob, Grep, Write, Edit) to understand the codebase and make changes.
-When modifying files, use Edit for surgical changes and Write for creating new files or full rewrites."#;
-
-/// The ACP pipeline manages communication with a Claude Code subprocess.
+/// The ACP pipeline manages chat execution and routes file changes
+/// through the Write Gate.
 ///
 /// Each `send_prompt()` call spawns a fresh subprocess. File changes
 /// proposed by the agent are routed through the Write Gate for review.
@@ -39,6 +34,7 @@ pub struct AcpPipeline {
     pub write_gate: Arc<Mutex<WriteGatePipeline>>,
     observer: Box<dyn AcpObserver>,
     model: String,
+    ollama_base_url: Option<String>,
     workspace_root: PathBuf,
     agent_id: String,
     options: AgentOptions,
@@ -49,6 +45,7 @@ impl AcpPipeline {
         write_gate: Arc<Mutex<WriteGatePipeline>>,
         observer: Box<dyn AcpObserver>,
         model: impl Into<String>,
+        ollama_base_url: Option<String>,
         workspace_root: impl Into<PathBuf>,
         agent_id: impl Into<String>,
         options: AgentOptions,
@@ -57,13 +54,14 @@ impl AcpPipeline {
             write_gate,
             observer,
             model: model.into(),
+            ollama_base_url,
             workspace_root: workspace_root.into(),
             agent_id: agent_id.into(),
             options,
         }
     }
 
-    /// Send a user prompt to Claude Code and process the streaming response.
+    /// Send a user prompt and process the streaming response.
     ///
     /// `@path/to/file` references in the prompt are resolved: the file
     /// contents are read and prepended as context. After the subprocess
@@ -76,6 +74,60 @@ impl AcpPipeline {
         conversation_history: &[(String, String)],
         file_attachments: &[PathBuf],
     ) -> Result<()> {
+        if shared::is_ollama_model(&self.model) {
+            let backend =
+                shared::create_backend_for_model(&self.model, self.ollama_base_url.as_deref())?;
+            let caps = backend.capabilities();
+            let request = CompletionRequest {
+                prompt: prompt.to_string(),
+                system_prompt: Some(shared::default_editor_system_prompt(&caps)),
+                workspace_root: self.workspace_root.clone(),
+                allowed_tools: if caps.tool_use {
+                    vec![
+                        "Read".into(),
+                        "Glob".into(),
+                        "Grep".into(),
+                        "Write".into(),
+                        "Edit".into(),
+                        "MultiEdit".into(),
+                    ]
+                } else {
+                    vec![]
+                },
+                file_attachments: file_attachments.to_vec(),
+                conversation_history: conversation_history.to_vec(),
+                file_refs: file_refs.to_vec(),
+                effort: Some(self.options.effort.clone()),
+                max_tokens: Some(self.options.max_tokens),
+                auto_approve: self.options.auto_approve,
+            };
+            executor::complete_to_write_gate(
+                &*backend,
+                request,
+                self.observer.as_ref(),
+                self.write_gate.clone(),
+                &self.agent_id,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        self.send_prompt_via_claude(prompt, file_refs, conversation_history, file_attachments)
+            .await
+    }
+
+    async fn send_prompt_via_claude(
+        &self,
+        prompt: &str,
+        file_refs: &[(String, String)],
+        conversation_history: &[(String, String)],
+        file_attachments: &[PathBuf],
+    ) -> Result<()> {
+        let claude_model = self
+            .model
+            .strip_prefix("claude-code:")
+            .or_else(|| self.model.strip_prefix("claude:"))
+            .unwrap_or(&self.model);
         let available_tools = &["Read", "Glob", "Grep", "Write", "Edit", "MultiEdit"];
         let approved_tools: &[&str] = if self.options.auto_approve {
             available_tools
@@ -83,33 +135,10 @@ impl AcpPipeline {
             &["Read", "Glob", "Grep"]
         };
 
-        // Build enriched prompt with conversation history + file contents
-        let mut parts = Vec::new();
-
-        // Include conversation history for multi-turn context
-        if !conversation_history.is_empty() {
-            parts.push("Previous conversation:\n".to_string());
-            for (role, content) in conversation_history {
-                // Truncate long messages to avoid prompt bloat
-                let truncated: String = content.chars().take(HISTORY_TRUNCATION_CHARS).collect();
-                let ellipsis = if content.chars().count() > HISTORY_TRUNCATION_CHARS { "..." } else { "" };
-                parts.push(format!("[{}]: {}{}\n", role, truncated, ellipsis));
-            }
-            parts.push("---\n".to_string());
-        }
-
-        // Include referenced file contents
-        if !file_refs.is_empty() {
-            parts.push("Referenced files:\n".to_string());
-            for (path, content) in file_refs {
-                parts.push(format!("--- {} ---\n{}\n--- end {} ---\n", path, content, path));
-            }
-        }
-
-        // The actual user prompt
-        parts.push(prompt.to_string());
-
-        let enriched_prompt = parts.join("\n");
+        let enriched_prompt = shared::build_enriched_prompt(prompt, conversation_history, file_refs);
+        let system_prompt = shared::default_editor_system_prompt(
+            &crate::swarm::backend::claude_code::ClaudeCodeBackend::new(claude_model).capabilities(),
+        );
 
         let attach_refs: Vec<&std::path::Path> = file_attachments
             .iter()
@@ -117,10 +146,10 @@ impl AcpPipeline {
             .collect();
 
         let mut session = AcpSession::spawn(
-            &self.model,
+            claude_model,
             &self.workspace_root,
             &enriched_prompt,
-            DEFAULT_SYSTEM_PROMPT,
+            &system_prompt,
             available_tools,
             approved_tools,
             &self.options,
@@ -611,7 +640,10 @@ mod tests {
 
     #[test]
     fn test_default_system_prompt_not_empty() {
-        assert!(!DEFAULT_SYSTEM_PROMPT.is_empty());
-        assert!(DEFAULT_SYSTEM_PROMPT.contains("gaviero"));
+        let prompt = shared::default_editor_system_prompt(
+            &crate::swarm::backend::claude_code::ClaudeCodeBackend::new("sonnet").capabilities(),
+        );
+        assert!(!prompt.is_empty());
+        assert!(prompt.contains("gaviero"));
     }
 }

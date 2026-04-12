@@ -18,6 +18,7 @@ use crate::validation_gate::ValidationPipeline;
 use crate::write_gate::WriteGatePipeline;
 
 use super::super::models::{AgentManifest, AgentStatus, WorkUnit};
+use super::shared::default_editor_system_prompt;
 use super::{AgentBackend, CompletionRequest, UnifiedStreamEvent};
 
 /// Run a work unit through any `AgentBackend`, producing an `AgentManifest`.
@@ -77,21 +78,31 @@ pub async fn run_backend(
             Some(fix) => format!("{}\n\n{}", base_prompt, fix),
         };
 
-        let request = CompletionRequest {
-            prompt,
-            system_prompt: None,
-            workspace_root: workspace_root.to_path_buf(),
-            allowed_tools: vec![
+        let capabilities = backend.capabilities();
+        let allowed_tools = if capabilities.tool_use {
+            vec![
                 "Read".into(),
                 "Glob".into(),
                 "Grep".into(),
                 "Write".into(),
                 "Edit".into(),
                 "MultiEdit".into(),
-            ],
+            ]
+        } else {
+            vec![]
+        };
+
+        let request = CompletionRequest {
+            prompt,
+            system_prompt: Some(default_editor_system_prompt(&capabilities)),
+            workspace_root: workspace_root.to_path_buf(),
+            allowed_tools,
             file_attachments: vec![],
             conversation_history: vec![],
             file_refs: vec![],
+            effort: None,
+            max_tokens: None,
+            auto_approve: true,
         };
 
         // Stream completion
@@ -339,7 +350,7 @@ async fn build_prompt(
 ///
 /// Returns `Ok(true)` if a proposal was created, `Ok(false)` if skipped
 /// (scope rejected, duplicate, unchanged content, empty diff).
-async fn propose_write(
+pub(crate) async fn propose_write(
     agent_id: &str,
     rel_path: &Path,
     proposed_content: &str,

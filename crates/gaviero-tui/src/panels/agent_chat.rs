@@ -1,4 +1,4 @@
-//! Agent chat panel — conversation history + input for Claude Code interaction.
+//! Agent chat panel — conversation history + input for provider-backed interaction.
 
 use ratatui::{
     buffer::Buffer as RataBuf,
@@ -25,7 +25,7 @@ use crate::widgets::text_input::TextInput;
 pub enum AttachmentKind {
     /// Text/code file — contents included in prompt context.
     Text,
-    /// Image file — passed via --file flag to Claude CLI.
+    /// Image file — passed to providers that support file attachments.
     Image,
 }
 
@@ -139,6 +139,7 @@ pub struct AgentSettings {
     pub model: String,
     pub effort: String,
     pub max_tokens: u32,
+    pub ollama_base_url: String,
     /// The namespace to write memories to.
     pub write_namespace: String,
     /// Namespaces to search when reading (always includes write_namespace).
@@ -151,6 +152,7 @@ impl Default for AgentSettings {
             model: "sonnet".to_string(),
             effort: "off".to_string(),
             max_tokens: 16384,
+            ollama_base_url: "http://localhost:11434".to_string(),
             write_namespace: "default".to_string(),
             read_namespaces: vec!["default".to_string()],
         }
@@ -187,7 +189,7 @@ pub struct AgentChatState {
     pub browse_mode: bool,
     /// Index of the currently highlighted message (into active conversation's messages).
     pub browsed_msg: usize,
-    /// Cached model options discovered from the `claude` CLI (lazily populated).
+    /// Cached model options discovered from provider tooling (lazily populated).
     cli_model_options: Option<Vec<String>>,
     /// Tick counter for spinner animation (incremented on each Event::Tick while streaming).
     pub tick_count: u64,
@@ -252,12 +254,15 @@ impl AgentChatState {
         }
     }
 
-    /// Get model options from the `claude` CLI (cached after first call).
+    /// Get model options from provider tooling (cached after first call).
     fn model_options(&mut self) -> &[String] {
         if self.cli_model_options.is_none() {
-            self.cli_model_options = Some(
-                gaviero_core::acp::session::discover_model_options(),
-            );
+            let mut options = gaviero_core::acp::session::discover_model_options();
+            let ollama_example = "ollama:qwen2.5-coder:7b".to_string();
+            if !options.iter().any(|opt| opt == &ollama_example) {
+                options.push(ollama_example);
+            }
+            self.cli_model_options = Some(options);
         }
         self.cli_model_options.as_deref().unwrap_or(&[])
     }
@@ -354,12 +359,13 @@ impl AgentChatState {
                     let current = self.effective_model().to_string();
                     let options = self.model_options().to_vec();
                     let list = if options.is_empty() {
-                        "sonnet, opus, haiku (or any full model name)".to_string()
+                        "sonnet, opus, haiku, ollama:qwen2.5-coder:7b".to_string()
                     } else {
                         options.join(", ")
                     };
                     self.add_system_message(&format!(
-                        "Current model: {}\nAvailable: {}\nUsage: /model <name>",
+                        "Current model: {}\nAvailable: {}\nUsage: /model <name>\n\
+                         Use `ollama:<model>` for local models.",
                         current, list
                     ));
                 } else {
@@ -501,7 +507,7 @@ impl AgentChatState {
             "/help" => {
                 self.add_system_message(
                     "Available commands:\n\
-                     /model <name>      — Set Claude model (sonnet, opus, haiku)\n\
+                     /model <name>      — Set model (sonnet, opus, haiku, ollama:<model>)\n\
                      /effort <level>    — Set effort level (off, low, medium, high, max)\n\
                      /namespace <name>  — Set memory namespace (or show current)\n\
                      /autoapprove       — Toggle auto-approve for this conversation (/yolo)\n\
@@ -513,7 +519,7 @@ impl AgentChatState {
                      /context           — Show estimated context usage\n\
                      /run <path>        — Execute a .gaviero DSL script\n\
                      /swarm <task>      — Plan and execute a multi-agent swarm\n\
-                     /cswarm <task>     — Coordinated swarm (Opus plans, Sonnet/Haiku execute)\n\
+                     /cswarm <task>     — Coordinated swarm (provider-aware coordinator planning)\n\
                      /undo-swarm        — Revert all changes from the last /cswarm run\n\
                      /help              — Show this help\n\n\
                      Keyboard shortcuts:\n\
@@ -754,7 +760,7 @@ impl AgentChatState {
         }
     }
 
-    /// Get all messages for multi-turn context (to send to Claude).
+    /// Get all messages for multi-turn context.
     pub fn context_messages(&self) -> Vec<(&str, &str)> {
         self.messages()
             .iter()
@@ -1768,7 +1774,7 @@ impl AgentChatState {
                     Style::default().fg(theme::ACCENT),
                 ),
                 ChatRole::Assistant => (
-                    "Claude: ",
+                    "Assistant: ",
                     Style::default().fg(theme::TEXT_FG),
                 ),
                 ChatRole::System => (
@@ -2340,3 +2346,53 @@ fn filter_file_blocks_for_display(text: &str) -> String {
     collapsed
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_file_references_extracts_multiple_paths() {
+        let refs = parse_file_references("check @src/main.rs and\n\t@docs/readme.md");
+        assert_eq!(refs, vec!["src/main.rs", "docs/readme.md"]);
+    }
+
+    #[test]
+    fn parse_file_references_ignores_embedded_at_symbols() {
+        let refs = parse_file_references("mail me at user@example.com or foo@bar but inspect @src/lib.rs");
+        assert_eq!(refs, vec!["src/lib.rs"]);
+    }
+
+    #[test]
+    fn effective_model_prefers_conversation_override() {
+        let mut state = AgentChatState::new();
+        state.agent_settings.model = "sonnet".to_string();
+        state.conversations[state.active_conv].model_override = Some("ollama:qwen2.5-coder:7b".to_string());
+
+        assert_eq!(state.effective_model(), "ollama:qwen2.5-coder:7b");
+    }
+
+    #[test]
+    fn process_slash_command_model_sets_override_and_clears_input() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "/model ollama:qwen2.5-coder:7b".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+
+        let handled = state.process_slash_command();
+
+        assert!(handled);
+        assert_eq!(
+            state.conversations[state.active_conv].model_override.as_deref(),
+            Some("ollama:qwen2.5-coder:7b")
+        );
+        assert!(state.text_input.text.is_empty());
+    }
+
+    #[test]
+    fn process_slash_command_returns_false_for_plain_text() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "hello world".to_string();
+
+        assert!(!state.process_slash_command());
+        assert!(state.conversations[state.active_conv].messages.is_empty());
+    }
+}

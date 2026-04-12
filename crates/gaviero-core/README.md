@@ -1,219 +1,100 @@
 # gaviero-core
 
-The execution engine for Gaviero. All agent I/O, multi-agent swarm orchestration, write-gated proposal review, iterative refinement, semantic memory, code knowledge graph, git integration, and syntax validation live here. The `gaviero-tui` and `gaviero-cli` binaries are thin shells that implement observer traits and call into this library.
+`gaviero-core` is the runtime library behind the Gaviero workspace. It owns
+provider dispatch, chat and swarm execution, write-gated file proposals,
+iteration and validation, workspace settings, memory, repo context building,
+git/worktree orchestration, session persistence, and terminal management.
 
----
+`gaviero-cli`, `gaviero-tui`, and `gaviero-dsl` are front-ends around this
+crate. If behavior differs between the binaries, the integration layer is the
+first place to look; the execution engine lives here.
 
-## What it provides
+## What this crate provides
 
-| Capability | Entry point |
-|---|---|
-| Run a single agent task with strategy loop | `iteration::IterationEngine::run()` |
-| Run a multi-agent swarm from a plan | `swarm::pipeline::execute()` |
-| Opus-powered task decomposition to DSL | `swarm::pipeline::plan_coordinated()` |
-| Validate file syntax after edits | `validation_gate::ValidationPipeline` |
-| Propose, review, and apply file changes | `write_gate::WriteGatePipeline` |
-| Semantic memory (store + search) | `memory::init()` → `MemoryStore` |
-| Context-aware prompt building (PageRank) | `repo_map::RepoMap` |
-| Code knowledge graph (callers, tests) | `repo_map::GraphBuilder`, `repo_map::Store` |
-| Git operations and worktree management | `git::GitRepo`, `git::WorktreeManager` |
-| Workspace settings and namespaces | `workspace::Workspace` |
-| Enforce write boundaries per agent | `scope_enforcer` |
-| Tree-sitter indentation heuristics | `indent::compute_indent()` |
-| Embedded terminal (PTY) management | `terminal::TerminalManager` |
+- A provider-aware backend layer behind `swarm::backend::AgentBackend`
+- A chat pipeline in `acp::client::AcpPipeline`
+- Multi-agent orchestration in `swarm::pipeline`
+- Tier routing and privacy routing in `swarm::router`
+- Iterative retry/escalation logic in `iteration`
+- Write proposal review/apply flow in `write_gate`
+- Syntax and compile-time validation gates in `validation_gate`
+- Workspace settings, namespaces, and session persistence
+- Semantic memory, repo-map ranking, and code graph context
+- Git repository/worktree helpers and embedded terminal management
 
----
+## Provider model specs
 
-## Modules
+The runtime now uses one model-spec convention across chat and swarm paths.
 
-| Module | Key Types / Functions |
-|---|---|
-| `types` | `FileScope`, `DiffHunk`, `WriteProposal`, `ModelTier`, `PrivacyLevel` |
-| `iteration` | `IterationEngine::run()`, `Strategy`, `IterationConfig` |
-| `validation_gate` | `ValidationGate` trait, `ValidationPipeline`, `TreeSitterGate`, `CargoCheckGate` |
-| `scope_enforcer` | Path-level write boundary enforcement for agent file access |
-| `repo_map` | `RepoMap`, `FileNode`, `ContextPlan` — PageRank-based context selection |
-| `repo_map::graph_builder` | Build code knowledge graph (call edges, test associations) |
-| `repo_map::store` | Persistent graph storage for cross-session reuse |
-| `repo_map::edges` | Edge types: caller/callee, test ownership, import |
-| `workspace` | `Workspace`, `WorkspaceFolder`, settings cascade |
-| `session_state` | `SessionState`, `TabState`, `PanelState` |
-| `tree_sitter` | `LANGUAGE_REGISTRY` (16 langs), `enrich_hunks()` |
-| `diff_engine` | `compute_hunks()` |
-| `observer` | `WriteGateObserver`, `AcpObserver`, `SwarmObserver` traits |
-| `write_gate` | `WriteGatePipeline`, `WriteMode` |
-| `acp` | `AcpSession`, `AcpPipeline`, `AcpSessionFactory` |
-| `git` | `GitRepo`, `WorktreeManager` |
-| `indent` | `compute_indent()`, `IndentResult`, tree-sitter + hybrid strategies |
-| `query_loader` | Tree-sitter `.scm` file discovery |
-| `memory` | `MemoryStore`, `OnnxEmbedder`, `CodeGraph`, `Consolidator`, `MemoryScope`, `SearchConfig` |
-| `swarm` | `execute()`, `plan_coordinated()`, `Coordinator`, `TierRouter`, `PrivacyScanner` |
-| `terminal` | `TerminalManager`, `TerminalInstance`, OSC 133 parsing |
+- `sonnet`, `opus`, `haiku`: Claude models via the Claude CLI backend
+- `claude:<name>` or `claude-code:<name>`: explicit Claude model selection
+- `ollama:<model>` or `local:<model>`: local Ollama model selection
+- Unprefixed model names default to Claude for backward compatibility
 
----
+Ollama base URLs are passed through `SwarmConfig.ollama_base_url` or the
+workspace setting `agent.ollamaBaseUrl`.
 
-## Usage
+## Main entry points
 
-### Running a single-agent task
+| Area | Entry points |
+| --- | --- |
+| Chat execution | `acp::client::AcpPipeline` |
+| Swarm execution | `swarm::pipeline::execute()` |
+| Coordinated planning | `swarm::pipeline::plan_coordinated()` |
+| Iterative execution | `iteration::IterationEngine` |
+| Backend abstraction | `swarm::backend::{AgentBackend, CompletionRequest}` |
+| Tier routing | `swarm::router::TierRouter` |
+| Write review/apply | `write_gate::WriteGatePipeline` |
+| Validation | `validation_gate::ValidationPipeline` |
+| Workspace settings | `workspace::Workspace` |
+| Semantic memory | `memory::MemoryStore` |
+| Repo ranking / graph | `repo_map::{RepoMap, graph_builder}` |
+| Git/worktrees | `git::{GitRepo, WorktreeManager, GitCoordinator}` |
+| Session / terminal | `session_state`, `terminal::TerminalManager` |
 
-```rust
-use gaviero_core::swarm::models::WorkUnit;
-use gaviero_core::types::FileScope;
+## Execution surfaces
 
-let unit = WorkUnit {
-    id: "my-task".into(),
-    description: "Add a hello function to src/lib.rs".into(),
-    scope: FileScope {
-        owned_paths: vec!["src/".into()],
-        read_only_paths: vec![],
-        interface_contracts: std::collections::HashMap::new(),
-    },
-    model: Some("sonnet".into()),
-    max_retries: 3,
-    // Graph-context fields (new):
-    impact_scope: false,             // do not auto-expand read_only with blast-radius files
-    context_callers_of: vec![],      // no caller-graph queries
-    context_tests_for: vec![],       // no test-file queries
-    context_depth: 2,                // BFS depth for graph traversal
-    ..Default::default()
-};
-```
+### Chat
 
-### Running a swarm from a compiled plan
+`AcpPipeline` enriches prompts with conversation history and file references,
+then routes the request through the provider-aware backend layer. Claude models
+still use the ACP subprocess path for the existing Claude CLI UX. Local
+`ollama:` and `local:` models go through the shared backend executor.
 
-```rust
-use gaviero_core::swarm::pipeline::{execute, SwarmConfig};
-use gaviero_core::swarm::plan::CompiledPlan;
-use gaviero_core::observer::SwarmObserver;
+### Swarm
 
-let plan = CompiledPlan::from_work_units(vec![unit], None);
+`swarm::pipeline::execute()` runs compiled plans. It validates scopes, computes
+dependency tiers, resolves a backend for each work unit through `TierRouter`,
+runs the iteration engine, applies verification, and merges results when
+worktrees are enabled.
 
-let config = SwarmConfig {
-    workspace_root: std::path::PathBuf::from("."),
-    model: "sonnet".into(),
-    max_parallel: 1,
-    use_worktrees: false,
-    read_namespaces: vec!["my-project".into()],
-    write_namespace: "my-project".into(),
-    context_files: vec![],
-};
+### Coordinated planning
 
-struct MyObserver;
-impl SwarmObserver for MyObserver { /* ... */ }
+`swarm::pipeline::plan_coordinated()` asks the coordinator to produce a
+reviewable `.gaviero` plan. The plan is meant to be inspected, optionally
+edited, compiled by `gaviero-dsl`, and then executed with the normal swarm
+pipeline.
 
-let result = execute(
-    &plan, &config, None, None, &MyObserver,
-    |id| Box::new(MyAcpObserver::new(id))
-).await?;
-```
+## Module overview
 
----
+- `acp`: Claude subprocess protocol plus the provider-aware chat pipeline
+- `swarm`: planning, routing, execution, merge, verification, and backends
+- `iteration`: retry/refine/best-of-N strategy logic
+- `validation_gate`: post-edit validation gates
+- `write_gate`: proposal review and file application
+- `workspace`: settings cascade and namespace resolution
+- `memory`: scoped semantic memory and consolidation
+- `repo_map`: ranked context planning and knowledge graph storage
+- `git`: git repository helpers and worktree orchestration
+- `session_state`: persisted editor state for the TUI
+- `terminal`: PTY lifecycle and terminal session helpers
+- `tree_sitter`, `diff_engine`, `indent`, `scope_enforcer`: editor/runtime
+  primitives used by higher-level systems
 
-## Iteration strategies
+## Notes
 
-`IterationConfig` controls how the engine refines agent output:
-
-| Strategy | Behaviour |
-|---|---|
-| `SinglePass` | One attempt, no inner retries |
-| `Refine` (default) | One attempt with up to `max_retries` validation-feedback cycles |
-| `BestOfN { n }` | n independent attempts; returns the first to pass validation, or the one with the most file changes |
-
-Model escalation: after `escalate_after` failed attempts the engine automatically upgrades from `cheap_model` to `expensive_model`.
-
----
-
-## Validation gates
-
-Validation runs automatically after every write and feeds failures back to the agent as corrective prompts.
-
-```rust
-// Rust workspace: tree-sitter syntax + cargo check
-let vp = ValidationPipeline::default_for_rust();
-
-// Any workspace: tree-sitter syntax only (fast)
-let vp = ValidationPipeline::fast_only();
-```
-
-Gates available: `TreeSitterGate` (syntax), `CargoCheckGate` (compile), `CargoClippyGate` (lint), `CargoTestGate` (test suite), `ImpactTestGate` (tests for modified files only).
-
----
-
-## Repo map and code knowledge graph
-
-The repo map builds a PageRank-ranked file graph so agents receive the most relevant context first. The code knowledge graph extends this with explicit edge types:
-
-```rust
-use gaviero_core::repo_map::{RepoMap, GraphBuilder};
-
-// Build context plan for a set of entry files
-let repo_map = RepoMap::build(&workspace_root, &entry_files, config).await?;
-let context_plan = repo_map.context_plan(token_budget);
-
-// Query callers of a specific file
-let callers = graph_store.callers_of("src/auth/session.rs", depth: 2)?;
-
-// Find test files associated with a path
-let tests = graph_store.tests_for("src/auth/", depth: 2)?;
-```
-
-These queries are exposed in the DSL via the `context {}` block inside `agent` declarations, and as `impact_scope true` in `scope {}` blocks.
-
----
-
-## Semantic memory
-
-Memory is organized in a five-level scope hierarchy. Searches cascade from the narrowest scope outward, stopping early when confidence is high.
-
-```
-global (0)  →  workspace (1)  →  repo (2)  →  module (3)  →  run (4)
-```
-
-```rust
-use gaviero_core::memory::{self, MemoryScope, WriteScope, SearchConfig, WriteMeta};
-
-// Open workspace-local store (.gaviero/memory.db)
-let store = memory::init_workspace(&workspace_root)?;
-
-// Open global store (~/.config/gaviero/memory.db)
-let store = memory::init_global()?;
-
-// Store with scope metadata
-let meta = WriteMeta {
-    scope: WriteScope::Module {
-        repo_root: workspace_root.clone(),
-        module_path: "crates/gaviero-core".into(),
-    },
-    importance: 0.8,
-    ..Default::default()
-};
-store.store_scoped("auth uses bcrypt for password hashing", &meta)?;
-
-// Cascading search — narrows from module → repo → workspace → global
-let scope = MemoryScope::for_module(&workspace_root, "crates/gaviero-core")?;
-let config = SearchConfig::new("authentication pattern", scope)
-    .with_max_results(10);
-let results = store.search_scoped(&config)?;
-```
-
-Retrieval scoring combines cosine similarity (50%), importance (20%), recency (15%), and scope proximity (15%) via Reciprocal Rank Fusion (RRF) over vector and FTS results. Embeddings are computed locally via ONNX Runtime (nomic-embed-text-v1.5) — no network calls for memory operations.
-
-The `Consolidator` runs after each swarm execution to triage run-scoped memories, apply importance decay (30-day half-life), and promote high-value entries to wider scopes.
-
----
-
-## Observer pattern
-
-Implement any of the three observer traits to receive real-time progress events:
-
-- `WriteGateObserver` — file proposal lifecycle events
-- `AcpObserver` — per-agent streaming events (text chunks, tool calls, validation results)
-- `SwarmObserver` — swarm-level events (phase changes, agent status, cost updates, tier dispatch)
-
-Observers are passed as `&dyn Trait` to `execute()` and `run_backend()`, enabling zero-copy event routing with no lock contention.
-
----
-
-## Supported languages (tree-sitter)
-
-Rust, JavaScript, TypeScript, Python, Java, Kotlin, Bash, C, C++, HTML, CSS, JSON, YAML, TOML, LaTeX.
+- This crate is the source of truth for runtime behavior.
+- The public Rust API is usable internally across the workspace, but it is not
+  yet documented as a stable external SDK.
+- If you are looking for language syntax, see `crates/gaviero-dsl`.
+- If you are looking for UI composition, see `crates/gaviero-tui`.

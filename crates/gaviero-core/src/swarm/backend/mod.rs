@@ -5,9 +5,11 @@
 //! (separate code paths for Claude Code subprocess and Ollama HTTP).
 
 pub mod claude_code;
+pub mod executor;
 pub mod mock;
 pub mod ollama;
 pub mod runner;
+pub mod shared;
 
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -131,6 +133,12 @@ pub struct CompletionRequest {
     pub conversation_history: Vec<(String, String)>,
     /// Referenced file contents as (path, content) pairs.
     pub file_refs: Vec<(String, String)>,
+    /// Optional effort / reasoning level.
+    pub effort: Option<String>,
+    /// Optional max output tokens.
+    pub max_tokens: Option<u32>,
+    /// Whether the backend should auto-approve provider permission prompts.
+    pub auto_approve: bool,
 }
 
 // ── Backend Config ──────────────────────────────────────────────────────────
@@ -203,6 +211,9 @@ mod tests {
             file_attachments: vec![],
             conversation_history: vec![],
             file_refs: vec![],
+            effort: None,
+            max_tokens: None,
+            auto_approve: true,
         };
 
         let mut stream = backend.stream_completion(req).await.unwrap();
@@ -238,6 +249,9 @@ mod tests {
             file_attachments: vec![],
             conversation_history: vec![],
             file_refs: vec![],
+            effort: None,
+            max_tokens: None,
+            auto_approve: true,
         };
 
         let mut stream = backend.stream_completion(req).await.unwrap();
