@@ -76,7 +76,12 @@ impl AcpPipeline {
         conversation_history: &[(String, String)],
         file_attachments: &[PathBuf],
     ) -> Result<()> {
-        let allowed_tools = &["Read", "Glob", "Grep", "Write", "Edit", "MultiEdit"];
+        let available_tools = &["Read", "Glob", "Grep", "Write", "Edit", "MultiEdit"];
+        let approved_tools: &[&str] = if self.options.auto_approve {
+            available_tools
+        } else {
+            &["Read", "Glob", "Grep"]
+        };
 
         // Build enriched prompt with conversation history + file contents
         let mut parts = Vec::new();
@@ -116,7 +121,8 @@ impl AcpPipeline {
             &self.workspace_root,
             &enriched_prompt,
             DEFAULT_SYSTEM_PROMPT,
-            allowed_tools,
+            available_tools,
+            approved_tools,
             &self.options,
             &attach_refs,
         )?;
@@ -254,6 +260,7 @@ impl AcpPipeline {
                                 }
                             }
                         }
+
                     }
                     StreamEvent::ResultEvent {
                         is_error,

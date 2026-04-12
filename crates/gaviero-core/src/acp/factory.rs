@@ -148,6 +148,7 @@ impl AcpSessionFactory {
     /// Create a one-shot session: spawn `claude --print`, write prompt, close stdin.
     ///
     /// This wraps the existing `AcpSession::spawn()` with no behavioral change.
+    /// All listed tools are both available and auto-approved.
     pub fn one_shot(
         &self,
         model: &str,
@@ -161,6 +162,7 @@ impl AcpSessionFactory {
             cwd,
             prompt,
             system_prompt,
+            tools,
             tools,
             &self.default_options,
             &[],

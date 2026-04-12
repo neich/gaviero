@@ -51,6 +51,7 @@ impl AgentBackend for ClaudeCodeBackend {
             &request.prompt,
             system_prompt,
             &allowed_tools,
+            &allowed_tools,
             &options,
             &file_attachments,
         )?;

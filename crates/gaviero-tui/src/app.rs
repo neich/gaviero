@@ -887,11 +887,14 @@ impl App {
                             respond,
                         },
                     );
-                    // Ensure the chat panel is visible so the user sees the dialog
+                    // Ensure the chat panel is visible and focused so the user
+                    // can respond to the permission dialog with y/n.
                     self.panel_visible.side_panel = true;
                     if self.side_panel != SidePanelMode::AgentChat {
                         self.side_panel = SidePanelMode::AgentChat;
                     }
+                    self.chat_state.active_conv = idx;
+                    self.focus = Focus::SidePanel;
                 } else {
                     // Unknown conversation — auto-deny
                     let _ = respond.send(false);
@@ -1457,9 +1460,9 @@ impl App {
             }
             Action::ToggleAutoApprove => {
                 self.chat_state.toggle_auto_approve();
-                let state = if self.chat_state.auto_approve_next { "ON" } else { "OFF" };
+                let state = if self.chat_state.effective_auto_approve() { "ON" } else { "OFF" };
                 self.status_message = Some((
-                    format!("Auto-approve: {} (Alt+Y to toggle)", state),
+                    format!("Auto-approve: {} (next message only)", state),
                     std::time::Instant::now(),
                 ));
             }
@@ -2078,8 +2081,8 @@ impl App {
         let model = self.chat_state.effective_model().to_string();
         let effort = self.chat_state.effective_effort().to_string();
         let max_tokens = self.chat_state.agent_settings.max_tokens;
-        // Take the auto-approve flag and reset it so it only applies to this one prompt
-        let auto_approve = self.chat_state.auto_approve_next;
+        let auto_approve = self.chat_state.effective_auto_approve();
+        // Reset the one-shot flag; persistent conversation flag stays
         self.chat_state.auto_approve_next = false;
 
         let options = gaviero_core::acp::session::AgentOptions {

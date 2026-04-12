@@ -194,6 +194,7 @@ async fn resolve_single_file(
         prompt,
         "You are a merge conflict resolver. Output only the resolved file content.",
         &[],  // no tools needed
+        &[],
         &AgentOptions::default(),
         &[],  // no file attachments
     )?;

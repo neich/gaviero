@@ -62,12 +62,14 @@ async fn try_plan(
     model: &str,
 ) -> Result<Vec<WorkUnit>> {
     let options = crate::acp::session::AgentOptions::default();
+    let tools = &["Read", "Glob", "Grep"];
     let mut session = AcpSession::spawn(
         model,
         workspace_root,
         user_prompt,
         system_prompt,
-        &["Read", "Glob", "Grep"],
+        tools,
+        tools,
         &options,
         &[],  // no file attachments
     )?;
