@@ -148,12 +148,14 @@ impl Coordinator {
         );
 
         let options = crate::acp::session::AgentOptions::default();
+        let tools = &["Read", "Glob", "Grep"];
         let mut session = AcpSession::spawn(
             &self.config.model,
             workspace_root,
             &user_prompt,
             &system_prompt,
-            &["Read", "Glob", "Grep"],
+            tools,
+            tools,
             &options,
             &[],
         )?;
@@ -260,12 +262,14 @@ impl Coordinator {
             auto_approve: true,
             ..Default::default()
         };
+        let tools = &["Read", "Glob", "Grep"];
         let mut session = AcpSession::spawn(
             &self.config.model,
             workspace_root,
             &user_prompt,
             &system_prompt,
-            &["Read", "Glob", "Grep"],
+            tools,
+            tools,
             &options,
             &[],
         )?;
