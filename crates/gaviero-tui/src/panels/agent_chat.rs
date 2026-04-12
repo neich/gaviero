@@ -127,6 +127,8 @@ pub struct Conversation {
     pub streaming_status: String,
     /// When streaming started, for elapsed time display.
     pub streaming_started_at: Option<Instant>,
+    /// Persistent auto-approve for this conversation (toggled via `/autoapprove`).
+    pub auto_approve: bool,
     /// Pending permission request waiting for user approval (y/n).
     pub pending_permission: Option<PendingPermission>,
 }
@@ -220,6 +222,7 @@ impl AgentChatState {
             is_streaming: false,
             streaming_status: String::new(),
             streaming_started_at: None,
+            auto_approve: false,
             pending_permission: None,
         };
         Self {
@@ -284,9 +287,14 @@ impl AgentChatState {
         }
     }
 
-    /// Toggle the auto-approve flag for the next prompt.
+    /// Toggle the one-shot auto-approve flag for the next prompt (Alt+Y).
     pub fn toggle_auto_approve(&mut self) {
         self.auto_approve_next = !self.auto_approve_next;
+    }
+
+    /// Whether auto-approve is effective (persistent conversation flag OR one-shot).
+    pub fn effective_auto_approve(&self) -> bool {
+        self.conversations[self.active_conv].auto_approve || self.auto_approve_next
     }
 
     /// Get the effective model for the active conversation.
@@ -451,6 +459,10 @@ impl AgentChatState {
                 self.text_input.cursor = 0;
                 true
             }
+            "/reset" | "/clear" => {
+                self.reset_conversation();
+                true
+            }
             "/namespace" | "/ns" => {
                 if arg.is_empty() {
                     let write = self.effective_write_namespace().to_string();
@@ -475,15 +487,28 @@ impl AgentChatState {
                 self.text_input.cursor = 0;
                 true
             }
+            "/autoapprove" | "/yolo" => {
+                let conv = &mut self.conversations[self.active_conv];
+                conv.auto_approve = !conv.auto_approve;
+                let state = if conv.auto_approve { "ON" } else { "OFF" };
+                self.add_system_message(&format!(
+                    "Auto-approve: {} for this conversation", state
+                ));
+                self.text_input.text.clear();
+                self.text_input.cursor = 0;
+                true
+            }
             "/help" => {
                 self.add_system_message(
                     "Available commands:\n\
                      /model <name>      — Set Claude model (sonnet, opus, haiku)\n\
                      /effort <level>    — Set effort level (off, low, medium, high, max)\n\
                      /namespace <name>  — Set memory namespace (or show current)\n\
+                     /autoapprove       — Toggle auto-approve for this conversation (/yolo)\n\
                      /attach <path>     — Attach a file (text or image)\n\
                      /attach            — List current attachments\n\
                      /detach <name|all> — Remove attachment(s)\n\
+                     /reset             — Clear messages, keep model/effort/namespace config\n\
                      /compact [N]       — Keep last N messages (default 6), discard older\n\
                      /context           — Show estimated context usage\n\
                      /run <path>        — Execute a .gaviero DSL script\n\
@@ -610,6 +635,7 @@ impl AgentChatState {
             is_streaming: false,
             streaming_status: String::new(),
             streaming_started_at: None,
+            auto_approve: false,
             pending_permission: None,
         };
         self.conversations.push(conv);
@@ -617,6 +643,40 @@ impl AgentChatState {
         self.scroll_offset = 0;
         self.text_input.text.clear();
         self.text_input.cursor = 0;
+    }
+
+    /// Reset the active conversation: clear messages but keep model/effort/namespace config.
+    pub fn reset_conversation(&mut self) {
+        let conv = &mut self.conversations[self.active_conv];
+        conv.messages.clear();
+        conv.is_streaming = false;
+        conv.streaming_status.clear();
+        conv.streaming_started_at = None;
+        conv.pending_permission = None;
+        self.scroll_offset = 0;
+        self.scroll_pinned_to_bottom = true;
+        self.text_input.text.clear();
+        self.text_input.cursor = 0;
+        self.attachments.clear();
+        self.browse_mode = false;
+        self.history_index = None;
+
+        let mut parts = Vec::new();
+        if let Some(ref m) = self.conversations[self.active_conv].model_override {
+            parts.push(format!("model={}", m));
+        }
+        if let Some(ref e) = self.conversations[self.active_conv].effort_override {
+            parts.push(format!("effort={}", e));
+        }
+        if let Some(ref ns) = self.conversations[self.active_conv].namespace_override {
+            parts.push(format!("namespace={}", ns));
+        }
+        let suffix = if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" Kept: {}", parts.join(", "))
+        };
+        self.add_system_message(&format!("Conversation reset.{}", suffix));
     }
 
     /// Close the active conversation. If it's the last one, replace it with a fresh one.
@@ -1457,6 +1517,7 @@ impl AgentChatState {
                     is_streaming: false,
                     streaming_status: String::new(),
                     streaming_started_at: None,
+                    auto_approve: false,
                     pending_permission: None,
                 });
             }
@@ -1947,7 +2008,7 @@ impl AgentChatState {
             "Rename: "
         } else if self.active_conv_streaming() {
             "Ctrl+C to cancel"
-        } else if self.auto_approve_next {
+        } else if self.effective_auto_approve() {
             "[auto-approve] > "
         } else {
             "> "
