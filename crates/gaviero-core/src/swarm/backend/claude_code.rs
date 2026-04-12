@@ -13,6 +13,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::acp::protocol::{StreamEvent, find_next_file_block, parse_file_blocks};
 use crate::acp::session::{AcpSession, AgentOptions};
 
+use super::shared::request_prompt;
 use super::{
     AgentBackend, Capabilities, CompletionRequest, StopReason, TokenUsage, UnifiedStreamEvent,
 };
@@ -39,16 +40,21 @@ impl AgentBackend for ClaudeCodeBackend {
         request: CompletionRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<UnifiedStreamEvent>> + Send>>> {
         let system_prompt = request.system_prompt.as_deref().unwrap_or("");
+        let prompt = request_prompt(&request);
         let allowed_tools: Vec<&str> = request.allowed_tools.iter().map(|s| s.as_str()).collect();
         let file_attachments: Vec<&std::path::Path> =
             request.file_attachments.iter().map(|p| p.as_path()).collect();
 
-        let options = AgentOptions::default();
+        let options = AgentOptions {
+            effort: request.effort.unwrap_or_else(|| "off".to_string()),
+            max_tokens: request.max_tokens.unwrap_or(16384),
+            auto_approve: request.auto_approve,
+        };
 
         let session = AcpSession::spawn(
             &self.model,
             &request.workspace_root,
-            &request.prompt,
+            &prompt,
             system_prompt,
             &allowed_tools,
             &allowed_tools,

@@ -11,13 +11,14 @@ use anyhow::{Context, Result};
 use super::{
     BatchStrategy, DiffReviewReport, IssueSeverity, ReviewIssue, UnitReview,
 };
-use crate::acp::session::{AcpSession, AgentOptions};
+use crate::swarm::backend::{executor, shared, CompletionRequest};
 use crate::types::ModelTier;
 
 /// Configuration for the diff reviewer.
 #[derive(Debug, Clone)]
 pub struct DiffReviewConfig {
     pub review_model: String,
+    pub ollama_base_url: Option<String>,
     pub max_diff_tokens: u32,
     pub batch_strategy: BatchStrategy,
     pub review_tiers: Vec<ModelTier>,
@@ -27,6 +28,7 @@ impl Default for DiffReviewConfig {
     fn default() -> Self {
         Self {
             review_model: "sonnet".into(),
+            ollama_base_url: None,
             max_diff_tokens: 16384,
             batch_strategy: BatchStrategy::PerDependencyTier,
             review_tiers: vec![ModelTier::Cheap],
@@ -98,7 +100,14 @@ impl DiffReviewer {
         for batch in batches {
             let prompt = build_review_prompt(plan_summary, &batch, self.config.max_diff_tokens);
 
-            match call_reviewer(&self.config.review_model, &prompt, workspace_root).await {
+            match call_reviewer(
+                &self.config.review_model,
+                self.config.ollama_base_url.as_deref(),
+                &prompt,
+                workspace_root,
+            )
+            .await
+            {
                 Ok(review_results) => {
                     for review in review_results {
                         self.reviewed_units.insert(review.unit_id.clone());
@@ -225,43 +234,30 @@ fn build_review_prompt(
 /// Call the reviewer model and parse the JSON response.
 async fn call_reviewer(
     model: &str,
+    ollama_base_url: Option<&str>,
     prompt: &str,
     workspace_root: &std::path::Path,
 ) -> Result<Vec<UnitReview>> {
-    let options = AgentOptions::default();
     let system = "You are a code reviewer. Review the diffs and respond with ONLY a JSON verdict.";
-
-    let mut session = AcpSession::spawn(
-        model,
-        workspace_root,
-        prompt,
-        system,
-        &[], // No tools — reviewer never writes
-        &[],
-        &options,
-        &[],
-    )?;
-
-    let mut response = String::new();
-    loop {
-        match session.next_event().await {
-            Ok(Some(crate::acp::protocol::StreamEvent::ContentDelta(text))) => {
-                response.push_str(&text);
-            }
-            Ok(Some(crate::acp::protocol::StreamEvent::ResultEvent {
-                result_text, ..
-            })) => {
-                if response.is_empty() {
-                    response = result_text;
-                }
-                break;
-            }
-            Ok(None) => break,
-            Err(_) => break,
-            _ => {}
-        }
-    }
-    let _ = session.wait().await;
+    let backend = shared::create_backend_for_model(model, ollama_base_url)?;
+    let response = executor::complete_to_text(
+        &*backend,
+        CompletionRequest {
+            prompt: prompt.to_string(),
+            system_prompt: Some(system.to_string()),
+            workspace_root: workspace_root.to_path_buf(),
+            allowed_tools: vec![],
+            file_attachments: vec![],
+            conversation_history: vec![],
+            file_refs: vec![],
+            effort: None,
+            max_tokens: None,
+            auto_approve: true,
+        },
+        None,
+    )
+    .await?
+    .text;
 
     // Parse JSON verdict
     parse_review_response(&response)

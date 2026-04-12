@@ -57,4 +57,17 @@ mod tests {
         let tree = parser.parse(src, None).unwrap();
         assert!(!tree.root_node().has_error(), "parse tree: {}", tree.root_node().to_sexp());
     }
+
+    #[test]
+    fn invalid_gaviero_syntax_produces_error_nodes() {
+        let mut parser = tree_sitter::Parser::new();
+        let lang: tree_sitter::Language = LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+
+        let tree = parser
+            .parse(r#"agent broken { prompt "missing closing brace""#, None)
+            .unwrap();
+
+        assert!(tree.root_node().has_error(), "parse tree: {}", tree.root_node().to_sexp());
+    }
 }

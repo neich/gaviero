@@ -1,18 +1,19 @@
-//! Task planner: uses Claude to decompose a high-level task into WorkUnits.
+//! Task planner: uses the configured backend to decompose a high-level task
+//! into WorkUnits.
 //!
-//! Spawns a Claude session with the task description, workspace file list,
-//! and memory context. Parses the response as JSON `Vec<WorkUnit>`.
+//! Sends the task description, workspace file list, and memory context through
+//! the shared backend layer, then parses the response as JSON `Vec<WorkUnit>`.
 //! Validates scopes and dependencies, retrying on failure.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use super::backend::{executor, shared, CompletionRequest};
 use super::models::WorkUnit;
 use super::validation;
-use crate::acp::session::AcpSession;
 
-/// Plan a task by asking Claude to decompose it into work units.
+/// Plan a task by asking the configured model to decompose it into work units.
 ///
 /// Returns a validated list of `WorkUnit`s with non-overlapping scopes
 /// and a valid dependency graph.
@@ -20,6 +21,7 @@ pub async fn plan_task(
     task: &str,
     workspace_root: &Path,
     model: &str,
+    ollama_base_url: Option<&str>,
     file_list: &[String],
     memory_context: &str,
 ) -> Result<Vec<WorkUnit>> {
@@ -40,7 +42,15 @@ pub async fn plan_task(
 
     const MAX_ATTEMPTS: usize = 2;
     for attempt in 0..MAX_ATTEMPTS {
-        match try_plan(&system_prompt, &user_prompt, workspace_root, model).await {
+        match try_plan(
+            &system_prompt,
+            &user_prompt,
+            workspace_root,
+            model,
+            ollama_base_url,
+        )
+        .await
+        {
             Ok(units) => return Ok(units),
             Err(e) => {
                 if attempt == 0 {
@@ -60,42 +70,27 @@ async fn try_plan(
     user_prompt: &str,
     workspace_root: &Path,
     model: &str,
+    ollama_base_url: Option<&str>,
 ) -> Result<Vec<WorkUnit>> {
-    let options = crate::acp::session::AgentOptions::default();
-    let tools = &["Read", "Glob", "Grep"];
-    let mut session = AcpSession::spawn(
-        model,
-        workspace_root,
-        user_prompt,
-        system_prompt,
-        tools,
-        tools,
-        &options,
-        &[],  // no file attachments
-    )?;
-
-    // Collect the full response
-    let mut response = String::new();
-    loop {
-        match session.next_event().await {
-            Ok(Some(crate::acp::protocol::StreamEvent::ContentDelta(text))) => {
-                response.push_str(&text);
-            }
-            Ok(Some(crate::acp::protocol::StreamEvent::ResultEvent { result_text, .. })) => {
-                if response.is_empty() {
-                    response = result_text;
-                }
-                break;
-            }
-            Ok(None) => break,
-            Err(e) => {
-                tracing::warn!("Stream error during planning: {}", e);
-                break;
-            }
-            _ => {}
-        }
-    }
-    let _ = session.wait().await;
+    let backend = shared::create_backend_for_model(model, ollama_base_url)?;
+    let response = executor::complete_to_text(
+        &*backend,
+        CompletionRequest {
+            prompt: user_prompt.to_string(),
+            system_prompt: Some(system_prompt.to_string()),
+            workspace_root: workspace_root.to_path_buf(),
+            allowed_tools: vec![],
+            file_attachments: vec![],
+            conversation_history: vec![],
+            file_refs: vec![],
+            effort: None,
+            max_tokens: None,
+            auto_approve: true,
+        },
+        None,
+    )
+    .await?
+    .text;
 
     // Extract JSON from the response (may be wrapped in ```json ... ```)
     let json_str = extract_json(&response)?;

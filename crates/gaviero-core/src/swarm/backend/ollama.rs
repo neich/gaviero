@@ -11,6 +11,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::acp::protocol::parse_file_blocks;
 
+use super::shared::request_prompt;
 use super::{
     AgentBackend, Capabilities, CompletionRequest, StopReason, TokenUsage, UnifiedStreamEvent,
 };
@@ -42,6 +43,7 @@ impl AgentBackend for OllamaStreamBackend {
         request: CompletionRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<UnifiedStreamEvent>> + Send>>> {
         let url = format!("{}/api/chat", self.base_url);
+        let prompt = request_prompt(&request);
 
         let mut messages = Vec::new();
 
@@ -58,14 +60,19 @@ impl AgentBackend for OllamaStreamBackend {
         // User message
         messages.push(serde_json::json!({
             "role": "user",
-            "content": request.prompt,
+            "content": prompt,
         }));
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.model,
             "messages": messages,
             "stream": true,
         });
+        if let Some(max_tokens) = request.max_tokens {
+            body["options"] = serde_json::json!({
+                "num_predict": max_tokens,
+            });
+        }
 
         let response = self
             .client
@@ -355,6 +362,9 @@ mod tests {
             file_attachments: vec![],
             conversation_history: vec![],
             file_refs: vec![],
+            effort: None,
+            max_tokens: None,
+            auto_approve: true,
         };
 
         let mut stream = backend.stream_completion(req).await.unwrap();
@@ -390,6 +400,9 @@ mod tests {
             file_attachments: vec![],
             conversation_history: vec![],
             file_refs: vec![],
+            effort: None,
+            max_tokens: None,
+            auto_approve: true,
         };
 
         let result = backend.stream_completion(req).await;
@@ -452,6 +465,9 @@ mod tests {
             file_attachments: vec![],
             conversation_history: vec![],
             file_refs: vec![],
+            effort: None,
+            max_tokens: None,
+            auto_approve: true,
         };
 
         let mut stream = backend.stream_completion(req).await.unwrap();

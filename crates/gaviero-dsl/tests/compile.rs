@@ -119,6 +119,18 @@ fn workflow_name_selector() {
 }
 
 #[test]
+fn multiple_workflows_without_selector_is_an_error() {
+    let src = r#"
+        agent a { description "a" }
+        workflow first  { steps [a] }
+        workflow second { steps [a] }
+    "#;
+    let err = compile(src, "test.gaviero", None, None).unwrap_err();
+    let report = format!("{:?}", err);
+    assert!(report.contains("multiple workflows"), "report: {}", report);
+}
+
+#[test]
 fn parse_error_missing_closing_brace() {
     let src = r#"agent x { description "hello" "#;
     let err = compile(src, "test.gaviero", None, None).unwrap_err();

@@ -10,9 +10,8 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
+use super::backend::{executor, shared, CompletionRequest};
 use super::models::{MergeConflict, MergeResult};
-use crate::acp::protocol::StreamEvent;
-use crate::acp::session::{AcpSession, AgentOptions};
 
 /// Merge an agent branch into the current branch.
 ///
@@ -138,6 +137,7 @@ pub async fn auto_resolve_conflicts(
     branch: &str,
     conflicts: &[MergeConflict],
     model: &str,
+    ollama_base_url: Option<&str>,
 ) -> Result<Vec<MergeConflict>> {
     let mut resolved_conflicts = Vec::new();
 
@@ -153,13 +153,21 @@ pub async fn auto_resolve_conflicts(
             content,
         );
 
-        match resolve_single_file(repo_dir, &conflict.file, &prompt, model).await {
+        match resolve_single_file(
+            repo_dir,
+            &conflict.file,
+            &prompt,
+            model,
+            ollama_base_url,
+        )
+        .await
+        {
             Ok(resolved_content) => {
                 resolve_conflict(repo_dir, &conflict.file, &resolved_content)?;
                 resolved_conflicts.push(MergeConflict {
                     file: conflict.file.clone(),
                     resolved: true,
-                    resolution_method: Some("claude".to_string()),
+                    resolution_method: Some(model.to_string()),
                 });
             }
             Err(e) => {
@@ -187,38 +195,33 @@ async fn resolve_single_file(
     _file: &Path,
     prompt: &str,
     model: &str,
+    ollama_base_url: Option<&str>,
 ) -> Result<String> {
-    let mut session = AcpSession::spawn(
-        model,
-        repo_dir,
-        prompt,
-        "You are a merge conflict resolver. Output only the resolved file content.",
-        &[],  // no tools needed
-        &[],
-        &AgentOptions::default(),
-        &[],  // no file attachments
-    )?;
-
-    let mut result_text = String::new();
-
-    loop {
-        match session.next_event().await? {
-            Some(StreamEvent::ContentDelta(text)) => {
-                result_text.push_str(&text);
-            }
-            Some(StreamEvent::ResultEvent { result_text: text, .. }) => {
-                if !text.is_empty() {
-                    result_text = text;
-                }
-                break;
-            }
-            None => break,
-            _ => {}
-        }
-    }
+    let backend = shared::create_backend_for_model(model, ollama_base_url)?;
+    let result_text = executor::complete_to_text(
+        &*backend,
+        CompletionRequest {
+            prompt: prompt.to_string(),
+            system_prompt: Some(
+                "You are a merge conflict resolver. Output only the resolved file content."
+                    .to_string(),
+            ),
+            workspace_root: repo_dir.to_path_buf(),
+            allowed_tools: vec![],
+            file_attachments: vec![],
+            conversation_history: vec![],
+            file_refs: vec![],
+            effort: None,
+            max_tokens: None,
+            auto_approve: true,
+        },
+        None,
+    )
+    .await?
+    .text;
 
     if result_text.trim().is_empty() {
-        anyhow::bail!("Claude returned empty resolution");
+        anyhow::bail!("provider returned empty conflict resolution");
     }
 
     // Strip markdown fences if Claude wraps the output

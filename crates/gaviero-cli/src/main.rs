@@ -9,31 +9,6 @@ use gaviero_core::memory::MemoryStore;
 use gaviero_core::observer::{AcpObserver, SwarmObserver};
 use gaviero_core::swarm::models::{AgentStatus, SwarmResult, WorkUnit};
 
-/// Claude model to use for `--task` and `--work-units` modes.
-#[derive(clap::ValueEnum, Clone, Debug, Default)]
-enum CliModel {
-    #[default]
-    Sonnet,
-    Opus,
-    Haiku,
-}
-
-impl CliModel {
-    fn as_str(&self) -> &'static str {
-        match self {
-            CliModel::Sonnet => "sonnet",
-            CliModel::Opus => "opus",
-            CliModel::Haiku => "haiku",
-        }
-    }
-}
-
-impl std::fmt::Display for CliModel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 impl std::fmt::Display for OutputFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -78,9 +53,21 @@ struct Cli {
     #[arg(long, default_value = "1")]
     max_parallel: usize,
 
-    /// Claude model to use.
-    #[arg(long, default_value_t = CliModel::Sonnet)]
-    model: CliModel,
+    /// Model spec to use for synthetic task execution and as the default runtime model.
+    /// Examples: sonnet, opus, haiku, claude:sonnet, ollama:qwen2.5-coder:7b.
+    /// Defaults to workspace agent.model, then sonnet.
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Model spec to use for coordinated planning.
+    /// Defaults to --model, then workspace agent.coordinator.model, then sonnet.
+    #[arg(long)]
+    coordinator_model: Option<String>,
+
+    /// Override the Ollama base URL.
+    /// Defaults to workspace agent.ollamaBaseUrl, then http://localhost:11434.
+    #[arg(long)]
+    ollama_base_url: Option<String>,
 
     /// Override the write namespace (default: from settings or folder name).
     #[arg(long)]
@@ -94,7 +81,7 @@ struct Cli {
     #[arg(long, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
 
-    /// Use coordinated planning: --model controls the planner (default sonnet).
+    /// Use coordinated planning: emits a .gaviero plan file for review and exits.
     /// Requires --task. Produces a .gaviero DSL file for review before execution.
     #[arg(long)]
     coordinated: bool,
@@ -219,6 +206,46 @@ impl SwarmObserver for CliSwarmObserver {
     }
 }
 
+fn resolve_model_spec(spec: &str, label: &str) -> Result<String> {
+    let trimmed = spec.trim();
+    gaviero_core::swarm::backend::shared::validate_model_spec(trimmed)
+        .with_context(|| format!("invalid {} model spec '{}'", label, trimmed))?;
+    Ok(trimmed.to_string())
+}
+
+fn workspace_setting_string(
+    workspace: &gaviero_core::workspace::Workspace,
+    key: &str,
+) -> Option<String> {
+    workspace
+        .resolve_setting(key, None)
+        .as_str()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn resolve_execution_model(cli: &Cli, workspace: &gaviero_core::workspace::Workspace) -> Result<String> {
+    let candidate = cli
+        .model
+        .clone()
+        .or_else(|| workspace_setting_string(workspace, gaviero_core::workspace::settings::AGENT_MODEL))
+        .unwrap_or_else(|| "sonnet".to_string());
+    resolve_model_spec(&candidate, "execution")
+}
+
+fn resolve_coordinator_model(
+    cli: &Cli,
+    workspace: &gaviero_core::workspace::Workspace,
+    execution_model: &str,
+) -> Result<String> {
+    let candidate = cli
+        .coordinator_model
+        .clone()
+        .or_else(|| workspace_setting_string(workspace, gaviero_core::workspace::settings::COORDINATOR_MODEL))
+        .unwrap_or_else(|| execution_model.to_string());
+    resolve_model_spec(&candidate, "coordinator")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -266,6 +293,18 @@ async fn main() -> Result<()> {
     let write_ns = cli.namespace.clone()
         .unwrap_or_else(|| workspace.resolve_namespace(None));
     let mut read_nss = workspace.resolve_read_namespaces(None);
+    let execution_model = resolve_execution_model(&cli, &workspace)?;
+    let coordinator_model = if cli.coordinated {
+        Some(resolve_coordinator_model(&cli, &workspace, &execution_model)?)
+    } else {
+        None
+    };
+    let ollama_base_url = cli.ollama_base_url.clone().or_else(|| {
+        workspace_setting_string(
+            &workspace,
+            gaviero_core::workspace::settings::AGENT_OLLAMA_BASE_URL,
+        )
+    });
     // Merge CLI --read-ns flags
     for ns in &cli.read_ns {
         if !read_nss.contains(ns) {
@@ -278,6 +317,14 @@ async fn main() -> Result<()> {
     }
 
     eprintln!("[namespace] write={}, read=[{}]", write_ns, read_nss.join(", "));
+    if let Some(ref coord_model) = coordinator_model {
+        eprintln!(
+            "[model] execution={}, coordinator={}",
+            execution_model, coord_model
+        );
+    } else {
+        eprintln!("[model] execution={}", execution_model);
+    }
 
     // Initialize memory store (graceful if it fails — offline, corrupt model, etc.)
     let memory: Option<Arc<MemoryStore>> =
@@ -318,7 +365,7 @@ async fn main() -> Result<()> {
             depends_on: Vec::new(),
             #[allow(deprecated)]
             backend: Default::default(),
-            model: Some(cli.model.as_str().to_string()),
+            model: Some(execution_model.clone()),
             tier: Default::default(),
             privacy: Default::default(),
             coordinator_instructions: String::new(),
@@ -364,7 +411,8 @@ async fn main() -> Result<()> {
     let config = gaviero_core::swarm::pipeline::SwarmConfig {
         max_parallel: cli.max_parallel,
         workspace_root: repo,
-        model: cli.model.as_str().to_string(),
+        model: execution_model.clone(),
+        ollama_base_url: ollama_base_url.clone(),
         use_worktrees: cli.max_parallel > 1,
         read_namespaces: read_nss,
         write_namespace: write_ns,
@@ -380,10 +428,11 @@ async fn main() -> Result<()> {
         let task = cli.task.as_deref()
             .ok_or_else(|| anyhow::anyhow!("--coordinated requires --task"))?;
         let coord_config = gaviero_core::swarm::coordinator::CoordinatorConfig {
-            model: cli.model.as_str().to_string(),
+            model: coordinator_model.clone().unwrap_or_else(|| execution_model.clone()),
+            ollama_base_url: ollama_base_url,
             ..Default::default()
         };
-        eprintln!("[mode] coordinated — planning DSL ({})", cli.model);
+        eprintln!("[mode] coordinated — planning DSL ({})", coord_config.model);
         let dsl_text = gaviero_core::swarm::pipeline::plan_coordinated(
             task,
             &config,
@@ -489,5 +538,104 @@ async fn main() -> Result<()> {
         Ok(())
     } else {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn temp_workspace(name: &str, settings_json: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "gaviero-cli-test-{}-{}",
+            name,
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join(".gaviero")).unwrap();
+        fs::write(base.join(".gaviero/settings.json"), settings_json).unwrap();
+        base
+    }
+
+    #[test]
+    fn cli_accepts_provider_aware_model_flags() {
+        let cli = Cli::try_parse_from([
+            "gaviero-cli",
+            "--task",
+            "fix it",
+            "--model",
+            "ollama:qwen2.5-coder:7b",
+            "--coordinator-model",
+            "claude:sonnet",
+            "--ollama-base-url",
+            "http://localhost:11434",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.model.as_deref(), Some("ollama:qwen2.5-coder:7b"));
+        assert_eq!(cli.coordinator_model.as_deref(), Some("claude:sonnet"));
+        assert_eq!(
+            cli.ollama_base_url.as_deref(),
+            Some("http://localhost:11434")
+        );
+    }
+
+    #[test]
+    fn resolve_model_spec_rejects_unknown_provider_prefix() {
+        let err = resolve_model_spec("openai:gpt-4.1", "execution").unwrap_err();
+        assert!(err.to_string().contains("invalid execution model spec"));
+    }
+
+    #[test]
+    fn resolve_execution_model_prefers_cli_over_workspace() {
+        let root = temp_workspace(
+            "execution-model",
+            r#"{
+              "agent": {
+                "model": "opus"
+              }
+            }"#,
+        );
+        let workspace = gaviero_core::workspace::Workspace::single_folder(root.clone());
+        let cli = Cli::try_parse_from([
+            "gaviero-cli",
+            "--task",
+            "fix it",
+            "--model",
+            "ollama:qwen2.5-coder:7b",
+        ])
+        .unwrap();
+
+        let resolved = resolve_execution_model(&cli, &workspace).unwrap();
+        assert_eq!(resolved, "ollama:qwen2.5-coder:7b");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_coordinator_model_uses_workspace_before_execution_fallback() {
+        let root = temp_workspace(
+            "coordinator-model",
+            r#"{
+              "agent": {
+                "model": "haiku",
+                "coordinator": {
+                  "model": "claude:sonnet"
+                }
+              }
+            }"#,
+        );
+        let workspace = gaviero_core::workspace::Workspace::single_folder(root.clone());
+        let cli = Cli::try_parse_from(["gaviero-cli", "--task", "plan it", "--coordinated"]).unwrap();
+
+        let execution = resolve_execution_model(&cli, &workspace).unwrap();
+        let coordinator = resolve_coordinator_model(&cli, &workspace, &execution).unwrap();
+
+        assert_eq!(execution, "haiku");
+        assert_eq!(coordinator, "claude:sonnet");
+
+        let _ = fs::remove_dir_all(root);
     }
 }

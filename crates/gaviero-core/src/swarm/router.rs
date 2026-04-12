@@ -1,6 +1,7 @@
 //! Tier routing: maps ModelTier + PrivacyLevel to concrete backend configuration.
 
 use crate::types::{ModelTier, PrivacyLevel};
+use super::backend::shared;
 use super::models::WorkUnit;
 
 /// Configuration for tier-based model routing.
@@ -91,15 +92,12 @@ impl TierRouter {
         unit: &WorkUnit,
     ) -> Result<Box<dyn super::backend::AgentBackend>, String> {
         match self.resolve(unit) {
-            ResolvedBackend::Claude { model } => {
-                Ok(Box::new(
-                    super::backend::claude_code::ClaudeCodeBackend::new(&model),
-                ))
-            }
+            ResolvedBackend::Claude { model } => shared::create_backend_for_model(&model, None)
+                .map_err(|e| e.to_string()),
             ResolvedBackend::Ollama { model, base_url } => {
-                Ok(Box::new(
-                    super::backend::ollama::OllamaStreamBackend::new(&base_url, &model),
-                ))
+                let model_spec = format!("ollama:{}", model);
+                shared::create_backend_for_model(&model_spec, Some(&base_url))
+                    .map_err(|e| e.to_string())
             }
             ResolvedBackend::Blocked { reason } => Err(reason),
         }
@@ -128,6 +126,18 @@ impl TierRouter {
 
     /// Resolve a model override, checking privacy constraints.
     fn resolve_model_override(&self, unit: &WorkUnit, model: &str) -> ResolvedBackend {
+        if shared::is_ollama_model(model) {
+            let resolved_model = model
+                .strip_prefix("ollama:")
+                .or_else(|| model.strip_prefix("local:"))
+                .unwrap_or(model)
+                .to_string();
+            return ResolvedBackend::Ollama {
+                model: resolved_model,
+                base_url: self.config.local.base_url.clone(),
+            };
+        }
+
         // Privacy check: LocalOnly units cannot use API models
         if unit.privacy == PrivacyLevel::LocalOnly {
             // Allow only if the override points to the local backend
@@ -188,6 +198,14 @@ fn routing_match(
         (ModelTier::Cheap, _, _) => ResolvedBackend::Claude {
             model: config.cheap_model.clone(),
         },
+        (ModelTier::Expensive, _, true)
+            if config.local.enabled && config.expensive_model == config.local.model =>
+        {
+            ResolvedBackend::Ollama {
+                model: config.local.model.clone(),
+                base_url: config.local.base_url.clone(),
+            }
+        }
         // Expensive: always API
         (ModelTier::Expensive, _, _) => ResolvedBackend::Claude {
             model: config.expensive_model.clone(),
@@ -202,7 +220,7 @@ pub fn validate_privacy(unit: &WorkUnit) -> Result<(), String> {
     if unit.privacy == PrivacyLevel::LocalOnly {
         if let Some(ref model) = unit.model {
             // Only local models are acceptable for LocalOnly units
-            if !model.contains("local") && !model.contains("ollama") && !model.contains("qwen") {
+            if !shared::is_ollama_model(model) && !model.contains("qwen") {
                 return Err(format!(
                     "unit '{}': LocalOnly privacy with API model override '{}'",
                     unit.id, model

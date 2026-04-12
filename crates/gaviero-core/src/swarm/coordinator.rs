@@ -1,5 +1,5 @@
 #![allow(deprecated)]
-//! Coordinator: Opus-powered task decomposition with tier annotations.
+//! Coordinator: provider-aware task decomposition with tier annotations.
 //!
 //! The coordinator replaces the existing planner for coordinated swarm runs.
 //! It produces a `TaskDAG` with tier annotations, dependency edges, and a
@@ -11,11 +11,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 
+use super::backend::{executor, shared, CompletionRequest};
 use super::models::{AgentBackend, WorkUnit};
 use super::planner::extract_json;
 use super::validation;
 use super::verify::VerificationStrategy;
-use crate::acp::session::AcpSession;
 use crate::memory::store::{MemoryStore, PrivacyFilter};
 use crate::types::{FileScope, ModelTier, PrivacyLevel};
 
@@ -23,6 +23,7 @@ use crate::types::{FileScope, ModelTier, PrivacyLevel};
 #[derive(Debug, Clone)]
 pub struct CoordinatorConfig {
     pub model: String,
+    pub ollama_base_url: Option<String>,
     pub max_context_tokens: u32,
 }
 
@@ -30,6 +31,7 @@ impl Default for CoordinatorConfig {
     fn default() -> Self {
         Self {
             model: "opus".into(),
+            ollama_base_url: None,
             max_context_tokens: 80000,
         }
     }
@@ -98,7 +100,7 @@ pub struct FailedUnit {
     pub tier_at_failure: ModelTier,
 }
 
-/// The coordinator: plans tier-annotated task DAGs via a single Opus call.
+/// The coordinator: plans tier-annotated task DAGs via a single model call.
 pub struct Coordinator {
     memory: Option<Arc<MemoryStore>>,
     config: CoordinatorConfig,
@@ -147,30 +149,16 @@ impl Coordinator {
             prompt
         );
 
-        let options = crate::acp::session::AgentOptions::default();
-        let tools = &["Read", "Glob", "Grep"];
-        let mut session = AcpSession::spawn(
+        let response = run_coordinator_request(
             &self.config.model,
+            self.config.ollama_base_url.as_deref(),
             workspace_root,
-            &user_prompt,
             &system_prompt,
-            tools,
-            tools,
-            &options,
-            &[],
-        )?;
-
-        // Collect full response, forwarding tool calls to observer.
-        // Tool details (file paths, patterns) come from AssistantMessage.tool_uses,
-        // NOT from ToolInputDelta (which the CLI may not emit).
-        let response = run_coordinator_session(
-            &mut session,
+            &user_prompt,
             observer.as_deref(),
             "Building plan...",
-            "coordination",
         )
-        .await;
-        let _ = session.wait().await;
+        .await?;
 
         // Parse the JSON response leniently (LLMs produce varying shapes)
         let json_str = extract_json(&response)
@@ -254,26 +242,6 @@ impl Coordinator {
             prompt
         );
 
-        if let Some(o) = obs { o.on_streaming_status("Spawning coordinator agent..."); }
-        // The coordinator only uses read-only tools (Read, Glob, Grep) so we
-        // auto-approve all permissions. This also lets the CLI start streaming
-        // immediately without waiting for explicit permission acknowledgements.
-        let options = crate::acp::session::AgentOptions {
-            auto_approve: true,
-            ..Default::default()
-        };
-        let tools = &["Read", "Glob", "Grep"];
-        let mut session = AcpSession::spawn(
-            &self.config.model,
-            workspace_root,
-            &user_prompt,
-            &system_prompt,
-            tools,
-            tools,
-            &options,
-            &[],
-        )?;
-
         let total_kb = (user_prompt.len() + system_prompt.len()) / 1024;
         if let Some(o) = obs {
             o.on_streaming_status(&format!(
@@ -281,14 +249,16 @@ impl Coordinator {
                 total_kb
             ));
         }
-        let response = run_coordinator_session(
-            &mut session,
+        let response = run_coordinator_request(
+            &self.config.model,
+            self.config.ollama_base_url.as_deref(),
+            workspace_root,
+            &system_prompt,
+            &user_prompt,
             obs,
             "Building DSL plan...",
-            "DSL coordination",
         )
-        .await;
-        let _ = session.wait().await;
+        .await?;
 
         // Strip markdown code fences if Opus wrapped the DSL in ```gaviero ... ```
         let dsl = strip_code_fence(&response);
@@ -441,124 +411,43 @@ impl Coordinator {
     }
 }
 
-/// Drive a coordinator ACP session to completion, collecting the full response text.
-///
-/// Forwards tool-use status and call details to `observer` when present.
-/// `building_status` is the status string shown when no tool is active.
-/// `error_context` labels the warning log on stream errors.
-/// How long to wait between stream events before emitting a keepalive status message.
-const COORDINATOR_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-async fn run_coordinator_session(
-    session: &mut AcpSession,
+async fn run_coordinator_request(
+    model: &str,
+    ollama_base_url: Option<&str>,
+    workspace_root: &Path,
+    system_prompt: &str,
+    user_prompt: &str,
     observer: Option<&dyn crate::observer::AcpObserver>,
     building_status: &str,
-    error_context: &str,
-) -> String {
-    let mut response = String::new();
-    let mut idle_count: u32 = 0;
-    loop {
-        let next = tokio::time::timeout(COORDINATOR_IDLE_TIMEOUT, session.next_event()).await;
-        let event_result = match next {
-            Err(_elapsed) => {
-                idle_count += 1;
-                let elapsed = idle_count * COORDINATOR_IDLE_TIMEOUT.as_secs() as u32;
-                if session.try_wait_exited() {
-                    tracing::warn!("Coordinator subprocess exited during idle wait");
-                    if let Some(obs) = observer {
-                        let stderr = session.stderr_output().await;
-                        let msg = if stderr.is_empty() {
-                            "Coordinator process exited unexpectedly.".to_string()
-                        } else {
-                            format!("Coordinator CLI error:\n{}", stderr)
-                        };
-                        obs.on_streaming_status(&msg);
-                    }
-                    break;
-                }
-                if let Some(obs) = observer {
-                    let stderr = session.stderr_output().await;
-                    let stderr_hint = if stderr.is_empty() {
-                        String::new()
-                    } else {
-                        // Show last stderr line as a hint
-                        let last = stderr.lines().last().unwrap_or("").trim().to_string();
-                        format!(" | stderr: {}", last)
-                    };
-                    obs.on_streaming_status(
-                        &format!("{} ({}s elapsed){}", building_status, elapsed, stderr_hint),
-                    );
-                }
-                continue;
-            }
-            Ok(result) => {
-                idle_count = 0;
-                result
-            }
-        };
-        match event_result {
-            Ok(Some(crate::acp::protocol::StreamEvent::ThinkingDelta(text))) => {
-                if let Some(obs) = observer {
-                    obs.on_stream_chunk(&text);
-                }
-            }
-            Ok(Some(crate::acp::protocol::StreamEvent::ContentDelta(text))) => {
-                if let Some(obs) = observer {
-                    obs.on_stream_chunk(&text);
-                }
-                response.push_str(&text);
-            }
-            Ok(Some(crate::acp::protocol::StreamEvent::ToolUseStart { tool_name, .. })) => {
-                if let Some(obs) = observer {
-                    obs.on_tool_call_started(&format!("[{}]", tool_name));
-                }
-            }
-            Ok(Some(crate::acp::protocol::StreamEvent::ToolInputDelta(_))) => {}
-            Ok(Some(crate::acp::protocol::StreamEvent::AssistantMessage { text, tool_uses })) => {
-                if let Some(obs) = observer {
-                    for tu in &tool_uses {
-                        let detail = extract_tool_detail(&tu.name, &tu.input.to_string());
-                        obs.on_tool_call_started(&detail);
-                    }
-                }
-                if response.is_empty() && !text.is_empty() {
-                    response = text;
-                }
-            }
-            Ok(Some(crate::acp::protocol::StreamEvent::ResultEvent { result_text, .. })) => {
-                if response.is_empty() {
-                    response = result_text;
-                }
-                break;
-            }
-            Ok(None) => break,
-            Err(e) => {
-                tracing::warn!("Stream error during {}: {}", error_context, e);
-                break;
-            }
-            Ok(Some(crate::acp::protocol::StreamEvent::PermissionRequest {
-                tool_name,
-                request_id,
-                ..
-            })) => {
-                // The coordinator only allows Read/Glob/Grep, so this should
-                // never fire. Auto-approve defensively to prevent a hang.
-                tracing::warn!(
-                    "Unexpected PermissionRequest from coordinator for '{}' — auto-approving",
-                    tool_name
-                );
-                session.respond_permission(true, &request_id);
-            }
-            _ => {}
-        }
-    }
+) -> Result<String> {
     if let Some(obs) = observer {
-        obs.on_message_complete("assistant", &response);
+        obs.on_streaming_status(building_status);
     }
-    response
+
+    let backend = shared::create_backend_for_model(model, ollama_base_url)?;
+    let response = executor::complete_to_text(
+        &*backend,
+        CompletionRequest {
+            prompt: user_prompt.to_string(),
+            system_prompt: Some(system_prompt.to_string()),
+            workspace_root: workspace_root.to_path_buf(),
+            allowed_tools: vec![],
+            file_attachments: vec![],
+            conversation_history: vec![],
+            file_refs: vec![],
+            effort: None,
+            max_tokens: None,
+            auto_approve: true,
+        },
+        observer,
+    )
+    .await?;
+
+    Ok(response.text)
 }
 
 /// Extract a human-readable detail string from tool input JSON.
+#[allow(dead_code)]
 pub(crate) fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
     // Try full JSON parse first
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(input_json) {
@@ -1039,9 +928,11 @@ fn build_coordinator_dsl_prompt(file_list: &[String], memory_context: &str) -> S
          - execution: single-file focused changes, test writing, error handling\n\
          - mechanical: renames, import updates, call-site propagation, formatting\n\n\
          CLIENT NAMES to use:\n\
-         - `opus` for reasoning-tier agents (model \"claude-opus-4-6\")\n\
-         - `sonnet` for execution-tier agents (model \"claude-sonnet-4-6\")\n\
-         - `haiku` for mechanical-tier agents (model \"claude-haiku-4-5-20251001\")\n\n\
+         - `reasoning` for reasoning-tier agents\n\
+         - `execution` for execution-tier agents\n\
+         - `mechanical` for mechanical-tier agents\n\
+         - Prefer omitting explicit `model` fields so runtime routing can choose the active provider.\n\
+           Only set a concrete model when the task truly requires a provider-specific override.\n\n\
          PROMPT CONTENT:\n\
          - Each agent's prompt must be SELF-CONTAINED — include all context needed\n\
          - Agents run in isolated git worktrees; they cannot access tmp/ or gitignored files\n\
