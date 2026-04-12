@@ -51,18 +51,21 @@ impl AcpSession {
     /// Spawn a new Claude Code subprocess.
     ///
     /// Uses `--print --output-format stream-json` for NDJSON streaming.
-    /// Tools are restricted to read-only operations.
+    ///
+    /// `available_tools` controls which tools the model can use (`--tools`).
+    /// `approved_tools` controls which of those are auto-approved without
+    /// a permission prompt (`--allowedTools`). Tools in `available_tools`
+    /// but not in `approved_tools` will trigger `PermissionRequest` events.
     pub fn spawn(
         model: &str,
         cwd: &Path,
         prompt: &str,
         system_prompt: &str,
-        allowed_tools: &[&str],
+        available_tools: &[&str],
+        approved_tools: &[&str],
         options: &AgentOptions,
         file_attachments: &[&Path],
     ) -> Result<Self> {
-        let tools_str = allowed_tools.join(",");
-
         let mut cmd = Command::new("claude");
         cmd.arg("--print")
             .arg("--output-format")
@@ -79,14 +82,16 @@ impl AcpSession {
 
         if options.auto_approve {
             cmd.arg("--dangerously-skip-permissions");
+        } else if !approved_tools.is_empty() {
+            cmd.arg("--allowedTools").arg(approved_tools.join(","));
         }
 
         if !system_prompt.is_empty() {
             cmd.arg("--append-system-prompt").arg(system_prompt);
         }
 
-        if !tools_str.is_empty() {
-            cmd.arg("--allowedTools").arg(&tools_str);
+        if !available_tools.is_empty() {
+            cmd.arg("--tools").arg(available_tools.join(","));
         }
 
         // Attach files (images, documents) via --file flag
@@ -96,7 +101,9 @@ impl AcpSession {
 
         cmd.arg("--add-dir").arg(cwd);
 
-        // Pass prompt via stdin (more robust than positional arg for multi-line prompts)
+        // Pass prompt as positional arg so stdin stays open for permission responses.
+        cmd.arg("--").arg(prompt);
+
         cmd.current_dir(cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -106,23 +113,24 @@ impl AcpSession {
 
         let mut child = cmd.spawn().context("spawning claude subprocess")?;
 
-        // Write prompt to stdin then close it immediately.
-        //
-        // `claude --print` reads stdin until EOF before processing — keeping
-        // stdin open causes claude to block forever waiting for more input.
-        // We must send EOF right after the prompt regardless of auto_approve.
-        //
-        // NOTE: permission responses via stdin are therefore not supported in
-        // --print mode; respond_permission() is a no-op (stdin_tx is always None).
-        if let Some(mut stdin) = child.stdin.take() {
-            let prompt_bytes = prompt.as_bytes().to_vec();
+        // Keep stdin open for permission responses.
+        // When a PermissionRequest arrives, respond_permission() sends
+        // JSON via this channel. Dropping the sender closes stdin.
+        let stdin_tx = if let Some(mut stdin) = child.stdin.take() {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             tokio::spawn(async move {
-                let _ = stdin.write_all(&prompt_bytes).await;
-                let _ = stdin.flush().await;
-                let _ = stdin.shutdown().await; // send EOF — unblocks claude
+                while let Some(line) = rx.recv().await {
+                    if stdin.write_all(line.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    let _ = stdin.flush().await;
+                }
+                let _ = stdin.shutdown().await;
             });
-        }
-        let stdin_tx: Option<tokio::sync::mpsc::UnboundedSender<String>> = None;
+            Some(tx)
+        } else {
+            None
+        };
 
         let stdout = child
             .stdout
