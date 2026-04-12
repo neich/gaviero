@@ -3,7 +3,6 @@ pub mod schema;
 pub mod onnx_embedder;
 pub mod store;
 pub mod model_manager;
-pub mod code_graph;
 pub mod consolidation;
 pub mod scope;
 pub mod scoring;

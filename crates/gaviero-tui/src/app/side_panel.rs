@@ -774,6 +774,21 @@ pub(super) fn send_chat_message(app: &mut App) {
     let memory = app.memory.clone();
     let read_ns = app.chat_state.agent_settings.read_namespaces.clone();
     let ollama_base_url = app.chat_state.agent_settings.ollama_base_url.clone();
+    let graph_budget_tokens = app.chat_state.agent_settings.graph_budget_tokens;
+    let repo_map_cache = app.repo_map.clone();
+    let graph_root = app.graph_workspace_root.clone().unwrap_or_else(|| root.clone());
+
+    // Seed paths for graph ranking: explicit @file refs + active buffer (if any), made relative to workspace root.
+    let mut graph_seeds: Vec<String> = refs.clone();
+    if let Some(buf) = app.buffers.get(app.active_buffer) {
+        if let Some(p) = buf.path.as_deref() {
+            if let Ok(rel) = p.strip_prefix(&graph_root) {
+                graph_seeds.push(rel.to_string_lossy().to_string());
+            }
+        }
+    }
+    graph_seeds.sort();
+    graph_seeds.dedup();
 
     let conv_id_clone = conv_id.clone();
     let task = tokio::spawn(async move {
@@ -783,8 +798,18 @@ pub(super) fn send_chat_message(app: &mut App) {
             gate.set_mode(WriteMode::Deferred);
         }
 
-        let enriched_prompt = if let Some(ref mem) = memory {
-            let ctx = match tokio::time::timeout(
+        // Graph-backed source context: ranked outline + impact radius for the seeds.
+        // This narrows what the LLM needs to pull via Read/Grep and is prepended to memory context.
+        let graph_ctx = crate::app::session::build_graph_context(
+            repo_map_cache,
+            graph_root,
+            graph_seeds,
+            graph_budget_tokens,
+        )
+        .await;
+
+        let mem_ctx = if let Some(ref mem) = memory {
+            match tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 mem.search_context(&read_ns, &prompt, 5),
             )
@@ -797,15 +822,20 @@ pub(super) fn send_chat_message(app: &mut App) {
                     );
                     String::new()
                 }
-            };
-            if ctx.is_empty() {
-                prompt.clone()
-            } else {
-                format!("{}\n\n{}", ctx, prompt)
             }
         } else {
-            prompt.clone()
+            String::new()
         };
+
+        let mut parts: Vec<String> = Vec::new();
+        if !graph_ctx.is_empty() {
+            parts.push(graph_ctx);
+        }
+        if !mem_ctx.is_empty() {
+            parts.push(mem_ctx);
+        }
+        parts.push(prompt.clone());
+        let enriched_prompt = parts.join("\n\n");
 
         let observer = TuiAcpObserver {
             tx: tx.clone(),

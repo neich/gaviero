@@ -22,6 +22,7 @@ use crate::widgets::tabs::TabBar;
 
 use gaviero_core::acp::client::AcpPipeline;
 use gaviero_core::memory::MemoryStore;
+use gaviero_core::repo_map::RepoMap;
 use gaviero_core::session_state::{self, SessionState, TabState};
 use gaviero_core::types::WriteProposal;
 use gaviero_core::workspace::Workspace;
@@ -35,9 +36,10 @@ mod left_panel;
 mod side_panel;
 mod commands;
 mod editing;
-mod session;
+pub(crate) mod session;
 mod state;
 mod observers;
+mod chat_memory;
 
 use self::observers::{TuiAcpObserver, TuiSwarmObserver, TuiWriteGateObserver};
 use self::state::{
@@ -133,6 +135,12 @@ pub struct App {
     // Memory
     pub memory: Option<Arc<MemoryStore>>,
 
+    // Code graph cache — lazy build, invalidated on file changes.
+    // `None` means "needs (re)build before next chat send".
+    pub repo_map: Arc<tokio::sync::RwLock<Option<Arc<RepoMap>>>>,
+    /// Workspace root path used for graph rebuilds (first root).
+    pub graph_workspace_root: Option<std::path::PathBuf>,
+
     // Git panel (M4)
     pub git_panel: crate::panels::git_panel::GitPanelState,
     pub git_repo: Option<gaviero_core::git::GitRepo>,
@@ -195,6 +203,10 @@ impl App {
             .as_str()
             .unwrap_or("http://localhost:11434")
             .to_string();
+        let agent_graph_budget_tokens = workspace
+            .resolve_setting(settings::AGENT_GRAPH_BUDGET_TOKENS, None)
+            .as_u64()
+            .unwrap_or(40_000) as usize;
 
         let write_namespace = workspace.resolve_namespace(None);
         let read_namespaces = workspace.resolve_read_namespaces(None);
@@ -202,6 +214,9 @@ impl App {
         // Open git repo for git panel (M4)
         let git_repo = workspace.roots().first()
             .and_then(|r| gaviero_core::git::GitRepo::open(r).ok());
+
+        // Primary workspace root for code-graph context (first root).
+        let graph_workspace_root = workspace.roots().first().map(|p| p.to_path_buf());
 
         let observer = TuiWriteGateObserver {
             tx: event_tx.clone(),
@@ -277,11 +292,14 @@ impl App {
                     ollama_base_url: agent_ollama_base_url,
                     write_namespace,
                     read_namespaces,
+                    graph_budget_tokens: agent_graph_budget_tokens,
                 };
                 cs
             },
             acp_tasks: HashMap::new(),
             memory: None,
+            repo_map: Arc::new(tokio::sync::RwLock::new(None)),
+            graph_workspace_root,
             git_panel: crate::panels::git_panel::GitPanelState::new(),
             git_repo,
             terminal_manager: gaviero_core::terminal::TerminalManager::new(

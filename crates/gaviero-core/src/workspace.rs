@@ -20,6 +20,8 @@ pub mod settings {
     pub const AGENT_EFFORT: &str = "agent.effort";
     pub const AGENT_MAX_TOKENS: &str = "agent.maxTokens";
     pub const AGENT_OLLAMA_BASE_URL: &str = "agent.ollamaBaseUrl";
+    /// Token budget for graph-based source-code context injection in simple chat. 0 disables.
+    pub const AGENT_GRAPH_BUDGET_TOKENS: &str = "agent.graphBudgetTokens";
 
     // Memory settings
     /// The namespace to write memories to.
@@ -429,6 +431,7 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::AGENT_MODEL => serde_json::json!("sonnet"),
         settings::AGENT_EFFORT => serde_json::json!("off"),
         settings::AGENT_MAX_TOKENS => serde_json::json!(16384),
+        settings::AGENT_GRAPH_BUDGET_TOKENS => serde_json::json!(40000),
         _ => serde_json::Value::Null,
     }
 }

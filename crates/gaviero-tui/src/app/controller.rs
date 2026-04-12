@@ -1,5 +1,17 @@
 use super::*;
 
+/// Mark the cached `RepoMap` as stale; the next chat send will rebuild it.
+///
+/// Cheap: acquires the lock briefly and writes `None`. Avoids rebuilding
+/// eagerly on every file save — rebuild cost is paid only when next needed.
+fn invalidate_repo_map(app: &App) {
+    let cache = app.repo_map.clone();
+    tokio::spawn(async move {
+        let mut guard = cache.write().await;
+        *guard = None;
+    });
+}
+
 pub(super) fn handle_event(app: &mut App, event: Event) {
     match event {
         Event::Key(key) => {
@@ -81,8 +93,12 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
         Event::Resize(_w, _h) => {
             app.needs_full_redraw = true;
         }
-        Event::FileChanged(path) => app.handle_file_changed(&path),
+        Event::FileChanged(path) => {
+            invalidate_repo_map(app);
+            app.handle_file_changed(&path);
+        }
         Event::FileTreeChanged => {
+            invalidate_repo_map(app);
             app.refresh_file_tree();
             app.refresh_git_panel();
         }
@@ -133,6 +149,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 app.chat_state.finalize_message_to(&conv_id, &role, &content);
                 if role == "assistant" {
                     app.chat_state.collapse_file_blocks_in(&conv_id);
+                    super::chat_memory::store_chat_turn(app, &conv_id, &content);
                 }
             }
         }
@@ -567,6 +584,14 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
             } else if app.focus == Focus::SidePanel
                 && app.side_panel == SidePanelMode::AgentChat
             {
+                let closing_conv_id = app
+                    .chat_state
+                    .conversations
+                    .get(app.chat_state.active_conv)
+                    .map(|c| c.id.clone());
+                if let Some(ref id) = closing_conv_id {
+                    super::chat_memory::consolidate_conversation(app, id);
+                }
                 app.chat_state.close_conversation();
             } else {
                 app.close_tab();

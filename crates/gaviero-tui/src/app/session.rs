@@ -74,6 +74,103 @@ pub(super) fn apply_first_run(app: &mut App, init_memory: bool) {
             });
         }
     }
+
+    // Warm up the code graph in the background so the first chat send doesn't pay build cost.
+    warm_up_repo_map(app);
+}
+
+/// Build graph-backed context text for a chat send: repo outline + impact radius.
+///
+/// Returns empty string if `seeds` is empty, `budget_tokens == 0`, or the graph
+/// can't be built. Rebuilds the cached `RepoMap` on demand if it was invalidated.
+pub(crate) async fn build_graph_context(
+    repo_map_cache: std::sync::Arc<tokio::sync::RwLock<Option<std::sync::Arc<gaviero_core::repo_map::RepoMap>>>>,
+    workspace_root: std::path::PathBuf,
+    seeds: Vec<String>,
+    budget_tokens: usize,
+) -> String {
+    if seeds.is_empty() || budget_tokens == 0 {
+        return String::new();
+    }
+
+    let repo_map = {
+        let guard = repo_map_cache.read().await;
+        guard.clone()
+    };
+    let repo_map = match repo_map {
+        Some(rm) => Some(rm),
+        None => {
+            let root = workspace_root.clone();
+            match tokio::task::spawn_blocking(move || gaviero_core::repo_map::RepoMap::build(&root)).await {
+                Ok(Ok(map)) => {
+                    let arc = std::sync::Arc::new(map);
+                    let mut guard = repo_map_cache.write().await;
+                    *guard = Some(arc.clone());
+                    Some(arc)
+                }
+                _ => None,
+            }
+        }
+    };
+
+    let mut sections: Vec<String> = Vec::new();
+
+    if let Some(rm) = &repo_map {
+        let plan = rm.rank_for_agent(&seeds, budget_tokens);
+        if !plan.repo_outline.is_empty() {
+            sections.push(plan.repo_outline);
+        }
+    }
+
+    // Impact radius lives in an on-disk SQLite store; rusqlite::Connection is !Send
+    // so we build the store, query, and format entirely inside spawn_blocking.
+    let seeds_clone = seeds.clone();
+    let root_clone = workspace_root.clone();
+    let impact_text = tokio::task::spawn_blocking(move || {
+        let (store, _) = gaviero_core::repo_map::graph_builder::build_graph(&root_clone).ok()?;
+        let seed_refs: Vec<&str> = seeds_clone.iter().map(|s| s.as_str()).collect();
+        let impact = store.impact_radius(&seed_refs, 2).ok()?;
+        if impact.affected_files.is_empty() {
+            None
+        } else {
+            Some(gaviero_core::repo_map::store::GraphStore::format_impact_for_prompt(&impact))
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+
+    if let Some(text) = impact_text {
+        sections.push(text);
+    }
+
+    sections.join("\n\n")
+}
+
+/// Spawn a background task that (re)builds `RepoMap` and writes it into `app.repo_map`.
+/// Safe to call multiple times — each invocation replaces the cached map.
+pub(crate) fn warm_up_repo_map(app: &App) {
+    let Some(root) = app.graph_workspace_root.clone() else {
+        return;
+    };
+    let cache = app.repo_map.clone();
+    tokio::spawn(async move {
+        match tokio::task::spawn_blocking(move || gaviero_core::repo_map::RepoMap::build(&root))
+            .await
+        {
+            Ok(Ok(map)) => {
+                let mut guard = cache.write().await;
+                *guard = Some(std::sync::Arc::new(map));
+                tracing::info!("repo_map warmed up");
+            }
+            Ok(Err(e)) => {
+                tracing::debug!("repo_map build skipped: {}", e);
+            }
+            Err(e) => {
+                tracing::warn!("repo_map build panicked: {}", e);
+            }
+        }
+    });
 }
 
 pub(super) fn try_quit(app: &mut App) {

@@ -144,6 +144,8 @@ pub struct AgentSettings {
     pub write_namespace: String,
     /// Namespaces to search when reading (always includes write_namespace).
     pub read_namespaces: Vec<String>,
+    /// Token budget for graph-based source-code context injection. 0 disables graph context.
+    pub graph_budget_tokens: usize,
 }
 
 impl Default for AgentSettings {
@@ -155,6 +157,7 @@ impl Default for AgentSettings {
             ollama_base_url: "http://localhost:11434".to_string(),
             write_namespace: "default".to_string(),
             read_namespaces: vec!["default".to_string()],
+            graph_budget_tokens: 40_000,
         }
     }
 }

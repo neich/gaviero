@@ -137,6 +137,9 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Warm up the code graph in the background (non-blocking).
+    crate::app::session::warm_up_repo_map(&app);
+
     // Main loop — drain all pending events before each render to reduce latency.
     // Without draining, each event triggers a full redraw; during streaming bursts
     // this means the MessageComplete event sits behind many intermediate events,

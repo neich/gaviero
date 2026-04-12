@@ -71,7 +71,6 @@ Some tests require network (Ollama health checks, model downloads). These are `#
 | `embedder.rs` | `Embedder` trait (embed_query, embed_document, embed_batch) |
 | `onnx_embedder.rs` | `OnnxEmbedder` — ONNX Runtime inference (nomic-embed-text-v1.5) |
 | `model_manager.rs` | Model download + cache management |
-| `code_graph.rs` | `CodeGraph` — symbol-level dependency tracking |
 
 ## Key Dependencies
 
