@@ -237,6 +237,7 @@ async fn call_reviewer(
         prompt,
         system,
         &[], // No tools — reviewer never writes
+        &[],
         &options,
         &[],
     )?;
