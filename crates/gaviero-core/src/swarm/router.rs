@@ -51,6 +51,8 @@ impl Default for LocalConfig {
 pub enum ResolvedBackend {
     /// Route to Claude API with the specified model.
     Claude { model: String },
+    /// Route to the Codex CLI with the specified model.
+    Codex { model: String },
     /// Route to Ollama local model.
     Ollama { model: String, base_url: String },
     /// Blocked — cannot dispatch (privacy constraint, unavailable backend).
@@ -94,6 +96,11 @@ impl TierRouter {
         match self.resolve(unit) {
             ResolvedBackend::Claude { model } => shared::create_backend_for_model(&model, None)
                 .map_err(|e| e.to_string()),
+            ResolvedBackend::Codex { model } => {
+                let model_spec = format!("codex:{}", model);
+                shared::create_backend_for_model(&model_spec, None)
+                    .map_err(|e| e.to_string())
+            }
             ResolvedBackend::Ollama { model, base_url } => {
                 let model_spec = format!("ollama:{}", model);
                 shared::create_backend_for_model(&model_spec, Some(&base_url))
@@ -138,7 +145,7 @@ impl TierRouter {
             };
         }
 
-        // Privacy check: LocalOnly units cannot use API models
+        // Privacy check: LocalOnly units cannot use API models (Claude or Codex)
         if unit.privacy == PrivacyLevel::LocalOnly {
             // Allow only if the override points to the local backend
             if model == self.config.local.model {
@@ -153,6 +160,15 @@ impl TierRouter {
                     model
                 ),
             };
+        }
+
+        if shared::is_codex_model(model) {
+            let resolved_model = model
+                .strip_prefix("codex-cli:")
+                .or_else(|| model.strip_prefix("codex:"))
+                .unwrap_or(model)
+                .to_string();
+            return ResolvedBackend::Codex { model: resolved_model };
         }
 
         ResolvedBackend::Claude { model: model.to_string() }
@@ -219,7 +235,14 @@ fn routing_match(
 pub fn validate_privacy(unit: &WorkUnit) -> Result<(), String> {
     if unit.privacy == PrivacyLevel::LocalOnly {
         if let Some(ref model) = unit.model {
-            // Only local models are acceptable for LocalOnly units
+            // Only local models are acceptable for LocalOnly units.
+            // Claude and Codex are both API-backed and therefore not allowed.
+            if shared::is_codex_model(model) {
+                return Err(format!(
+                    "unit '{}': LocalOnly privacy with Codex API model override '{}'",
+                    unit.id, model
+                ));
+            }
             if !shared::is_ollama_model(model) && !model.contains("qwen") {
                 return Err(format!(
                     "unit '{}': LocalOnly privacy with API model override '{}'",
@@ -330,6 +353,23 @@ mod tests {
         let router = TierRouter::new(config, true);
         let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
         assert!(matches!(router.resolve(&unit), ResolvedBackend::Ollama { .. }));
+    }
+
+    #[test]
+    fn test_codex_model_override_routes_to_codex_backend() {
+        let router = TierRouter::new(TierConfig::default(), false);
+        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, Some("codex:gpt-5-codex"));
+        assert_eq!(
+            router.resolve(&unit),
+            ResolvedBackend::Codex { model: "gpt-5-codex".into() }
+        );
+    }
+
+    #[test]
+    fn test_codex_blocked_under_local_only() {
+        let router = TierRouter::new(TierConfig::default(), true);
+        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::LocalOnly, Some("codex:gpt-5-codex"));
+        assert!(matches!(router.resolve(&unit), ResolvedBackend::Blocked { .. }));
     }
 
     #[test]
