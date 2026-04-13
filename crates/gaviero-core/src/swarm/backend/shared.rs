@@ -4,7 +4,8 @@ use super::{create_backend, AgentBackend, BackendConfig, Capabilities, Completio
 
 const HISTORY_TRUNCATION_CHARS: usize = 2000;
 const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
-const SUPPORTED_PROVIDER_PREFIXES: &[&str] = &["claude", "claude-code", "ollama", "local"];
+const SUPPORTED_PROVIDER_PREFIXES: &[&str] =
+    &["claude", "claude-code", "codex", "codex-cli", "ollama", "local"];
 
 pub fn build_enriched_prompt(
     prompt: &str,
@@ -73,6 +74,16 @@ pub fn backend_config_for_model(model_spec: &str, ollama_base_url: Option<&str>)
         };
     }
 
+    if let Some(model) = trimmed
+        .strip_prefix("codex-cli:")
+        .or_else(|| trimmed.strip_prefix("codex:"))
+    {
+        let m = model.trim();
+        return BackendConfig::Codex {
+            model: if m.is_empty() { None } else { Some(m.to_string()) },
+        };
+    }
+
     let claude_model = trimmed
         .strip_prefix("claude-code:")
         .or_else(|| trimmed.strip_prefix("claude:"))
@@ -95,7 +106,7 @@ pub fn validate_model_spec(model_spec: &str) -> Result<()> {
 
     if let Some((prefix, remainder)) = trimmed.split_once(':') {
         match prefix {
-            "ollama" | "local" | "claude" | "claude-code" => {
+            "ollama" | "local" | "claude" | "claude-code" | "codex" | "codex-cli" => {
                 if remainder.trim().is_empty() {
                     anyhow::bail!("model spec '{}' is missing a model name", trimmed);
                 }
@@ -124,6 +135,11 @@ pub fn create_backend_for_model(
 
 pub fn is_ollama_model(model_spec: &str) -> bool {
     model_spec.trim().starts_with("ollama:") || model_spec.trim().starts_with("local:")
+}
+
+pub fn is_codex_model(model_spec: &str) -> bool {
+    let t = model_spec.trim();
+    t.starts_with("codex:") || t.starts_with("codex-cli:")
 }
 
 pub fn request_prompt(request: &CompletionRequest) -> String {
@@ -184,9 +200,31 @@ mod tests {
             "claude-code:haiku",
             "ollama:qwen2.5-coder:7b",
             "local:qwen2.5-coder:14b",
+            "codex:gpt-5-codex",
+            "codex-cli:o4-mini",
         ] {
             validate_model_spec(spec).unwrap();
         }
+    }
+
+    #[test]
+    fn test_backend_config_for_model_parses_codex_prefix() {
+        let config = backend_config_for_model("codex:gpt-5-codex", None);
+        assert_eq!(
+            config,
+            BackendConfig::Codex {
+                model: Some("gpt-5-codex".into())
+            }
+        );
+    }
+
+    #[test]
+    fn test_is_codex_model() {
+        assert!(is_codex_model("codex:gpt-5"));
+        assert!(is_codex_model("codex-cli:o4-mini"));
+        assert!(!is_codex_model("claude:sonnet"));
+        assert!(!is_codex_model("ollama:qwen"));
+        assert!(!is_codex_model("sonnet"));
     }
 
     #[test]
