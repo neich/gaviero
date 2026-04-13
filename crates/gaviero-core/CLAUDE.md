@@ -48,7 +48,7 @@ Some tests require network (Ollama health checks, model downloads). These are `#
 | `calibration.rs` | Tier performance stats, history queries |
 | `plan.rs` | `CompiledPlan`, `PlanNode`, DAG with dependency edges |
 | `execution_state.rs` | Checkpoint/resume for interrupted runs |
-| `backend/` | `AgentBackend` trait, `ClaudeCodeBackend`, `OllamaStreamBackend`, `MockBackend` |
+| `backend/` | `AgentBackend` trait, `ClaudeCodeBackend`, `CodexBackend`, `OllamaStreamBackend`, `MockBackend` |
 | `verify/` | `structural` (tree-sitter), `diff_review` (LLM), `test_runner`, `combined` |
 | `merge.rs` | Git merge + Claude-powered conflict resolution |
 | `bus.rs` | Inter-agent broadcast + targeted messaging |
