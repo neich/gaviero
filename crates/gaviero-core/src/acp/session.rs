@@ -4,13 +4,26 @@
 //! events from stdout line by line.
 
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 
 use super::protocol::{StreamEvent, parse_stream_line};
+
+/// If the enriched prompt + system prompt combined exceed this size, pass the
+/// prompt to Claude through a workspace-local tempfile via `@`-reference
+/// instead of argv. Linux `ARG_MAX` is ~128 KB; 32 KB leaves ample headroom
+/// for the other flag args, environment, and OS overhead. The tempfile path
+/// itself has no practical size ceiling.
+const ARGV_THRESHOLD: usize = 32_768;
+
+/// Subdirectory under the workspace root where oversized prompt tempfiles live.
+/// `--add-dir <cwd>` already lets Claude read files under the workspace; the
+/// `.gaviero/tmp` subpath keeps these transient files out of the way of code.
+const TEMP_SUBDIR: &str = ".gaviero/tmp";
 
 /// Options for the Claude agent subprocess.
 #[derive(Debug, Clone)]
@@ -45,6 +58,49 @@ pub struct AcpSession {
     line_buf: String,
     /// Captured stderr lines (shared with drain task).
     stderr_buf: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// Held only so the tempfile survives until the subprocess exits.
+    /// `NamedTempFile::drop` removes the file from disk automatically.
+    _prompt_tempfile: Option<tempfile::NamedTempFile>,
+}
+
+/// Decide whether a prompt of `prompt_len + system_prompt_len` bytes should
+/// be passed via argv or a tempfile. Extracted so tests can exercise the
+/// decision without spawning a subprocess.
+pub(crate) fn would_use_tempfile(prompt_len: usize, system_prompt_len: usize) -> bool {
+    prompt_len + system_prompt_len >= ARGV_THRESHOLD
+}
+
+/// Write `prompt` to a workspace-local tempfile and return (NamedTempFile,
+/// short argv to use instead of the full prompt). The argv tells Claude to
+/// read the file via its `@`-syntax and follow its instructions.
+fn spill_prompt_to_tempfile(
+    cwd: &Path,
+    prompt: &str,
+) -> Result<(tempfile::NamedTempFile, String)> {
+    let dir: PathBuf = cwd.join(TEMP_SUBDIR);
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating tempdir {}", dir.display()))?;
+
+    let mut file = tempfile::Builder::new()
+        .prefix("prompt-")
+        .suffix(".md")
+        .tempfile_in(&dir)
+        .context("creating prompt tempfile")?;
+    file.write_all(prompt.as_bytes())
+        .context("writing prompt tempfile")?;
+    file.flush().context("flushing prompt tempfile")?;
+
+    let rel: PathBuf = file
+        .path()
+        .strip_prefix(cwd)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| file.path().to_path_buf());
+
+    let wrapper = format!(
+        "Read the full prompt at @{} and follow its instructions.",
+        rel.display()
+    );
+    Ok((file, wrapper))
 }
 
 impl AcpSession {
@@ -66,6 +122,24 @@ impl AcpSession {
         options: &AgentOptions,
         file_attachments: &[&Path],
     ) -> Result<Self> {
+        // Decide argv vs tempfile for the prompt. Small prompts take the
+        // zero-overhead argv path; anything that might approach ARG_MAX is
+        // spilled to a workspace-local `.gaviero/tmp/prompt-*.md` file and
+        // referenced via `@path` so the argv stays tiny.
+        let use_tempfile = would_use_tempfile(prompt.len(), system_prompt.len());
+        let (prompt_tempfile, argv_prompt): (Option<tempfile::NamedTempFile>, String) =
+            if use_tempfile {
+                let (file, wrapper) = spill_prompt_to_tempfile(cwd, prompt)?;
+                tracing::info!(
+                    "Spilling prompt to tempfile: path={}, prompt_len={}",
+                    file.path().display(),
+                    prompt.len(),
+                );
+                (Some(file), wrapper)
+            } else {
+                (None, prompt.to_string())
+            };
+
         let mut cmd = Command::new("claude");
         cmd.arg("--print")
             .arg("--output-format")
@@ -102,22 +176,42 @@ impl AcpSession {
         cmd.arg("--add-dir").arg(cwd);
 
         // Pass prompt as positional arg so stdin stays open for permission responses.
-        cmd.arg("--").arg(prompt);
+        cmd.arg("--").arg(&argv_prompt);
 
         cmd.current_dir(cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::piped());
 
-        tracing::info!("Spawning claude: model={}, cwd={}, prompt_len={}", model, cwd.display(), prompt.len());
+        tracing::info!(
+            "Spawning claude: model={}, cwd={}, prompt_len={}, via_tempfile={}",
+            model,
+            cwd.display(),
+            prompt.len(),
+            use_tempfile,
+        );
 
         let mut child = cmd.spawn().map_err(|e| {
-            anyhow::anyhow!(
-                "spawning claude subprocess: {e}\n\
-                 The `claude` CLI binary was not found on PATH. \
-                 Install it from https://docs.anthropic.com/claude/docs/claude-code, \
-                 or switch provider by setting agent.model to a `codex:...` / `ollama:...` spec."
-            )
+            if matches!(e.kind(), std::io::ErrorKind::NotFound) {
+                anyhow::anyhow!(
+                    "spawning claude subprocess: {e}\n\
+                     The `claude` CLI binary was not found on PATH. \
+                     Install it from https://docs.anthropic.com/claude/docs/claude-code, \
+                     or switch provider by setting agent.model to a `codex:...` / `ollama:...` spec."
+                )
+            } else if e.raw_os_error() == Some(7) {
+                // E2BIG after the tempfile fallback would mean the system
+                // prompt itself is >32 KB. We don't generate anything that
+                // size, so this is genuinely pathological — surface the raw
+                // error with a pointer at the system prompt as the suspect.
+                anyhow::anyhow!(
+                    "spawning claude subprocess: argument list too long.\n\
+                     This shouldn't happen — user prompts spill to a tempfile above {ARGV_THRESHOLD} B.\n\
+                     The system prompt or flag arguments must be pathologically large; report this as a bug."
+                )
+            } else {
+                anyhow::anyhow!("spawning claude subprocess: {e}")
+            }
         })?;
 
         // Keep stdin open for permission responses.
@@ -164,6 +258,7 @@ impl AcpSession {
             stdin_tx,
             line_buf: String::new(),
             stderr_buf,
+            _prompt_tempfile: prompt_tempfile,
         })
     }
 
@@ -249,6 +344,51 @@ pub fn is_claude_available() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn small_prompt_uses_argv() {
+        assert!(!would_use_tempfile(0, 0));
+        assert!(!would_use_tempfile(1_000, 500));
+        // Right at the boundary — well below ARGV_THRESHOLD.
+        assert!(!would_use_tempfile(ARGV_THRESHOLD - 1, 0));
+    }
+
+    #[test]
+    fn large_prompt_spills_to_tempfile() {
+        assert!(would_use_tempfile(ARGV_THRESHOLD, 0));
+        assert!(would_use_tempfile(100_000, 0));
+        // Combined prompt + system prompt crossing threshold.
+        assert!(would_use_tempfile(ARGV_THRESHOLD - 100, 200));
+    }
+
+    #[test]
+    fn spill_creates_readable_file_and_wrapper_refs_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+
+        let big_prompt = "x".repeat(50_000);
+        let (file, wrapper) = spill_prompt_to_tempfile(cwd, &big_prompt).expect("spill");
+
+        // File lives under {cwd}/.gaviero/tmp and has the full prompt on disk.
+        let on_disk = file.path();
+        assert!(on_disk.starts_with(cwd.join(TEMP_SUBDIR)));
+        let content = std::fs::read_to_string(on_disk).expect("read tempfile");
+        assert_eq!(content, big_prompt);
+
+        // Wrapper argv references the tempfile with `@relative_path` and is tiny.
+        assert!(wrapper.contains("@"));
+        assert!(wrapper.len() < 500);
+
+        // NamedTempFile drops → file removed from disk.
+        let held_path = on_disk.to_path_buf();
+        drop(file);
+        assert!(!held_path.exists(), "tempfile should be cleaned up on drop");
+    }
 }
 
 /// Query `claude --help` for the model options documented by the CLI.
