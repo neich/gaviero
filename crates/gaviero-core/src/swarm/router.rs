@@ -211,9 +211,7 @@ fn routing_match(
             model: config.local.model.clone(),
             base_url: config.local.base_url.clone(),
         },
-        (ModelTier::Cheap, _, _) => ResolvedBackend::Claude {
-            model: config.cheap_model.clone(),
-        },
+        (ModelTier::Cheap, _, _) => api_backend_for_spec(&config.cheap_model),
         (ModelTier::Expensive, _, true)
             if config.local.enabled && config.expensive_model == config.local.model =>
         {
@@ -223,9 +221,22 @@ fn routing_match(
             }
         }
         // Expensive: always API
-        (ModelTier::Expensive, _, _) => ResolvedBackend::Claude {
-            model: config.expensive_model.clone(),
-        },
+        (ModelTier::Expensive, _, _) => api_backend_for_spec(&config.expensive_model),
+    }
+}
+
+/// Route a bare (non-Ollama) model spec into the correct `ResolvedBackend` variant
+/// based on its prefix. `codex:` / `codex-cli:` map to Codex; everything else to Claude.
+fn api_backend_for_spec(model_spec: &str) -> ResolvedBackend {
+    if shared::is_codex_model(model_spec) {
+        let stripped = model_spec
+            .strip_prefix("codex-cli:")
+            .or_else(|| model_spec.strip_prefix("codex:"))
+            .unwrap_or(model_spec)
+            .to_string();
+        ResolvedBackend::Codex { model: stripped }
+    } else {
+        ResolvedBackend::Claude { model: model_spec.to_string() }
     }
 }
 

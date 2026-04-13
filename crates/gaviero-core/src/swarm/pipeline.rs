@@ -83,6 +83,11 @@ pub async fn execute(
         tier_config.local.model = local_model.clone();
         tier_config.cheap_model = local_model.clone();
         tier_config.expensive_model = local_model.clone();
+    } else if crate::swarm::backend::shared::is_codex_model(&config.model) {
+        // Codex is API-backed like Claude. Propagate to both tier defaults so
+        // work units without an explicit `model` override stay on Codex.
+        tier_config.cheap_model = config.model.clone();
+        tier_config.expensive_model = config.model.clone();
     }
     let tier_router = TierRouter::new(tier_config, selected_local_model.is_some());
     let git_coordinator = Arc::new(GitCoordinator::new());

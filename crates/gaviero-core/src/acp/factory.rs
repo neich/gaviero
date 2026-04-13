@@ -296,7 +296,14 @@ fn spawn_persistent(
 
     tracing::info!("Spawning persistent claude session: model={}, cwd={}", model, cwd.display());
 
-    let mut child = cmd.spawn().context("spawning persistent claude subprocess")?;
+    let mut child = cmd.spawn().map_err(|e| {
+        anyhow::anyhow!(
+            "spawning persistent claude subprocess: {e}\n\
+             The `claude` CLI binary was not found on PATH. \
+             Install it from https://docs.anthropic.com/claude/docs/claude-code, \
+             or switch provider by setting agent.model to a `codex:...` / `ollama:...` spec."
+        )
+    })?;
 
     let stdin = child.stdin.take()
         .ok_or_else(|| anyhow::anyhow!("failed to capture persistent session stdin"))?;

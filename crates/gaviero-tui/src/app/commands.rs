@@ -314,12 +314,17 @@ pub(super) fn handle_coordinated_swarm_command(app: &mut App) {
     let write_ns = app.chat_state.agent_settings.write_namespace.clone();
     let read_ns = app.chat_state.agent_settings.read_namespaces.clone();
     let ollama_base_url = app.chat_state.agent_settings.ollama_base_url.clone();
+    // Coordinator model resolution:
+    //   1. explicit agent.coordinator.model setting
+    //   2. chat's effective model (honors per-conv override + agent.model workspace setting)
+    // This lets users set `agent.model = codex:gpt-5-codex` and have swarm coordination
+    // route through Codex too, without a separate coordinator setting.
     let coordinator_model = app
         .workspace
         .resolve_setting(gaviero_core::workspace::settings::COORDINATOR_MODEL, None)
         .as_str()
-        .unwrap_or("opus")
-        .to_string();
+        .map(str::to_string)
+        .unwrap_or_else(|| app.chat_state.effective_model().to_string());
     let memory = app.memory.clone();
 
     tokio::spawn(async move {

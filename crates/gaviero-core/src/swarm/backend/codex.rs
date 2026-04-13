@@ -80,7 +80,14 @@ impl AgentBackend for CodexBackend {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        let mut child = cmd.spawn().context("spawning codex subprocess")?;
+        let mut child = cmd.spawn().map_err(|e| {
+            anyhow::anyhow!(
+                "spawning codex subprocess: {e}\n\
+                 The `codex` CLI binary was not found on PATH. \
+                 Install it from https://github.com/openai/codex, \
+                 or switch provider by setting agent.model to a `claude:...` / `ollama:...` spec."
+            )
+        })?;
         let stdout = child.stdout.take().context("codex stdout unavailable")?;
         let stderr = child.stderr.take().context("codex stderr unavailable")?;
 
