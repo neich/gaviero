@@ -297,12 +297,21 @@ fn spawn_persistent(
     tracing::info!("Spawning persistent claude session: model={}, cwd={}", model, cwd.display());
 
     let mut child = cmd.spawn().map_err(|e| {
-        anyhow::anyhow!(
-            "spawning persistent claude subprocess: {e}\n\
-             The `claude` CLI binary was not found on PATH. \
-             Install it from https://docs.anthropic.com/claude/docs/claude-code, \
-             or switch provider by setting agent.model to a `codex:...` / `ollama:...` spec."
-        )
+        if e.raw_os_error() == Some(7) {
+            anyhow::anyhow!(
+                "spawning persistent claude subprocess: argument list too long.\n\
+                 Lower `agent.graphBudgetTokens`, drop some @file refs, or switch to a codex/ollama model."
+            )
+        } else if matches!(e.kind(), std::io::ErrorKind::NotFound) {
+            anyhow::anyhow!(
+                "spawning persistent claude subprocess: {e}\n\
+                 The `claude` CLI binary was not found on PATH. \
+                 Install it from https://docs.anthropic.com/claude/docs/claude-code, \
+                 or switch provider by setting agent.model to a `codex:...` / `ollama:...` spec."
+            )
+        } else {
+            anyhow::anyhow!("spawning persistent claude subprocess: {e}")
+        }
     })?;
 
     let stdin = child.stdin.take()
