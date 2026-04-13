@@ -23,7 +23,7 @@ Binary name: `gaviero-cli`
 
 ## Key Flags
 
-- `--model <sonnet|opus|haiku>` — Claude model (default: sonnet)
+- `--model <spec>` — model string. Plain name (`sonnet`) / `claude:X` / `codex:X` / `ollama:X` / `local:X`. Default: sonnet.
 - `--auto-accept` — skip interactive review
 - `--resume` — resume interrupted run from checkpoint
 - `--max-retries N` — inner-loop retries (iteration mode)

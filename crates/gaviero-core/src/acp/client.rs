@@ -74,7 +74,10 @@ impl AcpPipeline {
         conversation_history: &[(String, String)],
         file_attachments: &[PathBuf],
     ) -> Result<()> {
-        if shared::is_ollama_model(&self.model) {
+        // Codex and Ollama both go through the trait-based executor path.
+        // Only Claude Code uses the specialized ACP session (below) for its
+        // bidirectional permission handshake.
+        if shared::is_ollama_model(&self.model) || shared::is_codex_model(&self.model) {
             let backend =
                 shared::create_backend_for_model(&self.model, self.ollama_base_url.as_deref())?;
             let caps = backend.capabilities();
