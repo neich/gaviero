@@ -29,6 +29,16 @@ use anyhow::Result;
 use crate::memory::MemoryStore;
 use crate::repo_map::RepoMap;
 
+/// Map a `GraphDecision` to the planner-side `GraphSelectionKind`.
+fn graph_decision_to_kind(d: GraphDecision) -> GraphSelectionKind {
+    match d {
+        GraphDecision::PathOnly => GraphSelectionKind::PathOnly,
+        GraphDecision::SignatureOnly => GraphSelectionKind::SignatureOnly,
+        GraphDecision::OutlineOnly => GraphSelectionKind::OutlineOnly,
+        GraphDecision::FullAttach => GraphSelectionKind::FullContent,
+    }
+}
+
 /// Owns bootstrap / delta / replay policy.
 ///
 /// V9 §4 type. M1 only consults `memory` and `repo_map`; M3 adds structured
@@ -102,12 +112,13 @@ impl<'a> ContextPlanner<'a> {
     }
 
     async fn collect_memory(
-        &self,
+        &mut self,
         input: &PlannerInput<'_>,
         out: &mut PlannerSelections,
     ) {
-        // Chat path passes pre-fetched memory context (computed via
-        // search_context inside the spawn task). M1 wraps it verbatim.
+        // Chat path can still pass pre-fetched memory context (M1/M2 carrier).
+        // M3 keeps the carrier as a fallback for callers not yet migrated;
+        // M10 deletes it.
         if let Some(text) = input.pre_fetched_memory_context {
             if !text.is_empty() {
                 out.memory_selections.push(MemorySelection {
@@ -124,31 +135,45 @@ impl<'a> ContextPlanner<'a> {
             }
             return;
         }
-        // Swarm path: planner queries the memory store directly.
+        // M3: planner queries structured `MemoryCandidate`s directly.
         let Some(mem) = self.memory else { return };
         if input.read_namespaces.is_empty() {
             return;
         }
         let query = input.memory_query_override.unwrap_or(input.user_message);
-        let ctx = mem.search_context(input.read_namespaces, query, input.memory_limit).await;
-        if ctx.is_empty() {
+        let candidates = mem
+            .search_candidates(input.read_namespaces, query, input.memory_limit)
+            .await;
+        if candidates.is_empty() {
             return;
         }
-        out.memory_selections.push(MemorySelection {
-            id: None,
-            namespace: None,
-            scope_label: None,
-            score: None,
-            trust: None,
-            content: ctx,
-            source_hash: None,
-            updated_at: None,
-        });
-        out.metadata.memory_count = 1;
+        // One MemorySelection per candidate (V9 §11 M3 acceptance:
+        // "planner logs show memory IDs ... per selection").
+        for c in &candidates {
+            self.ledger.injected_memory_ids.insert(c.id);
+            tracing::info!(
+                target: "turn_metrics",
+                memory_id = c.id,
+                memory_score = c.score,
+                memory_namespace = %c.namespace,
+                "memory_candidate"
+            );
+            out.memory_selections.push(MemorySelection {
+                id: Some(c.id),
+                namespace: Some(c.namespace.clone()),
+                scope_label: Some(c.scope_label.clone()),
+                score: Some(c.score),
+                trust: c.trust.clone(),
+                content: c.content.clone(),
+                source_hash: c.source_hash.clone(),
+                updated_at: c.updated_at.clone(),
+            });
+        }
+        out.metadata.memory_count = candidates.len();
     }
 
-    fn collect_graph(&self, input: &PlannerInput<'_>, out: &mut PlannerSelections) {
-        // Chat path passes the entire graph block pre-rendered. Use as-is.
+    fn collect_graph(&mut self, input: &PlannerInput<'_>, out: &mut PlannerSelections) {
+        // Chat path can still pass a pre-rendered graph block (M1/M2 carrier).
         if let Some(text) = input.pre_fetched_graph_context {
             if !text.is_empty() {
                 out.graph_selections.push(GraphSelection {
@@ -164,7 +189,9 @@ impl<'a> ContextPlanner<'a> {
             }
             return;
         }
-        // Swarm path: planner queries RepoMap directly.
+        // M3: planner queries `Vec<GraphCandidate>` directly and records
+        // per-file decisions in the ledger (V9 §11 M3 acceptance: "Ledger
+        // distinguishes attached vs outline-only files").
         let Some(rm) = self.repo_map else { return };
         if input.seed_paths.is_empty() || input.graph_budget_tokens == 0 {
             return;
@@ -174,21 +201,50 @@ impl<'a> ContextPlanner<'a> {
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
-        let plan = rm.rank_for_agent(&seeds, input.graph_budget_tokens);
-        if plan.repo_outline.is_empty() {
+        let candidates = rm.rank_for_agent_structured(&seeds, input.graph_budget_tokens);
+        if candidates.is_empty() {
             return;
         }
-        out.metadata.graph_token_estimate = plan.token_estimate;
-        out.graph_selections.push(GraphSelection {
-            path: None,
-            kind: GraphSelectionKind::OutlineOnly,
-            token_estimate: plan.token_estimate,
-            content: plan.repo_outline,
-            rank_score: None,
-            confidence: None,
-            symbols: Vec::new(),
-            content_digest: None,
-        });
+        let mut total_tokens = 0usize;
+        for c in &candidates {
+            total_tokens = total_tokens.saturating_add(c.token_estimate);
+            self.ledger
+                .injected_graph_decisions
+                .insert(c.path.clone(), c.decision);
+            match c.decision {
+                GraphDecision::FullAttach => {
+                    self.ledger.injected_file_digests.insert(
+                        c.path.clone(),
+                        crate::context_planner::ledger::ContentDigest(
+                            c.content_digest.clone().unwrap_or_default(),
+                        ),
+                    );
+                }
+                GraphDecision::OutlineOnly
+                | GraphDecision::SignatureOnly
+                | GraphDecision::PathOnly => {
+                    self.ledger.injected_outline_paths.insert(c.path.clone());
+                }
+            }
+            out.graph_selections.push(GraphSelection {
+                path: Some(c.path.clone()),
+                kind: graph_decision_to_kind(c.decision),
+                token_estimate: c.token_estimate,
+                content: c.rendered_line.clone(),
+                rank_score: Some(c.rank_score),
+                confidence: Some(c.confidence),
+                symbols: c
+                    .symbols
+                    .iter()
+                    .map(|s| crate::context_planner::types::Symbol {
+                        name: s.name.clone(),
+                        kind: s.kind.clone(),
+                    })
+                    .collect(),
+                content_digest: c.content_digest.clone(),
+            });
+        }
+        out.metadata.graph_token_estimate = total_tokens;
     }
 
     fn collect_pre_fetched_impact(
