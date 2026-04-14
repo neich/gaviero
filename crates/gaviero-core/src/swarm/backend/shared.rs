@@ -1,5 +1,8 @@
 use anyhow::Result;
 
+use crate::context_planner::PlannerSelections;
+use crate::types::FileScope;
+
 use super::{create_backend, AgentBackend, BackendConfig, Capabilities, CompletionRequest};
 
 const HISTORY_TRUNCATION_CHARS: usize = 2000;
@@ -142,6 +145,50 @@ pub fn is_codex_model(model_spec: &str) -> bool {
     t.starts_with("codex:") || t.starts_with("codex-cli:")
 }
 
+/// Render planner selections back into the legacy single-string prompt swarm
+/// backends consume today.
+///
+/// **M1 byte-identical guarantee** — the output of this function with the
+/// selections produced by [`crate::context_planner::ContextPlanner::plan`]
+/// must equal the output of the legacy `runner::build_prompt` for the same
+/// inputs. M10 (parity-gated cleanup) deletes the legacy path; until then
+/// keep both producing the same bytes.
+///
+/// Order (matches `runner::build_prompt`):
+/// 1. Graph selections (outline first, then impact text — preserved by
+///    insertion order in `selections.graph_selections`).
+/// 2. Memory selections.
+/// 3. Scope clause (if any).
+/// 4. Task text (coordinator instructions or description, decided by caller).
+pub fn render_swarm_prompt(
+    selections: &PlannerSelections,
+    scope: &FileScope,
+    task_text: &str,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    for g in &selections.graph_selections {
+        if !g.content.is_empty() {
+            parts.push(g.content.clone());
+        }
+    }
+
+    for m in &selections.memory_selections {
+        if !m.content.is_empty() {
+            parts.push(m.content.clone());
+        }
+    }
+
+    let scope_clause = scope.to_prompt_clause();
+    if !scope_clause.is_empty() {
+        parts.push(format!("[File scope]:\n{}", scope_clause));
+    }
+
+    parts.push(task_text.to_string());
+
+    parts.join("\n\n")
+}
+
 pub fn request_prompt(request: &CompletionRequest) -> String {
     build_enriched_prompt(
         &request.prompt,
@@ -233,5 +280,134 @@ mod tests {
         assert!(validate_model_spec("ollama:").is_err());
         let err = validate_model_spec("openai:gpt-4.1").unwrap_err();
         assert!(err.to_string().contains("unknown model prefix"));
+    }
+
+    // ── M1 byte-identity adapter tests ────────────────────────────
+    //
+    // These pin the V9 §11 M1 acceptance gate ("M0 metrics unchanged"):
+    // `render_swarm_prompt` consuming planner-produced selections must
+    // emit the exact same string the legacy `runner::build_prompt` produced
+    // for matching inputs.
+
+    use crate::context_planner::{
+        GraphSelection, GraphSelectionKind, MemorySelection, PlannerSelections,
+    };
+    use crate::types::FileScope;
+
+    fn legacy_build_prompt_equivalent(
+        graph_outline: Option<&str>,
+        impact_text: Option<&str>,
+        memory_ctx: Option<&str>,
+        scope: &FileScope,
+        task_text: &str,
+    ) -> String {
+        // Mirror runner.rs:340-389 build_prompt parts assembly exactly.
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(o) = graph_outline {
+            if !o.is_empty() {
+                parts.push(o.to_string());
+            }
+        }
+        if let Some(t) = impact_text {
+            parts.push(t.to_string());
+        }
+        if let Some(m) = memory_ctx {
+            if !m.is_empty() {
+                parts.push(m.to_string());
+            }
+        }
+        let scope_clause = scope.to_prompt_clause();
+        if !scope_clause.is_empty() {
+            parts.push(format!("[File scope]:\n{}", scope_clause));
+        }
+        parts.push(task_text.to_string());
+        parts.join("\n\n")
+    }
+
+    fn graph_outline_selection(content: &str, tokens: usize) -> GraphSelection {
+        GraphSelection {
+            path: None,
+            kind: GraphSelectionKind::OutlineOnly,
+            token_estimate: tokens,
+            content: content.to_string(),
+            rank_score: None,
+            confidence: None,
+            symbols: Vec::new(),
+            content_digest: None,
+        }
+    }
+
+    fn memory_selection(content: &str) -> MemorySelection {
+        MemorySelection {
+            id: None,
+            namespace: None,
+            scope_label: None,
+            score: None,
+            trust: None,
+            content: content.to_string(),
+            source_hash: None,
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn render_swarm_prompt_byte_matches_legacy_minimal() {
+        let scope = FileScope::default();
+        let task = "do the thing";
+        let selections = PlannerSelections::default();
+
+        let rendered = render_swarm_prompt(&selections, &scope, task);
+        let legacy = legacy_build_prompt_equivalent(None, None, None, &scope, task);
+        assert_eq!(rendered, legacy);
+    }
+
+    #[test]
+    fn render_swarm_prompt_byte_matches_legacy_with_graph_and_scope() {
+        let scope = FileScope {
+            owned_paths: vec!["src/lib.rs".into()],
+            ..Default::default()
+        };
+        let task = "implement foo";
+        let outline = "[Repo outline]\nfile1.rs\nfile2.rs";
+        let mut selections = PlannerSelections::default();
+        selections.graph_selections.push(graph_outline_selection(outline, 2000));
+
+        let rendered = render_swarm_prompt(&selections, &scope, task);
+        let legacy = legacy_build_prompt_equivalent(Some(outline), None, None, &scope, task);
+        assert_eq!(rendered, legacy);
+    }
+
+    #[test]
+    fn render_swarm_prompt_byte_matches_legacy_full_inputs() {
+        // Pins the full insertion order: graph_outline → impact → memory → scope → task.
+        // Exact same order runner::build_prompt uses.
+        let scope = FileScope {
+            owned_paths: vec!["src/lib.rs".into()],
+            read_only_paths: vec!["Cargo.toml".into()],
+            ..Default::default()
+        };
+        let outline = "[Repo outline]\nlib.rs";
+        let impact = "[Impact analysis] lib.rs touches main.rs";
+        let memory = "[Memory context]:\n- past lesson";
+        let task = "do task";
+
+        let mut selections = PlannerSelections::default();
+        selections
+            .graph_selections
+            .push(graph_outline_selection(outline, 1000));
+        selections
+            .graph_selections
+            .push(graph_outline_selection(impact, 0));
+        selections.memory_selections.push(memory_selection(memory));
+
+        let rendered = render_swarm_prompt(&selections, &scope, task);
+        let legacy = legacy_build_prompt_equivalent(
+            Some(outline),
+            Some(impact),
+            Some(memory),
+            &scope,
+            task,
+        );
+        assert_eq!(rendered, legacy, "swarm adapter must be byte-identical to legacy build_prompt");
     }
 }
