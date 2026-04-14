@@ -25,6 +25,8 @@
 //! before M10 parity is proven.
 
 pub mod claude;
+pub mod codex_app_server;
+pub mod codex_exec;
 pub mod registry;
 
 use std::path::PathBuf;
