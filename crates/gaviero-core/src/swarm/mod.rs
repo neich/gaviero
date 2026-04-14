@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod board;
+pub mod context_bundle;
 pub mod bus;
 pub mod calibration;
 pub mod context;
