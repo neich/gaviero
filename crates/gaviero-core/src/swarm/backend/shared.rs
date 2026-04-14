@@ -148,18 +148,21 @@ pub fn is_codex_model(model_spec: &str) -> bool {
 /// Render planner selections back into the legacy single-string prompt swarm
 /// backends consume today.
 ///
-/// **M1 byte-identical guarantee** — the output of this function with the
-/// selections produced by [`crate::context_planner::ContextPlanner::plan`]
-/// must equal the output of the legacy `runner::build_prompt` for the same
-/// inputs. M10 (parity-gated cleanup) deletes the legacy path; until then
-/// keep both producing the same bytes.
+/// **Byte-identical guarantee** (M1, preserved through M3) — the output of
+/// this function for the selections produced by
+/// [`crate::context_planner::ContextPlanner::plan`] must equal the output
+/// of the legacy `runner::build_prompt` for the same inputs.
 ///
-/// Order (matches `runner::build_prompt`):
-/// 1. Graph selections (outline first, then impact text — preserved by
-///    insertion order in `selections.graph_selections`).
-/// 2. Memory selections.
-/// 3. Scope clause (if any).
-/// 4. Task text (coordinator instructions or description, decided by caller).
+/// M3 distinguishes two selection shapes:
+/// * **Structured** (`path.is_some()` / `id.is_some()`): one selection per
+///   ranked file or memory hit; renderer combines them into the legacy
+///   `## Repository context:\n  ...` and `[Memory context]:\n- ...` blocks.
+/// * **Pre-rendered** (`path.is_none()` / `id.is_none()`): a single
+///   selection whose `content` already contains the formatted block
+///   (M1/M2 carrier from chat path). Renderer emits as-is.
+///
+/// Order matches `runner::build_prompt`: graph block, memory block, scope
+/// clause, task text. Joined with `"\n\n"`.
 pub fn render_swarm_prompt(
     selections: &PlannerSelections,
     scope: &FileScope,
@@ -167,16 +170,11 @@ pub fn render_swarm_prompt(
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
 
-    for g in &selections.graph_selections {
-        if !g.content.is_empty() {
-            parts.push(g.content.clone());
-        }
+    if let Some(block) = render_graph_block(&selections.graph_selections) {
+        parts.push(block);
     }
-
-    for m in &selections.memory_selections {
-        if !m.content.is_empty() {
-            parts.push(m.content.clone());
-        }
+    if let Some(block) = render_memory_block(&selections.memory_selections) {
+        parts.push(block);
     }
 
     let scope_clause = scope.to_prompt_clause();
@@ -187,6 +185,89 @@ pub fn render_swarm_prompt(
     parts.push(task_text.to_string());
 
     parts.join("\n\n")
+}
+
+/// Format graph selections into the legacy `## Repository context:` block.
+///
+/// Public so the chat adapter (`gaviero_tui::app::session`) can reuse it
+/// instead of duplicating the structured-vs-pre-rendered logic.
+pub fn render_graph_block(
+    graph_selections: &[crate::context_planner::GraphSelection],
+) -> Option<String> {
+    let structured: Vec<&crate::context_planner::GraphSelection> = graph_selections
+        .iter()
+        .filter(|g| g.path.is_some())
+        .collect();
+    let pre_rendered: Vec<&crate::context_planner::GraphSelection> = graph_selections
+        .iter()
+        .filter(|g| g.path.is_none())
+        .collect();
+
+    let mut chunks: Vec<String> = Vec::new();
+
+    if !structured.is_empty() {
+        let lines: Vec<String> = structured
+            .iter()
+            .filter(|g| !g.content.is_empty())
+            .map(|g| g.content.clone())
+            .collect();
+        if !lines.is_empty() {
+            chunks.push(format!("## Repository context:\n{}", lines.join("\n")));
+        }
+    }
+    for g in pre_rendered {
+        if !g.content.is_empty() {
+            chunks.push(g.content.clone());
+        }
+    }
+
+    if chunks.is_empty() {
+        None
+    } else {
+        Some(chunks.join("\n\n"))
+    }
+}
+
+/// Format memory selections into the legacy `[Memory context]:` block.
+pub fn render_memory_block(
+    memory_selections: &[crate::context_planner::MemorySelection],
+) -> Option<String> {
+    let structured: Vec<&crate::context_planner::MemorySelection> = memory_selections
+        .iter()
+        .filter(|m| m.id.is_some())
+        .collect();
+    let pre_rendered: Vec<&crate::context_planner::MemorySelection> = memory_selections
+        .iter()
+        .filter(|m| m.id.is_none())
+        .collect();
+
+    let mut chunks: Vec<String> = Vec::new();
+
+    if !structured.is_empty() {
+        let mut block = String::from("[Memory context]:\n");
+        for m in structured {
+            let ns = m.namespace.as_deref().unwrap_or("");
+            let score = m.score.unwrap_or(0.0);
+            // Trailing newline matches the legacy
+            // `MemoryStore::search_context` format exactly.
+            block.push_str(&format!(
+                "- [{}] {} (score: {:.2})\n",
+                ns, m.content, score
+            ));
+        }
+        chunks.push(block);
+    }
+    for m in pre_rendered {
+        if !m.content.is_empty() {
+            chunks.push(m.content.clone());
+        }
+    }
+
+    if chunks.is_empty() {
+        None
+    } else {
+        Some(chunks.join("\n\n"))
+    }
 }
 
 pub fn request_prompt(request: &CompletionRequest) -> String {
@@ -375,6 +456,137 @@ mod tests {
         let rendered = render_swarm_prompt(&selections, &scope, task);
         let legacy = legacy_build_prompt_equivalent(Some(outline), None, None, &scope, task);
         assert_eq!(rendered, legacy);
+    }
+
+    fn structured_graph_selection(
+        path: &str,
+        decision: crate::repo_map::GraphDecision,
+        line: &str,
+        tokens: usize,
+    ) -> GraphSelection {
+        GraphSelection {
+            path: Some(std::path::PathBuf::from(path)),
+            kind: match decision {
+                crate::repo_map::GraphDecision::PathOnly => GraphSelectionKind::PathOnly,
+                crate::repo_map::GraphDecision::SignatureOnly => GraphSelectionKind::SignatureOnly,
+                crate::repo_map::GraphDecision::OutlineOnly => GraphSelectionKind::OutlineOnly,
+                crate::repo_map::GraphDecision::FullAttach => GraphSelectionKind::FullContent,
+            },
+            token_estimate: tokens,
+            content: line.to_string(),
+            rank_score: Some(0.5),
+            confidence: Some(crate::repo_map::GraphConfidence::High),
+            symbols: Vec::new(),
+            content_digest: None,
+        }
+    }
+
+    fn structured_memory_selection(
+        id: i64,
+        namespace: &str,
+        body: &str,
+        score: f32,
+    ) -> MemorySelection {
+        MemorySelection {
+            id: Some(id),
+            namespace: Some(namespace.to_string()),
+            scope_label: Some(namespace.to_string()),
+            score: Some(score),
+            trust: None,
+            content: body.to_string(),
+            source_hash: None,
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn m3_structured_graph_renders_same_block_as_legacy() {
+        // V9 §11 M3 acceptance: prompt formatting is a final rendering step;
+        // structured per-file selections must collapse into the same
+        // "## Repository context:\n  line1\n  line2" block the legacy
+        // `rank_for_agent` produces.
+        let scope = FileScope::default();
+        let mut sel = PlannerSelections::default();
+        sel.graph_selections.push(structured_graph_selection(
+            "src/lib.rs",
+            crate::repo_map::GraphDecision::FullAttach,
+            "  [owned] src/lib.rs",
+            500,
+        ));
+        sel.graph_selections.push(structured_graph_selection(
+            "src/util.rs",
+            crate::repo_map::GraphDecision::SignatureOnly,
+            "  src/util.rs (foo, bar)",
+            20,
+        ));
+
+        let rendered = render_swarm_prompt(&sel, &scope, "the task");
+        let expected = "## Repository context:\n  [owned] src/lib.rs\n  src/util.rs (foo, bar)\n\nthe task";
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn m3_structured_memory_renders_same_block_as_legacy() {
+        // Pins the legacy `MemoryStore::search_context` per-entry format
+        // verbatim including the trailing newline.
+        let scope = FileScope::default();
+        let mut sel = PlannerSelections::default();
+        sel.memory_selections.push(structured_memory_selection(
+            10,
+            "workspace",
+            "remember to use git2",
+            3.05,
+        ));
+        sel.memory_selections.push(structured_memory_selection(
+            11,
+            "workspace",
+            "tests must hit real db",
+            2.42,
+        ));
+
+        let rendered = render_swarm_prompt(&sel, &scope, "the task");
+        // The legacy memory block ends with `\n` per entry; parts.join("\n\n")
+        // therefore produces three consecutive newlines before the task.
+        // Preserving this is part of the byte-identity guarantee — Claude's
+        // tokenizer sees the same surface form pre- and post-M3.
+        let expected = "[Memory context]:\n\
+                        - [workspace] remember to use git2 (score: 3.05)\n\
+                        - [workspace] tests must hit real db (score: 2.42)\n\
+                        \n\nthe task";
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn m3_mixed_structured_full_pipeline_byte_matches_legacy() {
+        // End-to-end byte-identity: structured graph + structured memory +
+        // scope clause + task. Compare against the same string the
+        // pre-M3 `runner::build_prompt` produced.
+        let scope = FileScope {
+            owned_paths: vec!["src/lib.rs".into()],
+            ..Default::default()
+        };
+        let mut sel = PlannerSelections::default();
+        sel.graph_selections.push(structured_graph_selection(
+            "src/lib.rs",
+            crate::repo_map::GraphDecision::FullAttach,
+            "  [owned] src/lib.rs",
+            500,
+        ));
+        sel.memory_selections.push(structured_memory_selection(
+            42,
+            "repo",
+            "key invariant",
+            1.5,
+        ));
+
+        let rendered = render_swarm_prompt(&sel, &scope, "do the task");
+        // Memory block trailing `\n` + `\n\n` part separator → three newlines
+        // before [File scope]. Same with scope's trailing `\n` before task.
+        let expected = "## Repository context:\n  [owned] src/lib.rs\n\n\
+                        [Memory context]:\n- [repo] key invariant (score: 1.50)\n\
+                        \n\n[File scope]:\n**Owned paths** (read/write):\n- `src/lib.rs`\n\
+                        \n\ndo the task";
+        assert_eq!(rendered, expected);
     }
 
     #[test]

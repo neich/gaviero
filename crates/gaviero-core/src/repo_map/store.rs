@@ -142,9 +142,13 @@ pub struct GraphNode {
     pub language: Option<String>,
 }
 
-/// Result of a blast-radius query.
+/// Result of a blast-radius query (V9 §4 `ImpactSummary` — typed return for
+/// graph impact queries; planner consumers receive structured data, not
+/// pre-rendered prompt strings).
+///
+/// Renamed from `ImpactResult` in M3 to align with V9 §4 spec naming.
 #[derive(Debug, Clone, Default)]
-pub struct ImpactResult {
+pub struct ImpactSummary {
     /// Files directly changed.
     pub changed_files: Vec<String>,
     /// All files transitively affected (including changed files).
@@ -322,9 +326,9 @@ impl GraphStore {
         &self,
         changed_files: &[&str],
         max_depth: usize,
-    ) -> Result<ImpactResult> {
+    ) -> Result<ImpactSummary> {
         if changed_files.is_empty() {
-            return Ok(ImpactResult::default());
+            return Ok(ImpactSummary::default());
         }
 
         // 1. Create temp table for seed files
@@ -391,7 +395,7 @@ impl GraphStore {
             }
         }
 
-        Ok(ImpactResult {
+        Ok(ImpactSummary {
             changed_files: changed_files.iter().map(|s| s.to_string()).collect(),
             affected_files,
             affected_tests,
@@ -401,7 +405,7 @@ impl GraphStore {
     }
 
     /// Format impact result as a prompt-friendly string.
-    pub fn format_impact_for_prompt(result: &ImpactResult) -> String {
+    pub fn format_impact_for_prompt(result: &ImpactSummary) -> String {
         let mut lines = Vec::new();
         lines.push("[Impact analysis]:".to_string());
 
@@ -592,7 +596,7 @@ mod tests {
 
     #[test]
     fn format_impact_prompt() {
-        let result = ImpactResult {
+        let result = ImpactSummary {
             changed_files: vec!["src/auth.rs".into()],
             affected_files: vec!["src/auth.rs".into(), "src/api.rs".into(), "tests/auth_test.rs".into()],
             affected_tests: vec!["tests/auth_test.rs".into()],

@@ -9,6 +9,14 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+// V9 §4 candidate types are owned by the modules that produce them
+// (`MemoryStore`, `RepoMap`, `GraphStore`) to avoid module cycles back
+// into `context_planner/`. Re-export here so consumers see V9's spec
+// home — `crate::context_planner::types::{MemoryCandidate, ..}`.
+pub use crate::memory::store::MemoryCandidate;
+pub use crate::repo_map::store::ImpactSummary;
+pub use crate::repo_map::{GraphCandidate, GraphConfidence};
+
 /// How a provider preserves model-side state between turns.
 ///
 /// Maps to V9 §5 provider table:
@@ -286,14 +294,6 @@ pub struct GraphSelection {
     pub symbols: Vec<Symbol>,
     /// Content digest for invalidation. M1: `None`.
     pub content_digest: Option<String>,
-}
-
-/// Placeholder for V9 §4 `GraphConfidence` band. M3 defines the variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum GraphConfidence {
-    Low,
-    Medium,
-    High,
 }
 
 /// Placeholder for V9 §4 `Symbol`. M3 fills.

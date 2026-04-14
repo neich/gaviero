@@ -29,14 +29,10 @@ pub enum Role {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ContentDigest(pub String);
 
-/// Per-file graph attachment decision (V9 §4 `GraphDecision`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum GraphDecision {
-    PathOnly,
-    SignatureOnly,
-    OutlineOnly,
-    FullAttach,
-}
+// V9 §4 `GraphDecision` is owned by `crate::repo_map` (see module-cycle
+// rationale on `MemoryCandidate`). Re-exported here so ledger consumers
+// see it at its V9-spec address.
+pub use crate::repo_map::GraphDecision;
 
 /// Placeholder for compaction summary record.
 ///

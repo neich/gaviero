@@ -276,25 +276,30 @@ mod tests {
 
 /// Render planner selections back into the legacy chat enriched-prompt string.
 ///
-/// **M1 byte-identical guarantee** — the output of this function with
-/// selections produced by [`gaviero_core::context_planner::ContextPlanner::plan`]
-/// must equal the existing `parts.join("\n\n")` assembly at side_panel.rs.
-/// Order: graph (single combined block today), memory, then user prompt.
+/// **Byte-identical guarantee** (M1, preserved through M3) — the output of
+/// this function for selections produced by
+/// [`gaviero_core::context_planner::ContextPlanner::plan`] must equal the
+/// chat path's pre-M1 `parts.join("\n\n")` assembly. M3 delegates the
+/// graph/memory block rendering to the shared helpers in
+/// `swarm/backend/shared.rs` so structured (M3) and pre-rendered (M2
+/// carrier) selections format the same way across chat and swarm.
+///
+/// Order: graph block, memory block, user prompt. Joined with `"\n\n"`.
 pub(crate) fn render_chat_selections(
     selections: &gaviero_core::context_planner::PlannerSelections,
     user_prompt: &str,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
 
-    for g in &selections.graph_selections {
-        if !g.content.is_empty() {
-            parts.push(g.content.clone());
-        }
+    if let Some(block) =
+        gaviero_core::swarm::backend::shared::render_graph_block(&selections.graph_selections)
+    {
+        parts.push(block);
     }
-    for m in &selections.memory_selections {
-        if !m.content.is_empty() {
-            parts.push(m.content.clone());
-        }
+    if let Some(block) =
+        gaviero_core::swarm::backend::shared::render_memory_block(&selections.memory_selections)
+    {
+        parts.push(block);
     }
     parts.push(user_prompt.to_string());
 
