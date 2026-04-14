@@ -80,7 +80,11 @@ impl ModelSpec {
     /// Parse a `<prefix>:<model>` spec. Bare `"<model>"` is treated as Claude.
     pub fn parse(raw: &str) -> Self {
         let trimmed = raw.trim();
-        for prefix in ["ollama", "local", "codex-cli", "codex", "claude-code", "claude"] {
+        // M8: `codex-app-server` must appear before `codex` so the longer
+        // prefix wins (string-prefix comparison would not disambiguate them
+        // on the suffix, but "codex-app-server:" does not start with "codex:"
+        // anyway — the colon makes them distinct).
+        for prefix in ["ollama", "local", "codex-app-server", "codex-cli", "codex", "claude-code", "claude"] {
             let with_colon = format!("{}:", prefix);
             if let Some(model) = trimmed.strip_prefix(&with_colon) {
                 return Self {
@@ -102,6 +106,7 @@ impl ModelSpec {
     pub fn provider(&self) -> Provider {
         match self.provider_prefix.as_str() {
             "ollama" | "local" => Provider::Ollama,
+            "codex-app-server" => Provider::CodexAppServer,
             "codex" | "codex-cli" => Provider::Codex,
             // Bare or claude-prefixed → Claude.
             _ => Provider::Claude,
@@ -114,7 +119,10 @@ impl ModelSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     Claude,
+    /// `codex exec` — `StatelessReplay` fallback.
     Codex,
+    /// `codex app-server` — `ProcessBound` continuity (M8).
+    CodexAppServer,
     Ollama,
 }
 
@@ -145,12 +153,23 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             // value back from any backend.
             max_context_tokens: Some(200_000),
         },
+        Provider::CodexAppServer => ProviderProfile {
+            provider: "codex".to_string(),
+            model: spec.model.clone(),
+            // M8: `codex-app-server:` prefix → ProcessBound (V9 §5 table).
+            // The subprocess stays alive across turns; thread ID round-trips
+            // via ContinuityHandle::CodexThreadId.
+            continuity_mode: ContinuityMode::ProcessBound,
+            supports_tool_use: true,
+            supports_native_resume: true,
+            max_context_tokens: None,
+        },
         Provider::Codex => ProviderProfile {
             provider: "codex".to_string(),
             model: spec.model.clone(),
-            // M1 treats all codex models as exec-mode StatelessReplay. M8
-            // adds the `codex-app-server:` prefix and flips qualifying
-            // models to ProcessBound.
+            // `codex exec` stays StatelessReplay (V9 §5). M8 adds the
+            // `codex-app-server:` prefix for ProcessBound; the plain `codex:`
+            // and `codex-cli:` prefixes retain this arm unchanged.
             continuity_mode: ContinuityMode::StatelessReplay,
             supports_tool_use: true,
             supports_native_resume: false,
@@ -386,6 +405,15 @@ mod tests {
         let codex = build_provider_profile(&ModelSpec::parse("codex:gpt-5-codex"), &runtime);
         assert_eq!(codex.continuity_mode, ContinuityMode::StatelessReplay);
         assert!(!codex.supports_native_resume);
+
+        // M8: codex-app-server: → ProcessBound (V9 §5 table).
+        let codex_as = build_provider_profile(
+            &ModelSpec::parse("codex-app-server:gpt-5-codex"),
+            &runtime,
+        );
+        assert_eq!(codex_as.continuity_mode, ContinuityMode::ProcessBound);
+        assert!(codex_as.supports_native_resume);
+        assert_eq!(codex_as.provider, "codex");
 
         let ollama = build_provider_profile(&ModelSpec::parse("ollama:llama3.1"), &runtime);
         assert_eq!(ollama.continuity_mode, ContinuityMode::StatelessReplay);
