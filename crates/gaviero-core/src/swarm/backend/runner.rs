@@ -10,6 +10,10 @@ use anyhow::Result;
 use futures::StreamExt;
 use tokio::sync::Mutex;
 
+use crate::context_planner::{
+    build_provider_profile, ContextPlanner, ModelSpec, PlannerFingerprint, PlannerInput,
+    RuntimeConfig, SessionLedger,
+};
 use crate::memory::MemoryStore;
 use crate::observer::AcpObserver;
 use crate::repo_map::RepoMap;
@@ -18,7 +22,7 @@ use crate::validation_gate::ValidationPipeline;
 use crate::write_gate::WriteGatePipeline;
 
 use super::super::models::{AgentManifest, AgentStatus, WorkUnit};
-use super::shared::default_editor_system_prompt;
+use super::shared::{default_editor_system_prompt, render_swarm_prompt};
 use super::{AgentBackend, CompletionRequest, UnifiedStreamEvent};
 
 /// Run a work unit through any `AgentBackend`, producing an `AgentManifest`.
@@ -31,7 +35,12 @@ use super::{AgentBackend, CompletionRequest, UnifiedStreamEvent};
 /// agent's base prompt so that even cheap-tier models have optimal scope.
 #[tracing::instrument(
     skip(backend, write_gate, memory, observer, validation, board, repo_map, impact_text),
-    fields(agent_id = %work_unit.id, tier = ?work_unit.tier)
+    fields(
+        agent_id = %work_unit.id,
+        tier = ?work_unit.tier,
+        backend_name = backend.name(),
+        read_namespaces = read_namespaces.len(),
+    )
 )]
 pub async fn run_backend(
     backend: &dyn AgentBackend,
@@ -55,7 +64,61 @@ pub async fn run_backend(
     }
 
     // 2. Build base prompt (memory + scope + task + optional repo context + impact analysis)
-    let mut base_prompt = build_prompt(work_unit, memory, read_namespaces, repo_map, impact_text).await;
+    //
+    // M1: route through the planner. Per V9 §11 M1 acceptance, the planner +
+    // adapter must produce byte-identical output to the legacy `build_prompt`.
+    // The planner is invoked once per swarm attempt with a one-shot
+    // ephemeral SessionLedger (Findings D/E in baselines/m0.md: swarm has
+    // no persistence, no resume, no replay). The legacy `build_prompt`
+    // stays in this file as a parity reference until M10.
+    let runtime = RuntimeConfig::default();
+    let model_spec = ModelSpec::parse(backend.name());
+    let provider_profile = build_provider_profile(&model_spec, &runtime);
+    let fingerprint = PlannerFingerprint::from_profile(&provider_profile);
+    let mut ledger = SessionLedger::new(&provider_profile, fingerprint);
+
+    let owned_paths_buf: Vec<std::path::PathBuf> = work_unit
+        .scope
+        .owned_paths
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+    let task_text = if work_unit.coordinator_instructions.is_empty() {
+        work_unit.description.clone()
+    } else {
+        work_unit.coordinator_instructions.clone()
+    };
+
+    let memory_query_override = work_unit.memory_read_query.as_deref();
+    let memory_limit = work_unit.memory_read_limit.unwrap_or(5);
+
+    let planner_input = PlannerInput {
+        user_message: &work_unit.description,
+        explicit_refs: &[],
+        seed_paths: &owned_paths_buf,
+        provider_profile: &provider_profile,
+        read_namespaces,
+        graph_budget_tokens: 8_000,
+        memory_query_override,
+        memory_limit,
+        file_ref_blobs: &[],
+        pre_fetched_impact_text: impact_text,
+        // Swarm path: planner queries memory + RepoMap directly.
+        pre_fetched_graph_context: None,
+        pre_fetched_memory_context: None,
+    };
+
+    let selections = {
+        let mut planner = ContextPlanner {
+            memory,
+            repo_map,
+            ledger: &mut ledger,
+            workspace_root,
+        };
+        planner.plan(&planner_input).await?
+    };
+
+    let mut base_prompt = render_swarm_prompt(&selections, &work_unit.scope, &task_text);
 
     // Prepend any relevant discoveries from other agents
     if let Some(b) = board {
@@ -105,6 +168,17 @@ pub async fn run_backend(
             auto_approve: true,
         };
 
+        // M0 instrumentation: per-attempt dispatch metrics for swarm baselines.
+        tracing::info!(
+            target: "turn_metrics",
+            kind = "swarm",
+            backend = backend.name(),
+            agent_id = %work_unit.id,
+            attempt,
+            prompt_chars = request.prompt.len(),
+            "turn_dispatch"
+        );
+
         // Stream completion
         let stream_result = backend.stream_completion(request).await;
         let mut stream = match stream_result {
@@ -128,6 +202,7 @@ pub async fn run_backend(
         let mut had_error = false;
         let mut error_msg = String::new();
         let mut in_thinking = false;
+        let mut read_count: usize = 0;
 
         while let Some(event_result) = stream.next().await {
             let event = match event_result {
@@ -156,6 +231,9 @@ pub async fn run_backend(
                     observer.on_stream_chunk(&text);
                 }
                 UnifiedStreamEvent::ToolCallStart { name, .. } => {
+                    if name == "Read" {
+                        read_count += 1;
+                    }
                     observer.on_tool_call_started(&name);
                     observer.on_streaming_status(&format!("Using {}...", name));
                 }
@@ -178,7 +256,19 @@ pub async fn run_backend(
                         }
                     }
                 }
-                UnifiedStreamEvent::Usage(_) => {}
+                UnifiedStreamEvent::Usage(usage) => {
+                    // M0 instrumentation: log provider-reported token usage.
+                    tracing::info!(
+                        target: "turn_metrics",
+                        kind = "swarm",
+                        agent_id = %work_unit.id,
+                        attempt,
+                        input_tokens = usage.input_tokens,
+                        output_tokens = usage.output_tokens,
+                        duration_ms = ?usage.duration_ms,
+                        "token_usage"
+                    );
+                }
                 UnifiedStreamEvent::Error(msg) => {
                     had_error = true;
                     error_msg = msg;
@@ -192,6 +282,16 @@ pub async fn run_backend(
         if in_thinking {
             observer.on_stream_chunk("\n</think>\n");
         }
+
+        // M0 instrumentation: emit per-attempt Read tool count.
+        tracing::info!(
+            target: "turn_metrics",
+            kind = "swarm",
+            agent_id = %work_unit.id,
+            attempt,
+            read_count,
+            "turn_read_count"
+        );
 
         if had_error {
             // Propagate hard errors immediately
@@ -295,6 +395,10 @@ pub async fn run_backend(
 }
 
 /// Build the base prompt (repo context + impact analysis + memory context + scope clause + task description).
+// Legacy parity reference. Kept until M10 per V9 §0 rule 6 so the swarm
+// adapter (`render_swarm_prompt` + `ContextPlanner::plan`) can be diffed
+// against this function during M2-M9. Do not delete before M10.
+#[allow(dead_code)]
 async fn build_prompt(
     work_unit: &WorkUnit,
     memory: Option<&MemoryStore>,
