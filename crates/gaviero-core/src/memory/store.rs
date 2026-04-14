@@ -67,6 +67,42 @@ pub struct SearchResult {
     pub score: f32,
 }
 
+/// V9 §4 `MemoryCandidate`: structured memory record returned by
+/// [`MemoryStore::search_candidates`] for the planner to consume.
+///
+/// M3 type. Lives in this module (not `context_planner/`) because
+/// `MemoryStore` constructs it directly — placing it under `context_planner`
+/// would create a cycle with `crate::memory`. Re-exported from
+/// `crate::context_planner::types` so consumers see the V9-spec home.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryCandidate {
+    pub id: i64,
+    pub namespace: String,
+    pub scope_label: String,
+    pub score: f32,
+    pub trust: Option<String>,
+    pub content: String,
+    pub source_hash: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+impl From<&SearchResult> for MemoryCandidate {
+    fn from(r: &SearchResult) -> Self {
+        Self {
+            id: r.entry.id,
+            namespace: r.entry.namespace.clone(),
+            // M3 placeholder: namespace is the closest proxy to a scope
+            // label until M4 lifts it from the actual MemoryScope.
+            scope_label: r.entry.namespace.clone(),
+            score: r.score,
+            trust: None,
+            content: r.entry.content.clone(),
+            source_hash: None,
+            updated_at: Some(r.entry.updated_at.clone()),
+        }
+    }
+}
+
 /// Semantic memory store backed by SQLite + sqlite-vec + ONNX embeddings.
 ///
 /// Key pattern: CPU-heavy embedding runs BEFORE acquiring the SQLite lock.
@@ -267,6 +303,46 @@ impl MemoryStore {
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
         self.search_multi_filtered(namespaces, query, limit, PrivacyFilter::IncludeAll).await
+    }
+
+    /// V9 §11 M3: structured memory candidates for the planner.
+    ///
+    /// Returns an empty `Vec` on error or no hits. Unlike [`Self::search_context`]
+    /// (which formats results as a prompt-ready string), this returns the
+    /// underlying records so the planner can record memory IDs in the ledger
+    /// and emit per-selection tracing. M10 deletes `search_context`.
+    pub async fn search_candidates(
+        &self,
+        namespaces: &[String],
+        query: &str,
+        limit: usize,
+    ) -> Vec<MemoryCandidate> {
+        match self.search_multi(namespaces, query, limit).await {
+            Ok(results) => {
+                // M0 legacy aggregate event — kept for baseline tooling
+                // continuity. M3's per-candidate `memory_candidate` events
+                // are emitted by the planner (`ContextPlanner::collect_memory`).
+                let ids: Vec<i64> = results.iter().map(|r| r.entry.id).collect();
+                let scores: Vec<f32> = results.iter().map(|r| r.score).collect();
+                tracing::info!(
+                    target: "turn_metrics",
+                    memory_ids = ?ids,
+                    memory_scores = ?scores,
+                    memory_count = results.len(),
+                    "memory_selection"
+                );
+                results.iter().map(MemoryCandidate::from).collect()
+            }
+            Err(e) => {
+                tracing::warn!("memory search failed: {}", e);
+                tracing::info!(
+                    target: "turn_metrics",
+                    memory_count = 0usize,
+                    "memory_selection"
+                );
+                Vec::new()
+            }
+        }
     }
 
     /// Search across namespaces and format results as a prompt-ready string.
@@ -1737,6 +1813,32 @@ mod tests {
         assert_eq!(results.len(), 2);
         // First result should have highest composite score
         assert!(results[0].score >= results[1].score);
+    }
+
+    #[tokio::test]
+    async fn m3_search_candidates_returns_structured_records() {
+        // V9 §11 M3 acceptance: planner gets structured `MemoryCandidate`s
+        // with id, namespace, score, content. Pins the From<&SearchResult>
+        // mapping and verifies search_candidates threads through correctly.
+        let store = MemoryStore::in_memory(mock_embedder()).unwrap();
+        let id1 = store.store("ws", "rust", "Rust programming language", None).await.unwrap();
+        let id2 = store.store("ws", "python", "Python scripting language", None).await.unwrap();
+
+        let candidates = store
+            .search_candidates(&["ws".to_string()], "Rust language", 5)
+            .await;
+        assert!(candidates.len() >= 2);
+        // All returned ids must be among the stored ones.
+        let ids: Vec<i64> = candidates.iter().map(|c| c.id).collect();
+        for c in &candidates {
+            assert_eq!(c.namespace, "ws");
+            assert_eq!(c.scope_label, "ws");
+            assert!(!c.content.is_empty());
+            assert!(c.score >= 0.0);
+            // updated_at populated from MemoryEntry.
+            assert!(c.updated_at.is_some());
+        }
+        assert!(ids.contains(&id1) || ids.contains(&id2));
     }
 
     #[tokio::test]
