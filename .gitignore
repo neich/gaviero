@@ -20,3 +20,5 @@ Thumbs.db
 tmp/
 *.so
 .claude/
+.codex
+.codex-tmp
