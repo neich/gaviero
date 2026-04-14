@@ -843,6 +843,12 @@ pub(super) fn send_chat_message(app: &mut App) {
     let auto_approve = app.chat_state.effective_auto_approve();
     app.chat_state.auto_approve_next = false;
 
+    // M6: `resume_session_id` deprecated; ClaudeSession reads it from
+    // `ContinuityHandle` instead. This construction site feeds
+    // `LegacyAgentSession` (Ollama/Codex) and `ClaudeSession` both;
+    // `ClaudeSession::new` reads the field to initialize its handle.
+    // Allow stays until M10 removes the field.
+    #[allow(deprecated)]
     let options = gaviero_core::acp::session::AgentOptions {
         effort,
         max_tokens,
@@ -967,32 +973,90 @@ pub(super) fn send_chat_message(app: &mut App) {
             }
         };
 
-        let enriched_prompt = crate::app::session::render_chat_selections(&selections, &prompt);
+        // V9 §11 M5: lift `PlannerSelections` into a transport `Turn` and
+        // dispatch through `AgentSession`. The registry hands back a
+        // `LegacyAgentSession` shim today; M6 swaps Claude's entry for a
+        // real `ClaudeSession` without touching this call site.
+        //
+        // File refs flow through `Turn::file_refs` as structured
+        // `FileAttachment`s: (path, Some(content)) for @file text refs,
+        // (path, None) for image attachments Claude routes via `--file`.
+        // The shim splits them back into the legacy tuple shape.
+        let mut turn_file_refs: Vec<gaviero_core::context_planner::FileAttachment> = Vec::new();
+        for (path, content) in &file_refs {
+            turn_file_refs.push(gaviero_core::context_planner::FileAttachment {
+                path: std::path::PathBuf::from(path),
+                content: Some(content.clone()),
+            });
+        }
+        for p in &cli_file_attachments {
+            turn_file_refs.push(gaviero_core::context_planner::FileAttachment {
+                path: p.clone(),
+                content: None,
+            });
+        }
+        // Wrap existing chat history (`context`) into the planner's
+        // ReplayPayload shape. The shim lifts it back for legacy backends.
+        let replay_history = if !context.is_empty() {
+            Some(gaviero_core::context_planner::ReplayPayload {
+                entries: context
+                    .iter()
+                    .map(|(r, c)| {
+                        let role = match r.as_str() {
+                            "assistant" => gaviero_core::context_planner::Role::Assistant,
+                            "system" => gaviero_core::context_planner::Role::System,
+                            _ => gaviero_core::context_planner::Role::User,
+                        };
+                        (role, c.clone())
+                    })
+                    .collect(),
+            })
+        } else {
+            None
+        };
+        // Fill `file_refs` / `replay_history` the planner left empty
+        // (chat does its own @file parsing and history slicing). Preserves
+        // M3 byte-identity through the shim.
+        let mut selections = selections;
+        selections.file_refs = turn_file_refs;
+        selections.replay_history = replay_history;
+
+        let transport_ctx = gaviero_core::agent_session::TransportContext {
+            user_message: prompt.clone(),
+            effort: if options.effort.is_empty() || options.effort == "off" {
+                None
+            } else {
+                Some(options.effort.clone())
+            },
+            auto_approve: options.auto_approve,
+        };
+        let turn = gaviero_core::agent_session::build_turn(selections, transport_ctx);
 
         let observer = TuiAcpObserver {
             tx: tx.clone(),
             conv_id: conv_id_clone.clone(),
         };
-        let pipeline = AcpPipeline::new(
-            wg.clone(),
-            Box::new(observer),
-            model,
-            Some(ollama_base_url),
-            root,
-            "claude-chat",
-            options,
+        let mut session = gaviero_core::agent_session::registry::create_session(
+            gaviero_core::agent_session::registry::SessionConstruction {
+                write_gate: wg.clone(),
+                observer: Box::new(observer),
+                model,
+                ollama_base_url: Some(ollama_base_url),
+                workspace_root: root,
+                agent_id: "claude-chat".to_string(),
+                options,
+                profile: provider_profile_clone,
+            },
         );
-        if let Err(e) = pipeline
-            .send_prompt(&enriched_prompt, &file_refs, &context, &cli_file_attachments)
-            .await
-        {
-            tracing::error!("send_prompt error: {}", e);
+        if let Err(e) = session.send_turn(turn).await {
+            tracing::error!("send_turn error: {}", e);
             let _ = tx.send(Event::MessageComplete {
                 conv_id: conv_id.clone(),
                 role: "system".to_string(),
                 content: format!("Error: {}", e),
             });
         }
+        session.close().await;
 
         let proposals = {
             let mut gate = wg.lock().await;
