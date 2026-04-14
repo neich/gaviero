@@ -184,6 +184,29 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 .iter_mut()
                 .find(|c| c.id == conv_id)
             {
+                // V9 §11 M4 resume-failure detection: if we asked Claude
+                // to `--resume <prior_id>` and it reported back a *different*
+                // session_id, the prior handle was rejected (likely the
+                // persisted conversation expired or was never saved). The
+                // new id becomes the canonical one going forward, but we
+                // also zero the ledger's turn_count so bootstrap fires on
+                // this turn — turn-1 context (graph + memory) needs to be
+                // re-injected since Claude has no server-side state.
+                let was_resume_attempt = conv.claude_session_id.is_some();
+                let resume_failed =
+                    was_resume_attempt && conv.claude_session_id.as_deref() != Some(session_id.as_str());
+                if resume_failed {
+                    tracing::warn!(
+                        target: "turn_metrics",
+                        conv_id = %conv_id,
+                        asked_id = %conv.claude_session_id.clone().unwrap_or_default(),
+                        got_id = %session_id,
+                        "claude resume rejected — forcing bootstrap on next turn"
+                    );
+                    if let Some(ref mut ledger) = conv.session_ledger {
+                        ledger.record_resume_failure();
+                    }
+                }
                 if conv.claude_session_id.as_deref() != Some(session_id.as_str()) {
                     tracing::info!(
                         "Captured Claude session id for conv {}: {}",
@@ -202,6 +225,12 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                             session_id,
                         ),
                     );
+                    if !resume_failed {
+                        // M4: track successful resume timing for future
+                        // invalidation heuristics (e.g., drop handles
+                        // older than N days).
+                        ledger.record_resume_success();
+                    }
                     if ledger.is_first_turn() {
                         ledger.record_turn_dispatched();
                     }

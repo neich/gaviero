@@ -181,6 +181,16 @@ pub struct StoredConversation {
     /// Per-conversation effort level override (None = use global default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_override: Option<String>,
+    /// V9 §11 M4: persisted planner ledger (continuity handle + fingerprint
+    /// + turn count + replay history). Absent in records written before M4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_ledger: Option<crate::context_planner::ledger::PersistedLedger>,
+    /// V9 §4 requires this alongside `session_ledger` for forward
+    /// compatibility — a reader that understands only the handle (not the
+    /// full ledger) can still resume. Redundant with `session_ledger.continuity_handle`
+    /// but kept as an explicit top-level field per V9 §4 line 420.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuity_handle: Option<crate::context_planner::types::ContinuityHandle>,
 }
 
 /// Index of all conversations for a workspace (lightweight, no messages).
@@ -351,5 +361,66 @@ mod tests {
         assert_eq!(state.active_tab, 2);
         assert!(state.panels.file_tree); // default true
         assert!(!state.panels.terminal); // default false
+    }
+
+    #[test]
+    fn m4_stored_conversation_forward_compatible_without_ledger_fields() {
+        // V9 §11 M4 forbidden shortcut: "No breaking schema change."
+        // A record written pre-M4 (no session_ledger / continuity_handle)
+        // must still deserialize. Both new fields have `#[serde(default)]`.
+        let json = r#"{
+            "id": "c1",
+            "title": "Old",
+            "messages": [],
+            "created": 1000,
+            "updated": 2000
+        }"#;
+        let stored: StoredConversation = serde_json::from_str(json).unwrap();
+        assert_eq!(stored.id, "c1");
+        assert!(stored.session_ledger.is_none());
+        assert!(stored.continuity_handle.is_none());
+    }
+
+    #[test]
+    fn m4_stored_conversation_round_trips_with_ledger() {
+        // Explicit variant tag on ContinuityHandle must survive the round-trip.
+        use crate::context_planner::ledger::{PersistedLedger, PlannerFingerprint};
+        use crate::context_planner::types::ContinuityHandle;
+
+        let persisted = PersistedLedger {
+            continuity_handle: Some(ContinuityHandle::ClaudeSessionId("abc".into())),
+            fingerprint: PlannerFingerprint {
+                provider: "claude".into(),
+                model: "sonnet".into(),
+                system_prompt_digest: String::new(),
+                toolset_digest: String::new(),
+                workspace_root_digest: String::new(),
+                branch_name: None,
+            },
+            turn_count: 2,
+            replay_history: Vec::new(),
+            last_successful_resume_unix: Some(1_700_000_000),
+        };
+        let stored = StoredConversation {
+            id: "c1".into(),
+            title: "T".into(),
+            messages: Vec::new(),
+            created: 1000,
+            updated: 2000,
+            model_override: None,
+            effort_override: None,
+            session_ledger: Some(persisted.clone()),
+            continuity_handle: Some(ContinuityHandle::ClaudeSessionId("abc".into())),
+        };
+
+        let json = serde_json::to_string(&stored).unwrap();
+        assert!(json.contains("ClaudeSessionId"));
+        let back: StoredConversation = serde_json::from_str(&json).unwrap();
+        let ledger = back.session_ledger.expect("ledger present");
+        assert_eq!(ledger.turn_count, 2);
+        match ledger.continuity_handle {
+            Some(ContinuityHandle::ClaudeSessionId(id)) => assert_eq!(id, "abc"),
+            _ => panic!("variant lost"),
+        }
     }
 }
