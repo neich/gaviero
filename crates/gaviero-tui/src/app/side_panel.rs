@@ -843,7 +843,7 @@ pub(super) fn send_chat_message(app: &mut App) {
     graph_seeds.dedup();
 
     // Snapshot the ledger for the spawn task. The planner only reads it in
-    // M1 (no mutation), so a clone is safe. The canonical ledger lives on
+    // M2 (no mutation), so a clone is safe. The canonical ledger lives on
     // the Conversation and is updated by the SystemInit event handler in
     // the controller — same lifecycle as `claude_session_id`.
     let ledger_snapshot = app.chat_state.conversations[app.chat_state.active_conv]
@@ -860,85 +860,81 @@ pub(super) fn send_chat_message(app: &mut App) {
             gate.set_mode(WriteMode::Deferred);
         }
 
-        // Graph + memory context is a one-time bootstrap — sent on turn 1,
-        // skipped on resumed turns. Claude holds the context server-side
-        // via `--resume`, so re-injecting it costs tokens and risks the
-        // Read-tool size limit on the prompt tempfile.
-        let graph_ctx = if is_first_turn {
-            crate::app::session::build_graph_context(
+        // M2: Chat hands the planner the raw memory + repo_map references
+        // and lets it own bootstrap policy. The TUI no longer decides what
+        // to inject — it only acquires the resources and pre-computes
+        // impact text (which lives in a `!Send` GraphStore, so it must be
+        // built inside spawn_blocking; M3 wires `graph_store` into the
+        // planner directly and removes this carrier).
+        //
+        // Follow-up turns: the planner's `is_first_turn()` check returns
+        // false (the controller's SystemInit handler bumps `turn_count`
+        // after Claude acknowledges turn 1), so memory + graph selections
+        // come back empty and `render_chat_selections` emits just the
+        // user message (V9 §11 M2 acceptance: "turn 2+ transmits only
+        // new user message").
+        let repo_map_arc = if is_first_turn {
+            crate::app::session::get_or_build_repo_map_cached(
                 repo_map_cache,
-                graph_root,
-                graph_seeds,
-                graph_budget_tokens,
+                graph_root.clone(),
             )
             .await
         } else {
-            String::new()
+            None
         };
-
-        let mem_ctx = if is_first_turn {
-            if let Some(ref mem) = memory {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    mem.search_context(&read_ns, &prompt, 5),
-                )
+        let impact_text = if is_first_turn {
+            crate::app::session::compute_impact_text(graph_root.clone(), graph_seeds.clone())
                 .await
-                {
-                    Ok(ctx) => ctx,
-                    Err(_) => {
-                        tracing::warn!(
-                            "Memory search timed out after 5s, proceeding without context"
-                        );
-                        String::new()
-                    }
-                }
-            } else {
-                String::new()
-            }
         } else {
-            String::new()
+            None
         };
 
-        // M1: route through the planner. The planner wraps the
-        // pre-fetched graph and memory strings into structured selections;
-        // `render_chat_selections` produces a byte-identical enriched
-        // prompt to the legacy `parts.join("\n\n")` assembly. M2 will
-        // move the graph/memory I/O into the planner itself and remove
-        // the pre_fetched_* carriers.
+        let seed_paths_buf: Vec<std::path::PathBuf> = if is_first_turn {
+            graph_seeds.iter().map(std::path::PathBuf::from).collect()
+        } else {
+            Vec::new()
+        };
+        let read_ns_for_planner: &[String] = if is_first_turn { &read_ns } else { &[] };
+        let budget_for_planner: usize = if is_first_turn { graph_budget_tokens } else { 0 };
+
         let mut local_ledger = ledger_snapshot;
         let planner_input = gaviero_core::context_planner::PlannerInput {
             user_message: &prompt,
             explicit_refs: &[],
-            seed_paths: &[],
+            seed_paths: &seed_paths_buf,
             provider_profile: &provider_profile_clone,
-            read_namespaces: &[],
-            graph_budget_tokens: 0,
+            read_namespaces: read_ns_for_planner,
+            graph_budget_tokens: budget_for_planner,
             memory_query_override: None,
-            memory_limit: 0,
+            memory_limit: 5,
             file_ref_blobs: &[],
-            pre_fetched_impact_text: None,
-            pre_fetched_graph_context: if graph_ctx.is_empty() {
-                None
-            } else {
-                Some(graph_ctx.as_str())
-            },
-            pre_fetched_memory_context: if mem_ctx.is_empty() {
-                None
-            } else {
-                Some(mem_ctx.as_str())
-            },
+            pre_fetched_impact_text: impact_text.as_deref(),
+            pre_fetched_graph_context: None,
+            pre_fetched_memory_context: None,
         };
+
         let selections = {
             let mut planner = gaviero_core::context_planner::ContextPlanner {
-                memory: None,
-                repo_map: None,
+                memory: memory.as_deref(),
+                repo_map: repo_map_arc.as_deref(),
                 ledger: &mut local_ledger,
-                workspace_root: std::path::Path::new("."),
+                workspace_root: &graph_root,
             };
-            match planner.plan(&planner_input).await {
-                Ok(s) => s,
-                Err(e) => {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                planner.plan(&planner_input),
+            )
+            .await
+            {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
                     tracing::error!("planner error: {}", e);
+                    gaviero_core::context_planner::PlannerSelections::default()
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Planner timed out after 5s, proceeding without bootstrap context"
+                    );
                     gaviero_core::context_planner::PlannerSelections::default()
                 }
             }

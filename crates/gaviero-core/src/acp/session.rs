@@ -157,14 +157,15 @@ impl AcpSession {
 
         // Session reuse: when a prior session_id is known (captured from the
         // first turn's SystemInit event), resume it so Claude's model keeps
-        // conversation context, read-file cache, and thinking state. Skipping
-        // this flag (and keeping --no-session-persistence) gives a fresh
-        // one-shot session — used on turn 1 and for swarm work units.
-        // M0 instrumentation: record resume hit/miss so baselines can
-        // correlate continuity mode with injection size. `resume_passed`
-        // reflects what we asked Claude to do; the CLI's `SystemInit`
-        // event confirms whether Claude actually accepted the id
-        // (logged separately in AcpPipeline::send_prompt_via_claude).
+        // conversation context, read-file cache, and thinking state.
+        //
+        // M2 (borrowed scope from M6): turn 1 must NOT pass
+        // `--no-session-persistence`. Doing so makes Claude discard the
+        // conversation immediately; turn 2's `--resume <id>` then errors with
+        // "No conversation found" — see [Finding G in baselines/m0.md]. The
+        // borrowed-scope rationale is documented on the M2 PR. M6 owns the
+        // rest of the Claude normalization (full session lifecycle, restart,
+        // etc.); this is the minimum to unblock M2 acceptance.
         let resume_passed = matches!(
             options.resume_session_id.as_deref(),
             Some(id) if !id.is_empty()
@@ -175,13 +176,10 @@ impl AcpSession {
             resume_passed,
             "session_resume_attempt"
         );
-        match options.resume_session_id.as_deref() {
-            Some(id) if !id.is_empty() => {
-                cmd.arg("--resume").arg(id);
-            }
-            _ => {
-                cmd.arg("--no-session-persistence");
-            }
+        if let Some(id) = options.resume_session_id.as_deref()
+            && !id.is_empty()
+        {
+            cmd.arg("--resume").arg(id);
         }
 
         if !options.effort.is_empty() && options.effort != "off" {
