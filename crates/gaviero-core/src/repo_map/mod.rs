@@ -157,6 +157,26 @@ impl RepoMap {
             format!("## Repository context:\n{}", outline_lines.join("\n"))
         };
 
+        // M0 instrumentation: expose ranked selection so baselines can
+        // measure graph-pruning effectiveness. Safe under V9 §2 — no API
+        // change; structured graph returns land in M3.
+        let full_paths: Vec<String> = full_content
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        let sig_paths: Vec<String> = signatures
+            .iter()
+            .map(|(p, _)| p.to_string_lossy().to_string())
+            .collect();
+        tracing::info!(
+            target: "turn_metrics",
+            graph_full_content = ?full_paths,
+            graph_signatures = ?sig_paths,
+            graph_token_estimate = tokens_used,
+            graph_budget = budget_tokens,
+            "graph_selection"
+        );
+
         ContextPlan {
             full_content,
             signatures,
