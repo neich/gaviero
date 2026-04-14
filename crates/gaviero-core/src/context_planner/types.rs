@@ -181,11 +181,17 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             provider: "ollama".to_string(),
             model: spec.model.clone(),
             continuity_mode: ContinuityMode::StatelessReplay,
-            // Tool-use depends on the local model; M9 may refine. Default
-            // false matches the conservative path today.
+            // Tool-use depends on the local model. Default false matches the
+            // conservative path; models that support tool use can override
+            // via config in a later milestone.
             supports_tool_use: false,
             supports_native_resume: false,
-            max_context_tokens: None,
+            // M9: set a conservative default context window for Ollama models.
+            // 8 192 tokens matches llama3.1 7B and many other popular models.
+            // The token-pressure compaction trigger in `OllamaSession` uses
+            // this value to bound replay history size. A future milestone may
+            // query the Ollama `/api/show` endpoint for per-model context size.
+            max_context_tokens: Some(8_192),
         },
     }
 }
