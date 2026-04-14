@@ -36,6 +36,11 @@ pub struct AgentOptions {
     /// When true, pass `--dangerously-skip-permissions` so the subprocess never
     /// pauses for permission prompts. Intended for single-prompt "yes to all" mode.
     pub auto_approve: bool,
+    /// When `Some`, resume the Claude session with the given id (Claude's
+    /// `--resume <id>` flag) so model context (prior messages, read file
+    /// cache) carries across turns. When `None`, a fresh one-shot session
+    /// is spawned.
+    pub resume_session_id: Option<String>,
 }
 
 impl Default for AgentOptions {
@@ -44,6 +49,7 @@ impl Default for AgentOptions {
             effort: "off".to_string(),
             max_tokens: 16384,
             auto_approve: false,
+            resume_session_id: None,
         }
     }
 }
@@ -147,8 +153,36 @@ impl AcpSession {
             .arg("--verbose")
             .arg("--include-partial-messages")
             .arg("--model")
-            .arg(model)
-            .arg("--no-session-persistence");
+            .arg(model);
+
+        // Session reuse: when a prior session_id is known (captured from the
+        // first turn's SystemInit event), resume it so Claude's model keeps
+        // conversation context, read-file cache, and thinking state. Skipping
+        // this flag (and keeping --no-session-persistence) gives a fresh
+        // one-shot session — used on turn 1 and for swarm work units.
+        // M0 instrumentation: record resume hit/miss so baselines can
+        // correlate continuity mode with injection size. `resume_passed`
+        // reflects what we asked Claude to do; the CLI's `SystemInit`
+        // event confirms whether Claude actually accepted the id
+        // (logged separately in AcpPipeline::send_prompt_via_claude).
+        let resume_passed = matches!(
+            options.resume_session_id.as_deref(),
+            Some(id) if !id.is_empty()
+        );
+        tracing::info!(
+            target: "turn_metrics",
+            provider = "claude",
+            resume_passed,
+            "session_resume_attempt"
+        );
+        match options.resume_session_id.as_deref() {
+            Some(id) if !id.is_empty() => {
+                cmd.arg("--resume").arg(id);
+            }
+            _ => {
+                cmd.arg("--no-session-persistence");
+            }
+        }
 
         if !options.effort.is_empty() && options.effort != "off" {
             cmd.arg("--effort").arg(&options.effort);
