@@ -45,11 +45,13 @@ impl AgentBackend for ClaudeCodeBackend {
         let file_attachments: Vec<&std::path::Path> =
             request.file_attachments.iter().map(|p| p.as_path()).collect();
 
+        // M6: `resume_session_id` deprecated; swarm work units are one-shot
+        // (no resume), so this is always None. Allow stays until M10.
+        #[allow(deprecated)]
         let options = AgentOptions {
             effort: request.effort.unwrap_or_else(|| "off".to_string()),
             max_tokens: request.max_tokens.unwrap_or(16384),
             auto_approve: request.auto_approve,
-            // Swarm work units are one-shot: no session reuse across units.
             resume_session_id: None,
         };
 

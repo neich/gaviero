@@ -19,11 +19,11 @@ use super::session::{AcpSession, AgentOptions};
 /// How long to wait for the next stream event before sending a keepalive status.
 /// Claude tool calls (Read, Grep on large repos) can take a while, so this should
 /// be generous enough to avoid false positives but short enough to reassure the user.
-const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum time to wait for the subprocess to exit after the stream ends.
 /// After this, the process is killed to avoid blocking the pipeline indefinitely.
-const PROCESS_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const PROCESS_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The ACP pipeline manages chat execution and routes file changes
 /// through the Write Gate.
@@ -67,6 +67,10 @@ impl AcpPipeline {
     /// contents are read and prepended as context. After the subprocess
     /// completes, any `<file>` blocks in the response are parsed and
     /// routed through the Write Gate as proposals.
+    // M6: `resume_session_id` is deprecated for new code but still read here
+    // for the Ollama/Codex instrumentation path via `LegacyAgentSession`.
+    // This allow stays until M10 deletes the field.
+    #[allow(deprecated)]
     pub async fn send_prompt(
         &self,
         prompt: &str,
@@ -148,10 +152,23 @@ impl AcpPipeline {
             return Ok(());
         }
 
-        self.send_prompt_via_claude(prompt, file_refs, conversation_history, file_attachments)
-            .await
+        // M6: Claude models now route through `ClaudeSession` in
+        // `agent_session/claude.rs`. `AcpPipeline::send_prompt` is only
+        // called from `LegacyAgentSession`, which is only instantiated for
+        // Ollama/Codex providers after M6. If this branch is reached the
+        // registry is misconfigured — log and bail rather than silently
+        // running the legacy Claude path.
+        tracing::error!(
+            model = %self.model,
+            "send_prompt reached Claude branch — route through ClaudeSession instead (registry bug)"
+        );
+        Ok(())
     }
 
+    /// M6: parity reference — Claude now routes through `ClaudeSession`.
+    /// Kept for M10 cleanup audit; `#[allow(dead_code)]` suppresses the
+    /// compiler warning while the parity window is open.
+    #[allow(dead_code, deprecated)]
     async fn send_prompt_via_claude(
         &self,
         prompt: &str,
@@ -546,99 +563,125 @@ impl AcpPipeline {
     }
 
     /// Create a write proposal through the Write Gate.
-    ///
-    /// Follows the propose_write pattern from SPEC.md 5.3:
-    /// brief lock for scope check → expensive work outside lock → brief lock for insertion.
-    ///
-    /// NOTE: There is a deliberate window between the scope check (step 1) and
-    /// insertion (step 5) where another task could finalize a proposal for the
-    /// same file. This is accepted to avoid holding the Mutex across I/O. In
-    /// practice the risk is low because only one agent session is active at a
-    /// time, and duplicate proposals for the same file are harmless (the user
-    /// reviews each one independently).
+    /// Delegates to the crate-level [`propose_write`] free function so
+    /// `ClaudeSession` (M6) can reuse the same logic without going through
+    /// `AcpPipeline`.
     async fn propose_write(&self, rel_path: &Path, proposed_content: &str) -> Result<()> {
-        let abs_path = self.workspace_root.join(rel_path);
-
-        // 1. Scope check + duplicate check + allocate ID (single lock)
-        let (id, is_deferred) = {
-            let mut gate = self.write_gate.lock().await;
-            let path_str = rel_path.to_string_lossy();
-            if !gate.is_scope_allowed(&self.agent_id, &path_str) {
-                tracing::warn!("Scope rejected for {}", rel_path.display());
-                return Ok(());
-            }
-            if gate.proposal_for_path(&abs_path).is_some() {
-                tracing::debug!("Skipping duplicate proposal for {}", rel_path.display());
-                return Ok(());
-            }
-            // Also check deferred proposals for duplicates
-            if gate.pending_proposals().iter().any(|p| p.file_path == abs_path) {
-                tracing::debug!("Skipping duplicate deferred proposal for {}", rel_path.display());
-                return Ok(());
-            }
-            (gate.next_id(), gate.is_deferred())
-        };
-
-        // 2. Read original content + build proposal (outside lock)
-        let original = if abs_path.exists() {
-            tokio::fs::read_to_string(&abs_path)
-                .await
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-
-        if original == proposed_content {
-            tracing::info!("propose_write: {} — content unchanged, skipping", rel_path.display());
-            return Ok(());
-        }
-
-        let proposal = WriteGatePipeline::build_proposal(
-            id,
+        propose_write(
+            &self.write_gate,
+            self.observer.as_ref(),
+            &self.workspace_root,
             &self.agent_id,
-            &abs_path,
-            &original,
+            rel_path,
             proposed_content,
-        );
-
-        if proposal.structural_hunks.is_empty() {
-            tracing::info!(
-                "propose_write: {} — no structural hunks after diff, skipping",
-                rel_path.display()
-            );
-            return Ok(());
-        }
-
-        tracing::info!(
-            "propose_write: {} — {} hunks, is_deferred={}, inserting",
-            rel_path.display(), proposal.structural_hunks.len(), is_deferred
-        );
-
-        // 3. Insert proposal (single lock)
-        let auto_accept_result = {
-            let mut gate = self.write_gate.lock().await;
-            gate.insert_proposal(proposal)
-        };
-
-        // 4. If deferred, notify observer for compact summary display
-        if is_deferred {
-            let old = if original.is_empty() { None } else { Some(original.as_str()) };
-            self.observer.on_proposal_deferred(&abs_path, old, proposed_content);
-        }
-
-        // 5. If AutoAccept mode, write to disk outside lock
-        if let Some((path, content)) = auto_accept_result {
-            tokio::fs::write(&path, &content)
-                .await
-                .context("writing auto-accepted file")?;
-        }
-
-        Ok(())
+        )
+        .await
     }
 }
 
+/// Create a write proposal through the Write Gate.
+///
+/// Extracted as a `pub(crate)` free function so both `AcpPipeline` (legacy
+/// Ollama/Codex path) and `ClaudeSession` (M6) can call it without
+/// duplicating the logic. Follows the propose_write pattern from SPEC.md 5.3:
+/// brief lock for scope check → expensive work outside lock → brief lock for
+/// insertion.
+///
+/// NOTE: There is a deliberate window between the scope check (step 1) and
+/// insertion (step 5) where another task could finalize a proposal for the
+/// same file. This is accepted to avoid holding the Mutex across I/O. In
+/// practice the risk is low because only one agent session is active at a
+/// time, and duplicate proposals for the same file are harmless (the user
+/// reviews each one independently).
+pub(crate) async fn propose_write(
+    write_gate: &Arc<Mutex<WriteGatePipeline>>,
+    observer: &dyn AcpObserver,
+    workspace_root: &Path,
+    agent_id: &str,
+    rel_path: &Path,
+    proposed_content: &str,
+) -> Result<()> {
+    let abs_path = workspace_root.join(rel_path);
+
+    // 1. Scope check + duplicate check + allocate ID (single lock)
+    let (id, is_deferred) = {
+        let mut gate = write_gate.lock().await;
+        let path_str = rel_path.to_string_lossy();
+        if !gate.is_scope_allowed(agent_id, &path_str) {
+            tracing::warn!("Scope rejected for {}", rel_path.display());
+            return Ok(());
+        }
+        if gate.proposal_for_path(&abs_path).is_some() {
+            tracing::debug!("Skipping duplicate proposal for {}", rel_path.display());
+            return Ok(());
+        }
+        // Also check deferred proposals for duplicates
+        if gate.pending_proposals().iter().any(|p| p.file_path == abs_path) {
+            tracing::debug!("Skipping duplicate deferred proposal for {}", rel_path.display());
+            return Ok(());
+        }
+        (gate.next_id(), gate.is_deferred())
+    };
+
+    // 2. Read original content + build proposal (outside lock)
+    let original = if abs_path.exists() {
+        tokio::fs::read_to_string(&abs_path)
+            .await
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    if original == proposed_content {
+        tracing::info!("propose_write: {} — content unchanged, skipping", rel_path.display());
+        return Ok(());
+    }
+
+    let proposal = WriteGatePipeline::build_proposal(
+        id,
+        agent_id,
+        &abs_path,
+        &original,
+        proposed_content,
+    );
+
+    if proposal.structural_hunks.is_empty() {
+        tracing::info!(
+            "propose_write: {} — no structural hunks after diff, skipping",
+            rel_path.display()
+        );
+        return Ok(());
+    }
+
+    tracing::info!(
+        "propose_write: {} — {} hunks, is_deferred={}, inserting",
+        rel_path.display(), proposal.structural_hunks.len(), is_deferred
+    );
+
+    // 3. Insert proposal (single lock)
+    let auto_accept_result = {
+        let mut gate = write_gate.lock().await;
+        gate.insert_proposal(proposal)
+    };
+
+    // 4. If deferred, notify observer for compact summary display
+    if is_deferred {
+        let old = if original.is_empty() { None } else { Some(original.as_str()) };
+        observer.on_proposal_deferred(&abs_path, old, proposed_content);
+    }
+
+    // 5. If AutoAccept mode, write to disk outside lock
+    if let Some((path, content)) = auto_accept_result {
+        tokio::fs::write(&path, &content)
+            .await
+            .context("writing auto-accepted file")?;
+    }
+
+    Ok(())
+}
+
 /// Return true if the error text indicates an OAuth / authentication failure.
-fn is_auth_error(text: &str) -> bool {
+pub(crate) fn is_auth_error(text: &str) -> bool {
     let lower = text.to_lowercase();
     (lower.contains("oauth") || lower.contains("authentication") || lower.contains("unauthorized"))
         && (lower.contains("expired") || lower.contains("invalid") || lower.contains("failed"))
@@ -649,7 +692,7 @@ fn is_auth_error(text: &str) -> bool {
 }
 
 /// Format a one-line summary for a tool call, extracting key info from the input JSON.
-fn format_tool_summary(tool_name: &str, input: &serde_json::Value, workspace_root: &Path) -> String {
+pub(crate) fn format_tool_summary(tool_name: &str, input: &serde_json::Value, workspace_root: &Path) -> String {
     let get_str = |key: &str| input.get(key).and_then(|v| v.as_str());
 
     // Try to make paths relative for display

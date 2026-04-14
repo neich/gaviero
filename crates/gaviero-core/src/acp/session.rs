@@ -40,10 +40,19 @@ pub struct AgentOptions {
     /// `--resume <id>` flag) so model context (prior messages, read file
     /// cache) carries across turns. When `None`, a fresh one-shot session
     /// is spawned.
+    ///
+    /// **Deprecated (M6).** `ClaudeSession` drives resume via
+    /// `ContinuityHandle::ClaudeSessionId` stored in the `SessionLedger`.
+    /// This field remains for `LegacyAgentSession` (Ollama/Codex) until M10
+    /// cleanup; new per-provider sessions must not read it. Removal: M10.
+    #[deprecated(since = "0.1.0", note = "M6: use ContinuityHandle::ClaudeSessionId via SessionLedger; removal in M10")]
     pub resume_session_id: Option<String>,
 }
 
 impl Default for AgentOptions {
+    // M6: `resume_session_id` deprecated; allow here because `Default` must
+    // initialize every field. Stays until M10 removes the field.
+    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             effort: "off".to_string(),
@@ -118,6 +127,8 @@ impl AcpSession {
     /// `approved_tools` controls which of those are auto-approved without
     /// a permission prompt (`--allowedTools`). Tools in `available_tools`
     /// but not in `approved_tools` will trigger `PermissionRequest` events.
+    // M6: reads `options.resume_session_id` (deprecated); allow stays until M10.
+    #[allow(deprecated)]
     pub fn spawn(
         model: &str,
         cwd: &Path,

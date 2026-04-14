@@ -20,7 +20,6 @@ use crate::panels::status_bar::StatusBar;
 use crate::theme::{self, Theme};
 use crate::widgets::tabs::TabBar;
 
-use gaviero_core::acp::client::AcpPipeline;
 use gaviero_core::memory::MemoryStore;
 use gaviero_core::repo_map::RepoMap;
 use gaviero_core::session_state::{self, SessionState, TabState};

@@ -15,6 +15,7 @@ pub mod indent;
 pub mod query_loader;
 pub mod memory;
 pub mod context_planner;
+pub mod agent_session;
 pub mod swarm;
 pub mod terminal;
 
