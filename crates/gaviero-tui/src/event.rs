@@ -60,6 +60,15 @@ pub enum Event {
         proposals: Vec<WriteProposal>,
     },
 
+    /// Claude emitted its session id (first `SystemInit` event of a turn).
+    /// The controller stores this on the matching `Conversation` so the
+    /// next turn can pass `--resume <session_id>` and avoid re-sending
+    /// conversation history + bootstrap context.
+    ClaudeSessionStarted {
+        conv_id: String,
+        session_id: String,
+    },
+
     // Swarm events (constructed by TuiSwarmObserver when swarm is launched)
     SwarmPhaseChanged(String),
     SwarmAgentStateChanged {
