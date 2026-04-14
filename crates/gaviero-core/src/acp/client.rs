@@ -74,6 +74,39 @@ impl AcpPipeline {
         conversation_history: &[(String, String)],
         file_attachments: &[PathBuf],
     ) -> Result<()> {
+        // M0 instrumentation: one "turn" event per send_prompt. Captures
+        // prompt size, provider selection, and continuity-mode hint (resume
+        // id presence) so baselines can diff first-turn vs follow-up.
+        let provider_hint = if shared::is_ollama_model(&self.model) {
+            "ollama"
+        } else if shared::is_codex_model(&self.model) {
+            "codex"
+        } else {
+            "claude"
+        };
+        let resume_hint = self
+            .options
+            .resume_session_id
+            .as_deref()
+            .map(|id| !id.is_empty())
+            .unwrap_or(false);
+        let history_chars: usize = conversation_history
+            .iter()
+            .map(|(r, c)| r.len() + c.len())
+            .sum();
+        tracing::info!(
+            target: "turn_metrics",
+            kind = "chat",
+            provider = provider_hint,
+            model = %self.model,
+            prompt_chars = prompt.len(),
+            replay_chars = history_chars,
+            file_refs_count = file_refs.len(),
+            file_attachments_count = file_attachments.len(),
+            resume_hint,
+            "turn_dispatch"
+        );
+
         // Codex and Ollama both go through the trait-based executor path.
         // Only Claude Code uses the specialized ACP session (below) for its
         // bidirectional permission handshake.
@@ -168,6 +201,10 @@ impl AcpPipeline {
         // Key: absolute path, Value: original content at the time of snapshot.
         let mut file_snapshots: HashMap<PathBuf, String> = HashMap::new();
 
+        // M0 instrumentation: count Read tool invocations per turn so baselines
+        // can measure graph pre-attach effectiveness (M7 target).
+        let mut read_count: usize = 0;
+
         // Process streaming events with idle timeout.
         // During tool execution, Claude CLI emits no events — the idle timeout
         // detects this and sends keepalive status updates so the UI stays responsive.
@@ -246,6 +283,10 @@ impl AcpPipeline {
                         }
                     }
                     StreamEvent::ToolUseStart { tool_name, .. } => {
+                        // M0 instrumentation: count Read invocations per turn.
+                        if tool_name == "Read" {
+                            read_count += 1;
+                        }
                         // Update streaming status for the spinner label.
                         // The enriched tool call (with details) will be sent
                         // from AssistantMessage when the full input is known.
@@ -331,7 +372,31 @@ impl AcpPipeline {
                         session.respond_permission(allow, &request_id);
                         idle_count = 0;
                     }
-                    StreamEvent::SystemInit { .. } => {}
+                    StreamEvent::SystemInit { session_id, .. } => {
+                        // M0 instrumentation: record whether Claude honored the
+                        // resume id we passed. `resume_accepted` = session id
+                        // we got back matches the id we asked for.
+                        let asked = self.options.resume_session_id.as_deref();
+                        let resume_accepted = match asked {
+                            Some(asked_id) if !asked_id.is_empty() && !session_id.is_empty() => {
+                                asked_id == session_id
+                            }
+                            _ => false,
+                        };
+                        tracing::info!(
+                            target: "turn_metrics",
+                            provider = "claude",
+                            session_id = %session_id,
+                            resume_accepted,
+                            "session_init"
+                        );
+                        // Hand the fresh session id to the observer so the TUI
+                        // can persist it on the Conversation and pass it back
+                        // via AgentOptions::resume_session_id on the next turn.
+                        if !session_id.is_empty() {
+                            self.observer.on_claude_session_started(&session_id);
+                        }
+                    }
                     StreamEvent::Unknown(_) => {}
                 },
                 Ok(None) => {
@@ -419,6 +484,14 @@ impl AcpPipeline {
                 session.kill();
             }
         }
+
+        // M0 instrumentation: emit per-turn Read tool count at end of stream.
+        tracing::info!(
+            target: "turn_metrics",
+            provider = "claude",
+            read_count,
+            "turn_read_count"
+        );
 
         // Create proposals from snapshotted files — compare original vs current disk content.
         // The CLI has already written the files, so we diff snapshot vs disk.

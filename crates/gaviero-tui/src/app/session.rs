@@ -147,6 +147,33 @@ pub(crate) async fn build_graph_context(
     sections.join("\n\n")
 }
 
+/// Render planner selections back into the legacy chat enriched-prompt string.
+///
+/// **M1 byte-identical guarantee** — the output of this function with
+/// selections produced by [`gaviero_core::context_planner::ContextPlanner::plan`]
+/// must equal the existing `parts.join("\n\n")` assembly at side_panel.rs.
+/// Order: graph (single combined block today), memory, then user prompt.
+pub(crate) fn render_chat_selections(
+    selections: &gaviero_core::context_planner::PlannerSelections,
+    user_prompt: &str,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    for g in &selections.graph_selections {
+        if !g.content.is_empty() {
+            parts.push(g.content.clone());
+        }
+    }
+    for m in &selections.memory_selections {
+        if !m.content.is_empty() {
+            parts.push(m.content.clone());
+        }
+    }
+    parts.push(user_prompt.to_string());
+
+    parts.join("\n\n")
+}
+
 /// Spawn a background task that (re)builds `RepoMap` and writes it into `app.repo_map`.
 /// Safe to call multiple times — each invocation replaces the cached map.
 pub(crate) fn warm_up_repo_map(app: &App) {

@@ -280,6 +280,18 @@ impl MemoryStore {
     ) -> String {
         match self.search_multi(namespaces, query, limit).await {
             Ok(results) if !results.is_empty() => {
+                // M0 instrumentation: expose selected memory IDs + scores so
+                // baselines can measure repeated-context waste across turns.
+                // Safe under V9 §2 "structured APIs land in M3" — no API change.
+                let ids: Vec<i64> = results.iter().map(|r| r.entry.id).collect();
+                let scores: Vec<f32> = results.iter().map(|r| r.score).collect();
+                tracing::info!(
+                    target: "turn_metrics",
+                    memory_ids = ?ids,
+                    memory_scores = ?scores,
+                    memory_count = results.len(),
+                    "memory_selection"
+                );
                 let mut ctx = String::from("[Memory context]:\n");
                 for r in &results {
                     ctx.push_str(&format!(
@@ -289,7 +301,14 @@ impl MemoryStore {
                 }
                 ctx
             }
-            _ => String::new(),
+            _ => {
+                tracing::info!(
+                    target: "turn_metrics",
+                    memory_count = 0usize,
+                    "memory_selection"
+                );
+                String::new()
+            }
         }
     }
 

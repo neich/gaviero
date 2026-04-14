@@ -177,6 +177,37 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                     .append_deferred_summary(&conv_id, &path, additions, deletions);
             }
         }
+        Event::ClaudeSessionStarted { conv_id, session_id } => {
+            if let Some(conv) = app
+                .chat_state
+                .conversations
+                .iter_mut()
+                .find(|c| c.id == conv_id)
+            {
+                if conv.claude_session_id.as_deref() != Some(session_id.as_str()) {
+                    tracing::info!(
+                        "Captured Claude session id for conv {}: {}",
+                        conv_id,
+                        session_id
+                    );
+                    conv.claude_session_id = Some(session_id.clone());
+                }
+                // M1: keep the planner ledger in sync. `record_continuity_handle`
+                // mirrors `claude_session_id`; `record_turn_dispatched` flips
+                // `is_first_turn()` for subsequent sends — equivalent to
+                // today's `claude_session_id.is_none()` check.
+                if let Some(ref mut ledger) = conv.session_ledger {
+                    ledger.record_continuity_handle(
+                        gaviero_core::context_planner::ContinuityHandle::ClaudeSessionId(
+                            session_id,
+                        ),
+                    );
+                    if ledger.is_first_turn() {
+                        ledger.record_turn_dispatched();
+                    }
+                }
+            }
+        }
         Event::AcpTaskCompleted { conv_id, proposals } => {
             tracing::info!(
                 "ACP task completed for conv {} with {} proposals",

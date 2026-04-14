@@ -131,6 +131,17 @@ pub struct Conversation {
     pub auto_approve: bool,
     /// Pending permission request waiting for user approval (y/n).
     pub pending_permission: Option<PendingPermission>,
+    /// Claude's session id, captured from the first turn's `SystemInit` event.
+    /// Subsequent turns pass this back via `--resume <id>` so Claude keeps
+    /// conversation memory server-side and we don't re-send history.
+    pub claude_session_id: Option<String>,
+    /// Per-conversation planner ledger (V9 §4 `SessionLedger`).
+    ///
+    /// **Lazily initialized** on the first send: the model isn't known until
+    /// the user sends, and the `ProviderProfile` factory needs the model.
+    /// Cleared on `reset_conversation` along with `claude_session_id`.
+    /// M4 will persist this across restarts.
+    pub session_ledger: Option<gaviero_core::context_planner::SessionLedger>,
 }
 
 /// Global agent settings read from workspace settings.
@@ -229,6 +240,8 @@ impl AgentChatState {
             streaming_started_at: None,
             auto_approve: false,
             pending_permission: None,
+            claude_session_id: None,
+            session_ledger: None,
         };
         Self {
             conversations: vec![conv],
@@ -646,6 +659,8 @@ impl AgentChatState {
             streaming_started_at: None,
             auto_approve: false,
             pending_permission: None,
+            claude_session_id: None,
+            session_ledger: None,
         };
         self.conversations.push(conv);
         self.active_conv = self.conversations.len() - 1;
@@ -662,6 +677,11 @@ impl AgentChatState {
         conv.streaming_status.clear();
         conv.streaming_started_at = None;
         conv.pending_permission = None;
+        // Drop the Claude session: starting over means bootstrap graph+memory
+        // context again and let Claude allocate a fresh session id.
+        conv.claude_session_id = None;
+        // Drop the planner ledger too — it's tied to the conversation.
+        conv.session_ledger = None;
         self.scroll_offset = 0;
         self.scroll_pinned_to_bottom = true;
         self.text_input.text.clear();
@@ -1528,6 +1548,12 @@ impl AgentChatState {
                     streaming_started_at: None,
                     auto_approve: false,
                     pending_permission: None,
+                    // Persisted conversations don't carry session ids — the
+                    // underlying Claude session was already torn down at shutdown.
+                    // First user message after restore bootstraps a new one.
+                    claude_session_id: None,
+                    // Ledger persistence lands in M4. M1 always restarts it.
+                    session_ledger: None,
                 });
             }
         }

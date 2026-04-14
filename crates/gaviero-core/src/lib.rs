@@ -14,6 +14,7 @@ pub mod git;
 pub mod indent;
 pub mod query_loader;
 pub mod memory;
+pub mod context_planner;
 pub mod swarm;
 pub mod terminal;
 

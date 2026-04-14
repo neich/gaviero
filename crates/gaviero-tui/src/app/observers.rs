@@ -151,4 +151,11 @@ impl AcpObserver for TuiAcpObserver {
             deletions,
         });
     }
+
+    fn on_claude_session_started(&self, session_id: &str) {
+        let _ = self.tx.send(Event::ClaudeSessionStarted {
+            conv_id: self.conv_id.clone(),
+            session_id: session_id.to_string(),
+        });
+    }
 }
