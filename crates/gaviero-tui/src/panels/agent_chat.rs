@@ -140,8 +140,16 @@ pub struct Conversation {
     /// **Lazily initialized** on the first send: the model isn't known until
     /// the user sends, and the `ProviderProfile` factory needs the model.
     /// Cleared on `reset_conversation` along with `claude_session_id`.
-    /// M4 will persist this across restarts.
+    /// M4 persists this across restarts via `pending_persisted_ledger`.
     pub session_ledger: Option<gaviero_core::context_planner::SessionLedger>,
+    /// M4: on restore from disk, the persisted ledger lands here. The
+    /// first send rehydrates [`session_ledger`] by calling
+    /// `SessionLedger::from_persisted` with the current `ProviderProfile`,
+    /// then runs `invalidate_if_fingerprint_changed` to drop the handle
+    /// if the model/toolset has changed since the save. Consumed (taken)
+    /// once rehydration runs.
+    pub pending_persisted_ledger:
+        Option<gaviero_core::context_planner::ledger::PersistedLedger>,
 }
 
 /// Global agent settings read from workspace settings.
@@ -242,6 +250,7 @@ impl AgentChatState {
             pending_permission: None,
             claude_session_id: None,
             session_ledger: None,
+            pending_persisted_ledger: None,
         };
         Self {
             conversations: vec![conv],
@@ -661,6 +670,7 @@ impl AgentChatState {
             pending_permission: None,
             claude_session_id: None,
             session_ledger: None,
+            pending_persisted_ledger: None,
         };
         self.conversations.push(conv);
         self.active_conv = self.conversations.len() - 1;
@@ -682,6 +692,7 @@ impl AgentChatState {
         conv.claude_session_id = None;
         // Drop the planner ledger too — it's tied to the conversation.
         conv.session_ledger = None;
+        conv.pending_persisted_ledger = None;
         self.scroll_offset = 0;
         self.scroll_pinned_to_bottom = true;
         self.text_input.text.clear();
@@ -1536,6 +1547,35 @@ impl AgentChatState {
                         tool_calls: m.tool_calls,
                     })
                     .collect();
+                // V9 §11 M4: restore the planner ledger and legacy
+                // `claude_session_id` from disk so the first post-restart
+                // turn can attempt resume. Fingerprint validation happens
+                // lazily in `side_panel::send_chat_message` when the
+                // current `ProviderProfile` is known — a model change
+                // between sessions invalidates the handle there.
+                //
+                // Priority: prefer `session_ledger` (full state incl.
+                // fingerprint + turn_count); fall back to bare
+                // `continuity_handle` if an older reader/writer produced
+                // only that. No handle at all → fresh bootstrap next turn.
+                let claude_session_id = match (&stored.session_ledger, &stored.continuity_handle) {
+                    (Some(l), _) => match &l.continuity_handle {
+                        Some(gaviero_core::context_planner::ContinuityHandle::ClaudeSessionId(
+                            id,
+                        )) => Some(id.clone()),
+                        _ => None,
+                    },
+                    (None, Some(gaviero_core::context_planner::ContinuityHandle::ClaudeSessionId(
+                        id,
+                    ))) => Some(id.clone()),
+                    _ => None,
+                };
+                // The full ledger is reconstructed on demand at send time
+                // (needs the current ProviderProfile — unavailable here).
+                // For now stash the persisted bytes back onto the conv so
+                // the send path can call `SessionLedger::from_persisted`.
+                let pending_ledger = stored.session_ledger;
+
                 self.conversations.push(Conversation {
                     id: stored.id,
                     title: stored.title,
@@ -1548,12 +1588,12 @@ impl AgentChatState {
                     streaming_started_at: None,
                     auto_approve: false,
                     pending_permission: None,
-                    // Persisted conversations don't carry session ids — the
-                    // underlying Claude session was already torn down at shutdown.
-                    // First user message after restore bootstraps a new one.
-                    claude_session_id: None,
-                    // Ledger persistence lands in M4. M1 always restarts it.
+                    claude_session_id,
+                    // M4: in-memory ledger is rehydrated at send time from
+                    // `pending_persisted_ledger` once the ProviderProfile
+                    // is known. Initially None (lazy-init still triggers).
                     session_ledger: None,
+                    pending_persisted_ledger: pending_ledger,
                 });
             }
         }
@@ -1602,6 +1642,14 @@ impl AgentChatState {
                 updated: ss::now_unix(),
                 model_override: conv.model_override.clone(),
                 effort_override: conv.effort_override.clone(),
+                // V9 §11 M4: persist planner ledger so first post-restart
+                // turn can attempt resume and recover read-file cache +
+                // thinking state. Fingerprint is part of the ledger and
+                // invalidates the handle on model/toolset change.
+                session_ledger: conv.session_ledger.as_ref().map(|l| l.to_persisted()),
+                continuity_handle: conv.session_ledger.as_ref().and_then(|l| {
+                    l.continuity_handle.clone()
+                }),
             };
 
             summaries.push(ss::ConversationSummary {
