@@ -749,17 +749,68 @@ pub(super) fn send_chat_message(app: &mut App) {
         }
     }
 
-    let context: Vec<(String, String)> = app
+    // Claude session reuse: on the first turn of a conversation,
+    // `resume_session_id` is None and we send bootstrap context (graph +
+    // memory + prior history). Claude replies with a `SystemInit` event
+    // carrying a fresh session id, which the controller stores on the
+    // `Conversation`. On every subsequent turn we pass that id back via
+    // `--resume` and send only the new user message — Claude retains
+    // history server-side, eliminating per-turn tempfile bloat.
+    let resume_session_id = app
         .chat_state
-        .context_messages()
-        .into_iter()
-        .rev()
-        .skip(1)
-        .rev()
-        .map(|(r, c)| (r.to_string(), c.to_string()))
-        .collect();
+        .conversations
+        .get(app.chat_state.active_conv)
+        .and_then(|c| c.claude_session_id.clone());
 
     let model = app.chat_state.effective_model().to_string();
+
+    // M1: lazy-init the per-conversation SessionLedger now that we know the
+    // model (needed by the ProviderProfile factory). The ledger is the
+    // canonical first-turn check (V9 §11 M1: "Ledger replaces ad-hoc
+    // is_first_turn logic"). Today's `claude_session_id.is_none()` and
+    // `ledger.is_first_turn()` are equivalent — the M4 invalidation logic
+    // makes them diverge meaningfully when persisted state goes stale.
+    let runtime = gaviero_core::context_planner::RuntimeConfig {
+        ollama_base_url: Some(app.chat_state.agent_settings.ollama_base_url.clone()),
+    };
+    let provider_profile = gaviero_core::context_planner::build_provider_profile(
+        &gaviero_core::context_planner::ModelSpec::parse(&model),
+        &runtime,
+    );
+    {
+        let conv = &mut app.chat_state.conversations[app.chat_state.active_conv];
+        if conv.session_ledger.is_none() {
+            let fp = gaviero_core::context_planner::PlannerFingerprint::from_profile(
+                &provider_profile,
+            );
+            conv.session_ledger = Some(gaviero_core::context_planner::SessionLedger::new(
+                &provider_profile,
+                fp,
+            ));
+        }
+    }
+    let is_first_turn = app.chat_state.conversations[app.chat_state.active_conv]
+        .session_ledger
+        .as_ref()
+        .map(|l| l.is_first_turn())
+        .unwrap_or(true);
+
+    // Conversation history is only inlined on the first turn. On resumed
+    // turns Claude already has it and re-sending wastes tokens + risks
+    // Claude's Read-tool size limits on the prompt tempfile.
+    let context: Vec<(String, String)> = if is_first_turn {
+        app.chat_state
+            .context_messages()
+            .into_iter()
+            .rev()
+            .skip(1)
+            .rev()
+            .map(|(r, c)| (r.to_string(), c.to_string()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let effort = app.chat_state.effective_effort().to_string();
     let max_tokens = app.chat_state.agent_settings.max_tokens;
     let auto_approve = app.chat_state.effective_auto_approve();
@@ -769,6 +820,7 @@ pub(super) fn send_chat_message(app: &mut App) {
         effort,
         max_tokens,
         auto_approve,
+        resume_session_id,
     };
 
     let memory = app.memory.clone();
@@ -790,6 +842,16 @@ pub(super) fn send_chat_message(app: &mut App) {
     graph_seeds.sort();
     graph_seeds.dedup();
 
+    // Snapshot the ledger for the spawn task. The planner only reads it in
+    // M1 (no mutation), so a clone is safe. The canonical ledger lives on
+    // the Conversation and is updated by the SystemInit event handler in
+    // the controller — same lifecycle as `claude_session_id`.
+    let ledger_snapshot = app.chat_state.conversations[app.chat_state.active_conv]
+        .session_ledger
+        .clone()
+        .expect("session_ledger initialized above");
+    let provider_profile_clone = provider_profile.clone();
+
     let conv_id_clone = conv_id.clone();
     let task = tokio::spawn(async move {
         {
@@ -798,44 +860,91 @@ pub(super) fn send_chat_message(app: &mut App) {
             gate.set_mode(WriteMode::Deferred);
         }
 
-        // Graph-backed source context: ranked outline + impact radius for the seeds.
-        // This narrows what the LLM needs to pull via Read/Grep and is prepended to memory context.
-        let graph_ctx = crate::app::session::build_graph_context(
-            repo_map_cache,
-            graph_root,
-            graph_seeds,
-            graph_budget_tokens,
-        )
-        .await;
-
-        let mem_ctx = if let Some(ref mem) = memory {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                mem.search_context(&read_ns, &prompt, 5),
+        // Graph + memory context is a one-time bootstrap — sent on turn 1,
+        // skipped on resumed turns. Claude holds the context server-side
+        // via `--resume`, so re-injecting it costs tokens and risks the
+        // Read-tool size limit on the prompt tempfile.
+        let graph_ctx = if is_first_turn {
+            crate::app::session::build_graph_context(
+                repo_map_cache,
+                graph_root,
+                graph_seeds,
+                graph_budget_tokens,
             )
             .await
-            {
-                Ok(ctx) => ctx,
-                Err(_) => {
-                    tracing::warn!(
-                        "Memory search timed out after 5s, proceeding without context"
-                    );
-                    String::new()
+        } else {
+            String::new()
+        };
+
+        let mem_ctx = if is_first_turn {
+            if let Some(ref mem) = memory {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    mem.search_context(&read_ns, &prompt, 5),
+                )
+                .await
+                {
+                    Ok(ctx) => ctx,
+                    Err(_) => {
+                        tracing::warn!(
+                            "Memory search timed out after 5s, proceeding without context"
+                        );
+                        String::new()
+                    }
                 }
+            } else {
+                String::new()
             }
         } else {
             String::new()
         };
 
-        let mut parts: Vec<String> = Vec::new();
-        if !graph_ctx.is_empty() {
-            parts.push(graph_ctx);
-        }
-        if !mem_ctx.is_empty() {
-            parts.push(mem_ctx);
-        }
-        parts.push(prompt.clone());
-        let enriched_prompt = parts.join("\n\n");
+        // M1: route through the planner. The planner wraps the
+        // pre-fetched graph and memory strings into structured selections;
+        // `render_chat_selections` produces a byte-identical enriched
+        // prompt to the legacy `parts.join("\n\n")` assembly. M2 will
+        // move the graph/memory I/O into the planner itself and remove
+        // the pre_fetched_* carriers.
+        let mut local_ledger = ledger_snapshot;
+        let planner_input = gaviero_core::context_planner::PlannerInput {
+            user_message: &prompt,
+            explicit_refs: &[],
+            seed_paths: &[],
+            provider_profile: &provider_profile_clone,
+            read_namespaces: &[],
+            graph_budget_tokens: 0,
+            memory_query_override: None,
+            memory_limit: 0,
+            file_ref_blobs: &[],
+            pre_fetched_impact_text: None,
+            pre_fetched_graph_context: if graph_ctx.is_empty() {
+                None
+            } else {
+                Some(graph_ctx.as_str())
+            },
+            pre_fetched_memory_context: if mem_ctx.is_empty() {
+                None
+            } else {
+                Some(mem_ctx.as_str())
+            },
+        };
+        let selections = {
+            let mut planner = gaviero_core::context_planner::ContextPlanner {
+                memory: None,
+                repo_map: None,
+                ledger: &mut local_ledger,
+                workspace_root: std::path::Path::new("."),
+            };
+            match planner.plan(&planner_input).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("planner error: {}", e);
+                    gaviero_core::context_planner::PlannerSelections::default()
+                }
+            }
+        };
+
+        let enriched_prompt = crate::app::session::render_chat_selections(&selections, &prompt);
 
         let observer = TuiAcpObserver {
             tx: tx.clone(),
