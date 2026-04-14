@@ -60,6 +60,12 @@ pub trait AcpObserver: Send + Sync {
 
     /// Called when a validation failure triggers an agent retry.
     fn on_validation_retry(&self, _attempt: u8, _max_retries: u8) {}
+
+    /// Called once per subprocess with the Claude session id captured from
+    /// the `SystemInit` event. Consumers can persist this and pass it back
+    /// via `AgentOptions::resume_session_id` on the next turn so Claude
+    /// retains model context. Default no-op for observers that don't care.
+    fn on_claude_session_started(&self, _session_id: &str) {}
 }
 
 /// Observer trait for swarm orchestration events.
