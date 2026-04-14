@@ -10,9 +10,11 @@
 //! and wraps the legacy concatenated strings in single-entry `MemorySelection`
 //! / `GraphSelection` records. M3 will widen to one entry per ranked item.
 
+pub mod compaction;
 pub mod ledger;
 pub mod types;
 
+pub use compaction::{compact_replay, should_compact, CompactionPolicy};
 pub use ledger::{
     CompactionRecord, ContentDigest, GraphDecision, PlannerFingerprint, Role, SessionLedger,
 };
