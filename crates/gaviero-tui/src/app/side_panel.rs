@@ -756,12 +756,6 @@ pub(super) fn send_chat_message(app: &mut App) {
     // `Conversation`. On every subsequent turn we pass that id back via
     // `--resume` and send only the new user message — Claude retains
     // history server-side, eliminating per-turn tempfile bloat.
-    let resume_session_id = app
-        .chat_state
-        .conversations
-        .get(app.chat_state.active_conv)
-        .and_then(|c| c.claude_session_id.clone());
-
     let model = app.chat_state.effective_model().to_string();
 
     // M1: lazy-init the per-conversation SessionLedger now that we know the
@@ -779,16 +773,49 @@ pub(super) fn send_chat_message(app: &mut App) {
     );
     {
         let conv = &mut app.chat_state.conversations[app.chat_state.active_conv];
+        let current_fp = gaviero_core::context_planner::PlannerFingerprint::from_profile(
+            &provider_profile,
+        );
+        // Step 1: rehydrate or lazy-init the ledger.
         if conv.session_ledger.is_none() {
-            let fp = gaviero_core::context_planner::PlannerFingerprint::from_profile(
-                &provider_profile,
-            );
-            conv.session_ledger = Some(gaviero_core::context_planner::SessionLedger::new(
-                &provider_profile,
-                fp,
-            ));
+            // M4: if this is the first send after restore from disk,
+            // rehydrate the ledger from persisted state. Otherwise start a
+            // fresh ledger seeded from the current profile.
+            let ledger = match conv.pending_persisted_ledger.take() {
+                Some(persisted) => gaviero_core::context_planner::SessionLedger::from_persisted(
+                    persisted,
+                    &provider_profile,
+                ),
+                None => gaviero_core::context_planner::SessionLedger::new(
+                    &provider_profile,
+                    current_fp.clone(),
+                ),
+            };
+            conv.session_ledger = Some(ledger);
+        }
+        // Step 2: run the fingerprint check on EVERY send, not only on
+        // lazy-init. The model can change mid-conversation via `/model`,
+        // which must invalidate the handle so haiku doesn't silently
+        // resume a session Claude opened under sonnet. V9 §11 M4
+        // acceptance: "Model change invalidates stored handle".
+        if let Some(ref mut ledger) = conv.session_ledger {
+            if ledger.invalidate_if_fingerprint_changed(&current_fp) {
+                // Also drop the legacy `claude_session_id` mirror so the
+                // next turn passes no `--resume` flag.
+                conv.claude_session_id = None;
+            }
         }
     }
+    // Read the (possibly invalidated) legacy handle AFTER the lazy-init
+    // block above — `invalidate_if_fingerprint_changed` may have cleared
+    // it when the model changed since save. Reading earlier would leak
+    // the stale id into `AgentOptions::resume_session_id` and Claude
+    // would silently accept the old session, defeating the invalidation.
+    let resume_session_id = app
+        .chat_state
+        .conversations
+        .get(app.chat_state.active_conv)
+        .and_then(|c| c.claude_session_id.clone());
     let is_first_turn = app.chat_state.conversations[app.chat_state.active_conv]
         .session_ledger
         .as_ref()
