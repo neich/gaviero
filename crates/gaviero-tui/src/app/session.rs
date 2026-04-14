@@ -279,12 +279,14 @@ mod tests {
 /// **Byte-identical guarantee** (M1, preserved through M3) — the output of
 /// this function for selections produced by
 /// [`gaviero_core::context_planner::ContextPlanner::plan`] must equal the
-/// chat path's pre-M1 `parts.join("\n\n")` assembly. M3 delegates the
-/// graph/memory block rendering to the shared helpers in
-/// `swarm/backend/shared.rs` so structured (M3) and pre-rendered (M2
-/// carrier) selections format the same way across chat and swarm.
+/// chat path's pre-M1 `parts.join("\n\n")` assembly.
 ///
-/// Order: graph block, memory block, user prompt. Joined with `"\n\n"`.
+/// **M5 status: parity reference.** The chat path now dispatches through
+/// `AgentSession`, whose legacy shim does its own rendering inside
+/// `agent_session::LegacyAgentSession::send_turn` (calling the same
+/// `swarm::backend::shared::render_{graph,memory}_block` helpers). This
+/// function is retained for tests and as a parity reference until M10.
+#[allow(dead_code)]
 pub(crate) fn render_chat_selections(
     selections: &gaviero_core::context_planner::PlannerSelections,
     user_prompt: &str,
