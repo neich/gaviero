@@ -26,10 +26,11 @@ use crate::write_gate::WriteGatePipeline;
 
 use crate::context_planner::ContinuityMode;
 
-use super::{AgentSession, LegacyAgentSession};
+use super::AgentSession;
 use super::claude::ClaudeSession;
 use super::codex_app_server::CodexAppServerSession;
 use super::codex_exec::CodexExecSession;
+use super::ollama::OllamaSession;
 
 /// Inputs the shim needs. Named struct (not positional args) so adding a
 /// per-session field is additive; new providers drop the ones they don't
@@ -54,7 +55,7 @@ pub struct SessionConstruction {
 /// M6: `NativeResume` (Claude) returns `ClaudeSession`.
 /// M8: `ProcessBound` (Codex app-server) returns `CodexAppServerSession`;
 ///     `StatelessReplay` Codex exec returns `CodexExecSession`.
-/// M9: remaining `StatelessReplay` (Ollama) will return `OllamaSession`.
+/// M9: `StatelessReplay` Ollama (and local:) returns `OllamaSession`.
 pub fn create_session(args: SessionConstruction) -> Box<dyn AgentSession> {
     match args.profile.continuity_mode {
         ContinuityMode::NativeResume => {
@@ -69,21 +70,15 @@ pub fn create_session(args: SessionConstruction) -> Box<dyn AgentSession> {
         }
         ContinuityMode::StatelessReplay => {
             if args.profile.provider == "codex" {
-                // M8: `codex exec` — named type distinct from the generic shim.
+                // M8: `codex exec` — named type distinct from Ollama so the
+                // registry can route them independently and M10 has separate
+                // deletion targets.
                 Box::new(CodexExecSession::new(args))
             } else {
-                // M9: Ollama and other StatelessReplay providers still use the
-                // legacy shim until OllamaSession lands.
-                Box::new(LegacyAgentSession::new(
-                    args.write_gate,
-                    args.observer,
-                    args.model,
-                    args.ollama_base_url,
-                    args.workspace_root,
-                    args.agent_id,
-                    args.options,
-                    args.profile,
-                ))
+                // M9: Ollama (and future StatelessReplay providers) get a
+                // bounded session that applies compaction before forwarding
+                // to the Ollama backend.
+                Box::new(OllamaSession::new(args))
             }
         }
     }
