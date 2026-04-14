@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use tokio::sync::{Mutex, Semaphore};
 
 use super::board::SharedBoard;
+use super::context_bundle::build_bundle;
 use super::router::{TierConfig, TierRouter};
 use super::bus::AgentBus;
 use super::coordinator::{Coordinator, CoordinatorConfig};
@@ -213,6 +214,9 @@ pub async fn execute(
                 }
                 map
             }),
+            // Single-agent fast path: no bundle pre-fetch (1 coordinator query
+            // + 1 runner query = 2, already within M7 ≤2 gate).
+            pre_fetched_memory: Arc::new(None),
         };
 
         invalidate_stale_sources(&memory, &unit, &config.workspace_root).await;
@@ -350,6 +354,29 @@ pub async fn execute(
         map
     });
 
+    // M7: Build SwarmContextBundle — one shared memory query for all work units.
+    //
+    // The coordinator already issues one DB query (coordinator.plan).  This
+    // second query covers all units' topics so each runner receives
+    // pre-fetched candidates and issues zero additional DB ops.
+    // Total for N-unit swarm: coordinator(1) + bundle(1) = 2 ≤ M7 gate.
+    //
+    // Architectural intent: concatenate all work-unit descriptions so the
+    // query captures the full swarm scope.
+    let swarm_intent: String = work_units
+        .iter()
+        .map(|u| u.description.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let bundle = build_bundle(
+        &swarm_intent,
+        memory.as_deref(),
+        &config.read_namespaces,
+        10,
+    )
+    .await;
+    let pre_fetched_memory: Arc<Option<String>> = Arc::new(bundle.memory_text_for_prompt());
+
     // Inter-agent communication bus (available for future coordination)
     let bus = Arc::new(tokio::sync::Mutex::new(AgentBus::new()));
     // Register all agents upfront so they can send messages to each other
@@ -419,6 +446,7 @@ pub async fn execute(
                     board: Some(shared_board.clone()),
                     repo_map: repo_map.clone(),
                     impact_texts: impact_texts.clone(),
+                    pre_fetched_memory: pre_fetched_memory.clone(),
                 };
                 let manifest = run_single_agent(
                     unit,
@@ -485,6 +513,7 @@ pub async fn execute(
                 let agent_impact = impact_texts.get(unit_id).cloned();
                 let router = tier_router.clone();
                 let iteration_config = plan.iteration_config.clone();
+                let pfm = pre_fetched_memory.clone();
                 if let Ok(backend) = resolve_backend_for_unit(&router, &unit) {
                     observer.on_tier_dispatch(unit_id, unit.tier, backend.name());
                 }
@@ -519,6 +548,7 @@ pub async fn execute(
                             board_ref.as_deref(),
                             (*rm).as_ref(),
                             agent_impact.as_deref(),
+                            (*pfm).as_deref(),
                             |candidate| resolve_backend_for_unit(&router, candidate),
                         )
                         .await
@@ -666,6 +696,7 @@ pub async fn execute(
                     board: Some(shared_board.clone()),
                     repo_map: repo_map.clone(),
                     impact_texts: impact_texts.clone(),
+                    pre_fetched_memory: pre_fetched_memory.clone(),
                 };
                 let manifest = run_single_agent(
                     unit,
@@ -817,6 +848,11 @@ struct AgentRunContext<'a> {
     repo_map: Arc<Option<crate::repo_map::RepoMap>>,
     /// Pre-computed impact analysis text per agent (from code knowledge graph).
     impact_texts: Arc<std::collections::HashMap<String, String>>,
+    /// Shared memory text pre-fetched for all runners (M7 bundle query, 1 DB op).
+    ///
+    /// `Some(text)` → planner skips per-runner DB query; `None` → fallback to
+    /// per-runner query (single-agent fast path does not pre-fetch).
+    pre_fetched_memory: Arc<Option<String>>,
 }
 
 /// Run a single agent, optionally in a worktree.
@@ -838,6 +874,7 @@ async fn run_single_agent(
     let board = ctx.board.clone();
     let repo_map = ctx.repo_map.clone();
     let impact_text = ctx.impact_texts.get(&unit.id).cloned();
+    let pre_fetched_memory_text = (*ctx.pre_fetched_memory).clone();
     let in_worktree = worktree_mgr.is_some();
     let agent_root = if let Some(mgr) = worktree_mgr {
         let handle = mgr.provision(&unit.id)?;
@@ -871,6 +908,7 @@ async fn run_single_agent(
             board.as_deref(),
             (*repo_map).as_ref(),
             impact_text.as_deref(),
+            pre_fetched_memory_text.as_deref(),
             |candidate| {
                 let backend = resolve_backend_for_unit(tier_router, candidate)?;
                 swarm_observer.on_tier_dispatch(&candidate.id, candidate.tier, backend.name());
