@@ -25,10 +25,23 @@ pub async fn complete_to_text(
     observer: Option<&dyn AcpObserver>,
 ) -> Result<CompletionOutcome> {
     validate_request(backend, &request)?;
+    // M0 instrumentation: log prompt size at dispatch so we know what the
+    // backend saw vs. what the planner will emit in later milestones.
+    tracing::info!(
+        target: "turn_metrics",
+        backend = backend.name(),
+        prompt_chars = request.prompt.len(),
+        history_entries = request.conversation_history.len(),
+        file_refs = request.file_refs.len(),
+        file_attachments = request.file_attachments.len(),
+        "backend_dispatch"
+    );
+    let backend_name = backend.name().to_string();
     let mut stream = backend.stream_completion(request).await?;
     let mut outcome = CompletionOutcome::default();
     let mut in_thinking = false;
     let mut error: Option<String> = None;
+    let mut read_count: usize = 0;
 
     while let Some(event_result) = stream.next().await {
         let event = event_result?;
@@ -57,6 +70,9 @@ pub async fn complete_to_text(
                 }
             }
             UnifiedStreamEvent::ToolCallStart { name, .. } => {
+                if name == "Read" {
+                    read_count += 1;
+                }
                 if let Some(obs) = observer {
                     obs.on_tool_call_started(&name);
                     obs.on_streaming_status(&format!("Using {}...", name));
@@ -66,6 +82,15 @@ pub async fn complete_to_text(
             UnifiedStreamEvent::ToolCallEnd { .. } => {}
             UnifiedStreamEvent::FileBlock { .. } => {}
             UnifiedStreamEvent::Usage(usage) => {
+                // M0 instrumentation: log provider-reported token usage.
+                tracing::info!(
+                    target: "turn_metrics",
+                    backend = %backend_name,
+                    input_tokens = usage.input_tokens,
+                    output_tokens = usage.output_tokens,
+                    duration_ms = ?usage.duration_ms,
+                    "token_usage"
+                );
                 outcome.usage = Some(usage);
             }
             UnifiedStreamEvent::Error(msg) => {
@@ -83,6 +108,14 @@ pub async fn complete_to_text(
             obs.on_stream_chunk("\n</think>\n");
         }
     }
+
+    // M0 instrumentation: emit per-turn Read tool count.
+    tracing::info!(
+        target: "turn_metrics",
+        backend = %backend_name,
+        read_count,
+        "turn_read_count"
+    );
 
     if let Some(obs) = observer {
         obs.on_message_complete("assistant", &outcome.text);
@@ -103,12 +136,25 @@ pub async fn complete_to_write_gate(
     agent_id: &str,
 ) -> Result<CompletionOutcome> {
     validate_request(backend, &request)?;
+    // M0 instrumentation: log prompt size at dispatch.
+    tracing::info!(
+        target: "turn_metrics",
+        backend = backend.name(),
+        agent_id,
+        prompt_chars = request.prompt.len(),
+        history_entries = request.conversation_history.len(),
+        file_refs = request.file_refs.len(),
+        file_attachments = request.file_attachments.len(),
+        "backend_dispatch"
+    );
+    let backend_name = backend.name().to_string();
     let workspace_root = request.workspace_root.clone();
     let mut stream = backend.stream_completion(request).await?;
     let mut modified_files = HashSet::new();
     let mut outcome = CompletionOutcome::default();
     let mut in_thinking = false;
     let mut error: Option<String> = None;
+    let mut read_count: usize = 0;
 
     while let Some(event_result) = stream.next().await {
         let event = event_result?;
@@ -129,6 +175,9 @@ pub async fn complete_to_write_gate(
                 observer.on_stream_chunk(&text);
             }
             UnifiedStreamEvent::ToolCallStart { name, .. } => {
+                if name == "Read" {
+                    read_count += 1;
+                }
                 observer.on_tool_call_started(&name);
                 observer.on_streaming_status(&format!("Using {}...", name));
             }
@@ -149,6 +198,16 @@ pub async fn complete_to_write_gate(
                 }
             }
             UnifiedStreamEvent::Usage(usage) => {
+                // M0 instrumentation: log provider-reported token usage.
+                tracing::info!(
+                    target: "turn_metrics",
+                    backend = %backend_name,
+                    agent_id,
+                    input_tokens = usage.input_tokens,
+                    output_tokens = usage.output_tokens,
+                    duration_ms = ?usage.duration_ms,
+                    "token_usage"
+                );
                 outcome.usage = Some(usage);
             }
             UnifiedStreamEvent::Error(msg) => {
@@ -164,6 +223,15 @@ pub async fn complete_to_write_gate(
     if in_thinking {
         observer.on_stream_chunk("\n</think>\n");
     }
+
+    // M0 instrumentation: emit per-turn Read tool count.
+    tracing::info!(
+        target: "turn_metrics",
+        backend = %backend_name,
+        agent_id,
+        read_count,
+        "turn_read_count"
+    );
 
     observer.on_message_complete("assistant", &outcome.text);
     outcome.modified_files = modified_files.into_iter().collect();
