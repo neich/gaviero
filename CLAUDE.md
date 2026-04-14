@@ -56,3 +56,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md).
 
 - Use context7 MCP for library docs.
 - MCP memory: namespace `Gaviero`. Store memories AI-optimized, not human-readable.
+
+## Response instructions for complex prompt requiring planning
+
+- Always performa a critical analysys of what the user is asking
+- Do not try to execute the prompt just because the users wants to. If you find problems or bad decissions, just tell the user
+- Always be explicit and honest with the risks of user's intentions
+- If possible, propose alternatives with critical comparison 
