@@ -108,6 +108,7 @@ impl TestGenerator {
             None,
             None,
             None, // no graph store for test generation
+            None, // no pre-fetched memory for test generation
         )
         .await
         {

@@ -34,7 +34,7 @@ use super::{AgentBackend, CompletionRequest, UnifiedStreamEvent};
 /// When `repo_map` is provided, a ranked context outline is prepended to the
 /// agent's base prompt so that even cheap-tier models have optimal scope.
 #[tracing::instrument(
-    skip(backend, write_gate, memory, observer, validation, board, repo_map, impact_text),
+    skip(backend, write_gate, memory, observer, validation, board, repo_map, impact_text, pre_fetched_memory),
     fields(
         agent_id = %work_unit.id,
         tier = ?work_unit.tier,
@@ -54,6 +54,9 @@ pub async fn run_backend(
     board: Option<&SharedBoard>,
     repo_map: Option<&RepoMap>,
     impact_text: Option<&str>,
+    // M7: pre-fetched memory text from SwarmContextBundle. Some → planner
+    // skips its own DB query. None → per-runner query (single-agent / tests).
+    pre_fetched_memory: Option<&str>,
 ) -> Result<AgentManifest> {
     let agent_id = format!("agent-{}", work_unit.id);
 
@@ -103,9 +106,10 @@ pub async fn run_backend(
         memory_limit,
         file_ref_blobs: &[],
         pre_fetched_impact_text: impact_text,
-        // Swarm path: planner queries memory + RepoMap directly.
         pre_fetched_graph_context: None,
-        pre_fetched_memory_context: None,
+        // M7: use bundle-pre-fetched memory when available; planner
+        // short-circuits its DB query when this field is Some.
+        pre_fetched_memory_context: pre_fetched_memory,
     };
 
     let selections = {
@@ -655,6 +659,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -689,6 +694,7 @@ mod tests {
             None,
             &["default".to_string()],
             &observer,
+            None,
             None,
             None,
             None,
@@ -736,6 +742,7 @@ mod tests {
             None,
             &["default".to_string()],
             &observer,
+            None,
             None,
             None,
             None,
@@ -791,6 +798,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -820,6 +828,7 @@ mod tests {
             None,
             &["default".to_string()],
             &observer,
+            None,
             None,
             None,
             None,

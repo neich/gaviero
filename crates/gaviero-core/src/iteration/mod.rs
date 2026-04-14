@@ -135,6 +135,7 @@ impl IterationEngine {
         board: Option<&SharedBoard>,
         repo_map: Option<&RepoMap>,
         impact_text: Option<&str>,
+        pre_fetched_memory: Option<&str>,
     ) -> IterationResult {
         let n_attempts = match &self.config.strategy {
             Strategy::SinglePass => 1,
@@ -181,6 +182,7 @@ impl IterationEngine {
                 board,
                 repo_map,
                 impact_text,
+                pre_fetched_memory,
             )
             .await
             {
@@ -257,6 +259,7 @@ impl IterationEngine {
         board: Option<&SharedBoard>,
         repo_map: Option<&RepoMap>,
         impact_text: Option<&str>,
+        pre_fetched_memory: Option<&str>,
         resolve_backend: F,
     ) -> IterationResult
     where
@@ -319,6 +322,7 @@ impl IterationEngine {
                     board,
                     repo_map,
                     impact_text,
+                    pre_fetched_memory,
                 )
                 .await
                 {
@@ -510,6 +514,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await;
         assert_eq!(result.attempts_run, 1);
@@ -534,6 +539,7 @@ mod tests {
                 None,
                 &[],
                 &NoopObserver,
+                None,
                 None,
                 None,
                 None,
@@ -563,6 +569,7 @@ mod tests {
                 None,
                 &[],
                 &NoopObserver,
+                None,
                 None,
                 None,
                 None,
