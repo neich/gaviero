@@ -665,6 +665,39 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 return;
             }
             if app.chat_state.chat_dragging {
+                // Auto-scroll if dragging above/below the chat area, then extend
+                // the selection to the top/bottom visible line.
+                if let Some(area) = app.chat_state.conv_area_cache {
+                    if row < area.y {
+                        app.chat_state.scroll_offset =
+                            app.chat_state.scroll_offset.saturating_sub(1);
+                        let line = app.chat_state.scroll_offset;
+                        let col_in_line = col.saturating_sub(area.x) as usize;
+                        let line_len = app.chat_state.rendered_lines_cache
+                            .get(line)
+                            .map(|(l, _)| l.chars().count())
+                            .unwrap_or(0);
+                        app.chat_state.extend_text_selection(line, col_in_line.min(line_len));
+                        return;
+                    } else if row >= area.y + area.height {
+                        let total = app.chat_state.rendered_lines_cache.len();
+                        let viewport = area.height as usize;
+                        let max_scroll = total.saturating_sub(viewport);
+                        if app.chat_state.scroll_offset < max_scroll {
+                            app.chat_state.scroll_offset += 1;
+                        }
+                        let line = (app.chat_state.scroll_offset + viewport)
+                            .min(total)
+                            .saturating_sub(1);
+                        let col_in_line = col.saturating_sub(area.x) as usize;
+                        let line_len = app.chat_state.rendered_lines_cache
+                            .get(line)
+                            .map(|(l, _)| l.chars().count())
+                            .unwrap_or(0);
+                        app.chat_state.extend_text_selection(line, col_in_line.min(line_len));
+                        return;
+                    }
+                }
                 if let Some((line, ci)) = app.chat_state.screen_to_text_pos(col, row) {
                     app.chat_state.extend_text_selection(line, ci);
                 }
