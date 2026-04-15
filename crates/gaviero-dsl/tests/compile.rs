@@ -477,39 +477,51 @@ fn template_plan_refinement() {
     let plan = compile_example_plan("plan_refinement.gaviero");
     let units = plan.work_units_ordered().expect("toposort");
 
-    // 4 agents: 2 init + 2 refine
+    // 4 agents: 2 init + 2 refine (separate focused prompts per phase)
     assert_eq!(units.len(), 4);
-    assert_eq!(units[0].id, "claude-plan-init");
-    assert_eq!(units[1].id, "codex-plan-init");
 
-    // Init agents use expensive tier and are isolated (no read-only paths)
-    assert_eq!(units[0].tier, gaviero_core::types::ModelTier::Expensive);
-    assert_eq!(units[1].tier, gaviero_core::types::ModelTier::Expensive);
-    assert!(units[0].scope.read_only_paths.is_empty(), "init agent must not have read-only scope");
-    assert!(units[1].scope.read_only_paths.is_empty(), "init agent must not have read-only scope");
+    let cinit   = units.iter().find(|u| u.id == "claude-init").expect("claude-init");
+    let xinit   = units.iter().find(|u| u.id == "codex-init").expect("codex-init");
+    let crefine = units.iter().find(|u| u.id == "claude-refine").expect("claude-refine");
+    let xrefine = units.iter().find(|u| u.id == "codex-refine").expect("codex-refine");
 
-    // Refine agents resolve the shared named prompt; {{AGENT}} is substituted
-    let claude = units.iter().find(|u| u.id == "claude").expect("claude agent");
-    let codex  = units.iter().find(|u| u.id == "codex").expect("codex agent");
-    assert!(claude.coordinator_instructions.contains("claude-plan-v{N+1}.md"),
-        "claude prompt should contain claude-plan-v{{N+1}}.md, got: {}", claude.coordinator_instructions);
-    assert!(codex.coordinator_instructions.contains("codex-plan-v{N+1}.md"),
-        "codex prompt should contain codex-plan-v{{N+1}}.md, got: {}", codex.coordinator_instructions);
-    // Each agent also writes a per-version summary file
-    assert!(claude.coordinator_instructions.contains("claude-summary_v{N+1}.md"),
-        "claude prompt should contain claude-summary_v{{N+1}}.md");
-    assert!(codex.coordinator_instructions.contains("codex-summary_v{N+1}.md"),
-        "codex prompt should contain codex-summary_v{{N+1}}.md");
+    // All use expensive tier
+    for u in &[cinit, xinit, crefine, xrefine] {
+        assert_eq!(u.tier, gaviero_core::types::ModelTier::Expensive,
+            "agent {} should be expensive", u.id);
+    }
 
-    // Both refine agents write to the same memory namespace
-    assert_eq!(claude.write_namespace.as_deref(), Some("plan-evolution"));
-    assert_eq!(codex.write_namespace.as_deref(), Some("plan-evolution"));
+    // Init agents: vars (MODEL_NAME, PLANS) substituted at compile time; no ITER
+    assert!(cinit.coordinator_instructions.contains("claude-plan-v1.md"),
+        "claude-init prompt should reference claude-plan-v1.md");
+    assert!(xinit.coordinator_instructions.contains("codex-plan-v1.md"),
+        "codex-init prompt should reference codex-plan-v1.md");
+    assert!(!cinit.coordinator_instructions.contains("{{ITER}}"),
+        "init prompt should not contain {{ITER}}");
 
-    // Loop config: 2 agents, 5 iterations
+    // Refine agents: vars substituted; ITER/PREV_ITER survive for runtime
+    assert!(crefine.coordinator_instructions.contains("claude-plan-v{{ITER}}.md"),
+        "claude-refine should reference claude-plan-v{{ITER}}.md");
+    assert!(xrefine.coordinator_instructions.contains("codex-plan-v{{ITER}}.md"),
+        "codex-refine should reference codex-plan-v{{ITER}}.md");
+    assert!(crefine.coordinator_instructions.contains("claude-plan-v{{PREV_ITER}}.md"),
+        "claude-refine should reference claude-plan-v{{PREV_ITER}}.md");
+
+    // Summary file also uses ITER
+    assert!(crefine.coordinator_instructions.contains("claude-summary-v{{ITER}}.md"),
+        "claude-refine should reference summary file");
+
+    // Refine agents write to memory
+    assert_eq!(crefine.write_namespace.as_deref(), Some("plan-evolution"));
+    assert_eq!(xrefine.write_namespace.as_deref(), Some("plan-evolution"));
+
+    // Loop config: 2 refine agents, 5 iterations, iter_start=2
     assert_eq!(plan.loop_configs.len(), 1);
-    assert_eq!(plan.loop_configs[0].agent_ids, vec!["claude", "codex"]);
-    assert_eq!(plan.loop_configs[0].max_iterations, 5);
+    let lc = &plan.loop_configs[0];
+    assert_eq!(lc.agent_ids, vec!["claude-refine", "codex-refine"]);
+    assert_eq!(lc.max_iterations, 5);
+    assert_eq!(lc.iter_start, 2);
 
-    // max_parallel 2 (init agents run in parallel)
+    // max_parallel 2
     assert_eq!(plan.max_parallel, Some(2));
 }
