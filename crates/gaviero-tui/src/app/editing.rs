@@ -738,13 +738,41 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 }
                 return;
             }
-            if app.mouse_dragging && app.layout.editor_area.contains((col, row).into()) {
+            if app.mouse_dragging {
+                let area = app.layout.editor_area;
                 if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
                     if buf.cursor.anchor.is_none() {
                         buf.cursor.anchor = Some((buf.cursor.line, buf.cursor.col));
                     }
                 }
-                app.set_cursor_from_mouse(col, row);
+                if row < area.y {
+                    // Dragging above editor: scroll up and move cursor to top visible line.
+                    if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
+                        buf.scroll.top_line = buf.scroll.top_line.saturating_sub(1);
+                        let new_line = buf.scroll.top_line;
+                        buf.cursor.line = new_line;
+                        let line_len = buf.line_len(new_line);
+                        buf.cursor.col = buf.cursor.col.min(line_len);
+                    }
+                } else if row >= area.y + area.height {
+                    // Dragging below editor: scroll down and move cursor to bottom visible line.
+                    if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
+                        let total = buf.line_count();
+                        let viewport = area.height as usize;
+                        let max_scroll = total.saturating_sub(viewport);
+                        if buf.scroll.top_line < max_scroll {
+                            buf.scroll.top_line += 1;
+                        }
+                        let new_line = (buf.scroll.top_line + viewport)
+                            .min(total)
+                            .saturating_sub(1);
+                        buf.cursor.line = new_line;
+                        let line_len = buf.line_len(new_line);
+                        buf.cursor.col = buf.cursor.col.min(line_len);
+                    }
+                } else if area.contains((col, row).into()) {
+                    app.set_cursor_from_mouse(col, row);
+                }
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
