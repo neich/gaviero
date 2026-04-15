@@ -83,7 +83,13 @@ pub struct LoopConfig {
     pub until: LoopUntilCondition,
     /// Hard upper bound on iterations.
     pub max_iterations: u32,
+    /// Absolute value of `{{ITER}}` on the first loop pass (default: 1).
+    /// Subsequent passes increment by 1.
+    #[serde(default = "default_iter_start")]
+    pub iter_start: u32,
 }
+
+fn default_iter_start() -> u32 { 1 }
 
 // ── CompiledPlan ─────────────────────────────────────────────
 

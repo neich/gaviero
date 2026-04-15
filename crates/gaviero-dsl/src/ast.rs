@@ -15,6 +15,9 @@ pub enum Item {
     Agent(AgentDecl),
     Workflow(WorkflowDecl),
     Prompt(PromptDecl),
+    /// A top-level `vars { KEY "value" ... }` block.
+    /// Keys defined here are substituted compile-time across all agents.
+    Vars(Vec<(String, String)>),
 }
 
 /// A top-level named prompt declaration.
@@ -97,6 +100,9 @@ pub struct AgentDecl {
     pub max_retries: Option<(u8, Span)>,
     pub memory: Option<MemoryBlock>,
     pub context: Option<ContextBlock>,
+    /// Per-agent compile-time substitution variables.
+    /// Override script-level vars; cannot shadow built-ins (PROMPT, AGENT).
+    pub vars: Vec<(String, String)>,
     pub span: Span,
 }
 
@@ -221,6 +227,7 @@ pub enum UntilCondition {
 /// loop {
 ///     agents [implement verify]
 ///     max_iterations 5
+///     iter_start 2
 ///     until { compile true test true }
 /// }
 /// ```
@@ -232,6 +239,9 @@ pub struct LoopBlock {
     pub until: UntilCondition,
     /// Hard upper bound on iterations.
     pub max_iterations: u32,
+    /// Absolute value of `{{ITER}}` on the first loop pass.
+    /// Subsequent passes increment by 1. Defaults to 1.
+    pub iter_start: u32,
     pub span: Span,
 }
 

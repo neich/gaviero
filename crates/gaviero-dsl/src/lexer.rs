@@ -17,6 +17,8 @@ pub enum Token {
     KwWorkflow,
 
     // ── Field keywords ───────────────────────────────────────────
+    #[token("vars")]
+    KwVars,
     #[token("tier")]
     KwTier,
     #[token("model")]
@@ -85,6 +87,8 @@ pub enum Token {
     KwAgents,
     #[token("max_iterations")]
     KwMaxIterations,
+    #[token("iter_start")]
+    KwIterStart,
     #[token("command")]
     KwCommand,
 
@@ -168,6 +172,8 @@ pub enum Token {
 impl fmt::Display for Token {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Token::KwVars => write!(f, "vars"),
+            Token::KwIterStart => write!(f, "iter_start"),
             Token::KwClient => write!(f, "client"),
             Token::KwAgent => write!(f, "agent"),
             Token::KwWorkflow => write!(f, "workflow"),
@@ -447,13 +453,22 @@ mod tests {
 
     #[test]
     fn loop_keywords() {
-        let (toks, errs) = lex("loop until agents max_iterations command");
+        let (toks, errs) = lex("loop until agents max_iterations iter_start command");
         assert!(errs.is_empty(), "lex errors: {:?}", errs);
         assert!(matches!(toks[0].0, Token::KwLoop));
         assert!(matches!(toks[1].0, Token::KwUntil));
         assert!(matches!(toks[2].0, Token::KwAgents));
         assert!(matches!(toks[3].0, Token::KwMaxIterations));
-        assert!(matches!(toks[4].0, Token::KwCommand));
+        assert!(matches!(toks[4].0, Token::KwIterStart));
+        assert!(matches!(toks[5].0, Token::KwCommand));
+    }
+
+    #[test]
+    fn vars_keyword() {
+        let (toks, errs) = lex("vars");
+        assert!(errs.is_empty(), "lex errors: {:?}", errs);
+        assert_eq!(toks.len(), 1);
+        assert!(matches!(toks[0].0, Token::KwVars));
     }
 
     #[test]

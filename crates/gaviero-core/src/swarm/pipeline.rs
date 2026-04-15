@@ -405,6 +405,14 @@ pub async fn execute(
 
     observer.on_phase_changed("running");
 
+    // Build a map from loop-agent id → iter_start for first-pass {{ITER}} substitution.
+    // Agents that appear in a loop block get {{ITER}}/{{PREV_ITER}} substituted before
+    // every dispatch (first pass uses iter_start; subsequent passes increment).
+    let loop_agent_first_iter: std::collections::HashMap<String, u32> = plan.loop_configs
+        .iter()
+        .flat_map(|lc| lc.agent_ids.iter().map(move |id| (id.clone(), lc.iter_start)))
+        .collect();
+
     // 3. Execute tiers
     for (tier_idx, tier) in tiers.iter().enumerate() {
         observer.on_tier_started(tier_idx + 1, tiers.len());
@@ -420,6 +428,16 @@ pub async fn execute(
 
                 let unit = unit_map.get(unit_id.as_str())
                     .with_context(|| format!("work unit '{}' not found", unit_id))?;
+
+                // Apply {{ITER}}/{{PREV_ITER}} for first pass of loop agents
+                let _iter_unit_seq: Option<WorkUnit>;
+                let unit: &WorkUnit = if let Some(&is) = loop_agent_first_iter.get(unit_id.as_str()) {
+                    _iter_unit_seq = Some(apply_iter_vars(unit, is));
+                    _iter_unit_seq.as_ref().unwrap()
+                } else {
+                    _iter_unit_seq = None;
+                    unit
+                };
 
                 exec_state.set_status(unit_id, NodeStatus::Running);
                 observer.on_agent_state_changed(
@@ -497,6 +515,13 @@ pub async fn execute(
                 let unit = (*unit_map.get(unit_id.as_str())
                     .with_context(|| format!("work unit '{}' not found", unit_id))?)
                     .clone();
+
+                // Apply {{ITER}}/{{PREV_ITER}} for first pass of loop agents
+                let unit = if let Some(&is) = loop_agent_first_iter.get(unit_id.as_str()) {
+                    apply_iter_vars(&unit, is)
+                } else {
+                    unit
+                };
 
                 let sem = semaphore.clone();
                 let root = config.workspace_root.clone();
@@ -667,10 +692,16 @@ pub async fn execute(
 
             // Re-run each agent in the loop sequentially
             for agent_id in &loop_config.agent_ids {
-                let unit = match unit_map.get(agent_id.as_str()) {
+                let unit_template = match unit_map.get(agent_id.as_str()) {
                     Some(u) => u,
                     None => continue,
                 };
+
+                // Substitute {{ITER}} / {{PREV_ITER}} for this specific iteration.
+                // iteration is 1-indexed here (1..max_iterations); iter_abs = iter_start + iteration.
+                let iter_abs = loop_config.iter_start + iteration as u32;
+                let iter_unit = apply_iter_vars(unit_template, iter_abs);
+                let unit = &iter_unit;
 
                 observer.on_agent_state_changed(
                     agent_id,
@@ -853,6 +884,18 @@ struct AgentRunContext<'a> {
     /// `Some(text)` → planner skips per-runner DB query; `None` → fallback to
     /// per-runner query (single-agent fast path does not pre-fetch).
     pre_fetched_memory: Arc<Option<String>>,
+}
+
+/// Clone `unit` and substitute `{{ITER}}` / `{{PREV_ITER}}` with `iter_abs`
+/// and `iter_abs - 1` respectively. Called for every loop-agent dispatch.
+fn apply_iter_vars(unit: &WorkUnit, iter_abs: u32) -> WorkUnit {
+    let prev = iter_abs.saturating_sub(1);
+    WorkUnit {
+        coordinator_instructions: unit.coordinator_instructions
+            .replace("{{ITER}}", &iter_abs.to_string())
+            .replace("{{PREV_ITER}}", &prev.to_string()),
+        ..unit.clone()
+    }
 }
 
 /// Run a single agent, optionally in a worktree.

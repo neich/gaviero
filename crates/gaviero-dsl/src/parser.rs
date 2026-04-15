@@ -25,6 +25,7 @@ enum AgentField {
     MaxRetries(u8, Span),
     Memory(MemoryBlock),
     Context(ContextBlock),
+    Vars(Vec<(String, String)>),
 }
 
 #[derive(Debug)]
@@ -67,6 +68,7 @@ enum LoopField {
     Agents(Vec<(String, Span)>),
     Until(UntilCondition),
     MaxIterations(u32),
+    IterStart(u32),
 }
 
 #[derive(Debug)]
@@ -110,6 +112,7 @@ where
         Token::KwUntil      => "until".to_owned(),
         Token::KwAgents     => "agents".to_owned(),
         Token::KwMaxIterations => "max_iterations".to_owned(),
+        Token::KwIterStart  => "iter_start".to_owned(),
         Token::KwCommand    => "command".to_owned(),
         // graph/impact contextual keywords
         Token::KwImpactScope => "impact_scope".to_owned(),
@@ -118,6 +121,8 @@ where
         Token::KwCallersOf  => "callers_of".to_owned(),
         Token::KwTestsFor   => "tests_for".to_owned(),
         Token::KwDepth      => "depth".to_owned(),
+        // vars contextual keyword
+        Token::KwVars       => "vars".to_owned(),
     };
 
     let string = select! {
@@ -156,6 +161,23 @@ where
         .repeated()
         .collect::<Vec<_>>()
         .delimited_by(just(Token::LBracket), just(Token::RBracket));
+
+    // ── vars block: { IDENT "value" ... } ────────────────────────
+    //
+    // Used at top level (Item::Vars) and inside agent declarations.
+    // Keys are identifiers (or contextual keywords); values are strings.
+
+    let vars_pair = ident
+        .then(string.clone())
+        .map(|(k, v)| (k, v));
+
+    let vars_block = just(Token::KwVars)
+        .ignore_then(
+            vars_pair
+                .repeated()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::LBrace), just(Token::RBrace)),
+        );
 
     // ── client declaration ────────────────────────────────────────
 
@@ -418,6 +440,7 @@ where
             .map(|(n, s)| AgentField::MaxRetries(n.min(255) as u8, s)),
         memory_block.clone().map(AgentField::Memory),
         context_block.map(AgentField::Context),
+        vars_block.clone().map(AgentField::Vars),
     ));
 
     let agent_decl = just(Token::KwAgent)
@@ -437,6 +460,7 @@ where
             let mut max_retries = None;
             let mut memory = None;
             let mut context = None;
+            let mut vars: Vec<(String, String)> = Vec::new();
             for f in fields {
                 match f {
                     AgentField::Description(v, s) => {
@@ -463,9 +487,12 @@ where
                     AgentField::Context(b) => {
                         context.get_or_insert(b);
                     }
+                    AgentField::Vars(pairs) => {
+                        vars.extend(pairs);
+                    }
                 }
             }
-            AgentDecl { name, name_span, description, client, scope, depends_on, prompt, max_retries, memory, context, span: e.span() }
+            AgentDecl { name, name_span, description, client, scope, depends_on, prompt, max_retries, memory, context, vars, span: e.span() }
         });
 
     // ── loop block (inside workflow steps) ─────────────────────────
@@ -523,6 +550,9 @@ where
         just(Token::KwMaxIterations)
             .ignore_then(integer)
             .map(|n| LoopField::MaxIterations(n as u32)),
+        just(Token::KwIterStart)
+            .ignore_then(integer)
+            .map(|n| LoopField::IterStart(n as u32)),
     ));
 
     let loop_block = just(Token::KwLoop)
@@ -536,11 +566,13 @@ where
             let mut agents = Vec::new();
             let mut until = None;
             let mut max_iterations = None;
+            let mut iter_start = None;
             for f in fields {
                 match f {
                     LoopField::Agents(v) => agents = v,
                     LoopField::Until(c) => { until.get_or_insert(c); }
                     LoopField::MaxIterations(n) => { max_iterations.get_or_insert(n); }
+                    LoopField::IterStart(n) => { iter_start.get_or_insert(n); }
                 }
             }
             LoopBlock {
@@ -549,6 +581,7 @@ where
                     compile: false, clippy: false, test: false, impact_tests: false, span: e.span(),
                 })),
                 max_iterations: max_iterations.unwrap_or(10),
+                iter_start: iter_start.unwrap_or(1),
                 span: e.span(),
             }
         });
@@ -682,6 +715,7 @@ where
         agent_decl.map(Item::Agent),
         workflow_decl.map(Item::Workflow),
         prompt_decl.map(Item::Prompt),
+        vars_block.map(Item::Vars),
     ));
 
     item.repeated()

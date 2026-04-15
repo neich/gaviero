@@ -1,6 +1,6 @@
 #![allow(deprecated)] // AgentBackend::ClaudeCode is deprecated but still needed for WorkUnit
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use miette::NamedSource;
 
@@ -40,10 +40,15 @@ pub fn compile_ast(
     let mut agent_map: HashMap<&str, &AgentDecl> = HashMap::new();
     let mut workflow_map: HashMap<&str, &WorkflowDecl> = HashMap::new();
     let mut prompt_map: HashMap<&str, &str> = HashMap::new();
+    let mut script_vars: Vec<(String, String)> = Vec::new();
     let mut errors: Vec<DslError> = Vec::new();
 
     for item in &script.items {
         match item {
+            Item::Vars(pairs) => {
+                // Later declarations override earlier ones for the same key.
+                script_vars.extend(pairs.clone());
+            }
             Item::Client(c) => {
                 if client_map.insert(c.name.as_str(), c).is_some() {
                     errors.push(DslError::Compile {
@@ -135,7 +140,7 @@ pub fn compile_ast(
     let mut compile_errors: Vec<DslError> = Vec::new();
 
     for decl in agent_order {
-        match compile_agent(decl, &client_map, &prompt_map, workflow_memory, source, filename, runtime_prompt) {
+        match compile_agent(decl, &client_map, &prompt_map, &script_vars, workflow_memory, source, filename, runtime_prompt) {
             Ok(wu) => work_units.push(wu),
             Err(e) => compile_errors.push(e),
         }
@@ -299,19 +304,28 @@ fn ordered_agents_from_workflow<'a>(
         }
     };
 
-    let mut agents = Vec::new();
+    let mut agents: Vec<&AgentDecl> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
     let mut errors = Vec::new();
 
     // Flatten StepItems: agent refs resolve directly, loop blocks contribute
-    // their inner agent list. The agents vec preserves declaration order.
+    // their inner agent list. Agents are deduplicated by name so the same
+    // agent can appear in both a linear step and a loop without being compiled
+    // twice. Declaration order is preserved (first occurrence wins).
     for step in steps {
         let refs: Vec<(&str, &Span)> = match step {
             StepItem::Agent(name, span) => vec![(name.as_str(), span)],
             StepItem::Loop(lb) => lb.agents.iter().map(|(n, s)| (n.as_str(), s)).collect(),
         };
         for (name, name_span) in refs {
+            if seen.contains(name) {
+                continue;
+            }
             match agent_map.get(name) {
-                Some(a) => agents.push(*a),
+                Some(a) => {
+                    seen.insert(name);
+                    agents.push(*a);
+                }
                 None => errors.push(DslError::Compile {
                     src: src(),
                     span: (name_span.start, name_span.end.saturating_sub(name_span.start)).into(),
@@ -327,10 +341,63 @@ fn ordered_agents_from_workflow<'a>(
     Ok(agents)
 }
 
+/// Apply compile-time variable substitution to a template string.
+///
+/// Substitution order (agent vars override script vars; built-ins override all):
+/// 1. Merge script vars + agent vars (agent wins on collision)
+/// 2. Apply merged vars in a single pass
+/// 3. Apply built-ins: `{{PROMPT}}` and `{{AGENT}}` (cannot be shadowed)
+///
+/// `{{ITER}}` and `{{PREV_ITER}}` are intentionally left untouched —
+/// they are injected at runtime by the loop executor.
+fn apply_vars(
+    text: &str,
+    script_vars: &[(String, String)],
+    agent_vars: &[(String, String)],
+    agent_name: &str,
+    runtime_prompt: Option<&str>,
+) -> String {
+    const RESERVED: &[&str] = &["PROMPT", "AGENT", "ITER", "PREV_ITER"];
+
+    // Build a merged list: script vars first, then agent vars overriding same keys.
+    // We apply the merged list in a single pass so that agent vars win.
+    let mut merged: Vec<(&str, &str)> = Vec::new();
+
+    for (k, v) in script_vars {
+        if RESERVED.contains(&k.as_str()) {
+            continue;
+        }
+        // Only include if not overridden by an agent var
+        if !agent_vars.iter().any(|(ak, _)| ak == k) {
+            merged.push((k.as_str(), v.as_str()));
+        }
+    }
+    for (k, v) in agent_vars {
+        if RESERVED.contains(&k.as_str()) {
+            eprintln!("⚠ agent `{agent_name}`: vars key `{k}` shadows a reserved variable and will be ignored");
+            continue;
+        }
+        merged.push((k.as_str(), v.as_str()));
+    }
+
+    let mut result = text.to_string();
+    for (k, v) in merged {
+        result = result.replace(&format!("{{{{{k}}}}}"), v);
+    }
+
+    // Built-ins (applied last, cannot be overridden by user vars)
+    if let Some(rp) = runtime_prompt {
+        result = result.replace("{{PROMPT}}", rp);
+    }
+    result = result.replace("{{AGENT}}", agent_name);
+    result
+}
+
 fn compile_agent(
     decl: &AgentDecl,
     client_map: &HashMap<&str, &ClientDecl>,
     prompt_map: &HashMap<&str, &str>,
+    script_vars: &[(String, String)],
     workflow_memory: Option<&MemoryBlock>,
     source: &str,
     filename: &str,
@@ -374,10 +441,12 @@ fn compile_agent(
         .map(|(deps, _)| deps.iter().map(|(s, _)| s.clone()).collect())
         .unwrap_or_default();
 
-    let description = match (&decl.description, runtime_prompt) {
-        (Some((s, _)), Some(rp)) => s.replace("{{PROMPT}}", rp),
-        (Some((s, _)), None) => s.clone(),
-        (None, _) => decl.name.clone(),
+    let description = {
+        let raw = match &decl.description {
+            Some((s, _)) => s.as_str(),
+            None => &decl.name,
+        };
+        apply_vars(raw, script_vars, &decl.vars, &decl.name, runtime_prompt)
     };
 
     // Resolve prompt: inline string or reference to a named prompt declaration.
@@ -398,13 +467,11 @@ fn compile_agent(
         None => None,
     };
 
-    // Apply substitutions. {{AGENT}} is substituted at compile time so that a
-    // shared named prompt can produce per-agent output paths.
-    let coordinator_instructions = match (prompt_text, runtime_prompt) {
-        (Some(s), Some(rp)) => s.replace("{{PROMPT}}", rp).replace("{{AGENT}}", &decl.name),
-        (Some(s), None) => s.replace("{{AGENT}}", &decl.name),
-        (None, Some(rp)) => rp.to_string(),
-        (None, None) => String::new(),
+    // Apply all compile-time substitutions.
+    // {{ITER}} and {{PREV_ITER}} are intentionally left for runtime.
+    let coordinator_instructions = match prompt_text {
+        Some(s) => apply_vars(s, script_vars, &decl.vars, &decl.name, runtime_prompt),
+        None => runtime_prompt.unwrap_or("").to_string(),
     };
 
     let max_retries = decl.max_retries.as_ref().map(|(n, _)| *n).unwrap_or(1);
@@ -444,10 +511,7 @@ fn compile_agent(
     let memory_read_query: Option<String> = decl.memory
         .as_ref()
         .and_then(|m| m.read_query.as_ref())
-        .map(|(s, _)| match runtime_prompt {
-            Some(rp) => s.replace("{{PROMPT}}", rp),
-            None => s.clone(),
-        });
+        .map(|(s, _)| apply_vars(s, script_vars, &decl.vars, &decl.name, runtime_prompt));
 
     let memory_read_limit: Option<usize> = decl.memory
         .as_ref()
@@ -457,10 +521,7 @@ fn compile_agent(
     let memory_write_content: Option<String> = decl.memory
         .as_ref()
         .and_then(|m| m.write_content.as_ref())
-        .map(|(s, _)| match runtime_prompt {
-            Some(rp) => s.replace("{{PROMPT}}", rp),
-            None => s.clone(),
-        });
+        .map(|(s, _)| apply_vars(s, script_vars, &decl.vars, &decl.name, runtime_prompt));
 
     // ── Graph / impact fields ─────────────────────────────────────
     let impact_scope = decl.scope
@@ -584,6 +645,7 @@ fn extract_loop_configs(wf: Option<&WorkflowDecl>) -> Vec<LoopConfig> {
                     agent_ids: lb.agents.iter().map(|(n, _)| n.clone()).collect(),
                     until: map_until_condition(&lb.until),
                     max_iterations: lb.max_iterations,
+                    iter_start: lb.iter_start,
                 })
             } else {
                 None
@@ -1227,5 +1289,184 @@ mod tests {
         let src = r#"agent my-agent { prompt "hello {{AGENT}}" }"#;
         let units = compile_str(src).expect("should compile");
         assert_eq!(units[0].coordinator_instructions, "hello my-agent");
+    }
+
+    // ── vars tests ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn script_vars_substituted_in_prompt() {
+        let src = r#"
+            vars { PLANS "plans" }
+            agent x { prompt "write to {{PLANS}}/out.md" }
+        "#;
+        let units = compile_str(src).expect("should compile");
+        assert_eq!(units[0].coordinator_instructions, "write to plans/out.md");
+    }
+
+    #[test]
+    fn agent_vars_substituted_in_prompt() {
+        let src = r#"
+            agent x {
+                vars { MODEL "claude" }
+                prompt "write to {{MODEL}}-output.md"
+            }
+        "#;
+        let units = compile_str(src).expect("should compile");
+        assert_eq!(units[0].coordinator_instructions, "write to claude-output.md");
+    }
+
+    #[test]
+    fn agent_vars_override_script_vars() {
+        let src = r#"
+            vars { MODEL "default" }
+            agent x {
+                vars { MODEL "claude" }
+                prompt "model: {{MODEL}}"
+            }
+        "#;
+        let units = compile_str(src).expect("should compile");
+        assert_eq!(units[0].coordinator_instructions, "model: claude");
+    }
+
+    #[test]
+    fn script_vars_used_when_no_agent_vars() {
+        let src = r#"
+            vars { PLANS "plans" }
+            agent x { prompt "path: {{PLANS}}/file.md" }
+            agent y { prompt "also: {{PLANS}}/other.md" }
+        "#;
+        let units = compile_str(src).expect("should compile");
+        assert_eq!(units[0].coordinator_instructions, "path: plans/file.md");
+        assert_eq!(units[1].coordinator_instructions, "also: plans/other.md");
+    }
+
+    #[test]
+    fn iter_and_prev_iter_survive_compile_time() {
+        // {{ITER}} and {{PREV_ITER}} must NOT be substituted at compile time —
+        // they are reserved for the runtime loop executor.
+        let src = r##"
+            agent x { prompt #"read v{{PREV_ITER}} write v{{ITER}}"# }
+        "##;
+        let units = compile_str(src).expect("should compile");
+        assert_eq!(units[0].coordinator_instructions, "read v{{PREV_ITER}} write v{{ITER}}");
+    }
+
+    #[test]
+    fn iter_start_parsed_and_propagated() {
+        let src = r#"
+            agent a { description "refine" }
+            workflow w {
+                steps [
+                    loop {
+                        agents [a]
+                        max_iterations 5
+                        iter_start 2
+                        until command "false"
+                    }
+                ]
+            }
+        "#;
+        let plan = compile_plan(src).expect("should compile");
+        assert_eq!(plan.loop_configs.len(), 1);
+        assert_eq!(plan.loop_configs[0].iter_start, 2);
+        assert_eq!(plan.loop_configs[0].max_iterations, 5);
+    }
+
+    #[test]
+    fn iter_start_defaults_to_1() {
+        let src = r#"
+            agent a { description "t" }
+            workflow w {
+                steps [
+                    loop {
+                        agents [a]
+                        max_iterations 3
+                        until command "false"
+                    }
+                ]
+            }
+        "#;
+        let plan = compile_plan(src).expect("should compile");
+        assert_eq!(plan.loop_configs[0].iter_start, 1);
+    }
+
+    #[test]
+    fn vars_combined_with_agent_and_prompt_substitution() {
+        // All three types of substitution should work together.
+        let src = r#"
+            vars { DIR "plans" }
+            agent claude {
+                vars { MODEL "claude" }
+                prompt "Read {{DIR}}/codex-plan-v1.md write {{DIR}}/{{MODEL}}-plan-v2.md by {{AGENT}}"
+            }
+        "#;
+        let units = compile_str(src).expect("should compile");
+        assert_eq!(
+            units[0].coordinator_instructions,
+            "Read plans/codex-plan-v1.md write plans/claude-plan-v2.md by claude"
+        );
+    }
+
+    #[test]
+    fn template_plan_refinement_example() {
+        // Smoke-test the full plan_refinement.gaviero example structure
+        let src = r##"
+            client opus  { tier expensive model "claude-opus-4-6" privacy public }
+            client codex { tier expensive model "codex:gpt-5.4"   privacy public }
+
+            vars { PLANS "plans" }
+
+            prompt init-body   #"Write to {{PLANS}}/{{MODEL_NAME}}-plan-v1.md"#
+            prompt refine-body #"Read {{PLANS}}/claude-plan-v{{PREV_ITER}}.md write {{PLANS}}/{{MODEL_NAME}}-plan-v{{ITER}}.md"#
+
+            agent claude-init  { vars { MODEL_NAME "claude" } client opus  prompt init-body }
+            agent codex-init   { vars { MODEL_NAME "codex"  } client codex prompt init-body }
+            agent claude-refine { vars { MODEL_NAME "claude" } client opus  prompt refine-body }
+            agent codex-refine  { vars { MODEL_NAME "codex"  } client codex prompt refine-body }
+
+            workflow feature-plan-refinement {
+                steps [
+                    claude-init
+                    codex-init
+                    loop {
+                        agents [claude-refine codex-refine]
+                        max_iterations 5
+                        iter_start 2
+                        until command "false"
+                    }
+                ]
+                max_parallel 2
+            }
+        "##;
+        let plan = compile_plan(src).expect("should compile");
+
+        // 4 distinct work units (no deduplication of different agents)
+        let units = plan.work_units_ordered().expect("toposort");
+        assert_eq!(units.len(), 4);
+
+        // All use expensive tier
+        for u in &units {
+            assert_eq!(u.tier, ModelTier::Expensive, "agent {} should be expensive", u.id);
+        }
+
+        // Init agents have MODEL_NAME and PLANS substituted at compile time
+        let cinit = units.iter().find(|u| u.id == "claude-init").unwrap();
+        assert_eq!(cinit.coordinator_instructions, "Write to plans/claude-plan-v1.md");
+
+        // Refine agents: PLANS and MODEL_NAME substituted; ITER/PREV_ITER left for runtime
+        let crefine = units.iter().find(|u| u.id == "claude-refine").unwrap();
+        assert_eq!(
+            crefine.coordinator_instructions,
+            "Read plans/claude-plan-v{{PREV_ITER}}.md write plans/claude-plan-v{{ITER}}.md"
+        );
+
+        // Loop config: iter_start=2, max_iterations=5
+        assert_eq!(plan.loop_configs.len(), 1);
+        assert_eq!(plan.loop_configs[0].iter_start, 2);
+        assert_eq!(plan.loop_configs[0].max_iterations, 5);
+        assert_eq!(plan.loop_configs[0].agent_ids, vec!["claude-refine", "codex-refine"]);
+
+        // max_parallel preserved
+        assert_eq!(plan.max_parallel, Some(2));
     }
 }
