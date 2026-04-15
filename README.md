@@ -1,23 +1,29 @@
 # Gaviero
 
-A terminal code editor built for working with AI coding agents. Gaviero gives you a full editing environment — file tree, syntax highlighting, git integration, embedded terminal — alongside a conversation panel where you chat with Claude agents that can read and modify your code. Every change an agent proposes passes through an interactive review before it touches disk.
+A terminal editor for collaborating with AI agents on code. Gaviero provides a full development environment — file tree, syntax highlighting, git integration, embedded terminal — alongside a chat panel where you work with Claude agents that can read and modify your code. Every change an agent proposes passes through an interactive review gate before touching disk.
 
-There is also a headless CLI for running agent tasks from scripts or CI, and a declarative DSL for composing multi-agent workflows.
+For automation and CI, there's a headless CLI (`gaviero-cli`). For complex multi-agent workflows, the Gaviero DSL lets you compose agents, scopes, verification, and iteration strategies declaratively.
 
-## Quick start
+## Installation
+
+Build from source (Rust 2024 edition required):
 
 ```bash
 cargo build --release
 ./target/release/gaviero ~/my-project
 ```
 
-The editor opens with the file tree on the left, your code in the center, and an agent chat panel on the right.
+Or to see all binaries:
+- `gaviero` — interactive TUI editor
+- `gaviero-cli` — headless command-line runner
 
-## The editor
+For full architecture and module details, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
-Gaviero is a self-contained terminal editor. You can use it for everyday editing without ever touching the AI features.
+## Editor Usage
 
-### Navigation
+Gaviero works as a standalone editor even without AI features. Use it for everyday coding with full syntax highlighting, git integration, and terminal access.
+
+### Keyboard Navigation
 
 | Key | What it does |
 |---|---|
@@ -91,9 +97,9 @@ The git panel (Ctrl+3) provides staging, committing, and branch management witho
 
 Ctrl+J (or F4) opens a terminal panel at the bottom. The terminal is a full PTY — run builds, tests, git commands, or anything else without switching windows.
 
-## Working with AI agents
+## AI Agent Features
 
-### Agent chat
+### Chat with Agents
 
 Open the side panel (Ctrl+p if hidden, then Ctrl+1) and type a message. The agent can read your project files but cannot write directly — every proposed change goes through the Write Gate.
 
@@ -121,9 +127,9 @@ When an agent proposes file changes, the editor opens a diff overlay showing eac
 
 Each hunk shows its enclosing AST node (function name, struct, class) so you know exactly what's being changed.
 
-### Swarm mode
+### Multi-Agent Coordination
 
-For larger tasks, you can coordinate multiple agents working in parallel:
+For complex tasks, coordinate multiple agents working in parallel:
 
 ```
 /cswarm refactor the authentication module to use JWT tokens
@@ -171,9 +177,9 @@ Store context from the chat panel:
 
 Memory databases are stored at `<workspace>/.gaviero/memory.db` (workspace-local) and `~/.config/gaviero/memory.db` (global). Configuration is in `.gaviero/settings.json`.
 
-## Headless CLI
+## Headless CLI Usage
 
-Run agent tasks without the editor:
+Run agent tasks from the command line or CI pipelines:
 
 ```bash
 gaviero-cli --repo ~/my-project --task "fix all compilation errors" --auto-accept
@@ -213,9 +219,9 @@ In coordinated mode, model selection is automatic — Opus plans the task, then 
 | `--resume` | Skip already-completed agents from a prior run |
 | `--trace FILE` | Write DEBUG-level JSON trace log |
 
-## Workflow scripts
+## Workflow Scripts (DSL)
 
-Reusable multi-agent workflows are defined in `.gaviero` files using the Gaviero DSL. The DSL compiler produces execution plans that the swarm engine runs.
+Define reusable multi-agent workflows in `.gaviero` files. The Gaviero DSL compiles declarative workflows into execution plans run by the swarm engine. Learn more in [crates/gaviero-dsl/README.md](crates/gaviero-dsl/README.md).
 
 ```gaviero
 client sonnet { tier cheap  model "claude-sonnet-4-6" }
@@ -261,11 +267,11 @@ See [crates/gaviero-dsl/README.md](crates/gaviero-dsl/README.md) for the full la
 
 ## Configuration
 
-Settings cascade in priority order:
+Settings cascade through these priority levels (highest to lowest):
 
-1. `.gaviero/settings.json` in the project directory
-2. `settings` block in a `.gaviero-workspace` file
-3. `~/.config/gaviero/settings.json` (user-level)
+1. `.gaviero/settings.json` — project-level workspace configuration
+2. `.gaviero-workspace` file — multi-folder workspace configuration
+3. `~/.config/gaviero/settings.json` — user-level defaults
 4. Built-in defaults
 
 ### Common settings
@@ -300,27 +306,40 @@ For multi-folder projects, create a `.gaviero-workspace` file:
 
 Color schemes live in `themes/` as TOML files. The default theme is One Dark inspired.
 
-## Architecture at a glance
+## Architecture
 
-Gaviero is a Cargo workspace with five crates:
+Gaviero is a Cargo workspace of five crates:
 
-| Crate | Role |
+| Crate | Purpose |
 |---|---|
-| `gaviero-core` | All logic: write gate, diffs, tree-sitter (16 languages), agent subprocess management, swarm orchestration, repo map (PageRank context), semantic memory, git (via git2), terminal PTY |
-| `gaviero-tui` | Terminal UI: ratatui + crossterm rendering, panels, input handling |
-| `gaviero-cli` | Headless runner: clap argument parsing, stdout observers |
-| `gaviero-dsl` | Compiler for `.gaviero` workflow scripts → `CompiledPlan` DAGs |
-| `tree-sitter-gaviero` | Tree-sitter grammar bindings for `.gaviero` DSL files |
+| **gaviero-core** | All runtime logic: write gate, diffs, tree-sitter (16 languages), agent orchestration, swarm pipeline, context ranking, semantic memory, git/worktrees, terminal PTY |
+| **gaviero-tui** | Terminal UI: event loop, panels, editor, chat, diff review, session restore |
+| **gaviero-cli** | Headless CLI: task argument parsing, observer wiring |
+| **gaviero-dsl** | Compiler for `.gaviero` workflow scripts → execution plans |
+| **tree-sitter-gaviero** | Tree-sitter grammar for `.gaviero` files |
 
-Core never depends on any UI crate. The TUI communicates with core pipelines through observer traits and a single event channel.
+Core is the source of truth — it has no UI dependencies. The TUI and CLI both delegate all logic to core through public APIs.
 
-For full architectural details, see [ARCHITECTURE.md](ARCHITECTURE.md).
+**Crate-specific README files:**
+- [crates/gaviero-core/README.md](crates/gaviero-core/README.md) — API entry points, subsystems, design
+- [crates/gaviero-tui/README.md](crates/gaviero-tui/README.md) — editor usage, panels, commands
+- [crates/gaviero-cli/README.md](crates/gaviero-cli/README.md) — CLI modes, flags, examples
+- [crates/gaviero-dsl/README.md](crates/gaviero-dsl/README.md) — language syntax, examples, compilation
+
+For complete architectural details including data flow, module maps, and inter-crate boundaries, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Requirements
 
-- Rust (2024 edition)
-- Linux or POSIX terminal
-- Claude API key (for agent features — the editor works fine without one)
+- **Rust 2024 edition** — for building from source
+- **Linux or POSIX terminal** — terminal environment for the TUI
+- **Claude API key** (optional) — required only for AI agent features; the editor works standalone
+
+## Getting Help
+
+Detailed documentation and development instructions:
+- Build and test: see [CLAUDE.md](CLAUDE.md)
+- Module structure and subsystems: see [ARCHITECTURE.md](ARCHITECTURE.md)
+- For feature requests or bug reports: https://github.com/anthropics/claude-code/issues
 
 ## License
 
