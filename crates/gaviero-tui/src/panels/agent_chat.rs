@@ -1158,45 +1158,29 @@ impl AgentChatState {
     }
 
     /// Extract the selected text from the cached rendered lines.
-    /// Lines from the same message that are word-wrap continuations are joined
-    /// with spaces; actual message boundaries use newlines.
+    /// Each rendered line is separated by a newline, matching the visual layout
+    /// as the user sees it on screen.
     pub fn selected_chat_text(&self) -> Option<String> {
         let (sl, sc, el, ec) = self.text_selection_range()?;
         if sl == el && sc == ec {
             return None;
         }
         let mut result = String::new();
-        let mut prev_msg_idx: Option<usize> = None;
         for line_idx in sl..=el {
             if line_idx >= self.rendered_lines_cache.len() {
                 break;
             }
-            let (ref line, msg_idx) = self.rendered_lines_cache[line_idx];
+            let (ref line, _msg_idx) = self.rendered_lines_cache[line_idx];
             let chars: Vec<char> = line.chars().collect();
             let start_c = if line_idx == sl { sc.min(chars.len()) } else { 0 };
             let end_c = if line_idx == el { ec.min(chars.len()) } else { chars.len() };
 
             if line_idx > sl {
-                // Same message = word-wrap continuation → join with space
-                // Different message or separator line (None) → newline
-                let same_msg = match (prev_msg_idx, msg_idx) {
-                    (Some(a), Some(b)) => a == b,
-                    _ => false,
-                };
-                if same_msg {
-                    // Don't add space if the previous line ended with a space
-                    // or this line starts with a space
-                    if !result.ends_with(' ') && !chars.get(start_c).map_or(true, |c| *c == ' ') {
-                        result.push(' ');
-                    }
-                } else {
-                    result.push('\n');
-                }
+                result.push('\n');
             }
 
             let selected: String = chars[start_c..end_c].iter().collect();
             result.push_str(&selected);
-            prev_msg_idx = msg_idx;
         }
         if result.is_empty() { None } else { Some(result) }
     }
