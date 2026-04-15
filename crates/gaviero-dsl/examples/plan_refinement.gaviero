@@ -2,6 +2,7 @@ client opus {
     tier expensive
     model "claude-opus-4-6"
     privacy public
+    default
 }
 
 client codex {
