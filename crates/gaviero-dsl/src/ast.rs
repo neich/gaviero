@@ -14,6 +14,39 @@ pub enum Item {
     Client(ClientDecl),
     Agent(AgentDecl),
     Workflow(WorkflowDecl),
+    Prompt(PromptDecl),
+}
+
+/// A top-level named prompt declaration.
+///
+/// ```text
+/// prompt refine-body #"
+///     You are refining a plan for: {{PROMPT}}
+///     ...write to plans/{{AGENT}}-plan-v{N+1}.md.
+/// "#
+/// ```
+///
+/// Agents reference it by name: `prompt refine-body`.
+/// The `{{AGENT}}` placeholder is substituted with the referencing agent's name at
+/// compile time, allowing one shared prompt to produce per-agent output paths.
+#[derive(Debug, Clone)]
+pub struct PromptDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub content: String,
+    pub content_span: Span,
+    pub span: Span,
+}
+
+/// How an agent's `prompt` field is specified.
+#[derive(Debug, Clone)]
+pub enum PromptSource {
+    /// An inline string literal: `prompt "text"` or `prompt #"text"#`.
+    Inline(String),
+    /// A reference to a named top-level `prompt` declaration by identifier.
+    ///
+    /// The `Span` points to the reference site for error reporting.
+    Ref(String, Span),
 }
 
 // ── client ────────────────────────────────────────────────────────────────
@@ -60,7 +93,7 @@ pub struct AgentDecl {
     pub client: Option<(String, Span)>,
     pub scope: Option<ScopeBlock>,
     pub depends_on: Option<(Vec<(String, Span)>, Span)>,
-    pub prompt: Option<(String, Span)>,
+    pub prompt: Option<(PromptSource, Span)>,
     pub max_retries: Option<(u8, Span)>,
     pub memory: Option<MemoryBlock>,
     pub context: Option<ContextBlock>,
