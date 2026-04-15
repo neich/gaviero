@@ -39,6 +39,7 @@ pub fn compile_ast(
     let mut client_map: HashMap<&str, &ClientDecl> = HashMap::new();
     let mut agent_map: HashMap<&str, &AgentDecl> = HashMap::new();
     let mut workflow_map: HashMap<&str, &WorkflowDecl> = HashMap::new();
+    let mut prompt_map: HashMap<&str, &str> = HashMap::new();
     let mut errors: Vec<DslError> = Vec::new();
 
     for item in &script.items {
@@ -67,6 +68,15 @@ pub fn compile_ast(
                         src: src(),
                         span: (w.name_span.start, w.name_span.end.saturating_sub(w.name_span.start)).into(),
                         reason: format!("duplicate workflow name `{}`", w.name),
+                    });
+                }
+            }
+            Item::Prompt(p) => {
+                if prompt_map.insert(p.name.as_str(), p.content.as_str()).is_some() {
+                    errors.push(DslError::Compile {
+                        src: src(),
+                        span: (p.name_span.start, p.name_span.end.saturating_sub(p.name_span.start)).into(),
+                        reason: format!("duplicate prompt name `{}`", p.name),
                     });
                 }
             }
@@ -125,7 +135,7 @@ pub fn compile_ast(
     let mut compile_errors: Vec<DslError> = Vec::new();
 
     for decl in agent_order {
-        match compile_agent(decl, &client_map, workflow_memory, source, filename, runtime_prompt) {
+        match compile_agent(decl, &client_map, &prompt_map, workflow_memory, source, filename, runtime_prompt) {
             Ok(wu) => work_units.push(wu),
             Err(e) => compile_errors.push(e),
         }
@@ -320,6 +330,7 @@ fn ordered_agents_from_workflow<'a>(
 fn compile_agent(
     decl: &AgentDecl,
     client_map: &HashMap<&str, &ClientDecl>,
+    prompt_map: &HashMap<&str, &str>,
     workflow_memory: Option<&MemoryBlock>,
     source: &str,
     filename: &str,
@@ -369,9 +380,29 @@ fn compile_agent(
         (None, _) => decl.name.clone(),
     };
 
-    let coordinator_instructions = match (&decl.prompt, runtime_prompt) {
-        (Some((s, _)), Some(rp)) => s.replace("{{PROMPT}}", rp),
-        (Some((s, _)), None) => s.clone(),
+    // Resolve prompt: inline string or reference to a named prompt declaration.
+    let prompt_text: Option<&str> = match &decl.prompt {
+        Some((PromptSource::Inline(s), _)) => Some(s.as_str()),
+        Some((PromptSource::Ref(name, ref_span), _)) => {
+            match prompt_map.get(name.as_str()) {
+                Some(content) => Some(content),
+                None => {
+                    return Err(DslError::Compile {
+                        src: src(),
+                        span: (ref_span.start, ref_span.end.saturating_sub(ref_span.start).max(1)).into(),
+                        reason: format!("undefined prompt `{}`", name),
+                    });
+                }
+            }
+        }
+        None => None,
+    };
+
+    // Apply substitutions. {{AGENT}} is substituted at compile time so that a
+    // shared named prompt can produce per-agent output paths.
+    let coordinator_instructions = match (prompt_text, runtime_prompt) {
+        (Some(s), Some(rp)) => s.replace("{{PROMPT}}", rp).replace("{{AGENT}}", &decl.name),
+        (Some(s), None) => s.replace("{{AGENT}}", &decl.name),
         (None, Some(rp)) => rp.to_string(),
         (None, None) => String::new(),
     };
@@ -1119,5 +1150,82 @@ mod tests {
         } else {
             panic!("expected Verify");
         }
+    }
+
+    // ── Named prompt declaration tests ────────────────────────────────────────
+
+    #[test]
+    fn named_prompt_resolves() {
+        let src = r#"
+            prompt my-prompt "do the thing"
+            agent x { prompt my-prompt }
+        "#;
+        let units = compile_str(src).expect("should compile");
+        assert_eq!(units[0].coordinator_instructions, "do the thing");
+    }
+
+    #[test]
+    fn named_prompt_with_runtime_prompt_substitution() {
+        let src = r#"
+            prompt body "task: {{PROMPT}}"
+            agent x { prompt body }
+        "#;
+        let (tokens, _) = lexer::lex(src);
+        let (ast, errs) = parser::parse(&tokens, src, "test.gaviero");
+        assert!(errs.is_empty(), "parse errors: {:?}", errs);
+        let units = compile_ast(&ast.unwrap(), src, "test.gaviero", None, Some("build the feature"))
+            .map(|c| c.work_units_ordered().expect("toposort"))
+            .expect("compile");
+        assert_eq!(units[0].coordinator_instructions, "task: build the feature");
+    }
+
+    #[test]
+    fn named_prompt_agent_substitution() {
+        let src = r#"
+            prompt body "write to {{AGENT}}-output.md"
+            agent alpha { prompt body }
+            agent beta  { prompt body }
+        "#;
+        let units = compile_str(src).expect("should compile");
+        let alpha = units.iter().find(|u| u.id == "alpha").unwrap();
+        let beta  = units.iter().find(|u| u.id == "beta").unwrap();
+        assert_eq!(alpha.coordinator_instructions, "write to alpha-output.md");
+        assert_eq!(beta.coordinator_instructions, "write to beta-output.md");
+    }
+
+    #[test]
+    fn named_prompt_undefined_ref_errors() {
+        let src = r#"agent x { prompt missing-prompt }"#;
+        let result = compile_str(src);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err().errors[0]);
+        assert!(msg.contains("missing-prompt"), "error: {}", msg);
+    }
+
+    #[test]
+    fn named_prompt_duplicate_decl_errors() {
+        let src = r#"
+            prompt foo "first"
+            prompt foo "second"
+            agent x { prompt foo }
+        "#;
+        let result = compile_str(src);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err().errors[0]);
+        assert!(msg.contains("foo"), "error: {}", msg);
+    }
+
+    #[test]
+    fn inline_prompt_still_works() {
+        let src = r#"agent x { prompt "inline text" }"#;
+        let units = compile_str(src).expect("should compile");
+        assert_eq!(units[0].coordinator_instructions, "inline text");
+    }
+
+    #[test]
+    fn inline_prompt_agent_substitution() {
+        let src = r#"agent my-agent { prompt "hello {{AGENT}}" }"#;
+        let units = compile_str(src).expect("should compile");
+        assert_eq!(units[0].coordinator_instructions, "hello my-agent");
     }
 }

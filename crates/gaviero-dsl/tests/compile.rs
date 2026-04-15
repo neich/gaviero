@@ -471,3 +471,45 @@ fn template_sync_memory() {
     // No loops
     assert!(plan.loop_configs.is_empty());
 }
+
+#[test]
+fn template_plan_refinement() {
+    let plan = compile_example_plan("plan_refinement.gaviero");
+    let units = plan.work_units_ordered().expect("toposort");
+
+    // 4 agents: 2 init + 2 refine
+    assert_eq!(units.len(), 4);
+    assert_eq!(units[0].id, "claude-plan-init");
+    assert_eq!(units[1].id, "codex-plan-init");
+
+    // Init agents use expensive tier and are isolated (no read-only paths)
+    assert_eq!(units[0].tier, gaviero_core::types::ModelTier::Expensive);
+    assert_eq!(units[1].tier, gaviero_core::types::ModelTier::Expensive);
+    assert!(units[0].scope.read_only_paths.is_empty(), "init agent must not have read-only scope");
+    assert!(units[1].scope.read_only_paths.is_empty(), "init agent must not have read-only scope");
+
+    // Refine agents resolve the shared named prompt; {{AGENT}} is substituted
+    let claude = units.iter().find(|u| u.id == "claude").expect("claude agent");
+    let codex  = units.iter().find(|u| u.id == "codex").expect("codex agent");
+    assert!(claude.coordinator_instructions.contains("claude-plan-v{N+1}.md"),
+        "claude prompt should contain claude-plan-v{{N+1}}.md, got: {}", claude.coordinator_instructions);
+    assert!(codex.coordinator_instructions.contains("codex-plan-v{N+1}.md"),
+        "codex prompt should contain codex-plan-v{{N+1}}.md, got: {}", codex.coordinator_instructions);
+    // Each agent also writes a per-version summary file
+    assert!(claude.coordinator_instructions.contains("claude-summary_v{N+1}.md"),
+        "claude prompt should contain claude-summary_v{{N+1}}.md");
+    assert!(codex.coordinator_instructions.contains("codex-summary_v{N+1}.md"),
+        "codex prompt should contain codex-summary_v{{N+1}}.md");
+
+    // Both refine agents write to the same memory namespace
+    assert_eq!(claude.write_namespace.as_deref(), Some("plan-evolution"));
+    assert_eq!(codex.write_namespace.as_deref(), Some("plan-evolution"));
+
+    // Loop config: 2 agents, 5 iterations
+    assert_eq!(plan.loop_configs.len(), 1);
+    assert_eq!(plan.loop_configs[0].agent_ids, vec!["claude", "codex"]);
+    assert_eq!(plan.loop_configs[0].max_iterations, 5);
+
+    // max_parallel 2 (init agents run in parallel)
+    assert_eq!(plan.max_parallel, Some(2));
+}

@@ -1,0 +1,165 @@
+client opus {
+    tier expensive
+    model "claude-opus-4-6"
+    privacy public
+}
+
+client codex {
+    tier expensive
+    model "codex:gpt-5.4"
+    privacy public
+}
+
+// ── Shared refinement prompt ─────────────────────────────────────────────────
+//
+// Both `claude` and `codex` refine agents reference this by name.
+// {{AGENT}} is substituted with the agent name at compile time, producing
+// per-agent output paths (plans/claude-plan-v{N+1}.md, plans/codex-plan-v{N+1}.md).
+
+prompt refine-body #"
+    You are iteratively refining an architecture plan for:
+
+    {{PROMPT}}
+
+    Steps:
+    1. List all files in plans/.
+    2. Find the highest version number N such that BOTH plans/claude-plan-v{N}.md
+       AND plans/codex-plan-v{N}.md exist. This is the last complete pair — the
+       shared baseline both models agreed to compare from.
+       (Ignore any file whose counterpart does not yet exist.)
+    3. Read plans/claude-plan-v[N].md and plans/codex-plan-v[N].md in full.
+    4. Analyse the pair: what does each plan get right? What does each miss,
+       oversimplify, or get wrong? Where do they conflict?
+    5. Synthesise a new plan that takes the strongest elements of both,
+       resolves conflicts with explicit reasoning, and improves on both.
+    6. Write your refined plan to plans/{{AGENT}}-plan-v{N+1}.md.
+       Begin the file with a "## Synthesis Notes" section that states the pair
+       you read, what you adopted from each plan, and what you changed or
+       discarded. Then continue with the full plan body.
+    7. Write a concise human-readable summary to plans/{{AGENT}}-summary_v{N+1}.md.
+       Keep it under 300 words. Cover:
+       - The main differences between the two v{N} plans
+       - The key choices you made in producing this version and why
+       - Anything significant that was kept, changed, or discarded
+       Write it for a human skimming the evolution of the plan, not for an agent.
+"#
+
+// ── Phase 1: Independent initial plans ──────────────────────────────────────
+
+agent claude-plan-init {
+    description "Create independent initial plan for: {{PROMPT}}"
+    client opus
+    scope {
+        // owned only — no read_only, so plans/ is unreachable for reading.
+        // Isolation is structural: even on re-runs, this agent cannot read
+        // existing versioned plan files.
+        owned ["plans/"]
+    }
+    prompt #"
+        You are producing an independent architecture plan for the following feature:
+
+        {{PROMPT}}
+
+        Think through the problem from first principles — do not try to read
+        any existing files. Reason purely from the feature description above.
+
+        Cover all of the following:
+        - Motivation and goals
+        - Proposed architecture and component breakdown
+        - Implementation steps (ordered, concrete)
+        - Data structures and API surface
+        - Risks and mitigations
+        - Alternatives considered and why rejected
+
+        Write your plan to plans/claude-plan-v1.md using clear markdown with headings.
+    "#
+}
+
+agent codex-plan-init {
+    description "Create independent initial plan for: {{PROMPT}}"
+    client codex
+    scope {
+        // owned only — no read_only, so plans/ is unreachable for reading.
+        // Isolation is structural: even on re-runs, this agent cannot read
+        // existing versioned plan files.
+        owned ["plans/"]
+    }
+    prompt #"
+        You are producing an independent architecture plan for the following feature:
+
+        {{PROMPT}}
+
+        Think through the problem from first principles — do not try to read
+        any existing files. Reason purely from the feature description above.
+
+        Cover all of the following:
+        - Motivation and goals
+        - Proposed architecture and component breakdown
+        - Implementation steps (ordered, concrete)
+        - Data structures and API surface
+        - Risks and mitigations
+        - Alternatives considered and why rejected
+
+        Write your plan to plans/codex-plan-v1.md using clear markdown with headings.
+    "#
+}
+
+// ── Phase 2: Iterative cross-model refinement ────────────────────────────────
+//
+// Both agents use the shared `refine-body` prompt. They run in parallel each
+// iteration — each reads the last complete pair independently, then writes its
+// own new version. The loop advances only after both finish.
+
+agent claude {
+    description "Refine feature plan via cross-model comparison (Claude)"
+    client opus
+    scope {
+        owned     ["plans/"]
+        read_only ["."]
+    }
+    prompt refine-body
+    memory {
+        write_ns      "plan-evolution"
+        importance    0.7
+        write_content #"
+            Claude refinement pass — feature: {{DESCRIPTION}}
+            Summary: {{SUMMARY}}
+        "#
+    }
+}
+
+agent codex {
+    description "Refine feature plan via cross-model comparison (Codex)"
+    client codex
+    scope {
+        owned     ["plans/"]
+        read_only ["."]
+    }
+    prompt refine-body
+    memory {
+        write_ns      "plan-evolution"
+        importance    0.7
+        write_content #"
+            Codex refinement pass — feature: {{DESCRIPTION}}
+            Summary: {{SUMMARY}}
+        "#
+    }
+}
+
+// ── Workflow ─────────────────────────────────────────────────────────────────
+
+workflow feature-plan-refinement {
+    steps [
+        claude-plan-init
+        codex-plan-init
+        loop {
+            agents         [claude codex]
+            max_iterations 5
+            until command "false"
+        }
+    ]
+    max_parallel 2
+    memory {
+        write_ns "plan-evolution"
+    }
+}
