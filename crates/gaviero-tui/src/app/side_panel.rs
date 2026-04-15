@@ -1,7 +1,18 @@
 use super::*;
 
 pub(super) fn handle_chat_action(app: &mut App, action: Action) {
-    app.chat_state.clear_text_selection();
+    // Only clear the output text selection on non-selection keypresses.
+    // SelectUp/SelectDown extend it; Copy reads it.
+    let is_selection_action = matches!(
+        action,
+        Action::SelectUp | Action::SelectDown | Action::SelectLeft
+            | Action::SelectRight | Action::SelectWordLeft | Action::SelectWordRight
+            | Action::Copy
+    );
+    let had_output_selection = app.chat_state.has_text_selection();
+    if !is_selection_action {
+        app.chat_state.clear_text_selection();
+    }
 
     if app.chat_state.renaming {
         match action {
@@ -252,8 +263,30 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
         Action::Copy => {
             if app.chat_state.active_conv_streaming() {
                 app.cancel_agent();
+            } else if had_output_selection {
+                // Copy the mouse/keyboard-selected text from the chat output
+                if let Some(text) = app.chat_state.selected_chat_text() {
+                    app.set_clipboard(&text);
+                }
+                app.chat_state.clear_text_selection();
+            } else if app.chat_state.text_input.has_selection() {
+                // Copy selected text from the input widget
+                if let Some(text) = app.chat_state.text_input.selected_text() {
+                    app.set_clipboard(&text.to_string());
+                }
+                app.chat_state.text_input.sel_anchor = None;
             } else {
                 app.chat_state.enter_browse_mode();
+            }
+        }
+        Action::SelectUp => {
+            if !app.chat_state.active_conv_streaming() {
+                app.chat_state.select_up_in_output();
+            }
+        }
+        Action::SelectDown => {
+            if !app.chat_state.active_conv_streaming() {
+                app.chat_state.select_down_in_output();
             }
         }
         _ => {}

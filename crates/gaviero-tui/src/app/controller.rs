@@ -19,6 +19,23 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 if let Some(inst) = app.terminal_manager.active_instance() {
                     if inst.spawned {
                         use crate::panels::terminal::{is_terminal_escape_key, key_event_to_bytes};
+
+                        // Intercept Ctrl+C when a terminal selection is active: copy instead of sending ^C.
+                        let is_ctrl_c = key.code == crossterm::event::KeyCode::Char('c')
+                            && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+                        if is_ctrl_c && app.terminal_selection.has_selection() {
+                            let text = if let Some(inst) = app.terminal_manager.active_instance_mut() {
+                                app.terminal_selection.extract_text(inst.screen_mut())
+                            } else {
+                                None
+                            };
+                            if let Some(text) = text {
+                                app.set_clipboard(&text);
+                            }
+                            app.terminal_selection.clear();
+                            return;
+                        }
+
                         if is_terminal_escape_key(&key) {
                             let action = Keymap::resolve(&key);
                             app.handle_action(action);
@@ -426,6 +443,34 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
                     let current = inst.screen().scrollback();
                     let page = inst.screen().size().0 as usize;
                     inst.screen_mut().set_scrollback(current.saturating_sub(page));
+                }
+                return;
+            }
+            Action::SelectUp => {
+                if let Some(inst) = app.terminal_manager.active_instance() {
+                    let (rows, cols) = inst.screen().size();
+                    app.terminal_selection.select_kb((-1, 0), rows, cols);
+                }
+                return;
+            }
+            Action::SelectDown => {
+                if let Some(inst) = app.terminal_manager.active_instance() {
+                    let (rows, cols) = inst.screen().size();
+                    app.terminal_selection.select_kb((1, 0), rows, cols);
+                }
+                return;
+            }
+            Action::SelectLeft => {
+                if let Some(inst) = app.terminal_manager.active_instance() {
+                    let (rows, cols) = inst.screen().size();
+                    app.terminal_selection.select_kb((0, -1), rows, cols);
+                }
+                return;
+            }
+            Action::SelectRight => {
+                if let Some(inst) = app.terminal_manager.active_instance() {
+                    let (rows, cols) = inst.screen().size();
+                    app.terminal_selection.select_kb((0, 1), rows, cols);
                 }
                 return;
             }

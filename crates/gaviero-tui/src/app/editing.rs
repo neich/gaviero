@@ -498,7 +498,9 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     if row >= content_y_start && row < area.y + area.height {
                         let vt_row = row - content_y_start;
                         let vt_col = col.saturating_sub(area.x);
-                        app.terminal_selection.start(vt_row, vt_col);
+                        if let Some(inst) = app.terminal_manager.active_instance() {
+                            app.terminal_selection.start(vt_row, vt_col, inst.screen());
+                        }
                     }
                     return;
                 }
@@ -680,19 +682,25 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                             inst.screen_mut().set_scrollback(current + 1);
                         }
                         let vt_col = col.saturating_sub(area.x);
-                        app.terminal_selection.extend(0, vt_col);
+                        if let Some(inst) = app.terminal_manager.active_instance() {
+                            app.terminal_selection.extend(0, vt_col, inst.screen());
+                        }
                     } else if row > last_content_row {
                         if let Some(inst) = app.terminal_manager.active_instance_mut() {
                             let current = inst.screen().scrollback();
                             inst.screen_mut().set_scrollback(current.saturating_sub(1));
                         }
                         let vt_col = col.saturating_sub(area.x);
-                        app.terminal_selection
-                            .extend(content_height.saturating_sub(1), vt_col);
+                        if let Some(inst) = app.terminal_manager.active_instance() {
+                            app.terminal_selection
+                                .extend(content_height.saturating_sub(1), vt_col, inst.screen());
+                        }
                     } else {
                         let vt_row = row - content_y_start;
                         let vt_col = col.saturating_sub(area.x);
-                        app.terminal_selection.extend(vt_row, vt_col);
+                        if let Some(inst) = app.terminal_manager.active_instance() {
+                            app.terminal_selection.extend(vt_row, vt_col, inst.screen());
+                        }
                     }
                 }
                 return;
@@ -708,10 +716,13 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
         }
         MouseEventKind::Up(MouseButton::Left) => {
             if app.terminal_selection.dragging {
-                if let Some(inst) = app.terminal_manager.active_instance() {
-                    if let Some(text) = app.terminal_selection.extract_text(inst.screen()) {
-                        app.set_clipboard(&text);
-                    }
+                let text = if let Some(inst) = app.terminal_manager.active_instance_mut() {
+                    app.terminal_selection.extract_text(inst.screen_mut())
+                } else {
+                    None
+                };
+                if let Some(text) = text {
+                    app.set_clipboard(&text);
                 }
                 app.terminal_selection.dragging = false;
             }

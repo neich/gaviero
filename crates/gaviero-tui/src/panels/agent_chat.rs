@@ -227,6 +227,8 @@ pub struct AgentChatState {
     pub text_sel_end: Option<(usize, usize)>,
     /// Whether mouse is currently dragging to select chat text.
     pub chat_dragging: bool,
+    /// Keyboard cursor line index into rendered_lines_cache, for Shift+Arrow selection.
+    pub chat_output_kb_cursor: Option<usize>,
     /// When true, the user has manually scrolled during streaming, so auto-scroll is paused.
     pub user_scrolled_during_stream: bool,
     /// When true, the next prompt will be sent with `--dangerously-skip-permissions`.
@@ -273,8 +275,9 @@ impl AgentChatState {
             conv_area_cache: None,
             text_sel_anchor: None,
             text_sel_end: None,
-            user_scrolled_during_stream: false,
             chat_dragging: false,
+            chat_output_kb_cursor: None,
+            user_scrolled_during_stream: false,
             auto_approve_next: false,
         }
     }
@@ -1097,6 +1100,7 @@ impl AgentChatState {
         self.text_sel_anchor = Some((line_idx, char_idx));
         self.text_sel_end = Some((line_idx, char_idx));
         self.chat_dragging = true;
+        self.chat_output_kb_cursor = None;
         // Exit browse mode if active
         self.browse_mode = false;
     }
@@ -1111,6 +1115,12 @@ impl AgentChatState {
         self.text_sel_anchor = None;
         self.text_sel_end = None;
         self.chat_dragging = false;
+        self.chat_output_kb_cursor = None;
+    }
+
+    /// Check if there is an active text selection in the chat output.
+    pub fn has_text_selection(&self) -> bool {
+        matches!((self.text_sel_anchor, self.text_sel_end), (Some(a), Some(e)) if a != e)
     }
 
     /// Get the ordered selection range: (start_line, start_char, end_line, end_char).
@@ -1212,6 +1222,56 @@ impl AgentChatState {
             .messages
             .get(self.browsed_msg)
             .map(|m| m.content.clone())
+    }
+
+    // ── Keyboard selection in chat output ─────────────────────────
+
+    /// Extend selection upward by one line in chat output.
+    pub fn select_up_in_output(&mut self) {
+        let total = self.rendered_lines_cache.len();
+        if total == 0 { return; }
+        let viewport = self.conv_area_cache
+            .map(|a| a.height as usize)
+            .unwrap_or(20);
+        let cursor = self.chat_output_kb_cursor.get_or_insert_with(|| {
+            (self.scroll_offset + viewport).min(total).saturating_sub(1)
+        });
+        if self.text_sel_anchor.is_none() {
+            self.text_sel_anchor = Some((*cursor, 0));
+        }
+        if *cursor > 0 { *cursor -= 1; }
+        let col = self.rendered_lines_cache
+            .get(*cursor)
+            .map(|(l, _)| l.chars().count())
+            .unwrap_or(0);
+        self.text_sel_end = Some((*cursor, col));
+        if *cursor < self.scroll_offset {
+            self.scroll_offset = *cursor;
+        }
+    }
+
+    /// Extend selection downward by one line in chat output.
+    pub fn select_down_in_output(&mut self) {
+        let total = self.rendered_lines_cache.len();
+        if total == 0 { return; }
+        let viewport = self.conv_area_cache
+            .map(|a| a.height as usize)
+            .unwrap_or(20);
+        let cursor = self.chat_output_kb_cursor.get_or_insert_with(|| {
+            (self.scroll_offset + viewport).min(total).saturating_sub(1)
+        });
+        if self.text_sel_anchor.is_none() {
+            self.text_sel_anchor = Some((*cursor, 0));
+        }
+        if *cursor + 1 < total { *cursor += 1; }
+        let col = self.rendered_lines_cache
+            .get(*cursor)
+            .map(|(l, _)| l.chars().count())
+            .unwrap_or(0);
+        self.text_sel_end = Some((*cursor, col));
+        if *cursor >= self.scroll_offset + viewport {
+            self.scroll_offset = (*cursor + 1).saturating_sub(viewport);
+        }
     }
 
     // ── @file autocomplete ─────────────────────────────────────
