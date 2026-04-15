@@ -1,100 +1,126 @@
 # gaviero-core
 
-`gaviero-core` is the runtime library behind the Gaviero workspace. It owns
-provider dispatch, chat and swarm execution, write-gated file proposals,
-iteration and validation, workspace settings, memory, repo context building,
-git/worktree orchestration, session persistence, and terminal management.
+Core runtime library for Gaviero. All execution logic — agent orchestration, write gates, memory, git, terminal — lives here. The TUI (`gaviero-tui`), CLI (`gaviero-cli`), and DSL compiler (`gaviero-dsl`) are all frontends that delegate to this library.
 
-`gaviero-cli`, `gaviero-tui`, and `gaviero-dsl` are front-ends around this
-crate. If behavior differs between the binaries, the integration layer is the
-first place to look; the execution engine lives here.
+## Overview
 
-## What this crate provides
+`gaviero-core` provides the complete execution engine for AI-powered code workflows:
 
-- A provider-aware backend layer behind `swarm::backend::AgentBackend`
-- A chat pipeline in `acp::client::AcpPipeline`
-- Multi-agent orchestration in `swarm::pipeline`
-- Tier routing and privacy routing in `swarm::router`
-- Iterative retry/escalation logic in `iteration`
-- Write proposal review/apply flow in `write_gate`
-- Syntax and compile-time validation gates in `validation_gate`
-- Workspace settings, namespaces, and session persistence
-- Semantic memory, repo-map ranking, and code graph context
-- Git repository/worktree helpers and embedded terminal management
+- **Chat execution** — Claude subprocess protocol (ACP) + provider-aware agent dispatch
+- **Swarm orchestration** — Multi-agent coordination with tier routing, scoped execution, and dependency graphs
+- **Write gates** — Diff review and interactive acceptance before changes touch disk
+- **Iteration & validation** — Retry loops with syntax checking, compilation, and test-based verification
+- **Semantic memory** — Hierarchical scoped embeddings (ONNX, SQLite) for cross-session knowledge
+- **Git & worktrees** — Repository operations and isolated execution contexts
+- **Workspace settings** — Configuration cascade (project → user → defaults)
+- **Terminal management** — PTY lifecycle and interactive shell sessions
 
-## Provider model specs
+There are no UI dependencies. Both TUI and CLI use the public APIs in this crate.
 
-The runtime now uses one model-spec convention across chat and swarm paths.
+## Installation & Build
 
-- `sonnet`, `opus`, `haiku`: Claude models via the Claude CLI backend
-- `claude:<name>` or `claude-code:<name>`: explicit Claude model selection
-- `ollama:<model>` or `local:<model>`: local Ollama model selection
-- Unprefixed model names default to Claude for backward compatibility
+```bash
+cargo build -p gaviero-core
+cargo test -p gaviero-core
+cargo clippy -p gaviero-core
+```
 
-Ollama base URLs are passed through `SwarmConfig.ollama_base_url` or the
-workspace setting `agent.ollamaBaseUrl`.
+Most tests run offline. Some (marked `#[ignore]`) require network for Ollama health checks or model downloads.
 
-## Main entry points
+## Provider Model Strings
 
-| Area | Entry points |
-| --- | --- |
-| Chat execution | `acp::client::AcpPipeline` |
-| Swarm execution | `swarm::pipeline::execute()` |
-| Coordinated planning | `swarm::pipeline::plan_coordinated()` |
-| Iterative execution | `iteration::IterationEngine` |
-| Backend abstraction | `swarm::backend::{AgentBackend, CompletionRequest}` |
-| Tier routing | `swarm::router::TierRouter` |
-| Write review/apply | `write_gate::WriteGatePipeline` |
-| Validation | `validation_gate::ValidationPipeline` |
-| Workspace settings | `workspace::Workspace` |
-| Semantic memory | `memory::MemoryStore` |
-| Repo ranking / graph | `repo_map::{RepoMap, graph_builder}` |
-| Git/worktrees | `git::{GitRepo, WorktreeManager, GitCoordinator}` |
-| Session / terminal | `session_state`, `terminal::TerminalManager` |
+Model selection uses a unified convention across chat and swarm execution:
 
-## Execution surfaces
+- **Claude models** — `sonnet`, `opus`, `haiku` (shorthand) or `claude:sonnet`, `claude-code:haiku` (explicit)
+- **Ollama/local** — `ollama:qwen2.5-coder:7b` or `local:model-name`
+- **Default** — unprefixed names route to Claude for backward compatibility
 
-### Chat
+Ollama server URL is configured via `SwarmConfig.ollama_base_url` or workspace setting `agent.ollamaBaseUrl`.
 
-`AcpPipeline` enriches prompts with conversation history and file references,
-then routes the request through the provider-aware backend layer. Claude models
-still use the ACP subprocess path for the existing Claude CLI UX. Local
-`ollama:` and `local:` models go through the shared backend executor.
+## API Overview
 
-### Swarm
+### Primary Entry Points
 
-`swarm::pipeline::execute()` runs compiled plans. It validates scopes, computes
-dependency tiers, resolves a backend for each work unit through `TierRouter`,
-runs the iteration engine, applies verification, and merges results when
-worktrees are enabled.
+| Subsystem | Main Type/Function | Purpose |
+|---|---|---|
+| **Chat** | `acp::client::AcpPipeline` | Single-turn agent execution with prompt enrichment |
+| **Swarm** | `swarm::pipeline::execute()` | Multi-agent orchestration from compiled plans |
+| **Planning** | `swarm::pipeline::plan_coordinated()` | Generate reviewable `.gaviero` plans |
+| **Backend** | `swarm::backend::AgentBackend` trait | Provider abstraction (Claude, Ollama, mock) |
+| **Routing** | `swarm::router::TierRouter` | Model tier resolution (local/cheap/expensive) |
+| **Iteration** | `iteration::IterationEngine` | Retry loops with verification feedback |
+| **Write Gate** | `write_gate::WriteGatePipeline` | Diff review + file application |
+| **Validation** | `validation_gate::ValidationGate` trait | Syntax and compilation verification |
+| **Memory** | `memory::MemoryStore` | Scoped semantic embeddings |
+| **Workspace** | `workspace::Workspace` | Settings and namespace resolution |
+| **Git** | `git::{GitRepo, WorktreeManager}` | Repository and worktree operations |
+| **Terminal** | `terminal::TerminalManager` | PTY lifecycle and shell sessions |
 
-### Coordinated planning
+### Observation & Events
 
-`swarm::pipeline::plan_coordinated()` asks the coordinator to produce a
-reviewable `.gaviero` plan. The plan is meant to be inspected, optionally
-edited, compiled by `gaviero-dsl`, and then executed with the normal swarm
-pipeline.
+Implement observer traits to receive execution events:
+- `observer::WriteGateObserver` — proposal changes
+- `observer::AcpObserver` — agent chat events
+- `observer::SwarmObserver` — multi-agent coordination events
 
-## Module overview
+## Usage Examples
 
-- `acp`: Claude subprocess protocol plus the provider-aware chat pipeline
-- `swarm`: planning, routing, execution, merge, verification, and backends
-- `iteration`: retry/refine/best-of-N strategy logic
-- `validation_gate`: post-edit validation gates
-- `write_gate`: proposal review and file application
-- `workspace`: settings cascade and namespace resolution
-- `memory`: scoped semantic memory and consolidation
-- `repo_map`: ranked context planning and knowledge graph storage
-- `git`: git repository helpers and worktree orchestration
-- `session_state`: persisted editor state for the TUI
-- `terminal`: PTY lifecycle and terminal session helpers
-- `tree_sitter`, `diff_engine`, `indent`, `scope_enforcer`: editor/runtime
-  primitives used by higher-level systems
+### Single-turn chat
 
-## Notes
+```rust
+use gaviero_core::acp::client::AcpPipeline;
 
-- This crate is the source of truth for runtime behavior.
-- The public Rust API is usable internally across the workspace, but it is not
-  yet documented as a stable external SDK.
-- If you are looking for language syntax, see `crates/gaviero-dsl`.
-- If you are looking for UI composition, see `crates/gaviero-tui`.
+let pipeline = AcpPipeline::new(workspace);
+let response = pipeline.send_prompt("review this code", &file_references)?;
+```
+
+### Multi-agent swarm execution
+
+```rust
+use gaviero_core::swarm::pipeline;
+
+let result = pipeline::execute(&compiled_plan, &workspace, &swarm_config).await?;
+```
+
+### Generating a coordinated plan
+
+```rust
+use gaviero_core::swarm::pipeline;
+
+let plan = pipeline::plan_coordinated(&task, &context).await?;
+println!("{}", plan.to_gaviero_script()?);  // Reviewable .gaviero format
+```
+
+## Module Overview
+
+| Module | Purpose |
+|---|---|
+| `acp/` | Claude subprocess protocol (ACP), session factory, prompt enrichment, file block routing |
+| `swarm/` | Multi-agent orchestration, tier routing, DAG execution, verification, git merge, backends |
+| `iteration/` | Retry loops, escalation, best-of-N strategy |
+| `validation_gate/` | Syntax validation (tree-sitter), compilation checks (cargo), test verification |
+| `write_gate/` | Diff review, hunk acceptance/rejection, scope enforcement |
+| `memory/` | 5-level hierarchical scoped embeddings (ONNX + SQLite + RRF search) |
+| `repo_map/` | PageRank-based context ranking, code graph, symbol resolution |
+| `workspace/` | Settings cascade, namespace resolution, project configuration |
+| `git/` | Git2 wrapper, worktree management, merge + conflict resolution |
+| `terminal/` | PTY lifecycle, OSC 133 parsing, interactive shell sessions |
+| `tree_sitter/` | Language registry (16 langs), query loader, AST enrichment |
+| `diff_engine/` | Hunk computation, context extraction |
+| `indent/` | Smart indentation (tree-sitter + hybrid + bracket strategies) |
+| `scope_enforcer/` | File path validation, write boundary enforcement |
+
+## Design Notes
+
+- **No UI dependencies** — core is pure library code
+- **Provider-neutral** — model strings are resolved at runtime, not compile-time
+- **Lock discipline** — no Mutex held across I/O, embedding, or parsing
+- **Memory writes** — always require explicit `WriteScope`; never infer scope level
+- **Scoring** — 50% similarity + 20% importance + 15% recency + 15% base, scaled by scope/trust
+- **Cascading search** — narrowest scope first, early exit at 0.70 confidence threshold
+
+## See Also
+
+- [ARCHITECTURE.md](../../ARCHITECTURE.md) — complete module dependency graph, data flow, type signatures
+- [crates/gaviero-dsl/README.md](../gaviero-dsl/README.md) — language syntax and examples
+- [CLAUDE.md](../../CLAUDE.md) — project conventions and rules

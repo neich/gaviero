@@ -25,6 +25,8 @@ pub enum Token {
     KwModel,
     #[token("privacy")]
     KwPrivacy,
+    #[token("default")]
+    KwDefault,
     #[token("scope")]
     KwScope,
     #[token("owned")]
@@ -180,6 +182,7 @@ impl fmt::Display for Token {
             Token::KwTier => write!(f, "tier"),
             Token::KwModel => write!(f, "model"),
             Token::KwPrivacy => write!(f, "privacy"),
+            Token::KwDefault => write!(f, "default"),
             Token::KwScope => write!(f, "scope"),
             Token::KwOwned => write!(f, "owned"),
             Token::KwReadOnly => write!(f, "read_only"),

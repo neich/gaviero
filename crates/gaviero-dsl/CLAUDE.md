@@ -1,6 +1,6 @@
 # gaviero-dsl
 
-Compiler for `.gaviero` workflow scripts. Transforms DSL source into `CompiledPlan` DAGs consumed by the swarm pipeline.
+Compiler for `.gaviero` workflow scripts. Lexer (logos) → Parser (chumsky) → AST → Compiler → `CompiledPlan` DAG.
 
 ## Build & Test
 
@@ -9,39 +9,37 @@ cargo test -p gaviero-dsl
 cargo clippy -p gaviero-dsl
 ```
 
-## Pipeline
+## Modules
 
-```
-Source (.gaviero) → Lexer (logos) → Parser (chumsky) → AST → Compiler → CompiledPlan
-```
-
-| Module | Purpose |
+| File | Purpose |
 |---|---|
-| `lexer.rs` | `lex()` — logos-based tokenizer |
-| `ast.rs` | `Script`, `AgentDecl`, `WorkflowDecl`, `ContextBlock`, `ScopeBlock`, `MemoryBlock`, `VerifyBlock` |
-| `parser.rs` | `parse()` — chumsky-based parser → AST |
-| `compiler.rs` | `compile_ast()` → `CompiledPlan` (DAG of `PlanNode`s with `WorkUnit`s) |
-| `error.rs` | `DslError`, `DslErrors` — miette diagnostic errors with spans |
+| `lexer.rs` | Logos tokenizer |
+| `ast.rs` | AST types: `Script`, `AgentDecl`, `WorkflowDecl`, blocks |
+| `parser.rs` | Chumsky parser → AST |
+| `compiler.rs` | Semantic analysis: `compile_ast()` → `CompiledPlan` |
+| `error.rs` | Miette diagnostics with source spans |
 
-**Entry point:** `compile(source, filename, workflow, runtime_prompt) → Result<CompiledPlan>`
+Entry point: `compile(source, filename, workflow, runtime_prompt) → Result<CompiledPlan>`
 
-## Key DSL Features
+## DSL Features
 
-- Agent declarations with `scope {}`, `memory {}`, `verify {}`, `context {}` blocks
-- Workflow declarations with ordered agent references and `depends_on`
-- `impact_scope` and `impact_tests` for verification configuration
-- `context {}` block: `callers_of`, `tests_for`, `depth` for repo-map-driven context
-
-## Dependencies
-
-- `gaviero-core` — for `CompiledPlan`, `WorkUnit`, `PlanNode` types
-- `logos` — lexer generator
-- `chumsky` — parser combinator
-- `miette` — error diagnostics with source spans
-- `thiserror` — error type derivation
+- Agent declarations: `scope {}`, `memory {}`, `verify {}`, `context {}` blocks
+- Workflows with ordered agents, `depends_on` edges
+- Context selection: `callers_of`, `tests_for`, `depth` (repo-map-driven)
+- Verification config: `impact_scope`, `impact_tests`
 
 ## Conventions
 
-- Errors carry source spans for precise diagnostics. Always propagate span info.
-- The compiler validates scope overlaps and dependency cycles at compile time.
-- Example scripts live in `examples/`.
+- Errors carry source spans. Always propagate span info.
+- Compiler validates scope overlaps and cycles at compile time.
+- Provider-neutral model strings (resolved at runtime by gaviero-core).
+
+## Dependencies
+
+- `gaviero-core` — types
+- `logos`, `chumsky` — lexing/parsing
+- `miette`, `thiserror` — diagnostics
+
+## See Also
+
+[ARCHITECTURE.md](../../ARCHITECTURE.md) — compilation pipeline, output types, scope validation.

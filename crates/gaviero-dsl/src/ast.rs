@@ -61,6 +61,7 @@ pub enum PromptSource {
 ///     tier coordinator
 ///     model "claude-opus-4-6"
 ///     privacy public
+///     default
 /// }
 /// ```
 #[derive(Debug, Clone)]
@@ -70,6 +71,7 @@ pub struct ClientDecl {
     pub tier: Option<(TierLit, Span)>,
     pub model: Option<(String, Span)>,
     pub privacy: Option<(PrivacyLit, Span)>,
+    pub is_default: bool,
     pub span: Span,
 }
 

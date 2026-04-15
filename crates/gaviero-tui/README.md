@@ -1,83 +1,116 @@
 # gaviero-tui
 
-`gaviero-tui` is the full-screen terminal workspace for Gaviero. It combines a
-multi-tab editor, file tree, search, review flows, agent chat, swarm dashboard,
-git panel, and embedded terminal in one process.
+Interactive terminal editor and workspace for Gaviero. Multi-tab code editor, file tree, git integration, agent chat, swarm dashboard, and embedded terminal all in one full-screen TUI.
 
-This crate is the interactive front-end. Runtime behavior still lives in
-`gaviero-core`.
+This is the interactive front-end. All execution logic lives in `gaviero-core`; the TUI handles rendering and input only.
 
-## What the TUI includes
+## Installation & Build
 
-- File tree, search, review, and git changes panels
-- Multi-buffer editor with syntax highlighting and markdown preview
-- Agent chat with streaming output, file references, and attachments
-- Swarm dashboard for `/swarm`, `/cswarm`, and `.gaviero` runs
-- Embedded terminal backed by `gaviero-core::terminal`
-- Session restore for tabs, layout, and conversations
-
-## Provider-aware agent usage
-
-Chat and swarm commands share the same provider model-spec rules as the core
-runtime.
-
-- `sonnet`, `opus`, `haiku`: Claude models
-- `ollama:<model>` or `local:<model>`: local Ollama models
-- `agent.ollamaBaseUrl`: workspace setting for the Ollama server URL
-
-Inside chat, `/model` can switch the active model. Example:
-
-```text
-/model ollama:qwen2.5-coder:7b
+```bash
+cargo build -p gaviero-tui
+cargo run -p gaviero-tui              # launch editor
+cargo test -p gaviero-tui
+cargo clippy -p gaviero-tui
 ```
 
-## Common commands
+Binary name: `gaviero`
 
-- `/model <name>`: set the active chat model
-- `/run <file.gaviero> [prompt]`: compile and run a DSL workflow
-- `/swarm <task>`: execute an immediate multi-agent swarm
-- `/cswarm <task>`: generate a reviewable coordinated plan
-- `/undo-swarm`: revert the last coordinated swarm result
-- `/remember <text>`: store a memory entry
-- `/attach <path>` / `/detach <name|all>`: manage attachments
+## Overview
 
-## Workspace settings
+The TUI combines multiple editing and collaboration features:
 
-The TUI reads `.gaviero/settings.json` through `gaviero-core::workspace`.
-Relevant AI settings include:
+- **Multi-tab editor** — Ropey-based rope buffer with syntax highlighting, undo/redo, search
+- **File tree** — Navigate and open files from a left panel
+- **Git panel** — Stage/unstage, commit, branch management, diff review
+- **Agent chat** — Talk to Claude agents with file context and streaming output
+- **Swarm dashboard** — Monitor multi-agent tasks, view logs, check timing and cost
+- **Search panel** — Workspace-wide search with results navigation
+- **Embedded terminal** — Full PTY shell with OSC 133 support
+- **Session restore** — Persistent tabs, layout, and conversation history
+
+## Running the Editor
+
+```bash
+gaviero                    # current directory
+gaviero /path/to/repo      # specific project
+gaviero /path/to/workspace.gaviero-workspace  # multi-folder workspace
+```
+
+On first run, you'll be prompted to create a workspace settings file.
+
+## Chat Commands
+
+Type these in the agent chat panel to control execution:
+
+| Command | Purpose |
+|---|---|
+| `/model <spec>` | Switch active model (e.g., `sonnet`, `ollama:qwen2.5-coder:7b`) |
+| `/run <file.gaviero>` | Compile and execute a DSL workflow |
+| `/run <file> <prompt>` | Execute with runtime prompt substitution |
+| `/swarm <task>` | Immediate multi-agent swarm (auto-decomposed) |
+| `/cswarm <task>` | Generate a reviewable coordinated plan (.gaviero file) |
+| `/undo-swarm` | Revert the last swarm result |
+| `/remember <text>` | Store a fact in semantic memory |
+| `/attach <path>` | Include a file in chat context |
+| `/detach <name\|all>` | Remove attachments |
+
+## Configuration
+
+The TUI reads workspace settings from this cascade:
+
+1. `.gaviero/settings.json` — project-level settings
+2. `.gaviero-workspace` file — multi-folder configuration
+3. `~/.config/gaviero/settings.json` — user defaults
+4. Built-in defaults
+
+Example `.gaviero/settings.json`:
 
 ```json
 {
+  "editor": {
+    "tabSize": 4,
+    "insertSpaces": true
+  },
   "agent": {
     "model": "sonnet",
-    "effort": "off",
     "maxTokens": 16384,
     "ollamaBaseUrl": "http://localhost:11434",
     "coordinator": {
-      "model": "sonnet"
+      "model": "opus"
     }
+  },
+  "memory": {
+    "namespace": "my-project"
   }
 }
 ```
 
-The first-run dialog can create a default settings file for a new workspace.
+## API / Architecture
 
-## Running
+The TUI implements three observer interfaces from `gaviero-core`:
 
-```bash
-gaviero
-gaviero /path/to/repo
-gaviero /path/to/workspace.gaviero-workspace
-```
+- `WriteGateObserver` — receives proposal accept/reject events
+- `AcpObserver` — receives agent chat progress events
+- `SwarmObserver` — receives multi-agent coordination events
 
-Logs are written to the platform cache directory because stderr is not visible
-in the alternate-screen TUI session.
+Each observer sends events to the main event loop as `Event` variants, which are processed synchronously.
 
-## Architectural shape
+**Event loop** — single-threaded: `draw → recv event → handle → repeat`
 
-The large historical `app.rs` god object has been decomposed into `src/app/`
-modules for controller, render, left-panel flows, side-panel flows, editing,
-session restore, observers, and shared state. `src/panels/` remains the home of
-panel state and panel rendering primitives.
+No background tasks mutate the `App` struct directly. All state changes flow through the event channel.
 
-See `ARCHITECTURE.md` for the module map and event flow.
+### Key keybindings
+
+| Context | Keys | Action |
+|---|---|---|
+| Editor | Ctrl+S | Save |
+| Editor | Ctrl+Z / Ctrl+Y | Undo / Redo |
+| Editor | Ctrl+F | Find in file |
+| Workspace | Alt+1/2/3/4 | Focus left / editor / right / terminal |
+| Workspace | Alt+a / Alt+w / Alt+g | Chat / Swarm / Git panel |
+| Diff review | `]h` / `[h` | Next / previous hunk |
+| Diff review | `a` / `r` | Accept / reject current hunk |
+| Diff review | `A` / `R` | Accept / reject all |
+| Diff review | `f` | Finalize (write to disk) |
+
+See the root [README.md](../../README.md) for a complete keybinding reference.

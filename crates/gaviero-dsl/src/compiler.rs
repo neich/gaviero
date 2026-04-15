@@ -41,6 +41,7 @@ pub fn compile_ast(
     let mut workflow_map: HashMap<&str, &WorkflowDecl> = HashMap::new();
     let mut prompt_map: HashMap<&str, &str> = HashMap::new();
     let mut script_vars: Vec<(String, String)> = Vec::new();
+    let mut default_client: Option<&ClientDecl> = None;
     let mut errors: Vec<DslError> = Vec::new();
 
     for item in &script.items {
@@ -56,6 +57,18 @@ pub fn compile_ast(
                         span: (c.name_span.start, c.name_span.end.saturating_sub(c.name_span.start)).into(),
                         reason: format!("duplicate client name `{}`", c.name),
                     });
+                }
+                // Track default client — only one is allowed
+                if c.is_default {
+                    if default_client.is_some() {
+                        errors.push(DslError::Compile {
+                            src: src(),
+                            span: (c.name_span.start, c.name_span.end.saturating_sub(c.name_span.start)).into(),
+                            reason: "only one client can be declared `default`".into(),
+                        });
+                    } else {
+                        default_client = Some(c);
+                    }
                 }
             }
             Item::Agent(a) => {
@@ -140,7 +153,7 @@ pub fn compile_ast(
     let mut compile_errors: Vec<DslError> = Vec::new();
 
     for decl in agent_order {
-        match compile_agent(decl, &client_map, &prompt_map, &script_vars, workflow_memory, source, filename, runtime_prompt) {
+        match compile_agent(decl, &client_map, default_client, &prompt_map, &script_vars, workflow_memory, source, filename, runtime_prompt) {
             Ok(wu) => work_units.push(wu),
             Err(e) => compile_errors.push(e),
         }
@@ -396,6 +409,7 @@ fn apply_vars(
 fn compile_agent(
     decl: &AgentDecl,
     client_map: &HashMap<&str, &ClientDecl>,
+    default_client: Option<&ClientDecl>,
     prompt_map: &HashMap<&str, &str>,
     script_vars: &[(String, String)],
     workflow_memory: Option<&MemoryBlock>,
@@ -407,6 +421,7 @@ fn compile_agent(
 
     // Resolve client reference
     let (tier, model, privacy) = if let Some((client_name, client_span)) = &decl.client {
+        // Explicit client reference
         let cd = client_map.get(client_name.as_str()).ok_or_else(|| DslError::Compile {
             src: src(),
             span: (client_span.start, client_span.end.saturating_sub(client_span.start).max(1)).into(),
@@ -416,7 +431,22 @@ fn compile_agent(
         let model = cd.model.as_ref().map(|(m, _)| m.clone());
         let privacy = cd.privacy.as_ref().map(|(p, _)| map_privacy(*p)).unwrap_or_default();
         (tier, model, privacy)
+    } else if let Some(dc) = default_client {
+        // No explicit client, but a default exists — use it
+        let tier = dc.tier.as_ref().map(|(t, _)| map_tier(*t)).unwrap_or_default();
+        let model = dc.model.as_ref().map(|(m, _)| m.clone());
+        let privacy = dc.privacy.as_ref().map(|(p, _)| map_privacy(*p)).unwrap_or_default();
+        (tier, model, privacy)
     } else {
+        // No explicit client, no default — warn if any clients are declared
+        if !client_map.is_empty() {
+            eprintln!(
+                "⚠ agent `{}`: no client declared and no default client set; \
+                 falling back to tier=Cheap/model=None. \
+                 Declare a default client with `default` in the client block.",
+                decl.name
+            );
+        }
         (ModelTier::default(), None, PrivacyLevel::default())
     };
 
@@ -748,6 +778,42 @@ mod tests {
         let units = compile_str(src).expect("should compile");
         assert_eq!(units[0].tier, ModelTier::Cheap); // Cheap is now the default
         assert_eq!(units[0].model, None);
+    }
+
+    #[test]
+    fn agent_no_client_uses_default_client() {
+        let src = r#"
+            client sonnet { tier cheap model "claude-sonnet-4-6" default }
+            agent a { description "uses default" }
+        "#;
+        let units = compile_str(src).expect("should compile");
+        assert_eq!(units[0].tier, ModelTier::Cheap);
+        assert_eq!(units[0].model, Some("claude-sonnet-4-6".to_string()));
+    }
+
+    #[test]
+    fn explicit_client_overrides_default() {
+        let src = r#"
+            client sonnet { tier cheap model "claude-sonnet-4-6" default }
+            client opus { tier expensive model "claude-opus-4-6" }
+            agent a { description "explicit opus" client opus }
+        "#;
+        let units = compile_str(src).expect("should compile");
+        assert_eq!(units[0].tier, ModelTier::Expensive);
+        assert_eq!(units[0].model, Some("claude-opus-4-6".to_string()));
+    }
+
+    #[test]
+    fn multiple_defaults_is_compile_error() {
+        let src = r#"
+            client sonnet { tier cheap model "claude-sonnet-4-6" default }
+            client opus { tier expensive model "claude-opus-4-6" default }
+            agent a { description "test" }
+        "#;
+        let result = compile_str(src);
+        assert!(result.is_err(), "multiple defaults should error");
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("default"), "error should mention default: {}", msg);
     }
 
     #[test]

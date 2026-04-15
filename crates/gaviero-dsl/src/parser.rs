@@ -13,6 +13,7 @@ enum ClientField {
     Tier(TierLit, Span),
     Model(String, Span),
     Privacy(PrivacyLit, Span),
+    Default,
 }
 
 #[derive(Debug)]
@@ -191,6 +192,7 @@ where
         just(Token::KwPrivacy)
             .ignore_then(privacy_lit.map_with(|v, e| (v, e.span())))
             .map(|(v, s)| ClientField::Privacy(v, s)),
+        just(Token::KwDefault).map(|_| ClientField::Default),
     ));
 
     let client_decl = just(Token::KwClient)
@@ -205,6 +207,7 @@ where
             let mut tier = None;
             let mut model = None;
             let mut privacy = None;
+            let mut is_default = false;
             for f in fields {
                 match f {
                     ClientField::Tier(v, s) => {
@@ -216,9 +219,12 @@ where
                     ClientField::Privacy(v, s) => {
                         privacy.get_or_insert((v, s));
                     }
+                    ClientField::Default => {
+                        is_default = true;
+                    }
                 }
             }
-            ClientDecl { name, name_span, tier, model, privacy, span: e.span() }
+            ClientDecl { name, name_span, tier, model, privacy, is_default, span: e.span() }
         });
 
     // ── scope block ───────────────────────────────────────────────
