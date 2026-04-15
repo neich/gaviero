@@ -21,7 +21,7 @@ enum AgentField {
     Client(String, Span),
     Scope(ScopeBlock),
     DependsOn(Vec<(String, Span)>, Span),
-    Prompt(String, Span),
+    Prompt(PromptSource, Span),
     MaxRetries(u8, Span),
     Memory(MemoryBlock),
     Context(ContextBlock),
@@ -408,8 +408,11 @@ where
             .ignore_then(ident_list.clone().map_with(|v, e| (v, e.span())))
             .map(|(v, s)| AgentField::DependsOn(v, s)),
         just(Token::KwPrompt)
-            .ignore_then(string.map_with(|s, e| (s, e.span())))
-            .map(|(v, s)| AgentField::Prompt(v, s)),
+            .ignore_then(choice((
+                string.map_with(|s, e| (PromptSource::Inline(s), e.span())),
+                ident.map_with(|s, e| (PromptSource::Ref(s, e.span()), e.span())),
+            )))
+            .map(|(src, s)| AgentField::Prompt(src, s)),
         just(Token::KwMaxRetries)
             .ignore_then(integer.map_with(|n, e| (n, e.span())))
             .map(|(n, s)| AgentField::MaxRetries(n.min(255) as u8, s)),
@@ -655,12 +658,30 @@ where
             }
         });
 
+    // ── top-level prompt declaration ──────────────────────────────
+    //
+    // prompt <name> <string>
+    //
+    // Agents reference it by identifier: `prompt <name>`
+
+    let prompt_decl = just(Token::KwPrompt)
+        .ignore_then(ident.map_with(|n, e| (n, e.span())))
+        .then(string.map_with(|s, e| (s, e.span())))
+        .map_with(|((name, name_span), (content, content_span)), e| PromptDecl {
+            name,
+            name_span,
+            content,
+            content_span,
+            span: e.span(),
+        });
+
     // ── top-level ─────────────────────────────────────────────────
 
     let item = choice((
         client_decl.map(Item::Client),
         agent_decl.map(Item::Agent),
         workflow_decl.map(Item::Workflow),
+        prompt_decl.map(Item::Prompt),
     ));
 
     item.repeated()
@@ -1163,6 +1184,71 @@ mod tests {
             assert_eq!(ctx.callers_of, vec!["src/lib.rs"]);
             assert!(ctx.tests_for.is_empty());
             assert!(ctx.depth.is_none());
+        }
+    }
+
+    // ── Named prompt declaration tests ────────────────────────────────────────
+
+    #[test]
+    fn prompt_decl_parses() {
+        let src = r#"prompt my-prompt "do the thing""#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        let ast = ast.unwrap();
+        assert_eq!(ast.items.len(), 1);
+        if let Item::Prompt(p) = &ast.items[0] {
+            assert_eq!(p.name, "my-prompt");
+            assert_eq!(p.content, "do the thing");
+        } else {
+            panic!("expected Prompt item");
+        }
+    }
+
+    #[test]
+    fn prompt_decl_raw_string_parses() {
+        let src = "prompt body #\"write to {{AGENT}}.md\"#";
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        if let Item::Prompt(p) = &ast.unwrap().items[0] {
+            assert_eq!(p.name, "body");
+            assert!(p.content.contains("{{AGENT}}"));
+        } else {
+            panic!("expected Prompt item");
+        }
+    }
+
+    #[test]
+    fn agent_prompt_ref_parses() {
+        let src = r#"
+            prompt my-p "text"
+            agent x { prompt my-p }
+        "#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        let ast = ast.unwrap();
+        // items[0] = Prompt, items[1] = Agent
+        if let Item::Agent(a) = &ast.items[1] {
+            match a.prompt.as_ref().expect("prompt field") {
+                (PromptSource::Ref(name, _), _) => assert_eq!(name, "my-p"),
+                (PromptSource::Inline(_), _) => panic!("expected Ref, got Inline"),
+            }
+        } else {
+            panic!("expected Agent item at index 1");
+        }
+    }
+
+    #[test]
+    fn agent_prompt_inline_is_inline_variant() {
+        let src = r#"agent x { prompt "inline text" }"#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        if let Item::Agent(a) = &ast.unwrap().items[0] {
+            match a.prompt.as_ref().expect("prompt field") {
+                (PromptSource::Inline(s), _) => assert_eq!(s, "inline text"),
+                (PromptSource::Ref(_, _), _) => panic!("expected Inline, got Ref"),
+            }
+        } else {
+            panic!("expected Agent item");
         }
     }
 }
