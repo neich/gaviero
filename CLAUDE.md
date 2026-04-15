@@ -7,8 +7,6 @@ Terminal editor + headless CLI. AI agent orchestration. Rust 2024.
 ```bash
 cargo build                    # all crates
 cargo test                     # all tests
-cargo test -p gaviero-core     # core only
-cargo test -p gaviero-dsl      # DSL only
 cargo clippy --workspace       # lint
 ```
 
@@ -16,20 +14,14 @@ Binaries: `gaviero` (TUI), `gaviero-cli` (headless).
 
 ## Workspace
 
-```
-crates/
-  gaviero-core/        Core: swarm, memory, ACP, write gate, git, indent, terminal
-  gaviero-tui/         TUI binary (ratatui + crossterm)
-  gaviero-cli/         Headless runner (clap)
-  gaviero-dsl/         .gaviero compiler (logos + chumsky -> CompiledPlan)
-  tree-sitter-gaviero/ Tree-sitter grammar for .gaviero files
-```
+Five crates — see per-crate CLAUDE.md for details:
+- `gaviero-core/` — all pipeline logic (no UI deps)
+- `gaviero-tui/` — terminal UI (ratatui + crossterm)
+- `gaviero-cli/` — headless runner (clap)
+- `gaviero-dsl/` — `.gaviero` compiler (logos + chumsky)
+- `tree-sitter-gaviero/` — tree-sitter grammar
 
-Pipeline logic -> `gaviero-core`. TUI = render + input. CLI = args + observers. Core has no UI dep.
-
-## Architecture
-
-See [ARCHITECTURE.md](ARCHITECTURE.md).
+Architecture: pipeline logic in core. TUI/CLI are thin wrappers with observers.
 
 ## Conventions
 
@@ -37,10 +29,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md).
 - Tokio runtime. Never hold Mutex across I/O or CPU work.
 - `tracing` for logging: `debug!`/`info!`/`warn!`/`error!`.
 - `serde` derive on all boundary types.
-- Tree-sitter re-exports from `gaviero-core::lib.rs`. Never depend `tree-sitter` directly downstream.
-- Agent writes flow through Write Gate. Agents get read-only tools (`Read`, `Glob`, `Grep`).
+- Tree-sitter re-exports from `gaviero-core::lib.rs`. Never import `tree-sitter` downstream.
+- Agent writes flow through Write Gate. Agents get read-only tools.
 - `git2` only. Never shell out to `git`.
-- Rust 2024 edition.
 
 ## Rules
 
@@ -49,17 +40,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md).
 - Embedding runs outside SQLite Mutex. Lock protects DB I/O only.
 - Swarm branches: `gaviero/{work_unit_id}`.
 - Worktrees: `.gaviero/worktrees/{id}/`, cleanup via `Drop`.
-- Memory writes require explicit `WriteScope`. Never guess scope.
-- Scoped search cascades narrow->wide, early-terminates at confidence threshold.
+- Memory writes require explicit `WriteScope`. Never infer scope.
+- Scoped search cascades narrow→wide, early-terminates at 0.70 confidence.
 
-## MCP Servers
+## See Also
 
-- Use context7 MCP for library docs.
-- MCP memory: namespace `Gaviero`. Store memories AI-optimized, not human-readable.
-
-## Response instructions for complex prompt requiring planning
-
-- Always performa a critical analysys of what the user is asking
-- Do not try to execute the prompt just because the users wants to. If you find problems or bad decissions, just tell the user
-- Always be explicit and honest with the risks of user's intentions
-- If possible, propose alternatives with critical comparison 
+- [ARCHITECTURE.md](ARCHITECTURE.md) — system design, data flow, subsystems
+- [.gaviero/docs-inventory.md](.gaviero/docs-inventory.md) — documentation status, gaps, TODOs
