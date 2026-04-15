@@ -16,66 +16,146 @@ pub struct TerminalSelectionState {
     pub anchor: Option<(u16, u16)>,
     /// Selection end in vt100 screen coordinates (row, col), updated on Drag.
     pub end: Option<(u16, u16)>,
+    /// Scrollback position when anchor was set (for tracking across scrolls).
+    pub anchor_scrollback: Option<usize>,
+    /// Scrollback position when end was last updated (for tracking across scrolls).
+    pub end_scrollback: Option<usize>,
     /// Whether the mouse is currently dragging to select.
     pub dragging: bool,
+    /// Keyboard cursor (row, col) for Shift+Arrow selection.
+    pub kb_cursor: Option<(u16, u16)>,
 }
 
 impl TerminalSelectionState {
     /// Begin a selection at (row, col) in vt100 screen coordinates.
-    pub fn start(&mut self, row: u16, col: u16) {
+    /// Takes screen reference to record scrollback position for accurate extraction during scrolling.
+    pub fn start(&mut self, row: u16, col: u16, screen: &vt100::Screen) {
+        let scrollback = screen.scrollback();
         self.anchor = Some((row, col));
+        self.anchor_scrollback = Some(scrollback);
         self.end = Some((row, col));
+        self.end_scrollback = Some(scrollback);
         self.dragging = true;
     }
 
     /// Extend the selection to (row, col).
-    pub fn extend(&mut self, row: u16, col: u16) {
+    /// Takes screen reference to record scrollback position for accurate extraction during scrolling.
+    pub fn extend(&mut self, row: u16, col: u16, screen: &vt100::Screen) {
+        let scrollback = screen.scrollback();
         self.end = Some((row, col));
+        self.end_scrollback = Some(scrollback);
     }
 
     /// Clear the selection entirely.
     pub fn clear(&mut self) {
         self.anchor = None;
         self.end = None;
+        self.anchor_scrollback = None;
+        self.end_scrollback = None;
         self.dragging = false;
+        self.kb_cursor = None;
     }
 
-    /// Ordered selection range: (start_row, start_col, end_row, end_col).
-    fn ordered_range(&self) -> Option<(u16, u16, u16, u16)> {
-        let (ar, ac) = self.anchor?;
-        let (er, ec) = self.end?;
-        if ar < er || (ar == er && ac <= ec) {
-            Some((ar, ac, er, ec))
-        } else {
-            Some((er, ec, ar, ac))
-        }
+    /// Check if there is an active text selection.
+    pub fn has_selection(&self) -> bool {
+        matches!((self.anchor, self.end), (Some(a), Some(e)) if a != e)
     }
 
     /// Check if a cell at (row, col) is within the selection.
-    pub fn is_selected(&self, row: u16, col: u16) -> bool {
-        let Some((sr, sc, er, ec)) = self.ordered_range() else { return false };
-        if sr == er && sc == ec { return false; }
-        if row < sr || row > er { return false; }
-        if row == sr && row == er { return col >= sc && col < ec; }
-        if row == sr { return col >= sc; }
-        if row == er { return col < ec; }
+    /// Accounts for scrollback changes to correctly highlight selections that span scrolled content.
+    pub fn is_selected(&self, row: u16, col: u16, screen: &vt100::Screen) -> bool {
+        let (ar, ac) = match self.anchor {
+            Some(a) => a,
+            None => return false,
+        };
+        let (er, ec) = match self.end {
+            Some(e) => e,
+            None => return false,
+        };
+
+        if ar == er && ac == ec { return false; }
+
+        let anchor_sb = self.anchor_scrollback.unwrap_or(0) as i32;
+        let end_sb = self.end_scrollback.unwrap_or(0) as i32;
+        let current_sb = screen.scrollback() as i32;
+
+        // Adjust each endpoint's screen row for scrollback change since it was recorded.
+        // When scrollback increases (scrolling back), older content appears at top,
+        // pushing existing content DOWN: new_row = old_row + (current_sb - original_sb).
+        let ar_current = (ar as i32 + (current_sb - anchor_sb)).max(0);
+        let er_current = (er as i32 + (current_sb - end_sb)).max(0);
+
+        // Normalize to (start_row, start_col, end_row, end_col) order.
+        let (sr, sc, er_norm, ec) = if ar_current < er_current || (ar_current == er_current && ac <= ec) {
+            (ar_current, ac, er_current, ec)
+        } else {
+            (er_current, ec, ar_current, ac)
+        };
+
+        let row_i = row as i32;
+        if row_i < sr || row_i > er_norm { return false; }
+        if row_i == sr && row_i == er_norm { return col >= sc && col < ec; }
+        if row_i == sr { return col >= sc; }
+        if row_i == er_norm { return col < ec; }
         true
     }
 
     /// Extract selected text from a vt100 screen. Each row is trimmed of
     /// trailing whitespace; rows are joined with newlines.
-    pub fn extract_text(&self, screen: &vt100::Screen) -> Option<String> {
-        let (sr, sc, er, ec) = self.ordered_range()?;
-        if sr == er && sc == ec { return None; }
+    /// Temporarily adjusts scrollback to access rows that are currently off-screen
+    /// due to scrolling during selection. Restores original scrollback before returning.
+    pub fn extract_text(&self, screen: &mut vt100::Screen) -> Option<String> {
+        let (ar, ac) = self.anchor?;
+        let (er, ec) = self.end?;
+        let anchor_sb = self.anchor_scrollback.unwrap_or(0) as i32;
+        let end_sb = self.end_scrollback.unwrap_or(0) as i32;
 
-        let mut result = String::new();
+        if ar == er && ac == ec && anchor_sb == end_sb { return None; }
+
+        let original_sb = screen.scrollback();
+        let screen_rows = screen.size().0 as i32;
         let screen_cols = screen.size().1;
-        for row in sr..=er {
-            let col_start = if row == sr { sc } else { 0 };
-            let col_end = if row == er { ec } else { screen_cols };
+
+        // Absolute position: lines back from present bottom. Higher value = older content.
+        // abs(row, sb) = sb + (screen_rows - 1 - row)
+        //   At sb=0, row=screen_rows-1 (bottom): abs=0 (the "present")
+        //   At sb=0, row=0 (top): abs=screen_rows-1
+        //   At sb=S, row=R: abs = S + (screen_rows - 1 - R)
+        let anchor_abs = anchor_sb + (screen_rows - 1 - ar as i32);
+        let end_abs = end_sb + (screen_rows - 1 - er as i32);
+
+        // Determine selection order: higher abs = top of selection (older content).
+        let (start_abs, start_col, end_abs_pos, end_col) =
+            if anchor_abs > end_abs || (anchor_abs == end_abs && ac <= ec) {
+                (anchor_abs, ac, end_abs, ec)
+            } else {
+                (end_abs, ec, anchor_abs, ac)
+            };
+
+        // Iterate from start (top, older) to end (bottom, newer), varying scrollback as needed.
+        let mut result = String::new();
+        let mut abs_pos = start_abs;
+        while abs_pos >= end_abs_pos {
+            let is_first = abs_pos == start_abs;
+            let is_last = abs_pos == end_abs_pos;
+            let col_start = if is_first { start_col } else { 0 };
+            let col_end = if is_last { end_col } else { screen_cols };
+
+            // Pick a scrollback value that brings abs_pos into the visible viewport.
+            // row_in_view = screen_rows - 1 + target_sb - abs_pos  (must be in [0, screen_rows))
+            // Use target_sb = max(0, abs_pos - (screen_rows - 1)) to place the row at the top
+            // when it's deep in history, or at natural position otherwise.
+            let target_sb = (abs_pos - (screen_rows - 1)).max(0);
+            let row_in_view = screen_rows - 1 + target_sb - abs_pos;
+            if row_in_view < 0 || row_in_view >= screen_rows {
+                abs_pos -= 1;
+                continue;
+            }
+            screen.set_scrollback(target_sb as usize);
+
             let mut line = String::new();
             for col in col_start..col_end {
-                if let Some(cell) = screen.cell(row, col) {
+                if let Some(cell) = screen.cell(row_in_view as u16, col) {
                     let contents = cell.contents();
                     if contents.is_empty() {
                         line.push(' ');
@@ -86,13 +166,38 @@ impl TerminalSelectionState {
                     line.push(' ');
                 }
             }
-            if row > sr {
+
+            if abs_pos < start_abs {
                 result.push('\n');
             }
             result.push_str(line.trim_end());
+
+            if abs_pos == 0 && end_abs_pos == 0 {
+                break;
+            }
+            abs_pos -= 1;
         }
 
+        // Restore original scrollback position.
+        screen.set_scrollback(original_sb);
+
         if result.is_empty() { None } else { Some(result) }
+    }
+
+    /// Extend keyboard selection in a given direction.
+    pub fn select_kb(&mut self, dir: (i16, i16), screen_rows: u16, screen_cols: u16) {
+        // Initialize cursor at bottom-left of screen if not yet active.
+        let cursor = self.kb_cursor.get_or_insert((screen_rows.saturating_sub(1), 0));
+        if self.anchor.is_none() {
+            self.anchor = Some(*cursor);
+            self.end = Some(*cursor);
+        }
+        let new_row = (cursor.0 as i16 + dir.0)
+            .clamp(0, screen_rows.saturating_sub(1) as i16) as u16;
+        let new_col = (cursor.1 as i16 + dir.1)
+            .clamp(0, screen_cols.saturating_sub(1) as i16) as u16;
+        *cursor = (new_row, new_col);
+        self.end = Some(*cursor);
     }
 }
 
@@ -121,7 +226,7 @@ pub fn render_terminal_screen(
             } else {
                 ' '
             };
-            let style = if selection.is_selected(row, col) {
+            let style = if selection.is_selected(row, col, screen) {
                 sel_style
             } else if let Some(cell) = cell {
                 vt100_style_to_ratatui(cell)
@@ -199,7 +304,7 @@ pub fn render_terminal_with_border(
             } else {
                 ' '
             };
-            let style = if selection.is_selected(row, col) {
+            let style = if selection.is_selected(row, col, screen) {
                 sel_style
             } else if let Some(cell) = cell {
                 vt100_style_to_ratatui(cell)
@@ -318,6 +423,11 @@ pub fn is_terminal_escape_key(key: &KeyEvent) -> bool {
         // Shift+PageUp/PageDown — page scroll in terminal
         | (KeyCode::PageUp, false, false, true)       // Shift+PageUp — page scroll back
         | (KeyCode::PageDown, false, false, true)     // Shift+PageDown — page scroll forward
+        // Keyboard text selection in terminal (escape to TUI, not PTY)
+        | (KeyCode::Up, false, false, true)           // Shift+Up — select up
+        | (KeyCode::Down, false, false, true)         // Shift+Down — select down
+        | (KeyCode::Left, false, false, true)         // Shift+Left — select left
+        | (KeyCode::Right, false, false, true)        // Shift+Right — select right
         // Ctrl+V — paste from clipboard (handled by app, not forwarded raw to PTY)
         | (KeyCode::Char('v'), true, false, false)
     )
