@@ -15,7 +15,11 @@ use crate::theme::Theme;
 /// Generate StyledSpans for markdown source text within a byte range.
 /// Scans from the beginning of the file to correctly track code block state,
 /// but only emits spans overlapping the visible byte range.
-pub fn highlight_markdown(source: &str, theme: &Theme, byte_range: std::ops::Range<usize>) -> Vec<StyledSpan> {
+pub fn highlight_markdown(
+    source: &str,
+    theme: &Theme,
+    byte_range: std::ops::Range<usize>,
+) -> Vec<StyledSpan> {
     let mut spans = Vec::new();
     let mut in_code_block = false;
     let mut code_block_start: usize = 0;
@@ -75,7 +79,10 @@ pub fn highlight_markdown(source: &str, theme: &Theme, byte_range: std::ops::Ran
 
 /// Find the next newline byte in the slice starting from `start`.
 fn memchr_newline(bytes: &[u8], start: usize) -> Option<usize> {
-    bytes[start..].iter().position(|&b| b == b'\n').map(|p| start + p)
+    bytes[start..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|p| start + p)
 }
 
 fn highlight_markdown_line(line: &str, offset: usize, theme: &Theme, spans: &mut Vec<StyledSpan>) {
@@ -84,7 +91,11 @@ fn highlight_markdown_line(line: &str, offset: usize, theme: &Theme, spans: &mut
     // Headings: # ## ### etc.
     if trimmed.starts_with('#') {
         let hashes = trimmed.chars().take_while(|c| *c == '#').count();
-        if hashes <= 6 && trimmed.get(hashes..hashes + 1).map_or(true, |c| c == " " || c.is_empty()) {
+        if hashes <= 6
+            && trimmed
+                .get(hashes..hashes + 1)
+                .map_or(true, |c| c == " " || c.is_empty())
+        {
             if let Some(style) = theme.highlight_style("markup.heading") {
                 spans.push(StyledSpan {
                     priority: 0,
@@ -155,7 +166,10 @@ fn highlight_inline(line: &str, offset: usize, theme: &Theme, spans: &mut Vec<St
         }
 
         // Bold: **...** or __...__
-        if i + 1 < len && ((bytes[i] == b'*' && bytes[i + 1] == b'*') || (bytes[i] == b'_' && bytes[i + 1] == b'_')) {
+        if i + 1 < len
+            && ((bytes[i] == b'*' && bytes[i + 1] == b'*')
+                || (bytes[i] == b'_' && bytes[i + 1] == b'_'))
+        {
             let marker = bytes[i];
             if let Some(end) = find_double_closing(line, i + 2, marker) {
                 if let Some(style) = theme.highlight_style("markup.bold") {
@@ -172,7 +186,9 @@ fn highlight_inline(line: &str, offset: usize, theme: &Theme, spans: &mut Vec<St
         }
 
         // Italic: *...* or _..._  (but not ** or __)
-        if (bytes[i] == b'*' || bytes[i] == b'_') && !matches!(bytes.get(i + 1), Some(b) if *b == bytes[i]) {
+        if (bytes[i] == b'*' || bytes[i] == b'_')
+            && !matches!(bytes.get(i + 1), Some(b) if *b == bytes[i])
+        {
             let marker = bytes[i];
             if let Some(end) = find_closing(line, i + 1, marker) {
                 if let Some(style) = theme.highlight_style("markup.italic") {
@@ -368,19 +384,15 @@ fn segment_style(seg: &TextSegment, theme: &Theme, default: Style) -> Style {
             .highlight_style("markup.italic")
             .unwrap_or(default)
             .add_modifier(Modifier::ITALIC),
-        SegmentKind::Code => theme
-            .highlight_style("markup.code")
-            .unwrap_or(default),
-        SegmentKind::Link(ref _url) => theme
-            .highlight_style("markup.link")
-            .unwrap_or(default),
+        SegmentKind::Code => theme.highlight_style("markup.code").unwrap_or(default),
+        SegmentKind::Link(ref _url) => theme.highlight_style("markup.link").unwrap_or(default),
     }
 }
 
 // ── Layout model ────────────────────────────────────────────────
 
 enum DisplayLine {
-    Heading(usize, String),        // level, text
+    Heading(usize, String), // level, text
     Text(Vec<TextSegment>),
     CodeBlock(String),
     Quote(String),
@@ -435,7 +447,9 @@ fn layout_markdown(source: &str, _max_width: usize) -> Vec<DisplayLine> {
 
         // Horizontal rules
         if (trimmed.starts_with("---") || trimmed.starts_with("***") || trimmed.starts_with("___"))
-            && trimmed.chars().all(|c| c == '-' || c == '*' || c == '_' || c == ' ')
+            && trimmed
+                .chars()
+                .all(|c| c == '-' || c == '*' || c == '_' || c == ' ')
             && trimmed.chars().filter(|c| !c.is_whitespace()).count() >= 3
         {
             lines.push(DisplayLine::HorizontalRule);
@@ -607,14 +621,22 @@ mod tests {
         let segments = parse_inline("hello **bold** and *italic* and `code`");
         assert!(segments.len() >= 5);
         assert!(segments.iter().any(|s| matches!(s.kind, SegmentKind::Bold)));
-        assert!(segments.iter().any(|s| matches!(s.kind, SegmentKind::Italic)));
+        assert!(
+            segments
+                .iter()
+                .any(|s| matches!(s.kind, SegmentKind::Italic))
+        );
         assert!(segments.iter().any(|s| matches!(s.kind, SegmentKind::Code)));
     }
 
     #[test]
     fn test_link_parsing() {
         let segments = parse_inline("see [example](https://example.com) here");
-        assert!(segments.iter().any(|s| matches!(s.kind, SegmentKind::Link(_))));
+        assert!(
+            segments
+                .iter()
+                .any(|s| matches!(s.kind, SegmentKind::Link(_)))
+        );
     }
 
     #[test]
