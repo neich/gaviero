@@ -44,14 +44,9 @@ pub enum ShellState {
     /// OSC 133;B received — prompt rendered, awaiting input.
     Idle,
     /// OSC 133;C received — a command is executing.
-    Running {
-        command: String,
-        started: Instant,
-    },
+    Running { command: String, started: Instant },
     /// OSC 133;D received — command finished, exit code available.
-    Finished {
-        exit_code: Option<i32>,
-    },
+    Finished { exit_code: Option<i32> },
 }
 
 impl ShellState {
