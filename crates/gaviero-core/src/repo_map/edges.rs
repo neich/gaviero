@@ -32,7 +32,9 @@ pub enum RefKind {
 /// Extract raw references from Rust source using tree-sitter.
 pub fn extract_rust_references(source: &str) -> Vec<RawReference> {
     let language = crate::tree_sitter::language_for_extension("rs");
-    let Some(language) = language else { return Vec::new() };
+    let Some(language) = language else {
+        return Vec::new();
+    };
 
     let mut parser = tree_sitter::Parser::new();
     if parser.set_language(&language).is_err() {
@@ -48,11 +50,7 @@ pub fn extract_rust_references(source: &str) -> Vec<RawReference> {
     refs
 }
 
-fn collect_rust_references(
-    node: tree_sitter::Node,
-    source: &[u8],
-    out: &mut Vec<RawReference>,
-) {
+fn collect_rust_references(node: tree_sitter::Node, source: &[u8], out: &mut Vec<RawReference>) {
     match node.kind() {
         // `use foo::bar::baz;` or `use foo::bar::{baz, qux};`
         "use_declaration" => {
@@ -86,7 +84,8 @@ fn collect_rust_references(
                     "identifier" => func_node.utf8_text(source).ok().map(|s| s.to_string()),
                     "field_expression" => {
                         // method.call() — extract the method name
-                        func_node.child_by_field_name("field")
+                        func_node
+                            .child_by_field_name("field")
                             .and_then(|n| n.utf8_text(source).ok())
                             .map(|s| s.to_string())
                     }
@@ -123,17 +122,17 @@ fn collect_rust_references(
 /// Handles: `use foo::bar;`, `use foo::bar as baz;`, `use foo::bar::*;`
 fn extract_use_path(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
     // The argument child contains the path
-    let arg = node.child_by_field_name("argument")
-        .or_else(|| {
-            // Some tree-sitter versions use a different structure
-            let mut cursor = node.walk();
-            node.children(&mut cursor)
-                .find(|c| c.kind() == "use_as_clause"
-                    || c.kind() == "scoped_use_list"
-                    || c.kind() == "use_wildcard"
-                    || c.kind() == "scoped_identifier"
-                    || c.kind() == "identifier")
-        })?;
+    let arg = node.child_by_field_name("argument").or_else(|| {
+        // Some tree-sitter versions use a different structure
+        let mut cursor = node.walk();
+        node.children(&mut cursor).find(|c| {
+            c.kind() == "use_as_clause"
+                || c.kind() == "scoped_use_list"
+                || c.kind() == "use_wildcard"
+                || c.kind() == "scoped_identifier"
+                || c.kind() == "identifier"
+        })
+    })?;
 
     // Get the text and clean it up
     let text = arg.utf8_text(source).ok()?;
@@ -147,21 +146,66 @@ fn extract_use_path(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
 
 /// Filter out common stdlib/macro calls that are noise for dependency analysis.
 fn is_noise_call(name: &str) -> bool {
-    matches!(name,
-        "println" | "eprintln" | "print" | "eprint"
-        | "format" | "write" | "writeln"
-        | "vec" | "assert" | "assert_eq" | "assert_ne" | "debug_assert"
-        | "panic" | "unreachable" | "unimplemented" | "todo"
-        | "dbg" | "cfg" | "env" | "include" | "include_str"
-        | "Some" | "None" | "Ok" | "Err"
-        | "Box::new" | "Arc::new" | "Rc::new"
-        | "String::new" | "String::from" | "Vec::new"
-        | "Default::default"
-        | "Into::into" | "From::from"
-        | "clone" | "to_string" | "to_owned" | "as_str" | "as_ref"
-        | "unwrap" | "expect" | "unwrap_or" | "unwrap_or_default" | "unwrap_or_else"
-        | "map" | "and_then" | "or_else" | "filter" | "collect" | "iter"
-        | "push" | "pop" | "insert" | "remove" | "contains" | "get" | "len" | "is_empty"
+    matches!(
+        name,
+        "println"
+            | "eprintln"
+            | "print"
+            | "eprint"
+            | "format"
+            | "write"
+            | "writeln"
+            | "vec"
+            | "assert"
+            | "assert_eq"
+            | "assert_ne"
+            | "debug_assert"
+            | "panic"
+            | "unreachable"
+            | "unimplemented"
+            | "todo"
+            | "dbg"
+            | "cfg"
+            | "env"
+            | "include"
+            | "include_str"
+            | "Some"
+            | "None"
+            | "Ok"
+            | "Err"
+            | "Box::new"
+            | "Arc::new"
+            | "Rc::new"
+            | "String::new"
+            | "String::from"
+            | "Vec::new"
+            | "Default::default"
+            | "Into::into"
+            | "From::from"
+            | "clone"
+            | "to_string"
+            | "to_owned"
+            | "as_str"
+            | "as_ref"
+            | "unwrap"
+            | "expect"
+            | "unwrap_or"
+            | "unwrap_or_default"
+            | "unwrap_or_else"
+            | "map"
+            | "and_then"
+            | "or_else"
+            | "filter"
+            | "collect"
+            | "iter"
+            | "push"
+            | "pop"
+            | "insert"
+            | "remove"
+            | "contains"
+            | "get"
+            | "len"
+            | "is_empty"
     )
 }
 
@@ -218,8 +262,11 @@ pub fn is_test_file(file_path: &str) -> bool {
 /// Map a tree-sitter node kind to a NodeKind for the graph.
 pub fn node_kind_from_ts(ts_kind: &str, file_path: &str) -> NodeKind {
     match ts_kind {
-        "function_item" | "function_definition" | "function_declaration"
-        | "method_declaration" | "method_definition" => {
+        "function_item"
+        | "function_definition"
+        | "function_declaration"
+        | "method_declaration"
+        | "method_definition" => {
             if is_test_file(file_path) {
                 NodeKind::Test
             } else {
@@ -249,12 +296,21 @@ use crate::types::FileScope;
 use super::models::WorkUnit;
 "#;
         let refs = extract_rust_references(src);
-        let imports: Vec<&str> = refs.iter()
+        let imports: Vec<&str> = refs
+            .iter()
             .filter(|r| r.kind == RefKind::Import)
             .map(|r| r.target_name.as_str())
             .collect();
-        assert!(imports.iter().any(|i| i.contains("HashMap")), "imports: {:?}", imports);
-        assert!(imports.iter().any(|i| i.contains("FileScope")), "imports: {:?}", imports);
+        assert!(
+            imports.iter().any(|i| i.contains("HashMap")),
+            "imports: {:?}",
+            imports
+        );
+        assert!(
+            imports.iter().any(|i| i.contains("FileScope")),
+            "imports: {:?}",
+            imports
+        );
     }
 
     #[test]
@@ -267,12 +323,17 @@ fn main() {
 }
 "#;
         let refs = extract_rust_references(src);
-        let calls: Vec<&str> = refs.iter()
+        let calls: Vec<&str> = refs
+            .iter()
             .filter(|r| r.kind == RefKind::Call)
             .map(|r| r.target_name.as_str())
             .collect();
         assert!(calls.contains(&"compute_value"), "calls: {:?}", calls);
-        assert!(calls.iter().any(|c| c.contains("helper")), "calls: {:?}", calls);
+        assert!(
+            calls.iter().any(|c| c.contains("helper")),
+            "calls: {:?}",
+            calls
+        );
         assert!(calls.contains(&"process"), "calls: {:?}", calls);
     }
 
@@ -286,7 +347,8 @@ impl Display for MyType {
 }
 "#;
         let refs = extract_rust_references(src);
-        let impls: Vec<&str> = refs.iter()
+        let impls: Vec<&str> = refs
+            .iter()
             .filter(|r| r.kind == RefKind::Implements)
             .map(|r| r.target_name.as_str())
             .collect();
@@ -304,7 +366,8 @@ fn example() {
 }
 "#;
         let refs = extract_rust_references(src);
-        let calls: Vec<&str> = refs.iter()
+        let calls: Vec<&str> = refs
+            .iter()
             .filter(|r| r.kind == RefKind::Call)
             .map(|r| r.target_name.as_str())
             .collect();
@@ -326,16 +389,32 @@ fn example() {
         let store = GraphStore::open_memory().unwrap();
 
         // File a.rs defines `compute`
-        store.upsert_node(
-            NodeKind::Function, "compute", "a.rs::compute", "a.rs",
-            Some(1), Some(5), Some("rust"), None,
-        ).unwrap();
+        store
+            .upsert_node(
+                NodeKind::Function,
+                "compute",
+                "a.rs::compute",
+                "a.rs",
+                Some(1),
+                Some(5),
+                Some("rust"),
+                None,
+            )
+            .unwrap();
 
         // File b.rs defines `caller` and calls `compute`
-        store.upsert_node(
-            NodeKind::Function, "caller", "b.rs::caller", "b.rs",
-            Some(1), Some(10), Some("rust"), None,
-        ).unwrap();
+        store
+            .upsert_node(
+                NodeKind::Function,
+                "caller",
+                "b.rs::caller",
+                "b.rs",
+                Some(1),
+                Some(10),
+                Some("rust"),
+                None,
+            )
+            .unwrap();
 
         let refs = vec![RawReference {
             target_name: "compute".into(),
@@ -348,7 +427,10 @@ fn example() {
 
         // When a.rs changes, b.rs should be affected (b calls a)
         let result = store.impact_radius(&["a.rs"], 3).unwrap();
-        assert!(result.affected_files.contains(&"b.rs".to_string()),
-            "b.rs should be affected when a.rs changes: {:?}", result.affected_files);
+        assert!(
+            result.affected_files.contains(&"b.rs".to_string()),
+            "b.rs should be affected when a.rs changes: {:?}",
+            result.affected_files
+        );
     }
 }
