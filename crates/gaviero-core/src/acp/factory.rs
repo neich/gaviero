@@ -273,7 +273,7 @@ fn spawn_persistent(
         .arg("--model")
         .arg(model);
 
-    if !options.effort.is_empty() && options.effort != "off" {
+    if !options.effort.is_empty() && options.effort != "off" && options.effort != "auto" {
         cmd.arg("--effort").arg(&options.effort);
     }
 

@@ -889,7 +889,7 @@ mod tests {
     }
 
     const FULL_EXAMPLE: &str = r##"
-        client opus   { tier coordinator model "claude-opus-4-6" }
+        client opus   { tier coordinator model "claude-opus-4-7" }
         client sonnet { tier execution   model "claude-sonnet-4-6" }
 
         agent researcher {
@@ -918,7 +918,7 @@ mod tests {
 
         assert_eq!(units[0].id, "researcher");
         assert_eq!(units[0].tier, ModelTier::Expensive);
-        assert_eq!(units[0].model, Some("claude-opus-4-6".to_string()));
+        assert_eq!(units[0].model, Some("claude-opus-4-7".to_string()));
         assert!(
             units[0]
                 .coordinator_instructions
@@ -978,19 +978,19 @@ mod tests {
     fn explicit_client_overrides_default() {
         let src = r#"
             client sonnet { tier cheap model "claude-sonnet-4-6" default }
-            client opus { tier expensive model "claude-opus-4-6" }
+            client opus { tier expensive model "claude-opus-4-7" }
             agent a { description "explicit opus" client opus }
         "#;
         let units = compile_str(src).expect("should compile");
         assert_eq!(units[0].tier, ModelTier::Expensive);
-        assert_eq!(units[0].model, Some("claude-opus-4-6".to_string()));
+        assert_eq!(units[0].model, Some("claude-opus-4-7".to_string()));
     }
 
     #[test]
     fn multiple_defaults_is_compile_error() {
         let src = r#"
             client sonnet { tier cheap model "claude-sonnet-4-6" default }
-            client opus { tier expensive model "claude-opus-4-6" default }
+            client opus { tier expensive model "claude-opus-4-7" default }
             agent a { description "test" }
         "#;
         let result = compile_str(src);
@@ -1798,7 +1798,7 @@ mod tests {
     fn template_plan_refinement_example() {
         // Smoke-test the full plan_refinement.gaviero example structure
         let src = r##"
-            client opus  { tier expensive model "claude-opus-4-6" privacy public }
+            client opus  { tier expensive model "claude-opus-4-7" privacy public }
             client codex { tier expensive model "codex:gpt-5.4"   privacy public }
 
             vars { PLANS "plans" }

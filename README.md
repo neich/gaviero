@@ -225,7 +225,7 @@ Define reusable multi-agent workflows in `.gaviero` files. The Gaviero DSL compi
 
 ```gaviero
 client sonnet { tier cheap  model "claude-sonnet-4-6" }
-client opus   { tier expensive model "claude-opus-4-6" }
+client opus   { tier expensive model "claude-opus-4-7" }
 
 agent reviewer {
     description "Review the PR and identify issues"

@@ -28,8 +28,10 @@ const TEMP_SUBDIR: &str = ".gaviero/tmp";
 /// Options for the Claude agent subprocess.
 #[derive(Debug, Clone)]
 pub struct AgentOptions {
-    /// Effort level for the CLI (off, low, medium, high, max).
-    /// "off" means don't pass --effort (use CLI default).
+    /// Effort level for the CLI (off, low, medium, high, xhigh, max, auto).
+    /// "off" and "auto" mean don't pass --effort (use CLI / model default).
+    /// `xhigh` applies on Opus 4.7; lower models fall back to `high`.
+    /// `max` is session-only (deepest reasoning, no token cap).
     pub effort: String,
     /// Max output tokens (0 = use default). Reserved for future API-based backends.
     pub max_tokens: u32,
@@ -192,7 +194,7 @@ impl AcpSession {
             cmd.arg("--resume").arg(id);
         }
 
-        if !options.effort.is_empty() && options.effort != "off" {
+        if !options.effort.is_empty() && options.effort != "off" && options.effort != "auto" {
             cmd.arg("--effort").arg(&options.effort);
         }
 

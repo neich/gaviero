@@ -894,7 +894,7 @@ mod tests {
 
     #[test]
     fn client_decl_full() {
-        let src = r#"client c { tier coordinator model "claude-opus-4-6" privacy public }"#;
+        let src = r#"client c { tier coordinator model "claude-opus-4-7" privacy public }"#;
         let (ast, errs) = parse_str(src);
         assert!(errs.is_empty(), "parse errors: {:?}", errs);
         let ast = ast.unwrap();
@@ -902,7 +902,7 @@ mod tests {
         if let Item::Client(c) = &ast.items[0] {
             assert_eq!(c.name, "c");
             assert!(matches!(c.tier, Some((TierLit::Coordinator, _))));
-            assert!(matches!(&c.model, Some((m, _)) if m == "claude-opus-4-6"));
+            assert!(matches!(&c.model, Some((m, _)) if m == "claude-opus-4-7"));
             assert!(matches!(c.privacy, Some((PrivacyLit::Public, _))));
         } else {
             panic!("expected Client item");

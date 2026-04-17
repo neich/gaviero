@@ -290,7 +290,7 @@ mod tests {
 
         let mut parser = gaviero_core::Parser::new();
         parser.set_language(&lang).unwrap();
-        let source = "client opus { tier expensive model \"claude-opus-4-6\" }\n\nagent scan {\n    description \"Scan\"\n    client opus\n    memory {\n        read_ns [\"shared\"]\n        importance 0.9\n    }\n}\n";
+        let source = "client opus { tier expensive model \"claude-opus-4-7\" }\n\nagent scan {\n    description \"Scan\"\n    client opus\n    memory {\n        read_ns [\"shared\"]\n        importance 0.9\n    }\n}\n";
         let rope = ropey::Rope::from_str(source);
         let tree = parser.parse(source, None).unwrap();
 
