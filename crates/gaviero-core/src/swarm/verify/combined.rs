@@ -35,7 +35,10 @@ pub async fn run_verification(
         VerificationStrategy::StructuralOnly => {
             run_structural_only(&all_modified, workspace_root, observer).await
         }
-        VerificationStrategy::DiffReview { review_tiers, batch_strategy } => {
+        VerificationStrategy::DiffReview {
+            review_tiers,
+            batch_strategy,
+        } => {
             run_diff_review_only(
                 review_tiers,
                 batch_strategy,
@@ -43,12 +46,16 @@ pub async fn run_verification(
                 workspace_root,
                 &all_modified,
                 observer,
-            ).await
+            )
+            .await
         }
         VerificationStrategy::TestSuite { command, targeted } => {
             run_test_suite_only(command, *targeted, &all_modified, workspace_root, observer).await
         }
-        VerificationStrategy::Combined { review_tiers, test_command } => {
+        VerificationStrategy::Combined {
+            review_tiers,
+            test_command,
+        } => {
             run_combined(
                 review_tiers,
                 test_command.as_deref(),
@@ -57,7 +64,8 @@ pub async fn run_verification(
                 workspace_root,
                 &all_modified,
                 observer,
-            ).await
+            )
+            .await
         }
     }
 }
@@ -130,7 +138,9 @@ async fn run_diff_review_only(
         })
         .collect();
 
-    let review_step = super::VerificationStep::DiffReview { units_to_review: diffs.len() };
+    let review_step = super::VerificationStep::DiffReview {
+        units_to_review: diffs.len(),
+    };
     observer.on_verification_step_started(&review_step);
 
     let mut reviewer = DiffReviewer::new(DiffReviewConfig {
@@ -227,15 +237,19 @@ async fn run_combined(
     let structural_step = super::VerificationStep::Structural;
     observer.on_verification_step_started(&structural_step);
     let structural_report = structural::verify(modified_files, workspace_root);
-    let structural_passed = structural_report.failures.iter().all(|f| {
-        matches!(f.severity, FailureSeverity::MissingNode)
-    });
+    let structural_passed = structural_report
+        .failures
+        .iter()
+        .all(|f| matches!(f.severity, FailureSeverity::MissingNode));
     observer.on_verification_step_complete(&structural_step, structural_passed);
 
     if !structural_passed {
         // Identify failing units for potential escalation
         for failure in &structural_report.failures {
-            if matches!(failure.severity, FailureSeverity::ParseError | FailureSeverity::MissingSymbol { .. }) {
+            if matches!(
+                failure.severity,
+                FailureSeverity::ParseError | FailureSeverity::MissingSymbol { .. }
+            ) {
                 if let Some(unit) = find_unit_for_file(units, manifests, &failure.path) {
                     escalations.push(EscalationRecord {
                         unit_id: unit.id.clone(),
@@ -274,7 +288,9 @@ async fn run_combined(
             .collect();
 
         if !diffs.is_empty() {
-            let review_step = super::VerificationStep::DiffReview { units_to_review: diffs.len() };
+            let review_step = super::VerificationStep::DiffReview {
+                units_to_review: diffs.len(),
+            };
             observer.on_verification_step_started(&review_step);
 
             let mut reviewer = DiffReviewer::new(DiffReviewConfig {
@@ -289,14 +305,18 @@ async fn run_combined(
                 // Record escalation opportunities for rejected units
                 for unit_review in &review.reviews {
                     if !unit_review.approved {
-                        let error_issues: Vec<_> = unit_review.issues.iter()
+                        let error_issues: Vec<_> = unit_review
+                            .issues
+                            .iter()
                             .filter(|i| i.severity == super::IssueSeverity::Error)
                             .cloned()
                             .collect();
                         if !error_issues.is_empty() {
                             escalations.push(EscalationRecord {
                                 unit_id: unit_review.unit_id.clone(),
-                                reason: EscalationReason::DiffReviewRejection { issues: error_issues },
+                                reason: EscalationReason::DiffReviewRejection {
+                                    issues: error_issues,
+                                },
                                 from_tier: ModelTier::Cheap, // Approximate
                                 to_tier: ModelTier::Expensive,
                                 succeeded: false,
@@ -430,10 +450,20 @@ mod tests {
             self.steps_started.lock().unwrap().push(strategy.into());
         }
         fn on_verification_step_started(&self, step: &super::super::VerificationStep) {
-            self.steps_started.lock().unwrap().push(format!("{:?}", step));
+            self.steps_started
+                .lock()
+                .unwrap()
+                .push(format!("{:?}", step));
         }
-        fn on_verification_step_complete(&self, step: &super::super::VerificationStep, passed: bool) {
-            self.steps_completed.lock().unwrap().push((format!("{:?}", step), passed));
+        fn on_verification_step_complete(
+            &self,
+            step: &super::super::VerificationStep,
+            passed: bool,
+        ) {
+            self.steps_completed
+                .lock()
+                .unwrap()
+                .push((format!("{:?}", step), passed));
         }
         fn on_verification_complete(&self, _passed: bool) {}
     }
@@ -477,13 +507,9 @@ mod tests {
         std::fs::write(&file, "fn main() {}\n").unwrap();
 
         let obs = mock_observer();
-        let report = run_structural_only(
-            &[PathBuf::from("good.rs")],
-            dir.path(),
-            &obs,
-        )
-        .await
-        .unwrap();
+        let report = run_structural_only(&[PathBuf::from("good.rs")], dir.path(), &obs)
+            .await
+            .unwrap();
 
         assert!(report.overall_passed);
         assert_eq!(report.structural.files_checked, 1);
@@ -497,13 +523,9 @@ mod tests {
         std::fs::write(&file, "fn main( {\n").unwrap();
 
         let obs = mock_observer();
-        let report = run_structural_only(
-            &[PathBuf::from("bad.rs")],
-            dir.path(),
-            &obs,
-        )
-        .await
-        .unwrap();
+        let report = run_structural_only(&[PathBuf::from("bad.rs")], dir.path(), &obs)
+            .await
+            .unwrap();
 
         assert!(!report.overall_passed);
         assert!(!report.structural.failures.is_empty());
@@ -565,7 +587,7 @@ mod tests {
         let obs = mock_observer();
         // No test command → only structural and diff review run
         let report = run_combined(
-            &[], // No review tiers
+            &[],  // No review tiers
             None, // No test command
             &manifests,
             &units,
