@@ -35,12 +35,12 @@ use crate::acp::session::{AcpSession, AgentOptions};
 use crate::context_planner::{ContinuityHandle, ContinuityMode, ProviderProfile};
 use crate::observer::AcpObserver;
 use crate::swarm::backend::AgentBackend as _;
-use crate::swarm::backend::shared;
 use crate::swarm::backend::UnifiedStreamEvent;
+use crate::swarm::backend::shared;
 use crate::write_gate::WriteGatePipeline;
 
-use super::{AgentSession, Turn};
 use super::registry::SessionConstruction;
+use super::{AgentSession, Turn};
 
 // ── ClaudeSession ─────────────────────────────────────────────────────────────
 
@@ -115,11 +115,7 @@ impl ClaudeSession {
     /// core of the Claude streaming path, extracted from
     /// `AcpPipeline::send_prompt_via_claude` (M6 parity reference kept there
     /// as `#[allow(dead_code)]` until M10).
-    async fn run_claude_turn(
-        &self,
-        turn: &Turn,
-        resume_session_id: Option<String>,
-    ) -> Result<()> {
+    async fn run_claude_turn(&self, turn: &Turn, resume_session_id: Option<String>) -> Result<()> {
         // ── Reconstruct legacy inputs from Turn ──────────────────────────
 
         // Enriched prompt: graph block → memory block → user message (byte-identical
@@ -161,8 +157,14 @@ impl ClaudeSession {
             .unwrap_or_default();
 
         // ── M0 instrumentation ────────────────────────────────────────────
-        let resume_hint = resume_session_id.as_deref().map(|id| !id.is_empty()).unwrap_or(false);
-        let history_chars: usize = conversation_history.iter().map(|(r, c)| r.len() + c.len()).sum();
+        let resume_hint = resume_session_id
+            .as_deref()
+            .map(|id| !id.is_empty())
+            .unwrap_or(false);
+        let history_chars: usize = conversation_history
+            .iter()
+            .map(|(r, c)| r.len() + c.len())
+            .sum();
         tracing::info!(
             target: "turn_metrics",
             kind = "chat",
@@ -339,10 +341,9 @@ impl ClaudeSession {
                                                 self.workspace_root.join(fp)
                                             };
                                             if !file_snapshots.contains_key(&abs_path) {
-                                                let content =
-                                                    tokio::fs::read_to_string(&abs_path)
-                                                        .await
-                                                        .unwrap_or_default();
+                                                let content = tokio::fs::read_to_string(&abs_path)
+                                                    .await
+                                                    .unwrap_or_default();
                                                 tracing::info!(
                                                     "Snapshot before tool {}: {} ({} bytes)",
                                                     tu.name,
@@ -374,8 +375,7 @@ impl ClaudeSession {
                                     if full_text.is_empty() && !result_text.is_empty() {
                                         full_text = result_text.clone();
                                     }
-                                    self.observer
-                                        .on_message_complete("assistant", &full_text);
+                                    self.observer.on_message_complete("assistant", &full_text);
                                 }
                                 break;
                             }
@@ -432,9 +432,7 @@ impl ClaudeSession {
                                 {
                                     Ok(status) => status.ok(),
                                     Err(_) => {
-                                        tracing::warn!(
-                                            "Process wait timed out on EOF, killing"
-                                        );
+                                        tracing::warn!("Process wait timed out on EOF, killing");
                                         session.kill();
                                         None
                                     }
@@ -482,8 +480,7 @@ impl ClaudeSession {
         }
 
         // Catch any <file> blocks that completed after the last ContentDelta.
-        let remaining =
-            crate::acp::protocol::parse_file_blocks(&full_text[file_scan_pos..]);
+        let remaining = crate::acp::protocol::parse_file_blocks(&full_text[file_scan_pos..]);
         for (rel_path, content) in remaining {
             if let Err(e) = propose_write(
                 &self.write_gate,
@@ -495,7 +492,11 @@ impl ClaudeSession {
             )
             .await
             {
-                tracing::error!("Failed to create proposal for {}: {}", rel_path.display(), e);
+                tracing::error!(
+                    "Failed to create proposal for {}: {}",
+                    rel_path.display(),
+                    e
+                );
             }
         }
 
@@ -523,7 +524,10 @@ impl ClaudeSession {
         // Create proposals from snapshotted files.
         if !file_snapshots.is_empty() {
             let total = file_snapshots.len();
-            tracing::info!("Processing {} file snapshots for tool-based proposals", total);
+            tracing::info!(
+                "Processing {} file snapshots for tool-based proposals",
+                total
+            );
             self.observer.on_streaming_status(&format!(
                 "Processing {} file change{}...",
                 total,
@@ -531,7 +535,9 @@ impl ClaudeSession {
             ));
             let snapshots: Vec<(PathBuf, String)> = file_snapshots.into_iter().collect();
             for (i, (abs_path, original)) in snapshots.iter().enumerate() {
-                let current = tokio::fs::read_to_string(abs_path).await.unwrap_or_default();
+                let current = tokio::fs::read_to_string(abs_path)
+                    .await
+                    .unwrap_or_default();
                 if current == *original {
                     tracing::info!("Snapshot unchanged: {}", abs_path.display());
                     continue;
@@ -590,9 +596,7 @@ impl AgentSession for ClaudeSession {
         // Extract resume id from the continuity handle (M6: drives resume via
         // `ContinuityHandle::ClaudeSessionId` rather than the legacy field).
         let resume_session_id = match &self.handle {
-            Some(ContinuityHandle::ClaudeSessionId(id)) if !id.is_empty() => {
-                Some(id.clone())
-            }
+            Some(ContinuityHandle::ClaudeSessionId(id)) if !id.is_empty() => Some(id.clone()),
             _ => None,
         };
 
