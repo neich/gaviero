@@ -111,7 +111,11 @@ pub fn load_session(workspace_key: &Path) -> SessionState {
         Ok(content) => match serde_json::from_str(&content) {
             Ok(state) => state,
             Err(e) => {
-                tracing::warn!("Corrupt session state at {}, using defaults: {}", state_path.display(), e);
+                tracing::warn!(
+                    "Corrupt session state at {}, using defaults: {}",
+                    state_path.display(),
+                    e
+                );
                 SessionState::default()
             }
         },
@@ -137,8 +141,7 @@ pub fn save_session(workspace_key: &Path, state: &SessionState) -> Result<()> {
 /// Uses a simple hash (not crypto-grade, just collision-resistant enough).
 fn path_to_key(path: &Path) -> String {
     // Canonicalize if possible, otherwise use as-is
-    let canonical = std::fs::canonicalize(path)
-        .unwrap_or_else(|_| path.to_path_buf());
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let s = canonical.to_string_lossy();
 
     // Simple FNV-1a 64-bit hash — fast, no extra deps
@@ -155,7 +158,7 @@ fn path_to_key(path: &Path) -> String {
 /// A single chat message stored on disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredMessage {
-    pub role: String,    // "user", "assistant", "system"
+    pub role: String, // "user", "assistant", "system"
     pub content: String,
     #[serde(default)]
     pub tool_calls: Vec<String>,
@@ -245,7 +248,11 @@ pub fn load_conversation_index(workspace_key: &Path) -> ConversationIndex {
         Ok(content) => match serde_json::from_str(&content) {
             Ok(index) => index,
             Err(e) => {
-                tracing::warn!("Corrupt conversation index at {}, using defaults: {}", index_path.display(), e);
+                tracing::warn!(
+                    "Corrupt conversation index at {}, using defaults: {}",
+                    index_path.display(),
+                    e
+                );
                 ConversationIndex::default()
             }
         },
@@ -255,8 +262,8 @@ pub fn load_conversation_index(workspace_key: &Path) -> ConversationIndex {
 
 /// Save the conversation index.
 pub fn save_conversation_index(workspace_key: &Path, index: &ConversationIndex) -> Result<()> {
-    let dir = conversations_dir(workspace_key)
-        .context("could not determine conversations directory")?;
+    let dir =
+        conversations_dir(workspace_key).context("could not determine conversations directory")?;
     std::fs::create_dir_all(&dir)?;
     let content = serde_json::to_string_pretty(index)?;
     std::fs::write(dir.join("index.json"), content)?;
@@ -273,8 +280,8 @@ pub fn load_conversation(workspace_key: &Path, conv_id: &str) -> Option<StoredCo
 
 /// Save a single conversation.
 pub fn save_conversation(workspace_key: &Path, conv: &StoredConversation) -> Result<()> {
-    let dir = conversations_dir(workspace_key)
-        .context("could not determine conversations directory")?;
+    let dir =
+        conversations_dir(workspace_key).context("could not determine conversations directory")?;
     std::fs::create_dir_all(&dir)?;
     let content = serde_json::to_string_pretty(conv)?;
     std::fs::write(dir.join(format!("{}.json", conv.id)), content)?;
@@ -283,8 +290,8 @@ pub fn save_conversation(workspace_key: &Path, conv: &StoredConversation) -> Res
 
 /// Delete a conversation by ID.
 pub fn delete_conversation(workspace_key: &Path, conv_id: &str) -> Result<()> {
-    let dir = conversations_dir(workspace_key)
-        .context("could not determine conversations directory")?;
+    let dir =
+        conversations_dir(workspace_key).context("could not determine conversations directory")?;
     let path = dir.join(format!("{}.json", conv_id));
     if path.exists() {
         std::fs::remove_file(&path)?;
