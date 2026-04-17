@@ -18,6 +18,33 @@ pub enum Item {
     /// A top-level `vars { KEY "value" ... }` block.
     /// Keys defined here are substituted compile-time across all agents.
     Vars(Vec<(String, String)>),
+    /// A top-level `tier <name> <client>` alias — a named routing label
+    /// that resolves to a concrete client profile. See [`TierAlias`].
+    TierAlias(TierAlias),
+}
+
+/// Top-level `tier <name> <client-ref>` declaration.
+///
+/// ```text
+/// client opus_deep { model "opus" effort xhigh }
+/// client codex_fast { model "codex:gpt-5-codex" effort medium }
+/// tier expensive opus_deep
+/// tier cheap codex_fast
+/// ```
+///
+/// An agent can then say `agent worker { tier cheap ... }` instead of binding
+/// to a concrete client. The alias layer is meant for swapping concrete
+/// bindings at the CLI (step 4) without touching agent definitions.
+#[derive(Debug, Clone)]
+pub struct TierAlias {
+    /// Alias name. Accepts any identifier-shaped name — conventional values
+    /// are `cheap` / `expensive`, but custom names are allowed.
+    pub name: String,
+    pub name_span: Span,
+    /// Name of a `ClientDecl` the alias resolves to.
+    pub client_ref: String,
+    pub client_ref_span: Span,
+    pub span: Span,
 }
 
 /// A top-level named prompt declaration.
@@ -60,19 +87,46 @@ pub enum PromptSource {
 /// client claude_opus {
 ///     tier coordinator
 ///     model "claude-opus-4-7"
+///     effort high
 ///     privacy public
+///     extra {
+///         "thinking_budget" "8000"
+///         "max_tokens"      "32768"
+///     }
 ///     default
 /// }
 /// ```
+///
+/// `effort` is a provider-neutral string (e.g. `off`/`auto`/`low`/`medium`/`high`/
+/// `xhigh`/`max`). Backends map it into their own reasoning/thinking knob and
+/// ignore values they don't recognise.
+///
+/// `extra` is a provider-specific escape hatch: each pair is forwarded verbatim
+/// to the backend, which is free to consume or ignore keys it doesn't know
+/// about. Values are always strings — backends parse them into their own types.
 #[derive(Debug, Clone)]
 pub struct ClientDecl {
     pub name: String,
     pub name_span: Span,
     pub tier: Option<(TierLit, Span)>,
     pub model: Option<(String, Span)>,
+    pub effort: Option<(String, Span)>,
+    pub extra: Vec<ExtraPair>,
     pub privacy: Option<(PrivacyLit, Span)>,
     pub is_default: bool,
     pub span: Span,
+}
+
+/// A single `key value` pair inside a client's `extra { ... }` block.
+///
+/// Key spans are carried so the compiler can emit well-located diagnostics
+/// when two pairs declare the same key.
+#[derive(Debug, Clone)]
+pub struct ExtraPair {
+    pub key: String,
+    pub key_span: Span,
+    pub value: String,
+    pub value_span: Span,
 }
 
 // ── agent ─────────────────────────────────────────────────────────────────
@@ -96,6 +150,9 @@ pub struct AgentDecl {
     pub description: Option<(String, Span)>,
     /// References a `ClientDecl` by name.
     pub client: Option<(String, Span)>,
+    /// References a top-level `tier <name> <client>` alias by name.
+    /// Mutually exclusive with `client` — enforced at compile time.
+    pub tier_ref: Option<(String, Span)>,
     pub scope: Option<ScopeBlock>,
     pub depends_on: Option<(Vec<(String, Span)>, Span)>,
     pub prompt: Option<(PromptSource, Span)>,
