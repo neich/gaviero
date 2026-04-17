@@ -77,6 +77,8 @@ impl TestGenerator {
             #[allow(deprecated)]
             backend: Default::default(),
             model: Some(model.to_string()),
+            effort: None,
+            extra: Vec::new(),
             tier: ModelTier::Cheap,
             privacy: PrivacyLevel::Public,
             coordinator_instructions: prompt,

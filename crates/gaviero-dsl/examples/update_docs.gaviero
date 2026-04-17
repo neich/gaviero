@@ -9,8 +9,19 @@
 // Usage:
 //   gaviero-cli --script update_docs.gaviero
 
-client sonnet { tier cheap     model "claude-sonnet-4-6" default }
-client opus   { tier expensive model "claude-opus-4-7" }
+client sonnet { tier cheap     model "claude-sonnet-4-6" effort medium default }
+client opus   { tier expensive model "claude-opus-4-7"   effort high }
+
+// Tier aliases give agents a routing label (`tier expensive`) that can be
+// re-pointed at launch time without editing this script. Agents below keep
+// `client opus` / `client sonnet` because the doc-writing roles are tied to
+// specific capabilities (CLAUDE.md/ARCHITECTURE.md benefit from opus's deep
+// context) rather than to an abstract tier — the aliases are here as a ready
+// escape hatch for when a user wants to run the whole pass on a single
+// provider for consistency.
+
+tier cheap     sonnet
+tier expensive opus
 
 // ── Shared configuration ──────────────────────────────────────────────────────
 //

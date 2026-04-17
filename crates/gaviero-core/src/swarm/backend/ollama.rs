@@ -74,6 +74,18 @@ impl AgentBackend for OllamaStreamBackend {
             });
         }
 
+        // Ollama doesn't yet consume `extra { ... }` keys — a future milestone
+        // could fold recognised keys (e.g. `temperature`, `num_ctx`) into the
+        // request body. Log so users see unhonoured DSL knobs.
+        for (k, v) in &request.extra {
+            tracing::debug!(
+                target: "backend.ollama",
+                key = %k,
+                value = %v,
+                "ignoring extra key (ollama backend does not consume this yet)"
+            );
+        }
+
         let response = self
             .client
             .post(&url)
@@ -359,6 +371,7 @@ mod tests {
             conversation_history: vec![],
             file_refs: vec![],
             effort: None,
+            extra: Vec::new(),
             max_tokens: None,
             auto_approve: true,
         };
@@ -397,6 +410,7 @@ mod tests {
             conversation_history: vec![],
             file_refs: vec![],
             effort: None,
+            extra: Vec::new(),
             max_tokens: None,
             auto_approve: true,
         };
@@ -462,6 +476,7 @@ mod tests {
             conversation_history: vec![],
             file_refs: vec![],
             effort: None,
+            extra: Vec::new(),
             max_tokens: None,
             auto_approve: true,
         };

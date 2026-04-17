@@ -58,6 +58,19 @@ impl AgentBackend for ClaudeCodeBackend {
             resume_session_id: None,
         };
 
+        // Claude Code doesn't yet consume `extra { ... }` keys. Log them so
+        // users see their DSL knobs aren't being honoured rather than wondering
+        // silently. Future milestones can promote specific keys (e.g.
+        // `thinking_budget`) into `AgentOptions`.
+        for (k, v) in &request.extra {
+            tracing::debug!(
+                target: "backend.claude",
+                key = %k,
+                value = %v,
+                "ignoring extra key (claude backend does not consume this yet)"
+            );
+        }
+
         let session = AcpSession::spawn(
             &self.model,
             &request.workspace_root,

@@ -160,6 +160,8 @@ mod tests {
             depends_on: vec![],
             backend: Default::default(),
             model: None,
+            effort: None,
+            extra: Vec::new(),
             tier: Default::default(),
             privacy,
             coordinator_instructions: String::new(),

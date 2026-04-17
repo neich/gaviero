@@ -167,7 +167,8 @@ pub async fn run_backend(
             file_attachments: vec![],
             conversation_history: vec![],
             file_refs: vec![],
-            effort: None,
+            effort: work_unit.effort.clone(),
+            extra: work_unit.extra.clone(),
             max_tokens: None,
             auto_approve: true,
         };
@@ -620,6 +621,8 @@ mod tests {
             depends_on: vec![],
             backend: Default::default(),
             model: None,
+            effort: None,
+            extra: Vec::new(),
             tier: crate::types::ModelTier::Cheap,
             privacy: crate::types::PrivacyLevel::Public,
             coordinator_instructions: String::new(),

@@ -418,7 +418,10 @@ impl AgentChatState {
                     self.add_system_message(&format!(
                         "Effort level: {}.\n\
                          Usage: /effort <off|auto|low|medium|high|xhigh|max>\n\
-                         `xhigh` applies on Opus 4.7 (falls back to `high` on older models).\n\
+                         Applies to Claude and Codex sessions (Ollama ignores it).\n\
+                         `xhigh` applies on Opus 4.7 (falls back to `high` on older \
+                         Claude models, and is clamped to `high` on Codex).\n\
+                         `off`/`auto` omit the reasoning hint entirely.\n\
                          `max` is session-only.",
                         current
                     ));
@@ -542,8 +545,8 @@ impl AgentChatState {
             "/help" => {
                 self.add_system_message(
                     "Available commands:\n\
-                     /model <name>      — Set model (sonnet, opus, haiku, opusplan, sonnet[1m], opus[1m], ollama:<model>)\n\
-                     /effort <level>    — Set effort level (off, auto, low, medium, high, xhigh, max)\n\
+                     /model <name>      — Set model (sonnet, opus, haiku, opusplan, sonnet[1m], opus[1m], codex:<model>, ollama:<model>)\n\
+                     /effort <level>    — Set effort/reasoning level for Claude + Codex (off, auto, low, medium, high, xhigh, max)\n\
                      /namespace <name>  — Set memory namespace (or show current)\n\
                      /autoapprove       — Toggle auto-approve for this conversation (/yolo)\n\
                      /attach <path>     — Attach a file (text or image)\n\
@@ -552,7 +555,7 @@ impl AgentChatState {
                      /reset             — Clear messages, keep model/effort/namespace config\n\
                      /compact [N]       — Keep last N messages (default 6), discard older\n\
                      /context           — Show estimated context usage\n\
-                     /run <path>        — Execute a .gaviero DSL script\n\
+                     /run <path>        — Execute a .gaviero DSL script (supports `client { effort ... extra { ... } }` and top-level `tier <name> <client>` aliases)\n\
                      /swarm <task>      — Plan and execute a multi-agent swarm\n\
                      /cswarm <task>     — Coordinated swarm (provider-aware coordinator planning)\n\
                      /undo-swarm        — Revert all changes from the last /cswarm run\n\

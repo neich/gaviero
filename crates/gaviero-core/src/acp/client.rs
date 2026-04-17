@@ -138,6 +138,7 @@ impl AcpPipeline {
                 conversation_history: conversation_history.to_vec(),
                 file_refs: file_refs.to_vec(),
                 effort: Some(self.options.effort.clone()),
+                extra: Vec::new(),
                 max_tokens: Some(self.options.max_tokens),
                 auto_approve: self.options.auto_approve,
             };

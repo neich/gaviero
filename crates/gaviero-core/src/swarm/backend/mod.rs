@@ -136,6 +136,10 @@ pub struct CompletionRequest {
     pub file_refs: Vec<(String, String)>,
     /// Optional effort / reasoning level.
     pub effort: Option<String>,
+    /// Provider-specific pass-through parameters from the DSL
+    /// `client { extra { ... } }` block. Each backend consumes the keys it
+    /// understands and logs the rest at `tracing::debug` level.
+    pub extra: Vec<(String, String)>,
     /// Optional max output tokens.
     pub max_tokens: Option<u32>,
     /// Whether the backend should auto-approve provider permission prompts.
@@ -218,6 +222,7 @@ mod tests {
             conversation_history: vec![],
             file_refs: vec![],
             effort: None,
+            extra: Vec::new(),
             max_tokens: None,
             auto_approve: true,
         };
@@ -258,6 +263,7 @@ mod tests {
             conversation_history: vec![],
             file_refs: vec![],
             effort: None,
+            extra: Vec::new(),
             max_tokens: None,
             auto_approve: true,
         };

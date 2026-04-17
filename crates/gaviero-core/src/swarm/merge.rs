@@ -207,6 +207,7 @@ async fn resolve_single_file(
             conversation_history: vec![],
             file_refs: vec![],
             effort: None,
+            extra: Vec::new(),
             max_tokens: None,
             auto_approve: true,
         },

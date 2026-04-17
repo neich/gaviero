@@ -12,6 +12,8 @@ use crate::lexer::Token;
 enum ClientField {
     Tier(TierLit, Span),
     Model(String, Span),
+    Effort(String, Span),
+    Extra(Vec<ExtraPair>),
     Privacy(PrivacyLit, Span),
     Default,
 }
@@ -20,6 +22,7 @@ enum ClientField {
 enum AgentField {
     Description(String, Span),
     Client(String, Span),
+    TierRef(String, Span),
     Scope(ScopeBlock),
     DependsOn(Vec<(String, Span)>, Span),
     Prompt(PromptSource, Span),
@@ -155,6 +158,22 @@ where
     let integer = select! { Token::Int(n) => n };
     let float_lit = select! { Token::Float(v) => v };
 
+    // ── tier name: accepts TierLit tokens (cheap/expensive/etc.) or a bare
+    // ident. Always produces a String — the compiler treats tier names as
+    // opaque strings so custom aliases are allowed alongside the conventional
+    // `cheap` / `expensive`.
+    let tier_name = choice((
+        select! {
+            Token::TierCheap       => "cheap".to_owned(),
+            Token::TierExpensive   => "expensive".to_owned(),
+            Token::TierCoordinator => "coordinator".to_owned(),
+            Token::TierReasoning   => "reasoning".to_owned(),
+            Token::TierExecution   => "execution".to_owned(),
+            Token::TierMechanical  => "mechanical".to_owned(),
+        },
+        ident,
+    ));
+
     // ── String list: [ "a" "b" ... ] ─────────────────────────────
 
     let str_list = string
@@ -186,6 +205,48 @@ where
 
     // ── client declaration ────────────────────────────────────────
 
+    // `effort <ident-or-string>` — accept bare identifiers (e.g. `effort high`)
+    // and quoted strings (e.g. `effort "xhigh"`). Values are validated by the
+    // backend, so the parser just captures the token text verbatim.
+    let effort_value = choice((
+        string,
+        ident,
+        // Allow tier/privacy/strategy tokens as bare values too so users aren't
+        // surprised when a keyword happens to collide with a reasoning level.
+        select! {
+            Token::TierCheap       => "cheap".to_owned(),
+            Token::TierExpensive   => "expensive".to_owned(),
+            Token::TierCoordinator => "coordinator".to_owned(),
+            Token::TierReasoning   => "reasoning".to_owned(),
+            Token::TierExecution   => "execution".to_owned(),
+            Token::TierMechanical  => "mechanical".to_owned(),
+        },
+    ));
+
+    // ── extra block: { (ident | str) str ... } ──────────────────
+    //
+    // Provider-specific pass-through. Keys are idents or strings (strings let
+    // users escape reserved-word collisions); values are always quoted strings.
+    // Backends parse values into native types.
+    let extra_key = choice((ident, string));
+
+    let extra_pair = extra_key
+        .map_with(|s, e| (s, e.span()))
+        .then(string.map_with(|s, e| (s, e.span())))
+        .map(|((k, ks), (v, vs))| ExtraPair {
+            key: k,
+            key_span: ks,
+            value: v,
+            value_span: vs,
+        });
+
+    let extra_block = just(Token::KwExtra).ignore_then(
+        extra_pair
+            .repeated()
+            .collect::<Vec<_>>()
+            .delimited_by(just(Token::LBrace), just(Token::RBrace)),
+    );
+
     let client_field = choice((
         just(Token::KwTier)
             .ignore_then(tier_lit.map_with(|v, e| (v, e.span())))
@@ -193,6 +254,10 @@ where
         just(Token::KwModel)
             .ignore_then(string.map_with(|s, e| (s, e.span())))
             .map(|(v, s)| ClientField::Model(v, s)),
+        just(Token::KwEffort)
+            .ignore_then(effort_value.map_with(|v, e| (v, e.span())))
+            .map(|(v, s)| ClientField::Effort(v, s)),
+        extra_block.map(ClientField::Extra),
         just(Token::KwPrivacy)
             .ignore_then(privacy_lit.map_with(|v, e| (v, e.span())))
             .map(|(v, s)| ClientField::Privacy(v, s)),
@@ -210,6 +275,8 @@ where
         .map_with(|((name, name_span), fields), e| {
             let mut tier = None;
             let mut model = None;
+            let mut effort = None;
+            let mut extra: Vec<ExtraPair> = Vec::new();
             let mut privacy = None;
             let mut is_default = false;
             for f in fields {
@@ -219,6 +286,15 @@ where
                     }
                     ClientField::Model(v, s) => {
                         model.get_or_insert((v, s));
+                    }
+                    ClientField::Effort(v, s) => {
+                        effort.get_or_insert((v, s));
+                    }
+                    ClientField::Extra(pairs) => {
+                        // Multiple `extra { ... }` blocks in one client are merged
+                        // (later blocks append). Duplicate-key detection happens
+                        // in the compiler where spans can be surfaced nicely.
+                        extra.extend(pairs);
                     }
                     ClientField::Privacy(v, s) => {
                         privacy.get_or_insert((v, s));
@@ -233,6 +309,8 @@ where
                 name_span,
                 tier,
                 model,
+                effort,
+                extra,
                 privacy,
                 is_default,
                 span: e.span(),
@@ -480,6 +558,11 @@ where
         just(Token::KwClient)
             .ignore_then(ident.map_with(|s, e| (s, e.span())))
             .map(|(v, s)| AgentField::Client(v, s)),
+        // `tier <name>` — references a top-level tier alias. Mutually
+        // exclusive with `client`; the compiler rejects agents that set both.
+        just(Token::KwTier)
+            .ignore_then(tier_name.map_with(|s, e| (s, e.span())))
+            .map(|(v, s)| AgentField::TierRef(v, s)),
         scope_block.map(AgentField::Scope),
         just(Token::KwDependsOn)
             .ignore_then(ident_list.clone().map_with(|v, e| (v, e.span())))
@@ -509,6 +592,7 @@ where
         .map_with(|((name, name_span), fields), e| {
             let mut description = None;
             let mut client = None;
+            let mut tier_ref = None;
             let mut scope = None;
             let mut depends_on = None;
             let mut prompt = None;
@@ -523,6 +607,9 @@ where
                     }
                     AgentField::Client(v, s) => {
                         client.get_or_insert((v, s));
+                    }
+                    AgentField::TierRef(v, s) => {
+                        tier_ref.get_or_insert((v, s));
                     }
                     AgentField::Scope(b) => {
                         scope.get_or_insert(b);
@@ -552,6 +639,7 @@ where
                 name_span,
                 description,
                 client,
+                tier_ref,
                 scope,
                 depends_on,
                 prompt,
@@ -824,6 +912,26 @@ where
             },
         );
 
+    // ── top-level tier alias: `tier <name> <client-ref>` ──────────
+    //
+    // A one-line declaration that binds a (possibly new) tier label to a
+    // concrete `client` profile. The compiler validates that `client_ref`
+    // names an existing `ClientDecl`. Names may be tier literals (`cheap`,
+    // `expensive`, …) or arbitrary idents — the compiler treats them as
+    // opaque strings.
+    let tier_alias_decl = just(Token::KwTier)
+        .ignore_then(tier_name.map_with(|n, e| (n, e.span())))
+        .then(ident.map_with(|n, e| (n, e.span())))
+        .map_with(
+            |((name, name_span), (client_ref, client_ref_span)), e| TierAlias {
+                name,
+                name_span,
+                client_ref,
+                client_ref_span,
+                span: e.span(),
+            },
+        );
+
     // ── top-level ─────────────────────────────────────────────────
 
     let item = choice((
@@ -832,6 +940,7 @@ where
         workflow_decl.map(Item::Workflow),
         prompt_decl.map(Item::Prompt),
         vars_block.map(Item::Vars),
+        tier_alias_decl.map(Item::TierAlias),
     ));
 
     item.repeated()
@@ -904,6 +1013,143 @@ mod tests {
             assert!(matches!(c.tier, Some((TierLit::Coordinator, _))));
             assert!(matches!(&c.model, Some((m, _)) if m == "claude-opus-4-7"));
             assert!(matches!(c.privacy, Some((PrivacyLit::Public, _))));
+            assert!(c.effort.is_none());
+        } else {
+            panic!("expected Client item");
+        }
+    }
+
+    #[test]
+    fn client_decl_with_effort_ident() {
+        let src = r#"client c { model "opus" effort high }"#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "parse errors: {:?}", errs);
+        if let Item::Client(c) = &ast.unwrap().items[0] {
+            assert!(matches!(&c.effort, Some((v, _)) if v == "high"));
+        } else {
+            panic!("expected Client item");
+        }
+    }
+
+    #[test]
+    fn client_decl_with_effort_string() {
+        // Quoted form allows values that don't lex as bare idents.
+        let src = r#"client c { model "opus" effort "xhigh" }"#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "parse errors: {:?}", errs);
+        if let Item::Client(c) = &ast.unwrap().items[0] {
+            assert!(matches!(&c.effort, Some((v, _)) if v == "xhigh"));
+        } else {
+            panic!("expected Client item");
+        }
+    }
+
+    #[test]
+    fn client_decl_with_extra_block() {
+        let src = r#"
+            client c {
+                model "opus"
+                extra {
+                    thinking_budget "8000"
+                    max_tokens      "32768"
+                }
+            }
+        "#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "parse errors: {:?}", errs);
+        if let Item::Client(c) = &ast.unwrap().items[0] {
+            assert_eq!(c.extra.len(), 2);
+            assert_eq!(c.extra[0].key, "thinking_budget");
+            assert_eq!(c.extra[0].value, "8000");
+            assert_eq!(c.extra[1].key, "max_tokens");
+            assert_eq!(c.extra[1].value, "32768");
+        } else {
+            panic!("expected Client item");
+        }
+    }
+
+    #[test]
+    fn client_decl_extra_empty_is_ok() {
+        let src = r#"client c { model "opus" extra { } }"#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "parse errors: {:?}", errs);
+        if let Item::Client(c) = &ast.unwrap().items[0] {
+            assert!(c.extra.is_empty());
+        } else {
+            panic!("expected Client item");
+        }
+    }
+
+    #[test]
+    fn top_level_tier_alias_parses() {
+        let src = r#"
+            client deep { model "opus" }
+            tier expensive deep
+        "#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "parse errors: {:?}", errs);
+        let ast = ast.unwrap();
+        assert_eq!(ast.items.len(), 2);
+        if let Item::TierAlias(ta) = &ast.items[1] {
+            assert_eq!(ta.name, "expensive");
+            assert_eq!(ta.client_ref, "deep");
+        } else {
+            panic!("expected TierAlias item at index 1");
+        }
+    }
+
+    #[test]
+    fn top_level_tier_alias_with_custom_name() {
+        // Non-tier-literal alias names should also work.
+        let src = r#"
+            client c { model "opus" }
+            tier fast c
+        "#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "parse errors: {:?}", errs);
+        if let Item::TierAlias(ta) = &ast.unwrap().items[1] {
+            assert_eq!(ta.name, "fast");
+            assert_eq!(ta.client_ref, "c");
+        } else {
+            panic!("expected TierAlias item");
+        }
+    }
+
+    #[test]
+    fn agent_tier_field_parses() {
+        let src = r#"
+            client deep { model "opus" }
+            tier expensive deep
+            agent a { tier expensive description "task" }
+        "#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "parse errors: {:?}", errs);
+        if let Item::Agent(a) = &ast.unwrap().items[2] {
+            assert!(matches!(&a.tier_ref, Some((n, _)) if n == "expensive"));
+            assert!(a.client.is_none());
+        } else {
+            panic!("expected Agent item");
+        }
+    }
+
+    #[test]
+    fn client_decl_merges_multiple_extra_blocks() {
+        // A user might (by accident or on purpose) split extras into multiple
+        // blocks. The parser concatenates; duplicate detection happens later
+        // in the compiler.
+        let src = r#"
+            client c {
+                model "opus"
+                extra { a "1" }
+                extra { b "2" }
+            }
+        "#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "parse errors: {:?}", errs);
+        if let Item::Client(c) = &ast.unwrap().items[0] {
+            assert_eq!(c.extra.len(), 2);
+            assert_eq!(c.extra[0].key, "a");
+            assert_eq!(c.extra[1].key, "b");
         } else {
             panic!("expected Client item");
         }
