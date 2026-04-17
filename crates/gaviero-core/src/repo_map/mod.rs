@@ -154,7 +154,9 @@ impl RepoMap {
             .node_indices()
             .filter(|&idx| {
                 let p = self.graph[idx].path.to_string_lossy();
-                owned.iter().any(|o| p.starts_with(o.as_str()) || *o == "." || *o == "./")
+                owned
+                    .iter()
+                    .any(|o| p.starts_with(o.as_str()) || *o == "." || *o == "./")
             })
             .collect();
 
@@ -177,8 +179,7 @@ impl RepoMap {
         let high_cutoff = (total as f64 * 0.10).ceil() as usize;
         let medium_cutoff = high_cutoff + (total as f64 * 0.30).ceil() as usize;
 
-        let owned_set: std::collections::HashSet<NodeIndex> =
-            owned_indices.into_iter().collect();
+        let owned_set: std::collections::HashSet<NodeIndex> = owned_indices.into_iter().collect();
         let mut tokens_used: usize = 0;
         let mut out: Vec<GraphCandidate> = Vec::new();
 
