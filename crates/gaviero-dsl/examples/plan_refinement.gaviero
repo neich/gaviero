@@ -1,6 +1,6 @@
 client opus {
     tier expensive
-    model "claude-opus-4-6"
+    model "claude-opus-4-7"
     privacy public
     default
 }
