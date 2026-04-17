@@ -6,7 +6,9 @@
 use std::path::{Path, PathBuf};
 
 use super::{ErrorNode, FailureSeverity, StructuralFailure, StructuralReport};
-use crate::tree_sitter::{find_enclosing_node, language_for_extension, language_name_for_extension};
+use crate::tree_sitter::{
+    find_enclosing_node, language_for_extension, language_name_for_extension,
+};
 
 /// Parse all modified files with tree-sitter and report any ERROR or MISSING nodes.
 ///
@@ -25,10 +27,7 @@ pub fn verify(modified_files: &[PathBuf], workspace_root: &Path) -> StructuralRe
         };
 
         // Determine language from extension
-        let ext = abs_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
         let Some(language) = language_for_extension(ext) else {
             // Unknown extension — skip, not a failure
@@ -191,8 +190,7 @@ fn walk_for_errors(
         let line = node.start_position().row;
         let col = node.start_position().column;
         let snippet = context_snippet(lines, line);
-        let parent_symbol = find_enclosing_node(tree, source, line)
-            .and_then(|n| n.name);
+        let parent_symbol = find_enclosing_node(tree, source, line).and_then(|n| n.name);
 
         errors.push(ErrorWithSeverity {
             node: ErrorNode {
@@ -208,8 +206,7 @@ fn walk_for_errors(
         let line = node.start_position().row;
         let col = node.start_position().column;
         let snippet = context_snippet(lines, line);
-        let parent_symbol = find_enclosing_node(tree, source, line)
-            .and_then(|n| n.name);
+        let parent_symbol = find_enclosing_node(tree, source, line).and_then(|n| n.name);
 
         errors.push(ErrorWithSeverity {
             node: ErrorNode {
@@ -250,23 +247,29 @@ fn collect_defined_names(tree: &tree_sitter::Tree, source: &[u8]) -> Vec<String>
     names
 }
 
-fn walk_for_names(
-    cursor: &mut tree_sitter::TreeCursor,
-    source: &[u8],
-    names: &mut Vec<String>,
-) {
+fn walk_for_names(cursor: &mut tree_sitter::TreeCursor, source: &[u8], names: &mut Vec<String>) {
     let node = cursor.node();
     let kind = node.kind();
 
     // Check if this node is a definition that has a name
     const DEF_KINDS: &[&str] = &[
-        "function_item", "function_definition", "function_declaration",
-        "method_declaration", "method_definition",
-        "class_declaration", "class_definition",
-        "struct_item", "enum_item", "impl_item", "trait_item",
-        "interface_declaration", "const_item",
-        "object_declaration", "companion_object",
-        "variable_declarator", "lexical_declaration",
+        "function_item",
+        "function_definition",
+        "function_declaration",
+        "method_declaration",
+        "method_definition",
+        "class_declaration",
+        "class_definition",
+        "struct_item",
+        "enum_item",
+        "impl_item",
+        "trait_item",
+        "interface_declaration",
+        "const_item",
+        "object_declaration",
+        "companion_object",
+        "variable_declarator",
+        "lexical_declaration",
     ];
 
     if DEF_KINDS.contains(&kind) {
@@ -298,12 +301,24 @@ fn walk_for_names(
 pub fn extract_expected_symbols(instructions: &str) -> Vec<String> {
     let mut symbols = Vec::new();
     let patterns = [
-        "create function ", "add function ", "define function ",
-        "create struct ", "add struct ", "define struct ",
-        "create enum ", "add enum ", "define enum ",
-        "create trait ", "add trait ", "define trait ",
-        "implement trait ", "create class ", "add class ",
-        "create method ", "add method ", "define method ",
+        "create function ",
+        "add function ",
+        "define function ",
+        "create struct ",
+        "add struct ",
+        "define struct ",
+        "create enum ",
+        "add enum ",
+        "define enum ",
+        "create trait ",
+        "add trait ",
+        "define trait ",
+        "implement trait ",
+        "create class ",
+        "add class ",
+        "create method ",
+        "add method ",
+        "define method ",
     ];
 
     let lower = instructions.to_lowercase();
