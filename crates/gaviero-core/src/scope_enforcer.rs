@@ -40,7 +40,12 @@ pub struct ScopeViolation {
 
 impl std::fmt::Display for ScopeViolation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "scope violation for {}: {}", self.path.display(), self.reason)
+        write!(
+            f,
+            "scope violation for {}: {}",
+            self.path.display(),
+            self.reason
+        )
     }
 }
 
@@ -63,17 +68,16 @@ impl ScopeEnforcer {
         if Self::is_sensitive(path) {
             return Err(ScopeViolation {
                 path: path.to_path_buf(),
-                reason: format!(
-                    "path matches sensitive file block-list"
-                ),
+                reason: format!("path matches sensitive file block-list"),
             });
         }
 
         let path_str = path.to_string_lossy();
-        let allowed = self.scope.owned_paths.is_empty()
-            || self.scope.owned_paths.iter().any(|owned| {
-                path_str.starts_with(owned.as_str()) || path_str == owned.as_str()
-            });
+        let allowed =
+            self.scope.owned_paths.is_empty()
+                || self.scope.owned_paths.iter().any(|owned| {
+                    path_str.starts_with(owned.as_str()) || path_str == owned.as_str()
+                });
 
         if !allowed {
             return Err(ScopeViolation {
@@ -99,7 +103,10 @@ impl ScopeEnforcer {
 
         let path_str = path.to_string_lossy();
         // Allow if explicitly listed in owned_paths or read_only_paths
-        let explicitly_allowed = self.scope.owned_paths.iter()
+        let explicitly_allowed = self
+            .scope
+            .owned_paths
+            .iter()
             .chain(self.scope.read_only_paths.iter())
             .any(|p| path_str.starts_with(p.as_str()) || path_str == p.as_str());
 
@@ -117,9 +124,7 @@ impl ScopeEnforcer {
     pub fn is_sensitive(path: &Path) -> bool {
         let path_str = path.to_string_lossy();
         BLOCKED.iter().any(|blocked| {
-            path_str == *blocked
-                || path_str.ends_with(blocked)
-                || path_str.contains(blocked)
+            path_str == *blocked || path_str.ends_with(blocked) || path_str.contains(blocked)
         })
     }
 }
