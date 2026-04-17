@@ -4,9 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::diff_engine::compute_hunks;
 use crate::observer::WriteGateObserver;
 use crate::tree_sitter::{enrich_hunks, language_for_extension};
-use crate::types::{
-    FileScope, HunkStatus, ProposalStatus, WriteProposal,
-};
+use crate::types::{FileScope, HunkStatus, ProposalStatus, WriteProposal};
 
 /// Controls how proposals are handled.
 #[derive(Clone, Debug, PartialEq)]
@@ -48,7 +46,8 @@ impl WriteGatePipeline {
 
     /// Register a file scope for an agent.
     pub fn register_agent_scope(&mut self, agent_id: &str, scope: &FileScope) {
-        self.agent_scopes.insert(agent_id.to_string(), scope.clone());
+        self.agent_scopes
+            .insert(agent_id.to_string(), scope.clone());
     }
 
     /// Check if an agent is allowed to write to a path.
@@ -82,10 +81,7 @@ impl WriteGatePipeline {
     ) -> WriteProposal {
         let hunks = compute_hunks(original_content, proposed_content);
 
-        let ext = file_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let structural_hunks = match language_for_extension(ext) {
             Some(lang) => enrich_hunks(hunks, original_content, lang),
             None => hunks
@@ -236,8 +232,7 @@ impl WriteGatePipeline {
         let proposal = self.proposals.remove(&proposal_id)?;
         let content = assemble_final_content(&proposal);
         let path = proposal.file_path.clone();
-        self.observer
-            .on_proposal_finalized(&path.to_string_lossy());
+        self.observer.on_proposal_finalized(&path.to_string_lossy());
         Some((path, content))
     }
 
@@ -333,7 +328,11 @@ fn update_proposal_status(proposal: &mut WriteProposal) {
         (true, false) => ProposalStatus::Accepted,
         (false, true) => {
             // Check if all rejected or some still pending
-            if proposal.structural_hunks.iter().all(|h| h.status == HunkStatus::Rejected) {
+            if proposal
+                .structural_hunks
+                .iter()
+                .all(|h| h.status == HunkStatus::Rejected)
+            {
                 ProposalStatus::Rejected
             } else {
                 ProposalStatus::Pending
@@ -349,8 +348,8 @@ mod tests {
     use super::*;
     use crate::observer::WriteGateObserver;
     use crate::types::WriteProposal;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     struct TestObserver {
         created_count: Arc<AtomicU64>,
@@ -388,7 +387,14 @@ mod tests {
         }
     }
 
-    fn make_pipeline(mode: WriteMode) -> (WriteGatePipeline, Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>) {
+    fn make_pipeline(
+        mode: WriteMode,
+    ) -> (
+        WriteGatePipeline,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+    ) {
         let (obs, c, u, f) = TestObserver::new();
         let pipeline = WriteGatePipeline::new(mode, Box::new(obs));
         (pipeline, c, u, f)
@@ -406,7 +412,10 @@ mod tests {
             "fn new() {}\n",
         );
         let result = pipeline.insert_proposal(proposal);
-        assert!(result.is_none(), "Interactive mode should not return content");
+        assert!(
+            result.is_none(),
+            "Interactive mode should not return content"
+        );
         assert_eq!(created.load(Ordering::SeqCst), 1);
         assert!(pipeline.get_proposal(id).is_some());
     }
@@ -460,7 +469,11 @@ mod tests {
         );
         let result = pipeline.insert_proposal(proposal);
         assert!(result.is_none(), "Deferred mode should not return content");
-        assert_eq!(created.load(Ordering::SeqCst), 0, "No observer notification in deferred mode");
+        assert_eq!(
+            created.load(Ordering::SeqCst),
+            0,
+            "No observer notification in deferred mode"
+        );
         assert_eq!(pipeline.pending_proposals().len(), 1);
 
         // Add a second proposal
@@ -574,8 +587,10 @@ mod tests {
         let (mut pipeline, _c, _u, _f) = make_pipeline(WriteMode::Interactive);
         let id = pipeline.next_id();
 
-        let original = "fn foo() {\n    let x = 1;\n    let y = 2;\n}\n\nfn bar() {\n    let z = 3;\n}\n";
-        let proposed = "fn foo() {\n    let x = 42;\n    let y = 2;\n}\n\nfn bar() {\n    let z = 99;\n}\n";
+        let original =
+            "fn foo() {\n    let x = 1;\n    let y = 2;\n}\n\nfn bar() {\n    let z = 3;\n}\n";
+        let proposed =
+            "fn foo() {\n    let x = 42;\n    let y = 2;\n}\n\nfn bar() {\n    let z = 99;\n}\n";
         let proposal = WriteGatePipeline::build_proposal(
             id,
             "test-agent",
@@ -590,7 +605,9 @@ mod tests {
 
         let p = pipeline.get_proposal(id).unwrap();
         // The hunk in foo should be accepted
-        let foo_hunks: Vec<_> = p.structural_hunks.iter()
+        let foo_hunks: Vec<_> = p
+            .structural_hunks
+            .iter()
             .filter(|h| h.enclosing_node.as_ref().and_then(|n| n.name.as_deref()) == Some("foo"))
             .collect();
         assert!(foo_hunks.iter().all(|h| h.status == HunkStatus::Accepted));
