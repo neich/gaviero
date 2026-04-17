@@ -235,10 +235,7 @@ pub fn parse_ollama_chunk(line: &str) -> Vec<UnifiedStreamEvent> {
         }
     } else {
         // Final chunk: extract usage metrics
-        let eval_count = json
-            .get("eval_count")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+        let eval_count = json.get("eval_count").and_then(|v| v.as_u64()).unwrap_or(0);
         let prompt_eval_count = json
             .get("prompt_eval_count")
             .and_then(|v| v.as_u64())
@@ -302,8 +299,7 @@ mod tests {
 
     #[test]
     fn test_parse_ollama_empty_content_skipped() {
-        let line =
-            r#"{"model":"qwen","message":{"role":"assistant","content":""},"done":false}"#;
+        let line = r#"{"model":"qwen","message":{"role":"assistant","content":""},"done":false}"#;
         let events = parse_ollama_chunk(line);
         assert!(events.is_empty());
     }
