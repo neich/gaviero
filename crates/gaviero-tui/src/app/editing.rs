@@ -353,11 +353,8 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                                 app.search_panel.editing = true;
                                 return;
                             }
-                            let idx = app
-                                .search_panel
-                                .scroll
-                                .offset
-                                + relative_row.saturating_sub(2);
+                            let idx =
+                                app.search_panel.scroll.offset + relative_row.saturating_sub(2);
                             if idx < app.search_panel.results.len() {
                                 app.search_panel.scroll.selected = idx;
                                 let result = app.search_panel.results[idx].clone();
@@ -418,7 +415,9 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 if app.diff_review.is_none() {
                     let is_double_click = app
                         .last_click
-                        .map(|(lc, lr, lt)| lc == col && lr == row && lt.elapsed().as_millis() < 400)
+                        .map(|(lc, lr, lt)| {
+                            lc == col && lr == row && lt.elapsed().as_millis() < 400
+                        })
                         .unwrap_or(false);
 
                     if is_double_click {
@@ -673,11 +672,14 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                             app.chat_state.scroll_offset.saturating_sub(1);
                         let line = app.chat_state.scroll_offset;
                         let col_in_line = col.saturating_sub(area.x) as usize;
-                        let line_len = app.chat_state.rendered_lines_cache
+                        let line_len = app
+                            .chat_state
+                            .rendered_lines_cache
                             .get(line)
                             .map(|(l, _)| l.chars().count())
                             .unwrap_or(0);
-                        app.chat_state.extend_text_selection(line, col_in_line.min(line_len));
+                        app.chat_state
+                            .extend_text_selection(line, col_in_line.min(line_len));
                         return;
                     } else if row >= area.y + area.height {
                         let total = app.chat_state.rendered_lines_cache.len();
@@ -690,11 +692,14 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                             .min(total)
                             .saturating_sub(1);
                         let col_in_line = col.saturating_sub(area.x) as usize;
-                        let line_len = app.chat_state.rendered_lines_cache
+                        let line_len = app
+                            .chat_state
+                            .rendered_lines_cache
                             .get(line)
                             .map(|(l, _)| l.chars().count())
                             .unwrap_or(0);
-                        app.chat_state.extend_text_selection(line, col_in_line.min(line_len));
+                        app.chat_state
+                            .extend_text_selection(line, col_in_line.min(line_len));
                         return;
                     }
                 }
@@ -725,8 +730,11 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                         }
                         let vt_col = col.saturating_sub(area.x);
                         if let Some(inst) = app.terminal_manager.active_instance() {
-                            app.terminal_selection
-                                .extend(content_height.saturating_sub(1), vt_col, inst.screen());
+                            app.terminal_selection.extend(
+                                content_height.saturating_sub(1),
+                                vt_col,
+                                inst.screen(),
+                            );
                         }
                     } else {
                         let vt_row = row - content_y_start;
@@ -826,8 +834,9 @@ pub(super) fn scroll_panel_to_row(app: &mut App, target: ScrollbarTarget, row: u
             let max_scroll = total.saturating_sub(track_height);
             let row_in_track = row.saturating_sub(area.y) as usize;
             let fraction = row_in_track as f64 / track_height.saturating_sub(1).max(1) as f64;
-            buf.scroll.top_line =
-                (fraction * max_scroll as f64).round().min(max_scroll as f64) as usize;
+            buf.scroll.top_line = (fraction * max_scroll as f64)
+                .round()
+                .min(max_scroll as f64) as usize;
         }
         ScrollbarTarget::Chat => {
             let Some(area) = app.layout.side_panel_area else {
@@ -844,8 +853,9 @@ pub(super) fn scroll_panel_to_row(app: &mut App, target: ScrollbarTarget, row: u
             let max_scroll = total.saturating_sub(conv_height);
             let row_in_track = row.saturating_sub(area.y + 1) as usize;
             let fraction = row_in_track as f64 / conv_height.saturating_sub(1).max(1) as f64;
-            app.chat_state.scroll_offset =
-                (fraction * max_scroll as f64).round().min(max_scroll as f64) as usize;
+            app.chat_state.scroll_offset = (fraction * max_scroll as f64)
+                .round()
+                .min(max_scroll as f64) as usize;
         }
         ScrollbarTarget::LeftPanel => {
             let Some(area) = app.layout.file_tree_area else {
@@ -863,9 +873,12 @@ pub(super) fn scroll_panel_to_row(app: &mut App, target: ScrollbarTarget, row: u
                     }
                     let max_scroll = total.saturating_sub(track_height);
                     let row_in_track = row.saturating_sub(area.y) as usize;
-                    let fraction = row_in_track as f64 / track_height.saturating_sub(1).max(1) as f64;
-                    app.file_tree.scroll.offset =
-                        (fraction * max_scroll as f64).round().min(max_scroll as f64) as usize;
+                    let fraction =
+                        row_in_track as f64 / track_height.saturating_sub(1).max(1) as f64;
+                    app.file_tree.scroll.offset = (fraction * max_scroll as f64)
+                        .round()
+                        .min(max_scroll as f64)
+                        as usize;
                 }
                 LeftPanelMode::Search => {
                     let total = app.search_panel.results.len();
@@ -875,9 +888,12 @@ pub(super) fn scroll_panel_to_row(app: &mut App, target: ScrollbarTarget, row: u
                     }
                     let max_scroll = total.saturating_sub(viewport);
                     let row_in_track = row.saturating_sub(area.y) as usize;
-                    let fraction = row_in_track as f64 / track_height.saturating_sub(1).max(1) as f64;
-                    app.search_panel.scroll.offset =
-                        (fraction * max_scroll as f64).round().min(max_scroll as f64) as usize;
+                    let fraction =
+                        row_in_track as f64 / track_height.saturating_sub(1).max(1) as f64;
+                    app.search_panel.scroll.offset = (fraction * max_scroll as f64)
+                        .round()
+                        .min(max_scroll as f64)
+                        as usize;
                 }
                 LeftPanelMode::Review => {
                     if let Some(ref mut br) = app.batch_review {
@@ -889,8 +905,10 @@ pub(super) fn scroll_panel_to_row(app: &mut App, target: ScrollbarTarget, row: u
                         let row_in_track = row.saturating_sub(area.y) as usize;
                         let fraction =
                             row_in_track as f64 / track_height.saturating_sub(1).max(1) as f64;
-                        br.scroll_offset =
-                            (fraction * max_scroll as f64).round().min(max_scroll as f64) as usize;
+                        br.scroll_offset = (fraction * max_scroll as f64)
+                            .round()
+                            .min(max_scroll as f64)
+                            as usize;
                     }
                 }
                 LeftPanelMode::Changes => {
@@ -903,8 +921,10 @@ pub(super) fn scroll_panel_to_row(app: &mut App, target: ScrollbarTarget, row: u
                         let row_in_track = row.saturating_sub(area.y) as usize;
                         let fraction =
                             row_in_track as f64 / track_height.saturating_sub(1).max(1) as f64;
-                        cs.scroll_offset =
-                            (fraction * max_scroll as f64).round().min(max_scroll as f64) as usize;
+                        cs.scroll_offset = (fraction * max_scroll as f64)
+                            .round()
+                            .min(max_scroll as f64)
+                            as usize;
                     }
                 }
             }
@@ -1067,7 +1087,8 @@ pub(super) fn handle_file_changed(app: &mut App, path: &Path) {
         return;
     }
 
-    let proposal = WriteGatePipeline::build_proposal(0, "external", path, &old_content, &new_content);
+    let proposal =
+        WriteGatePipeline::build_proposal(0, "external", path, &old_content, &new_content);
 
     let _ = app.buffers[buf_idx].reload();
 
