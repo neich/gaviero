@@ -45,6 +45,12 @@ struct Cli {
     #[arg(long, conflicts_with_all = ["task", "work_units"])]
     script: Option<PathBuf>,
 
+    /// Path to a file whose contents replace every `{{PROMPT}}` placeholder in
+    /// the DSL script. Also becomes the full prompt for any agent without a
+    /// `prompt` field. Only valid with `--script`.
+    #[arg(long, requires = "script")]
+    prompt_file: Option<PathBuf>,
+
     /// Auto-accept all changes (no interactive review).
     #[arg(long)]
     auto_accept: bool,
@@ -390,10 +396,20 @@ async fn main() -> Result<()> {
         let source = std::fs::read_to_string(script_path)
             .with_context(|| format!("reading script: {}", script_path.display()))?;
         let filename = script_path.display().to_string();
-        gaviero_dsl::compile(&source, &filename, None, None).map_err(|report| {
-            eprintln!("{:?}", report);
-            anyhow::anyhow!("DSL compilation failed")
-        })?
+        let runtime_prompt = if let Some(ref p) = cli.prompt_file {
+            Some(
+                std::fs::read_to_string(p)
+                    .with_context(|| format!("reading prompt file: {}", p.display()))?,
+            )
+        } else {
+            None
+        };
+        gaviero_dsl::compile(&source, &filename, None, runtime_prompt.as_deref()).map_err(
+            |report| {
+                eprintln!("{:?}", report);
+                anyhow::anyhow!("DSL compilation failed")
+            },
+        )?
     } else if let Some(ref task) = cli.task {
         let units = vec![WorkUnit {
             id: "task-0".to_string(),
@@ -649,6 +665,35 @@ mod tests {
             cli.ollama_base_url.as_deref(),
             Some("http://localhost:11434")
         );
+    }
+
+    #[test]
+    fn cli_accepts_prompt_file_with_script() {
+        let cli = Cli::try_parse_from([
+            "gaviero-cli",
+            "--script",
+            "workflow.gaviero",
+            "--prompt-file",
+            "prompt.txt",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.prompt_file.as_deref(),
+            Some(std::path::Path::new("prompt.txt"))
+        );
+    }
+
+    #[test]
+    fn cli_rejects_prompt_file_without_script() {
+        let err = Cli::try_parse_from([
+            "gaviero-cli",
+            "--task",
+            "fix it",
+            "--prompt-file",
+            "prompt.txt",
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("--prompt-file"));
     }
 
     #[test]
