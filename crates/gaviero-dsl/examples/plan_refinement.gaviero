@@ -19,7 +19,7 @@ client opus {
     tier expensive
     model "claude-opus-4-7"
     privacy public
-    effort xhigh
+    effort auto
     extra {
         // Request a larger extended-thinking budget for the deep-synthesis
         // refine pass. Claude will consume this once the backend promotes
@@ -98,7 +98,7 @@ prompt refine-body #"
     3. Synthesise a new plan taking the strongest elements of both,
        resolving conflicts with explicit reasoning, and improving on both.
     4. Write your refined plan to {{PLANS}}/{{MODEL_NAME}}-plan-v{{ITER}}.md.
-       Begin with a "## Synthesis Notes" section: the pair you read, what
+       Begin with a '## Synthesis Notes' section: the pair you read, what
        you adopted from each, what you changed or discarded.
     5. Write a concise summary (under 300 words) to
        {{PLANS}}/{{MODEL_NAME}}-summary-v{{ITER}}.md covering the main
