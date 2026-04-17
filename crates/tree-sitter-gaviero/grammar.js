@@ -9,7 +9,14 @@ module.exports = grammar({
     source_file: ($) => repeat($._definition),
 
     _definition: ($) =>
-      choice($.client_declaration, $.agent_declaration, $.workflow_declaration),
+      choice(
+        $.client_declaration,
+        $.agent_declaration,
+        $.workflow_declaration,
+        $.prompt_declaration,
+        $.tier_alias_declaration,
+        $.vars_block,
+      ),
 
     // ── Comments ─────────────────────────────────────────────────
     comment: (_) => token(seq("//", /.*/)),
@@ -22,8 +29,47 @@ module.exports = grammar({
       choice(
         seq("tier", $.tier_value),
         seq("model", $._string_value),
-        seq("privacy", $.privacy_value)
+        seq("effort", $._effort_value),
+        seq("privacy", $.privacy_value),
+        $.extra_block,
+        "default",
       ),
+
+    _effort_value: ($) =>
+      choice($._string_value, $.identifier, $.tier_value),
+
+    // ── Extra block: `extra { (ident | str) str ... }` ───────────
+    extra_block: ($) =>
+      seq("extra", "{", repeat($.extra_pair), "}"),
+
+    extra_pair: ($) =>
+      seq(choice($.identifier, $._string_value), $._string_value),
+
+    // ── Vars block: `vars { IDENT "value" ... }` ─────────────────
+    // Used at top-level and inside agent declarations.
+    vars_block: ($) =>
+      seq("vars", "{", repeat($.vars_pair), "}"),
+
+    vars_pair: ($) => seq($.identifier, $._string_value),
+
+    // ── Top-level tier alias: `tier <name> <client-ref>` ─────────
+    tier_alias_declaration: ($) =>
+      seq("tier", $.tier_alias_name, $.identifier),
+
+    tier_alias_name: ($) =>
+      choice(
+        $.identifier,
+        "cheap",
+        "expensive",
+        "coordinator",
+        "reasoning",
+        "execution",
+        "mechanical",
+      ),
+
+    // ── Top-level prompt declaration: `prompt <name> <string>` ───
+    prompt_declaration: ($) =>
+      seq("prompt", $.identifier, $._string_value),
 
     // ── Agent ────────────────────────────────────────────────────
     agent_declaration: ($) =>
@@ -33,12 +79,14 @@ module.exports = grammar({
       choice(
         seq("description", $._string_value),
         seq("client", $.identifier),
+        seq("tier", $.tier_alias_name),
         $.scope_block,
         seq("depends_on", $.identifier_list),
-        seq("prompt", $._string_value),
+        seq("prompt", choice($._string_value, $.identifier)),
         seq("max_retries", $.integer),
         $.memory_block,
-        $.context_block
+        $.context_block,
+        $.vars_block,
       ),
 
     // ── Scope block ──────────────────────────────────────────────
@@ -98,7 +146,11 @@ module.exports = grammar({
       choice(
         seq("agents", $.identifier_list),
         $.until_clause,
-        seq("max_iterations", $.integer)
+        seq("max_iterations", $.integer),
+        seq("iter_start", $.integer),
+        seq("stability", $.integer),
+        seq("judge_timeout", $.integer),
+        seq("strict_judge", $.boolean),
       ),
 
     // ── Until clause (3 variants) ────────────────────────────────
