@@ -56,7 +56,7 @@ pub async fn execute(
     initial_state: Option<ExecutionState>,
     memory: Option<Arc<MemoryStore>>,
     observer: &dyn SwarmObserver,
-    make_observer: impl Fn(&str) -> Box<dyn AcpObserver>,
+    make_observer: impl Fn(&str) -> Box<dyn AcpObserver> + Send + Sync,
 ) -> Result<SwarmResult> {
     tracing::info!(
         agents = plan.graph.node_count(),
@@ -1122,7 +1122,7 @@ struct LoopConditionContext<'a> {
     bus: &'a Arc<tokio::sync::Mutex<AgentBus>>,
     all_manifests: &'a mut Vec<AgentManifest>,
     run_id: &'a str,
-    make_observer: &'a dyn Fn(&str) -> Box<dyn AcpObserver>,
+    make_observer: &'a (dyn Fn(&str) -> Box<dyn AcpObserver> + Send + Sync),
     /// When true, unparseable judge output on a completed run is promoted to
     /// `AgentStatus::Failed`. Wired from `LoopConfig.strict_judge`.
     strict_judge: bool,
@@ -1705,7 +1705,7 @@ pub async fn plan_coordinated(
     coordinator_config: CoordinatorConfig,
     memory: Option<Arc<MemoryStore>>,
     observer: &dyn SwarmObserver,
-    make_observer: impl Fn(&str) -> Box<dyn AcpObserver>,
+    make_observer: impl Fn(&str) -> Box<dyn AcpObserver> + Send + Sync,
 ) -> Result<String> {
     observer.on_coordination_started(prompt);
     observer.on_agent_state_changed(
