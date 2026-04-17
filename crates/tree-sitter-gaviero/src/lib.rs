@@ -21,8 +21,14 @@ mod tests {
         let mut parser = tree_sitter::Parser::new();
         let lang: tree_sitter::Language = LANGUAGE.into();
         parser.set_language(&lang).unwrap();
-        let tree = parser.parse(r#"client c { tier coordinator model "opus" }"#, None).unwrap();
-        assert!(!tree.root_node().has_error(), "parse tree: {}", tree.root_node().to_sexp());
+        let tree = parser
+            .parse(r#"client c { tier coordinator model "opus" }"#, None)
+            .unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "parse tree: {}",
+            tree.root_node().to_sexp()
+        );
     }
 
     #[test]
@@ -30,8 +36,14 @@ mod tests {
         let mut parser = tree_sitter::Parser::new();
         let lang: tree_sitter::Language = LANGUAGE.into();
         parser.set_language(&lang).unwrap();
-        let tree = parser.parse(r#"agent x { prompt "do the thing" }"#, None).unwrap();
-        assert!(!tree.root_node().has_error(), "parse tree: {}", tree.root_node().to_sexp());
+        let tree = parser
+            .parse(r#"agent x { prompt "do the thing" }"#, None)
+            .unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "parse tree: {}",
+            tree.root_node().to_sexp()
+        );
     }
 
     #[test]
@@ -41,7 +53,11 @@ mod tests {
         parser.set_language(&lang).unwrap();
         let src = "agent x { prompt #\"\nhello\nworld\n\"# }";
         let tree = parser.parse(src, None).unwrap();
-        assert!(!tree.root_node().has_error(), "parse tree: {}", tree.root_node().to_sexp());
+        assert!(
+            !tree.root_node().has_error(),
+            "parse tree: {}",
+            tree.root_node().to_sexp()
+        );
     }
 
     #[test]
@@ -55,7 +71,11 @@ mod tests {
             workflow w { steps [a] max_parallel 2 }
         "#;
         let tree = parser.parse(src, None).unwrap();
-        assert!(!tree.root_node().has_error(), "parse tree: {}", tree.root_node().to_sexp());
+        assert!(
+            !tree.root_node().has_error(),
+            "parse tree: {}",
+            tree.root_node().to_sexp()
+        );
     }
 
     #[test]
@@ -68,6 +88,10 @@ mod tests {
             .parse(r#"agent broken { prompt "missing closing brace""#, None)
             .unwrap();
 
-        assert!(tree.root_node().has_error(), "parse tree: {}", tree.root_node().to_sexp());
+        assert!(
+            tree.root_node().has_error(),
+            "parse tree: {}",
+            tree.root_node().to_sexp()
+        );
     }
 }
