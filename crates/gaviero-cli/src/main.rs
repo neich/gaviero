@@ -407,6 +407,8 @@ async fn main() -> Result<()> {
             #[allow(deprecated)]
             backend: Default::default(),
             model: Some(execution_model.clone()),
+            effort: None,
+            extra: Vec::new(),
             tier: Default::default(),
             privacy: Default::default(),
             coordinator_instructions: String::new(),
