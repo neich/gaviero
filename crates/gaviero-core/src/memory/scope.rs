@@ -27,9 +27,7 @@ pub const SCOPE_RUN: i32 = 4;
 
 /// Deterministic 12-hex-char hash of a canonical path, used as repo/workspace ID.
 pub fn hash_path(path: &Path) -> String {
-    let canonical = path
-        .canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf());
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
     // First 6 bytes = 12 hex chars — enough to avoid collisions in practice.
     digest[..6]
@@ -76,9 +74,9 @@ impl ScopeFilter {
     /// The `repo_id` for this filter, if any.
     pub fn repo_id(&self) -> Option<&str> {
         match self {
-            Self::Repo { repo_id }
-            | Self::Module { repo_id, .. }
-            | Self::Run { repo_id, .. } => Some(repo_id),
+            Self::Repo { repo_id } | Self::Module { repo_id, .. } | Self::Run { repo_id, .. } => {
+                Some(repo_id)
+            }
             _ => None,
         }
     }
@@ -110,7 +108,10 @@ pub enum WriteScope {
     /// Agent writing run-local observations.
     Run { repo_id: String, run_id: String },
     /// Agent /remember or consolidation promoting to module.
-    Module { repo_id: String, module_path: String },
+    Module {
+        repo_id: String,
+        module_path: String,
+    },
     /// Cross-module repo knowledge.
     Repo { repo_id: String },
     /// Cross-repo workspace knowledge.
@@ -139,7 +140,10 @@ impl WriteScope {
             Self::Global => "global".to_string(),
             Self::Workspace => "workspace".to_string(),
             Self::Repo { repo_id } => format!("repo:{repo_id}"),
-            Self::Module { repo_id, module_path } => {
+            Self::Module {
+                repo_id,
+                module_path,
+            } => {
                 format!("repo:{repo_id}/module:{module_path}")
             }
             Self::Run { repo_id, run_id } => {
@@ -151,9 +155,9 @@ impl WriteScope {
     /// The `repo_id` embedded in this scope, if any.
     pub fn repo_id(&self) -> Option<&str> {
         match self {
-            Self::Repo { repo_id }
-            | Self::Module { repo_id, .. }
-            | Self::Run { repo_id, .. } => Some(repo_id),
+            Self::Repo { repo_id } | Self::Module { repo_id, .. } | Self::Run { repo_id, .. } => {
+                Some(repo_id)
+            }
             _ => None,
         }
     }
@@ -174,7 +178,10 @@ impl WriteScope {
             Self::Repo { repo_id } => ScopeFilter::Repo {
                 repo_id: repo_id.clone(),
             },
-            Self::Module { repo_id, module_path } => ScopeFilter::Module {
+            Self::Module {
+                repo_id,
+                module_path,
+            } => ScopeFilter::Module {
                 repo_id: repo_id.clone(),
                 module_path: module_path.clone(),
             },
@@ -226,9 +233,8 @@ impl MemoryScope {
         let repo_id = folder.map(|f| hash_path(f));
 
         // Module = longest common prefix of owned_paths
-        let module_path = owned_paths.and_then(|paths| {
-            common_prefix(paths).filter(|p| !p.is_empty() && p != ".")
-        });
+        let module_path = owned_paths
+            .and_then(|paths| common_prefix(paths).filter(|p| !p.is_empty() && p != "."));
 
         Self {
             global_db,
@@ -492,7 +498,10 @@ mod tests {
         assert_eq!(WriteScope::Global.to_path_string(), "global");
         assert_eq!(WriteScope::Workspace.to_path_string(), "workspace");
         assert_eq!(
-            WriteScope::Repo { repo_id: "abc".into() }.to_path_string(),
+            WriteScope::Repo {
+                repo_id: "abc".into()
+            }
+            .to_path_string(),
             "repo:abc"
         );
         assert_eq!(
@@ -517,13 +526,27 @@ mod tests {
     fn test_write_scope_level_int() {
         assert_eq!(WriteScope::Global.level_int(), 0);
         assert_eq!(WriteScope::Workspace.level_int(), 1);
-        assert_eq!(WriteScope::Repo { repo_id: "x".into() }.level_int(), 2);
         assert_eq!(
-            WriteScope::Module { repo_id: "x".into(), module_path: "m".into() }.level_int(),
+            WriteScope::Repo {
+                repo_id: "x".into()
+            }
+            .level_int(),
+            2
+        );
+        assert_eq!(
+            WriteScope::Module {
+                repo_id: "x".into(),
+                module_path: "m".into()
+            }
+            .level_int(),
             3
         );
         assert_eq!(
-            WriteScope::Run { repo_id: "x".into(), run_id: "r".into() }.level_int(),
+            WriteScope::Run {
+                repo_id: "x".into(),
+                run_id: "r".into()
+            }
+            .level_int(),
             4
         );
     }
@@ -532,13 +555,27 @@ mod tests {
     fn test_scope_filter_level_int() {
         assert_eq!(ScopeFilter::Global.level_int(), 0);
         assert_eq!(ScopeFilter::Workspace.level_int(), 1);
-        assert_eq!(ScopeFilter::Repo { repo_id: "x".into() }.level_int(), 2);
         assert_eq!(
-            ScopeFilter::Module { repo_id: "x".into(), module_path: "m".into() }.level_int(),
+            ScopeFilter::Repo {
+                repo_id: "x".into()
+            }
+            .level_int(),
+            2
+        );
+        assert_eq!(
+            ScopeFilter::Module {
+                repo_id: "x".into(),
+                module_path: "m".into()
+            }
+            .level_int(),
             3
         );
         assert_eq!(
-            ScopeFilter::Run { repo_id: "x".into(), run_id: "r".into() }.level_int(),
+            ScopeFilter::Run {
+                repo_id: "x".into(),
+                run_id: "r".into()
+            }
+            .level_int(),
             4
         );
     }
@@ -558,10 +595,7 @@ mod tests {
             Some("crates".into())
         );
         assert_eq!(common_prefix(&[]), None);
-        assert_eq!(
-            common_prefix(&["a/b".into(), "c/d".into()]),
-            None
-        );
+        assert_eq!(common_prefix(&["a/b".into(), "c/d".into()]), None);
     }
 
     #[test]
@@ -612,7 +646,10 @@ mod tests {
         };
         // Default excludes run (ephemeral), picks module as narrowest persistent
         match scope.default_write_scope() {
-            WriteScope::Module { repo_id, module_path } => {
+            WriteScope::Module {
+                repo_id,
+                module_path,
+            } => {
                 assert_eq!(repo_id, "repo1");
                 assert_eq!(module_path, "crates/core");
             }
