@@ -3,7 +3,7 @@ use gaviero_core::types::ModelTier;
 use gaviero_dsl::compile;
 
 const FULL_EXAMPLE: &str = r##"
-    client opus   { tier coordinator model "claude-opus-4-6"    privacy public }
+    client opus   { tier coordinator model "claude-opus-4-7"    privacy public }
     client sonnet { tier execution   model "claude-sonnet-4-6"  }
 
     agent researcher {
@@ -50,7 +50,7 @@ fn full_example_compiles_to_two_units() {
     // researcher
     assert_eq!(units[0].id, "researcher");
     assert_eq!(units[0].tier, ModelTier::Expensive);
-    assert_eq!(units[0].model, Some("claude-opus-4-6".to_string()));
+    assert_eq!(units[0].model, Some("claude-opus-4-7".to_string()));
     assert!(
         units[0]
             .coordinator_instructions
