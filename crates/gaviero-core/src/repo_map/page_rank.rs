@@ -12,8 +12,8 @@
 
 use std::collections::HashMap;
 
-use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::Direction;
+use petgraph::graph::{DiGraph, NodeIndex};
 
 /// Run personalized PageRank on `graph`.
 ///
@@ -36,12 +36,17 @@ pub fn rank_nodes<N, E>(
     // Build personalization vector
     let base_weight = 1.0 / n as f64;
     let owned_boost = 50.0 * base_weight;
-    let owned_set: std::collections::HashSet<NodeIndex> = personalized_nodes.iter().copied().collect();
+    let owned_set: std::collections::HashSet<NodeIndex> =
+        personalized_nodes.iter().copied().collect();
 
     let mut personalization: HashMap<NodeIndex, f64> = graph
         .node_indices()
         .map(|idx| {
-            let w = if owned_set.contains(&idx) { owned_boost } else { base_weight };
+            let w = if owned_set.contains(&idx) {
+                owned_boost
+            } else {
+                base_weight
+            };
             (idx, w)
         })
         .collect();
@@ -63,7 +68,12 @@ pub fn rank_nodes<N, E>(
     // Pre-compute out-degrees
     let out_degree: HashMap<NodeIndex, usize> = graph
         .node_indices()
-        .map(|idx| (idx, graph.neighbors_directed(idx, Direction::Outgoing).count()))
+        .map(|idx| {
+            (
+                idx,
+                graph.neighbors_directed(idx, Direction::Outgoing).count(),
+            )
+        })
         .collect();
 
     // Power iterations
