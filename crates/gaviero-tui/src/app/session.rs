@@ -58,8 +58,10 @@ pub(super) fn apply_first_run(app: &mut App, init_memory: bool) {
         if let Some(root) = app.workspace.roots().first().map(|r| r.to_path_buf()) {
             let tx = app.event_tx.clone();
             tokio::spawn(async move {
-                match tokio::task::spawn_blocking(move || gaviero_core::memory::init_workspace(&root))
-                    .await
+                match tokio::task::spawn_blocking(move || {
+                    gaviero_core::memory::init_workspace(&root)
+                })
+                .await
                 {
                     Ok(Ok(store)) => {
                         let _ = tx.send(Event::MemoryReady(store));
@@ -125,7 +127,8 @@ pub(crate) async fn compute_impact_text(
         return None;
     }
     tokio::task::spawn_blocking(move || {
-        let (store, _) = gaviero_core::repo_map::graph_builder::build_graph(&workspace_root).ok()?;
+        let (store, _) =
+            gaviero_core::repo_map::graph_builder::build_graph(&workspace_root).ok()?;
         let seed_refs: Vec<&str> = seeds.iter().map(|s| s.as_str()).collect();
         let impact = store.impact_radius(&seed_refs, 2).ok()?;
         if impact.affected_files.is_empty() {
@@ -173,8 +176,8 @@ pub(crate) async fn build_graph_context(
 mod tests {
     use super::*;
     use gaviero_core::context_planner::{
-        build_provider_profile, ContextPlanner, ModelSpec, PlannerFingerprint, PlannerInput,
-        PlannerSelections, RuntimeConfig, SessionLedger,
+        ContextPlanner, ModelSpec, PlannerFingerprint, PlannerInput, PlannerSelections,
+        RuntimeConfig, SessionLedger, build_provider_profile,
     };
 
     #[tokio::test]
@@ -267,10 +270,7 @@ mod tests {
                 updated_at: None,
             });
         let out = render_chat_selections(&sel, "do the thing");
-        assert_eq!(
-            out,
-            "[Graph] outline\n\n[Memory] context\n\ndo the thing"
-        );
+        assert_eq!(out, "[Graph] outline\n\n[Memory] context\n\ndo the thing");
     }
 }
 
