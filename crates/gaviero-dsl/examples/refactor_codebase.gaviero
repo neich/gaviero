@@ -8,14 +8,22 @@
 //   gaviero-cli --script refactor_codebase.gaviero \
 //     --task "replace all anyhow::Result with typed error enums per module"
 
-client sonnet { tier cheap     model "claude-sonnet-4-6" }
-client opus   { tier expensive model "claude-opus-4-7" }
+client sonnet { tier cheap     model "claude-sonnet-4-6" effort medium }
+client opus   { tier expensive model "claude-opus-4-7"   effort high }
+
+// Tier aliases let downstream agents reference routing labels instead of
+// concrete profiles — a launch-time `--tier expensive=<other_client>` flag
+// (see step 4 of the roadmap) then retargets every agent bound to that
+// label without touching this file.
+
+tier cheap     sonnet
+tier expensive opus
 
 // ── Phase 1: Analyse ─────────────────────────────────────────────────────────
 
 agent analyse {
     description "Analyse codebase for refactor: {{PROMPT}}"
-    client opus
+    tier expensive
     scope {
         read_only ["src/" "tests/" "crates/" "Cargo.toml" "CLAUDE.md" "ARCHITECTURE.md"]
     }
@@ -47,7 +55,7 @@ agent analyse {
 
 agent refactor {
     description "Apply refactor: {{PROMPT}}"
-    client sonnet
+    tier cheap
     depends_on [analyse]
     scope {
         owned     ["src/" "crates/"]
@@ -74,7 +82,7 @@ agent refactor {
 
 agent fix_tests {
     description "Update tests after refactor: {{PROMPT}}"
-    client sonnet
+    tier cheap
     depends_on [refactor]
     scope {
         owned     ["tests/" "src/"]
@@ -99,7 +107,7 @@ agent fix_tests {
 
 agent record_changes {
     description "Record refactor to memory: {{PROMPT}}"
-    client opus
+    tier expensive
     depends_on [fix_tests]
     scope {
         read_only ["src/" "crates/" "tests/"]
