@@ -45,8 +45,7 @@ pub fn render_scrollbar(
             .max(1.0) as usize;
         let max_scroll = total_items.saturating_sub(visible_items);
         let fraction = scroll_offset as f64 / max_scroll.max(1) as f64;
-        let start = (fraction * track_height.saturating_sub(size).max(1) as f64)
-            .round() as usize;
+        let start = (fraction * track_height.saturating_sub(size).max(1) as f64).round() as usize;
         (start, size)
     };
 
