@@ -45,7 +45,10 @@ pub struct AgentOptions {
     /// `ContinuityHandle::ClaudeSessionId` stored in the `SessionLedger`.
     /// This field remains for `LegacyAgentSession` (Ollama/Codex) until M10
     /// cleanup; new per-provider sessions must not read it. Removal: M10.
-    #[deprecated(since = "0.1.0", note = "M6: use ContinuityHandle::ClaudeSessionId via SessionLedger; removal in M10")]
+    #[deprecated(
+        since = "0.1.0",
+        note = "M6: use ContinuityHandle::ClaudeSessionId via SessionLedger; removal in M10"
+    )]
     pub resume_session_id: Option<String>,
 }
 
@@ -88,13 +91,9 @@ pub(crate) fn would_use_tempfile(prompt_len: usize, system_prompt_len: usize) ->
 /// Write `prompt` to a workspace-local tempfile and return (NamedTempFile,
 /// short argv to use instead of the full prompt). The argv tells Claude to
 /// read the file via its `@`-syntax and follow its instructions.
-fn spill_prompt_to_tempfile(
-    cwd: &Path,
-    prompt: &str,
-) -> Result<(tempfile::NamedTempFile, String)> {
+fn spill_prompt_to_tempfile(cwd: &Path, prompt: &str) -> Result<(tempfile::NamedTempFile, String)> {
     let dir: PathBuf = cwd.join(TEMP_SUBDIR);
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating tempdir {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating tempdir {}", dir.display()))?;
 
     let mut file = tempfile::Builder::new()
         .prefix("prompt-")
@@ -368,7 +367,10 @@ impl AcpSession {
 
     /// Wait for the subprocess to exit and return its status.
     pub async fn wait(&mut self) -> Result<std::process::ExitStatus> {
-        self.child.wait().await.context("waiting for claude subprocess")
+        self.child
+            .wait()
+            .await
+            .context("waiting for claude subprocess")
     }
 
     /// Return captured stderr lines (useful for diagnosing exit-without-output).
