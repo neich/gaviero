@@ -176,14 +176,12 @@ impl TerminalManager {
 
     /// Get the active terminal instance (immutable).
     pub fn active_instance(&self) -> Option<&TerminalInstance> {
-        self.active_tab
-            .and_then(|id| self.terminals.get(&id))
+        self.active_tab.and_then(|id| self.terminals.get(&id))
     }
 
     /// Get the active terminal instance (mutable).
     pub fn active_instance_mut(&mut self) -> Option<&mut TerminalInstance> {
-        self.active_tab
-            .and_then(|id| self.terminals.get_mut(&id))
+        self.active_tab.and_then(|id| self.terminals.get_mut(&id))
     }
 
     /// Get an instance by ID.
