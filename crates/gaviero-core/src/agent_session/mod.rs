@@ -60,8 +60,8 @@ use crate::write_gate::WriteGatePipeline;
 pub struct TransportContext {
     /// The new user message this turn dispatches.
     pub user_message: String,
-    /// Provider-specific reasoning effort ("low"/"medium"/"high"/"off").
-    /// `None` = provider default.
+    /// Provider-specific reasoning effort ("low"/"medium"/"high"/"xhigh"/"max"/"off"/"auto").
+    /// `None`, `"off"`, or `"auto"` = provider/model default.
     pub effort: Option<String>,
     /// Whether the user pre-approved writes for this turn.
     pub auto_approve: bool,
