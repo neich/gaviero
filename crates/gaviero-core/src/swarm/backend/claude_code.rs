@@ -42,8 +42,11 @@ impl AgentBackend for ClaudeCodeBackend {
         let system_prompt = request.system_prompt.as_deref().unwrap_or("");
         let prompt = request_prompt(&request);
         let allowed_tools: Vec<&str> = request.allowed_tools.iter().map(|s| s.as_str()).collect();
-        let file_attachments: Vec<&std::path::Path> =
-            request.file_attachments.iter().map(|p| p.as_path()).collect();
+        let file_attachments: Vec<&std::path::Path> = request
+            .file_attachments
+            .iter()
+            .map(|p| p.as_path())
+            .collect();
 
         // M6: `resume_session_id` deprecated; swarm work units are one-shot
         // (no resume), so this is always None. Allow stays until M10.
@@ -321,7 +324,9 @@ mod tests {
             &mut pos,
         );
         assert_eq!(events.len(), 1);
-        assert!(matches!(&events[0], UnifiedStreamEvent::ToolCallDelta { args_chunk, .. } if args_chunk == r#"{"file_path":"#));
+        assert!(
+            matches!(&events[0], UnifiedStreamEvent::ToolCallDelta { args_chunk, .. } if args_chunk == r#"{"file_path":"#)
+        );
     }
 
     #[test]
@@ -339,7 +344,9 @@ mod tests {
             &mut pos,
         );
         assert_eq!(events.len(), 2);
-        assert!(matches!(&events[0], UnifiedStreamEvent::Usage(u) if u.cost_usd == Some(0.02) && u.duration_ms == Some(1500)));
+        assert!(
+            matches!(&events[0], UnifiedStreamEvent::Usage(u) if u.cost_usd == Some(0.02) && u.duration_ms == Some(1500))
+        );
         assert_eq!(events[1], UnifiedStreamEvent::Done(StopReason::EndTurn));
     }
 
@@ -396,12 +403,10 @@ mod tests {
         let events = map_acp_event(
             &StreamEvent::AssistantMessage {
                 text: "done".into(),
-                tool_uses: vec![
-                    ToolUseInfo {
-                        name: "Read".into(),
-                        input: serde_json::json!({"file_path": "src/lib.rs"}),
-                    },
-                ],
+                tool_uses: vec![ToolUseInfo {
+                    name: "Read".into(),
+                    input: serde_json::json!({"file_path": "src/lib.rs"}),
+                }],
             },
             &mut text,
             &mut pos,
