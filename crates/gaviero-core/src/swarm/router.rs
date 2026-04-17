@@ -292,6 +292,8 @@ mod tests {
             depends_on: vec![],
             backend: Default::default(),
             model: model.map(|s| s.to_string()),
+            effort: None,
+            extra: Vec::new(),
             tier,
             privacy,
             coordinator_instructions: String::new(),
