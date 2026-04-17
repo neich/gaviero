@@ -91,7 +91,10 @@ impl PersistentSession {
         use tokio::io::AsyncBufReadExt;
         loop {
             self.line_buf.clear();
-            let bytes = self.stdout.read_line(&mut self.line_buf).await
+            let bytes = self
+                .stdout
+                .read_line(&mut self.line_buf)
+                .await
                 .context("reading persistent session stdout")?;
             if bytes == 0 {
                 return Ok(None);
@@ -197,25 +200,19 @@ impl AcpSessionFactory {
     }
 
     /// Send a prompt to a persistent session and collect the response events.
-    pub async fn send_to_persistent(
-        &self,
-        key: &str,
-        prompt: &str,
-    ) -> Result<Vec<StreamEvent>> {
+    pub async fn send_to_persistent(&self, key: &str, prompt: &str) -> Result<Vec<StreamEvent>> {
         let mut sessions = self.persistent_sessions.lock().await;
-        let session = sessions.get_mut(key)
+        let session = sessions
+            .get_mut(key)
             .ok_or_else(|| anyhow::anyhow!("no persistent session with key '{}'", key))?;
         session.send_prompt(prompt).await
     }
 
     /// Send a slash command (e.g., `/compact`) to a persistent session.
-    pub async fn send_command(
-        &self,
-        key: &str,
-        command: &str,
-    ) -> Result<Vec<StreamEvent>> {
+    pub async fn send_command(&self, key: &str, command: &str) -> Result<Vec<StreamEvent>> {
         let mut sessions = self.persistent_sessions.lock().await;
-        let session = sessions.get_mut(key)
+        let session = sessions
+            .get_mut(key)
             .ok_or_else(|| anyhow::anyhow!("no persistent session with key '{}'", key))?;
         session.send_command(command).await
     }
@@ -247,7 +244,8 @@ impl AcpSessionFactory {
     /// List all active persistent session keys.
     pub async fn active_sessions(&self) -> Vec<String> {
         let sessions = self.persistent_sessions.lock().await;
-        sessions.iter()
+        sessions
+            .iter()
             .filter(|(_, s)| s.is_alive())
             .map(|(k, _)| k.clone())
             .collect()
@@ -294,7 +292,11 @@ fn spawn_persistent(
         .stderr(Stdio::null()) // Persistent sessions don't capture stderr
         .stdin(Stdio::piped());
 
-    tracing::info!("Spawning persistent claude session: model={}, cwd={}", model, cwd.display());
+    tracing::info!(
+        "Spawning persistent claude session: model={}, cwd={}",
+        model,
+        cwd.display()
+    );
 
     let mut child = cmd.spawn().map_err(|e| {
         if e.raw_os_error() == Some(7) {
@@ -314,9 +316,13 @@ fn spawn_persistent(
         }
     })?;
 
-    let stdin = child.stdin.take()
+    let stdin = child
+        .stdin
+        .take()
         .ok_or_else(|| anyhow::anyhow!("failed to capture persistent session stdin"))?;
-    let stdout = child.stdout.take()
+    let stdout = child
+        .stdout
+        .take()
         .ok_or_else(|| anyhow::anyhow!("failed to capture persistent session stdout"))?;
 
     Ok(PersistentSession {
@@ -369,6 +375,11 @@ mod tests {
         let factory = AcpSessionFactory::new(AgentOptions::default());
         let result = factory.send_to_persistent("missing", "hello").await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("no persistent session"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("no persistent session")
+        );
     }
 }
