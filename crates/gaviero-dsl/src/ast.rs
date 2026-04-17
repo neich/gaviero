@@ -244,6 +244,16 @@ pub struct LoopBlock {
     /// Absolute value of `{{ITER}}` on the first loop pass.
     /// Subsequent passes increment by 1. Defaults to 1.
     pub iter_start: u32,
+    /// Require K consecutive PASS verdicts from the judge before exiting.
+    /// Defaults to 1 (single PASS exits, matching legacy behaviour).
+    /// Only meaningful for `until agent <name>`.
+    pub stability: u32,
+    /// Hard timeout for each judge invocation, in seconds. 0 = disabled.
+    /// Only meaningful for `until agent <name>`.
+    pub judge_timeout_secs: u32,
+    /// When `true` (default), unparseable judge output is treated as a hard
+    /// failure; when `false`, legacy silent-FAIL behaviour.
+    pub strict_judge: bool,
     pub span: Span,
 }
 
