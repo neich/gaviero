@@ -388,7 +388,8 @@ impl AgentChatState {
                     let current = self.effective_model().to_string();
                     let options = self.model_options().to_vec();
                     let list = if options.is_empty() {
-                        "sonnet, opus, haiku, ollama:qwen2.5-coder:7b".to_string()
+                        "sonnet, opus, haiku, opusplan, sonnet[1m], opus[1m], ollama:qwen2.5-coder:7b"
+                            .to_string()
                     } else {
                         options.join(", ")
                     };
@@ -415,19 +416,24 @@ impl AgentChatState {
                 if arg.is_empty() {
                     let current = self.effective_effort();
                     self.add_system_message(&format!(
-                        "Effort level: {}.\nUsage: /effort <off|low|medium|high|max>",
+                        "Effort level: {}.\n\
+                         Usage: /effort <off|auto|low|medium|high|xhigh|max>\n\
+                         `xhigh` applies on Opus 4.7 (falls back to `high` on older models).\n\
+                         `max` is session-only.",
                         current
                     ));
                 } else {
                     let level = match arg {
                         "off" | "0" | "none" => "off",
+                        "auto" => "auto",
                         "low" | "l" => "low",
                         "medium" | "med" | "m" => "medium",
                         "high" | "h" => "high",
+                        "xhigh" | "xh" => "xhigh",
                         "max" => "max",
                         _ => {
                             self.add_system_message(
-                                "Invalid effort level. Use: off, low, medium, high, max",
+                                "Invalid effort level. Use: off, auto, low, medium, high, xhigh, max",
                             );
                             self.text_input.text.clear();
                             self.text_input.cursor = 0;
@@ -536,8 +542,8 @@ impl AgentChatState {
             "/help" => {
                 self.add_system_message(
                     "Available commands:\n\
-                     /model <name>      — Set model (sonnet, opus, haiku, ollama:<model>)\n\
-                     /effort <level>    — Set effort level (off, low, medium, high, max)\n\
+                     /model <name>      — Set model (sonnet, opus, haiku, opusplan, sonnet[1m], opus[1m], ollama:<model>)\n\
+                     /effort <level>    — Set effort level (off, auto, low, medium, high, xhigh, max)\n\
                      /namespace <name>  — Set memory namespace (or show current)\n\
                      /autoapprove       — Toggle auto-approve for this conversation (/yolo)\n\
                      /attach <path>     — Attach a file (text or image)\n\
@@ -603,10 +609,14 @@ impl AgentChatState {
     /// Context window size in tokens for the effective model.
     fn context_limit_tokens(&self) -> usize {
         let model = self.effective_model();
+        // Trailing `[1m]` (e.g. `sonnet[1m]`, `claude-opus-4-7[1m]`) selects
+        // the 1M-token extended context variant — see Claude Code model-config
+        // docs. Strip the suffix before matching the base alias.
+        if model.ends_with("[1m]") {
+            return 1_000_000;
+        }
         match model {
-            "opus" => 200_000,
-            "sonnet" => 200_000,
-            "haiku" => 200_000,
+            "opus" | "sonnet" | "haiku" => 200_000,
             _ => 200_000,
         }
     }
