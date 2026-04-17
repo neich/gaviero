@@ -10,8 +10,8 @@
 
 use tree_sitter::{Query, Tree};
 
-use super::treesitter::compute_treesitter_indent;
 use super::IndentResult;
+use super::treesitter::compute_treesitter_indent;
 
 const MAX_BASELINE_SEARCH: usize = 5;
 
@@ -35,7 +35,13 @@ pub fn compute_hybrid_indent(
 
     // Step 1: compute expected indent for the new line
     let new_result = compute_treesitter_indent(
-        doc, tree, indent_query, cursor_byte, true, tab_width, indent_unit,
+        doc,
+        tree,
+        indent_query,
+        cursor_byte,
+        true,
+        tab_width,
+        indent_unit,
     );
     let expected_new = new_result.level;
 
@@ -63,7 +69,13 @@ pub fn compute_hybrid_indent(
         0
     };
     let baseline_result = compute_treesitter_indent(
-        doc, tree, indent_query, baseline_cursor, true, tab_width, indent_unit,
+        doc,
+        tree,
+        indent_query,
+        baseline_cursor,
+        true,
+        tab_width,
+        indent_unit,
     );
     let expected_baseline = baseline_result.level;
 
@@ -169,7 +181,11 @@ mod tests {
         // But baseline is 3-space... the hybrid should adapt.
         // baseline actual level in 4-sp units = 3/4 = 0. So new = 0+1 = 1. Hmm.
         // This test shows hybrid adapts: even with wrong indent, delta is correct.
-        assert!(result.level >= 1, "should produce at least level 1, got {}", result.level);
+        assert!(
+            result.level >= 1,
+            "should produce at least level 1, got {}",
+            result.level
+        );
     }
 
     #[test]
