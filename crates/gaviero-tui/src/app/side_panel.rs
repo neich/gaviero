@@ -5,8 +5,12 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
     // SelectUp/SelectDown extend it; Copy reads it.
     let is_selection_action = matches!(
         action,
-        Action::SelectUp | Action::SelectDown | Action::SelectLeft
-            | Action::SelectRight | Action::SelectWordLeft | Action::SelectWordRight
+        Action::SelectUp
+            | Action::SelectDown
+            | Action::SelectLeft
+            | Action::SelectRight
+            | Action::SelectWordLeft
+            | Action::SelectWordRight
             | Action::Copy
     );
     let had_output_selection = app.chat_state.has_text_selection();
@@ -112,7 +116,13 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
                     app.handle_undo_swarm_command();
                 } else if app.chat_state.text_input.text.trim().starts_with("/swarm") {
                     app.handle_swarm_command();
-                } else if app.chat_state.text_input.text.trim().starts_with("/remember") {
+                } else if app
+                    .chat_state
+                    .text_input
+                    .text
+                    .trim()
+                    .starts_with("/remember")
+                {
                     app.handle_remember_command();
                 } else if app.chat_state.text_input.text.trim().starts_with("/attach") {
                     app.handle_attach_command();
@@ -309,7 +319,12 @@ pub(super) fn handle_swarm_dashboard_action(app: &mut App, action: Action) {
             let branch = agent.and_then(|a| a.branch.clone());
             let agent_id = agent.map(|a| a.id.clone());
             let is_completed = agent
-                .map(|a| matches!(a.status, gaviero_core::swarm::models::AgentStatus::Completed))
+                .map(|a| {
+                    matches!(
+                        a.status,
+                        gaviero_core::swarm::models::AgentStatus::Completed
+                    )
+                })
                 .unwrap_or(false);
 
             if !is_completed {
@@ -381,8 +396,8 @@ pub(super) fn handle_swarm_dashboard_action(app: &mut App, action: Action) {
                                 tx.send(Event::SwarmPhaseChanged(format!("revert failed: {}", e)));
                         }
                         Err(e) => {
-                            let _ =
-                                tx.send(Event::SwarmPhaseChanged(format!("revert panicked: {}", e)));
+                            let _ = tx
+                                .send(Event::SwarmPhaseChanged(format!("revert panicked: {}", e)));
                         }
                     }
                 });
@@ -466,7 +481,8 @@ pub(super) fn handle_swarm_dashboard_action(app: &mut App, action: Action) {
         },
         Action::PageDown => match dash.focus {
             DashboardFocus::Table => {
-                dash.scroll.selected = (dash.scroll.selected + 10).min(agent_count.saturating_sub(1));
+                dash.scroll.selected =
+                    (dash.scroll.selected + 10).min(agent_count.saturating_sub(1));
                 dash.scroll.ensure_visible();
                 reset_detail!(dash);
             }
@@ -655,16 +671,11 @@ pub(super) fn handle_git_panel_action(app: &mut App, action: Action) {
 
                         if original != current {
                             let proposal = WriteGatePipeline::build_proposal(
-                                0,
-                                "git-diff",
-                                &abs_path,
-                                &original,
-                                &current,
+                                0, "git-diff", &abs_path, &original, &current,
                             );
                             app.open_file(&abs_path);
                             app.focus = Focus::Editor;
-                            app.diff_review =
-                                Some(DiffReviewState::new(proposal, DiffSource::Acp));
+                            app.diff_review = Some(DiffReviewState::new(proposal, DiffSource::Acp));
                         } else {
                             app.open_file(&abs_path);
                             app.focus = Focus::Editor;
@@ -806,9 +817,8 @@ pub(super) fn send_chat_message(app: &mut App) {
     );
     {
         let conv = &mut app.chat_state.conversations[app.chat_state.active_conv];
-        let current_fp = gaviero_core::context_planner::PlannerFingerprint::from_profile(
-            &provider_profile,
-        );
+        let current_fp =
+            gaviero_core::context_planner::PlannerFingerprint::from_profile(&provider_profile);
         // Step 1: rehydrate or lazy-init the ledger.
         if conv.session_ledger.is_none() {
             // M4: if this is the first send after restore from disk,
@@ -894,7 +904,10 @@ pub(super) fn send_chat_message(app: &mut App) {
     let ollama_base_url = app.chat_state.agent_settings.ollama_base_url.clone();
     let graph_budget_tokens = app.chat_state.agent_settings.graph_budget_tokens;
     let repo_map_cache = app.repo_map.clone();
-    let graph_root = app.graph_workspace_root.clone().unwrap_or_else(|| root.clone());
+    let graph_root = app
+        .graph_workspace_root
+        .clone()
+        .unwrap_or_else(|| root.clone());
 
     // Seed paths for graph ranking: explicit @file refs + active buffer (if any), made relative to workspace root.
     let mut graph_seeds: Vec<String> = refs.clone();
@@ -922,7 +935,10 @@ pub(super) fn send_chat_message(app: &mut App) {
     let task = tokio::spawn(async move {
         {
             let mut gate = wg.lock().await;
-            tracing::info!("Write gate mode before: {:?}, switching to Deferred", gate.mode());
+            tracing::info!(
+                "Write gate mode before: {:?}, switching to Deferred",
+                gate.mode()
+            );
             gate.set_mode(WriteMode::Deferred);
         }
 
@@ -940,17 +956,13 @@ pub(super) fn send_chat_message(app: &mut App) {
         // user message (V9 §11 M2 acceptance: "turn 2+ transmits only
         // new user message").
         let repo_map_arc = if is_first_turn {
-            crate::app::session::get_or_build_repo_map_cached(
-                repo_map_cache,
-                graph_root.clone(),
-            )
-            .await
+            crate::app::session::get_or_build_repo_map_cached(repo_map_cache, graph_root.clone())
+                .await
         } else {
             None
         };
         let impact_text = if is_first_turn {
-            crate::app::session::compute_impact_text(graph_root.clone(), graph_seeds.clone())
-                .await
+            crate::app::session::compute_impact_text(graph_root.clone(), graph_seeds.clone()).await
         } else {
             None
         };
@@ -961,7 +973,11 @@ pub(super) fn send_chat_message(app: &mut App) {
             Vec::new()
         };
         let read_ns_for_planner: &[String] = if is_first_turn { &read_ns } else { &[] };
-        let budget_for_planner: usize = if is_first_turn { graph_budget_tokens } else { 0 };
+        let budget_for_planner: usize = if is_first_turn {
+            graph_budget_tokens
+        } else {
+            0
+        };
 
         let mut local_ledger = ledger_snapshot;
         let planner_input = gaviero_core::context_planner::PlannerInput {
@@ -1102,7 +1118,10 @@ pub(super) fn send_chat_message(app: &mut App) {
             proposals
         };
         if !proposals.is_empty() {
-            tracing::info!("Sending AcpTaskCompleted with {} proposals", proposals.len());
+            tracing::info!(
+                "Sending AcpTaskCompleted with {} proposals",
+                proposals.len()
+            );
             let _ = tx.send(Event::AcpTaskCompleted {
                 conv_id: conv_id_clone,
                 proposals,
@@ -1129,10 +1148,8 @@ pub(super) fn chat_paste_from_clipboard(app: &mut App) {
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_else(|| "clipboard.png".to_string());
-                        app.chat_state.add_attachment(
-                            path,
-                            crate::panels::agent_chat::AttachmentKind::Image,
-                        );
+                        app.chat_state
+                            .add_attachment(path, crate::panels::agent_chat::AttachmentKind::Image);
                         app.chat_state.add_system_message(&format!(
                             "Pasted clipboard image: {} ({}x{})",
                             display_name, img.width, img.height
@@ -1162,6 +1179,7 @@ pub(super) fn cancel_agent(app: &mut App) {
         task.abort();
         app.chat_state.conversations[app.chat_state.active_conv].is_streaming = false;
         app.chat_state.conversations[app.chat_state.active_conv].streaming_started_at = None;
-        app.chat_state.finalize_message("system", "Cancelled by user.");
+        app.chat_state
+            .finalize_message("system", "Cancelled by user.");
     }
 }
