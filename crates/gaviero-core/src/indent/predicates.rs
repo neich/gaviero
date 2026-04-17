@@ -39,9 +39,10 @@ pub fn evaluate_single_predicate(
             if let (Some(PredicateArg::Capture(a)), Some(PredicateArg::Capture(b))) =
                 (args.first(), args.get(1))
             {
-                if let (Some(Some(node_a)), Some(Some(node_b))) =
-                    (capture_nodes.get(*a as usize), capture_nodes.get(*b as usize))
-                {
+                if let (Some(Some(node_a)), Some(Some(node_b))) = (
+                    capture_nodes.get(*a as usize),
+                    capture_nodes.get(*b as usize),
+                ) {
                     return node_a.start_line == node_b.start_line;
                 }
             }
@@ -51,9 +52,10 @@ pub fn evaluate_single_predicate(
             if let (Some(PredicateArg::Capture(a)), Some(PredicateArg::Capture(b))) =
                 (args.first(), args.get(1))
             {
-                if let (Some(Some(node_a)), Some(Some(node_b))) =
-                    (capture_nodes.get(*a as usize), capture_nodes.get(*b as usize))
-                {
+                if let (Some(Some(node_a)), Some(Some(node_b))) = (
+                    capture_nodes.get(*a as usize),
+                    capture_nodes.get(*b as usize),
+                ) {
                     return node_a.start_line != node_b.start_line;
                 }
             }

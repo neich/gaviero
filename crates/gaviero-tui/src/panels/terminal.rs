@@ -73,7 +73,9 @@ impl TerminalSelectionState {
             None => return false,
         };
 
-        if ar == er && ac == ec { return false; }
+        if ar == er && ac == ec {
+            return false;
+        }
 
         let anchor_sb = self.anchor_scrollback.unwrap_or(0) as i32;
         let end_sb = self.end_scrollback.unwrap_or(0) as i32;
@@ -86,17 +88,26 @@ impl TerminalSelectionState {
         let er_current = (er as i32 + (current_sb - end_sb)).max(0);
 
         // Normalize to (start_row, start_col, end_row, end_col) order.
-        let (sr, sc, er_norm, ec) = if ar_current < er_current || (ar_current == er_current && ac <= ec) {
-            (ar_current, ac, er_current, ec)
-        } else {
-            (er_current, ec, ar_current, ac)
-        };
+        let (sr, sc, er_norm, ec) =
+            if ar_current < er_current || (ar_current == er_current && ac <= ec) {
+                (ar_current, ac, er_current, ec)
+            } else {
+                (er_current, ec, ar_current, ac)
+            };
 
         let row_i = row as i32;
-        if row_i < sr || row_i > er_norm { return false; }
-        if row_i == sr && row_i == er_norm { return col >= sc && col < ec; }
-        if row_i == sr { return col >= sc; }
-        if row_i == er_norm { return col < ec; }
+        if row_i < sr || row_i > er_norm {
+            return false;
+        }
+        if row_i == sr && row_i == er_norm {
+            return col >= sc && col < ec;
+        }
+        if row_i == sr {
+            return col >= sc;
+        }
+        if row_i == er_norm {
+            return col < ec;
+        }
         true
     }
 
@@ -110,7 +121,9 @@ impl TerminalSelectionState {
         let anchor_sb = self.anchor_scrollback.unwrap_or(0) as i32;
         let end_sb = self.end_scrollback.unwrap_or(0) as i32;
 
-        if ar == er && ac == ec && anchor_sb == end_sb { return None; }
+        if ar == er && ac == ec && anchor_sb == end_sb {
+            return None;
+        }
 
         let original_sb = screen.scrollback();
         let screen_rows = screen.size().0 as i32;
@@ -181,21 +194,27 @@ impl TerminalSelectionState {
         // Restore original scrollback position.
         screen.set_scrollback(original_sb);
 
-        if result.is_empty() { None } else { Some(result) }
+        if result.is_empty() {
+            None
+        } else {
+            Some(result)
+        }
     }
 
     /// Extend keyboard selection in a given direction.
     pub fn select_kb(&mut self, dir: (i16, i16), screen_rows: u16, screen_cols: u16) {
         // Initialize cursor at bottom-left of screen if not yet active.
-        let cursor = self.kb_cursor.get_or_insert((screen_rows.saturating_sub(1), 0));
+        let cursor = self
+            .kb_cursor
+            .get_or_insert((screen_rows.saturating_sub(1), 0));
         if self.anchor.is_none() {
             self.anchor = Some(*cursor);
             self.end = Some(*cursor);
         }
-        let new_row = (cursor.0 as i16 + dir.0)
-            .clamp(0, screen_rows.saturating_sub(1) as i16) as u16;
-        let new_col = (cursor.1 as i16 + dir.1)
-            .clamp(0, screen_cols.saturating_sub(1) as i16) as u16;
+        let new_row =
+            (cursor.0 as i16 + dir.0).clamp(0, screen_rows.saturating_sub(1) as i16) as u16;
+        let new_col =
+            (cursor.1 as i16 + dir.1).clamp(0, screen_cols.saturating_sub(1) as i16) as u16;
         *cursor = (new_row, new_col);
         self.end = Some(*cursor);
     }
@@ -340,7 +359,9 @@ pub fn key_event_to_bytes(key: &KeyEvent) -> Vec<u8> {
 
     match key.code {
         KeyCode::Char(c) if ctrl => {
-            let byte = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a').wrapping_add(1);
+            let byte = (c.to_ascii_lowercase() as u8)
+                .wrapping_sub(b'a')
+                .wrapping_add(1);
             vec![byte]
         }
         KeyCode::Char(c) if alt => {
@@ -449,10 +470,18 @@ fn vt100_style_to_ratatui(cell: &vt100::Cell) -> ratatui::style::Style {
     };
 
     let mut modifier = Modifier::empty();
-    if cell.bold() { modifier |= Modifier::BOLD; }
-    if cell.italic() { modifier |= Modifier::ITALIC; }
-    if cell.underline() { modifier |= Modifier::UNDERLINED; }
-    if cell.inverse() { modifier |= Modifier::REVERSED; }
+    if cell.bold() {
+        modifier |= Modifier::BOLD;
+    }
+    if cell.italic() {
+        modifier |= Modifier::ITALIC;
+    }
+    if cell.underline() {
+        modifier |= Modifier::UNDERLINED;
+    }
+    if cell.inverse() {
+        modifier |= Modifier::REVERSED;
+    }
 
     Style::default().fg(fg).bg(bg).add_modifier(modifier)
 }

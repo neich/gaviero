@@ -58,8 +58,12 @@ pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<
             let after_tag = after_tag.strip_suffix("</think>").unwrap_or(after_tag);
             if !after_tag.is_empty() {
                 let cleaned = strip_inline_markers(after_tag.trim());
-                for wl in crate::widgets::render_utils::word_wrap(&format!("  {}", cleaned), width) {
-                    output.push(ChatLine { style: reasoning_style, text: wl });
+                for wl in crate::widgets::render_utils::word_wrap(&format!("  {}", cleaned), width)
+                {
+                    output.push(ChatLine {
+                        style: reasoning_style,
+                        text: wl,
+                    });
                 }
             }
             if trimmed.ends_with("</think>") {
@@ -73,8 +77,12 @@ pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<
             let before_tag = trimmed.strip_suffix("</think>").unwrap_or("");
             if !before_tag.is_empty() {
                 let cleaned = strip_inline_markers(before_tag.trim());
-                for wl in crate::widgets::render_utils::word_wrap(&format!("  {}", cleaned), width) {
-                    output.push(ChatLine { style: reasoning_style, text: wl });
+                for wl in crate::widgets::render_utils::word_wrap(&format!("  {}", cleaned), width)
+                {
+                    output.push(ChatLine {
+                        style: reasoning_style,
+                        text: wl,
+                    });
                 }
             }
             in_thinking_block = false;
@@ -83,11 +91,18 @@ pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<
         }
         if in_thinking_block {
             if trimmed.is_empty() {
-                output.push(ChatLine { style: reasoning_style, text: String::new() });
+                output.push(ChatLine {
+                    style: reasoning_style,
+                    text: String::new(),
+                });
             } else {
                 let cleaned = strip_inline_markers(trimmed);
-                for wl in crate::widgets::render_utils::word_wrap(&format!("  {}", cleaned), width) {
-                    output.push(ChatLine { style: reasoning_style, text: wl });
+                for wl in crate::widgets::render_utils::word_wrap(&format!("  {}", cleaned), width)
+                {
+                    output.push(ChatLine {
+                        style: reasoning_style,
+                        text: wl,
+                    });
                 }
             }
             i += 1;
@@ -172,7 +187,10 @@ pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<
                     2 => "▌ ",
                     _ => "▎ ",
                 };
-                for wl in crate::widgets::render_utils::word_wrap(&format!("{}{}", marker, content), width) {
+                for wl in crate::widgets::render_utils::word_wrap(
+                    &format!("{}{}", marker, content),
+                    width,
+                ) {
                     output.push(ChatLine {
                         style: heading_style,
                         text: wl,
@@ -202,7 +220,10 @@ pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<
             let pad: String = "  ".repeat(indent);
             let content = strip_inline_markers(&trimmed[2..]);
             let first = format!("{}• {}", pad, content);
-            for (j, wl) in crate::widgets::render_utils::word_wrap(&first, width).into_iter().enumerate() {
+            for (j, wl) in crate::widgets::render_utils::word_wrap(&first, width)
+                .into_iter()
+                .enumerate()
+            {
                 if j == 0 {
                     output.push(ChatLine {
                         style: base_style,
@@ -240,8 +261,7 @@ pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<
         // Tool call and file proposal markers: [Read ...], [Write ...], [wrote ...], etc.
         // Style with dim color to visually distinguish from regular text
         if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.contains("](") {
-            let marker_style = Style::default()
-                .fg(theme::TOOL_DIM);
+            let marker_style = Style::default().fg(theme::TOOL_DIM);
             output.push(ChatLine {
                 style: marker_style,
                 text: format!("  {}", trimmed),
@@ -489,7 +509,10 @@ mod tests {
         assert!(lines[1].text.contains("        double"));
         // Ensure no tab characters remain
         for line in &lines {
-            assert!(!line.text.contains('\t'), "tab character should be expanded");
+            assert!(
+                !line.text.contains('\t'),
+                "tab character should be expanded"
+            );
         }
     }
 
@@ -513,6 +536,9 @@ mod tests {
         // The column for "日本" should be 4 display cols wide (not 2)
         let data_row = &lines[3].text; // top, header, separator, first data row
         // "日本" has display width 4, cell should be padded correctly
-        assert!(data_row.contains("日本"), "data row should contain wide chars");
+        assert!(
+            data_row.contains("日本"),
+            "data row should contain wide chars"
+        );
     }
 }

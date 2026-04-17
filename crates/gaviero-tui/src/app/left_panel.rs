@@ -264,10 +264,7 @@ pub(super) fn execute_move(app: &mut App, src: std::path::PathBuf, dest_dir: std
             ));
         }
         Err(e) => {
-            app.status_message = Some((
-                format!("Move failed: {}", e),
-                std::time::Instant::now(),
-            ));
+            app.status_message = Some((format!("Move failed: {}", e), std::time::Instant::now()));
         }
     }
     app.move_state = None;
@@ -306,7 +303,9 @@ pub(super) fn render_move_panel_info(app: &App, frame: &mut Frame, tree_area: Re
     for col in 0..dialog_area.width {
         let cx = dialog_area.x + col;
         if cx < frame.area().right() {
-            frame.buffer_mut()[(cx, y)].set_char('─').set_style(sep_style);
+            frame.buffer_mut()[(cx, y)]
+                .set_char('─')
+                .set_style(sep_style);
         }
     }
 
@@ -527,6 +526,5 @@ pub(super) fn refresh_file_tree(app: &mut App) {
     let selected = app.file_tree.scroll.selected;
     app.file_tree = FileTreeState::from_roots(&roots, &excludes, &git_allow);
     app.file_tree.restore_expanded(&expanded);
-    app.file_tree.scroll.selected =
-        selected.min(app.file_tree.entries.len().saturating_sub(1));
+    app.file_tree.scroll.selected = selected.min(app.file_tree.entries.len().saturating_sub(1));
 }

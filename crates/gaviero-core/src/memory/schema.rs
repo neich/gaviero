@@ -2,7 +2,6 @@
 ///
 /// Uses `PRAGMA user_version` to track the current schema version.
 /// Each migration runs exactly once, in order, on database open.
-
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
@@ -70,9 +69,7 @@ fn migrate_v2(conn: &Connection) -> Result<()> {
     // the migration system was introduced).
     let has_privacy: bool = conn
         .prepare("SELECT * FROM pragma_table_info('memories') WHERE name = 'privacy'")
-        .and_then(|mut stmt| {
-            stmt.query_row([], |_| Ok(true))
-        })
+        .and_then(|mut stmt| stmt.query_row([], |_| Ok(true)))
         .unwrap_or(false);
 
     if !has_privacy {
@@ -82,10 +79,8 @@ fn migrate_v2(conn: &Connection) -> Result<()> {
         .context("adding privacy column")?;
     }
 
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_memories_privacy ON memories(privacy);",
-    )
-    .context("creating privacy index")?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_memories_privacy ON memories(privacy);")
+        .context("creating privacy index")?;
 
     Ok(())
 }
@@ -105,10 +100,8 @@ fn migrate_v3(conn: &Connection, embedding_dims: usize) -> Result<()> {
             .and_then(|mut stmt| stmt.query_row([], |_| Ok(true)))
             .unwrap_or(false);
         if !has_col {
-            conn.execute_batch(&format!(
-                "ALTER TABLE memories ADD COLUMN {col} {typedef};"
-            ))
-            .with_context(|| format!("adding {col} column"))?;
+            conn.execute_batch(&format!("ALTER TABLE memories ADD COLUMN {col} {typedef};"))
+                .with_context(|| format!("adding {col} column"))?;
         }
         Ok(())
     };
@@ -213,10 +206,8 @@ fn migrate_v4(conn: &Connection, embedding_dims: usize) -> Result<()> {
             .and_then(|mut stmt| stmt.query_row([], |_| Ok(true)))
             .unwrap_or(false);
         if !has_col {
-            conn.execute_batch(&format!(
-                "ALTER TABLE memories ADD COLUMN {col} {typedef};"
-            ))
-            .with_context(|| format!("adding {col} column"))?;
+            conn.execute_batch(&format!("ALTER TABLE memories ADD COLUMN {col} {typedef};"))
+                .with_context(|| format!("adding {col} column"))?;
         }
         Ok(())
     };
@@ -241,7 +232,7 @@ fn migrate_v4(conn: &Connection, embedding_dims: usize) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_memories_type
              ON memories(memory_type);
          CREATE INDEX IF NOT EXISTS idx_memories_run
-             ON memories(run_id);"
+             ON memories(run_id);",
     )
     .context("creating scope indexes")?;
 
@@ -249,17 +240,14 @@ fn migrate_v4(conn: &Connection, embedding_dims: usize) -> Result<()> {
     // We use SQLite's built-in hex() + sha256 (via Rust) to fill this.
     // Since SQLite doesn't have SHA-256 built in, we do it in a loop.
     {
-        let mut stmt = conn.prepare(
-            "SELECT id, content FROM memories WHERE content_hash IS NULL"
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT id, content FROM memories WHERE content_hash IS NULL")?;
         let rows: Vec<(i64, String)> = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .filter_map(|r| r.ok())
             .collect();
 
-        let mut update = conn.prepare(
-            "UPDATE memories SET content_hash = ?1 WHERE id = ?2"
-        )?;
+        let mut update = conn.prepare("UPDATE memories SET content_hash = ?1 WHERE id = ?2")?;
         for (id, content) in &rows {
             let hash = content_hash(content);
             update.execute(rusqlite::params![hash, id])?;
@@ -284,7 +272,7 @@ fn migrate_v4(conn: &Connection, embedding_dims: usize) -> Result<()> {
          UPDATE memories SET scope_level = 4, trust = 'medium'
          WHERE (namespace LIKE 'tiers:%' OR key LIKE 'tiers:%') AND scope_level = 2;
          UPDATE memories SET trust = 'high'
-         WHERE key LIKE 'user:%' AND trust = 'medium';"
+         WHERE key LIKE 'user:%' AND trust = 'medium';",
     )
     .context("migrating namespace to scope")?;
 
@@ -294,14 +282,14 @@ fn migrate_v4(conn: &Connection, embedding_dims: usize) -> Result<()> {
         "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
             content,
             tokenize='porter unicode61'
-        );"
+        );",
     )
     .context("creating FTS5 table")?;
 
     // Populate FTS from existing data
     conn.execute_batch(
         "INSERT OR IGNORE INTO memories_fts(rowid, content)
-         SELECT id, content FROM memories;"
+         SELECT id, content FROM memories;",
     )
     .context("populating FTS5")?;
 
@@ -316,7 +304,7 @@ fn migrate_v4(conn: &Connection, embedding_dims: usize) -> Result<()> {
         CREATE TRIGGER IF NOT EXISTS memories_fts_au AFTER UPDATE OF content ON memories BEGIN
             DELETE FROM memories_fts WHERE rowid = old.id;
             INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
-        END;"
+        END;",
     )
     .context("creating FTS sync triggers")?;
 
@@ -335,7 +323,7 @@ fn migrate_v4(conn: &Connection, embedding_dims: usize) -> Result<()> {
         "INSERT OR IGNORE INTO vec_memories_scoped(memory_id, embedding, scope_level)
          SELECT v.memory_id, v.embedding, m.scope_level
          FROM vec_memories v
-         JOIN memories m ON m.id = v.memory_id;"
+         JOIN memories m ON m.id = v.memory_id;",
     )
     .context("migrating vectors to scoped table")?;
 
@@ -348,7 +336,7 @@ fn migrate_v4(conn: &Connection, embedding_dims: usize) -> Result<()> {
             accessed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
         );
         CREATE INDEX IF NOT EXISTS idx_access_log_memory
-            ON memory_access_log(memory_id);"
+            ON memory_access_log(memory_id);",
     )
     .context("creating access log table")?;
 
@@ -371,9 +359,9 @@ mod tests {
     fn setup_conn() -> Connection {
         // Register BEFORE opening the connection (auto_extension applies to new opens)
         unsafe {
-            rusqlite::ffi::sqlite3_auto_extension(Some(
-                std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ()),
-            ));
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
         }
         Connection::open_in_memory().unwrap()
     }
@@ -396,7 +384,13 @@ mod tests {
         assert!(has_privacy);
 
         // Verify v3 columns exist
-        for col in &["importance", "access_count", "last_accessed_at", "source_file", "source_hash"] {
+        for col in &[
+            "importance",
+            "access_count",
+            "last_accessed_at",
+            "source_file",
+            "source_hash",
+        ] {
             let has: bool = conn
                 .prepare(&format!(
                     "SELECT * FROM pragma_table_info('memories') WHERE name = '{col}'"
@@ -485,8 +479,15 @@ mod tests {
 
         // Verify v4 columns exist
         for col in &[
-            "scope_level", "scope_path", "repo_id", "module_path",
-            "run_id", "content_hash", "memory_type", "trust", "tag",
+            "scope_level",
+            "scope_path",
+            "repo_id",
+            "module_path",
+            "run_id",
+            "content_hash",
+            "memory_type",
+            "trust",
+            "tag",
         ] {
             let has: bool = conn
                 .prepare(&format!(
@@ -506,14 +507,18 @@ mod tests {
 
         // Verify scoped vec table exists
         let has_vec_scoped: bool = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='vec_memories_scoped'")
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='vec_memories_scoped'",
+            )
             .and_then(|mut stmt| stmt.query_row([], |_| Ok(true)))
             .unwrap_or(false);
         assert!(has_vec_scoped, "vec_memories_scoped should exist");
 
         // Verify access log table exists
         let has_access_log: bool = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='memory_access_log'")
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='memory_access_log'",
+            )
             .and_then(|mut stmt| stmt.query_row([], |_| Ok(true)))
             .unwrap_or(false);
         assert!(has_access_log, "memory_access_log should exist");

@@ -3,11 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::theme;
 use crate::widgets::scroll_state::ScrollState;
 use crate::widgets::text_input::TextInput;
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    style::Style,
-};
+use ratatui::{buffer::Buffer, layout::Rect, style::Style};
 
 /// A single search result: file path + line number + matching line text.
 #[derive(Debug, Clone)]
@@ -71,7 +67,9 @@ impl SearchPanelState {
     }
 
     fn search_dir(&mut self, root: &Path, dir: &Path, excludes: &[String]) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
 
         for entry in entries.flatten() {
             let path = entry.path();
@@ -106,7 +104,9 @@ impl SearchPanelState {
 
     fn search_file(&mut self, path: &Path, rel_path: &Path) {
         // Skip binary files (check first 512 bytes)
-        let Ok(content) = std::fs::read_to_string(path) else { return };
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return;
+        };
 
         let query_lower = self.query.to_lowercase();
         for (i, line) in content.lines().enumerate() {
@@ -143,14 +143,20 @@ impl SearchPanelState {
 
         // ── Input field (row 0) ─────────────────────────────────
         let input_y = area.y;
-        let input_bg = if focused && self.editing { theme::INPUT_BG } else { bg };
+        let input_bg = if focused && self.editing {
+            theme::INPUT_BG
+        } else {
+            bg
+        };
         let prompt = " \u{1F50D} "; // 🔍 magnifying glass + space
         let prompt_style = Style::default().fg(theme::TEXT_DIM).bg(input_bg);
 
         // Clear input row
         for x in area.x..area.right() {
             if input_y < buf.area().bottom() {
-                buf[(x, input_y)].set_char(' ').set_style(Style::default().bg(input_bg));
+                buf[(x, input_y)]
+                    .set_char(' ')
+                    .set_style(Style::default().bg(input_bg));
             }
         }
 
@@ -181,7 +187,9 @@ impl SearchPanelState {
             let hint_style = Style::default().fg(theme::TEXT_DIM).bg(input_bg);
             let mut hx = text_x;
             for ch in hint.chars() {
-                if hx >= area.right() { break; }
+                if hx >= area.right() {
+                    break;
+                }
                 if input_y < buf.area().bottom() {
                     buf[(hx, input_y)].set_char(ch).set_style(hint_style);
                 }
@@ -191,7 +199,9 @@ impl SearchPanelState {
             let input_style = Style::default().fg(fg).bg(input_bg);
             let mut ix = text_x;
             for ch in self.input.text.chars() {
-                if ix >= area.right() { break; }
+                if ix >= area.right() {
+                    break;
+                }
                 if input_y < buf.area().bottom() {
                     buf[(ix, input_y)].set_char(ch).set_style(input_style);
                 }
@@ -219,7 +229,11 @@ impl SearchPanelState {
                 format!(" {} results", self.results.len())
             };
             let summary_style = Style::default()
-                .fg(if self.results.is_empty() { theme::TEXT_DIM } else { theme::WARNING })
+                .fg(if self.results.is_empty() {
+                    theme::TEXT_DIM
+                } else {
+                    theme::WARNING
+                })
                 .bg(bg);
             for (i, ch) in summary.chars().enumerate() {
                 let sx = area.x + i as u16;
@@ -248,19 +262,15 @@ impl SearchPanelState {
             let line_bg = if is_selected { sel_bg } else { bg };
 
             // File path + line number
-            let path_str = format!(
-                " {}:{}",
-                result.path.display(),
-                result.line_number
-            );
-            let path_style = Style::default()
-                .fg(theme::FOCUS_BORDER)
-                .bg(line_bg);
+            let path_str = format!(" {}:{}", result.path.display(), result.line_number);
+            let path_style = Style::default().fg(theme::FOCUS_BORDER).bg(line_bg);
             let text_style = Style::default().fg(fg).bg(line_bg);
 
             // Clear row
             for rx in area.x..area.right() {
-                buf[(rx, y)].set_char(' ').set_style(Style::default().bg(line_bg));
+                buf[(rx, y)]
+                    .set_char(' ')
+                    .set_style(Style::default().bg(line_bg));
             }
 
             // Render path

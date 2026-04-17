@@ -70,6 +70,9 @@ enum LoopField {
     Until(UntilCondition),
     MaxIterations(u32),
     IterStart(u32),
+    Stability(u32),
+    JudgeTimeout(u32),
+    StrictJudge(bool),
 }
 
 #[derive(Debug)]
@@ -85,7 +88,8 @@ enum MemoryField {
 
 // ── Parser builder ─────────────────────────────────────────────────────────
 
-fn script_parser<'src, I>() -> impl Parser<'src, I, Script, extra::Err<Rich<'src, Token, Span>>> + Clone
+fn script_parser<'src, I>()
+-> impl Parser<'src, I, Script, extra::Err<Rich<'src, Token, Span>>> + Clone
 where
     I: ValueInput<'src, Token = Token, Span = Span>,
 {
@@ -114,6 +118,9 @@ where
         Token::KwAgents     => "agents".to_owned(),
         Token::KwMaxIterations => "max_iterations".to_owned(),
         Token::KwIterStart  => "iter_start".to_owned(),
+        Token::KwStability  => "stability".to_owned(),
+        Token::KwJudgeTimeout => "judge_timeout".to_owned(),
+        Token::KwStrictJudge => "strict_judge".to_owned(),
         Token::KwCommand    => "command".to_owned(),
         // graph/impact contextual keywords
         Token::KwImpactScope => "impact_scope".to_owned(),
@@ -168,17 +175,14 @@ where
     // Used at top level (Item::Vars) and inside agent declarations.
     // Keys are identifiers (or contextual keywords); values are strings.
 
-    let vars_pair = ident
-        .then(string.clone())
-        .map(|(k, v)| (k, v));
+    let vars_pair = ident.then(string.clone()).map(|(k, v)| (k, v));
 
-    let vars_block = just(Token::KwVars)
-        .ignore_then(
-            vars_pair
-                .repeated()
-                .collect::<Vec<_>>()
-                .delimited_by(just(Token::LBrace), just(Token::RBrace)),
-        );
+    let vars_block = just(Token::KwVars).ignore_then(
+        vars_pair
+            .repeated()
+            .collect::<Vec<_>>()
+            .delimited_by(just(Token::LBrace), just(Token::RBrace)),
+    );
 
     // ── client declaration ────────────────────────────────────────
 
@@ -224,7 +228,15 @@ where
                     }
                 }
             }
-            ClientDecl { name, name_span, tier, model, privacy, is_default, span: e.span() }
+            ClientDecl {
+                name,
+                name_span,
+                tier,
+                model,
+                privacy,
+                is_default,
+                span: e.span(),
+            }
         });
 
     // ── scope block ───────────────────────────────────────────────
@@ -259,10 +271,17 @@ where
                 match f {
                     ScopeField::Owned(v) => owned.extend(v),
                     ScopeField::ReadOnly(v) => read_only.extend(v),
-                    ScopeField::ImpactScope(v) => { impact_scope.get_or_insert((v, e.span())); }
+                    ScopeField::ImpactScope(v) => {
+                        impact_scope.get_or_insert((v, e.span()));
+                    }
                 }
             }
-            ScopeBlock { owned, read_only, impact_scope, span: e.span() }
+            ScopeBlock {
+                owned,
+                read_only,
+                impact_scope,
+                span: e.span(),
+            }
         });
 
     // ── memory block ──────────────────────────────────────────────
@@ -309,15 +328,34 @@ where
             for f in fields {
                 match f {
                     MemoryField::ReadNs(v) => read_ns.extend(v),
-                    MemoryField::WriteNs(s) => { write_ns.get_or_insert(s); }
-                    MemoryField::Importance(v) => { importance.get_or_insert(v); }
+                    MemoryField::WriteNs(s) => {
+                        write_ns.get_or_insert(s);
+                    }
+                    MemoryField::Importance(v) => {
+                        importance.get_or_insert(v);
+                    }
                     MemoryField::StalenessSources(v) => staleness_sources.extend(v),
-                    MemoryField::ReadQuery(s) => { read_query.get_or_insert((s, e.span())); }
-                    MemoryField::ReadLimit(n) => { read_limit.get_or_insert((n, e.span())); }
-                    MemoryField::WriteContent(s) => { write_content.get_or_insert((s, e.span())); }
+                    MemoryField::ReadQuery(s) => {
+                        read_query.get_or_insert((s, e.span()));
+                    }
+                    MemoryField::ReadLimit(n) => {
+                        read_limit.get_or_insert((n, e.span()));
+                    }
+                    MemoryField::WriteContent(s) => {
+                        write_content.get_or_insert((s, e.span()));
+                    }
                 }
             }
-            MemoryBlock { read_ns, write_ns, importance, staleness_sources, read_query, read_limit, write_content, span: e.span() }
+            MemoryBlock {
+                read_ns,
+                write_ns,
+                importance,
+                staleness_sources,
+                read_query,
+                read_limit,
+                write_content,
+                span: e.span(),
+            }
         });
 
     // ── bool literal (true/false as Ident) ───────────────────────
@@ -355,9 +393,7 @@ where
             just(Token::KwClippy)
                 .ignore_then(b2)
                 .map(VerifyField::Clippy),
-            just(Token::KwTest)
-                .ignore_then(b3)
-                .map(VerifyField::Test),
+            just(Token::KwTest).ignore_then(b3).map(VerifyField::Test),
             just(Token::KwImpactTests)
                 .ignore_then(b4)
                 .map(VerifyField::ImpactTests),
@@ -384,7 +420,13 @@ where
                     VerifyField::ImpactTests(v) => impact_tests = v,
                 }
             }
-            VerifyBlock { compile, clippy, test, impact_tests, span: e.span() }
+            VerifyBlock {
+                compile,
+                clippy,
+                test,
+                impact_tests,
+                span: e.span(),
+            }
         });
 
     // ── context block ─────────────────────────────────────────────
@@ -416,10 +458,17 @@ where
                 match f {
                     ContextField::CallersOf(v) => callers_of.extend(v),
                     ContextField::TestsFor(v) => tests_for.extend(v),
-                    ContextField::Depth(n) => { depth.get_or_insert((n, e.span())); }
+                    ContextField::Depth(n) => {
+                        depth.get_or_insert((n, e.span()));
+                    }
                 }
             }
-            ContextBlock { callers_of, tests_for, depth, span: e.span() }
+            ContextBlock {
+                callers_of,
+                tests_for,
+                depth,
+                span: e.span(),
+            }
         });
 
     // ── agent declaration ─────────────────────────────────────────
@@ -498,7 +547,20 @@ where
                     }
                 }
             }
-            AgentDecl { name, name_span, description, client, scope, depends_on, prompt, max_retries, memory, context, vars, span: e.span() }
+            AgentDecl {
+                name,
+                name_span,
+                description,
+                client,
+                scope,
+                depends_on,
+                prompt,
+                max_retries,
+                memory,
+                context,
+                vars,
+                span: e.span(),
+            }
         });
 
     // ── loop block (inside workflow steps) ─────────────────────────
@@ -510,10 +572,16 @@ where
         let b3 = bool_lit.clone();
         let b4 = bool_lit.clone();
         let until_verify_field = choice((
-            just(Token::KwCompile).ignore_then(b1).map(VerifyField::Compile),
-            just(Token::KwClippy).ignore_then(b2).map(VerifyField::Clippy),
+            just(Token::KwCompile)
+                .ignore_then(b1)
+                .map(VerifyField::Compile),
+            just(Token::KwClippy)
+                .ignore_then(b2)
+                .map(VerifyField::Clippy),
             just(Token::KwTest).ignore_then(b3).map(VerifyField::Test),
-            just(Token::KwImpactTests).ignore_then(b4).map(VerifyField::ImpactTests),
+            just(Token::KwImpactTests)
+                .ignore_then(b4)
+                .map(VerifyField::ImpactTests),
         ));
         let until_verify = until_verify_field
             .repeated()
@@ -532,7 +600,13 @@ where
                         VerifyField::ImpactTests(v) => impact_tests = v,
                     }
                 }
-                UntilCondition::Verify(VerifyBlock { compile, clippy, test, impact_tests, span: e.span() })
+                UntilCondition::Verify(VerifyBlock {
+                    compile,
+                    clippy,
+                    test,
+                    impact_tests,
+                    span: e.span(),
+                })
             });
 
         let until_agent = just(Token::KwAgent)
@@ -559,6 +633,15 @@ where
         just(Token::KwIterStart)
             .ignore_then(integer)
             .map(|n| LoopField::IterStart(n as u32)),
+        just(Token::KwStability)
+            .ignore_then(integer)
+            .map(|n| LoopField::Stability(n as u32)),
+        just(Token::KwJudgeTimeout)
+            .ignore_then(integer)
+            .map(|n| LoopField::JudgeTimeout(n as u32)),
+        just(Token::KwStrictJudge)
+            .ignore_then(bool_lit)
+            .map(LoopField::StrictJudge),
     ));
 
     let loop_block = just(Token::KwLoop)
@@ -573,21 +656,46 @@ where
             let mut until = None;
             let mut max_iterations = None;
             let mut iter_start = None;
+            let mut stability = None;
+            let mut judge_timeout_secs = None;
+            let mut strict_judge = None;
             for f in fields {
                 match f {
                     LoopField::Agents(v) => agents = v,
-                    LoopField::Until(c) => { until.get_or_insert(c); }
-                    LoopField::MaxIterations(n) => { max_iterations.get_or_insert(n); }
-                    LoopField::IterStart(n) => { iter_start.get_or_insert(n); }
+                    LoopField::Until(c) => {
+                        until.get_or_insert(c);
+                    }
+                    LoopField::MaxIterations(n) => {
+                        max_iterations.get_or_insert(n);
+                    }
+                    LoopField::IterStart(n) => {
+                        iter_start.get_or_insert(n);
+                    }
+                    LoopField::Stability(n) => {
+                        stability.get_or_insert(n);
+                    }
+                    LoopField::JudgeTimeout(n) => {
+                        judge_timeout_secs.get_or_insert(n);
+                    }
+                    LoopField::StrictJudge(b) => {
+                        strict_judge.get_or_insert(b);
+                    }
                 }
             }
             LoopBlock {
                 agents,
                 until: until.unwrap_or(UntilCondition::Verify(VerifyBlock {
-                    compile: false, clippy: false, test: false, impact_tests: false, span: e.span(),
+                    compile: false,
+                    clippy: false,
+                    test: false,
+                    impact_tests: false,
+                    span: e.span(),
                 })),
                 max_iterations: max_iterations.unwrap_or(10),
                 iter_start: iter_start.unwrap_or(1),
+                stability: stability.unwrap_or(1),
+                judge_timeout_secs: judge_timeout_secs.unwrap_or(120),
+                strict_judge: strict_judge.unwrap_or(true),
                 span: e.span(),
             }
         });
@@ -706,13 +814,15 @@ where
     let prompt_decl = just(Token::KwPrompt)
         .ignore_then(ident.map_with(|n, e| (n, e.span())))
         .then(string.map_with(|s, e| (s, e.span())))
-        .map_with(|((name, name_span), (content, content_span)), e| PromptDecl {
-            name,
-            name_span,
-            content,
-            content_span,
-            span: e.span(),
-        });
+        .map_with(
+            |((name, name_span), (content, content_span)), e| PromptDecl {
+                name,
+                name_span,
+                content,
+                content_span,
+                span: e.span(),
+            },
+        );
 
     // ── top-level ─────────────────────────────────────────────────
 
@@ -942,7 +1052,10 @@ mod tests {
         assert!(errs.is_empty(), "{:?}", errs);
         if let Item::Agent(a) = &ast.unwrap().items[0] {
             let mem = a.memory.as_ref().expect("memory block");
-            assert_eq!(mem.read_query.as_ref().map(|(s, _)| s.as_str()), Some("security vulnerabilities in auth"));
+            assert_eq!(
+                mem.read_query.as_ref().map(|(s, _)| s.as_str()),
+                Some("security vulnerabilities in auth")
+            );
             assert_eq!(mem.read_limit.as_ref().map(|(n, _)| *n), Some(10));
         }
     }
@@ -989,7 +1102,10 @@ mod tests {
             assert_eq!(mem.read_ns, vec!["shared"]);
             assert_eq!(mem.write_ns.as_deref(), Some("output"));
             assert!(matches!(mem.importance, Some(v) if (v - 0.8).abs() < 1e-5));
-            assert_eq!(mem.read_query.as_ref().map(|(s, _)| s.as_str()), Some("prior analysis results"));
+            assert_eq!(
+                mem.read_query.as_ref().map(|(s, _)| s.as_str()),
+                Some("prior analysis results")
+            );
             assert_eq!(mem.read_limit.as_ref().map(|(n, _)| *n), Some(15));
             assert!(mem.write_content.is_some());
         }
@@ -1078,7 +1194,9 @@ mod tests {
         if let Item::Workflow(w) = &ast.unwrap().items[1] {
             let (steps, _) = w.steps.as_ref().unwrap();
             if let StepItem::Loop(lb) = &steps[0] {
-                assert!(matches!(&lb.until, UntilCondition::Command(cmd, _) if cmd == "cargo test --quiet"));
+                assert!(
+                    matches!(&lb.until, UntilCondition::Command(cmd, _) if cmd == "cargo test --quiet")
+                );
                 assert_eq!(lb.max_iterations, 10);
             } else {
                 panic!("expected Loop step");

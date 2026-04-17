@@ -77,8 +77,17 @@ mod tests {
     #[test]
     fn codex_exec_is_stateless_replay() {
         // Verify the mode constant so a future refactor can't silently change it.
-        assert_eq!(ContinuityMode::StatelessReplay, ContinuityMode::StatelessReplay);
-        assert_ne!(ContinuityMode::StatelessReplay, ContinuityMode::ProcessBound);
-        assert_ne!(ContinuityMode::StatelessReplay, ContinuityMode::NativeResume);
+        assert_eq!(
+            ContinuityMode::StatelessReplay,
+            ContinuityMode::StatelessReplay
+        );
+        assert_ne!(
+            ContinuityMode::StatelessReplay,
+            ContinuityMode::ProcessBound
+        );
+        assert_ne!(
+            ContinuityMode::StatelessReplay,
+            ContinuityMode::NativeResume
+        );
     }
 }

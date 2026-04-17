@@ -185,7 +185,8 @@ loop {
 
 Exit conditions:
 - `until verification { ... }` — verification-based exit
-- `until agent reviewer` — human judgment (agent decision)
+- `until agent reviewer` — run a judge agent on-demand; emit `PASS` / `FAIL`,
+  `VERDICT: PASS|FAIL`, or JSON like `{"pass": true}`
 - `until command "cargo test"` — shell command exit status
 
 ## Running Workflows

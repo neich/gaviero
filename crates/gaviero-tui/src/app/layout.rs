@@ -10,7 +10,11 @@ pub(super) fn toggle_fullscreen(app: &mut App) {
 
 pub(super) fn switch_layout(app: &mut App, n: u8) {
     let idx = n as usize;
-    tracing::debug!("switch_layout: n={}, presets_len={}", n, app.layout_presets.len());
+    tracing::debug!(
+        "switch_layout: n={}, presets_len={}",
+        n,
+        app.layout_presets.len()
+    );
     if idx >= app.layout_presets.len() {
         return;
     }
@@ -49,8 +53,16 @@ pub(super) fn effective_panel_constraints(app: &App, total_width: u16) -> (u16, 
             } else {
                 0
             };
-            let ft_w = if preset.file_tree_pct > 0 { ft_w.max(1) } else { 0 };
-            let sp_w = if preset.side_panel_pct > 0 { sp_w.max(1) } else { 0 };
+            let ft_w = if preset.file_tree_pct > 0 {
+                ft_w.max(1)
+            } else {
+                0
+            };
+            let sp_w = if preset.side_panel_pct > 0 {
+                sp_w.max(1)
+            } else {
+                0
+            };
             return (ft_w, sp_w);
         }
     }

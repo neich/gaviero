@@ -10,11 +10,11 @@
 //! - `TreeSitterGate`  — fast syntax check via tree-sitter (delegates to verify::structural)
 //! - `CargoCheckGate`  — slow semantic check via `cargo check`
 
-pub mod tree_sitter_gate;
 pub mod cargo_gate;
+pub mod tree_sitter_gate;
 
-pub use tree_sitter_gate::TreeSitterGate;
 pub use cargo_gate::CargoCheckGate;
+pub use tree_sitter_gate::TreeSitterGate;
 
 use std::path::{Path, PathBuf};
 
@@ -84,10 +84,7 @@ impl ValidationPipeline {
     /// Default pipeline for Rust projects: tree-sitter (fast) + cargo check (slow).
     pub fn default_for_rust() -> Self {
         Self {
-            gates: vec![
-                Box::new(TreeSitterGate),
-                Box::new(CargoCheckGate),
-            ],
+            gates: vec![Box::new(TreeSitterGate), Box::new(CargoCheckGate)],
         }
     }
 
@@ -138,7 +135,8 @@ impl ValidationPipeline {
         workdir: &Path,
         fast_only: bool,
     ) -> Option<(&'static str, ValidationResult)> {
-        self.run_reporting(files, workdir, fast_only, |_, _| {}).await
+        self.run_reporting(files, workdir, fast_only, |_, _| {})
+            .await
     }
 }
 

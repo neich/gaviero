@@ -30,10 +30,23 @@ pub enum Event {
     ProposalFinalized(String), // file path
 
     // ACP agent events (conv_id identifies which conversation)
-    StreamChunk { conv_id: String, text: String },
-    ToolCallStarted { conv_id: String, tool_name: String },
-    StreamingStatus { conv_id: String, status: String },
-    MessageComplete { conv_id: String, role: String, content: String },
+    StreamChunk {
+        conv_id: String,
+        text: String,
+    },
+    ToolCallStarted {
+        conv_id: String,
+        tool_name: String,
+    },
+    StreamingStatus {
+        conv_id: String,
+        status: String,
+    },
+    MessageComplete {
+        conv_id: String,
+        role: String,
+        content: String,
+    },
 
     /// A file proposal was deferred (batch review mode) — show compact summary in chat.
     FileProposalDeferred {
@@ -76,13 +89,22 @@ pub enum Event {
         status: gaviero_core::swarm::models::AgentStatus,
         detail: String,
     },
-    SwarmTierStarted { current: usize, total: usize },
+    SwarmTierStarted {
+        current: usize,
+        total: usize,
+    },
     SwarmCompleted(Box<gaviero_core::swarm::models::SwarmResult>),
-    SwarmMergeConflict { branch: String, files: Vec<String> },
+    SwarmMergeConflict {
+        branch: String,
+        files: Vec<String>,
+    },
 
     // Coordination lifecycle events
     SwarmCoordinationStarted(String),
-    SwarmCoordinationComplete { unit_count: usize, summary: String },
+    SwarmCoordinationComplete {
+        unit_count: usize,
+        summary: String,
+    },
     SwarmTierDispatch {
         unit_id: String,
         tier: gaviero_core::types::ModelTier,
@@ -128,7 +150,11 @@ impl EventLoop {
             loop {
                 // Poll crossterm events in a blocking thread
                 let event = tokio::task::spawn_blocking(|| {
-                    if crossterm::event::poll(Duration::from_millis(crate::theme::CROSSTERM_POLL_MS)).unwrap_or(false) {
+                    if crossterm::event::poll(Duration::from_millis(
+                        crate::theme::CROSSTERM_POLL_MS,
+                    ))
+                    .unwrap_or(false)
+                    {
                         crossterm::event::read().ok()
                     } else {
                         None
@@ -224,7 +250,8 @@ impl EventLoop {
     pub fn spawn_tick_timer(&self) {
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(crate::theme::TICK_INTERVAL_MS));
+            let mut interval =
+                tokio::time::interval(Duration::from_millis(crate::theme::TICK_INTERVAL_MS));
             loop {
                 interval.tick().await;
                 if tx.send(Event::Tick).is_err() {

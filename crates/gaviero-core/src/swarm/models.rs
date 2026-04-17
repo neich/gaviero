@@ -33,7 +33,6 @@ pub struct WorkUnit {
     pub model: Option<String>,
 
     // ── Tier routing fields ──────────────────────────────────────
-
     /// Model tier assigned by the coordinator.
     #[serde(default)]
     pub tier: ModelTier,
@@ -54,7 +53,6 @@ pub struct WorkUnit {
     pub escalation_tier: Option<ModelTier>,
 
     // ── Memory routing fields (from DSL `memory {}` block) ───────
-
     /// Memory namespaces to read from for this agent's context.
     /// `None` means inherit `SwarmConfig.read_namespaces`.
     #[serde(default)]
@@ -76,7 +74,6 @@ pub struct WorkUnit {
     pub staleness_sources: Vec<String>,
 
     // ── Explicit memory control (from DSL `memory {}` extensions) ──
-
     /// Custom semantic search query for memory context.
     /// When `Some`, replaces `description` as the search query in `build_prompt`.
     #[serde(default)]
@@ -92,7 +89,6 @@ pub struct WorkUnit {
     pub memory_write_content: Option<String>,
 
     // ── Graph / impact fields (from DSL `scope` and `context` blocks) ──
-
     /// When true, automatically expand `read_only_paths` with blast-radius files.
     #[serde(default)]
     pub impact_scope: bool,

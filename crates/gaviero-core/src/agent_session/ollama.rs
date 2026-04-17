@@ -25,7 +25,7 @@ use std::pin::Pin;
 use anyhow::Result;
 use futures::Stream;
 
-use crate::context_planner::compaction::{compact_replay, should_compact, CompactionPolicy};
+use crate::context_planner::compaction::{CompactionPolicy, compact_replay, should_compact};
 use crate::context_planner::{ContinuityHandle, ContinuityMode, ReplayPayload};
 use crate::swarm::backend::UnifiedStreamEvent;
 
@@ -96,8 +96,7 @@ impl AgentSession for OllamaSession {
         if let Some(ref payload) = turn.replay_history
             && should_compact(&self.policy, &payload.entries, self.max_context_tokens)
         {
-            let (compacted_entries, record) =
-                compact_replay(&self.policy, payload.entries.clone());
+            let (compacted_entries, record) = compact_replay(&self.policy, payload.entries.clone());
             tracing::info!(
                 target: "turn_metrics",
                 turns_compacted = record.turns_compacted,
@@ -105,8 +104,10 @@ impl AgentSession for OllamaSession {
                 max_context_tokens = ?self.max_context_tokens,
                 "ollama_replay_compacted"
             );
-            turn.replay_history = Some(ReplayPayload { entries: compacted_entries })
-                .filter(|p| !p.entries.is_empty());
+            turn.replay_history = Some(ReplayPayload {
+                entries: compacted_entries,
+            })
+            .filter(|p| !p.entries.is_empty());
         }
 
         self.inner.send_turn(turn).await
@@ -131,7 +132,7 @@ impl AgentSession for OllamaSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context_planner::compaction::{should_compact, CompactionPolicy};
+    use crate::context_planner::compaction::{CompactionPolicy, should_compact};
     use crate::context_planner::ledger::Role;
 
     // Build a replay history of `pairs` (user, assistant) pairs.
@@ -149,9 +150,18 @@ mod tests {
     #[test]
     fn ollama_session_is_stateless_replay() {
         // Verify the mode constant so a future refactor can't silently change it.
-        assert_eq!(ContinuityMode::StatelessReplay, ContinuityMode::StatelessReplay);
-        assert_ne!(ContinuityMode::StatelessReplay, ContinuityMode::NativeResume);
-        assert_ne!(ContinuityMode::StatelessReplay, ContinuityMode::ProcessBound);
+        assert_eq!(
+            ContinuityMode::StatelessReplay,
+            ContinuityMode::StatelessReplay
+        );
+        assert_ne!(
+            ContinuityMode::StatelessReplay,
+            ContinuityMode::NativeResume
+        );
+        assert_ne!(
+            ContinuityMode::StatelessReplay,
+            ContinuityMode::ProcessBound
+        );
     }
 
     #[test]
@@ -164,7 +174,7 @@ mod tests {
         //   10 pairs × 2 × ~1 000 chars = ~20 000 chars → ~5 000 tokens > 4 915.
         let policy = CompactionPolicy {
             max_context_tokens_fraction: 0.6,
-            max_turn_pairs: 100,        // disable turn-count trigger
+            max_turn_pairs: 100,         // disable turn-count trigger
             max_replay_chars: 1_000_000, // disable char-count trigger
             keep_turn_pairs: 4,
         };

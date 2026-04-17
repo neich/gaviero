@@ -1,11 +1,7 @@
-use ratatui::{
-    buffer::Buffer as RataBuf,
-    layout::Rect,
-    style::Color,
-};
+use ratatui::{buffer::Buffer as RataBuf, layout::Rect, style::Color};
 use unicode_width::UnicodeWidthChar;
 
-use crate::theme::{CURRENT_LINE_BG, SELECTION_BG, SEARCH_HIGHLIGHT_BG};
+use crate::theme::{CURRENT_LINE_BG, SEARCH_HIGHLIGHT_BG, SELECTION_BG};
 
 use super::buffer::Buffer;
 use super::highlight::{HighlightConfig, StyledSpan, run_highlights};
@@ -93,14 +89,7 @@ impl<'a> EditorView<'a> {
         );
     }
 
-    fn render_gutter(
-        &self,
-        line_idx: usize,
-        x: u16,
-        y: u16,
-        gutter_width: u16,
-        buf: &mut RataBuf,
-    ) {
+    fn render_gutter(&self, line_idx: usize, x: u16, y: u16, gutter_width: u16, buf: &mut RataBuf) {
         let is_current = line_idx == self.buffer.cursor.line;
         let style = if is_current {
             self.theme.ui_style("line_number.active")
@@ -108,7 +97,11 @@ impl<'a> EditorView<'a> {
             self.theme.ui_style("line_number")
         };
 
-        let num_str = format!("{:>width$} ", line_idx + 1, width = (gutter_width as usize) - 1);
+        let num_str = format!(
+            "{:>width$} ",
+            line_idx + 1,
+            width = (gutter_width as usize) - 1
+        );
         let x_max = (x + gutter_width).min(buf.area().right());
         for (i, ch) in num_str.chars().enumerate() {
             let cx = x + i as u16;
@@ -171,10 +164,18 @@ impl<'a> EditorView<'a> {
                     if let Some(fg) = span.style.fg {
                         style = style.fg(fg);
                     }
-                    if span.style.add_modifier.contains(ratatui::style::Modifier::BOLD) {
+                    if span
+                        .style
+                        .add_modifier
+                        .contains(ratatui::style::Modifier::BOLD)
+                    {
                         style = style.add_modifier(ratatui::style::Modifier::BOLD);
                     }
-                    if span.style.add_modifier.contains(ratatui::style::Modifier::UNDERLINED) {
+                    if span
+                        .style
+                        .add_modifier
+                        .contains(ratatui::style::Modifier::UNDERLINED)
+                    {
                         style = style.add_modifier(ratatui::style::Modifier::UNDERLINED);
                     }
                 }
@@ -349,9 +350,10 @@ impl<'a> EditorView<'a> {
             return false;
         }
         // Binary search or linear scan on pre-computed matches
-        self.buffer.search_matches.iter().any(|&(l, start, end)| {
-            l == line && col >= start && col < end
-        })
+        self.buffer
+            .search_matches
+            .iter()
+            .any(|&(l, start, end)| l == line && col >= start && col < end)
     }
 }
 

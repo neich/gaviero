@@ -333,8 +333,7 @@ impl TextInput {
 
     /// Save current state to undo stack.
     pub fn push_undo(&mut self) {
-        self.undo_stack
-            .push((self.text.clone(), self.cursor));
+        self.undo_stack.push((self.text.clone(), self.cursor));
         if self.undo_stack.len() > MAX_UNDO {
             self.undo_stack.remove(0);
         }
@@ -345,8 +344,7 @@ impl TextInput {
     #[allow(dead_code)]
     pub fn undo(&mut self) {
         if let Some((text, cursor)) = self.undo_stack.pop() {
-            self.redo_stack
-                .push((self.text.clone(), self.cursor));
+            self.redo_stack.push((self.text.clone(), self.cursor));
             self.text = text;
             self.cursor = cursor;
             self.sel_anchor = None;
@@ -357,8 +355,7 @@ impl TextInput {
     #[allow(dead_code)]
     pub fn redo(&mut self) {
         if let Some((text, cursor)) = self.redo_stack.pop() {
-            self.undo_stack
-                .push((self.text.clone(), self.cursor));
+            self.undo_stack.push((self.text.clone(), self.cursor));
             self.text = text;
             self.cursor = cursor;
             self.sel_anchor = None;

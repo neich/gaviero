@@ -19,7 +19,8 @@ pub const SEARCH_HIGHLIGHT_BG: Color = Color::Rgb(120, 90, 30);
 /// Focused panel border / accent.
 pub const FOCUS_BORDER: Color = Color::Rgb(97, 175, 239);
 /// Unfocused panel border (same value as TEXT_DIM; reserved for semantic use).
-#[allow(unused)] pub const UNFOCUS_BORDER: Color = Color::Rgb(99, 109, 131);
+#[allow(unused)]
+pub const UNFOCUS_BORDER: Color = Color::Rgb(99, 109, 131);
 /// Default foreground text.
 pub const TEXT_FG: Color = Color::Rgb(171, 178, 191);
 /// Dimmed / secondary text.
@@ -35,13 +36,17 @@ pub const SUCCESS: Color = Color::Rgb(80, 200, 80);
 /// Error color (red).
 pub const ERROR: Color = Color::Rgb(220, 80, 80);
 /// Diff added line background (used by diff_overlay).
-#[allow(unused)] pub const DIFF_ADDED_BG: Color = Color::Rgb(40, 65, 42);
+#[allow(unused)]
+pub const DIFF_ADDED_BG: Color = Color::Rgb(40, 65, 42);
 /// Diff added line (accepted) background.
-#[allow(unused)] pub const DIFF_ADDED_ACCEPTED_BG: Color = Color::Rgb(45, 74, 48);
+#[allow(unused)]
+pub const DIFF_ADDED_ACCEPTED_BG: Color = Color::Rgb(45, 74, 48);
 /// Diff removed line background (used by diff_overlay).
-#[allow(unused)] pub const DIFF_REMOVED_BG: Color = Color::Rgb(65, 40, 40);
+#[allow(unused)]
+pub const DIFF_REMOVED_BG: Color = Color::Rgb(65, 40, 40);
 /// Diff removed line (rejected/crossed) background.
-#[allow(unused)] pub const DIFF_REMOVED_REJECTED_BG: Color = Color::Rgb(55, 45, 45);
+#[allow(unused)]
+pub const DIFF_REMOVED_REJECTED_BG: Color = Color::Rgb(55, 45, 45);
 /// Tab bar background.
 pub const TAB_BG: Color = Color::Rgb(36, 40, 47);
 /// Input field background.
@@ -98,17 +103,23 @@ pub const PANEL_HEADER_UNFOCUSED_FG: Color = Color::Rgb(120, 128, 145);
 // ── Magic Number Constants ──────────────────────────────────────
 
 /// Default tab display width.
-#[allow(unused)] pub const DEFAULT_TAB_WIDTH: u8 = 4;
+#[allow(unused)]
+pub const DEFAULT_TAB_WIDTH: u8 = 4;
 /// Crossterm event poll timeout in milliseconds.
-#[allow(unused)] pub const CROSSTERM_POLL_MS: u64 = 50;
+#[allow(unused)]
+pub const CROSSTERM_POLL_MS: u64 = 50;
 /// UI tick interval in milliseconds (~30fps).
-#[allow(unused)] pub const TICK_INTERVAL_MS: u64 = 33;
+#[allow(unused)]
+pub const TICK_INTERVAL_MS: u64 = 33;
 /// Default number of messages to keep on /compact.
-#[allow(unused)] pub const DEFAULT_COMPACT_KEEP: usize = 6;
+#[allow(unused)]
+pub const DEFAULT_COMPACT_KEEP: usize = 6;
 /// Maximum lines to search upward for indent baseline.
-#[allow(unused)] pub const MAX_BASELINE_SEARCH_LINES: usize = 5;
+#[allow(unused)]
+pub const MAX_BASELINE_SEARCH_LINES: usize = 5;
 /// Broadcast bus channel capacity.
-#[allow(unused)] pub const BUS_CHANNEL_CAPACITY: usize = 256;
+#[allow(unused)]
+pub const BUS_CHANNEL_CAPACITY: usize = 256;
 /// Terminal resize step (percentage per key press).
 pub const TERMINAL_RESIZE_STEP: u16 = 5;
 /// Terminal maximum split percentage.
@@ -116,23 +127,30 @@ pub const TERMINAL_MAX_PERCENT: u16 = 80;
 /// Terminal minimum split percentage.
 pub const TERMINAL_MIN_PERCENT: u16 = 10;
 /// Chat panel page-scroll lines.
-#[allow(unused)] pub const CHAT_PAGE_SCROLL: usize = 20;
+#[allow(unused)]
+pub const CHAT_PAGE_SCROLL: usize = 20;
 /// Diff viewer page-scroll lines.
 pub const DIFF_PAGE_SCROLL: usize = 10;
 /// Mouse scroll delta (lines per wheel event).
-#[allow(unused)] pub const MOUSE_SCROLL_DELTA: usize = 3;
+#[allow(unused)]
+pub const MOUSE_SCROLL_DELTA: usize = 3;
 /// Diff gutter width (columns).
 pub const DIFF_GUTTER_WIDTH: u16 = 5;
 /// Chat input area height (rows).
-#[allow(unused)] pub const INPUT_AREA_HEIGHT: u16 = 3;
+#[allow(unused)]
+pub const INPUT_AREA_HEIGHT: u16 = 3;
 /// Maximum autocomplete popup height (rows).
-#[allow(unused)] pub const AUTOCOMPLETE_MAX_HEIGHT: u16 = 8;
+#[allow(unused)]
+pub const AUTOCOMPLETE_MAX_HEIGHT: u16 = 8;
 /// Status message display duration (seconds).
-#[allow(unused)] pub const STATUS_MESSAGE_DURATION_SECS: u64 = 5;
+#[allow(unused)]
+pub const STATUS_MESSAGE_DURATION_SECS: u64 = 5;
 /// Diff context lines for unified diff.
-#[allow(unused)] pub const DIFF_CONTEXT_LINES: usize = 3;
+#[allow(unused)]
+pub const DIFF_CONTEXT_LINES: usize = 3;
 /// Maximum task planning retry attempts.
-#[allow(unused)] pub const MAX_PLAN_ATTEMPTS: usize = 2;
+#[allow(unused)]
+pub const MAX_PLAN_ATTEMPTS: usize = 2;
 
 #[derive(Debug, Deserialize)]
 struct ThemeFile {
@@ -209,40 +227,141 @@ impl Theme {
         // Foreground colors are bright enough for contrast; background colors
         // are either omitted (inherit terminal bg) or high enough to stand out.
         let mut highlights = HashMap::new();
-        highlights.insert("comment".into(), Style::default().fg(Color::Rgb(127, 132, 142)));
-        highlights.insert("string".into(), Style::default().fg(Color::Rgb(152, 195, 121)));
-        highlights.insert("string.special.key".into(), Style::default().fg(Color::Rgb(224, 108, 117)));
-        highlights.insert("constant.numeric".into(), Style::default().fg(Color::Rgb(209, 154, 102)));
-        highlights.insert("constant.builtin".into(), Style::default().fg(Color::Rgb(209, 154, 102)).add_modifier(Modifier::BOLD));
-        highlights.insert("keyword".into(), Style::default().fg(Color::Rgb(198, 120, 221)));
-        highlights.insert("keyword.function".into(), Style::default().fg(Color::Rgb(198, 120, 221)));
-        highlights.insert("function".into(), Style::default().fg(Color::Rgb(97, 175, 239)));
-        highlights.insert("function.call".into(), Style::default().fg(Color::Rgb(97, 175, 239)));
-        highlights.insert("type".into(), Style::default().fg(Color::Rgb(229, 192, 123)));
-        highlights.insert("variable".into(), Style::default().fg(Color::Rgb(171, 178, 191)));
-        highlights.insert("number".into(), Style::default().fg(Color::Rgb(209, 154, 102)));
-        highlights.insert("property".into(), Style::default().fg(Color::Rgb(224, 108, 117)));
-        highlights.insert("operator".into(), Style::default().fg(Color::Rgb(200, 204, 212)));
-        highlights.insert("punctuation".into(), Style::default().fg(Color::Rgb(157, 165, 180)));
+        highlights.insert(
+            "comment".into(),
+            Style::default().fg(Color::Rgb(127, 132, 142)),
+        );
+        highlights.insert(
+            "string".into(),
+            Style::default().fg(Color::Rgb(152, 195, 121)),
+        );
+        highlights.insert(
+            "string.special.key".into(),
+            Style::default().fg(Color::Rgb(224, 108, 117)),
+        );
+        highlights.insert(
+            "constant.numeric".into(),
+            Style::default().fg(Color::Rgb(209, 154, 102)),
+        );
+        highlights.insert(
+            "constant.builtin".into(),
+            Style::default()
+                .fg(Color::Rgb(209, 154, 102))
+                .add_modifier(Modifier::BOLD),
+        );
+        highlights.insert(
+            "keyword".into(),
+            Style::default().fg(Color::Rgb(198, 120, 221)),
+        );
+        highlights.insert(
+            "keyword.function".into(),
+            Style::default().fg(Color::Rgb(198, 120, 221)),
+        );
+        highlights.insert(
+            "function".into(),
+            Style::default().fg(Color::Rgb(97, 175, 239)),
+        );
+        highlights.insert(
+            "function.call".into(),
+            Style::default().fg(Color::Rgb(97, 175, 239)),
+        );
+        highlights.insert(
+            "type".into(),
+            Style::default().fg(Color::Rgb(229, 192, 123)),
+        );
+        highlights.insert(
+            "variable".into(),
+            Style::default().fg(Color::Rgb(171, 178, 191)),
+        );
+        highlights.insert(
+            "number".into(),
+            Style::default().fg(Color::Rgb(209, 154, 102)),
+        );
+        highlights.insert(
+            "property".into(),
+            Style::default().fg(Color::Rgb(224, 108, 117)),
+        );
+        highlights.insert(
+            "operator".into(),
+            Style::default().fg(Color::Rgb(200, 204, 212)),
+        );
+        highlights.insert(
+            "punctuation".into(),
+            Style::default().fg(Color::Rgb(157, 165, 180)),
+        );
         // Markdown
-        highlights.insert("markup.heading".into(), Style::default().fg(Color::Rgb(97, 175, 239)).add_modifier(Modifier::BOLD));
-        highlights.insert("markup.bold".into(), Style::default().fg(Color::Rgb(229, 192, 123)).add_modifier(Modifier::BOLD));
-        highlights.insert("markup.italic".into(), Style::default().fg(Color::Rgb(198, 120, 221)));
-        highlights.insert("markup.link".into(), Style::default().fg(Color::Rgb(97, 175, 239)));
-        highlights.insert("markup.link.url".into(), Style::default().fg(Color::Rgb(152, 195, 121)));
-        highlights.insert("markup.code".into(), Style::default().fg(Color::Rgb(152, 195, 121)));
-        highlights.insert("markup.code.block".into(), Style::default().fg(Color::Rgb(127, 132, 142)));
-        highlights.insert("markup.list".into(), Style::default().fg(Color::Rgb(209, 154, 102)));
-        highlights.insert("markup.quote".into(), Style::default().fg(Color::Rgb(127, 132, 142)));
+        highlights.insert(
+            "markup.heading".into(),
+            Style::default()
+                .fg(Color::Rgb(97, 175, 239))
+                .add_modifier(Modifier::BOLD),
+        );
+        highlights.insert(
+            "markup.bold".into(),
+            Style::default()
+                .fg(Color::Rgb(229, 192, 123))
+                .add_modifier(Modifier::BOLD),
+        );
+        highlights.insert(
+            "markup.italic".into(),
+            Style::default().fg(Color::Rgb(198, 120, 221)),
+        );
+        highlights.insert(
+            "markup.link".into(),
+            Style::default().fg(Color::Rgb(97, 175, 239)),
+        );
+        highlights.insert(
+            "markup.link.url".into(),
+            Style::default().fg(Color::Rgb(152, 195, 121)),
+        );
+        highlights.insert(
+            "markup.code".into(),
+            Style::default().fg(Color::Rgb(152, 195, 121)),
+        );
+        highlights.insert(
+            "markup.code.block".into(),
+            Style::default().fg(Color::Rgb(127, 132, 142)),
+        );
+        highlights.insert(
+            "markup.list".into(),
+            Style::default().fg(Color::Rgb(209, 154, 102)),
+        );
+        highlights.insert(
+            "markup.quote".into(),
+            Style::default().fg(Color::Rgb(127, 132, 142)),
+        );
 
         let mut ui = HashMap::new();
-        ui.insert("line_number".into(), Style::default().fg(Color::Rgb(99, 109, 131)));
-        ui.insert("line_number.active".into(), Style::default().fg(Color::Rgb(171, 178, 191)));
-        ui.insert("cursor".into(), Style::default().bg(Color::Rgb(82, 139, 255)));
-        ui.insert("selection".into(), Style::default().bg(Color::Rgb(77, 120, 204)));
-        ui.insert("diff.added".into(), Style::default().bg(Color::Rgb(45, 74, 48)));
-        ui.insert("diff.removed".into(), Style::default().bg(Color::Rgb(74, 45, 45)));
-        ui.insert("status_bar".into(), Style::default().fg(Color::Rgb(215, 218, 224)).bg(Color::Rgb(44, 49, 58)));
+        ui.insert(
+            "line_number".into(),
+            Style::default().fg(Color::Rgb(99, 109, 131)),
+        );
+        ui.insert(
+            "line_number.active".into(),
+            Style::default().fg(Color::Rgb(171, 178, 191)),
+        );
+        ui.insert(
+            "cursor".into(),
+            Style::default().bg(Color::Rgb(82, 139, 255)),
+        );
+        ui.insert(
+            "selection".into(),
+            Style::default().bg(Color::Rgb(77, 120, 204)),
+        );
+        ui.insert(
+            "diff.added".into(),
+            Style::default().bg(Color::Rgb(45, 74, 48)),
+        );
+        ui.insert(
+            "diff.removed".into(),
+            Style::default().bg(Color::Rgb(74, 45, 45)),
+        );
+        ui.insert(
+            "status_bar".into(),
+            Style::default()
+                .fg(Color::Rgb(215, 218, 224))
+                .bg(Color::Rgb(44, 49, 58)),
+        );
 
         Self { highlights, ui }
     }

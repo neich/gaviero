@@ -84,7 +84,15 @@ impl ModelSpec {
         // prefix wins (string-prefix comparison would not disambiguate them
         // on the suffix, but "codex-app-server:" does not start with "codex:"
         // anyway — the colon makes them distinct).
-        for prefix in ["ollama", "local", "codex-app-server", "codex-cli", "codex", "claude-code", "claude"] {
+        for prefix in [
+            "ollama",
+            "local",
+            "codex-app-server",
+            "codex-cli",
+            "codex",
+            "claude-code",
+            "claude",
+        ] {
             let with_colon = format!("{}:", prefix);
             if let Some(model) = trimmed.strip_prefix(&with_colon) {
                 return Self {
@@ -381,12 +389,22 @@ mod tests {
     #[test]
     fn model_spec_parses_known_prefixes() {
         let cases = [
-            ("claude-code:sonnet", "claude-code", "sonnet", Provider::Claude),
+            (
+                "claude-code:sonnet",
+                "claude-code",
+                "sonnet",
+                Provider::Claude,
+            ),
             ("claude:opus", "claude", "opus", Provider::Claude),
             ("sonnet", "", "sonnet", Provider::Claude),
             ("codex:gpt-5-codex", "codex", "gpt-5-codex", Provider::Codex),
             ("codex-cli:o4-mini", "codex-cli", "o4-mini", Provider::Codex),
-            ("ollama:qwen2.5-coder:7b", "ollama", "qwen2.5-coder:7b", Provider::Ollama),
+            (
+                "ollama:qwen2.5-coder:7b",
+                "ollama",
+                "qwen2.5-coder:7b",
+                Provider::Ollama,
+            ),
             ("local:llama3.1", "local", "llama3.1", Provider::Ollama),
         ];
         for (raw, prefix, model, provider) in cases {
@@ -413,10 +431,8 @@ mod tests {
         assert!(!codex.supports_native_resume);
 
         // M8: codex-app-server: → ProcessBound (V9 §5 table).
-        let codex_as = build_provider_profile(
-            &ModelSpec::parse("codex-app-server:gpt-5-codex"),
-            &runtime,
-        );
+        let codex_as =
+            build_provider_profile(&ModelSpec::parse("codex-app-server:gpt-5-codex"), &runtime);
         assert_eq!(codex_as.continuity_mode, ContinuityMode::ProcessBound);
         assert!(codex_as.supports_native_resume);
         assert_eq!(codex_as.provider, "codex");

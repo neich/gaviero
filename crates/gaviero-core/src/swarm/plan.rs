@@ -12,8 +12,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
-use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::Direction;
+use petgraph::graph::{DiGraph, NodeIndex};
 use serde::{Deserialize, Serialize};
 
 use super::models::WorkUnit;
@@ -87,9 +87,36 @@ pub struct LoopConfig {
     /// Subsequent passes increment by 1.
     #[serde(default = "default_iter_start")]
     pub iter_start: u32,
+    /// When `true` (default), an unparseable judge verdict on a completed run
+    /// marks the manifest as `Failed` instead of silently treating it as FAIL.
+    /// Set to `false` for lenient legacy behaviour.
+    #[serde(default = "default_strict_judge")]
+    pub strict_judge: bool,
+    /// Require K consecutive PASS verdicts before exiting the loop (default: 1).
+    /// Only meaningful for `until agent <name>`; ignored for verify/command.
+    #[serde(default = "default_stability")]
+    pub stability: u32,
+    /// Hard timeout for each judge invocation, in seconds (default: 120).
+    /// 0 disables the timeout. Only meaningful for `until agent <name>`.
+    #[serde(default = "default_judge_timeout_secs")]
+    pub judge_timeout_secs: u32,
 }
 
-fn default_iter_start() -> u32 { 1 }
+fn default_iter_start() -> u32 {
+    1
+}
+
+fn default_strict_judge() -> bool {
+    true
+}
+
+fn default_stability() -> u32 {
+    1
+}
+
+fn default_judge_timeout_secs() -> u32 {
+    120
+}
 
 // ── CompiledPlan ─────────────────────────────────────────────
 
@@ -111,6 +138,11 @@ pub struct CompiledPlan {
     pub verification_config: VerificationConfig,
     /// Explicit loop configurations within the workflow.
     pub loop_configs: Vec<LoopConfig>,
+    /// Auxiliary judge agents referenced by `until agent ...`.
+    ///
+    /// These units are compiled for runtime lookup and on-demand execution,
+    /// but they are not scheduled as normal workflow steps in the main DAG.
+    pub loop_judge_units: Vec<WorkUnit>,
 }
 
 impl CompiledPlan {
@@ -186,7 +218,9 @@ impl CompiledPlan {
 
         // First pass: add all nodes
         for unit in &units {
-            let idx = graph.add_node(PlanNode { work_unit: unit.clone() });
+            let idx = graph.add_node(PlanNode {
+                work_unit: unit.clone(),
+            });
             id_to_idx.insert(unit.id.clone(), idx);
         }
 
@@ -207,6 +241,7 @@ impl CompiledPlan {
             iteration_config: IterationConfig::default(),
             verification_config: VerificationConfig::default(),
             loop_configs: Vec::new(),
+            loop_judge_units: Vec::new(),
         }
     }
 
@@ -225,6 +260,11 @@ impl CompiledPlan {
             .node_weights()
             .map(|n| (n.work_unit.id.as_str(), n.work_unit.description.as_str()))
             .collect();
+        ids.extend(
+            self.loop_judge_units
+                .iter()
+                .map(|u| (u.id.as_str(), u.description.as_str())),
+        );
         ids.sort_unstable();
         for (id, desc) in ids {
             id.hash(&mut hasher);

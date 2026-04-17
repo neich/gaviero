@@ -30,11 +30,7 @@ impl OllamaBackend {
     /// Generate a completion from the local model.
     ///
     /// Streaming is disabled — waits for the full response.
-    pub async fn generate(
-        &self,
-        prompt: &str,
-        system: &str,
-    ) -> Result<String> {
+    pub async fn generate(&self, prompt: &str, system: &str) -> Result<String> {
         let url = format!("{}/api/generate", self.base_url);
 
         let body = serde_json::json!({
@@ -44,7 +40,8 @@ impl OllamaBackend {
             "stream": false,
         });
 
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .json(&body)
             .send()
@@ -57,10 +54,7 @@ impl OllamaBackend {
             anyhow::bail!("Ollama returned {}: {}", status, text);
         }
 
-        let json: serde_json::Value = response
-            .json()
-            .await
-            .context("parsing Ollama response")?;
+        let json: serde_json::Value = response.json().await.context("parsing Ollama response")?;
 
         json.get("response")
             .and_then(|v| v.as_str())

@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use super::scope::{MemoryScope, ScopeFilter, Trust, MemoryType};
+use super::scope::{MemoryScope, MemoryType, ScopeFilter, Trust};
 
 // ── SearchConfig ──────────────────────────────────────────────
 
@@ -187,7 +187,10 @@ pub fn format_memories_for_prompt(memories: &[ScoredMemory]) -> String {
         };
         ctx.push_str(&format!(
             "- [{}:{}] {} (score: {:.2})\n",
-            scope_label, m.memory_type.as_str(), m.content, m.final_score
+            scope_label,
+            m.memory_type.as_str(),
+            m.content,
+            m.final_score
         ));
     }
     ctx
@@ -200,25 +203,41 @@ mod tests {
     #[test]
     fn test_score_narrower_scope_wins() {
         let module_score = score(
-            0.8, 0.5, 1.0, 0, Trust::Medium,
-            &ScopeFilter::Module { repo_id: "r".into(), module_path: "m".into() },
+            0.8,
+            0.5,
+            1.0,
+            0,
+            Trust::Medium,
+            &ScopeFilter::Module {
+                repo_id: "r".into(),
+                module_path: "m".into(),
+            },
         );
-        let global_score = score(
-            0.8, 0.5, 1.0, 0, Trust::Medium,
-            &ScopeFilter::Global,
-        );
+        let global_score = score(0.8, 0.5, 1.0, 0, Trust::Medium, &ScopeFilter::Global);
         assert!(module_score > global_score);
     }
 
     #[test]
     fn test_score_high_trust_wins() {
         let high = score(
-            0.7, 0.5, 1.0, 0, Trust::High,
-            &ScopeFilter::Repo { repo_id: "r".into() },
+            0.7,
+            0.5,
+            1.0,
+            0,
+            Trust::High,
+            &ScopeFilter::Repo {
+                repo_id: "r".into(),
+            },
         );
         let low = score(
-            0.7, 0.5, 1.0, 0, Trust::Low,
-            &ScopeFilter::Repo { repo_id: "r".into() },
+            0.7,
+            0.5,
+            1.0,
+            0,
+            Trust::Low,
+            &ScopeFilter::Repo {
+                repo_id: "r".into(),
+            },
         );
         assert!(high > low);
     }
@@ -226,12 +245,24 @@ mod tests {
     #[test]
     fn test_score_recency_matters() {
         let recent = score(
-            0.7, 0.5, 0.0, 0, Trust::Medium,
-            &ScopeFilter::Repo { repo_id: "r".into() },
+            0.7,
+            0.5,
+            0.0,
+            0,
+            Trust::Medium,
+            &ScopeFilter::Repo {
+                repo_id: "r".into(),
+            },
         );
         let old = score(
-            0.7, 0.5, 90.0, 0, Trust::Medium,
-            &ScopeFilter::Repo { repo_id: "r".into() },
+            0.7,
+            0.5,
+            90.0,
+            0,
+            Trust::Medium,
+            &ScopeFilter::Repo {
+                repo_id: "r".into(),
+            },
         );
         assert!(recent > old);
     }

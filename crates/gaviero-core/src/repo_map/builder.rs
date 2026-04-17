@@ -62,8 +62,14 @@ fn walk_dir(
 }
 
 pub const SKIP_DIRS: &[&str] = &[
-    "target", "node_modules", ".git", ".cargo", ".cache",
-    "dist", "build", "__pycache__",
+    "target",
+    "node_modules",
+    ".git",
+    ".cargo",
+    ".cache",
+    "dist",
+    "build",
+    "__pycache__",
 ];
 
 /// Build a `FileNode` for a single source file, or `None` if unreadable.
@@ -75,7 +81,11 @@ fn build_node(abs_path: &Path, rel_path: PathBuf) -> Option<FileNode> {
     // Skip files that are too large to be source code (binary data, build artifacts, etc.)
     if let Ok(meta) = std::fs::metadata(abs_path) {
         if meta.len() > MAX_FILE_BYTES {
-            tracing::debug!("repo_map: skipping large file ({} bytes): {}", meta.len(), abs_path.display());
+            tracing::debug!(
+                "repo_map: skipping large file ({} bytes): {}",
+                meta.len(),
+                abs_path.display()
+            );
             return None;
         }
     }
@@ -89,10 +99,7 @@ fn build_node(abs_path: &Path, rel_path: PathBuf) -> Option<FileNode> {
     };
     let token_estimate = content.len() / 4;
 
-    let ext = abs_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
+    let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     let symbols = if language_for_extension(ext).is_some() {
         extract_symbols(ext, &content)
@@ -128,12 +135,21 @@ pub fn extract_symbols(ext: &str, content: &str) -> Vec<Symbol> {
 }
 
 const DEF_KINDS: &[&str] = &[
-    "function_item", "function_definition", "function_declaration",
-    "method_declaration", "method_definition",
-    "class_declaration", "class_definition",
-    "struct_item", "enum_item", "impl_item", "trait_item",
-    "interface_declaration", "const_item",
-    "object_declaration", "companion_object",
+    "function_item",
+    "function_definition",
+    "function_declaration",
+    "method_declaration",
+    "method_definition",
+    "class_declaration",
+    "class_definition",
+    "struct_item",
+    "enum_item",
+    "impl_item",
+    "trait_item",
+    "interface_declaration",
+    "const_item",
+    "object_declaration",
+    "companion_object",
 ];
 
 fn collect_symbols(node: tree_sitter::Node, source: &[u8], out: &mut Vec<Symbol>) {

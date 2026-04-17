@@ -57,8 +57,12 @@ impl TierStats {
              cheap={}/{} (escalations: {}), \
              expensive={}/{} (escalations: {})",
             run_id,
-            self.cheap_succeeded, self.cheap_total, self.cheap_escalated,
-            self.expensive_succeeded, self.expensive_total, self.expensive_escalated,
+            self.cheap_succeeded,
+            self.cheap_total,
+            self.cheap_escalated,
+            self.expensive_succeeded,
+            self.expensive_total,
+            self.expensive_escalated,
         )
     }
 
@@ -68,7 +72,11 @@ impl TierStats {
             ModelTier::Cheap => (self.cheap_succeeded, self.cheap_total),
             ModelTier::Expensive => (self.expensive_succeeded, self.expensive_total),
         };
-        if total == 0 { None } else { Some(succeeded as f64 / total as f64) }
+        if total == 0 {
+            None
+        } else {
+            Some(succeeded as f64 / total as f64)
+        }
     }
 }
 
@@ -119,14 +127,20 @@ pub async fn query_tier_history(
     namespaces: &[String],
     limit: usize,
 ) -> String {
-    let Some(mem) = memory else { return String::new() };
+    let Some(mem) = memory else {
+        return String::new();
+    };
 
-    let results = match mem.search_multi(namespaces, "tier accuracy escalation", limit).await {
+    let results = match mem
+        .search_multi(namespaces, "tier accuracy escalation", limit)
+        .await
+    {
         Ok(r) => r,
         Err(_) => return String::new(),
     };
 
-    let tier_entries: Vec<_> = results.iter()
+    let tier_entries: Vec<_> = results
+        .iter()
         .filter(|r| r.entry.key.starts_with("tiers:"))
         .collect();
 

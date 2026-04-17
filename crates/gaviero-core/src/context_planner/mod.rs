@@ -14,14 +14,15 @@ pub mod compaction;
 pub mod ledger;
 pub mod types;
 
-pub use compaction::{compact_replay, should_compact, CompactionPolicy};
+pub use compaction::{CompactionPolicy, compact_replay, should_compact};
 pub use ledger::{
     CompactionRecord, ContentDigest, GraphDecision, PlannerFingerprint, Role, SessionLedger,
 };
 pub use types::{
-    build_provider_profile, ContinuityHandle, ContinuityMode, FileAttachment, GraphConfidence,
-    GraphSelection, GraphSelectionKind, MemorySelection, ModelSpec, PlannerInput, PlannerMetadata,
+    ContinuityHandle, ContinuityMode, FileAttachment, GraphConfidence, GraphSelection,
+    GraphSelectionKind, MemorySelection, ModelSpec, PlannerInput, PlannerMetadata,
     PlannerSelections, Provider, ProviderProfile, ReplayPayload, RuntimeConfig, Symbol,
+    build_provider_profile,
 };
 
 use std::path::Path;
@@ -113,11 +114,7 @@ impl<'a> ContextPlanner<'a> {
         Ok(selections)
     }
 
-    async fn collect_memory(
-        &mut self,
-        input: &PlannerInput<'_>,
-        out: &mut PlannerSelections,
-    ) {
+    async fn collect_memory(&mut self, input: &PlannerInput<'_>, out: &mut PlannerSelections) {
         // Chat path can still pass pre-fetched memory context (M1/M2 carrier).
         // M3 keeps the carrier as a fallback for callers not yet migrated;
         // M10 deletes it.
@@ -249,12 +246,10 @@ impl<'a> ContextPlanner<'a> {
         out.metadata.graph_token_estimate = total_tokens;
     }
 
-    fn collect_pre_fetched_impact(
-        &self,
-        input: &PlannerInput<'_>,
-        out: &mut PlannerSelections,
-    ) {
-        let Some(text) = input.pre_fetched_impact_text else { return };
+    fn collect_pre_fetched_impact(&self, input: &PlannerInput<'_>, out: &mut PlannerSelections) {
+        let Some(text) = input.pre_fetched_impact_text else {
+            return;
+        };
         if text.is_empty() {
             return;
         }
@@ -382,7 +377,10 @@ mod tests {
         };
         let sel = planner.plan(&input).await.unwrap();
         assert!(sel.memory_selections.is_empty());
-        assert!(sel.graph_selections.is_empty(), "graph must skip on follow-up turn");
+        assert!(
+            sel.graph_selections.is_empty(),
+            "graph must skip on follow-up turn"
+        );
         assert!(!sel.metadata.is_first_turn);
     }
 

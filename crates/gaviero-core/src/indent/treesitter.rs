@@ -6,20 +6,17 @@
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Query, QueryCursor, QueryPredicateArg, Tree};
 
+use super::IndentResult;
 use super::captures::{IndentCapture, IndentCaptureType, IndentScope, LineAccumulator};
 use super::predicates::{CaptureNodeInfo, PredicateArg, evaluate_single_predicate};
-use super::IndentResult;
 
 /// Map of node ID → list of (capture type, scope, column).
-pub type CaptureMap = std::collections::HashMap<usize, Vec<(IndentCaptureType, IndentScope, usize)>>;
+pub type CaptureMap =
+    std::collections::HashMap<usize, Vec<(IndentCaptureType, IndentScope, usize)>>;
 
 /// Build the capture map for the entire tree. Call once and pass to
 /// `indent_for_cursor` for each line to avoid re-running the query.
-pub fn build_document_capture_map(
-    tree: &Tree,
-    indent_query: &Query,
-    source: &[u8],
-) -> CaptureMap {
+pub fn build_document_capture_map(tree: &Tree, indent_query: &Query, source: &[u8]) -> CaptureMap {
     build_capture_map(indent_query, &tree.root_node(), source)
 }
 
@@ -36,7 +33,14 @@ pub fn compute_treesitter_indent(
     let source = doc.to_string();
     let source_bytes = source.as_bytes();
     let capture_map = build_capture_map(indent_query, &tree.root_node(), source_bytes);
-    indent_for_cursor(doc, tree, &capture_map, cursor_byte, _tab_width, indent_unit)
+    indent_for_cursor(
+        doc,
+        tree,
+        &capture_map,
+        cursor_byte,
+        _tab_width,
+        indent_unit,
+    )
 }
 
 /// Compute indentation at a cursor position using a pre-built capture map.
@@ -175,9 +179,7 @@ fn build_capture_map(
             };
             let scope = scope_override.unwrap_or_else(|| ct.default_scope());
             let col = cap.node.start_position().column;
-            map.entry(cap.node.id())
-                .or_default()
-                .push((ct, scope, col));
+            map.entry(cap.node.id()).or_default().push((ct, scope, col));
         }
     }
 

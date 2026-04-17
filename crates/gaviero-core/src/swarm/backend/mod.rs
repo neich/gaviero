@@ -177,9 +177,7 @@ pub fn create_backend(config: &BackendConfig) -> Result<Box<dyn AgentBackend>> {
             Ok(Box::new(codex::CodexBackend::new(m)))
         }
         BackendConfig::Ollama { model, base_url } => {
-            let url = base_url
-                .as_deref()
-                .unwrap_or("http://localhost:11434");
+            let url = base_url.as_deref().unwrap_or("http://localhost:11434");
             Ok(Box::new(ollama::OllamaStreamBackend::new(url, model)))
         }
         BackendConfig::Custom { command, args } => {
@@ -233,7 +231,9 @@ mod tests {
         assert_eq!(collected.len(), 4);
         assert_eq!(collected[0], UnifiedStreamEvent::TextDelta("Hello ".into()));
         assert_eq!(collected[1], UnifiedStreamEvent::TextDelta("world".into()));
-        assert!(matches!(&collected[2], UnifiedStreamEvent::FileBlock { path, .. } if path == &PathBuf::from("src/main.rs")));
+        assert!(
+            matches!(&collected[2], UnifiedStreamEvent::FileBlock { path, .. } if path == &PathBuf::from("src/main.rs"))
+        );
         assert_eq!(collected[3], UnifiedStreamEvent::Done(StopReason::EndTurn));
     }
 
@@ -296,7 +296,9 @@ mod tests {
     #[test]
     fn test_backend_config_serde_roundtrip() {
         // ClaudeCode variant
-        let cc = BackendConfig::ClaudeCode { model: Some("sonnet".into()) };
+        let cc = BackendConfig::ClaudeCode {
+            model: Some("sonnet".into()),
+        };
         let json = serde_json::to_string(&cc).unwrap();
         let parsed: BackendConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cc, parsed);
@@ -327,7 +329,9 @@ mod tests {
     // Test 5: Factory produces correct backends
     #[test]
     fn test_factory_produces_correct_backends() {
-        let cc = BackendConfig::ClaudeCode { model: Some("sonnet".into()) };
+        let cc = BackendConfig::ClaudeCode {
+            model: Some("sonnet".into()),
+        };
         let backend = create_backend(&cc).unwrap();
         assert!(backend.name().contains("claude"));
 

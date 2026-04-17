@@ -44,9 +44,11 @@ impl SharedBoard {
         let relevant: Vec<&SharedEntry> = entries
             .iter()
             .filter(|e| {
-                e.tags
-                    .iter()
-                    .any(|tag| owned_paths.iter().any(|p| p.contains(tag.as_str()) || tag.contains(p.as_str())))
+                e.tags.iter().any(|tag| {
+                    owned_paths
+                        .iter()
+                        .any(|p| p.contains(tag.as_str()) || tag.contains(p.as_str()))
+                })
             })
             .collect();
 
@@ -56,7 +58,10 @@ impl SharedBoard {
 
         let mut out = String::from("## Discoveries from other agents:\n");
         for entry in relevant {
-            out.push_str(&format!("- (from {}) {}\n", entry.from_agent, entry.content));
+            out.push_str(&format!(
+                "- (from {}) {}\n",
+                entry.from_agent, entry.content
+            ));
         }
         out
     }

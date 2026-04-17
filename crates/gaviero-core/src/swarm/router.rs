@@ -1,8 +1,8 @@
 //! Tier routing: maps ModelTier + PrivacyLevel to concrete backend configuration.
 
-use crate::types::{ModelTier, PrivacyLevel};
 use super::backend::shared;
 use super::models::WorkUnit;
+use crate::types::{ModelTier, PrivacyLevel};
 
 /// Configuration for tier-based model routing.
 #[derive(Debug, Clone)]
@@ -68,7 +68,10 @@ pub struct TierRouter {
 
 impl TierRouter {
     pub fn new(config: TierConfig, ollama_available: bool) -> Self {
-        Self { config, ollama_available }
+        Self {
+            config,
+            ollama_available,
+        }
     }
 
     /// Resolve a WorkUnit to a concrete backend + model.
@@ -94,12 +97,12 @@ impl TierRouter {
         unit: &WorkUnit,
     ) -> Result<Box<dyn super::backend::AgentBackend>, String> {
         match self.resolve(unit) {
-            ResolvedBackend::Claude { model } => shared::create_backend_for_model(&model, None)
-                .map_err(|e| e.to_string()),
+            ResolvedBackend::Claude { model } => {
+                shared::create_backend_for_model(&model, None).map_err(|e| e.to_string())
+            }
             ResolvedBackend::Codex { model } => {
                 let model_spec = format!("codex:{}", model);
-                shared::create_backend_for_model(&model_spec, None)
-                    .map_err(|e| e.to_string())
+                shared::create_backend_for_model(&model_spec, None).map_err(|e| e.to_string())
             }
             ResolvedBackend::Ollama { model, base_url } => {
                 let model_spec = format!("ollama:{}", model);
@@ -168,10 +171,14 @@ impl TierRouter {
                 .or_else(|| model.strip_prefix("codex:"))
                 .unwrap_or(model)
                 .to_string();
-            return ResolvedBackend::Codex { model: resolved_model };
+            return ResolvedBackend::Codex {
+                model: resolved_model,
+            };
         }
 
-        ResolvedBackend::Claude { model: model.to_string() }
+        ResolvedBackend::Claude {
+            model: model.to_string(),
+        }
     }
 
     /// Update Ollama availability (call after health check).
@@ -236,7 +243,9 @@ fn api_backend_for_spec(model_spec: &str) -> ResolvedBackend {
             .to_string();
         ResolvedBackend::Codex { model: stripped }
     } else {
-        ResolvedBackend::Claude { model: model_spec.to_string() }
+        ResolvedBackend::Claude {
+            model: model_spec.to_string(),
+        }
     }
 }
 
@@ -309,7 +318,9 @@ mod tests {
         let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, Some("opus"));
         assert_eq!(
             router.resolve(&unit),
-            ResolvedBackend::Claude { model: "opus".into() }
+            ResolvedBackend::Claude {
+                model: "opus".into()
+            }
         );
     }
 
@@ -317,14 +328,20 @@ mod tests {
     fn test_local_only_blocks_without_ollama() {
         let router = TierRouter::new(TierConfig::default(), false);
         let unit = test_unit(ModelTier::Cheap, PrivacyLevel::LocalOnly, None);
-        assert!(matches!(router.resolve(&unit), ResolvedBackend::Blocked { .. }));
+        assert!(matches!(
+            router.resolve(&unit),
+            ResolvedBackend::Blocked { .. }
+        ));
     }
 
     #[test]
     fn test_local_only_routes_to_ollama() {
         let router = TierRouter::new(TierConfig::default(), true);
         let unit = test_unit(ModelTier::Cheap, PrivacyLevel::LocalOnly, None);
-        assert!(matches!(router.resolve(&unit), ResolvedBackend::Ollama { .. }));
+        assert!(matches!(
+            router.resolve(&unit),
+            ResolvedBackend::Ollama { .. }
+        ));
     }
 
     #[test]
@@ -333,7 +350,9 @@ mod tests {
         let unit = test_unit(ModelTier::Expensive, PrivacyLevel::Public, None);
         assert_eq!(
             router.resolve(&unit),
-            ResolvedBackend::Claude { model: "sonnet".into() }
+            ResolvedBackend::Claude {
+                model: "sonnet".into()
+            }
         );
     }
 
@@ -343,7 +362,9 @@ mod tests {
         let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
         assert_eq!(
             router.resolve(&unit),
-            ResolvedBackend::Claude { model: "haiku".into() }
+            ResolvedBackend::Claude {
+                model: "haiku".into()
+            }
         );
     }
 
@@ -353,7 +374,9 @@ mod tests {
         let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
         assert_eq!(
             router.resolve(&unit),
-            ResolvedBackend::Claude { model: "haiku".into() }
+            ResolvedBackend::Claude {
+                model: "haiku".into()
+            }
         );
     }
 
@@ -363,31 +386,50 @@ mod tests {
         config.local.enabled = true;
         let router = TierRouter::new(config, true);
         let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
-        assert!(matches!(router.resolve(&unit), ResolvedBackend::Ollama { .. }));
+        assert!(matches!(
+            router.resolve(&unit),
+            ResolvedBackend::Ollama { .. }
+        ));
     }
 
     #[test]
     fn test_codex_model_override_routes_to_codex_backend() {
         let router = TierRouter::new(TierConfig::default(), false);
-        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, Some("codex:gpt-5-codex"));
+        let unit = test_unit(
+            ModelTier::Cheap,
+            PrivacyLevel::Public,
+            Some("codex:gpt-5-codex"),
+        );
         assert_eq!(
             router.resolve(&unit),
-            ResolvedBackend::Codex { model: "gpt-5-codex".into() }
+            ResolvedBackend::Codex {
+                model: "gpt-5-codex".into()
+            }
         );
     }
 
     #[test]
     fn test_codex_blocked_under_local_only() {
         let router = TierRouter::new(TierConfig::default(), true);
-        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::LocalOnly, Some("codex:gpt-5-codex"));
-        assert!(matches!(router.resolve(&unit), ResolvedBackend::Blocked { .. }));
+        let unit = test_unit(
+            ModelTier::Cheap,
+            PrivacyLevel::LocalOnly,
+            Some("codex:gpt-5-codex"),
+        );
+        assert!(matches!(
+            router.resolve(&unit),
+            ResolvedBackend::Blocked { .. }
+        ));
     }
 
     #[test]
     fn test_local_only_model_override_blocked() {
         let router = TierRouter::new(TierConfig::default(), true);
         let unit = test_unit(ModelTier::Cheap, PrivacyLevel::LocalOnly, Some("sonnet"));
-        assert!(matches!(router.resolve(&unit), ResolvedBackend::Blocked { .. }));
+        assert!(matches!(
+            router.resolve(&unit),
+            ResolvedBackend::Blocked { .. }
+        ));
     }
 
     #[test]
@@ -398,7 +440,12 @@ mod tests {
         // Cheap → Expensive
         unit.escalation_tier = Some(ModelTier::Expensive);
         let esc = router.escalate(&unit).unwrap();
-        assert_eq!(esc, ResolvedBackend::Claude { model: "sonnet".into() });
+        assert_eq!(
+            esc,
+            ResolvedBackend::Claude {
+                model: "sonnet".into()
+            }
+        );
 
         // Expensive → None (no escalation)
         unit.tier = ModelTier::Expensive;
@@ -412,7 +459,9 @@ mod tests {
         let unit = test_unit(ModelTier::Expensive, PrivacyLevel::Public, None);
         assert_eq!(
             router.resolve(&unit),
-            ResolvedBackend::Claude { model: "sonnet".into() }
+            ResolvedBackend::Claude {
+                model: "sonnet".into()
+            }
         );
     }
 

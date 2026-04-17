@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 // ── Schema ───────────────────────────────────────────────────────
 
@@ -220,7 +220,7 @@ impl GraphStore {
     pub fn nodes_for_file(&self, file_path: &str) -> Result<Vec<GraphNode>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, name, qualified_name, file_path, line_start, line_end, language
-             FROM nodes WHERE file_path = ?1"
+             FROM nodes WHERE file_path = ?1",
         )?;
         let rows = stmt.query_map(params![file_path], |row| {
             Ok(GraphNode {
@@ -239,9 +239,14 @@ impl GraphStore {
 
     /// Delete all nodes and edges for a given file path.
     pub fn delete_file(&self, file_path: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM edges WHERE file_path = ?1", params![file_path])?;
-        self.conn.execute("DELETE FROM nodes WHERE file_path = ?1", params![file_path])?;
-        self.conn.execute("DELETE FROM file_hashes WHERE file_path = ?1", params![file_path])?;
+        self.conn
+            .execute("DELETE FROM edges WHERE file_path = ?1", params![file_path])?;
+        self.conn
+            .execute("DELETE FROM nodes WHERE file_path = ?1", params![file_path])?;
+        self.conn.execute(
+            "DELETE FROM file_hashes WHERE file_path = ?1",
+            params![file_path],
+        )?;
         Ok(())
     }
 
@@ -268,9 +273,9 @@ impl GraphStore {
 
     /// Get the stored hash for a file, or None if not tracked.
     pub fn get_file_hash(&self, file_path: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT hash FROM file_hashes WHERE file_path = ?1"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT hash FROM file_hashes WHERE file_path = ?1")?;
         let result = stmt.query_row(params![file_path], |row| row.get::<_, String>(0));
         match result {
             Ok(h) => Ok(Some(h)),
@@ -292,7 +297,9 @@ impl GraphStore {
 
     /// Return all tracked file paths and their hashes.
     pub fn all_file_hashes(&self) -> Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare("SELECT file_path, hash FROM file_hashes")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT file_path, hash FROM file_hashes")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -303,8 +310,12 @@ impl GraphStore {
 
     /// Count total nodes and edges.
     pub fn stats(&self) -> Result<(usize, usize)> {
-        let nodes: i64 = self.conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
-        let edges: i64 = self.conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
+        let nodes: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
+        let edges: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
         Ok((nodes as usize, edges as usize))
     }
 
@@ -322,18 +333,15 @@ impl GraphStore {
     ///   `target_qn` (the callee/imported). When a file changes, we want
     ///   files whose edges TARGET nodes in the changed file → those files
     ///   are the dependents.
-    pub fn impact_radius(
-        &self,
-        changed_files: &[&str],
-        max_depth: usize,
-    ) -> Result<ImpactSummary> {
+    pub fn impact_radius(&self, changed_files: &[&str], max_depth: usize) -> Result<ImpactSummary> {
         if changed_files.is_empty() {
             return Ok(ImpactSummary::default());
         }
 
         // 1. Create temp table for seed files
         self.conn.execute(
-            "CREATE TEMP TABLE IF NOT EXISTS _impact_seed_files (fp TEXT PRIMARY KEY)", [],
+            "CREATE TEMP TABLE IF NOT EXISTS _impact_seed_files (fp TEXT PRIMARY KEY)",
+            [],
         )?;
         self.conn.execute("DELETE FROM _impact_seed_files", [])?;
         for cf in changed_files {
@@ -413,7 +421,9 @@ impl GraphStore {
             lines.push(format!("Changed: {}", result.changed_files.join(", ")));
         }
 
-        let non_changed: Vec<&str> = result.affected_files.iter()
+        let non_changed: Vec<&str> = result
+            .affected_files
+            .iter()
             .filter(|f| !result.changed_files.contains(f))
             .map(|s| s.as_str())
             .collect();
@@ -422,11 +432,17 @@ impl GraphStore {
         }
 
         if !result.affected_tests.is_empty() {
-            lines.push(format!("Affected tests: {}", result.affected_tests.join(", ")));
+            lines.push(format!(
+                "Affected tests: {}",
+                result.affected_tests.join(", ")
+            ));
         }
 
         if !result.test_gaps.is_empty() {
-            lines.push(format!("Test gaps (no coverage): {}", result.test_gaps.join(", ")));
+            lines.push(format!(
+                "Test gaps (no coverage): {}",
+                result.test_gaps.join(", ")
+            ));
         }
 
         lines.join("\n")
@@ -447,9 +463,9 @@ impl GraphStore {
     /// Resolve a symbol name to its qualified name(s) across the graph.
     /// Used for cross-file reference resolution.
     pub fn resolve_symbol(&self, name: &str) -> Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT qualified_name, file_path FROM nodes WHERE name = ?1"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT qualified_name, file_path FROM nodes WHERE name = ?1")?;
         let rows = stmt.query_map(params![name], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -464,14 +480,30 @@ mod tests {
     #[test]
     fn create_and_query_nodes() {
         let store = GraphStore::open_memory().unwrap();
-        store.upsert_node(
-            NodeKind::Function, "foo", "src/lib.rs::foo", "src/lib.rs",
-            Some(10), Some(20), Some("rust"), None,
-        ).unwrap();
-        store.upsert_node(
-            NodeKind::Function, "bar", "src/lib.rs::bar", "src/lib.rs",
-            Some(25), Some(35), Some("rust"), None,
-        ).unwrap();
+        store
+            .upsert_node(
+                NodeKind::Function,
+                "foo",
+                "src/lib.rs::foo",
+                "src/lib.rs",
+                Some(10),
+                Some(20),
+                Some("rust"),
+                None,
+            )
+            .unwrap();
+        store
+            .upsert_node(
+                NodeKind::Function,
+                "bar",
+                "src/lib.rs::bar",
+                "src/lib.rs",
+                Some(25),
+                Some(35),
+                Some("rust"),
+                None,
+            )
+            .unwrap();
 
         let nodes = store.nodes_for_file("src/lib.rs").unwrap();
         assert_eq!(nodes.len(), 2);
@@ -481,11 +513,21 @@ mod tests {
     #[test]
     fn delete_file_removes_nodes_and_edges() {
         let store = GraphStore::open_memory().unwrap();
-        store.upsert_node(
-            NodeKind::Function, "foo", "a.rs::foo", "a.rs",
-            Some(1), Some(5), Some("rust"), None,
-        ).unwrap();
-        store.insert_edge(EdgeKind::Calls, "a.rs::foo", "b.rs::bar", "a.rs", 3).unwrap();
+        store
+            .upsert_node(
+                NodeKind::Function,
+                "foo",
+                "a.rs::foo",
+                "a.rs",
+                Some(1),
+                Some(5),
+                Some("rust"),
+                None,
+            )
+            .unwrap();
+        store
+            .insert_edge(EdgeKind::Calls, "a.rs::foo", "b.rs::bar", "a.rs", 3)
+            .unwrap();
         store.set_file_hash("a.rs", "abc123").unwrap();
 
         store.delete_file("a.rs").unwrap();
@@ -500,25 +542,68 @@ mod tests {
         assert!(store.get_file_hash("foo.rs").unwrap().is_none());
 
         store.set_file_hash("foo.rs", "hash1").unwrap();
-        assert_eq!(store.get_file_hash("foo.rs").unwrap().as_deref(), Some("hash1"));
+        assert_eq!(
+            store.get_file_hash("foo.rs").unwrap().as_deref(),
+            Some("hash1")
+        );
 
         store.set_file_hash("foo.rs", "hash2").unwrap();
-        assert_eq!(store.get_file_hash("foo.rs").unwrap().as_deref(), Some("hash2"));
+        assert_eq!(
+            store.get_file_hash("foo.rs").unwrap().as_deref(),
+            Some("hash2")
+        );
     }
 
     #[test]
     fn impact_radius_linear_chain() {
         // a.rs::foo → b.rs::bar → c.rs::baz (Calls edges)
         let store = GraphStore::open_memory().unwrap();
-        store.upsert_node(NodeKind::Function, "foo", "a.rs::foo", "a.rs", Some(1), None, Some("rust"), None).unwrap();
-        store.upsert_node(NodeKind::Function, "bar", "b.rs::bar", "b.rs", Some(1), None, Some("rust"), None).unwrap();
-        store.upsert_node(NodeKind::Function, "baz", "c.rs::baz", "c.rs", Some(1), None, Some("rust"), None).unwrap();
+        store
+            .upsert_node(
+                NodeKind::Function,
+                "foo",
+                "a.rs::foo",
+                "a.rs",
+                Some(1),
+                None,
+                Some("rust"),
+                None,
+            )
+            .unwrap();
+        store
+            .upsert_node(
+                NodeKind::Function,
+                "bar",
+                "b.rs::bar",
+                "b.rs",
+                Some(1),
+                None,
+                Some("rust"),
+                None,
+            )
+            .unwrap();
+        store
+            .upsert_node(
+                NodeKind::Function,
+                "baz",
+                "c.rs::baz",
+                "c.rs",
+                Some(1),
+                None,
+                Some("rust"),
+                None,
+            )
+            .unwrap();
 
         // Edge direction: source calls target → source depends on target
         // If c.rs changes, who is affected? b.rs (calls c.rs), then a.rs (calls b.rs)
         // Edges: a calls b, b calls c → a.rs::foo -> b.rs::bar, b.rs::bar -> c.rs::baz
-        store.insert_edge(EdgeKind::Calls, "a.rs::foo", "b.rs::bar", "a.rs", 2).unwrap();
-        store.insert_edge(EdgeKind::Calls, "b.rs::bar", "c.rs::baz", "b.rs", 3).unwrap();
+        store
+            .insert_edge(EdgeKind::Calls, "a.rs::foo", "b.rs::bar", "a.rs", 2)
+            .unwrap();
+        store
+            .insert_edge(EdgeKind::Calls, "b.rs::bar", "c.rs::baz", "b.rs", 3)
+            .unwrap();
 
         // Change c.rs → should affect b.rs (direct caller) and a.rs (transitive)
         let result = store.impact_radius(&["c.rs"], 5).unwrap();
@@ -530,12 +615,49 @@ mod tests {
     #[test]
     fn impact_radius_respects_depth() {
         let store = GraphStore::open_memory().unwrap();
-        store.upsert_node(NodeKind::Function, "foo", "a.rs::foo", "a.rs", Some(1), None, Some("rust"), None).unwrap();
-        store.upsert_node(NodeKind::Function, "bar", "b.rs::bar", "b.rs", Some(1), None, Some("rust"), None).unwrap();
-        store.upsert_node(NodeKind::Function, "baz", "c.rs::baz", "c.rs", Some(1), None, Some("rust"), None).unwrap();
+        store
+            .upsert_node(
+                NodeKind::Function,
+                "foo",
+                "a.rs::foo",
+                "a.rs",
+                Some(1),
+                None,
+                Some("rust"),
+                None,
+            )
+            .unwrap();
+        store
+            .upsert_node(
+                NodeKind::Function,
+                "bar",
+                "b.rs::bar",
+                "b.rs",
+                Some(1),
+                None,
+                Some("rust"),
+                None,
+            )
+            .unwrap();
+        store
+            .upsert_node(
+                NodeKind::Function,
+                "baz",
+                "c.rs::baz",
+                "c.rs",
+                Some(1),
+                None,
+                Some("rust"),
+                None,
+            )
+            .unwrap();
 
-        store.insert_edge(EdgeKind::Calls, "a.rs::foo", "b.rs::bar", "a.rs", 2).unwrap();
-        store.insert_edge(EdgeKind::Calls, "b.rs::bar", "c.rs::baz", "b.rs", 3).unwrap();
+        store
+            .insert_edge(EdgeKind::Calls, "a.rs::foo", "b.rs::bar", "a.rs", 2)
+            .unwrap();
+        store
+            .insert_edge(EdgeKind::Calls, "b.rs::bar", "c.rs::baz", "b.rs", 3)
+            .unwrap();
 
         // Depth 1: c.rs changes → only b.rs affected (direct), not a.rs
         let result = store.impact_radius(&["c.rs"], 1).unwrap();
@@ -546,14 +668,48 @@ mod tests {
     #[test]
     fn impact_radius_finds_tests() {
         let store = GraphStore::open_memory().unwrap();
-        store.upsert_node(NodeKind::Function, "foo", "src/lib.rs::foo", "src/lib.rs", Some(1), None, Some("rust"), None).unwrap();
-        store.upsert_node(NodeKind::Test, "test_foo", "tests/test_lib.rs::test_foo", "tests/test_lib.rs", Some(1), None, Some("rust"), None).unwrap();
+        store
+            .upsert_node(
+                NodeKind::Function,
+                "foo",
+                "src/lib.rs::foo",
+                "src/lib.rs",
+                Some(1),
+                None,
+                Some("rust"),
+                None,
+            )
+            .unwrap();
+        store
+            .upsert_node(
+                NodeKind::Test,
+                "test_foo",
+                "tests/test_lib.rs::test_foo",
+                "tests/test_lib.rs",
+                Some(1),
+                None,
+                Some("rust"),
+                None,
+            )
+            .unwrap();
 
         // Test imports/calls source
-        store.insert_edge(EdgeKind::Calls, "tests/test_lib.rs::test_foo", "src/lib.rs::foo", "tests/test_lib.rs", 3).unwrap();
+        store
+            .insert_edge(
+                EdgeKind::Calls,
+                "tests/test_lib.rs::test_foo",
+                "src/lib.rs::foo",
+                "tests/test_lib.rs",
+                3,
+            )
+            .unwrap();
 
         let result = store.impact_radius(&["src/lib.rs"], 3).unwrap();
-        assert!(result.affected_tests.contains(&"tests/test_lib.rs".to_string()));
+        assert!(
+            result
+                .affected_tests
+                .contains(&"tests/test_lib.rs".to_string())
+        );
     }
 
     #[test]
@@ -566,7 +722,18 @@ mod tests {
     #[test]
     fn test_gaps_detected() {
         let store = GraphStore::open_memory().unwrap();
-        store.upsert_node(NodeKind::Function, "foo", "src/lib.rs::foo", "src/lib.rs", Some(1), None, Some("rust"), None).unwrap();
+        store
+            .upsert_node(
+                NodeKind::Function,
+                "foo",
+                "src/lib.rs::foo",
+                "src/lib.rs",
+                Some(1),
+                None,
+                Some("rust"),
+                None,
+            )
+            .unwrap();
         // No TestedBy edge for src/lib.rs
         let result = store.impact_radius(&["src/lib.rs"], 3).unwrap();
         assert!(result.test_gaps.contains(&"src/lib.rs".to_string()));
@@ -575,9 +742,33 @@ mod tests {
     #[test]
     fn stats_counts() {
         let store = GraphStore::open_memory().unwrap();
-        store.upsert_node(NodeKind::Function, "foo", "a.rs::foo", "a.rs", None, None, None, None).unwrap();
-        store.upsert_node(NodeKind::Function, "bar", "b.rs::bar", "b.rs", None, None, None, None).unwrap();
-        store.insert_edge(EdgeKind::Calls, "a.rs::foo", "b.rs::bar", "a.rs", 1).unwrap();
+        store
+            .upsert_node(
+                NodeKind::Function,
+                "foo",
+                "a.rs::foo",
+                "a.rs",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .upsert_node(
+                NodeKind::Function,
+                "bar",
+                "b.rs::bar",
+                "b.rs",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .insert_edge(EdgeKind::Calls, "a.rs::foo", "b.rs::bar", "a.rs", 1)
+            .unwrap();
 
         let (nodes, edges) = store.stats().unwrap();
         assert_eq!(nodes, 2);
@@ -587,8 +778,30 @@ mod tests {
     #[test]
     fn resolve_symbol_finds_matches() {
         let store = GraphStore::open_memory().unwrap();
-        store.upsert_node(NodeKind::Function, "process", "a.rs::process", "a.rs", None, None, None, None).unwrap();
-        store.upsert_node(NodeKind::Function, "process", "b.rs::process", "b.rs", None, None, None, None).unwrap();
+        store
+            .upsert_node(
+                NodeKind::Function,
+                "process",
+                "a.rs::process",
+                "a.rs",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .upsert_node(
+                NodeKind::Function,
+                "process",
+                "b.rs::process",
+                "b.rs",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
 
         let matches = store.resolve_symbol("process").unwrap();
         assert_eq!(matches.len(), 2);
@@ -598,7 +811,11 @@ mod tests {
     fn format_impact_prompt() {
         let result = ImpactSummary {
             changed_files: vec!["src/auth.rs".into()],
-            affected_files: vec!["src/auth.rs".into(), "src/api.rs".into(), "tests/auth_test.rs".into()],
+            affected_files: vec![
+                "src/auth.rs".into(),
+                "src/api.rs".into(),
+                "tests/auth_test.rs".into(),
+            ],
             affected_tests: vec!["tests/auth_test.rs".into()],
             test_gaps: vec![],
             truncated: false,

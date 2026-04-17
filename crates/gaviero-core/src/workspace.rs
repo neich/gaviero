@@ -97,8 +97,7 @@ pub struct Workspace {
 impl Workspace {
     /// Load a `.gaviero-workspace` file.
     pub fn load(path: &Path) -> Result<Self> {
-        let content =
-            std::fs::read_to_string(path).context("reading .gaviero-workspace file")?;
+        let content = std::fs::read_to_string(path).context("reading .gaviero-workspace file")?;
         let file: WorkspaceFile =
             serde_json::from_str(&content).context("parsing .gaviero-workspace file")?;
 
@@ -175,7 +174,8 @@ impl Workspace {
             }
 
             // Derive namespace from folder name
-            let namespace = folder.path
+            let namespace = folder
+                .path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("default")
@@ -242,8 +242,7 @@ impl Workspace {
             // Reload into workspace_settings and cache so the current session uses them
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
                 self.workspace_settings = val.clone();
-                self.folder_settings_cache
-                    .insert(folder.path.clone(), val);
+                self.folder_settings_cache.insert(folder.path.clone(), val);
             }
         }
     }
@@ -365,8 +364,7 @@ impl Workspace {
             return ns.to_string();
         }
         // Fallback: derive from the first folder name
-        let folder = root
-            .or_else(|| self.roots().first().copied());
+        let folder = root.or_else(|| self.roots().first().copied());
         folder
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
@@ -481,13 +479,19 @@ mod tests {
             folder_settings_cache: HashMap::new(),
             user_settings_cache: None,
         };
-        assert_eq!(ws.resolve_setting("editor.tabSize", None), serde_json::json!(2));
+        assert_eq!(
+            ws.resolve_setting("editor.tabSize", None),
+            serde_json::json!(2)
+        );
     }
 
     #[test]
     fn test_resolve_setting_falls_to_default() {
         let ws = Workspace::single_folder(PathBuf::from("/tmp/test"));
-        assert_eq!(ws.resolve_setting("editor.tabSize", None), serde_json::json!(4));
+        assert_eq!(
+            ws.resolve_setting("editor.tabSize", None),
+            serde_json::json!(4)
+        );
     }
 
     #[test]

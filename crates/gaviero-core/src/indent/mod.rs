@@ -49,10 +49,21 @@ pub fn compute_indent(
     if let (Some(tree), Some(query)) = (tree, indent_query) {
         return match indent_heuristic {
             IndentHeuristic::Hybrid => heuristic::compute_hybrid_indent(
-                doc, tree, query, cursor_byte, tab_width, indent_unit,
+                doc,
+                tree,
+                query,
+                cursor_byte,
+                tab_width,
+                indent_unit,
             ),
             IndentHeuristic::TreeSitter => treesitter::compute_treesitter_indent(
-                doc, tree, query, cursor_byte, new_line_below, tab_width, indent_unit,
+                doc,
+                tree,
+                query,
+                cursor_byte,
+                new_line_below,
+                tab_width,
+                indent_unit,
             ),
         };
     }

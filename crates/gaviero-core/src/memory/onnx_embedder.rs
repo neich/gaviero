@@ -88,12 +88,17 @@ impl OnnxEmbedder {
         }
 
         // Tokenize all texts
-        let encodings = self.tokenizer
+        let encodings = self
+            .tokenizer
             .encode_batch(texts.to_vec(), true)
             .map_err(|e| anyhow::anyhow!("tokenization failed: {}", e))?;
 
         let batch_size = encodings.len();
-        let max_len = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(0);
+        let max_len = encodings
+            .iter()
+            .map(|e| e.get_ids().len())
+            .max()
+            .unwrap_or(0);
 
         // Build input tensors: input_ids and attention_mask
         let mut input_ids = Array2::<i64>::zeros((batch_size, max_len));
@@ -122,8 +127,14 @@ impl OnnxEmbedder {
             .map_err(|e| anyhow::anyhow!("creating token_type_ids tensor: {e}"))?;
 
         // Run ONNX inference (requires &mut session)
-        let mut session = self.session.lock().map_err(|e| anyhow::anyhow!("session lock poisoned: {e}"))?;
-        let needs_token_type_ids = session.inputs().iter().any(|i| i.name() == "token_type_ids");
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|e| anyhow::anyhow!("session lock poisoned: {e}"))?;
+        let needs_token_type_ids = session
+            .inputs()
+            .iter()
+            .any(|i| i.name() == "token_type_ids");
         let outputs = if needs_token_type_ids {
             session.run(ort::inputs![
                 "input_ids" => ids_tensor,
@@ -135,7 +146,8 @@ impl OnnxEmbedder {
                 "input_ids" => ids_tensor,
                 "attention_mask" => mask_tensor,
             ])
-        }.map_err(|e| anyhow::anyhow!("ONNX inference failed: {e}"))?;
+        }
+        .map_err(|e| anyhow::anyhow!("ONNX inference failed: {e}"))?;
 
         // Extract output: [batch, seq_len, hidden_dim]
         let output_array = outputs[0]
@@ -240,8 +252,9 @@ mod tests {
     #[test]
     #[ignore] // Requires ONNX model to be downloaded
     fn test_nomic_embedder() {
-        let embedder = OnnxEmbedder::from_model(&super::super::model_manager::NOMIC_EMBED_TEXT_V1_5)
-            .expect("Failed to load nomic model");
+        let embedder =
+            OnnxEmbedder::from_model(&super::super::model_manager::NOMIC_EMBED_TEXT_V1_5)
+                .expect("Failed to load nomic model");
 
         // Test query embedding
         let query_emb = embedder.embed_query("What is Rust?").unwrap();
@@ -250,7 +263,9 @@ mod tests {
         assert!((norm - 1.0).abs() < 0.01);
 
         // Test document embedding
-        let doc_emb = embedder.embed_document("Rust is a systems programming language").unwrap();
+        let doc_emb = embedder
+            .embed_document("Rust is a systems programming language")
+            .unwrap();
         assert_eq!(doc_emb.len(), 768);
     }
 }

@@ -47,9 +47,20 @@ impl Default for TestRunnerConfig {
 
 fn default_inherit_env() -> Vec<String> {
     [
-        "PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME", "GOPATH",
-        "JAVA_HOME", "NODE_PATH", "PYTHONPATH", "VIRTUAL_ENV",
-        "CONDA_PREFIX", "DATABASE_URL", "RUST_LOG", "RUST_BACKTRACE", "CI",
+        "PATH",
+        "HOME",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "GOPATH",
+        "JAVA_HOME",
+        "NODE_PATH",
+        "PYTHONPATH",
+        "VIRTUAL_ENV",
+        "CONDA_PREFIX",
+        "DATABASE_URL",
+        "RUST_LOG",
+        "RUST_BACKTRACE",
+        "CI",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -175,7 +186,10 @@ pub fn auto_detect_test_command(project_root: &Path) -> Option<String> {
     for name in &["pytest.ini", "setup.cfg", "pyproject.toml"] {
         if project_root.join(name).exists() {
             if let Ok(content) = std::fs::read_to_string(project_root.join(name)) {
-                if content.contains("[tool.pytest") || content.contains("[pytest]") || *name == "pytest.ini" {
+                if content.contains("[tool.pytest")
+                    || content.contains("[pytest]")
+                    || *name == "pytest.ini"
+                {
                     return Some("pytest".into());
                 }
             }
@@ -183,7 +197,8 @@ pub fn auto_detect_test_command(project_root: &Path) -> Option<String> {
     }
 
     // Gradle
-    if project_root.join("build.gradle").exists() || project_root.join("build.gradle.kts").exists() {
+    if project_root.join("build.gradle").exists() || project_root.join("build.gradle.kts").exists()
+    {
         return Some("gradle test".into());
     }
 
@@ -363,7 +378,10 @@ fn parse_rust_test_output(output: &str) -> Option<ParsedTestResults> {
     let mut failures = Vec::new();
     for line in output.lines() {
         if line.starts_with("test ") && line.contains(" ... FAILED") {
-            if let Some(name) = line.strip_prefix("test ").and_then(|s| s.split(" ... ").next()) {
+            if let Some(name) = line
+                .strip_prefix("test ")
+                .and_then(|s| s.split(" ... ").next())
+            {
                 failures.push(TestFailure {
                     test_name: name.to_string(),
                     message: String::new(),
@@ -422,7 +440,14 @@ fn find_number_before_keyword(text: &str, keyword: &str) -> Option<usize> {
     for (pos, _) in text.match_indices(keyword) {
         // Walk backwards to find digits
         let before = &text[..pos];
-        let num_str: String = before.chars().rev().take_while(|c| c.is_ascii_digit()).collect::<String>().chars().rev().collect();
+        let num_str: String = before
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
         if let Ok(n) = num_str.parse::<usize>() {
             return Some(n);
         }
@@ -438,7 +463,10 @@ mod tests {
     fn test_auto_detect_cargo() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
-        assert_eq!(auto_detect_test_command(dir.path()), Some("cargo test".into()));
+        assert_eq!(
+            auto_detect_test_command(dir.path()),
+            Some("cargo test".into())
+        );
     }
 
     #[test]
@@ -449,7 +477,10 @@ mod tests {
             r#"{"scripts": {"test": "jest"}}"#,
         )
         .unwrap();
-        assert_eq!(auto_detect_test_command(dir.path()), Some("npm test".into()));
+        assert_eq!(
+            auto_detect_test_command(dir.path()),
+            Some("npm test".into())
+        );
     }
 
     #[test]
@@ -461,9 +492,15 @@ mod tests {
     #[test]
     fn test_auto_detect_makefile() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Makefile"), "all:\n\techo hi\n\ntest:\n\techo test\n")
-            .unwrap();
-        assert_eq!(auto_detect_test_command(dir.path()), Some("make test".into()));
+        std::fs::write(
+            dir.path().join("Makefile"),
+            "all:\n\techo hi\n\ntest:\n\techo test\n",
+        )
+        .unwrap();
+        assert_eq!(
+            auto_detect_test_command(dir.path()),
+            Some("make test".into())
+        );
     }
 
     #[test]

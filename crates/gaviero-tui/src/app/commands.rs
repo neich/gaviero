@@ -18,7 +18,8 @@ pub(super) fn handle_swarm_command(app: &mut App) {
         return;
     }
 
-    app.chat_state.add_user_message(&format!("/swarm {}", task_desc));
+    app.chat_state
+        .add_user_message(&format!("/swarm {}", task_desc));
     app.chat_state.add_system_message(&format!(
         "Planning swarm task: {}\nSwitch to SWARM panel (Ctrl+Shift+P) to monitor progress.",
         task_desc
@@ -27,8 +28,10 @@ pub(super) fn handle_swarm_command(app: &mut App) {
     app.side_panel = SidePanelMode::SwarmDashboard;
     app.panel_visible.side_panel = true;
     app.swarm_dashboard.reset("planning");
-    app.swarm_dashboard.status_message =
-        format!("Planning task: {}...", task_desc.chars().take(60).collect::<String>());
+    app.swarm_dashboard.status_message = format!(
+        "Planning task: {}...",
+        task_desc.chars().take(60).collect::<String>()
+    );
 
     let tx = app.event_tx.clone();
     let root = app
@@ -76,7 +79,10 @@ pub(super) fn handle_swarm_command(app: &mut App) {
         };
 
         let unit_count = work_units.len();
-        let _ = tx.send(Event::SwarmPhaseChanged(format!("planned ({} agents)", unit_count)));
+        let _ = tx.send(Event::SwarmPhaseChanged(format!(
+            "planned ({} agents)",
+            unit_count
+        )));
 
         let plan = gaviero_core::swarm::plan::CompiledPlan::from_work_units(work_units, None);
         let config = pipeline::SwarmConfig {
@@ -164,8 +170,11 @@ pub(super) fn handle_run_script_command(app: &mut App) {
     let raw = match std::fs::read_to_string(&resolved) {
         Ok(s) => s,
         Err(e) => {
-            app.chat_state
-                .add_system_message(&format!("Cannot read {}: {}", resolved.display(), e));
+            app.chat_state.add_system_message(&format!(
+                "Cannot read {}: {}",
+                resolved.display(),
+                e
+            ));
             return;
         }
     };
@@ -264,7 +273,8 @@ pub(super) fn handle_coordinated_swarm_command(app: &mut App) {
         return;
     }
 
-    app.chat_state.add_user_message(&format!("/cswarm {}", task_desc));
+    app.chat_state
+        .add_user_message(&format!("/cswarm {}", task_desc));
     app.chat_state.add_system_message(&format!(
         "Coordinated swarm: {}\nThe coordinator will produce a .gaviero plan file for review.\n\
          Switch to SWARM panel (Ctrl+Shift+P) to monitor.",
@@ -274,8 +284,10 @@ pub(super) fn handle_coordinated_swarm_command(app: &mut App) {
     app.side_panel = SidePanelMode::SwarmDashboard;
     app.panel_visible.side_panel = true;
     app.swarm_dashboard.reset("coordinating");
-    app.swarm_dashboard.status_message =
-        format!("Coordinator planning (DSL): {}...", task_desc.chars().take(60).collect::<String>());
+    app.swarm_dashboard.status_message = format!(
+        "Coordinator planning (DSL): {}...",
+        task_desc.chars().take(60).collect::<String>()
+    );
 
     let tx = app.event_tx.clone();
     let root = app
@@ -426,9 +438,8 @@ pub(super) fn handle_undo_swarm_command(app: &mut App) {
     app.panel_visible.side_panel = true;
     app.focus = Focus::SidePanel;
     app.swarm_dashboard.pending_undo_confirm = true;
-    app.chat_state.add_system_message(
-        "Swarm dashboard: press u to confirm undo all changes, Esc to cancel.",
-    );
+    app.chat_state
+        .add_system_message("Swarm dashboard: press u to confirm undo all changes, Esc to cancel.");
 }
 
 pub(super) fn handle_remember_command(app: &mut App) {

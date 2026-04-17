@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 
 use crate::observer::AcpObserver;
 use crate::swarm::backend::AgentBackend as _;
-use crate::swarm::backend::{executor, shared, CompletionRequest};
+use crate::swarm::backend::{CompletionRequest, executor, shared};
 use crate::write_gate::WriteGatePipeline;
 
 use super::protocol::{StreamEvent, find_next_file_block, parse_file_blocks};
@@ -188,15 +188,15 @@ impl AcpPipeline {
             &["Read", "Glob", "Grep"]
         };
 
-        let enriched_prompt = shared::build_enriched_prompt(prompt, conversation_history, file_refs);
+        let enriched_prompt =
+            shared::build_enriched_prompt(prompt, conversation_history, file_refs);
         let system_prompt = shared::default_editor_system_prompt(
-            &crate::swarm::backend::claude_code::ClaudeCodeBackend::new(claude_model).capabilities(),
+            &crate::swarm::backend::claude_code::ClaudeCodeBackend::new(claude_model)
+                .capabilities(),
         );
 
-        let attach_refs: Vec<&std::path::Path> = file_attachments
-            .iter()
-            .map(|p| p.as_path())
-            .collect();
+        let attach_refs: Vec<&std::path::Path> =
+            file_attachments.iter().map(|p| p.as_path()).collect();
 
         let mut session = AcpSession::spawn(
             claude_model,
@@ -227,11 +227,7 @@ impl AcpPipeline {
         // detects this and sends keepalive status updates so the UI stays responsive.
         let mut idle_count: u32 = 0;
         loop {
-            let next = tokio::time::timeout(
-                STREAM_IDLE_TIMEOUT,
-                session.next_event(),
-            )
-            .await;
+            let next = tokio::time::timeout(STREAM_IDLE_TIMEOUT, session.next_event()).await;
 
             match next {
                 // Timeout — no event received within STREAM_IDLE_TIMEOUT
@@ -253,9 +249,10 @@ impl AcpPipeline {
                         break;
                     }
                     // Process still alive — send keepalive status
-                    self.observer.on_streaming_status(
-                        &format!("Working... ({}s elapsed, tools running)", elapsed_secs),
-                    );
+                    self.observer.on_streaming_status(&format!(
+                        "Working... ({}s elapsed, tools running)",
+                        elapsed_secs
+                    ));
                     tracing::debug!(
                         "Stream idle for {}s, subprocess still alive — sending keepalive",
                         elapsed_secs
@@ -266,206 +263,226 @@ impl AcpPipeline {
                 Ok(result) => {
                     idle_count = 0; // reset on any activity
                     match result {
-                Ok(Some(event)) => match event {
-                    StreamEvent::ThinkingDelta(text) => {
-                        if !in_thinking {
-                            self.observer.on_stream_chunk("<think>\n");
-                            in_thinking = true;
-                        }
-                        self.observer.on_stream_chunk(&text);
-                    }
-                    StreamEvent::ContentDelta(text) => {
-                        if in_thinking {
-                            self.observer.on_stream_chunk("\n</think>\n");
-                            in_thinking = false;
-                        }
-                        full_text.push_str(&text);
-                        self.observer.on_stream_chunk(&text);
-
-                        // Detect complete <file> blocks as they arrive (fallback path)
-                        while let Some((rel_path, content, end)) =
-                            find_next_file_block(&full_text, file_scan_pos)
-                        {
-                            tracing::info!(
-                                "Detected <file> block: path={}, content_len={}",
-                                rel_path.display(), content.len()
-                            );
-                            file_scan_pos = end;
-                            if let Err(e) = self.propose_write(&rel_path, &content).await {
-                                tracing::error!(
-                                    "Failed to create proposal for {}: {}",
-                                    rel_path.display(), e
-                                );
+                        Ok(Some(event)) => match event {
+                            StreamEvent::ThinkingDelta(text) => {
+                                if !in_thinking {
+                                    self.observer.on_stream_chunk("<think>\n");
+                                    in_thinking = true;
+                                }
+                                self.observer.on_stream_chunk(&text);
                             }
-                        }
-                    }
-                    StreamEvent::ToolUseStart { tool_name, .. } => {
-                        // M0 instrumentation: count Read invocations per turn.
-                        if tool_name == "Read" {
-                            read_count += 1;
-                        }
-                        // Update streaming status for the spinner label.
-                        // The enriched tool call (with details) will be sent
-                        // from AssistantMessage when the full input is known.
-                        self.observer.on_streaming_status(&format!("Using {}...", tool_name));
-                    }
-                    StreamEvent::ToolInputDelta(_) => {
-                        // Tool input JSON fragments — ignored here.
-                        // The AcpPipeline extracts tool details from AssistantMessage instead.
-                    }
-                    StreamEvent::AssistantMessage { text, tool_uses } => {
-                        // Use the complete message text if we didn't get deltas
-                        if full_text.is_empty() && !text.is_empty() {
-                            full_text = text;
-                        }
+                            StreamEvent::ContentDelta(text) => {
+                                if in_thinking {
+                                    self.observer.on_stream_chunk("\n</think>\n");
+                                    in_thinking = false;
+                                }
+                                full_text.push_str(&text);
+                                self.observer.on_stream_chunk(&text);
 
-                        // Enrich tool calls with details from the input JSON.
-                        // This replaces the bare names sent by ToolUseStart.
-                        for tu in &tool_uses {
-                            let summary = format_tool_summary(&tu.name, &tu.input, &self.workspace_root);
-                            self.observer.on_tool_call_started(&summary);
-                        }
-
-                        // Snapshot files BEFORE the CLI executes Write/Edit tools.
-                        // The AssistantMessage fires when the model finishes a turn,
-                        // before the CLI executes the tool calls within it.
-                        for tu in &tool_uses {
-                            if matches!(tu.name.as_str(), "Write" | "Edit" | "MultiEdit") {
-                                if let Some(fp) = tu.input.get("file_path").and_then(|v| v.as_str()) {
-                                    let abs_path = if Path::new(fp).is_absolute() {
-                                        PathBuf::from(fp)
-                                    } else {
-                                        self.workspace_root.join(fp)
-                                    };
-                                    if !file_snapshots.contains_key(&abs_path) {
-                                        let content = tokio::fs::read_to_string(&abs_path)
-                                            .await
-                                            .unwrap_or_default();
-                                        tracing::info!(
-                                            "Snapshot before tool {}: {} ({} bytes)",
-                                            tu.name, abs_path.display(), content.len()
+                                // Detect complete <file> blocks as they arrive (fallback path)
+                                while let Some((rel_path, content, end)) =
+                                    find_next_file_block(&full_text, file_scan_pos)
+                                {
+                                    tracing::info!(
+                                        "Detected <file> block: path={}, content_len={}",
+                                        rel_path.display(),
+                                        content.len()
+                                    );
+                                    file_scan_pos = end;
+                                    if let Err(e) = self.propose_write(&rel_path, &content).await {
+                                        tracing::error!(
+                                            "Failed to create proposal for {}: {}",
+                                            rel_path.display(),
+                                            e
                                         );
-                                        file_snapshots.insert(abs_path, content);
                                     }
                                 }
                             }
-                        }
+                            StreamEvent::ToolUseStart { tool_name, .. } => {
+                                // M0 instrumentation: count Read invocations per turn.
+                                if tool_name == "Read" {
+                                    read_count += 1;
+                                }
+                                // Update streaming status for the spinner label.
+                                // The enriched tool call (with details) will be sent
+                                // from AssistantMessage when the full input is known.
+                                self.observer
+                                    .on_streaming_status(&format!("Using {}...", tool_name));
+                            }
+                            StreamEvent::ToolInputDelta(_) => {
+                                // Tool input JSON fragments — ignored here.
+                                // The AcpPipeline extracts tool details from AssistantMessage instead.
+                            }
+                            StreamEvent::AssistantMessage { text, tool_uses } => {
+                                // Use the complete message text if we didn't get deltas
+                                if full_text.is_empty() && !text.is_empty() {
+                                    full_text = text;
+                                }
 
-                    }
-                    StreamEvent::ResultEvent {
-                        is_error,
-                        result_text,
-                        ..
-                    } => {
-                        if is_error {
-                            let msg = if is_auth_error(&result_text) {
-                                format!(
-                                    "Error: {}\n\nTo re-authenticate, run `claude login` in a terminal, then retry.",
-                                    result_text
-                                )
+                                // Enrich tool calls with details from the input JSON.
+                                // This replaces the bare names sent by ToolUseStart.
+                                for tu in &tool_uses {
+                                    let summary = format_tool_summary(
+                                        &tu.name,
+                                        &tu.input,
+                                        &self.workspace_root,
+                                    );
+                                    self.observer.on_tool_call_started(&summary);
+                                }
+
+                                // Snapshot files BEFORE the CLI executes Write/Edit tools.
+                                // The AssistantMessage fires when the model finishes a turn,
+                                // before the CLI executes the tool calls within it.
+                                for tu in &tool_uses {
+                                    if matches!(tu.name.as_str(), "Write" | "Edit" | "MultiEdit") {
+                                        if let Some(fp) =
+                                            tu.input.get("file_path").and_then(|v| v.as_str())
+                                        {
+                                            let abs_path = if Path::new(fp).is_absolute() {
+                                                PathBuf::from(fp)
+                                            } else {
+                                                self.workspace_root.join(fp)
+                                            };
+                                            if !file_snapshots.contains_key(&abs_path) {
+                                                let content = tokio::fs::read_to_string(&abs_path)
+                                                    .await
+                                                    .unwrap_or_default();
+                                                tracing::info!(
+                                                    "Snapshot before tool {}: {} ({} bytes)",
+                                                    tu.name,
+                                                    abs_path.display(),
+                                                    content.len()
+                                                );
+                                                file_snapshots.insert(abs_path, content);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            StreamEvent::ResultEvent {
+                                is_error,
+                                result_text,
+                                ..
+                            } => {
+                                if is_error {
+                                    let msg = if is_auth_error(&result_text) {
+                                        format!(
+                                            "Error: {}\n\nTo re-authenticate, run `claude login` in a terminal, then retry.",
+                                            result_text
+                                        )
+                                    } else {
+                                        format!("Error: {}", result_text)
+                                    };
+                                    self.observer.on_message_complete("system", &msg);
+                                } else {
+                                    if full_text.is_empty() && !result_text.is_empty() {
+                                        full_text = result_text.clone();
+                                    }
+                                    self.observer.on_message_complete("assistant", &full_text);
+                                }
+                                break;
+                            }
+                            StreamEvent::PermissionRequest {
+                                tool_name,
+                                description,
+                                request_id,
+                            } => {
+                                // Pause the pipeline: ask the observer (TUI) for a decision.
+                                // The session is not borrowed here so awaiting is safe.
+                                let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+                                self.observer
+                                    .on_permission_request(&tool_name, &description, tx);
+                                let allow = rx.await.unwrap_or(false);
+                                tracing::info!(
+                                    "Permission request for '{}': {}",
+                                    tool_name,
+                                    if allow { "allowed" } else { "denied" }
+                                );
+                                session.respond_permission(allow, &request_id);
+                                idle_count = 0;
+                            }
+                            StreamEvent::SystemInit { session_id, .. } => {
+                                // M0 instrumentation: record whether Claude honored the
+                                // resume id we passed. `resume_accepted` = session id
+                                // we got back matches the id we asked for.
+                                let asked = self.options.resume_session_id.as_deref();
+                                let resume_accepted = match asked {
+                                    Some(asked_id)
+                                        if !asked_id.is_empty() && !session_id.is_empty() =>
+                                    {
+                                        asked_id == session_id
+                                    }
+                                    _ => false,
+                                };
+                                tracing::info!(
+                                    target: "turn_metrics",
+                                    provider = "claude",
+                                    session_id = %session_id,
+                                    resume_accepted,
+                                    "session_init"
+                                );
+                                // Hand the fresh session id to the observer so the TUI
+                                // can persist it on the Conversation and pass it back
+                                // via AgentOptions::resume_session_id on the next turn.
+                                if !session_id.is_empty() {
+                                    self.observer.on_claude_session_started(&session_id);
+                                }
+                            }
+                            StreamEvent::Unknown(_) => {}
+                        },
+                        Ok(None) => {
+                            if !full_text.is_empty() {
+                                self.observer.on_message_complete("assistant", &full_text);
                             } else {
-                                format!("Error: {}", result_text)
-                            };
-                            self.observer.on_message_complete("system", &msg);
-                        } else {
-                            if full_text.is_empty() && !result_text.is_empty() {
-                                full_text = result_text.clone();
-                            }
-                            self.observer.on_message_complete("assistant", &full_text);
-                        }
-                        break;
-                    }
-                    StreamEvent::PermissionRequest { tool_name, description, request_id } => {
-                        // Pause the pipeline: ask the observer (TUI) for a decision.
-                        // The session is not borrowed here so awaiting is safe.
-                        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-                        self.observer.on_permission_request(&tool_name, &description, tx);
-                        let allow = rx.await.unwrap_or(false);
-                        tracing::info!(
-                            "Permission request for '{}': {}",
-                            tool_name,
-                            if allow { "allowed" } else { "denied" }
-                        );
-                        session.respond_permission(allow, &request_id);
-                        idle_count = 0;
-                    }
-                    StreamEvent::SystemInit { session_id, .. } => {
-                        // M0 instrumentation: record whether Claude honored the
-                        // resume id we passed. `resume_accepted` = session id
-                        // we got back matches the id we asked for.
-                        let asked = self.options.resume_session_id.as_deref();
-                        let resume_accepted = match asked {
-                            Some(asked_id) if !asked_id.is_empty() && !session_id.is_empty() => {
-                                asked_id == session_id
-                            }
-                            _ => false,
-                        };
-                        tracing::info!(
-                            target: "turn_metrics",
-                            provider = "claude",
-                            session_id = %session_id,
-                            resume_accepted,
-                            "session_init"
-                        );
-                        // Hand the fresh session id to the observer so the TUI
-                        // can persist it on the Conversation and pass it back
-                        // via AgentOptions::resume_session_id on the next turn.
-                        if !session_id.is_empty() {
-                            self.observer.on_claude_session_started(&session_id);
-                        }
-                    }
-                    StreamEvent::Unknown(_) => {}
-                },
-                Ok(None) => {
-                    if !full_text.is_empty() {
-                        self.observer.on_message_complete("assistant", &full_text);
-                    } else {
-                        // Include stderr/unparsed stdout + exit status for diagnostics.
-                        // Wait for process to exit first so stderr drain task can finish.
-                        let exit_status = match tokio::time::timeout(
-                            PROCESS_WAIT_TIMEOUT,
-                            session.wait(),
-                        ).await {
-                            Ok(status) => status.ok(),
-                            Err(_) => {
-                                tracing::warn!("Process wait timed out on EOF, killing");
-                                session.kill();
-                                None
-                            }
-                        };
-                        tokio::task::yield_now().await;
-                        let stderr = session.stderr_output().await;
-                        let exit_info = match exit_status {
-                            Some(s) => format!(" (exit code: {})", s),
-                            None => String::new(),
-                        };
-                        let msg = if stderr.is_empty() {
-                            format!(
-                                "Claude process exited without output{}\n\
+                                // Include stderr/unparsed stdout + exit status for diagnostics.
+                                // Wait for process to exit first so stderr drain task can finish.
+                                let exit_status = match tokio::time::timeout(
+                                    PROCESS_WAIT_TIMEOUT,
+                                    session.wait(),
+                                )
+                                .await
+                                {
+                                    Ok(status) => status.ok(),
+                                    Err(_) => {
+                                        tracing::warn!("Process wait timed out on EOF, killing");
+                                        session.kill();
+                                        None
+                                    }
+                                };
+                                tokio::task::yield_now().await;
+                                let stderr = session.stderr_output().await;
+                                let exit_info = match exit_status {
+                                    Some(s) => format!(" (exit code: {})", s),
+                                    None => String::new(),
+                                };
+                                let msg = if stderr.is_empty() {
+                                    format!(
+                                        "Claude process exited without output{}\n\
                                  Check ~/.cache/gaviero/gaviero.log for details.",
-                                exit_info
-                            )
-                        } else {
-                            let base = format!("Claude CLI error{}:\n{}", exit_info, stderr);
-                            if is_auth_error(&stderr) {
-                                format!(
-                                    "{}\n\nTo re-authenticate, run `claude login` in a terminal, then retry.",
-                                    base
-                                )
-                            } else {
-                                base
+                                        exit_info
+                                    )
+                                } else {
+                                    let base =
+                                        format!("Claude CLI error{}:\n{}", exit_info, stderr);
+                                    if is_auth_error(&stderr) {
+                                        format!(
+                                            "{}\n\nTo re-authenticate, run `claude login` in a terminal, then retry.",
+                                            base
+                                        )
+                                    } else {
+                                        base
+                                    }
+                                };
+                                self.observer.on_message_complete("system", &msg);
                             }
-                        };
-                        self.observer.on_message_complete("system", &msg);
+                            break;
+                        }
+                        Err(e) => {
+                            self.observer
+                                .on_message_complete("system", &format!("Stream error: {}", e));
+                            break;
+                        }
                     }
-                    break;
-                }
-                Err(e) => {
-                    self.observer
-                        .on_message_complete("system", &format!("Stream error: {}", e));
-                    break;
-                }
-            }
                 }
             }
         }
@@ -479,7 +496,11 @@ impl AcpPipeline {
         let remaining = parse_file_blocks(&full_text[file_scan_pos..]);
         for (rel_path, content) in remaining {
             if let Err(e) = self.propose_write(&rel_path, &content).await {
-                tracing::error!("Failed to create proposal for {}: {}", rel_path.display(), e);
+                tracing::error!(
+                    "Failed to create proposal for {}: {}",
+                    rel_path.display(),
+                    e
+                );
             }
         }
 
@@ -518,9 +539,11 @@ impl AcpPipeline {
                 "Processing {} file snapshots for tool-based proposals",
                 total
             );
-            self.observer.on_streaming_status(
-                &format!("Processing {} file change{}...", total, if total == 1 { "" } else { "s" }),
-            );
+            self.observer.on_streaming_status(&format!(
+                "Processing {} file change{}...",
+                total,
+                if total == 1 { "" } else { "s" }
+            ));
             for (i, (abs_path, original)) in file_snapshots.iter().enumerate() {
                 let current = tokio::fs::read_to_string(&abs_path)
                     .await
@@ -531,13 +554,17 @@ impl AcpPipeline {
                 }
                 tracing::info!(
                     "File changed by tool: {} (orig={} bytes, new={} bytes)",
-                    abs_path.display(), original.len(), current.len()
+                    abs_path.display(),
+                    original.len(),
+                    current.len()
                 );
 
                 if total > 1 {
-                    self.observer.on_streaming_status(
-                        &format!("Processing file {}/{}...", i + 1, total),
-                    );
+                    self.observer.on_streaming_status(&format!(
+                        "Processing file {}/{}...",
+                        i + 1,
+                        total
+                    ));
                 }
 
                 // Revert the file to its original content on disk.
@@ -548,12 +575,14 @@ impl AcpPipeline {
                 }
 
                 // Now create a proposal through the write gate (in Deferred mode)
-                let rel_path = abs_path.strip_prefix(&self.workspace_root)
+                let rel_path = abs_path
+                    .strip_prefix(&self.workspace_root)
                     .unwrap_or(abs_path.as_path());
                 if let Err(e) = self.propose_write(rel_path, &current).await {
                     tracing::error!(
                         "Failed to create proposal for {}: {}",
-                        abs_path.display(), e
+                        abs_path.display(),
+                        e
                     );
                 }
             }
@@ -616,8 +645,15 @@ pub(crate) async fn propose_write(
             return Ok(());
         }
         // Also check deferred proposals for duplicates
-        if gate.pending_proposals().iter().any(|p| p.file_path == abs_path) {
-            tracing::debug!("Skipping duplicate deferred proposal for {}", rel_path.display());
+        if gate
+            .pending_proposals()
+            .iter()
+            .any(|p| p.file_path == abs_path)
+        {
+            tracing::debug!(
+                "Skipping duplicate deferred proposal for {}",
+                rel_path.display()
+            );
             return Ok(());
         }
         (gate.next_id(), gate.is_deferred())
@@ -633,17 +669,15 @@ pub(crate) async fn propose_write(
     };
 
     if original == proposed_content {
-        tracing::info!("propose_write: {} — content unchanged, skipping", rel_path.display());
+        tracing::info!(
+            "propose_write: {} — content unchanged, skipping",
+            rel_path.display()
+        );
         return Ok(());
     }
 
-    let proposal = WriteGatePipeline::build_proposal(
-        id,
-        agent_id,
-        &abs_path,
-        &original,
-        proposed_content,
-    );
+    let proposal =
+        WriteGatePipeline::build_proposal(id, agent_id, &abs_path, &original, proposed_content);
 
     if proposal.structural_hunks.is_empty() {
         tracing::info!(
@@ -655,7 +689,9 @@ pub(crate) async fn propose_write(
 
     tracing::info!(
         "propose_write: {} — {} hunks, is_deferred={}, inserting",
-        rel_path.display(), proposal.structural_hunks.len(), is_deferred
+        rel_path.display(),
+        proposal.structural_hunks.len(),
+        is_deferred
     );
 
     // 3. Insert proposal (single lock)
@@ -666,7 +702,11 @@ pub(crate) async fn propose_write(
 
     // 4. If deferred, notify observer for compact summary display
     if is_deferred {
-        let old = if original.is_empty() { None } else { Some(original.as_str()) };
+        let old = if original.is_empty() {
+            None
+        } else {
+            Some(original.as_str())
+        };
         observer.on_proposal_deferred(&abs_path, old, proposed_content);
     }
 
@@ -692,7 +732,11 @@ pub(crate) fn is_auth_error(text: &str) -> bool {
 }
 
 /// Format a one-line summary for a tool call, extracting key info from the input JSON.
-pub(crate) fn format_tool_summary(tool_name: &str, input: &serde_json::Value, workspace_root: &Path) -> String {
+pub(crate) fn format_tool_summary(
+    tool_name: &str,
+    input: &serde_json::Value,
+    workspace_root: &Path,
+) -> String {
     let get_str = |key: &str| input.get(key).and_then(|v| v.as_str());
 
     // Try to make paths relative for display
@@ -744,7 +788,11 @@ pub(crate) fn format_tool_summary(tool_name: &str, input: &serde_json::Value, wo
         "Bash" => {
             if let Some(cmd) = get_str("command") {
                 let short: String = cmd.chars().take(60).collect();
-                if cmd.len() > 60 { format!("Bash: {}...", short) } else { format!("Bash: {}", short) }
+                if cmd.len() > 60 {
+                    format!("Bash: {}...", short)
+                } else {
+                    format!("Bash: {}", short)
+                }
             } else {
                 "Bash".into()
             }

@@ -8,8 +8,8 @@ use unicode_width::UnicodeWidthChar;
 
 #[derive(Clone, Debug)]
 pub struct Cursor {
-    pub line: usize,   // 0-indexed line in rope
-    pub col: usize,    // 0-indexed grapheme offset within line
+    pub line: usize,                    // 0-indexed line in rope
+    pub col: usize,                     // 0-indexed grapheme offset within line
     pub anchor: Option<(usize, usize)>, // Selection start (line, col), None if no selection
 }
 
@@ -32,8 +32,15 @@ pub struct Scroll {
 /// All positions are **char indices** into the Rope (not byte offsets).
 #[derive(Clone, Debug)]
 pub enum Change {
-    Insert { pos: usize, text: String },
-    Delete { pos: usize, len: usize, deleted: String },
+    Insert {
+        pos: usize,
+        text: String,
+    },
+    Delete {
+        pos: usize,
+        len: usize,
+        deleted: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -133,13 +140,10 @@ impl Buffer {
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let text = Rope::from_str(&content);
 
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let language = gaviero_core::tree_sitter::language_for_extension(ext);
-        let lang_name = gaviero_core::tree_sitter::language_name_for_extension(ext)
-            .map(|s| s.to_string());
+        let lang_name =
+            gaviero_core::tree_sitter::language_name_for_extension(ext).map(|s| s.to_string());
 
         let (tree, parser) = if let Some(ref lang) = language {
             let mut parser = Parser::new();
@@ -216,11 +220,16 @@ impl Buffer {
             let inverse = match change {
                 Change::Insert { pos, text } => {
                     let char_len = text.chars().count();
-                    Change::Delete { pos: *pos, len: char_len, deleted: text.clone() }
+                    Change::Delete {
+                        pos: *pos,
+                        len: char_len,
+                        deleted: text.clone(),
+                    }
                 }
-                Change::Delete { pos, deleted, .. } => {
-                    Change::Insert { pos: *pos, text: deleted.clone() }
-                }
+                Change::Delete { pos, deleted, .. } => Change::Insert {
+                    pos: *pos,
+                    text: deleted.clone(),
+                },
             };
             self.notify_tree_edit(&inverse);
             match change {
@@ -332,10 +341,7 @@ impl Buffer {
         let indent_len = result.whitespace.len();
 
         let transaction = Transaction {
-            changes: vec![Change::Insert {
-                pos,
-                text,
-            }],
+            changes: vec![Change::Insert { pos, text }],
             cursor_before: self.cursor.clone(),
         };
         self.apply(transaction);
@@ -355,10 +361,7 @@ impl Buffer {
         let unit_len = unit.len();
         let pos = self.cursor_char_pos();
         let transaction = Transaction {
-            changes: vec![Change::Insert {
-                pos,
-                text: unit,
-            }],
+            changes: vec![Change::Insert { pos, text: unit }],
             cursor_before: self.cursor.clone(),
         };
         self.apply(transaction);
@@ -425,11 +428,12 @@ impl Buffer {
         let prev_char = self.text.char(pos - 1);
 
         // For CRLF: delete both \r and \n together
-        let (del_pos, del_len, del_text) = if prev_char == '\n' && pos >= 2 && self.text.char(pos - 2) == '\r' {
-            (pos - 2, 2, "\r\n".to_string())
-        } else {
-            (pos - 1, 1, prev_char.to_string())
-        };
+        let (del_pos, del_len, del_text) =
+            if prev_char == '\n' && pos >= 2 && self.text.char(pos - 2) == '\r' {
+                (pos - 2, 2, "\r\n".to_string())
+            } else {
+                (pos - 1, 1, prev_char.to_string())
+            };
 
         let transaction = Transaction {
             changes: vec![Change::Delete {
@@ -763,7 +767,9 @@ impl Buffer {
     fn format_compact(&mut self, lang: &str, content: &str) -> String {
         match lang {
             "json" => {
-                if let Some(formatted) = format_json_smart(content, &self.indent_unit, JsonCompactness::Compact) {
+                if let Some(formatted) =
+                    format_json_smart(content, &self.indent_unit, JsonCompactness::Compact)
+                {
                     return self.apply_formatted(content, &formatted, "compact");
                 }
             }
@@ -776,7 +782,11 @@ impl Buffer {
         }
         let expanded = expand_single_line_constructs(content, ExpandMode::BracesOnly);
         let split = self.split_fields_in_blocks(&expanded);
-        let split = if lang == "gaviero" { insert_declaration_separators(&split) } else { split };
+        let split = if lang == "gaviero" {
+            insert_declaration_separators(&split)
+        } else {
+            split
+        };
         let collapsed = collapse_multiline_constructs(&split);
         self.reindent_and_apply(content, &collapsed, "compact")
     }
@@ -785,7 +795,9 @@ impl Buffer {
     fn format_normal(&mut self, lang: &str, content: &str) -> String {
         match lang {
             "json" => {
-                if let Some(formatted) = format_json_smart(content, &self.indent_unit, JsonCompactness::Normal) {
+                if let Some(formatted) =
+                    format_json_smart(content, &self.indent_unit, JsonCompactness::Normal)
+                {
                     return self.apply_formatted(content, &formatted, "normal");
                 }
             }
@@ -793,7 +805,11 @@ impl Buffer {
         }
         let expanded = expand_single_line_constructs(content, ExpandMode::All);
         let split = self.split_fields_in_blocks(&expanded);
-        let split = if lang == "gaviero" { insert_declaration_separators(&split) } else { split };
+        let split = if lang == "gaviero" {
+            insert_declaration_separators(&split)
+        } else {
+            split
+        };
         let collapsed = collapse_multiline_constructs(&split);
         self.reindent_and_apply(content, &collapsed, "normal")
     }
@@ -802,7 +818,9 @@ impl Buffer {
     fn format_expanded(&mut self, lang: &str, content: &str) -> String {
         // Try external tools first
         let external_result = match lang {
-            "rust" => self.try_external_format("rustfmt", &["--edition".into(), "2024".into()], content),
+            "rust" => {
+                self.try_external_format("rustfmt", &["--edition".into(), "2024".into()], content)
+            }
             "python" => self.try_external_format("black", &["-q".into(), "-".into()], content),
             "c" | "cpp" => self.try_external_format("clang-format", &[], content),
             "java" => self.try_external_format("clang-format", &["--style=Google".into()], content),
@@ -814,7 +832,9 @@ impl Buffer {
         // JSON/TOML: standard pretty-print (one element per line)
         match lang {
             "json" => {
-                if let Some(formatted) = format_json_smart(content, &self.indent_unit, JsonCompactness::Expanded) {
+                if let Some(formatted) =
+                    format_json_smart(content, &self.indent_unit, JsonCompactness::Expanded)
+                {
                     return self.apply_formatted(content, &formatted, "expanded");
                 }
             }
@@ -827,7 +847,11 @@ impl Buffer {
         }
         let expanded = expand_single_line_constructs(content, ExpandMode::All);
         let split = self.split_fields_in_blocks(&expanded);
-        let split = if lang == "gaviero" { insert_declaration_separators(&split) } else { split };
+        let split = if lang == "gaviero" {
+            insert_declaration_separators(&split)
+        } else {
+            split
+        };
         self.reindent_and_apply(content, &split, "expanded")
     }
 
@@ -947,7 +971,9 @@ impl Buffer {
 
         // Expand to whole lines
         let start_line = self.text.char_to_line(sel_start);
-        let end_line = self.text.char_to_line(sel_end.saturating_sub(1).max(sel_start));
+        let end_line = self
+            .text
+            .char_to_line(sel_end.saturating_sub(1).max(sel_start));
 
         let content = self.text.to_string();
         let reindented = gaviero_core::indent::bracket::reindent_line_range(
@@ -962,7 +988,11 @@ impl Buffer {
         }
 
         self.cursor.anchor = None;
-        self.apply_formatted(&content, &reindented, &format!("re-indent lines {}-{}", start_line + 1, end_line + 1))
+        self.apply_formatted(
+            &content,
+            &reindented,
+            &format!("re-indent lines {}-{}", start_line + 1, end_line + 1),
+        )
     }
 
     // --- Internal helpers ---
@@ -1061,9 +1091,7 @@ impl Buffer {
     /// Get the selected text. Returns empty string if no selection.
     pub fn selected_text(&self) -> String {
         match self.selection_range() {
-            Some((start, end)) if start < end => {
-                self.text.slice(start..end).to_string()
-            }
+            Some((start, end)) if start < end => self.text.slice(start..end).to_string(),
             _ => String::new(),
         }
     }
@@ -1164,7 +1192,8 @@ impl Buffer {
             self.insert_text(lines.first().copied().unwrap_or(""));
         } else {
             // Determine the base indent of the pasted text (from first non-empty line)
-            let paste_base_indent = lines.iter()
+            let paste_base_indent = lines
+                .iter()
                 .find(|l| !l.trim().is_empty())
                 .map(|l| {
                     let trimmed = l.trim_start();
@@ -1309,7 +1338,10 @@ impl Buffer {
         }
         replacement.push_str(&prev_text);
         // Trim trailing newline if original didn't have one
-        if cur_end == self.text.len_chars() && replacement.ends_with('\n') && !deleted.ends_with('\n') {
+        if cur_end == self.text.len_chars()
+            && replacement.ends_with('\n')
+            && !deleted.ends_with('\n')
+        {
             replacement.pop();
         }
 
@@ -1356,7 +1388,10 @@ impl Buffer {
             replacement.push('\n');
         }
         replacement.push_str(&cur_text);
-        if next_end == self.text.len_chars() && replacement.ends_with('\n') && !deleted.ends_with('\n') {
+        if next_end == self.text.len_chars()
+            && replacement.ends_with('\n')
+            && !deleted.ends_with('\n')
+        {
             replacement.pop();
         }
 
@@ -1386,11 +1421,18 @@ impl Buffer {
         let line_start = self.text.line_to_char(line);
         let line_chars = self.text.line(line).len_chars();
         // End position is end of line content (before newline)
-        let end = line_start + if line_chars > 0 && self.text.line(line).as_str().map_or(false, |s| s.ends_with('\n')) {
-            line_chars - 1
-        } else {
-            line_chars
-        };
+        let end = line_start
+            + if line_chars > 0
+                && self
+                    .text
+                    .line(line)
+                    .as_str()
+                    .map_or(false, |s| s.ends_with('\n'))
+            {
+                line_chars - 1
+            } else {
+                line_chars
+            };
 
         if pos >= end {
             return;
@@ -1491,8 +1533,12 @@ impl Buffer {
         self.search_highlight = query;
         self.search_matches.clear();
 
-        let Some(ref q) = self.search_highlight else { return };
-        if q.is_empty() { return; }
+        let Some(ref q) = self.search_highlight else {
+            return;
+        };
+        if q.is_empty() {
+            return;
+        }
 
         let query_lower = q.to_lowercase();
         for line_idx in 0..self.text.len_lines() {
@@ -1517,9 +1563,10 @@ impl Buffer {
         }
         let (cl, cc) = (self.cursor.line, self.cursor.col);
         // Find the first match strictly after the cursor position
-        let next = self.search_matches.iter().find(|&&(l, c, _)| {
-            l > cl || (l == cl && c > cc)
-        });
+        let next = self
+            .search_matches
+            .iter()
+            .find(|&&(l, c, _)| l > cl || (l == cl && c > cc));
         let (line, col) = match next {
             Some(&(l, c, _)) => (l, c),
             None => {
@@ -1544,9 +1591,11 @@ impl Buffer {
         }
         let (cl, cc) = (self.cursor.line, self.cursor.col);
         // Find the last match strictly before the cursor position
-        let prev = self.search_matches.iter().rev().find(|&&(l, c, _)| {
-            l < cl || (l == cl && c < cc)
-        });
+        let prev = self
+            .search_matches
+            .iter()
+            .rev()
+            .find(|&&(l, c, _)| l < cl || (l == cl && c < cc));
         let (line, col) = match prev {
             Some(&(l, c, _)) => (l, c),
             None => {
@@ -1685,7 +1734,9 @@ fn treesitter_reindent(
 
     // Build capture map ONCE for the whole document instead of per-line.
     let capture_map = gaviero_core::indent::treesitter::build_document_capture_map(
-        tree, query, content.as_bytes(),
+        tree,
+        query,
+        content.as_bytes(),
     );
 
     let mut result = String::with_capacity(content.len());
@@ -1704,7 +1755,12 @@ fn treesitter_reindent(
             let prev_trimmed_len = prev_line_text.trim_end_matches('\n').len();
             let cursor_byte = rope.line_to_byte(i - 1) + prev_trimmed_len;
             let r = gaviero_core::indent::treesitter::indent_for_cursor(
-                &rope, tree, &capture_map, cursor_byte, 4, indent_unit,
+                &rope,
+                tree,
+                &capture_map,
+                cursor_byte,
+                4,
+                indent_unit,
             );
             r.level.max(0) as usize
         } else {
@@ -1723,7 +1779,10 @@ fn treesitter_reindent(
 
         // Compare actual whitespace against expected
         let expected_ws = indent_unit.repeat(expected_level);
-        let actual_ws: String = line.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+        let actual_ws: String = line
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
 
         if actual_ws == expected_ws {
             // Correct — keep the original line exactly as-is
@@ -2027,7 +2086,10 @@ fn collapse_multiline_constructs(content: &str) -> String {
 
                 // Only collapse if the result is reasonably short (< 100 chars)
                 if collapsed.trim().len() <= 100 {
-                    let indent: String = lines[i].chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+                    let indent: String = lines[i]
+                        .chars()
+                        .take_while(|c| *c == ' ' || *c == '\t')
+                        .collect();
                     result.push_str(&indent);
                     result.push_str(collapsed.trim());
                     result.push('\n');
@@ -2057,7 +2119,11 @@ fn collapse_multiline_constructs(content: &str) -> String {
 /// - All inner lines are simple (no nested multi-line blocks)
 /// - The close bracket is on its own line
 /// - No line comments in the inner content
-fn find_collapsible_block(lines: &[&str], start_line: usize, close_char: char) -> Option<(usize, String)> {
+fn find_collapsible_block(
+    lines: &[&str],
+    start_line: usize,
+    close_char: char,
+) -> Option<(usize, String)> {
     let mut depth = 1i32;
     let mut inner_parts: Vec<String> = Vec::new();
 
@@ -2125,7 +2191,11 @@ enum JsonCompactness {
 }
 
 /// Format JSON with configurable compactness.
-fn format_json_smart(content: &str, indent_unit: &str, compactness: JsonCompactness) -> Option<String> {
+fn format_json_smart(
+    content: &str,
+    indent_unit: &str,
+    compactness: JsonCompactness,
+) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(content).ok()?;
     let mut result = String::new();
     json_write_value(&value, &mut result, 0, indent_unit, &compactness);
@@ -2174,7 +2244,8 @@ fn json_write_value(
                     // Inline if all elements are simple (not objects/arrays)
                     // and the result would be short
                     let all_simple = arr.iter().all(|v| !v.is_object() && !v.is_array());
-                    let est_len: usize = arr.iter().map(|v| estimate_json_len(v)).sum::<usize>() + arr.len() * 2 + 2;
+                    let est_len: usize =
+                        arr.iter().map(|v| estimate_json_len(v)).sum::<usize>() + arr.len() * 2 + 2;
                     all_simple && est_len <= 80
                 }
                 JsonCompactness::Expanded => false,
@@ -2183,7 +2254,9 @@ fn json_write_value(
             if inline {
                 out.push('[');
                 for (i, v) in arr.iter().enumerate() {
-                    if i > 0 { out.push_str(", "); }
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
                     json_write_value(v, out, depth + 1, indent_unit, compactness);
                 }
                 out.push(']');
@@ -2192,7 +2265,9 @@ fn json_write_value(
                 for (i, v) in arr.iter().enumerate() {
                     push_indent(out, depth + 1, indent_unit);
                     json_write_value(v, out, depth + 1, indent_unit, compactness);
-                    if i + 1 < arr.len() { out.push(','); }
+                    if i + 1 < arr.len() {
+                        out.push(',');
+                    }
                     out.push('\n');
                 }
                 push_indent(out, depth, indent_unit);
@@ -2209,7 +2284,11 @@ fn json_write_value(
                 JsonCompactness::Compact => {
                     // Inline if all values are simple and result is short
                     let all_simple = obj.values().all(|v| !v.is_object() && !v.is_array());
-                    let est_len: usize = obj.iter().map(|(k, v)| k.len() + 4 + estimate_json_len(v)).sum::<usize>() + 2;
+                    let est_len: usize = obj
+                        .iter()
+                        .map(|(k, v)| k.len() + 4 + estimate_json_len(v))
+                        .sum::<usize>()
+                        + 2;
                     all_simple && est_len <= 80
                 }
                 JsonCompactness::Normal | JsonCompactness::Expanded => false,
@@ -2218,7 +2297,9 @@ fn json_write_value(
             if inline {
                 out.push('{');
                 for (i, (k, v)) in obj.iter().enumerate() {
-                    if i > 0 { out.push_str(", "); }
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
                     out.push('"');
                     out.push_str(k);
                     out.push_str("\": ");
@@ -2234,7 +2315,9 @@ fn json_write_value(
                     out.push_str(k);
                     out.push_str("\": ");
                     json_write_value(v, out, depth + 1, indent_unit, compactness);
-                    if i + 1 < len { out.push(','); }
+                    if i + 1 < len {
+                        out.push(',');
+                    }
                     out.push('\n');
                 }
                 push_indent(out, depth, indent_unit);
@@ -2248,11 +2331,24 @@ fn json_write_value(
 fn estimate_json_len(v: &serde_json::Value) -> usize {
     match v {
         serde_json::Value::Null => 4,
-        serde_json::Value::Bool(b) => if *b { 4 } else { 5 },
+        serde_json::Value::Bool(b) => {
+            if *b {
+                4
+            } else {
+                5
+            }
+        }
         serde_json::Value::Number(n) => n.to_string().len(),
         serde_json::Value::String(s) => s.len() + 2,
-        serde_json::Value::Array(a) => a.iter().map(|v| estimate_json_len(v) + 2).sum::<usize>() + 2,
-        serde_json::Value::Object(o) => o.iter().map(|(k, v)| k.len() + 4 + estimate_json_len(v)).sum::<usize>() + 2,
+        serde_json::Value::Array(a) => {
+            a.iter().map(|v| estimate_json_len(v) + 2).sum::<usize>() + 2
+        }
+        serde_json::Value::Object(o) => {
+            o.iter()
+                .map(|(k, v)| k.len() + 4 + estimate_json_len(v))
+                .sum::<usize>()
+                + 2
+        }
     }
 }
 
@@ -2531,11 +2627,7 @@ mod tests {
 
 /// Collect text of all "number" nodes in the tree via DFS.
 #[allow(dead_code)]
-fn collect_numbers(
-    node: gaviero_core::Node,
-    source: &[u8],
-    out: &mut Vec<String>,
-) {
+fn collect_numbers(node: gaviero_core::Node, source: &[u8], out: &mut Vec<String>) {
     if node.kind() == "number" {
         if let Ok(text) = node.utf8_text(source) {
             out.push(text.to_string());

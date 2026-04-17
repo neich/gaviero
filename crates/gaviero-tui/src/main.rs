@@ -19,7 +19,10 @@ use app::App;
 use event::EventLoop;
 
 #[derive(Parser)]
-#[command(name = "gaviero", about = "Terminal code editor for AI agent orchestration")]
+#[command(
+    name = "gaviero",
+    about = "Terminal code editor for AI agent orchestration"
+)]
 struct Cli {
     /// Path to open (directory or .gaviero-workspace file)
     #[arg(default_value = ".")]
@@ -57,10 +60,9 @@ async fn main() -> Result<()> {
     let log_dir = dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("gaviero");
-    std::fs::create_dir_all(&log_dir)
-        .context("creating log directory")?;
-    let log_file = std::fs::File::create(log_dir.join("gaviero.log"))
-        .context("creating log file")?;
+    std::fs::create_dir_all(&log_dir).context("creating log directory")?;
+    let log_file =
+        std::fs::File::create(log_dir.join("gaviero.log")).context("creating log file")?;
     tracing_subscriber::fmt()
         .with_writer(std::sync::Mutex::new(log_file))
         .with_max_level(tracing::Level::DEBUG)
@@ -71,7 +73,10 @@ async fn main() -> Result<()> {
     let path = std::fs::canonicalize(&cli.path)
         .with_context(|| format!("resolving path: {}", cli.path.display()))?;
 
-    let workspace = if path.extension().is_some_and(|ext| ext == "gaviero-workspace") {
+    let workspace = if path
+        .extension()
+        .is_some_and(|ext| ext == "gaviero-workspace")
+    {
         gaviero_core::workspace::Workspace::load(&path)?
     } else {
         gaviero_core::workspace::Workspace::single_folder(path)
@@ -89,8 +94,13 @@ async fn main() -> Result<()> {
     // Terminal setup
     enable_raw_mode().context("enabling raw mode")?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)
-        .context("entering alternate screen")?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )
+    .context("entering alternate screen")?;
 
     // RAII guard: if anything below returns Err via `?`, the terminal
     // is still restored when `_guard` is dropped.

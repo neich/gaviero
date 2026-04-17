@@ -212,7 +212,9 @@ impl SessionLedger {
             turn_count: self.turn_count,
             replay_history: self.replay_history.clone(),
             last_successful_resume_unix: self.last_successful_resume.and_then(|t| {
-                t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs())
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_secs())
             }),
         }
     }
@@ -263,7 +265,7 @@ impl SessionLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context_planner::types::{build_provider_profile, ModelSpec, RuntimeConfig};
+    use crate::context_planner::types::{ModelSpec, RuntimeConfig, build_provider_profile};
 
     fn fixture_ledger() -> SessionLedger {
         let profile = build_provider_profile(
@@ -359,11 +361,10 @@ mod tests {
         assert!(json.contains("ClaudeSessionId"));
 
         let back: PersistedLedger = serde_json::from_str(&json).unwrap();
-        let profile =
-            crate::context_planner::types::build_provider_profile(
-                &crate::context_planner::types::ModelSpec::parse("claude-code:sonnet"),
-                &crate::context_planner::types::RuntimeConfig::default(),
-            );
+        let profile = crate::context_planner::types::build_provider_profile(
+            &crate::context_planner::types::ModelSpec::parse("claude-code:sonnet"),
+            &crate::context_planner::types::RuntimeConfig::default(),
+        );
         let restored = SessionLedger::from_persisted(back, &profile);
 
         assert_eq!(restored.turn_count, 2);

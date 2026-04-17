@@ -277,7 +277,10 @@ mod tests {
         let scope = FileScope {
             owned_paths: vec!["src/".into()],
             read_only_paths: vec!["Cargo.toml".into()],
-            interface_contracts: HashMap::from([("api::Client".into(), "pub fn connect(&self) -> Result<()>".into())]),
+            interface_contracts: HashMap::from([(
+                "api::Client".into(),
+                "pub fn connect(&self) -> Result<()>".into(),
+            )]),
         };
         let clause = scope.to_prompt_clause();
         assert!(clause.contains("Owned paths"));

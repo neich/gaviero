@@ -1,20 +1,19 @@
-pub mod embedder;
-pub mod schema;
-pub mod onnx_embedder;
-pub mod store;
-pub mod model_manager;
 pub mod consolidation;
+pub mod embedder;
+pub mod model_manager;
+pub mod onnx_embedder;
+pub mod schema;
 pub mod scope;
 pub mod scoring;
+pub mod store;
 
 pub use embedder::Embedder;
-pub use store::{MemoryStore, StoreOptions};
 pub use model_manager::ModelManager;
 pub use scope::{
-    MemoryScope, WriteScope, ScopeFilter, WriteMeta, StoreResult, Trust, MemoryType,
-    hash_path,
+    MemoryScope, MemoryType, ScopeFilter, StoreResult, Trust, WriteMeta, WriteScope, hash_path,
 };
-pub use scoring::{SearchConfig, ScoredMemory, format_memories_for_prompt};
+pub use scoring::{ScoredMemory, SearchConfig, format_memories_for_prompt};
+pub use store::{MemoryStore, StoreOptions};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,9 +34,9 @@ pub fn init(db_path: Option<&Path>) -> anyhow::Result<Arc<MemoryStore>> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let embedder = Arc::new(
-        onnx_embedder::OnnxEmbedder::from_model(&model_manager::NOMIC_EMBED_TEXT_V1_5)?
-    ) as Arc<dyn Embedder>;
+    let embedder = Arc::new(onnx_embedder::OnnxEmbedder::from_model(
+        &model_manager::NOMIC_EMBED_TEXT_V1_5,
+    )?) as Arc<dyn Embedder>;
 
     let store = MemoryStore::open(&db, embedder)?;
     Ok(Arc::new(store))

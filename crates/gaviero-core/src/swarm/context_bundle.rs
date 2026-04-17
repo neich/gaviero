@@ -81,9 +81,7 @@ pub async fn build_bundle(
     read_namespaces: &[String],
     memory_limit: usize,
 ) -> SwarmContextBundle {
-    let shared_memory = if let (Some(mem), false) =
-        (memory, read_namespaces.is_empty())
-    {
+    let shared_memory = if let (Some(mem), false) = (memory, read_namespaces.is_empty()) {
         tracing::info!(
             target: "turn_metrics",
             kind = "swarm_bundle",
@@ -154,7 +152,9 @@ mod tests {
             test_gaps: vec![],
             truncated: false,
         };
-        let slice = GraphSlice { impact: Some(impact) };
+        let slice = GraphSlice {
+            impact: Some(impact),
+        };
         let imp = slice.impact.unwrap();
         assert_eq!(imp.affected_files.len(), 2);
         assert!(!imp.truncated);

@@ -30,7 +30,11 @@ pub struct FileTreeState {
 
 impl FileTreeState {
     /// Build the file tree from workspace roots.
-    pub fn from_roots(roots: &[&Path], exclude_patterns: &[String], git_allow_list: &[String]) -> Self {
+    pub fn from_roots(
+        roots: &[&Path],
+        exclude_patterns: &[String],
+        git_allow_list: &[String],
+    ) -> Self {
         let mut entries = Vec::new();
 
         for root in roots {
@@ -76,7 +80,8 @@ impl FileTreeState {
         let depth = self.entries[index].depth + 1;
 
         // Check if this is a .git directory (apply allowlist instead of denylist)
-        let is_git_dir = parent_path.file_name()
+        let is_git_dir = parent_path
+            .file_name()
             .map(|n| n == ".git")
             .unwrap_or(false);
 
@@ -188,20 +193,31 @@ impl FileTreeState {
     pub fn toggle_expand(&mut self) {
         let idx = self.scroll.selected;
         if idx >= self.entries.len() {
-            tracing::debug!("toggle_expand: idx {} out of range ({})", idx, self.entries.len());
+            tracing::debug!(
+                "toggle_expand: idx {} out of range ({})",
+                idx,
+                self.entries.len()
+            );
             return;
         }
 
         let entry = &self.entries[idx];
         tracing::debug!(
             "toggle_expand: idx={}, name={}, is_dir={}, expanded={}, children_loaded={}",
-            idx, entry.name, entry.is_dir, entry.expanded, entry.children_loaded
+            idx,
+            entry.name,
+            entry.is_dir,
+            entry.expanded,
+            entry.children_loaded
         );
 
         if self.entries[idx].is_dir {
             if self.entries[idx].expanded {
                 self.collapse(idx);
-                tracing::debug!("toggle_expand: collapsed, entries now: {}", self.entries.len());
+                tracing::debug!(
+                    "toggle_expand: collapsed, entries now: {}",
+                    self.entries.len()
+                );
             } else {
                 self.entries[idx].expanded = true;
                 if !self.entries[idx].children_loaded {
@@ -218,7 +234,9 @@ impl FileTreeState {
 
     /// Get the path of the selected entry (for opening files).
     pub fn selected_path(&self) -> Option<&Path> {
-        self.entries.get(self.scroll.selected).map(|e| e.path.as_path())
+        self.entries
+            .get(self.scroll.selected)
+            .map(|e| e.path.as_path())
     }
 
     /// Is the selected entry a file?
@@ -292,7 +310,13 @@ impl FileTreeState {
     /// Render the file tree into the given area.
     /// NOTE: takes &mut self to auto-scroll the selection into view.
     /// `move_source` highlights the file being moved (SelectingDest / Confirming states).
-    pub fn render(&mut self, area: Rect, buf: &mut Buffer, focused: bool, move_source: Option<&std::path::Path>) {
+    pub fn render(
+        &mut self,
+        area: Rect,
+        buf: &mut Buffer,
+        focused: bool,
+        move_source: Option<&std::path::Path>,
+    ) {
         let border_style = if focused {
             Style::default().fg(theme::FOCUS_BORDER)
         } else {
@@ -310,7 +334,10 @@ impl FileTreeState {
         self.scroll.set_viewport(viewport);
         self.scroll.ensure_visible();
 
-        let visible_entries = self.entries.iter().enumerate()
+        let visible_entries = self
+            .entries
+            .iter()
+            .enumerate()
             .skip(self.scroll.offset)
             .take(viewport);
 

@@ -3,12 +3,18 @@ use anyhow::Result;
 use crate::context_planner::PlannerSelections;
 use crate::types::FileScope;
 
-use super::{create_backend, AgentBackend, BackendConfig, Capabilities, CompletionRequest};
+use super::{AgentBackend, BackendConfig, Capabilities, CompletionRequest, create_backend};
 
 const HISTORY_TRUNCATION_CHARS: usize = 2000;
 const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
-const SUPPORTED_PROVIDER_PREFIXES: &[&str] =
-    &["claude", "claude-code", "codex", "codex-cli", "ollama", "local"];
+const SUPPORTED_PROVIDER_PREFIXES: &[&str] = &[
+    "claude",
+    "claude-code",
+    "codex",
+    "codex-cli",
+    "ollama",
+    "local",
+];
 
 pub fn build_enriched_prompt(
     prompt: &str,
@@ -83,7 +89,11 @@ pub fn backend_config_for_model(model_spec: &str, ollama_base_url: Option<&str>)
     {
         let m = model.trim();
         return BackendConfig::Codex {
-            model: if m.is_empty() { None } else { Some(m.to_string()) },
+            model: if m.is_empty() {
+                None
+            } else {
+                Some(m.to_string())
+            },
         };
     }
 
@@ -250,10 +260,7 @@ pub fn render_memory_block(
             let score = m.score.unwrap_or(0.0);
             // Trailing newline matches the legacy
             // `MemoryStore::search_context` format exactly.
-            block.push_str(&format!(
-                "- [{}] {} (score: {:.2})\n",
-                ns, m.content, score
-            ));
+            block.push_str(&format!("- [{}] {} (score: {:.2})\n", ns, m.content, score));
         }
         chunks.push(block);
     }
@@ -451,7 +458,9 @@ mod tests {
         let task = "implement foo";
         let outline = "[Repo outline]\nfile1.rs\nfile2.rs";
         let mut selections = PlannerSelections::default();
-        selections.graph_selections.push(graph_outline_selection(outline, 2000));
+        selections
+            .graph_selections
+            .push(graph_outline_selection(outline, 2000));
 
         let rendered = render_swarm_prompt(&selections, &scope, task);
         let legacy = legacy_build_prompt_equivalent(Some(outline), None, None, &scope, task);
@@ -521,7 +530,8 @@ mod tests {
         ));
 
         let rendered = render_swarm_prompt(&sel, &scope, "the task");
-        let expected = "## Repository context:\n  [owned] src/lib.rs\n  src/util.rs (foo, bar)\n\nthe task";
+        let expected =
+            "## Repository context:\n  [owned] src/lib.rs\n  src/util.rs (foo, bar)\n\nthe task";
         assert_eq!(rendered, expected);
     }
 
@@ -613,13 +623,11 @@ mod tests {
         selections.memory_selections.push(memory_selection(memory));
 
         let rendered = render_swarm_prompt(&selections, &scope, task);
-        let legacy = legacy_build_prompt_equivalent(
-            Some(outline),
-            Some(impact),
-            Some(memory),
-            &scope,
-            task,
+        let legacy =
+            legacy_build_prompt_equivalent(Some(outline), Some(impact), Some(memory), &scope, task);
+        assert_eq!(
+            rendered, legacy,
+            "swarm adapter must be byte-identical to legacy build_prompt"
         );
-        assert_eq!(rendered, legacy, "swarm adapter must be byte-identical to legacy build_prompt");
     }
 }

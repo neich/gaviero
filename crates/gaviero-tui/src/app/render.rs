@@ -92,19 +92,24 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
         .get(app.active_buffer)
         .map(|b| b.display_name().to_string())
         .unwrap_or_else(|| "EDITOR".to_string());
-    let (_editor_header, editor_content) =
-        App::render_panel_header(frame, editor_full_area, &editor_title, editor_focused, false);
+    let (_editor_header, editor_content) = App::render_panel_header(
+        frame,
+        editor_full_area,
+        &editor_title,
+        editor_focused,
+        false,
+    );
 
-    let (actual_editor_area, preview_area) = if app.preview_visible && app.is_current_buffer_markdown()
-    {
-        let split = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(editor_content);
-        (split[0], Some(split[1]))
-    } else {
-        (editor_content, None)
-    };
+    let (actual_editor_area, preview_area) =
+        if app.preview_visible && app.is_current_buffer_markdown() {
+            let split = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(editor_content);
+            (split[0], Some(split[1]))
+        } else {
+            (editor_content, None)
+        };
 
     app.layout.editor_area = actual_editor_area;
     app.render_editor(frame, actual_editor_area);
@@ -300,7 +305,12 @@ pub(super) fn render_editor(app: &mut App, frame: &mut Frame, area: Rect) {
         .as_ref()
         .and_then(|name| app.highlight_configs.get(name));
 
-    let view = EditorView::new(buf, &app.theme, highlight_config, app.focus == Focus::Editor);
+    let view = EditorView::new(
+        buf,
+        &app.theme,
+        highlight_config,
+        app.focus == Focus::Editor,
+    );
     view.render(editor_area, frame.buffer_mut());
 }
 
@@ -379,7 +389,12 @@ pub(super) fn render_find_bar(app: &App, frame: &mut Frame, area: Rect) {
     }
 }
 
-pub(super) fn render_tree_dialog(_app: &App, frame: &mut Frame, tree_area: Rect, dialog: &TreeDialog) {
+pub(super) fn render_tree_dialog(
+    _app: &App,
+    frame: &mut Frame,
+    tree_area: Rect,
+    dialog: &TreeDialog,
+) {
     let dialog_height: u16 = 2;
     if tree_area.height < dialog_height + 2 {
         return;
@@ -393,9 +408,7 @@ pub(super) fn render_tree_dialog(_app: &App, frame: &mut Frame, tree_area: Rect,
         height: dialog_height,
     };
 
-    let bg_style = Style::default()
-        .fg(theme::TEXT_BRIGHT)
-        .bg(theme::INPUT_BG);
+    let bg_style = Style::default().fg(theme::TEXT_BRIGHT).bg(theme::INPUT_BG);
 
     for row in 0..dialog_area.height {
         for col in 0..dialog_area.width {
@@ -409,21 +422,19 @@ pub(super) fn render_tree_dialog(_app: &App, frame: &mut Frame, tree_area: Rect,
         }
     }
 
-    let sep_style = Style::default()
-        .fg(theme::FOCUS_BORDER)
-        .bg(theme::INPUT_BG);
+    let sep_style = Style::default().fg(theme::FOCUS_BORDER).bg(theme::INPUT_BG);
     for col in 0..dialog_area.width {
         let cx = dialog_area.x + col;
         if cx < frame.area().right() {
-            frame.buffer_mut()[(cx, y)].set_char('─').set_style(sep_style);
+            frame.buffer_mut()[(cx, y)]
+                .set_char('─')
+                .set_style(sep_style);
         }
     }
 
     let input_y = y + 1;
     let prompt = dialog.prompt();
-    let prompt_style = Style::default()
-        .fg(theme::FOCUS_BORDER)
-        .bg(theme::INPUT_BG);
+    let prompt_style = Style::default().fg(theme::FOCUS_BORDER).bg(theme::INPUT_BG);
 
     let mut x = dialog_area.x;
     for ch in prompt.chars() {
@@ -449,7 +460,9 @@ pub(super) fn render_tree_dialog(_app: &App, frame: &mut Frame, tree_area: Rect,
     };
     for ch in display_text.chars() {
         if x < dialog_area.x + dialog_area.width {
-            frame.buffer_mut()[(x, input_y)].set_char(ch).set_style(bg_style);
+            frame.buffer_mut()[(x, input_y)]
+                .set_char(ch)
+                .set_style(bg_style);
             x += 1;
         }
     }
@@ -502,7 +515,9 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
         for (i, ch) in status_text.chars().enumerate() {
             let x = area.x + i as u16;
             if x < area.right() {
-                frame.buffer_mut()[(x, area.y)].set_char(ch).set_style(style);
+                frame.buffer_mut()[(x, area.y)]
+                    .set_char(ch)
+                    .set_style(style);
             }
         }
         for x in (area.x + status_text.len() as u16)..area.right() {
@@ -522,7 +537,9 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
         for (i, ch) in status_text.chars().enumerate() {
             let x = area.x + i as u16;
             if x < area.right() {
-                frame.buffer_mut()[(x, area.y)].set_char(ch).set_style(style);
+                frame.buffer_mut()[(x, area.y)]
+                    .set_char(ch)
+                    .set_style(style);
             }
         }
         for x in (area.x + status_text.len() as u16)..area.right() {
@@ -820,16 +837,24 @@ pub(super) fn render_markdown_preview(app: &App, frame: &mut Frame, area: Rect) 
 pub(super) fn render_side_panel(app: &mut App, frame: &mut Frame, area: Rect) {
     match app.side_panel {
         SidePanelMode::AgentChat => {
-            app.chat_state
-                .render(area, frame.buffer_mut(), app.focus == Focus::SidePanel, &app.theme);
+            app.chat_state.render(
+                area,
+                frame.buffer_mut(),
+                app.focus == Focus::SidePanel,
+                &app.theme,
+            );
         }
         SidePanelMode::SwarmDashboard => {
             app.swarm_dashboard
                 .render(area, frame.buffer_mut(), app.focus == Focus::SidePanel);
         }
         SidePanelMode::GitPanel => {
-            app.git_panel
-                .render(area, frame.buffer_mut(), app.focus == Focus::SidePanel, &app.theme);
+            app.git_panel.render(
+                area,
+                frame.buffer_mut(),
+                app.focus == Focus::SidePanel,
+                &app.theme,
+            );
         }
     }
 }

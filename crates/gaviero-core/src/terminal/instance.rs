@@ -79,10 +79,7 @@ impl TerminalInstance {
     }
 
     /// Spawn the shell subprocess and start the reader task.
-    pub fn spawn(
-        &mut self,
-        event_tx: mpsc::Sender<TerminalEvent>,
-    ) -> Result<()> {
+    pub fn spawn(&mut self, event_tx: mpsc::Sender<TerminalEvent>) -> Result<()> {
         if self.spawned {
             return Ok(());
         }

@@ -11,6 +11,12 @@ client codex {
     privacy public
 }
 
+client sonnet {
+    tier cheap
+    model "claude-sonnet-4-6"
+    privacy public
+}
+
 // ── Shared configuration ──────────────────────────────────────────────────────
 //
 // INIT_VER: the version written by the init phase; read by the first loop pass
@@ -24,11 +30,13 @@ vars {
 // ── Prompts ───────────────────────────────────────────────────────────────────
 //
 // Two focused prompts: one for independent initial planning, one for
-// cross-model synthesis.
+// cross-model synthesis, and one for convergence judgment.
 //
 //   Init agents:   MODEL_NAME set per-agent; writes v{{INIT_VER}}
 //   Refine agents: MODEL_NAME + PEER_NAME set per-agent; reads v{{PREV_ITER}},
 //                  writes v{{ITER}} — all injected by the DSL at runtime
+//   Judge agent:   reads v{{ITER}} (and optionally v{{PREV_ITER}}) and must
+//                  emit `VERDICT: PASS` or `VERDICT: FAIL`
 
 prompt init-body #"
     You are producing an independent architecture plan for:
@@ -67,6 +75,42 @@ prompt refine-body #"
        {{PLANS}}/{{MODEL_NAME}}-summary-v{{ITER}}.md covering the main
        differences between the two v{{PREV_ITER}} plans and the key choices
        made in this version. Write it for a human skimming the evolution.
+"#
+
+prompt judge-body #"
+    You are deciding whether two independently refined architecture plans have
+    converged for:
+
+    {{PROMPT}}
+
+    {{ITER_EVIDENCE}}
+
+    The digest above lists what the refine agents actually changed this
+    iteration. Use it to focus your reading — if a file is not listed there
+    it did not change this pass.
+
+    1. Read {{PLANS}}/claude-plan-v{{ITER}}.md and
+       {{PLANS}}/codex-plan-v{{ITER}}.md in full.
+    2. Read {{PLANS}}/claude-summary-v{{ITER}}.md and
+       {{PLANS}}/codex-summary-v{{ITER}}.md.
+    3. If useful, compare against v{{PREV_ITER}} to judge whether the latest
+       changes are still material.
+    4. Return PASS only if:
+       - the two current plans agree on the core architecture and major
+         implementation steps,
+       - any remaining differences are low-impact editorial refinements,
+       - the newest iteration made minor refinements rather than material
+         design changes.
+    5. Otherwise return FAIL.
+
+    Output format — emit exactly one fenced JSON object as your last output:
+
+    ```json
+    {"verdict": "pass" | "fail", "reason": "<one short paragraph>"}
+    ```
+
+    A plain `VERDICT: PASS` / `VERDICT: FAIL` line is also accepted as a
+    fallback, but the JSON form is preferred for machine-parseability.
 "#
 
 // ── Agents ────────────────────────────────────────────────────────────────────
@@ -127,19 +171,46 @@ agent codex-refine {
     }
 }
 
+agent convergence-judge {
+    description "Judge plan convergence: {{PROMPT}}"
+    client sonnet
+    scope {
+        read_only ["plans/"]
+    }
+    prompt judge-body
+}
+
 // ── Workflow ──────────────────────────────────────────────────────────────────
 //
 // Phase 1 (parallel): claude-init and codex-init each write an independent v1
 // plan from first principles with no cross-reading.
 //
-// Phase 2 (loop x5, parallel): claude-refine and codex-refine run in parallel
-// each iteration. Both read the previous pair (v{{PREV_ITER}}) and write a
-// new synthesised plan (v{{ITER}}) plus a summary of choices made.
+// Phase 2 (loop up to x10): claude-refine and codex-refine repeatedly read the
+// previous pair (v{{PREV_ITER}}) and write a new synthesised plan (v{{ITER}})
+// plus a summary of choices made.
+//
+// After each pass, convergence-judge evaluates the latest pair. Judge-control
+// knobs (all optional; shown here with explicit values for documentation):
+//
+//   stability 2      → require 2 consecutive PASS verdicts before exiting.
+//                      A single PASS is treated as provisional: the refine
+//                      agents run one more pass and the judge re-evaluates.
+//                      This guards against a flaky "looks good" verdict on
+//                      a plan that is still materially evolving.
+//   judge_timeout 90 → hard cap each judge invocation at 90s (0 disables).
+//   strict_judge true → unparseable judge output fails the iteration loudly
+//                       instead of silently being treated as FAIL. The judge
+//                       prompt above commits to a JSON-object verdict, so
+//                       any drift is worth surfacing.
+//
+// The judge prompt also uses `{{ITER_EVIDENCE}}`: the runtime substitutes a
+// bounded digest of the refine agents' most recent summaries and modified
+// files so the judge can focus on what actually changed this pass.
 //
 // iter_start 2: loop iteration 1 → ITER=2, PREV_ITER=1 (reads v1 init plans)
 //               loop iteration 2 → ITER=3, PREV_ITER=2
 //               ...
-//               loop iteration 5 → ITER=6, PREV_ITER=5
+//               loop iteration 10 → ITER=11, PREV_ITER=10
 
 workflow feature-plan-refinement {
     steps [
@@ -147,9 +218,12 @@ workflow feature-plan-refinement {
         codex-init
         loop {
             agents         [claude-refine codex-refine]
-            max_iterations 5
+            max_iterations 10
             iter_start     2
-            until command  "false"
+            stability      2
+            judge_timeout  90
+            strict_judge   true
+            until agent    convergence-judge
         }
     ]
     max_parallel 2

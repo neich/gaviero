@@ -355,7 +355,11 @@ mod tests {
         assert_eq!(turn.graph_selections.len(), snapshot.graph_selections.len());
         // GraphSelection contains `GraphConfidence` which lacks PartialEq by
         // default — compare the non-confidence fields explicitly.
-        for (a, b) in turn.graph_selections.iter().zip(snapshot.graph_selections.iter()) {
+        for (a, b) in turn
+            .graph_selections
+            .iter()
+            .zip(snapshot.graph_selections.iter())
+        {
             assert_eq!(a.path, b.path);
             assert_eq!(a.kind, b.kind);
             assert_eq!(a.token_estimate, b.token_estimate);

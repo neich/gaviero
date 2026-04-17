@@ -10,7 +10,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
-use super::backend::{executor, shared, CompletionRequest};
+use super::backend::{CompletionRequest, executor, shared};
 use super::models::{MergeConflict, MergeResult};
 
 /// Merge an agent branch into the current branch.
@@ -122,7 +122,10 @@ fn complete_merge(repo_dir: &Path, branch: &str) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git commit after conflict resolution failed: {}", stderr.trim());
+        anyhow::bail!(
+            "git commit after conflict resolution failed: {}",
+            stderr.trim()
+        );
     }
     Ok(())
 }
@@ -153,15 +156,7 @@ pub async fn auto_resolve_conflicts(
             content,
         );
 
-        match resolve_single_file(
-            repo_dir,
-            &conflict.file,
-            &prompt,
-            model,
-            ollama_base_url,
-        )
-        .await
-        {
+        match resolve_single_file(repo_dir, &conflict.file, &prompt, model, ollama_base_url).await {
             Ok(resolved_content) => {
                 resolve_conflict(repo_dir, &conflict.file, &resolved_content)?;
                 resolved_conflicts.push(MergeConflict {

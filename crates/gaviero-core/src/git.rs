@@ -80,9 +80,13 @@ impl GitRepo {
 
     /// Create a new branch pointing at HEAD.
     pub fn create_branch(&self, name: &str) -> Result<()> {
-        let head_commit = self.repo.head()?.peel_to_commit()
+        let head_commit = self
+            .repo
+            .head()?
+            .peel_to_commit()
             .context("resolving HEAD to commit")?;
-        self.repo.branch(name, &head_commit, false)
+        self.repo
+            .branch(name, &head_commit, false)
             .with_context(|| format!("creating branch '{}'", name))?;
         Ok(())
     }
@@ -91,7 +95,9 @@ impl GitRepo {
     pub fn is_clean(&self) -> Result<bool> {
         let mut opts = git2::StatusOptions::new();
         opts.include_untracked(true);
-        let statuses = self.repo.statuses(Some(&mut opts))
+        let statuses = self
+            .repo
+            .statuses(Some(&mut opts))
             .context("checking repo status")?;
         Ok(statuses.is_empty())
     }
@@ -99,7 +105,8 @@ impl GitRepo {
     /// Stage all changes and create a commit.
     pub fn commit_all(&self, message: &str) -> Result<git2::Oid> {
         let mut index = self.repo.index().context("reading index")?;
-        index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
             .context("staging all files")?;
         index.write().context("writing index")?;
 
@@ -107,17 +114,16 @@ impl GitRepo {
         let tree = self.repo.find_tree(tree_oid).context("finding tree")?;
 
         let sig = self.repo.signature().context("reading signature")?;
-        let parent = self.repo.head()?.peel_to_commit()
+        let parent = self
+            .repo
+            .head()?
+            .peel_to_commit()
             .context("resolving parent commit")?;
 
-        let oid = self.repo.commit(
-            Some("HEAD"),
-            &sig,
-            &sig,
-            message,
-            &tree,
-            &[&parent],
-        ).context("creating commit")?;
+        let oid = self
+            .repo
+            .commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent])
+            .context("creating commit")?;
 
         Ok(oid)
     }
@@ -135,9 +141,10 @@ impl GitRepo {
     /// changes as separate entries.
     pub fn file_status(&self) -> Result<Vec<FileStatusEntry>> {
         let mut opts = git2::StatusOptions::new();
-        opts.include_untracked(true)
-            .renames_head_to_index(true);
-        let statuses = self.repo.statuses(Some(&mut opts))
+        opts.include_untracked(true).renames_head_to_index(true);
+        let statuses = self
+            .repo
+            .statuses(Some(&mut opts))
             .context("reading file status")?;
 
         let mut entries = Vec::new();
@@ -147,24 +154,56 @@ impl GitRepo {
 
             // Index (staged) changes
             if s.intersects(git2::Status::INDEX_NEW) {
-                entries.push(FileStatusEntry { path: path.clone(), status: FileStatus::Added, staged: true });
+                entries.push(FileStatusEntry {
+                    path: path.clone(),
+                    status: FileStatus::Added,
+                    staged: true,
+                });
             } else if s.intersects(git2::Status::INDEX_MODIFIED) {
-                entries.push(FileStatusEntry { path: path.clone(), status: FileStatus::Modified, staged: true });
+                entries.push(FileStatusEntry {
+                    path: path.clone(),
+                    status: FileStatus::Modified,
+                    staged: true,
+                });
             } else if s.intersects(git2::Status::INDEX_DELETED) {
-                entries.push(FileStatusEntry { path: path.clone(), status: FileStatus::Deleted, staged: true });
+                entries.push(FileStatusEntry {
+                    path: path.clone(),
+                    status: FileStatus::Deleted,
+                    staged: true,
+                });
             } else if s.intersects(git2::Status::INDEX_RENAMED) {
-                entries.push(FileStatusEntry { path: path.clone(), status: FileStatus::Renamed, staged: true });
+                entries.push(FileStatusEntry {
+                    path: path.clone(),
+                    status: FileStatus::Renamed,
+                    staged: true,
+                });
             }
 
             // Working tree (unstaged) changes
             if s.intersects(git2::Status::WT_NEW) {
-                entries.push(FileStatusEntry { path: path.clone(), status: FileStatus::Untracked, staged: false });
+                entries.push(FileStatusEntry {
+                    path: path.clone(),
+                    status: FileStatus::Untracked,
+                    staged: false,
+                });
             } else if s.intersects(git2::Status::WT_MODIFIED) {
-                entries.push(FileStatusEntry { path: path.clone(), status: FileStatus::Modified, staged: false });
+                entries.push(FileStatusEntry {
+                    path: path.clone(),
+                    status: FileStatus::Modified,
+                    staged: false,
+                });
             } else if s.intersects(git2::Status::WT_DELETED) {
-                entries.push(FileStatusEntry { path: path.clone(), status: FileStatus::Deleted, staged: false });
+                entries.push(FileStatusEntry {
+                    path: path.clone(),
+                    status: FileStatus::Deleted,
+                    staged: false,
+                });
             } else if s.intersects(git2::Status::WT_RENAMED) {
-                entries.push(FileStatusEntry { path: path.clone(), status: FileStatus::Renamed, staged: false });
+                entries.push(FileStatusEntry {
+                    path: path.clone(),
+                    status: FileStatus::Renamed,
+                    staged: false,
+                });
             }
         }
 
@@ -177,7 +216,9 @@ impl GitRepo {
     /// Stage a file (add to index).
     pub fn stage_file(&self, path: &str) -> Result<()> {
         let mut index = self.repo.index().context("reading index")?;
-        let abs = self.repo.workdir()
+        let abs = self
+            .repo
+            .workdir()
             .ok_or_else(|| anyhow::anyhow!("bare repository"))?
             .join(path);
 
@@ -185,7 +226,9 @@ impl GitRepo {
             index.add_path(Path::new(path)).context("staging file")?;
         } else {
             // File was deleted — remove from index
-            index.remove_path(Path::new(path)).context("staging deleted file")?;
+            index
+                .remove_path(Path::new(path))
+                .context("staging deleted file")?;
         }
         index.write().context("writing index")?;
         Ok(())
@@ -194,23 +237,31 @@ impl GitRepo {
     /// Unstage a file (reset index entry to HEAD).
     pub fn unstage_file(&self, path: &str) -> Result<()> {
         let mut index = self.repo.index().context("reading index")?;
-        let head_tree = self.repo.head()?.peel_to_tree()
+        let head_tree = self
+            .repo
+            .head()?
+            .peel_to_tree()
             .context("resolving HEAD tree")?;
 
         match head_tree.get_path(Path::new(path)) {
             Ok(entry) => {
                 // File exists in HEAD — reset index to HEAD version
                 let obj = entry.to_object(&self.repo)?;
-                let blob = obj.as_blob()
+                let blob = obj
+                    .as_blob()
                     .ok_or_else(|| anyhow::anyhow!("HEAD entry is not a blob"))?;
                 let mut idx_entry = git2::IndexEntry {
                     ctime: git2::IndexTime::new(0, 0),
                     mtime: git2::IndexTime::new(0, 0),
-                    dev: 0, ino: 0, mode: entry.filemode() as u32,
-                    uid: 0, gid: 0,
+                    dev: 0,
+                    ino: 0,
+                    mode: entry.filemode() as u32,
+                    uid: 0,
+                    gid: 0,
                     file_size: blob.content().len() as u32,
                     id: entry.id(),
-                    flags: 0, flags_extended: 0,
+                    flags: 0,
+                    flags_extended: 0,
                     path: path.as_bytes().to_vec(),
                 };
                 index.add(&idx_entry).context("resetting index entry")?;
@@ -219,7 +270,9 @@ impl GitRepo {
             }
             Err(_) => {
                 // File is newly added (not in HEAD) — remove from index
-                index.remove_path(Path::new(path)).context("removing from index")?;
+                index
+                    .remove_path(Path::new(path))
+                    .context("removing from index")?;
             }
         }
 
@@ -230,7 +283,8 @@ impl GitRepo {
     /// Stage all changes.
     pub fn stage_all(&self) -> Result<()> {
         let mut index = self.repo.index().context("reading index")?;
-        index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
             .context("staging all")?;
         index.write().context("writing index")?;
         Ok(())
@@ -240,7 +294,8 @@ impl GitRepo {
     pub fn discard_changes(&self, path: &str) -> Result<()> {
         let mut cb = git2::build::CheckoutBuilder::new();
         cb.path(path).force();
-        self.repo.checkout_head(Some(&mut cb))
+        self.repo
+            .checkout_head(Some(&mut cb))
             .with_context(|| format!("discarding changes for {}", path))?;
         Ok(())
     }
@@ -253,12 +308,16 @@ impl GitRepo {
         let tree_oid = index.write_tree().context("writing tree")?;
         let tree = self.repo.find_tree(tree_oid).context("finding tree")?;
         let sig = self.repo.signature().context("reading signature")?;
-        let parent = self.repo.head()?.peel_to_commit()
+        let parent = self
+            .repo
+            .head()?
+            .peel_to_commit()
             .context("resolving parent commit")?;
 
-        let oid = self.repo.commit(
-            Some("HEAD"), &sig, &sig, message, &tree, &[&parent],
-        ).context("creating commit")?;
+        let oid = self
+            .repo
+            .commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent])
+            .context("creating commit")?;
         Ok(oid)
     }
 
@@ -267,12 +326,15 @@ impl GitRepo {
         let mut index = self.repo.index().context("reading index")?;
         let tree_oid = index.write_tree().context("writing tree")?;
         let tree = self.repo.find_tree(tree_oid).context("finding tree")?;
-        let head = self.repo.head()?.peel_to_commit()
+        let head = self
+            .repo
+            .head()?
+            .peel_to_commit()
             .context("resolving HEAD")?;
 
-        let oid = head.amend(
-            Some("HEAD"), None, None, None, Some(message), Some(&tree),
-        ).context("amending commit")?;
+        let oid = head
+            .amend(Some("HEAD"), None, None, None, Some(message), Some(&tree))
+            .context("amending commit")?;
         Ok(oid)
     }
 
@@ -286,7 +348,9 @@ impl GitRepo {
         for branch_result in branches {
             let (branch, branch_type) = branch_result.context("reading branch")?;
             let name = branch.name()?.unwrap_or("").to_string();
-            if name.is_empty() { continue; }
+            if name.is_empty() {
+                continue;
+            }
             result.push(BranchEntry {
                 name,
                 is_current: branch.is_head(),
@@ -298,30 +362,41 @@ impl GitRepo {
 
     /// Read a file's content from HEAD (for diffing against working tree).
     pub fn head_file_content(&self, rel_path: &str) -> Result<String> {
-        let head_tree = self.repo.head()?.peel_to_tree()
+        let head_tree = self
+            .repo
+            .head()?
+            .peel_to_tree()
             .context("resolving HEAD tree")?;
-        let entry = head_tree.get_path(Path::new(rel_path))
+        let entry = head_tree
+            .get_path(Path::new(rel_path))
             .with_context(|| format!("file '{}' not in HEAD", rel_path))?;
         let obj = entry.to_object(&self.repo)?;
-        let blob = obj.as_blob()
+        let blob = obj
+            .as_blob()
             .ok_or_else(|| anyhow::anyhow!("'{}' is not a file", rel_path))?;
-        let content = std::str::from_utf8(blob.content())
-            .context("file is not UTF-8")?;
+        let content = std::str::from_utf8(blob.content()).context("file is not UTF-8")?;
         Ok(content.to_string())
     }
 
     /// Checkout a local branch.
     pub fn checkout(&self, branch: &str) -> Result<()> {
-        let branch_ref = self.repo.find_branch(branch, git2::BranchType::Local)
+        let branch_ref = self
+            .repo
+            .find_branch(branch, git2::BranchType::Local)
             .with_context(|| format!("finding branch '{}'", branch))?;
-        let commit = branch_ref.get().peel_to_commit()
+        let commit = branch_ref
+            .get()
+            .peel_to_commit()
             .context("resolving branch to commit")?;
 
-        self.repo.checkout_tree(
-            commit.as_object(),
-            Some(git2::build::CheckoutBuilder::new().safe()),
-        ).context("checkout tree")?;
-        self.repo.set_head(&format!("refs/heads/{}", branch))
+        self.repo
+            .checkout_tree(
+                commit.as_object(),
+                Some(git2::build::CheckoutBuilder::new().safe()),
+            )
+            .context("checkout tree")?;
+        self.repo
+            .set_head(&format!("refs/heads/{}", branch))
             .context("setting HEAD")?;
         Ok(())
     }
@@ -336,7 +411,11 @@ pub fn current_head_sha(repo_dir: &Path) -> Result<String> {
         .current_dir(repo_dir)
         .output()
         .context("git rev-parse HEAD")?;
-    anyhow::ensure!(out.status.success(), "git rev-parse HEAD failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    anyhow::ensure!(
+        out.status.success(),
+        "git rev-parse HEAD failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
@@ -347,7 +426,11 @@ pub fn files_changed_in_commit(repo_dir: &Path) -> Result<Vec<PathBuf>> {
         .current_dir(repo_dir)
         .output()
         .context("git diff-tree")?;
-    anyhow::ensure!(out.status.success(), "git diff-tree failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    anyhow::ensure!(
+        out.status.success(),
+        "git diff-tree failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
     Ok(String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter(|l| !l.is_empty())
@@ -420,13 +503,12 @@ pub struct WorktreeHandle {
 
 impl WorktreeManager {
     pub fn new(repo_dir: PathBuf) -> Self {
-        let worktree_base = std::env::temp_dir()
-            .join("gaviero-worktrees")
-            .join(
-                repo_dir.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("repo")
-            );
+        let worktree_base = std::env::temp_dir().join("gaviero-worktrees").join(
+            repo_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("repo"),
+        );
         Self {
             repo_dir,
             worktree_base,
@@ -474,12 +556,17 @@ impl WorktreeManager {
         let wt_path = self.worktree_base.join(&name);
 
         // Resolve HEAD to a concrete commit SHA (avoids "invalid reference: HEAD")
-        let commit = self.head_commit()
+        let commit = self
+            .head_commit()
             .context("repo must have at least one commit for worktree isolation")?;
 
         // Ensure base directory exists
-        std::fs::create_dir_all(&self.worktree_base)
-            .with_context(|| format!("creating worktree base dir: {}", self.worktree_base.display()))?;
+        std::fs::create_dir_all(&self.worktree_base).with_context(|| {
+            format!(
+                "creating worktree base dir: {}",
+                self.worktree_base.display()
+            )
+        })?;
 
         // Clean up stale state from previous runs
         if wt_path.exists() {
@@ -576,11 +663,7 @@ impl WorktreeManager {
     /// documents). Each `(rel_path, content)` pair is written to `<worktree>/<rel_path>`,
     /// creating parent directories as needed. This lets the subagent use the `Read` tool
     /// to access the file exactly as the coordinator can.
-    pub fn inject_context_files(
-        &self,
-        agent_id: &str,
-        files: &[(String, String)],
-    ) -> Result<()> {
+    pub fn inject_context_files(&self, agent_id: &str, files: &[(String, String)]) -> Result<()> {
         if files.is_empty() {
             return Ok(());
         }
@@ -671,7 +754,8 @@ mod tests {
         };
         {
             let tree = repo.find_tree(tree_oid).unwrap();
-            repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[]).unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])
+                .unwrap();
         }
 
         let git_repo = GitRepo { repo };
@@ -793,7 +877,10 @@ mod tests {
 
         // Checkout back to original
         let branches = repo.branches().unwrap();
-        let original = branches.iter().find(|b| b.name != "other" && !b.is_remote).unwrap();
+        let original = branches
+            .iter()
+            .find(|b| b.name != "other" && !b.is_remote)
+            .unwrap();
         repo.checkout(&original.name).unwrap();
         assert_ne!(repo.current_branch().unwrap(), "other");
     }

@@ -27,7 +27,11 @@ pub fn load_highlight_config(language: Language, lang_name: &str) -> Result<High
     let scm = find_query_file(lang_name, "highlights.scm")?;
     let query = Query::new(&language, &scm)
         .map_err(|e| anyhow::anyhow!("tree-sitter query error for {}: {}", lang_name, e))?;
-    let group_names = query.capture_names().iter().map(|s| s.to_string()).collect();
+    let group_names = query
+        .capture_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     Ok(HighlightConfig { query, group_names })
 }
 
@@ -41,8 +45,12 @@ fn bundled_highlight_query(lang: &str, _file: &str) -> Result<String> {
     match lang {
         "rust" => Ok(include_str!("../../../../queries/rust/highlights.scm").to_string()),
         "java" => Ok(include_str!("../../../../queries/java/highlights.scm").to_string()),
-        "javascript" => Ok(include_str!("../../../../queries/javascript/highlights.scm").to_string()),
-        "typescript" => Ok(include_str!("../../../../queries/typescript/highlights.scm").to_string()),
+        "javascript" => {
+            Ok(include_str!("../../../../queries/javascript/highlights.scm").to_string())
+        }
+        "typescript" => {
+            Ok(include_str!("../../../../queries/typescript/highlights.scm").to_string())
+        }
         "html" => Ok(include_str!("../../../../queries/html/highlights.scm").to_string()),
         "css" => Ok(include_str!("../../../../queries/css/highlights.scm").to_string()),
         "json" => Ok(include_str!("../../../../queries/json/highlights.scm").to_string()),
@@ -77,7 +85,10 @@ pub fn run_highlights(
     let mut matches = cursor.matches(&config.query, tree.root_node(), source_bytes);
 
     let mut spans = Vec::new();
-    while let Some(m) = { matches.advance(); matches.get() } {
+    while let Some(m) = {
+        matches.advance();
+        matches.get()
+    } {
         for capture in m.captures {
             let group = &config.group_names[capture.index as usize];
             if let Some(style) = theme.highlight_style(group) {
@@ -100,7 +111,8 @@ pub fn run_highlights(
     // The rendering loop applies spans in order and the LAST match wins, so
     // more-specific spans (higher priority, narrower) end up last and win.
     spans.sort_by(|a, b| {
-        a.start_byte.cmp(&b.start_byte)
+        a.start_byte
+            .cmp(&b.start_byte)
             .then_with(|| {
                 let a_width = a.end_byte - a.start_byte;
                 let b_width = b.end_byte - b.start_byte;
@@ -157,7 +169,10 @@ mod tests {
         let scm = find_query_file("rust", "highlights.scm");
         assert!(scm.is_ok(), "rust highlights.scm should be bundled");
         let content = scm.unwrap();
-        assert!(content.contains("comment"), "should contain comment patterns");
+        assert!(
+            content.contains("comment"),
+            "should contain comment patterns"
+        );
     }
 
     #[test]
@@ -172,8 +187,8 @@ mod tests {
 
         let lang = gaviero_core::tree_sitter::language_for_extension("rs")
             .expect("should have rust language");
-        let config = load_highlight_config(lang.clone(), "rust")
-            .expect("should load rust highlights");
+        let config =
+            load_highlight_config(lang.clone(), "rust").expect("should load rust highlights");
         eprintln!("Capture groups: {:?}", config.group_names);
 
         let mut parser = gaviero_core::Parser::new();
@@ -188,7 +203,10 @@ mod tests {
         for s in &spans {
             eprintln!("  byte {}..{} => {:?}", s.start_byte, s.end_byte, s.style);
         }
-        assert!(!spans.is_empty(), "should produce highlight spans for Rust code");
+        assert!(
+            !spans.is_empty(),
+            "should produce highlight spans for Rust code"
+        );
     }
 
     #[test]
@@ -197,8 +215,8 @@ mod tests {
 
         let lang = gaviero_core::tree_sitter::language_for_extension("py")
             .expect("should have python language");
-        let config = load_highlight_config(lang.clone(), "python")
-            .expect("should load python highlights");
+        let config =
+            load_highlight_config(lang.clone(), "python").expect("should load python highlights");
 
         let mut parser = gaviero_core::Parser::new();
         parser.set_language(&lang).unwrap();
@@ -208,7 +226,10 @@ mod tests {
 
         let theme = Theme::builtin_default();
         let spans = run_highlights(&tree, &rope, &config, &theme, 0..source.len());
-        assert!(!spans.is_empty(), "should produce highlight spans for Python code");
+        assert!(
+            !spans.is_empty(),
+            "should produce highlight spans for Python code"
+        );
     }
 
     #[test]
@@ -217,18 +238,22 @@ mod tests {
 
         let lang = gaviero_core::tree_sitter::language_for_extension("yml")
             .expect("should have yaml language");
-        let config = load_highlight_config(lang.clone(), "yaml")
-            .expect("should load yaml highlights");
+        let config =
+            load_highlight_config(lang.clone(), "yaml").expect("should load yaml highlights");
 
         let mut parser = gaviero_core::Parser::new();
         parser.set_language(&lang).unwrap();
-        let source = "name: my-app\nversion: 1.0\ndebug: true\n# comment\nitems:\n  - foo\n  - bar\n";
+        let source =
+            "name: my-app\nversion: 1.0\ndebug: true\n# comment\nitems:\n  - foo\n  - bar\n";
         let rope = ropey::Rope::from_str(source);
         let tree = parser.parse(source, None).unwrap();
 
         let theme = Theme::builtin_default();
         let spans = run_highlights(&tree, &rope, &config, &theme, 0..source.len());
-        assert!(!spans.is_empty(), "should produce highlight spans for YAML code");
+        assert!(
+            !spans.is_empty(),
+            "should produce highlight spans for YAML code"
+        );
     }
 
     #[test]
@@ -237,8 +262,8 @@ mod tests {
 
         let lang = gaviero_core::tree_sitter::language_for_extension("kt")
             .expect("should have kotlin language");
-        let config = load_highlight_config(lang.clone(), "kotlin")
-            .expect("should load kotlin highlights");
+        let config =
+            load_highlight_config(lang.clone(), "kotlin").expect("should load kotlin highlights");
 
         let mut parser = gaviero_core::Parser::new();
         parser.set_language(&lang).unwrap();
@@ -248,7 +273,10 @@ mod tests {
 
         let theme = Theme::builtin_default();
         let spans = run_highlights(&tree, &rope, &config, &theme, 0..source.len());
-        assert!(!spans.is_empty(), "should produce highlight spans for Kotlin code");
+        assert!(
+            !spans.is_empty(),
+            "should produce highlight spans for Kotlin code"
+        );
     }
 
     #[test]
@@ -257,8 +285,8 @@ mod tests {
 
         let lang = gaviero_core::tree_sitter::language_for_extension("gaviero")
             .expect("should have gaviero language");
-        let config = load_highlight_config(lang.clone(), "gaviero")
-            .expect("should load gaviero highlights");
+        let config =
+            load_highlight_config(lang.clone(), "gaviero").expect("should load gaviero highlights");
 
         let mut parser = gaviero_core::Parser::new();
         parser.set_language(&lang).unwrap();
@@ -268,19 +296,30 @@ mod tests {
 
         let theme = Theme::builtin_default();
         let spans = run_highlights(&tree, &rope, &config, &theme, 0..source.len());
-        assert!(!spans.is_empty(), "should produce highlight spans for gaviero code");
+        assert!(
+            !spans.is_empty(),
+            "should produce highlight spans for gaviero code"
+        );
 
         // Keywords should be purple
-        let keyword_spans: Vec<_> = spans.iter()
+        let keyword_spans: Vec<_> = spans
+            .iter()
             .filter(|s| s.style.fg == Some(ratatui::style::Color::Rgb(198, 120, 221)))
             .collect();
-        assert!(!keyword_spans.is_empty(), "should produce purple spans for gaviero keywords");
+        assert!(
+            !keyword_spans.is_empty(),
+            "should produce purple spans for gaviero keywords"
+        );
 
         // Strings should be green
-        let string_spans: Vec<_> = spans.iter()
+        let string_spans: Vec<_> = spans
+            .iter()
             .filter(|s| s.style.fg == Some(ratatui::style::Color::Rgb(152, 195, 121)))
             .collect();
-        assert!(!string_spans.is_empty(), "should produce green spans for gaviero strings");
+        assert!(
+            !string_spans.is_empty(),
+            "should produce green spans for gaviero strings"
+        );
     }
 
     #[test]
@@ -289,8 +328,8 @@ mod tests {
 
         let lang = gaviero_core::tree_sitter::language_for_extension("json")
             .expect("should have json language");
-        let config = load_highlight_config(lang.clone(), "json")
-            .expect("should load json highlights");
+        let config =
+            load_highlight_config(lang.clone(), "json").expect("should load json highlights");
 
         let mut parser = gaviero_core::Parser::new();
         parser.set_language(&lang).unwrap();
@@ -303,38 +342,65 @@ mod tests {
         eprintln!("JSON spans ({}):", spans.len());
         for s in &spans {
             let text = &source[s.start_byte..s.end_byte];
-            eprintln!("  {:?}..{:?} {:?} => {:?}", s.start_byte, s.end_byte, text, s.style);
+            eprintln!(
+                "  {:?}..{:?} {:?} => {:?}",
+                s.start_byte, s.end_byte, text, s.style
+            );
         }
 
         // String values (non-key strings) — green
-        let string_val_spans: Vec<_> = spans.iter()
+        let string_val_spans: Vec<_> = spans
+            .iter()
             .filter(|s| s.style.fg == Some(ratatui::style::Color::Rgb(152, 195, 121)))
             .collect();
-        assert!(!string_val_spans.is_empty(), "should produce green spans for JSON string values");
+        assert!(
+            !string_val_spans.is_empty(),
+            "should produce green spans for JSON string values"
+        );
 
         // Keys must be more specific (red/pink) and must come AFTER generic string (green)
         // so that they win in the last-wins rendering loop.
-        let key_spans: Vec<_> = spans.iter()
+        let key_spans: Vec<_> = spans
+            .iter()
             .filter(|s| s.style.fg == Some(ratatui::style::Color::Rgb(224, 108, 117)))
             .collect();
-        assert!(!key_spans.is_empty(), "should produce red spans for JSON keys");
+        assert!(
+            !key_spans.is_empty(),
+            "should produce red spans for JSON keys"
+        );
         // For each key span there must be a green span at the same range that
         // comes BEFORE it in the list (so the red span wins).
         for key_span in &key_spans {
-            let green_before = spans.iter()
-                .position(|s| s.start_byte == key_span.start_byte
-                    && s.end_byte == key_span.end_byte
-                    && s.style.fg == Some(ratatui::style::Color::Rgb(152, 195, 121)))
-                .and_then(|gi| spans.iter().position(|s| std::ptr::eq(s, *key_span)).map(|ki| gi < ki));
-            assert_eq!(green_before, Some(true),
+            let green_before = spans
+                .iter()
+                .position(|s| {
+                    s.start_byte == key_span.start_byte
+                        && s.end_byte == key_span.end_byte
+                        && s.style.fg == Some(ratatui::style::Color::Rgb(152, 195, 121))
+                })
+                .and_then(|gi| {
+                    spans
+                        .iter()
+                        .position(|s| std::ptr::eq(s, *key_span))
+                        .map(|ki| gi < ki)
+                });
+            assert_eq!(
+                green_before,
+                Some(true),
                 "red key span at {}..{} must follow its green string span so red wins",
-                key_span.start_byte, key_span.end_byte);
+                key_span.start_byte,
+                key_span.end_byte
+            );
         }
 
         // Numbers — orange
-        let number_spans: Vec<_> = spans.iter()
+        let number_spans: Vec<_> = spans
+            .iter()
             .filter(|s| s.style.fg == Some(ratatui::style::Color::Rgb(209, 154, 102)))
             .collect();
-        assert!(!number_spans.is_empty(), "should produce orange spans for JSON numbers");
+        assert!(
+            !number_spans.is_empty(),
+            "should produce orange spans for JSON numbers"
+        );
     }
 }

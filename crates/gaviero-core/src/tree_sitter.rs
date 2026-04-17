@@ -9,21 +9,73 @@ type GrammarFn = fn() -> tree_sitter::Language;
 
 const LANGUAGE_REGISTRY: &[(&[&str], &str, Option<GrammarFn>)] = &[
     (&["rs"], "rust", Some(|| tree_sitter_rust::LANGUAGE.into())),
-    (&["java"], "java", Some(|| tree_sitter_java::LANGUAGE.into())),
-    (&["js", "mjs", "cjs"], "javascript", Some(|| tree_sitter_javascript::LANGUAGE.into())),
-    (&["ts", "tsx"], "typescript", Some(|| tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())),
-    (&["html", "htm"], "html", Some(|| tree_sitter_html::LANGUAGE.into())),
+    (
+        &["java"],
+        "java",
+        Some(|| tree_sitter_java::LANGUAGE.into()),
+    ),
+    (
+        &["js", "mjs", "cjs"],
+        "javascript",
+        Some(|| tree_sitter_javascript::LANGUAGE.into()),
+    ),
+    (
+        &["ts", "tsx"],
+        "typescript",
+        Some(|| tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+    ),
+    (
+        &["html", "htm"],
+        "html",
+        Some(|| tree_sitter_html::LANGUAGE.into()),
+    ),
     (&["css"], "css", Some(|| tree_sitter_css::LANGUAGE.into())),
-    (&["json"], "json", Some(|| tree_sitter_json::LANGUAGE.into())),
-    (&["sh", "bash"], "bash", Some(|| tree_sitter_bash::LANGUAGE.into())),
-    (&["toml"], "toml", Some(|| tree_sitter_toml_ng::LANGUAGE.into())),
+    (
+        &["json"],
+        "json",
+        Some(|| tree_sitter_json::LANGUAGE.into()),
+    ),
+    (
+        &["sh", "bash"],
+        "bash",
+        Some(|| tree_sitter_bash::LANGUAGE.into()),
+    ),
+    (
+        &["toml"],
+        "toml",
+        Some(|| tree_sitter_toml_ng::LANGUAGE.into()),
+    ),
     (&["c", "h"], "c", Some(|| tree_sitter_c::LANGUAGE.into())),
-    (&["cpp", "hpp", "cc", "cxx"], "cpp", Some(|| tree_sitter_cpp::LANGUAGE.into())),
-    (&["tex", "sty", "cls", "bib"], "latex", Some(|| codebook_tree_sitter_latex::LANGUAGE.into())),
-    (&["py", "pyi"], "python", Some(|| tree_sitter_python::LANGUAGE.into())),
-    (&["yml", "yaml"], "yaml", Some(|| tree_sitter_yaml::LANGUAGE.into())),
-    (&["kt", "kts"], "kotlin", Some(|| tree_sitter_kotlin_ng::LANGUAGE.into())),
-    (&["gaviero"], "gaviero", Some(|| tree_sitter_gaviero::LANGUAGE.into())),
+    (
+        &["cpp", "hpp", "cc", "cxx"],
+        "cpp",
+        Some(|| tree_sitter_cpp::LANGUAGE.into()),
+    ),
+    (
+        &["tex", "sty", "cls", "bib"],
+        "latex",
+        Some(|| codebook_tree_sitter_latex::LANGUAGE.into()),
+    ),
+    (
+        &["py", "pyi"],
+        "python",
+        Some(|| tree_sitter_python::LANGUAGE.into()),
+    ),
+    (
+        &["yml", "yaml"],
+        "yaml",
+        Some(|| tree_sitter_yaml::LANGUAGE.into()),
+    ),
+    (
+        &["kt", "kts"],
+        "kotlin",
+        Some(|| tree_sitter_kotlin_ng::LANGUAGE.into()),
+    ),
+    (
+        &["gaviero"],
+        "gaviero",
+        Some(|| tree_sitter_gaviero::LANGUAGE.into()),
+    ),
     (&["md", "markdown"], "markdown", None),
 ];
 
@@ -193,7 +245,13 @@ fn describe_hunk(hunk: &DiffHunk, enclosing: Option<&NodeInfo>) -> String {
     match enclosing {
         Some(node) => {
             let name = node.name.as_deref().unwrap_or("<anonymous>");
-            format!("{} {} in {} `{}`", action, line_range, node.kind.replace('_', " "), name)
+            format!(
+                "{} {} in {} `{}`",
+                action,
+                line_range,
+                node.kind.replace('_', " "),
+                name
+            )
         }
         None => format!("{} {}", action, line_range),
     }
@@ -245,7 +303,8 @@ mod tests {
 
     #[test]
     fn test_enrich_hunks_finds_enclosing_function() {
-        let original = "fn foo() {\n    let x = 1;\n    let y = 2;\n}\n\nfn bar() {\n    let z = 3;\n}\n";
+        let original =
+            "fn foo() {\n    let x = 1;\n    let y = 2;\n}\n\nfn bar() {\n    let z = 3;\n}\n";
         let lang = language_for_extension("rs").unwrap();
 
         let hunk = DiffHunk {
