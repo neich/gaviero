@@ -119,6 +119,7 @@ mod tests {
             conversation_history: vec![],
             file_refs: vec![],
             effort: None,
+            extra: Vec::new(),
             max_tokens: None,
             auto_approve: true,
         };
@@ -145,6 +146,7 @@ mod tests {
             conversation_history: vec![],
             file_refs: vec![],
             effort: None,
+            extra: Vec::new(),
             max_tokens: None,
             auto_approve: true,
         };
