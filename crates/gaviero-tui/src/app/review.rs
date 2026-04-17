@@ -250,10 +250,8 @@ pub(super) fn handle_batch_review_action(app: &mut App, action: &Action) -> bool
                 if br.proposals.is_empty() {
                     app.batch_review = None;
                     app.left_panel = LeftPanelMode::FileTree;
-                    app.status_message = Some((
-                        "All files reviewed".to_string(),
-                        std::time::Instant::now(),
-                    ));
+                    app.status_message =
+                        Some(("All files reviewed".to_string(), std::time::Instant::now()));
                 }
             }
             true
@@ -327,12 +325,7 @@ pub(super) fn cancel_batch_review(app: &mut App) {
     ));
 }
 
-pub(super) fn render_review_file_list(
-    app: &mut App,
-    frame: &mut Frame,
-    area: Rect,
-    focused: bool,
-) {
+pub(super) fn render_review_file_list(app: &mut App, frame: &mut Frame, area: Rect, focused: bool) {
     use ratatui::style::Modifier;
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Widget};
@@ -444,7 +437,12 @@ pub(super) fn render_batch_review_diff(app: &mut App, frame: &mut Frame, area: R
     };
 
     if br.cached_diff_index != br.selected_index {
-        let old_lines: Vec<&str> = proposal.old_content.as_deref().unwrap_or("").lines().collect();
+        let old_lines: Vec<&str> = proposal
+            .old_content
+            .as_deref()
+            .unwrap_or("")
+            .lines()
+            .collect();
         let new_lines: Vec<&str> = proposal.new_content.lines().collect();
         br.cached_diff = build_simple_diff(&old_lines, &new_lines);
         br.cached_diff_index = br.selected_index;
@@ -491,14 +489,18 @@ pub(super) fn render_batch_review_diff(app: &mut App, frame: &mut Frame, area: R
                 Style::default()
                     .fg(theme::SUCCESS)
                     .add_modifier(Modifier::BOLD),
-                Style::default().fg(theme::SUCCESS).bg(theme::DIFF_ADD_LINE_BG),
+                Style::default()
+                    .fg(theme::SUCCESS)
+                    .bg(theme::DIFF_ADD_LINE_BG),
             ),
             DiffKind::Removed => (
                 " - │ ",
                 Style::default()
                     .fg(theme::ERROR)
                     .add_modifier(Modifier::BOLD),
-                Style::default().fg(theme::ERROR).bg(theme::DIFF_REM_LINE_BG),
+                Style::default()
+                    .fg(theme::ERROR)
+                    .bg(theme::DIFF_REM_LINE_BG),
             ),
             DiffKind::Context => (
                 "   │ ",
@@ -841,14 +843,18 @@ pub(super) fn render_changes_diff(app: &mut App, frame: &mut Frame, area: Rect) 
                 Style::default()
                     .fg(theme::SUCCESS)
                     .add_modifier(Modifier::BOLD),
-                Style::default().fg(theme::SUCCESS).bg(theme::DIFF_ADD_LINE_BG),
+                Style::default()
+                    .fg(theme::SUCCESS)
+                    .bg(theme::DIFF_ADD_LINE_BG),
             ),
             DiffKind::Removed => (
                 " - │ ",
                 Style::default()
                     .fg(theme::ERROR)
                     .add_modifier(Modifier::BOLD),
-                Style::default().fg(theme::ERROR).bg(theme::DIFF_REM_LINE_BG),
+                Style::default()
+                    .fg(theme::ERROR)
+                    .bg(theme::DIFF_REM_LINE_BG),
             ),
             DiffKind::Context => (
                 "   │ ",
