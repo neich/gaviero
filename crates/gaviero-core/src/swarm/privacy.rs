@@ -4,8 +4,8 @@
 //! when file paths match configured patterns. This is a safety net — the
 //! privacy decision is never purely LLM-determined.
 
-use crate::types::PrivacyLevel;
 use crate::swarm::models::WorkUnit;
+use crate::types::PrivacyLevel;
 
 /// Evaluates privacy levels based on configured glob patterns.
 #[derive(Debug, Clone)]
@@ -21,7 +21,9 @@ struct GlobPattern {
 
 impl GlobPattern {
     fn new(pattern: &str) -> Self {
-        Self { raw: pattern.to_string() }
+        Self {
+            raw: pattern.to_string(),
+        }
     }
 
     /// Check if a path matches this pattern.
@@ -102,7 +104,12 @@ impl PrivacyScanner {
         }
 
         // Check all paths in scope
-        for path in unit.scope.owned_paths.iter().chain(unit.scope.read_only_paths.iter()) {
+        for path in unit
+            .scope
+            .owned_paths
+            .iter()
+            .chain(unit.scope.read_only_paths.iter())
+        {
             if self.matches_any(path) {
                 return PrivacyLevel::LocalOnly;
             }
