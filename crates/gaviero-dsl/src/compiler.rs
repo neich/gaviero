@@ -54,7 +54,11 @@ pub fn compile_ast(
                 if client_map.insert(c.name.as_str(), c).is_some() {
                     errors.push(DslError::Compile {
                         src: src(),
-                        span: (c.name_span.start, c.name_span.end.saturating_sub(c.name_span.start)).into(),
+                        span: (
+                            c.name_span.start,
+                            c.name_span.end.saturating_sub(c.name_span.start),
+                        )
+                            .into(),
                         reason: format!("duplicate client name `{}`", c.name),
                     });
                 }
@@ -63,7 +67,11 @@ pub fn compile_ast(
                     if default_client.is_some() {
                         errors.push(DslError::Compile {
                             src: src(),
-                            span: (c.name_span.start, c.name_span.end.saturating_sub(c.name_span.start)).into(),
+                            span: (
+                                c.name_span.start,
+                                c.name_span.end.saturating_sub(c.name_span.start),
+                            )
+                                .into(),
                             reason: "only one client can be declared `default`".into(),
                         });
                     } else {
@@ -75,7 +83,11 @@ pub fn compile_ast(
                 if agent_map.insert(a.name.as_str(), a).is_some() {
                     errors.push(DslError::Compile {
                         src: src(),
-                        span: (a.name_span.start, a.name_span.end.saturating_sub(a.name_span.start)).into(),
+                        span: (
+                            a.name_span.start,
+                            a.name_span.end.saturating_sub(a.name_span.start),
+                        )
+                            .into(),
                         reason: format!("duplicate agent name `{}`", a.name),
                     });
                 }
@@ -84,16 +96,27 @@ pub fn compile_ast(
                 if workflow_map.insert(w.name.as_str(), w).is_some() {
                     errors.push(DslError::Compile {
                         src: src(),
-                        span: (w.name_span.start, w.name_span.end.saturating_sub(w.name_span.start)).into(),
+                        span: (
+                            w.name_span.start,
+                            w.name_span.end.saturating_sub(w.name_span.start),
+                        )
+                            .into(),
                         reason: format!("duplicate workflow name `{}`", w.name),
                     });
                 }
             }
             Item::Prompt(p) => {
-                if prompt_map.insert(p.name.as_str(), p.content.as_str()).is_some() {
+                if prompt_map
+                    .insert(p.name.as_str(), p.content.as_str())
+                    .is_some()
+                {
                     errors.push(DslError::Compile {
                         src: src(),
-                        span: (p.name_span.start, p.name_span.end.saturating_sub(p.name_span.start)).into(),
+                        span: (
+                            p.name_span.start,
+                            p.name_span.end.saturating_sub(p.name_span.start),
+                        )
+                            .into(),
                         reason: format!("duplicate prompt name `{}`", p.name),
                     });
                 }
@@ -105,70 +128,114 @@ pub fn compile_ast(
         return Err(DslErrors::new(errors));
     }
 
-    // ── Phase 2: determine agent execution order ──────────────────
+    // ── Phase 2: determine selected workflow and primary agent order ───────
 
-    // Returns (agents, max_parallel, workflow_memory)
-    let (agent_order, workflow_max_parallel, workflow_memory): (Vec<&AgentDecl>, Option<usize>, Option<&MemoryBlock>) =
-        if let Some(wf_name) = workflow {
-            // Explicit workflow named
-            let wf = workflow_map.get(wf_name).ok_or_else(|| {
-                DslErrors::single(DslError::Compile {
-                    src: src(),
-                    span: (0, 1).into(),
-                    reason: format!("workflow `{}` is not defined", wf_name),
-                })
-            })?;
-            let agents = ordered_agents_from_workflow(wf, &agent_map, source, filename)?;
-            let mp = wf.max_parallel.as_ref().map(|(n, _)| *n);
-            (agents, mp, wf.memory.as_ref())
-        } else if workflow_map.len() == 1 {
-            // Exactly one workflow — use it implicitly
-            let wf = workflow_map.values().next().unwrap();
-            let agents = ordered_agents_from_workflow(wf, &agent_map, source, filename)?;
-            let mp = wf.max_parallel.as_ref().map(|(n, _)| *n);
-            (agents, mp, wf.memory.as_ref())
-        } else if workflow_map.is_empty() {
-            // No workflow — run all agents in declaration order
-            let agents = script
-                .items
-                .iter()
-                .filter_map(|i| if let Item::Agent(a) = i { Some(a) } else { None })
-                .collect();
-            (agents, None, None)
-        } else {
-            // Multiple workflows with no selector — ambiguous
-            return Err(DslErrors::single(DslError::Compile {
+    let selected_workflow: Option<&WorkflowDecl> = if let Some(wf_name) = workflow {
+        Some(*workflow_map.get(wf_name).ok_or_else(|| {
+            DslErrors::single(DslError::Compile {
                 src: src(),
                 span: (0, 1).into(),
-                reason: format!(
-                    "multiple workflows defined ({}); pass --workflow <name> to select one",
-                    workflow_map.keys().cloned().collect::<Vec<_>>().join(", ")
-                ),
-            }));
-        };
+                reason: format!("workflow `{}` is not defined", wf_name),
+            })
+        })?)
+    } else if workflow_map.len() == 1 {
+        workflow_map.values().next().copied()
+    } else if workflow_map.is_empty() {
+        None
+    } else {
+        return Err(DslErrors::single(DslError::Compile {
+            src: src(),
+            span: (0, 1).into(),
+            reason: format!(
+                "multiple workflows defined ({}); pass --workflow <name> to select one",
+                workflow_map.keys().cloned().collect::<Vec<_>>().join(", ")
+            ),
+        }));
+    };
+
+    // Returns (agents, max_parallel, workflow_memory)
+    let (agent_order, workflow_max_parallel, workflow_memory): (
+        Vec<&AgentDecl>,
+        Option<usize>,
+        Option<&MemoryBlock>,
+    ) = if let Some(wf) = selected_workflow {
+        let agents = ordered_agents_from_workflow(wf, &agent_map, source, filename)?;
+        let mp = wf.max_parallel.as_ref().map(|(n, _)| *n);
+        (agents, mp, wf.memory.as_ref())
+    } else {
+        let agents = script
+            .items
+            .iter()
+            .filter_map(|i| {
+                if let Item::Agent(a) = i {
+                    Some(a)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        (agents, None, None)
+    };
+
+    let loop_judge_decls = match selected_workflow {
+        Some(wf) => collect_loop_judge_agents(wf, &agent_map, &agent_order, source, filename)?,
+        None => Vec::new(),
+    };
 
     // ── Phase 3: compile each agent to WorkUnit ───────────────────
 
     let mut work_units = Vec::with_capacity(agent_order.len());
+    let mut loop_judge_units = Vec::with_capacity(loop_judge_decls.len());
     let mut compile_errors: Vec<DslError> = Vec::new();
 
     for decl in agent_order {
-        match compile_agent(decl, &client_map, default_client, &prompt_map, &script_vars, workflow_memory, source, filename, runtime_prompt) {
+        match compile_agent(
+            decl,
+            &client_map,
+            default_client,
+            &prompt_map,
+            &script_vars,
+            workflow_memory,
+            source,
+            filename,
+            runtime_prompt,
+        ) {
             Ok(wu) => work_units.push(wu),
+            Err(e) => compile_errors.push(e),
+        }
+    }
+
+    for decl in loop_judge_decls {
+        match compile_agent(
+            decl,
+            &client_map,
+            default_client,
+            &prompt_map,
+            &script_vars,
+            workflow_memory,
+            source,
+            filename,
+            runtime_prompt,
+        ) {
+            Ok(wu) => loop_judge_units.push(wu),
             Err(e) => compile_errors.push(e),
         }
     }
 
     // ── Phase 4: validate depends_on references ───────────────────
 
-    for wu in &work_units {
+    for wu in work_units.iter().chain(loop_judge_units.iter()) {
         if let Some(decl) = agent_map.get(wu.id.as_str()) {
             if let Some((deps, _)) = &decl.depends_on {
                 for (dep_name, dep_span) in deps {
                     if !agent_map.contains_key(dep_name.as_str()) {
                         compile_errors.push(DslError::Compile {
                             src: src(),
-                            span: (dep_span.start, dep_span.end.saturating_sub(dep_span.start).max(1)).into(),
+                            span: (
+                                dep_span.start,
+                                dep_span.end.saturating_sub(dep_span.start).max(1),
+                            )
+                                .into(),
                             reason: format!(
                                 "agent `{}` depends_on `{}` which is not defined",
                                 wu.id, dep_name
@@ -195,10 +262,7 @@ pub fn compile_ast(
         return Err(DslErrors::single(DslError::Compile {
             src: src(),
             span: span.into(),
-            reason: format!(
-                "dependency cycle detected: {}",
-                cycle.join(" -> ")
-            ),
+            reason: format!("dependency cycle detected: {}", cycle.join(" -> ")),
         }));
     }
 
@@ -206,22 +270,16 @@ pub fn compile_ast(
 
     // Warn when all agents are independent (no depends_on); single-agent with
     // strategy refine may be a better choice.
-    let independent_count = work_units.iter().filter(|u| u.depends_on.is_empty()).count();
+    let independent_count = work_units
+        .iter()
+        .filter(|u| u.depends_on.is_empty())
+        .count();
     if work_units.len() > 1 && independent_count == work_units.len() {
         eprintln!(
             "⚠ This workflow has {} independent agents. Consider using a single agent with `strategy refine`.",
             work_units.len()
         );
     }
-
-    // Resolve which workflow was selected (if any).
-    let selected_workflow: Option<&WorkflowDecl> = if let Some(wf_name) = workflow {
-        workflow_map.get(wf_name).copied()
-    } else if workflow_map.len() == 1 {
-        workflow_map.values().next().copied()
-    } else {
-        None
-    };
 
     let iteration_config = selected_workflow
         .map(build_iteration_config)
@@ -239,6 +297,7 @@ pub fn compile_ast(
     plan.iteration_config = iteration_config;
     plan.verification_config = verification_config;
     plan.loop_configs = loop_configs;
+    plan.loop_judge_units = loop_judge_units;
     Ok(plan)
 }
 
@@ -253,9 +312,14 @@ fn detect_cycle(work_units: &[WorkUnit]) -> Option<Vec<String>> {
         .collect();
 
     #[derive(Clone, Copy, PartialEq)]
-    enum Visit { Unvisited, InProgress, Done }
+    enum Visit {
+        Unvisited,
+        InProgress,
+        Done,
+    }
 
-    let mut state: HashMap<String, Visit> = deps.keys().map(|k| (k.clone(), Visit::Unvisited)).collect();
+    let mut state: HashMap<String, Visit> =
+        deps.keys().map(|k| (k.clone(), Visit::Unvisited)).collect();
     let mut path: Vec<String> = Vec::new();
 
     let keys: Vec<String> = deps.keys().cloned().collect();
@@ -341,7 +405,11 @@ fn ordered_agents_from_workflow<'a>(
                 }
                 None => errors.push(DslError::Compile {
                     src: src(),
-                    span: (name_span.start, name_span.end.saturating_sub(name_span.start)).into(),
+                    span: (
+                        name_span.start,
+                        name_span.end.saturating_sub(name_span.start),
+                    )
+                        .into(),
                     reason: format!("workflow step `{}` is not a defined agent", name),
                 }),
             }
@@ -352,6 +420,66 @@ fn ordered_agents_from_workflow<'a>(
         return Err(DslErrors::new(errors));
     }
     Ok(agents)
+}
+
+fn collect_loop_judge_agents<'a>(
+    wf: &WorkflowDecl,
+    agent_map: &HashMap<&str, &'a AgentDecl>,
+    primary_agents: &[&'a AgentDecl],
+    source: &str,
+    filename: &str,
+) -> Result<Vec<&'a AgentDecl>, DslErrors> {
+    let src = || NamedSource::new(filename, source.to_string());
+
+    let Some((steps, _)) = &wf.steps else {
+        return Ok(Vec::new());
+    };
+
+    let primary_ids: HashSet<&str> = primary_agents.iter().map(|a| a.name.as_str()).collect();
+    let mut judges: Vec<&AgentDecl> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut errors = Vec::new();
+
+    for step in steps {
+        let StepItem::Loop(lb) = step else { continue };
+        let UntilCondition::Agent(name, span) = &lb.until else {
+            continue;
+        };
+
+        if seen.contains(name.as_str()) {
+            continue;
+        }
+
+        if primary_ids.contains(name.as_str()) {
+            errors.push(DslError::Compile {
+                src: src(),
+                span: (span.start, span.end.saturating_sub(span.start).max(1)).into(),
+                reason: format!(
+                    "loop judge agent `{}` also appears as a workflow step — judges must use a distinct name to avoid id shadowing at runtime",
+                    name
+                ),
+            });
+            continue;
+        }
+
+        match agent_map.get(name.as_str()) {
+            Some(agent) => {
+                seen.insert(name.as_str());
+                judges.push(*agent);
+            }
+            None => errors.push(DslError::Compile {
+                src: src(),
+                span: (span.start, span.end.saturating_sub(span.start).max(1)).into(),
+                reason: format!("loop condition references undefined judge agent `{}`", name),
+            }),
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(judges)
+    } else {
+        Err(DslErrors::new(errors))
+    }
 }
 
 /// Apply compile-time variable substitution to a template string.
@@ -387,7 +515,9 @@ fn apply_vars(
     }
     for (k, v) in agent_vars {
         if RESERVED.contains(&k.as_str()) {
-            eprintln!("⚠ agent `{agent_name}`: vars key `{k}` shadows a reserved variable and will be ignored");
+            eprintln!(
+                "⚠ agent `{agent_name}`: vars key `{k}` shadows a reserved variable and will be ignored"
+            );
             continue;
         }
         merged.push((k.as_str(), v.as_str()));
@@ -422,20 +552,42 @@ fn compile_agent(
     // Resolve client reference
     let (tier, model, privacy) = if let Some((client_name, client_span)) = &decl.client {
         // Explicit client reference
-        let cd = client_map.get(client_name.as_str()).ok_or_else(|| DslError::Compile {
-            src: src(),
-            span: (client_span.start, client_span.end.saturating_sub(client_span.start).max(1)).into(),
-            reason: format!("undefined client `{}`", client_name),
-        })?;
-        let tier = cd.tier.as_ref().map(|(t, _)| map_tier(*t)).unwrap_or_default();
+        let cd = client_map
+            .get(client_name.as_str())
+            .ok_or_else(|| DslError::Compile {
+                src: src(),
+                span: (
+                    client_span.start,
+                    client_span.end.saturating_sub(client_span.start).max(1),
+                )
+                    .into(),
+                reason: format!("undefined client `{}`", client_name),
+            })?;
+        let tier = cd
+            .tier
+            .as_ref()
+            .map(|(t, _)| map_tier(*t))
+            .unwrap_or_default();
         let model = cd.model.as_ref().map(|(m, _)| m.clone());
-        let privacy = cd.privacy.as_ref().map(|(p, _)| map_privacy(*p)).unwrap_or_default();
+        let privacy = cd
+            .privacy
+            .as_ref()
+            .map(|(p, _)| map_privacy(*p))
+            .unwrap_or_default();
         (tier, model, privacy)
     } else if let Some(dc) = default_client {
         // No explicit client, but a default exists — use it
-        let tier = dc.tier.as_ref().map(|(t, _)| map_tier(*t)).unwrap_or_default();
+        let tier = dc
+            .tier
+            .as_ref()
+            .map(|(t, _)| map_tier(*t))
+            .unwrap_or_default();
         let model = dc.model.as_ref().map(|(m, _)| m.clone());
-        let privacy = dc.privacy.as_ref().map(|(p, _)| map_privacy(*p)).unwrap_or_default();
+        let privacy = dc
+            .privacy
+            .as_ref()
+            .map(|(p, _)| map_privacy(*p))
+            .unwrap_or_default();
         (tier, model, privacy)
     } else {
         // No explicit client, no default — warn if any clients are declared
@@ -482,18 +634,20 @@ fn compile_agent(
     // Resolve prompt: inline string or reference to a named prompt declaration.
     let prompt_text: Option<&str> = match &decl.prompt {
         Some((PromptSource::Inline(s), _)) => Some(s.as_str()),
-        Some((PromptSource::Ref(name, ref_span), _)) => {
-            match prompt_map.get(name.as_str()) {
-                Some(content) => Some(content),
-                None => {
-                    return Err(DslError::Compile {
-                        src: src(),
-                        span: (ref_span.start, ref_span.end.saturating_sub(ref_span.start).max(1)).into(),
-                        reason: format!("undefined prompt `{}`", name),
-                    });
-                }
+        Some((PromptSource::Ref(name, ref_span), _)) => match prompt_map.get(name.as_str()) {
+            Some(content) => Some(content),
+            None => {
+                return Err(DslError::Compile {
+                    src: src(),
+                    span: (
+                        ref_span.start,
+                        ref_span.end.saturating_sub(ref_span.start).max(1),
+                    )
+                        .into(),
+                    reason: format!("undefined prompt `{}`", name),
+                });
             }
-        }
+        },
         None => None,
     };
 
@@ -517,60 +671,78 @@ fn compile_agent(
         let mut merged: Vec<String> = workflow_memory
             .map(|m| m.read_ns.clone())
             .unwrap_or_default();
-        for ns in decl.memory.as_ref().map(|m| m.read_ns.clone()).unwrap_or_default() {
+        for ns in decl
+            .memory
+            .as_ref()
+            .map(|m| m.read_ns.clone())
+            .unwrap_or_default()
+        {
             if !merged.contains(&ns) {
                 merged.push(ns);
             }
         }
-        if merged.is_empty() { None } else { Some(merged) }
+        if merged.is_empty() {
+            None
+        } else {
+            Some(merged)
+        }
     };
 
-    let write_namespace: Option<String> = decl.memory
+    let write_namespace: Option<String> = decl
+        .memory
         .as_ref()
         .and_then(|m| m.write_ns.clone())
         .or_else(|| workflow_memory.and_then(|m| m.write_ns.clone()));
 
     let memory_importance: Option<f32> = decl.memory.as_ref().and_then(|m| m.importance);
 
-    let staleness_sources: Vec<String> = decl.memory
+    let staleness_sources: Vec<String> = decl
+        .memory
         .as_ref()
         .map(|m| m.staleness_sources.clone())
         .unwrap_or_default();
 
     // ── Explicit memory control fields ───────────────────────────
-    let memory_read_query: Option<String> = decl.memory
+    let memory_read_query: Option<String> = decl
+        .memory
         .as_ref()
         .and_then(|m| m.read_query.as_ref())
         .map(|(s, _)| apply_vars(s, script_vars, &decl.vars, &decl.name, runtime_prompt));
 
-    let memory_read_limit: Option<usize> = decl.memory
+    let memory_read_limit: Option<usize> = decl
+        .memory
         .as_ref()
         .and_then(|m| m.read_limit.as_ref())
         .map(|(n, _)| *n);
 
-    let memory_write_content: Option<String> = decl.memory
+    let memory_write_content: Option<String> = decl
+        .memory
         .as_ref()
         .and_then(|m| m.write_content.as_ref())
         .map(|(s, _)| apply_vars(s, script_vars, &decl.vars, &decl.name, runtime_prompt));
 
     // ── Graph / impact fields ─────────────────────────────────────
-    let impact_scope = decl.scope
+    let impact_scope = decl
+        .scope
         .as_ref()
         .and_then(|s| s.impact_scope.as_ref())
         .map(|(v, _)| *v)
         .unwrap_or(false);
 
-    let context_callers_of: Vec<String> = decl.context
+    let context_callers_of: Vec<String> = decl
+        .context
         .as_ref()
         .map(|c| c.callers_of.clone())
         .unwrap_or_default();
 
-    let context_tests_for: Vec<String> = decl.context
+    let context_tests_for: Vec<String> = decl
+        .context
         .as_ref()
         .map(|c| c.tests_for.clone())
         .unwrap_or_default();
 
-    let context_depth: u32 = decl.context
+    let context_depth: u32 = decl
+        .context
         .as_ref()
         .and_then(|c| c.depth.as_ref())
         .map(|(n, _)| *n)
@@ -676,6 +848,9 @@ fn extract_loop_configs(wf: Option<&WorkflowDecl>) -> Vec<LoopConfig> {
                     until: map_until_condition(&lb.until),
                     max_iterations: lb.max_iterations,
                     iter_start: lb.iter_start,
+                    strict_judge: lb.strict_judge,
+                    stability: lb.stability.max(1),
+                    judge_timeout_secs: lb.judge_timeout_secs,
                 })
             } else {
                 None
@@ -686,14 +861,14 @@ fn extract_loop_configs(wf: Option<&WorkflowDecl>) -> Vec<LoopConfig> {
 
 fn map_until_condition(cond: &UntilCondition) -> LoopUntilCondition {
     match cond {
-        UntilCondition::Verify(vb) => LoopUntilCondition::Verify(
-            gaviero_core::swarm::plan::VerificationConfig {
+        UntilCondition::Verify(vb) => {
+            LoopUntilCondition::Verify(gaviero_core::swarm::plan::VerificationConfig {
                 compile: vb.compile,
                 clippy: vb.clippy,
                 test: vb.test,
                 impact_tests: vb.impact_tests,
-            },
-        ),
+            })
+        }
         UntilCondition::Agent(name, _) => LoopUntilCondition::Agent(name.clone()),
         UntilCondition::Command(cmd, _) => LoopUntilCondition::Command(cmd.clone()),
     }
@@ -744,7 +919,11 @@ mod tests {
         assert_eq!(units[0].id, "researcher");
         assert_eq!(units[0].tier, ModelTier::Expensive);
         assert_eq!(units[0].model, Some("claude-opus-4-6".to_string()));
-        assert!(units[0].coordinator_instructions.contains("architecture document"));
+        assert!(
+            units[0]
+                .coordinator_instructions
+                .contains("architecture document")
+        );
         assert_eq!(units[0].max_retries, 2);
         assert_eq!(units[0].scope.owned_paths, vec!["docs/architecture.md"]);
         assert_eq!(units[0].scope.read_only_paths, vec!["src/**"]);
@@ -752,7 +931,11 @@ mod tests {
         assert_eq!(units[1].id, "implementer");
         assert_eq!(units[1].tier, ModelTier::Cheap);
         assert_eq!(units[1].depends_on, vec!["researcher"]);
-        assert!(units[1].coordinator_instructions.contains("architecture document"));
+        assert!(
+            units[1]
+                .coordinator_instructions
+                .contains("architecture document")
+        );
     }
 
     #[test]
@@ -813,7 +996,11 @@ mod tests {
         let result = compile_str(src);
         assert!(result.is_err(), "multiple defaults should error");
         let msg = format!("{:?}", result.unwrap_err());
-        assert!(msg.contains("default"), "error should mention default: {}", msg);
+        assert!(
+            msg.contains("default"),
+            "error should mention default: {}",
+            msg
+        );
     }
 
     #[test]
@@ -979,11 +1166,17 @@ mod tests {
         // The span should point at "nonexistent", not at file start (0,1)
         if let DslError::Compile { span, .. } = err {
             let offset: usize = span.offset();
-            assert!(offset > 0, "span should point at the bad dep, not file start");
+            assert!(
+                offset > 0,
+                "span should point at the bad dep, not file start"
+            );
         }
     }
 
-    fn compile_str_with_prompt<'a>(src: &'a str, runtime_prompt: Option<&'a str>) -> Result<Vec<WorkUnit>, DslErrors> {
+    fn compile_str_with_prompt<'a>(
+        src: &'a str,
+        runtime_prompt: Option<&'a str>,
+    ) -> Result<Vec<WorkUnit>, DslErrors> {
         let (tokens, _) = lexer::lex(src);
         let (ast, errs) = parser::parse(&tokens, src, "test.gaviero");
         assert!(errs.is_empty(), "parse errors: {:?}", errs);
@@ -1002,7 +1195,10 @@ mod tests {
     fn runtime_prompt_fixed_prompt_unchanged() {
         let src = r##"agent x { prompt #"Fixed task: do the thing"# }"##;
         let units = compile_str_with_prompt(src, Some("ignored")).unwrap();
-        assert_eq!(units[0].coordinator_instructions, "Fixed task: do the thing");
+        assert_eq!(
+            units[0].coordinator_instructions,
+            "Fixed task: do the thing"
+        );
     }
 
     #[test]
@@ -1044,7 +1240,10 @@ mod tests {
             }
         "#;
         let units = compile_str(src).unwrap();
-        assert_eq!(units[0].memory_read_query.as_deref(), Some("custom search query"));
+        assert_eq!(
+            units[0].memory_read_query.as_deref(),
+            Some("custom search query")
+        );
         assert_eq!(units[0].memory_read_limit, Some(10));
     }
 
@@ -1060,7 +1259,10 @@ mod tests {
         "##;
         let units = compile_str(src).unwrap();
         assert_eq!(units[0].write_namespace.as_deref(), Some("output"));
-        assert_eq!(units[0].memory_write_content.as_deref(), Some("Findings: {{SUMMARY}}"));
+        assert_eq!(
+            units[0].memory_write_content.as_deref(),
+            Some("Findings: {{SUMMARY}}")
+        );
     }
 
     #[test]
@@ -1073,7 +1275,10 @@ mod tests {
             }
         "#;
         let units = compile_str_with_prompt(src, Some("auth bugs")).unwrap();
-        assert_eq!(units[0].memory_read_query.as_deref(), Some("find results for auth bugs"));
+        assert_eq!(
+            units[0].memory_read_query.as_deref(),
+            Some("find results for auth bugs")
+        );
     }
 
     #[test]
@@ -1114,7 +1319,9 @@ mod tests {
         let lc = &plan.loop_configs[0];
         assert_eq!(lc.agent_ids, vec!["a", "b"]);
         assert_eq!(lc.max_iterations, 5);
-        assert!(matches!(&lc.until, LoopUntilCondition::Verify(v) if v.compile && v.test && !v.clippy));
+        assert!(
+            matches!(&lc.until, LoopUntilCondition::Verify(v) if v.compile && v.test && !v.clippy)
+        );
     }
 
     #[test]
@@ -1133,7 +1340,9 @@ mod tests {
         "#;
         let plan = compile_plan(src).unwrap();
         assert_eq!(plan.loop_configs.len(), 1);
-        assert!(matches!(&plan.loop_configs[0].until, LoopUntilCondition::Command(cmd) if cmd == "make test"));
+        assert!(
+            matches!(&plan.loop_configs[0].until, LoopUntilCondition::Command(cmd) if cmd == "make test")
+        );
     }
 
     #[test]
@@ -1153,7 +1362,107 @@ mod tests {
         "#;
         let plan = compile_plan(src).unwrap();
         assert_eq!(plan.loop_configs.len(), 1);
-        assert!(matches!(&plan.loop_configs[0].until, LoopUntilCondition::Agent(name) if name == "judge"));
+        assert!(
+            matches!(&plan.loop_configs[0].until, LoopUntilCondition::Agent(name) if name == "judge")
+        );
+        assert_eq!(plan.loop_judge_units.len(), 1);
+        assert_eq!(plan.loop_judge_units[0].id, "judge");
+    }
+
+    #[test]
+    fn undefined_loop_judge_is_compile_error() {
+        let src = r#"
+            agent impl_agent { description "implement" }
+            workflow w {
+                steps [
+                    loop {
+                        agents [impl_agent]
+                        max_iterations 3
+                        until agent judge
+                    }
+                ]
+            }
+        "#;
+
+        let err = compile_plan(src).expect_err("undefined loop judge should fail");
+        assert!(
+            err.errors
+                .iter()
+                .any(|e| e.to_string().contains("undefined judge agent `judge`")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn loop_stability_judge_timeout_strict_judge_defaults_and_overrides() {
+        // Defaults when no judge-control fields are present.
+        let src = r#"
+            agent impl_agent { description "implement" }
+            agent judge { description "judge" }
+            workflow w {
+                steps [
+                    loop {
+                        agents [impl_agent]
+                        max_iterations 3
+                        until agent judge
+                    }
+                ]
+            }
+        "#;
+        let plan = compile_plan(src).unwrap();
+        let lc = &plan.loop_configs[0];
+        assert_eq!(lc.stability, 1, "default stability");
+        assert_eq!(lc.judge_timeout_secs, 120, "default judge_timeout");
+        assert!(lc.strict_judge, "default strict_judge");
+
+        // Explicit overrides.
+        let src = r#"
+            agent impl_agent { description "implement" }
+            agent judge { description "judge" }
+            workflow w {
+                steps [
+                    loop {
+                        agents [impl_agent]
+                        max_iterations 10
+                        stability 3
+                        judge_timeout 45
+                        strict_judge false
+                        until agent judge
+                    }
+                ]
+            }
+        "#;
+        let plan = compile_plan(src).unwrap();
+        let lc = &plan.loop_configs[0];
+        assert_eq!(lc.stability, 3);
+        assert_eq!(lc.judge_timeout_secs, 45);
+        assert!(!lc.strict_judge);
+    }
+
+    #[test]
+    fn loop_judge_shadowing_workflow_agent_is_compile_error() {
+        // Using an agent's name as `until agent <name>` is ambiguous at runtime
+        // (shadowing the workflow unit_map). The compiler must reject it.
+        let src = r#"
+            agent impl_agent { description "implement" }
+            workflow w {
+                steps [
+                    loop {
+                        agents [impl_agent]
+                        max_iterations 3
+                        until agent impl_agent
+                    }
+                ]
+            }
+        "#;
+
+        let err = compile_plan(src).expect_err("shadowing should fail");
+        assert!(
+            err.errors
+                .iter()
+                .any(|e| e.to_string().contains("also appears as a workflow step")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
@@ -1301,9 +1610,15 @@ mod tests {
         let (tokens, _) = lexer::lex(src);
         let (ast, errs) = parser::parse(&tokens, src, "test.gaviero");
         assert!(errs.is_empty(), "parse errors: {:?}", errs);
-        let units = compile_ast(&ast.unwrap(), src, "test.gaviero", None, Some("build the feature"))
-            .map(|c| c.work_units_ordered().expect("toposort"))
-            .expect("compile");
+        let units = compile_ast(
+            &ast.unwrap(),
+            src,
+            "test.gaviero",
+            None,
+            Some("build the feature"),
+        )
+        .map(|c| c.work_units_ordered().expect("toposort"))
+        .expect("compile");
         assert_eq!(units[0].coordinator_instructions, "task: build the feature");
     }
 
@@ -1316,7 +1631,7 @@ mod tests {
         "#;
         let units = compile_str(src).expect("should compile");
         let alpha = units.iter().find(|u| u.id == "alpha").unwrap();
-        let beta  = units.iter().find(|u| u.id == "beta").unwrap();
+        let beta = units.iter().find(|u| u.id == "beta").unwrap();
         assert_eq!(alpha.coordinator_instructions, "write to alpha-output.md");
         assert_eq!(beta.coordinator_instructions, "write to beta-output.md");
     }
@@ -1378,7 +1693,10 @@ mod tests {
             }
         "#;
         let units = compile_str(src).expect("should compile");
-        assert_eq!(units[0].coordinator_instructions, "write to claude-output.md");
+        assert_eq!(
+            units[0].coordinator_instructions,
+            "write to claude-output.md"
+        );
     }
 
     #[test]
@@ -1414,7 +1732,10 @@ mod tests {
             agent x { prompt #"read v{{PREV_ITER}} write v{{ITER}}"# }
         "##;
         let units = compile_str(src).expect("should compile");
-        assert_eq!(units[0].coordinator_instructions, "read v{{PREV_ITER}} write v{{ITER}}");
+        assert_eq!(
+            units[0].coordinator_instructions,
+            "read v{{PREV_ITER}} write v{{ITER}}"
+        );
     }
 
     #[test]
@@ -1512,12 +1833,20 @@ mod tests {
 
         // All use expensive tier
         for u in &units {
-            assert_eq!(u.tier, ModelTier::Expensive, "agent {} should be expensive", u.id);
+            assert_eq!(
+                u.tier,
+                ModelTier::Expensive,
+                "agent {} should be expensive",
+                u.id
+            );
         }
 
         // Init agents have MODEL_NAME and PLANS substituted at compile time
         let cinit = units.iter().find(|u| u.id == "claude-init").unwrap();
-        assert_eq!(cinit.coordinator_instructions, "Write to plans/claude-plan-v1.md");
+        assert_eq!(
+            cinit.coordinator_instructions,
+            "Write to plans/claude-plan-v1.md"
+        );
 
         // Refine agents: PLANS and MODEL_NAME substituted; ITER/PREV_ITER left for runtime
         let crefine = units.iter().find(|u| u.id == "claude-refine").unwrap();
@@ -1530,7 +1859,10 @@ mod tests {
         assert_eq!(plan.loop_configs.len(), 1);
         assert_eq!(plan.loop_configs[0].iter_start, 2);
         assert_eq!(plan.loop_configs[0].max_iterations, 5);
-        assert_eq!(plan.loop_configs[0].agent_ids, vec!["claude-refine", "codex-refine"]);
+        assert_eq!(
+            plan.loop_configs[0].agent_ids,
+            vec!["claude-refine", "codex-refine"]
+        );
 
         // max_parallel preserved
         assert_eq!(plan.max_parallel, Some(2));
