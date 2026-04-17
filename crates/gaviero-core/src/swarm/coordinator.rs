@@ -11,7 +11,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::backend::{executor, shared, CompletionRequest};
+use super::backend::{CompletionRequest, executor, shared};
 use super::models::{AgentBackend, WorkUnit};
 use super::planner::extract_json;
 use super::validation;
@@ -58,7 +58,9 @@ pub struct TaskDAG {
 /// - `[["a","b"], ["c","d"]]` — tuples as arrays
 /// - `[{"from":"a","to":"b"}]` — objects
 /// - missing/null — empty vec
-fn deserialize_dep_graph<'de, D>(deserializer: D) -> std::result::Result<Vec<(String, String)>, D::Error>
+fn deserialize_dep_graph<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<(String, String)>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -161,8 +163,8 @@ impl Coordinator {
         .await?;
 
         // Parse the JSON response leniently (LLMs produce varying shapes)
-        let json_str = extract_json(&response)
-            .context("extracting JSON from coordinator response")?;
+        let json_str =
+            extract_json(&response).context("extracting JSON from coordinator response")?;
         let mut dag = parse_task_dag_lenient(&json_str)?;
 
         // Auto-resolve scope overlaps before validation
@@ -192,8 +194,10 @@ impl Coordinator {
                 } else {
                     format!(" (after: {})", unit.depends_on.join(", "))
                 };
-                summary.push_str(&format!("  [{}] {} — {}{}\n",
-                    tier_label, unit.id, unit.description, deps));
+                summary.push_str(&format!(
+                    "  [{}] {} — {}{}\n",
+                    tier_label, unit.id, unit.description, deps
+                ));
             }
             obs.on_stream_chunk(&summary);
         }
@@ -223,7 +227,9 @@ impl Coordinator {
     ) -> Result<String> {
         let obs = observer.as_deref();
 
-        if let Some(o) = obs { o.on_streaming_status("Searching memory context..."); }
+        if let Some(o) = obs {
+            o.on_streaming_status("Searching memory context...");
+        }
         let memory_context = if let Some(ref mem) = self.memory {
             mem.search_context_filtered(
                 read_namespaces,
@@ -328,7 +334,8 @@ impl Coordinator {
         let results = mem.search_multi(namespaces, prompt, 20).await.ok()?;
 
         // Filter to agent result entries with high similarity
-        let agent_results: Vec<_> = results.iter()
+        let agent_results: Vec<_> = results
+            .iter()
             .filter(|r| r.entry.key.starts_with("agents:") && r.score > 0.8)
             .collect();
 
@@ -337,7 +344,8 @@ impl Coordinator {
         }
 
         // Group by run_id and pick the best-matching run
-        let mut run_scores: std::collections::HashMap<String, (f32, usize)> = std::collections::HashMap::new();
+        let mut run_scores: std::collections::HashMap<String, (f32, usize)> =
+            std::collections::HashMap::new();
         for r in &agent_results {
             if let Some(run_id) = extract_run_id_from_key(&r.entry.key) {
                 let entry = run_scores.entry(run_id).or_insert((0.0, 0));
@@ -346,10 +354,14 @@ impl Coordinator {
             }
         }
 
-        let best_run = run_scores.into_iter()
-            .max_by(|a, b| a.1.0.partial_cmp(&b.1.0).unwrap_or(std::cmp::Ordering::Equal))?;
+        let best_run = run_scores.into_iter().max_by(|a, b| {
+            a.1.0
+                .partial_cmp(&b.1.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
 
-        self.load_continuity_for_run(mem, namespaces, &best_run.0).await
+        self.load_continuity_for_run(mem, namespaces, &best_run.0)
+            .await
     }
 
     /// Load continuity context for a specific run ID from memory.
@@ -363,7 +375,8 @@ impl Coordinator {
         let query = format!("agents:{}", run_id);
         let results = mem.search_multi(namespaces, &query, 50).await.ok()?;
 
-        let agent_entries: Vec<_> = results.iter()
+        let agent_entries: Vec<_> = results
+            .iter()
             .filter(|r| r.entry.key.starts_with(&format!("agents:{}:", run_id)))
             .collect();
 
@@ -376,12 +389,15 @@ impl Coordinator {
         let mut failed_units = Vec::new();
 
         for entry in &agent_entries {
-            let unit_id = entry.entry.key
+            let unit_id = entry
+                .entry
+                .key
                 .strip_prefix(&format!("agents:{}:", run_id))
                 .unwrap_or("")
                 .to_string();
 
-            if entry.entry.content.contains("Completed") || !entry.entry.content.contains("Failed") {
+            if entry.entry.content.contains("Completed") || !entry.entry.content.contains("Failed")
+            {
                 completed_units.push(unit_id);
             } else {
                 failed_units.push(FailedUnit {
@@ -394,10 +410,14 @@ impl Coordinator {
 
         // Load plan summary from verification entry if available
         let verification_key = format!("verification:{}", run_id);
-        let plan_summary = mem.get(
-            namespaces.first().map(|s| s.as_str()).unwrap_or("default"),
-            &verification_key,
-        ).await.ok().flatten()
+        let plan_summary = mem
+            .get(
+                namespaces.first().map(|s| s.as_str()).unwrap_or("default"),
+                &verification_key,
+            )
+            .await
+            .ok()
+            .flatten()
             .map(|e| e.content)
             .unwrap_or_default();
 
@@ -452,17 +472,18 @@ pub(crate) fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
     // Try full JSON parse first
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(input_json) {
         let arg = match tool_name {
-            "Read" | "read" => v.get("file_path")
+            "Read" | "read" => v
+                .get("file_path")
                 .or_else(|| v.get("path"))
                 .and_then(|v| v.as_str()),
-            "Glob" | "glob" => v.get("pattern")
-                .and_then(|v| v.as_str()),
-            "Grep" | "grep" => v.get("pattern")
-                .and_then(|v| v.as_str()),
-            "Write" | "write" | "Edit" | "edit" => v.get("file_path")
+            "Glob" | "glob" => v.get("pattern").and_then(|v| v.as_str()),
+            "Grep" | "grep" => v.get("pattern").and_then(|v| v.as_str()),
+            "Write" | "write" | "Edit" | "edit" => v
+                .get("file_path")
                 .or_else(|| v.get("path"))
                 .and_then(|v| v.as_str()),
-            "Bash" | "bash" => v.get("command")
+            "Bash" | "bash" => v
+                .get("command")
                 .and_then(|v| v.as_str())
                 .map(|s| if s.len() > 60 { &s[..60] } else { s }),
             _ => None,
@@ -517,16 +538,15 @@ fn extract_run_id_from_key(key: &str) -> Option<String> {
 /// parses into `serde_json::Value` and extracts fields manually with fallbacks.
 fn parse_task_dag_lenient(json_str: &str) -> Result<TaskDAG> {
     let v: serde_json::Value = serde_json::from_str(json_str)
-        .with_context(|| format!(
-            "invalid JSON: {}",
-            &json_str[..json_str.len().min(200)]
-        ))?;
+        .with_context(|| format!("invalid JSON: {}", &json_str[..json_str.len().min(200)]))?;
 
-    let obj = v.as_object()
+    let obj = v
+        .as_object()
         .ok_or_else(|| anyhow::anyhow!("expected JSON object, got {}", v_type(&v)))?;
 
     // plan_summary — string, optional
-    let plan_summary = obj.get("plan_summary")
+    let plan_summary = obj
+        .get("plan_summary")
         .or_else(|| obj.get("summary"))
         .or_else(|| obj.get("plan"))
         .and_then(|v| v.as_str())
@@ -534,11 +554,13 @@ fn parse_task_dag_lenient(json_str: &str) -> Result<TaskDAG> {
         .to_string();
 
     // units — array of work unit objects (required)
-    let units_val = obj.get("units")
+    let units_val = obj
+        .get("units")
         .or_else(|| obj.get("tasks"))
         .or_else(|| obj.get("work_units"))
         .ok_or_else(|| anyhow::anyhow!("missing 'units' array in TaskDAG"))?;
-    let units_arr = units_val.as_array()
+    let units_arr = units_val
+        .as_array()
         .ok_or_else(|| anyhow::anyhow!("'units' must be an array, got {}", v_type(units_val)))?;
 
     let mut units = Vec::with_capacity(units_arr.len());
@@ -552,17 +574,22 @@ fn parse_task_dag_lenient(json_str: &str) -> Result<TaskDAG> {
     }
 
     if units.is_empty() {
-        anyhow::bail!("no valid work units in TaskDAG (parsed {} entries)", units_arr.len());
+        anyhow::bail!(
+            "no valid work units in TaskDAG (parsed {} entries)",
+            units_arr.len()
+        );
     }
 
     // verification_strategy — optional, default to Combined
-    let verification_strategy = obj.get("verification_strategy")
+    let verification_strategy = obj
+        .get("verification_strategy")
         .or_else(|| obj.get("verification"))
         .map(parse_verification_strategy)
         .unwrap_or_default();
 
     // dependency_graph — optional, extract from units.depends_on if not present
-    let dependency_graph = obj.get("dependency_graph")
+    let dependency_graph = obj
+        .get("dependency_graph")
         .and_then(|v| parse_dep_graph(v))
         .unwrap_or_default();
 
@@ -577,57 +604,69 @@ fn parse_task_dag_lenient(json_str: &str) -> Result<TaskDAG> {
 
 /// Parse a single WorkUnit from a JSON value, leniently.
 fn parse_work_unit_lenient(v: &serde_json::Value) -> Result<WorkUnit> {
-    let obj = v.as_object()
+    let obj = v
+        .as_object()
         .ok_or_else(|| anyhow::anyhow!("work unit must be an object"))?;
 
     let id = get_str(obj, &["id", "name", "unit_id"])
         .ok_or_else(|| anyhow::anyhow!("work unit missing 'id'"))?;
 
-    let description = get_str(obj, &["description", "task", "title", "summary"])
-        .unwrap_or_default();
+    let description =
+        get_str(obj, &["description", "task", "title", "summary"]).unwrap_or_default();
 
-    let coordinator_instructions = get_str(obj, &["coordinator_instructions", "instructions", "prompt", "details"])
-        .unwrap_or_default();
+    let coordinator_instructions = get_str(
+        obj,
+        &[
+            "coordinator_instructions",
+            "instructions",
+            "prompt",
+            "details",
+        ],
+    )
+    .unwrap_or_default();
 
     // scope — object with owned_paths, or array of strings, or single string
-    let scope = obj.get("scope")
-        .map(parse_scope)
-        .unwrap_or_default();
+    let scope = obj.get("scope").map(parse_scope).unwrap_or_default();
 
     // depends_on — array of strings
-    let depends_on = obj.get("depends_on")
+    let depends_on = obj
+        .get("depends_on")
         .or_else(|| obj.get("dependencies"))
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     // tier — string like "reasoning", "execution", "mechanical"
-    let tier = obj.get("tier")
+    let tier = obj
+        .get("tier")
         .and_then(|v| v.as_str())
         .map(parse_model_tier)
         .unwrap_or(ModelTier::Cheap);
 
     // privacy — string like "public", "local_only"
-    let privacy = obj.get("privacy")
+    let privacy = obj
+        .get("privacy")
         .and_then(|v| v.as_str())
         .map(parse_privacy_level)
         .unwrap_or(PrivacyLevel::Public);
 
-    let estimated_tokens = obj.get("estimated_tokens")
+    let estimated_tokens = obj
+        .get("estimated_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
 
-    let max_retries = obj.get("max_retries")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1) as u8;
+    let max_retries = obj.get("max_retries").and_then(|v| v.as_u64()).unwrap_or(1) as u8;
 
-    let escalation_tier = obj.get("escalation_tier")
+    let escalation_tier = obj
+        .get("escalation_tier")
         .and_then(|v| v.as_str())
         .map(parse_model_tier);
 
-    let model = obj.get("model")
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    let model = obj.get("model").and_then(|v| v.as_str()).map(String::from);
 
     Ok(WorkUnit {
         id,
@@ -661,12 +700,14 @@ fn parse_scope(v: &serde_json::Value) -> FileScope {
     match v {
         // Object: { "owned_paths": [...], "read_only_paths": [...] }
         serde_json::Value::Object(obj) => {
-            let owned = obj.get("owned_paths")
+            let owned = obj
+                .get("owned_paths")
                 .or_else(|| obj.get("write"))
                 .or_else(|| obj.get("files"))
                 .and_then(parse_string_array)
                 .unwrap_or_default();
-            let read_only = obj.get("read_only_paths")
+            let read_only = obj
+                .get("read_only_paths")
                 .or_else(|| obj.get("read_only"))
                 .or_else(|| obj.get("read"))
                 .and_then(parse_string_array)
@@ -679,7 +720,10 @@ fn parse_scope(v: &serde_json::Value) -> FileScope {
         }
         // Array: ["src/auth/", "src/types.rs"] → all as owned
         serde_json::Value::Array(arr) => {
-            let owned = arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+            let owned = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
             FileScope {
                 owned_paths: owned,
                 read_only_paths: Vec::new(),
@@ -704,7 +748,8 @@ fn parse_verification_strategy(v: &serde_json::Value) -> VerificationStrategy {
     };
 
     // Check "type" field for variant
-    let variant = obj.get("type")
+    let variant = obj
+        .get("type")
         .and_then(|v| v.as_str())
         .unwrap_or("combined")
         .to_lowercase();
@@ -712,23 +757,33 @@ fn parse_verification_strategy(v: &serde_json::Value) -> VerificationStrategy {
     match variant.as_str() {
         "structural_only" | "structural" => VerificationStrategy::StructuralOnly,
         "test_suite" | "test" | "tests" => {
-            let command = obj.get("test_command")
+            let command = obj
+                .get("test_command")
                 .or_else(|| obj.get("command"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("cargo test")
                 .to_string();
             VerificationStrategy::TestSuite {
                 command,
-                targeted: obj.get("targeted").and_then(|v| v.as_bool()).unwrap_or(false),
+                targeted: obj
+                    .get("targeted")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
             }
         }
         _ => {
             // "combined" or any unknown → Combined with defaults
-            let review_tiers = obj.get("review_tiers")
+            let review_tiers = obj
+                .get("review_tiers")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(parse_model_tier)).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(parse_model_tier))
+                        .collect()
+                })
                 .unwrap_or_else(|| vec![ModelTier::Cheap]);
-            let test_command = obj.get("test_command")
+            let test_command = obj
+                .get("test_command")
                 .or_else(|| obj.get("command"))
                 .and_then(|v| v.as_str())
                 .map(String::from);
@@ -777,13 +832,17 @@ fn get_str(obj: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> O
 
 fn parse_string_array(v: &serde_json::Value) -> Option<Vec<String>> {
     v.as_array().map(|arr| {
-        arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+        arr.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
     })
 }
 
 fn parse_model_tier(s: &str) -> ModelTier {
     match s.to_lowercase().as_str() {
-        "expensive" | "coordinator" | "coord" | "c" | "reasoning" | "reason" | "r" => ModelTier::Expensive,
+        "expensive" | "coordinator" | "coord" | "c" | "reasoning" | "reason" | "r" => {
+            ModelTier::Expensive
+        }
         "cheap" | "execution" | "exec" | "e" | "mechanical" | "mech" | "m" => ModelTier::Cheap,
         _ => ModelTier::Cheap,
     }
@@ -966,14 +1025,15 @@ fn strip_code_fence(text: &str) -> &str {
     let trimmed = text.trim();
 
     // Find the first opening fence (prefer the language-tagged one)
-    let fence_pos = trimmed
-        .find("```gaviero")
-        .or_else(|| trimmed.find("```"));
+    let fence_pos = trimmed.find("```gaviero").or_else(|| trimmed.find("```"));
 
     if let Some(pos) = fence_pos {
         let after_fence = &trimmed[pos..];
         // Skip past the opening fence line to the first newline
-        let inner_start = after_fence.find('\n').map(|p| p + 1).unwrap_or(after_fence.len());
+        let inner_start = after_fence
+            .find('\n')
+            .map(|p| p + 1)
+            .unwrap_or(after_fence.len());
         let inner = &after_fence[inner_start..];
         // Remove trailing ```
         if let Some(end) = inner.rfind("```") {
@@ -1243,7 +1303,10 @@ mod tests {
         // scope as array
         let json = r#"{ "units": [{ "id": "b", "scope": ["src/auth.rs", "src/lib.rs"] }] }"#;
         let dag = parse_task_dag_lenient(json).unwrap();
-        assert_eq!(dag.units[0].scope.owned_paths, vec!["src/auth.rs", "src/lib.rs"]);
+        assert_eq!(
+            dag.units[0].scope.owned_paths,
+            vec!["src/auth.rs", "src/lib.rs"]
+        );
 
         // scope as string
         let json = r#"{ "units": [{ "id": "c", "scope": "src/" }] }"#;
@@ -1269,7 +1332,10 @@ mod tests {
         }"#;
         let dag = parse_task_dag_lenient(json).unwrap();
         match &dag.verification_strategy {
-            VerificationStrategy::Combined { review_tiers, test_command } => {
+            VerificationStrategy::Combined {
+                review_tiers,
+                test_command,
+            } => {
                 assert_eq!(review_tiers.len(), 2);
                 assert_eq!(test_command.as_deref(), Some("cargo test && npm run build"));
             }
@@ -1281,7 +1347,10 @@ mod tests {
     fn test_lenient_missing_verification() {
         let json = r#"{ "units": [{ "id": "a" }] }"#;
         let dag = parse_task_dag_lenient(json).unwrap();
-        assert!(matches!(dag.verification_strategy, VerificationStrategy::Combined { .. }));
+        assert!(matches!(
+            dag.verification_strategy,
+            VerificationStrategy::Combined { .. }
+        ));
     }
 
     #[test]
@@ -1329,10 +1398,7 @@ mod tests {
 
     #[test]
     fn test_resolve_no_overlaps() {
-        let mut units = vec![
-            make_unit("a", &[]),
-            make_unit("b", &[]),
-        ];
+        let mut units = vec![make_unit("a", &[]), make_unit("b", &[])];
         units[0].scope.owned_paths = vec!["src/a.rs".into()];
         units[1].scope.owned_paths = vec!["src/b.rs".into()];
 
@@ -1344,10 +1410,7 @@ mod tests {
 
     #[test]
     fn test_resolve_exact_file_conflict() {
-        let mut units = vec![
-            make_unit("backend", &[]),
-            make_unit("database", &[]),
-        ];
+        let mut units = vec![make_unit("backend", &[]), make_unit("database", &[])];
         units[0].scope.owned_paths = vec!["src/main.rs".into(), "src/config.rs".into()];
         units[1].scope.owned_paths = vec!["src/main.rs".into(), "src/db.rs".into()];
 
@@ -1358,28 +1421,55 @@ mod tests {
         assert!(fixes[0].contains("owned by backend"));
 
         // backend keeps src/main.rs
-        assert!(units[0].scope.owned_paths.contains(&"src/main.rs".to_string()));
+        assert!(
+            units[0]
+                .scope
+                .owned_paths
+                .contains(&"src/main.rs".to_string())
+        );
         // database has it moved to read_only
-        assert!(!units[1].scope.owned_paths.contains(&"src/main.rs".to_string()));
-        assert!(units[1].scope.read_only_paths.contains(&"src/main.rs".to_string()));
+        assert!(
+            !units[1]
+                .scope
+                .owned_paths
+                .contains(&"src/main.rs".to_string())
+        );
+        assert!(
+            units[1]
+                .scope
+                .read_only_paths
+                .contains(&"src/main.rs".to_string())
+        );
         // database keeps src/db.rs
-        assert!(units[1].scope.owned_paths.contains(&"src/db.rs".to_string()));
+        assert!(
+            units[1]
+                .scope
+                .owned_paths
+                .contains(&"src/db.rs".to_string())
+        );
     }
 
     #[test]
     fn test_resolve_directory_prefix_overlap() {
-        let mut units = vec![
-            make_unit("full", &[]),
-            make_unit("partial", &[]),
-        ];
+        let mut units = vec![make_unit("full", &[]), make_unit("partial", &[])];
         units[0].scope.owned_paths = vec!["src/".into()];
         units[1].scope.owned_paths = vec!["src/main.rs".into()];
 
         let fixes = resolve_scope_overlaps(&mut units);
         assert_eq!(fixes.len(), 1);
         // "full" owns src/ so "partial" can't own src/main.rs
-        assert!(!units[1].scope.owned_paths.contains(&"src/main.rs".to_string()));
-        assert!(units[1].scope.read_only_paths.contains(&"src/main.rs".to_string()));
+        assert!(
+            !units[1]
+                .scope
+                .owned_paths
+                .contains(&"src/main.rs".to_string())
+        );
+        assert!(
+            units[1]
+                .scope
+                .read_only_paths
+                .contains(&"src/main.rs".to_string())
+        );
     }
 
     #[test]
@@ -1395,8 +1485,23 @@ mod tests {
 
         let fixes = resolve_scope_overlaps(&mut units);
         assert_eq!(fixes.len(), 2); // b and c both conflict with a
-        assert!(units[0].scope.owned_paths.contains(&"shared.rs".to_string()));
-        assert!(units[1].scope.read_only_paths.contains(&"shared.rs".to_string()));
-        assert!(units[2].scope.read_only_paths.contains(&"shared.rs".to_string()));
+        assert!(
+            units[0]
+                .scope
+                .owned_paths
+                .contains(&"shared.rs".to_string())
+        );
+        assert!(
+            units[1]
+                .scope
+                .read_only_paths
+                .contains(&"shared.rs".to_string())
+        );
+        assert!(
+            units[2]
+                .scope
+                .read_only_paths
+                .contains(&"shared.rs".to_string())
+        );
     }
 }
