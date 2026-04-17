@@ -75,8 +75,22 @@ impl AgentBackend for CodexBackend {
             .arg("--config")
             .arg("approval_policy=never")
             .arg("--config")
-            .arg("sandbox=read-only")
-            .arg(&combined_prompt)
+            .arg("sandbox=read-only");
+
+        if let Some(codex_effort) = map_effort_to_codex(request.effort.as_deref()) {
+            cmd.arg("--config")
+                .arg(format!("model_reasoning_effort={codex_effort}"));
+        }
+
+        // Forward every `extra { k v }` pair as a `-c k=v` override to codex.
+        // Codex treats `--config` args as TOML-shaped overrides and silently
+        // ignores unknown keys, so this is a safe pass-through: users opt in
+        // explicitly via the DSL.
+        for (k, v) in &request.extra {
+            cmd.arg("--config").arg(format!("{k}={v}"));
+        }
+
+        cmd.arg(&combined_prompt)
             .current_dir(&request.workspace_root)
             .env("NO_COLOR", "1")
             .stdin(Stdio::null())
@@ -233,6 +247,34 @@ async fn drive_codex_stdout(
     Ok(())
 }
 
+/// Map the DSL's provider-neutral `effort` vocabulary into Codex's
+/// `model_reasoning_effort` config value.
+///
+/// Gaviero accepts `off`, `auto`, `low`, `medium`, `high`, `xhigh`, `max`
+/// (shared with Claude). Codex only understands `minimal`, `low`, `medium`,
+/// `high`. `None` means "omit the flag and let Codex use its default".
+///
+/// `xhigh` / `max` are clamped to `high` — Codex has no tier above that.
+/// `off` / `auto` map to `None` so the user can use a single `client` block
+/// across providers without forcing Codex into a specific tier.
+fn map_effort_to_codex(effort: Option<&str>) -> Option<&'static str> {
+    match effort?.trim().to_ascii_lowercase().as_str() {
+        "off" | "auto" | "" => None,
+        "minimal" => Some("minimal"),
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" | "xhigh" | "max" => Some("high"),
+        other => {
+            tracing::warn!(
+                target: "backend.codex",
+                effort = other,
+                "unknown effort value; not forwarding to codex (supported: minimal|low|medium|high|xhigh|max|off|auto)"
+            );
+            None
+        }
+    }
+}
+
 fn format_exit_error(
     exit_status: &std::io::Result<std::process::ExitStatus>,
     stderr_text: &str,
@@ -272,6 +314,38 @@ mod tests {
         assert!(caps.supports_file_blocks);
         assert!(caps.supports_system_prompt);
         assert!(caps.streaming);
+    }
+
+    #[test]
+    fn test_map_effort_to_codex_known_values() {
+        assert_eq!(map_effort_to_codex(Some("low")), Some("low"));
+        assert_eq!(map_effort_to_codex(Some("medium")), Some("medium"));
+        assert_eq!(map_effort_to_codex(Some("high")), Some("high"));
+        assert_eq!(map_effort_to_codex(Some("minimal")), Some("minimal"));
+    }
+
+    #[test]
+    fn test_map_effort_to_codex_clamps_above_high() {
+        assert_eq!(map_effort_to_codex(Some("xhigh")), Some("high"));
+        assert_eq!(map_effort_to_codex(Some("max")), Some("high"));
+    }
+
+    #[test]
+    fn test_map_effort_to_codex_off_and_auto_omit() {
+        assert_eq!(map_effort_to_codex(Some("off")), None);
+        assert_eq!(map_effort_to_codex(Some("auto")), None);
+        assert_eq!(map_effort_to_codex(None), None);
+    }
+
+    #[test]
+    fn test_map_effort_to_codex_case_insensitive() {
+        assert_eq!(map_effort_to_codex(Some("HIGH")), Some("high"));
+        assert_eq!(map_effort_to_codex(Some("Medium")), Some("medium"));
+    }
+
+    #[test]
+    fn test_map_effort_to_codex_unknown_omitted() {
+        assert_eq!(map_effort_to_codex(Some("turbo")), None);
     }
 
     #[test]
