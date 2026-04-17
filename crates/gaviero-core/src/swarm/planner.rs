@@ -9,7 +9,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use super::backend::{executor, shared, CompletionRequest};
+use super::backend::{CompletionRequest, executor, shared};
 use super::models::WorkUnit;
 use super::validation;
 
@@ -94,15 +94,23 @@ async fn try_plan(
 
     // Extract JSON from the response (may be wrapped in ```json ... ```)
     let json_str = extract_json(&response)?;
-    let units: Vec<WorkUnit> = serde_json::from_str(&json_str)
-        .with_context(|| format!("parsing work units JSON: {}", &json_str[..json_str.len().min(200)]))?;
+    let units: Vec<WorkUnit> = serde_json::from_str(&json_str).with_context(|| {
+        format!(
+            "parsing work units JSON: {}",
+            &json_str[..json_str.len().min(200)]
+        )
+    })?;
 
     // Validate
     let scope_errors = validation::validate_scopes(&units);
     if !scope_errors.is_empty() {
         anyhow::bail!(
             "scope overlaps: {}",
-            scope_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ")
+            scope_errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
         );
     }
 
@@ -121,7 +129,7 @@ fn build_planner_prompt(file_list: &[String], memory_context: &str) -> String {
          - Each work unit must have non-overlapping owned_paths (no two agents write to the same file/directory)\n\
          - Use depends_on to express ordering when one unit needs another's output\n\
          - Keep units as independent as possible to maximize parallelism\n\
-         - Use directory-level scopes (ending with /) when an agent needs a whole subtree\n\n"
+         - Use directory-level scopes (ending with /) when an agent needs a whole subtree\n\n",
     );
 
     if !file_list.is_empty() {
@@ -214,15 +222,30 @@ fn repair_truncated_json(json: &str) -> String {
 
     for &b in bytes {
         let ch = b as char;
-        if escape_next { escape_next = false; continue; }
-        if ch == '\\' && in_string { escape_next = true; continue; }
-        if ch == '"' { in_string = !in_string; continue; }
-        if in_string { continue; }
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        if ch == '\\' && in_string {
+            escape_next = true;
+            continue;
+        }
+        if ch == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
         match ch {
             '{' => stack.push('{'),
             '[' => stack.push('['),
-            '}' => { stack.pop(); }
-            ']' => { stack.pop(); }
+            '}' => {
+                stack.pop();
+            }
+            ']' => {
+                stack.pop();
+            }
             _ => {}
         }
     }
@@ -245,7 +268,11 @@ fn repair_truncated_json(json: &str) -> String {
     for _ in 0..5 {
         let candidate = close_json(&result);
         if serde_json::from_str::<serde_json::Value>(&candidate).is_ok() {
-            tracing::info!("Repaired truncated JSON ({} → {} bytes)", json.len(), candidate.len());
+            tracing::info!(
+                "Repaired truncated JSON ({} → {} bytes)",
+                json.len(),
+                candidate.len()
+            );
             return candidate;
         }
 
@@ -279,15 +306,30 @@ fn close_json(json: &str) -> String {
     let mut stack: Vec<char> = Vec::new();
 
     for ch in result.chars() {
-        if escape_next { escape_next = false; continue; }
-        if ch == '\\' && in_string { escape_next = true; continue; }
-        if ch == '"' { in_string = !in_string; continue; }
-        if in_string { continue; }
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        if ch == '\\' && in_string {
+            escape_next = true;
+            continue;
+        }
+        if ch == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
         match ch {
             '{' => stack.push('{'),
             '[' => stack.push('['),
-            '}' => { stack.pop(); }
-            ']' => { stack.pop(); }
+            '}' => {
+                stack.pop();
+            }
+            ']' => {
+                stack.pop();
+            }
             _ => {}
         }
     }
