@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use gaviero_core::memory::consolidation::Consolidator;
-use gaviero_core::memory::{hash_path, MemoryStore, StoreOptions};
+use gaviero_core::memory::{MemoryStore, StoreOptions, hash_path};
 
 use super::App;
 use crate::panels::agent_chat::ChatRole;
@@ -124,7 +124,10 @@ pub(crate) fn store_chat_turn(app: &App, conv_id: &str, assistant_content: &str)
 
     let mem: Arc<MemoryStore> = memory.clone();
     tokio::spawn(async move {
-        if let Err(e) = mem.store_with_options(&namespace, &key, &content, &opts).await {
+        if let Err(e) = mem
+            .store_with_options(&namespace, &key, &content, &opts)
+            .await
+        {
             tracing::warn!("chat memory write-back failed: {}", e);
         } else {
             tracing::debug!(
