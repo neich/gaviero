@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::tree_sitter::language_for_extension;
 
-use super::builder::{extract_symbols, SKIP_DIRS};
+use super::builder::{SKIP_DIRS, extract_symbols};
 use super::edges::{
     extract_rust_references, is_test_file, node_kind_from_ts, resolve_and_insert_edges,
 };
@@ -68,10 +68,8 @@ fn incremental_build(store: &GraphStore, workspace: &Path) -> Result<BuildResult
     result.files_scanned = source_files.len();
 
     // 2. Get existing file hashes
-    let existing_hashes: std::collections::HashMap<String, String> = store
-        .all_file_hashes()?
-        .into_iter()
-        .collect();
+    let existing_hashes: std::collections::HashMap<String, String> =
+        store.all_file_hashes()?.into_iter().collect();
 
     // 3. Detect deleted files (in store but not on disk)
     let current_files: std::collections::HashSet<String> = source_files
@@ -244,7 +242,8 @@ mod tests {
         std::fs::write(
             dir.path().join("lib.rs"),
             "pub fn hello() {}\nfn internal() {}",
-        ).unwrap();
+        )
+        .unwrap();
 
         let (store, result) = build_graph(dir.path()).unwrap();
         assert_eq!(result.files_scanned, 1);
@@ -318,10 +317,7 @@ mod tests {
         std::fs::write(dir.path().join("a.rs"), "pub fn compute() -> i32 { 42 }").unwrap();
 
         // b.rs calls `compute`
-        std::fs::write(
-            dir.path().join("b.rs"),
-            "fn main() { let x = compute(); }",
-        ).unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn main() { let x = compute(); }").unwrap();
 
         let (store, result) = build_graph(dir.path()).unwrap();
         assert!(result.total_edges > 0, "expected some edges, got 0");
@@ -344,7 +340,8 @@ mod tests {
         std::fs::write(
             dir.path().join("tests").join("test_lib.rs"),
             "fn test_process() { process(); }",
-        ).unwrap();
+        )
+        .unwrap();
 
         let (store, _) = build_graph(dir.path()).unwrap();
         let impact = store.impact_radius(&["lib.rs"], 3).unwrap();
