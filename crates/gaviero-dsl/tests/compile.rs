@@ -41,8 +41,8 @@ const FULL_EXAMPLE: &str = r##"
 
 #[test]
 fn full_example_compiles_to_two_units() {
-    let compiled = compile(FULL_EXAMPLE, "test.gaviero", None, None)
-        .expect("should compile without errors");
+    let compiled =
+        compile(FULL_EXAMPLE, "test.gaviero", None, None).expect("should compile without errors");
     let units = compiled.work_units_ordered().expect("toposort");
 
     assert_eq!(units.len(), 2, "expected 2 work units");
@@ -52,7 +52,9 @@ fn full_example_compiles_to_two_units() {
     assert_eq!(units[0].tier, ModelTier::Expensive);
     assert_eq!(units[0].model, Some("claude-opus-4-6".to_string()));
     assert!(
-        units[0].coordinator_instructions.contains("architecture document"),
+        units[0]
+            .coordinator_instructions
+            .contains("architecture document"),
         "prompt: {}",
         units[0].coordinator_instructions
     );
@@ -71,8 +73,8 @@ fn full_example_compiles_to_two_units() {
 
 #[test]
 fn full_example_max_parallel_propagated() {
-    let compiled = compile(FULL_EXAMPLE, "test.gaviero", None, None)
-        .expect("should compile without errors");
+    let compiled =
+        compile(FULL_EXAMPLE, "test.gaviero", None, None).expect("should compile without errors");
     assert_eq!(compiled.max_parallel, Some(2));
 }
 
@@ -99,7 +101,10 @@ fn no_workflow_runs_all_agents() {
         agent a { description "first" }
         agent b { description "second" }
     "#;
-    let units = compile(src, "test.gaviero", None, None).unwrap().work_units_ordered().expect("toposort");
+    let units = compile(src, "test.gaviero", None, None)
+        .unwrap()
+        .work_units_ordered()
+        .expect("toposort");
     assert_eq!(units.len(), 2);
     assert_eq!(units[0].id, "a");
     assert_eq!(units[1].id, "b");
@@ -113,7 +118,10 @@ fn workflow_name_selector() {
         workflow just_b { steps [b] }
         workflow both   { steps [a b] }
     "#;
-    let units = compile(src, "test.gaviero", Some("just_b"), None).unwrap().work_units_ordered().expect("toposort");
+    let units = compile(src, "test.gaviero", Some("just_b"), None)
+        .unwrap()
+        .work_units_ordered()
+        .expect("toposort");
     assert_eq!(units.len(), 1);
     assert_eq!(units[0].id, "b");
 }
@@ -185,7 +193,10 @@ fn strategy_best_of_n_propagated() {
     "#;
     let compiled = compile(src, "test.gaviero", None, None).expect("should compile");
     assert!(
-        matches!(compiled.iteration_config.strategy, Strategy::BestOfN { n: 3 }),
+        matches!(
+            compiled.iteration_config.strategy,
+            Strategy::BestOfN { n: 3 }
+        ),
         "expected BestOfN(3) strategy, got {:?}",
         compiled.iteration_config.strategy
     );
@@ -198,7 +209,10 @@ fn test_first_true_propagated() {
         workflow w { steps [a] test_first true }
     "#;
     let compiled = compile(src, "test.gaviero", None, None).expect("should compile");
-    assert!(compiled.iteration_config.test_first, "expected test_first = true");
+    assert!(
+        compiled.iteration_config.test_first,
+        "expected test_first = true"
+    );
 }
 
 #[test]
@@ -246,7 +260,10 @@ fn iteration_config_defaults_when_no_workflow() {
     let src = r#"agent a { description "task" }"#;
     let compiled = compile(src, "test.gaviero", None, None).expect("should compile");
     // No workflow → defaults
-    assert!(matches!(compiled.iteration_config.strategy, Strategy::Refine));
+    assert!(matches!(
+        compiled.iteration_config.strategy,
+        Strategy::Refine
+    ));
     assert!(!compiled.iteration_config.test_first);
     assert_eq!(compiled.iteration_config.max_retries, 5);
     assert!(!compiled.verification_config.compile);
@@ -272,19 +289,18 @@ fn attempts_propagated() {
     "#;
     let compiled = compile(src, "test.gaviero", None, None).expect("should compile");
     assert_eq!(compiled.iteration_config.max_attempts, 4);
-    assert!(matches!(compiled.iteration_config.strategy, Strategy::BestOfN { n: 4 }));
+    assert!(matches!(
+        compiled.iteration_config.strategy,
+        Strategy::BestOfN { n: 4 }
+    ));
 }
 
 // ── Example file compilation tests ──────────────────────────────
 
 fn compile_example(filename: &str) -> Vec<gaviero_core::swarm::models::WorkUnit> {
-    let path = format!(
-        "{}/examples/{}",
-        env!("CARGO_MANIFEST_DIR"),
-        filename
-    );
-    let source = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("reading {}: {}", path, e));
+    let path = format!("{}/examples/{}", env!("CARGO_MANIFEST_DIR"), filename);
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {}", path, e));
     compile(&source, filename, None, None)
         .unwrap_or_else(|e| panic!("compiling {}:\n{:?}", filename, e))
         .work_units_ordered()
@@ -335,7 +351,11 @@ fn example_multi_crate_test() {
     assert_eq!(units.len(), 3);
     assert_eq!(units[0].id, "change_core");
     assert_eq!(units[2].id, "workspace_test");
-    assert!(units[2].coordinator_instructions.contains("cargo test --workspace"));
+    assert!(
+        units[2]
+            .coordinator_instructions
+            .contains("cargo test --workspace")
+    );
 }
 
 #[test]
@@ -347,7 +367,12 @@ fn example_security_audit() {
     // scan uses reasoning tier → maps to Expensive
     assert_eq!(units[0].tier, ModelTier::Expensive);
     // write_security_tests owns the tests/security/ directory
-    assert!(units[2].scope.owned_paths.contains(&"tests/security/".to_string()));
+    assert!(
+        units[2]
+            .scope
+            .owned_paths
+            .contains(&"tests/security/".to_string())
+    );
 }
 
 #[test]
@@ -357,10 +382,25 @@ fn example_security_audit_memory() {
     assert_eq!(units[0].id, "scan");
 
     // scan: read_ns merges workflow ["shared","security-policies"] + agent ["prior-audits"]
-    let ns = units[0].read_namespaces.as_ref().expect("scan should have read_namespaces");
-    assert!(ns.contains(&"shared".to_string()), "missing workflow ns 'shared': {:?}", ns);
-    assert!(ns.contains(&"security-policies".to_string()), "missing workflow ns 'security-policies': {:?}", ns);
-    assert!(ns.contains(&"prior-audits".to_string()), "missing agent ns 'prior-audits': {:?}", ns);
+    let ns = units[0]
+        .read_namespaces
+        .as_ref()
+        .expect("scan should have read_namespaces");
+    assert!(
+        ns.contains(&"shared".to_string()),
+        "missing workflow ns 'shared': {:?}",
+        ns
+    );
+    assert!(
+        ns.contains(&"security-policies".to_string()),
+        "missing workflow ns 'security-policies': {:?}",
+        ns
+    );
+    assert!(
+        ns.contains(&"prior-audits".to_string()),
+        "missing agent ns 'prior-audits': {:?}",
+        ns
+    );
     // workflow ns must come before agent ns
     assert!(ns.iter().position(|s| s == "shared") < ns.iter().position(|s| s == "prior-audits"));
 
@@ -373,22 +413,24 @@ fn example_security_audit_memory() {
 
     // verify: no agent-specific memory, but inherits workflow read_ns + write_ns
     assert_eq!(units[3].id, "verify");
-    let verify_ns = units[3].read_namespaces.as_ref().expect("verify should inherit workflow ns");
+    let verify_ns = units[3]
+        .read_namespaces
+        .as_ref()
+        .expect("verify should inherit workflow ns");
     assert!(verify_ns.contains(&"shared".to_string()));
     assert!(verify_ns.contains(&"security-policies".to_string()));
     // verify has its own read_ns from memory block
     assert!(verify_ns.contains(&"scan-findings".to_string()));
-    assert_eq!(units[3].write_namespace.as_deref(), Some("verification-results"));
+    assert_eq!(
+        units[3].write_namespace.as_deref(),
+        Some("verification-results")
+    );
 }
 
 fn compile_example_plan(filename: &str) -> gaviero_core::swarm::plan::CompiledPlan {
-    let path = format!(
-        "{}/examples/{}",
-        env!("CARGO_MANIFEST_DIR"),
-        filename
-    );
-    let source = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("reading {}: {}", path, e));
+    let path = format!("{}/examples/{}", env!("CARGO_MANIFEST_DIR"), filename);
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {}", path, e));
     compile(&source, filename, None, None)
         .unwrap_or_else(|e| panic!("compiling {}:\n{:?}", filename, e))
 }
@@ -404,10 +446,19 @@ fn template_feature_iterative() {
     assert_eq!(units[3].id, "summarize");
     // Has a loop config
     assert_eq!(plan.loop_configs.len(), 1);
-    assert_eq!(plan.loop_configs[0].agent_ids, vec!["implement", "write_tests"]);
+    assert_eq!(
+        plan.loop_configs[0].agent_ids,
+        vec!["implement", "write_tests"]
+    );
     assert_eq!(plan.loop_configs[0].max_iterations, 5);
     // Orchestrator reads from memory
-    assert!(units[0].read_namespaces.as_ref().unwrap().contains(&"architecture".to_string()));
+    assert!(
+        units[0]
+            .read_namespaces
+            .as_ref()
+            .unwrap()
+            .contains(&"architecture".to_string())
+    );
     // Summarize writes to memory with custom content
     assert_eq!(units[3].write_namespace.as_deref(), Some("feature-history"));
     assert!(units[3].memory_write_content.is_some());
@@ -422,7 +473,10 @@ fn template_refactor_codebase() {
     assert_eq!(units[3].id, "record_changes");
     // Has a loop config
     assert_eq!(plan.loop_configs.len(), 1);
-    assert_eq!(plan.loop_configs[0].agent_ids, vec!["refactor", "fix_tests"]);
+    assert_eq!(
+        plan.loop_configs[0].agent_ids,
+        vec!["refactor", "fix_tests"]
+    );
     assert_eq!(plan.loop_configs[0].max_iterations, 8);
     // Analyse has custom read_query
     assert!(units[0].memory_read_query.is_some());
@@ -465,7 +519,10 @@ fn template_sync_memory() {
     assert!(units[0].memory_read_query.is_some());
     assert_eq!(units[0].memory_read_limit, Some(20));
     // reconcile_architecture has staleness_sources
-    let arch_agent = units.iter().find(|u| u.id == "reconcile_architecture").unwrap();
+    let arch_agent = units
+        .iter()
+        .find(|u| u.id == "reconcile_architecture")
+        .unwrap();
     assert!(!arch_agent.staleness_sources.is_empty());
     assert!(arch_agent.memory_write_content.is_some());
     // No loops
@@ -480,47 +537,100 @@ fn template_plan_refinement() {
     // 4 agents: 2 init + 2 refine (separate focused prompts per phase)
     assert_eq!(units.len(), 4);
 
-    let cinit   = units.iter().find(|u| u.id == "claude-init").expect("claude-init");
-    let xinit   = units.iter().find(|u| u.id == "codex-init").expect("codex-init");
-    let crefine = units.iter().find(|u| u.id == "claude-refine").expect("claude-refine");
-    let xrefine = units.iter().find(|u| u.id == "codex-refine").expect("codex-refine");
+    let cinit = units
+        .iter()
+        .find(|u| u.id == "claude-init")
+        .expect("claude-init");
+    let xinit = units
+        .iter()
+        .find(|u| u.id == "codex-init")
+        .expect("codex-init");
+    let crefine = units
+        .iter()
+        .find(|u| u.id == "claude-refine")
+        .expect("claude-refine");
+    let xrefine = units
+        .iter()
+        .find(|u| u.id == "codex-refine")
+        .expect("codex-refine");
 
     // All use expensive tier
     for u in &[cinit, xinit, crefine, xrefine] {
-        assert_eq!(u.tier, gaviero_core::types::ModelTier::Expensive,
-            "agent {} should be expensive", u.id);
+        assert_eq!(
+            u.tier,
+            gaviero_core::types::ModelTier::Expensive,
+            "agent {} should be expensive",
+            u.id
+        );
     }
 
     // Init agents: vars (MODEL_NAME, PLANS) substituted at compile time; no ITER
-    assert!(cinit.coordinator_instructions.contains("claude-plan-v1.md"),
-        "claude-init prompt should reference claude-plan-v1.md");
-    assert!(xinit.coordinator_instructions.contains("codex-plan-v1.md"),
-        "codex-init prompt should reference codex-plan-v1.md");
-    assert!(!cinit.coordinator_instructions.contains("{{ITER}}"),
-        "init prompt should not contain {{ITER}}");
+    assert!(
+        cinit.coordinator_instructions.contains("claude-plan-v1.md"),
+        "claude-init prompt should reference claude-plan-v1.md"
+    );
+    assert!(
+        xinit.coordinator_instructions.contains("codex-plan-v1.md"),
+        "codex-init prompt should reference codex-plan-v1.md"
+    );
+    assert!(
+        !cinit.coordinator_instructions.contains("{{ITER}}"),
+        "init prompt should not contain {{ITER}}"
+    );
 
     // Refine agents: vars substituted; ITER/PREV_ITER survive for runtime
-    assert!(crefine.coordinator_instructions.contains("claude-plan-v{{ITER}}.md"),
-        "claude-refine should reference claude-plan-v{{ITER}}.md");
-    assert!(xrefine.coordinator_instructions.contains("codex-plan-v{{ITER}}.md"),
-        "codex-refine should reference codex-plan-v{{ITER}}.md");
-    assert!(crefine.coordinator_instructions.contains("claude-plan-v{{PREV_ITER}}.md"),
-        "claude-refine should reference claude-plan-v{{PREV_ITER}}.md");
+    assert!(
+        crefine
+            .coordinator_instructions
+            .contains("claude-plan-v{{ITER}}.md"),
+        "claude-refine should reference claude-plan-v{{ITER}}.md"
+    );
+    assert!(
+        xrefine
+            .coordinator_instructions
+            .contains("codex-plan-v{{ITER}}.md"),
+        "codex-refine should reference codex-plan-v{{ITER}}.md"
+    );
+    assert!(
+        crefine
+            .coordinator_instructions
+            .contains("claude-plan-v{{PREV_ITER}}.md"),
+        "claude-refine should reference claude-plan-v{{PREV_ITER}}.md"
+    );
 
     // Summary file also uses ITER
-    assert!(crefine.coordinator_instructions.contains("claude-summary-v{{ITER}}.md"),
-        "claude-refine should reference summary file");
+    assert!(
+        crefine
+            .coordinator_instructions
+            .contains("claude-summary-v{{ITER}}.md"),
+        "claude-refine should reference summary file"
+    );
 
     // Refine agents write to memory
     assert_eq!(crefine.write_namespace.as_deref(), Some("plan-evolution"));
     assert_eq!(xrefine.write_namespace.as_deref(), Some("plan-evolution"));
 
-    // Loop config: 2 refine agents, 5 iterations, iter_start=2
+    // Loop config: 2 refine agents, 10 iterations, iter_start=2,
+    // plus the new judge-control knobs (stability, judge_timeout, strict_judge).
     assert_eq!(plan.loop_configs.len(), 1);
     let lc = &plan.loop_configs[0];
     assert_eq!(lc.agent_ids, vec!["claude-refine", "codex-refine"]);
-    assert_eq!(lc.max_iterations, 5);
+    assert_eq!(lc.max_iterations, 10);
     assert_eq!(lc.iter_start, 2);
+    assert_eq!(lc.stability, 2);
+    assert_eq!(lc.judge_timeout_secs, 90);
+    assert!(lc.strict_judge);
+
+    // Judge agent is compiled into the aux list, not the main DAG.
+    assert_eq!(plan.loop_judge_units.len(), 1);
+    assert_eq!(plan.loop_judge_units[0].id, "convergence-judge");
+    // Judge prompt uses the new iteration-evidence placeholder.
+    assert!(
+        plan.loop_judge_units[0]
+            .coordinator_instructions
+            .contains("{{ITER_EVIDENCE}}"),
+        "judge prompt should reference {{{{ITER_EVIDENCE}}}}"
+    );
 
     // max_parallel 2
     assert_eq!(plan.max_parallel, Some(2));
