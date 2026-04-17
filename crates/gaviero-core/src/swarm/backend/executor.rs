@@ -253,7 +253,10 @@ fn validate_request(backend: &dyn AgentBackend, request: &CompletionRequest) -> 
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false)
     {
-        anyhow::bail!("backend '{}' does not support system prompts", backend.name());
+        anyhow::bail!(
+            "backend '{}' does not support system prompts",
+            backend.name()
+        );
     }
 
     if !caps.vision && !request.file_attachments.is_empty() {
