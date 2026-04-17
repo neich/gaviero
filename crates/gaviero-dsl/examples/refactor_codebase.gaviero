@@ -9,7 +9,7 @@
 //     --task "replace all anyhow::Result with typed error enums per module"
 
 client sonnet { tier cheap     model "claude-sonnet-4-6" }
-client opus   { tier expensive model "claude-opus-4-6" }
+client opus   { tier expensive model "claude-opus-4-7" }
 
 // ── Phase 1: Analyse ─────────────────────────────────────────────────────────
 
