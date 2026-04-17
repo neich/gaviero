@@ -1,4 +1,0 @@
-This is a test file to verify the permission prompt is working.
-You can safely delete this file.
-Edit test: approval prompt verification attempt #3 after rebuild.
-Timestamp: 2026-04-12 - latest test.

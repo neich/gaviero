@@ -32,7 +32,7 @@ client sonnet { tier cheap model "claude-sonnet-4-6" }
 Client with expensive tier and privacy
 =====
 
-client opus { tier expensive model "claude-opus-4-6" privacy public }
+client opus { tier expensive model "claude-opus-4-7" privacy public }
 
 -----
 
