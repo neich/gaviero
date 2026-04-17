@@ -147,7 +147,12 @@ impl AcpObserver for CliAcpObserver {
         }
     }
 
-    fn on_proposal_deferred(&self, path: &std::path::Path, _old_content: Option<&str>, _new_content: &str) {
+    fn on_proposal_deferred(
+        &self,
+        path: &std::path::Path,
+        _old_content: Option<&str>,
+        _new_content: &str,
+    ) {
         eprintln!("  ✎ {}", path.display());
     }
 
@@ -177,8 +182,12 @@ impl SwarmObserver for CliSwarmObserver {
     }
     fn on_agent_state_changed(&self, work_unit_id: &str, status: &AgentStatus, detail: &str) {
         match status {
-            AgentStatus::Running => eprintln!("\n── agent: {} ─────────────────────────────", work_unit_id),
-            AgentStatus::Completed => eprintln!("── done: {} ──────────────────────────────", work_unit_id),
+            AgentStatus::Running => {
+                eprintln!("\n── agent: {} ─────────────────────────────", work_unit_id)
+            }
+            AgentStatus::Completed => {
+                eprintln!("── done: {} ──────────────────────────────", work_unit_id)
+            }
             AgentStatus::Failed(_) => eprintln!("── failed: {} {}", work_unit_id, detail),
             _ => eprintln!("[agent:{}] {:?} {}", work_unit_id, status, detail),
         }
@@ -193,13 +202,23 @@ impl SwarmObserver for CliSwarmObserver {
         eprintln!("[completed] success={}", result.success);
     }
     fn on_coordination_started(&self, prompt: &str) {
-        eprintln!("[coordinator] planning: {}...", &prompt[..prompt.len().min(80)]);
+        eprintln!(
+            "[coordinator] planning: {}...",
+            &prompt[..prompt.len().min(80)]
+        );
     }
     fn on_coordination_complete(&self, dag: &gaviero_core::swarm::coordinator::TaskDAG) {
-        eprintln!("[coordinator] planned {} units: {}", dag.units.len(), dag.plan_summary);
+        eprintln!(
+            "[coordinator] planned {} units: {}",
+            dag.units.len(),
+            dag.plan_summary
+        );
     }
     fn on_tier_dispatch(&self, unit_id: &str, tier: gaviero_core::types::ModelTier, backend: &str) {
-        eprintln!("[dispatch] {}  tier={:?}  backend={}", unit_id, tier, backend);
+        eprintln!(
+            "[dispatch] {}  tier={:?}  backend={}",
+            unit_id, tier, backend
+        );
     }
     fn on_cost_update(&self, estimate: &gaviero_core::swarm::verify::CostEstimate) {
         eprintln!("[cost] ~${:.4}", estimate.estimated_usd);
@@ -224,11 +243,16 @@ fn workspace_setting_string(
         .filter(|s| !s.is_empty())
 }
 
-fn resolve_execution_model(cli: &Cli, workspace: &gaviero_core::workspace::Workspace) -> Result<String> {
+fn resolve_execution_model(
+    cli: &Cli,
+    workspace: &gaviero_core::workspace::Workspace,
+) -> Result<String> {
     let candidate = cli
         .model
         .clone()
-        .or_else(|| workspace_setting_string(workspace, gaviero_core::workspace::settings::AGENT_MODEL))
+        .or_else(|| {
+            workspace_setting_string(workspace, gaviero_core::workspace::settings::AGENT_MODEL)
+        })
         .unwrap_or_else(|| "sonnet".to_string());
     resolve_model_spec(&candidate, "execution")
 }
@@ -241,7 +265,12 @@ fn resolve_coordinator_model(
     let candidate = cli
         .coordinator_model
         .clone()
-        .or_else(|| workspace_setting_string(workspace, gaviero_core::workspace::settings::COORDINATOR_MODEL))
+        .or_else(|| {
+            workspace_setting_string(
+                workspace,
+                gaviero_core::workspace::settings::COORDINATOR_MODEL,
+            )
+        })
         .unwrap_or_else(|| execution_model.to_string());
     resolve_model_spec(&candidate, "coordinator")
 }
@@ -271,7 +300,10 @@ async fn main() -> Result<()> {
 
     // ── --graph: build/update code knowledge graph and exit ──────
     if cli.graph {
-        eprintln!("[graph] building code knowledge graph for {}...", repo.display());
+        eprintln!(
+            "[graph] building code knowledge graph for {}...",
+            repo.display()
+        );
         let (store, result) = gaviero_core::repo_map::graph_builder::build_graph(&repo)
             .context("building code knowledge graph")?;
         let (nodes, edges) = store.stats()?;
@@ -290,12 +322,18 @@ async fn main() -> Result<()> {
     workspace.ensure_settings();
 
     // Resolve namespaces: CLI flags override settings, which override folder name
-    let write_ns = cli.namespace.clone()
+    let write_ns = cli
+        .namespace
+        .clone()
         .unwrap_or_else(|| workspace.resolve_namespace(None));
     let mut read_nss = workspace.resolve_read_namespaces(None);
     let execution_model = resolve_execution_model(&cli, &workspace)?;
     let coordinator_model = if cli.coordinated {
-        Some(resolve_coordinator_model(&cli, &workspace, &execution_model)?)
+        Some(resolve_coordinator_model(
+            &cli,
+            &workspace,
+            &execution_model,
+        )?)
     } else {
         None
     };
@@ -316,7 +354,11 @@ async fn main() -> Result<()> {
         read_nss.insert(0, write_ns.clone());
     }
 
-    eprintln!("[namespace] write={}, read=[{}]", write_ns, read_nss.join(", "));
+    eprintln!(
+        "[namespace] write={}, read=[{}]",
+        write_ns,
+        read_nss.join(", ")
+    );
     if let Some(ref coord_model) = coordinator_model {
         eprintln!(
             "[model] execution={}, coordinator={}",
@@ -348,11 +390,10 @@ async fn main() -> Result<()> {
         let source = std::fs::read_to_string(script_path)
             .with_context(|| format!("reading script: {}", script_path.display()))?;
         let filename = script_path.display().to_string();
-        gaviero_dsl::compile(&source, &filename, None, None)
-            .map_err(|report| {
-                eprintln!("{:?}", report);
-                anyhow::anyhow!("DSL compilation failed")
-            })?
+        gaviero_dsl::compile(&source, &filename, None, None).map_err(|report| {
+            eprintln!("{:?}", report);
+            anyhow::anyhow!("DSL compilation failed")
+        })?
     } else if let Some(ref task) = cli.task {
         let units = vec![WorkUnit {
             id: "task-0".to_string(),
@@ -386,8 +427,8 @@ async fn main() -> Result<()> {
         }];
         gaviero_core::swarm::plan::CompiledPlan::from_work_units(units, None)
     } else if let Some(ref json) = cli.work_units {
-        let units = serde_json::from_str::<Vec<WorkUnit>>(json)
-            .context("parsing --work-units JSON")?;
+        let units =
+            serde_json::from_str::<Vec<WorkUnit>>(json).context("parsing --work-units JSON")?;
         gaviero_core::swarm::plan::CompiledPlan::from_work_units(units, None)
     } else {
         anyhow::bail!("Either --task, --work-units, or --script is required");
@@ -425,10 +466,14 @@ async fn main() -> Result<()> {
         if cli.script.is_some() {
             anyhow::bail!("--coordinated requires --task, not --script");
         }
-        let task = cli.task.as_deref()
+        let task = cli
+            .task
+            .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--coordinated requires --task"))?;
         let coord_config = gaviero_core::swarm::coordinator::CoordinatorConfig {
-            model: coordinator_model.clone().unwrap_or_else(|| execution_model.clone()),
+            model: coordinator_model
+                .clone()
+                .unwrap_or_else(|| execution_model.clone()),
             ollama_base_url: ollama_base_url,
             ..Default::default()
         };
@@ -440,23 +485,29 @@ async fn main() -> Result<()> {
             memory,
             &swarm_observer,
             |_| Box::new(CliAcpObserver::new()) as Box<dyn gaviero_core::observer::AcpObserver>,
-        ).await?;
+        )
+        .await?;
 
         let plan_path = if let Some(ref out) = cli.output {
-            if out.is_absolute() { out.clone() } else { config.workspace_root.join(out) }
+            if out.is_absolute() {
+                out.clone()
+            } else {
+                config.workspace_root.join(out)
+            }
         } else {
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            config.workspace_root.join("tmp").join(format!("gaviero_plan_{}.gaviero", timestamp))
+            config
+                .workspace_root
+                .join("tmp")
+                .join(format!("gaviero_plan_{}.gaviero", timestamp))
         };
         if let Some(parent) = plan_path.parent() {
-            std::fs::create_dir_all(parent)
-                .context("creating output directory")?;
+            std::fs::create_dir_all(parent).context("creating output directory")?;
         }
-        std::fs::write(&plan_path, &dsl_text)
-            .context("writing plan file")?;
+        std::fs::write(&plan_path, &dsl_text).context("writing plan file")?;
 
         // Validate immediately so the user gets early feedback on syntax errors.
         let plan_filename = plan_path.display().to_string();
@@ -467,7 +518,10 @@ async fn main() -> Result<()> {
                 let tier_count = gaviero_core::swarm::validation::dependency_tiers(&units)
                     .map(|t| t.len())
                     .unwrap_or(1);
-                eprintln!("[plan] valid — {} agents, {} tiers", agent_count, tier_count);
+                eprintln!(
+                    "[plan] valid — {} agents, {} tiers",
+                    agent_count, tier_count
+                );
             }
             Err(report) => {
                 eprintln!("{:?}", report);
@@ -487,11 +541,18 @@ async fn main() -> Result<()> {
         let hash = plan.hash();
         match gaviero_core::swarm::execution_state::ExecutionState::load(&hash) {
             Ok(Some(state)) => {
-                let completed = state.node_states.values()
-                    .filter(|s| s.status == gaviero_core::swarm::execution_state::NodeStatus::Completed)
+                let completed = state
+                    .node_states
+                    .values()
+                    .filter(|s| {
+                        s.status == gaviero_core::swarm::execution_state::NodeStatus::Completed
+                    })
                     .count();
-                eprintln!("[resume] loaded checkpoint: {}/{} nodes already completed",
-                    completed, state.node_states.len());
+                eprintln!(
+                    "[resume] loaded checkpoint: {}/{} nodes already completed",
+                    completed,
+                    state.node_states.len()
+                );
                 Some(state)
             }
             Ok(None) => {
@@ -514,7 +575,8 @@ async fn main() -> Result<()> {
         memory,
         &swarm_observer,
         |_| Box::new(CliAcpObserver::new()) as Box<dyn gaviero_core::observer::AcpObserver>,
-    ).await?;
+    )
+    .await?;
 
     // Output results
     match cli.format {
@@ -528,8 +590,16 @@ async fn main() -> Result<()> {
                     AgentStatus::Failed(e) => format!("FAIL: {}", e),
                     other => format!("{:?}", other),
                 };
-                println!("{}: {} ({})", m.work_unit_id, status_str,
-                    m.modified_files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "));
+                println!(
+                    "{}: {} ({})",
+                    m.work_unit_id,
+                    status_str,
+                    m.modified_files
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
             }
         }
     }
@@ -548,11 +618,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn temp_workspace(name: &str, settings_json: &str) -> PathBuf {
-        let base = std::env::temp_dir().join(format!(
-            "gaviero-cli-test-{}-{}",
-            name,
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("gaviero-cli-test-{}-{}", name, std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join(".gaviero")).unwrap();
         fs::write(base.join(".gaviero/settings.json"), settings_json).unwrap();
@@ -628,7 +695,8 @@ mod tests {
             }"#,
         );
         let workspace = gaviero_core::workspace::Workspace::single_folder(root.clone());
-        let cli = Cli::try_parse_from(["gaviero-cli", "--task", "plan it", "--coordinated"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["gaviero-cli", "--task", "plan it", "--coordinated"]).unwrap();
 
         let execution = resolve_execution_model(&cli, &workspace).unwrap();
         let coordinator = resolve_coordinator_model(&cli, &workspace, &execution).unwrap();
