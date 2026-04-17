@@ -216,10 +216,7 @@ impl IterationEngine {
 
             // Stall detection (for BestOfN)
             if detector.record(&manifest.modified_files) {
-                tracing::debug!(
-                    attempt,
-                    "iteration engine: stall detected, stopping early"
-                );
+                tracing::debug!(attempt, "iteration engine: stall detected, stopping early");
                 break;
             }
         }
@@ -292,7 +289,9 @@ impl IterationEngine {
                         )
                         .await;
                     if test_files.is_empty() {
-                        tracing::warn!("test-first: no test files generated — proceeding without tests");
+                        tracing::warn!(
+                            "test-first: no test files generated — proceeding without tests"
+                        );
                     } else {
                         tracing::info!("test-first: {} test files generated", test_files.len());
                     }
@@ -364,10 +363,7 @@ impl IterationEngine {
             }
 
             if detector.record(&manifest.modified_files) {
-                tracing::debug!(
-                    attempt,
-                    "iteration engine: stall detected, stopping early"
-                );
+                tracing::debug!(attempt, "iteration engine: stall detected, stopping early");
                 break;
             }
         }
@@ -587,14 +583,18 @@ mod tests {
                                 UnifiedStreamEvent::Error("attempt failed".into()),
                                 UnifiedStreamEvent::Done(StopReason::Error),
                             ],
-                        )) as Box<dyn crate::swarm::backend::AgentBackend>)
+                        ))
+                            as Box<dyn crate::swarm::backend::AgentBackend>)
                     }
                 },
             )
             .await;
 
         let seen = seen_models.lock().expect("recorded models lock").clone();
-        assert_eq!(seen, vec!["cheap-model".to_string(), "expensive-model".to_string()]);
+        assert_eq!(
+            seen,
+            vec!["cheap-model".to_string(), "expensive-model".to_string()]
+        );
         assert!(!result.all_passed);
         assert_eq!(result.attempts_run, 2);
     }
