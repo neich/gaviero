@@ -191,7 +191,8 @@ impl SwarmDashboardState {
                 entry.started_at = Some(std::time::Instant::now());
             }
             // Only log actual state transitions to avoid flooding
-            let state_changed = std::mem::discriminant(&entry.status) != std::mem::discriminant(status);
+            let state_changed =
+                std::mem::discriminant(&entry.status) != std::mem::discriminant(status);
             entry.status = status.clone();
             entry.detail = detail.to_string();
             if state_changed {
@@ -240,10 +241,15 @@ impl SwarmDashboardState {
 
     pub fn set_result(&mut self, result: SwarmResult) {
         for manifest in &result.manifests {
-            if let Some(entry) = self.agents.iter_mut().find(|a| a.id == manifest.work_unit_id) {
+            if let Some(entry) = self
+                .agents
+                .iter_mut()
+                .find(|a| a.id == manifest.work_unit_id)
+            {
                 entry.status = manifest.status.clone();
                 entry.branch = manifest.branch.clone();
-                entry.modified_files = manifest.modified_files
+                entry.modified_files = manifest
+                    .modified_files
                     .iter()
                     .map(|p| p.to_string_lossy().to_string())
                     .collect();
@@ -254,7 +260,10 @@ impl SwarmDashboardState {
                 entry.detail = if n > 0 {
                     format!("Modified {} file{}", n, if n == 1 { "" } else { "s" })
                 } else {
-                    manifest.summary.clone().unwrap_or_else(|| entry.detail.clone())
+                    manifest
+                        .summary
+                        .clone()
+                        .unwrap_or_else(|| entry.detail.clone())
                 };
             }
         }
@@ -265,7 +274,9 @@ impl SwarmDashboardState {
 
     /// Append streaming text from an agent. Coalesces consecutive Text lines.
     pub fn append_stream_chunk(&mut self, agent_id: &str, text: &str) {
-        let Some(entry) = self.agents.iter_mut().find(|a| a.id == agent_id) else { return };
+        let Some(entry) = self.agents.iter_mut().find(|a| a.id == agent_id) else {
+            return;
+        };
 
         // Strip ANSI escape sequences — raw escape codes written char-by-char into
         // the ratatui cell buffer corrupt neighbouring panels.
@@ -288,7 +299,9 @@ impl SwarmDashboardState {
     /// Record a tool call for an agent.
     /// `tool_info` may already be formatted as `"[Read] path"` or just `"Read"`.
     pub fn add_tool_call(&mut self, agent_id: &str, tool_info: &str) {
-        let Some(entry) = self.agents.iter_mut().find(|a| a.id == agent_id) else { return };
+        let Some(entry) = self.agents.iter_mut().find(|a| a.id == agent_id) else {
+            return;
+        };
         let text = if tool_info.starts_with('[') {
             tool_info.to_string()
         } else {
@@ -307,13 +320,23 @@ impl SwarmDashboardState {
     /// — status updates are transient labels (e.g., "Building plan..."),
     /// not meaningful events worth preserving in the log.
     pub fn set_streaming_status(&mut self, agent_id: &str, status: &str) {
-        let Some(entry) = self.agents.iter_mut().find(|a| a.id == agent_id) else { return };
+        let Some(entry) = self.agents.iter_mut().find(|a| a.id == agent_id) else {
+            return;
+        };
         entry.detail = status.to_string();
     }
 
     /// Record a file change for an agent.
-    pub fn add_file_change(&mut self, agent_id: &str, path: &str, additions: usize, deletions: usize) {
-        let Some(entry) = self.agents.iter_mut().find(|a| a.id == agent_id) else { return };
+    pub fn add_file_change(
+        &mut self,
+        agent_id: &str,
+        path: &str,
+        additions: usize,
+        deletions: usize,
+    ) {
+        let Some(entry) = self.agents.iter_mut().find(|a| a.id == agent_id) else {
+            return;
+        };
         let line = format!("[wrote {} +{} -{}]", path, additions, deletions);
         entry.detail = line.clone();
         entry.activity.push(ActivityLine {
@@ -403,10 +426,21 @@ impl SwarmDashboardState {
             String::new()
         };
         let header = if self.tier_total > 0 {
-            format!(" SWARM  {}  Tier {}/{}  {} agents{}",
-                self.phase, self.tier_current, self.tier_total, self.agents.len(), cost_part)
+            format!(
+                " SWARM  {}  Tier {}/{}  {} agents{}",
+                self.phase,
+                self.tier_current,
+                self.tier_total,
+                self.agents.len(),
+                cost_part
+            )
         } else {
-            format!(" SWARM  {}  {} agents{}", self.phase, self.agents.len(), cost_part)
+            format!(
+                " SWARM  {}  {} agents{}",
+                self.phase,
+                self.agents.len(),
+                cost_part
+            )
         };
         let style = Style::default()
             .fg(theme::WARNING)
@@ -421,7 +455,9 @@ impl SwarmDashboardState {
             let spinner = match (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_millis() / 300) % 4
+                .as_millis()
+                / 300)
+                % 4
             {
                 0 => "⠋",
                 1 => "⠙",
@@ -484,7 +520,9 @@ impl SwarmDashboardState {
 
             // Clear row
             for x in area.x..area.right() {
-                buf[(x, y)].set_char(' ').set_style(Style::default().bg(row_bg));
+                buf[(x, y)]
+                    .set_char(' ')
+                    .set_style(Style::default().bg(row_bg));
             }
 
             // Status icon
@@ -494,7 +532,14 @@ impl SwarmDashboardState {
                 AgentStatus::Completed => ("✓", theme::SUCCESS),
                 AgentStatus::Failed(_) => ("✗", theme::ERROR),
             };
-            render_text(buf, area.x + 1, y, area.x + 3, icon, Style::default().fg(icon_color).bg(row_bg));
+            render_text(
+                buf,
+                area.x + 1,
+                y,
+                area.x + 3,
+                icon,
+                Style::default().fg(icon_color).bg(row_bg),
+            );
 
             // Tier badge
             let mut col = area.x + 3;
@@ -503,13 +548,33 @@ impl SwarmDashboardState {
                     ModelTier::Cheap => ("C", theme::TIER_CHEAP),
                     ModelTier::Expensive => ("E", theme::TIER_EXPENSIVE),
                 };
-                render_text(buf, col, y, col + 2, badge, Style::default().fg(badge_color).bg(row_bg).add_modifier(Modifier::BOLD));
+                render_text(
+                    buf,
+                    col,
+                    y,
+                    col + 2,
+                    badge,
+                    Style::default()
+                        .fg(badge_color)
+                        .bg(row_bg)
+                        .add_modifier(Modifier::BOLD),
+                );
                 col += 2;
             }
 
             // Agent ID (truncated to ~14 chars)
             let id_display: String = agent.id.chars().take(14).collect();
-            render_text(buf, col, y, col + 15, &id_display, Style::default().fg(fg).bg(row_bg).add_modifier(Modifier::BOLD));
+            render_text(
+                buf,
+                col,
+                y,
+                col + 15,
+                &id_display,
+                Style::default()
+                    .fg(fg)
+                    .bg(row_bg)
+                    .add_modifier(Modifier::BOLD),
+            );
             col += 15;
 
             // Elapsed time (right-aligned)
@@ -526,29 +591,61 @@ impl SwarmDashboardState {
             let hint_width = hint_str.len() as u16;
 
             if !elapsed_str.is_empty() {
-                let elapsed_x = area.right().saturating_sub(elapsed_str.len() as u16 + 1 + hint_width);
+                let elapsed_x = area
+                    .right()
+                    .saturating_sub(elapsed_str.len() as u16 + 1 + hint_width);
                 if elapsed_x > col {
-                    render_text(buf, elapsed_x, y, elapsed_x + elapsed_str.len() as u16,
-                        &elapsed_str, Style::default().fg(theme::TEXT_DIM).bg(row_bg));
+                    render_text(
+                        buf,
+                        elapsed_x,
+                        y,
+                        elapsed_x + elapsed_str.len() as u16,
+                        &elapsed_str,
+                        Style::default().fg(theme::TEXT_DIM).bg(row_bg),
+                    );
                 }
                 if !hint_str.is_empty() {
                     let hint_x = area.right().saturating_sub(hint_width);
-                    render_text(buf, hint_x, y, area.right(), hint_str,
-                        Style::default().fg(theme::ACCENT).bg(row_bg));
+                    render_text(
+                        buf,
+                        hint_x,
+                        y,
+                        area.right(),
+                        hint_str,
+                        Style::default().fg(theme::ACCENT).bg(row_bg),
+                    );
                 }
                 let detail_end = elapsed_x.saturating_sub(1);
                 let detail = truncate_detail(agent, (detail_end.saturating_sub(col)) as usize);
-                render_text(buf, col, y, detail_end, &detail,
-                    Style::default().fg(theme::MEDIUM_GRAY).bg(row_bg));
+                render_text(
+                    buf,
+                    col,
+                    y,
+                    detail_end,
+                    &detail,
+                    Style::default().fg(theme::MEDIUM_GRAY).bg(row_bg),
+                );
             } else {
                 let right_edge = area.right().saturating_sub(hint_width);
                 if !hint_str.is_empty() {
-                    render_text(buf, right_edge, y, area.right(), hint_str,
-                        Style::default().fg(theme::ACCENT).bg(row_bg));
+                    render_text(
+                        buf,
+                        right_edge,
+                        y,
+                        area.right(),
+                        hint_str,
+                        Style::default().fg(theme::ACCENT).bg(row_bg),
+                    );
                 }
                 let detail = truncate_detail(agent, (right_edge.saturating_sub(col)) as usize);
-                render_text(buf, col, y, right_edge, &detail,
-                    Style::default().fg(theme::MEDIUM_GRAY).bg(row_bg));
+                render_text(
+                    buf,
+                    col,
+                    y,
+                    right_edge,
+                    &detail,
+                    Style::default().fg(theme::MEDIUM_GRAY).bg(row_bg),
+                );
             }
         }
     }
@@ -557,11 +654,17 @@ impl SwarmDashboardState {
         if y >= buf.area().bottom() {
             return;
         }
-        let agent_name = self.agents.get(self.scroll.selected)
+        let agent_name = self
+            .agents
+            .get(self.scroll.selected)
             .map(|a| a.id.as_str())
             .unwrap_or("(none)");
 
-        let focus_indicator = if self.focus == DashboardFocus::Detail { " ▼" } else { "" };
+        let focus_indicator = if self.focus == DashboardFocus::Detail {
+            " ▼"
+        } else {
+            ""
+        };
         let label = format!(" {}{} ", agent_name, focus_indicator);
         let sep_color = if self.focus == DashboardFocus::Detail {
             theme::FOCUS_BORDER
@@ -569,7 +672,10 @@ impl SwarmDashboardState {
             theme::TEXT_DIM
         };
         let sep_style = Style::default().fg(sep_color).bg(bg);
-        let label_style = Style::default().fg(theme::FOCUS_BORDER).bg(bg).add_modifier(Modifier::BOLD);
+        let label_style = Style::default()
+            .fg(theme::FOCUS_BORDER)
+            .bg(bg)
+            .add_modifier(Modifier::BOLD);
 
         // Draw separator line
         let mut cx = x;
@@ -609,18 +715,30 @@ impl SwarmDashboardState {
         // Undo confirmation prompt (shown at bottom of detail pane)
         let detail_area = if self.pending_undo_confirm && area.height > 1 {
             render_undo_confirm_line(area, buf, bg);
-            Rect { height: area.height - 1, ..area }
+            Rect {
+                height: area.height - 1,
+                ..area
+            }
         } else {
             area
         };
 
-        let Some(agent) = self.agents.get(self.scroll.selected) else { return };
+        let Some(agent) = self.agents.get(self.scroll.selected) else {
+            return;
+        };
 
         if agent.activity.is_empty() {
             let msg = " Waiting for activity...";
             let style = Style::default().fg(theme::TEXT_DIM).bg(bg);
             if detail_area.y < detail_area.bottom() {
-                render_text(buf, detail_area.x, detail_area.y, detail_area.right(), msg, style);
+                render_text(
+                    buf,
+                    detail_area.x,
+                    detail_area.y,
+                    detail_area.right(),
+                    msg,
+                    style,
+                );
             }
             return;
         }
@@ -656,18 +774,19 @@ impl SwarmDashboardState {
                     .fg(theme::ACTIVITY_TOOL_CALL)
                     .bg(bg)
                     .add_modifier(Modifier::BOLD),
-                ActivityKind::FileChange => Style::default()
-                    .fg(theme::SUCCESS)
-                    .bg(bg),
-                ActivityKind::Status => Style::default()
-                    .fg(theme::ACTIVITY_STATUS)
-                    .bg(bg),
-                ActivityKind::Text => Style::default()
-                    .fg(theme::TEXT_FG)
-                    .bg(bg),
+                ActivityKind::FileChange => Style::default().fg(theme::SUCCESS).bg(bg),
+                ActivityKind::Status => Style::default().fg(theme::ACTIVITY_STATUS).bg(bg),
+                ActivityKind::Text => Style::default().fg(theme::TEXT_FG).bg(bg),
             };
 
-            render_text(buf, detail_area.x + 1, y, detail_area.x + content_width as u16, text, style);
+            render_text(
+                buf,
+                detail_area.x + 1,
+                y,
+                detail_area.x + content_width as u16,
+                text,
+                style,
+            );
         }
 
         // Scrollbar
@@ -676,26 +795,52 @@ impl SwarmDashboardState {
         }
     }
 
-    fn render_diff_overlay(&self, area: Rect, buf: &mut Buffer, bg: Color, diff: &SwarmAgentDiffState) {
-        if area.height == 0 { return; }
+    fn render_diff_overlay(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        bg: Color,
+        diff: &SwarmAgentDiffState,
+    ) {
+        if area.height == 0 {
+            return;
+        }
 
         // Header line
         let header = format!(" [diff] {}   Esc: back  j/k: scroll", diff.agent_id);
-        let header_style = Style::default().fg(theme::ACCENT).bg(bg).add_modifier(Modifier::BOLD);
+        let header_style = Style::default()
+            .fg(theme::ACCENT)
+            .bg(bg)
+            .add_modifier(Modifier::BOLD);
         render_text(buf, area.x, area.y, area.right(), &header, header_style);
 
-        if area.height <= 1 { return; }
-        let content_area = Rect { y: area.y + 1, height: area.height - 1, ..area };
+        if area.height <= 1 {
+            return;
+        }
+        let content_area = Rect {
+            y: area.y + 1,
+            height: area.height - 1,
+            ..area
+        };
 
         if diff.lines.is_empty() {
             let style = Style::default().fg(theme::TEXT_DIM).bg(bg);
-            render_text(buf, content_area.x + 1, content_area.y, content_area.right(), " (no diff available)", style);
+            render_text(
+                buf,
+                content_area.x + 1,
+                content_area.y,
+                content_area.right(),
+                " (no diff available)",
+                style,
+            );
             return;
         }
 
         let content_width = content_area.width.saturating_sub(1) as usize; // -1 for scrollbar
         // Word-wrap diff lines so nothing is clipped
-        let wrapped_lines: Vec<(DiffLineKind, String)> = diff.lines.iter()
+        let wrapped_lines: Vec<(DiffLineKind, String)> = diff
+            .lines
+            .iter()
             .flat_map(|(kind, text)| {
                 word_wrap_line(text, content_width)
                     .into_iter()
@@ -709,18 +854,32 @@ impl SwarmDashboardState {
 
         for row in 0..viewport {
             let idx = scroll + row;
-            if idx >= total { break; }
+            if idx >= total {
+                break;
+            }
             let y = content_area.y + row as u16;
-            if y >= content_area.bottom() { break; }
+            if y >= content_area.bottom() {
+                break;
+            }
 
             let (kind, text) = &wrapped_lines[idx];
             let style = match kind {
                 DiffLineKind::Added => Style::default().fg(Color::Green).bg(bg),
                 DiffLineKind::Removed => Style::default().fg(Color::Red).bg(bg),
-                DiffLineKind::Header => Style::default().fg(Color::Yellow).bg(bg).add_modifier(Modifier::BOLD),
+                DiffLineKind::Header => Style::default()
+                    .fg(Color::Yellow)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
                 DiffLineKind::Context => Style::default().fg(theme::TEXT_DIM).bg(bg),
             };
-            render_text(buf, content_area.x + 1, y, content_area.x + content_width as u16, text, style);
+            render_text(
+                buf,
+                content_area.x + 1,
+                y,
+                content_area.x + content_width as u16,
+                text,
+                style,
+            );
         }
 
         if total > viewport {
@@ -748,7 +907,10 @@ pub fn count_display_lines(activity: &[ActivityLine], width: usize) -> usize {
 /// Flatten activity lines AND word-wrap each one to `width` columns.
 /// The returned vec has one entry per rendered row, suitable for direct indexing
 /// in the scroll/viewport calculation.
-fn flatten_and_wrap_activity(activity: &[ActivityLine], width: usize) -> Vec<(ActivityKind, String)> {
+fn flatten_and_wrap_activity(
+    activity: &[ActivityLine],
+    width: usize,
+) -> Vec<(ActivityKind, String)> {
     let mut lines = Vec::new();
     for entry in activity {
         for line in entry.text.split('\n') {
@@ -888,14 +1050,18 @@ pub fn strip_ansi(text: &str) -> String {
                     chars.next(); // consume '['
                     // consume until alphabetic char
                     for c in chars.by_ref() {
-                        if c.is_ascii_alphabetic() { break; }
+                        if c.is_ascii_alphabetic() {
+                            break;
+                        }
                     }
                 }
                 Some(']') => {
                     chars.next(); // consume ']'
                     // OSC sequence — ends at BEL (\x07) or ST (\x1b\\)
                     for c in chars.by_ref() {
-                        if c == '\x07' || c == '\x1b' { break; }
+                        if c == '\x07' || c == '\x1b' {
+                            break;
+                        }
                     }
                 }
                 _ => {
@@ -914,9 +1080,12 @@ pub fn strip_ansi(text: &str) -> String {
 pub fn parse_diff(text: &str) -> Vec<(DiffLineKind, String)> {
     text.lines()
         .map(|line| {
-            let kind = if line.starts_with("+++") || line.starts_with("---")
-                || line.starts_with("diff ") || line.starts_with("index ")
-                || line.starts_with("@@") || line.starts_with("new file")
+            let kind = if line.starts_with("+++")
+                || line.starts_with("---")
+                || line.starts_with("diff ")
+                || line.starts_with("index ")
+                || line.starts_with("@@")
+                || line.starts_with("new file")
                 || line.starts_with("deleted file")
             {
                 DiffLineKind::Header
@@ -935,15 +1104,22 @@ pub fn parse_diff(text: &str) -> Vec<(DiffLineKind, String)> {
 /// Render the undo confirmation message at the bottom of `area`.
 fn render_undo_confirm_line(area: Rect, buf: &mut Buffer, bg: Color) {
     let y = area.bottom().saturating_sub(1);
-    if y < area.y { return; }
+    if y < area.y {
+        return;
+    }
     let msg = " Press u again to confirm UNDO ALL swarm changes. Esc to cancel.";
-    let style = Style::default().fg(Color::Yellow).bg(bg).add_modifier(Modifier::BOLD);
+    let style = Style::default()
+        .fg(Color::Yellow)
+        .bg(bg)
+        .add_modifier(Modifier::BOLD);
     render_text(buf, area.x, y, area.right(), msg, style);
 }
 
 /// Format elapsed time for an agent.
 fn format_elapsed(agent: &AgentEntry) -> String {
-    let Some(started) = agent.started_at else { return String::new() };
+    let Some(started) = agent.started_at else {
+        return String::new();
+    };
     if matches!(agent.status, AgentStatus::Pending) {
         return String::new();
     }
@@ -968,7 +1144,11 @@ fn truncate_detail(agent: &AgentEntry, max_chars: usize) -> String {
         agent.detail.clone()
     };
     if detail.len() > max_chars {
-        detail.chars().take(max_chars.saturating_sub(1)).collect::<String>() + "…"
+        detail
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>()
+            + "…"
     } else {
         detail
     }
