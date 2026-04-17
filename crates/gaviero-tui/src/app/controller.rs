@@ -22,13 +22,16 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
 
                         // Intercept Ctrl+C when a terminal selection is active: copy instead of sending ^C.
                         let is_ctrl_c = key.code == crossterm::event::KeyCode::Char('c')
-                            && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+                            && key
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL);
                         if is_ctrl_c && app.terminal_selection.has_selection() {
-                            let text = if let Some(inst) = app.terminal_manager.active_instance_mut() {
-                                app.terminal_selection.extract_text(inst.screen_mut())
-                            } else {
-                                None
-                            };
+                            let text =
+                                if let Some(inst) = app.terminal_manager.active_instance_mut() {
+                                    app.terminal_selection.extract_text(inst.screen_mut())
+                                } else {
+                                    None
+                                };
                             if let Some(text) = text {
                                 app.set_clipboard(&text);
                             }
@@ -60,8 +63,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
 
             if app.quit_confirm {
                 match key.code {
-                    crossterm::event::KeyCode::Char('y')
-                    | crossterm::event::KeyCode::Char('Y') => {
+                    crossterm::event::KeyCode::Char('y') | crossterm::event::KeyCode::Char('Y') => {
                         app.should_quit = true;
                     }
                     _ => {
@@ -163,7 +165,8 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 }
                 tracing::warn!("Swarm message: {}", content);
             } else {
-                app.chat_state.finalize_message_to(&conv_id, &role, &content);
+                app.chat_state
+                    .finalize_message_to(&conv_id, &role, &content);
                 if role == "assistant" {
                     app.chat_state.collapse_file_blocks_in(&conv_id);
                     super::chat_memory::store_chat_turn(app, &conv_id, &content);
@@ -194,7 +197,10 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                     .append_deferred_summary(&conv_id, &path, additions, deletions);
             }
         }
-        Event::ClaudeSessionStarted { conv_id, session_id } => {
+        Event::ClaudeSessionStarted {
+            conv_id,
+            session_id,
+        } => {
             if let Some(conv) = app
                 .chat_state
                 .conversations
@@ -210,8 +216,8 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 // this turn — turn-1 context (graph + memory) needs to be
                 // re-injected since Claude has no server-side state.
                 let was_resume_attempt = conv.claude_session_id.is_some();
-                let resume_failed =
-                    was_resume_attempt && conv.claude_session_id.as_deref() != Some(session_id.as_str());
+                let resume_failed = was_resume_attempt
+                    && conv.claude_session_id.as_deref() != Some(session_id.as_str());
                 if resume_failed {
                     tracing::warn!(
                         target: "turn_metrics",
@@ -351,7 +357,8 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             tier,
             backend,
         } => {
-            app.swarm_dashboard.set_tier_dispatch(&unit_id, tier, &backend);
+            app.swarm_dashboard
+                .set_tier_dispatch(&unit_id, tier, &backend);
         }
         Event::SwarmCostUpdate(estimate) => {
             app.swarm_dashboard.set_cost(estimate.estimated_usd);
@@ -369,7 +376,8 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 .unwrap_or(&plan_path)
                 .display()
                 .to_string();
-            app.swarm_dashboard.status_message = format!("Plan saved: {} — review and /run it", rel);
+            app.swarm_dashboard.status_message =
+                format!("Plan saved: {} — review and /run it", rel);
             app.chat_state.add_system_message(&format!(
                 "Plan saved to `{}`.\nReview it (it's open in the editor), then run it with:\n  /run {}",
                 rel, rel,
@@ -442,7 +450,8 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
                 if let Some(inst) = app.terminal_manager.active_instance_mut() {
                     let current = inst.screen().scrollback();
                     let page = inst.screen().size().0 as usize;
-                    inst.screen_mut().set_scrollback(current.saturating_sub(page));
+                    inst.screen_mut()
+                        .set_scrollback(current.saturating_sub(page));
                 }
                 return;
             }
@@ -686,9 +695,7 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
         Action::CloseTab => {
             if app.focus == Focus::Terminal {
                 app.handle_action(Action::CloseTerminal);
-            } else if app.focus == Focus::SidePanel
-                && app.side_panel == SidePanelMode::AgentChat
-            {
+            } else if app.focus == Focus::SidePanel && app.side_panel == SidePanelMode::AgentChat {
                 let closing_conv_id = app
                     .chat_state
                     .conversations
