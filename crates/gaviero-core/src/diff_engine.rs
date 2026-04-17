@@ -15,12 +15,14 @@ pub fn compute_hunks(original: &str, proposed: &str) -> Vec<DiffHunk> {
             let new_start = op.new_range().start;
             let new_end = op.new_range().end;
 
-            let original_text: String = diff.iter_changes(op)
+            let original_text: String = diff
+                .iter_changes(op)
                 .filter(|c| c.tag() != ChangeTag::Insert)
                 .map(|c| c.to_string_lossy().into_owned())
                 .collect();
 
-            let proposed_text: String = diff.iter_changes(op)
+            let proposed_text: String = diff
+                .iter_changes(op)
                 .filter(|c| c.tag() != ChangeTag::Delete)
                 .map(|c| c.to_string_lossy().into_owned())
                 .collect();
