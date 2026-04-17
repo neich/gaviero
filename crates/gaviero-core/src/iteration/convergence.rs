@@ -43,7 +43,9 @@ mod tests {
     use super::*;
 
     fn paths(n: usize) -> Vec<PathBuf> {
-        (0..n).map(|i| PathBuf::from(format!("file{}.rs", i))).collect()
+        (0..n)
+            .map(|i| PathBuf::from(format!("file{}.rs", i)))
+            .collect()
     }
 
     #[test]
@@ -59,7 +61,7 @@ mod tests {
         let mut d = ConvergenceDetector::new();
         d.record(&paths(2));
         assert!(!d.record(&paths(2))); // first flat — stall_count = 1
-        assert!(d.record(&paths(2)));  // second flat — stall_count = 2 → stalled
+        assert!(d.record(&paths(2))); // second flat — stall_count = 2 → stalled
     }
 
     #[test]
