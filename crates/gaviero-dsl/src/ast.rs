@@ -59,7 +59,7 @@ pub enum PromptSource {
 /// ```text
 /// client claude_opus {
 ///     tier coordinator
-///     model "claude-opus-4-6"
+///     model "claude-opus-4-7"
 ///     privacy public
 ///     default
 /// }
