@@ -11,13 +11,13 @@ use futures::StreamExt;
 use tokio::sync::Mutex;
 
 use crate::context_planner::{
-    build_provider_profile, ContextPlanner, ModelSpec, PlannerFingerprint, PlannerInput,
-    RuntimeConfig, SessionLedger,
+    ContextPlanner, ModelSpec, PlannerFingerprint, PlannerInput, RuntimeConfig, SessionLedger,
+    build_provider_profile,
 };
 use crate::memory::MemoryStore;
 use crate::observer::AcpObserver;
 use crate::repo_map::RepoMap;
-use crate::swarm::board::{parse_discoveries, SharedBoard};
+use crate::swarm::board::{SharedBoard, parse_discoveries};
 use crate::validation_gate::ValidationPipeline;
 use crate::write_gate::WriteGatePipeline;
 
@@ -244,8 +244,15 @@ pub async fn run_backend(
                 UnifiedStreamEvent::ToolCallDelta { .. } => {}
                 UnifiedStreamEvent::ToolCallEnd { .. } => {}
                 UnifiedStreamEvent::FileBlock { path, content } => {
-                    match propose_write(&agent_id, &path, &content, workspace_root, &write_gate, observer)
-                        .await
+                    match propose_write(
+                        &agent_id,
+                        &path,
+                        &content,
+                        workspace_root,
+                        &write_gate,
+                        observer,
+                    )
+                    .await
                     {
                         Ok(true) => {
                             attempt_modified.push(workspace_root.join(&path));
@@ -305,7 +312,11 @@ pub async fn run_backend(
                 modified_files: all_modified.into_iter().collect(),
                 branch: None,
                 summary: Some(error_msg),
-                output: if full_text.is_empty() { None } else { Some(full_text.clone()) },
+                output: if full_text.is_empty() {
+                    None
+                } else {
+                    Some(full_text.clone())
+                },
                 cost_usd: 0.0,
             });
         }
@@ -343,7 +354,9 @@ pub async fn run_backend(
                     if can_retry {
                         observer.on_validation_retry(next_attempt as u8, work_unit.max_retries);
                         // Build corrective prompt using the first failed file as context
-                        let failed_file = files.first().map(|p| p.as_path())
+                        let failed_file = files
+                            .first()
+                            .map(|p| p.as_path())
                             .unwrap_or(std::path::Path::new("unknown"));
                         corrective = Some(crate::validation_gate::corrective_prompt(
                             gate_name,
@@ -367,7 +380,11 @@ pub async fn run_backend(
                         modified_files: all_modified.into_iter().collect(),
                         branch: None,
                         summary: Some(format!("Validation failed ({}): {}", gate_name, message)),
-                        output: if full_text.is_empty() { None } else { Some(full_text.clone()) },
+                        output: if full_text.is_empty() {
+                            None
+                        } else {
+                            Some(full_text.clone())
+                        },
                         cost_usd: 0.0,
                     });
                 }
@@ -381,7 +398,11 @@ pub async fn run_backend(
             modified_files: all_modified.into_iter().collect(),
             branch: None,
             summary: Some(format!("Modified {} files", attempt_modified.len())),
-            output: if full_text.is_empty() { None } else { Some(full_text) },
+            output: if full_text.is_empty() {
+                None
+            } else {
+                Some(full_text)
+            },
             cost_usd: 0.0,
         });
     }
@@ -502,13 +523,8 @@ pub(crate) async fn propose_write(
         return Ok(false);
     }
 
-    let proposal = WriteGatePipeline::build_proposal(
-        id,
-        agent_id,
-        &abs_path,
-        &original,
-        proposed_content,
-    );
+    let proposal =
+        WriteGatePipeline::build_proposal(id, agent_id, &abs_path, &original, proposed_content);
 
     if proposal.structural_hunks.is_empty() {
         return Ok(false);
