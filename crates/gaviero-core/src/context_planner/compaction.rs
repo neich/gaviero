@@ -61,11 +61,7 @@ impl Default for CompactionPolicy {
 
 impl CompactionPolicy {
     /// Convenience constructor for tests or custom sessions.
-    pub fn custom(
-        max_turn_pairs: u32,
-        max_replay_chars: usize,
-        keep_turn_pairs: u32,
-    ) -> Self {
+    pub fn custom(max_turn_pairs: u32, max_replay_chars: usize, keep_turn_pairs: u32) -> Self {
         Self {
             max_turn_pairs,
             max_replay_chars,
@@ -115,11 +111,12 @@ pub fn should_compact(
     }
 
     // Trigger 3: max_context_tokens pressure.
-    if let Some(max_tok) = max_context_tokens.filter(|&t| t > 0 && policy.max_context_tokens_fraction > 0.0) {
+    if let Some(max_tok) =
+        max_context_tokens.filter(|&t| t > 0 && policy.max_context_tokens_fraction > 0.0)
+    {
         // Rough BPE token estimate: 4 chars per token.
         let estimated_tokens = total_chars / 4;
-        let pressure_threshold =
-            (max_tok as f32 * policy.max_context_tokens_fraction) as usize;
+        let pressure_threshold = (max_tok as f32 * policy.max_context_tokens_fraction) as usize;
         if estimated_tokens >= pressure_threshold {
             tracing::debug!(
                 target: "compaction",
@@ -235,7 +232,7 @@ mod tests {
         // pressure". This is the canonical test that exercises trigger 3.
         let policy = CompactionPolicy {
             max_context_tokens_fraction: 0.6,
-            max_turn_pairs: 100,      // disable other triggers
+            max_turn_pairs: 100, // disable other triggers
             max_replay_chars: 1_000_000,
             ..Default::default()
         };
@@ -318,7 +315,10 @@ mod tests {
         };
         let history = make_history(3);
         let (_, record) = compact_replay(&policy, history);
-        assert!(record.created_at.is_some(), "CompactionRecord must have a timestamp");
+        assert!(
+            record.created_at.is_some(),
+            "CompactionRecord must have a timestamp"
+        );
     }
 
     #[test]
