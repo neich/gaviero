@@ -18,10 +18,7 @@ pub struct ToolUseInfo {
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     /// Session initialization (type: "system", subtype: "init").
-    SystemInit {
-        session_id: String,
-        model: String,
-    },
+    SystemInit { session_id: String, model: String },
 
     /// Streaming text chunk from the assistant response.
     ContentDelta(String),
@@ -111,16 +108,15 @@ pub fn parse_stream_line(line: &str) -> Result<StreamEvent> {
                     let delta = event.get("delta").cloned().unwrap_or(Value::Null);
                     let delta_type = opt_str(&delta, "type");
                     if delta_type == "text_delta" {
-                        Ok(StreamEvent::ContentDelta(
-                            required_str(&delta, "text")?,
-                        ))
+                        Ok(StreamEvent::ContentDelta(required_str(&delta, "text")?))
                     } else if delta_type == "thinking_delta" {
-                        Ok(StreamEvent::ThinkingDelta(
-                            required_str(&delta, "thinking")?,
-                        ))
+                        Ok(StreamEvent::ThinkingDelta(required_str(
+                            &delta, "thinking",
+                        )?))
                     } else if delta_type == "input_json_delta" {
                         Ok(StreamEvent::ToolInputDelta(
-                            delta.get("partial_json")
+                            delta
+                                .get("partial_json")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string(),
@@ -164,13 +160,12 @@ pub fn parse_stream_line(line: &str) -> Result<StreamEvent> {
                             }
                         }
                         "tool_use" => {
-                            let name = block.get("name")
+                            let name = block
+                                .get("name")
                                 .and_then(|n| n.as_str())
                                 .unwrap_or("")
                                 .to_string();
-                            let input = block.get("input")
-                                .cloned()
-                                .unwrap_or(Value::Null);
+                            let input = block.get("input").cloned().unwrap_or(Value::Null);
                             tool_uses.push(ToolUseInfo { name, input });
                         }
                         _ => {}
@@ -178,10 +173,7 @@ pub fn parse_stream_line(line: &str) -> Result<StreamEvent> {
                 }
             }
 
-            Ok(StreamEvent::AssistantMessage {
-                text,
-                tool_uses,
-            })
+            Ok(StreamEvent::AssistantMessage { text, tool_uses })
         }
 
         // Final result:
@@ -206,12 +198,17 @@ pub fn parse_stream_line(line: &str) -> Result<StreamEvent> {
             let tool_name = opt_str(&v, "tool_name").to_string();
             let description = opt_str(&v, "description").to_string();
             // Accept either "id" or "permission_request_id" for robustness
-            let request_id = v.get("permission_request_id")
+            let request_id = v
+                .get("permission_request_id")
                 .or_else(|| v.get("id"))
                 .and_then(|s| s.as_str())
                 .unwrap_or("")
                 .to_string();
-            Ok(StreamEvent::PermissionRequest { tool_name, description, request_id })
+            Ok(StreamEvent::PermissionRequest {
+                tool_name,
+                description,
+                request_id,
+            })
         }
 
         _ => Ok(StreamEvent::Unknown(v)),
@@ -299,13 +296,12 @@ pub fn parse_file_blocks(text: &str) -> Vec<(PathBuf, String)> {
         let content_end = content_start + close_pos;
 
         // Strip trailing newline from content if present
-        let content_end = if content_end > content_start
-            && text.as_bytes()[content_end - 1] == b'\n'
-        {
-            content_end - 1
-        } else {
-            content_end
-        };
+        let content_end =
+            if content_end > content_start && text.as_bytes()[content_end - 1] == b'\n' {
+                content_end - 1
+            } else {
+                content_end
+            };
 
         let content = text[content_start..content_end].to_string();
         results.push((PathBuf::from(path_str), content));
@@ -391,10 +387,7 @@ Done!"#;
         let blocks = parse_file_blocks(text);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].0, PathBuf::from("src/main.rs"));
-        assert_eq!(
-            blocks[0].1,
-            "fn main() {\n    println!(\"hello\");\n}"
-        );
+        assert_eq!(blocks[0].1, "fn main() {\n    println!(\"hello\");\n}");
     }
 
     #[test]
