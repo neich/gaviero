@@ -148,8 +148,7 @@ pub struct Conversation {
     /// then runs `invalidate_if_fingerprint_changed` to drop the handle
     /// if the model/toolset has changed since the save. Consumed (taken)
     /// once rehydration runs.
-    pub pending_persisted_ledger:
-        Option<gaviero_core::context_planner::ledger::PersistedLedger>,
+    pub pending_persisted_ledger: Option<gaviero_core::context_planner::ledger::PersistedLedger>,
 }
 
 /// Global agent settings read from workspace settings.
@@ -302,7 +301,9 @@ impl AgentChatState {
 
     /// Is the active conversation waiting for a permission decision?
     pub fn active_conv_pending_permission(&self) -> bool {
-        self.conversations[self.active_conv].pending_permission.is_some()
+        self.conversations[self.active_conv]
+            .pending_permission
+            .is_some()
     }
 
     /// Store a pending permission request on the named conversation.
@@ -403,8 +404,7 @@ impl AgentChatState {
                         "haiku" | "claude-haiku" => "haiku",
                         other => other, // Allow arbitrary model strings
                     };
-                    self.conversations[self.active_conv].model_override =
-                        Some(model.to_string());
+                    self.conversations[self.active_conv].model_override = Some(model.to_string());
                     self.add_system_message(&format!("Model set to: {}", model));
                 }
                 self.text_input.text.clear();
@@ -427,15 +427,14 @@ impl AgentChatState {
                         "max" => "max",
                         _ => {
                             self.add_system_message(
-                                "Invalid effort level. Use: off, low, medium, high, max"
+                                "Invalid effort level. Use: off, low, medium, high, max",
                             );
                             self.text_input.text.clear();
                             self.text_input.cursor = 0;
                             return true;
                         }
                     };
-                    self.conversations[self.active_conv].effort_override =
-                        Some(level.to_string());
+                    self.conversations[self.active_conv].effort_override = Some(level.to_string());
                     self.add_system_message(&format!("Effort level set to: {}", level));
                 }
                 self.text_input.text.clear();
@@ -452,15 +451,13 @@ impl AgentChatState {
                 let total = conv.messages.len();
                 if total <= keep {
                     self.add_system_message(&format!(
-                        "Nothing to compact ({} messages, keeping {})", total, keep
+                        "Nothing to compact ({} messages, keeping {})",
+                        total, keep
                     ));
                 } else {
                     let removed = total - keep;
                     // Summarize removed messages into a single system note
-                    let summary = format!(
-                        "[{} earlier messages compacted]",
-                        removed
-                    );
+                    let summary = format!("[{} earlier messages compacted]", removed);
                     let kept: Vec<ChatMessage> = conv.messages.split_off(total - keep);
                     conv.messages.clear();
                     conv.messages.push(ChatMessage {
@@ -501,8 +498,15 @@ impl AgentChatState {
                 if arg.is_empty() {
                     let write = self.effective_write_namespace().to_string();
                     let read = self.effective_read_namespaces();
-                    let read_str = read.iter()
-                        .map(|ns| if *ns == write { format!("{} (write)", ns) } else { ns.clone() })
+                    let read_str = read
+                        .iter()
+                        .map(|ns| {
+                            if *ns == write {
+                                format!("{} (write)", ns)
+                            } else {
+                                ns.clone()
+                            }
+                        })
                         .collect::<Vec<_>>()
                         .join(", ");
                     self.add_system_message(&format!(
@@ -510,8 +514,7 @@ impl AgentChatState {
                         write, read_str
                     ));
                 } else {
-                    self.conversations[self.active_conv].namespace_override =
-                        Some(arg.to_string());
+                    self.conversations[self.active_conv].namespace_override = Some(arg.to_string());
                     self.add_system_message(&format!(
                         "Write namespace set to: {} (for this conversation)",
                         arg
@@ -525,9 +528,7 @@ impl AgentChatState {
                 let conv = &mut self.conversations[self.active_conv];
                 conv.auto_approve = !conv.auto_approve;
                 let state = if conv.auto_approve { "ON" } else { "OFF" };
-                self.add_system_message(&format!(
-                    "Auto-approve: {} for this conversation", state
-                ));
+                self.add_system_message(&format!("Auto-approve: {} for this conversation", state));
                 self.text_input.text.clear();
                 self.text_input.cursor = 0;
                 true
@@ -559,14 +560,17 @@ impl AgentChatState {
                      PageUp / PageDown  — Scroll chat history\n\
                      Esc                — Clear input / return to editor\n\n\
                      Use @filename to reference workspace files in your prompt.\n\
-                     Use /attach to attach files from outside the workspace."
+                     Use /attach to attach files from outside the workspace.",
                 );
                 self.text_input.text.clear();
                 self.text_input.cursor = 0;
                 true
             }
             _ => {
-                self.add_system_message(&format!("Unknown command: {}. Type /help for available commands.", cmd));
+                self.add_system_message(&format!(
+                    "Unknown command: {}. Type /help for available commands.",
+                    cmd
+                ));
                 self.text_input.text.clear();
                 self.text_input.cursor = 0;
                 true
@@ -608,11 +612,13 @@ impl AgentChatState {
     }
 
     pub fn add_system_message(&mut self, content: &str) {
-        self.conversations[self.active_conv].messages.push(ChatMessage {
-            role: ChatRole::System,
-            content: content.to_string(),
-            tool_calls: Vec::new(),
-        });
+        self.conversations[self.active_conv]
+            .messages
+            .push(ChatMessage {
+                role: ChatRole::System,
+                content: content.to_string(),
+                tool_calls: Vec::new(),
+            });
         self.scroll_to_bottom();
     }
 
@@ -635,7 +641,7 @@ impl AgentChatState {
     /// Start renaming the active conversation. Puts current title into the input field.
     pub fn start_rename(&mut self) {
         let title = self.conversations[self.active_conv].title.clone();
-        self.text_input.text =title;
+        self.text_input.text = title;
         self.text_input.cursor = self.text_input.char_count();
         self.renaming = true;
     }
@@ -936,21 +942,33 @@ impl AgentChatState {
     }
 
     /// Build visual lines as (start_char_idx, char_count) for the current input.
-    fn build_visual_lines(&self, first_line_width: usize, full_width: usize) -> Vec<(usize, usize)> {
+    fn build_visual_lines(
+        &self,
+        first_line_width: usize,
+        full_width: usize,
+    ) -> Vec<(usize, usize)> {
         let mut lines = Vec::new();
         let mut pos = 0;
         for (logical_idx, logical_line) in self.text_input.text.split('\n').enumerate() {
             let line_char_count = logical_line.chars().count();
-            let avail = if lines.is_empty() { first_line_width } else { full_width };
+            let avail = if lines.is_empty() {
+                first_line_width
+            } else {
+                full_width
+            };
             if line_char_count == 0 {
                 lines.push((pos, 0));
             } else {
                 let mut col = 0;
                 let first_visual = lines.len();
                 while col < line_char_count {
-                    let w = if lines.is_empty() { first_line_width }
-                            else if lines.len() == first_visual { avail }
-                            else { full_width };
+                    let w = if lines.is_empty() {
+                        first_line_width
+                    } else if lines.len() == first_visual {
+                        avail
+                    } else {
+                        full_width
+                    };
                     let w = w.max(1);
                     let take = w.min(line_char_count - col);
                     lines.push((pos + col, take));
@@ -969,7 +987,10 @@ impl AgentChatState {
     }
 
     /// Find which visual line the cursor is on and the column within it.
-    fn find_cursor_in_visual_lines(lines: &[(usize, usize)], cursor_char_pos: usize) -> (usize, usize) {
+    fn find_cursor_in_visual_lines(
+        lines: &[(usize, usize)],
+        cursor_char_pos: usize,
+    ) -> (usize, usize) {
         for (i, &(start, len)) in lines.iter().enumerate() {
             if cursor_char_pos >= start && cursor_char_pos <= start + len {
                 if cursor_char_pos < start + len || i == lines.len() - 1 {
@@ -1018,12 +1039,12 @@ impl AgentChatState {
                 self.history_stash = self.text_input.text.clone();
                 let idx = user_msgs.len() - 1;
                 self.history_index = Some(idx);
-                self.text_input.text =user_msgs[idx].clone();
+                self.text_input.text = user_msgs[idx].clone();
             }
             Some(idx) if idx > 0 => {
                 let new_idx = idx - 1;
                 self.history_index = Some(new_idx);
-                self.text_input.text =user_msgs[new_idx].clone();
+                self.text_input.text = user_msgs[new_idx].clone();
             }
             _ => {}
         }
@@ -1032,15 +1053,17 @@ impl AgentChatState {
 
     /// Navigate history downward (newer). Called when Down is pressed while browsing history.
     pub fn history_down(&mut self) {
-        let Some(idx) = self.history_index else { return };
+        let Some(idx) = self.history_index else {
+            return;
+        };
         let user_msgs = self.active_user_messages();
         if idx + 1 < user_msgs.len() {
             let new_idx = idx + 1;
             self.history_index = Some(new_idx);
-            self.text_input.text =user_msgs[new_idx].clone();
+            self.text_input.text = user_msgs[new_idx].clone();
         } else {
             self.history_index = None;
-            self.text_input.text =std::mem::take(&mut self.history_stash);
+            self.text_input.text = std::mem::take(&mut self.history_stash);
         }
         self.text_input.cursor = self.text_input.char_count();
     }
@@ -1076,8 +1099,11 @@ impl AgentChatState {
         if line_idx >= self.rendered_lines_cache.len() {
             // Clamp to last line
             let last = self.rendered_lines_cache.len().saturating_sub(1);
-            let char_count = self.rendered_lines_cache.get(last)
-                .map(|(l, _)| l.chars().count()).unwrap_or(0);
+            let char_count = self
+                .rendered_lines_cache
+                .get(last)
+                .map(|(l, _)| l.chars().count())
+                .unwrap_or(0);
             return Some((last, char_count));
         }
         let target_col = col.saturating_sub(area.x) as usize;
@@ -1172,8 +1198,16 @@ impl AgentChatState {
             }
             let (ref line, _msg_idx) = self.rendered_lines_cache[line_idx];
             let chars: Vec<char> = line.chars().collect();
-            let start_c = if line_idx == sl { sc.min(chars.len()) } else { 0 };
-            let end_c = if line_idx == el { ec.min(chars.len()) } else { chars.len() };
+            let start_c = if line_idx == sl {
+                sc.min(chars.len())
+            } else {
+                0
+            };
+            let end_c = if line_idx == el {
+                ec.min(chars.len())
+            } else {
+                chars.len()
+            };
 
             if line_idx > sl {
                 result.push('\n');
@@ -1182,7 +1216,11 @@ impl AgentChatState {
             let selected: String = chars[start_c..end_c].iter().collect();
             result.push_str(&selected);
         }
-        if result.is_empty() { None } else { Some(result) }
+        if result.is_empty() {
+            None
+        } else {
+            Some(result)
+        }
     }
 
     /// Move to the previous message in browse mode.
@@ -1213,18 +1251,24 @@ impl AgentChatState {
     /// Extend selection upward by one line in chat output.
     pub fn select_up_in_output(&mut self) {
         let total = self.rendered_lines_cache.len();
-        if total == 0 { return; }
-        let viewport = self.conv_area_cache
+        if total == 0 {
+            return;
+        }
+        let viewport = self
+            .conv_area_cache
             .map(|a| a.height as usize)
             .unwrap_or(20);
-        let cursor = self.chat_output_kb_cursor.get_or_insert_with(|| {
-            (self.scroll_offset + viewport).min(total).saturating_sub(1)
-        });
+        let cursor = self
+            .chat_output_kb_cursor
+            .get_or_insert_with(|| (self.scroll_offset + viewport).min(total).saturating_sub(1));
         if self.text_sel_anchor.is_none() {
             self.text_sel_anchor = Some((*cursor, 0));
         }
-        if *cursor > 0 { *cursor -= 1; }
-        let col = self.rendered_lines_cache
+        if *cursor > 0 {
+            *cursor -= 1;
+        }
+        let col = self
+            .rendered_lines_cache
             .get(*cursor)
             .map(|(l, _)| l.chars().count())
             .unwrap_or(0);
@@ -1237,18 +1281,24 @@ impl AgentChatState {
     /// Extend selection downward by one line in chat output.
     pub fn select_down_in_output(&mut self) {
         let total = self.rendered_lines_cache.len();
-        if total == 0 { return; }
-        let viewport = self.conv_area_cache
+        if total == 0 {
+            return;
+        }
+        let viewport = self
+            .conv_area_cache
             .map(|a| a.height as usize)
             .unwrap_or(20);
-        let cursor = self.chat_output_kb_cursor.get_or_insert_with(|| {
-            (self.scroll_offset + viewport).min(total).saturating_sub(1)
-        });
+        let cursor = self
+            .chat_output_kb_cursor
+            .get_or_insert_with(|| (self.scroll_offset + viewport).min(total).saturating_sub(1));
         if self.text_sel_anchor.is_none() {
             self.text_sel_anchor = Some((*cursor, 0));
         }
-        if *cursor + 1 < total { *cursor += 1; }
-        let col = self.rendered_lines_cache
+        if *cursor + 1 < total {
+            *cursor += 1;
+        }
+        let col = self
+            .rendered_lines_cache
             .get(*cursor)
             .map(|(l, _)| l.chars().count())
             .unwrap_or(0);
@@ -1326,7 +1376,10 @@ impl AgentChatState {
         if !self.autocomplete.active || self.autocomplete.matches.is_empty() {
             return;
         }
-        let selected = self.autocomplete.selected.min(self.autocomplete.matches.len() - 1);
+        let selected = self
+            .autocomplete
+            .selected
+            .min(self.autocomplete.matches.len() - 1);
         let path = self.autocomplete.matches[selected].clone();
         let at_pos = self.autocomplete.at_pos;
 
@@ -1456,13 +1509,17 @@ impl AgentChatState {
     }
 
     pub fn append_stream_chunk_to(&mut self, conv_id: &str, text: &str) {
-        let Some(idx) = self.find_conv_idx(conv_id) else { return };
+        let Some(idx) = self.find_conv_idx(conv_id) else {
+            return;
+        };
         self.conversations[idx].streaming_status = "Writing...".to_string();
         let msgs = &mut self.conversations[idx].messages;
         if let Some(last) = msgs.last_mut() {
             if last.role == ChatRole::Assistant {
                 last.content.push_str(text);
-                if idx == self.active_conv { self.scroll_to_bottom(); }
+                if idx == self.active_conv {
+                    self.scroll_to_bottom();
+                }
                 return;
             }
         }
@@ -1471,11 +1528,15 @@ impl AgentChatState {
             content: text.to_string(),
             tool_calls: Vec::new(),
         });
-        if idx == self.active_conv { self.scroll_to_bottom(); }
+        if idx == self.active_conv {
+            self.scroll_to_bottom();
+        }
     }
 
     pub fn add_tool_call_to(&mut self, conv_id: &str, tool_name: &str) {
-        let Some(idx) = self.find_conv_idx(conv_id) else { return };
+        let Some(idx) = self.find_conv_idx(conv_id) else {
+            return;
+        };
         let msgs = &mut self.conversations[idx].messages;
 
         // Inline tool call markers into the message content so they appear
@@ -1497,9 +1558,18 @@ impl AgentChatState {
 
     /// Append a compact file proposal summary to the assistant's current streaming message.
     /// Displayed as `[wrote path/to/file.rs +N -M]` inline in the chat output.
-    pub fn append_deferred_summary(&mut self, conv_id: &str, path: &std::path::Path, additions: usize, deletions: usize) {
-        let Some(idx) = self.find_conv_idx(conv_id) else { return };
-        let rel = path.file_name()
+    pub fn append_deferred_summary(
+        &mut self,
+        conv_id: &str,
+        path: &std::path::Path,
+        additions: usize,
+        deletions: usize,
+    ) {
+        let Some(idx) = self.find_conv_idx(conv_id) else {
+            return;
+        };
+        let rel = path
+            .file_name()
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_else(|| path.to_string_lossy().to_string());
         let summary = format!("\n[wrote {} +{} -{}]", rel, additions, deletions);
@@ -1507,7 +1577,9 @@ impl AgentChatState {
         if let Some(last) = msgs.last_mut() {
             if last.role == ChatRole::Assistant {
                 last.content.push_str(&summary);
-                if idx == self.active_conv { self.scroll_to_bottom(); }
+                if idx == self.active_conv {
+                    self.scroll_to_bottom();
+                }
                 return;
             }
         }
@@ -1517,11 +1589,15 @@ impl AgentChatState {
             content: summary,
             tool_calls: Vec::new(),
         });
-        if idx == self.active_conv { self.scroll_to_bottom(); }
+        if idx == self.active_conv {
+            self.scroll_to_bottom();
+        }
     }
 
     pub fn finalize_message_to(&mut self, conv_id: &str, role: &str, content: &str) {
-        let Some(idx) = self.find_conv_idx(conv_id) else { return };
+        let Some(idx) = self.find_conv_idx(conv_id) else {
+            return;
+        };
         let chat_role = match role {
             "user" => ChatRole::User,
             "assistant" => ChatRole::Assistant,
@@ -1537,7 +1613,9 @@ impl AgentChatState {
                 self.conversations[idx].is_streaming = false;
                 self.conversations[idx].streaming_status.clear();
                 self.conversations[idx].streaming_started_at = None;
-                if idx == self.active_conv { self.scroll_to_bottom(); }
+                if idx == self.active_conv {
+                    self.scroll_to_bottom();
+                }
                 return;
             }
         }
@@ -1553,12 +1631,16 @@ impl AgentChatState {
         self.conversations[idx].is_streaming = false;
         self.conversations[idx].streaming_status.clear();
         self.conversations[idx].streaming_started_at = None;
-        if idx == self.active_conv { self.scroll_to_bottom(); }
+        if idx == self.active_conv {
+            self.scroll_to_bottom();
+        }
     }
 
     /// Replace `<file>` blocks in the last assistant message with short summaries.
     pub fn collapse_file_blocks_in(&mut self, conv_id: &str) {
-        let Some(idx) = self.find_conv_idx(conv_id) else { return };
+        let Some(idx) = self.find_conv_idx(conv_id) else {
+            return;
+        };
         let msgs = &mut self.conversations[idx].messages;
         if let Some(last) = msgs.last_mut() {
             if last.role == ChatRole::Assistant && last.content.contains("<file path=\"") {
@@ -1609,9 +1691,10 @@ impl AgentChatState {
                         )) => Some(id.clone()),
                         _ => None,
                     },
-                    (None, Some(gaviero_core::context_planner::ContinuityHandle::ClaudeSessionId(
-                        id,
-                    ))) => Some(id.clone()),
+                    (
+                        None,
+                        Some(gaviero_core::context_planner::ContinuityHandle::ClaudeSessionId(id)),
+                    ) => Some(id.clone()),
                     _ => None,
                 };
                 // The full ledger is reconstructed on demand at send time
@@ -1691,9 +1774,10 @@ impl AgentChatState {
                 // thinking state. Fingerprint is part of the ledger and
                 // invalidates the handle on model/toolset change.
                 session_ledger: conv.session_ledger.as_ref().map(|l| l.to_persisted()),
-                continuity_handle: conv.session_ledger.as_ref().and_then(|l| {
-                    l.continuity_handle.clone()
-                }),
+                continuity_handle: conv
+                    .session_ledger
+                    .as_ref()
+                    .and_then(|l| l.continuity_handle.clone()),
             };
 
             summaries.push(ss::ConversationSummary {
@@ -1708,7 +1792,10 @@ impl AgentChatState {
             }
         }
 
-        let active_id = self.conversations.get(self.active_conv).map(|c| c.id.clone());
+        let active_id = self
+            .conversations
+            .get(self.active_conv)
+            .map(|c| c.id.clone());
         let index = ss::ConversationIndex {
             conversations: summaries,
             active_id,
@@ -1828,7 +1915,9 @@ impl AgentChatState {
         for x in 0..area.width {
             let cx = area.x + x;
             if cx < buf.area().right() && area.y < buf.area().bottom() {
-                buf[(cx, area.y)].set_char(' ').set_style(Style::default().bg(bg));
+                buf[(cx, area.y)]
+                    .set_char(' ')
+                    .set_style(Style::default().bg(bg));
             }
         }
 
@@ -1836,7 +1925,10 @@ impl AgentChatState {
         for (i, conv) in self.conversations.iter().enumerate() {
             let is_active = i == self.active_conv;
             let style = if is_active {
-                Style::default().fg(fg_active).bg(bg).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(fg_active)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(fg_inactive).bg(bg)
             };
@@ -1858,9 +1950,9 @@ impl AgentChatState {
 
             // Separator
             if x < area.x + area.width && x < buf.area().right() {
-                buf[(x, area.y)].set_char('│').set_style(
-                    Style::default().fg(theme::BORDER_DIM).bg(bg),
-                );
+                buf[(x, area.y)]
+                    .set_char('│')
+                    .set_style(Style::default().fg(theme::BORDER_DIM).bg(bg));
                 x += 1;
             }
         }
@@ -1890,18 +1982,9 @@ impl AgentChatState {
 
         for (msg_idx, msg) in self.messages().iter().enumerate() {
             let (prefix, base_style) = match msg.role {
-                ChatRole::User => (
-                    "You: ",
-                    Style::default().fg(theme::ACCENT),
-                ),
-                ChatRole::Assistant => (
-                    "Assistant: ",
-                    Style::default().fg(theme::TEXT_FG),
-                ),
-                ChatRole::System => (
-                    "System: ",
-                    Style::default().fg(theme::WARNING),
-                ),
+                ChatRole::User => ("You: ", Style::default().fg(theme::ACCENT)),
+                ChatRole::Assistant => ("Assistant: ", Style::default().fg(theme::TEXT_FG)),
+                ChatRole::System => ("System: ", Style::default().fg(theme::WARNING)),
             };
 
             // Filter <file> blocks from display (both complete and in-progress)
@@ -1937,30 +2020,47 @@ impl AgentChatState {
             let frame = spinner_frames[(self.tick_count / 6) as usize % spinner_frames.len()];
             let conv = &self.conversations[self.active_conv];
             let status = &conv.streaming_status;
-            let label = if status.is_empty() { "Thinking..." } else { status.as_str() };
-            let elapsed_str = conv.streaming_started_at.map(|t| {
-                let secs = t.elapsed().as_secs();
-                if secs < 60 {
-                    format!(" ({}s)", secs)
-                } else {
-                    format!(" ({}m{}s)", secs / 60, secs % 60)
-                }
-            }).unwrap_or_default();
-            let stream_style = Style::default()
-                .fg(theme::ACCENT);
-            lines.push((stream_style, format!("{} {}{}", frame, label, elapsed_str), None));
+            let label = if status.is_empty() {
+                "Thinking..."
+            } else {
+                status.as_str()
+            };
+            let elapsed_str = conv
+                .streaming_started_at
+                .map(|t| {
+                    let secs = t.elapsed().as_secs();
+                    if secs < 60 {
+                        format!(" ({}s)", secs)
+                    } else {
+                        format!(" ({}m{}s)", secs / 60, secs % 60)
+                    }
+                })
+                .unwrap_or_default();
+            let stream_style = Style::default().fg(theme::ACCENT);
+            lines.push((
+                stream_style,
+                format!("{} {}{}", frame, label, elapsed_str),
+                None,
+            ));
         }
 
         // Cache rendered line texts + message index for mouse text selection
-        self.rendered_lines_cache = lines.iter().map(|(_, text, mi)| (text.clone(), *mi)).collect();
+        self.rendered_lines_cache = lines
+            .iter()
+            .map(|(_, text, mi)| (text.clone(), *mi))
+            .collect();
 
         // In browse mode, scroll to keep the browsed message visible
         let total = lines.len();
         let viewport = area.height as usize;
         if self.browse_mode {
             // Find first and last line belonging to the browsed message
-            let first_line = lines.iter().position(|(_, _, mi)| *mi == Some(self.browsed_msg));
-            let last_line = lines.iter().rposition(|(_, _, mi)| *mi == Some(self.browsed_msg));
+            let first_line = lines
+                .iter()
+                .position(|(_, _, mi)| *mi == Some(self.browsed_msg));
+            let last_line = lines
+                .iter()
+                .rposition(|(_, _, mi)| *mi == Some(self.browsed_msg));
             if let (Some(first), Some(last)) = (first_line, last_line) {
                 if first < self.scroll_offset {
                     self.scroll_offset = first;
@@ -1995,7 +2095,11 @@ impl AgentChatState {
                 && line_idx < lines.len()
                 && lines[line_idx].2 == Some(self.browsed_msg);
 
-            let row_bg = if is_browsed { browse_bg } else { default_style.bg.unwrap_or(Color::Reset) };
+            let row_bg = if is_browsed {
+                browse_bg
+            } else {
+                default_style.bg.unwrap_or(Color::Reset)
+            };
 
             // Clear row
             let clear_style = if is_browsed {
@@ -2013,9 +2117,7 @@ impl AgentChatState {
             if line_idx < lines.len() {
                 let (style, ref text, _) = lines[line_idx];
                 let line_style = if is_browsed { style.bg(row_bg) } else { style };
-                let sel_style = Style::default()
-                    .fg(theme::TAB_BG)
-                    .bg(theme::ACCENT);
+                let sel_style = Style::default().fg(theme::TAB_BG).bg(theme::ACCENT);
                 let mut cx = area.x;
                 let mut char_idx = 0usize;
                 for ch in text.chars() {
@@ -2030,7 +2132,10 @@ impl AgentChatState {
                     } else {
                         line_style
                     };
-                    if cx + ch_width <= area.x + area.width && cx < buf.area().right() && y < buf.area().bottom() {
+                    if cx + ch_width <= area.x + area.width
+                        && cx < buf.area().right()
+                        && y < buf.area().bottom()
+                    {
                         buf[(cx, y)].set_char(display_ch).set_style(final_style);
                     }
                     cx += ch_width;
@@ -2042,16 +2147,17 @@ impl AgentChatState {
         // Browse mode hint
         if self.browse_mode {
             let hint = " [BROWSE] ↑↓ nav  Ctrl+C copy  Esc exit ";
-            let hint_style = Style::default()
-                .fg(theme::TAB_BG)
-                .bg(theme::ACCENT);
+            let hint_style = Style::default().fg(theme::TAB_BG).bg(theme::ACCENT);
             let hint_y = area.y;
             let hint_display_w = UnicodeWidthStr::width(hint) as u16;
             let hint_x = area.x + area.width.saturating_sub(hint_display_w);
             let mut cx = hint_x;
             for ch in hint.chars() {
                 let ch_w = UnicodeWidthChar::width(ch).unwrap_or(1) as u16;
-                if cx + ch_w <= area.x + area.width && cx < buf.area().right() && hint_y < buf.area().bottom() {
+                if cx + ch_w <= area.x + area.width
+                    && cx < buf.area().right()
+                    && hint_y < buf.area().bottom()
+                {
                     buf[(cx, hint_y)].set_char(ch).set_style(hint_style);
                 }
                 cx += ch_w;
@@ -2059,13 +2165,7 @@ impl AgentChatState {
         }
 
         // Scrollbar
-        crate::widgets::scrollbar::render_scrollbar(
-            area,
-            buf,
-            total,
-            viewport,
-            self.scroll_offset,
-        );
+        crate::widgets::scrollbar::render_scrollbar(area, buf, total, viewport, self.scroll_offset);
     }
 
     fn render_input(&self, area: Rect, buf: &mut RataBuf, focused: bool, _theme: &Theme) {
@@ -2086,15 +2186,24 @@ impl AgentChatState {
 
         // Permission request overlay: replaces normal input area
         if let Some(ref perm) = self.conversations[self.active_conv].pending_permission {
-            let warn_style = Style::default().fg(theme::WARNING).bg(bg).add_modifier(Modifier::BOLD);
+            let warn_style = Style::default()
+                .fg(theme::WARNING)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD);
             let text_style = Style::default().fg(theme::TEXT_BRIGHT).bg(bg);
-            let key_style = Style::default().fg(theme::ACCENT).bg(bg).add_modifier(Modifier::BOLD);
+            let key_style = Style::default()
+                .fg(theme::ACCENT)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD);
 
             // Line 0: header
             let header = format!(" ⚠ Permission: {} ", perm.tool_name);
             let mut cx = area.x;
             for ch in header.chars() {
-                if cx < area.x + area.width && cx < buf.area().right() && area.y < buf.area().bottom() {
+                if cx < area.x + area.width
+                    && cx < buf.area().right()
+                    && area.y < buf.area().bottom()
+                {
                     buf[(cx, area.y)].set_char(ch).set_style(warn_style);
                     cx += 1;
                 }
@@ -2104,12 +2213,19 @@ impl AgentChatState {
             if area.height > 1 {
                 let desc_y = area.y + 1;
                 let max_w = area.width as usize;
-                let desc: String = perm.description.chars().take(max_w.saturating_sub(1)).collect();
+                let desc: String = perm
+                    .description
+                    .chars()
+                    .take(max_w.saturating_sub(1))
+                    .collect();
                 let mut cx = area.x;
                 buf[(cx, desc_y)].set_char(' ').set_style(text_style);
                 cx += 1;
                 for ch in desc.chars() {
-                    if cx < area.x + area.width && cx < buf.area().right() && desc_y < buf.area().bottom() {
+                    if cx < area.x + area.width
+                        && cx < buf.area().right()
+                        && desc_y < buf.area().bottom()
+                    {
                         buf[(cx, desc_y)].set_char(ch).set_style(text_style);
                         cx += 1;
                     }
@@ -2121,8 +2237,15 @@ impl AgentChatState {
             let keys = " [y] Allow  [n] Deny ";
             let mut cx = area.x;
             for ch in keys.chars() {
-                if cx < area.x + area.width && cx < buf.area().right() && hint_y < buf.area().bottom() {
-                    let s = if ch == 'y' || ch == 'n' { key_style } else { text_style };
+                if cx < area.x + area.width
+                    && cx < buf.area().right()
+                    && hint_y < buf.area().bottom()
+                {
+                    let s = if ch == 'y' || ch == 'n' {
+                        key_style
+                    } else {
+                        text_style
+                    };
                     buf[(cx, hint_y)].set_char(ch).set_style(s);
                     cx += 1;
                 }
@@ -2140,9 +2263,7 @@ impl AgentChatState {
         } else {
             "> "
         };
-        let prompt_style = Style::default()
-            .fg(theme::ACCENT)
-            .bg(bg);
+        let prompt_style = Style::default().fg(theme::ACCENT).bg(bg);
 
         let mut x = area.x;
         for ch in prompt.chars() {
@@ -2160,9 +2281,7 @@ impl AgentChatState {
         if self.text_input.text.is_empty() && !self.active_conv_streaming() {
             // Hint text
             let hint = "Type a message, Enter to send";
-            let hint_style = Style::default()
-                .fg(theme::TEXT_DIM)
-                .bg(bg);
+            let hint_style = Style::default().fg(theme::TEXT_DIM).bg(bg);
             for (i, ch) in hint.chars().enumerate() {
                 let hx = x + i as u16;
                 if hx < area.x + area.width && hx < buf.area().right() {
@@ -2172,7 +2291,8 @@ impl AgentChatState {
             // Show cursor at prompt position even with empty input
             if focused {
                 let cursor_style = Style::default().fg(bg).bg(theme::TEXT_FG);
-                if x < area.x + area.width && x < buf.area().right() && area.y < buf.area().bottom() {
+                if x < area.x + area.width && x < buf.area().right() && area.y < buf.area().bottom()
+                {
                     buf[(x, area.y)].set_style(cursor_style);
                 }
             }
@@ -2190,7 +2310,11 @@ impl AgentChatState {
             // Split by actual newlines first, then wrap each logical line
             for (logical_idx, logical_line) in self.text_input.text.split('\n').enumerate() {
                 let line_char_count = logical_line.chars().count();
-                let avail = if lines.is_empty() { text_width } else { full_width };
+                let avail = if lines.is_empty() {
+                    text_width
+                } else {
+                    full_width
+                };
 
                 if line_char_count == 0 {
                     // Empty line (just a newline)
@@ -2200,9 +2324,13 @@ impl AgentChatState {
                     let mut col = 0;
                     let first_visual = lines.len();
                     while col < line_char_count {
-                        let w = if lines.len() == 0 { text_width }
-                                else if lines.len() == first_visual { avail }
-                                else { full_width };
+                        let w = if lines.len() == 0 {
+                            text_width
+                        } else if lines.len() == first_visual {
+                            avail
+                        } else {
+                            full_width
+                        };
                         let take = w.min(line_char_count - col);
                         lines.push((pos + col, take));
                         col += take;
@@ -2273,14 +2401,20 @@ impl AgentChatState {
                     let ch_idx = start + i;
                     if ch_idx < input_chars.len() {
                         let ch = input_chars[ch_idx];
-                        if ch == '\n' || ch == '\r' { continue; }
+                        if ch == '\n' || ch == '\r' {
+                            continue;
+                        }
                         let cx = x_start + i as u16;
-                        if cx < area.x + area.width && cx < buf.area().right() && y < buf.area().bottom() {
-                            let ch_style = if sel_range.map_or(false, |(s, e)| ch_idx >= s && ch_idx < e) {
-                                Style::default().fg(fg).bg(theme::SELECTION_BG)
-                            } else {
-                                style
-                            };
+                        if cx < area.x + area.width
+                            && cx < buf.area().right()
+                            && y < buf.area().bottom()
+                        {
+                            let ch_style =
+                                if sel_range.map_or(false, |(s, e)| ch_idx >= s && ch_idx < e) {
+                                    Style::default().fg(fg).bg(theme::SELECTION_BG)
+                                } else {
+                                    style
+                                };
                             buf[(cx, y)].set_char(ch).set_style(ch_style);
                         }
                     }
@@ -2363,7 +2497,9 @@ impl AgentChatState {
         for col in 0..area.width {
             let cx = area.x + col;
             if cx < buf.area().right() {
-                buf[(cx, y)].set_char(' ').set_style(Style::default().bg(bg));
+                buf[(cx, y)]
+                    .set_char(' ')
+                    .set_style(Style::default().bg(bg));
             }
         }
 
@@ -2479,7 +2615,8 @@ mod tests {
 
     #[test]
     fn parse_file_references_ignores_embedded_at_symbols() {
-        let refs = parse_file_references("mail me at user@example.com or foo@bar but inspect @src/lib.rs");
+        let refs =
+            parse_file_references("mail me at user@example.com or foo@bar but inspect @src/lib.rs");
         assert_eq!(refs, vec!["src/lib.rs"]);
     }
 
@@ -2487,7 +2624,8 @@ mod tests {
     fn effective_model_prefers_conversation_override() {
         let mut state = AgentChatState::new();
         state.agent_settings.model = "sonnet".to_string();
-        state.conversations[state.active_conv].model_override = Some("ollama:qwen2.5-coder:7b".to_string());
+        state.conversations[state.active_conv].model_override =
+            Some("ollama:qwen2.5-coder:7b".to_string());
 
         assert_eq!(state.effective_model(), "ollama:qwen2.5-coder:7b");
     }
@@ -2502,7 +2640,9 @@ mod tests {
 
         assert!(handled);
         assert_eq!(
-            state.conversations[state.active_conv].model_override.as_deref(),
+            state.conversations[state.active_conv]
+                .model_override
+                .as_deref(),
             Some("ollama:qwen2.5-coder:7b")
         );
         assert!(state.text_input.text.is_empty());
