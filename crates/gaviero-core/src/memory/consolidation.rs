@@ -160,15 +160,17 @@ impl Consolidator {
     ///
     /// If a module-level memory is accessed by agents in 3+ different modules,
     /// promote a copy to repo scope with boosted importance.
-    pub async fn promote_frequent_cross_scope(
-        &self,
-        min_cross_hits: i64,
-    ) -> Result<usize> {
-        let candidates = self.memory.find_promotion_candidates(min_cross_hits).await?;
+    pub async fn promote_frequent_cross_scope(&self, min_cross_hits: i64) -> Result<usize> {
+        let candidates = self
+            .memory
+            .find_promotion_candidates(min_cross_hits)
+            .await?;
         let mut promoted = 0;
 
         for mem in &candidates {
-            let Some(repo_id) = &mem.repo_id else { continue };
+            let Some(repo_id) = &mem.repo_id else {
+                continue;
+            };
 
             let meta = WriteMeta {
                 memory_type: mem.memory_type,
@@ -191,10 +193,7 @@ impl Consolidator {
             {
                 Ok(super::scope::StoreResult::Inserted(_)) => {
                     promoted += 1;
-                    tracing::debug!(
-                        memory_id = mem.id,
-                        "promotion: module → repo"
-                    );
+                    tracing::debug!(memory_id = mem.id, "promotion: module → repo");
                 }
                 Ok(_) => {} // deduplicated or already covered
                 Err(e) => {
@@ -247,7 +246,6 @@ impl Consolidator {
         }
         Ok(None)
     }
-
 }
 
 /// Helper to merge two memory entries' content using LLM.
@@ -294,7 +292,10 @@ mod tests {
     async fn test_consolidate_run_empty() {
         let store = Arc::new(MemoryStore::in_memory(Arc::new(MockEmbedder)).unwrap());
         let consolidator = Consolidator::new(store);
-        let report = consolidator.consolidate_run("nonexistent", "repo1").await.unwrap();
+        let report = consolidator
+            .consolidate_run("nonexistent", "repo1")
+            .await
+            .unwrap();
         assert_eq!(report.promoted, 0);
         assert_eq!(report.pruned, 0);
     }
