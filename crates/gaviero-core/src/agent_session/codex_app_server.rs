@@ -68,7 +68,7 @@ use base64::Engine as _;
 use futures::Stream;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::context_planner::{ContinuityHandle, ContinuityMode};
@@ -176,8 +176,14 @@ impl CodexAppServerSession {
             )
         })?;
 
-        let stdout = child.stdout.take().context("codex app-server stdout unavailable")?;
-        let stdin = child.stdin.take().context("codex app-server stdin unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("codex app-server stdout unavailable")?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("codex app-server stdin unavailable")?;
         let mut stdin = BufWriter::new(stdin);
         let mut lines = BufReader::new(stdout).lines();
 
@@ -185,7 +191,13 @@ impl CodexAppServerSession {
         // background reader — avoids races between init messages and turn events.
         let thread_id = tokio::time::timeout(
             std::time::Duration::from_secs(15),
-            handshake(&mut stdin, &mut lines, &self.model, &self.workspace_root, &self.handle),
+            handshake(
+                &mut stdin,
+                &mut lines,
+                &self.model,
+                &self.workspace_root,
+                &self.handle,
+            ),
         )
         .await
         .context("codex app-server: handshake timed out")??;
@@ -318,14 +330,17 @@ async fn handshake(
     read_until_response(lines, init_id).await?;
 
     // 2. initialized notification (no response expected)
-    write_msg(stdin, &rpc_notification("initialized", serde_json::json!({}))).await?;
+    write_msg(
+        stdin,
+        &rpc_notification("initialized", serde_json::json!({})),
+    )
+    .await?;
 
     // 3. thread/start or thread/resume
     let (method, params) = match existing_handle {
-        Some(ContinuityHandle::CodexThreadId(id)) => (
-            "thread/resume",
-            serde_json::json!({ "threadId": id }),
-        ),
+        Some(ContinuityHandle::CodexThreadId(id)) => {
+            ("thread/resume", serde_json::json!({ "threadId": id }))
+        }
         _ => (
             "thread/start",
             serde_json::json!({
@@ -409,13 +424,21 @@ fn parse_rpc_event(line: &str) -> (Vec<UnifiedStreamEvent>, bool) {
     match method {
         // V9 §6: item/agentMessage/delta → TextDelta(delta)
         "item/agentMessage/delta" => {
-            let delta = params.get("delta").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let delta = params
+                .get("delta")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             (vec![UnifiedStreamEvent::TextDelta(delta)], false)
         }
 
         // V9 §6: item/reasoningMessage/delta → ThinkingDelta(delta)
         "item/reasoningMessage/delta" | "item/reasoning/delta" => {
-            let delta = params.get("delta").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let delta = params
+                .get("delta")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             (vec![UnifiedStreamEvent::ThinkingDelta(delta)], false)
         }
 
@@ -424,8 +447,18 @@ fn parse_rpc_event(line: &str) -> (Vec<UnifiedStreamEvent>, bool) {
         "item/started" => {
             let item = params.get("item").unwrap_or(&serde_json::Value::Null);
             if item.get("type").and_then(|v| v.as_str()) == Some("commandExecution") {
-                let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                (vec![UnifiedStreamEvent::ToolCallStart { id, name: "Bash".to_string() }], false)
+                let id = item
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                (
+                    vec![UnifiedStreamEvent::ToolCallStart {
+                        id,
+                        name: "Bash".to_string(),
+                    }],
+                    false,
+                )
             } else {
                 (vec![], false)
             }
@@ -434,7 +467,11 @@ fn parse_rpc_event(line: &str) -> (Vec<UnifiedStreamEvent>, bool) {
         // V9 §6: item/commandExecution/outputDelta → ToolCallDelta
         // Real: params.deltaBase64 (base64-encoded stdout/stderr)
         "item/commandExecution/outputDelta" => {
-            let id = params.get("itemId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let id = params
+                .get("itemId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let chunk = params
                 .get("deltaBase64")
                 .and_then(|v| v.as_str())
@@ -445,7 +482,13 @@ fn parse_rpc_event(line: &str) -> (Vec<UnifiedStreamEvent>, bool) {
                         .and_then(|bytes| String::from_utf8(bytes).ok())
                 })
                 .unwrap_or_default();
-            (vec![UnifiedStreamEvent::ToolCallDelta { id, args_chunk: chunk }], false)
+            (
+                vec![UnifiedStreamEvent::ToolCallDelta {
+                    id,
+                    args_chunk: chunk,
+                }],
+                false,
+            )
         }
 
         // V9 §6: item/commandExecution final → ToolCallEnd { id }
@@ -453,7 +496,11 @@ fn parse_rpc_event(line: &str) -> (Vec<UnifiedStreamEvent>, bool) {
         "item/completed" => {
             let item = params.get("item").unwrap_or(&serde_json::Value::Null);
             if item.get("type").and_then(|v| v.as_str()) == Some("commandExecution") {
-                let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let id = item
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 (vec![UnifiedStreamEvent::ToolCallEnd { id }], false)
             } else {
                 (vec![], false)
@@ -464,11 +511,16 @@ fn parse_rpc_event(line: &str) -> (Vec<UnifiedStreamEvent>, bool) {
         //        turn/completed (status=failed)    → Error + Done(Error)
         "turn/completed" => {
             let turn = params.get("turn").unwrap_or(&serde_json::Value::Null);
-            let status = turn.get("status").and_then(|v| v.as_str()).unwrap_or("completed");
+            let status = turn
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("completed");
             let events: Vec<UnifiedStreamEvent> = if status == "completed" {
                 let usage = turn.get("tokenUsage");
-                let input_tokens =
-                    usage.and_then(|u| u.get("inputTokens")).and_then(|v| v.as_u64()).unwrap_or(0);
+                let input_tokens = usage
+                    .and_then(|u| u.get("inputTokens"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 let output_tokens = usage
                     .and_then(|u| u.get("outputTokens"))
                     .and_then(|v| v.as_u64())
@@ -549,7 +601,10 @@ mod tests {
         let (events, done) = parse(
             r#"{"method":"item/reasoningMessage/delta","params":{"itemId":"i2","delta":"thinking"}}"#,
         );
-        assert_eq!(events, vec![UnifiedStreamEvent::ThinkingDelta("thinking".into())]);
+        assert_eq!(
+            events,
+            vec![UnifiedStreamEvent::ThinkingDelta("thinking".into())]
+        );
         assert!(!done);
     }
 
@@ -560,7 +615,10 @@ mod tests {
         );
         assert_eq!(
             events,
-            vec![UnifiedStreamEvent::ToolCallStart { id: "cmd1".into(), name: "Bash".into() }]
+            vec![UnifiedStreamEvent::ToolCallStart {
+                id: "cmd1".into(),
+                name: "Bash".into()
+            }]
         );
         assert!(!done);
     }
@@ -584,7 +642,10 @@ mod tests {
         assert!(!done);
         assert_eq!(
             events,
-            vec![UnifiedStreamEvent::ToolCallDelta { id: "cmd1".into(), args_chunk: "ls\n".into() }]
+            vec![UnifiedStreamEvent::ToolCallDelta {
+                id: "cmd1".into(),
+                args_chunk: "ls\n".into()
+            }]
         );
     }
 
@@ -593,7 +654,10 @@ mod tests {
         let (events, done) = parse(
             r#"{"method":"item/completed","params":{"item":{"type":"commandExecution","id":"cmd1","status":"completed","exitCode":0}}}"#,
         );
-        assert_eq!(events, vec![UnifiedStreamEvent::ToolCallEnd { id: "cmd1".into() }]);
+        assert_eq!(
+            events,
+            vec![UnifiedStreamEvent::ToolCallEnd { id: "cmd1".into() }]
+        );
         assert!(!done);
     }
 
@@ -617,7 +681,10 @@ mod tests {
             r#"{"method":"turn/completed","params":{"turn":{"status":"failed","error":{"message":"context exceeded"}}}}"#,
         );
         assert!(done);
-        assert_eq!(events[0], UnifiedStreamEvent::Error("context exceeded".into()));
+        assert_eq!(
+            events[0],
+            UnifiedStreamEvent::Error("context exceeded".into())
+        );
         assert_eq!(events[1], UnifiedStreamEvent::Done(StopReason::Error));
     }
 
@@ -659,7 +726,11 @@ mod tests {
 
     #[test]
     fn rpc_request_format() {
-        let msg = rpc_request("initialize", 0, serde_json::json!({"clientInfo":{"name":"x"}}));
+        let msg = rpc_request(
+            "initialize",
+            0,
+            serde_json::json!({"clientInfo":{"name":"x"}}),
+        );
         let val: serde_json::Value = serde_json::from_str(msg.trim()).unwrap();
         assert_eq!(val["method"], "initialize");
         assert_eq!(val["id"], 0);
