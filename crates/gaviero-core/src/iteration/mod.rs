@@ -444,6 +444,8 @@ mod tests {
             #[allow(deprecated)]
             backend: Default::default(),
             model: None,
+            effort: None,
+            extra: Vec::new(),
             tier: ModelTier::Cheap,
             privacy: PrivacyLevel::Public,
             coordinator_instructions: "do something".into(),
