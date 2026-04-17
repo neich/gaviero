@@ -23,6 +23,10 @@ pub enum Token {
     KwTier,
     #[token("model")]
     KwModel,
+    #[token("effort")]
+    KwEffort,
+    #[token("extra")]
+    KwExtra,
     #[token("privacy")]
     KwPrivacy,
     #[token("default")]
@@ -187,6 +191,8 @@ impl fmt::Display for Token {
             Token::KwWorkflow => write!(f, "workflow"),
             Token::KwTier => write!(f, "tier"),
             Token::KwModel => write!(f, "model"),
+            Token::KwEffort => write!(f, "effort"),
+            Token::KwExtra => write!(f, "extra"),
             Token::KwPrivacy => write!(f, "privacy"),
             Token::KwDefault => write!(f, "default"),
             Token::KwScope => write!(f, "scope"),
