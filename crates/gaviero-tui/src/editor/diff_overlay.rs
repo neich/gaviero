@@ -127,9 +127,18 @@ impl DiffReviewState {
 
 fn update_proposal_status(proposal: &mut WriteProposal) {
     use gaviero_core::types::ProposalStatus;
-    let all_accepted = proposal.structural_hunks.iter().all(|h| h.status == HunkStatus::Accepted);
-    let all_rejected = proposal.structural_hunks.iter().all(|h| h.status == HunkStatus::Rejected);
-    let any_accepted = proposal.structural_hunks.iter().any(|h| h.status == HunkStatus::Accepted);
+    let all_accepted = proposal
+        .structural_hunks
+        .iter()
+        .all(|h| h.status == HunkStatus::Accepted);
+    let all_rejected = proposal
+        .structural_hunks
+        .iter()
+        .all(|h| h.status == HunkStatus::Rejected);
+    let any_accepted = proposal
+        .structural_hunks
+        .iter()
+        .any(|h| h.status == HunkStatus::Accepted);
 
     if all_accepted {
         proposal.status = ProposalStatus::Accepted;
@@ -219,10 +228,7 @@ fn build_diff_lines(proposal: &WriteProposal) -> Vec<DiffLine> {
                 .structural_hunks
                 .get(hunk_i + 1)
                 .map(|next| {
-                    next.enclosing_node
-                        .as_ref()
-                        .and_then(|n| n.name.as_deref())
-                        != Some(name)
+                    next.enclosing_node.as_ref().and_then(|n| n.name.as_deref()) != Some(name)
                 })
                 .unwrap_or(true);
 
@@ -306,20 +312,18 @@ pub fn render_diff_overlay(
         let (gutter_str, gutter_style) = match &dl.kind {
             DiffLineKind::Added => (
                 " + │ ",
-                Style::default().fg(Color::Rgb(80, 200, 80)).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Rgb(80, 200, 80))
+                    .add_modifier(Modifier::BOLD),
             ),
             DiffLineKind::Removed => (
                 " - │ ",
-                Style::default().fg(Color::Rgb(220, 80, 80)).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Rgb(220, 80, 80))
+                    .add_modifier(Modifier::BOLD),
             ),
-            DiffLineKind::Context => (
-                "   │ ",
-                Style::default().fg(Color::Rgb(99, 109, 131)),
-            ),
-            DiffLineKind::NodeBar(_) => (
-                "   │ ",
-                Style::default().fg(Color::Rgb(97, 175, 239)),
-            ),
+            DiffLineKind::Context => ("   │ ", Style::default().fg(Color::Rgb(99, 109, 131))),
+            DiffLineKind::NodeBar(_) => ("   │ ", Style::default().fg(Color::Rgb(97, 175, 239))),
         };
 
         for (i, ch) in gutter_str.chars().enumerate() {
@@ -337,9 +341,7 @@ pub fn render_diff_overlay(
                     .and_then(|i| proposal.structural_hunks.get(i))
                     .map(|h| &h.status);
                 match hunk_status {
-                    Some(HunkStatus::Accepted) => theme
-                        .default_style()
-                        .bg(Color::Rgb(45, 74, 48)),
+                    Some(HunkStatus::Accepted) => theme.default_style().bg(Color::Rgb(45, 74, 48)),
                     Some(HunkStatus::Rejected) => theme
                         .default_style()
                         .fg(Color::Rgb(120, 120, 120))
@@ -359,9 +361,7 @@ pub fn render_diff_overlay(
                         .fg(Color::Rgb(120, 120, 120))
                         .add_modifier(Modifier::CROSSED_OUT)
                         .bg(Color::Rgb(55, 45, 45)),
-                    Some(HunkStatus::Rejected) => theme
-                        .default_style()
-                        .bg(Color::Rgb(74, 45, 45)),
+                    Some(HunkStatus::Rejected) => theme.default_style().bg(Color::Rgb(74, 45, 45)),
                     _ => theme.default_style().bg(Color::Rgb(65, 40, 40)),
                 }
             }
@@ -437,17 +437,37 @@ mod tests {
         let lines = build_diff_lines(&proposal);
 
         // Should have: context(aaa), removed(bbb), added(BBB), context(ccc)
-        assert!(lines.iter().any(|l| l.kind == DiffLineKind::Context && l.text == "aaa"));
-        assert!(lines.iter().any(|l| l.kind == DiffLineKind::Removed && l.text == "bbb"));
-        assert!(lines.iter().any(|l| l.kind == DiffLineKind::Added && l.text == "BBB"));
-        assert!(lines.iter().any(|l| l.kind == DiffLineKind::Context && l.text == "ccc"));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.kind == DiffLineKind::Context && l.text == "aaa")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.kind == DiffLineKind::Removed && l.text == "bbb")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.kind == DiffLineKind::Added && l.text == "BBB")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.kind == DiffLineKind::Context && l.text == "ccc")
+        );
     }
 
     #[test]
     fn test_build_diff_lines_addition() {
         let proposal = make_proposal("aaa\nccc\n", "aaa\nbbb\nccc\n");
         let lines = build_diff_lines(&proposal);
-        assert!(lines.iter().any(|l| l.kind == DiffLineKind::Added && l.text == "bbb"));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.kind == DiffLineKind::Added && l.text == "bbb")
+        );
     }
 
     #[test]
@@ -468,9 +488,15 @@ mod tests {
         let proposal = make_proposal("aaa\nbbb\nccc\nddd\n", "aaa\nBBB\nccc\nDDD\n");
         let mut state = DiffReviewState::new(proposal, DiffSource::Acp);
         state.accept_hunk(0);
-        assert_eq!(state.proposal.structural_hunks[0].status, HunkStatus::Accepted);
+        assert_eq!(
+            state.proposal.structural_hunks[0].status,
+            HunkStatus::Accepted
+        );
         state.reject_hunk(1);
-        assert_eq!(state.proposal.structural_hunks[1].status, HunkStatus::Rejected);
+        assert_eq!(
+            state.proposal.structural_hunks[1].status,
+            HunkStatus::Rejected
+        );
         assert_eq!(state.proposal.status, ProposalStatus::PartiallyAccepted);
     }
 }
