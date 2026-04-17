@@ -189,6 +189,8 @@ mod tests {
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             backend: Default::default(),
             model: None,
+            effort: None,
+            extra: Vec::new(),
             tier: Default::default(),
             privacy: Default::default(),
             coordinator_instructions: String::new(),
