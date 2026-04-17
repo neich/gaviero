@@ -11,7 +11,9 @@ pub(super) struct TuiWriteGateObserver {
 
 impl WriteGateObserver for TuiWriteGateObserver {
     fn on_proposal_created(&self, proposal: &WriteProposal) {
-        let _ = self.tx.send(Event::ProposalCreated(Box::new(proposal.clone())));
+        let _ = self
+            .tx
+            .send(Event::ProposalCreated(Box::new(proposal.clone())));
     }
 
     fn on_proposal_updated(&self, proposal_id: u64) {
@@ -58,11 +60,15 @@ impl gaviero_core::observer::SwarmObserver for TuiSwarmObserver {
     }
 
     fn on_completed(&self, result: &gaviero_core::swarm::models::SwarmResult) {
-        let _ = self.tx.send(Event::SwarmCompleted(Box::new(result.clone())));
+        let _ = self
+            .tx
+            .send(Event::SwarmCompleted(Box::new(result.clone())));
     }
 
     fn on_coordination_started(&self, prompt: &str) {
-        let _ = self.tx.send(Event::SwarmCoordinationStarted(prompt.to_string()));
+        let _ = self
+            .tx
+            .send(Event::SwarmCoordinationStarted(prompt.to_string()));
     }
 
     fn on_coordination_complete(&self, dag: &gaviero_core::swarm::coordinator::TaskDAG) {
