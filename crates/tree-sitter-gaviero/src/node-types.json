@@ -57,6 +57,14 @@
         {
           "type": "string",
           "named": true
+        },
+        {
+          "type": "tier_alias_name",
+          "named": true
+        },
+        {
+          "type": "vars_block",
+          "named": true
         }
       ]
     }
@@ -91,8 +99,16 @@
     "fields": {},
     "children": {
       "multiple": false,
-      "required": true,
+      "required": false,
       "types": [
+        {
+          "type": "extra_block",
+          "named": true
+        },
+        {
+          "type": "identifier",
+          "named": true
+        },
         {
           "type": "privacy_value",
           "named": true
@@ -147,6 +163,44 @@
     }
   },
   {
+    "type": "extra_block",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "extra_pair",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "extra_pair",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "raw_string",
+          "named": true
+        },
+        {
+          "type": "string",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "identifier_list",
     "named": true,
     "fields": {},
@@ -184,6 +238,10 @@
       "multiple": false,
       "required": true,
       "types": [
+        {
+          "type": "boolean",
+          "named": true
+        },
         {
           "type": "identifier_list",
           "named": true
@@ -251,6 +309,29 @@
     "fields": {}
   },
   {
+    "type": "prompt_declaration",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "raw_string",
+          "named": true
+        },
+        {
+          "type": "string",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "scope_block",
     "named": true,
     "fields": {},
@@ -299,6 +380,18 @@
         },
         {
           "type": "client_declaration",
+          "named": true
+        },
+        {
+          "type": "prompt_declaration",
+          "named": true
+        },
+        {
+          "type": "tier_alias_declaration",
+          "named": true
+        },
+        {
+          "type": "vars_block",
           "named": true
         },
         {
@@ -356,6 +449,40 @@
         },
         {
           "type": "string",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "tier_alias_declaration",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "tier_alias_name",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "tier_alias_name",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": false,
+      "types": [
+        {
+          "type": "identifier",
           "named": true
         }
       ]
@@ -433,6 +560,44 @@
       "types": [
         {
           "type": "verify_field",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "vars_block",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "vars_pair",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "vars_pair",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "raw_string",
+          "named": true
+        },
+        {
+          "type": "string",
           "named": true
         }
       ]
@@ -579,6 +744,10 @@
     "named": false
   },
   {
+    "type": "default",
+    "named": false
+  },
+  {
     "type": "depends_on",
     "named": false
   },
@@ -591,6 +760,10 @@
     "named": false
   },
   {
+    "type": "effort",
+    "named": false
+  },
+  {
     "type": "escalate_after",
     "named": false
   },
@@ -600,6 +773,10 @@
   },
   {
     "type": "expensive",
+    "named": false
+  },
+  {
+    "type": "extra",
     "named": false
   },
   {
@@ -629,6 +806,14 @@
   {
     "type": "integer",
     "named": true
+  },
+  {
+    "type": "iter_start",
+    "named": false
+  },
+  {
+    "type": "judge_timeout",
+    "named": false
   },
   {
     "type": "local_only",
@@ -715,6 +900,10 @@
     "named": false
   },
   {
+    "type": "stability",
+    "named": false
+  },
+  {
     "type": "staleness_sources",
     "named": false
   },
@@ -724,6 +913,10 @@
   },
   {
     "type": "strategy",
+    "named": false
+  },
+  {
+    "type": "strict_judge",
     "named": false
   },
   {
@@ -752,6 +945,10 @@
   },
   {
     "type": "until",
+    "named": false
+  },
+  {
+    "type": "vars",
     "named": false
   },
   {

@@ -2,21 +2,28 @@
 "client" @keyword
 "agent" @keyword
 "workflow" @keyword
+"prompt" @keyword
+"vars" @keyword
 
 ; ── Declaration names ─────────────────────────────────────────
 (client_declaration (identifier) @type)
 (agent_declaration (identifier) @type)
 (workflow_declaration (identifier) @type)
+(prompt_declaration (identifier) @type)
+(tier_alias_declaration (tier_alias_name) @type)
+(tier_alias_declaration (identifier) @variable)
 
 ; ── Field keywords ────────────────────────────────────────────
 "tier" @keyword
 "model" @keyword
+"effort" @keyword
+"extra" @keyword
+"default" @keyword.modifier
 "privacy" @keyword
 "scope" @keyword
 "owned" @keyword
 "read_only" @keyword
 "depends_on" @keyword
-"prompt" @keyword
 "description" @keyword
 "max_retries" @keyword
 "steps" @keyword
@@ -50,6 +57,10 @@
 "until" @keyword
 "agents" @keyword
 "max_iterations" @keyword
+"iter_start" @keyword
+"stability" @keyword
+"judge_timeout" @keyword
+"strict_judge" @keyword
 "command" @keyword
 
 ; ── Scope keywords ────────────────────────────────────────────
@@ -77,7 +88,12 @@
 (identifier_list (identifier) @variable)
 (step_list (identifier) @variable)
 (agent_field (identifier) @variable)
+(agent_field (tier_alias_name) @variable)
 (until_agent (identifier) @variable)
+
+; ── Vars / extra pair keys ────────────────────────────────────
+(vars_pair (identifier) @property)
+(extra_pair (identifier) @property)
 
 ; ── Strings ───────────────────────────────────────────────────
 (string) @string

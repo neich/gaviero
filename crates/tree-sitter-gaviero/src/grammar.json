@@ -23,6 +23,18 @@
         {
           "type": "SYMBOL",
           "name": "workflow_declaration"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "prompt_declaration"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "tier_alias_declaration"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "vars_block"
         }
       ]
     },
@@ -104,6 +116,19 @@
           "members": [
             {
               "type": "STRING",
+              "value": "effort"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "_effort_value"
+            }
+          ]
+        },
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
               "value": "privacy"
             },
             {
@@ -111,6 +136,181 @@
               "name": "privacy_value"
             }
           ]
+        },
+        {
+          "type": "SYMBOL",
+          "name": "extra_block"
+        },
+        {
+          "type": "STRING",
+          "value": "default"
+        }
+      ]
+    },
+    "_effort_value": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "_string_value"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "identifier"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "tier_value"
+        }
+      ]
+    },
+    "extra_block": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "extra"
+        },
+        {
+          "type": "STRING",
+          "value": "{"
+        },
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "SYMBOL",
+            "name": "extra_pair"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": "}"
+        }
+      ]
+    },
+    "extra_pair": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SYMBOL",
+              "name": "identifier"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "_string_value"
+            }
+          ]
+        },
+        {
+          "type": "SYMBOL",
+          "name": "_string_value"
+        }
+      ]
+    },
+    "vars_block": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "vars"
+        },
+        {
+          "type": "STRING",
+          "value": "{"
+        },
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "SYMBOL",
+            "name": "vars_pair"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": "}"
+        }
+      ]
+    },
+    "vars_pair": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "identifier"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "_string_value"
+        }
+      ]
+    },
+    "tier_alias_declaration": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "tier"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "tier_alias_name"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "identifier"
+        }
+      ]
+    },
+    "tier_alias_name": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "identifier"
+        },
+        {
+          "type": "STRING",
+          "value": "cheap"
+        },
+        {
+          "type": "STRING",
+          "value": "expensive"
+        },
+        {
+          "type": "STRING",
+          "value": "coordinator"
+        },
+        {
+          "type": "STRING",
+          "value": "reasoning"
+        },
+        {
+          "type": "STRING",
+          "value": "execution"
+        },
+        {
+          "type": "STRING",
+          "value": "mechanical"
+        }
+      ]
+    },
+    "prompt_declaration": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "prompt"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "identifier"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "_string_value"
         }
       ]
     },
@@ -172,6 +372,19 @@
           ]
         },
         {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "tier"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "tier_alias_name"
+            }
+          ]
+        },
+        {
           "type": "SYMBOL",
           "name": "scope_block"
         },
@@ -196,8 +409,17 @@
               "value": "prompt"
             },
             {
-              "type": "SYMBOL",
-              "name": "_string_value"
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "SYMBOL",
+                  "name": "_string_value"
+                },
+                {
+                  "type": "SYMBOL",
+                  "name": "identifier"
+                }
+              ]
             }
           ]
         },
@@ -221,6 +443,10 @@
         {
           "type": "SYMBOL",
           "name": "context_block"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "vars_block"
         }
       ]
     },
@@ -615,6 +841,58 @@
             {
               "type": "SYMBOL",
               "name": "integer"
+            }
+          ]
+        },
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "iter_start"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "integer"
+            }
+          ]
+        },
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "stability"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "integer"
+            }
+          ]
+        },
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "judge_timeout"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "integer"
+            }
+          ]
+        },
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "strict_judge"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "boolean"
             }
           ]
         }
