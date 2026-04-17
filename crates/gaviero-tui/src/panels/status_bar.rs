@@ -41,10 +41,7 @@ impl<'a> StatusBar<'a> {
                 editor_buf.cursor.line + 1,
                 editor_buf.cursor.col + 1
             );
-            let lang = editor_buf
-                .lang_name
-                .as_deref()
-                .unwrap_or("Plain Text");
+            let lang = editor_buf.lang_name.as_deref().unwrap_or("Plain Text");
             let right = format!("{} │ {} │ {} ", cursor, lang, self.model_info);
 
             // Transient message goes in the center
@@ -76,10 +73,7 @@ impl<'a> StatusBar<'a> {
             if left_end < right_start {
                 let center_width = right_start - left_end;
                 let center_text = format!(" {} ", center);
-                let center_line = Line::from(Span::styled(
-                    center_text,
-                    style,
-                ));
+                let center_line = Line::from(Span::styled(center_text, style));
                 let center_area = Rect {
                     x: left_end,
                     y: area.y,
