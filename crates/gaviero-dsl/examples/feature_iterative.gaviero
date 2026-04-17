@@ -8,14 +8,22 @@
 //   gaviero-cli --script feature_iterative.gaviero \
 //     --task "add rate limiting middleware with per-user and per-endpoint quotas"
 
-client sonnet { tier cheap     model "claude-sonnet-4-6" }
-client opus   { tier expensive model "claude-opus-4-7" }
+client sonnet { tier cheap     model "claude-sonnet-4-6" effort medium }
+client opus   { tier expensive model "claude-opus-4-7"   effort high }
+
+// Tier aliases let agents bind to a role (`tier expensive`) instead of a
+// concrete profile (`client opus`). A CLI override can then swap the binding
+// at launch time without touching this file (e.g. point `expensive` at a
+// cheaper model for a dry-run, or at codex for a comparison run).
+
+tier cheap     sonnet
+tier expensive opus
 
 // ── Phase 1: Plan ────────────────────────────────────────────────────────────
 
 agent orchestrator {
     description "Decompose and plan: {{PROMPT}}"
-    client opus
+    tier expensive
     scope {
         read_only ["src/" "tests/" "Cargo.toml" "CLAUDE.md" "ARCHITECTURE.md"]
     }
@@ -48,7 +56,7 @@ agent orchestrator {
 
 agent implement {
     description "Implement feature: {{PROMPT}}"
-    client sonnet
+    tier cheap
     depends_on [orchestrator]
     scope {
         owned     ["src/"]
@@ -75,7 +83,7 @@ agent implement {
 
 agent write_tests {
     description "Write and fix tests for: {{PROMPT}}"
-    client sonnet
+    tier cheap
     depends_on [implement]
     scope {
         owned     ["tests/" "src/"]
@@ -97,6 +105,9 @@ agent write_tests {
 
 // ── Phase 3: Summary ─────────────────────────────────────────────────────────
 
+// Kept as `client opus` (rather than `tier expensive`) on purpose — both
+// forms coexist, and pinning a critical agent directly to a profile makes
+// its binding non-swappable by CLI tier overrides.
 agent summarize {
     description "Write memory summary for: {{PROMPT}}"
     client opus
