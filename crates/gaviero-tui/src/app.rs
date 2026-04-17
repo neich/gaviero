@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
 use crossterm::event::{MouseButton, MouseEventKind};
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::Frame;
 
 use crate::editor::buffer::Buffer;
 use crate::editor::diff_overlay::{self, DiffReviewState, DiffSource};
@@ -27,28 +27,27 @@ use gaviero_core::types::WriteProposal;
 use gaviero_core::workspace::Workspace;
 use gaviero_core::write_gate::{WriteGatePipeline, WriteMode};
 
-mod layout;
-mod render;
-mod controller;
-mod review;
-mod left_panel;
-mod side_panel;
-mod commands;
-mod editing;
-pub(crate) mod session;
-mod state;
-mod observers;
 mod chat_memory;
+mod commands;
+mod controller;
+mod editing;
+mod layout;
+mod left_panel;
+mod observers;
+mod render;
+mod review;
+pub(crate) mod session;
+mod side_panel;
+mod state;
 
 use self::observers::{TuiAcpObserver, TuiSwarmObserver, TuiWriteGateObserver};
 use self::state::{
-    build_simple_diff, BatchReviewState, ChangesEntry, ChangesState, DiffKind, FirstRunDialog,
-    FirstRunStep, Focus, LayoutAreas, LayoutPreset, LeftPanelMode, MoveState, PanelVisibility,
-    ReviewProposal, ScrollbarTarget, SidePanelMode, TreeDialog, TreeDialogKind,
+    BatchReviewState, ChangesEntry, ChangesState, DiffKind, FirstRunDialog, FirstRunStep, Focus,
+    LayoutAreas, LayoutPreset, LeftPanelMode, MoveState, PanelVisibility, ReviewProposal,
+    ScrollbarTarget, SidePanelMode, TreeDialog, TreeDialogKind, build_simple_diff,
 };
 
 // ── Constants ────────────────────────────────────────────────────
-
 
 /// Gutter column width used for mouse hit-testing in diff review mode.
 const DIFF_GUTTER_WIDTH: u16 = 5;
@@ -158,7 +157,8 @@ impl App {
         let file_tree = FileTreeState::from_roots(&roots, &excludes, &git_allow);
 
         // Detect first run: no .gaviero/settings.json for any workspace root.
-        let is_first_run = roots.first()
+        let is_first_run = roots
+            .first()
             .map(|root| !root.join(".gaviero").join("settings.json").exists())
             .unwrap_or(false);
 
@@ -211,7 +211,9 @@ impl App {
         let read_namespaces = workspace.resolve_read_namespaces(None);
 
         // Open git repo for git panel (M4)
-        let git_repo = workspace.roots().first()
+        let git_repo = workspace
+            .roots()
+            .first()
             .and_then(|r| gaviero_core::git::GitRepo::open(r).ok());
 
         // Primary workspace root for code-graph context (first root).
@@ -243,7 +245,10 @@ impl App {
             should_quit: false,
             quit_confirm: false,
             first_run_dialog: if is_first_run {
-                Some(FirstRunDialog { step: FirstRunStep::AskSettings, create_settings: false })
+                Some(FirstRunDialog {
+                    step: FirstRunStep::AskSettings,
+                    create_settings: false,
+                })
             } else {
                 None
             },
@@ -785,7 +790,10 @@ fn osc52_copy(text: &str) -> bool {
     // OSC 52 ; c ; <base64> ST
     let seq = format!("\x1b]52;c;{}\x07", encoded);
     use std::io::Write as _;
-    std::io::stdout().write_all(seq.as_bytes()).and_then(|_| std::io::stdout().flush()).is_ok()
+    std::io::stdout()
+        .write_all(seq.as_bytes())
+        .and_then(|_| std::io::stdout().flush())
+        .is_ok()
 }
 
 fn gutter_width(line_count: usize) -> u16 {
@@ -884,9 +892,7 @@ fn parse_layout_presets(workspace: &Workspace) -> Vec<LayoutPreset> {
 ///
 /// Encodes RGBA pixel data to PNG using the `png` crate.
 /// Returns the path to the saved temporary file.
-fn save_clipboard_image_as_png(
-    img: &arboard::ImageData,
-) -> anyhow::Result<std::path::PathBuf> {
+fn save_clipboard_image_as_png(img: &arboard::ImageData) -> anyhow::Result<std::path::PathBuf> {
     use std::io::BufWriter;
 
     let cache_dir = dirs::cache_dir()
@@ -918,12 +924,20 @@ fn list_workspace_files(root: &std::path::Path, limit: usize) -> Vec<String> {
     let mut files = Vec::new();
     let walker = std::fs::read_dir(root);
     fn walk(dir: &std::path::Path, prefix: &str, files: &mut Vec<String>, limit: usize) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
         for entry in entries.flatten() {
-            if files.len() >= limit { return; }
+            if files.len() >= limit {
+                return;
+            }
             let name = entry.file_name().to_string_lossy().to_string();
             // Skip hidden dirs, build artifacts, node_modules
-            if name.starts_with('.') || name == "target" || name == "node_modules" || name == "build" {
+            if name.starts_with('.')
+                || name == "target"
+                || name == "node_modules"
+                || name == "build"
+            {
                 continue;
             }
             let path = format!("{}{}", prefix, name);
@@ -956,7 +970,10 @@ fn extract_gaviero_block(src: &str) -> String {
         let content_start = start_idx + 1;
         // Use the *last* bare ``` in the file as the closing fence so that inner
         // code blocks inside prompt strings don't cause early termination.
-        if let Some(rel_end) = lines[content_start..].iter().rposition(|l| l.trim() == "```") {
+        if let Some(rel_end) = lines[content_start..]
+            .iter()
+            .rposition(|l| l.trim() == "```")
+        {
             let content = lines[content_start..content_start + rel_end].join("\n");
             return content;
         }
