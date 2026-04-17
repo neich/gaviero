@@ -3,10 +3,10 @@
 //! The coordinator selects a strategy during planning. The strategy
 //! determines which verification steps run in Phase 4 of the pipeline.
 
-pub mod structural;
-pub mod diff_review;
-pub mod test_runner;
 pub mod combined;
+pub mod diff_review;
+pub mod structural;
+pub mod test_runner;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -29,10 +29,7 @@ pub enum VerificationStrategy {
         batch_strategy: BatchStrategy,
     },
     /// Run test suite after merge.
-    TestSuite {
-        command: String,
-        targeted: bool,
-    },
+    TestSuite { command: String, targeted: bool },
     /// All three strategies in sequence with early termination.
     Combined {
         #[serde(default)]
@@ -210,10 +207,16 @@ pub struct EscalationRecord {
 #[derive(Debug, Clone)]
 pub enum EscalationReason {
     StructuralParseError,
-    DiffReviewRejection { issues: Vec<ReviewIssue> },
-    TestFailure { test_names: Vec<String> },
+    DiffReviewRejection {
+        issues: Vec<ReviewIssue>,
+    },
+    TestFailure {
+        test_names: Vec<String>,
+    },
     /// Agent failed during execution (timeout, backend error, panic).
-    AgentFailure { reason: String },
+    AgentFailure {
+        reason: String,
+    },
 }
 
 // ── Cost ────────────────────────────────────────────────────────
@@ -242,7 +245,10 @@ mod tests {
         let json = serde_json::to_string(&strategy).unwrap();
         let back: VerificationStrategy = serde_json::from_str(&json).unwrap();
         match back {
-            VerificationStrategy::Combined { review_tiers, test_command } => {
+            VerificationStrategy::Combined {
+                review_tiers,
+                test_command,
+            } => {
                 assert_eq!(review_tiers, vec![ModelTier::Cheap]);
                 assert_eq!(test_command.as_deref(), Some("cargo test"));
             }
