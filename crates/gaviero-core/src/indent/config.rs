@@ -48,7 +48,10 @@ impl IndentQueryCache {
 }
 
 /// Load and compile an indent query for a language.
-fn load_indent_query(lang_name: &str, ts_language: &tree_sitter::Language) -> Result<tree_sitter::Query> {
+fn load_indent_query(
+    lang_name: &str,
+    ts_language: &tree_sitter::Language,
+) -> Result<tree_sitter::Query> {
     let scm = find_indent_query_file(lang_name)?;
     tree_sitter::Query::new(ts_language, &scm)
         .map_err(|e| anyhow::anyhow!("indent query error for {}: {}", lang_name, e))
@@ -104,8 +107,8 @@ mod tests {
 
         let mut cache = IndentQueryCache::new();
         for (ext, lang_name) in &languages {
-            let ts_lang = language_for_extension(ext)
-                .unwrap_or_else(|| panic!("no grammar for {}", ext));
+            let ts_lang =
+                language_for_extension(ext).unwrap_or_else(|| panic!("no grammar for {}", ext));
             let query = cache.get_or_load(lang_name, &ts_lang);
             assert!(
                 query.is_some(),
