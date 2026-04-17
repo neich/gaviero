@@ -136,7 +136,10 @@ impl TestGenerator {
             // gate is heavy and will be run in the main iteration loop anyway.
             let failure = fast_only
                 .run_reporting(&written, workspace_root, false, |gate, passed| {
-                    tracing::debug!("test-gen compile check [{gate}]: {}", if passed { "pass" } else { "fail" });
+                    tracing::debug!(
+                        "test-gen compile check [{gate}]: {}",
+                        if passed { "pass" } else { "fail" }
+                    );
                 })
                 .await;
 
