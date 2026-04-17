@@ -91,6 +91,12 @@ pub enum Token {
     KwMaxIterations,
     #[token("iter_start")]
     KwIterStart,
+    #[token("stability")]
+    KwStability,
+    #[token("judge_timeout")]
+    KwJudgeTimeout,
+    #[token("strict_judge")]
+    KwStrictJudge,
     #[token("command")]
     KwCommand,
 
@@ -212,6 +218,9 @@ impl fmt::Display for Token {
             Token::KwUntil => write!(f, "until"),
             Token::KwAgents => write!(f, "agents"),
             Token::KwMaxIterations => write!(f, "max_iterations"),
+            Token::KwStability => write!(f, "stability"),
+            Token::KwJudgeTimeout => write!(f, "judge_timeout"),
+            Token::KwStrictJudge => write!(f, "strict_judge"),
             Token::KwCommand => write!(f, "command"),
             Token::KwImpactScope => write!(f, "impact_scope"),
             Token::KwImpactTests => write!(f, "impact_tests"),
@@ -321,7 +330,8 @@ mod tests {
 
     #[test]
     fn tier_and_privacy_values() {
-        let (toks, errs) = lex("coordinator reasoning execution mechanical cheap expensive public local_only");
+        let (toks, errs) =
+            lex("coordinator reasoning execution mechanical cheap expensive public local_only");
         assert!(errs.is_empty());
         assert!(matches!(toks[0].0, Token::TierCoordinator));
         assert!(matches!(toks[3].0, Token::TierMechanical));
@@ -386,7 +396,9 @@ mod tests {
 
     #[test]
     fn memory_keywords() {
-        let (toks, errs) = lex("memory read_ns write_ns importance staleness_sources read_query read_limit write_content");
+        let (toks, errs) = lex(
+            "memory read_ns write_ns importance staleness_sources read_query read_limit write_content",
+        );
         assert!(errs.is_empty(), "lex errors: {:?}", errs);
         assert!(matches!(toks[0].0, Token::KwMemory));
         assert!(matches!(toks[1].0, Token::KwReadNs));
@@ -439,7 +451,11 @@ mod tests {
         assert!(errs.is_empty(), "lex errors: {:?}", errs);
         assert_eq!(toks.len(), 1);
         if let Token::RawStr(s) = &toks[0].0 {
-            assert!(s.contains("#!/bin/bash"), "content should contain #!/bin/bash, got: {}", s);
+            assert!(
+                s.contains("#!/bin/bash"),
+                "content should contain #!/bin/bash, got: {}",
+                s
+            );
         } else {
             panic!("expected RawStr, got {:?}", toks[0].0);
         }
@@ -464,6 +480,15 @@ mod tests {
         assert!(matches!(toks[3].0, Token::KwMaxIterations));
         assert!(matches!(toks[4].0, Token::KwIterStart));
         assert!(matches!(toks[5].0, Token::KwCommand));
+    }
+
+    #[test]
+    fn judge_control_keywords() {
+        let (toks, errs) = lex("stability judge_timeout strict_judge");
+        assert!(errs.is_empty(), "lex errors: {:?}", errs);
+        assert!(matches!(toks[0].0, Token::KwStability));
+        assert!(matches!(toks[1].0, Token::KwJudgeTimeout));
+        assert!(matches!(toks[2].0, Token::KwStrictJudge));
     }
 
     #[test]
