@@ -308,9 +308,17 @@ fn baseline_indent_level(whitespace: &str, indent_unit: &str) -> usize {
         return 0;
     }
     // Count how many indent_units fit in the whitespace
-    let ws_width: usize = whitespace.chars().map(|c| if c == '\t' { 4 } else { 1 }).sum();
-    let unit_width: usize = indent_unit.chars().map(|c| if c == '\t' { 4 } else { 1 }).sum();
-    if unit_width == 0 { return 0; }
+    let ws_width: usize = whitespace
+        .chars()
+        .map(|c| if c == '\t' { 4 } else { 1 })
+        .sum();
+    let unit_width: usize = indent_unit
+        .chars()
+        .map(|c| if c == '\t' { 4 } else { 1 })
+        .sum();
+    if unit_width == 0 {
+        return 0;
+    }
     ws_width / unit_width
 }
 
@@ -390,8 +398,14 @@ mod tests {
         // Line 2 is wrong (0 indent instead of 1), line 3 is correct
         let input = "fn main() {\nlet x = 1;\n    let y = 2;\n}\n";
         let result = reindent_document(input, "    ");
-        assert!(result.contains("    let x = 1;"), "wrong indent should be fixed");
-        assert!(result.contains("    let y = 2;"), "correct indent should be preserved");
+        assert!(
+            result.contains("    let x = 1;"),
+            "wrong indent should be fixed"
+        );
+        assert!(
+            result.contains("    let y = 2;"),
+            "correct indent should be preserved"
+        );
     }
 
     #[test]
