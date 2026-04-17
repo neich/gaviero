@@ -57,12 +57,8 @@ pub async fn build_context(
     // 2. Query memory for relevant summaries
     let memory_summaries = if config.use_memory_summaries {
         if let Some(mem) = memory {
-            mem.search_context_filtered(
-                namespaces,
-                prompt,
-                10,
-                PrivacyFilter::ExcludeLocalOnly,
-            ).await
+            mem.search_context_filtered(namespaces, prompt, 10, PrivacyFilter::ExcludeLocalOnly)
+                .await
         } else {
             String::new()
         }
@@ -122,25 +118,25 @@ fn collect_file_list(workspace_root: &Path, max_files: usize) -> Vec<String> {
     files
 }
 
-fn collect_recursive(
-    root: &Path,
-    dir: &Path,
-    files: &mut Vec<String>,
-    depth: usize,
-    max: usize,
-) {
+fn collect_recursive(root: &Path, dir: &Path, files: &mut Vec<String>, depth: usize, max: usize) {
     if depth > 10 || files.len() >= max {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         if files.len() >= max {
             return;
         }
         let path = entry.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if name.starts_with('.') || name == "target" || name == "node_modules"
-            || name == "dist" || name == "build" || name == "__pycache__"
+        if name.starts_with('.')
+            || name == "target"
+            || name == "node_modules"
+            || name == "dist"
+            || name == "build"
+            || name == "__pycache__"
         {
             continue;
         }
@@ -164,7 +160,11 @@ fn extract_referenced_files(prompt: &str, workspace_root: &Path) -> Vec<(String,
                 if let Ok(content) = std::fs::read_to_string(&full_path) {
                     // Truncate large files
                     let truncated = if content.len() > 8000 {
-                        format!("{}...\n[truncated, {} chars total]", &content[..8000], content.len())
+                        format!(
+                            "{}...\n[truncated, {} chars total]",
+                            &content[..8000],
+                            content.len()
+                        )
                     } else {
                         content
                     };
@@ -251,7 +251,8 @@ mod tests {
             &None,
             &[],
             &ContextConfig::default(),
-        ).await;
+        )
+        .await;
 
         assert!(!ctx.file_list.is_empty());
         assert!(ctx.memory_summaries.is_empty());
