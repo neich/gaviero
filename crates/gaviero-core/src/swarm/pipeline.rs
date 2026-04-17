@@ -1797,6 +1797,8 @@ mod tests {
             #[allow(deprecated)]
             backend: Default::default(),
             model: model.map(|m| m.to_string()),
+            effort: None,
+            extra: Vec::new(),
             tier,
             privacy,
             coordinator_instructions: String::new(),
