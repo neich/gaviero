@@ -232,10 +232,7 @@ mod tests {
         let mut parser = OscParser::new();
         let input = b"\x1b]0;my terminal\x07";
         let (results, clean) = parser.feed(input);
-        assert_eq!(
-            results,
-            vec![OscResult::Title("my terminal".to_string())]
-        );
+        assert_eq!(results, vec![OscResult::Title("my terminal".to_string())]);
         assert!(clean.is_empty());
     }
 
@@ -268,10 +265,7 @@ mod tests {
 
         // Second chunk: rest of OSC body + terminator
         let (r2, c2) = parser.feed(b"3;B\x07more");
-        assert_eq!(
-            r2,
-            vec![OscResult::Osc133(Osc133Marker::CommandInputStart)]
-        );
+        assert_eq!(r2, vec![OscResult::Osc133(Osc133Marker::CommandInputStart)]);
         assert_eq!(c2, b"more");
     }
 
