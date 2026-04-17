@@ -10,7 +10,7 @@ use tracing;
 use super::embedder::Embedder;
 use super::schema;
 use super::scope::{
-    MemoryScope, MemoryType, ScopeFilter, StoreResult, Trust, WriteScope, WriteMeta,
+    MemoryScope, MemoryType, ScopeFilter, StoreResult, Trust, WriteMeta, WriteScope,
 };
 use super::scoring::{self, ScoredMemory, SearchConfig};
 
@@ -130,12 +130,10 @@ impl MemoryStore {
     fn register_sqlite_vec() {
         use std::sync::Once;
         static INIT: Once = Once::new();
-        INIT.call_once(|| {
-            unsafe {
-                rusqlite::ffi::sqlite3_auto_extension(Some(
-                    std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ()),
-                ));
-            }
+        INIT.call_once(|| unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
         });
     }
 
@@ -150,8 +148,7 @@ impl MemoryStore {
     /// Create an in-memory store (for testing).
     pub fn in_memory(embedder: Arc<dyn Embedder>) -> Result<Self> {
         Self::register_sqlite_vec();
-        let conn = Connection::open_in_memory()
-            .context("opening in-memory database")?;
+        let conn = Connection::open_in_memory().context("opening in-memory database")?;
         Self::init(conn, embedder)
     }
 
@@ -185,7 +182,8 @@ impl MemoryStore {
             metadata: metadata.map(|s| s.to_string()),
             ..Default::default()
         };
-        self.store_with_options(namespace, key, content, &opts).await
+        self.store_with_options(namespace, key, content, &opts)
+            .await
     }
 
     /// Store a memory entry with explicit privacy level.
@@ -204,7 +202,8 @@ impl MemoryStore {
             metadata: metadata.map(|s| s.to_string()),
             ..Default::default()
         };
-        self.store_with_options(namespace, key, content, &opts).await
+        self.store_with_options(namespace, key, content, &opts)
+            .await
     }
 
     /// Store a memory entry with full options control.
@@ -219,7 +218,9 @@ impl MemoryStore {
         opts: &StoreOptions,
     ) -> Result<i64> {
         // Compute embedding outside the lock (CPU-heavy)
-        let embedding = self.embedder.embed_document(content)
+        let embedding = self
+            .embedder
+            .embed_document(content)
             .context("computing embedding")?;
         let embedding_blob = embedding_to_blob(&embedding);
         let model_id = self.embedder.model_id().to_string();
@@ -248,17 +249,28 @@ impl MemoryStore {
                 source_hash = excluded.source_hash,
                 updated_at = datetime('now')",
             rusqlite::params![
-                ns, k, c, embedding_blob, model_id, opts.metadata,
-                opts.privacy, opts.importance, opts.source_file, opts.source_hash
+                ns,
+                k,
+                c,
+                embedding_blob,
+                model_id,
+                opts.metadata,
+                opts.privacy,
+                opts.importance,
+                opts.source_file,
+                opts.source_hash
             ],
-        ).context("inserting memory")?;
+        )
+        .context("inserting memory")?;
 
         // Get the row id (works for both insert and update)
-        let id: i64 = conn.query_row(
-            "SELECT id FROM memories WHERE namespace = ?1 AND key = ?2",
-            rusqlite::params![ns, k],
-            |row| row.get(0),
-        ).context("getting memory id after upsert")?;
+        let id: i64 = conn
+            .query_row(
+                "SELECT id FROM memories WHERE namespace = ?1 AND key = ?2",
+                rusqlite::params![ns, k],
+                |row| row.get(0),
+            )
+            .context("getting memory id after upsert")?;
 
         // Upsert into vec_memories for KNN search.
         // vec0 tables don't support INSERT OR REPLACE, so delete first then insert.
@@ -269,7 +281,8 @@ impl MemoryStore {
         conn.execute(
             "INSERT INTO vec_memories(memory_id, embedding) VALUES (?1, ?2)",
             rusqlite::params![id, embedding_blob],
-        ).context("inserting into vec_memories")?;
+        )
+        .context("inserting into vec_memories")?;
 
         Ok(id)
     }
@@ -290,7 +303,8 @@ impl MemoryStore {
             query,
             limit,
             PrivacyFilter::IncludeAll,
-        ).await
+        )
+        .await
     }
 
     /// Search across multiple namespaces.
@@ -302,7 +316,8 @@ impl MemoryStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
-        self.search_multi_filtered(namespaces, query, limit, PrivacyFilter::IncludeAll).await
+        self.search_multi_filtered(namespaces, query, limit, PrivacyFilter::IncludeAll)
+            .await
     }
 
     /// V9 §11 M3: structured memory candidates for the planner.
@@ -348,12 +363,7 @@ impl MemoryStore {
     /// Search across namespaces and format results as a prompt-ready string.
     ///
     /// Returns an empty string on error or if no results are found.
-    pub async fn search_context(
-        &self,
-        namespaces: &[String],
-        query: &str,
-        limit: usize,
-    ) -> String {
+    pub async fn search_context(&self, namespaces: &[String], query: &str, limit: usize) -> String {
         match self.search_multi(namespaces, query, limit).await {
             Ok(results) if !results.is_empty() => {
                 // M0 instrumentation: expose selected memory IDs + scores so
@@ -396,7 +406,10 @@ impl MemoryStore {
         limit: usize,
         filter: PrivacyFilter,
     ) -> String {
-        match self.search_multi_filtered(namespaces, query, limit, filter).await {
+        match self
+            .search_multi_filtered(namespaces, query, limit, filter)
+            .await
+        {
             Ok(results) if !results.is_empty() => {
                 let mut ctx = String::from("[Memory context]:\n");
                 for r in &results {
@@ -427,7 +440,9 @@ impl MemoryStore {
         }
 
         // Compute query embedding outside the lock (CPU-heavy)
-        let query_embedding = self.embedder.embed_query(query)
+        let query_embedding = self
+            .embedder
+            .embed_query(query)
             .context("computing query embedding")?;
         let query_blob = embedding_to_blob(&query_embedding);
 
@@ -435,22 +450,24 @@ impl MemoryStore {
 
         // Over-fetch from vec_memories (5x limit to allow for post-filtering)
         let fetch_k = limit * 5;
-        let mut stmt = conn.prepare(
-            "SELECT v.memory_id, v.distance,
+        let mut stmt = conn
+            .prepare(
+                "SELECT v.memory_id, v.distance,
                     m.id, m.namespace, m.key, m.content, m.metadata,
                     m.created_at, m.updated_at, m.importance, m.access_count,
                     m.last_accessed_at, m.privacy
              FROM vec_memories v
              JOIN memories m ON m.id = v.memory_id
-             WHERE v.embedding MATCH ?1 AND k = ?2"
-        ).context("preparing KNN search")?;
+             WHERE v.embedding MATCH ?1 AND k = ?2",
+            )
+            .context("preparing KNN search")?;
 
         let now = chrono_now_utc();
-        let ns_set: std::collections::HashSet<&str> = namespaces.iter().map(|s| s.as_str()).collect();
+        let ns_set: std::collections::HashSet<&str> =
+            namespaces.iter().map(|s| s.as_str()).collect();
 
-        let mut results: Vec<SearchResult> = stmt.query_map(
-            rusqlite::params![query_blob, fetch_k as i64],
-            |row| {
+        let mut results: Vec<SearchResult> = stmt
+            .query_map(rusqlite::params![query_blob, fetch_k as i64], |row| {
                 let distance: f32 = row.get(1)?;
                 let namespace: String = row.get(3)?;
                 let privacy: String = row.get(12)?;
@@ -467,39 +484,44 @@ impl MemoryStore {
                     last_accessed_at: row.get(11)?,
                 };
                 Ok((entry, distance, privacy))
-            },
-        )
-        .context("executing KNN search")?
-        .filter_map(|r| r.ok())
-        .filter(|(entry, _, privacy)| {
-            // Post-filter: namespace membership
-            if !ns_set.contains(entry.namespace.as_str()) {
-                return false;
-            }
-            // Post-filter: privacy
-            if filter == PrivacyFilter::ExcludeLocalOnly && privacy == "local_only" {
-                return false;
-            }
-            true
-        })
-        .map(|(entry, distance, _)| {
-            // Convert L2 distance to cosine similarity for L2-normalized vectors:
-            // L2_dist² = 2 - 2·cos_sim  →  cos_sim = 1 - L2_dist²/2
-            let relevance = (1.0 - distance * distance / 2.0).max(0.0);
-            let hours = hours_since(&entry.last_accessed_at, &entry.updated_at, &now);
-            let score = retrieval_score(hours, entry.importance, relevance, entry.access_count);
-            SearchResult { entry, score }
-        })
-        .collect();
+            })
+            .context("executing KNN search")?
+            .filter_map(|r| r.ok())
+            .filter(|(entry, _, privacy)| {
+                // Post-filter: namespace membership
+                if !ns_set.contains(entry.namespace.as_str()) {
+                    return false;
+                }
+                // Post-filter: privacy
+                if filter == PrivacyFilter::ExcludeLocalOnly && privacy == "local_only" {
+                    return false;
+                }
+                true
+            })
+            .map(|(entry, distance, _)| {
+                // Convert L2 distance to cosine similarity for L2-normalized vectors:
+                // L2_dist² = 2 - 2·cos_sim  →  cos_sim = 1 - L2_dist²/2
+                let relevance = (1.0 - distance * distance / 2.0).max(0.0);
+                let hours = hours_since(&entry.last_accessed_at, &entry.updated_at, &now);
+                let score = retrieval_score(hours, entry.importance, relevance, entry.access_count);
+                SearchResult { entry, score }
+            })
+            .collect();
 
         // Sort by composite score descending
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(limit);
 
         // Update access tracking for returned results
         if !results.is_empty() {
             let ids: Vec<i64> = results.iter().map(|r| r.entry.id).collect();
-            let placeholders: String = ids.iter().enumerate()
+            let placeholders: String = ids
+                .iter()
+                .enumerate()
                 .map(|(i, _)| format!("?{}", i + 1))
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -508,7 +530,8 @@ impl MemoryStore {
                  WHERE id IN ({})",
                 placeholders
             );
-            let params: Vec<&dyn rusqlite::types::ToSql> = ids.iter()
+            let params: Vec<&dyn rusqlite::types::ToSql> = ids
+                .iter()
                 .map(|id| id as &dyn rusqlite::types::ToSql)
                 .collect();
             let _ = conn.execute(&sql, params.as_slice()); // best-effort
@@ -525,26 +548,23 @@ impl MemoryStore {
         let mut stmt = conn.prepare(
             "SELECT id, namespace, key, content, metadata, created_at, updated_at,
                     importance, access_count, last_accessed_at
-             FROM memories WHERE namespace = ?1 AND key = ?2"
+             FROM memories WHERE namespace = ?1 AND key = ?2",
         )?;
 
-        let entry = stmt.query_row(
-            rusqlite::params![namespace, key],
-            |row| {
-                Ok(MemoryEntry {
-                    id: row.get(0)?,
-                    namespace: row.get(1)?,
-                    key: row.get(2)?,
-                    content: row.get(3)?,
-                    metadata: row.get(4)?,
-                    created_at: row.get(5)?,
-                    updated_at: row.get(6)?,
-                    importance: row.get(7)?,
-                    access_count: row.get(8)?,
-                    last_accessed_at: row.get(9)?,
-                })
-            },
-        );
+        let entry = stmt.query_row(rusqlite::params![namespace, key], |row| {
+            Ok(MemoryEntry {
+                id: row.get(0)?,
+                namespace: row.get(1)?,
+                key: row.get(2)?,
+                content: row.get(3)?,
+                metadata: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
+                importance: row.get(7)?,
+                access_count: row.get(8)?,
+                last_accessed_at: row.get(9)?,
+            })
+        });
 
         match entry {
             Ok(e) => Ok(Some(e)),
@@ -556,9 +576,8 @@ impl MemoryStore {
     /// List all keys in a namespace.
     pub async fn list_keys(&self, namespace: &str) -> Result<Vec<String>> {
         let conn = self.conn.lock().await;
-        let mut stmt = conn.prepare(
-            "SELECT key FROM memories WHERE namespace = ?1 ORDER BY key"
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT key FROM memories WHERE namespace = ?1 ORDER BY key")?;
         let keys: Vec<String> = stmt
             .query_map(rusqlite::params![namespace], |row| row.get(0))?
             .filter_map(|r| r.ok())
@@ -571,9 +590,10 @@ impl MemoryStore {
         let conn = self.conn.lock().await;
 
         // Get id for vec_memories cleanup
-        let id: Option<i64> = conn.prepare(
-            "SELECT id FROM memories WHERE namespace = ?1 AND key = ?2"
-        )?.query_row(rusqlite::params![namespace, key], |row| row.get(0)).ok();
+        let id: Option<i64> = conn
+            .prepare("SELECT id FROM memories WHERE namespace = ?1 AND key = ?2")?
+            .query_row(rusqlite::params![namespace, key], |row| row.get(0))
+            .ok();
 
         let rows = conn.execute(
             "DELETE FROM memories WHERE namespace = ?1 AND key = ?2",
@@ -596,11 +616,11 @@ impl MemoryStore {
         let conn = self.conn.lock().await;
 
         // Collect ids for vec_memories cleanup
-        let ids: Vec<i64> = conn.prepare(
-            "SELECT id FROM memories WHERE namespace = ?1"
-        )?.query_map(rusqlite::params![namespace], |row| row.get(0))?
-          .filter_map(|r| r.ok())
-          .collect();
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM memories WHERE namespace = ?1")?
+            .query_map(rusqlite::params![namespace], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
 
         let rows = conn.execute(
             "DELETE FROM memories WHERE namespace = ?1",
@@ -626,9 +646,7 @@ impl MemoryStore {
         // Read all entries outside the lock
         let entries = {
             let conn = self.conn.lock().await;
-            let mut stmt = conn.prepare(
-                "SELECT id, content FROM memories WHERE namespace = ?1"
-            )?;
+            let mut stmt = conn.prepare("SELECT id, content FROM memories WHERE namespace = ?1")?;
             let entries: Vec<(i64, String)> = stmt
                 .query_map(rusqlite::params![namespace], |row| {
                     Ok((row.get(0)?, row.get(1)?))
@@ -684,7 +702,7 @@ impl MemoryStore {
 
             let mut stmt = conn.prepare(
                 "SELECT id, source_hash FROM memories
-                 WHERE source_file = ?1 AND source_hash IS NOT NULL AND source_hash != ?2"
+                 WHERE source_file = ?1 AND source_hash IS NOT NULL AND source_hash != ?2",
             )?;
             let rows: Vec<(i64, String)> = stmt
                 .query_map(rusqlite::params![path_str, current_hash], |row| {
@@ -736,7 +754,9 @@ impl MemoryStore {
         let scope_path = scope.to_path_string();
 
         // Compute embedding outside the lock
-        let embedding = self.embedder.embed_document(content)
+        let embedding = self
+            .embedder
+            .embed_document(content)
             .context("computing embedding for scoped store")?;
         let embedding_blob = embedding_to_blob(&embedding);
         let model_id = self.embedder.model_id().to_string();
@@ -747,7 +767,7 @@ impl MemoryStore {
         let existing: Option<i64> = conn
             .prepare(
                 "SELECT id FROM memories
-                 WHERE content_hash = ?1 AND scope_path = ?2"
+                 WHERE content_hash = ?1 AND scope_path = ?2",
             )?
             .query_row(rusqlite::params![hash, scope_path], |row| row.get(0))
             .ok();
@@ -771,7 +791,7 @@ impl MemoryStore {
                 .prepare(
                     "SELECT 1 FROM memories
                      WHERE content_hash = ?1 AND scope_level = ?2
-                     LIMIT 1"
+                     LIMIT 1",
                 )?
                 .query_row(rusqlite::params![hash, level], |_| Ok(true))
                 .unwrap_or(false);
@@ -851,11 +871,10 @@ impl MemoryStore {
     /// Searches from narrowest to widest scope, accumulating results.
     /// Stops widening when enough high-confidence results are found.
     /// Uses hybrid vector + FTS search via RRF when `use_fts` is enabled.
-    pub async fn search_scoped(
-        &self,
-        config: &SearchConfig,
-    ) -> Result<Vec<ScoredMemory>> {
-        let query_embedding = self.embedder.embed_query(&config.query)
+    pub async fn search_scoped(&self, config: &SearchConfig) -> Result<Vec<ScoredMemory>> {
+        let query_embedding = self
+            .embedder
+            .embed_query(&config.query)
             .context("computing query embedding for scoped search")?;
         let query_blob = embedding_to_blob(&query_embedding);
 
@@ -890,12 +909,16 @@ impl MemoryStore {
             };
 
             // Merge via RRF if both sources produced results
-            let candidate_ids: Vec<(i64, f32)> = if !fts_candidates.is_empty() && !vec_candidates.is_empty() {
-                let merged = scoring::merge_rrf(&vec_candidates, &fts_candidates, 60);
-                merged.into_iter().map(|(id, _rrf, sim)| (id, sim)).collect()
-            } else {
-                vec_candidates
-            };
+            let candidate_ids: Vec<(i64, f32)> =
+                if !fts_candidates.is_empty() && !vec_candidates.is_empty() {
+                    let merged = scoring::merge_rrf(&vec_candidates, &fts_candidates, 60);
+                    merged
+                        .into_iter()
+                        .map(|(id, _rrf, sim)| (id, sim))
+                        .collect()
+                } else {
+                    vec_candidates
+                };
 
             // Score and accumulate
             for (memory_id, raw_sim) in &candidate_ids {
@@ -904,7 +927,9 @@ impl MemoryStore {
                 }
 
                 // Load full memory record
-                let Some(mem) = self.load_scoped_memory(&conn, *memory_id, *raw_sim, &now, &level)? else {
+                let Some(mem) =
+                    self.load_scoped_memory(&conn, *memory_id, *raw_sim, &now, &level)?
+                else {
                     continue;
                 };
 
@@ -932,7 +957,9 @@ impl MemoryStore {
 
         // Final ranking
         accumulated.sort_by(|a, b| {
-            b.final_score.partial_cmp(&a.final_score).unwrap_or(std::cmp::Ordering::Equal)
+            b.final_score
+                .partial_cmp(&a.final_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
         accumulated.truncate(config.max_results);
 
@@ -947,14 +974,9 @@ impl MemoryStore {
     }
 
     /// Format scoped search results as a prompt-ready context string.
-    pub async fn search_scoped_context(
-        &self,
-        config: &SearchConfig,
-    ) -> String {
+    pub async fn search_scoped_context(&self, config: &SearchConfig) -> String {
         match self.search_scoped(config).await {
-            Ok(results) if !results.is_empty() => {
-                scoring::format_memories_for_prompt(&results)
-            }
+            Ok(results) if !results.is_empty() => scoring::format_memories_for_prompt(&results),
             _ => String::new(),
         }
     }
@@ -973,11 +995,13 @@ impl MemoryStore {
         // Over-fetch to allow post-filtering by repo_id/module_path
         let fetch_k = limit * 3;
 
-        let mut stmt = conn.prepare(
-            "SELECT v.memory_id, v.distance
+        let mut stmt = conn
+            .prepare(
+                "SELECT v.memory_id, v.distance
              FROM vec_memories_scoped v
-             WHERE v.embedding MATCH ?1 AND k = ?2 AND v.scope_level = ?3"
-        ).context("preparing scoped KNN")?;
+             WHERE v.embedding MATCH ?1 AND k = ?2 AND v.scope_level = ?3",
+            )
+            .context("preparing scoped KNN")?;
 
         let results: Vec<(i64, f32)> = stmt
             .query_map(
@@ -1003,15 +1027,17 @@ impl MemoryStore {
     ) -> Result<Vec<(i64, f64)>> {
         let fetch_k = limit * 3;
 
-        let mut stmt = conn.prepare(
-            "SELECT f.rowid, f.rank
+        let mut stmt = conn
+            .prepare(
+                "SELECT f.rowid, f.rank
              FROM memories_fts f
              JOIN memories m ON m.id = f.rowid
              WHERE memories_fts MATCH ?1
              AND m.scope_level = ?2
              ORDER BY f.rank
-             LIMIT ?3"
-        ).context("preparing FTS search")?;
+             LIMIT ?3",
+            )
+            .context("preparing FTS search")?;
 
         let results: Vec<(i64, f64)> = stmt
             .query_map(
@@ -1053,29 +1079,29 @@ impl MemoryStore {
     fn matches_scope_filter(&self, conn: &Connection, memory_id: i64, level: &ScopeFilter) -> bool {
         match level {
             ScopeFilter::Global | ScopeFilter::Workspace => true,
-            ScopeFilter::Repo { repo_id } => {
-                conn.prepare("SELECT 1 FROM memories WHERE id = ?1 AND repo_id = ?2")
-                    .and_then(|mut s| s.query_row(rusqlite::params![memory_id, repo_id], |_| Ok(true)))
-                    .unwrap_or(false)
-            }
-            ScopeFilter::Module { repo_id, module_path } => {
-                conn.prepare(
-                    "SELECT 1 FROM memories WHERE id = ?1 AND repo_id = ?2 AND module_path = ?3"
+            ScopeFilter::Repo { repo_id } => conn
+                .prepare("SELECT 1 FROM memories WHERE id = ?1 AND repo_id = ?2")
+                .and_then(|mut s| s.query_row(rusqlite::params![memory_id, repo_id], |_| Ok(true)))
+                .unwrap_or(false),
+            ScopeFilter::Module {
+                repo_id,
+                module_path,
+            } => conn
+                .prepare(
+                    "SELECT 1 FROM memories WHERE id = ?1 AND repo_id = ?2 AND module_path = ?3",
                 )
                 .and_then(|mut s| {
-                    s.query_row(rusqlite::params![memory_id, repo_id, module_path], |_| Ok(true))
+                    s.query_row(rusqlite::params![memory_id, repo_id, module_path], |_| {
+                        Ok(true)
+                    })
                 })
-                .unwrap_or(false)
-            }
-            ScopeFilter::Run { repo_id, run_id } => {
-                conn.prepare(
-                    "SELECT 1 FROM memories WHERE id = ?1 AND repo_id = ?2 AND run_id = ?3"
-                )
+                .unwrap_or(false),
+            ScopeFilter::Run { repo_id, run_id } => conn
+                .prepare("SELECT 1 FROM memories WHERE id = ?1 AND repo_id = ?2 AND run_id = ?3")
                 .and_then(|mut s| {
                     s.query_row(rusqlite::params![memory_id, repo_id, run_id], |_| Ok(true))
                 })
-                .unwrap_or(false)
-            }
+                .unwrap_or(false),
         }
     }
 
@@ -1088,55 +1114,51 @@ impl MemoryStore {
         now: &str,
         level: &ScopeFilter,
     ) -> Result<Option<ScoredMemory>> {
-        let result = conn.prepare(
-            "SELECT id, content, content_hash, scope_level, scope_path,
+        let result = conn
+            .prepare(
+                "SELECT id, content, content_hash, scope_level, scope_path,
                     repo_id, module_path, memory_type, trust, importance,
                     access_count, created_at, updated_at, last_accessed_at,
                     tag, namespace, key
-             FROM memories WHERE id = ?1"
-        )?.query_row(rusqlite::params![memory_id], |row| {
-            let accessed_at: Option<String> = row.get(13)?;
-            let updated_at: String = row.get(12)?;
-            let trust_str: String = row.get(8)?;
-            let type_str: String = row.get(7)?;
-            let importance: f32 = row.get(9)?;
-            let access_count: i32 = row.get(10)?;
+             FROM memories WHERE id = ?1",
+            )?
+            .query_row(rusqlite::params![memory_id], |row| {
+                let accessed_at: Option<String> = row.get(13)?;
+                let updated_at: String = row.get(12)?;
+                let trust_str: String = row.get(8)?;
+                let type_str: String = row.get(7)?;
+                let importance: f32 = row.get(9)?;
+                let access_count: i32 = row.get(10)?;
 
-            let trust = Trust::parse_str(&trust_str);
-            let days = hours_since(&accessed_at, &updated_at, now) / 24.0;
+                let trust = Trust::parse_str(&trust_str);
+                let days = hours_since(&accessed_at, &updated_at, now) / 24.0;
 
-            let final_score = scoring::score(
-                raw_similarity,
-                importance,
-                days,
-                access_count,
-                trust,
-                level,
-            );
+                let final_score =
+                    scoring::score(raw_similarity, importance, days, access_count, trust, level);
 
-            Ok(ScoredMemory {
-                id: row.get(0)?,
-                content: row.get(1)?,
-                content_hash: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                scope_level: row.get(3)?,
-                scope_path: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                repo_id: row.get(5)?,
-                module_path: row.get(6)?,
-                memory_type: MemoryType::parse_str(&type_str),
-                trust,
-                importance,
-                access_count,
-                created_at: row.get(11)?,
-                updated_at,
-                accessed_at,
-                tag: row.get(14)?,
-                namespace: row.get(15)?,
-                key: row.get(16)?,
-                raw_similarity,
-                fts_rank: None,
-                final_score,
-            })
-        });
+                Ok(ScoredMemory {
+                    id: row.get(0)?,
+                    content: row.get(1)?,
+                    content_hash: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    scope_level: row.get(3)?,
+                    scope_path: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                    repo_id: row.get(5)?,
+                    module_path: row.get(6)?,
+                    memory_type: MemoryType::parse_str(&type_str),
+                    trust,
+                    importance,
+                    access_count,
+                    created_at: row.get(11)?,
+                    updated_at,
+                    accessed_at,
+                    tag: row.get(14)?,
+                    namespace: row.get(15)?,
+                    key: row.get(16)?,
+                    raw_similarity,
+                    fts_rank: None,
+                    final_score,
+                })
+            });
 
         match result {
             Ok(m) => Ok(Some(m)),
@@ -1180,9 +1202,7 @@ impl MemoryStore {
 
         // Find all matching memories
         let ids: Vec<i64> = conn
-            .prepare(
-                "SELECT id FROM memories WHERE scope_path = ?1 OR scope_path LIKE ?2"
-            )?
+            .prepare("SELECT id FROM memories WHERE scope_path = ?1 OR scope_path LIKE ?2")?
             .query_map(
                 rusqlite::params![scope_path, format!("{}/%", scope_path)],
                 |row| row.get(0),
@@ -1230,9 +1250,18 @@ impl MemoryStore {
             .collect();
 
         for id in &ids {
-            let _ = conn.execute("DELETE FROM vec_memories_scoped WHERE memory_id = ?1", rusqlite::params![id]);
-            let _ = conn.execute("DELETE FROM vec_memories WHERE memory_id = ?1", rusqlite::params![id]);
-            let _ = conn.execute("DELETE FROM memory_access_log WHERE memory_id = ?1", rusqlite::params![id]);
+            let _ = conn.execute(
+                "DELETE FROM vec_memories_scoped WHERE memory_id = ?1",
+                rusqlite::params![id],
+            );
+            let _ = conn.execute(
+                "DELETE FROM vec_memories WHERE memory_id = ?1",
+                rusqlite::params![id],
+            );
+            let _ = conn.execute(
+                "DELETE FROM memory_access_log WHERE memory_id = ?1",
+                rusqlite::params![id],
+            );
         }
 
         let count = conn.execute(
@@ -1252,7 +1281,7 @@ impl MemoryStore {
                     repo_id, module_path, memory_type, trust, importance,
                     access_count, created_at, updated_at, last_accessed_at,
                     tag, namespace, key
-             FROM memories WHERE run_id = ?1"
+             FROM memories WHERE run_id = ?1",
         )?;
 
         let results: Vec<ScoredMemory> = stmt
@@ -1432,7 +1461,7 @@ impl MemoryStore {
         let rows: Vec<(i64, f32, String)> = conn
             .prepare(
                 "SELECT id, importance, COALESCE(last_accessed_at, updated_at)
-                 FROM memories WHERE scope_level >= 2"
+                 FROM memories WHERE scope_level >= 2",
             )?
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .filter_map(|r| r.ok())
@@ -1459,16 +1488,25 @@ impl MemoryStore {
                 "SELECT id FROM memories
                  WHERE importance < ?1
                  AND COALESCE(last_accessed_at, updated_at) < datetime('now', '-90 days')
-                 AND trust != 'high'"
+                 AND trust != 'high'",
             )?
             .query_map(rusqlite::params![min_importance], |row| row.get(0))?
             .filter_map(|r| r.ok())
             .collect();
 
         for id in &prune_ids {
-            let _ = conn.execute("DELETE FROM vec_memories_scoped WHERE memory_id = ?1", rusqlite::params![id]);
-            let _ = conn.execute("DELETE FROM vec_memories WHERE memory_id = ?1", rusqlite::params![id]);
-            let _ = conn.execute("DELETE FROM memory_access_log WHERE memory_id = ?1", rusqlite::params![id]);
+            let _ = conn.execute(
+                "DELETE FROM vec_memories_scoped WHERE memory_id = ?1",
+                rusqlite::params![id],
+            );
+            let _ = conn.execute(
+                "DELETE FROM vec_memories WHERE memory_id = ?1",
+                rusqlite::params![id],
+            );
+            let _ = conn.execute(
+                "DELETE FROM memory_access_log WHERE memory_id = ?1",
+                rusqlite::params![id],
+            );
         }
 
         let pruned = conn.execute(
@@ -1489,7 +1527,10 @@ impl MemoryStore {
     }
 
     /// Find module-level memories accessed from other modules (promotion candidates).
-    pub async fn find_promotion_candidates(&self, min_cross_hits: i64) -> Result<Vec<ScoredMemory>> {
+    pub async fn find_promotion_candidates(
+        &self,
+        min_cross_hits: i64,
+    ) -> Result<Vec<ScoredMemory>> {
         let conn = self.conn.lock().await;
 
         let mut stmt = conn.prepare(
@@ -1503,7 +1544,7 @@ impl MemoryStore {
              WHERE m.scope_level = 3
              AND a.module_path != m.module_path
              GROUP BY m.id
-             HAVING cross_module_hits >= ?1"
+             HAVING cross_module_hits >= ?1",
         )?;
 
         let results: Vec<ScoredMemory> = stmt
@@ -1558,18 +1599,25 @@ impl MemoryStore {
         // Delete entries older than max_age_days (only swarm-generated keys)
         if max_age_days > 0 {
             // Collect ids to delete from vec_memories too
-            let ids: Vec<i64> = conn.prepare(
-                "SELECT id FROM memories WHERE namespace = ?1
+            let ids: Vec<i64> = conn
+                .prepare(
+                    "SELECT id FROM memories WHERE namespace = ?1
                  AND key NOT LIKE 'user:%'
                  AND (key LIKE 'agents:%' OR key LIKE 'verification:%' OR key LIKE 'tiers:%')
-                 AND created_at < datetime('now', ?2)"
-            )?.query_map(
-                rusqlite::params![namespace, format!("-{} days", max_age_days)],
-                |row| row.get(0),
-            )?.filter_map(|r| r.ok()).collect();
+                 AND created_at < datetime('now', ?2)",
+                )?
+                .query_map(
+                    rusqlite::params![namespace, format!("-{} days", max_age_days)],
+                    |row| row.get(0),
+                )?
+                .filter_map(|r| r.ok())
+                .collect();
 
             for id in &ids {
-                let _ = conn.execute("DELETE FROM vec_memories WHERE memory_id = ?1", rusqlite::params![id]);
+                let _ = conn.execute(
+                    "DELETE FROM vec_memories WHERE memory_id = ?1",
+                    rusqlite::params![id],
+                );
             }
 
             let rows = conn.execute(
@@ -1577,10 +1625,7 @@ impl MemoryStore {
                  AND key NOT LIKE 'user:%'
                  AND (key LIKE 'agents:%' OR key LIKE 'verification:%' OR key LIKE 'tiers:%')
                  AND created_at < datetime('now', ?2)",
-                rusqlite::params![
-                    namespace,
-                    format!("-{} days", max_age_days),
-                ],
+                rusqlite::params![namespace, format!("-{} days", max_age_days),],
             )?;
             total_deleted += rows;
         }
@@ -1593,7 +1638,7 @@ impl MemoryStore {
                  FROM memories
                  WHERE namespace = ?1 AND key LIKE 'agents:%'
                  GROUP BY parsed_run_id
-                 ORDER BY first_seen DESC"
+                 ORDER BY first_seen DESC",
             )?;
 
             let run_ids: Vec<String> = stmt
@@ -1601,26 +1646,32 @@ impl MemoryStore {
                 .filter_map(|r| r.ok())
                 .collect();
 
-
             if run_ids.len() > max_runs {
                 let old_runs = &run_ids[max_runs..];
                 for run_id in old_runs {
                     // Collect ids for vec_memories cleanup
-                    let ids: Vec<i64> = conn.prepare(
-                        "SELECT id FROM memories WHERE namespace = ?1
-                         AND (key LIKE ?2 OR key LIKE ?3 OR key LIKE ?4)"
-                    )?.query_map(
-                        rusqlite::params![
-                            namespace,
-                            format!("agents:{}:%", run_id),
-                            format!("verification:{}", run_id),
-                            format!("tiers:{}", run_id),
-                        ],
-                        |row| row.get(0),
-                    )?.filter_map(|r| r.ok()).collect();
+                    let ids: Vec<i64> = conn
+                        .prepare(
+                            "SELECT id FROM memories WHERE namespace = ?1
+                         AND (key LIKE ?2 OR key LIKE ?3 OR key LIKE ?4)",
+                        )?
+                        .query_map(
+                            rusqlite::params![
+                                namespace,
+                                format!("agents:{}:%", run_id),
+                                format!("verification:{}", run_id),
+                                format!("tiers:{}", run_id),
+                            ],
+                            |row| row.get(0),
+                        )?
+                        .filter_map(|r| r.ok())
+                        .collect();
 
                     for id in &ids {
-                        let _ = conn.execute("DELETE FROM vec_memories WHERE memory_id = ?1", rusqlite::params![id]);
+                        let _ = conn.execute(
+                            "DELETE FROM vec_memories WHERE memory_id = ?1",
+                            rusqlite::params![id],
+                        );
                     }
 
                     let rows = conn.execute(
@@ -1671,7 +1722,9 @@ fn parse_sqlite_datetime_diff_hours(from: &str, to: &str) -> Option<f64> {
     // SQLite datetime format: "YYYY-MM-DD HH:MM:SS"
     let parse = |s: &str| -> Option<i64> {
         let parts: Vec<&str> = s.split(|c| c == '-' || c == ' ' || c == ':').collect();
-        if parts.len() < 6 { return None; }
+        if parts.len() < 6 {
+            return None;
+        }
         let year: i64 = parts[0].parse().ok()?;
         let month: i64 = parts[1].parse().ok()?;
         let day: i64 = parts[2].parse().ok()?;
@@ -1727,7 +1780,7 @@ fn days_to_ymd(days: i64) -> (i64, i64, i64) {
 
 /// Compute SHA256 hash of a file's contents.
 pub fn file_hash(path: &Path) -> Result<String> {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let bytes = std::fs::read(path)
         .with_context(|| format!("reading file for hash: {}", path.display()))?;
     let hash = Sha256::digest(&bytes);
@@ -1771,8 +1824,12 @@ mod tests {
             Ok(vec)
         }
 
-        fn dimensions(&self) -> usize { 8 }
-        fn model_id(&self) -> &str { "mock" }
+        fn dimensions(&self) -> usize {
+            8
+        }
+        fn model_id(&self) -> &str {
+            "mock"
+        }
     }
 
     fn mock_embedder() -> Arc<dyn Embedder> {
@@ -1782,7 +1839,10 @@ mod tests {
     #[tokio::test]
     async fn test_store_and_get() {
         let store = MemoryStore::in_memory(mock_embedder()).unwrap();
-        let id = store.store("test", "greeting", "hello world", None).await.unwrap();
+        let id = store
+            .store("test", "greeting", "hello world", None)
+            .await
+            .unwrap();
         assert!(id > 0);
 
         let entry = store.get("test", "greeting").await.unwrap().unwrap();
@@ -1805,9 +1865,18 @@ mod tests {
     #[tokio::test]
     async fn test_search() {
         let store = MemoryStore::in_memory(mock_embedder()).unwrap();
-        store.store("ns", "rust", "Rust programming language", None).await.unwrap();
-        store.store("ns", "python", "Python scripting language", None).await.unwrap();
-        store.store("ns", "cooking", "How to make pasta", None).await.unwrap();
+        store
+            .store("ns", "rust", "Rust programming language", None)
+            .await
+            .unwrap();
+        store
+            .store("ns", "python", "Python scripting language", None)
+            .await
+            .unwrap();
+        store
+            .store("ns", "cooking", "How to make pasta", None)
+            .await
+            .unwrap();
 
         let results = store.search("ns", "Rust language", 2).await.unwrap();
         assert_eq!(results.len(), 2);
@@ -1821,8 +1890,14 @@ mod tests {
         // with id, namespace, score, content. Pins the From<&SearchResult>
         // mapping and verifies search_candidates threads through correctly.
         let store = MemoryStore::in_memory(mock_embedder()).unwrap();
-        let id1 = store.store("ws", "rust", "Rust programming language", None).await.unwrap();
-        let id2 = store.store("ws", "python", "Python scripting language", None).await.unwrap();
+        let id1 = store
+            .store("ws", "rust", "Rust programming language", None)
+            .await
+            .unwrap();
+        let id2 = store
+            .store("ws", "python", "Python scripting language", None)
+            .await
+            .unwrap();
 
         let candidates = store
             .search_candidates(&["ws".to_string()], "Rust language", 5)
@@ -1885,7 +1960,10 @@ mod tests {
     #[tokio::test]
     async fn test_store_with_privacy() {
         let store = MemoryStore::in_memory(mock_embedder()).unwrap();
-        let id = store.store_with_privacy("ns", "k", "secret content", "local_only", None).await.unwrap();
+        let id = store
+            .store_with_privacy("ns", "k", "secret content", "local_only", None)
+            .await
+            .unwrap();
         assert!(id > 0);
 
         let entry = store.get("ns", "k").await.unwrap().unwrap();
@@ -1897,26 +1975,50 @@ mod tests {
         let store = MemoryStore::in_memory(mock_embedder()).unwrap();
 
         // Store entries with different privacy levels
-        store.store_with_privacy("ns", "public1", "Rust programming", "public", None).await.unwrap();
-        store.store_with_privacy("ns", "private1", "Secret clinical data", "local_only", None).await.unwrap();
-        store.store_with_privacy("ns", "public2", "Python scripting", "public", None).await.unwrap();
+        store
+            .store_with_privacy("ns", "public1", "Rust programming", "public", None)
+            .await
+            .unwrap();
+        store
+            .store_with_privacy("ns", "private1", "Secret clinical data", "local_only", None)
+            .await
+            .unwrap();
+        store
+            .store_with_privacy("ns", "public2", "Python scripting", "public", None)
+            .await
+            .unwrap();
 
         // ExcludeLocalOnly should not return the local_only entry
         let namespaces = vec!["ns".to_string()];
-        let ctx = store.search_context_filtered(&namespaces, "programming", 10, PrivacyFilter::ExcludeLocalOnly).await;
+        let ctx = store
+            .search_context_filtered(
+                &namespaces,
+                "programming",
+                10,
+                PrivacyFilter::ExcludeLocalOnly,
+            )
+            .await;
         assert!(!ctx.contains("Secret clinical data"));
         assert!(ctx.contains("Rust programming") || ctx.contains("Python scripting"));
 
         // IncludeAll should return all entries
-        let ctx_all = store.search_context_filtered(&namespaces, "programming", 10, PrivacyFilter::IncludeAll).await;
+        let ctx_all = store
+            .search_context_filtered(&namespaces, "programming", 10, PrivacyFilter::IncludeAll)
+            .await;
         assert!(ctx_all.contains("Secret clinical data") || ctx_all.contains("Rust programming"));
     }
 
     #[tokio::test]
     async fn test_store_with_privacy_upserts() {
         let store = MemoryStore::in_memory(mock_embedder()).unwrap();
-        store.store_with_privacy("ns", "k", "v1", "public", None).await.unwrap();
-        store.store_with_privacy("ns", "k", "v2", "local_only", Some("{\"v\":2}")).await.unwrap();
+        store
+            .store_with_privacy("ns", "k", "v1", "public", None)
+            .await
+            .unwrap();
+        store
+            .store_with_privacy("ns", "k", "v2", "local_only", Some("{\"v\":2}"))
+            .await
+            .unwrap();
 
         let entry = store.get("ns", "k").await.unwrap().unwrap();
         assert_eq!(entry.content, "v2");
@@ -1931,7 +2033,10 @@ mod tests {
             source_hash: Some("abc123".to_string()),
             ..Default::default()
         };
-        store.store_with_options("ns", "k", "important content", &opts).await.unwrap();
+        store
+            .store_with_options("ns", "k", "important content", &opts)
+            .await
+            .unwrap();
 
         let entry = store.get("ns", "k").await.unwrap().unwrap();
         assert_eq!(entry.content, "important content");
@@ -1943,24 +2048,47 @@ mod tests {
         let store = MemoryStore::in_memory(mock_embedder()).unwrap();
 
         // Store two similar entries with different importance
-        let opts_low = StoreOptions { importance: 0.1, ..Default::default() };
-        let opts_high = StoreOptions { importance: 1.0, ..Default::default() };
-        store.store_with_options("ns", "low", "test content alpha", &opts_low).await.unwrap();
-        store.store_with_options("ns", "high", "test content alpha beta", &opts_high).await.unwrap();
+        let opts_low = StoreOptions {
+            importance: 0.1,
+            ..Default::default()
+        };
+        let opts_high = StoreOptions {
+            importance: 1.0,
+            ..Default::default()
+        };
+        store
+            .store_with_options("ns", "low", "test content alpha", &opts_low)
+            .await
+            .unwrap();
+        store
+            .store_with_options("ns", "high", "test content alpha beta", &opts_high)
+            .await
+            .unwrap();
 
         let results = store.search("ns", "test content alpha", 2).await.unwrap();
         assert_eq!(results.len(), 2);
         // High-importance entry should rank first (assuming similar relevance)
-        assert!(results[0].entry.importance > results[1].entry.importance
-                || results[0].score >= results[1].score);
+        assert!(
+            results[0].entry.importance > results[1].entry.importance
+                || results[0].score >= results[1].score
+        );
     }
 
     #[tokio::test]
     async fn test_prune_preserves_user_entries() {
         let store = MemoryStore::in_memory(mock_embedder()).unwrap();
-        store.store("ns", "user:note1", "my note", None).await.unwrap();
-        store.store("ns", "agents:run1:unit1", "agent result", None).await.unwrap();
-        store.store("ns", "verification:run1", "v result", None).await.unwrap();
+        store
+            .store("ns", "user:note1", "my note", None)
+            .await
+            .unwrap();
+        store
+            .store("ns", "agents:run1:unit1", "agent result", None)
+            .await
+            .unwrap();
+        store
+            .store("ns", "verification:run1", "v result", None)
+            .await
+            .unwrap();
 
         // Prune with 0 max_age (won't delete recent), but exercise the code
         let deleted = store.prune("ns", 0, 100).await.unwrap();
@@ -1977,11 +2105,30 @@ mod tests {
 
         // Create entries for 3 runs
         for run in 1..=3 {
-            store.store("ns", &format!("agents:run{}:a", run), &format!("run {} a", run), None).await.unwrap();
-            store.store("ns", &format!("agents:run{}:b", run), &format!("run {} b", run), None).await.unwrap();
+            store
+                .store(
+                    "ns",
+                    &format!("agents:run{}:a", run),
+                    &format!("run {} a", run),
+                    None,
+                )
+                .await
+                .unwrap();
+            store
+                .store(
+                    "ns",
+                    &format!("agents:run{}:b", run),
+                    &format!("run {} b", run),
+                    None,
+                )
+                .await
+                .unwrap();
         }
         // Also a user entry that should not be pruned
-        store.store("ns", "user:important", "keep this", None).await.unwrap();
+        store
+            .store("ns", "user:important", "keep this", None)
+            .await
+            .unwrap();
 
         let keys_before = store.list_keys("ns").await.unwrap();
         assert_eq!(keys_before.len(), 7); // 6 agent + 1 user
@@ -2011,10 +2158,15 @@ mod tests {
     #[tokio::test]
     async fn test_store_scoped_insert() {
         let store = MemoryStore::in_memory(mock_embedder()).unwrap();
-        let scope = WriteScope::Repo { repo_id: "test_repo".into() };
+        let scope = WriteScope::Repo {
+            repo_id: "test_repo".into(),
+        };
         let meta = WriteMeta::default();
 
-        let result = store.store_scoped(&scope, "hello scoped world", &meta).await.unwrap();
+        let result = store
+            .store_scoped(&scope, "hello scoped world", &meta)
+            .await
+            .unwrap();
         match result {
             StoreResult::Inserted(id) => assert!(id > 0),
             other => panic!("expected Inserted, got {:?}", other),
@@ -2024,14 +2176,22 @@ mod tests {
     #[tokio::test]
     async fn test_store_scoped_dedup_same_scope() {
         let store = MemoryStore::in_memory(mock_embedder()).unwrap();
-        let scope = WriteScope::Repo { repo_id: "r1".into() };
+        let scope = WriteScope::Repo {
+            repo_id: "r1".into(),
+        };
         let meta = WriteMeta::default();
 
-        let r1 = store.store_scoped(&scope, "dedup test content", &meta).await.unwrap();
+        let r1 = store
+            .store_scoped(&scope, "dedup test content", &meta)
+            .await
+            .unwrap();
         assert!(matches!(r1, StoreResult::Inserted(_)));
 
         // Same content at same scope → deduplicate
-        let r2 = store.store_scoped(&scope, "dedup test content", &meta).await.unwrap();
+        let r2 = store
+            .store_scoped(&scope, "dedup test content", &meta)
+            .await
+            .unwrap();
         assert!(matches!(r2, StoreResult::Deduplicated(_)));
     }
 
@@ -2041,8 +2201,13 @@ mod tests {
         let meta = WriteMeta::default();
 
         // Store at repo level (scope_level=2)
-        let repo_scope = WriteScope::Repo { repo_id: "r1".into() };
-        store.store_scoped(&repo_scope, "shared knowledge", &meta).await.unwrap();
+        let repo_scope = WriteScope::Repo {
+            repo_id: "r1".into(),
+        };
+        store
+            .store_scoped(&repo_scope, "shared knowledge", &meta)
+            .await
+            .unwrap();
 
         // Try to store same content at module level (scope_level=3, narrower)
         // → broader scope (repo=2) already covers it, so skip
@@ -2050,15 +2215,24 @@ mod tests {
             repo_id: "r1".into(),
             module_path: "crates/core".into(),
         };
-        let r2 = store.store_scoped(&module_scope, "shared knowledge", &meta).await.unwrap();
+        let r2 = store
+            .store_scoped(&module_scope, "shared knowledge", &meta)
+            .await
+            .unwrap();
         assert!(matches!(r2, StoreResult::AlreadyCovered));
 
         // Store at workspace level (scope_level=1, broader than repo=2)
         let ws_scope = WriteScope::Workspace;
-        store.store_scoped(&ws_scope, "workspace fact", &meta).await.unwrap();
+        store
+            .store_scoped(&ws_scope, "workspace fact", &meta)
+            .await
+            .unwrap();
 
         // Same content at repo level should see it's already covered at broader scope
-        let r3 = store.store_scoped(&repo_scope, "workspace fact", &meta).await.unwrap();
+        let r3 = store
+            .store_scoped(&repo_scope, "workspace fact", &meta)
+            .await
+            .unwrap();
         assert!(matches!(r3, StoreResult::AlreadyCovered));
     }
 
@@ -2068,14 +2242,22 @@ mod tests {
         let meta = WriteMeta::default();
 
         // Store memories at different scope levels
-        let repo_scope = WriteScope::Repo { repo_id: "r1".into() };
-        store.store_scoped(&repo_scope, "Rust programming patterns", &meta).await.unwrap();
+        let repo_scope = WriteScope::Repo {
+            repo_id: "r1".into(),
+        };
+        store
+            .store_scoped(&repo_scope, "Rust programming patterns", &meta)
+            .await
+            .unwrap();
 
         let module_scope = WriteScope::Module {
             repo_id: "r1".into(),
             module_path: "crates/core".into(),
         };
-        store.store_scoped(&module_scope, "Core module Rust conventions", &meta).await.unwrap();
+        store
+            .store_scoped(&module_scope, "Core module Rust conventions", &meta)
+            .await
+            .unwrap();
 
         // Build a scope that includes both levels
         let scope = MemoryScope {
@@ -2099,9 +2281,17 @@ mod tests {
         let store = MemoryStore::in_memory(mock_embedder()).unwrap();
         let meta = WriteMeta::default();
 
-        let repo_scope = WriteScope::Repo { repo_id: "r1".into() };
-        store.store_scoped(&repo_scope, "repo memory 1", &meta).await.unwrap();
-        store.store_scoped(&repo_scope, "repo memory 2", &meta).await.unwrap();
+        let repo_scope = WriteScope::Repo {
+            repo_id: "r1".into(),
+        };
+        store
+            .store_scoped(&repo_scope, "repo memory 1", &meta)
+            .await
+            .unwrap();
+        store
+            .store_scoped(&repo_scope, "repo memory 2", &meta)
+            .await
+            .unwrap();
 
         let deleted = store.forget_scope(&repo_scope).await.unwrap();
         assert_eq!(deleted, 2);
@@ -2116,8 +2306,14 @@ mod tests {
             run_id: "run_abc".into(),
         };
         let meta = WriteMeta::agent_observation("agent1");
-        store.store_scoped(&run_scope, "observation 1", &meta).await.unwrap();
-        store.store_scoped(&run_scope, "observation 2", &meta).await.unwrap();
+        store
+            .store_scoped(&run_scope, "observation 1", &meta)
+            .await
+            .unwrap();
+        store
+            .store_scoped(&run_scope, "observation 2", &meta)
+            .await
+            .unwrap();
 
         let deleted = store.delete_by_run("run_abc").await.unwrap();
         assert_eq!(deleted, 2);
@@ -2136,8 +2332,14 @@ mod tests {
             run_id: "run_xyz".into(),
         };
         let meta = WriteMeta::agent_observation("fixer");
-        store.store_scoped(&run_scope, "found issue in auth module", &meta).await.unwrap();
-        store.store_scoped(&run_scope, "fixed permissions check", &meta).await.unwrap();
+        store
+            .store_scoped(&run_scope, "found issue in auth module", &meta)
+            .await
+            .unwrap();
+        store
+            .store_scoped(&run_scope, "fixed permissions check", &meta)
+            .await
+            .unwrap();
 
         let memories = store.query_by_run("run_xyz").await.unwrap();
         assert_eq!(memories.len(), 2);
