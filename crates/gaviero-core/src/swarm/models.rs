@@ -31,6 +31,19 @@ pub struct WorkUnit {
     /// When `None`, the `TierRouter` resolves the model from `tier`.
     #[serde(default)]
     pub model: Option<String>,
+    /// Reasoning/effort level requested by the DSL `client { effort ... }`
+    /// field. Provider-neutral string; each backend maps it into its own knob
+    /// (Claude `effort`, Codex `model_reasoning_effort`, etc.) and ignores
+    /// values it doesn't recognise. `None` means "use the backend's default".
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// Provider-specific key/value pairs from the DSL `client { extra { ... } }`
+    /// block. Backends consume keys they understand and ignore the rest.
+    /// Order is preserved (the DSL allows duplicate-key detection only at
+    /// compile time; by the time a `WorkUnit` is constructed all keys are
+    /// unique).
+    #[serde(default)]
+    pub extra: Vec<(String, String)>,
 
     // ── Tier routing fields ──────────────────────────────────────
     /// Model tier assigned by the coordinator.
