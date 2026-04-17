@@ -165,20 +165,32 @@ mod tests {
 
     #[test]
     fn ensure_visible_scrolls_up() {
-        let mut s = ScrollState { selected: 2, offset: 5, viewport: 10 };
+        let mut s = ScrollState {
+            selected: 2,
+            offset: 5,
+            viewport: 10,
+        };
         s.ensure_visible();
         assert_eq!(s.offset, 2);
     }
 
     #[test]
     fn visible_range_basic() {
-        let s = ScrollState { selected: 0, offset: 3, viewport: 5 };
+        let s = ScrollState {
+            selected: 0,
+            offset: 3,
+            viewport: 5,
+        };
         assert_eq!(s.visible_range(20, 5), 3..8);
     }
 
     #[test]
     fn visible_range_clamps_to_item_count() {
-        let s = ScrollState { selected: 0, offset: 18, viewport: 5 };
+        let s = ScrollState {
+            selected: 0,
+            offset: 18,
+            viewport: 5,
+        };
         assert_eq!(s.visible_range(20, 5), 18..20);
     }
 
@@ -191,14 +203,22 @@ mod tests {
 
     #[test]
     fn clamp_adjusts_selection() {
-        let mut s = ScrollState { selected: 10, offset: 5, viewport: 10 };
+        let mut s = ScrollState {
+            selected: 10,
+            offset: 5,
+            viewport: 10,
+        };
         s.clamp(3);
         assert_eq!(s.selected, 2);
     }
 
     #[test]
     fn scroll_without_moving_selection() {
-        let mut s = ScrollState { selected: 5, offset: 0, viewport: 10 };
+        let mut s = ScrollState {
+            selected: 5,
+            offset: 0,
+            viewport: 10,
+        };
         s.scroll_down(3, 20);
         assert_eq!(s.offset, 3);
         assert_eq!(s.selected, 5); // unchanged
