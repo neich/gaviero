@@ -312,10 +312,22 @@ mod tests {
 
     #[test]
     fn test_capture_type_from_name() {
-        assert_eq!(IndentCaptureType::from_name("indent"), Some(IndentCaptureType::Indent));
-        assert_eq!(IndentCaptureType::from_name("outdent"), Some(IndentCaptureType::Outdent));
-        assert_eq!(IndentCaptureType::from_name("indent.always"), Some(IndentCaptureType::IndentAlways));
-        assert_eq!(IndentCaptureType::from_name("extend"), Some(IndentCaptureType::Extend));
+        assert_eq!(
+            IndentCaptureType::from_name("indent"),
+            Some(IndentCaptureType::Indent)
+        );
+        assert_eq!(
+            IndentCaptureType::from_name("outdent"),
+            Some(IndentCaptureType::Outdent)
+        );
+        assert_eq!(
+            IndentCaptureType::from_name("indent.always"),
+            Some(IndentCaptureType::IndentAlways)
+        );
+        assert_eq!(
+            IndentCaptureType::from_name("extend"),
+            Some(IndentCaptureType::Extend)
+        );
         assert_eq!(IndentCaptureType::from_name("unknown"), None);
     }
 }
