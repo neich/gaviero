@@ -8,10 +8,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use super::{
-    BatchStrategy, DiffReviewReport, IssueSeverity, ReviewIssue, UnitReview,
-};
-use crate::swarm::backend::{executor, shared, CompletionRequest};
+use super::{BatchStrategy, DiffReviewReport, IssueSeverity, ReviewIssue, UnitReview};
+use crate::swarm::backend::{CompletionRequest, executor, shared};
 use crate::types::ModelTier;
 
 /// Configuration for the diff reviewer.
@@ -170,11 +168,7 @@ fn batch_diffs<'a>(
 }
 
 /// Build the review prompt following the plan's §5.3 format.
-fn build_review_prompt(
-    plan_summary: &str,
-    batch: &[&ReviewableDiff],
-    max_tokens: u32,
-) -> String {
+fn build_review_prompt(plan_summary: &str, batch: &[&ReviewableDiff], max_tokens: u32) -> String {
     let mut prompt = String::new();
 
     prompt.push_str("SECTION 1: COORDINATOR CONTEXT\n");
@@ -286,8 +280,8 @@ fn parse_review_response(response: &str) -> Result<Vec<UnitReview>> {
         suggested_fix: Option<String>,
     }
 
-    let verdict: ReviewVerdict = serde_json::from_str(&json_str)
-        .context("parsing reviewer verdict JSON")?;
+    let verdict: ReviewVerdict =
+        serde_json::from_str(&json_str).context("parsing reviewer verdict JSON")?;
 
     let issues: Vec<ReviewIssue> = verdict
         .issues
@@ -300,7 +294,11 @@ fn parse_review_response(response: &str) -> Result<Vec<UnitReview>> {
             },
             file: PathBuf::from(raw.file),
             line_range: raw.line_range.and_then(|r| {
-                if r.len() == 2 { Some((r[0], r[1])) } else { None }
+                if r.len() == 2 {
+                    Some((r[0], r[1]))
+                } else {
+                    None
+                }
             }),
             description: raw.description,
             suggested_fix: raw.suggested_fix,
