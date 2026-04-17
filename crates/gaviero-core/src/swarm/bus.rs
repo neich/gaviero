@@ -37,7 +37,10 @@ impl AgentBus {
     pub fn register(
         &mut self,
         agent_id: &str,
-    ) -> (broadcast::Receiver<BusMessage>, mpsc::UnboundedReceiver<BusMessage>) {
+    ) -> (
+        broadcast::Receiver<BusMessage>,
+        mpsc::UnboundedReceiver<BusMessage>,
+    ) {
         let broadcast_rx = self.broadcast_tx.subscribe();
         let (inbox_tx, inbox_rx) = mpsc::unbounded_channel();
         self.inboxes.insert(agent_id.to_string(), inbox_tx);
