@@ -10,7 +10,7 @@
 //   gaviero-cli --script update_docs.gaviero
 
 client sonnet { tier cheap     model "claude-sonnet-4-6" default }
-client opus   { tier expensive model "claude-opus-4-6" }
+client opus   { tier expensive model "claude-opus-4-7" }
 
 // ── Shared configuration ──────────────────────────────────────────────────────
 //
