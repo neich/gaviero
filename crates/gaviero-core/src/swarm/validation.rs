@@ -44,10 +44,8 @@ pub fn validate_scopes(units: &[WorkUnit]) -> Vec<ScopeError> {
 
     for i in 0..units.len() {
         for j in (i + 1)..units.len() {
-            let overlaps = find_overlapping_paths(
-                &units[i].scope.owned_paths,
-                &units[j].scope.owned_paths,
-            );
+            let overlaps =
+                find_overlapping_paths(&units[i].scope.owned_paths, &units[j].scope.owned_paths);
             if !overlaps.is_empty() {
                 errors.push(ScopeError {
                     unit_a: units[i].id.clone(),
