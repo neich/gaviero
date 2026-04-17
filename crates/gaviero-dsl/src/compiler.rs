@@ -40,6 +40,7 @@ pub fn compile_ast(
     let mut agent_map: HashMap<&str, &AgentDecl> = HashMap::new();
     let mut workflow_map: HashMap<&str, &WorkflowDecl> = HashMap::new();
     let mut prompt_map: HashMap<&str, &str> = HashMap::new();
+    let mut tier_alias_map: HashMap<&str, &TierAlias> = HashMap::new();
     let mut script_vars: Vec<(String, String)> = Vec::new();
     let mut default_client: Option<&ClientDecl> = None;
     let mut errors: Vec<DslError> = Vec::new();
@@ -121,6 +122,43 @@ pub fn compile_ast(
                     });
                 }
             }
+            Item::TierAlias(ta) => {
+                if tier_alias_map.insert(ta.name.as_str(), ta).is_some() {
+                    errors.push(DslError::Compile {
+                        src: src(),
+                        span: (
+                            ta.name_span.start,
+                            ta.name_span.end.saturating_sub(ta.name_span.start).max(1),
+                        )
+                            .into(),
+                        reason: format!("duplicate tier alias `{}`", ta.name),
+                    });
+                }
+            }
+        }
+    }
+
+    // ── Validate tier alias client references ─────────────────────
+    //
+    // Done here (not inside compile_agent) so the error is attached to the
+    // alias declaration rather than each agent that references it.
+    for ta in tier_alias_map.values() {
+        if !client_map.contains_key(ta.client_ref.as_str()) {
+            errors.push(DslError::Compile {
+                src: src(),
+                span: (
+                    ta.client_ref_span.start,
+                    ta.client_ref_span
+                        .end
+                        .saturating_sub(ta.client_ref_span.start)
+                        .max(1),
+                )
+                    .into(),
+                reason: format!(
+                    "tier alias `{}` references undefined client `{}`",
+                    ta.name, ta.client_ref
+                ),
+            });
         }
     }
 
@@ -192,6 +230,7 @@ pub fn compile_ast(
         match compile_agent(
             decl,
             &client_map,
+            &tier_alias_map,
             default_client,
             &prompt_map,
             &script_vars,
@@ -209,6 +248,7 @@ pub fn compile_ast(
         match compile_agent(
             decl,
             &client_map,
+            &tier_alias_map,
             default_client,
             &prompt_map,
             &script_vars,
@@ -539,6 +579,7 @@ fn apply_vars(
 fn compile_agent(
     decl: &AgentDecl,
     client_map: &HashMap<&str, &ClientDecl>,
+    tier_alias_map: &HashMap<&str, &TierAlias>,
     default_client: Option<&ClientDecl>,
     prompt_map: &HashMap<&str, &str>,
     script_vars: &[(String, String)],
@@ -549,48 +590,86 @@ fn compile_agent(
 ) -> Result<WorkUnit, DslError> {
     let src = || NamedSource::new(filename, source.to_string());
 
-    // Resolve client reference
-    let (tier, model, privacy) = if let Some((client_name, client_span)) = &decl.client {
-        // Explicit client reference
-        let cd = client_map
-            .get(client_name.as_str())
-            .ok_or_else(|| DslError::Compile {
-                src: src(),
-                span: (
-                    client_span.start,
-                    client_span.end.saturating_sub(client_span.start).max(1),
-                )
-                    .into(),
-                reason: format!("undefined client `{}`", client_name),
-            })?;
+    // ── Reject mutually-exclusive client + tier ──────────────────
+    //
+    // An agent may reference a concrete client OR a tier alias, but not both.
+    // Point the diagnostic at the tier field so the author sees the conflict
+    // on the newer surface syntax.
+    if let (Some((cn, _)), Some((tn, ts))) = (&decl.client, &decl.tier_ref) {
+        return Err(DslError::Compile {
+            src: src(),
+            span: (ts.start, ts.end.saturating_sub(ts.start).max(1)).into(),
+            reason: format!(
+                "agent `{}` declares both `client {}` and `tier {}` — pick one",
+                decl.name, cn, tn
+            ),
+        });
+    }
+
+    // Resolve the effective `ClientDecl` for this agent, if any.
+    //
+    // Order of precedence:
+    //   1. `client <name>` — explicit concrete binding.
+    //   2. `tier <name>`   — resolve through tier alias → `ClientDecl`.
+    //   3. top-level `default` client.
+    //   4. no client — fall through to defaults + warning.
+    let resolved_client: Option<&ClientDecl> =
+        if let Some((client_name, client_span)) = &decl.client {
+            let cd = client_map
+                .get(client_name.as_str())
+                .copied()
+                .ok_or_else(|| DslError::Compile {
+                    src: src(),
+                    span: (
+                        client_span.start,
+                        client_span.end.saturating_sub(client_span.start).max(1),
+                    )
+                        .into(),
+                    reason: format!("undefined client `{}`", client_name),
+                })?;
+            Some(cd)
+        } else if let Some((tier_name, tier_span)) = &decl.tier_ref {
+            let alias =
+                tier_alias_map
+                    .get(tier_name.as_str())
+                    .ok_or_else(|| DslError::Compile {
+                        src: src(),
+                        span: (
+                            tier_span.start,
+                            tier_span.end.saturating_sub(tier_span.start).max(1),
+                        )
+                            .into(),
+                        reason: format!(
+                            "agent `{}` references undefined tier alias `{}`",
+                            decl.name, tier_name
+                        ),
+                    })?;
+            // The alias's client_ref validity was already checked in phase 1.
+            // Re-lookup here is a contract: tier_alias_map values only reach
+            // this point if their client_ref resolves.
+            Some(client_map[alias.client_ref.as_str()])
+        } else {
+            default_client
+        };
+
+    let (tier, model, effort, extra, privacy) = if let Some(cd) = resolved_client {
         let tier = cd
             .tier
             .as_ref()
             .map(|(t, _)| map_tier(*t))
             .unwrap_or_default();
         let model = cd.model.as_ref().map(|(m, _)| m.clone());
+        let effort = cd.effort.as_ref().map(|(e, _)| e.clone());
+        let extra = compile_extra(&cd.extra, &cd.name, source, filename)?;
         let privacy = cd
             .privacy
             .as_ref()
             .map(|(p, _)| map_privacy(*p))
             .unwrap_or_default();
-        (tier, model, privacy)
-    } else if let Some(dc) = default_client {
-        // No explicit client, but a default exists — use it
-        let tier = dc
-            .tier
-            .as_ref()
-            .map(|(t, _)| map_tier(*t))
-            .unwrap_or_default();
-        let model = dc.model.as_ref().map(|(m, _)| m.clone());
-        let privacy = dc
-            .privacy
-            .as_ref()
-            .map(|(p, _)| map_privacy(*p))
-            .unwrap_or_default();
-        (tier, model, privacy)
+        (tier, model, effort, extra, privacy)
     } else {
-        // No explicit client, no default — warn if any clients are declared
+        // No explicit client, no tier alias, no default — warn if any
+        // clients are declared, then fall back to defaults.
         if !client_map.is_empty() {
             eprintln!(
                 "⚠ agent `{}`: no client declared and no default client set; \
@@ -599,7 +678,13 @@ fn compile_agent(
                 decl.name
             );
         }
-        (ModelTier::default(), None, PrivacyLevel::default())
+        (
+            ModelTier::default(),
+            None,
+            None,
+            Vec::new(),
+            PrivacyLevel::default(),
+        )
     };
 
     // Build scope
@@ -755,6 +840,8 @@ fn compile_agent(
         depends_on,
         backend: AgentBackend::default(),
         model,
+        effort,
+        extra,
         tier,
         privacy,
         coordinator_instructions,
@@ -773,6 +860,46 @@ fn compile_agent(
         context_tests_for,
         context_depth,
     })
+}
+
+/// Validate a client's `extra { ... }` pairs and flatten them into
+/// `Vec<(key, value)>` for the compiled `WorkUnit`.
+///
+/// Fails if the same key appears more than once — surfacing the span of the
+/// second occurrence so the diagnostic points at the redeclaration.
+fn compile_extra(
+    pairs: &[ExtraPair],
+    client_name: &str,
+    source: &str,
+    filename: &str,
+) -> Result<Vec<(String, String)>, DslError> {
+    let mut seen: HashMap<&str, &Span> = HashMap::new();
+    let mut out: Vec<(String, String)> = Vec::with_capacity(pairs.len());
+
+    for pair in pairs {
+        if let Some(_first) = seen.insert(pair.key.as_str(), &pair.key_span) {
+            // HashMap::insert returns the *previous* span; `pair.key_span` is
+            // the second occurrence, which is what we want to point at.
+            return Err(DslError::Compile {
+                src: NamedSource::new(filename, source.to_string()),
+                span: (
+                    pair.key_span.start,
+                    pair.key_span
+                        .end
+                        .saturating_sub(pair.key_span.start)
+                        .max(1),
+                )
+                    .into(),
+                reason: format!(
+                    "duplicate extra key `{}` in client `{}`",
+                    pair.key, client_name
+                ),
+            });
+        }
+        out.push((pair.key.clone(), pair.value.clone()));
+    }
+
+    Ok(out)
 }
 
 fn map_tier(t: TierLit) -> ModelTier {
@@ -961,6 +1088,219 @@ mod tests {
         let units = compile_str(src).expect("should compile");
         assert_eq!(units[0].tier, ModelTier::Cheap); // Cheap is now the default
         assert_eq!(units[0].model, None);
+        assert!(units[0].effort.is_none());
+    }
+
+    #[test]
+    fn client_effort_flows_to_work_unit() {
+        let src = r#"
+            client deep { model "opus" effort high }
+            agent a { client deep description "task" }
+        "#;
+        let units = compile_str(src).expect("should compile");
+        assert_eq!(units[0].effort.as_deref(), Some("high"));
+        assert_eq!(units[0].model.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn default_client_effort_flows_to_work_unit() {
+        let src = r#"
+            client deep { model "opus" effort xhigh default }
+            agent a { description "uses default" }
+        "#;
+        let units = compile_str(src).expect("should compile");
+        assert_eq!(units[0].effort.as_deref(), Some("xhigh"));
+    }
+
+    #[test]
+    fn explicit_client_effort_overrides_default() {
+        let src = r#"
+            client fast { model "haiku" effort low default }
+            client deep { model "opus" effort high }
+            agent a { client deep description "task" }
+        "#;
+        let units = compile_str(src).expect("should compile");
+        assert_eq!(units[0].effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn client_extra_flows_to_work_unit() {
+        let src = r#"
+            client deep {
+                model "opus"
+                extra {
+                    thinking_budget "8000"
+                    max_tokens      "32768"
+                }
+            }
+            agent a { client deep description "task" }
+        "#;
+        let units = compile_str(src).expect("should compile");
+        assert_eq!(units[0].extra.len(), 2);
+        assert_eq!(units[0].extra[0], ("thinking_budget".into(), "8000".into()));
+        assert_eq!(units[0].extra[1], ("max_tokens".into(), "32768".into()));
+    }
+
+    #[test]
+    fn default_client_extras_flow_to_work_unit() {
+        let src = r#"
+            client deep {
+                model "opus"
+                default
+                extra { thinking_budget "4000" }
+            }
+            agent a { description "uses default" }
+        "#;
+        let units = compile_str(src).expect("should compile");
+        assert_eq!(units[0].extra.len(), 1);
+        assert_eq!(units[0].extra[0].0, "thinking_budget");
+    }
+
+    #[test]
+    fn duplicate_extra_key_is_compile_error() {
+        let src = r#"
+            client deep {
+                model "opus"
+                extra {
+                    thinking_budget "8000"
+                    thinking_budget "9000"
+                }
+            }
+            agent a { client deep description "task" }
+        "#;
+        let err = compile_str(src).expect_err("duplicate extra key should fail");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("duplicate extra key")
+                && msg.contains("thinking_budget")
+                && msg.contains("deep"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn tier_alias_resolves_to_client_fields() {
+        let src = r#"
+            client deep { model "opus" effort xhigh }
+            tier expensive deep
+            agent a { tier expensive description "task" }
+        "#;
+        let units = compile_str(src).expect("should compile");
+        assert_eq!(units[0].model.as_deref(), Some("opus"));
+        assert_eq!(units[0].effort.as_deref(), Some("xhigh"));
+    }
+
+    #[test]
+    fn tier_alias_propagates_extras() {
+        let src = r#"
+            client deep {
+                model "opus"
+                extra { thinking_budget "8000" }
+            }
+            tier expensive deep
+            agent a { tier expensive description "task" }
+        "#;
+        let units = compile_str(src).expect("should compile");
+        assert_eq!(units[0].extra.len(), 1);
+        assert_eq!(units[0].extra[0].0, "thinking_budget");
+    }
+
+    #[test]
+    fn undefined_tier_alias_is_compile_error() {
+        let src = r#"
+            client deep { model "opus" }
+            agent a { tier ghost description "task" }
+        "#;
+        let err = compile_str(src).expect_err("undefined alias should fail");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("undefined tier alias") && msg.contains("ghost"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn tier_alias_to_undefined_client_is_compile_error() {
+        let src = r#"
+            tier expensive ghost_client
+            agent a { tier expensive description "task" }
+        "#;
+        let err = compile_str(src).expect_err("alias→ghost client should fail");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("tier alias") && msg.contains("ghost_client"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn duplicate_tier_alias_is_compile_error() {
+        let src = r#"
+            client a { model "opus" }
+            client b { model "haiku" }
+            tier cheap a
+            tier cheap b
+        "#;
+        let err = compile_str(src).expect_err("duplicate alias should fail");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("duplicate tier alias") && msg.contains("cheap"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn agent_cannot_declare_both_client_and_tier() {
+        let src = r#"
+            client deep { model "opus" }
+            tier expensive deep
+            agent a { client deep tier expensive description "task" }
+        "#;
+        let err = compile_str(src).expect_err("both client+tier should fail");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("both") && msg.contains("client") && msg.contains("tier"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn tier_alias_with_custom_name_resolves() {
+        let src = r#"
+            client c { model "haiku" effort low }
+            tier blazingly_fast c
+            agent a { tier blazingly_fast description "task" }
+        "#;
+        let units = compile_str(src).expect("should compile");
+        assert_eq!(units[0].model.as_deref(), Some("haiku"));
+        assert_eq!(units[0].effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn explicit_client_takes_precedence_over_default() {
+        let src = r#"
+            client fast { model "haiku" default }
+            client deep { model "opus" }
+            tier expensive deep
+            agent a { tier expensive description "task" }
+        "#;
+        let units = compile_str(src).expect("should compile");
+        assert_eq!(units[0].model.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn extras_empty_when_no_extra_block() {
+        let src = r#"
+            client deep { model "opus" }
+            agent a { client deep description "task" }
+        "#;
+        let units = compile_str(src).expect("should compile");
+        assert!(units[0].extra.is_empty());
     }
 
     #[test]
