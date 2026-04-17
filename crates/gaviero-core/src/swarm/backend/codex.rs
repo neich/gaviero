@@ -36,7 +36,11 @@ pub struct CodexBackend {
 
 impl CodexBackend {
     pub fn new(model: &str) -> Self {
-        let m = if model.is_empty() { DEFAULT_CODEX_MODEL } else { model };
+        let m = if model.is_empty() {
+            DEFAULT_CODEX_MODEL
+        } else {
+            model
+        };
         Self {
             model: m.to_string(),
             display_name: format!("codex:{}", m),
@@ -187,7 +191,10 @@ async fn drive_codex_stdout(
     let mut file_scan_pos: usize = 0;
 
     loop {
-        let n = reader.read(&mut buf).await.context("reading codex stdout")?;
+        let n = reader
+            .read(&mut buf)
+            .await
+            .context("reading codex stdout")?;
         if n == 0 {
             break;
         }
@@ -235,9 +242,7 @@ fn format_exit_error(
         Err(e) => format!("failed to wait for codex: {e}"),
     };
     if stderr_text.trim().is_empty() {
-        format!(
-            "{status_line}\nCheck that the `codex` CLI is installed and OPENAI_API_KEY is set."
-        )
+        format!("{status_line}\nCheck that the `codex` CLI is installed and OPENAI_API_KEY is set.")
     } else {
         format!("{status_line}\n{}", stderr_text.trim())
     }
