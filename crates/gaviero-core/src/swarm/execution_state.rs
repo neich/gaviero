@@ -160,7 +160,9 @@ impl ExecutionState {
 
     /// Path to the checkpoint file for a given plan hash.
     pub fn checkpoint_path(plan_hash: &str) -> PathBuf {
-        PathBuf::from(".gaviero").join("state").join(format!("{}.json", plan_hash))
+        PathBuf::from(".gaviero")
+            .join("state")
+            .join(format!("{}.json", plan_hash))
     }
 
     /// Serialize state to `.gaviero/state/{hash}.json`.
