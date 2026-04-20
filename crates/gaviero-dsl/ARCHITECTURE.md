@@ -1,6 +1,6 @@
 # gaviero-dsl — Architecture
 
-Compiler for `.gaviero` DSL. Transforms source text → CompiledPlan DAG consumed by `gaviero-core::swarm::pipeline`.
+Compiler for `.gaviero` scripts. Source text → AST → `CompiledPlan` DAG consumed by `gaviero_core::swarm::pipeline`.
 
 ---
 
@@ -8,12 +8,14 @@ Compiler for `.gaviero` DSL. Transforms source text → CompiledPlan DAG consume
 
 ```
 gaviero-dsl/src/
-├─ lib.rs                Entry point: pub fn compile(...)
-├─ lexer.rs              Logos tokenizer
-├─ ast.rs                Syntax tree types
-├─ parser.rs             Chumsky parser combinators
-├─ compiler.rs           Semantic analysis (7-phase)
-└─ error.rs              Miette diagnostic errors
+├─ lib.rs       Public entry points: compile, compile_with_vars
+├─ lexer.rs     Logos tokenizer (shebang, strings, raw blocks, idents)
+├─ ast.rs       Syntax tree types (Script, Item, Agent/Workflow/Client,
+│               PromptDecl, TierAlias, Vars, blocks)
+├─ parser.rs    Chumsky parser combinators → Script
+├─ compiler.rs  Semantic analysis: resolve vars/prompts/tiers, apply
+│               substitutions, validate scopes, build CompiledPlan
+└─ error.rs     DslError / DslErrors — miette diagnostics with spans
 ```
 
 ---
@@ -21,40 +23,29 @@ gaviero-dsl/src/
 ## 2. Compilation Pipeline
 
 ```
-              ┌─────────────────────────────────────────┐
-              │         Source Text (.gaviero)          │
-              └──────────────┬──────────────────────────┘
-                             │
-                    ┌────────▼────────┐
-                    │    Lexer        │
-                    │  (logos)        │
-                    │ → Token[]       │
-                    └────────┬────────┘
-                             │
-                    ┌────────▼────────┐
-                    │    Parser       │
-                    │  (chumsky)      │
-                    │ → AST           │
-                    └────────┬────────┘
-                             │
-                    ┌────────▼────────────────────┐
-                    │  Compiler (7-phase)         │
-                    │                             │
-                    │ Phase 1: Lex into tokens    │
-                    │ Phase 2: Parse to AST       │
-                    │ Phase 3: Index declarations │
-                    │ Phase 4: Detect duplicates  │
-                    │ Phase 5: Select workflow    │
-                    │ Phase 6: Validate scopes    │
-                    │ Phase 7: Build CompiledPlan │
-                    │ → errors with spans         │
-                    └────────┬────────────────────┘
-                             │
-                    ┌────────▼────────────┐
-                    │   CompiledPlan      │
-                    │  (petgraph DAG)     │
-                    │  (ready for exec)   │
-                    └─────────────────────┘
+source
+  │
+  ▼ lexer::lex
+tokens
+  │
+  ▼ parser::parse
+AST (Script { items: Vec<Item> })
+  │
+  ▼ compiler::compile_ast_with_vars
+    1. index Items   (clients, agents, workflows, prompts, vars, tiers)
+    2. duplicate-name checks (carrying spans)
+    3. select workflow (by name if given, else single, else error)
+    4. merge vars      (CLI overrides > script vars > agent vars; AGENT
+                        and PROMPT are reserved)
+    5. resolve prompt refs (PromptSource::Ref → PromptDecl.content)
+    6. resolve tier aliases (TierAlias → ClientDecl)
+    7. apply_vars over prompts, descriptions, scope paths, memory fields
+    8. scope validation via path_pattern::patterns_overlap
+    9. build WorkUnit / LoopConfig / IterationConfig / VerificationConfig
+   10. assemble CompiledPlan (petgraph DAG)
+  │
+  ▼
+CompiledPlan   (gaviero_core::swarm::plan::CompiledPlan)
 ```
 
 ---
@@ -67,279 +58,157 @@ pub fn compile(
     filename: &str,
     workflow: Option<&str>,
     runtime_prompt: Option<&str>,
-) -> Result<CompiledPlan, miette::Report>
+) -> Result<CompiledPlan, miette::Report>;
+
+pub fn compile_with_vars(
+    source: &str,
+    filename: &str,
+    workflow: Option<&str>,
+    runtime_prompt: Option<&str>,
+    override_vars: &[(String, String)],
+) -> Result<CompiledPlan, miette::Report>;
 ```
 
-**Inputs:**
-- `source`: `.gaviero` source code
-- `filename`: for span/error reporting
-- `workflow`: optional selector if file has multiple `workflow` blocks
-- `runtime_prompt`: optional `{{PROMPT}}` substitution (from user/CLI)
+- `workflow`: select by name when the file declares multiple.
+- `runtime_prompt`: substitutes every `{{PROMPT}}`; also acts as full prompt for agents without a `prompt` field.
+- `override_vars`: replace entries in the top-level `vars {}` (used by `gaviero-cli --var KEY=VALUE`). Agent-level `vars` still win; `AGENT` and `PROMPT` are reserved.
 
-**Output:**
-- `Ok(CompiledPlan)`: DAG ready for swarm execution
-- `Err(miette::Report)`: diagnostic with source spans
+Output is `gaviero_core::swarm::plan::CompiledPlan` — no transformation needed before execution.
 
 ---
 
-## 4. AST Responsibilities
-
-Syntax tree stays close to source structure. No name resolution, no semantic validation.
-
-### Top-level Types (ast.rs)
+## 4. AST Shape
 
 ```rust
-pub struct Script {
-    pub items: Vec<Item>,
-}
+pub struct Script { pub items: Vec<Item> }
 
 pub enum Item {
-    ClientDecl(ClientDecl),
-    AgentDecl(AgentDecl),
-    WorkflowDecl(WorkflowDecl),
+    Client(ClientDecl),
+    Agent(AgentDecl),
+    Workflow(WorkflowDecl),
+    Prompt(PromptDecl),                  // top-level named prompt
+    Vars(Vec<(String, String)>),         // script-level substitution map
+    TierAlias(TierAlias),                // `tier <name> <client-ref>`
 }
+```
 
+### `ClientDecl` (`ast.rs`)
+
+```rust
 pub struct ClientDecl {
     pub name: String,
-    pub tier: Option<ModelTier>,
-    pub model: String,
-    pub privacy: Option<PrivacyLevel>,
+    pub tier: Option<(TierLit, Span)>,
+    pub model: Option<(String, Span)>,
+    pub effort: Option<(String, Span)>,      // off/auto/low/medium/high/xhigh/max
+    pub extra: Vec<ExtraPair>,               // provider pass-through
+    pub privacy: Option<(PrivacyLit, Span)>,
+    pub is_default: bool,                    // `default` keyword
+    pub span: Span,
 }
+```
 
+`extra { "key" "value" }` pairs are forwarded verbatim to the backend (Codex forwards as `-c k=v` to `codex exec`; Claude consumes the whitelist in `backend/claude_code.rs` and logs the rest at `tracing::debug`).
+
+### `AgentDecl`
+
+```rust
 pub struct AgentDecl {
     pub name: String,
-    pub description: String,
-    pub client: String,
+    pub description: Option<(String, Span)>,
+    pub client: Option<(String, Span)>,         // mutually exclusive with tier_ref
+    pub tier_ref: Option<(String, Span)>,       // reference to TierAlias
     pub scope: Option<ScopeBlock>,
+    pub depends_on: Option<(Vec<(String, Span)>, Span)>,
+    pub prompt: Option<(PromptSource, Span)>,   // Inline(text) or Ref(name, span)
+    pub max_retries: Option<(u8, Span)>,
     pub memory: Option<MemoryBlock>,
     pub context: Option<ContextBlock>,
-    pub verify: Option<VerifyBlock>,
-    pub depends_on: Vec<String>,
-    pub prompt: String,
-    pub max_retries: Option<u8>,
-}
-
-pub struct WorkflowDecl {
-    pub name: String,
-    pub steps: Vec<String>,  // Agent names in order
-    pub max_parallel: Option<usize>,
-    pub strategy: Option<StrategyLit>,
-    pub test_first: bool,
-    pub max_retries: Option<u8>,
-    pub attempts: Option<u8>,
-    pub escalate_after: Option<u8>,
-    pub memory: Option<MemoryBlock>,
-    pub verify: Option<VerifyBlock>,
-    pub loops: Vec<LoopBlock>,
+    pub vars: Vec<(String, String)>,            // per-agent substitutions
+    pub span: Span,
 }
 ```
 
-### Block Types
+### `MemoryBlock`
 
-**ScopeBlock:**
+Field names match compiler output: `read_ns`, `write_ns`, `importance`, `read_query`, `read_limit`, `write_content`, `staleness_sources`. `write_content` supports `{{SUMMARY}}`, `{{FILES}}`, `{{AGENT}}`, `{{DESCRIPTION}}`.
+
+### `ContextBlock`
+
+`callers_of`, `tests_for`, `depth`, plus `impact_scope` (moved to `ScopeBlock` in the scope form).
+
+### `PromptDecl`, `TierAlias`, `PromptSource`
+
 ```rust
-pub struct ScopeBlock {
-    pub owned: Vec<String>,
-    pub read_only: Vec<String>,
-    pub interface_contracts: HashMap<String, String>,
-}
+pub struct PromptDecl { pub name: String, pub content: String, ... }
+pub struct TierAlias  { pub name: String, pub client_ref: String, ... }
+pub enum PromptSource { Inline(String), Ref(String, Span) }
 ```
 
-**MemoryBlock:**
-```rust
-pub struct MemoryBlock {
-    pub read_namespaces: Vec<String>,
-    pub write_namespace: Option<String>,
-    pub importance: Option<f32>,
-    pub read_query: Option<String>,
-    pub read_limit: Option<usize>,
-}
-```
+`{{AGENT}}` inside a referenced `prompt` expands to the caller's agent name, letting one shared prompt produce per-agent output paths.
 
-**ContextBlock:**
-```rust
-pub struct ContextBlock {
-    pub callers_of: Vec<String>,
-    pub tests_for: Vec<String>,
-    pub depth: Option<u32>,
-    pub impact_scope: bool,
-}
-```
+### `WorkflowDecl` + `LoopBlock`
 
-**VerifyBlock:**
-```rust
-pub struct VerifyBlock {
-    pub verify_compilation: bool,
-    pub verify_tests: bool,
-    pub verify_diffs: bool,
-    pub impact_tests: Vec<String>,
-}
-```
-
-**LoopBlock:**
-```rust
-pub struct LoopBlock {
-    pub agents: Vec<String>,
-    pub until: UntilCondition,
-    pub max_iterations: u32,
-}
-
-pub enum UntilCondition {
-    Verify,
-    Agent { judgment: String },
-    Command { exit_code: i32 },
-}
-```
+Workflows hold `steps: Vec<StepItem>`, `max_parallel`, `strategy`, `verify`, `memory`, and a `Vec<LoopBlock>`. Loops have `agents`, `max_iterations`, `iter_start`, `stability`, `judge_timeout`, `strict_judge`, and an `UntilCondition` (`Verify(VerifyBlock) | Agent(name) | Command(exit)`).
 
 ---
 
-## 5. Compiler Responsibilities
+## 5. Variable + Prompt Substitution
 
-`compiler.rs` performs semantic work:
+Precedence (high → low) for a `{{KEY}}` token:
+1. Reserved runtime values: `{{PROMPT}}`, `{{AGENT}}`, and planner-injected keys (`{{ITER}}`, `{{PREV_ITER}}`, `{{ITER_EVIDENCE}}`) at runtime.
+2. Agent-level `vars { KEY "v" }`.
+3. CLI `--var KEY=VALUE` (`override_vars`).
+4. Script-level `vars {}`.
 
-### Phase-by-phase
+`apply_vars` runs over:
+- agent `prompt` bodies (inline or resolved `PromptDecl`),
+- `description`,
+- `scope { owned [...] read_only [...] }` path lists,
+- `memory { staleness_sources read_query write_content }`.
 
-**Phase 1: Lex**
-```
-lexer::lex(source) → Token[]
-```
-
-**Phase 2: Parse**
-```
-parser::parse(tokens) → AST
-```
-
-**Phase 3: Index Declarations**
-```
-FOR each Item in AST:
-  ├─ ClientDecl → Map<String, ClientDecl>
-  ├─ AgentDecl → Map<String, AgentDecl>
-  └─ WorkflowDecl → Map<String, WorkflowDecl>
-  
-Detect & error on duplicate names
-```
-
-**Phase 4: Select Workflow**
-```
-IF multiple workflows:
-  SELECT by workflow param OR error "ambiguous"
-ELSE:
-  SELECT single workflow
-  
-IF no workflows: error "no workflow found"
-```
-
-**Phase 5: Validate Scopes**
-```
-FOR each agent in workflow:
-  ├─ Resolve client reference
-  ├─ Build FileScope from scope block
-  └─ Check no owned_path overlaps with other agents
-  
-error on: scope violations, unknown client refs
-```
-
-**Phase 6: Resolve Dependencies**
-```
-FOR each depends_on edge:
-  ├─ Check agent exists
-  └─ Detect cycles via DFS
-  
-error on: unknown agent, circular dependency
-```
-
-**Phase 7: Build CompiledPlan**
-```
-FOR each agent in workflow order:
-  ├─ Build WorkUnit from AgentDecl + ClientDecl
-  ├─ Attach depends_on edges
-  └─ Resolve context expansion (callers_of, tests_for)
-
-Build DAG via petgraph::DiGraph<PlanNode, DependencyEdge>
-Attach IterationConfig from workflow strategy/retries/attempts
-Attach VerificationConfig from workflow verify block
-Attach LoopConfig[] from workflow loops
-Compute plan hash for checkpointing
-
-Return CompiledPlan
-```
+This lets agents declare `DOC_NAME` once and use it in both their prompt body and their scope paths.
 
 ---
 
-## 6. Error Handling
+## 6. Scope Validation
 
-All errors carry source spans for precise diagnostics via `miette`.
+`compiler.rs` delegates to `gaviero_core::path_pattern::patterns_overlap` for pairwise checks across every `owned` path. Glob-disjoint siblings are accepted: `plans/claude-*.md` does not overlap `plans/codex-*.md`. Concrete prefix / substring / subdirectory cases remain flagged (e.g., `src/` overlaps `src/foo.rs`).
 
-### Error Types (error.rs)
+The same matcher backs `scope_enforcer::is_scope_allowed` at runtime, so compile-time and runtime agree.
+
+---
+
+## 7. Error Handling
+
+All errors carry `SourceSpan`s and route through `miette`:
 
 ```rust
 pub enum DslError {
-    Lex {
-        message: String,
-        span: SourceSpan,
-        label: String,
-    },
-    Parse {
-        message: String,
-        expected: Vec<String>,
-        span: SourceSpan,
-    },
-    Compile {
-        message: String,
-        span: SourceSpan,
-        context: Option<String>,
-    },
+    Lex   { src, span },
+    Parse { message, expected, span, … },
+    Compile { message, span, context, … },
 }
+
+pub struct DslErrors(pub Vec<DslError>);   // miette::Report wrapper
 ```
 
-**Wrapper:** `DslErrors` (plural) — `miette::Report` with proper formatting.
-
-**Errors propagate with spans all the way to CLI/TUI:**
-
-```
-error: duplicate agent name "parse_config"
-  ┌─ example.gaviero:15:1
-  │
-15 │ agent parse_config {
-   │ ^^^^^^^^^^^^^^^^^^ previously defined here
-   │
-16 │ agent parse_config {  ← duplicate
-   │ ^^^^^^^^^^^^^^^^^^ error
-```
+Representative diagnostics: unknown client / tier / prompt reference, duplicate name, circular `depends_on`, scope overlap, reserved var shadow (`PROMPT`/`AGENT`), missing workflow in multi-workflow files, unknown `{{KEY}}` substitution.
 
 ---
 
-## 7. Name Resolution
+## 8. Name Resolution
 
-Agent references (`depends_on`, workflow `steps`) resolved at compile time.
+All names resolved at compile time:
+- agent → `ClientDecl` (direct) or `TierAlias` → `ClientDecl` (indirect),
+- workflow `steps` and `depends_on` targets must exist as agents,
+- `prompt <name>` must reference a `PromptDecl`,
+- no cycles in `depends_on` (DFS).
 
-**Invariants:**
-- All agent names in workflow must exist in same source
-- All `depends_on` targets must exist
-- No circular dependencies
-- No overlapping FileScope
-
-**No runtime name resolution.** All names resolved before CompiledPlan produced.
+No runtime name lookup — `CompiledPlan` carries fully resolved `WorkUnit`s.
 
 ---
 
-## 8. Model Strings
-
-Models remain **opaque strings** in DSL. Provider-neutral.
-
-```
-"claude:opus"       (Claude API)
-"claude:sonnet"     (Claude API)
-"ollama:llama2"     (Ollama)
-"codex:endpoint"    (OpenAI-compatible)
-"sonnet"            (implicit "claude:sonnet")
-```
-
-**Resolution deferred to `gaviero-core::swarm::backend::shared`.**
-
----
-
-## 9. Output: CompiledPlan Structure
+## 9. Output — `CompiledPlan`
 
 ```rust
 pub struct CompiledPlan {
@@ -350,158 +219,69 @@ pub struct CompiledPlan {
     pub verification_config: VerificationConfig,
     pub loop_configs: Vec<LoopConfig>,
 }
-
-pub struct PlanNode {
-    pub work_unit: WorkUnit,
-    pub status: NodeStatus,
-}
 ```
 
-**Key methods:**
-- `work_units_ordered() -> Vec<WorkUnit>`: Kahn's topo-sort
-- `hash() -> String`: stable checkpoint ID
+Key methods: `work_units_ordered` (Kahn topo-sort), `from_work_units`, `hash`.
 
 ---
 
-## 10. Grammar Syntax Notes
+## 10. Grammar Syntax
 
 ### Literals
 
 ```
-String:   "double quoted" or #"raw block"#
-Identifier: [a-zA-Z_][a-zA-Z0-9_]*
-List:     [item1 item2 item3]
-Number:   0-255 (for tiers, retries)
-Boolean:  true/false
-Path:     src/foo.rs, *.rs, **/*.py
+"double-quoted"   #"raw block"#           // strings
+[a b c]                                     // lists
+0..255                                      // numbers (tiers, retries)
+true / false                                // booleans
+src/foo.rs   *.rs   **/*.py                 // path globs
 ```
 
-### Keywords
+### Top-level declarations
 
-**Declaration:**
-`client`, `agent`, `workflow`
+`client`, `agent`, `workflow`, `prompt`, `vars`, `tier <alias> <client>`.
 
-**Scope:**
-`scope`, `owned`, `read_only`, `interface_contract`
+### Client
 
-**Memory:**
-`memory`, `read_from`, `write_to`, `importance`, `read_query`, `read_limit`
+`tier`, `model`, `effort`, `privacy`, `extra { "k" "v" }`, `default`.
 
-**Context:**
-`context`, `callers_of`, `tests_for`, `depth`, `impact_scope`
+### Agent
 
-**Verification:**
-`verify`, `compilation`, `tests`, `diffs`, `impact_tests`
+`description`, `client` | `tier`, `scope { owned read_only impact_scope }`, `memory { read_ns write_ns importance staleness_sources read_query read_limit write_content }`, `context { callers_of tests_for depth }`, `depends_on [...]`, `prompt "…"` | `prompt <name>`, `max_retries`, `vars { KEY "v" }`.
 
-**Iteration:**
-`strategy` (e.g., `best_of_3`), `max_retries`, `attempts`, `test_first`, `escalate_after`
+### Workflow
 
-**Execution:**
-`depends_on`, `max_parallel`, `tier`, `privacy`
+`steps [...]` (agents or `loop { ... }` blocks), `max_parallel`, `strategy` (`single_pass | refine | best_of_N`), `verify`, `memory`, `max_retries`, `attempts`, `test_first`, `escalate_after`.
 
-**Loops:**
-`loop`, `until`, `max_iterations` (verify | agent | command)
+### Loop
 
-### Deprecated Tier Names
-
-Legacy names still parse but normalize to new tiers:
-
-```
-coordinator     → expensive tier
-reasoning       → expensive tier
-execution       → cheap tier
-mechanical      → cheap tier
-```
+`agents`, `max_iterations`, `iter_start`, `stability`, `judge_timeout`, `strict_judge`, `until verify { ... }` | `until agent <name>` | `until command <string>`.
 
 ---
 
-## 11. Integration with gaviero-core
-
-CompiledPlan directly consumed by:
+## 11. Integration
 
 ```
-gaviero_core::swarm::pipeline::execute(plan, config, memory, observer)
+gaviero_core::swarm::pipeline::execute(plan, config, memory, observer, …)
 ```
 
-No transformation needed. All plan data structures (`WorkUnit`, `PlanNode`, `CompiledPlan`) shared between `gaviero-dsl` and `gaviero-core`.
+consumes `CompiledPlan` directly. `WorkUnit`, `PlanNode`, `FileScope`, `ModelTier`, and `PrivacyLevel` live in `gaviero-core` and are shared — no intermediate representation.
 
 ---
 
 ## 12. Concurrency & Safety
 
-**Single-threaded compilation.** No async, no Mutex.
-
-**Safety:**
-- Source spans preserved throughout
-- All errors include context
-- No panics in public API (returns `Result`)
+Compilation is single-threaded, no async, no locks. All errors return `Result`; no panics in the public API. Source spans are preserved end-to-end.
 
 ---
 
 ## 13. Dependencies
 
-- **gaviero-core** — `CompiledPlan`, `WorkUnit`, `PlanNode`, `FileScope`, `ModelTier`, `PrivacyLevel`
-- **logos** — lexer generation
-- **chumsky** — parser combinators
-- **miette** — error diagnostics with source spans
-- **thiserror** — error type derivation
-- **serde** — serialization (if needed)
+- `gaviero-core` — `CompiledPlan`, `WorkUnit`, `FileScope`, `path_pattern`, types
+- `logos` — lexer
+- `chumsky` — parser combinators
+- `miette` + `thiserror` — diagnostics
 
 ---
 
-## 14. Example Compilation
-
-```gaviero
-client opus {
-  tier expensive
-  model claude:opus
-  privacy public
-}
-
-agent parse_config {
-  client opus
-  description "Extract configuration schema from source"
-  
-  scope {
-    owned [src/ docs/]
-    read_only [Cargo.toml]
-  }
-  
-  memory {
-    read_from [module]
-    write_to module
-    importance 0.8
-  }
-  
-  context {
-    tests_for [src/config.rs]
-    depth 2
-  }
-  
-  depends_on []
-  
-  prompt #"
-    Extract the config struct definition and generate JSON schema.
-  "#
-}
-
-workflow main {
-  steps [parse_config]
-  max_parallel 1
-  strategy best_of_2
-  verify {
-    compilation true
-  }
-}
-```
-
-**Compilation result:**
-- One `WorkUnit` for `parse_config`
-- CompiledPlan with single-node DAG
-- IterationConfig: `best_of_2`
-- VerificationConfig: `verify_compilation=true`
-- Ready for execution
-
----
-
-See [CLAUDE.md](CLAUDE.md) for build, test, conventions.
+See [CLAUDE.md](CLAUDE.md) for build & conventions, and the examples in `examples/` (`plan_refinement.gaviero`, `update_docs.gaviero`, `phased_plan.gaviero`) for `prompt`, `vars`, `tier`-alias, loop, and `extra` usage.

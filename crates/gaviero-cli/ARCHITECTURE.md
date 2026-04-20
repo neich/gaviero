@@ -1,483 +1,227 @@
 # gaviero-cli — Architecture
 
-Headless CLI runner. Thin wrapper around `gaviero-core` with argument parsing and observer wiring.
+Headless runner. `clap` front end + observer wiring; all runtime work delegates to `gaviero-core` and `gaviero-dsl`.
 
 ---
 
-## 1. Design Philosophy
+## 1. Design
 
-**Intentionally minimal.** All logic in `gaviero-core`.
+Intentionally minimal:
+- Parse flags with `clap`.
+- Construct one input plan (one of four shapes).
+- Wire `AcpObserver` / `SwarmObserver` to stderr.
+- Delegate to `gaviero_core::swarm::pipeline::execute` or `swarm::coordinator`.
+- Write results to stdout (text or JSON).
 
-- Parse CLI flags with `clap`
-- Build one of 3 input plan shapes
-- Wire up observers (AcpObserver, SwarmObserver)
-- Delegate execution to core
-- Print results to stdout (JSON/text)
-
-**No state management, no caching, no business logic in this crate.**
-
----
-
-## 2. File Structure
-
-```
-gaviero-cli/src/
-└─ main.rs      ~500 LOC: Cli struct, observers, execution
-```
+Single source file: `src/main.rs` (~1 KLOC) containing `Cli`, `CliAcpObserver`, `CliSwarmObserver`, and `run()`.
 
 ---
 
-## 3. Execution Flow
+## 2. Execution Flow
 
 ```
-Parse CLI args (clap)
-  │
-  ├─ Load Workspace
-  ├─ Resolve workspace root + settings
-  └─ Initialize memory store (best-effort)
-      │
-      ├─ Choose input mode:
-      │   ├─ --task <text>
-      │   │   → Synthetic WorkUnit
-      │   │   → Model resolved from --model or workspace default
-      │   │
-      │   ├─ --work-units <json>
-      │   │   → Deserialize JSON array of WorkUnit objects
-      │   │   → Use as-is
-      │   │
-      │   └─ --script <path>
-      │       → gaviero_dsl::compile(source, ...)
-      │       → Produces CompiledPlan
-      │
-      ├─ Apply CLI iteration overrides
-      │   ├─ --max-retries N
-      │   ├─ --attempts N
-      │   ├─ --test-first
-      │   └─ --escalate-after M
-      │
-      └─ Choose execution:
-          ├─ IF --coordinated
-          │   ├─ swarm::coordinator::plan_coordinated()
-          │   │   → NLP task decomposition (Opus-powered)
-          │   │   → Produces CompiledPlan
-          │   ├─ Write to gaviero_plan.txt or stdout
-          │   └─ Exit (no execution)
-          │
-          └─ ELSE
-              ├─ swarm::pipeline::execute(plan, config, memory, observer, ...)
-              │
-              ├─ Print SwarmResult to stdout
-              │
-              └─ Exit with status: 0 (success) / 1 (failure)
+parse Cli (clap)
+   │
+   ├─ open Workspace + settings (`gaviero_core::workspace`)
+   ├─ init MemoryStore (best-effort; continues on failure)
+   │
+   ├─ input mode:
+   │     ┌─ --task <text>          → synthetic WorkUnit (full repo scope)
+   │     ├─ --work-units <json>    → Vec<WorkUnit> (serde)
+   │     ├─ --script <path>        → gaviero_dsl::compile_with_vars(...)
+   │     └─ --graph                → build/update repo-map, print stats, exit
+   │
+   ├─ apply iteration overrides  (--max-retries, --attempts,
+   │                              --test-first, --escalate-after, --no-iterate)
+   │
+   ├─ --coordinated?
+   │     yes → swarm::coordinator::plan_coordinated → write .gaviero, exit
+   │     no  → swarm::pipeline::execute
+   │
+   └─ print SwarmResult (text or JSON) → exit(0/1)
 ```
 
 ---
 
-## 4. Input Modes
+## 3. Input Modes
 
 ### `--task <text>`
 
-**Creates a synthetic WorkUnit:**
-
-```rust
-let unit = WorkUnit {
-    id: "task".to_string(),
-    description: text.to_string(),
-    scope: FileScope {
-        owned_paths: vec![".".to_string()],  // full repo
-        read_only_paths: vec![],
-        interface_contracts: Default::default(),
-    },
-    depends_on: vec![],
-    coordinator_instructions: text.to_string(),
-    model: resolved_model.clone(),  // from --model or workspace
-    tier: ModelTier::Cheap,         // default
-    privacy: PrivacyLevel::Public,  // default
-    max_retries: 1,                 // default
-    escalation_tier: None,
-    // ... other fields default
-};
-
-let plan = CompiledPlan::from_work_units(vec![unit])?;
-```
+Creates a synthetic `WorkUnit` with scope `owned_paths = ["."]`, `tier=Cheap`, `privacy=Public`, model from `--model` or workspace default. Wrapped in a single-node `CompiledPlan::from_work_units(vec![unit])`.
 
 ### `--work-units <json>`
 
-**Deserialize JSON array:**
-
-```json
-[
-  {
-    "id": "parse_ast",
-    "description": "Parse Python AST",
-    "scope": {
-      "owned_paths": ["src/parser/"],
-      "read_only_paths": []
-    },
-    "depends_on": [],
-    "model": "claude:opus",
-    ...
-  },
-  ...
-]
-```
-
-Parsed into `Vec<WorkUnit>`, then `CompiledPlan::from_work_units()`.
+`serde_json::from_str::<Vec<WorkUnit>>` then `CompiledPlan::from_work_units`.
 
 ### `--script <path>`
 
-**Compile `.gaviero` DSL file:**
-
 ```rust
 let source = fs::read_to_string(path)?;
-let plan = gaviero_dsl::compile(&source, path, workflow, runtime_prompt)?;
-```
-
-**This path supports provider-aware model strings in DSL:**
-```
-client sonnet { model claude:sonnet }
-client local { model ollama:llama2 }
-agent task1 { client sonnet }
-```
-
----
-
-## 5. Observers
-
-### CliAcpObserver
-
-Prints agent stream events to stderr:
-
-```rust
-pub struct CliAcpObserver;
-
-impl AcpObserver for CliAcpObserver {
-    fn on_stream_chunk(&self, chunk: &str) {
-        eprintln!("[agent] {}", chunk);
-    }
-    
-    fn on_tool_call_started(&self, tool_name: &str, tool_use_id: &str) {
-        eprintln!("[tool] {} ({})", tool_name, tool_use_id);
-    }
-    
-    fn on_message_complete(&self, stats: &MessageStats) {
-        eprintln!("[done] {} tokens, ${:.4}", stats.output_tokens, stats.cost_usd);
-    }
-    
-    // ... other callbacks log to stderr
-}
-```
-
-### CliSwarmObserver
-
-Prints swarm phases to stderr:
-
-```rust
-pub struct CliSwarmObserver;
-
-impl SwarmObserver for CliSwarmObserver {
-    fn on_phase_changed(&self, phase: &str) {
-        eprintln!("[swarm] phase: {}", phase);
-    }
-    
-    fn on_agent_state_changed(&self, unit_id: &str, status: AgentStatus) {
-        eprintln!("[unit] {}: {:?}", unit_id, status);
-    }
-    
-    fn on_tier_started(&self, tier: usize, units: &[WorkUnit]) {
-        eprintln!("[tier] {} ({} units)", tier, units.len());
-    }
-    
-    fn on_tier_dispatch(&self, tier: usize, unit_ids: &[String]) {
-        eprintln!("[dispatch] tier {}: {:?}", tier, unit_ids);
-    }
-    
-    fn on_completed(&self, result: &SwarmResult) {
-        eprintln!("[complete] success: {}", result.success);
-    }
-    
-    // ... other callbacks
-}
-```
-
-**Key pattern:** All events to stderr, so stdout remains clean for structured output (JSON).
-
----
-
-## 6. Model Resolution
-
-### Model Spec Parsing
-
-The CLI accepts `--model <spec>` in several formats:
-
-```
-sonnet                  → implicit "claude:sonnet"
-claude:opus             → Claude API (Opus)
-claude:sonnet           → Claude API (Sonnet)
-claude:haiku            → Claude API (Haiku)
-ollama:llama2           → Local Ollama + model name
-ollama:neural-chat      → Local Ollama + model name
-codex:http://localhost:8000  → OpenAI-compatible endpoint
-local:http://localhost:8000  → Alias for codex
-```
-
-Validated via `gaviero_core::swarm::backend::shared::validate_model_spec()`.
-
-### Tier/Provider Mapping
-
-`TierRouter` resolves `(ModelTier, PrivacyLevel)` to concrete backend:
-
-```
-Cheap + Public      → Claude Haiku
-Expensive + Public  → Claude Sonnet or Opus
-LocalOnly           → Ollama (if available) or error
-```
-
-If `--model` specifies provider directly, it overrides tier mapping.
-
----
-
-## 7. Iteration Overrides
-
-CLI flags can override `CompiledPlan` iteration config:
-
-```
---max-retries 5         IterationConfig::max_retries = 5
---attempts 3            IterationConfig::attempts = 3 (best_of_3)
---test-first            IterationConfig::test_first = true
---escalate-after 2      IterationConfig::escalate_after = 2
-```
-
-Applied **after** parsing input plan:
-
-```rust
-if let Some(max_retries) = args.max_retries {
-    iteration_config.max_retries = max_retries;
-}
-if let Some(attempts) = args.attempts {
-    iteration_config.strategy = Strategy::BestOfN(attempts);
-}
-// ... etc
-```
-
----
-
-## 8. Coordinated Mode
-
-`--coordinated` flag triggers planning without execution:
-
-```
-gaviero-cli --task "Refactor parser module" --coordinated --model claude:opus
-```
-
-**Execution:**
-
-```rust
-let plan = swarm::coordinator::plan_coordinated(
-    &task_description,
-    &workspace,
-    memory.as_ref(),
-    coordinator_model,
+let plan = gaviero_dsl::compile_with_vars(
+    &source, path, workflow, runtime_prompt, &override_vars,
 )?;
-
-// Write output
-println!("{}", plan.to_dsl());  // Renders CompiledPlan as .gaviero
-
-// Exit (no execution)
 ```
 
-**Output:** `.gaviero` script suitable for review, modification, and `--script` input.
+- `--workflow <name>` selects a workflow when the script declares multiple.
+- `--prompt-file <path>` reads the file's contents and supplies them as `runtime_prompt` (substituted for every `{{PROMPT}}`; also used as the full prompt for agents without a `prompt` field).
+- `--var KEY=VALUE` (repeatable) overrides entries in the script's top-level `vars {}`; CLI overrides beat script-level vars but not agent-level vars.
+
+### `--graph`
+
+Builds or refreshes the code knowledge graph (`gaviero_core::repo_map`), prints statistics, then exits without running agents. Honours `--exclude` (comma-separated or repeated, bare names match basename at any depth; `/`-containing values are globs).
 
 ---
 
-## 9. Output Modes
+## 4. Observers
 
-### Text (default)
+### `CliAcpObserver`
 
-Human-readable summary printed to stdout:
+Prints stream chunks, tool calls, validation results, retries, and deferred proposals to stderr. Mirrors the agent-chat output the TUI renders, so CI logs are readable.
 
-```
-Swarm Result
-============
-Success: true
-Units completed: 3/3
-Execution time: 45.2s
-Total cost: $0.32
+### `CliSwarmObserver`
 
-Manifests:
-- parse_config (completed, 2 attempts)
-- build_schema (completed, 1 attempt)
-- write_docs (completed, 1 attempt)
+Prints phase, agent state, tier start/dispatch, merge conflicts, cost updates, and completion to stderr.
 
-Merge: Success (3 branches merged, 0 conflicts)
-```
-
-### JSON (`--format json`)
-
-Structured output:
-
-```json
-{
-  "success": true,
-  "manifests": [
-    {
-      "unit_id": "parse_config",
-      "status": "completed",
-      "attempts": 2,
-      "cost_usd": 0.12
-    },
-    ...
-  ],
-  "merge_results": [...],
-  "total_cost_usd": 0.32,
-  "total_time_secs": 45.2
-}
-```
-
-Suitable for CI integration, log aggregation, or tooling.
+All events route to stderr so stdout stays clean for structured output (`--format json`).
 
 ---
 
-## 10. Resume Checkpoint
+## 5. Model Resolution
 
-`--resume` flag loads execution state from checkpoint:
+Model spec passed via `--model` (or the DSL `client` decl) is parsed by `gaviero_core::swarm::backend::shared::backend_config_for_model`:
 
 ```
-gaviero-cli --script plan.gaviero --resume
+sonnet | opus | haiku       → claude:<same>
+claude:<name>               → Claude API (ACP)
+ollama:<name>               → Ollama HTTP SSE
+codex:<name>                → Codex (codex exec / app-server)
+local:<url>                 → OpenAI-compatible endpoint
 ```
 
-**Behavior:**
+Validation via `validate_model_spec`. `--coordinator-model` picks the planner model for `--coordinated`. `--ollama-base-url` overrides the Ollama endpoint (defaults to workspace setting, then `http://localhost:11434`).
 
-1. Load `.gaviero/state/{plan_hash}.json`
-2. Find completed nodes in ExecutionState
-3. Skip them; resume at next pending node
-4. Continue execution
-5. Update checkpoint after each node
-
-**Checkpoint format:** JSON serialization of `ExecutionState`:
-
-```json
-{
-  "plan_hash": "abc123def456",
-  "nodes": [
-    { "node_id": "parse_config", "status": "completed" },
-    { "node_id": "build_schema", "status": "pending" }
-  ]
-}
-```
+`TierRouter` maps `(ModelTier, PrivacyLevel)` to a concrete backend; `PrivacyScanner` can promote a unit to `LocalOnly` based on glob matches against sensitive paths.
 
 ---
 
-## 11. Memory Integration
+## 6. Iteration Overrides
 
-Memory store initialized best-effort:
+| Flag | Effect on `IterationConfig` |
+|---|---|
+| `--max-retries N` | inner-loop retries per attempt (default 5) |
+| `--attempts N` | independent attempts → `Strategy::BestOfN(N)` |
+| `--test-first` | TDD red phase before the edit loop |
+| `--escalate-after M` | escalate tier after M failed attempts |
+| `--no-iterate` | single pass (overrides `--max-retries`) |
 
-```rust
-let memory = match memory::init_workspace(&workspace).await {
-    Ok(store) => Some(Arc::new(store)),
-    Err(e) => {
-        eprintln!("Warning: memory init failed: {}", e);
-        None
-    }
-};
-```
-
-If memory unavailable, execution continues (non-fatal).
+Applied after the `CompiledPlan` is produced, before `pipeline::execute`.
 
 ---
 
-## 12. Exit Codes
+## 7. Coordinated Mode
+
+```
+gaviero-cli --task "..." --coordinated --model claude:opus
+```
+
+Calls `swarm::coordinator::plan_coordinated(task, workspace, memory, coordinator_model)` which emits a `CompiledPlan`. The plan is serialised back to `.gaviero` form and written to `--output` or `tmp/gaviero_plan_<timestamp>.gaviero`. No agents run — the output is meant for review before a subsequent `--script` invocation.
+
+---
+
+## 8. Resume / Checkpointing
+
+`--resume` loads `.gaviero/state/{plan_hash}.json` (an `ExecutionState`) and skips nodes marked `Completed`. The plan hash comes from `CompiledPlan::hash` so changing the script produces a fresh checkpoint file.
+
+---
+
+## 9. Memory Integration
+
+`MemoryStore::init` is best-effort; failure is non-fatal and logged. `--namespace` overrides the write namespace (default: settings → folder name), `--read-ns` adds additional read namespaces (repeatable). `--no-memory` bypasses memory entirely.
+
+---
+
+## 10. Output & Exit Codes
+
+- `--format text` (default): human-readable summary (phases, manifests, merge results, cost, duration).
+- `--format json`: structured `SwarmResult` JSON for CI ingestion.
+- `--output <path>`: write to a file instead of stdout.
 
 | Code | Meaning |
 |---|---|
-| 0 | Success: all agents completed, all verification passed |
-| 1 | Failure: agent failed, validation failed, or execution aborted |
-| 2 | Argument error: invalid flags, missing required input |
-| 3 | Setup error: workspace not found, memory init panic, etc. |
+| 0 | success |
+| 1 | failure (agent, validation, merge, or abort) |
+| 2 | argument error (invalid flags) |
+| 3 | setup error (workspace / memory init / panic) |
 
 ---
 
-## 13. CLI Flags Reference
+## 11. Flag Reference
 
 ### Input
-
 ```
---task <text>           Single task (full repo scope)
---work-units <json>     JSON array of WorkUnit objects
---script <path>         .gaviero DSL file
---workflow <name>       Select workflow (if multiple in DSL file)
+--task <text>              single synthetic WorkUnit (full repo scope)
+--work-units <json>        Vec<WorkUnit> as JSON
+--script <path>            .gaviero DSL script
+--workflow <name>          select workflow (multi-workflow scripts)
+--prompt-file <path>       file contents become {{PROMPT}} / default prompt
+--var KEY=VALUE            override script-level vars (repeatable)
 ```
 
-### Execution Control
-
+### Execution
 ```
---model <spec>          Model string (default: sonnet)
---auto-accept           Skip interactive review
---resume                Resume from checkpoint
---max-retries N         Override iteration max_retries
---attempts N            Best-of-N strategy
---test-first            TDD red phase
---escalate-after M      Escalate model after N attempts
+--model <spec>             sonnet / opus / claude:X / codex:X / ollama:X / local:URL
+--coordinator-model <spec> planner model for --coordinated
+--ollama-base-url <url>    override Ollama endpoint
+--auto-accept              skip interactive review
+--resume                   resume from checkpoint
+--max-retries N            inner-loop retries (default 5)
+--attempts N               BestOfN
+--test-first               TDD red phase
+--no-iterate               single pass
+--escalate-after M         escalate tier after M attempts
+--max-parallel N           parallel agents (currently sequential)
 ```
 
 ### Memory
-
 ```
---namespace <name>      Write namespace (default: module)
---read-ns <name>        Override read namespace
---no-memory             Disable memory entirely
+--namespace <name>         write namespace
+--read-ns <name>           additional read namespace (repeatable)
+--no-memory                disable memory
+```
+
+### Repo map
+```
+--graph                    build/update code knowledge graph and exit
+--exclude <glob>           folder/glob to skip (comma-separated or repeatable)
 ```
 
 ### Coordination
-
 ```
---coordinated           Generate .gaviero plan only (no execute)
---coordinator-model <spec>  Model for planning (default: opus)
-```
-
-### Output
-
-```
---format <text|json>    Output format (default: text)
---output <path>         Write output to file (default: stdout)
+--coordinated              emit .gaviero plan only (no execution)
+--output <path>            output path for --coordinated (default: tmp/...)
 ```
 
-### Config
-
+### Output / diagnostics
 ```
---settings <path>       Override workspace settings file
---debug                 Enable debug logging (RUST_LOG=debug)
+--format <text|json>       output format
+--trace <path>             JSON trace log (enables DEBUG tracing)
+--repo <path>              repository / workspace root (default: .)
 ```
 
 ---
 
-## 14. Dependencies
+## 12. Error Reporting
 
-- **gaviero-core:** all runtime logic
-- **gaviero-dsl:** DSL compilation
-- **clap:** argument parsing (derive macros)
-- **tokio:** async runtime
-- **serde/serde_json:** JSON deserialization
-- **miette:** error formatting
+Compilation errors (`miette::Report` from `gaviero-dsl`) print with source spans to stderr. Runtime errors surface through observer callbacks; fatal errors use `anyhow::Context` all the way up and exit with the appropriate code.
 
 ---
 
-## 15. Error Messages
+## 13. Dependencies
 
-All errors printed to stderr with context:
-
-```
-error: invalid model spec
-  expected: "model:variant" or plain name
-  got: "badmodel::"
-  
-error: workspace not found
-  searched: .gaviero-workspace, ~/.config/gaviero/settings.json
-  
-error: compilation failed
-  [source miette diagnostic from dsl]
-```
+- `gaviero-core`, `gaviero-dsl`
+- `clap` (derive), `tokio`, `serde` / `serde_json`
+- `miette` + `anyhow` — diagnostics / error propagation
 
 ---
 
-See [CLAUDE.md](CLAUDE.md) and [README.md](README.md) for flags examples and use cases.
+See [CLAUDE.md](CLAUDE.md) for conventions and [README.md](README.md) for end-to-end examples.

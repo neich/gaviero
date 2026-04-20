@@ -32,6 +32,7 @@ Most tests run offline. Some (marked `#[ignore]`) require network for Ollama hea
 Model selection uses a unified convention across chat and swarm execution:
 
 - **Claude models** — `sonnet`, `opus`, `haiku` (shorthand) or `claude:sonnet`, `claude-code:haiku` (explicit)
+- **Codex** — `codex:<model>` (e.g., `codex:gpt-5.4`) — routed to the Codex backend
 - **Ollama/local** — `ollama:qwen2.5-coder:7b` or `local:model-name`
 - **Default** — unprefixed names route to Claude for backward compatibility
 
@@ -97,11 +98,15 @@ println!("{}", plan.to_gaviero_script()?);  // Reviewable .gaviero format
 |---|---|
 | `acp/` | Claude subprocess protocol (ACP), session factory, prompt enrichment, file block routing |
 | `swarm/` | Multi-agent orchestration, tier routing, DAG execution, verification, git merge, backends |
+| `agent_session/` | Per-agent session lifecycle, state tracking, ACP session wiring |
+| `context_planner/` | Context selection planning: repo-map queries, callers_of, tests_for resolution |
+| `session_state/` | Persistent session state (checkpoint/resume, history) |
 | `iteration/` | Retry loops, escalation, best-of-N strategy |
 | `validation_gate/` | Syntax validation (tree-sitter), compilation checks (cargo), test verification |
 | `write_gate/` | Diff review, hunk acceptance/rejection, scope enforcement |
 | `memory/` | 5-level hierarchical scoped embeddings (ONNX + SQLite + RRF search) |
 | `repo_map/` | PageRank-based context ranking, code graph, symbol resolution |
+| `path_pattern/` | Glob-style path pattern matching and scope overlap detection for DSL validation |
 | `workspace/` | Settings cascade, namespace resolution, project configuration |
 | `git/` | Git2 wrapper, worktree management, merge + conflict resolution |
 | `terminal/` | PTY lifecycle, OSC 133 parsing, interactive shell sessions |

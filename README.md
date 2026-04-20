@@ -203,12 +203,14 @@ In coordinated mode, model selection is automatic — Opus plans the task, then 
 | `--repo PATH` | Workspace root (default: current directory) |
 | `--task TEXT` | Task description (creates one agent) |
 | `--script FILE` | Compile and execute a `.gaviero` workflow file |
+| `--prompt-file FILE` | File contents replace `{{PROMPT}}` in DSL script (requires `--script`) |
+| `--var KEY=VALUE` | Override a `vars {}` entry in a DSL script (repeatable, requires `--script`) |
 | `--work-units JSON` | WorkUnit array for multi-agent tasks |
 | `--coordinated` | Use Opus to plan, then tier-routed execution (ignores `--model`) |
 | `--output PATH` | Output path for generated plan file (`--coordinated` only) |
 | `--auto-accept` | Skip interactive review |
 | `--max-parallel N` | Parallel agent limit (default: 1) |
-| `--model NAME` | Claude model for single-agent mode (default: sonnet) |
+| `--model NAME` | Model spec: `sonnet`, `opus`, `codex:<model>`, `ollama:<model>` (default: sonnet) |
 | `--namespace NS` | Memory write namespace |
 | `--read-ns NS` | Additional read namespaces (repeatable) |
 | `--format text\|json` | Output format |
@@ -218,20 +220,33 @@ In coordinated mode, model selection is automatic — Opus plans the task, then 
 | `--no-iterate` | Single pass only — disables retry loop |
 | `--resume` | Skip already-completed agents from a prior run |
 | `--trace FILE` | Write DEBUG-level JSON trace log |
+| `--graph` | Build/update code knowledge graph and exit |
+| `--exclude PATTERN` | Exclude folders from repo-map scanning (repeatable, comma-separated) |
 
 ## Workflow Scripts (DSL)
 
 Define reusable multi-agent workflows in `.gaviero` files. The Gaviero DSL compiles declarative workflows into execution plans run by the swarm engine. Learn more in [crates/gaviero-dsl/README.md](crates/gaviero-dsl/README.md).
 
 ```gaviero
-client sonnet { tier cheap  model "claude-sonnet-4-6" }
-client opus   { tier expensive model "claude-opus-4-7" }
+client sonnet { tier cheap     model "claude-sonnet-4-6" effort low  default }
+client opus   { tier expensive model "claude-opus-4-7"   effort high }
+
+tier cheap     sonnet
+tier expensive opus
+
+vars {
+    PLANS "plans"
+}
+
+prompt review-instructions #"
+    Review the code changes in {{PROMPT}} and list all bugs and style issues.
+"#
 
 agent reviewer {
     description "Review the PR and identify issues"
     client opus
     scope { read_only ["src/" "tests/"] }
-    prompt "Review the code changes and list all bugs and style issues."
+    prompt review-instructions
 }
 
 agent fixer {
