@@ -48,36 +48,19 @@ pub(super) fn handle_review_action(app: &mut App, action: &Action) -> bool {
             true
         }
         Action::InsertChar('f') if is_interactive => {
-            let review = app.diff_review.take().unwrap();
-            let mut proposal = review.proposal;
-            for hunk in &mut proposal.structural_hunks {
-                if hunk.status == gaviero_core::types::HunkStatus::Pending {
-                    hunk.status = gaviero_core::types::HunkStatus::Accepted;
-                }
-            }
-            let content = gaviero_core::write_gate::assemble_final_content(&proposal);
-            let path = proposal.file_path.clone();
-
-            if let Err(e) = std::fs::write(&path, &content) {
-                tracing::error!("Failed to write finalized file {}: {}", path.display(), e);
-            } else {
-                for buf in &mut app.buffers {
-                    if buf.path.as_deref() == Some(path.as_path()) {
-                        let _ = buf.reload();
-                    }
-                }
-            }
-
-            let wg = app.write_gate.clone();
-            let id = proposal.id;
-            tokio::spawn(async move {
-                let mut gate = wg.lock().await;
-                gate.finalize(id);
-            });
+            finalize_current_review(app);
             true
         }
-        Action::InsertChar('q') | Action::Quit => {
+        Action::InsertChar('q') => {
             app.diff_review = None;
+            true
+        }
+        Action::Quit => {
+            // Ctrl+Q routes through the quit-confirm dialog; it sees the
+            // pending review and offers accept-and-quit / reject-and-quit /
+            // cancel. Plain `q` keeps the "dismiss review" behavior above so
+            // muscle memory isn't broken.
+            super::session::try_quit(app);
             true
         }
         Action::CursorDown | Action::InsertChar('j') => {
@@ -107,6 +90,41 @@ pub(super) fn handle_review_action(app: &mut App, action: &Action) -> bool {
             false
         }
     }
+}
+
+/// Accept every pending hunk, write the finalized content to disk, reload any
+/// open buffer pointing at that file, and finalize the write gate. Used by
+/// the `f` key in review and by the quit-confirm "accept & quit" path.
+pub(super) fn finalize_current_review(app: &mut App) {
+    let review = match app.diff_review.take() {
+        Some(r) => r,
+        None => return,
+    };
+    let mut proposal = review.proposal;
+    for hunk in &mut proposal.structural_hunks {
+        if hunk.status == gaviero_core::types::HunkStatus::Pending {
+            hunk.status = gaviero_core::types::HunkStatus::Accepted;
+        }
+    }
+    let content = gaviero_core::write_gate::assemble_final_content(&proposal);
+    let path = proposal.file_path.clone();
+
+    if let Err(e) = std::fs::write(&path, &content) {
+        tracing::error!("Failed to write finalized file {}: {}", path.display(), e);
+    } else {
+        for buf in &mut app.buffers {
+            if buf.path.as_deref() == Some(path.as_path()) {
+                let _ = buf.reload();
+            }
+        }
+    }
+
+    let wg = app.write_gate.clone();
+    let id = proposal.id;
+    tokio::spawn(async move {
+        let mut gate = wg.lock().await;
+        gate.finalize(id);
+    });
 }
 
 pub(super) fn enter_review_mode(app: &mut App, proposal: WriteProposal, source: DiffSource) {

@@ -909,10 +909,20 @@ pub(super) fn render_quit_confirm(app: &App, frame: &mut Frame, area: Rect) {
         .map(|a| a.id.clone())
         .collect();
 
+    let pending_review = app
+        .diff_review
+        .as_ref()
+        .map(|r| r.proposal.file_path.display().to_string());
+
     let mut lines: Vec<String> = Vec::new();
     lines.push(String::new());
     lines.push("  Quit gaviero?".to_string());
     lines.push(String::new());
+    if let Some(ref path) = pending_review {
+        lines.push("  Pending diff review:".to_string());
+        lines.push(format!("    • {}", path));
+        lines.push(String::new());
+    }
     if !unsaved.is_empty() {
         lines.push("  Unsaved files:".to_string());
         for name in &unsaved {
@@ -934,7 +944,14 @@ pub(super) fn render_quit_confirm(app: &App, frame: &mut Frame, area: Rect) {
         }
         lines.push(String::new());
     }
-    lines.push("  [y] Quit anyway   [n / Esc] Cancel".to_string());
+    if pending_review.is_some() {
+        lines.push(
+            "  [a] Accept & quit   [r] Reject & quit   [y] Quit anyway   [n / Esc] Cancel"
+                .to_string(),
+        );
+    } else {
+        lines.push("  [y] Quit anyway   [n / Esc] Cancel".to_string());
+    }
     lines.push(String::new());
 
     let dialog_w: u16 = lines
