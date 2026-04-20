@@ -52,7 +52,7 @@ client sonnet {
 // as PREV_ITER (iter_start 2 → PREV_ITER=1 on loop iteration 1).
 
 vars {
-    PLANS    "plans"
+    OUT_DIR  "plans"
     INIT_VER "1"
 }
 
@@ -72,7 +72,7 @@ prompt init-body #"
 
     {{PROMPT}}
 
-    Think from first principles. Do NOT read any existing files in {{PLANS}}/.
+    Think from first principles. Do NOT read any existing files in {{OUT_DIR}}/.
 
     Cover all of the following:
     - Motivation and goals
@@ -82,7 +82,7 @@ prompt init-body #"
     - Risks and mitigations
     - Alternatives considered and why rejected
 
-    Write your plan to {{PLANS}}/{{MODEL_NAME}}-init-v{{INIT_VER}}.md using
+    Write your plan to {{OUT_DIR}}/{{MODEL_NAME}}-init-v{{INIT_VER}}.md using
     clear markdown with headings. Do not hedge — commit to a design.
 "#
 
@@ -96,19 +96,19 @@ prompt refine-body #"
     `1`, read the `-init-v1.md` files; otherwise read the `-refine-plan-…`
     files.
 
-    1. Read {{PLANS}}/{{MODEL_NAME}}-init-v{{PREV_ITER}}.md (if it exists) or
-       {{PLANS}}/{{MODEL_NAME}}-refine-plan-v{{PREV_ITER}}.md, and the peer's
-       equivalent {{PLANS}}/{{PEER_NAME}}-…-v{{PREV_ITER}}.md, in full.
+    1. Read {{OUT_DIR}}/{{MODEL_NAME}}-init-v{{PREV_ITER}}.md (if it exists) or
+       {{OUT_DIR}}/{{MODEL_NAME}}-refine-plan-v{{PREV_ITER}}.md, and the peer's
+       equivalent {{OUT_DIR}}/{{PEER_NAME}}-…-v{{PREV_ITER}}.md, in full.
     2. Analyse the pair: what does each get right? What does each miss,
        oversimplify, or get wrong? Where do they conflict?
     3. Synthesise a new plan taking the strongest elements of both,
        resolving conflicts with explicit reasoning, and improving on both.
     4. Write your refined plan to
-       {{PLANS}}/{{MODEL_NAME}}-refine-plan-v{{ITER}}.md. Begin with a
+       {{OUT_DIR}}/{{MODEL_NAME}}-refine-plan-v{{ITER}}.md. Begin with a
        '## Synthesis Notes' section: the pair you read, what you adopted from
        each, what you changed or discarded.
     5. Write a concise summary (under 300 words) to
-       {{PLANS}}/{{MODEL_NAME}}-refine-summary-v{{ITER}}.md covering the main
+       {{OUT_DIR}}/{{MODEL_NAME}}-refine-summary-v{{ITER}}.md covering the main
        differences between the two v{{PREV_ITER}} plans and the key choices
        made in this version. Write it for a human skimming the evolution.
 "#
@@ -125,10 +125,10 @@ prompt judge-body #"
     iteration. Use it to focus your reading — if a file is not listed there
     it did not change this pass.
 
-    1. Read {{PLANS}}/claude-refine-plan-v{{ITER}}.md and
-       {{PLANS}}/codex-refine-plan-v{{ITER}}.md in full.
-    2. Read {{PLANS}}/claude-refine-summary-v{{ITER}}.md and
-       {{PLANS}}/codex-refine-summary-v{{ITER}}.md.
+    1. Read {{OUT_DIR}}/claude-refine-plan-v{{ITER}}.md and
+       {{OUT_DIR}}/codex-refine-plan-v{{ITER}}.md in full.
+    2. Read {{OUT_DIR}}/claude-refine-summary-v{{ITER}}.md and
+       {{OUT_DIR}}/codex-refine-summary-v{{ITER}}.md.
     3. If useful, compare against v{{PREV_ITER}} to judge whether the latest
        changes are still material.
     4. Return PASS only if:
@@ -152,10 +152,10 @@ prompt judge-body #"
 // ── Agents ────────────────────────────────────────────────────────────────────
 
 // Ownership uses glob patterns so each phase/model pair owns a disjoint
-// filename namespace inside `plans/`:
-//   plans/<model>-init-v*.md
-//   plans/<model>-refine-plan-v*.md
-//   plans/<model>-refine-summary-v*.md
+// filename namespace inside `{{OUT_DIR}}/`:
+//   {{OUT_DIR}}/<model>-init-v*.md
+//   {{OUT_DIR}}/<model>-refine-plan-v*.md
+//   {{OUT_DIR}}/<model>-refine-summary-v*.md
 // The scope validator checks patterns for real overlap (see
 // `gaviero_core::path_pattern`), so `claude-init-*` and `codex-init-*` are
 // accepted, while collisions within a pattern are still flagged.
@@ -165,7 +165,7 @@ agent claude-init {
     description "Initial plan (Claude): {{PROMPT}}"
     client opus
     scope {
-        owned ["plans/claude-init-*.md"]
+        owned ["{{OUT_DIR}}/claude-init-*.md"]
     }
     prompt init-body
 }
@@ -175,7 +175,7 @@ agent codex-init {
     description "Initial plan (Codex): {{PROMPT}}"
     client codex
     scope {
-        owned ["plans/codex-init-*.md"]
+        owned ["{{OUT_DIR}}/codex-init-*.md"]
     }
     prompt init-body
 }
@@ -185,8 +185,8 @@ agent claude-refine {
     description "Refine plan (Claude): {{PROMPT}}"
     client opus
     scope {
-        owned     ["plans/claude-refine-*.md"]
-        read_only ["plans/"]
+        owned     ["{{OUT_DIR}}/claude-refine-*.md"]
+        read_only ["{{OUT_DIR}}/"]
     }
     prompt refine-body
     memory {
@@ -203,8 +203,8 @@ agent codex-refine {
     description "Refine plan (Codex): {{PROMPT}}"
     client codex
     scope {
-        owned     ["plans/codex-refine-*.md"]
-        read_only ["plans/"]
+        owned     ["{{OUT_DIR}}/codex-refine-*.md"]
+        read_only ["{{OUT_DIR}}/"]
     }
     prompt refine-body
     memory {
@@ -220,7 +220,7 @@ agent convergence-judge {
     description "Judge plan convergence: {{PROMPT}}"
     client sonnet
     scope {
-        read_only ["plans/"]
+        read_only ["{{OUT_DIR}}/"]
     }
     prompt judge-body
 }
