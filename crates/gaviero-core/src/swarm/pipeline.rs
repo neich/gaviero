@@ -38,6 +38,11 @@ pub struct SwarmConfig {
     /// Populated from `@file` references in the user prompt that are not git-tracked
     /// (e.g. `tmp/` plan documents). Each entry is `(rel_path, content)`.
     pub context_files: Vec<(String, String)>,
+    /// Folder names or glob patterns to skip when scanning the workspace for
+    /// repo-map / code-graph building. Bare names (no `/`) match any directory
+    /// basename; entries with `/` are glob-matched against workspace-relative
+    /// paths (see [`crate::path_pattern::matches`]).
+    pub excludes: Vec<String>,
 }
 
 /// Execute a swarm of work units from a compiled plan.
@@ -131,7 +136,12 @@ pub async fn execute(
     observer.on_phase_changed("validating");
 
     // 1. Validate scopes
-    let scope_errors = validation::validate_scopes(&work_units);
+    let loop_groups: Vec<Vec<String>> = plan
+        .loop_configs
+        .iter()
+        .map(|lc| lc.agent_ids.clone())
+        .collect();
+    let scope_errors = validation::validate_scopes(&work_units, &loop_groups);
     if !scope_errors.is_empty() {
         let msg = scope_errors
             .iter()
@@ -184,7 +194,7 @@ pub async fn execute(
                 ))
             };
         let single_repo_map: Arc<Option<crate::repo_map::RepoMap>> = Arc::new(
-            crate::repo_map::RepoMap::build(&config.workspace_root)
+            crate::repo_map::RepoMap::build(&config.workspace_root, &config.excludes)
                 .map_err(|e| {
                     tracing::debug!("repo_map build skipped: {}", e);
                     e
@@ -193,7 +203,7 @@ pub async fn execute(
         );
         // Pre-compute impact analysis for the single agent
         let single_impact_text: Option<String> =
-            crate::repo_map::graph_builder::build_graph(&config.workspace_root)
+            crate::repo_map::graph_builder::build_graph(&config.workspace_root, &config.excludes)
                 .map(|(store, result)| {
                     tracing::info!(
                         "code graph: {} nodes, {} edges ({} files changed, {} unchanged)",
@@ -288,6 +298,7 @@ pub async fn execute(
             &plan.verification_config,
             std::slice::from_ref(&manifest),
             &config.workspace_root,
+            &config.excludes,
             observer,
         )
         .await?;
@@ -329,7 +340,7 @@ pub async fn execute(
 
     // Build repo map once for context optimization (best-effort; failures are non-fatal)
     let repo_map: Arc<Option<crate::repo_map::RepoMap>> = Arc::new(
-        crate::repo_map::RepoMap::build(&config.workspace_root)
+        crate::repo_map::RepoMap::build(&config.workspace_root, &config.excludes)
             .map_err(|e| {
                 tracing::debug!("repo_map build skipped: {}", e);
                 e
@@ -342,7 +353,7 @@ pub async fn execute(
     // and share them as a Send-safe HashMap.
     let impact_texts: Arc<std::collections::HashMap<String, String>> = Arc::new({
         let mut map = std::collections::HashMap::new();
-        match crate::repo_map::graph_builder::build_graph(&config.workspace_root) {
+        match crate::repo_map::graph_builder::build_graph(&config.workspace_root, &config.excludes) {
             Ok((store, result)) => {
                 tracing::info!(
                     "code graph: {} nodes, {} edges ({} files changed, {} unchanged)",
@@ -1060,6 +1071,7 @@ pub async fn execute(
         &plan.verification_config,
         &all_manifests,
         &config.workspace_root,
+        &config.excludes,
         observer,
     )
     .await?;
@@ -1393,6 +1405,7 @@ async fn run_post_execution_verification(
     config: &super::plan::VerificationConfig,
     manifests: &[AgentManifest],
     workspace_root: &std::path::Path,
+    excludes: &[String],
     observer: &dyn SwarmObserver,
 ) -> Result<bool> {
     if !config.compile && !config.clippy && !config.test && !config.impact_tests {
@@ -1403,8 +1416,13 @@ async fn run_post_execution_verification(
     observer.on_verification_started("workflow_config");
 
     let modified_files = collect_completed_modified_files(manifests);
-    let passed =
-        run_verification_checks(config, workspace_root, Some(modified_files.as_slice())).await?;
+    let passed = run_verification_checks(
+        config,
+        workspace_root,
+        excludes,
+        Some(modified_files.as_slice()),
+    )
+    .await?;
     if !passed {
         observer.on_verification_complete(false);
         return Ok(false);
@@ -1425,6 +1443,7 @@ fn collect_completed_modified_files(manifests: &[AgentManifest]) -> Vec<std::pat
 async fn run_verification_checks(
     config: &super::plan::VerificationConfig,
     workspace_root: &std::path::Path,
+    excludes: &[String],
     modified_files: Option<&[std::path::PathBuf]>,
 ) -> Result<bool> {
     if config.compile && !run_verification_command(workspace_root, "cargo", &["check"]).await {
@@ -1439,7 +1458,7 @@ async fn run_verification_checks(
         let passed = if let Some(files) = modified_files {
             run_test_verification(workspace_root, files, true).await?
         } else {
-            run_conservative_impact_tests(workspace_root).await
+            run_conservative_impact_tests(workspace_root, excludes).await
         };
         if !passed {
             return Ok(false);
@@ -1490,8 +1509,11 @@ async fn run_test_verification(
     Ok(report.passed)
 }
 
-async fn run_conservative_impact_tests(workspace_root: &std::path::Path) -> bool {
-    match crate::repo_map::graph_builder::build_graph(workspace_root) {
+async fn run_conservative_impact_tests(
+    workspace_root: &std::path::Path,
+    excludes: &[String],
+) -> bool {
+    match crate::repo_map::graph_builder::build_graph(workspace_root, excludes) {
         Ok((store, _)) => {
             let all_src: Vec<String> = store
                 .all_file_hashes()
@@ -2093,7 +2115,7 @@ async fn evaluate_loop_condition(
 ) -> bool {
     match condition {
         super::plan::LoopUntilCondition::Verify(config) => {
-            run_verification_checks(config, &ctx.config.workspace_root, None)
+            run_verification_checks(config, &ctx.config.workspace_root, &ctx.config.excludes, None)
                 .await
                 .unwrap_or(false)
         }
