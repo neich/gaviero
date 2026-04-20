@@ -114,6 +114,19 @@ pub trait SwarmObserver: Send + Sync {
     /// Called when verification completes.
     fn on_verification_complete(&self, _passed: bool) {}
 
+    // ── Loop lifecycle ──────────────────────────────────────────────
+
+    /// Called when a loop iteration is about to start.
+    ///
+    /// `current` is 1-based; `max` is the configured `max_iterations`.
+    fn on_loop_iteration_started(&self, _current: u32, _max: u32, _agents: &[String]) {}
+
+    /// Called after each loop condition evaluation.
+    ///
+    /// `passed` is the raw judge/verify result; `consecutive` and `stability`
+    /// reflect the running PASS streak and its required target.
+    fn on_loop_verdict(&self, _passed: bool, _consecutive: u32, _stability: u32) {}
+
     // ── Cost tracking ───────────────────────────────────────────────
 
     /// Called with updated cost estimates during execution.

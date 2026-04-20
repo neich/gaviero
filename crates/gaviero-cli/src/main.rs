@@ -148,27 +148,39 @@ struct Cli {
     vars: Vec<String>,
 }
 
-/// CLI observer that prints agent events to stderr, mirroring agent chat output.
-struct CliAcpObserver;
+/// CLI observer that prints agent events to stderr.
+///
+/// When `verbose` is false (script mode), raw streamed text is suppressed;
+/// only tool calls, status updates, file writes, and validation results are shown.
+/// All lines are prefixed with `[{agent_id}]` for easy multi-agent tracing.
+struct CliAcpObserver {
+    agent_id: String,
+    verbose: bool,
+}
 
 impl CliAcpObserver {
-    fn new() -> Self {
-        Self
+    fn new(agent_id: impl Into<String>, verbose: bool) -> Self {
+        Self {
+            agent_id: agent_id.into(),
+            verbose,
+        }
     }
 }
 
 impl AcpObserver for CliAcpObserver {
     fn on_stream_chunk(&self, text: &str) {
-        eprint!("{}", text);
-        let _ = std::io::stderr().flush();
+        if self.verbose {
+            eprint!("{}", text);
+            let _ = std::io::stderr().flush();
+        }
     }
 
     fn on_tool_call_started(&self, tool_name: &str) {
-        eprintln!("\n  ⚙ {}", tool_name);
+        eprintln!("  [{}] ⚙ {}", self.agent_id, tool_name);
     }
 
     fn on_message_complete(&self, role: &str, _content: &str) {
-        if role == "assistant" {
+        if self.verbose && role == "assistant" {
             eprintln!(); // newline after streamed text
         }
     }
@@ -179,23 +191,23 @@ impl AcpObserver for CliAcpObserver {
         _old_content: Option<&str>,
         _new_content: &str,
     ) {
-        eprintln!("  ✎ {}", path.display());
+        eprintln!("  [{}] ✎ {}", self.agent_id, path.display());
     }
 
     fn on_streaming_status(&self, status: &str) {
-        eprintln!("  … {}", status);
+        eprintln!("  [{}] … {}", self.agent_id, status);
     }
 
     fn on_validation_result(&self, gate: &str, passed: bool, message: Option<&str>) {
         if passed {
-            eprintln!("  ✓ {}", gate);
+            eprintln!("  [{}] ✓ {}", self.agent_id, gate);
         } else {
-            eprintln!("  ✗ {} — {}", gate, message.unwrap_or(""));
+            eprintln!("  [{}] ✗ {} — {}", self.agent_id, gate, message.unwrap_or(""));
         }
     }
 
     fn on_validation_retry(&self, attempt: u8, max_retries: u8) {
-        eprintln!("  ↺ retry {}/{}", attempt, max_retries);
+        eprintln!("  [{}] ↺ retry {}/{}", self.agent_id, attempt, max_retries);
     }
 }
 
@@ -206,46 +218,101 @@ impl SwarmObserver for CliSwarmObserver {
     fn on_phase_changed(&self, phase: &str) {
         eprintln!("[phase] {}", phase);
     }
+
     fn on_agent_state_changed(&self, work_unit_id: &str, status: &AgentStatus, detail: &str) {
         match status {
             AgentStatus::Running => {
-                eprintln!("\n── agent: {} ─────────────────────────────", work_unit_id)
+                if detail.is_empty() {
+                    eprintln!("[agent] {} starting", work_unit_id);
+                } else {
+                    eprintln!("[agent] {} starting — {}", work_unit_id, detail);
+                }
             }
             AgentStatus::Completed => {
-                eprintln!("── done: {} ──────────────────────────────", work_unit_id)
+                eprintln!("[agent] {} done", work_unit_id);
             }
-            AgentStatus::Failed(_) => eprintln!("── failed: {} {}", work_unit_id, detail),
-            _ => eprintln!("[agent:{}] {:?} {}", work_unit_id, status, detail),
+            AgentStatus::Failed(err) => {
+                eprintln!("[agent] {} FAILED — {}", work_unit_id, err);
+            }
+            AgentStatus::Pending => {
+                eprintln!("[agent] {} queued", work_unit_id);
+            }
         }
     }
+
     fn on_tier_started(&self, current: usize, total: usize) {
         eprintln!("[tier] {}/{}", current, total);
     }
+
     fn on_merge_conflict(&self, branch: &str, files: &[String]) {
-        eprintln!("[conflict] branch={} files={}", branch, files.join(", "));
+        eprintln!("[conflict] branch={}  files={}", branch, files.join(", "));
     }
+
     fn on_completed(&self, result: &SwarmResult) {
-        eprintln!("[completed] success={}", result.success);
+        let n_ok = result
+            .manifests
+            .iter()
+            .filter(|m| matches!(m.status, AgentStatus::Completed))
+            .count();
+        let n_fail = result.manifests.len() - n_ok;
+        if n_fail == 0 {
+            eprintln!("[done] all {} agent(s) succeeded", n_ok);
+        } else {
+            eprintln!("[done] {}/{} failed", n_fail, result.manifests.len());
+        }
     }
+
     fn on_coordination_started(&self, prompt: &str) {
         eprintln!(
-            "[coordinator] planning: {}...",
+            "[coordinator] planning: {}…",
             &prompt[..prompt.len().min(80)]
         );
     }
+
     fn on_coordination_complete(&self, dag: &gaviero_core::swarm::coordinator::TaskDAG) {
         eprintln!(
-            "[coordinator] planned {} units: {}",
+            "[coordinator] planned {} unit(s): {}",
             dag.units.len(),
             dag.plan_summary
         );
     }
+
     fn on_tier_dispatch(&self, unit_id: &str, tier: gaviero_core::types::ModelTier, backend: &str) {
         eprintln!(
-            "[dispatch] {}  tier={:?}  backend={}",
-            unit_id, tier, backend
+            "[dispatch] {}  →  {}  ({})",
+            unit_id,
+            backend,
+            format!("{:?}", tier).to_lowercase()
         );
     }
+
+    fn on_loop_iteration_started(&self, current: u32, max: u32, agents: &[String]) {
+        eprintln!(
+            "[loop] iteration {}/{}  agents=[{}]",
+            current,
+            max,
+            agents.join(", ")
+        );
+    }
+
+    fn on_loop_verdict(&self, passed: bool, consecutive: u32, stability: u32) {
+        if passed {
+            if consecutive >= stability {
+                eprintln!(
+                    "[loop] verdict PASS — converged (streak {}/{})",
+                    consecutive, stability
+                );
+            } else {
+                eprintln!(
+                    "[loop] verdict PASS — streak {}/{}, continuing for stability",
+                    consecutive, stability
+                );
+            }
+        } else {
+            eprintln!("[loop] verdict FAIL — streak reset");
+        }
+    }
+
     fn on_cost_update(&self, estimate: &gaviero_core::swarm::verify::CostEstimate) {
         eprintln!("[cost] ~${:.4}", estimate.estimated_usd);
     }
@@ -535,6 +602,16 @@ async fn main() -> Result<()> {
                 eprintln!("{}", fmt_unit(u));
             }
         }
+        for (i, lc) in plan.loop_configs.iter().enumerate() {
+            eprintln!(
+                "[plan] loop {}  agents=[{}]  max_iterations={}  stability={}  iter_start={}",
+                i + 1,
+                lc.agent_ids.join(", "),
+                lc.max_iterations,
+                lc.stability,
+                lc.iter_start,
+            );
+        }
     }
 
     // Execute via swarm pipeline
@@ -576,7 +653,10 @@ async fn main() -> Result<()> {
             coord_config,
             memory,
             &swarm_observer,
-            |_| Box::new(CliAcpObserver::new()) as Box<dyn gaviero_core::observer::AcpObserver>,
+            |agent_id| {
+            Box::new(CliAcpObserver::new(agent_id, true))
+                as Box<dyn gaviero_core::observer::AcpObserver>
+        },
         )
         .await?;
 
@@ -666,7 +746,11 @@ async fn main() -> Result<()> {
         initial_state,
         memory,
         &swarm_observer,
-        |_| Box::new(CliAcpObserver::new()) as Box<dyn gaviero_core::observer::AcpObserver>,
+        |agent_id| {
+            let verbose = cli.script.is_none();
+            Box::new(CliAcpObserver::new(agent_id, verbose))
+                as Box<dyn gaviero_core::observer::AcpObserver>
+        },
     )
     .await?;
 

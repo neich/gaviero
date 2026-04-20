@@ -878,6 +878,7 @@ pub async fn execute(
 
             if condition_met {
                 consecutive_pass = consecutive_pass.saturating_add(1);
+                observer.on_loop_verdict(true, consecutive_pass, stability_target);
                 if consecutive_pass >= stability_target {
                     tracing::info!(
                         "Loop converged after {} iteration(s) with {}/{} consecutive PASS for agents {:?}",
@@ -903,6 +904,7 @@ pub async fn execute(
                     );
                 }
                 consecutive_pass = 0;
+                observer.on_loop_verdict(false, 0, stability_target);
             }
 
             tracing::info!(
@@ -910,6 +912,11 @@ pub async fn execute(
                 iteration + 1,
                 loop_config.max_iterations,
                 loop_config.agent_ids
+            );
+            observer.on_loop_iteration_started(
+                iteration + 1,
+                loop_config.max_iterations,
+                &loop_config.agent_ids,
             );
             observer.on_phase_changed(&format!("loop iteration {}", iteration + 1));
 
