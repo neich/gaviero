@@ -7,7 +7,7 @@
 //!
 //! ## Usage
 //! ```ignore
-//! let repo_map = RepoMap::build(&workspace_root)?;
+//! let repo_map = RepoMap::build(&workspace_root, &[])?;
 //! let plan = repo_map.rank_for_agent(&["src/auth/"], 32_000);
 //! // Inject plan.repo_outline into the agent's system prompt
 //! ```
@@ -124,9 +124,10 @@ pub struct RepoMap {
 }
 
 impl RepoMap {
-    /// Build a `RepoMap` by scanning `workspace`.
-    pub fn build(workspace: &Path) -> anyhow::Result<Self> {
-        let graph = builder::build(workspace)?;
+    /// Build a `RepoMap` by scanning `workspace`, skipping any path matching
+    /// `excludes` (see [`builder::is_excluded`]).
+    pub fn build(workspace: &Path, excludes: &[String]) -> anyhow::Result<Self> {
+        let graph = builder::build(workspace, excludes)?;
         Ok(Self { graph })
     }
 
@@ -154,9 +155,9 @@ impl RepoMap {
             .node_indices()
             .filter(|&idx| {
                 let p = self.graph[idx].path.to_string_lossy();
-                owned
-                    .iter()
-                    .any(|o| p.starts_with(o.as_str()) || *o == "." || *o == "./")
+                owned.iter().any(|o| {
+                    o == "." || o == "./" || crate::path_pattern::matches(o, &p)
+                })
             })
             .collect();
 
@@ -340,7 +341,7 @@ mod tests {
     #[test]
     fn empty_workspace_builds() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let map = RepoMap::build(dir.path()).expect("build");
+        let map = RepoMap::build(dir.path(), &[]).expect("build");
         assert_eq!(map.graph.node_count(), 0);
     }
 
@@ -350,7 +351,7 @@ mod tests {
         std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
         std::fs::write(dir.path().join("lib.rs"), "pub fn helper() {}").unwrap();
 
-        let map = RepoMap::build(dir.path()).expect("build");
+        let map = RepoMap::build(dir.path(), &[]).expect("build");
         let plan = map.rank_for_agent(&["main.rs".to_string()], 10_000);
         assert!(!plan.repo_outline.is_empty() || map.graph.node_count() == 0);
     }
@@ -364,7 +365,7 @@ mod tests {
         std::fs::write(dir.path().join("lib.rs"), "pub fn helper() {}").unwrap();
         std::fs::write(dir.path().join("util.rs"), "pub fn other() {}").unwrap();
 
-        let map = RepoMap::build(dir.path()).expect("build");
+        let map = RepoMap::build(dir.path(), &[]).expect("build");
         let candidates = map.rank_for_agent_structured(&["main.rs".to_string()], 10_000);
         if map.graph.node_count() == 0 {
             // Graph build is heuristic — skip if empty workspace detected.
@@ -405,7 +406,7 @@ mod tests {
         std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
         std::fs::write(dir.path().join("lib.rs"), "pub fn helper() {}").unwrap();
 
-        let map = RepoMap::build(dir.path()).expect("build");
+        let map = RepoMap::build(dir.path(), &[]).expect("build");
         if map.graph.node_count() == 0 {
             return;
         }

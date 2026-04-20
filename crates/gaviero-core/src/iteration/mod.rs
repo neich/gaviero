@@ -398,12 +398,18 @@ impl IterationEngine {
             _ => self.config.max_retries.min(u8::MAX as u32) as u8,
         };
 
-        if attempt >= self.config.escalate_after {
-            unit.model = Some(self.config.expensive_model.clone());
-            unit.tier = ModelTier::Expensive;
-        } else {
-            unit.model = Some(self.config.cheap_model.clone());
-            unit.tier = ModelTier::Cheap;
+        // Respect DSL-pinned models. When the WorkUnit already has a concrete
+        // model (from a `client` block), the iteration engine's cheap→expensive
+        // escalation is skipped — the user picked that model intentionally,
+        // and the router routes by `unit.model` directly.
+        if work_unit.model.is_none() {
+            if attempt >= self.config.escalate_after {
+                unit.model = Some(self.config.expensive_model.clone());
+                unit.tier = ModelTier::Expensive;
+            } else {
+                unit.model = Some(self.config.cheap_model.clone());
+                unit.tier = ModelTier::Cheap;
+            }
         }
 
         unit
@@ -599,5 +605,65 @@ mod tests {
         );
         assert!(!result.all_passed);
         assert_eq!(result.attempts_run, 2);
+    }
+
+    #[tokio::test]
+    async fn dsl_pinned_model_is_preserved_across_attempts() {
+        // Regression: DSL `client` blocks populate unit.model; the iteration
+        // engine must NOT override it with cheap_model/expensive_model. The
+        // user picked that model intentionally.
+        let engine = IterationEngine::new(IterationConfig {
+            strategy: Strategy::BestOfN { n: 2 },
+            escalate_after: 1,
+            cheap_model: "cheap-default".into(),
+            expensive_model: "expensive-default".into(),
+            ..Default::default()
+        });
+        let seen_models = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+        let mut pinned = make_unit("t");
+        pinned.model = Some("claude-opus-4-7".into());
+        pinned.tier = ModelTier::Expensive;
+
+        let _ = engine
+            .run_with_backend_factory(
+                pinned,
+                make_gate(),
+                Path::new("/tmp"),
+                None,
+                &[],
+                &NoopObserver,
+                None,
+                None,
+                None,
+                None,
+                None,
+                {
+                    let seen_models = Arc::clone(&seen_models);
+                    move |unit| {
+                        seen_models
+                            .lock()
+                            .expect("recorded models lock")
+                            .push(unit.model.clone().unwrap_or_default());
+                        Ok(Box::new(MockBackend::new(
+                            "failing",
+                            vec![
+                                UnifiedStreamEvent::Error("attempt failed".into()),
+                                UnifiedStreamEvent::Done(StopReason::Error),
+                            ],
+                        ))
+                            as Box<dyn crate::swarm::backend::AgentBackend>)
+                    }
+                },
+            )
+            .await;
+
+        let seen = seen_models.lock().expect("recorded models lock").clone();
+        assert_eq!(
+            seen,
+            vec!["claude-opus-4-7".to_string(), "claude-opus-4-7".to_string()],
+            "DSL-pinned model must be preserved on every attempt, not clobbered \
+             by cheap/expensive_model defaults"
+        );
     }
 }

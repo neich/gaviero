@@ -18,11 +18,15 @@ use super::{FileNode, ReferenceEdge, Symbol};
 
 /// Walk `workspace` and build a `DiGraph<FileNode, ReferenceEdge>`.
 ///
-/// Skips hidden directories (`.git`, `.cargo`, `target`, `node_modules`).
+/// Skips hidden directories (`.git`, `.cargo`, `target`, `node_modules`) plus
+/// any caller-supplied `excludes` (see [`is_excluded`]).
 /// Unknown file extensions produce a node with an empty symbol list.
-pub fn build(workspace: &Path) -> anyhow::Result<DiGraph<FileNode, ReferenceEdge>> {
+pub fn build(
+    workspace: &Path,
+    excludes: &[String],
+) -> anyhow::Result<DiGraph<FileNode, ReferenceEdge>> {
     let mut graph: DiGraph<FileNode, ReferenceEdge> = DiGraph::new();
-    walk_dir(workspace, workspace, &mut graph)?;
+    walk_dir(workspace, workspace, &mut graph, excludes)?;
     Ok(graph)
 }
 
@@ -30,6 +34,7 @@ fn walk_dir(
     dir: &Path,
     workspace: &Path,
     graph: &mut DiGraph<FileNode, ReferenceEdge>,
+    excludes: &[String],
 ) -> anyhow::Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -48,17 +53,48 @@ fn walk_dir(
             continue;
         }
 
+        let rel = path.strip_prefix(workspace).unwrap_or(&path);
+        if is_excluded(file_name, rel, excludes) {
+            continue;
+        }
+
         if path.is_dir() {
-            walk_dir(&path, workspace, graph)?;
+            walk_dir(&path, workspace, graph, excludes)?;
         } else if path.is_file() {
-            let rel = path.strip_prefix(workspace).unwrap_or(&path).to_path_buf();
-            if let Some(node) = build_node(&path, rel) {
+            if let Some(node) = build_node(&path, rel.to_path_buf()) {
                 graph.add_node(node);
             }
         }
     }
 
     Ok(())
+}
+
+/// Returns `true` if `rel_path` (or its basename) matches any exclude pattern.
+///
+/// Rules:
+/// - An entry without `/` is treated as a basename match (e.g. `node_modules`
+///   excludes any directory with that name at any depth).
+/// - An entry with `/` is treated as a glob-style pattern matched against the
+///   workspace-relative path (reuses [`crate::path_pattern::matches`]).
+pub fn is_excluded(file_name: &str, rel_path: &Path, excludes: &[String]) -> bool {
+    if excludes.is_empty() {
+        return false;
+    }
+    let rel_str = rel_path.to_string_lossy();
+    for pat in excludes {
+        let trimmed = pat.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !trimmed.contains('/') && trimmed == file_name {
+            return true;
+        }
+        if crate::path_pattern::matches(trimmed, &rel_str) {
+            return true;
+        }
+    }
+    false
 }
 
 pub const SKIP_DIRS: &[&str] = &[

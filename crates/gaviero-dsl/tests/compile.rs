@@ -635,3 +635,120 @@ fn template_plan_refinement() {
     // max_parallel 2
     assert_eq!(plan.max_parallel, Some(2));
 }
+
+#[test]
+fn template_phased_plan() {
+    let plan = compile_example_plan("phased_plan.gaviero");
+    let units = plan.work_units_ordered().expect("toposort");
+
+    // Main DAG: analyse_plan + phase_executor + phase_gate + final_audit.
+    // The judge is compiled into loop_judge_units, not the main DAG.
+    assert_eq!(units.len(), 4);
+    assert_eq!(units[0].id, "analyse_plan");
+    assert_eq!(units.last().unwrap().id, "final_audit");
+
+    // Loop wraps phase_executor + phase_gate, with phase_judge as the
+    // until-agent.
+    assert_eq!(plan.loop_configs.len(), 1);
+    let lc = &plan.loop_configs[0];
+    assert_eq!(lc.agent_ids, vec!["phase_executor", "phase_gate"]);
+    assert_eq!(lc.max_iterations, 12);
+    assert_eq!(lc.stability, 1);
+    assert_eq!(lc.judge_timeout_secs, 60);
+    assert!(lc.strict_judge);
+
+    assert_eq!(plan.loop_judge_units.len(), 1);
+    assert_eq!(plan.loop_judge_units[0].id, "phase_judge");
+
+    // Tier routing: expensive on reasoning agents, cheap on gate and judge.
+    let tier_of = |id: &str| {
+        units
+            .iter()
+            .chain(plan.loop_judge_units.iter())
+            .find(|u| u.id == id)
+            .unwrap_or_else(|| panic!("agent {} not found", id))
+            .tier
+    };
+    assert_eq!(
+        tier_of("analyse_plan"),
+        gaviero_core::types::ModelTier::Expensive
+    );
+    assert_eq!(
+        tier_of("phase_executor"),
+        gaviero_core::types::ModelTier::Expensive
+    );
+    assert_eq!(
+        tier_of("final_audit"),
+        gaviero_core::types::ModelTier::Expensive
+    );
+    assert_eq!(
+        tier_of("phase_gate"),
+        gaviero_core::types::ModelTier::Cheap
+    );
+    assert_eq!(
+        tier_of("phase_judge"),
+        gaviero_core::types::ModelTier::Cheap
+    );
+
+    // Dependency chain: phase_executor → analyse_plan; phase_gate →
+    // phase_executor; final_audit → phase_gate (loop exit).
+    let dep = |id: &str| -> Vec<String> {
+        units
+            .iter()
+            .find(|u| u.id == id)
+            .unwrap_or_else(|| panic!("agent {} not found", id))
+            .depends_on
+            .clone()
+    };
+    assert_eq!(dep("phase_executor"), vec!["analyse_plan"]);
+    assert_eq!(dep("phase_gate"), vec!["phase_executor"]);
+    assert_eq!(dep("final_audit"), vec!["phase_gate"]);
+
+    // OUT_DIR is compile-time substituted in prompts AND scope paths;
+    // {{PROMPT}}, {{ITER}}, {{ITER_EVIDENCE}} survive to runtime.
+    let executor = units.iter().find(|u| u.id == "phase_executor").unwrap();
+    assert!(
+        executor.coordinator_instructions.contains("plans/log/"),
+        "OUT_DIR should be compile-time substituted in prompts"
+    );
+    assert!(
+        executor.coordinator_instructions.contains("{{ITER}}"),
+        "runtime ITER should survive compile"
+    );
+    assert!(
+        executor
+            .scope
+            .owned_paths
+            .iter()
+            .any(|p| p == "plans/log/phase-*.md"),
+        "OUT_DIR should be compile-time substituted in scope.owned, got {:?}",
+        executor.scope.owned_paths
+    );
+    assert!(
+        executor
+            .scope
+            .read_only_paths
+            .iter()
+            .any(|p| p == "plans/log/"),
+        "OUT_DIR should be compile-time substituted in scope.read_only, got {:?}",
+        executor.scope.read_only_paths
+    );
+
+    let analyse = &units[0];
+    assert!(
+        analyse.coordinator_instructions.contains("{{PROMPT}}"),
+        "runtime PROMPT should survive compile"
+    );
+
+    let judge = &plan.loop_judge_units[0];
+    assert!(
+        judge.coordinator_instructions.contains("{{ITER_EVIDENCE}}"),
+        "judge should reference {{{{ITER_EVIDENCE}}}}"
+    );
+
+    // Final audit writes to memory.
+    let audit = units.iter().find(|u| u.id == "final_audit").unwrap();
+    assert_eq!(audit.write_namespace.as_deref(), Some("phase-history"));
+    assert_eq!(audit.memory_importance, Some(0.9));
+    assert!(audit.memory_write_content.is_some());
+}

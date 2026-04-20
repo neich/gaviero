@@ -73,11 +73,12 @@ impl ScopeEnforcer {
         }
 
         let path_str = path.to_string_lossy();
-        let allowed =
-            self.scope.owned_paths.is_empty()
-                || self.scope.owned_paths.iter().any(|owned| {
-                    path_str.starts_with(owned.as_str()) || path_str == owned.as_str()
-                });
+        let allowed = self.scope.owned_paths.is_empty()
+            || self
+                .scope
+                .owned_paths
+                .iter()
+                .any(|owned| crate::path_pattern::matches(owned, &path_str));
 
         if !allowed {
             return Err(ScopeViolation {
@@ -108,7 +109,7 @@ impl ScopeEnforcer {
             .owned_paths
             .iter()
             .chain(self.scope.read_only_paths.iter())
-            .any(|p| path_str.starts_with(p.as_str()) || path_str == p.as_str());
+            .any(|p| crate::path_pattern::matches(p, &path_str));
 
         if explicitly_allowed {
             return Ok(());

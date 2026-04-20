@@ -94,6 +94,7 @@ pub(super) fn handle_swarm_command(app: &mut App) {
             read_namespaces: read_ns,
             write_namespace: write_ns,
             context_files: vec![],
+            excludes: vec![],
         };
 
         let observer = TuiSwarmObserver { tx: tx.clone() };
@@ -228,6 +229,7 @@ pub(super) fn handle_run_script_command(app: &mut App) {
             read_namespaces: read_ns,
             write_namespace: write_ns,
             context_files: vec![],
+            excludes: vec![],
         };
 
         let observer = TuiSwarmObserver { tx: tx.clone() };
@@ -351,6 +353,7 @@ pub(super) fn handle_coordinated_swarm_command(app: &mut App) {
             read_namespaces: read_ns,
             write_namespace: write_ns,
             context_files,
+            excludes: vec![],
         };
 
         let coord_config = coordinator::CoordinatorConfig {

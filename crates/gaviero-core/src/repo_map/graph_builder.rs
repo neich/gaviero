@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::tree_sitter::language_for_extension;
 
-use super::builder::{SKIP_DIRS, extract_symbols};
+use super::builder::{SKIP_DIRS, extract_symbols, is_excluded};
 use super::edges::{
     extract_rust_references, is_test_file, node_kind_from_ts, resolve_and_insert_edges,
 };
@@ -44,27 +44,40 @@ const MAX_FILE_BYTES: u64 = 1_000_000;
 /// Build or incrementally update the code knowledge graph for a workspace.
 ///
 /// The graph database is stored at `{workspace}/.gaviero/code_graph.db`.
-pub fn build_graph(workspace: &Path) -> Result<(GraphStore, BuildResult)> {
+/// `excludes` is a list of folder names or glob patterns to skip
+/// (see [`crate::repo_map::builder::is_excluded`]).
+pub fn build_graph(
+    workspace: &Path,
+    excludes: &[String],
+) -> Result<(GraphStore, BuildResult)> {
     let db_dir = workspace.join(".gaviero");
     let db_path = db_dir.join("code_graph.db");
     let store = GraphStore::open(&db_path)
         .with_context(|| format!("opening graph store at {}", db_path.display()))?;
 
-    let result = incremental_build(&store, workspace)?;
+    let result = incremental_build(&store, workspace, excludes)?;
     Ok((store, result))
 }
 
 /// Build into an existing (possibly in-memory) store.
-pub fn build_graph_into(store: &GraphStore, workspace: &Path) -> Result<BuildResult> {
-    incremental_build(store, workspace)
+pub fn build_graph_into(
+    store: &GraphStore,
+    workspace: &Path,
+    excludes: &[String],
+) -> Result<BuildResult> {
+    incremental_build(store, workspace, excludes)
 }
 
-fn incremental_build(store: &GraphStore, workspace: &Path) -> Result<BuildResult> {
+fn incremental_build(
+    store: &GraphStore,
+    workspace: &Path,
+    excludes: &[String],
+) -> Result<BuildResult> {
     let mut result = BuildResult::default();
 
     // 1. Collect all source files
     let mut source_files: Vec<(PathBuf, PathBuf)> = Vec::new(); // (abs_path, rel_path)
-    collect_source_files(workspace, workspace, &mut source_files)?;
+    collect_source_files(workspace, workspace, &mut source_files, excludes)?;
     result.files_scanned = source_files.len();
 
     // 2. Get existing file hashes
@@ -182,6 +195,7 @@ fn collect_source_files(
     dir: &Path,
     workspace: &Path,
     out: &mut Vec<(PathBuf, PathBuf)>,
+    excludes: &[String],
 ) -> Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -196,14 +210,18 @@ fn collect_source_files(
             continue;
         }
 
+        let rel = path.strip_prefix(workspace).unwrap_or(&path);
+        if is_excluded(file_name, rel, excludes) {
+            continue;
+        }
+
         if path.is_dir() {
-            collect_source_files(&path, workspace, out)?;
+            collect_source_files(&path, workspace, out, excludes)?;
         } else if path.is_file() {
             // Only index files with known extensions
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             if language_for_extension(ext).is_some() {
-                let rel = path.strip_prefix(workspace).unwrap_or(&path).to_path_buf();
-                out.push((path.clone(), rel));
+                out.push((path.clone(), rel.to_path_buf()));
             }
         }
     }
@@ -231,7 +249,7 @@ mod tests {
     #[test]
     fn build_empty_workspace() {
         let dir = tempfile::tempdir().unwrap();
-        let (_, result) = build_graph(dir.path()).unwrap();
+        let (_, result) = build_graph(dir.path(), &[]).unwrap();
         assert_eq!(result.files_scanned, 0);
         assert_eq!(result.files_changed, 0);
     }
@@ -245,7 +263,7 @@ mod tests {
         )
         .unwrap();
 
-        let (store, result) = build_graph(dir.path()).unwrap();
+        let (store, result) = build_graph(dir.path(), &[]).unwrap();
         assert_eq!(result.files_scanned, 1);
         assert_eq!(result.files_changed, 1);
         assert!(result.total_nodes >= 3); // File + 2 functions
@@ -262,11 +280,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("lib.rs"), "fn foo() {}").unwrap();
 
-        let (_, r1) = build_graph(dir.path()).unwrap();
+        let (_, r1) = build_graph(dir.path(), &[]).unwrap();
         assert_eq!(r1.files_changed, 1);
 
         // Second build: same content → should skip
-        let (_, r2) = build_graph(dir.path()).unwrap();
+        let (_, r2) = build_graph(dir.path(), &[]).unwrap();
         assert_eq!(r2.files_changed, 0);
         assert_eq!(r2.files_unchanged, 1);
     }
@@ -276,13 +294,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("lib.rs"), "fn foo() {}").unwrap();
 
-        let (_, r1) = build_graph(dir.path()).unwrap();
+        let (_, r1) = build_graph(dir.path(), &[]).unwrap();
         assert_eq!(r1.files_changed, 1);
 
         // Modify the file
         std::fs::write(dir.path().join("lib.rs"), "fn foo() {}\nfn bar() {}").unwrap();
 
-        let (store, r2) = build_graph(dir.path()).unwrap();
+        let (store, r2) = build_graph(dir.path(), &[]).unwrap();
         assert_eq!(r2.files_changed, 1);
         assert_eq!(r2.files_unchanged, 0);
 
@@ -297,13 +315,13 @@ mod tests {
         std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
         std::fs::write(dir.path().join("b.rs"), "fn b() {}").unwrap();
 
-        let (_, r1) = build_graph(dir.path()).unwrap();
+        let (_, r1) = build_graph(dir.path(), &[]).unwrap();
         assert_eq!(r1.files_scanned, 2);
 
         // Delete b.rs
         std::fs::remove_file(dir.path().join("b.rs")).unwrap();
 
-        let (store, r2) = build_graph(dir.path()).unwrap();
+        let (store, r2) = build_graph(dir.path(), &[]).unwrap();
         assert_eq!(r2.files_scanned, 1);
         assert_eq!(r2.files_removed, 1);
         assert!(store.nodes_for_file("b.rs").unwrap().is_empty());
@@ -319,7 +337,7 @@ mod tests {
         // b.rs calls `compute`
         std::fs::write(dir.path().join("b.rs"), "fn main() { let x = compute(); }").unwrap();
 
-        let (store, result) = build_graph(dir.path()).unwrap();
+        let (store, result) = build_graph(dir.path(), &[]).unwrap();
         assert!(result.total_edges > 0, "expected some edges, got 0");
 
         // Changing a.rs should affect b.rs
@@ -343,7 +361,7 @@ mod tests {
         )
         .unwrap();
 
-        let (store, _) = build_graph(dir.path()).unwrap();
+        let (store, _) = build_graph(dir.path(), &[]).unwrap();
         let impact = store.impact_radius(&["lib.rs"], 3).unwrap();
         assert!(
             impact.affected_tests.iter().any(|t| t.contains("test_lib")),

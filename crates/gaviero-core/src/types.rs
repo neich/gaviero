@@ -20,18 +20,13 @@ pub struct FileScope {
 impl FileScope {
     /// Check if a path is within this scope's owned paths.
     /// Directory entries (ending with `/`) use prefix matching;
-    /// file entries use exact matching.
+    /// file entries use exact matching; entries with `*`/`?`/`**` use
+    /// glob-style matching (see `path_pattern`).
     /// Paths are normalized: leading `./` is stripped, whitespace is trimmed.
     pub fn is_owned(&self, path: &str) -> bool {
-        let normalized = normalize_path(path);
-        self.owned_paths.iter().any(|owned| {
-            let owned = normalize_path(owned);
-            if owned.ends_with('/') {
-                normalized.starts_with(&owned) || normalized == owned.trim_end_matches('/')
-            } else {
-                normalized == owned
-            }
-        })
+        self.owned_paths
+            .iter()
+            .any(|owned| crate::path_pattern::matches(owned, path))
     }
 
     /// Render the scope as a markdown clause for inclusion in prompts.

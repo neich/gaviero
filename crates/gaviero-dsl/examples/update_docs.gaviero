@@ -10,7 +10,18 @@
 //   gaviero-cli --script update_docs.gaviero
 
 client sonnet { tier cheap     model "claude-sonnet-4-6" effort medium default }
-client opus   { tier expensive model "claude-opus-4-7"   effort high }
+client opus {
+    tier expensive
+    model "claude-opus-4-7"
+    effort high
+    extra {
+        // CLAUDE.md and ARCHITECTURE.md synthesis reads the whole workspace
+        // plus the inventory report — give opus enough extended-thinking
+        // budget to reason over all of it in one pass. Ignored by backends
+        // that don't consume the key.
+        "thinking_budget" "8000"
+    }
+}
 
 // Tier aliases give agents a routing label (`tier expensive`) that can be
 // re-pointed at launch time without editing this script. Agents below keep
@@ -121,11 +132,11 @@ The fixed context injected into every AI prompt. It must contain:
     depends_on [inventory]
     scope {
         owned     [
-            "CLAUDE.md"
-            "crates/gaviero-core/CLAUDE.md"
-            "crates/gaviero-dsl/CLAUDE.md"
-            "crates/gaviero-tui/CLAUDE.md"
-            "crates/gaviero-cli/CLAUDE.md"
+            "{{DOC_NAME}}"
+            "crates/gaviero-core/{{DOC_NAME}}"
+            "crates/gaviero-dsl/{{DOC_NAME}}"
+            "crates/gaviero-tui/{{DOC_NAME}}"
+            "crates/gaviero-cli/{{DOC_NAME}}"
         ]
         read_only ["src/" "crates/" "Cargo.toml" ".gaviero/"]
     }
@@ -159,11 +170,11 @@ The user-facing description of each crate/project. It must contain:
     depends_on [inventory]
     scope {
         owned     [
-            "README.md"
-            "crates/gaviero-core/README.md"
-            "crates/gaviero-dsl/README.md"
-            "crates/gaviero-tui/README.md"
-            "crates/gaviero-cli/README.md"
+            "{{DOC_NAME}}"
+            "crates/gaviero-core/{{DOC_NAME}}"
+            "crates/gaviero-dsl/{{DOC_NAME}}"
+            "crates/gaviero-tui/{{DOC_NAME}}"
+            "crates/gaviero-cli/{{DOC_NAME}}"
         ]
         read_only ["src/" "crates/" "Cargo.toml" ".gaviero/"]
     }
@@ -198,11 +209,11 @@ The deep technical description of a crate/project. It must contain:
     depends_on [inventory]
     scope {
         owned     [
-            "ARCHITECTURE.md"
-            "crates/gaviero-core/ARCHITECTURE.md"
-            "crates/gaviero-dsl/ARCHITECTURE.md"
-            "crates/gaviero-tui/ARCHITECTURE.md"
-            "crates/gaviero-cli/ARCHITECTURE.md"
+            "{{DOC_NAME}}"
+            "crates/gaviero-core/{{DOC_NAME}}"
+            "crates/gaviero-dsl/{{DOC_NAME}}"
+            "crates/gaviero-tui/{{DOC_NAME}}"
+            "crates/gaviero-cli/{{DOC_NAME}}"
         ]
         read_only ["src/" "crates/" "Cargo.toml" ".gaviero/"]
     }

@@ -7,6 +7,7 @@ pub mod indent;
 pub mod iteration;
 pub mod memory;
 pub mod observer;
+pub mod path_pattern;
 pub mod query_loader;
 pub mod repo_map;
 pub mod scope_enforcer;

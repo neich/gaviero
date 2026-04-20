@@ -731,17 +731,8 @@ pub(super) fn refresh_chat_autocomplete(app: &mut App) {
         at_pos <= text.len() && text[..at_pos].trim() == "/run"
     };
 
-    let files: Vec<String> = app
-        .file_tree
-        .entries
-        .iter()
-        .filter(|e| !e.is_dir)
-        .filter_map(|e| {
-            e.path
-                .strip_prefix(&root)
-                .ok()
-                .map(|p| p.to_string_lossy().to_string())
-        })
+    let files: Vec<String> = list_workspace_files(&root, 2000)
+        .into_iter()
         .filter(|f| !is_run_path_context || f.ends_with(".gaviero"))
         .collect();
 

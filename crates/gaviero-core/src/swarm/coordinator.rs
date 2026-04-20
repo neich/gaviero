@@ -278,8 +278,9 @@ impl Coordinator {
     pub fn validate_dag(&self, dag: &TaskDAG) -> Result<()> {
         let units = &dag.units;
 
-        // Check scope overlaps (reuse existing validation)
-        let scope_errors = validation::validate_scopes(units);
+        // Check scope overlaps (reuse existing validation).
+        // TaskDAG has no loop groupings — coordinator-produced DAGs are flat.
+        let scope_errors = validation::validate_scopes(units, &[]);
         if !scope_errors.is_empty() {
             anyhow::bail!(
                 "coordinator DAG has scope overlaps: {}",
@@ -933,16 +934,7 @@ fn resolve_scope_overlaps(units: &mut [WorkUnit]) -> Vec<String> {
 
 /// Check if two normalized paths overlap (same as validation.rs logic).
 fn paths_overlap_normalized(a: &str, b: &str) -> bool {
-    if a == b {
-        return true;
-    }
-    if a.ends_with('/') && (b.starts_with(a) || b == a.trim_end_matches('/')) {
-        return true;
-    }
-    if b.ends_with('/') && (a.starts_with(b) || a == b.trim_end_matches('/')) {
-        return true;
-    }
-    false
+    crate::path_pattern::patterns_overlap(a, b)
 }
 
 /// Build the system prompt for DSL-output coordination.

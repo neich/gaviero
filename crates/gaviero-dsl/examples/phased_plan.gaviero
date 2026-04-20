@@ -1,0 +1,357 @@
+// Template: Execute a multi-phase implementation plan with dynamic phase extraction
+//
+// Shape:
+//   analyse_plan (opus)              — extracts phases from the plan
+//     ↓
+//   loop {
+//     phase_executor (opus)          — runs phase {{ITER}} from the briefing
+//     phase_gate     (sonnet)        — PASS / STOP verdict on this phase
+//     until agent phase_judge        — sonnet: "all briefing phases done?"
+//     max_iterations 12              — safety cap; actual count comes from briefing
+//   }
+//     ↓
+//   final_audit  (opus)              — cross-phase integration audit
+//
+// Why this shape: the DSL DAG is static at compile time, but the number of
+// phases only becomes known after analyse_plan reads the plan document.
+// A loop with a judge expresses "run one phase per iteration until the
+// briefing is exhausted" without the script committing to a phase count.
+//
+// Tiers:
+//   * analyse_plan, phase_executor, final_audit — expensive. Each does real
+//     reasoning: extracting structure, executing a phase, cross-checking.
+//   * phase_gate, phase_judge — cheap. Pattern-match on structured markers
+//     (VERDICT: lines, phase counts), no deep reasoning.
+//
+// Hard-fail mechanism:
+//   * phase_gate ends its log with `VERDICT: PASS` or `VERDICT: STOP: <reason>`.
+//   * On STOP, phase_judge exits the loop; phase_executor's STEP 0 halt
+//     check also refuses to run the next phase if it ever fires.
+//   * Workflow-level `verify { compile … test … }` is the runtime safety net
+//     — catches broken builds regardless of what the gates said.
+//
+// Scope tradeoff vs. a hardcoded-phases version:
+//   A single phase_executor runs every iteration, so its `owned` must cover
+//   every file any phase could touch (src/ + tests/). You lose the per-phase
+//   partition safety a hand-authored flat script would give you. If the plan
+//   is big enough that you want per-phase ownership, fork this script and
+//   hardcode the phase agents instead.
+//
+// Usage:
+//   gaviero-cli --script phased_plan.gaviero \
+//               --prompt-file /path/to/your/plan.md \
+//               --var OUT_DIR=plans/log
+//
+// OUT_DIR is the single knob for where logs, briefings, and audits land.
+// Both prompts and scope paths substitute {{OUT_DIR}} at compile time, so
+// a single --var override relocates every output the script produces.
+
+client opus {
+    tier expensive
+    model "claude-opus-4-7"
+    effort high
+    extra {
+        // analyse_plan, phase_executor, and final_audit all do multi-document
+        // synthesis — request a larger extended-thinking budget so Opus can
+        // reason over the full plan + prior phase logs without running out.
+        // Backends that don't consume the key ignore it (logged at debug).
+        "thinking_budget" "8000"
+    }
+}
+
+// `default` covers agents that don't declare `tier` or `client` explicitly.
+// Every agent in this script sets a tier, so this is purely defensive —
+// a misspelled `tier expensive` in a fork would fall back to sonnet rather
+// than trigger the "no client declared" warning + haiku default.
+client sonnet {
+    tier cheap
+    model "claude-sonnet-4-6"
+    effort medium
+    default
+}
+
+tier expensive opus
+tier cheap     sonnet
+
+vars {
+    OUT_DIR "plans/log"
+}
+
+// ── Prompts ──────────────────────────────────────────────────────────────────
+
+prompt analyse-body #"
+    You are extracting an execution briefing from an implementation plan.
+
+    The implementation plan (passed via --prompt-file):
+
+    {{PROMPT}}
+
+    Skim CLAUDE.md and ARCHITECTURE.md for project conventions.
+
+    Produce {{OUT_DIR}}/00-briefing.md with this exact structure:
+
+        # Briefing
+
+        PHASE_COUNT: <integer>
+
+        ## Phase 1 — <short title>
+        Goal: <one paragraph>
+        Files to touch: <bullet list>
+        Acceptance criteria: <numbered list>
+        Depends on: <earlier phase numbers or "none">
+
+        ## Phase 2 — <short title>
+        ...
+
+        (repeat for every phase the plan contains)
+
+        ## Cross-phase notes
+        - Ordering constraints
+        - Known risks
+        - Ambiguities or gaps in the plan — flag them, do NOT paper over
+
+        VERDICT: PROCEED
+
+    The `PHASE_COUNT` line is machine-read by the judge. Be exact.
+    Each phase heading must be `## Phase <N> — <title>`, numbered from 1.
+
+    If the plan is incoherent, self-contradictory, or missing a critical
+    phase, replace the final line with:
+
+        VERDICT: STOP: <one paragraph naming the gap>
+
+    Downstream phases refuse to run if the briefing STOPs.
+"#
+
+prompt phase-body #"
+    You are the phase executor. This is iteration {{ITER}}.
+
+    STEP 0 — halt check.
+      Read {{OUT_DIR}}/00-briefing.md. If its last line is `VERDICT: STOP: …`
+      or if iteration {{ITER}} is greater than PHASE_COUNT, write a single
+      line to {{OUT_DIR}}/phase-{{ITER}}.md:
+
+          HALTED: nothing to execute (briefing STOP or phase count exceeded)
+
+      and exit without modifying any source files.
+
+      If {{ITER}} > 1, also read {{OUT_DIR}}/gate-{{PREV_ITER}}.md. If its
+      last line is `VERDICT: STOP: …`, write:
+
+          HALTED: <quote the STOP reason verbatim>
+
+      to {{OUT_DIR}}/phase-{{ITER}}.md and exit.
+
+    STEP 1 — locate your phase.
+      From {{OUT_DIR}}/00-briefing.md, read the section headed
+      `## Phase {{ITER}} — …`. That is your entire scope for this iteration.
+      Read every prior `{{OUT_DIR}}/phase-*.md` to understand what earlier
+      phases actually did (which may differ from what was planned).
+
+    STEP 2 — execute the phase.
+      Follow the phase's goal, file list, and acceptance criteria literally.
+      Rules:
+        - Touch only the files the briefing lists for Phase {{ITER}}. If the
+          list is wrong, stop and record a DISCOVERY (see STEP 3) rather than
+          widening scope silently.
+        - Follow the plan's API choices exactly; do not redesign.
+        - Run targeted `cargo check` / `cargo test` as you go.
+
+    STEP 3 — write {{OUT_DIR}}/phase-{{ITER}}.md with:
+        - Phase number and title (copied from briefing)
+        - Files modified (list)
+        - Acceptance criteria — status (met | partial | not met)
+        - Deferred items and why
+        - DISCOVERIES: anything this phase learned that casts doubt on later
+          phases — be explicit. The gate reads this section to decide.
+"#
+
+prompt gate-body #"
+    You are the gate after phase {{ITER}}. Your role is cheap, not deep:
+    scan the phase log and diff for anything that should halt the run.
+
+    Read:
+      - {{OUT_DIR}}/phase-{{ITER}}.md (especially DISCOVERIES)
+      - The git diff for files modified in this phase
+      - {{OUT_DIR}}/00-briefing.md — phase {{ITER}}'s acceptance criteria
+
+    Write {{OUT_DIR}}/gate-{{ITER}}.md. End it with exactly one of:
+
+        VERDICT: PASS
+        VERDICT: STOP: <one-paragraph reason>
+
+    Return STOP when:
+      - A discovery invalidates a later phase's plan (wrong API assumption,
+        missing dependency, scope expanded beyond the briefing).
+      - Acceptance criteria are materially unmet and retrying won't help —
+        the plan is wrong, not the implementation.
+      - Files outside the phase's declared file list were modified.
+      - Phase log starts with `HALTED:` — propagate the halt.
+
+    Return PASS when the phase did its job and later phases can proceed,
+    even if minor TODOs remain.
+
+    Be short. You are a fast gate, not a reviewer. Do not modify source files.
+"#
+
+prompt judge-body #"
+    You decide whether the phased run is complete.
+
+    {{ITER_EVIDENCE}}
+
+    Read:
+      - {{OUT_DIR}}/00-briefing.md — parse the `PHASE_COUNT: <N>` line
+      - {{OUT_DIR}}/gate-{{ITER}}.md — the latest gate verdict
+
+    Return PASS (loop exits) when ANY of:
+      1. Iteration {{ITER}} equals PHASE_COUNT AND the latest gate ends with
+         `VERDICT: PASS`. All phases completed cleanly.
+      2. The latest gate ends with `VERDICT: STOP: …`. The run is halted by
+         policy; final_audit will report the halt.
+      3. The briefing itself ended with `VERDICT: STOP:`. There is no work
+         to do.
+
+    Return FAIL (loop continues) when more phases remain and the latest
+    gate PASSed — the next iteration should run Phase {{ITER}}+1.
+
+    Output format — emit exactly one fenced JSON object as your last output:
+
+    ```json
+    {"verdict": "pass" | "fail", "reason": "<one short paragraph>"}
+    ```
+"#
+
+prompt audit-body #"
+    Final integration audit across every phase that ran.
+
+    Read:
+      - {{OUT_DIR}}/00-briefing.md
+      - Every {{OUT_DIR}}/phase-*.md and {{OUT_DIR}}/gate-*.md
+      - The full git diff vs the pre-swarm SHA (via tooling)
+
+    Write {{OUT_DIR}}/99-audit.md covering:
+      - Scope: did each phase deliver what the briefing promised?
+      - Cross-phase: regressions or inconsistencies introduced late that
+        earlier phases assumed weren't there
+      - API: does the public surface match the plan's stated API exactly?
+      - Tests: are the promised tests real and passing?
+      - Halts: if any phase HALTED, explain why and what remains undone
+      - Follow-ups: anything deferred for a future run
+
+    End with one of:
+
+        VERDICT: ACCEPT — merge as-is
+        VERDICT: REJECT — <reason + which phase to re-run>
+        VERDICT: HALTED — <which phase halted and why>
+"#
+
+// ── Agents ───────────────────────────────────────────────────────────────────
+
+agent analyse_plan {
+    description "Extract phases from plan: {{PROMPT}}"
+    tier expensive
+    scope {
+        owned     ["{{OUT_DIR}}/00-briefing.md"]
+        read_only ["src/" "tests/" "Cargo.toml" "CLAUDE.md" "ARCHITECTURE.md"]
+    }
+    prompt analyse-body
+    max_retries 1
+
+    memory {
+        read_ns    ["architecture" "phase-history"]
+        read_query "multi-phase implementation risks for {{PROMPT}}"
+        read_limit 10
+    }
+}
+
+// Single generic executor — runs once per loop iteration and picks its
+// phase from the briefing using {{ITER}}. Broad `owned` scope is the
+// cost of not hardcoding phases; the validator allows overlap here
+// because phase_executor and phase_gate share the same loop group.
+agent phase_executor {
+    description "Execute phase {{ITER}} from briefing"
+    tier expensive
+    depends_on [analyse_plan]
+    scope {
+        owned     ["src/" "tests/" "{{OUT_DIR}}/phase-*.md"]
+        read_only ["{{OUT_DIR}}/" "Cargo.toml" "ARCHITECTURE.md"]
+    }
+    prompt phase-body
+    max_retries 2
+}
+
+agent phase_gate {
+    description "Gate verdict after phase {{ITER}}"
+    tier cheap
+    depends_on [phase_executor]
+    scope {
+        owned     ["{{OUT_DIR}}/gate-*.md"]
+        read_only ["{{OUT_DIR}}/" "src/" "tests/"]
+    }
+    prompt gate-body
+    max_retries 1
+}
+
+agent phase_judge {
+    description "Judge whether all briefing phases are done"
+    tier cheap
+    scope {
+        read_only ["{{OUT_DIR}}/"]
+    }
+    prompt judge-body
+}
+
+agent final_audit {
+    description "Final integration audit: {{PROMPT}}"
+    tier expensive
+    depends_on [phase_gate]
+    scope {
+        owned     ["{{OUT_DIR}}/99-audit.md"]
+        read_only ["{{OUT_DIR}}/" "src/" "tests/" "Cargo.toml"]
+    }
+    prompt audit-body
+    max_retries 1
+
+    memory {
+        write_ns      "phase-history"
+        importance    0.9
+        write_content #"
+            Multi-phase execution — {{PROMPT}}
+            Audit: {{SUMMARY}}
+        "#
+        staleness_sources ["src/" "tests/"]
+    }
+}
+
+// ── Workflow ─────────────────────────────────────────────────────────────────
+//
+// max_iterations 12 is a safety cap, not a phase count. The judge exits the
+// loop as soon as iteration {{ITER}} equals the briefing's PHASE_COUNT (or
+// a gate STOPs). If your plan genuinely has more than ~10 phases, raise
+// this — or reconsider whether the plan should be split.
+//
+// stability 1 because the judge's pass/fail is deterministic (reading a
+// counter and a verdict line), not a vibes-based "converged?" judgment.
+// No need to re-confirm.
+
+workflow phased_plan {
+    steps [
+        analyse_plan
+        loop {
+            agents         [phase_executor phase_gate]
+            max_iterations 12
+            stability      1
+            judge_timeout  60
+            strict_judge   true
+            until agent    phase_judge
+        }
+        final_audit
+    ]
+    max_parallel 1
+    verify { compile true clippy true test true }
+
+    memory {
+        read_ns  ["architecture" "phase-history"]
+        write_ns "phase-history"
+    }
+}

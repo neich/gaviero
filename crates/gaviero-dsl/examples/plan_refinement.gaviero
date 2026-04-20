@@ -82,7 +82,7 @@ prompt init-body #"
     - Risks and mitigations
     - Alternatives considered and why rejected
 
-    Write your plan to {{PLANS}}/{{MODEL_NAME}}-plan-v{{INIT_VER}}.md using
+    Write your plan to {{PLANS}}/{{MODEL_NAME}}-init-v{{INIT_VER}}.md using
     clear markdown with headings. Do not hedge — commit to a design.
 "#
 
@@ -91,17 +91,24 @@ prompt refine-body #"
 
     {{PROMPT}}
 
-    1. Read {{PLANS}}/{{MODEL_NAME}}-plan-v{{PREV_ITER}}.md and
-       {{PLANS}}/{{PEER_NAME}}-plan-v{{PREV_ITER}}.md in full.
+    The previous pair lives in either `-init-v1.md` (iteration 1) or
+    `-refine-plan-v{{PREV_ITER}}.md` (later iterations). If `{{PREV_ITER}}` is
+    `1`, read the `-init-v1.md` files; otherwise read the `-refine-plan-…`
+    files.
+
+    1. Read {{PLANS}}/{{MODEL_NAME}}-init-v{{PREV_ITER}}.md (if it exists) or
+       {{PLANS}}/{{MODEL_NAME}}-refine-plan-v{{PREV_ITER}}.md, and the peer's
+       equivalent {{PLANS}}/{{PEER_NAME}}-…-v{{PREV_ITER}}.md, in full.
     2. Analyse the pair: what does each get right? What does each miss,
        oversimplify, or get wrong? Where do they conflict?
     3. Synthesise a new plan taking the strongest elements of both,
        resolving conflicts with explicit reasoning, and improving on both.
-    4. Write your refined plan to {{PLANS}}/{{MODEL_NAME}}-plan-v{{ITER}}.md.
-       Begin with a '## Synthesis Notes' section: the pair you read, what
-       you adopted from each, what you changed or discarded.
+    4. Write your refined plan to
+       {{PLANS}}/{{MODEL_NAME}}-refine-plan-v{{ITER}}.md. Begin with a
+       '## Synthesis Notes' section: the pair you read, what you adopted from
+       each, what you changed or discarded.
     5. Write a concise summary (under 300 words) to
-       {{PLANS}}/{{MODEL_NAME}}-summary-v{{ITER}}.md covering the main
+       {{PLANS}}/{{MODEL_NAME}}-refine-summary-v{{ITER}}.md covering the main
        differences between the two v{{PREV_ITER}} plans and the key choices
        made in this version. Write it for a human skimming the evolution.
 "#
@@ -118,10 +125,10 @@ prompt judge-body #"
     iteration. Use it to focus your reading — if a file is not listed there
     it did not change this pass.
 
-    1. Read {{PLANS}}/claude-plan-v{{ITER}}.md and
-       {{PLANS}}/codex-plan-v{{ITER}}.md in full.
-    2. Read {{PLANS}}/claude-summary-v{{ITER}}.md and
-       {{PLANS}}/codex-summary-v{{ITER}}.md.
+    1. Read {{PLANS}}/claude-refine-plan-v{{ITER}}.md and
+       {{PLANS}}/codex-refine-plan-v{{ITER}}.md in full.
+    2. Read {{PLANS}}/claude-refine-summary-v{{ITER}}.md and
+       {{PLANS}}/codex-refine-summary-v{{ITER}}.md.
     3. If useful, compare against v{{PREV_ITER}} to judge whether the latest
        changes are still material.
     4. Return PASS only if:
@@ -144,12 +151,21 @@ prompt judge-body #"
 
 // ── Agents ────────────────────────────────────────────────────────────────────
 
+// Ownership uses glob patterns so each phase/model pair owns a disjoint
+// filename namespace inside `plans/`:
+//   plans/<model>-init-v*.md
+//   plans/<model>-refine-plan-v*.md
+//   plans/<model>-refine-summary-v*.md
+// The scope validator checks patterns for real overlap (see
+// `gaviero_core::path_pattern`), so `claude-init-*` and `codex-init-*` are
+// accepted, while collisions within a pattern are still flagged.
+
 agent claude-init {
     vars { MODEL_NAME "claude" }
     description "Initial plan (Claude): {{PROMPT}}"
     client opus
     scope {
-        owned ["plans/"]
+        owned ["plans/claude-init-*.md"]
     }
     prompt init-body
 }
@@ -159,7 +175,7 @@ agent codex-init {
     description "Initial plan (Codex): {{PROMPT}}"
     client codex
     scope {
-        owned ["plans/"]
+        owned ["plans/codex-init-*.md"]
     }
     prompt init-body
 }
@@ -169,7 +185,7 @@ agent claude-refine {
     description "Refine plan (Claude): {{PROMPT}}"
     client opus
     scope {
-        owned     ["plans/"]
+        owned     ["plans/claude-refine-*.md"]
         read_only ["plans/"]
     }
     prompt refine-body
@@ -187,7 +203,7 @@ agent codex-refine {
     description "Refine plan (Codex): {{PROMPT}}"
     client codex
     scope {
-        owned     ["plans/"]
+        owned     ["plans/codex-refine-*.md"]
         read_only ["plans/"]
     }
     prompt refine-body

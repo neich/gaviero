@@ -552,7 +552,7 @@ impl AgentChatState {
                      /attach <path>     — Attach a file (text or image)\n\
                      /attach            — List current attachments\n\
                      /detach <name|all> — Remove attachment(s)\n\
-                     /reset             — Clear messages, keep model/effort/namespace config\n\
+                     /reset             — Clear agent context (keeps visible chat history)\n\
                      /compact [N]       — Keep last N messages (default 6), discard older\n\
                      /context           — Show estimated context usage\n\
                      /run <path>        — Execute a .gaviero DSL script (supports `client { effort ... extra { ... } }` and top-level `tier <name> <client>` aliases)\n\
@@ -701,44 +701,17 @@ impl AgentChatState {
         self.text_input.cursor = 0;
     }
 
-    /// Reset the active conversation: clear messages but keep model/effort/namespace config.
+    /// Reset the agent context: drop the session + planner ledger so the next
+    /// turn bootstraps fresh. Visible chat history, attachments, scroll, and
+    /// input are preserved.
     pub fn reset_conversation(&mut self) {
         let conv = &mut self.conversations[self.active_conv];
-        conv.messages.clear();
-        conv.is_streaming = false;
-        conv.streaming_status.clear();
-        conv.streaming_started_at = None;
-        conv.pending_permission = None;
-        // Drop the Claude session: starting over means bootstrap graph+memory
-        // context again and let Claude allocate a fresh session id.
         conv.claude_session_id = None;
-        // Drop the planner ledger too — it's tied to the conversation.
         conv.session_ledger = None;
         conv.pending_persisted_ledger = None;
-        self.scroll_offset = 0;
-        self.scroll_pinned_to_bottom = true;
         self.text_input.text.clear();
         self.text_input.cursor = 0;
-        self.attachments.clear();
-        self.browse_mode = false;
-        self.history_index = None;
-
-        let mut parts = Vec::new();
-        if let Some(ref m) = self.conversations[self.active_conv].model_override {
-            parts.push(format!("model={}", m));
-        }
-        if let Some(ref e) = self.conversations[self.active_conv].effort_override {
-            parts.push(format!("effort={}", e));
-        }
-        if let Some(ref ns) = self.conversations[self.active_conv].namespace_override {
-            parts.push(format!("namespace={}", ns));
-        }
-        let suffix = if parts.is_empty() {
-            String::new()
-        } else {
-            format!(" Kept: {}", parts.join(", "))
-        };
-        self.add_system_message(&format!("Conversation reset.{}", suffix));
+        self.add_system_message("Context cleared. Next turn will bootstrap fresh (chat history preserved).");
     }
 
     /// Close the active conversation. If it's the last one, replace it with a fresh one.
