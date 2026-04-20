@@ -95,13 +95,24 @@ pub async fn run_backend(
     let memory_query_override = work_unit.memory_read_query.as_deref();
     let memory_limit = work_unit.memory_read_limit.unwrap_or(5);
 
+    // Agents with `context { depth 0 }` (and no callers_of/tests_for) opt out
+    // of the pre-injected graph — they read specific files via tools instead.
+    let graph_budget_tokens = if work_unit.context_depth == 0
+        && work_unit.context_callers_of.is_empty()
+        && work_unit.context_tests_for.is_empty()
+    {
+        0
+    } else {
+        8_000
+    };
+
     let planner_input = PlannerInput {
         user_message: &work_unit.description,
         explicit_refs: &[],
         seed_paths: &owned_paths_buf,
         provider_profile: &provider_profile,
         read_namespaces,
-        graph_budget_tokens: 8_000,
+        graph_budget_tokens,
         memory_query_override,
         memory_limit,
         file_ref_blobs: &[],

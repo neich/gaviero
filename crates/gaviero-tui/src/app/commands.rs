@@ -45,6 +45,7 @@ pub(super) fn handle_swarm_command(app: &mut App) {
     let write_ns = app.chat_state.agent_settings.write_namespace.clone();
     let read_ns = app.chat_state.agent_settings.read_namespaces.clone();
     let memory = app.memory.clone();
+    let excludes = parse_exclude_patterns(&app.workspace);
 
     tokio::spawn(async move {
         use gaviero_core::swarm::{pipeline, planner};
@@ -55,7 +56,7 @@ pub(super) fn handle_swarm_command(app: &mut App) {
             String::new()
         };
 
-        let file_list = list_workspace_files(&root, 200);
+        let file_list = list_workspace_files(&root, 200, &excludes);
         let work_units = match planner::plan_task(
             &task_desc,
             &root,

@@ -81,6 +81,28 @@ prompt init-body #"
     - Data structures and API surface
     - Risks and mitigations
     - Alternatives considered and why rejected
+    - **Phase decomposition for automated execution.** Partition the work into
+      phases sized to land as a single reviewable PR (not per-sub-step,
+      not per-whole-tier). For each phase specify:
+        * owned files / crates (what this phase writes),
+        * read-only dependencies (what this phase must read),
+        * concrete pass/fail acceptance signals (compile, clippy lint, named
+          tests, grep regressions — prefer mechanical signals over prose),
+        * entanglement: which earlier phases' decisions must remain visible
+          to this phase's executor (drives whether prior-phase logs must be
+          read in full or just the gate verdicts).
+      Call out when two candidate phases share enough surface that they
+      should be merged rather than split.
+    - **Execution shape for `phased_plan.gaviero`.** Recommend either:
+        (a) one `phased_plan.gaviero` loop invocation covering all phases, or
+        (b) N separate invocations with a human review checkpoint between
+            top-level items,
+      and state the tradeoff explicitly (resume granularity, diff-review
+      size, cross-phase entanglement, gate cost). If (a), specify the
+      minimum `phase_executor.owned` scope union that the DSL needs
+      (widening beyond the default template is a real cost — call it out).
+      If (b), specify the natural split boundaries and what each invocation's
+      `{{PROMPT}}` should carry.
 
     Write your plan to {{OUT_DIR}}/{{MODEL_NAME}}-init-v{{INIT_VER}}.md using
     clear markdown with headings. Do not hedge — commit to a design.
@@ -107,6 +129,17 @@ prompt refine-body #"
        {{OUT_DIR}}/{{MODEL_NAME}}-refine-plan-v{{ITER}}.md. Begin with a
        '## Synthesis Notes' section: the pair you read, what you adopted from
        each, what you changed or discarded.
+       The refined plan MUST retain (or introduce, if absent from the pair)
+       a '## Phase decomposition' section and an '## Execution shape' section
+       as specified by the init-phase brief:
+         - Phase decomposition: per-phase owned files/crates, read-only
+           dependencies, mechanical pass/fail signals, and cross-phase
+           entanglement notes.
+         - Execution shape: single `phased_plan.gaviero` loop invocation vs
+           N invocations with human checkpoints, with the tradeoff stated
+           and the required scope / `{{PROMPT}}` structure spelled out.
+       If the v{{PREV_ITER}} pair disagrees on these, resolve the conflict
+       in Synthesis Notes and commit to one shape.
     5. Write a concise summary (under 300 words) to
        {{OUT_DIR}}/{{MODEL_NAME}}-refine-summary-v{{ITER}}.md covering the main
        differences between the two v{{PREV_ITER}} plans and the key choices

@@ -920,10 +920,20 @@ fn save_clipboard_image_as_png(img: &arboard::ImageData) -> anyhow::Result<std::
     Ok(path)
 }
 
-fn list_workspace_files(root: &std::path::Path, limit: usize) -> Vec<String> {
+fn list_workspace_files(
+    root: &std::path::Path,
+    limit: usize,
+    excludes: &[String],
+) -> Vec<String> {
     let mut files = Vec::new();
     let walker = std::fs::read_dir(root);
-    fn walk(dir: &std::path::Path, prefix: &str, files: &mut Vec<String>, limit: usize) {
+    fn walk(
+        dir: &std::path::Path,
+        prefix: &str,
+        files: &mut Vec<String>,
+        limit: usize,
+        excludes: &[String],
+    ) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
@@ -932,26 +942,40 @@ fn list_workspace_files(root: &std::path::Path, limit: usize) -> Vec<String> {
                 return;
             }
             let name = entry.file_name().to_string_lossy().to_string();
-            // Skip hidden dirs, build artifacts, node_modules
-            if name.starts_with('.')
-                || name == "target"
-                || name == "node_modules"
-                || name == "build"
-            {
+            if name == ".git" {
+                continue;
+            }
+            if matches_exclude(&name, excludes) {
                 continue;
             }
             let path = format!("{}{}", prefix, name);
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                walk(&entry.path(), &format!("{}/", path), files, limit);
+                walk(&entry.path(), &format!("{}/", path), files, limit, excludes);
             } else {
                 files.push(path);
             }
         }
     }
     if walker.is_ok() {
-        walk(root, "", &mut files, limit);
+        walk(root, "", &mut files, limit, excludes);
     }
     files
+}
+
+/// Match a single path component against the `files.exclude` pattern set.
+/// Mirrors `FileTreeState::is_excluded` (panels/file_tree.rs) so `@` autocomplete
+/// and the file tree agree on what's hidden.
+fn matches_exclude(name: &str, excludes: &[String]) -> bool {
+    for pattern in excludes {
+        let pat = pattern.trim_start_matches("**/");
+        if name == pat {
+            return true;
+        }
+        if name.starts_with('.') && pattern == ".*" {
+            return true;
+        }
+    }
+    false
 }
 
 /// If `src` is markdown-wrapped (i.e. the LLM emitted ```gaviero fences around the
