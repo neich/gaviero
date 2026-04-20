@@ -101,7 +101,7 @@ pub(crate) async fn get_or_build_repo_map_cached(
         return Some(rm);
     }
     let root = workspace_root.clone();
-    match tokio::task::spawn_blocking(move || gaviero_core::repo_map::RepoMap::build(&root)).await {
+    match tokio::task::spawn_blocking(move || gaviero_core::repo_map::RepoMap::build(&root, &[])).await {
         Ok(Ok(map)) => {
             let arc = std::sync::Arc::new(map);
             let mut guard = repo_map_cache.write().await;
@@ -128,7 +128,7 @@ pub(crate) async fn compute_impact_text(
     }
     tokio::task::spawn_blocking(move || {
         let (store, _) =
-            gaviero_core::repo_map::graph_builder::build_graph(&workspace_root).ok()?;
+            gaviero_core::repo_map::graph_builder::build_graph(&workspace_root, &[]).ok()?;
         let seed_refs: Vec<&str> = seeds.iter().map(|s| s.as_str()).collect();
         let impact = store.impact_radius(&seed_refs, 2).ok()?;
         if impact.affected_files.is_empty() {
@@ -316,7 +316,7 @@ pub(crate) fn warm_up_repo_map(app: &App) {
     };
     let cache = app.repo_map.clone();
     tokio::spawn(async move {
-        match tokio::task::spawn_blocking(move || gaviero_core::repo_map::RepoMap::build(&root))
+        match tokio::task::spawn_blocking(move || gaviero_core::repo_map::RepoMap::build(&root, &[]))
             .await
         {
             Ok(Ok(map)) => {
