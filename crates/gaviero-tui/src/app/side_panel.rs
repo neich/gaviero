@@ -731,7 +731,8 @@ pub(super) fn refresh_chat_autocomplete(app: &mut App) {
         at_pos <= text.len() && text[..at_pos].trim() == "/run"
     };
 
-    let files: Vec<String> = list_workspace_files(&root, 2000)
+    let excludes = parse_exclude_patterns(&app.workspace);
+    let files: Vec<String> = list_workspace_files(&root, 2000, &excludes)
         .into_iter()
         .filter(|f| !is_run_path_context || f.ends_with(".gaviero"))
         .collect();
