@@ -34,6 +34,21 @@ pub fn compile(
     workflow: Option<&str>,
     runtime_prompt: Option<&str>,
 ) -> Result<CompiledPlan, miette::Report> {
+    compile_with_vars(source, filename, workflow, runtime_prompt, &[])
+}
+
+/// Like [`compile`] but accepts variable overrides that take precedence over
+/// the script-level `vars {}` block (agent-level vars still win over these).
+///
+/// Useful for CLI flags like `--var KEY=VALUE` that let callers override
+/// output paths or other script-wide settings without editing the script.
+pub fn compile_with_vars(
+    source: &str,
+    filename: &str,
+    workflow: Option<&str>,
+    runtime_prompt: Option<&str>,
+    override_vars: &[(String, String)],
+) -> Result<CompiledPlan, miette::Report> {
     use miette::NamedSource;
 
     // Phase 1: Lex
@@ -60,6 +75,6 @@ pub fn compile(
     };
 
     // Phase 3: Compile
-    compiler::compile_ast(&ast, source, filename, workflow, runtime_prompt)
+    compiler::compile_ast_with_vars(&ast, source, filename, workflow, runtime_prompt, override_vars)
         .map_err(|e| miette::Report::new(e))
 }
