@@ -39,11 +39,19 @@ impl std::fmt::Display for CycleError {
 /// O(n²) pairwise check. Each pair of paths is tested for:
 /// - Exact match (both files)
 /// - Prefix containment (one or both are directories ending with '/')
-pub fn validate_scopes(units: &[WorkUnit]) -> Vec<ScopeError> {
+///
+/// `loop_groups` lists agent-id sets that iterate inside the same
+/// `loop { ... }` block. Pairs within the same group are skipped: loop
+/// siblings are expected to collaborate on shared paths across iterations,
+/// and their relative order is controlled by `depends_on` within the loop.
+pub fn validate_scopes(units: &[WorkUnit], loop_groups: &[Vec<String>]) -> Vec<ScopeError> {
     let mut errors = Vec::new();
 
     for i in 0..units.len() {
         for j in (i + 1)..units.len() {
+            if share_loop_group(&units[i].id, &units[j].id, loop_groups) {
+                continue;
+            }
             let overlaps =
                 find_overlapping_paths(&units[i].scope.owned_paths, &units[j].scope.owned_paths);
             if !overlaps.is_empty() {
@@ -57,6 +65,12 @@ pub fn validate_scopes(units: &[WorkUnit]) -> Vec<ScopeError> {
     }
 
     errors
+}
+
+fn share_loop_group(a: &str, b: &str, groups: &[Vec<String>]) -> bool {
+    groups
+        .iter()
+        .any(|g| g.iter().any(|id| id == a) && g.iter().any(|id| id == b))
 }
 
 /// Check if two sets of owned paths overlap.
@@ -74,29 +88,10 @@ fn find_overlapping_paths(paths_a: &[String], paths_b: &[String]) -> Vec<String>
     overlaps
 }
 
-/// Check if two paths overlap (exact match, or one is a prefix of the other).
+/// Check if two path patterns could share a concrete file match.
+/// Delegates to the glob-aware pattern overlap check.
 fn paths_overlap(a: &str, b: &str) -> bool {
-    let a = crate::types::normalize_path(a);
-    let b = crate::types::normalize_path(b);
-    let a = a.as_str();
-    let b = b.as_str();
-
-    if a == b {
-        return true;
-    }
-
-    // Directory prefix: "src/" contains "src/main.rs"
-    let a_is_dir = a.ends_with('/');
-    let b_is_dir = b.ends_with('/');
-
-    if a_is_dir && (b.starts_with(a) || b == a.trim_end_matches('/')) {
-        return true;
-    }
-    if b_is_dir && (a.starts_with(b) || a == b.trim_end_matches('/')) {
-        return true;
-    }
-
-    false
+    crate::path_pattern::patterns_overlap(a, b)
 }
 
 /// Compute dependency tiers using Kahn's algorithm (topological sort).
@@ -220,7 +215,7 @@ mod tests {
             unit("b", &["src/api/"], &[]),
             unit("c", &["src/db/"], &[]),
         ];
-        assert!(validate_scopes(&units).is_empty());
+        assert!(validate_scopes(&units, &[]).is_empty());
     }
 
     #[test]
@@ -229,7 +224,7 @@ mod tests {
             unit("a", &["src/main.rs"], &[]),
             unit("b", &["src/main.rs"], &[]),
         ];
-        let errors = validate_scopes(&units);
+        let errors = validate_scopes(&units, &[]);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].unit_a, "a");
         assert_eq!(errors[0].unit_b, "b");
@@ -241,8 +236,35 @@ mod tests {
             unit("a", &["src/"], &[]),
             unit("b", &["src/auth/login.rs"], &[]),
         ];
-        let errors = validate_scopes(&units);
+        let errors = validate_scopes(&units, &[]);
         assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn test_overlap_allowed_within_same_loop_group() {
+        let units = vec![
+            unit("refactor", &["src/", "crates/"], &[]),
+            unit("fix_tests", &["tests/", "src/"], &["refactor"]),
+        ];
+        let loop_groups = vec![vec!["refactor".to_string(), "fix_tests".to_string()]];
+        assert!(validate_scopes(&units, &loop_groups).is_empty());
+    }
+
+    #[test]
+    fn test_overlap_still_fails_across_loop_groups() {
+        // Two loops; "a" and "c" overlap but are not in the same loop.
+        let units = vec![
+            unit("a", &["src/"], &[]),
+            unit("b", &["src/"], &["a"]),
+            unit("c", &["src/"], &[]),
+        ];
+        let loop_groups = vec![vec!["a".to_string(), "b".to_string()]];
+        let errors = validate_scopes(&units, &loop_groups);
+        assert_eq!(errors.len(), 2);
+        for err in &errors {
+            let pair = (err.unit_a.as_str(), err.unit_b.as_str());
+            assert!(pair == ("a", "c") || pair == ("b", "c"));
+        }
     }
 
     // ── Dependency tier tests ───────────────────────────────────
