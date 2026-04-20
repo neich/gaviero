@@ -102,8 +102,8 @@ async fn try_plan(
         )
     })?;
 
-    // Validate
-    let scope_errors = validation::validate_scopes(&units);
+    // Validate. Legacy planner produces a flat unit list — no loop groupings.
+    let scope_errors = validation::validate_scopes(&units, &[]);
     if !scope_errors.is_empty() {
         anyhow::bail!(
             "scope overlaps: {}",
