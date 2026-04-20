@@ -321,7 +321,40 @@ pub fn compile_ast_with_vars(
         }));
     }
 
-    // ── Phase 6: build iteration / verification configs ───────────
+    // ── Phase 6: inject step-ordering barriers for loop blocks ────
+    //
+    // Agents inside a `loop { }` block implicitly depend on all agents from
+    // preceding steps in the workflow `steps [...]` list, so the loop never
+    // starts before earlier phases complete. Agent-to-agent steps are left
+    // independent (no implicit sequential ordering between bare agent refs).
+    if let Some(wf) = selected_workflow {
+        if let Some((steps, _)) = &wf.steps {
+            let mut preceding: Vec<String> = Vec::new();
+            for step in steps {
+                match step {
+                    StepItem::Agent(name, _) => preceding.push(name.clone()),
+                    StepItem::Loop(lb) => {
+                        let loop_ids: Vec<String> =
+                            lb.agents.iter().map(|(n, _)| n.clone()).collect();
+                        if !preceding.is_empty() {
+                            for wu in work_units.iter_mut() {
+                                if loop_ids.contains(&wu.id) {
+                                    for dep in &preceding {
+                                        if !wu.depends_on.contains(dep) {
+                                            wu.depends_on.push(dep.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        preceding.extend(loop_ids);
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Phase 7: build iteration / verification configs ───────────
 
     // Warn when all agents are independent (no depends_on); single-agent with
     // strategy refine may be a better choice.
@@ -344,7 +377,7 @@ pub fn compile_ast_with_vars(
         .map(build_verification_config)
         .unwrap_or_default();
 
-    // ── Phase 7: extract LoopConfigs from workflow steps ────────
+    // ── Phase 8: extract LoopConfigs from workflow steps ────────
 
     let loop_configs = extract_loop_configs(selected_workflow);
 
@@ -1868,6 +1901,38 @@ mod tests {
         assert!(ids.contains(&"pre"));
         assert!(ids.contains(&"looped"));
         assert!(ids.contains(&"post"));
+    }
+
+    #[test]
+    fn loop_agents_depend_on_preceding_steps() {
+        let src = r#"
+            agent init-a  { description "first init" }
+            agent init-b  { description "second init" }
+            agent refine  { description "refine" }
+            agent judge   { description "judge" }
+            workflow w {
+                steps [
+                    init-a
+                    init-b
+                    loop {
+                        agents [refine]
+                        max_iterations 5
+                        until agent judge
+                    }
+                ]
+            }
+        "#;
+        let plan = compile_plan(src).unwrap();
+        let units = plan.work_units_ordered().unwrap();
+        let refine = units.iter().find(|u| u.id == "refine").unwrap();
+        let mut deps = refine.depends_on.clone();
+        deps.sort();
+        assert_eq!(deps, vec!["init-a", "init-b"]);
+        // init agents themselves have no injected deps
+        let init_a = units.iter().find(|u| u.id == "init-a").unwrap();
+        assert!(init_a.depends_on.is_empty());
+        let init_b = units.iter().find(|u| u.id == "init-b").unwrap();
+        assert!(init_b.depends_on.is_empty());
     }
 
     // ── Graph / impact tests ─────────────────────────────────────
