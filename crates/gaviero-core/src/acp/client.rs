@@ -713,6 +713,11 @@ pub(crate) async fn propose_write(
 
     // 5. If AutoAccept mode, write to disk outside lock
     if let Some((path, content)) = auto_accept_result {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .context("creating parent directories")?;
+        }
         tokio::fs::write(&path, &content)
             .await
             .context("writing auto-accepted file")?;
