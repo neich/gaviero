@@ -1,6 +1,6 @@
 # gaviero-core — Architecture
 
-Shared execution layer. All runtime logic: swarm orchestration, ACP chat, memory, write gate, validation, git, terminal. No UI dependencies.
+Shared execution layer. All runtime logic: swarm, memory, ACP, write gate, validation, git, terminal, repo map, context planning. No UI dependencies.
 
 ---
 
@@ -8,642 +8,272 @@ Shared execution layer. All runtime logic: swarm orchestration, ACP chat, memory
 
 ```
 gaviero-core/src/
-├─ lib.rs                     Re-exports tree-sitter + 18 public modules
-├─ types.rs                   Core types: FileScope, WriteProposal, ModelTier, PrivacyLevel
-├─ workspace.rs               Workspace model, settings cascade
-├─ session_state.rs           SessionState (UI tabs, panels, conversations)
-├─ tree_sitter.rs             LANGUAGE_REGISTRY (16 langs), enrich_hunks()
-├─ diff_engine.rs             compute_hunks() → Vec<DiffHunk>
-├─ write_gate.rs              WriteGatePipeline, WriteMode, proposal lifecycle
-├─ observer.rs                Observer trait definitions (WriteGateObserver, AcpObserver, SwarmObserver)
-├─ scope_enforcer.rs          FileScope validation, permission checks
-├─ git.rs                     GitRepo, WorktreeManager (git2 wrapper)
-├─ query_loader.rs            Tree-sitter .scm query file discovery
-├─ acp/                        Claude subprocess protocol & session management
-│  ├─ session.rs              AcpSession, spawn, polling, stderr output
-│  ├─ protocol.rs             NDJSON parsing (SystemInit, ContentDelta, ToolUseStart, etc.)
-│  ├─ client.rs               AcpPipeline, prompt enrichment, file block routing
-│  └─ factory.rs              AcpSessionFactory, session lifecycle
-├─ swarm/                      Multi-agent orchestration engine (6-phase pipeline)
-│  ├─ models.rs               WorkUnit, AgentManifest, SwarmResult, MergeResult
-│  ├─ plan.rs                 CompiledPlan, PlanNode, petgraph DAG
-│  ├─ pipeline.rs             Main orchestration: validate → execute → merge → verify → cleanup → consolidate
-│  ├─ coordinator.rs          Natural-language task decomposition → TaskDAG (Opus-powered)
-│  ├─ validation.rs           Scope overlap detection, Kahn's topological sort
-│  ├─ router.rs               TierRouter: (ModelTier, PrivacyLevel) → ResolvedBackend
-│  ├─ privacy.rs              PrivacyScanner: glob-based privacy override
-│  ├─ calibration.rs          TierStats, per-tier success tracking
-│  ├─ replanner.rs            Mid-execution replanning decisions
-│  ├─ execution_state.rs      ExecutionState, NodeStatus, checkpoint/resume
-│  ├─ merge.rs                Git merge + Claude-powered conflict resolution
-│  ├─ bus.rs                  AgentBus: broadcast + targeted messaging
-│  ├─ board.rs                SharedBoard: agent discovery board
-│  ├─ context.rs              RepositoryContext collection + ref extraction
-│  ├─ backend/                AgentBackend abstraction + implementations
-│  │  ├─ mod.rs               AgentBackend trait, UnifiedStreamEvent, CompletionRequest, Capabilities
-│  │  ├─ shared.rs            Model-spec parsing, provider detection, prompt enrichment
-│  │  ├─ executor.rs          run_backend(), stream event processing
-│  │  ├─ claude_code.rs       ClaudeCodeBackend (ACP subprocess via ClaudeCodeSession)
-│  │  ├─ ollama.rs            OllamaStreamBackend (HTTP SSE)
-│  │  ├─ codex.rs             CodexBackend (OpenAI-compatible)
-│  │  ├─ mock.rs              MockBackend (testing)
-│  │  └─ runner.rs            run_backend() orchestrator logic
-│  └─ verify/                  Verification strategies
-│     ├─ structural.rs         TreeSitterGate: parse-error detection
-│     ├─ diff_review.rs        LLM diff review (batched per-unit/tier/aggregate)
-│     ├─ test_runner.rs        Test command execution (auto-detect + targeted)
-│     └─ combined.rs           Verification orchestrator (sequential + escalation)
-├─ memory/                     Hierarchical scoped embeddings + consolidation
-│  ├─ store.rs                MemoryStore (SQLite + sqlite-vec wrapper)
-│  ├─ scope.rs                MemoryScope (5-level), WriteScope, Trust, MemoryType
-│  ├─ scoring.rs              SearchConfig, ScoredMemory, scoring formula
-│  ├─ consolidation.rs        Consolidator (3-phase: triage → decay → promotion)
-│  ├─ embedder.rs             Embedder trait interface
-│  ├─ onnx_embedder.rs        OnnxEmbedder (ort + tokenizers, nomic-embed-text-v1.5)
-│  ├─ model_manager.rs        Model download + cache management
-│  └─ code_graph.rs           Code knowledge graph (SQLite-backed)
-├─ repo_map/                   File ranking + context graph
-│  ├─ mod.rs                  RepoMap, build(), rank_for_agent()
-│  ├─ store.rs                GraphStore, FileNode, DirectedEdge
-│  └─ pagerank.rs             Personalized PageRank
-├─ iteration/                  Retry + escalation + best-of-N engine
-│  ├─ mod.rs                  IterationEngine, IterationConfig, Strategy
-│  ├─ engine.rs               Retry loop logic, convergence detection
-│  └─ converter.rs            TestGenerator: TDD test generation
-├─ validation_gate/            Syntax + semantic validation gates
-│  ├─ mod.rs                  ValidationPipeline, ValidationGate trait
-│  ├─ tree_sitter_gate.rs     Parse-error detection
-│  └─ cargo_check_gate.rs     Rust compile checks
-├─ indent/                     Tree-sitter + heuristic indentation
-│  ├─ mod.rs                  compute_indent() dispatcher
-│  ├─ tree_sitter.rs          Query-based indent
-│  ├─ hybrid.rs               Heuristic fallback
-│  └─ bracket.rs              Bracket counting final fallback
-└─ terminal/                   Embedded PTY + shell session management
-   ├─ mod.rs                  TerminalManager, TerminalInstance lifecycle
-   ├─ pty.rs                  PTY spawning (portable-pty)
-   └─ osc133.rs               OSC 133 prompt/command parsing
+├─ lib.rs               Re-exports tree-sitter types + 21 pub mod
+├─ types.rs             FileScope, WriteProposal, DiffHunk, StructuralHunk,
+│                       ModelTier, PrivacyLevel, NodeInfo, normalize_path
+├─ workspace.rs         Workspace, settings cascade, namespace resolution
+├─ session_state.rs     SessionState, TabState, PanelState, StoredConversation,
+│                       ConversationIndex (+ load_session / save_session)
+├─ tree_sitter.rs       LANGUAGE_REGISTRY (16 langs), enrich_hunks
+├─ diff_engine.rs       compute_hunks (via `similar`)
+├─ write_gate.rs        WriteGatePipeline, WriteMode, proposal lifecycle
+├─ observer.rs          WriteGateObserver, AcpObserver, SwarmObserver
+├─ scope_enforcer.rs    FileScope checks (thin wrapper over path_pattern)
+├─ path_pattern.rs      Glob matcher + patterns_overlap — backs DSL scope-
+│                       overlap validation and swarm::validation
+├─ git.rs               GitRepo, WorktreeManager, GitCoordinator (git2)
+├─ query_loader.rs      Tree-sitter .scm query discovery
+├─ indent/              compute_indent dispatcher
+│  ├─ tree_sitter.rs    Query-based indent
+│  ├─ hybrid.rs         Heuristic fallback
+│  └─ bracket.rs        Bracket-counting final fallback
+├─ terminal/            PTY lifecycle + OSC 133
+│  ├─ pty.rs            portable-pty spawn + I/O
+│  └─ osc133.rs         Prompt/command boundary parsing
+├─ repo_map/            File ranking + personalized PageRank
+│  ├─ store.rs          GraphStore, FileNode, DirectedEdge
+│  ├─ builder.rs        Graph construction from source symbols
+│  ├─ graph_builder.rs  Incremental graph updates
+│  └─ pagerank.rs       PageRank over agent-preferred nodes
+├─ acp/                 Claude subprocess (ACP protocol)
+│  ├─ session.rs        AcpSession (spawn, streaming, tempfile spill)
+│  ├─ protocol.rs       NDJSON parsing, ContentDelta / ToolUse / Result
+│  ├─ client.rs         AcpPipeline, propose_write, prompt enrichment
+│  └─ factory.rs        AcpSessionFactory (one_shot / persistent)
+├─ agent_session/       V9 transport layer — AgentSession trait + impls
+│  ├─ mod.rs            Turn, TransportContext, build_turn (PlannerSelections
+│  │                    → Turn), LegacyAgentSession shim
+│  ├─ claude.rs         Claude AgentSession (backed by AcpPipeline)
+│  ├─ codex_exec.rs     Codex via `codex exec`
+│  ├─ codex_app_server.rs Codex app-server transport
+│  ├─ ollama.rs         Ollama HTTP SSE transport
+│  └─ registry.rs       Session registration + routing
+├─ context_planner/     Bootstrap / delta / replay policy
+│  ├─ mod.rs            ContextPlanner, plan() → PlannerSelections
+│  ├─ types.rs          PlannerInput, MemorySelection, GraphSelection,
+│  │                    ReplayPayload, ContinuityHandle, ProviderProfile
+│  ├─ ledger.rs         SessionLedger, PlannerFingerprint, ContentDigest
+│  └─ compaction.rs     CompactionPolicy, compact_replay, should_compact
+├─ memory/              Scoped embeddings + consolidation
+│  ├─ store.rs          MemoryStore (SQLite + sqlite-vec)
+│  ├─ scope.rs          MemoryScope (5-level), WriteScope, Trust, MemoryType
+│  ├─ scoring.rs        SearchConfig, ScoredMemory, scoring formula
+│  ├─ consolidation.rs  Consolidator (triage → decay → promotion)
+│  ├─ embedder.rs       Embedder trait
+│  ├─ onnx_embedder.rs  OnnxEmbedder (nomic-embed-text-v1.5)
+│  ├─ model_manager.rs  Model download + cache
+│  └─ code_graph.rs     Code knowledge graph (impact queries)
+├─ swarm/               6-phase orchestration
+│  ├─ models.rs         WorkUnit, AgentManifest, SwarmResult, MergeResult
+│  ├─ plan.rs           CompiledPlan, PlanNode, DependencyEdge
+│  ├─ pipeline.rs       validate → execute → merge → verify → cleanup →
+│  │                    consolidate
+│  ├─ coordinator.rs    NLP task → CompiledPlan (Opus-powered)
+│  ├─ planner.rs        Static planner utilities
+│  ├─ validation.rs     Pairwise scope overlap, topological sort
+│  ├─ router.rs         TierRouter: (tier, privacy) → ResolvedBackend
+│  ├─ privacy.rs        PrivacyScanner (glob privacy override)
+│  ├─ replanner.rs      Mid-execution replanning decisions
+│  ├─ execution_state.rs Checkpoint / resume
+│  ├─ merge.rs          Claude-assisted merge conflict resolution
+│  ├─ bus.rs            AgentBus (broadcast + targeted)
+│  ├─ board.rs          SharedBoard (tagged agent findings)
+│  ├─ context.rs        Repository context collection
+│  ├─ backend/          AgentBackend + shared, executor, runner,
+│  │                    claude_code, ollama, codex, mock
+│  └─ verify/           structural, diff_review, test_runner, combined
+├─ iteration/           IterationEngine (retry, BestOfN, TDD)
+└─ validation_gate/     ValidationPipeline, TreeSitterGate, CargoCheckGate
 ```
 
 ---
 
 ## 2. Core Data Structures
 
-### FileScope (types.rs:124)
+**`FileScope` (`types.rs`):** `owned_paths`, `read_only_paths`, `interface_contracts`. Matched through `path_pattern` globs. Pairwise overlap uses `path_pattern::patterns_overlap` so glob-disjoint siblings (`plans/claude-*.md` vs `plans/codex-*.md`) are accepted.
 
-Agent permission boundary.
+**`WorkUnit` (`swarm/models.rs`):** id, description, scope, depends_on, coordinator instructions, model / tier / privacy, retries + escalation tier, memory routing (`read_namespaces`, `write_namespace`, `memory_importance`, `staleness_sources`, `memory_read_query`, `memory_read_limit`, `memory_write_content`), context (`impact_scope`, `context_callers_of`, `context_tests_for`, `context_depth`).
 
-```rust
-pub struct FileScope {
-    pub owned_paths: Vec<String>,
-    pub read_only_paths: Vec<String>,
-    pub interface_contracts: HashMap<String, String>,
-}
-```
+**`CompiledPlan` (`swarm/plan.rs`):** `DiGraph<PlanNode, DependencyEdge>`, `max_parallel`, `iteration_config`, `verification_config`, `loop_configs`, `source_file`. Methods: `work_units_ordered`, `from_work_units`, `hash`.
 
-**Invariants:**
-- No two agents can own overlapping paths
-- All file writes checked against this before accepting
+**`UnifiedStreamEvent` (`swarm/backend/mod.rs`):** `TextDelta | ThinkingDelta | ToolCallStart/Delta/End | FileBlock | Usage | Error | Done`.
 
-**Used by:**
-- `write_gate`: scope validation
-- `swarm::validation`: overlap detection
-- `memory/scope`: module-level namespace routing
+**`MemoryScope` (`memory/scope.rs`):** 5-level resolved scope chain (`global`, `workspace`, `repo`, `module`, `run`) with `levels()` returning narrowest→widest order. `WriteScope` is always explicit.
 
-### WorkUnit (swarm/models.rs:52)
-
-Complete specification of one agent's task.
-
-```rust
-pub struct WorkUnit {
-    pub id: String,
-    pub description: String,
-    pub scope: FileScope,
-    pub depends_on: Vec<String>,
-    pub coordinator_instructions: String,
-    pub model: Option<String>,
-    pub tier: ModelTier,
-    pub privacy: PrivacyLevel,
-    pub max_retries: u8,
-    pub escalation_tier: Option<ModelTier>,
-    // Memory routing fields
-    pub read_namespaces: Option<Vec<String>>,
-    pub write_namespace: Option<String>,
-    pub memory_importance: Option<f32>,
-    // Context expansion fields
-    pub impact_scope: bool,
-    pub context_callers_of: Vec<String>,
-    pub context_tests_for: Vec<String>,
-    pub context_depth: u32,
-}
-```
-
-### CompiledPlan (swarm/plan.rs:18)
-
-Immutable DAG of WorkUnits with metadata.
-
-```rust
-pub struct CompiledPlan {
-    pub graph: DiGraph<PlanNode, DependencyEdge>,
-    pub max_parallel: Option<usize>,
-    pub source_file: Option<PathBuf>,
-    pub iteration_config: IterationConfig,
-    pub verification_config: VerificationConfig,
-    pub loop_configs: Vec<LoopConfig>,
-}
-```
-
-**Key methods:**
-- `work_units_ordered() -> Vec<WorkUnit>`: Kahn's topo-sort
-- `from_work_units(Vec<WorkUnit>) -> Result<Self>`: flat list → DAG with dependency edges
-- `hash() -> String`: stable checkpoint identifier
-
-### UnifiedStreamEvent (swarm/backend/mod.rs:84)
-
-Normalized backend event stream (provider-agnostic).
-
-```rust
-pub enum UnifiedStreamEvent {
-    TextDelta { content: String },
-    ThinkingDelta { content: String },
-    ToolCallStart { tool_name: String, tool_use_id: String },
-    ToolCallDelta { tool_use_id: String, input_delta: String },
-    ToolCallEnd { tool_use_id: String },
-    FileBlock { path: PathBuf, content: String },
-    Usage { input_tokens: u32, output_tokens: u32, cost_usd: f64 },
-    Error { message: String, is_auth_error: bool },
-    Done { stop_reason: StopReason },
-}
-```
-
-**Produced by all backends; consumed by:**
-- `backend::executor::complete_to_text()`: collects text
-- `backend::executor::complete_to_write_gate()`: routes file blocks
-- `acp/client.rs`: inserts proposals
-
-### MemoryScope (memory/scope.rs:24)
-
-Resolved scope chain for hierarchical search.
-
-```rust
-pub struct MemoryScope {
-    pub global_db: PathBuf,
-    pub workspace_db: Option<PathBuf>,
-    pub workspace_id: Option<String>,
-    pub repo_id: Option<String>,
-    pub module_path: Option<String>,
-    pub run_id: Option<String>,
-}
-```
-
-**Search cascade:** run → module → repo → workspace → global (narrows → widens).
+**`PlannerSelections` (`context_planner/types.rs`):** memory + graph + replay payloads and `ProviderProfile`. Produced by `ContextPlanner::plan`, lifted into a `Turn` by `agent_session::build_turn` (thin, lossless).
 
 ---
 
-## 3. Subsystem: Swarm Pipeline
-
-6-phase agent orchestration engine. Located in `swarm/pipeline.rs`.
-
-### Phase 1: Validate
-
-```rust
-validate_scopes()              // O(n²) pairwise check: no overlap
-work_units_ordered()           // Kahn's topo-sort
-dependency_tiers()             // Vec<Vec<WorkUnit>> parallel groups
-```
-
-Aborts if validation fails.
-
-### Phase 2: Execute
+## 3. Swarm Pipeline (6 phases)
 
 ```
-For each tier (sequential):
-  For each unit (parallel, bounded by semaphore):
-    ├─ git worktree checkout (gaviero/{unit_id})
-    ├─ IterationEngine::run(unit, config)
-    │  ├─ [if test_first] generate failing tests
-    │  └─ FOR attempt in 0..max_attempts:
-    │      ├─ escalate tier if attempt >= escalate_after
-    │      ├─ run_backend(unit, tier, attempt)
-    │      │  ├─ build_prompt() [memory, context, feedback]
-    │      │  ├─ backend.stream_completion()
-    │      │  ├─ FOR each FileBlock: write_gate.insert_proposal()
-    │      │  └─ ValidationPipeline::run(modified_files)
-    │      │      → PASS: next unit
-    │      │      → FAIL: corrective prompt → retry
-    │      └─ Checkpoint ExecutionState
-```
-
-### Phase 3: Merge
-
-```
-For each successful worktree:
-  git merge --no-ff main
-  on conflict: MergeResolver queries Claude for resolution
-```
-
-### Phase 4: Verify
-
-```
-Per VerificationStrategy:
-  ├─ StructuralOnly: tree-sitter parse check
-  ├─ DiffReview: LLM review (batched)
-  ├─ TestSuite: run_tests
-  └─ Combined: all three, sequential, early exit
-Escalate on failure
-```
-
-### Phase 5: Cleanup
-
-```
-WorktreeManager::teardown_all()
-Delete gaviero/* branches
-```
-
-### Phase 6: Consolidation
-
-```
-Consolidator::consolidate_run(run_id, repo_id)
-  ├─ Triage: promote high-importance to module/repo
-  ├─ Decay: exponential importance decay (30-day half-life)
-  └─ Promotion: cross-scope if 3+ hits
+VALIDATE   pairwise scope overlap (path_pattern), Kahn topo-sort,
+           dependency_tiers → Vec<Vec<WorkUnit>>
+EXECUTE    per tier: for each unit (Semaphore-bounded parallel):
+             git worktree checkout (gaviero/{unit_id})
+             IterationEngine::run
+               attempts loop with escalation:
+                 build_prompt (memory + graph + board + feedback)
+                 backend.stream_completion → UnifiedStreamEvent
+                 each FileBlock → write_gate.insert_proposal
+                 ValidationPipeline::run → corrective retry on fail
+             Checkpoint ExecutionState
+MERGE      git merge --no-ff main; MergeResolver (Claude) on conflict
+VERIFY     StructuralOnly | DiffReview | TestSuite | Combined (early-exit)
+CLEANUP    WorktreeManager::teardown_all, drop gaviero/* branches
+CONSOLIDATE triage (importance ≥ 0.4) → decay (30-day half-life) →
+            cross-scope promotion (3+ module hits → repo, ×1.2)
 ```
 
 ---
 
-## 4. Subsystem: Memory
+## 4. Memory
 
-Hierarchical, scoped embeddings with SQL backend and consolidation.
+**Scope hierarchy (narrow→wide):** `Run → Module → Repo → Workspace → Global`.
 
-### Scope Hierarchy
-
+**Search (`store.rs::search_scoped`):**
 ```
-0: Global        ~/.config/gaviero/memory.db
- └─ 1: Workspace <workspace>/.gaviero/memory.db
-     └─ 2: Repo   Single git repo
-         └─ 3: Module Crate/subdir (FileScope.owned_paths)
-             └─ 4: Run   Ephemeral per-execution
-```
-
-### Search Pipeline (`memory/store.rs::search_scoped()`)
-
-```
-1. NO LOCK: embedder.embed(query_text) → Vec<f32>  [CPU: ONNX]
-
-2. CASCADE (narrowest → widest):
-   FOR level in scope.levels():
-     │
-     ├─ BRIEF LOCK: vec_search_at_level()
-     │   SELECT from vec_memories_scoped WHERE scope_level = ?
-     │   Release lock
-     │
-     ├─ BRIEF LOCK: fts_search_at_level()  [optional]
-     │   SELECT from memories_fts INNER JOIN memories
-     │   Release lock
-     │
-     ├─ NO LOCK: merge_rrf(vec_results, fts_results)
-     │   RRF: 70% vector + 30% FTS
-     │
-     ├─ NO LOCK: score each candidate
-     │   final = (sim*0.50 + importance*0.20 + recency*0.15 + 0.15)
-     │           * scope_weight * trust_weight
-     │
-     └─ EARLY EXIT: if best_score > 0.70 stop widening
-
-3. NO LOCK: deduplicate by content_hash
-
-4. Return top-K ScoredMemory
+1. NO LOCK   embedder.embed(query) [ONNX]
+2. CASCADE   for each level narrowest→widest:
+               BRIEF LOCK vec_search_at_level
+               BRIEF LOCK fts_search_at_level (optional)
+               NO LOCK    merge_rrf(vec 0.7, fts 0.3)
+               NO LOCK    score = (sim*0.5 + importance*0.2 +
+                                   recency*0.15 + 0.15) * scope * trust
+               EXIT       if best_score > 0.70
+3. NO LOCK   deduplicate by content_hash
+4. return top-K ScoredMemory
 ```
 
-**Lock discipline:** Embeddings outside lock. Brief lock per DB query. Scoring outside lock.
+**Write (`store_scoped`):** embed → SHA-256 content hash → brief-lock dedup (reinforce / skip-because-broader / insert) → brief-lock insert into `vec_memories_scoped` + `memories_fts`.
 
-### Write Pipeline (`memory/store.rs::store_scoped()`)
+**Consolidation (`consolidation.rs`):** `triage` promotes `importance ≥ 0.4` run memories to Module/Repo and deletes run rows; `decay_and_prune` applies `exp(-0.023 * days)`; `cross-scope promotion` promotes items accessed from ≥ 3 distinct modules to repo scope with a 1.2× importance boost.
 
-```
-1. NO LOCK: embedder.embed(content) → Vec<f32>
-
-2. NO LOCK: content_hash = SHA-256(normalized(content))
-
-3. BRIEF LOCK: deduplication check
-   SELECT FROM memories WHERE content_hash = ?
-   ├─ Exact match same scope → reinforce (update importance)
-   │   → StoreResult::Deduplicated(id)
-   ├─ Exact match broader scope → skip
-   │   → StoreResult::AlreadyCovered
-   └─ No match → INSERT
-      → StoreResult::Inserted(id)
-
-4. BRIEF LOCK: insert into vec_memories_scoped + memories_fts
-   (FTS trigger auto-updates search index)
-```
-
-### Consolidation (`memory/consolidation.rs::Consolidator`)
-
-3-phase pipeline, runs after swarm execution:
-
-```
-Phase 1: RUN TRIAGE
-  query_by_run(run_id) → Vec<ScoredMemory>
-  FOR each with importance >= 0.4:
-    store_scoped(Module or Repo, content, consolidation_meta)
-  delete_by_run(run_id)
-
-Phase 2: DECAY + PRUNING
-  FOR each memory:
-    importance *= exp(-0.023 * days_since_access)
-    if importance < threshold: delete
-
-Phase 3: CROSS-SCOPE PROMOTION
-  find_promotion_candidates(min_cross_hits=3)
-  → memories accessed by 3+ different modules
-  promote to Repo scope, 1.2x boost
-```
-
-### Embedder (`memory/embedder.rs`)
-
-**Interface:**
-
-```rust
-pub trait Embedder: Send + Sync {
-    fn embed(&self, text: &str) -> Result<Vec<f32>>;
-    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
-    fn dimensions(&self) -> usize;
-    fn model_id(&self) -> &str;
-}
-```
-
-**Implementation: OnnxEmbedder** (`onnx_embedder.rs`)
-- **Model:** nomic-embed-text-v1.5 (768 dimensions)
-- **Runtime:** `ort` (ONNX) + `tokenizers` crate
-- **Pooling:** mean pooling + L2 norm
-- **Vector search:** sqlite-vec `vec0` virtual table, cosine distance
+**Embedder:** `OnnxEmbedder` — nomic-embed-text-v1.5 (768 dim), `ort 2.0` + `tokenizers`, mean pooling + L2 norm, cosine distance via `sqlite-vec`.
 
 ---
 
-## 5. Subsystem: Backend Abstraction
+## 5. Backend Abstraction
 
-Provider-agnostic interface. Located in `swarm/backend/`.
+`AgentBackend` trait produces `Stream<Item = Result<UnifiedStreamEvent>>`. Implementations: `ClaudeCodeBackend` (ACP subprocess), `OllamaStreamBackend` (HTTP SSE), `CodexBackend` (OpenAI-compatible), `MockBackend`.
 
-### AgentBackend Trait (mod.rs:45)
-
-```rust
-#[async_trait]
-pub trait AgentBackend: Send + Sync + 'static {
-    async fn stream_completion(
-        &self,
-        req: CompletionRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<UnifiedStreamEvent>> + Send>>>;
-
-    fn capabilities(&self) -> Capabilities;
-    fn name(&self) -> &str;
-    async fn health_check(&self) -> Result<()>;
-}
+**Model spec (`backend/shared.rs::backend_config_for_model`):**
+```
+sonnet | opus | haiku     → claude:<same>
+claude:<name>             → Claude API
+ollama:<name>             → Ollama
+codex:<name>              → Codex
+local:<url>               → OpenAI-compatible endpoint
 ```
 
-### Implementations
+**Tier routing (`router.rs::TierRouter`):** `(ModelTier, PrivacyLevel) → ResolvedBackend`.
 
-| Backend | Code | Provider | Protocol |
-|---|---|---|---|
-| ClaudeCode | `claude_code.rs` | Claude API | ACP subprocess (NDJSON) |
-| Ollama | `ollama.rs` | Local Ollama | HTTP SSE `/api/generate` |
-| Codex | `codex.rs` | OpenAI-compatible | OpenAI stream format |
-| Mock | `mock.rs` | Synthetic (testing) | In-memory event queue |
-
-### Provider Resolution (`swarm/backend/shared.rs`)
-
-**Model-spec parsing:**
-```
-"claude:opus"          → Claude Opus (via ACP)
-"claude:sonnet"        → Claude Sonnet
-"ollama:llama2"        → Ollama + model name
-"local:endpoint"       → OpenAI-compatible endpoint
-"sonnet"               → Default Claude (Sonnet)
-```
-
-**Tier routing (`swarm/router.rs::TierRouter`):**
-```
-(ModelTier, PrivacyLevel) → ResolvedBackend
-
-Cheap + Public      → Claude Haiku
-Expensive + Public  → Claude Sonnet/Opus
-LocalOnly          → Ollama (if enabled) or Blocked
-```
-
-**Privacy override (`swarm/privacy.rs::PrivacyScanner`):**
-- Glob-based path matching (e.g., `**/*.key`, `**/.env`)
-- Overrides privacy to `LocalOnly` even if unit specifies Public
+**Privacy override (`privacy.rs::PrivacyScanner`):** glob match against `**/*.key`, `**/.env`, … promotes a unit to `LocalOnly` regardless of declared level.
 
 ---
 
-## 6. Subsystem: Write Gate
+## 6. Context Planner + Agent Session (V9)
 
-Enforces file-write safety. Located in `write_gate.rs`.
+```
+PlannerInput  ──► ContextPlanner::plan ──►  PlannerSelections
+                                              │
+                                              ▼
+                                    agent_session::build_turn
+                                              │
+                                              ▼
+                                              Turn
+                                              │
+                                              ▼
+                         impl AgentSession::send_turn(Turn)
+                                  (Claude / Codex / Ollama)
+                                              │
+                                              ▼
+                           Stream<UnifiedStreamEvent>
+```
 
-### WriteMode Enum
+The planner is the single owner of memory queries, graph selection, replay, and continuity. `LegacyAgentSession` wraps `AcpPipeline` for byte-identical migration; provider-specific impls replace it progressively.
 
-| Mode | Behavior | When used |
+---
+
+## 7. Write Gate
+
+Modes: `Interactive` (queue → TUI review), `AutoAccept` (validate + write), `Deferred` (batch), `RejectAll` (drop silently).
+
+Lifecycle:
+
+```
+write(path, content)
+  ├─ BRIEF LOCK   is_scope_allowed(agent_id, path)  [path_pattern]
+  ├─ NO LOCK      compute_hunks → enrich_hunks (StructuralHunk)
+  ├─ BRIEF LOCK   insert_proposal (mode-specific)
+  └─ NO LOCK      fs::write if finalized
+```
+
+Observers: `on_proposal_created / updated / finalized`. UI can accept/reject per hunk or per AST node (`enclosing_node`).
+
+---
+
+## 8. ACP (Claude subprocess)
+
+`AcpSessionFactory` spawns `one_shot` or `persistent` sessions. `AcpSession` handles NDJSON over stdin/stdout; large prompts spill to a tempfile (`ARGV_THRESHOLD` in `session.rs`). Events: `SystemInit`, `ContentDelta`, `ToolUseStart`, `AssistantMessage`, `ResultEvent` (parsed in `protocol.rs`). `AcpPipeline` enriches prompts and routes detected file blocks through the write gate.
+
+---
+
+## 9. Concurrency
+
+| Component | Primitive | Rule |
 |---|---|---|
-| `Interactive` | Queue proposals → TUI review | Editor (chat) |
-| `AutoAccept` | Validate scope, accept + write | Swarm (CI-friendly) |
-| `Deferred` | Accumulate for batch review | TUI agent chat |
-| `RejectAll` | Silently discard | Safety fallback |
+| `WriteGatePipeline` | `tokio::sync::Mutex` | No lock across diff, parse, I/O |
+| `MemoryStore` | `tokio::sync::Mutex<rusqlite::Connection>` | Embed outside lock |
+| `ExecutionState` | `Mutex<Vec<NodeStatus>>` | Checkpoint after each node |
+| `AgentBus` | `broadcast::channel` | Lock-free |
+| Parallel agents | `Semaphore` | Bounded per tier |
 
-### Proposal Lifecycle
-
-```
-WorkUnit.write(path, content)
-│
-├─ 1. BRIEF LOCK: is_scope_allowed(agent_id, path)?
-│    Release lock
-│    ├─ PASS → continue
-│    └─ FAIL → reject, observer callback
-│
-├─ 2. NO LOCK: compute diff
-│    original = fs::read_to_string(path)
-│    hunks = diff_engine::compute_hunks(original, content)
-│    structural = tree_sitter::enrich_hunks(hunks, original, lang)
-│
-├─ 3. BRIEF LOCK: insert_proposal()
-│    ├─ Interactive → queue + on_proposal_created()
-│    ├─ AutoAccept → accept all + finalize
-│    ├─ Deferred → accumulate
-│    └─ RejectAll → discard
-│    Release lock
-│
-└─ 4. [if finalized] NO LOCK: fs::write(path, content)
-```
-
-**Lock discipline:** Mutex held for O(1) operations only. All I/O, parsing, diff outside lock.
+**Never hold a Mutex across `await`, tree-sitter parse, or `fs` I/O.**
 
 ---
 
-## 7. Subsystem: ACP (Claude Subprocess)
+## 10. Error Handling
 
-Claude Code integration. Located in `acp/`.
-
-### Session Lifecycle
-
-```
-AcpSessionFactory
-├─ one_shot(model, prompt) → Result<String>
-│   One prompt, one response, cleanup
-└─ persistent(model) → AcpSession
-   persistent.send_prompt(prompt) → Stream<AcpEvent>
-   persistent.next_event() → Option<AcpEvent>
-```
-
-### NDJSON Protocol (protocol.rs)
-
-**Event types:**
-
-| Type | JSON | Meaning |
+| Error | Recoverable | Handling |
 |---|---|---|
-| `SystemInit` | `{ session_id, model }` | Session established |
-| `ContentDelta` | `{ delta: { type: "text_delta", text: "..." } }` | Streaming text |
-| `ToolUseStart` | `{ delta: { type: "input_json_delta", input: "..." } }` | Tool call starting |
-| `AssistantMessage` | `{ message: { content: [...] } }` | Turn complete |
-| `ResultEvent` | `{ event: "result", ... }` | Final result with cost |
+| parse/compile | compile-time | miette diagnostic with span |
+| scope violation | no | reject proposal, observer, log |
+| agent failure | yes | `AgentStatus::Failed`, escalate if configured |
+| validation gate | yes | corrective feedback → retry |
+| merge conflict | yes | Claude resolution or user choice |
+| memory init | no, non-fatal | `Option<Arc<MemoryStore>>`, continue |
+| consolidation / cleanup | no, non-fatal | log, continue |
 
-### AcpPipeline (client.rs)
+---
 
-Prompt enrichment + file block routing:
+## 11. Hard Constraints
+
+1. All agent writes through `WriteGatePipeline`.
+2. `git2` only.
+3. Tree-sitter for syntax, highlight, indent.
+4. `MemoryStore` behind `tokio::sync::Mutex`; embedding outside lock.
+5. No UI types in core.
+6. `AgentBackend` + `UnifiedStreamEvent` provider-agnostic; selection via `TierRouter` + `PrivacyScanner`.
+7. Explicit `WriteScope` — never inferred.
+8. Swarm branches `gaviero/{work_unit_id}`; worktrees `.gaviero/worktrees/{id}/`, cleanup via `Drop`.
+
+---
+
+## 12. Public API
 
 ```rust
-pub struct AcpPipeline {
-    session: AcpSession,
-    write_gate: Arc<Mutex<WriteGatePipeline>>,
-}
+pub mod acp;              pub mod agent_session;   pub mod context_planner;
+pub mod memory;           pub mod swarm;           pub mod repo_map;
+pub mod write_gate;       pub mod validation_gate; pub mod iteration;
+pub mod workspace;        pub mod git;             pub mod session_state;
+pub mod path_pattern;     pub mod scope_enforcer;  pub mod observer;
+pub mod types;            pub mod tree_sitter;     pub mod diff_engine;
+pub mod query_loader;     pub mod indent;          pub mod terminal;
 
-impl AcpPipeline {
-    pub async fn propose_write(&self, path: PathBuf, content: String) -> Result<()> {
-        // File block detected in stream
-        // Scope check → diff → structural enrichment → write_gate.insert_proposal()
-    }
-}
+pub use ::tree_sitter::{Language, Parser, Tree, Node, Query, QueryCursor, Point, InputEdit};
 ```
 
 ---
 
-## 8. Concurrency Model
-
-Single shared `tokio` runtime.
-
-### Sync Primitives Used
-
-```rust
-Arc<tokio::sync::Mutex<T>>         // WriteGatePipeline, MemoryStore
-Arc<dyn Observer>                  // Observer trait objects
-mpsc::UnboundedChannel<Event>      // TUI event loop (single receiver)
-broadcast::channel                 // AgentBus (multi-receiver)
-Semaphore                          // Parallel agent count bound
-```
-
-### Lock Rules
-
-| Component | Lock Type | Golden Rule |
-|---|---|---|
-| WriteGatePipeline | Mutex | Never hold across I/O, parsing, or diff computation |
-| MemoryStore | Mutex<rusqlite::Connection> | Embedding outside lock. Brief lock per DB op. |
-| ExecutionState | Mutex<Vec<NodeStatus>> | Checkpoint after each node (resumable) |
-| AgentBus | broadcast::channel | Lock-free, async-friendly |
-
-**Never hold Mutex across await, tree-sitter parse, or fs I/O.**
-
----
-
-## 9. Error Handling Strategy
-
-| Error | Module | Recoverable? | Handling |
-|---|---|---|---|
-| Parse/compile error | dsl, validator | Time-of-compile | Miette diagnostic return |
-| Scope violation | write_gate | Runtime | Reject proposal, log |
-| Agent execution failure | swarm::backend | Yes | AgentStatus::Failed, escalate if configured |
-| Validation failure | validation_gate | Yes | Corrective feedback → retry same agent |
-| Merge conflict | merge | Interactive | Claude resolution or user choice |
-| Memory init failure | memory | Non-fatal | Option<Arc<MemoryStore>>, continue without memory |
-| Consolidation failure | consolidation | Non-fatal | Log, continue (best-effort) |
-
----
-
-## 10. Hard Constraints
-
-Architectural invariants. Do not violate.
-
-1. **Write Gate Mandatory**
-   - All agent writes through `WriteGatePipeline`
-   - No direct `fs::write` from agent paths
-   - Scope validation before any disk I/O
-
-2. **git2 Only**
-   - Never shell out to `git`
-   - All git ops via `git2` crate
-
-3. **Tree-Sitter for Structure**
-   - Syntax analysis: tree-sitter queries
-   - Highlighting: tree-sitter queries
-   - Indentation: tree-sitter + heuristic + bracket fallback
-   - 16-language registry
-
-4. **Mutex-Wrapped SQLite**
-   - `MemoryStore` wraps `rusqlite::Connection` in `tokio::sync::Mutex`
-   - All DB methods async/awaitable
-   - Embedding outside lock
-
-5. **Observer-Only Coupling**
-   - Core never imports TUI/CLI types
-   - All communication via trait objects
-   - Backends opaque to orchestration
-
-6. **Provider-Agnostic Backend**
-   - `AgentBackend` + `UnifiedStreamEvent`
-   - Model selection via `TierRouter` + `PrivacyScanner`
-
-7. **Embedding Outside Lock**
-   - ONNX inference completes before SQLite Mutex
-   - Applies to store, search, consolidation
-
-8. **Explicit Scope Writes**
-   - Every `store_scoped()` requires explicit `WriteScope`
-   - Never infer scope from path
-   - `WriteScope` parameter mandatory, non-optional
-
----
-
-## 11. Public API
-
-```rust
-// Root re-exports
-pub use types::*;
-pub use observer::{WriteGateObserver, AcpObserver, SwarmObserver};
-pub use swarm::models::{WorkUnit, CompiledPlan, SwarmResult};
-pub use memory::{MemoryStore, MemoryScope, WriteScope, SearchConfig};
-pub use tree_sitter::LANGUAGE_REGISTRY;
-
-// Subsystem modules
-pub mod swarm;              // pipeline::execute(), coordinator::plan()
-pub mod acp;                // AcpPipeline, AcpSessionFactory
-pub mod memory;             // MemoryStore methods
-pub mod write_gate;         // WriteGatePipeline
-pub mod workspace;          // Workspace::open()
-pub mod git;                // GitRepo, WorktreeManager
-pub mod iteration;          // IterationEngine
-pub mod validation_gate;    // ValidationPipeline
-pub mod observer;           // Trait definitions
-pub mod repo_map;           // RepoMap
-```
-
----
-
-## 12. Key Dependencies
-
-- **tokio 1.x:** async runtime, channels
-- **tree-sitter 0.25:** 16 grammars
-- **git2 0.19:** worktrees, merge
-- **rusqlite 0.32 + sqlite-vec:** vector storage
-- **ort 2.0:** ONNX inference
-- **petgraph 0.8:** DAG ops
-- **ropey, portable-pty, vt100:** text buffer, PTY, terminal
-
----
-
-See [CLAUDE.md](CLAUDE.md) for conventions, build, test instructions.
+See [CLAUDE.md](CLAUDE.md) for conventions, build, and rules.
