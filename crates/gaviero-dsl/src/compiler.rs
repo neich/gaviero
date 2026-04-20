@@ -32,6 +32,19 @@ pub fn compile_ast(
     workflow: Option<&str>,
     runtime_prompt: Option<&str>,
 ) -> Result<CompiledPlan, DslErrors> {
+    compile_ast_with_vars(script, source, filename, workflow, runtime_prompt, &[])
+}
+
+/// Like [`compile_ast`] but accepts additional variable overrides that take
+/// precedence over script-level `vars {}` declarations (but not agent-level vars).
+pub fn compile_ast_with_vars(
+    script: &Script,
+    source: &str,
+    filename: &str,
+    workflow: Option<&str>,
+    runtime_prompt: Option<&str>,
+    override_vars: &[(String, String)],
+) -> Result<CompiledPlan, DslErrors> {
     let src = || NamedSource::new(filename, source.to_string());
 
     // ── Phase 1: index declarations ───────────────────────────────
@@ -234,6 +247,7 @@ pub fn compile_ast(
             default_client,
             &prompt_map,
             &script_vars,
+            override_vars,
             workflow_memory,
             source,
             filename,
@@ -252,6 +266,7 @@ pub fn compile_ast(
             default_client,
             &prompt_map,
             &script_vars,
+            override_vars,
             workflow_memory,
             source,
             filename,
@@ -534,21 +549,31 @@ fn collect_loop_judge_agents<'a>(
 fn apply_vars(
     text: &str,
     script_vars: &[(String, String)],
+    override_vars: &[(String, String)],
     agent_vars: &[(String, String)],
     agent_name: &str,
     runtime_prompt: Option<&str>,
 ) -> String {
     const RESERVED: &[&str] = &["PROMPT", "AGENT", "ITER", "PREV_ITER"];
 
-    // Build a merged list: script vars first, then agent vars overriding same keys.
-    // We apply the merged list in a single pass so that agent vars win.
+    // Priority (highest to lowest, after built-ins):
+    //   agent vars > CLI override vars > script vars
     let mut merged: Vec<(&str, &str)> = Vec::new();
 
     for (k, v) in script_vars {
         if RESERVED.contains(&k.as_str()) {
             continue;
         }
-        // Only include if not overridden by an agent var
+        if !agent_vars.iter().any(|(ak, _)| ak == k)
+            && !override_vars.iter().any(|(ok, _)| ok == k)
+        {
+            merged.push((k.as_str(), v.as_str()));
+        }
+    }
+    for (k, v) in override_vars {
+        if RESERVED.contains(&k.as_str()) {
+            continue;
+        }
         if !agent_vars.iter().any(|(ak, _)| ak == k) {
             merged.push((k.as_str(), v.as_str()));
         }
@@ -583,6 +608,7 @@ fn compile_agent(
     default_client: Option<&ClientDecl>,
     prompt_map: &HashMap<&str, &str>,
     script_vars: &[(String, String)],
+    override_vars: &[(String, String)],
     workflow_memory: Option<&MemoryBlock>,
     source: &str,
     filename: &str,
@@ -687,11 +713,14 @@ fn compile_agent(
         )
     };
 
-    // Build scope
+    // Build scope. Paths get the same compile-time var substitution as
+    // prompts/descriptions so scripts can drive output roots via --var
+    // (e.g. owned ["{{OUT_DIR}}/briefing.md"] → owned ["plans/log/briefing.md"]).
+    let sub = |s: &str| apply_vars(s, script_vars, override_vars, &decl.vars, &decl.name, runtime_prompt);
     let scope = if let Some(sb) = &decl.scope {
         FileScope {
-            owned_paths: sb.owned.clone(),
-            read_only_paths: sb.read_only.clone(),
+            owned_paths: sb.owned.iter().map(|p| sub(p)).collect(),
+            read_only_paths: sb.read_only.iter().map(|p| sub(p)).collect(),
             interface_contracts: HashMap::new(),
         }
     } else {
@@ -713,7 +742,7 @@ fn compile_agent(
             Some((s, _)) => s.as_str(),
             None => &decl.name,
         };
-        apply_vars(raw, script_vars, &decl.vars, &decl.name, runtime_prompt)
+        apply_vars(raw, script_vars, override_vars, &decl.vars, &decl.name, runtime_prompt)
     };
 
     // Resolve prompt: inline string or reference to a named prompt declaration.
@@ -739,7 +768,7 @@ fn compile_agent(
     // Apply all compile-time substitutions.
     // {{ITER}} and {{PREV_ITER}} are intentionally left for runtime.
     let coordinator_instructions = match prompt_text {
-        Some(s) => apply_vars(s, script_vars, &decl.vars, &decl.name, runtime_prompt),
+        Some(s) => apply_vars(s, script_vars, override_vars, &decl.vars, &decl.name, runtime_prompt),
         None => runtime_prompt.unwrap_or("").to_string(),
     };
 
@@ -784,7 +813,7 @@ fn compile_agent(
     let staleness_sources: Vec<String> = decl
         .memory
         .as_ref()
-        .map(|m| m.staleness_sources.clone())
+        .map(|m| m.staleness_sources.iter().map(|p| sub(p)).collect())
         .unwrap_or_default();
 
     // ── Explicit memory control fields ───────────────────────────
@@ -792,7 +821,7 @@ fn compile_agent(
         .memory
         .as_ref()
         .and_then(|m| m.read_query.as_ref())
-        .map(|(s, _)| apply_vars(s, script_vars, &decl.vars, &decl.name, runtime_prompt));
+        .map(|(s, _)| apply_vars(s, script_vars, override_vars, &decl.vars, &decl.name, runtime_prompt));
 
     let memory_read_limit: Option<usize> = decl
         .memory
@@ -804,7 +833,7 @@ fn compile_agent(
         .memory
         .as_ref()
         .and_then(|m| m.write_content.as_ref())
-        .map(|(s, _)| apply_vars(s, script_vars, &decl.vars, &decl.name, runtime_prompt));
+        .map(|(s, _)| apply_vars(s, script_vars, override_vars, &decl.vars, &decl.name, runtime_prompt));
 
     // ── Graph / impact fields ─────────────────────────────────────
     let impact_scope = decl
@@ -2062,6 +2091,37 @@ mod tests {
         let units = compile_str(src).expect("should compile");
         assert_eq!(units[0].coordinator_instructions, "path: plans/file.md");
         assert_eq!(units[1].coordinator_instructions, "also: plans/other.md");
+    }
+
+    #[test]
+    fn vars_substituted_in_scope_paths() {
+        // Scope paths get the same compile-time var substitution as prompts,
+        // so --var OUT_DIR=... can relocate a script's output root without
+        // touching the file.
+        let src = r#"
+            vars { OUT_DIR "plans/log" }
+            agent x {
+                scope {
+                    owned     ["{{OUT_DIR}}/out.md" "src/{{AGENT}}/"]
+                    read_only ["{{OUT_DIR}}/" "src/"]
+                }
+                memory {
+                    write_ns          "ns"
+                    staleness_sources ["{{OUT_DIR}}/"]
+                }
+                prompt "noop"
+            }
+        "#;
+        let units = compile_str(src).expect("should compile");
+        assert_eq!(
+            units[0].scope.owned_paths,
+            vec!["plans/log/out.md", "src/x/"]
+        );
+        assert_eq!(
+            units[0].scope.read_only_paths,
+            vec!["plans/log/", "src/"]
+        );
+        assert_eq!(units[0].staleness_sources, vec!["plans/log/"]);
     }
 
     #[test]
