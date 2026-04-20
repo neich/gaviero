@@ -62,8 +62,21 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             }
 
             if app.quit_confirm {
+                use crossterm::event::KeyCode;
+                let has_review = app.diff_review.is_some();
                 match key.code {
-                    crossterm::event::KeyCode::Char('y') | crossterm::event::KeyCode::Char('Y') => {
+                    KeyCode::Char('a') | KeyCode::Char('A') if has_review => {
+                        super::review::finalize_current_review(app);
+                        app.quit_confirm = false;
+                        app.try_quit();
+                    }
+                    KeyCode::Char('r') | KeyCode::Char('R') if has_review => {
+                        app.diff_review = None;
+                        app.quit_confirm = false;
+                        app.try_quit();
+                    }
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        app.diff_review = None;
                         app.should_quit = true;
                     }
                     _ => {
