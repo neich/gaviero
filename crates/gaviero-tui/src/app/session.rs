@@ -358,7 +358,13 @@ pub(super) fn try_quit(app: &mut App) {
         .filter(|a| matches!(a.status, AgentStatus::Running))
         .count();
 
-    if unsaved.is_empty() && streaming_agents == 0 && running_swarm == 0 {
+    let has_pending_review = app.diff_review.is_some();
+
+    if unsaved.is_empty()
+        && streaming_agents == 0
+        && running_swarm == 0
+        && !has_pending_review
+    {
         app.should_quit = true;
     } else {
         app.quit_confirm = true;
