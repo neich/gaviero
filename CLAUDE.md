@@ -15,11 +15,11 @@ Binaries: `gaviero` (TUI), `gaviero-cli` (headless).
 ## Workspace
 
 Five crates — see per-crate CLAUDE.md for details:
-- `gaviero-core/` — all pipeline logic (no UI deps)
-- `gaviero-tui/` — terminal UI (ratatui + crossterm)
-- `gaviero-cli/` — headless runner (clap)
-- `gaviero-dsl/` — `.gaviero` compiler (logos + chumsky)
-- `tree-sitter-gaviero/` — tree-sitter grammar
+- [`gaviero-core/`](crates/gaviero-core/CLAUDE.md) — all pipeline logic (no UI deps)
+- [`gaviero-tui/`](crates/gaviero-tui/CLAUDE.md) — terminal UI (ratatui + crossterm)
+- [`gaviero-cli/`](crates/gaviero-cli/CLAUDE.md) — headless runner (clap)
+- [`gaviero-dsl/`](crates/gaviero-dsl/CLAUDE.md) — `.gaviero` compiler (logos + chumsky)
+- [`tree-sitter-gaviero/`](crates/tree-sitter-gaviero/CLAUDE.md) — tree-sitter grammar
 
 Architecture: pipeline logic in core. TUI/CLI are thin wrappers with observers.
 
@@ -36,6 +36,7 @@ Architecture: pipeline logic in core. TUI/CLI are thin wrappers with observers.
 ## Rules
 
 - Never bypass scope validation. Agents stay within `FileScope`.
+- Scope overlap is enforced via `gaviero-core::path_pattern` — glob patterns that share no concrete path are allowed; literal prefix overlap is not.
 - Never hold WriteGatePipeline Mutex across diff, tree-sitter, or disk I/O.
 - Embedding runs outside SQLite Mutex. Lock protects DB I/O only.
 - Swarm branches: `gaviero/{work_unit_id}`.
