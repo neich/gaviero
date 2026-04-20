@@ -126,6 +126,22 @@ struct Cli {
     /// Does not run any agents. Useful after major codebase changes.
     #[arg(long)]
     graph: bool,
+
+    /// Folder name or glob pattern to exclude from repo-map scanning.
+    /// Can be specified multiple times and/or as a comma-separated list
+    /// (e.g. `--exclude node_modules,docs/**`). A bare name like `node_modules`
+    /// matches any directory with that basename at any depth; patterns
+    /// containing `/` are glob-matched against paths relative to `--repo`
+    /// (e.g. `docs/**`).
+    #[arg(long = "exclude", value_delimiter = ',')]
+    exclude: Vec<String>,
+
+    /// Override a `vars {}` entry in a DSL script. Format: KEY=VALUE.
+    /// Can be specified multiple times (e.g. `--var LOG_DIR=out --var FOO=bar`).
+    /// CLI overrides beat script-level vars but not agent-level vars.
+    /// Only valid with `--script`.
+    #[arg(long = "var", requires = "script")]
+    vars: Vec<String>,
 }
 
 /// CLI observer that prints agent events to stderr, mirroring agent chat output.
@@ -231,6 +247,17 @@ impl SwarmObserver for CliSwarmObserver {
     }
 }
 
+fn parse_var_overrides(raw: &[String]) -> Result<Vec<(String, String)>> {
+    raw.iter()
+        .map(|s| {
+            let (k, v) = s
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("--var `{}`: expected KEY=VALUE format", s))?;
+            Ok((k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
 fn resolve_model_spec(spec: &str, label: &str) -> Result<String> {
     let trimmed = spec.trim();
     gaviero_core::swarm::backend::shared::validate_model_spec(trimmed)
@@ -310,8 +337,9 @@ async fn main() -> Result<()> {
             "[graph] building code knowledge graph for {}...",
             repo.display()
         );
-        let (store, result) = gaviero_core::repo_map::graph_builder::build_graph(&repo)
-            .context("building code knowledge graph")?;
+        let (store, result) =
+            gaviero_core::repo_map::graph_builder::build_graph(&repo, &cli.exclude)
+                .context("building code knowledge graph")?;
         let (nodes, edges) = store.stats()?;
         eprintln!("[graph] done");
         eprintln!("  files scanned:   {}", result.files_scanned);
@@ -404,12 +432,18 @@ async fn main() -> Result<()> {
         } else {
             None
         };
-        gaviero_dsl::compile(&source, &filename, None, runtime_prompt.as_deref()).map_err(
-            |report| {
-                eprintln!("{:?}", report);
-                anyhow::anyhow!("DSL compilation failed")
-            },
-        )?
+        let override_vars = parse_var_overrides(&cli.vars)?;
+        gaviero_dsl::compile_with_vars(
+            &source,
+            &filename,
+            None,
+            runtime_prompt.as_deref(),
+            &override_vars,
+        )
+        .map_err(|report| {
+            eprintln!("{:?}", report);
+            anyhow::anyhow!("DSL compilation failed")
+        })?
     } else if let Some(ref task) = cli.task {
         let units = vec![WorkUnit {
             id: "task-0".to_string(),
@@ -464,6 +498,35 @@ async fn main() -> Result<()> {
         plan.iteration_config.test_first = cli.test_first;
     }
 
+    // When a --script is in play, the earlier `[model]` banner is only the
+    // fallback for DSL units without a `client`/`tier`. Print the actual
+    // per-agent resolution so the user sees what will be dispatched.
+    if cli.script.is_some() {
+        let ordered = plan
+            .work_units_ordered()
+            .map_err(|e| anyhow::anyhow!("plan graph error: {}", e))?;
+        let name_width = ordered
+            .iter()
+            .chain(plan.loop_judge_units.iter())
+            .map(|u| u.id.len())
+            .max()
+            .unwrap_or(0);
+        let fmt_unit = |u: &WorkUnit| {
+            let model = u.model.as_deref().unwrap_or("<fallback>");
+            format!("  {:<width$}  {:?}  {}", u.id, u.tier, model, width = name_width)
+        };
+        eprintln!("[plan] {} agent(s):", ordered.len());
+        for u in &ordered {
+            eprintln!("{}", fmt_unit(u));
+        }
+        if !plan.loop_judge_units.is_empty() {
+            eprintln!("[plan] {} loop judge(s):", plan.loop_judge_units.len());
+            for u in &plan.loop_judge_units {
+                eprintln!("{}", fmt_unit(u));
+            }
+        }
+    }
+
     // Execute via swarm pipeline
     // plan.max_parallel overrides the CLI flag when declared.
     let swarm_observer = CliSwarmObserver;
@@ -476,6 +539,7 @@ async fn main() -> Result<()> {
         read_namespaces: read_nss,
         write_namespace: write_ns,
         context_files: vec![],
+        excludes: cli.exclude.clone(),
     };
 
     // --coordinated: produce a DSL plan file for review, then exit.
@@ -665,6 +729,86 @@ mod tests {
             cli.ollama_base_url.as_deref(),
             Some("http://localhost:11434")
         );
+    }
+
+    #[test]
+    fn cli_accepts_repeated_exclude_flags() {
+        let cli = Cli::try_parse_from([
+            "gaviero-cli",
+            "--task",
+            "fix it",
+            "--exclude",
+            "node_modules",
+            "--exclude",
+            "docencia",
+            "--exclude",
+            "data/**",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.exclude,
+            vec![
+                "node_modules".to_string(),
+                "docencia".to_string(),
+                "data/**".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn cli_accepts_comma_separated_exclude_values() {
+        let cli = Cli::try_parse_from([
+            "gaviero-cli",
+            "--task",
+            "fix it",
+            "--exclude",
+            "node_modules,docencia,data/**",
+            "--exclude",
+            "target,dist",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.exclude,
+            vec![
+                "node_modules".to_string(),
+                "docencia".to_string(),
+                "data/**".to_string(),
+                "target".to_string(),
+                "dist".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn cli_accepts_var_with_script() {
+        let cli = Cli::try_parse_from([
+            "gaviero-cli",
+            "--script",
+            "workflow.gaviero",
+            "--var",
+            "LOG_DIR=out/log",
+            "--var",
+            "FOO=bar",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.vars,
+            vec!["LOG_DIR=out/log".to_string(), "FOO=bar".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_var_overrides_splits_on_first_equals() {
+        let raw = vec!["KEY=val=ue".to_string(), "FOO=bar".to_string()];
+        let pairs = parse_var_overrides(&raw).unwrap();
+        assert_eq!(pairs[0], ("KEY".to_string(), "val=ue".to_string()));
+        assert_eq!(pairs[1], ("FOO".to_string(), "bar".to_string()));
+    }
+
+    #[test]
+    fn parse_var_overrides_rejects_missing_equals() {
+        let raw = vec!["BADVAR".to_string()];
+        assert!(parse_var_overrides(&raw).is_err());
     }
 
     #[test]
