@@ -117,6 +117,10 @@ struct Cli {
     #[arg(long)]
     trace: Option<PathBuf>,
 
+    /// Enable INFO-level logging to stderr. Use twice (-vv) for DEBUG.
+    #[arg(long = "verbose", short = 'v', action = clap::ArgAction::Count)]
+    verbose: u8,
+
     /// Output path for the generated .gaviero DSL plan file (--coordinated only).
     /// Defaults to tmp/gaviero_plan_<timestamp>.gaviero inside the repo.
     #[arg(long, requires = "coordinated")]
@@ -312,7 +316,8 @@ fn resolve_coordinator_model(
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize tracing: JSON to file when --trace is set, human-readable to stderr otherwise
+    // Initialize tracing: JSON to file when --trace is set, human-readable to stderr otherwise.
+    // --verbose/-v = INFO, -vv = DEBUG.
     if let Some(ref trace_path) = cli.trace {
         let file = std::fs::File::create(trace_path)
             .with_context(|| format!("creating trace file: {}", trace_path.display()))?;
@@ -322,9 +327,14 @@ async fn main() -> Result<()> {
             .with_max_level(tracing::Level::DEBUG)
             .init();
     } else {
+        let level = match cli.verbose {
+            0 => tracing::Level::WARN,
+            1 => tracing::Level::INFO,
+            _ => tracing::Level::DEBUG,
+        };
         tracing_subscriber::fmt()
             .with_writer(std::io::stderr)
-            .with_max_level(tracing::Level::WARN)
+            .with_max_level(level)
             .init();
     }
 

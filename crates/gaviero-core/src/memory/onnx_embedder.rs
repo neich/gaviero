@@ -4,10 +4,17 @@ use anyhow::{Context, Result};
 use ndarray::Array2;
 use ort::session::Session;
 use ort::value::TensorRef;
-use tokenizers::Tokenizer;
+use tokenizers::{Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy};
 
 use super::embedder::Embedder;
 use super::model_manager::{ModelInfo, ModelManager};
+
+/// Upper bound for tokenized sequence length. Caps ONNX memory (attention
+/// scales as O(seq²)) so oversized inputs cannot OOM the process. 512 is the
+/// standard retrieval-embedder context; nomic-embed-text-v1.5 and e5-small-v2
+/// both accept far less than this (the former tops out at 8192, the latter at
+/// 512), so 512 is safe for all currently-supported models.
+const MAX_SEQUENCE_LENGTH: usize = 512;
 
 /// ONNX-based text embedder using E5, nomic-embed-text, or similar models.
 ///
@@ -68,8 +75,17 @@ impl OnnxEmbedder {
             .commit_from_file(onnx_path)
             .map_err(|e| anyhow::anyhow!("loading ONNX model from {}: {e}", onnx_path.display()))?;
 
-        let tokenizer = Tokenizer::from_file(tokenizer_path)
+        let mut tokenizer = Tokenizer::from_file(tokenizer_path)
             .map_err(|e| anyhow::anyhow!("loading tokenizer: {}", e))?;
+
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: MAX_SEQUENCE_LENGTH,
+                strategy: TruncationStrategy::LongestFirst,
+                stride: 0,
+                direction: TruncationDirection::Right,
+            }))
+            .map_err(|e| anyhow::anyhow!("configuring tokenizer truncation: {}", e))?;
 
         Ok(Self {
             session: Mutex::new(session),

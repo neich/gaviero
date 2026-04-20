@@ -193,43 +193,58 @@ pub async fn execute(
                     crate::validation_gate::ValidationPipeline::fast_only(),
                 ))
             };
-        let single_repo_map: Arc<Option<crate::repo_map::RepoMap>> = Arc::new(
-            crate::repo_map::RepoMap::build(&config.workspace_root, &config.excludes)
-                .map_err(|e| {
-                    tracing::debug!("repo_map build skipped: {}", e);
-                    e
+        let single_repo_map: Arc<Option<crate::repo_map::RepoMap>> = {
+            let workspace = config.workspace_root.clone();
+            let excludes = config.excludes.clone();
+            Arc::new(
+                tokio::task::spawn_blocking(move || {
+                    crate::repo_map::RepoMap::build(&workspace, &excludes)
+                        .map_err(|e| {
+                            tracing::debug!("repo_map build skipped: {}", e);
+                            e
+                        })
+                        .ok()
                 })
-                .ok(),
-        );
+                .await
+                .unwrap_or(None),
+            )
+        };
         // Pre-compute impact analysis for the single agent
-        let single_impact_text: Option<String> =
-            crate::repo_map::graph_builder::build_graph(&config.workspace_root, &config.excludes)
-                .map(|(store, result)| {
-                    tracing::info!(
-                        "code graph: {} nodes, {} edges ({} files changed, {} unchanged)",
-                        result.total_nodes,
-                        result.total_edges,
-                        result.files_changed,
-                        result.files_unchanged,
-                    );
-                    let owned: Vec<&str> =
-                        unit.scope.owned_paths.iter().map(|s| s.as_str()).collect();
-                    if owned.is_empty() {
-                        return None;
-                    }
-                    store.impact_radius(&owned, 3).ok().and_then(|impact| {
-                        if impact.affected_files.is_empty() {
-                            None
-                        } else {
-                            Some(
-                                crate::repo_map::store::GraphStore::format_impact_for_prompt(
-                                    &impact,
-                                ),
-                            )
+        let single_impact_text: Option<String> = {
+            let workspace = config.workspace_root.clone();
+            let excludes = config.excludes.clone();
+            let owned_paths = unit.scope.owned_paths.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::repo_map::graph_builder::build_graph(&workspace, &excludes)
+                    .map(|(store, result)| {
+                        tracing::info!(
+                            "code graph: {} nodes, {} edges ({} files changed, {} unchanged)",
+                            result.total_nodes,
+                            result.total_edges,
+                            result.files_changed,
+                            result.files_unchanged,
+                        );
+                        let owned: Vec<&str> = owned_paths.iter().map(|s| s.as_str()).collect();
+                        if owned.is_empty() {
+                            return None;
                         }
+                        store.impact_radius(&owned, 3).ok().and_then(|impact| {
+                            if impact.affected_files.is_empty() {
+                                None
+                            } else {
+                                Some(
+                                    crate::repo_map::store::GraphStore::format_impact_for_prompt(
+                                        &impact,
+                                    ),
+                                )
+                            }
+                        })
                     })
-                })
-                .unwrap_or(None);
+                    .unwrap_or(None)
+            })
+            .await
+            .unwrap_or(None)
+        };
 
         let effective_read_ns: Vec<String> = unit
             .read_namespaces
@@ -338,101 +353,129 @@ pub async fn execute(
             ))
         };
 
-    // Build repo map once for context optimization (best-effort; failures are non-fatal)
-    let repo_map: Arc<Option<crate::repo_map::RepoMap>> = Arc::new(
-        crate::repo_map::RepoMap::build(&config.workspace_root, &config.excludes)
-            .map_err(|e| {
-                tracing::debug!("repo_map build skipped: {}", e);
-                e
+    // Build repo map once for context optimization (best-effort; failures are non-fatal).
+    // Runs on a blocking thread to avoid starving the async executor during workspace scan.
+    tracing::info!("repo_map: scanning workspace");
+    let repo_map: Arc<Option<crate::repo_map::RepoMap>> = {
+        let workspace = config.workspace_root.clone();
+        let excludes = config.excludes.clone();
+        Arc::new(
+            tokio::task::spawn_blocking(move || {
+                crate::repo_map::RepoMap::build(&workspace, &excludes)
+                    .map_err(|e| {
+                        tracing::debug!("repo_map build skipped: {}", e);
+                        e
+                    })
+                    .ok()
+                    .inspect(|_| tracing::info!("repo_map: done"))
             })
-            .ok(),
-    );
+            .await
+            .unwrap_or(None),
+        )
+    };
 
     // Build code knowledge graph and pre-compute impact analysis + context queries per agent.
-    // GraphStore uses rusqlite (!Send), so we compute all texts upfront
-    // and share them as a Send-safe HashMap.
-    let impact_texts: Arc<std::collections::HashMap<String, String>> = Arc::new({
-        let mut map = std::collections::HashMap::new();
-        match crate::repo_map::graph_builder::build_graph(&config.workspace_root, &config.excludes) {
-            Ok((store, result)) => {
-                tracing::info!(
-                    "code graph: {} nodes, {} edges ({} files changed, {} unchanged)",
-                    result.total_nodes,
-                    result.total_edges,
-                    result.files_changed,
-                    result.files_unchanged,
-                );
-                for wu in work_units.iter().chain(plan.loop_judge_units.iter()) {
-                    let mut sections: Vec<String> = Vec::new();
+    // GraphStore uses rusqlite (!Send), so we compute all texts upfront and share them as a
+    // Send-safe HashMap. Runs on a blocking thread for the same reason as repo_map above.
+    tracing::info!("code graph: indexing workspace");
+    let units_for_graph: Vec<WorkUnit> = work_units
+        .iter()
+        .chain(plan.loop_judge_units.iter())
+        .cloned()
+        .collect();
+    let impact_texts: Arc<std::collections::HashMap<String, String>> = {
+        let workspace = config.workspace_root.clone();
+        let excludes = config.excludes.clone();
+        Arc::new(
+            tokio::task::spawn_blocking(move || {
+                let mut map = std::collections::HashMap::new();
+                match crate::repo_map::graph_builder::build_graph(&workspace, &excludes) {
+                    Ok((store, result)) => {
+                        tracing::info!(
+                            "code graph: {} nodes, {} edges ({} files changed, {} unchanged)",
+                            result.total_nodes,
+                            result.total_edges,
+                            result.files_changed,
+                            result.files_unchanged,
+                        );
+                        for wu in &units_for_graph {
+                            let mut sections: Vec<String> = Vec::new();
 
-                    // Impact analysis from owned paths
-                    let owned: Vec<&str> =
-                        wu.scope.owned_paths.iter().map(|s| s.as_str()).collect();
-                    if !owned.is_empty() {
-                        let depth = if wu.impact_scope {
-                            wu.context_depth.max(3) as usize
-                        } else {
-                            3
-                        };
-                        if let Ok(impact) = store.impact_radius(&owned, depth) {
-                            if !impact.affected_files.is_empty() {
-                                sections.push(
-                                    crate::repo_map::store::GraphStore::format_impact_for_prompt(
-                                        &impact,
-                                    ),
-                                );
+                            let owned: Vec<&str> =
+                                wu.scope.owned_paths.iter().map(|s| s.as_str()).collect();
+                            if !owned.is_empty() {
+                                let depth = if wu.impact_scope {
+                                    wu.context_depth.max(3) as usize
+                                } else {
+                                    3
+                                };
+                                if let Ok(impact) = store.impact_radius(&owned, depth) {
+                                    if !impact.affected_files.is_empty() {
+                                        sections.push(
+                                            crate::repo_map::store::GraphStore::format_impact_for_prompt(
+                                                &impact,
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+
+                            if !wu.context_callers_of.is_empty() {
+                                let refs: Vec<&str> =
+                                    wu.context_callers_of.iter().map(|s| s.as_str()).collect();
+                                if let Ok(impact) =
+                                    store.impact_radius(&refs, wu.context_depth as usize)
+                                {
+                                    let callers: Vec<&str> = impact
+                                        .affected_files
+                                        .iter()
+                                        .filter(|f| !wu.context_callers_of.contains(f))
+                                        .map(|s| s.as_str())
+                                        .collect();
+                                    if !callers.is_empty() {
+                                        sections.push(format!(
+                                            "[Callers of {:?}]:\n{}",
+                                            wu.context_callers_of,
+                                            callers.join(", ")
+                                        ));
+                                    }
+                                }
+                            }
+
+                            if !wu.context_tests_for.is_empty() {
+                                let refs: Vec<&str> =
+                                    wu.context_tests_for.iter().map(|s| s.as_str()).collect();
+                                if let Ok(impact) =
+                                    store.impact_radius(&refs, wu.context_depth as usize)
+                                {
+                                    if !impact.affected_tests.is_empty() {
+                                        sections.push(format!(
+                                            "[Tests for {:?}]:\n{}",
+                                            wu.context_tests_for,
+                                            impact.affected_tests.join(", ")
+                                        ));
+                                    }
+                                }
+                            }
+
+                            if !sections.is_empty() {
+                                map.insert(wu.id.clone(), sections.join("\n\n"));
                             }
                         }
                     }
-
-                    // Context block: callers_of queries
-                    if !wu.context_callers_of.is_empty() {
-                        let refs: Vec<&str> =
-                            wu.context_callers_of.iter().map(|s| s.as_str()).collect();
-                        if let Ok(impact) = store.impact_radius(&refs, wu.context_depth as usize) {
-                            let callers: Vec<&str> = impact
-                                .affected_files
-                                .iter()
-                                .filter(|f| !wu.context_callers_of.contains(f))
-                                .map(|s| s.as_str())
-                                .collect();
-                            if !callers.is_empty() {
-                                sections.push(format!(
-                                    "[Callers of {:?}]:\n{}",
-                                    wu.context_callers_of,
-                                    callers.join(", ")
-                                ));
-                            }
-                        }
-                    }
-
-                    // Context block: tests_for queries
-                    if !wu.context_tests_for.is_empty() {
-                        let refs: Vec<&str> =
-                            wu.context_tests_for.iter().map(|s| s.as_str()).collect();
-                        if let Ok(impact) = store.impact_radius(&refs, wu.context_depth as usize) {
-                            if !impact.affected_tests.is_empty() {
-                                sections.push(format!(
-                                    "[Tests for {:?}]:\n{}",
-                                    wu.context_tests_for,
-                                    impact.affected_tests.join(", ")
-                                ));
-                            }
-                        }
-                    }
-
-                    if !sections.is_empty() {
-                        map.insert(wu.id.clone(), sections.join("\n\n"));
+                    Err(e) => {
+                        tracing::debug!("code graph build skipped: {}", e);
                     }
                 }
-            }
-            Err(e) => {
-                tracing::debug!("code graph build skipped: {}", e);
-            }
-        }
-        map
-    });
+                tracing::info!("code graph: done");
+                map
+            })
+            .await
+            .unwrap_or_default(),
+        )
+    };
 
+    tracing::info!("memory bundle: querying");
     // M7: Build SwarmContextBundle — one shared memory query for all work units.
     //
     // The coordinator already issues one DB query (coordinator.plan).  This
