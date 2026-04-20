@@ -113,7 +113,29 @@ pub const SKIP_DIRS: &[&str] = &[
 /// compiled artifacts, etc.) are skipped — they are not useful for context ranking.
 const MAX_FILE_BYTES: u64 = 1_000_000;
 
+/// Maximum content length to pass to tree-sitter for symbol extraction (200 KB).
+/// Generated files like parser.c can be several hundred KB and produce enormous
+/// in-memory ASTs that consume gigabytes — they also have no hand-authored symbols
+/// worth indexing, so skipping them is pure benefit.
+pub const MAX_PARSE_BYTES: usize = 200_000;
+
+/// Tree-sitter parse timeout to guard against pathological inputs (2 seconds).
+const PARSE_TIMEOUT_MICROS: u64 = 2_000_000;
+
+const BINARY_EXTENSIONS: &[&str] = &[
+    "so", "a", "dylib", "dll", "exe", "o", "wasm",
+    "pdf", "png", "jpg", "jpeg", "gif", "ico",
+    "zip", "tar", "gz", "xz", "bz2",
+    "db", "sqlite", "sqlite3",
+    "bin", "dat",
+];
+
 fn build_node(abs_path: &Path, rel_path: PathBuf) -> Option<FileNode> {
+    let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if BINARY_EXTENSIONS.contains(&ext) {
+        return None;
+    }
+
     // Skip files that are too large to be source code (binary data, build artifacts, etc.)
     if let Ok(meta) = std::fs::metadata(abs_path) {
         if meta.len() > MAX_FILE_BYTES {
@@ -135,9 +157,7 @@ fn build_node(abs_path: &Path, rel_path: PathBuf) -> Option<FileNode> {
     };
     let token_estimate = content.len() / 4;
 
-    let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-
-    let symbols = if language_for_extension(ext).is_some() {
+    let symbols = if language_for_extension(ext).is_some() && content.len() <= MAX_PARSE_BYTES {
         extract_symbols(ext, &content)
     } else {
         Vec::new()
@@ -160,6 +180,7 @@ pub fn extract_symbols(ext: &str, content: &str) -> Vec<Symbol> {
     if parser.set_language(&language).is_err() {
         return Vec::new();
     }
+    parser.set_timeout_micros(PARSE_TIMEOUT_MICROS);
     let Some(tree) = parser.parse(content, None) else {
         return Vec::new();
     };
