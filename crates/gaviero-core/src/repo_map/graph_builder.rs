@@ -123,7 +123,11 @@ fn incremental_build(
 
         // Extract symbols and insert nodes
         let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let symbols = extract_symbols(ext, &content);
+        let symbols = if content.len() <= super::builder::MAX_PARSE_BYTES {
+            extract_symbols(ext, &content)
+        } else {
+            Vec::new()
+        };
         let language = crate::tree_sitter::language_name_for_extension(ext);
         let is_test = is_test_file(&rel_str);
 
