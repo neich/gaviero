@@ -12,14 +12,36 @@ cargo clippy -p gaviero-dsl
 
 ## Core Concepts
 
-**Client** — Define model, tier, and privacy defaults for groups of agents:
+**Client** — Define model, tier, effort, and optional provider-specific extras:
 ```gaviero
-client reasoning { tier expensive model "sonnet" }
+client reasoning { tier expensive model "claude-opus-4-7" effort high default }
+client fast      { tier cheap     model "claude-sonnet-4-6" effort low }
+```
+
+**Tier alias** — Name a routing label and bind it to a client:
+```gaviero
+tier cheap     fast
+tier expensive reasoning
+```
+
+**Vars** — Script-level key/value substitutions applied across all agents:
+```gaviero
+vars {
+    PLANS   "plans"
+    VERSION "1"
+}
+```
+
+**Prompt** — Named, reusable prompt templates with `{{VAR}}` substitution:
+```gaviero
+prompt review-body #"
+    Review {{PLANS}}/{{MODEL}}-draft.md and list all issues.
+"#
 ```
 
 **Agent** — A unit of work with scope, prompt, dependencies, and optional blocks:
 ```gaviero
-agent design { description "..." client reasoning scope {...} prompt "..." }
+agent design { description "..." client reasoning scope {...} prompt review-body }
 ```
 
 **Workflow** — Orchestrates agents with execution strategy, verification, and loop rules:
@@ -88,11 +110,71 @@ workflow refactor_auth {
 
 ## Language Reference
 
+### Client Block
+
+Declares a model, tier, effort level, and optional provider-specific extras:
+
+```gaviero
+client opus {
+    tier      expensive
+    model     "claude-opus-4-7"
+    privacy   public
+    effort    high
+    extra {
+        "thinking_budget" "8000"   // provider pass-through; unknown keys logged
+    }
+    default    // used when no client is specified on an agent
+}
+```
+
+- `effort` — provider-neutral knob: `off` / `auto` / `low` / `medium` / `high` / `xhigh` / `max`
+- `extra { "k" "v" ... }` — provider-specific key/value pairs forwarded verbatim
+
+### Tier Aliases
+
+Bind a routing label to a client so agents reference an abstract tier rather than a specific model:
+
+```gaviero
+tier cheap     sonnet
+tier expensive opus
+```
+
+Agents using `tier expensive` are re-routed by changing one line.
+
+### Top-level Vars
+
+Script-level substitution applied to agent prompts, descriptions, and scope paths before compilation:
+
+```gaviero
+vars {
+    PLANS   "plans"
+    VERSION "1"
+}
+```
+
+Override at the CLI with `--var PLANS=output`.
+
+### Named Prompts
+
+Reusable prompt templates referenced by name in agents:
+
+```gaviero
+prompt review-body #"
+    Review {{PLANS}}/{{MODEL}}-draft.md for correctness.
+"#
+
+agent reviewer {
+    client opus
+    prompt review-body    // reference by name
+}
+```
+
 ### Model Strings
 
 Provider-neutral: resolved at runtime by gaviero-core.
 
 - **Claude** — `sonnet`, `opus`, `haiku` (shorthand) or `claude:sonnet`, `claude-code:haiku` (explicit)
+- **Codex** — `codex:<model>` (e.g., `codex:gpt-5.4`)
 - **Ollama/local** — `ollama:qwen2.5-coder:7b` or `local:model-name`
 
 ### Scope Block
@@ -107,8 +189,12 @@ scope {
 }
 ```
 
-- `owned [...]` — files the agent may modify
-- `read_only [...]` — extra readable paths
+- `owned [...]` — files the agent may modify. Entries are glob-style
+  patterns: trailing `/` for a directory prefix, `*`/`?` for single-segment
+  wildcards, `**` to match across `/`. Two agents overlap only when their
+  patterns could resolve to the same concrete path (e.g.
+  `plans/claude-*.md` and `plans/codex-*.md` do **not** overlap).
+- `read_only [...]` — extra readable paths (same pattern syntax)
 - `impact_scope true` — include caller/callee graph around owned files
 
 ### Context Block
@@ -133,10 +219,12 @@ Control semantic memory reads and writes:
 
 ```gaviero
 memory {
-    namespace "domain-knowledge"
-    write_namespace "current-task"
-    trust "high"
-    limit 5
+    read_ns       ["domain-knowledge" "shared"]   // additive with workflow-level read_ns
+    write_ns      "current-task"                   // overrides workflow-level write_ns
+    importance    0.8                              // retrieval weight for written memories (0.0–1.0)
+    read_query    "architecture decisions and patterns"  // custom semantic search query
+    read_limit    15                               // max memories to retrieve
+    write_content #"Summary: {{PROMPT}}"#          // template for the stored memory text
 }
 ```
 
@@ -219,13 +307,17 @@ The output is a `.gaviero` file you can inspect, edit, and then execute.
 
 ## API Overview
 
-### Main entry point
+### Entry points
 
 ```rust
-use gaviero_dsl::compile;
+use gaviero_dsl::{compile, compile_with_vars};
 
+// Basic compilation
 let plan = compile(source, filename, workflow_name, runtime_prompt)?;
-// plan is a CompiledPlan DAG ready for swarm execution
+
+// With CLI-level var overrides (beat script-level vars {}, lose to agent-level vars {})
+let overrides = vec![("PLANS".to_string(), "output".to_string())];
+let plan = compile_with_vars(source, filename, workflow_name, runtime_prompt, &overrides)?;
 ```
 
 ### Return type
