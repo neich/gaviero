@@ -1,6 +1,6 @@
 # gaviero-core
 
-All pipeline logic: swarm, memory, ACP (Claude subprocess), write gate, git, terminal, validation.
+All pipeline logic: swarm, memory, ACP (Claude subprocess), write gate, git, terminal, validation. No UI dependencies.
 
 ## Build & Test
 
@@ -9,39 +9,52 @@ cargo test -p gaviero-core
 cargo clippy -p gaviero-core
 ```
 
-Network tests (`Ollama`, model downloads) are `#[ignore]` by default.
+Network tests (Ollama, model downloads) are `#[ignore]` by default.
+
+## Public Modules (from `src/lib.rs`)
+
+| Module | Purpose |
+|---|---|
+| `swarm` | Multi-agent orchestration, tier routing, verification, merge |
+| `memory` | 5-level scoped ONNX embeddings + consolidation |
+| `acp` | Claude subprocess sessions (persistent / one-shot) |
+| `write_gate` | File modification boundary + diff review |
+| `validation_gate` | Structural + semantic validation pipeline |
+| `scope_enforcer` | `FileScope` enforcement on proposals |
+| `path_pattern` | Glob-aware scope overlap detection (backs DSL scope validation) |
+| `agent_session` | Per-agent session lifetime + state plumbing |
+| `context_planner` | Pre-prompt context assembly (graph + memory + files) |
+| `session_state` | Checkpointable session state for resume |
+| `repo_map` | Code knowledge graph (tree-sitter driven) |
+| `tree_sitter` | 16-language registry, query loader |
+| `diff_engine` | Unified diff generation / application |
+| `git` | `git2` wrapper, worktrees, branches |
+| `terminal` | PTY + OSC 133 + `vt100` emulation |
+| `indent` | Hybrid indent detection |
+| `iteration` | Iteration/retry loop control |
+| `observer` | `WriteGateObserver`, `AcpObserver`, `SwarmObserver` traits |
+| `query_loader` | Tree-sitter query discovery |
+| `types` | Shared boundary types |
+| `workspace` | `.gaviero/settings.json` + workspace discovery |
 
 ## Key Subsystems
 
-**Swarm** (`swarm/`): Multi-agent orchestration engine.
-- Tier execution (local/cheap/expensive) with parallel fan-out
-- Verification gates (structural, diff review, test runner)
-- Git merge + Claude-powered conflict resolution
-- Scope validation, dependency DAG, checkpoint/resume
+**Swarm** (`swarm/`): tier execution (local/cheap/expensive), parallel fan-out, verification gates, scope validation, dependency DAG, checkpoint/resume, conflict resolution.
 
-**Memory** (`memory/`): 5-level scoped embeddings (global → workspace → repo → module → run).
-- SQLite + sqlite-vec backend, ONNX embedder (nomic-embed-text-v1.5)
-- Cascading search narrows scope, early-terminates at 0.70 confidence
-- 3-phase consolidation: triage → decay/prune → cross-scope promotion
+**Memory** (`memory/`): SQLite + sqlite-vec, nomic-embed-text-v1.5 ONNX. Cascading scope search (global → workspace → repo → module → run), early-terminate at 0.70 confidence. 3-phase consolidation: triage → decay/prune → cross-scope promotion.
 
-**ACP** (`acp/`): Claude subprocess integration.
-- Session factory, persistent or one-shot modes
-- Prompt enrichment, file block routing, streaming
+**ACP** (`acp/`): Claude subprocess — session factory, argv/tempfile prompt spill, streaming file-block extraction.
 
-**Write Gate** (`write_gate/`): File modification boundary enforcement.
-- Interactive/auto-accept/reject-all modes
-- Diff review, scope validation, observer callbacks
-
-**Utilities**: git (git2 wrapper + worktrees), tree-sitter (16-lang registry, query loader), diff engine, terminal (PTY + OSC 133), indent (hybrid strategy).
+**Write Gate** (`write_gate/`): interactive / auto-accept / reject-all modes; diff review; scope validation; observer callbacks.
 
 ## Conventions
 
 - Lock discipline: never hold Mutex across I/O, parsing, or embedding.
-- `AgentBackend` trait is object-safe; all backends in `backend/` implement it.
-- Memory model: nomic-embed-text-v1.5, cosine similarity.
+- `AgentBackend` trait is object-safe; all backends in `swarm/backend/` implement it.
+- Embedding model: nomic-embed-text-v1.5, cosine similarity.
 - Memory writes require explicit `WriteScope` — never infer.
 - Scoring: 50% similarity + 20% importance + 15% recency + 15% base, scaled by scope/trust weights.
-- Hybrid search: RRF merges vector (0.7) + FTS (0.3) results.
+- Hybrid search: RRF merges vector (0.7) + FTS (0.3).
 
 ## Dependencies
 
