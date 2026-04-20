@@ -127,10 +127,12 @@ Ollama server URL precedence:
 | `--repo` | `<path>` | Workspace root (default: current directory) |
 | `--task` | `<text>` | Single-task mode — auto-scoped, full repo |
 | `--script` | `<path>` | `.gaviero` DSL workflow file |
+| `--prompt-file` | `<path>` | File whose contents replace `{{PROMPT}}` in DSL script (requires `--script`) |
+| `--var` | `KEY=VALUE` | Override a `vars {}` entry in a DSL script (repeatable, requires `--script`) |
 | `--work-units` | `<json>` | Explicit work unit definitions |
 | `--coordinated` | — | Generate reviewable plan, don't execute |
 | `--output` | `<path>` | Save generated plan to file (`--coordinated`) |
-| `--model` | `<spec>` | Execution model (default: sonnet) |
+| `--model` | `<spec>` | Model: `sonnet`, `opus`, `codex:<m>`, `ollama:<m>` (default: sonnet) |
 | `--coordinator-model` | `<spec>` | Planner model for `--coordinated` |
 | `--ollama-base-url` | `<url>` | Ollama server URL |
 | `--auto-accept` | — | Skip interactive review, apply changes directly |
@@ -144,7 +146,8 @@ Ollama server URL precedence:
 | `--read-ns` | `<ns>` | Additional read namespaces (repeatable) |
 | `--format` | `text\|json` | Output format |
 | `--trace` | `<file>` | Write DEBUG-level JSON trace log |
-| `--graph` | — | Build code graph and exit |
+| `--graph` | — | Build/update code knowledge graph and exit |
+| `--exclude` | `<pattern>` | Exclude folders from repo-map scanning (repeatable, comma-separated) |
 
 ## Output
 
