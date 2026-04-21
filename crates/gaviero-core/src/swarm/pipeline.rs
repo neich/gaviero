@@ -1213,11 +1213,18 @@ fn apply_iter_vars(unit: &WorkUnit, iter_abs: u32) -> WorkUnit {
 /// modified files so the judge can decide on facts instead of hallucinating.
 fn apply_iter_vars_with_evidence(unit: &WorkUnit, iter_abs: u32, evidence: &str) -> WorkUnit {
     let prev = iter_abs.saturating_sub(1);
+    let iter_str = iter_abs.to_string();
+    let prev_str = prev.to_string();
+    let sub = |s: &str| {
+        s.replace("{{ITER}}", &iter_str)
+            .replace("{{PREV_ITER}}", &prev_str)
+    };
     WorkUnit {
+        description: sub(&unit.description),
         coordinator_instructions: unit
             .coordinator_instructions
-            .replace("{{ITER}}", &iter_abs.to_string())
-            .replace("{{PREV_ITER}}", &prev.to_string())
+            .replace("{{ITER}}", &iter_str)
+            .replace("{{PREV_ITER}}", &prev_str)
             .replace("{{ITER_EVIDENCE}}", evidence),
         ..unit.clone()
     }

@@ -179,9 +179,20 @@ impl AcpObserver for CliAcpObserver {
         eprintln!("  [{}] ⚙ {}", self.agent_id, tool_name);
     }
 
-    fn on_message_complete(&self, role: &str, _content: &str) {
-        if self.verbose && role == "assistant" {
+    fn on_message_complete(&self, role: &str, content: &str) {
+        if role != "assistant" {
+            return;
+        }
+        if self.verbose {
             eprintln!(); // newline after streamed text
+            return;
+        }
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        for line in trimmed.lines() {
+            eprintln!("  [{}] ▸ {}", self.agent_id, line);
         }
     }
 
@@ -223,19 +234,24 @@ impl SwarmObserver for CliSwarmObserver {
         match status {
             AgentStatus::Running => {
                 if detail.is_empty() {
-                    eprintln!("[agent] {} starting", work_unit_id);
+                    eprintln!("[{}] starting", work_unit_id);
                 } else {
-                    eprintln!("[agent] {} starting — {}", work_unit_id, detail);
+                    eprintln!("[{}] starting — {}", work_unit_id, detail);
                 }
             }
             AgentStatus::Completed => {
-                eprintln!("[agent] {} done", work_unit_id);
+                let summary = detail.trim();
+                if summary.is_empty() {
+                    eprintln!("[{}] ✓ done", work_unit_id);
+                } else {
+                    eprintln!("[{}] ✓ done — {}", work_unit_id, summary);
+                }
             }
             AgentStatus::Failed(err) => {
-                eprintln!("[agent] {} FAILED — {}", work_unit_id, err);
+                eprintln!("[{}] ✗ FAILED — {}", work_unit_id, err);
             }
             AgentStatus::Pending => {
-                eprintln!("[agent] {} queued", work_unit_id);
+                eprintln!("[{}] queued", work_unit_id);
             }
         }
     }
