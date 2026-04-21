@@ -30,6 +30,7 @@ enum AgentField {
     Memory(MemoryBlock),
     Context(ContextBlock),
     Vars(Vec<(String, String)>),
+    Tools(Vec<String>),
 }
 
 #[derive(Debug)]
@@ -579,6 +580,9 @@ where
         memory_block.clone().map(AgentField::Memory),
         context_block.map(AgentField::Context),
         vars_block.clone().map(AgentField::Vars),
+        just(Token::KwTools)
+            .ignore_then(str_list.clone())
+            .map(AgentField::Tools),
     ));
 
     let agent_decl = just(Token::KwAgent)
@@ -600,6 +604,7 @@ where
             let mut memory = None;
             let mut context = None;
             let mut vars: Vec<(String, String)> = Vec::new();
+            let mut tools: Vec<String> = Vec::new();
             for f in fields {
                 match f {
                     AgentField::Description(v, s) => {
@@ -632,6 +637,9 @@ where
                     AgentField::Vars(pairs) => {
                         vars.extend(pairs);
                     }
+                    AgentField::Tools(ts) => {
+                        tools.extend(ts);
+                    }
                 }
             }
             AgentDecl {
@@ -647,6 +655,7 @@ where
                 memory,
                 context,
                 vars,
+                tools,
                 span: e.span(),
             }
         });
@@ -1638,6 +1647,30 @@ mod tests {
             }
         } else {
             panic!("expected Agent item at index 1");
+        }
+    }
+
+    #[test]
+    fn agent_tools_field_parses() {
+        let src = r#"agent x { tools ["Bash" "WebFetch"] }"#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        if let Item::Agent(a) = &ast.unwrap().items[0] {
+            assert_eq!(a.tools, vec!["Bash", "WebFetch"]);
+        } else {
+            panic!("expected Agent item");
+        }
+    }
+
+    #[test]
+    fn agent_without_tools_has_empty_vec() {
+        let src = r#"agent x { description "noop" }"#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        if let Item::Agent(a) = &ast.unwrap().items[0] {
+            assert!(a.tools.is_empty());
+        } else {
+            panic!("expected Agent item");
         }
     }
 
