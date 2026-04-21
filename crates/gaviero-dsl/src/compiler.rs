@@ -921,6 +921,7 @@ fn compile_agent(
         context_callers_of,
         context_tests_for,
         context_depth,
+        extra_allowed_tools: decl.tools.clone(),
     })
 }
 
@@ -1982,6 +1983,25 @@ mod tests {
         assert!(units[0].context_callers_of.is_empty());
         assert!(units[0].context_tests_for.is_empty());
         assert_eq!(units[0].context_depth, 2);
+    }
+
+    #[test]
+    fn tools_field_propagates_to_work_unit() {
+        let src = r#"
+            agent x {
+                description "runs cargo"
+                tools ["Bash" "WebFetch"]
+            }
+        "#;
+        let units = compile_str(src).unwrap();
+        assert_eq!(units[0].extra_allowed_tools, vec!["Bash", "WebFetch"]);
+    }
+
+    #[test]
+    fn tools_defaults_to_empty_when_absent() {
+        let src = r#"agent x { description "t" }"#;
+        let units = compile_str(src).unwrap();
+        assert!(units[0].extra_allowed_tools.is_empty());
     }
 
     #[test]
