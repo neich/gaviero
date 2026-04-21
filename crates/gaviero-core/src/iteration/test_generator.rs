@@ -96,6 +96,7 @@ impl TestGenerator {
             context_callers_of: vec![],
             context_tests_for: vec![],
             context_depth: 2,
+            extra_allowed_tools: vec![],
         };
 
         let manifest = match run_backend(
