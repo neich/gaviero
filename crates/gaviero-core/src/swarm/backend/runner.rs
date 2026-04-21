@@ -158,14 +158,23 @@ pub async fn run_backend(
 
         let capabilities = backend.capabilities();
         let allowed_tools = if capabilities.tool_use {
-            vec![
+            let mut tools: Vec<String> = vec![
                 "Read".into(),
                 "Glob".into(),
                 "Grep".into(),
                 "Write".into(),
                 "Edit".into(),
                 "MultiEdit".into(),
-            ]
+            ];
+            // DSL `agent { tools [...] }` opt-in: extras only, deduped.
+            // Grants like `Bash` intentionally bypass the write-gate scope
+            // check, so the DSL is the sole place this can happen.
+            for extra in &work_unit.extra_allowed_tools {
+                if !tools.iter().any(|t| t == extra) {
+                    tools.push(extra.clone());
+                }
+            }
+            tools
         } else {
             vec![]
         };
@@ -651,6 +660,7 @@ mod tests {
             context_callers_of: vec![],
             context_tests_for: vec![],
             context_depth: 2,
+            extra_allowed_tools: vec![],
         }
     }
 

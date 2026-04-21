@@ -553,6 +553,7 @@ async fn main() -> Result<()> {
             context_callers_of: vec![],
             context_tests_for: vec![],
             context_depth: 2,
+            extra_allowed_tools: vec![],
         }];
         gaviero_core::swarm::plan::CompiledPlan::from_work_units(units, None)
     } else if let Some(ref json) = cli.work_units {

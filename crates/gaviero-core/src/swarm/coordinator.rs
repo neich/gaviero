@@ -696,6 +696,7 @@ fn parse_work_unit_lenient(v: &serde_json::Value) -> Result<WorkUnit> {
         context_callers_of: vec![],
         context_tests_for: vec![],
         context_depth: 2,
+        extra_allowed_tools: Vec::new(),
     })
 }
 
@@ -1142,6 +1143,7 @@ mod tests {
             context_callers_of: vec![],
             context_tests_for: vec![],
             context_depth: 2,
+            extra_allowed_tools: vec![],
         }
     }
 

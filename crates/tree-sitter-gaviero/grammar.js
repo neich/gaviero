@@ -87,6 +87,7 @@ module.exports = grammar({
         $.memory_block,
         $.context_block,
         $.vars_block,
+        seq("tools", $.string_list),
       ),
 
     // ── Scope block ──────────────────────────────────────────────

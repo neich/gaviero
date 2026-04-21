@@ -117,6 +117,17 @@ pub struct WorkUnit {
     /// BFS depth limit for context graph queries (default: 2).
     #[serde(default = "default_context_depth")]
     pub context_depth: u32,
+
+    /// Extra tools this agent may invoke, beyond the runner's default
+    /// read-only set (`Read, Glob, Grep, Write, Edit, MultiEdit`). Names are
+    /// forwarded verbatim to the backend via `--allowedTools`.
+    ///
+    /// Populated from the DSL `agent { tools [...] }` block. Opting into
+    /// `Bash` (or any other shell-capable tool) bypasses the write-gate
+    /// scope enforcement — only grant it to agents that must run
+    /// `cargo check` / `cargo test` and similar.
+    #[serde(default)]
+    pub extra_allowed_tools: Vec<String>,
 }
 
 fn default_context_depth() -> u32 {

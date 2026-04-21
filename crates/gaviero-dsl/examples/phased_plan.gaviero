@@ -1,12 +1,11 @@
 // Template: Execute a multi-phase implementation plan with dynamic phase extraction
 //
 // Shape:
-//   analyse_plan (opus)              — extracts phases from the plan (resume-aware)
+//   analyse_plan (opus)              — extracts phases from the plan
 //     ↓
 //   loop {
 //     phase_executor (opus)          — runs phase {{ITER}} from the briefing
-//     phase_gate     (sonnet)        — runs cargo check/test, writes verdict,
-//                                      appends to execution journal
+//     phase_gate     (sonnet)        — PASS / STOP verdict on this phase
 //     until agent phase_judge        — sonnet: "all briefing phases done?"
 //     max_iterations 12              — safety cap; actual count comes from briefing
 //   }
@@ -25,31 +24,18 @@
 //     (VERDICT: lines, phase counts), no deep reasoning.
 //
 // Hard-fail mechanism:
-//   * phase_gate runs mechanical verification (`cargo check`, targeted
-//     `cargo test`) BEFORE emitting its verdict. Failed builds produce
-//     `VERDICT: STOP: <failing command>` automatically — no prose argument.
+//   * phase_gate ends its log with `VERDICT: PASS` or `VERDICT: STOP: <reason>`.
 //   * On STOP, phase_judge exits the loop; phase_executor's STEP 0 halt
 //     check also refuses to run the next phase if it ever fires.
-//   * Workflow-level `verify { compile … test … }` is the final safety net
-//     at end-of-run.
-//
-// Recovery (re-run same OUT_DIR after a crash or interruption):
-//   Every phase writes a single entry to {{OUT_DIR}}/01-journal.md of the
-//   form `## Phase N — <title>\nStatus: DONE|HALTED|FAILED\n…`. On re-run:
-//     * analyse_plan sees {{OUT_DIR}}/00-briefing.md already exists and
-//       reuses it verbatim (no regeneration).
-//     * phase_executor's STEP 0 checks the journal for
-//       `Phase {{ITER}}: DONE` and skips, writing a `RESUMED_SKIP` record.
-//     * The loop walks forward to the first not-yet-DONE phase and resumes.
-//   Recovery is "re-run with the same --var OUT_DIR". No CLI flag needed.
+//   * Workflow-level `verify { compile … test … }` is the runtime safety net
+//     — catches broken builds regardless of what the gates said.
 //
 // Scope tradeoff vs. a hardcoded-phases version:
 //   A single phase_executor runs every iteration, so its `owned` must cover
-//   every file any phase could touch (e.g. `crates/` in a workspace, or
-//   `src/` + `tests/` in a single-crate repo). You lose the per-phase
-//   partition safety a hand-authored flat script would give you. If the
-//   plan is big enough that you want per-phase ownership, fork this script
-//   and hardcode the phase agents instead.
+//   every file any phase could touch (src/ + tests/). You lose the per-phase
+//   partition safety a hand-authored flat script would give you. If the plan
+//   is big enough that you want per-phase ownership, fork this script and
+//   hardcode the phase agents instead.
 //
 // Usage:
 //   gaviero-cli --script phased_plan.gaviero \
@@ -96,22 +82,11 @@ vars {
 prompt analyse-body #"
     You are extracting an execution briefing from an implementation plan.
 
-    STEP 0 — resume check.
-      If {{OUT_DIR}}/00-briefing.md already exists AND its last line is
-      `VERDICT: PROCEED`, this is a resumed run. Do NOT regenerate the
-      briefing (it is the contract the downstream phases depend on).
-      Exit without modifying any files. The existing briefing stands; the
-      loop will walk forward from the first not-yet-DONE phase based on
-      {{OUT_DIR}}/01-journal.md.
-
-      Otherwise, proceed with the steps below to produce a fresh briefing.
-
     The implementation plan (passed via --prompt-file):
 
     {{PROMPT}}
 
-    Skim CLAUDE.md and ARCHITECTURE.md for project conventions. Code
-    in this repo lives under `crates/<crate>/src/`, not a top-level `src/`.
+    Skim CLAUDE.md and ARCHITECTURE.md for project conventions.
 
     Produce {{OUT_DIR}}/00-briefing.md with this exact structure:
 
@@ -151,40 +126,27 @@ prompt analyse-body #"
 prompt phase-body #"
     You are the phase executor. This is iteration {{ITER}}.
 
-    STEP 0 — halt + resume check.
-      a) Read {{OUT_DIR}}/00-briefing.md. If its last line is
-         `VERDICT: STOP: …` or if iteration {{ITER}} is greater than
-         PHASE_COUNT, write a single line to {{OUT_DIR}}/phase-{{ITER}}.md:
+    STEP 0 — halt check.
+      Read {{OUT_DIR}}/00-briefing.md. If its last line is `VERDICT: STOP: …`
+      or if iteration {{ITER}} is greater than PHASE_COUNT, write a single
+      line to {{OUT_DIR}}/phase-{{ITER}}.md:
 
-             HALTED: nothing to execute (briefing STOP or phase count exceeded)
+          HALTED: nothing to execute (briefing STOP or phase count exceeded)
 
-         and exit without modifying any source files.
+      and exit without modifying any source files.
 
-      b) If {{ITER}} > 1, read {{OUT_DIR}}/gate-{{PREV_ITER}}.md. If its
-         last line is `VERDICT: STOP: …`, write:
+      If {{ITER}} > 1, also read {{OUT_DIR}}/gate-{{PREV_ITER}}.md. If its
+      last line is `VERDICT: STOP: …`, write:
 
-             HALTED: <quote the STOP reason verbatim>
+          HALTED: <quote the STOP reason verbatim>
 
-         to {{OUT_DIR}}/phase-{{ITER}}.md and exit.
-
-      c) Resume check. If {{OUT_DIR}}/01-journal.md exists AND contains a
-         `## Phase {{ITER}}` section whose `Status:` line reads `DONE`,
-         this phase already completed in a prior run. Write to
-         {{OUT_DIR}}/phase-{{ITER}}.md:
-
-             RESUMED_SKIP: Phase {{ITER}} already DONE per journal
-
-         and exit without modifying any source files. The loop advances
-         to the next iteration. This is the recovery mechanism — re-running
-         with the same --var OUT_DIR picks up at the first not-DONE phase.
+      to {{OUT_DIR}}/phase-{{ITER}}.md and exit.
 
     STEP 1 — locate your phase.
       From {{OUT_DIR}}/00-briefing.md, read the section headed
-      `## Phase {{ITER}} — …`. That is your execution target for this
-      iteration. If {{ITER}} > 1, also read every {{OUT_DIR}}/gate-*.md
-      file so far — their DISCOVERIES sections are the channel through
-      which earlier phases tell you their assumptions changed. Skip the
-      full phase-*.md logs; the gate summary is enough.
+      `## Phase {{ITER}} — …`. That is your entire scope for this iteration.
+      Read every prior `{{OUT_DIR}}/phase-*.md` to understand what earlier
+      phases actually did (which may differ from what was planned).
 
     STEP 2 — execute the phase.
       Follow the phase's goal, file list, and acceptance criteria literally.
@@ -205,77 +167,31 @@ prompt phase-body #"
 "#
 
 prompt gate-body #"
-    You are the gate after phase {{ITER}}. Do NOT modify source files.
-    Your job is mechanical verification + verdict + journal append.
+    You are the gate after phase {{ITER}}. Your role is cheap, not deep:
+    scan the phase log and diff for anything that should halt the run.
 
-    STEP 0 — propagate HALT / RESUMED_SKIP.
-      Read {{OUT_DIR}}/phase-{{ITER}}.md. If its first line starts with
-      `HALTED:` or `RESUMED_SKIP:`:
-        - Write {{OUT_DIR}}/gate-{{ITER}}.md containing (on one line,
-          verbatim, no extra commentary after it):
+    Read:
+      - {{OUT_DIR}}/phase-{{ITER}}.md (especially DISCOVERIES)
+      - The git diff for files modified in this phase
+      - {{OUT_DIR}}/00-briefing.md — phase {{ITER}}'s acceptance criteria
 
-              VERDICT: PASS
+    Write {{OUT_DIR}}/gate-{{ITER}}.md. End it with exactly one of:
 
-          (PASS because a SKIP is not a failure — the journal already
-          records the prior DONE status; HALTED cases are detected by the
-          judge via gate-{{PREV_ITER}}'s original STOP.) You MAY include
-          prose above the VERDICT line; the verdict line itself must be
-          the last line, exactly `VERDICT: PASS`.
-        - Append to {{OUT_DIR}}/01-journal.md one entry (see STEP 4) with
-          Status: SKIPPED or HALTED as appropriate, then exit.
+        VERDICT: PASS
+        VERDICT: STOP: <one-paragraph reason>
 
-    STEP 1 — mechanical verification.
-      Run, in order, and capture the exit status of each:
-        1. `cargo check --workspace` (or the project's equivalent build
-           command per CLAUDE.md).
-        2. `cargo clippy --workspace -- -D warnings` (same caveat).
-        3. Targeted `cargo test` — derive the test selector from the
-           briefing's Phase {{ITER}} "Acceptance criteria" or from the
-           files listed under "Files to touch" (e.g.
-           `cargo test -p <crate-of-touched-file> <module::path>`).
-      If any command fails, the gate verdict is STOP; record the first
-      failing command verbatim in the reason.
+    Return STOP when:
+      - A discovery invalidates a later phase's plan (wrong API assumption,
+        missing dependency, scope expanded beyond the briefing).
+      - Acceptance criteria are materially unmet and retrying won't help —
+        the plan is wrong, not the implementation.
+      - Files outside the phase's declared file list were modified.
+      - Phase log starts with `HALTED:` — propagate the halt.
 
-    STEP 2 — prose review.
-      Read:
-        - {{OUT_DIR}}/phase-{{ITER}}.md (especially DISCOVERIES)
-        - The git diff for files modified in this phase
-        - {{OUT_DIR}}/00-briefing.md — phase {{ITER}}'s acceptance criteria
+    Return PASS when the phase did its job and later phases can proceed,
+    even if minor TODOs remain.
 
-      Additional STOP triggers beyond mechanical failure:
-        - A DISCOVERY invalidates a later phase's plan (wrong API assumption,
-          missing dependency, scope expanded beyond the briefing).
-        - Acceptance criteria are materially unmet and retrying won't help —
-          the plan is wrong, not the implementation.
-        - Files outside the phase's declared file list were modified.
-
-    STEP 3 — write {{OUT_DIR}}/gate-{{ITER}}.md with:
-        - The three mechanical-verification commands and their exit status.
-        - The prose review findings (one paragraph).
-        - End with exactly one of:
-              VERDICT: PASS
-              VERDICT: STOP: <one-paragraph reason>
-
-    STEP 4 — append to {{OUT_DIR}}/01-journal.md.
-      If the journal does not yet exist, create it with a `# Execution
-      Journal` heading. Append this exact block (no embellishment):
-
-          ## Phase {{ITER}} — <phase title from briefing>
-          Status: DONE | HALTED | SKIPPED | FAILED
-          Verdict: PASS | STOP
-          Commands: cargo check=<ok|fail>, cargo clippy=<ok|fail>, cargo test=<ok|fail>
-          Touched: <comma-separated file list>
-          Notes: <one line — DISCOVERY summary or "clean">
-
-      Status values:
-        - DONE      — verification passed and verdict is PASS.
-        - SKIPPED   — RESUMED_SKIP was propagated; phase had completed earlier.
-        - HALTED    — upstream STOP propagated (briefing or prior gate).
-        - FAILED    — verdict is STOP for this phase's own work.
-
-      The journal is the recovery contract: phase_executor.STEP 0 reads
-      it on the next run to decide whether to skip. Keep entries terse,
-      one block per phase, appended in iteration order.
+    Be short. You are a fast gate, not a reviewer. Do not modify source files.
 "#
 
 prompt judge-body #"
@@ -310,28 +226,23 @@ prompt audit-body #"
 
     Read:
       - {{OUT_DIR}}/00-briefing.md
-      - {{OUT_DIR}}/01-journal.md — the per-phase DONE/SKIPPED/HALTED/FAILED
-        ledger. Start here: it is the canonical summary of what happened.
       - Every {{OUT_DIR}}/phase-*.md and {{OUT_DIR}}/gate-*.md
       - The full git diff vs the pre-swarm SHA (via tooling)
 
     Write {{OUT_DIR}}/99-audit.md covering:
       - Scope: did each phase deliver what the briefing promised?
-        Cross-reference the journal's Status column.
       - Cross-phase: regressions or inconsistencies introduced late that
-        earlier phases assumed weren't there.
+        earlier phases assumed weren't there
       - API: does the public surface match the plan's stated API exactly?
-      - Tests: are the promised tests real and passing? Note any phase
-        whose journal entry shows `cargo test=fail`.
-      - Halts / Skips: if any phase HALTED, SKIPPED, or FAILED, explain
-        what remains undone and how to resume.
-      - Follow-ups: anything deferred for a future run.
+      - Tests: are the promised tests real and passing?
+      - Halts: if any phase HALTED, explain why and what remains undone
+      - Follow-ups: anything deferred for a future run
 
     End with one of:
 
         VERDICT: ACCEPT — merge as-is
         VERDICT: REJECT — <reason + which phase to re-run>
-        VERDICT: HALTED — <which phase halted and why + resume instructions>
+        VERDICT: HALTED — <which phase halted and why>
 "#
 
 // ── Agents ───────────────────────────────────────────────────────────────────
@@ -341,7 +252,7 @@ agent analyse_plan {
     tier expensive
     scope {
         owned     ["{{OUT_DIR}}/00-briefing.md"]
-        read_only ["crates/" "Cargo.toml" "CLAUDE.md" "ARCHITECTURE.md"]
+        read_only ["src/" "tests/" "Cargo.toml" "CLAUDE.md" "ARCHITECTURE.md"]
     }
     prompt analyse-body
     max_retries 1
@@ -362,8 +273,8 @@ agent phase_executor {
     tier expensive
     depends_on [analyse_plan]
     scope {
-        owned     ["crates/" "{{OUT_DIR}}/phase-*.md"]
-        read_only ["{{OUT_DIR}}/" "Cargo.toml" "ARCHITECTURE.md" "CLAUDE.md"]
+        owned     ["src/" "tests/" "{{OUT_DIR}}/phase-*.md"]
+        read_only ["{{OUT_DIR}}/" "Cargo.toml" "ARCHITECTURE.md"]
     }
     prompt phase-body
     max_retries 2
@@ -374,14 +285,11 @@ agent phase_gate {
     tier cheap
     depends_on [phase_executor]
     scope {
-        owned     ["{{OUT_DIR}}/gate-*.md" "{{OUT_DIR}}/01-journal.md"]
-        read_only ["{{OUT_DIR}}/" "crates/"]
+        owned     ["{{OUT_DIR}}/gate-*.md"]
+        read_only ["{{OUT_DIR}}/" "src/" "tests/"]
     }
     prompt gate-body
     max_retries 1
-
-    context { depth 0 }
-    memory { read_limit 0 }
 }
 
 agent phase_judge {
@@ -391,9 +299,6 @@ agent phase_judge {
         read_only ["{{OUT_DIR}}/"]
     }
     prompt judge-body
-
-    context { depth 0 }
-    memory { read_limit 0 }
 }
 
 agent final_audit {
@@ -402,7 +307,7 @@ agent final_audit {
     depends_on [phase_gate]
     scope {
         owned     ["{{OUT_DIR}}/99-audit.md"]
-        read_only ["{{OUT_DIR}}/" "crates/" "Cargo.toml"]
+        read_only ["{{OUT_DIR}}/" "src/" "tests/" "Cargo.toml"]
     }
     prompt audit-body
     max_retries 1
@@ -414,7 +319,7 @@ agent final_audit {
             Multi-phase execution — {{PROMPT}}
             Audit: {{SUMMARY}}
         "#
-        staleness_sources ["crates/"]
+        staleness_sources ["src/" "tests/"]
     }
 }
 
