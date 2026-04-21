@@ -45,6 +45,8 @@ pub enum Token {
     KwDescription,
     #[token("max_retries")]
     KwMaxRetries,
+    #[token("tools")]
+    KwTools,
     #[token("steps")]
     KwSteps,
     #[token("max_parallel")]
@@ -202,6 +204,7 @@ impl fmt::Display for Token {
             Token::KwPrompt => write!(f, "prompt"),
             Token::KwDescription => write!(f, "description"),
             Token::KwMaxRetries => write!(f, "max_retries"),
+            Token::KwTools => write!(f, "tools"),
             Token::KwSteps => write!(f, "steps"),
             Token::KwMaxParallel => write!(f, "max_parallel"),
             Token::KwMemory => write!(f, "memory"),
