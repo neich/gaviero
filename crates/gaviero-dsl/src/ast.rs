@@ -162,6 +162,15 @@ pub struct AgentDecl {
     /// Per-agent compile-time substitution variables.
     /// Override script-level vars; cannot shadow built-ins (PROMPT, AGENT).
     pub vars: Vec<(String, String)>,
+    /// Extra tools requested for this agent on top of the runner's default
+    /// read-only set (`Read, Glob, Grep, Write, Edit, MultiEdit`). Names are
+    /// passed verbatim to the backend via `--allowedTools`. The backend
+    /// rejects unknown names, so the DSL stores raw strings.
+    ///
+    /// Opting into `Bash` (or any other shell-capable tool) bypasses the
+    /// write-gate's guarantees — use sparingly, only for agents that truly
+    /// need to run `cargo check` / `cargo test` / etc.
+    pub tools: Vec<String>,
     pub span: Span,
 }
 
