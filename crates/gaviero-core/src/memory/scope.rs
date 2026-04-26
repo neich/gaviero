@@ -583,6 +583,12 @@ pub struct WriteMeta {
     /// Retrieval trust multiplier in [0.0, 1.0]. Defaults to
     /// `source_kind.default_trust()` via [`WriteMeta::for_source`].
     pub trust_score: f32,
+    /// Tier C / C1: lifecycle class. Defaults to `Record` so legacy
+    /// callers don't need updating; producers of immutable transcripts
+    /// (`process_turn_complete`'s history row) and consolidator
+    /// summaries (`process_session_consolidate`) override via
+    /// [`WriteMeta::with_kind`].
+    pub kind: super::kind::MemoryKind,
 }
 
 impl Default for WriteMeta {
@@ -595,6 +601,7 @@ impl Default for WriteMeta {
             tag: None,
             source_kind: MemorySource::UnknownLegacy,
             trust_score: MemorySource::UnknownLegacy.default_trust(),
+            kind: super::kind::MemoryKind::Record,
         }
     }
 }
@@ -621,7 +628,16 @@ impl WriteMeta {
             tag: None,
             source_kind,
             trust_score,
+            kind: super::kind::MemoryKind::Record,
         }
+    }
+
+    /// Tier C / C1: override the lifecycle class. Defaults to
+    /// `Record`. History writes (immutable raw transcripts) and
+    /// Summary writes (session consolidator output) override here.
+    pub fn with_kind(mut self, kind: super::kind::MemoryKind) -> Self {
+        self.kind = kind;
+        self
     }
 
     /// Override the default trust score (clamped to [0.0, 1.0]).

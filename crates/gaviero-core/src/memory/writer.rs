@@ -822,9 +822,13 @@ async fn process_session_consolidate(
         }
     };
     if !parsed.session_summary.trim().is_empty() {
+        // C1: the consolidator's session-summary blob is the canonical
+        // Summary kind row — semantic merge across similar sessions,
+        // injected as session context when topically relevant.
         let meta = WriteMeta::for_source(MemorySource::LlmConsolidated)
             .with_importance(0.7)
             .with_type(super::scope::MemoryType::Factual)
+            .with_kind(super::kind::MemoryKind::Summary)
             .with_tag(format!("session_summary:{run_id}"));
         let _ = store
             .store_scoped(&summary_scope, &parsed.session_summary, &meta)
@@ -899,6 +903,22 @@ async fn process_telemetry_classify(
 /// panel hands the op to the writer task, never calls `MemoryStore`
 /// directly.
 async fn process_panel_edit(store: &Arc<MemoryStore>, op: PanelEditOp) -> Result<WriteResult> {
+    // C1: the panel cannot mutate history rows. Guard at the writer
+    // task before the operation reaches the DB; the SQL immutability
+    // trigger added in C1.3 is the second line of defense.
+    let target_id = match &op {
+        PanelEditOp::Delete { memory_id }
+        | PanelEditOp::Pin { memory_id, .. }
+        | PanelEditOp::SetScope { memory_id, .. }
+        | PanelEditOp::UpdateText { memory_id, .. } => *memory_id,
+    };
+    if let Some(super::kind::MemoryKind::History) = store.get_memory_kind(target_id).await? {
+        return Err(anyhow!(
+            "panel cannot edit history row {target_id} — history is append-only \
+             (use /forget-history to redact)"
+        ));
+    }
+
     match op {
         PanelEditOp::Delete { memory_id } => {
             let n = store.delete_memory_by_id(memory_id).await?;
@@ -965,6 +985,34 @@ async fn process_turn_complete(
     use super::extractor;
 
     let started = std::time::Instant::now();
+
+    // ── C1: persist the immutable History row first ───────────────────
+    //
+    // Every TurnComplete now also writes a `kind = history` row carrying
+    // the verbatim transcript at Run scope. The row is the source of
+    // truth for every derived record. Plan §C1: "History-write failure
+    // does not lose records and vice versa." We capture errors but
+    // never propagate — the extractor path below still runs even if
+    // this write fails.
+    let history_id = write_history_row(store, &session_id, &turn_id, &repo_id, &run_id, &transcript)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                target: "memory_history",
+                turn_id = %turn_id,
+                error = %e,
+                "history-row write failed; proceeding to extractor path"
+            );
+            None
+        });
+    if let Some(id) = history_id {
+        tracing::debug!(
+            target: "memory_history",
+            turn_id = %turn_id,
+            history_id = id,
+            "history row persisted"
+        );
+    }
 
     // ── A1: persist session-ledger row + annotated flags ─────────────
     //
@@ -1126,6 +1174,51 @@ async fn process_turn_complete(
     );
 
     Ok(last_result)
+}
+
+/// C1: write a `kind = history` row carrying the verbatim transcript
+/// for one chat turn, plus the provenance bundle (`session_id`, `turn_id`,
+/// `manifest_id` cross-ref) as a tag-encoded payload so the panel can
+/// navigate to the matching S4 manifest. Returns the inserted row id
+/// when the write produces a fresh row, `None` otherwise (dedup is
+/// disabled for history but the path still passes through `store_scoped`
+/// for consistency).
+async fn write_history_row(
+    store: &Arc<MemoryStore>,
+    session_id: &str,
+    turn_id: &str,
+    repo_id: &str,
+    run_id: &str,
+    transcript: &str,
+) -> Result<Option<i64>> {
+    use super::kind::MemoryKind;
+    use super::scope::{MemoryType, WriteMeta, WriteScope};
+    use super::trust_defaults::MemorySource;
+
+    let scope = WriteScope::Run {
+        repo_id: repo_id.to_string(),
+        run_id: run_id.to_string(),
+    };
+    // The tag carries the navigational keys (session_id + turn_id) so
+    // the panel can join history rows to manifests without an extra
+    // index. Trust = 1.0 from `RawTranscript`. Importance is high
+    // because History rows are the audit trail; B4-style decay does
+    // not apply since they're not injected into chat anyway.
+    let meta = WriteMeta::for_source(MemorySource::RawTranscript)
+        .with_kind(MemoryKind::History)
+        .with_type(MemoryType::Factual)
+        .with_importance(1.0)
+        .with_tag(format!("history:{session_id}:{turn_id}"));
+
+    let res = store
+        .store_scoped(&scope, transcript, &meta)
+        .await
+        .map_err(|e| anyhow!("history store_scoped: {e}"))?;
+    Ok(match res {
+        super::scope::StoreResult::Inserted(id) => Some(id),
+        super::scope::StoreResult::Deduplicated(id) => Some(id),
+        super::scope::StoreResult::AlreadyCovered => None,
+    })
 }
 
 /// Last-resort write for `TurnComplete` when extraction can't run (LLM
@@ -1476,5 +1569,145 @@ mod tests {
 
         // The fallback writes at Run scope with the provided repo/run id.
         assert_eq!(handle.queue_depth(), 0);
+    }
+
+    /// C1.2: TurnComplete writes a `kind = history` row carrying the
+    /// verbatim transcript at Run scope, regardless of whether the
+    /// extractor LLM is configured (None here).
+    #[tokio::test]
+    async fn c1_turn_complete_writes_history_row() {
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let store = Arc::new(MemoryStore::in_memory(embedder).unwrap());
+        let handle = spawn_writer_task(WriterConfig {
+            stores: MemoryStores::from_single_store(store.clone()),
+            llm: None,
+            observer: None,
+            manifest_observer: None,
+        });
+
+        let transcript = "USER: c1 history check\nASSISTANT: ack";
+        handle
+            .turn_complete(
+                "conv-c1",
+                "t-c1",
+                "repo-c1",
+                None,
+                "conv-c1",
+                transcript,
+                None,
+            )
+            .unwrap();
+
+        // Drain.
+        for _ in 0..40 {
+            if handle.queue_depth() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Read the row through the public lookup and assert it
+        // carries the History kind with the transcript intact.
+        let tag = "history:conv-c1:t-c1";
+        let found = store
+            .find_memory_by_tag(tag)
+            .await
+            .expect("lookup ok")
+            .expect("history row must exist");
+        let (id, kind, content) = found;
+        assert!(id > 0);
+        assert_eq!(kind, super::super::kind::MemoryKind::History);
+        assert_eq!(content, transcript);
+
+        // get_memory_kind matches.
+        let by_id = store.get_memory_kind(id).await.unwrap();
+        assert_eq!(by_id, Some(super::super::kind::MemoryKind::History));
+    }
+
+    /// C1.2: PanelEdit operations refuse to mutate history rows. The
+    /// guard runs in the writer task, before SQL hits the DB. (The
+    /// SQL trigger from C1.3 will be the second line of defense.)
+    #[tokio::test]
+    async fn c1_panel_edit_refuses_to_touch_history() {
+        use super::super::scope::{MemoryType, WriteMeta, WriteScope};
+        use super::super::trust_defaults::MemorySource;
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let store = Arc::new(MemoryStore::in_memory(embedder).unwrap());
+        let handle = spawn_writer_task(WriterConfig {
+            stores: MemoryStores::from_single_store(store.clone()),
+            llm: None,
+            observer: None,
+            manifest_observer: None,
+        });
+
+        // Seed one history row + one record row at the same scope.
+        let scope = WriteScope::Run {
+            repo_id: "repo-x".into(),
+            run_id: "run-x".into(),
+        };
+        let history_meta = WriteMeta::for_source(MemorySource::RawTranscript)
+            .with_kind(super::super::kind::MemoryKind::History)
+            .with_type(MemoryType::Factual)
+            .with_tag("history-x");
+        let record_meta = WriteMeta::for_source(MemorySource::UserRemember)
+            .with_type(MemoryType::Decision)
+            .with_tag("record-x");
+
+        let history_id = match store
+            .store_scoped(&scope, "TRANSCRIPT body", &history_meta)
+            .await
+            .unwrap()
+        {
+            super::super::scope::StoreResult::Inserted(id) => id,
+            _ => panic!("history insert should succeed"),
+        };
+        let record_id = match store
+            .store_scoped(&scope, "Record body", &record_meta)
+            .await
+            .unwrap()
+        {
+            super::super::scope::StoreResult::Inserted(id) => id,
+            _ => panic!("record insert should succeed"),
+        };
+
+        // Try to delete the history row through the panel — must fail.
+        let (tx, rx) = oneshot::channel();
+        handle
+            .enqueue(WriterMessage::PanelEdit {
+                op: PanelEditOp::Delete {
+                    memory_id: history_id,
+                },
+                ack: Some(tx),
+            })
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(500), rx)
+            .await
+            .expect("ack within timeout")
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "delete of history row must be rejected: {result:?}"
+        );
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("history is append-only") || err_msg.contains("history row"),
+            "unexpected error: {err_msg}"
+        );
+
+        // The record path through the same op still works.
+        let (tx, rx) = oneshot::channel();
+        handle
+            .enqueue(WriterMessage::PanelEdit {
+                op: PanelEditOp::Delete {
+                    memory_id: record_id,
+                },
+                ack: Some(tx),
+            })
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(500), rx)
+            .await
+            .expect("ack within timeout")
+            .unwrap();
+        assert!(result.is_ok(), "delete of record row must succeed: {result:?}");
     }
 }

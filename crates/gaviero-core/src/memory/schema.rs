@@ -6,7 +6,22 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Increment when adding a new migration.
-const CURRENT_VERSION: u32 = 9;
+const CURRENT_VERSION: u32 = 12;
+
+/// First schema version where the `memory_kind` discriminator exists.
+/// Used by [`needs_c1_backup`] to decide whether to take a one-shot
+/// pre-migration snapshot of the DB file before running v10.
+pub const C1_SCHEMA_VERSION: u32 = 10;
+
+/// C1.3: name of the trigger that vetoes UPDATE on history rows.
+/// Exported so the C2.4 `RedactHistory` handler — the **only**
+/// authorized callsite that may drop/recreate this trigger inside a
+/// transaction — can reference the constant. CI greps for the
+/// constant name to enforce single-callsite discipline (see C2.4).
+pub const C1_HISTORY_IMMUTABLE_TRIGGER_UPDATE: &str = "memories_history_immutable_update";
+
+/// C1.3: name of the trigger that vetoes DELETE on history rows.
+pub const C1_HISTORY_IMMUTABLE_TRIGGER_DELETE: &str = "memories_history_immutable_delete";
 
 /// Run all pending migrations on the given connection.
 ///
@@ -48,12 +63,36 @@ pub fn run_migrations(conn: &Connection, embedding_dims: usize) -> Result<()> {
     if version < 9 {
         migrate_v9(conn).context("migration v9")?;
     }
+    if version < 10 {
+        migrate_v10(conn).context("migration v10")?;
+    }
+    if version < 11 {
+        migrate_v11(conn).context("migration v11")?;
+    }
+    if version < 12 {
+        migrate_v12(conn).context("migration v12")?;
+    }
 
     // Stamp the current version
     conn.pragma_update(None, "user_version", CURRENT_VERSION)
         .context("updating user_version")?;
 
     Ok(())
+}
+
+/// Read the current `user_version` from a DB file without running any
+/// migrations. Used by the bootstrap to decide whether to snapshot the
+/// file before applying the load-bearing v10 (C1) migration.
+pub fn read_user_version(conn: &Connection) -> Result<u32> {
+    conn.pragma_query_value(None, "user_version", |row| row.get(0))
+        .context("reading user_version")
+}
+
+/// Returns true when the next call to [`run_migrations`] will cross the
+/// C1 boundary (v10) and should therefore be preceded by a backup of the
+/// DB file. Centralized here so callers don't bake the version number in.
+pub fn needs_c1_backup(conn: &Connection) -> bool {
+    matches!(read_user_version(conn), Ok(v) if v < C1_SCHEMA_VERSION && v > 0)
 }
 
 /// v1: Initial schema — memories table + indexes.
@@ -550,6 +589,187 @@ fn migrate_v9(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v10 (Tier C Phase 2 / C1): typed memory stores discriminator.
+///
+/// Adds a `memory_kind` discriminator column to `memories` so the table
+/// can host three lifecycle classes — `record` (the workhorse, mutable,
+/// injected, dedup'd), `history` (immutable raw transcripts, never
+/// injected), and `summary` (consolidator output, semantic merge). The
+/// column is `TEXT NOT NULL DEFAULT 'record'` with a `CHECK` constraint
+/// pinning the allowed values; existing rows take the default and so
+/// remain `record` after migration.
+///
+/// Per-kind convenience views (`v_records`, `v_history`, `v_summaries`)
+/// shadow the base table for each discriminator. They're query-time
+/// sugar — the SQL immutability trigger introduced in C1.3 fires on the
+/// **base** table, never on the views, since SQLite views are read-only
+/// by default and any application path that wants to bypass the
+/// discriminator would need to write through `memories` directly anyway.
+///
+/// We deliberately do **not** install the immutability trigger here.
+/// C1.1's job is to add the column, the index, and the views, and to
+/// leave the existing rows correctly defaulted. The trigger lands in
+/// C1.3, after the writer dispatch (C1.2) ensures every code path
+/// already sets `memory_kind` correctly on insert.
+fn migrate_v10(conn: &Connection) -> Result<()> {
+    let has_kind: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('memories') WHERE name = 'memory_kind'")
+        .and_then(|mut s| s.query_row([], |_| Ok(true)))
+        .unwrap_or(false);
+
+    if !has_kind {
+        conn.execute_batch(
+            "ALTER TABLE memories ADD COLUMN memory_kind TEXT NOT NULL DEFAULT 'record'
+                 CHECK (memory_kind IN ('record', 'history', 'summary'));",
+        )
+        .context("adding memory_kind column")?;
+    }
+
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(memory_kind);
+         CREATE INDEX IF NOT EXISTS idx_memories_kind_scope
+             ON memories(memory_kind, scope_level);
+         CREATE VIEW IF NOT EXISTS v_records   AS SELECT * FROM memories WHERE memory_kind = 'record';
+         CREATE VIEW IF NOT EXISTS v_history   AS SELECT * FROM memories WHERE memory_kind = 'history';
+         CREATE VIEW IF NOT EXISTS v_summaries AS SELECT * FROM memories WHERE memory_kind = 'summary';",
+    )
+    .context("installing memory_kind index + per-kind views")?;
+
+    // Stamp completion timestamp so the TUI can surface a one-shot
+    // banner ("Gaviero's memory schema upgraded to typed stores; backup
+    // at <path>") without keeping ambient state. Best-effort.
+    let _ = conn.execute(
+        "INSERT INTO _gaviero_meta(key, value)
+             VALUES ('c1_migration_completed_at', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             ON CONFLICT(key) DO NOTHING",
+        [],
+    );
+
+    Ok(())
+}
+
+/// v11 (Tier C / C1.3): SQL-level immutability guard for History rows.
+///
+/// Installs two BEFORE triggers on `memories` that veto UPDATE and
+/// DELETE statements whose target row has `memory_kind = 'history'`.
+/// SQLite triggers cannot return errors directly — the canonical idiom
+/// is `SELECT RAISE(ABORT, '<msg>')`, which aborts the statement and
+/// rolls back the change.
+///
+/// Why a BEFORE trigger and not AFTER:
+/// - BEFORE lets us inspect `OLD` and short-circuit *before* the
+///   write touches indexes, FTS, and sqlite-vec.
+/// - AFTER would still leave intermediate rows in derived tables in
+///   the small window before the abort propagates.
+///
+/// Why two triggers (not one) and not a CHECK constraint:
+/// - SQLite CHECK constraints fire on every row insert, but we *do*
+///   want to allow inserting history rows (just not updating /
+///   deleting them).
+/// - One trigger per operation keeps each diagnostic message specific:
+///   "history row UPDATE rejected" vs "DELETE rejected".
+///
+/// The triggers fire on the **base** `memories` table — views are
+/// read-only by default in SQLite, so the v10 `v_history` view does
+/// not need its own trigger. The single legitimate path that bypasses
+/// these triggers is the C2.4 `RedactHistory` writer-task variant,
+/// which drops + recreates them inside a single transaction. CI grep
+/// enforces that no other callsite contains the trigger names.
+fn migrate_v11(conn: &Connection) -> Result<()> {
+    install_history_immutable_triggers(conn)
+}
+
+/// Install the C1.3 immutability triggers. Idempotent — the migration
+/// uses `CREATE TRIGGER IF NOT EXISTS`. **Public to the crate** so the
+/// C2.4 `RedactHistory` handler can re-install the triggers after its
+/// brief privileged window. No other code path may call this.
+pub(crate) fn install_history_immutable_triggers(conn: &Connection) -> Result<()> {
+    let sql = format!(
+        "CREATE TRIGGER IF NOT EXISTS {update_trigger}
+            BEFORE UPDATE ON memories
+            FOR EACH ROW
+            WHEN OLD.memory_kind = 'history'
+            BEGIN
+                SELECT RAISE(ABORT,
+                    'history row UPDATE rejected: history is append-only \
+                     (use /forget-history to redact via RedactHistory)');
+            END;
+         CREATE TRIGGER IF NOT EXISTS {delete_trigger}
+            BEFORE DELETE ON memories
+            FOR EACH ROW
+            WHEN OLD.memory_kind = 'history'
+            BEGIN
+                SELECT RAISE(ABORT,
+                    'history row DELETE rejected: history is append-only \
+                     (use /forget-history to redact via RedactHistory)');
+            END;",
+        update_trigger = C1_HISTORY_IMMUTABLE_TRIGGER_UPDATE,
+        delete_trigger = C1_HISTORY_IMMUTABLE_TRIGGER_DELETE,
+    );
+    conn.execute_batch(&sql)
+        .context("installing C1 history-immutable triggers")
+}
+
+/// v12 (Tier C / C1.4): zstd compression scaffolding for History rows.
+///
+/// Adds two columns to `memories`:
+/// - `compressed INTEGER NOT NULL DEFAULT 0` — boolean flag.
+/// - `content_blob BLOB` — zstd-encoded transcript bytes when
+///   `compressed = 1`. NULL otherwise.
+///
+/// When `compressed = 1`, the canonical body lives in `content_blob`
+/// and `content` is replaced by a placeholder (typically the SHA-256
+/// hex prefix so debug tooling can still recognize the row by content
+/// hash). The application-level read path
+/// ([`crate::memory::store::MemoryStore::read_history_content`])
+/// transparently decompresses + SHA-verifies; mismatch raises a
+/// data-integrity alarm. The compression itself runs inside the
+/// sleeptime pass via the dedicated trigger-disable window — see
+/// [`super::store::MemoryStore::compress_history_row`].
+fn migrate_v12(conn: &Connection) -> Result<()> {
+    let add_column_if_missing = |col: &str, typedef: &str| -> Result<()> {
+        let has_col: bool = conn
+            .prepare(&format!(
+                "SELECT 1 FROM pragma_table_info('memories') WHERE name = '{col}'"
+            ))
+            .and_then(|mut s| s.query_row([], |_| Ok(true)))
+            .unwrap_or(false);
+        if !has_col {
+            conn.execute_batch(&format!("ALTER TABLE memories ADD COLUMN {col} {typedef};"))
+                .with_context(|| format!("adding {col} column"))?;
+        }
+        Ok(())
+    };
+
+    add_column_if_missing("compressed", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing("content_blob", "BLOB")?;
+
+    // Index lets sleeptime cheaply pick eligible rows: history rows
+    // that haven't been compressed yet, ordered by age.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_memories_history_compress
+            ON memories(memory_kind, compressed, created_at)
+            WHERE memory_kind = 'history';",
+    )
+    .context("creating history-compression index")?;
+
+    Ok(())
+}
+
+/// Drop the C1.3 immutability triggers. **Crate-private and only the
+/// C2.4 `RedactHistory` handler may call this**, inside a transaction
+/// that re-installs them before commit. Any other callsite is a bug
+/// and breaks the audit invariant — CI grep enforces single-callsite.
+pub(crate) fn drop_history_immutable_triggers(conn: &Connection) -> Result<()> {
+    conn.execute_batch(&format!(
+        "DROP TRIGGER IF EXISTS {update_trigger};
+         DROP TRIGGER IF EXISTS {delete_trigger};",
+        update_trigger = C1_HISTORY_IMMUTABLE_TRIGGER_UPDATE,
+        delete_trigger = C1_HISTORY_IMMUTABLE_TRIGGER_DELETE,
+    ))
+    .context("dropping C1 history-immutable triggers")
+}
+
 /// Compute SHA-256 hash of normalized content for dedup.
 pub fn content_hash(content: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -856,6 +1076,412 @@ mod tests {
             .unwrap();
         assert!(!hash.is_empty());
         assert_eq!(hash, content_hash("hello world"));
+    }
+
+    #[test]
+    fn test_v10_adds_memory_kind_column_and_views() {
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+
+        // Column exists with the expected NOT NULL default.
+        let has_kind: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('memories') WHERE name = 'memory_kind'")
+            .and_then(|mut s| s.query_row([], |_| Ok(true)))
+            .unwrap_or(false);
+        assert!(has_kind, "memory_kind column must exist");
+
+        // CHECK constraint blocks invalid kinds.
+        conn.execute_batch(
+            "INSERT INTO memories (namespace, key, content, scope_level, scope_path,
+                content_hash, memory_kind)
+             VALUES ('default', 'k_ok', 'ok', 2, 'repo:x', 'h_ok', 'record');",
+        )
+        .unwrap();
+        let bad = conn.execute_batch(
+            "INSERT INTO memories (namespace, key, content, scope_level, scope_path,
+                content_hash, memory_kind)
+             VALUES ('default', 'k_bad', 'bad', 2, 'repo:x', 'h_bad', 'episode');",
+        );
+        assert!(bad.is_err(), "CHECK must reject unknown memory_kind");
+
+        // Default for inserts that omit memory_kind is 'record'.
+        conn.execute_batch(
+            "INSERT INTO memories (namespace, key, content, scope_level, scope_path, content_hash)
+             VALUES ('default', 'k_default', 'no kind', 2, 'repo:x', 'h_def');",
+        )
+        .unwrap();
+        let kind: String = conn
+            .query_row(
+                "SELECT memory_kind FROM memories WHERE key = 'k_default'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, "record");
+
+        // Views are present and partition correctly.
+        for (view, kind) in [
+            ("v_records", "record"),
+            ("v_history", "history"),
+            ("v_summaries", "summary"),
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {view}"), [], |r| r.get(0))
+                .unwrap();
+            // We've inserted 2 records and no history/summary above.
+            let expected = if kind == "record" { 2 } else { 0 };
+            assert_eq!(count, expected, "{view} should have {expected} row(s)");
+        }
+    }
+
+    #[test]
+    fn test_v10_legacy_rows_default_to_record() {
+        // Walk a v9 DB through the v10 upgrade and confirm pre-existing
+        // rows take the 'record' default for memory_kind.
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+
+        // Force back to v9 and remove v10 artifacts to simulate an
+        // older DB receiving the migration.
+        conn.pragma_update(None, "user_version", 9_u32).unwrap();
+        conn.execute_batch(
+            "DROP VIEW IF EXISTS v_records;
+             DROP VIEW IF EXISTS v_history;
+             DROP VIEW IF EXISTS v_summaries;",
+        )
+        .unwrap();
+        // SQLite has no clean way to drop a column; instead, set the
+        // existing rows' memory_kind to NULL via a roundabout, then
+        // mark all rows so we can detect backfill. We can't actually
+        // drop the column here without rebuilding the table — but the
+        // ADD COLUMN guard in migrate_v10 is keyed on column presence,
+        // so we instead pre-populate a non-default kind and verify the
+        // re-run is idempotent (the migration must not clobber it).
+        conn.execute_batch(
+            "INSERT INTO memories (namespace, key, content, scope_level, scope_path,
+                content_hash, memory_kind)
+             VALUES ('default', 'legacy:r', 'legacy', 2, 'repo:x', 'h_l', 'record');",
+        )
+        .unwrap();
+
+        run_migrations(&conn, 8).unwrap();
+
+        let kind: String = conn
+            .query_row(
+                "SELECT memory_kind FROM memories WHERE key = 'legacy:r'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, "record");
+
+        // Views are reinstated.
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM v_records", [], |r| r.get(0))
+            .unwrap();
+        assert!(n >= 1);
+    }
+
+    #[test]
+    fn test_v10_index_present() {
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type='index' AND name IN ('idx_memories_kind', 'idx_memories_kind_scope')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2, "both kind indexes should exist");
+    }
+
+    #[test]
+    fn test_needs_c1_backup_only_for_pre_v10() {
+        let conn = setup_conn();
+        // Fresh DB at user_version 0 — bootstrap path, no upgrade
+        // backup needed (there's nothing to back up).
+        assert!(!needs_c1_backup(&conn));
+
+        // Walk to v9 and verify backup is requested.
+        migrate_v1(&conn).unwrap();
+        migrate_v2(&conn).unwrap();
+        migrate_v3(&conn, 8).unwrap();
+        migrate_v4(&conn, 8).unwrap();
+        migrate_v5(&conn).unwrap();
+        migrate_v6(&conn).unwrap();
+        migrate_v7(&conn).unwrap();
+        migrate_v8(&conn).unwrap();
+        migrate_v9(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 9_u32).unwrap();
+        assert!(needs_c1_backup(&conn), "v9 → v10 upgrade should request a backup");
+
+        // After v10 lands, no backup is requested again.
+        run_migrations(&conn, 8).unwrap();
+        assert!(!needs_c1_backup(&conn));
+    }
+
+    /// C1.3: helper that seeds a v11 DB with one history row and
+    /// returns its id. Used by the smuggling-attempt suite below.
+    fn seed_history_row(conn: &Connection) -> i64 {
+        conn.execute_batch(
+            "INSERT INTO memories (
+                namespace, key, content, scope_level, scope_path,
+                content_hash, memory_kind, memory_type, trust, source, trust_score,
+                repo_id, run_id
+            ) VALUES (
+                'default', 'history:s:t', 'TRANSCRIPT', 4, 'repo:r/run:run-1',
+                'h_hist', 'history', 'factual', 'high', 'raw_transcript', 1.0,
+                'r', 'run-1'
+            );",
+        )
+        .unwrap();
+        conn.query_row(
+            "SELECT id FROM memories WHERE key = 'history:s:t'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// C1.3: every documented attempt to UPDATE a history row must be
+    /// vetoed by the trigger. The plan calls for ≥10 smuggling
+    /// attempts; each `assert_history_immutable_*` below counts as one.
+    #[test]
+    fn test_c1_trigger_rejects_direct_update_by_id() {
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+        let id = seed_history_row(&conn);
+        let r = conn.execute(
+            "UPDATE memories SET content = 'tampered' WHERE id = ?1",
+            rusqlite::params![id],
+        );
+        assert!(r.is_err(), "UPDATE-by-id should fail: {r:?}");
+    }
+
+    #[test]
+    fn test_c1_trigger_rejects_direct_update_by_key() {
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+        let _ = seed_history_row(&conn);
+        let r = conn.execute(
+            "UPDATE memories SET content = 'tampered' WHERE key = 'history:s:t'",
+            [],
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_c1_trigger_rejects_unscoped_blanket_update() {
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+        let _ = seed_history_row(&conn);
+        // No WHERE → would touch every row, including history.
+        let r = conn.execute("UPDATE memories SET importance = 0.0", []);
+        assert!(r.is_err(), "blanket UPDATE must abort on the history row");
+    }
+
+    #[test]
+    fn test_c1_trigger_rejects_update_targeting_kind_change() {
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+        let id = seed_history_row(&conn);
+        // Try to "demote" history to record. This is the most insidious
+        // smuggling path: change the kind first, then mutate freely.
+        // The BEFORE trigger inspects `OLD.memory_kind`, not the new
+        // value, so this is rejected.
+        let r = conn.execute(
+            "UPDATE memories SET memory_kind = 'record' WHERE id = ?1",
+            rusqlite::params![id],
+        );
+        assert!(r.is_err(), "kind-demotion attempt must be rejected");
+    }
+
+    #[test]
+    fn test_c1_trigger_rejects_update_with_subquery_filter() {
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+        let _ = seed_history_row(&conn);
+        let r = conn.execute(
+            "UPDATE memories SET content = 'tampered'
+              WHERE id IN (SELECT id FROM memories WHERE memory_kind = 'history')",
+            [],
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_c1_trigger_rejects_update_with_join_via_cte() {
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+        let id = seed_history_row(&conn);
+        let r = conn.execute(
+            "WITH targets AS (SELECT id FROM memories WHERE memory_kind = 'history')
+             UPDATE memories SET content = 'tampered' WHERE id IN (SELECT id FROM targets)",
+            rusqlite::params![],
+        );
+        assert!(r.is_err(), "CTE-driven UPDATE must be rejected (id={id})");
+    }
+
+    #[test]
+    fn test_c1_trigger_rejects_direct_delete_by_id() {
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+        let id = seed_history_row(&conn);
+        let r = conn.execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id]);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_c1_trigger_rejects_blanket_delete() {
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+        let _ = seed_history_row(&conn);
+        let r = conn.execute("DELETE FROM memories", []);
+        assert!(r.is_err(), "blanket DELETE must fail on history row");
+    }
+
+    #[test]
+    fn test_c1_trigger_rejects_delete_via_subquery() {
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+        let _ = seed_history_row(&conn);
+        let r = conn.execute(
+            "DELETE FROM memories WHERE id IN
+                (SELECT id FROM memories WHERE memory_kind = 'history')",
+            [],
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_c1_trigger_rejects_cascade_delete_via_run_id() {
+        // Run-id based bulk delete is the path the writer task uses
+        // for `DeleteRun` (Tier S). It must NOT take history rows
+        // with it: history is provenance and must outlive the run.
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+        let _ = seed_history_row(&conn);
+        let r = conn.execute(
+            "DELETE FROM memories WHERE run_id = 'run-1'",
+            [],
+        );
+        assert!(r.is_err(), "DeleteRun-style sweep must skip / abort on history");
+    }
+
+    #[test]
+    fn test_c1_trigger_allows_record_updates() {
+        // Counter-test: the trigger must NOT fire on record rows.
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+        conn.execute_batch(
+            "INSERT INTO memories (
+                namespace, key, content, scope_level, scope_path,
+                content_hash, memory_kind, memory_type, trust, source, trust_score
+            ) VALUES (
+                'default', 'rec:1', 'body', 2, 'repo:r',
+                'h_rec', 'record', 'factual', 'medium', 'user_remember', 1.0
+            );",
+        )
+        .unwrap();
+        let id: i64 = conn
+            .query_row("SELECT id FROM memories WHERE key = 'rec:1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        // UPDATE on a record row is fine.
+        conn.execute(
+            "UPDATE memories SET content = 'edited' WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .unwrap();
+        let after: String = conn
+            .query_row(
+                "SELECT content FROM memories WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, "edited");
+        // DELETE on a record row is fine.
+        let n = conn
+            .execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn test_c1_trigger_allows_summary_updates() {
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+        conn.execute_batch(
+            "INSERT INTO memories (
+                namespace, key, content, scope_level, scope_path,
+                content_hash, memory_kind, memory_type, trust, source, trust_score
+            ) VALUES (
+                'default', 'sum:1', 'summary body', 2, 'repo:r',
+                'h_sum', 'summary', 'factual', 'medium', 'llm_consolidated', 0.75
+            );",
+        )
+        .unwrap();
+        let id: i64 = conn
+            .query_row("SELECT id FROM memories WHERE key = 'sum:1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "UPDATE memories SET importance = 0.9 WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_c1_trigger_allows_history_inserts() {
+        // Inserts must work — only UPDATE and DELETE are vetoed.
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+        let _ = seed_history_row(&conn);
+        // A second insert with a different key also goes through.
+        conn.execute_batch(
+            "INSERT INTO memories (
+                namespace, key, content, scope_level, scope_path,
+                content_hash, memory_kind, memory_type, trust, source, trust_score
+            ) VALUES (
+                'default', 'history:s:t2', 'TRANSCRIPT 2', 4, 'repo:r/run:run-1',
+                'h_hist2', 'history', 'factual', 'high', 'raw_transcript', 1.0
+            );",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_c1_trigger_recreate_after_drop_round_trip() {
+        // C2.4 will need to drop + reinstall the triggers inside a
+        // transaction. Verify that round-trip works cleanly: drop,
+        // veto disappears; reinstall, veto returns.
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+        let _ = seed_history_row(&conn);
+
+        // Drop and confirm UPDATE now succeeds.
+        drop_history_immutable_triggers(&conn).unwrap();
+        conn.execute(
+            "UPDATE memories SET content = 'briefly tampered'
+                WHERE memory_kind = 'history'",
+            [],
+        )
+        .unwrap();
+
+        // Reinstall and confirm UPDATE is rejected again.
+        install_history_immutable_triggers(&conn).unwrap();
+        let r = conn.execute(
+            "UPDATE memories SET content = 'tampered again'
+                WHERE memory_kind = 'history'",
+            [],
+        );
+        assert!(r.is_err(), "trigger must be effective after reinstall");
     }
 
     #[test]

@@ -875,10 +875,60 @@ pub(super) fn handle_memory_panel_action(app: &mut App, action: Action) {
         return;
     }
 
+    // C1.5: destructive keys (`d` delete, `e` edit text, `p` pin, `s`
+    // change scope) are vetoed when the History tab is active. The
+    // writer task (C1.2) and the SQL trigger (C1.3) are the load-
+    // bearing defenses; this guard is UX polish — surface "history is
+    // read-only" before the user spends a confirm-keystroke.
+    if app.memory_panel.history_tab_active() {
+        let blocked = matches!(
+            action,
+            Action::InsertChar('d')
+                | Action::InsertChar('e')
+                | Action::InsertChar('p')
+                | Action::InsertChar('s')
+        );
+        if blocked {
+            app.memory_panel.last_error = Some((
+                "history is read-only — use /forget-history to redact".to_string(),
+                std::time::Instant::now(),
+            ));
+            return;
+        }
+    }
+
     match action {
         Action::Tab => app.memory_panel.focus_next(),
         Action::CursorDown => cursor_down_in_focus(app),
         Action::CursorUp => cursor_up_in_focus(app),
+        // C1.5: kind-tab switching. Refresh of `recent_rows` is
+        // triggered by the next observer event; for an immediate
+        // refresh users can press `r` (existing reload) or wait for
+        // the standard 100ms refresh debounce.
+        Action::InsertChar('1') => {
+            if app
+                .memory_panel
+                .set_active_kind(gaviero_core::memory::MemoryKind::Record)
+            {
+                refresh_recent_rows_for_kind(app);
+            }
+        }
+        Action::InsertChar('2') => {
+            if app
+                .memory_panel
+                .set_active_kind(gaviero_core::memory::MemoryKind::History)
+            {
+                refresh_recent_rows_for_kind(app);
+            }
+        }
+        Action::InsertChar('3') => {
+            if app
+                .memory_panel
+                .set_active_kind(gaviero_core::memory::MemoryKind::Summary)
+            {
+                refresh_recent_rows_for_kind(app);
+            }
+        }
         Action::InsertChar('i') if app.memory_panel.focused == PanelSection::InjectedNow => {
             app.memory_panel.load_inspect_pool();
             app.memory_panel.inspecting = true;
@@ -1156,6 +1206,33 @@ fn schedule_memory_panel_search(app: &mut App) {
                 .map(crate::panels::memory_panel::MemoryRow::from_scored)
                 .collect();
             let _ = tx.send(crate::event::Event::MemorySearchResults { rows });
+        }
+    });
+}
+
+/// C1.5: trigger a fresh `recent_memories_by_kind` query when the
+/// user switches kind tabs. Side-effecting: spawns a tokio task that
+/// queries and posts a `MemorySearchResults` event back to the main
+/// loop. The standard observer-driven refresh (in `controller.rs`)
+/// also picks up the new active_kind on the next memory-write event;
+/// this helper just makes the tab switch feel instant.
+fn refresh_recent_rows_for_kind(app: &mut App) {
+    let Some(mem) = app.memory.clone() else {
+        return;
+    };
+    let active_kind = app.memory_panel.active_kind;
+    let tx = app.event_tx.clone();
+    tokio::spawn(async move {
+        if let Ok(rows) = mem
+            .workspace()
+            .recent_memories_by_kind(active_kind, 24, 50)
+            .await
+        {
+            let panel_rows: Vec<crate::panels::memory_panel::MemoryRow> = rows
+                .iter()
+                .map(crate::panels::memory_panel::MemoryRow::from_scored)
+                .collect();
+            let _ = tx.send(crate::event::Event::MemorySearchResults { rows: panel_rows });
         }
     });
 }

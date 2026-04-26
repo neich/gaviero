@@ -33,7 +33,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 
 use gaviero_core::memory::store::{InjectionManifestRow, SessionLedgerTurn};
-use gaviero_core::memory::{MemorySource, ScoredMemory};
+use gaviero_core::memory::{MemoryKind, MemorySource, ScoredMemory};
 
 /// Panel-local color palette. Kept internal so future theme integration
 /// touches one place. Chosen to sit on dark-gray terminal backgrounds.
@@ -186,6 +186,15 @@ impl ScopeChoice {
 pub struct MemoryPanelState {
     pub focused: PanelSection,
 
+    /// C1.5: which lifecycle class the panel is currently filtered to.
+    /// Default is `Record` (the workhorse). Switching tabs (`1`/`2`/`3`
+    /// keys) changes which kind populates the Recently Written list and
+    /// gates the destructive keys — when on the History tab, the panel
+    /// rejects `d`/`e`/`p`/`s` with a "history is read-only" message,
+    /// reinforcing the C1.2 writer-task guard and the C1.3 SQL trigger
+    /// at the UI layer.
+    pub active_kind: MemoryKind,
+
     // ── Section 1: Injected Now ──────────────────────────────────
     /// Current turn's manifest row (may be `None` until a manifest
     /// lands). Payload JSON is parsed lazily for the detail view.
@@ -259,6 +268,7 @@ impl Default for MemoryPanelState {
     fn default() -> Self {
         Self {
             focused: PanelSection::InjectedNow,
+            active_kind: MemoryKind::Record,
             current_manifest: None,
             current_ledger: None,
             injected_cursor: 0,
@@ -293,6 +303,29 @@ impl MemoryPanelState {
     /// Cycle focus to the next section. Bound to `Tab`.
     pub fn focus_next(&mut self) {
         self.focused = self.focused.next();
+    }
+
+    /// C1.5: switch the active kind tab. Returns `true` when the kind
+    /// actually changed so callers can decide whether to refresh the
+    /// rows. Bound to `1` (Records), `2` (History), `3` (Summaries).
+    pub fn set_active_kind(&mut self, kind: MemoryKind) -> bool {
+        if self.active_kind == kind {
+            return false;
+        }
+        self.active_kind = kind;
+        // Reset cursors so we don't land on a row that no longer
+        // exists in the new tab's list.
+        self.recent_cursor = 0;
+        self.search_cursor = 0;
+        self.recent_rows.clear();
+        true
+    }
+
+    /// C1.5: convenience for the side_panel destructive-key guard.
+    /// Returns `true` when the active tab is the read-only History
+    /// tab — destructive ops should refuse and show a hint.
+    pub fn history_tab_active(&self) -> bool {
+        self.active_kind == MemoryKind::History
     }
 
     /// Parse the candidate pool out of the current manifest's payload.
@@ -364,6 +397,14 @@ impl MemoryPanelState {
             return;
         }
 
+        // C1.5 tab strip: one line at the very top showing the
+        // available kinds and which is active.
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(inner);
+        self.render_kind_tabs(outer[0], buf);
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -372,12 +413,44 @@ impl MemoryPanelState {
                 Constraint::Percentage(20),
                 Constraint::Percentage(15),
             ])
-            .split(inner);
+            .split(outer[1]);
 
         self.render_injected_now(chunks[0], buf, focused);
         self.render_recently_written(chunks[1], buf, focused);
         self.render_scope_summary(chunks[2], buf, focused);
         self.render_search(chunks[3], buf, focused);
+    }
+
+    /// C1.5 tab strip render. Single-line, three labels, current tab
+    /// highlighted with the accent color. Switches via `1`/`2`/`3` —
+    /// see [`super::super::app::side_panel::handle_memory_panel_action`].
+    fn render_kind_tabs(&self, area: Rect, buf: &mut Buffer) {
+        let mut spans: Vec<Span> = Vec::with_capacity(8);
+        spans.push(Span::styled(" ", Style::default()));
+        for (idx, kind) in [
+            ("1", MemoryKind::Record),
+            ("2", MemoryKind::History),
+            ("3", MemoryKind::Summary),
+        ]
+        .iter()
+        {
+            let active = *kind == self.active_kind;
+            let label = match kind {
+                MemoryKind::Record => "Records",
+                MemoryKind::History => "History (read-only)",
+                MemoryKind::Summary => "Summaries",
+            };
+            let style = if active {
+                Style::default()
+                    .fg(COLOR_ACCENT)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                Style::default().fg(COLOR_MUTED)
+            };
+            spans.push(Span::styled(format!("[{idx}] {label}"), style));
+            spans.push(Span::raw("  "));
+        }
+        Paragraph::new(Line::from(spans)).render(area, buf);
     }
 
     fn render_injected_now(&self, area: Rect, buf: &mut Buffer, focused: bool) {
@@ -641,6 +714,7 @@ fn format_memory_row(row: &MemoryRow, selected: bool) -> Line<'static> {
         MemorySource::LlmConsolidated | MemorySource::SwarmConsolidated => "⟂C",
         MemorySource::McpImport => "⟂M",
         MemorySource::ToolOutput => "⟂T",
+        MemorySource::RawTranscript => "⟂H",
         MemorySource::UnknownLegacy => "⟂?",
     };
     // B6 utilization indicator: ↑ for highly-used (>0.6), ⟂ for

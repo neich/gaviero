@@ -171,6 +171,55 @@ impl MemoryStores {
         }))
     }
 
+    /// C1: probe every DB this registry would open at workspace bootstrap
+    /// for a pending typed-stores (v10) migration. Returns the per-DB
+    /// proposals so the bootstrap layer (TUI / CLI) can ask the user
+    /// for consent before opening anything destructive.
+    ///
+    /// Safe to call before any store has been opened. Does not mutate
+    /// any DB file. Order: global → workspace → registered folders.
+    /// Aliased folders (canonical path == workspace root) are deduped
+    /// against the workspace path so a single-folder workspace doesn't
+    /// surface the same proposal twice.
+    pub fn probe_pending_c1_migrations(
+        workspace_root: &Path,
+        workspace: &Workspace,
+    ) -> Result<Vec<super::store::C1MigrationProposal>> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        let global_path = super::global_db_path()?;
+        if let Some(p) = super::store::probe_c1_migration(&global_path)? {
+            if seen.insert(p.db_path.clone()) {
+                out.push(p);
+            }
+        }
+
+        let workspace_path = workspace_root.join(".gaviero/memory.db");
+        let workspace_canonical = canonicalize(workspace_root);
+        if let Some(p) = super::store::probe_c1_migration(&workspace_path)? {
+            if seen.insert(p.db_path.clone()) {
+                out.push(p);
+            }
+        }
+
+        for folder in workspace.folders() {
+            let canonical = canonicalize(&folder.path);
+            // Aliased to the workspace store — already probed above.
+            if canonical == workspace_canonical {
+                continue;
+            }
+            let folder_db = canonical.join(".gaviero/memory.db");
+            if let Some(p) = super::store::probe_c1_migration(&folder_db)? {
+                if seen.insert(p.db_path.clone()) {
+                    out.push(p);
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
     /// Build a registry whose three slots all alias to a single
     /// in-memory store. Used by tests that pre-date the multi-DB split.
     /// Unknown `repo_id` lookups also resolve to the same store

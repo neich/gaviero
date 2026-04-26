@@ -1,9 +1,11 @@
 pub mod annotations;
+pub mod compression;
 pub mod consolidation;
 pub mod consolidation_llm;
 pub mod embedder;
 pub mod eval;
 pub mod extractor;
+pub mod kind;
 pub mod model_manager;
 pub mod observer;
 pub mod onnx_embedder;
@@ -26,6 +28,7 @@ pub use annotations::{
 };
 pub use consolidation_llm::{BackendConsolidationLlm, ConsolidationLlm, NoopConsolidationLlm};
 pub use embedder::{DualEmbedder, Embedder, EmbeddingPurpose, NullEmbedder};
+pub use kind::MemoryKind;
 pub use model_manager::ModelManager;
 pub use observer::MemoryObserver;
 pub use reranker::{
@@ -48,7 +51,9 @@ pub use session_consolidator::{
 pub use sleeptime::{
     SleeptimeConfig, SleeptimeObserver, SleeptimeOperation, SleeptimeReport, run_sleeptime,
 };
-pub use store::{MemoryStore, MemoryUtilization, StoreOptions};
+pub use store::{
+    C1MigrationProposal, MemoryStore, MemoryUtilization, StoreOptions, probe_c1_migration,
+};
 pub use stores::{EmbedderMismatch, MemoryStores};
 pub use telemetry::{
     ClassifiedItem, ClassifyConfig, TelemetryObserver, TelemetryReport, UseClass, classify_turn,

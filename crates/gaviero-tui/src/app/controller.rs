@@ -400,11 +400,19 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 }
             }
             app.memory_panel.last_recent_refresh = Some(now);
+            // C1.5: Section 2 query honors the active kind tab so the
+            // Recently Written list reflects whichever kind the user
+            // selected (Records / History / Summaries).
+            let active_kind = app.memory_panel.active_kind;
             // Fire a fresh query for Section 2 + 3.
             if let Some(mem) = app.memory.clone() {
                 let tx = app.event_tx.clone();
                 tokio::spawn(async move {
-                    if let Ok(rows) = mem.workspace().recent_memories(24, 50).await {
+                    if let Ok(rows) = mem
+                        .workspace()
+                        .recent_memories_by_kind(active_kind, 24, 50)
+                        .await
+                    {
                         let panel_rows: Vec<crate::panels::memory_panel::MemoryRow> = rows
                             .iter()
                             .map(crate::panels::memory_panel::MemoryRow::from_scored)

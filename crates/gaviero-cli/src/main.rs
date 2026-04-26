@@ -241,6 +241,15 @@ struct Cli {
 
     #[arg(long = "utilization-asc")]
     utilization_asc: bool,
+
+    /// Tier C / C1: accept the typed-stores schema migration on first
+    /// post-upgrade run. Headless contexts cannot prompt the user
+    /// interactively, so an explicit opt-in is required when any
+    /// reachable `memory.db` is at a pre-v10 schema. Without this flag
+    /// the run aborts and prints the affected files plus the proposed
+    /// backup path. The TUI (`gaviero`) prompts on stdin instead.
+    #[arg(long = "accept-c1-migration")]
+    accept_c1_migration: bool,
 }
 
 /// CLI observer that prints agent events to stderr.
@@ -942,6 +951,40 @@ async fn main() -> Result<()> {
 
     let repo = std::fs::canonicalize(&cli.repo)
         .with_context(|| format!("resolving repo path: {}", cli.repo.display()))?;
+
+    // ── Tier C / C1: enforce explicit consent for the typed-stores
+    // migration. Headless invocation cannot prompt; require the
+    // `--accept-c1-migration` flag if any reachable memory.db is at a
+    // pre-v10 schema. Plan §"Anti-patterns to avoid": no silent
+    // migration on first run.
+    {
+        let workspace = gaviero_core::workspace::Workspace::single_folder(repo.clone());
+        let pending = gaviero_core::memory::MemoryStores::probe_pending_c1_migrations(
+            &repo, &workspace,
+        )
+        .context("probing for pending C1 typed-stores migration")?;
+        if !pending.is_empty() && !cli.accept_c1_migration {
+            eprintln!(
+                "Gaviero's memory schema requires a one-time typed-stores upgrade (C1)."
+            );
+            eprintln!("Affected databases:");
+            for p in &pending {
+                eprintln!(
+                    "  - {}  (v{} → v{})",
+                    p.db_path.display(),
+                    p.current_version,
+                    p.target_version
+                );
+                eprintln!("    backup → {}", p.proposed_backup_path.display());
+            }
+            eprintln!();
+            eprintln!(
+                "Re-run with `--accept-c1-migration` to proceed. Each DB will be \
+                 snapshotted to the path shown above before migration."
+            );
+            std::process::exit(2);
+        }
+    }
 
     // ── Manifest introspection (Tier S / S4): print and exit ─────
     if cli.manifest_last.is_some() || cli.manifest_turn.is_some() {
