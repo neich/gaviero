@@ -312,7 +312,8 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                         app.side_panel = match app.side_panel {
                             SidePanelMode::AgentChat => SidePanelMode::SwarmDashboard,
                             SidePanelMode::SwarmDashboard => SidePanelMode::GitPanel,
-                            SidePanelMode::GitPanel => SidePanelMode::AgentChat,
+                            SidePanelMode::GitPanel => SidePanelMode::MemoryPanel,
+                            SidePanelMode::MemoryPanel => SidePanelMode::AgentChat,
                         };
                         return;
                     }

@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::memory::MemoryStore;
+use crate::memory::MemoryStores;
 use crate::observer::AcpObserver;
 use crate::repo_map::RepoMap;
 use crate::swarm::backend::AgentBackend;
@@ -128,7 +128,7 @@ impl IterationEngine {
         work_unit: WorkUnit,
         write_gate: Arc<Mutex<WriteGatePipeline>>,
         workspace_root: &Path,
-        memory: Option<&MemoryStore>,
+        memory: Option<&Arc<MemoryStores>>,
         read_namespaces: &[String],
         observer: &dyn AcpObserver,
         validation: Option<&ValidationPipeline>,
@@ -249,7 +249,7 @@ impl IterationEngine {
         work_unit: WorkUnit,
         write_gate: Arc<Mutex<WriteGatePipeline>>,
         workspace_root: &Path,
-        memory: Option<&MemoryStore>,
+        memory: Option<&Arc<MemoryStores>>,
         read_namespaces: &[String],
         observer: &dyn AcpObserver,
         validation: Option<&ValidationPipeline>,

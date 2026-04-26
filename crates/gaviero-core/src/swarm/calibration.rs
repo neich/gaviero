@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use crate::memory::MemoryStore;
+use crate::memory::{MemoryStore, MemoryStores, WriterHandle};
 use crate::swarm::models::{AgentManifest, AgentStatus, WorkUnit};
 use crate::types::ModelTier;
 
@@ -81,31 +81,33 @@ impl TierStats {
 }
 
 /// Store tier accuracy stats to memory after a swarm run.
+///
+/// Routes through the single-writer `WriterHandle` so post-swarm calibration
+/// writes serialize with every other memory write on the workspace.
 pub async fn store_tier_stats(
-    memory: &Option<Arc<MemoryStore>>,
+    writer: Option<&WriterHandle>,
     namespace: &str,
     run_id: &str,
     stats: &TierStats,
 ) {
-    let Some(mem) = memory else { return };
+    let Some(w) = writer else { return };
     let key = format!("tiers:{}", run_id);
     let content = stats.to_summary(run_id);
-
-    if let Err(e) = mem.store(namespace, &key, &content, None).await {
+    if let Err(e) = w.user_remember(namespace, key, content, None).await {
         tracing::warn!("Failed to store tier stats: {}", e);
     }
 }
 
 /// Store a verification summary to memory after Phase 4.
 pub async fn store_verification_summary(
-    memory: &Option<Arc<MemoryStore>>,
+    writer: Option<&WriterHandle>,
     namespace: &str,
     run_id: &str,
     passed: bool,
     escalation_count: usize,
     details: &str,
 ) {
-    let Some(mem) = memory else { return };
+    let Some(w) = writer else { return };
     let key = format!("verification:{}", run_id);
     let content = format!(
         "Verification {}: {} escalations. {}",
@@ -113,8 +115,7 @@ pub async fn store_verification_summary(
         escalation_count,
         details,
     );
-
-    if let Err(e) = mem.store(namespace, &key, &content, None).await {
+    if let Err(e) = w.user_remember(namespace, key, content, None).await {
         tracing::warn!("Failed to store verification summary: {}", e);
     }
 }
@@ -123,7 +124,7 @@ pub async fn store_verification_summary(
 ///
 /// Returns a formatted string suitable for inclusion in the coordinator prompt.
 pub async fn query_tier_history(
-    memory: &Option<Arc<MemoryStore>>,
+    memory: &Option<Arc<MemoryStores>>,
     namespaces: &[String],
     limit: usize,
 ) -> String {
@@ -132,6 +133,7 @@ pub async fn query_tier_history(
     };
 
     let results = match mem
+        .workspace()
         .search_multi(namespaces, "tier accuracy escalation", limit)
         .await
     {
@@ -265,9 +267,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_store_tier_stats_no_memory() {
-        // Should not panic
-        store_tier_stats(&None, "ns", "run1", &TierStats::default()).await;
+    async fn test_store_tier_stats_no_writer() {
+        // Should not panic when no writer is available.
+        store_tier_stats(None, "ns", "run1", &TierStats::default()).await;
     }
 
     #[tokio::test]

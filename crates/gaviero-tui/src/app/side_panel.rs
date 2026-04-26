@@ -130,6 +130,24 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
                     app.handle_detach_command();
                 } else if app.chat_state.text_input.text.trim().starts_with("/run") {
                     app.handle_run_script_command();
+                } else if app
+                    .chat_state
+                    .text_input
+                    .text
+                    .trim()
+                    .starts_with("/reembed")
+                {
+                    app.handle_reembed_command();
+                } else if app
+                    .chat_state
+                    .text_input
+                    .text
+                    .trim()
+                    .starts_with("/consolidate-session")
+                {
+                    app.handle_consolidate_session_command();
+                } else if app.chat_state.text_input.text.trim().starts_with("/sleep") {
+                    app.handle_sleep_command();
                 } else if !app.chat_state.process_slash_command() {
                     app.send_chat_message();
                 }
@@ -714,6 +732,490 @@ pub(super) fn refresh_git_panel(app: &mut App) {
     }
 }
 
+/// A4: handle a TUI action while the memory panel is focused.
+///
+/// Keybindings (plan §A4):
+/// * `Tab` cycles section focus.
+/// * `i` / `Esc` enter / leave inspect overlay (Injected Now).
+/// * `h` / `Esc` enter / leave history overlay.
+/// * `d`/`p`/`s`/`e` → delete / pin / scope-change / edit on Recently
+///    Written (edit-text UX is kept minimal here: pop an inline text
+///    input via `insert_char` in a follow-up change).
+/// * `y`/`n` confirm / reject a pending delete.
+/// * `/` activates search; printable chars type into the query; `Esc`
+///    clears search.
+pub(super) fn handle_memory_panel_action(app: &mut App, action: Action) {
+    use crate::panels::memory_panel::{PanelPromptMode, PanelSection, ScopeChoice};
+    use gaviero_core::memory::writer::PanelEditOp;
+
+    // Inline `e` / `s` prompts hijack input until Enter / Esc.
+    if !matches!(app.memory_panel.prompt_mode, PanelPromptMode::None) {
+        match action {
+            Action::Quit => {
+                app.memory_panel.prompt_mode = PanelPromptMode::None;
+            }
+            Action::Enter => {
+                commit_panel_prompt(app);
+            }
+            Action::InsertChar(ch) => match &mut app.memory_panel.prompt_mode {
+                PanelPromptMode::EditText { buffer, .. } => buffer.push(ch),
+                PanelPromptMode::SetScope { .. } => {}
+                PanelPromptMode::None => {}
+            },
+            Action::Backspace => {
+                if let PanelPromptMode::EditText { buffer, .. } = &mut app.memory_panel.prompt_mode
+                {
+                    buffer.pop();
+                }
+            }
+            Action::CursorLeft => {
+                if let PanelPromptMode::SetScope { selected, .. } =
+                    &mut app.memory_panel.prompt_mode
+                {
+                    *selected = selected.prev();
+                }
+            }
+            Action::CursorRight => {
+                if let PanelPromptMode::SetScope { selected, .. } =
+                    &mut app.memory_panel.prompt_mode
+                {
+                    *selected = selected.next();
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // Inspect / history overlays consume Esc / arrow keys.
+    if app.memory_panel.inspecting {
+        match action {
+            Action::Quit => app.memory_panel.inspecting = false,
+            _ => {}
+        }
+        return;
+    }
+    if app.memory_panel.history_mode {
+        match action {
+            Action::Quit => app.memory_panel.history_mode = false,
+            Action::CursorUp => {
+                app.memory_panel.history_cursor = app.memory_panel.history_cursor.saturating_sub(1);
+            }
+            Action::CursorDown => {
+                let max = app.memory_panel.history_rows.len().saturating_sub(1);
+                app.memory_panel.history_cursor = (app.memory_panel.history_cursor + 1).min(max);
+            }
+            Action::Enter => {
+                // Load the selected historical manifest as the
+                // "current" one so the main view reflects that turn.
+                if let Some(row) = app
+                    .memory_panel
+                    .history_rows
+                    .get(app.memory_panel.history_cursor)
+                    .cloned()
+                {
+                    app.memory_panel.current_manifest = Some(row);
+                    app.memory_panel.manifest_selected_items.clear();
+                    app.memory_panel.history_mode = false;
+                    refresh_manifest_selected_items(app);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // Pending delete confirmation short-circuits.
+    if let Some(memory_id) = app.memory_panel.confirm_delete_id {
+        match action {
+            Action::InsertChar('y') | Action::InsertChar('Y') => {
+                app.memory_panel.confirm_delete_id = None;
+                if let Some(writer) = app.memory_writer.as_ref().cloned() {
+                    tokio::spawn(async move {
+                        let _ = writer.enqueue(gaviero_core::memory::WriterMessage::PanelEdit {
+                            op: PanelEditOp::Delete { memory_id },
+                            ack: None,
+                        });
+                    });
+                }
+            }
+            Action::InsertChar('n') | Action::InsertChar('N') | Action::Quit => {
+                app.memory_panel.confirm_delete_id = None;
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // Live-search typing intercepts printable chars.
+    if app.memory_panel.search_active {
+        match action {
+            Action::InsertChar(ch) => {
+                app.memory_panel.search_query.push(ch);
+                schedule_memory_panel_search(app);
+            }
+            Action::Backspace => {
+                app.memory_panel.search_query.pop();
+                schedule_memory_panel_search(app);
+            }
+            Action::Quit => {
+                app.memory_panel.search_active = false;
+                app.memory_panel.search_query.clear();
+                app.memory_panel.search_results.clear();
+            }
+            Action::CursorDown => {
+                let max = app.memory_panel.search_results.len().saturating_sub(1);
+                app.memory_panel.search_cursor = (app.memory_panel.search_cursor + 1).min(max);
+            }
+            Action::CursorUp => {
+                app.memory_panel.search_cursor = app.memory_panel.search_cursor.saturating_sub(1);
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    match action {
+        Action::Tab => app.memory_panel.focus_next(),
+        Action::CursorDown => cursor_down_in_focus(app),
+        Action::CursorUp => cursor_up_in_focus(app),
+        Action::InsertChar('i') if app.memory_panel.focused == PanelSection::InjectedNow => {
+            app.memory_panel.load_inspect_pool();
+            app.memory_panel.inspecting = true;
+        }
+        Action::InsertChar('h') if app.memory_panel.focused == PanelSection::InjectedNow => {
+            load_memory_panel_history(app);
+            app.memory_panel.history_mode = true;
+        }
+        Action::InsertChar('d') if app.memory_panel.focused == PanelSection::RecentlyWritten => {
+            if let Some(row) = app
+                .memory_panel
+                .recent_rows
+                .get(app.memory_panel.recent_cursor)
+            {
+                app.memory_panel.confirm_delete_id = Some(row.id);
+            }
+        }
+        Action::InsertChar('p') if app.memory_panel.focused == PanelSection::RecentlyWritten => {
+            if let (Some(row), Some(writer)) = (
+                app.memory_panel
+                    .recent_rows
+                    .get(app.memory_panel.recent_cursor)
+                    .cloned(),
+                app.memory_writer.clone(),
+            ) {
+                tokio::spawn(async move {
+                    let _ = writer.enqueue(gaviero_core::memory::WriterMessage::PanelEdit {
+                        op: PanelEditOp::Pin {
+                            memory_id: row.id,
+                            trust_score: 1.0,
+                        },
+                        ack: None,
+                    });
+                });
+            }
+        }
+        Action::InsertChar('e') if app.memory_panel.focused == PanelSection::RecentlyWritten => {
+            if let Some(row) = app
+                .memory_panel
+                .recent_rows
+                .get(app.memory_panel.recent_cursor)
+                .cloned()
+            {
+                app.memory_panel.prompt_mode = PanelPromptMode::EditText {
+                    memory_id: row.id,
+                    buffer: row.text,
+                };
+            }
+        }
+        Action::InsertChar('s') if app.memory_panel.focused == PanelSection::RecentlyWritten => {
+            if let Some(row) = app
+                .memory_panel
+                .recent_rows
+                .get(app.memory_panel.recent_cursor)
+                .cloned()
+            {
+                let current = match row.scope_level {
+                    0 => ScopeChoice::Global,
+                    1 => ScopeChoice::Workspace,
+                    2 => ScopeChoice::Repo,
+                    3 => ScopeChoice::Module,
+                    _ => ScopeChoice::Run,
+                };
+                app.memory_panel.prompt_mode = PanelPromptMode::SetScope {
+                    memory_id: row.id,
+                    selected: current,
+                };
+            }
+        }
+        Action::InsertChar('/') => {
+            app.memory_panel.focused = PanelSection::Search;
+            app.memory_panel.search_active = true;
+            app.memory_panel.search_query.clear();
+            app.memory_panel.search_results.clear();
+        }
+        _ => {}
+    }
+}
+
+/// Commit the current `PanelPromptMode` — fires the appropriate
+/// `PanelEditOp` through the writer and clears the mode. Invoked on
+/// `Enter` from the inline prompt.
+fn commit_panel_prompt(app: &mut App) {
+    use crate::panels::memory_panel::{PanelPromptMode, ScopeChoice};
+    use gaviero_core::memory::writer::PanelEditOp;
+    use gaviero_core::memory::{WriteScope, hash_path};
+
+    let mode = std::mem::replace(&mut app.memory_panel.prompt_mode, PanelPromptMode::None);
+    let writer = match app.memory_writer.clone() {
+        Some(w) => w,
+        None => return,
+    };
+
+    match mode {
+        PanelPromptMode::EditText { memory_id, buffer } => {
+            let trimmed = buffer.trim().to_string();
+            if trimmed.is_empty() {
+                return;
+            }
+            tokio::spawn(async move {
+                let _ = writer.enqueue(gaviero_core::memory::WriterMessage::PanelEdit {
+                    op: PanelEditOp::UpdateText {
+                        memory_id,
+                        new_text: trimmed,
+                    },
+                    ack: None,
+                });
+            });
+        }
+        PanelPromptMode::SetScope {
+            memory_id,
+            selected,
+        } => {
+            let workspace_root = match app.workspace.roots().first().cloned() {
+                Some(r) => r,
+                None => return,
+            };
+            let repo_id = hash_path(&workspace_root);
+            let new_scope = match selected {
+                ScopeChoice::Global => WriteScope::Global,
+                ScopeChoice::Workspace => WriteScope::Workspace,
+                ScopeChoice::Repo => WriteScope::Repo { repo_id },
+                ScopeChoice::Module => {
+                    let module_path = app
+                        .buffers
+                        .get(app.active_buffer)
+                        .and_then(|b| b.path.as_ref())
+                        .and_then(|p| p.strip_prefix(&workspace_root).ok())
+                        .and_then(|rel| rel.parent().map(|p| p.to_string_lossy().to_string()))
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "".to_string());
+                    if module_path.is_empty() {
+                        WriteScope::Repo { repo_id }
+                    } else {
+                        WriteScope::Module {
+                            repo_id,
+                            module_path,
+                        }
+                    }
+                }
+                ScopeChoice::Run => {
+                    let run_id = app.chat_state.conversations[app.chat_state.active_conv]
+                        .id
+                        .clone();
+                    WriteScope::Run { repo_id, run_id }
+                }
+            };
+            tokio::spawn(async move {
+                let _ = writer.enqueue(gaviero_core::memory::WriterMessage::PanelEdit {
+                    op: PanelEditOp::SetScope {
+                        memory_id,
+                        new_scope,
+                    },
+                    ack: None,
+                });
+            });
+        }
+        PanelPromptMode::None => {}
+    }
+}
+
+fn cursor_down_in_focus(app: &mut App) {
+    use crate::panels::memory_panel::PanelSection;
+    match app.memory_panel.focused {
+        PanelSection::InjectedNow => {
+            let max = app
+                .memory_panel
+                .manifest_selected_items
+                .len()
+                .saturating_sub(1);
+            app.memory_panel.injected_cursor = (app.memory_panel.injected_cursor + 1).min(max);
+        }
+        PanelSection::RecentlyWritten => {
+            let max = app.memory_panel.recent_rows.len().saturating_sub(1);
+            app.memory_panel.recent_cursor = (app.memory_panel.recent_cursor + 1).min(max);
+        }
+        _ => {}
+    }
+}
+
+fn cursor_up_in_focus(app: &mut App) {
+    use crate::panels::memory_panel::PanelSection;
+    match app.memory_panel.focused {
+        PanelSection::InjectedNow => {
+            app.memory_panel.injected_cursor = app.memory_panel.injected_cursor.saturating_sub(1);
+        }
+        PanelSection::RecentlyWritten => {
+            app.memory_panel.recent_cursor = app.memory_panel.recent_cursor.saturating_sub(1);
+        }
+        _ => {}
+    }
+}
+
+/// Bootstrap fill the memory panel from `memory.db` when it first
+/// opens (or after a TUI restart). Fires three async queries — recent
+/// writes, scope summary, and the most recent manifest — and streams
+/// results back via existing Event::Memory* variants.
+pub(super) fn refresh_memory_panel(app: &mut App) {
+    let Some(mem) = app.memory.clone() else {
+        return;
+    };
+    let tx = app.event_tx.clone();
+    tokio::spawn(async move {
+        // Most recent manifest (across all sessions).
+        if let Ok(rows) = mem.workspace().recent_manifests(1).await {
+            if let Some(row) = rows.into_iter().next() {
+                let _ = tx.send(crate::event::Event::MemoryManifestPersisted {
+                    turn_id: row.turn_id,
+                    session_id: row.session_id,
+                });
+            }
+        }
+        // Recently-written seed — piggy-back through MemoryWriteCommitted
+        // so the controller runs the same refresh path.
+        let _ = tx.send(crate::event::Event::MemoryWriteCommitted {
+            kind: "PanelBootstrap".to_string(),
+        });
+    });
+}
+
+/// Fire a debounced live-search against `MemoryStore::search_scoped`.
+fn schedule_memory_panel_search(app: &mut App) {
+    use crate::panels::memory_panel::SEARCH_DEBOUNCE;
+    let now = std::time::Instant::now();
+    if let Some(prev) = app.memory_panel.search_last_run {
+        if now.duration_since(prev) < SEARCH_DEBOUNCE {
+            // Too soon — let the timer-driven re-invocation catch up.
+            // The actual run happens below anyway; keeping a simple
+            // eager path since typing cadence for humans is typically
+            // < 1 event per 150ms.
+        }
+    }
+    app.memory_panel.search_last_run = Some(now);
+
+    let Some(mem) = app.memory.clone() else {
+        return;
+    };
+    let query = app.memory_panel.search_query.clone();
+    if query.trim().is_empty() {
+        app.memory_panel.search_results.clear();
+        return;
+    }
+    let workspace_root = app
+        .workspace
+        .roots()
+        .first()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let retrieval_cfg = app
+        .workspace
+        .resolve_retrieval_config(Some(&workspace_root));
+    let rerank_cfg = app.workspace.resolve_rerank_config(Some(&workspace_root));
+    let reranker = app.memory_reranker.clone();
+    let tx = app.event_tx.clone();
+    tokio::spawn(async move {
+        // Memory panel search has no active-file context →
+        // folder = None. Registry walks workspace + global only.
+        let scope =
+            gaviero_core::memory::MemoryScope::from_context(&workspace_root, None, None, None);
+        let reranker_ref: Option<&dyn gaviero_core::memory::Reranker> = reranker.as_deref();
+        let out = gaviero_core::memory::retrieve_ranked(
+            &mem,
+            &scope,
+            &query,
+            5,
+            &retrieval_cfg,
+            reranker_ref,
+            Some(&rerank_cfg),
+        )
+        .await;
+        if let Ok(out) = out {
+            let rows: Vec<crate::panels::memory_panel::MemoryRow> = out
+                .items
+                .iter()
+                .map(crate::panels::memory_panel::MemoryRow::from_scored)
+                .collect();
+            let _ = tx.send(crate::event::Event::MemorySearchResults { rows });
+        }
+    });
+}
+
+/// Load the last 30 manifests (any session) for the history overlay.
+fn load_memory_panel_history(app: &mut App) {
+    let Some(mem) = app.memory.clone() else {
+        return;
+    };
+    let tx = app.event_tx.clone();
+    tokio::spawn(async move {
+        if let Ok(rows) = mem.workspace().recent_manifests(30).await {
+            let _ = tx.send(crate::event::Event::MemoryHistoryRows { rows });
+        }
+    });
+}
+
+/// Re-query the selected memory items of the current manifest — called
+/// after a `MemoryManifestPersisted` event or when the user opens a
+/// historical manifest from the history overlay.
+pub(super) fn refresh_manifest_selected_items(app: &mut App) {
+    let Some(manifest) = app.memory_panel.current_manifest.clone() else {
+        return;
+    };
+    let Some(mem) = app.memory.clone() else {
+        return;
+    };
+    let tx = app.event_tx.clone();
+    tokio::spawn(async move {
+        // Parse `selected_ids` out of the payload.
+        let ids: Vec<i64> = serde_json::from_str::<serde_json::Value>(&manifest.payload)
+            .ok()
+            .and_then(|v| {
+                v.get("selected_ids")
+                    .and_then(|a| a.as_array())
+                    .map(|arr| arr.iter().filter_map(|x| x.as_i64()).collect())
+            })
+            .unwrap_or_default();
+
+        // Resolve each id via a lightweight lookup. No search needed —
+        // load via `recent_memories` and filter. This is coarser than
+        // ideal but sidesteps adding a bulk-get-by-id API for MVP.
+        if ids.is_empty() {
+            let _ = tx.send(crate::event::Event::MemorySelectedItems { rows: Vec::new() });
+            return;
+        }
+        let pool = mem
+            .workspace()
+            .recent_memories(24 * 7, 500)
+            .await
+            .unwrap_or_default();
+        let rows: Vec<crate::panels::memory_panel::MemoryRow> = pool
+            .iter()
+            .filter(|m| ids.contains(&m.id))
+            .map(crate::panels::memory_panel::MemoryRow::from_scored)
+            .collect();
+        let _ = tx.send(crate::event::Event::MemorySelectedItems { rows });
+    });
+}
+
 pub(super) fn refresh_chat_autocomplete(app: &mut App) {
     if !app.chat_state.autocomplete.active {
         return;
@@ -745,21 +1247,41 @@ pub(super) fn send_chat_message(app: &mut App) {
         .id
         .clone();
     let prompt = app.chat_state.take_input();
-    app.chat_state.add_user_message(&prompt);
-    app.chat_state.conversations[app.chat_state.active_conv].is_streaming = true;
-    app.chat_state.conversations[app.chat_state.active_conv].streaming_status =
-        "Connecting...".to_string();
-    app.chat_state.conversations[app.chat_state.active_conv].streaming_started_at =
-        Some(std::time::Instant::now());
-
-    let tx = app.event_tx.clone();
-    let wg = app.write_gate.clone();
     let root = app
         .workspace
         .roots()
         .first()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let turn_id = format!(
+        "{}-{}",
+        conv_id,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+    let pending_module_path = app
+        .buffers
+        .get(app.active_buffer)
+        .and_then(|b| b.path.as_deref())
+        .and_then(|p| p.strip_prefix(&root).ok())
+        .and_then(|rel| rel.parent())
+        .map(|p| p.to_string_lossy().to_string())
+        .filter(|p| !p.is_empty());
+
+    app.chat_state.add_user_message(&prompt);
+    {
+        let conv = &mut app.chat_state.conversations[app.chat_state.active_conv];
+        conv.pending_turn_id = Some(turn_id.clone());
+        conv.pending_module_path = pending_module_path;
+        conv.is_streaming = true;
+        conv.streaming_status = "Connecting...".to_string();
+        conv.streaming_started_at = Some(std::time::Instant::now());
+    }
+
+    let tx = app.event_tx.clone();
+    let wg = app.write_gate.clone();
 
     let refs = crate::panels::agent_chat::parse_file_references(&prompt);
     let mut file_refs: Vec<(String, String)> = Vec::new();
@@ -892,6 +1414,61 @@ pub(super) fn send_chat_message(app: &mut App) {
     };
 
     let memory = app.memory.clone();
+    let memory_writer = app.memory_writer.clone();
+    // B2: clone the reranker handle + cfg so the spawned future can
+    // pass them to `retrieve_for_chat_with_reranker` without holding
+    // an `&App` reference across `.await`.
+    let memory_reranker = app.memory_reranker.clone();
+    let memory_rerank_cfg = app.memory_rerank_cfg.clone();
+    let chat_injection_config = app.workspace.resolve_chat_injection_config(Some(&root));
+    let retrieval_cfg = app.workspace.resolve_retrieval_config(Some(&root));
+    let manifests_enabled = app
+        .workspace
+        .resolve_setting(
+            gaviero_core::workspace::settings::MEMORY_MANIFESTS_ENABLED,
+            Some(&root),
+        )
+        .as_bool()
+        .unwrap_or(true);
+    let capture_candidate_pool = app
+        .workspace
+        .resolve_setting(
+            gaviero_core::workspace::settings::MEMORY_MANIFESTS_CAPTURE_POOL,
+            Some(&root),
+        )
+        .as_bool()
+        .unwrap_or(true);
+    // B2: pull embedder + reranker names so the manifest reflects what
+    // produced the candidate pool. Stale only when the user changes
+    // settings mid-session — the manifest still records the *old* name
+    // for that turn, which is correct.
+    let embedder_name = app
+        .memory
+        .as_ref()
+        .map(|m| m.embedder().model_id().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let reranker_name = if app
+        .workspace
+        .resolve_setting(
+            gaviero_core::workspace::settings::MEMORY_RERANKER_ENABLED,
+            Some(&root),
+        )
+        .as_bool()
+        .unwrap_or(false)
+    {
+        Some(
+            app.workspace
+                .resolve_setting(
+                    gaviero_core::workspace::settings::MEMORY_RERANKER_MODEL,
+                    Some(&root),
+                )
+                .as_str()
+                .unwrap_or("none")
+                .to_string(),
+        )
+    } else {
+        None
+    };
     let read_ns = app.chat_state.agent_settings.read_namespaces.clone();
     let ollama_base_url = app.chat_state.agent_settings.ollama_base_url.clone();
     let graph_budget_tokens = app.chat_state.agent_settings.graph_budget_tokens;
@@ -924,6 +1501,7 @@ pub(super) fn send_chat_message(app: &mut App) {
     let provider_profile_clone = provider_profile.clone();
 
     let conv_id_clone = conv_id.clone();
+    let turn_id_clone = turn_id.clone();
     let task = tokio::spawn(async move {
         {
             let mut gate = wg.lock().await;
@@ -989,7 +1567,7 @@ pub(super) fn send_chat_message(app: &mut App) {
 
         let selections = {
             let mut planner = gaviero_core::context_planner::ContextPlanner {
-                memory: memory.as_deref(),
+                memory: memory.as_ref(),
                 repo_map: repo_map_arc.as_deref(),
                 ledger: &mut local_ledger,
                 workspace_root: &graph_root,
@@ -1013,6 +1591,65 @@ pub(super) fn send_chat_message(app: &mut App) {
                 }
             }
         };
+
+        // Tier S / S1: chat memory auto-injection. Retrieval runs on every
+        // turn; graph/replay bootstrap remains first-turn only above.
+        let chat_injection: Option<gaviero_core::memory::ChatInjection> =
+            if let Some(mem) = memory.as_ref() {
+                // Chat injection: folder context would require
+                // threading the active editor file through; for now
+                // pass None and rely on workspace + global retrieval.
+                let memory_scope =
+                    gaviero_core::memory::MemoryScope::from_context(&graph_root, None, None, None);
+                let reranker_ref: Option<&dyn gaviero_core::memory::Reranker> =
+                    memory_reranker.as_deref();
+                match gaviero_core::memory::retrieval::retrieve_for_chat_with_reranker(
+                    mem,
+                    &memory_scope,
+                    &prompt,
+                    &chat_injection_config,
+                    &retrieval_cfg,
+                    reranker_ref,
+                    memory_rerank_cfg.as_ref(),
+                )
+                .await
+                {
+                    Ok(inj) => inj,
+                    Err(e) => {
+                        tracing::warn!("retrieve_for_chat failed: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+        if let Some(ref inj) = chat_injection {
+            let _ = tx.send(Event::ChatMemoryInjected {
+                conv_id: conv_id_clone.clone(),
+                items_injected: inj.items.len(),
+                pool_size: inj.pool.len(),
+                tokens_used: inj.tokens_used,
+                token_budget: inj.token_budget,
+            });
+            if manifests_enabled {
+                if let Some(ref writer) = memory_writer {
+                    let payload = build_injection_manifest_payload(
+                        &prompt,
+                        inj,
+                        capture_candidate_pool,
+                        &embedder_name,
+                        reranker_name.as_deref(),
+                    );
+                    let _ =
+                        writer.enqueue(gaviero_core::memory::WriterMessage::InjectionManifest {
+                            turn_id: turn_id_clone.clone(),
+                            session_id: conv_id_clone.clone(),
+                            payload,
+                        });
+                }
+            }
+        }
 
         // V9 §11 M5: lift `PlannerSelections` into a transport `Turn` and
         // dispatch through `AgentSession`. The registry hands back a
@@ -1061,6 +1698,26 @@ pub(super) fn send_chat_message(app: &mut App) {
         let mut selections = selections;
         selections.file_refs = turn_file_refs;
         selections.replay_history = replay_history;
+
+        // S1: splice the chat-turn memory block as a pre-rendered
+        // MemorySelection. The provider renderers emit `content` as-is for
+        // selections with `id.is_none()` / `namespace.is_none()`.
+        if let Some(inj) = chat_injection {
+            if !inj.items.is_empty() && !inj.block.is_empty() {
+                selections
+                    .memory_selections
+                    .push(gaviero_core::context_planner::MemorySelection {
+                        id: None,
+                        namespace: None,
+                        scope_label: None,
+                        score: None,
+                        trust: None,
+                        content: inj.block,
+                        source_hash: None,
+                        updated_at: None,
+                    });
+            }
+        }
 
         let transport_ctx = gaviero_core::agent_session::TransportContext {
             user_message: prompt.clone(),
@@ -1174,4 +1831,89 @@ pub(super) fn cancel_agent(app: &mut App) {
         app.chat_state
             .finalize_message("system", "Cancelled by user.");
     }
+}
+
+/// Build the S4 retrieval-manifest JSON payload from a `ChatInjection`.
+///
+/// The payload is consumed by the writer task's `InjectionManifest`
+/// handler, which persists it verbatim into the `injection_manifests`
+/// table. Keep the shape stable — downstream tools (Tier B6 telemetry,
+/// CLI introspection) read it as opaque JSON.
+fn build_injection_manifest_payload(
+    query_text: &str,
+    inj: &gaviero_core::memory::ChatInjection,
+    include_pool: bool,
+    embedder_name: &str,
+    reranker_name: Option<&str>,
+) -> serde_json::Value {
+    let selected_ids: Vec<i64> = inj.items.iter().map(|m| m.id).collect();
+    // B2: bump schema_version to 2 when the reranker fired so consumers
+    // can branch on shape. Old (v1) consumers still parse v2 because
+    // every B2 field is additive and optional.
+    let any_reranked = inj.pool.iter().any(|c| c.rerank_score.is_some());
+    let schema_version = if any_reranked { 2 } else { 1 };
+    let scoring_formula_version = if any_reranked {
+        "v2-rerank-blend"
+    } else {
+        "v1-composite"
+    };
+    let mut payload = serde_json::json!({
+        "schema_version": schema_version,
+        "scoring_formula_version": scoring_formula_version,
+        "embedder_name": embedder_name,
+        "query_text": query_text,
+        "selected_ids": selected_ids,
+        "token_budget_used": inj.tokens_used,
+        "token_budget_limit": inj.token_budget,
+    });
+    if let Some(name) = reranker_name {
+        payload["reranker_name"] = serde_json::Value::String(name.to_string());
+    }
+    // B3: scope distribution summary so the panel + CLI can show
+    // cross-scope balance per turn without rescanning the pool. Order
+    // is stable (lexicographic by scope label) for deterministic
+    // diffing across replays.
+    {
+        use std::collections::BTreeMap;
+        let mut by_scope: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+        for c in &inj.pool {
+            let entry = by_scope.entry(c.scope_label.clone()).or_default();
+            entry.0 += 1;
+            if c.selected {
+                entry.1 += 1;
+            }
+        }
+        let dist: Vec<serde_json::Value> = by_scope
+            .into_iter()
+            .map(|(label, (in_pool, selected))| {
+                serde_json::json!({
+                    "scope_label": label,
+                    "count_in_pool": in_pool,
+                    "count_selected": selected,
+                })
+            })
+            .collect();
+        payload["scope_distribution"] = serde_json::Value::Array(dist);
+    }
+    if include_pool {
+        let pool: Vec<serde_json::Value> = inj
+            .pool
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "memory_id": c.memory_id,
+                    "scope_label": c.scope_label,
+                    "namespace": c.namespace,
+                    "raw_similarity": c.raw_similarity,
+                    "composite_score": c.composite_score,
+                    "selected": c.selected,
+                    "exclusion_reason": c.exclusion_reason,
+                    "rerank_score": c.rerank_score,
+                    "blended_score": c.blended_score,
+                })
+            })
+            .collect();
+        payload["candidate_pool"] = serde_json::Value::Array(pool);
+    }
+    payload
 }

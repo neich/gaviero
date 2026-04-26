@@ -61,10 +61,44 @@ pub fn default_editor_system_prompt(capabilities: &Capabilities) -> String {
     format!(
         "You are a coding assistant working inside the gaviero editor.\n\n{}\n\
          When proposing file changes, emit complete <file path=\"relative/path\">...</file> blocks \
-         so the editor can review them before applying.",
-        tool_clause
+         so the editor can review them before applying.\n\n\
+         {ann}",
+        tool_clause,
+        ann = TURN_ANNOTATIONS_CONVENTION,
     )
 }
+
+/// Teaches the LLM the `<turn_annotations>` sidecar convention.
+///
+/// **Cache discipline (Anthropic prompt caching, plan §A1 risks):** this
+/// block is deliberately placed at the end of the system prompt so it
+/// lives in the cached segment. It doesn't depend on per-turn context;
+/// the cache boundary is correct today because every concatenation in
+/// `default_editor_system_prompt` is stable across turns for a given
+/// model.
+pub const TURN_ANNOTATIONS_CONVENTION: &str = r#"MEMORY SIDECAR — always end your final response with a `<turn_annotations>...</turn_annotations>` JSON block. The editor strips this block before showing your reply to the user, so it is never visible; its sole purpose is to flag durable project facts for future retrieval.
+
+Required shape:
+
+<turn_annotations>
+{
+  "v": 1,
+  "flags": [
+    { "type": "decision", "importance": 0.8, "scope": "repo",
+      "text": "…≤280 chars…", "refs": ["src/foo.rs:L42"] }
+  ],
+  "session_thread": "one-line summary of what the current turn is about",
+  "open_questions": ["questions you did not resolve this turn"]
+}
+</turn_annotations>
+
+Rules:
+- `type` ∈ { decision, lesson, error, convention, preference, gotcha, invariant }
+- `scope` ∈ { run, module, repo, workspace, global }
+- `importance` ∈ [0.0, 1.0]; emit only ≥ 0.3. 0.9+ = architectural; 0.6–0.9 = module-level; 0.3–0.6 = local.
+- 0–5 flags per turn. `{"flags": []}` is valid; **do not skip the block**.
+- Do NOT flag: generic programming knowledge, restatements of the user's request, tentative plans, assistant intent. Only outcomes.
+- Emit valid JSON — no code fences around the block, no trailing commentary."#;
 
 pub fn backend_config_for_model(model_spec: &str, ollama_base_url: Option<&str>) -> BackendConfig {
     let trimmed = model_spec.trim();

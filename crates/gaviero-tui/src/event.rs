@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use gaviero_core::memory::MemoryStore;
 use gaviero_core::terminal::TerminalEvent;
 use gaviero_core::types::WriteProposal;
 
@@ -82,6 +81,75 @@ pub enum Event {
         session_id: String,
     },
 
+    /// Fired once per chat turn after `retrieve_for_chat` selects the memories
+    /// that will be spliced into the prompt. Summary is surfaced in the
+    /// status bar and (Tier A4) the memory panel. Mirrors S4's manifest data
+    /// at a coarser granularity — keeps the per-candidate pool off the UI
+    /// event path.
+    ChatMemoryInjected {
+        conv_id: String,
+        items_injected: usize,
+        pool_size: usize,
+        tokens_used: usize,
+        token_budget: usize,
+    },
+
+    /// A4: writer task enqueued a write. Panel counts events for the
+    /// "activity" pulse indicator but does not re-query yet.
+    MemoryWriteEnqueued {
+        kind: String,
+    },
+    /// A4: writer task committed a write. Triggers a debounced panel
+    /// refresh of the "Recently Written" section.
+    MemoryWriteCommitted {
+        kind: String,
+    },
+    /// A4: writer task failed. Logs to status bar and panel.
+    MemoryWriteFailed {
+        kind: String,
+        error: String,
+    },
+    /// A4: writer task persisted an `injection_manifests` row. Panel
+    /// re-queries the row for the "Injected Now" section.
+    MemoryManifestPersisted {
+        turn_id: String,
+        session_id: String,
+    },
+    /// A5: read-only MCP tool activity from the in-process server.
+    McpToolCall {
+        tool_name: String,
+        duration_ms: u64,
+        error: Option<String>,
+    },
+
+    /// A4: live-search results from the panel's spawned query. Receiver
+    /// overwrites `MemoryPanelState::search_results` and resets the
+    /// cursor to 0.
+    MemorySearchResults {
+        rows: Vec<crate::panels::memory_panel::MemoryRow>,
+    },
+
+    /// A4: history overlay fill — last N manifests across all sessions.
+    MemoryHistoryRows {
+        rows: Vec<gaviero_core::memory::store::InjectionManifestRow>,
+    },
+
+    /// A4: resolved `selected_ids` for the current manifest, loaded
+    /// from the memories table. Populates "Injected Now" section body.
+    MemorySelectedItems {
+        rows: Vec<crate::panels::memory_panel::MemoryRow>,
+    },
+
+    /// A4: current manifest row re-fetched after `MemoryManifestPersisted`.
+    MemoryManifestReady {
+        row: gaviero_core::memory::store::InjectionManifestRow,
+    },
+
+    /// A4: per-scope counts + last-write timestamps for Section 3.
+    MemoryScopeSummary {
+        rows: Vec<crate::panels::memory_panel::ScopeSummaryRow>,
+    },
+
     // Swarm events (constructed by TuiSwarmObserver when swarm is launched)
     SwarmPhaseChanged(String),
     SwarmAgentStateChanged {
@@ -116,7 +184,7 @@ pub enum Event {
     SwarmDslPlanReady(PathBuf),
 
     // Memory
-    MemoryReady(Arc<MemoryStore>),
+    MemoryReady(Arc<gaviero_core::memory::MemoryStores>),
 
     // Internal
     Tick,

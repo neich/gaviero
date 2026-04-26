@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Increment when adding a new migration.
-const CURRENT_VERSION: u32 = 4;
+const CURRENT_VERSION: u32 = 9;
 
 /// Run all pending migrations on the given connection.
 ///
@@ -32,6 +32,21 @@ pub fn run_migrations(conn: &Connection, embedding_dims: usize) -> Result<()> {
     }
     if version < 4 {
         migrate_v4(conn, embedding_dims).context("migration v4")?;
+    }
+    if version < 5 {
+        migrate_v5(conn).context("migration v5")?;
+    }
+    if version < 6 {
+        migrate_v6(conn).context("migration v6")?;
+    }
+    if version < 7 {
+        migrate_v7(conn).context("migration v7")?;
+    }
+    if version < 8 {
+        migrate_v8(conn).context("migration v8")?;
+    }
+    if version < 9 {
+        migrate_v9(conn).context("migration v9")?;
     }
 
     // Stamp the current version
@@ -343,6 +358,198 @@ fn migrate_v4(conn: &Connection, embedding_dims: usize) -> Result<()> {
     Ok(())
 }
 
+/// v5 (Tier S / S4): injection manifests table.
+///
+/// One row per chat-turn retrieval decision. Persisted from the single-
+/// consumer writer task in response to `WriterMessage::InjectionManifest`.
+/// Separate from the `memories` / `vec_memories_scoped` world — manifests
+/// are not embedded, not semantically searchable, purely a rolling
+/// forensic log (default 30-day retention via the sleeptime prune in B5).
+///
+/// `payload` is opaque JSON: schema_version, query_text, selected_ids,
+/// candidate_pool (when enabled), scoring_formula_version, embedder_name.
+/// Index on (session_id, created_at) so the CLI / panel can fetch the
+/// last N manifests for a conversation cheaply.
+fn migrate_v5(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS injection_manifests (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            turn_id      TEXT    NOT NULL,
+            session_id   TEXT    NOT NULL,
+            source_channel TEXT  NOT NULL DEFAULT 'chat',
+            payload      TEXT    NOT NULL,
+            created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_manifests_session
+            ON injection_manifests(session_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_manifests_turn
+            ON injection_manifests(turn_id);",
+    )
+    .context("creating injection_manifests table")?;
+    Ok(())
+}
+
+/// v6 (Tier A / A3): per-memory `source` and fine-grained `trust_score`.
+///
+/// Adds two columns:
+/// * `source` TEXT — write origin (`user_remember`, `llm_extracted`,
+///   `llm_annotated`, `llm_consolidated`, `swarm_consolidated`,
+///   `mcp_import`, `tool_output`, `user_panel`, `unknown_legacy`).
+/// * `trust_score` REAL — float in [0.0, 1.0] replacing the enum
+///   `trust` column's role as a composite-score multiplier. The old
+///   `trust` enum column stays for backward compat but is no longer
+///   authoritative.
+///
+/// Backfill: rows where the v4 migration tagged `trust = 'high'` (i.e.
+/// `key LIKE 'user:%'`) map to `source = 'user_remember'`,
+/// `trust_score = 1.0`. Everything else maps to
+/// `source = 'unknown_legacy'`, `trust_score = 0.75`.
+fn migrate_v6(conn: &Connection) -> Result<()> {
+    let add_column_if_missing = |col: &str, typedef: &str| -> Result<()> {
+        let has_col: bool = conn
+            .prepare(&format!(
+                "SELECT * FROM pragma_table_info('memories') WHERE name = '{col}'"
+            ))
+            .and_then(|mut stmt| stmt.query_row([], |_| Ok(true)))
+            .unwrap_or(false);
+        if !has_col {
+            conn.execute_batch(&format!("ALTER TABLE memories ADD COLUMN {col} {typedef};"))
+                .with_context(|| format!("adding {col} column"))?;
+        }
+        Ok(())
+    };
+
+    add_column_if_missing("source", "TEXT NOT NULL DEFAULT 'unknown_legacy'")?;
+    add_column_if_missing("trust_score", "REAL NOT NULL DEFAULT 0.6")?;
+
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_memories_source ON memories(source);")
+        .context("creating source index")?;
+
+    // Backfill: user-authored rows get trust 1.0; everything else 0.75.
+    conn.execute_batch(
+        "UPDATE memories
+             SET source = 'user_remember',
+                 trust_score = 1.0
+             WHERE source = 'unknown_legacy'
+               AND (trust = 'high' OR key LIKE 'user:%');
+         UPDATE memories
+             SET trust_score = 0.75
+             WHERE source = 'unknown_legacy'
+               AND trust_score = 0.6;",
+    )
+    .context("backfilling source + trust_score")?;
+
+    Ok(())
+}
+
+/// v7 (Tier A / A1): session ledger for LLM-emitted `<turn_annotations>`.
+///
+/// `session_thread` and `open_questions` from each turn's annotations
+/// block are stored here, keyed by `(session_id, turn_id)`. Tier B5's
+/// session consolidator reads the thread values to segment sessions
+/// thematically; Tier A4's panel surfaces `open_questions` as a follow-
+/// up list. They are **not** injected into prompts — chat injection
+/// only sees the memory table.
+///
+/// Keeping these in their own table avoids bloating `memories` with
+/// session-scoped records that don't belong in retrieval.
+fn migrate_v7(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS session_ledger_turns (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id       TEXT NOT NULL,
+            turn_id          TEXT NOT NULL,
+            session_thread   TEXT,
+            open_questions   TEXT,
+            annotations_json TEXT,
+            created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_slt_session
+            ON session_ledger_turns(session_id, created_at DESC);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_slt_session_turn
+            ON session_ledger_turns(session_id, turn_id);",
+    )
+    .context("creating session_ledger_turns table")?;
+    Ok(())
+}
+
+/// v8: Tier B / B1 — `_gaviero_meta` key/value table for upgrade
+/// metadata. Today's only known key is `embedder_model` (stamped by
+/// the re-embed migration); future tiers will add scoring-formula
+/// version, last sleeptime run, etc. Pre-existing rows from databases
+/// created with an older `embedder_model` are detected by an absence
+/// of the row, which the bootstrap interprets as the legacy default.
+fn migrate_v8(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _gaviero_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );",
+    )
+    .context("creating _gaviero_meta table")?;
+    Ok(())
+}
+
+/// v9: Tier B Phase 2 — session consolidation + sleeptime audit +
+/// retrieval-use telemetry.
+///
+/// * `superseded_by` column on `memories`: B5 SUPERSEDE marks an old
+///   row as replaced. Soft-delete keyed to the new memory id.
+/// * `sleeptime_audit`: append-only log of every sleeptime operation
+///   so a Tier C2 `/forget` audit trail / undo path can reverse them
+///   manually if needed.
+/// * `retrieval_use`: per-(memory, turn) classification produced by the
+///   B6 telemetry pass. Long-lived; pruned to 90 days by sleeptime.
+fn migrate_v9(conn: &Connection) -> Result<()> {
+    let has_superseded: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('memories') WHERE name = 'superseded_by'")
+        .and_then(|mut s| s.query_row([], |_| Ok(true)))
+        .unwrap_or(false);
+    if !has_superseded {
+        conn.execute_batch(
+            "ALTER TABLE memories ADD COLUMN superseded_by INTEGER REFERENCES memories(id);
+             CREATE INDEX IF NOT EXISTS idx_memories_superseded
+                 ON memories(superseded_by) WHERE superseded_by IS NOT NULL;",
+        )
+        .context("adding superseded_by column")?;
+    }
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sleeptime_audit (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id      TEXT    NOT NULL,
+            kind        TEXT    NOT NULL,        -- decay_flag|near_dup_merge|promote|trust_rescore|prune_telemetry
+            memory_id   INTEGER,                  -- target row (or NULL for sweeps)
+            related_id  INTEGER,                  -- e.g. merge winner
+            payload     TEXT    NOT NULL,         -- opaque JSON: before/after, deltas, reasoning
+            dry_run     INTEGER NOT NULL DEFAULT 0,
+            created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_sleeptime_audit_run ON sleeptime_audit(run_id);
+        CREATE INDEX IF NOT EXISTS idx_sleeptime_audit_memory ON sleeptime_audit(memory_id);
+
+        CREATE TABLE IF NOT EXISTS retrieval_use (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id          INTEGER NOT NULL,
+            turn_id            TEXT    NOT NULL,
+            session_id         TEXT,
+            injected_rank      INTEGER NOT NULL,
+            classification     TEXT    NOT NULL,  -- used|partial|unused
+            cosine_to_response REAL    NOT NULL,
+            substring_hit      INTEGER NOT NULL DEFAULT 0,
+            created_at         TEXT    NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_retrieval_use_memory
+            ON retrieval_use(memory_id);
+        CREATE INDEX IF NOT EXISTS idx_retrieval_use_turn
+            ON retrieval_use(turn_id);
+        CREATE INDEX IF NOT EXISTS idx_retrieval_use_classification
+            ON retrieval_use(classification);",
+    )
+    .context("creating sleeptime_audit + retrieval_use tables")?;
+    Ok(())
+}
+
 /// Compute SHA-256 hash of normalized content for dedup.
 pub fn content_hash(content: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -406,6 +613,102 @@ mod tests {
             .and_then(|mut stmt| stmt.query_row([], |_| Ok(true)))
             .unwrap_or(false);
         assert!(has_episodes, "episodes table should exist");
+
+        // v5: injection_manifests table exists
+        let has_manifests: bool = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='injection_manifests'",
+            )
+            .and_then(|mut stmt| stmt.query_row([], |_| Ok(true)))
+            .unwrap_or(false);
+        assert!(has_manifests, "injection_manifests table should exist");
+    }
+
+    #[test]
+    fn test_v6_adds_source_and_trust_score() {
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+        // Sanity: both columns exist with expected defaults.
+        for (col, ty) in &[("source", "TEXT"), ("trust_score", "REAL")] {
+            let has: bool = conn
+                .prepare(&format!(
+                    "SELECT * FROM pragma_table_info('memories') WHERE name = '{col}' AND type = '{ty}'"
+                ))
+                .and_then(|mut stmt| stmt.query_row([], |_| Ok(true)))
+                .unwrap_or(false);
+            assert!(has, "missing v6 column: {col} ({ty})");
+        }
+    }
+
+    #[test]
+    fn test_v6_backfills_user_rows_as_trusted() {
+        let conn = setup_conn();
+        // Stop at v5 so we can seed then re-run to v6.
+        run_migrations(&conn, 8).unwrap();
+        // Reset to v5 and wipe the v6-added columns to simulate a v5 DB
+        // that receives the v6 migration.
+        conn.pragma_update(None, "user_version", 5_u32).unwrap();
+        // Insert a user-authored row under the pre-A3 convention and a
+        // generic row under the legacy default. `execute_batch` because
+        // `execute` only runs one statement.
+        conn.execute_batch(
+            "INSERT INTO memories (namespace, key, content, scope_level, scope_path,
+                content_hash, trust, source, trust_score)
+             VALUES ('default', 'user:note1', 'user note', 2, 'repo:x', 'h1', 'high',
+                 'unknown_legacy', 0.6);
+             INSERT INTO memories (namespace, key, content, scope_level, scope_path,
+                content_hash, trust, source, trust_score)
+             VALUES ('default', 'agents:run:x', 'agent obs', 4, 'repo:x/run:r', 'h2', 'medium',
+                 'unknown_legacy', 0.6);",
+        )
+        .unwrap();
+        // Re-run migrations (idempotent on v6 artifacts).
+        run_migrations(&conn, 8).unwrap();
+
+        let (user_src, user_trust): (String, f32) = conn
+            .query_row(
+                "SELECT source, trust_score FROM memories WHERE key = 'user:note1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(user_src, "user_remember");
+        assert!((user_trust - 1.0).abs() < 1e-6);
+
+        let (other_src, other_trust): (String, f32) = conn
+            .query_row(
+                "SELECT source, trust_score FROM memories WHERE key = 'agents:run:x'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(other_src, "unknown_legacy");
+        assert!((other_trust - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_v5_upgrade_from_v4() {
+        // Walk a pre-v5 DB through migrations and confirm the manifests
+        // table appears without touching prior columns.
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+        // Force version back to 4, drop v5 artifacts, then re-run.
+        conn.pragma_update(None, "user_version", 4_u32).unwrap();
+        conn.execute_batch("DROP TABLE IF EXISTS injection_manifests;")
+            .unwrap();
+        run_migrations(&conn, 8).unwrap();
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='injection_manifests'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]

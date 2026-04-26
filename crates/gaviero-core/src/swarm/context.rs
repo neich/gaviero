@@ -7,6 +7,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::memory::MemoryStores;
 use crate::memory::store::{MemoryStore, PrivacyFilter};
 
 /// Configuration for context building.
@@ -47,7 +48,7 @@ pub struct RepoContext {
 pub async fn build_context(
     workspace_root: &Path,
     prompt: &str,
-    memory: &Option<Arc<MemoryStore>>,
+    memory: &Option<Arc<MemoryStores>>,
     namespaces: &[String],
     config: &ContextConfig,
 ) -> RepoContext {
@@ -57,7 +58,8 @@ pub async fn build_context(
     // 2. Query memory for relevant summaries
     let memory_summaries = if config.use_memory_summaries {
         if let Some(mem) = memory {
-            mem.search_context_filtered(namespaces, prompt, 10, PrivacyFilter::ExcludeLocalOnly)
+            mem.workspace()
+                .search_context_filtered(namespaces, prompt, 10, PrivacyFilter::ExcludeLocalOnly)
                 .await
         } else {
             String::new()

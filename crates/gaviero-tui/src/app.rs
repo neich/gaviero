@@ -20,7 +20,7 @@ use crate::panels::status_bar::StatusBar;
 use crate::theme::{self, Theme};
 use crate::widgets::tabs::TabBar;
 
-use gaviero_core::memory::MemoryStore;
+use gaviero_core::memory::{MemoryStore, WriterHandle};
 use gaviero_core::repo_map::RepoMap;
 use gaviero_core::session_state::{self, SessionState, TabState};
 use gaviero_core::types::WriteProposal;
@@ -42,9 +42,9 @@ mod state;
 
 use self::observers::{TuiAcpObserver, TuiSwarmObserver, TuiWriteGateObserver};
 use self::state::{
-    BatchReviewState, ChangesEntry, ChangesState, DiffKind, FirstRunDialog, FirstRunStep, Focus,
-    LayoutAreas, LayoutPreset, LeftPanelMode, MoveState, PanelVisibility, ReviewProposal,
-    ScrollbarTarget, SidePanelMode, TreeDialog, TreeDialogKind, build_simple_diff,
+    BatchReviewState, ChangesEntry, ChangesState, CodexTrustDialog, DiffKind, FirstRunDialog,
+    FirstRunStep, Focus, LayoutAreas, LayoutPreset, LeftPanelMode, MoveState, PanelVisibility,
+    ReviewProposal, ScrollbarTarget, SidePanelMode, TreeDialog, TreeDialogKind, build_simple_diff,
 };
 
 // ── Constants ────────────────────────────────────────────────────
@@ -70,6 +70,9 @@ pub struct App {
     quit_confirm: bool,
     /// First-run setup dialog shown when no `.gaviero/settings.json` is found.
     first_run_dialog: Option<FirstRunDialog>,
+    /// Codex MCP trust prompt. `Some` while the user must answer the
+    /// one-time consent modal before a pending `/swarm` run proceeds.
+    pub(crate) codex_trust_dialog: Option<CodexTrustDialog>,
     /// When true, the main loop should call `terminal.clear()` before the next draw
     /// to force a full redraw and fix any terminal state corruption.
     pub needs_full_redraw: bool,
@@ -131,7 +134,18 @@ pub struct App {
     acp_tasks: HashMap<String, tokio::task::JoinHandle<()>>,
 
     // Memory
-    pub memory: Option<Arc<MemoryStore>>,
+    pub memory: Option<Arc<gaviero_core::memory::MemoryStores>>,
+    /// Single writer handle for all memory writes — see
+    /// `gaviero_core::memory::writer`. Populated alongside `memory` once the
+    /// store is initialized.
+    pub memory_writer: Option<WriterHandle>,
+    /// Tier B / B2: optional cross-encoder reranker. Populated on
+    /// `Event::MemoryReady` only when both `memory.reranker.enabled` is
+    /// true and the model file loaded successfully. Retrieval falls
+    /// back silently to composite-only ranking when this is `None`.
+    pub memory_reranker: Option<Arc<dyn gaviero_core::memory::Reranker>>,
+    /// B2: cached reranker config snapshot at memory-ready time.
+    pub memory_rerank_cfg: Option<gaviero_core::memory::RerankConfig>,
 
     // Code graph cache — lazy build, invalidated on file changes.
     // `None` means "needs (re)build before next chat send".
@@ -142,6 +156,15 @@ pub struct App {
     // Git panel (M4)
     pub git_panel: crate::panels::git_panel::GitPanelState,
     pub git_repo: Option<gaviero_core::git::GitRepo>,
+
+    // Memory panel (Tier A / A4)
+    pub memory_panel: crate::panels::memory_panel::MemoryPanelState,
+
+    /// MCP server handle (Tier A / A5). Spawned on `Event::MemoryReady`
+    /// when `mcp.gavieroServer.enabled` is true. On workspace close the
+    /// handle's `shutdown` is awaited so the Unix socket file is
+    /// cleaned up.
+    pub mcp_server: Option<gaviero_core::mcp::McpServerHandle>,
 
     // Terminal (M4) — managed by TerminalManager in gaviero-core
     pub terminal_manager: gaviero_core::terminal::TerminalManager,
@@ -244,6 +267,7 @@ impl App {
             },
             should_quit: false,
             quit_confirm: false,
+            codex_trust_dialog: None,
             first_run_dialog: if is_first_run {
                 Some(FirstRunDialog {
                     step: FirstRunStep::AskSettings,
@@ -302,9 +326,14 @@ impl App {
             },
             acp_tasks: HashMap::new(),
             memory: None,
+            memory_writer: None,
+            memory_reranker: None,
+            memory_rerank_cfg: None,
             repo_map: Arc::new(tokio::sync::RwLock::new(None)),
             graph_workspace_root,
             git_panel: crate::panels::git_panel::GitPanelState::new(),
+            memory_panel: crate::panels::memory_panel::MemoryPanelState::new(),
+            mcp_server: None,
             git_repo,
             terminal_manager: gaviero_core::terminal::TerminalManager::new(
                 gaviero_core::terminal::TerminalConfig::default(),
@@ -336,6 +365,15 @@ impl App {
 
     fn handle_git_panel_action(&mut self, action: Action) {
         side_panel::handle_git_panel_action(self, action);
+    }
+
+    fn handle_memory_panel_action(&mut self, action: Action) {
+        side_panel::handle_memory_panel_action(self, action);
+    }
+
+    /// Refresh the memory panel from `memory.db` (bootstrap fill).
+    fn refresh_memory_panel(&mut self) {
+        side_panel::refresh_memory_panel(self);
     }
 
     /// Read the HEAD version of a file (for diff display).
@@ -380,6 +418,22 @@ impl App {
     /// Handle `/remember <text>` command — store text to semantic memory.
     fn handle_remember_command(&mut self) {
         commands::handle_remember_command(self);
+    }
+
+    /// Handle `/reembed` command — Tier B / B1 migration trigger.
+    fn handle_reembed_command(&mut self) {
+        commands::handle_reembed_command(self);
+    }
+
+    /// Handle `/consolidate-session` — Tier B / B5 session
+    /// consolidator (manual trigger).
+    fn handle_consolidate_session_command(&mut self) {
+        commands::handle_consolidate_session_command(self);
+    }
+
+    /// Handle `/sleep [--dry-run]` — Tier B / B5 sleeptime pass.
+    fn handle_sleep_command(&mut self) {
+        commands::handle_sleep_command(self);
     }
 
     /// Handle `/attach [path]` command.
@@ -769,6 +823,10 @@ impl App {
     fn render_first_run_dialog(&self, frame: &mut Frame, area: Rect) {
         render::render_first_run_dialog(self, frame, area);
     }
+
+    fn render_codex_trust_dialog(&self, frame: &mut Frame, area: Rect) {
+        render::render_codex_trust_dialog(self, frame, area);
+    }
 }
 
 /// Result of a clipboard write attempt.
@@ -920,11 +978,7 @@ fn save_clipboard_image_as_png(img: &arboard::ImageData) -> anyhow::Result<std::
     Ok(path)
 }
 
-fn list_workspace_files(
-    root: &std::path::Path,
-    limit: usize,
-    excludes: &[String],
-) -> Vec<String> {
+fn list_workspace_files(root: &std::path::Path, limit: usize, excludes: &[String]) -> Vec<String> {
     let mut files = Vec::new();
     let walker = std::fs::read_dir(root);
     fn walk(

@@ -5,10 +5,19 @@
 //! ```text
 //! global                  personal cross-workspace knowledge
 //!   └─ workspace          business-level project (.gaviero-workspace)
-//!        └─ repo          single git repository (WorkspaceFolder)
+//!        └─ repo          a workspace folder (shared across workspaces)
 //!             └─ module   crate / package / subdirectory (FileScope.owned_paths)
 //!                  └─ run single swarm execution (ephemeral, consolidated upward)
 //! ```
+//!
+//! Physical storage layout (3 SQLite files):
+//! - `global` lives in `~/.config/gaviero/memory.db`.
+//! - `workspace` and `run` live in `<workspace-root>/.gaviero/memory.db`.
+//! - `repo` and `module` live in `<folder-root>/.gaviero/memory.db`.
+//!
+//! When a workspace is a single directly-opened directory, `workspace_root`
+//! and `folder_root` are the same path, so the workspace and folder DBs
+//! collapse to one file.
 
 use std::path::{Path, PathBuf};
 
@@ -37,6 +46,41 @@ pub fn hash_path(path: &Path) -> String {
             let _ = write!(s, "{b:02x}");
             s
         })
+}
+
+// ── StoreKind ─────────────────────────────────────────────────
+
+/// Identifies which physical SQLite file a scope is stored in.
+///
+/// Routing rules:
+/// - `Global` → `~/.config/gaviero/memory.db`
+/// - `Workspace` → `<workspace-root>/.gaviero/memory.db` (workspace + run scopes)
+/// - `Folder(repo_id)` → `<folder-root>/.gaviero/memory.db` (repo + module scopes)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum StoreKind {
+    Global,
+    Workspace,
+    Folder { repo_id: String },
+}
+
+/// Derive the [`StoreKind`] that owns a row given its persisted
+/// `(scope_level, repo_id)`. Mirrors the routing in
+/// [`WriteScope::target_store`] / [`ScopeFilter::target_store`] so the
+/// retrieval merge can route per-row access logging back to the right
+/// store.
+///
+/// Returns `None` when the inputs are inconsistent (e.g., a repo /
+/// module / run row without a `repo_id`).
+pub fn store_kind_for_scope(scope_level: i32, repo_id: Option<&str>) -> Option<StoreKind> {
+    match scope_level {
+        SCOPE_GLOBAL => Some(StoreKind::Global),
+        SCOPE_WORKSPACE => Some(StoreKind::Workspace),
+        SCOPE_RUN => Some(StoreKind::Workspace),
+        SCOPE_REPO | SCOPE_MODULE => repo_id.map(|r| StoreKind::Folder {
+            repo_id: r.to_string(),
+        }),
+        _ => None,
+    }
 }
 
 // ── ScopeFilter ───────────────────────────────────────────────
@@ -94,6 +138,21 @@ impl ScopeFilter {
         match self {
             Self::Run { run_id, .. } => Some(run_id),
             _ => None,
+        }
+    }
+
+    /// Which physical store this scope reads from.
+    ///
+    /// Run-scope reads go to the workspace store (run rows live there);
+    /// repo and module reads go to the folder store keyed by `repo_id`.
+    pub fn target_store(&self) -> StoreKind {
+        match self {
+            Self::Global => StoreKind::Global,
+            Self::Workspace => StoreKind::Workspace,
+            Self::Run { .. } => StoreKind::Workspace,
+            Self::Repo { repo_id } | Self::Module { repo_id, .. } => StoreKind::Folder {
+                repo_id: repo_id.clone(),
+            },
         }
     }
 }
@@ -170,6 +229,56 @@ impl WriteScope {
         }
     }
 
+    /// Which physical store this write targets.
+    ///
+    /// Run-scope writes go to the workspace store (run rows live there);
+    /// repo and module writes go to the folder store keyed by `repo_id`.
+    pub fn target_store(&self) -> StoreKind {
+        match self {
+            Self::Global => StoreKind::Global,
+            Self::Workspace => StoreKind::Workspace,
+            Self::Run { .. } => StoreKind::Workspace,
+            Self::Repo { repo_id } | Self::Module { repo_id, .. } => StoreKind::Folder {
+                repo_id: repo_id.clone(),
+            },
+        }
+    }
+
+    /// Broader (ancestor) scopes for cross-scope dedup, ordered
+    /// narrowest → widest. Each tuple is `(level, scope_path,
+    /// target_store)`. Used by the registry to probe other physical
+    /// DBs for content-hash coverage before performing the target
+    /// write.
+    pub fn ancestors(&self) -> Vec<(i32, String, StoreKind)> {
+        match self {
+            Self::Global => Vec::new(),
+            Self::Workspace => vec![(SCOPE_GLOBAL, "global".to_string(), StoreKind::Global)],
+            Self::Repo { .. } => vec![
+                (
+                    SCOPE_WORKSPACE,
+                    "workspace".to_string(),
+                    StoreKind::Workspace,
+                ),
+                (SCOPE_GLOBAL, "global".to_string(), StoreKind::Global),
+            ],
+            Self::Module { repo_id, .. } | Self::Run { repo_id, .. } => vec![
+                (
+                    SCOPE_REPO,
+                    format!("repo:{repo_id}"),
+                    StoreKind::Folder {
+                        repo_id: repo_id.clone(),
+                    },
+                ),
+                (
+                    SCOPE_WORKSPACE,
+                    "workspace".to_string(),
+                    StoreKind::Workspace,
+                ),
+                (SCOPE_GLOBAL, "global".to_string(), StoreKind::Global),
+            ],
+        }
+    }
+
     /// Convert to a `ScopeFilter` for use in search.
     pub fn to_filter(&self) -> ScopeFilter {
         match self {
@@ -198,16 +307,22 @@ impl WriteScope {
 /// Resolved scope chain for the current execution context.
 ///
 /// Built from Workspace + WorkspaceFolder + FileScope + optional run_id.
-/// Used by retrieval to determine which scope levels to cascade through.
+/// Used by retrieval to determine which scope levels to cascade through,
+/// and by the [`super::MemoryStores`] registry to pick which physical
+/// SQLite file each scope level lives in.
 #[derive(Debug, Clone)]
 pub struct MemoryScope {
     /// Global DB path: `~/.config/gaviero/memory.db`.
     pub global_db: PathBuf,
     /// Workspace DB path: `<workspace-root>/.gaviero/memory.db`.
+    /// Holds workspace and run scopes.
     pub workspace_db: PathBuf,
+    /// Folder (repo) DB path: `<folder-root>/.gaviero/memory.db`.
+    /// Holds repo and module scopes. `None` when the agent has no folder context.
+    pub repo_db: Option<PathBuf>,
     /// Hash of canonical workspace path.
     pub workspace_id: String,
-    /// Hash of canonical repo root (present when agent has repo context).
+    /// Hash of canonical folder root (present when agent has repo context).
     pub repo_id: Option<String>,
     /// Narrowest module prefix derived from FileScope.owned_paths.
     pub module_path: Option<String>,
@@ -217,6 +332,11 @@ pub struct MemoryScope {
 
 impl MemoryScope {
     /// Build a scope chain from the current execution context.
+    ///
+    /// `folder` is the workspace folder root (which we treat as the "repo"
+    /// — folder identity is what matters, no `.git` requirement). When
+    /// `folder == workspace_root`, the workspace and folder DBs resolve
+    /// to the same physical file.
     pub fn from_context(
         workspace_root: &Path,
         folder: Option<&Path>,
@@ -231,6 +351,7 @@ impl MemoryScope {
         let workspace_id = hash_path(workspace_root);
 
         let repo_id = folder.map(|f| hash_path(f));
+        let repo_db = folder.map(|f| f.join(".gaviero/memory.db"));
 
         // Module = longest common prefix of owned_paths
         let module_path = owned_paths
@@ -239,6 +360,7 @@ impl MemoryScope {
         Self {
             global_db,
             workspace_db,
+            repo_db,
             workspace_id,
             repo_id,
             module_path,
@@ -384,6 +506,11 @@ pub enum MemoryType {
     Decision,
     Pattern,
     Gotcha,
+    Convention,
+    Invariant,
+    Preference,
+    Lesson,
+    Error,
 }
 
 impl MemoryType {
@@ -394,6 +521,11 @@ impl MemoryType {
             Self::Decision => "decision",
             Self::Pattern => "pattern",
             Self::Gotcha => "gotcha",
+            Self::Convention => "convention",
+            Self::Invariant => "invariant",
+            Self::Preference => "preference",
+            Self::Lesson => "lesson",
+            Self::Error => "error",
         }
     }
 
@@ -403,6 +535,11 @@ impl MemoryType {
             "decision" => Self::Decision,
             "pattern" => Self::Pattern,
             "gotcha" => Self::Gotcha,
+            "convention" => Self::Convention,
+            "invariant" => Self::Invariant,
+            "preference" => Self::Preference,
+            "lesson" => Self::Lesson,
+            "error" => Self::Error,
             _ => Self::Factual,
         }
     }
@@ -423,7 +560,16 @@ pub enum StoreResult {
 
 // ── WriteMeta ─────────────────────────────────────────────────
 
+use super::trust_defaults::{MemorySource, clamp_trust};
+
 /// Metadata for a scoped memory write.
+///
+/// Tier A3 added `source_kind: MemorySource` (typed write origin) and
+/// `trust_score: f32` (the [0.0, 1.0] retrieval multiplier). The legacy
+/// `source: String` + `trust: Trust` fields are retained as mirrors so
+/// pre-A3 call sites keep compiling; new code should prefer
+/// [`WriteMeta::for_source`]. Inserts read the typed fields — the legacy
+/// fields are written to their columns for backward compat only.
 #[derive(Debug, Clone)]
 pub struct WriteMeta {
     pub memory_type: MemoryType,
@@ -431,6 +577,12 @@ pub struct WriteMeta {
     pub trust: Trust,
     pub source: String,
     pub tag: Option<String>,
+    /// Typed write-origin tag. Drives default `trust_score` and feeds
+    /// the A3 `source` column.
+    pub source_kind: MemorySource,
+    /// Retrieval trust multiplier in [0.0, 1.0]. Defaults to
+    /// `source_kind.default_trust()` via [`WriteMeta::for_source`].
+    pub trust_score: f32,
 }
 
 impl Default for WriteMeta {
@@ -441,42 +593,78 @@ impl Default for WriteMeta {
             trust: Trust::Medium,
             source: String::new(),
             tag: None,
+            source_kind: MemorySource::UnknownLegacy,
+            trust_score: MemorySource::UnknownLegacy.default_trust(),
         }
     }
 }
 
 impl WriteMeta {
-    /// Convenience: metadata for an agent observation during a swarm run.
-    pub fn agent_observation(agent_id: &str) -> Self {
+    /// Canonical constructor for A3+ callers. Sets both the typed
+    /// `source_kind` and the default `trust_score` for that source;
+    /// also mirrors the legacy `source: String` + `trust: Trust` fields
+    /// so the row's old columns stay populated.
+    pub fn for_source(source_kind: MemorySource) -> Self {
+        let trust_score = source_kind.default_trust();
+        let trust = if trust_score >= 0.9 {
+            Trust::High
+        } else if trust_score >= 0.65 {
+            Trust::Medium
+        } else {
+            Trust::Low
+        };
         Self {
             memory_type: MemoryType::Factual,
-            importance: 0.4,
-            trust: Trust::Medium,
-            source: format!("agent:{agent_id}"),
+            importance: 0.5,
+            trust,
+            source: source_kind.as_str().to_string(),
             tag: None,
+            source_kind,
+            trust_score,
         }
+    }
+
+    /// Override the default trust score (clamped to [0.0, 1.0]).
+    pub fn with_trust_score(mut self, t: f32) -> Self {
+        self.trust_score = clamp_trust(t);
+        self
+    }
+
+    /// Override importance (clamped to [0.0, 1.0]).
+    pub fn with_importance(mut self, i: f32) -> Self {
+        self.importance = clamp_trust(i);
+        self
+    }
+
+    /// Override memory type.
+    pub fn with_type(mut self, t: MemoryType) -> Self {
+        self.memory_type = t;
+        self
+    }
+
+    /// Override tag.
+    pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
+        self.tag = Some(tag.into());
+        self
+    }
+
+    /// Convenience: metadata for an agent observation during a swarm run.
+    pub fn agent_observation(agent_id: &str) -> Self {
+        Self::for_source(MemorySource::SwarmConsolidated)
+            .with_importance(0.4)
+            .with_tag(format!("agent:{agent_id}"))
     }
 
     /// Convenience: metadata for a user /remember command.
     pub fn user_remember() -> Self {
-        Self {
-            memory_type: MemoryType::Factual,
-            importance: 0.8,
-            trust: Trust::High,
-            source: "user:/remember".to_string(),
-            tag: None,
-        }
+        Self::for_source(MemorySource::UserRemember).with_importance(0.8)
     }
 
     /// Convenience: metadata for consolidation-promoted memories.
     pub fn consolidation(source_run_id: &str) -> Self {
-        Self {
-            memory_type: MemoryType::Factual,
-            importance: 0.5,
-            trust: Trust::Low,
-            source: format!("consolidation:run:{source_run_id}"),
-            tag: None,
-        }
+        Self::for_source(MemorySource::LlmConsolidated)
+            .with_importance(0.5)
+            .with_tag(format!("consolidation:run:{source_run_id}"))
     }
 }
 
@@ -603,6 +791,7 @@ mod tests {
         let scope = MemoryScope {
             global_db: PathBuf::from("/tmp/global.db"),
             workspace_db: PathBuf::from("/tmp/ws.db"),
+            repo_db: Some(PathBuf::from("/tmp/folder.db")),
             workspace_id: "ws1".into(),
             repo_id: Some("repo1".into()),
             module_path: Some("crates/core".into()),
@@ -623,6 +812,7 @@ mod tests {
         let scope = MemoryScope {
             global_db: PathBuf::from("/tmp/global.db"),
             workspace_db: PathBuf::from("/tmp/ws.db"),
+            repo_db: Some(PathBuf::from("/tmp/folder.db")),
             workspace_id: "ws1".into(),
             repo_id: Some("repo1".into()),
             module_path: None,
@@ -639,6 +829,7 @@ mod tests {
         let scope = MemoryScope {
             global_db: PathBuf::from("/tmp/global.db"),
             workspace_db: PathBuf::from("/tmp/ws.db"),
+            repo_db: Some(PathBuf::from("/tmp/folder.db")),
             workspace_id: "ws1".into(),
             repo_id: Some("repo1".into()),
             module_path: Some("crates/core".into()),
@@ -658,6 +849,103 @@ mod tests {
     }
 
     #[test]
+    fn test_from_context_distinct_workspace_and_folder() {
+        let workspace = Path::new("/tmp/ws");
+        let folder = Path::new("/tmp/lib-repo");
+        let scope = MemoryScope::from_context(workspace, Some(folder), None, None);
+        assert_eq!(scope.workspace_db, workspace.join(".gaviero/memory.db"));
+        assert_eq!(
+            scope.repo_db.as_deref(),
+            Some(folder.join(".gaviero/memory.db").as_path())
+        );
+        assert_eq!(scope.workspace_id, hash_path(workspace));
+        assert_eq!(scope.repo_id.as_deref(), Some(hash_path(folder).as_str()));
+    }
+
+    #[test]
+    fn test_from_context_collapsed_single_folder() {
+        // When workspace_root == folder_root, the workspace and folder DBs
+        // resolve to the same physical file.
+        let root = Path::new("/tmp/single-open");
+        let scope = MemoryScope::from_context(root, Some(root), None, None);
+        assert_eq!(scope.repo_db.as_deref(), Some(scope.workspace_db.as_path()));
+    }
+
+    #[test]
+    fn test_target_store_routing() {
+        assert_eq!(WriteScope::Global.target_store(), StoreKind::Global);
+        assert_eq!(WriteScope::Workspace.target_store(), StoreKind::Workspace);
+        // Run rows live in the workspace DB.
+        assert_eq!(
+            WriteScope::Run {
+                repo_id: "abc".into(),
+                run_id: "r1".into(),
+            }
+            .target_store(),
+            StoreKind::Workspace
+        );
+        // Repo / module rows live in the folder DB, keyed by repo_id.
+        assert_eq!(
+            WriteScope::Repo {
+                repo_id: "abc".into()
+            }
+            .target_store(),
+            StoreKind::Folder {
+                repo_id: "abc".into()
+            }
+        );
+        assert_eq!(
+            WriteScope::Module {
+                repo_id: "abc".into(),
+                module_path: "crates/core".into(),
+            }
+            .target_store(),
+            StoreKind::Folder {
+                repo_id: "abc".into()
+            }
+        );
+    }
+
+    #[test]
+    fn test_scope_filter_target_store_matches_write_scope() {
+        let cases = [
+            (WriteScope::Global, ScopeFilter::Global),
+            (WriteScope::Workspace, ScopeFilter::Workspace),
+            (
+                WriteScope::Repo {
+                    repo_id: "r".into(),
+                },
+                ScopeFilter::Repo {
+                    repo_id: "r".into(),
+                },
+            ),
+            (
+                WriteScope::Module {
+                    repo_id: "r".into(),
+                    module_path: "m".into(),
+                },
+                ScopeFilter::Module {
+                    repo_id: "r".into(),
+                    module_path: "m".into(),
+                },
+            ),
+            (
+                WriteScope::Run {
+                    repo_id: "r".into(),
+                    run_id: "x".into(),
+                },
+                ScopeFilter::Run {
+                    repo_id: "r".into(),
+                    run_id: "x".into(),
+                },
+            ),
+        ];
+        for (ws, sf) in cases {
+            assert_eq!(ws.target_store(), sf.target_store());
+        }
+    }
+
+    #[test]
     fn test_trust_roundtrip() {
         assert_eq!(Trust::parse_str("high"), Trust::High);
         assert_eq!(Trust::parse_str("medium"), Trust::Medium);
@@ -673,6 +961,11 @@ mod tests {
             MemoryType::Decision,
             MemoryType::Pattern,
             MemoryType::Gotcha,
+            MemoryType::Convention,
+            MemoryType::Invariant,
+            MemoryType::Preference,
+            MemoryType::Lesson,
+            MemoryType::Error,
         ] {
             assert_eq!(MemoryType::parse_str(ty.as_str()), ty);
         }

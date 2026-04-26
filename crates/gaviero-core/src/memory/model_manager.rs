@@ -24,6 +24,28 @@ pub const NOMIC_EMBED_TEXT_V1_5: ModelInfo = ModelInfo {
     dimensions: 768,
 };
 
+/// Tier B / B1: Alibaba-NLP/gte-modernbert-base — Apache-2.0, ~149M
+/// parameters, 768-dim (same as nomic so no schema change), 8192-token
+/// context. Uses `"search_query: "` / `"search_document: "` prefixes.
+pub const GTE_MODERNBERT_BASE: ModelInfo = ModelInfo {
+    id: "gte-modernbert-base",
+    onnx_url: "https://huggingface.co/Alibaba-NLP/gte-modernbert-base/resolve/main/onnx/model.onnx",
+    tokenizer_url: "https://huggingface.co/Alibaba-NLP/gte-modernbert-base/resolve/main/tokenizer.json",
+    dimensions: 768,
+};
+
+/// Resolve a settings string (`"nomic" | "gte-modernbert" | ""`) to a
+/// `ModelInfo`. Empty / unknown values fall back to the configured
+/// default (currently `"nomic"`; B1g flips this to `"gte-modernbert"`).
+pub fn resolve_embedder_model(name: &str) -> &'static ModelInfo {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "gte-modernbert" | "gte-modernbert-base" => &GTE_MODERNBERT_BASE,
+        "nomic" | "nomic-v15" | "nomic-v1.5" | "nomic-embed-text-v1.5" => &NOMIC_EMBED_TEXT_V1_5,
+        "e5" | "e5-small-v2" => &E5_SMALL_V2,
+        _ => &NOMIC_EMBED_TEXT_V1_5,
+    }
+}
+
 /// Manages download and caching of embedding model files.
 pub struct ModelManager {
     cache_dir: PathBuf,

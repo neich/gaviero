@@ -66,6 +66,26 @@ pub trait AcpObserver: Send + Sync {
     /// via `AgentOptions::resume_session_id` on the next turn so Claude
     /// retains model context. Default no-op for observers that don't care.
     fn on_claude_session_started(&self, _session_id: &str) {}
+
+    /// Fired once per chat turn immediately after the prompt assembler has
+    /// decided which memories to inject. Carries a summary snapshot
+    /// (`items_injected`, `tokens_used`, `token_budget`) for UI / logging.
+    /// The full `ChatInjection` lives on the writer path (S4 manifest).
+    ///
+    /// Default no-op — observers that don't care about injection telemetry
+    /// pay nothing.
+    fn on_memory_injected(&self, _summary: &ChatInjectionSummary) {}
+}
+
+/// Lightweight summary of a chat memory injection decision. Handed to
+/// observers via `on_memory_injected`. Full per-candidate detail lives on
+/// the S4 manifest writer path.
+#[derive(Debug, Clone)]
+pub struct ChatInjectionSummary {
+    pub items_injected: usize,
+    pub pool_size: usize,
+    pub tokens_used: usize,
+    pub token_budget: usize,
 }
 
 /// Observer trait for swarm orchestration events.

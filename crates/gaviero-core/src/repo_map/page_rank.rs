@@ -14,6 +14,7 @@ use std::collections::HashMap;
 
 use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
+use petgraph::visit::EdgeRef;
 
 /// Run personalized PageRank on `graph`.
 ///
@@ -28,6 +29,32 @@ pub fn rank_nodes<N, E>(
     damping: f64,
     max_iterations: usize,
 ) -> HashMap<NodeIndex, f64> {
+    rank_nodes_weighted(
+        graph,
+        personalized_nodes,
+        damping,
+        max_iterations,
+        None,
+        |_| 1.0,
+    )
+}
+
+/// Run personalized PageRank with typed-edge and target-specificity weighting.
+///
+/// Each transition weight is `edge_weight(edge) * specificity[target]`, then the
+/// outgoing row is normalized. Nodes with zero outgoing weight are treated as
+/// dangling nodes.
+pub fn rank_nodes_weighted<N, E, F>(
+    graph: &DiGraph<N, E>,
+    personalized_nodes: &[NodeIndex],
+    damping: f64,
+    max_iterations: usize,
+    specificity: Option<&HashMap<NodeIndex, f64>>,
+    edge_weight: F,
+) -> HashMap<NodeIndex, f64>
+where
+    F: Fn(&E) -> f64,
+{
     let n = graph.node_count();
     if n == 0 {
         return HashMap::new();
@@ -65,14 +92,17 @@ pub fn rank_nodes<N, E>(
         .map(|idx| (idx, 1.0 / n as f64))
         .collect();
 
-    // Pre-compute out-degrees
-    let out_degree: HashMap<NodeIndex, usize> = graph
+    // Pre-compute normalized outgoing transition weights.
+    let out_weight: HashMap<NodeIndex, f64> = graph
         .node_indices()
         .map(|idx| {
-            (
-                idx,
-                graph.neighbors_directed(idx, Direction::Outgoing).count(),
-            )
+            let total: f64 = graph
+                .edges_directed(idx, Direction::Outgoing)
+                .map(|edge| {
+                    transition_weight(edge.weight(), edge.target(), specificity, &edge_weight)
+                })
+                .sum();
+            (idx, total)
         })
         .collect();
 
@@ -84,17 +114,24 @@ pub fn rank_nodes<N, E>(
         // Dangling mass: nodes with no outgoing edges contribute to all nodes
         let dangling_mass: f64 = graph
             .node_indices()
-            .filter(|idx| out_degree[idx] == 0)
+            .filter(|idx| out_weight[idx] <= f64::EPSILON)
             .map(|idx| rank[&idx])
             .sum();
 
         for idx in graph.node_indices() {
             // Collect incoming rank
             let incoming: f64 = graph
-                .neighbors_directed(idx, Direction::Incoming)
-                .map(|src| {
-                    let deg = out_degree[&src].max(1) as f64;
-                    rank[&src] / deg
+                .edges_directed(idx, Direction::Incoming)
+                .map(|edge| {
+                    let src = edge.source();
+                    let denom = out_weight[&src];
+                    if denom <= f64::EPSILON {
+                        0.0
+                    } else {
+                        let weight =
+                            transition_weight(edge.weight(), idx, specificity, &edge_weight);
+                        rank[&src] * weight / denom
+                    }
                 })
                 .sum();
 
@@ -107,6 +144,23 @@ pub fn rank_nodes<N, E>(
     }
 
     rank
+}
+
+fn transition_weight<E, F>(
+    edge: &E,
+    target: NodeIndex,
+    specificity: Option<&HashMap<NodeIndex, f64>>,
+    edge_weight: &F,
+) -> f64
+where
+    F: Fn(&E) -> f64,
+{
+    let edge_w = edge_weight(edge).max(0.0);
+    let specificity_w = specificity
+        .and_then(|m| m.get(&target).copied())
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0);
+    edge_w * specificity_w
 }
 
 #[cfg(test)]
@@ -145,5 +199,31 @@ mod tests {
         let g: DiGraph<(), ()> = DiGraph::new();
         let ranks = rank_nodes(&g, &[], 0.85, 10);
         assert!(ranks.is_empty());
+    }
+
+    #[test]
+    fn specificity_downweights_generic_target_propagation() {
+        let mut g: DiGraph<(), ()> = DiGraph::new();
+        let seed = g.add_node(());
+        let generic = g.add_node(());
+        let domain = g.add_node(());
+        let tail = g.add_node(());
+        g.add_edge(seed, generic, ());
+        g.add_edge(seed, domain, ());
+        g.add_edge(generic, tail, ());
+        g.add_edge(domain, tail, ());
+
+        let mut specificity = HashMap::new();
+        specificity.insert(seed, 1.0);
+        specificity.insert(generic, 0.01);
+        specificity.insert(domain, 1.0);
+        specificity.insert(tail, 1.0);
+
+        let ranks = rank_nodes_weighted(&g, &[seed], 0.85, 20, Some(&specificity), |_| 1.0);
+        assert!(
+            ranks[&domain] > ranks[&generic],
+            "domain-specific node should outrank generic node: {:?}",
+            ranks
+        );
     }
 }

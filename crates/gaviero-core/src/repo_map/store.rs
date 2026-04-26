@@ -1,7 +1,8 @@
 //! SQLite-backed code knowledge graph.
 //!
 //! Stores code structure as nodes (File, Function, Struct, Trait, Enum, Test)
-//! and edges (Imports, Calls, Implements, TestedBy, Contains).
+//! and typed edges (Calls, Imports, Implements, Defines, TestOf, doc references,
+//! and future contract declarations).
 //!
 //! Supports incremental updates via file-hash diffing and blast-radius queries
 //! via recursive CTE.
@@ -51,6 +52,39 @@ CREATE INDEX IF NOT EXISTS idx_edges_tgt  ON edges(target_qn);
 CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind);
 CREATE INDEX IF NOT EXISTS idx_edges_file ON edges(file_path);
 ";
+
+/// C4: one-shot migration applied at every `open*` call.
+///
+/// Pre-C4 databases stored edges with either NULL `kind` (very old
+/// schema) or the legacy aliases `'Contains'`/`'TestedBy'`. The
+/// in-memory `EdgeKind::from_str` already handles those aliases
+/// transparently, but the persisted rows are still untyped from a
+/// query-planner perspective: `mode=callers` wouldn't match a
+/// NULL-kind edge.
+///
+/// We default any NULL `kind` to `'Imports'` (the recommended neutral
+/// fallback per the plan) so the row keeps showing up under
+/// `mode=all`/`mode=impact`. We *don't* delete legacy rows — the
+/// next incremental graph build replaces them by qualified-name
+/// upsert with the correct typed kind. The migration is idempotent:
+/// a fully-migrated database has no NULL `kind` rows so the UPDATE is
+/// a no-op.
+///
+/// **Post-upgrade workflow.** Run `gaviero-cli --graph` once after
+/// updating to a build that includes C4 to repopulate every edge
+/// with its proper typed kind. Without that re-scan, legacy rows
+/// remain `'Imports'` and `mode=callers` / `mode=tests` /
+/// `mode=implementations` queries will under-return — they still
+/// surface the file via `mode=all`, but per-intent precision degrades
+/// until the rebuild lands.
+fn migrate_typed_edges(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE edges SET kind = 'Imports' WHERE kind IS NULL OR kind = ''",
+        [],
+    )
+    .context("typed-edge migration: defaulting null kinds")?;
+    Ok(())
+}
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -103,28 +137,238 @@ impl NodeKind {
 }
 
 /// Edge kinds in the knowledge graph.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EdgeKind {
-    /// File imports/uses another module.
-    Imports,
     /// Function/method calls another function.
     Calls,
+    /// File imports/uses another module.
+    Imports,
     /// Type implements a trait/interface or extends a class.
     Implements,
+    /// File/module defines a symbol.
+    Defines,
     /// Test file/function tests source code.
-    TestedBy,
-    /// File contains a symbol (parent-child).
-    Contains,
+    TestOf,
+    /// Doc comment/string on source references a symbol.
+    ReferencesDocstringOf,
+    /// Tier D1 placeholder for promoted contracts from node docs.
+    DeclaresContractWith,
 }
 
 impl EdgeKind {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Imports => "Imports",
             Self::Calls => "Calls",
+            Self::Imports => "Imports",
             Self::Implements => "Implements",
-            Self::TestedBy => "TestedBy",
-            Self::Contains => "Contains",
+            Self::Defines => "Defines",
+            Self::TestOf => "TestOf",
+            Self::ReferencesDocstringOf => "ReferencesDocstringOf",
+            Self::DeclaresContractWith => "DeclaresContractWith",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "Calls" => Some(Self::Calls),
+            "Imports" => Some(Self::Imports),
+            "Implements" => Some(Self::Implements),
+            "Defines" | "Contains" => Some(Self::Defines),
+            "TestOf" | "TestedBy" => Some(Self::TestOf),
+            "ReferencesDocstringOf" => Some(Self::ReferencesDocstringOf),
+            "DeclaresContractWith" => Some(Self::DeclaresContractWith),
+            _ => None,
+        }
+    }
+}
+
+/// Query intent for graph blast-radius traversal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BlastRadiusMode {
+    Impact,
+    Callers,
+    Tests,
+    Implementations,
+    All,
+}
+
+impl Default for BlastRadiusMode {
+    fn default() -> Self {
+        Self::All
+    }
+}
+
+impl BlastRadiusMode {
+    pub fn from_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "impact" => Self::Impact,
+            "callers" => Self::Callers,
+            "tests" => Self::Tests,
+            "implementations" => Self::Implementations,
+            "all" | "" => Self::All,
+            _ => Self::All,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Impact => "impact",
+            Self::Callers => "callers",
+            Self::Tests => "tests",
+            Self::Implementations => "implementations",
+            Self::All => "all",
+        }
+    }
+
+    fn edge_kind_sql_list(&self) -> &'static str {
+        match self {
+            Self::Impact => {
+                "'Calls','Imports','Implements','Defines','TestOf',\
+                 'ReferencesDocstringOf','DeclaresContractWith','Contains','TestedBy'"
+            }
+            Self::Callers => "'Calls'",
+            Self::Tests => "'TestOf','TestedBy'",
+            Self::Implementations => "'Implements'",
+            Self::All => {
+                "'Calls','Imports','Implements','Defines','TestOf',\
+                 'ReferencesDocstringOf','DeclaresContractWith','Contains','TestedBy'"
+            }
+        }
+    }
+
+    /// Per-intent edge weight preset. Returned weight is `0.0` when an edge
+    /// kind should be excluded from PageRank propagation, `1.0` when it
+    /// dominates, and an intermediate value when it contributes but is
+    /// outranked by a more relevant kind for the intent.
+    ///
+    /// Equivalent to `EdgeWeights::default_for(self).weight(kind)` —
+    /// provided as a thin shim so call sites that don't need to honor
+    /// user overrides stay terse.
+    pub fn edge_weight(&self, kind: EdgeKind) -> f64 {
+        EdgeWeights::default_for(*self).weight(kind)
+    }
+}
+
+/// Per-intent edge weight map for PageRank propagation.
+///
+/// `EdgeWeights::default_for(mode)` returns the plan's recommended
+/// preset; an embedding application loading
+/// `repoMap.edges.weights.<intent>` from settings can override
+/// individual kinds via [`Self::set`]. Unknown kinds (or omitted
+/// settings entries) keep the preset value.
+///
+/// Plan presets:
+/// - `Impact`:           Calls=1.0, Implements=0.9, Defines=0.8,
+///                       Imports=0.5, TestOf=0.3, others=0.2
+/// - `Callers`:          Calls=1.0, others=0.0
+/// - `Tests`:            TestOf=1.0, others=0.0
+/// - `Implementations`:  Implements=1.0, others=0.0
+/// - `All`:              all=1.0
+#[derive(Debug, Clone, Copy)]
+pub struct EdgeWeights {
+    pub calls: f64,
+    pub imports: f64,
+    pub implements: f64,
+    pub defines: f64,
+    pub test_of: f64,
+    pub references_docstring_of: f64,
+    pub declares_contract_with: f64,
+}
+
+impl EdgeWeights {
+    pub fn default_for(mode: BlastRadiusMode) -> Self {
+        match mode {
+            BlastRadiusMode::Impact => Self {
+                calls: 1.0,
+                implements: 0.9,
+                defines: 0.8,
+                imports: 0.5,
+                test_of: 0.3,
+                references_docstring_of: 0.2,
+                declares_contract_with: 0.2,
+            },
+            BlastRadiusMode::Callers => Self {
+                calls: 1.0,
+                ..Self::zero()
+            },
+            BlastRadiusMode::Tests => Self {
+                test_of: 1.0,
+                ..Self::zero()
+            },
+            BlastRadiusMode::Implementations => Self {
+                implements: 1.0,
+                ..Self::zero()
+            },
+            BlastRadiusMode::All => Self {
+                calls: 1.0,
+                imports: 1.0,
+                implements: 1.0,
+                defines: 1.0,
+                test_of: 1.0,
+                references_docstring_of: 1.0,
+                declares_contract_with: 1.0,
+            },
+        }
+    }
+
+    fn zero() -> Self {
+        Self {
+            calls: 0.0,
+            imports: 0.0,
+            implements: 0.0,
+            defines: 0.0,
+            test_of: 0.0,
+            references_docstring_of: 0.0,
+            declares_contract_with: 0.0,
+        }
+    }
+
+    pub fn weight(&self, kind: EdgeKind) -> f64 {
+        match kind {
+            EdgeKind::Calls => self.calls,
+            EdgeKind::Imports => self.imports,
+            EdgeKind::Implements => self.implements,
+            EdgeKind::Defines => self.defines,
+            EdgeKind::TestOf => self.test_of,
+            EdgeKind::ReferencesDocstringOf => self.references_docstring_of,
+            EdgeKind::DeclaresContractWith => self.declares_contract_with,
+        }
+    }
+
+    /// Merge a settings-supplied JSON object into the preset. The
+    /// object's keys must match the lowercase EdgeKind names
+    /// (`"calls"`, `"imports"`, `"implements"`, `"defines"`,
+    /// `"testOf"`, `"referencesDocstringOf"`,
+    /// `"declaresContractWith"`); each value is an `f64` clamped to
+    /// `[0.0, 1.0]`. Unknown keys are ignored — embedding apps should
+    /// log a warning if they want to surface typos.
+    pub fn apply_overrides(&mut self, overrides: &serde_json::Map<String, serde_json::Value>) {
+        let pull = |key: &str| -> Option<f64> {
+            overrides
+                .get(key)
+                .and_then(|v| v.as_f64())
+                .map(|f| f.clamp(0.0, 1.0))
+        };
+        if let Some(v) = pull("calls") {
+            self.calls = v;
+        }
+        if let Some(v) = pull("imports") {
+            self.imports = v;
+        }
+        if let Some(v) = pull("implements") {
+            self.implements = v;
+        }
+        if let Some(v) = pull("defines") {
+            self.defines = v;
+        }
+        if let Some(v) = pull("testOf") {
+            self.test_of = v;
+        }
+        if let Some(v) = pull("referencesDocstringOf") {
+            self.references_docstring_of = v;
+        }
+        if let Some(v) = pull("declaresContractWith") {
+            self.declares_contract_with = v;
         }
     }
 }
@@ -179,6 +423,7 @@ impl GraphStore {
             .with_context(|| format!("opening graph db: {}", db_path.display()))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
         conn.execute_batch(SCHEMA_SQL)?;
+        migrate_typed_edges(&conn)?;
         Ok(Self { conn })
     }
 
@@ -186,6 +431,7 @@ impl GraphStore {
     pub fn open_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA_SQL)?;
+        migrate_typed_edges(&conn)?;
         Ok(Self { conn })
     }
 
@@ -334,9 +580,20 @@ impl GraphStore {
     ///   files whose edges TARGET nodes in the changed file → those files
     ///   are the dependents.
     pub fn impact_radius(&self, changed_files: &[&str], max_depth: usize) -> Result<ImpactSummary> {
+        self.impact_radius_with_mode(changed_files, max_depth, BlastRadiusMode::All)
+    }
+
+    /// Mode-aware blast-radius traversal over typed edges.
+    pub fn impact_radius_with_mode(
+        &self,
+        changed_files: &[&str],
+        max_depth: usize,
+        mode: BlastRadiusMode,
+    ) -> Result<ImpactSummary> {
         if changed_files.is_empty() {
             return Ok(ImpactSummary::default());
         }
+        let edge_kinds = mode.edge_kind_sql_list();
 
         // 1. Create temp table for seed files
         self.conn.execute(
@@ -365,6 +622,7 @@ impl GraphStore {
                 JOIN nodes n ON n.file_path = a.file
                 JOIN edges e ON e.target_qn = n.qualified_name
                 WHERE a.depth < {max_depth}
+                  AND e.kind IN ({edge_kinds})
                   AND e.file_path != a.file
             )
             SELECT DISTINCT file FROM affected"
@@ -393,7 +651,7 @@ impl GraphStore {
                     SELECT 1 FROM edges e
                     JOIN nodes n ON n.qualified_name = e.target_qn
                     WHERE n.file_path = ?1
-                      AND (e.file_path LIKE '%test%' OR e.kind = 'TestedBy')
+                      AND (e.kind IN ('TestOf','TestedBy') OR e.file_path LIKE '%test%')
                 )",
                 params![cf],
                 |row| row.get(0),
@@ -410,6 +668,58 @@ impl GraphStore {
             test_gaps,
             truncated: false,
         })
+    }
+
+    /// C3: format impact result with per-file rank/specificity badges.
+    ///
+    /// `ranks` maps each file path to `(rank_score, specificity)` —
+    /// produced by [`crate::repo_map::rank_files_with_mode`] or
+    /// [`crate::repo_map::rank_files_with_weights`]. When `ranks`
+    /// covers the affected set, each emitted line gets a `[sp 0.92]`
+    /// suffix so the TUI panel and chat injection both surface the
+    /// HippoRAG specificity score the agent is paying for.
+    pub fn format_impact_for_prompt_ranked(
+        result: &ImpactSummary,
+        ranks: &std::collections::HashMap<String, (f64, f64)>,
+    ) -> String {
+        let badge = |path: &str| -> String {
+            ranks
+                .get(path)
+                .map(|(_, sp)| format!("{path} [sp {sp:.2}]"))
+                .unwrap_or_else(|| path.to_string())
+        };
+
+        let mut lines = Vec::new();
+        lines.push("[Impact analysis]:".to_string());
+
+        if !result.changed_files.is_empty() {
+            let labelled: Vec<String> = result.changed_files.iter().map(|p| badge(p)).collect();
+            lines.push(format!("Changed: {}", labelled.join(", ")));
+        }
+
+        let non_changed: Vec<String> = result
+            .affected_files
+            .iter()
+            .filter(|f| !result.changed_files.contains(f))
+            .map(|p| badge(p))
+            .collect();
+        if !non_changed.is_empty() {
+            lines.push(format!("Affected dependents: {}", non_changed.join(", ")));
+        }
+
+        if !result.affected_tests.is_empty() {
+            let labelled: Vec<String> = result.affected_tests.iter().map(|p| badge(p)).collect();
+            lines.push(format!("Affected tests: {}", labelled.join(", ")));
+        }
+
+        if !result.test_gaps.is_empty() {
+            lines.push(format!(
+                "Test gaps (no coverage): {}",
+                result.test_gaps.join(", ")
+            ));
+        }
+
+        lines.join("\n")
     }
 
     /// Format impact result as a prompt-friendly string.
@@ -458,6 +768,82 @@ impl GraphStore {
     pub fn commit(&self) -> Result<()> {
         self.conn.execute_batch("COMMIT")?;
         Ok(())
+    }
+
+    /// C4: project the persisted graph into file-level (source, target,
+    /// kind) triples for in-memory PageRank.
+    ///
+    /// `source` is the edge's `file_path` (where the reference lives);
+    /// `target` is the file containing the symbol matched by
+    /// `target_qn`. Self-edges are filtered. Used by the MCP
+    /// `blast_radius` handler to apply per-intent edge weights via
+    /// `BlastRadiusMode::edge_weight`.
+    pub fn file_edges(&self) -> Result<Vec<(String, String, EdgeKind)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT e.file_path, n.file_path, e.kind
+             FROM edges e
+             JOIN nodes n ON n.qualified_name = e.target_qn",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let src: String = row.get(0)?;
+            let tgt: String = row.get(1)?;
+            let kind_s: String = row.get(2)?;
+            Ok((src, tgt, kind_s))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (src, tgt, kind_s) = r?;
+            if src == tgt {
+                continue;
+            }
+            if let Some(kind) = EdgeKind::from_str(&kind_s) {
+                out.push((src, tgt, kind));
+            }
+        }
+        Ok(out)
+    }
+
+    /// All distinct file paths known to the graph (from both `nodes`
+    /// and `edges`). The MCP handler uses this as the node set when
+    /// projecting into a `DiGraph` for PageRank.
+    pub fn all_file_paths(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT file_path FROM nodes
+             UNION
+             SELECT DISTINCT file_path FROM edges",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Per-symbol document frequency: how many distinct files reference
+    /// a symbol with the same name. C3 callers use this to derive a
+    /// file-level specificity map without rebuilding the in-memory
+    /// `RepoMap` graph from disk.
+    pub fn symbol_document_frequency(&self) -> Result<std::collections::HashMap<String, usize>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT n.name, COUNT(DISTINCT n.file_path) FROM nodes n GROUP BY n.name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for r in rows {
+            let (name, df) = r?;
+            out.insert(name, df);
+        }
+        Ok(out)
+    }
+
+    /// Names of all symbols defined in `file_path`. Combined with
+    /// [`Self::symbol_document_frequency`] this lets the MCP handler
+    /// compute per-file specificity without loading the source files.
+    pub fn symbols_in_file(&self, file_path: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name FROM nodes WHERE file_path = ?1")?;
+        let rows = stmt.query_map(params![file_path], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// Resolve a symbol name to its qualified name(s) across the graph.
@@ -713,6 +1099,185 @@ mod tests {
     }
 
     #[test]
+    fn impact_radius_mode_filters_edge_kinds() {
+        let store = GraphStore::open_memory().unwrap();
+        store
+            .upsert_node(
+                NodeKind::Function,
+                "foo",
+                "src/lib.rs::foo",
+                "src/lib.rs",
+                Some(1),
+                None,
+                Some("rust"),
+                None,
+            )
+            .unwrap();
+        store
+            .upsert_node(
+                NodeKind::Function,
+                "run",
+                "src/app.rs::run",
+                "src/app.rs",
+                Some(1),
+                None,
+                Some("rust"),
+                None,
+            )
+            .unwrap();
+        store
+            .upsert_node(
+                NodeKind::Test,
+                "test_foo",
+                "tests/test_lib.rs::test_foo",
+                "tests/test_lib.rs",
+                Some(1),
+                None,
+                Some("rust"),
+                None,
+            )
+            .unwrap();
+        store
+            .insert_edge(
+                EdgeKind::Calls,
+                "src/app.rs::run",
+                "src/lib.rs::foo",
+                "src/app.rs",
+                2,
+            )
+            .unwrap();
+        store
+            .insert_edge(
+                EdgeKind::TestOf,
+                "tests/test_lib.rs::test_foo",
+                "src/lib.rs::foo",
+                "tests/test_lib.rs",
+                3,
+            )
+            .unwrap();
+
+        let callers = store
+            .impact_radius_with_mode(&["src/lib.rs"], 2, BlastRadiusMode::Callers)
+            .unwrap();
+        assert!(callers.affected_files.contains(&"src/app.rs".to_string()));
+        assert!(
+            !callers
+                .affected_files
+                .contains(&"tests/test_lib.rs".to_string())
+        );
+
+        let tests = store
+            .impact_radius_with_mode(&["src/lib.rs"], 2, BlastRadiusMode::Tests)
+            .unwrap();
+        assert!(
+            tests
+                .affected_files
+                .contains(&"tests/test_lib.rs".to_string())
+        );
+        assert!(!tests.affected_files.contains(&"src/app.rs".to_string()));
+    }
+
+    #[test]
+    fn edge_weights_overrides_clamp_and_fallback() {
+        let mut weights = EdgeWeights::default_for(BlastRadiusMode::Impact);
+        // Plan defaults for Impact mode.
+        assert_eq!(weights.weight(EdgeKind::Calls), 1.0);
+        assert_eq!(weights.weight(EdgeKind::TestOf), 0.3);
+
+        // User overrides via the JSON object shape from
+        // `repoMap.edges.weights.impact`. Out-of-range values clamp;
+        // unknown keys are ignored; un-listed kinds keep their preset.
+        let json = serde_json::json!({
+            "calls": 0.4,
+            "testOf": 1.5,
+            "imports": -0.1,
+            "unknownKind": 0.99,
+        });
+        weights.apply_overrides(json.as_object().unwrap());
+        assert_eq!(weights.weight(EdgeKind::Calls), 0.4);
+        assert_eq!(
+            weights.weight(EdgeKind::TestOf),
+            1.0,
+            "1.5 must clamp to 1.0"
+        );
+        assert_eq!(
+            weights.weight(EdgeKind::Imports),
+            0.0,
+            "-0.1 must clamp to 0.0"
+        );
+        assert_eq!(
+            weights.weight(EdgeKind::Implements),
+            0.9,
+            "Implements untouched: must keep preset"
+        );
+    }
+
+    #[test]
+    fn typed_edge_migration_defaults_null_kind_to_imports() {
+        // Simulate a pre-C4 database: insert a row with NULL kind and
+        // re-run the migration. After migration the kind is 'Imports'
+        // and the row participates in mode=all blast-radius queries.
+        let store = GraphStore::open_memory().unwrap();
+        store
+            .upsert_node(
+                NodeKind::Function,
+                "process",
+                "src/lib.rs::process",
+                "src/lib.rs",
+                Some(1),
+                None,
+                Some("rust"),
+                None,
+            )
+            .unwrap();
+        store
+            .upsert_node(
+                NodeKind::Function,
+                "caller",
+                "src/app.rs::caller",
+                "src/app.rs",
+                Some(1),
+                None,
+                Some("rust"),
+                None,
+            )
+            .unwrap();
+        // The current schema has `kind TEXT NOT NULL`, but a pre-C4
+        // database may have either NULL kinds (older schema) or empty
+        // strings (very early B-tier rows). The migration treats both
+        // the same, so we exercise the empty-string path which the
+        // current schema accepts.
+        store
+            .conn
+            .execute(
+                "INSERT INTO edges (kind, source_qn, target_qn, file_path, line)
+                 VALUES ('', 'src/app.rs::caller', 'src/lib.rs::process', 'src/app.rs', 3)",
+                [],
+            )
+            .unwrap();
+
+        super::migrate_typed_edges(&store.conn).unwrap();
+
+        let kind: String = store
+            .conn
+            .query_row(
+                "SELECT kind FROM edges WHERE source_qn = 'src/app.rs::caller'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, "Imports", "NULL kind must default to 'Imports'");
+
+        // The migrated edge participates in mode=all traversal.
+        let result = store.impact_radius(&["src/lib.rs"], 2).unwrap();
+        assert!(
+            result.affected_files.contains(&"src/app.rs".to_string()),
+            "migrated edge must be reachable: {:?}",
+            result.affected_files
+        );
+    }
+
+    #[test]
     fn impact_radius_empty_input() {
         let store = GraphStore::open_memory().unwrap();
         let result = store.impact_radius(&[], 5).unwrap();
@@ -734,7 +1299,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        // No TestedBy edge for src/lib.rs
+        // No TestOf edge for src/lib.rs
         let result = store.impact_radius(&["src/lib.rs"], 3).unwrap();
         assert!(result.test_gaps.contains(&"src/lib.rs".to_string()));
     }
@@ -805,6 +1370,26 @@ mod tests {
 
         let matches = store.resolve_symbol("process").unwrap();
         assert_eq!(matches.len(), 2);
+    }
+
+    #[test]
+    fn format_impact_prompt_ranked_renders_specificity_badge() {
+        let result = ImpactSummary {
+            changed_files: vec!["src/auth.rs".into()],
+            affected_files: vec!["src/auth.rs".into(), "src/api.rs".into()],
+            affected_tests: vec!["tests/auth_test.rs".into()],
+            test_gaps: vec![],
+            truncated: false,
+        };
+        let mut ranks = std::collections::HashMap::new();
+        ranks.insert("src/auth.rs".into(), (0.9, 0.92));
+        ranks.insert("src/api.rs".into(), (0.4, 0.71));
+        ranks.insert("tests/auth_test.rs".into(), (0.2, 0.05));
+
+        let text = GraphStore::format_impact_for_prompt_ranked(&result, &ranks);
+        assert!(text.contains("src/auth.rs [sp 0.92]"), "{text}");
+        assert!(text.contains("src/api.rs [sp 0.71]"), "{text}");
+        assert!(text.contains("tests/auth_test.rs [sp 0.05]"), "{text}");
     }
 
     #[test]

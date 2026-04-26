@@ -5,6 +5,7 @@ pub mod diff_engine;
 pub mod git;
 pub mod indent;
 pub mod iteration;
+pub mod mcp;
 pub mod memory;
 pub mod observer;
 pub mod path_pattern;

@@ -265,10 +265,7 @@ mod tests {
 
     #[test]
     fn overlap_disjoint_globs() {
-        assert!(!patterns_overlap(
-            "plans/claude-*.md",
-            "plans/codex-*.md"
-        ));
+        assert!(!patterns_overlap("plans/claude-*.md", "plans/codex-*.md"));
     }
 
     #[test]

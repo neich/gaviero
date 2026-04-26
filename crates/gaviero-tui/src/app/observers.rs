@@ -164,4 +164,72 @@ impl AcpObserver for TuiAcpObserver {
             session_id: session_id.to_string(),
         });
     }
+
+    fn on_memory_injected(&self, summary: &gaviero_core::observer::ChatInjectionSummary) {
+        let _ = self.tx.send(Event::ChatMemoryInjected {
+            conv_id: self.conv_id.clone(),
+            items_injected: summary.items_injected,
+            pool_size: summary.pool_size,
+            tokens_used: summary.tokens_used,
+            token_budget: summary.token_budget,
+        });
+    }
+}
+
+/// A4: forwards `MemoryObserver` callbacks from the writer task to the
+/// TUI event loop. Fires on every write the writer task processes, so
+/// the memory panel's "Recently Written" section can refresh in real
+/// time. Debouncing / rate-limiting lives on the panel side.
+pub(super) struct TuiMemoryObserver {
+    pub tx: mpsc::UnboundedSender<Event>,
+}
+
+impl gaviero_core::memory::MemoryObserver for TuiMemoryObserver {
+    fn on_write_enqueued(&self, kind: &str) {
+        let _ = self.tx.send(Event::MemoryWriteEnqueued {
+            kind: kind.to_string(),
+        });
+    }
+    fn on_write_committed(&self, kind: &str, _result: &gaviero_core::memory::WriteResult) {
+        let _ = self.tx.send(Event::MemoryWriteCommitted {
+            kind: kind.to_string(),
+        });
+    }
+    fn on_write_failed(&self, kind: &str, error: &str) {
+        let _ = self.tx.send(Event::MemoryWriteFailed {
+            kind: kind.to_string(),
+            error: error.to_string(),
+        });
+    }
+}
+
+/// A4: forwards `ManifestObserver::on_manifest_persisted` to the TUI
+/// event loop so the panel's "Injected Now" section can re-query the
+/// just-landed manifest without polling.
+pub(super) struct TuiManifestObserver {
+    pub tx: mpsc::UnboundedSender<Event>,
+}
+
+impl gaviero_core::memory::observer::ManifestObserver for TuiManifestObserver {
+    fn on_manifest_persisted(&self, turn_id: &str, session_id: &str) {
+        let _ = self.tx.send(Event::MemoryManifestPersisted {
+            turn_id: turn_id.to_string(),
+            session_id: session_id.to_string(),
+        });
+    }
+}
+
+/// A5: forwards read-only MCP tool calls into the TUI event loop.
+pub(super) struct TuiMcpObserver {
+    pub tx: mpsc::UnboundedSender<Event>,
+}
+
+impl gaviero_core::mcp::McpToolCallObserver for TuiMcpObserver {
+    fn on_tool_call(&self, entry: &gaviero_core::mcp::McpCallLogEntry) {
+        let _ = self.tx.send(Event::McpToolCall {
+            tool_name: entry.tool_name.clone(),
+            duration_ms: entry.duration.as_millis() as u64,
+            error: entry.error.clone(),
+        });
+    }
 }

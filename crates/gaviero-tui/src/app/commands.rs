@@ -18,6 +18,69 @@ pub(super) fn handle_swarm_command(app: &mut App) {
         return;
     }
 
+    // First-swarm-run Codex trust prompt. If the user has never
+    // answered, stash the task and open the modal — the dialog handler
+    // replays `run_swarm` after the answer persists.
+    if should_prompt_codex_trust(app) {
+        app.codex_trust_dialog = Some(super::state::CodexTrustDialog {
+            pending_task: task_desc,
+        });
+        return;
+    }
+
+    run_swarm(app, task_desc);
+}
+
+/// Returns `true` when the Codex trust consent has not yet been given
+/// or denied for this workspace — i.e. the value resolves to
+/// `"unknown"` (the hardcoded default).
+fn should_prompt_codex_trust(app: &App) -> bool {
+    use gaviero_core::workspace::settings as S;
+    let root = app.workspace.roots().first().map(|p| p.to_path_buf());
+    let value = app
+        .workspace
+        .resolve_setting(S::MCP_GAVIERO_CODEX_TRUST, root.as_deref());
+    matches!(value.as_str(), Some("unknown"))
+}
+
+fn mcp_config_for_workspace(
+    app: &App,
+    root: &std::path::Path,
+) -> gaviero_core::mcp::McpConfigSynth {
+    use gaviero_core::workspace::settings as S;
+
+    let enabled = app
+        .workspace
+        .resolve_setting(S::MCP_GAVIERO_ENABLED, Some(root))
+        .as_bool()
+        .unwrap_or(true);
+    let shim_binary = app
+        .workspace
+        .resolve_setting(S::MCP_GAVIERO_SHIM_BINARY, Some(root))
+        .as_str()
+        .unwrap_or("gaviero-mcp-shim")
+        .to_string();
+    let codex_trust = match app
+        .workspace
+        .resolve_setting(S::MCP_GAVIERO_CODEX_TRUST, Some(root))
+        .as_str()
+        .unwrap_or("unknown")
+    {
+        "granted" | "trusted" => gaviero_core::mcp::TrustConsent::Granted,
+        "denied" | "untrusted" => gaviero_core::mcp::TrustConsent::Denied,
+        _ => gaviero_core::mcp::TrustConsent::Unknown,
+    };
+
+    gaviero_core::mcp::McpConfigSynth {
+        worktree: root.to_path_buf(),
+        socket_path: root.join(".gaviero/mcp.sock"),
+        shim_binary,
+        codex_trust,
+        enabled,
+    }
+}
+
+pub(crate) fn run_swarm(app: &mut App, task_desc: String) {
     app.chat_state
         .add_user_message(&format!("/swarm {}", task_desc));
     app.chat_state.add_system_message(&format!(
@@ -45,13 +108,18 @@ pub(super) fn handle_swarm_command(app: &mut App) {
     let write_ns = app.chat_state.agent_settings.write_namespace.clone();
     let read_ns = app.chat_state.agent_settings.read_namespaces.clone();
     let memory = app.memory.clone();
+    let memory_writer = app.memory_writer.clone();
+    let mcp_config = mcp_config_for_workspace(app, &root);
     let excludes = parse_exclude_patterns(&app.workspace);
+    let specificity = app.workspace.resolve_specificity_config(Some(&root));
 
     tokio::spawn(async move {
         use gaviero_core::swarm::{pipeline, planner};
 
         let memory_ctx = if let Some(ref mem) = memory {
-            mem.search_context(&read_ns, &task_desc, 5).await
+            mem.workspace()
+                .search_context(&read_ns, &task_desc, 5)
+                .await
         } else {
             String::new()
         };
@@ -96,6 +164,9 @@ pub(super) fn handle_swarm_command(app: &mut App) {
             write_namespace: write_ns,
             context_files: vec![],
             excludes: vec![],
+            memory_writer,
+            mcp_config: Some(mcp_config),
+            specificity,
         };
 
         let observer = TuiSwarmObserver { tx: tx.clone() };
@@ -215,6 +286,9 @@ pub(super) fn handle_run_script_command(app: &mut App) {
     let write_ns = app.chat_state.agent_settings.write_namespace.clone();
     let read_ns = app.chat_state.agent_settings.read_namespaces.clone();
     let memory = app.memory.clone();
+    let memory_writer = app.memory_writer.clone();
+    let mcp_config = mcp_config_for_workspace(app, &root);
+    let specificity = app.workspace.resolve_specificity_config(Some(&root));
 
     tokio::spawn(async move {
         use gaviero_core::swarm::pipeline;
@@ -231,6 +305,9 @@ pub(super) fn handle_run_script_command(app: &mut App) {
             write_namespace: write_ns,
             context_files: vec![],
             excludes: vec![],
+            memory_writer,
+            mcp_config: Some(mcp_config),
+            specificity,
         };
 
         let observer = TuiSwarmObserver { tx: tx.clone() };
@@ -341,6 +418,9 @@ pub(super) fn handle_coordinated_swarm_command(app: &mut App) {
         .map(str::to_string)
         .unwrap_or_else(|| app.chat_state.effective_model().to_string());
     let memory = app.memory.clone();
+    let memory_writer = app.memory_writer.clone();
+    let mcp_config = mcp_config_for_workspace(app, &root);
+    let specificity = app.workspace.resolve_specificity_config(Some(&root));
 
     tokio::spawn(async move {
         use gaviero_core::swarm::{coordinator, pipeline};
@@ -355,6 +435,9 @@ pub(super) fn handle_coordinated_swarm_command(app: &mut App) {
             write_namespace: write_ns,
             context_files,
             excludes: vec![],
+            memory_writer,
+            mcp_config: Some(mcp_config),
+            specificity,
         };
 
         let coord_config = coordinator::CoordinatorConfig {
@@ -446,56 +529,450 @@ pub(super) fn handle_undo_swarm_command(app: &mut App) {
         .add_system_message("Swarm dashboard: press u to confirm undo all changes, Esc to cancel.");
 }
 
+/// A2: resolve the scope a `/remember` invocation targets.
+///
+/// * `/remember` → user's configured default (`memory.remember.defaultScope`)
+/// * `/remember-here` → Run (session-local)
+/// * `/remember-module` → Module (requires active file; else Repo with a note)
+/// * `/remember-workspace` → Workspace
+/// * `/remember-global` → Global
+///
+/// Returns `Ok((scope, variant_label, module_fallback_note))`. The
+/// caller emits `note` if non-empty to teach the user about the
+/// fallback.
+fn resolve_remember_scope(
+    app: &App,
+    variant: &str,
+) -> Result<
+    (
+        gaviero_core::memory::WriteScope,
+        &'static str,
+        Option<String>,
+    ),
+    String,
+> {
+    use gaviero_core::memory::{WriteScope, hash_path};
+    use gaviero_core::workspace::settings as S;
+
+    let workspace_root = app
+        .workspace
+        .roots()
+        .first()
+        .cloned()
+        .ok_or_else(|| "no workspace root".to_string())?;
+    let repo_id = hash_path(&workspace_root);
+
+    match variant {
+        "here" => {
+            let run_id = app.chat_state.conversations[app.chat_state.active_conv]
+                .id
+                .clone();
+            Ok((WriteScope::Run { repo_id, run_id }, "Run", None))
+        }
+        "module" => {
+            let module_path = app
+                .buffers
+                .get(app.active_buffer)
+                .and_then(|b| b.path.as_ref())
+                .and_then(|p| p.strip_prefix(&workspace_root).ok())
+                .and_then(|rel| rel.parent().map(|p| p.to_string_lossy().to_string()))
+                .filter(|s| !s.is_empty());
+            match module_path {
+                Some(m) => Ok((
+                    WriteScope::Module {
+                        repo_id,
+                        module_path: m,
+                    },
+                    "Module",
+                    None,
+                )),
+                None => Ok((
+                    WriteScope::Repo { repo_id },
+                    "Repo",
+                    Some(
+                        "ℹ Module scope requires a focused file; stored at [Repo] instead."
+                            .to_string(),
+                    ),
+                )),
+            }
+        }
+        "workspace" => Ok((WriteScope::Workspace, "Workspace", None)),
+        "global" => Ok((WriteScope::Global, "Global", None)),
+        "" => {
+            // Default variant — read from settings.
+            let default = app
+                .workspace
+                .resolve_setting(S::MEMORY_REMEMBER_DEFAULT_SCOPE, Some(&workspace_root))
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "repo".to_string());
+            match default.to_ascii_lowercase().as_str() {
+                "run" => {
+                    let run_id = app.chat_state.conversations[app.chat_state.active_conv]
+                        .id
+                        .clone();
+                    Ok((WriteScope::Run { repo_id, run_id }, "Run", None))
+                }
+                "module" => resolve_remember_scope(app, "module"),
+                "workspace" => Ok((WriteScope::Workspace, "Workspace", None)),
+                "global" => Ok((WriteScope::Global, "Global", None)),
+                _ => Ok((WriteScope::Repo { repo_id }, "Repo", None)),
+            }
+        }
+        other => Err(format!("unknown /remember variant: {other}")),
+    }
+}
+
+/// Tier B / B5: `/consolidate-session` — manual end-of-session
+/// consolidator trigger. Pulls the last N turns of transcript out of
+/// the active conversation, stamps the session's repo + run ids, and
+/// hands the lot to the writer task. Result lands as a system message.
+pub(super) fn handle_consolidate_session_command(app: &mut App) {
+    let _ = app.chat_state.take_input();
+    app.chat_state.add_user_message("/consolidate-session");
+
+    let Some(writer) = app.memory_writer.clone() else {
+        app.chat_state
+            .add_system_message("Memory writer not initialised; cannot consolidate.");
+        return;
+    };
+
+    let conv_id = app.chat_state.conversations[app.chat_state.active_conv]
+        .id
+        .clone();
+    let workspace_root = app
+        .workspace
+        .roots()
+        .first()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let repo_id = gaviero_core::memory::hash_path(&workspace_root);
+
+    // Concat the conversation's visible turn texts as a coarse
+    // transcript. Good enough for an explicit /consolidate-session
+    // trigger; the idle-trigger path (Tier B5 follow-up) uses the same
+    // helper.
+    let transcript: String = app.chat_state.conversations[app.chat_state.active_conv]
+        .messages
+        .iter()
+        .map(|m| format!("{:?}: {}", m.role, m.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let tx = app.event_tx.clone();
+    tokio::spawn(async move {
+        let res = writer
+            .session_consolidate(conv_id.clone(), repo_id, None, conv_id.clone(), transcript)
+            .await;
+        let msg = match res {
+            Ok(_) => "Session consolidator: queued for processing.".to_string(),
+            Err(e) => format!("Session consolidator failed: {e}"),
+        };
+        let _ = tx.send(Event::MessageComplete {
+            conv_id: String::new(),
+            role: "system".to_string(),
+            content: msg,
+        });
+    });
+}
+
+/// Tier B / B5: `/sleep [--dry-run]` — kick off the sleeptime pass.
+/// Fire-and-forget; the writer task handles audit + observer events.
+pub(super) fn handle_sleep_command(app: &mut App) {
+    let input = app.chat_state.take_input();
+    let trimmed = input.trim();
+    let dry_run = trimmed.contains("--dry-run");
+    app.chat_state.add_user_message(trimmed);
+
+    let Some(writer) = app.memory_writer.clone() else {
+        app.chat_state
+            .add_system_message("Memory writer not initialised; cannot run sleeptime.");
+        return;
+    };
+    let payload = serde_json::json!({ "dry_run": dry_run });
+    if let Err(e) = writer.sleeptime(payload) {
+        app.chat_state
+            .add_system_message(&format!("Sleeptime enqueue failed: {e}"));
+    } else {
+        app.chat_state.add_system_message(if dry_run {
+            "Sleeptime queued (dry-run; no writes will land)."
+        } else {
+            "Sleeptime queued."
+        });
+    }
+}
+
+/// Tier B / B1: `/reembed` — re-embed every memory under the currently
+/// configured embedder. Runs on a tokio task so the TUI stays
+/// responsive; takes a `.bak-<ts>` of `memory.db` before mutating
+/// (mandatory rollback path), then streams progress as system messages.
+///
+/// The configured embedder comes from `memory.embedder.model`; if it
+/// matches what's already stamped in `_gaviero_meta.embedder_model`,
+/// the run still goes through but every row hits the
+/// `current_model == new_model_id` skip path inside `reembed_all`.
+pub(super) fn handle_reembed_command(app: &mut App) {
+    use gaviero_core::workspace::settings as S;
+    let _ = app.chat_state.take_input();
+    app.chat_state.add_user_message("/reembed");
+
+    let Some(store) = app.memory.clone() else {
+        app.chat_state
+            .add_system_message("Memory not initialized; cannot run /reembed.");
+        return;
+    };
+
+    let root = app
+        .workspace
+        .roots()
+        .first()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let new_model = app
+        .workspace
+        .resolve_setting(S::MEMORY_EMBEDDER_MODEL, Some(&root))
+        .as_str()
+        .unwrap_or("nomic")
+        .to_string();
+    let batch_size = app
+        .workspace
+        .resolve_setting(S::MEMORY_EMBEDDER_REEMBED_BATCH_SIZE, Some(&root))
+        .as_u64()
+        .unwrap_or(32) as usize;
+
+    let tx = app.event_tx.clone();
+    tokio::spawn(async move {
+        let _ = tx.send(Event::MessageComplete {
+            conv_id: String::new(),
+            role: "system".to_string(),
+            content: format!(
+                "Re-embedding memories with `{new_model}` (batch {batch_size}). \
+                 A `.bak-<ts>` of memory.db is taken first."
+            ),
+        });
+
+        // Load the new embedder OUTSIDE the spawn-blocking — ONNX init
+        // is CPU-heavy, so push it off the runtime.
+        let new_model_for_load = new_model.clone();
+        let new_embedder = match tokio::task::spawn_blocking(move || {
+            gaviero_core::memory::build_embedder_by_name(&new_model_for_load)
+        })
+        .await
+        {
+            Ok(Ok(e)) => e,
+            Ok(Err(e)) => {
+                let _ = tx.send(Event::MessageComplete {
+                    conv_id: String::new(),
+                    role: "system".to_string(),
+                    content: format!("/reembed: failed to load `{new_model}`: {e}"),
+                });
+                return;
+            }
+            Err(e) => {
+                let _ = tx.send(Event::MessageComplete {
+                    conv_id: String::new(),
+                    role: "system".to_string(),
+                    content: format!("/reembed: embedder load panicked: {e}"),
+                });
+                return;
+            }
+        };
+
+        // Reembed currently runs against the workspace store only.
+        // Per-folder reembed is a follow-up: extend reembed_all to
+        // accept &MemoryStores and iterate opened_stores().
+        let workspace_store = store.workspace().clone();
+        match gaviero_core::memory::reembed_migration::reembed_all(
+            &workspace_store,
+            new_embedder,
+            batch_size,
+            None,
+        )
+        .await
+        {
+            Ok(report) => {
+                let _ = tx.send(Event::MessageComplete {
+                    conv_id: String::new(),
+                    role: "system".to_string(),
+                    content: format!(
+                        "/reembed done: {} re-embedded, {} skipped, {} failed (total {}). Backup: {}",
+                        report.re_embedded,
+                        report.skipped,
+                        report.failed,
+                        report.total,
+                        report
+                            .backup_path
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "(in-memory store; no backup)".into()),
+                    ),
+                });
+            }
+            Err(e) => {
+                let _ = tx.send(Event::MessageComplete {
+                    conv_id: String::new(),
+                    role: "system".to_string(),
+                    content: format!("/reembed failed: {e}"),
+                });
+            }
+        }
+    });
+}
+
 pub(super) fn handle_remember_command(app: &mut App) {
     let input = app.chat_state.take_input();
-    let text = input.trim().strip_prefix("/remember").unwrap_or("").trim();
+    let trimmed = input.trim();
+
+    // Parse variant from the head word.
+    let (variant, rest) = if let Some(r) = trimmed.strip_prefix("/remember-here") {
+        ("here", r)
+    } else if let Some(r) = trimmed.strip_prefix("/remember-module") {
+        ("module", r)
+    } else if let Some(r) = trimmed.strip_prefix("/remember-workspace") {
+        ("workspace", r)
+    } else if let Some(r) = trimmed.strip_prefix("/remember-global") {
+        ("global", r)
+    } else if let Some(r) = trimmed.strip_prefix("/remember") {
+        ("", r)
+    } else {
+        return;
+    };
+    let text = rest.trim();
 
     if text.is_empty() {
         app.chat_state.add_system_message(
-            "Usage: /remember <text to remember>\n\
-             Stores text to semantic memory for future retrieval.",
+            "Usage: /remember <text> (default scope)\n\
+             /remember-here <text>       — Run (dies with session)\n\
+             /remember-module <text>     — Module (current file's dir)\n\
+             /remember-workspace <text>  — Workspace\n\
+             /remember-global <text>     — Global\n\
+             Default scope is configurable via memory.remember.defaultScope.",
         );
         return;
     }
 
     app.chat_state.add_user_message(&input);
 
-    let Some(ref memory) = app.memory else {
+    let Some(ref writer) = app.memory_writer else {
         app.chat_state.add_system_message(
             "Memory is not available (initialization may still be in progress).",
         );
         return;
     };
 
-    let mem = memory.clone();
-    let ns = app.chat_state.agent_settings.write_namespace.clone();
+    let (scope, scope_label, fallback_note) = match resolve_remember_scope(app, variant) {
+        Ok(v) => v,
+        Err(e) => {
+            app.chat_state
+                .add_system_message(&format!("/remember: {e}"));
+            return;
+        }
+    };
+    if let Some(note) = &fallback_note {
+        app.chat_state.add_system_message(note);
+    }
+
+    // A2: before writing, check for a near-duplicate at a broader scope
+    // so we can print the "reinforced" confirmation instead of a plain
+    // insertion badge. The check uses `search_scoped` with the target
+    // scope's MemoryScope chain.
+    let writer = writer.clone();
     let content = text.to_string();
-    let key = format!(
-        "user:{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-    );
     let tx = app.event_tx.clone();
     let conv_id = app.chat_state.conversations[app.chat_state.active_conv]
         .id
         .clone();
+    let memory = app.memory.clone();
+    let show_badge = app
+        .workspace
+        .resolve_setting(
+            gaviero_core::workspace::settings::MEMORY_REMEMBER_SHOW_SCOPE_BADGE,
+            None,
+        )
+        .as_bool()
+        .unwrap_or(true);
+    let show_reinforce = app
+        .workspace
+        .resolve_setting(
+            gaviero_core::workspace::settings::MEMORY_REMEMBER_SHOW_SIMILARITY_ON_REINFORCE,
+            None,
+        )
+        .as_bool()
+        .unwrap_or(true);
+    let workspace_root = app
+        .workspace
+        .roots()
+        .first()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
 
     tokio::spawn(async move {
-        match mem.store(&ns, &key, &content, None).await {
-            Ok(_) => {
+        // Pre-check: do we have a very similar memory at a broader scope?
+        // Prefix the scope chain from the configured workspace down to
+        // Module so cascading search covers everything wider than Run.
+        let reinforce_hit: Option<(String, f32)> = match &memory {
+            Some(mem) => {
+                let mscope = gaviero_core::memory::MemoryScope::from_context(
+                    &workspace_root,
+                    Some(&workspace_root),
+                    None,
+                    None,
+                );
+                let cfg =
+                    gaviero_core::memory::SearchConfig::new(&content, mscope).with_max_results(1);
+                match mem.workspace().search_scoped(&cfg).await {
+                    Ok(ref results) if !results.is_empty() && results[0].raw_similarity >= 0.90 => {
+                        let m = &results[0];
+                        let label = match m.scope_level {
+                            0 => "Global",
+                            1 => "Workspace",
+                            2 => "Repo",
+                            3 => "Module",
+                            _ => "Run",
+                        };
+                        Some((label.to_string(), m.raw_similarity))
+                    }
+                    _ => None,
+                }
+            }
+            None => None,
+        };
+
+        match writer.user_remember_scoped(scope, content.clone()).await {
+            Ok(result) => {
+                let badge = if show_badge {
+                    format!("[{scope_label}] ")
+                } else {
+                    String::new()
+                };
+                let body = match (&result, &reinforce_hit) {
+                    (_, Some((other_label, sim))) if show_reinforce => format!(
+                        "✓ Reinforced existing [{other_label}] memory (similarity {sim:.2}): \
+                         \"{content}\""
+                    ),
+                    (gaviero_core::memory::WriteResult::Deduplicated(_), _) => {
+                        format!("✓ {badge}Already known: \"{content}\"")
+                    }
+                    (gaviero_core::memory::WriteResult::AlreadyCovered, _) => {
+                        format!("✓ {badge}Covered by a broader scope; no new row: \"{content}\"")
+                    }
+                    _ => format!("✓ {badge}Remembered: \"{content}\""),
+                };
                 let _ = tx.send(Event::MessageComplete {
                     conv_id,
                     role: "system".to_string(),
-                    content: format!("Remembered: \"{}\"", content),
+                    content: body,
                 });
             }
             Err(e) => {
+                let msg = if e.to_string().contains("timeout") {
+                    format!("⧖ Queued [{scope_label}] \"{content}\" (writer busy)")
+                } else {
+                    format!("Failed to store memory: {e}")
+                };
                 let _ = tx.send(Event::MessageComplete {
                     conv_id,
                     role: "system".to_string(),
-                    content: format!("Failed to store memory: {}", e),
+                    content: msg,
                 });
             }
         }

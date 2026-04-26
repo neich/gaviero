@@ -75,6 +75,13 @@ pub fn compile_with_vars(
     };
 
     // Phase 3: Compile
-    compiler::compile_ast_with_vars(&ast, source, filename, workflow, runtime_prompt, override_vars)
-        .map_err(|e| miette::Report::new(e))
+    compiler::compile_ast_with_vars(
+        &ast,
+        source,
+        filename,
+        workflow,
+        runtime_prompt,
+        override_vars,
+    )
+    .map_err(|e| miette::Report::new(e))
 }

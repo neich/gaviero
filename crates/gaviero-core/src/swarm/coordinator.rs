@@ -16,6 +16,7 @@ use super::models::{AgentBackend, WorkUnit};
 use super::planner::extract_json;
 use super::validation;
 use super::verify::VerificationStrategy;
+use crate::memory::MemoryStores;
 use crate::memory::store::{MemoryStore, PrivacyFilter};
 use crate::types::{FileScope, ModelTier, PrivacyLevel};
 
@@ -104,12 +105,12 @@ pub struct FailedUnit {
 
 /// The coordinator: plans tier-annotated task DAGs via a single model call.
 pub struct Coordinator {
-    memory: Option<Arc<MemoryStore>>,
+    memory: Option<Arc<MemoryStores>>,
     config: CoordinatorConfig,
 }
 
 impl Coordinator {
-    pub fn new(memory: Option<Arc<MemoryStore>>, config: CoordinatorConfig) -> Self {
+    pub fn new(memory: Option<Arc<MemoryStores>>, config: CoordinatorConfig) -> Self {
         Self { memory, config }
     }
 
@@ -128,13 +129,14 @@ impl Coordinator {
     ) -> Result<TaskDAG> {
         // Memory enrichment (privacy-filtered for API)
         let memory_context = if let Some(ref mem) = self.memory {
-            mem.search_context_filtered(
-                read_namespaces,
-                prompt,
-                10,
-                PrivacyFilter::ExcludeLocalOnly,
-            )
-            .await
+            mem.workspace()
+                .search_context_filtered(
+                    read_namespaces,
+                    prompt,
+                    10,
+                    PrivacyFilter::ExcludeLocalOnly,
+                )
+                .await
         } else {
             String::new()
         };
@@ -231,13 +233,14 @@ impl Coordinator {
             o.on_streaming_status("Searching memory context...");
         }
         let memory_context = if let Some(ref mem) = self.memory {
-            mem.search_context_filtered(
-                read_namespaces,
-                prompt,
-                10,
-                PrivacyFilter::ExcludeLocalOnly,
-            )
-            .await
+            mem.workspace()
+                .search_context_filtered(
+                    read_namespaces,
+                    prompt,
+                    10,
+                    PrivacyFilter::ExcludeLocalOnly,
+                )
+                .await
         } else {
             String::new()
         };
@@ -332,7 +335,11 @@ impl Coordinator {
         }
 
         // Strategy 2: semantic search for matching prior runs
-        let results = mem.search_multi(namespaces, prompt, 20).await.ok()?;
+        let results = mem
+            .workspace()
+            .search_multi(namespaces, prompt, 20)
+            .await
+            .ok()?;
 
         // Filter to agent result entries with high similarity
         let agent_results: Vec<_> = results
@@ -368,13 +375,17 @@ impl Coordinator {
     /// Load continuity context for a specific run ID from memory.
     async fn load_continuity_for_run(
         &self,
-        mem: &MemoryStore,
+        mem: &Arc<MemoryStores>,
         namespaces: &[String],
         run_id: &str,
     ) -> Option<ContinuityContext> {
         // Search for all entries from this run
         let query = format!("agents:{}", run_id);
-        let results = mem.search_multi(namespaces, &query, 50).await.ok()?;
+        let results = mem
+            .workspace()
+            .search_multi(namespaces, &query, 50)
+            .await
+            .ok()?;
 
         let agent_entries: Vec<_> = results
             .iter()
@@ -412,6 +423,7 @@ impl Coordinator {
         // Load plan summary from verification entry if available
         let verification_key = format!("verification:{}", run_id);
         let plan_summary = mem
+            .workspace()
             .get(
                 namespaces.first().map(|s| s.as_str()).unwrap_or("default"),
                 &verification_key,

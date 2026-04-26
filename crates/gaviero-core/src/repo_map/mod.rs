@@ -14,9 +14,10 @@
 //!
 //! See Phase 5 of the implementation plan.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use petgraph::graph::DiGraph;
+use petgraph::graph::{DiGraph, NodeIndex};
 
 pub mod builder;
 pub mod edges;
@@ -47,9 +48,17 @@ pub struct Symbol {
     pub line: usize,
 }
 
-/// An edge between two file nodes (future: parse-based reference).
+/// A typed edge between two file nodes.
 #[derive(Debug, Clone)]
-pub struct ReferenceEdge;
+pub struct ReferenceEdge {
+    pub kind: store::EdgeKind,
+}
+
+impl ReferenceEdge {
+    pub fn new(kind: store::EdgeKind) -> Self {
+        Self { kind }
+    }
+}
 
 // ── Context plan ─────────────────────────────────────────────
 
@@ -64,6 +73,63 @@ pub struct ContextPlan {
     pub repo_outline: String,
     /// Estimated total token cost of this plan.
     pub token_estimate: usize,
+}
+
+/// Compute IDF-like node specificity for the file-level repo map.
+///
+/// The persisted code graph stores symbol-level nodes, but this in-memory
+/// `RepoMap` ranks files. We therefore collapse symbol specificity onto each
+/// file by averaging the normalized specificity of its extracted symbols.
+pub fn compute_specificity_map(
+    graph: &DiGraph<FileNode, ReferenceEdge>,
+    stop_symbol_threshold: f64,
+) -> HashMap<NodeIndex, f64> {
+    let n = graph.node_count();
+    if n == 0 {
+        return HashMap::new();
+    }
+
+    let mut df: HashMap<String, usize> = HashMap::new();
+    for idx in graph.node_indices() {
+        let mut seen: HashSet<&str> = HashSet::new();
+        for sym in &graph[idx].symbols {
+            if seen.insert(sym.name.as_str()) {
+                *df.entry(sym.name.clone()).or_default() += 1;
+            }
+        }
+    }
+
+    let mut raw_by_symbol: HashMap<&str, f64> = HashMap::new();
+    let mut max_raw = 0.0f64;
+    for (symbol, count) in &df {
+        let ratio = *count as f64 / n as f64;
+        let raw = if ratio > stop_symbol_threshold {
+            0.0
+        } else {
+            (n as f64 / *count as f64).ln().max(0.0)
+        };
+        max_raw = max_raw.max(raw);
+        raw_by_symbol.insert(symbol.as_str(), raw);
+    }
+
+    graph
+        .node_indices()
+        .map(|idx| {
+            let symbols = &graph[idx].symbols;
+            let specificity = if symbols.is_empty() {
+                1.0
+            } else if max_raw <= f64::EPSILON {
+                0.0
+            } else {
+                let sum: f64 = symbols
+                    .iter()
+                    .map(|sym| raw_by_symbol.get(sym.name.as_str()).copied().unwrap_or(0.0))
+                    .sum();
+                (sum / symbols.len() as f64 / max_raw).clamp(0.0, 1.0)
+            };
+            (idx, specificity)
+        })
+        .collect()
 }
 
 // ── M3 structured candidates (V9 §4) ─────────────────────────
@@ -103,6 +169,7 @@ pub enum GraphDecision {
 pub struct GraphCandidate {
     pub path: PathBuf,
     pub rank_score: f64,
+    pub specificity: f64,
     pub confidence: GraphConfidence,
     pub decision: GraphDecision,
     pub token_estimate: usize,
@@ -116,19 +183,198 @@ pub struct GraphCandidate {
     pub content_digest: Option<String>,
 }
 
+/// C3 + C4: rank a set of files using mode-weighted PageRank +
+/// specificity, sourced from the persisted [`store::GraphStore`].
+///
+/// Used by the MCP `blast_radius` handler: the SQL CTE picks which
+/// files are reachable in the chosen mode, this function then orders
+/// them by per-intent edge weights with HippoRAG-style stop-symbol
+/// damping. Returns one `(score, specificity)` pair per file in
+/// `affected`. Files absent from the graph (e.g. seed paths that don't
+/// appear as edge endpoints) get `(0.0, 1.0)` so they don't get
+/// silently dropped from the output.
+pub fn rank_files_with_mode(
+    store: &store::GraphStore,
+    seeds: &[&str],
+    affected: &[String],
+    mode: store::BlastRadiusMode,
+    config: SpecificityConfig,
+) -> anyhow::Result<HashMap<String, (f64, f64)>> {
+    rank_files_with_weights(
+        store,
+        seeds,
+        affected,
+        store::EdgeWeights::default_for(mode),
+        config,
+    )
+}
+
+/// Variant of [`rank_files_with_mode`] that takes an explicit
+/// [`store::EdgeWeights`] map. Used by the MCP `blast_radius` handler
+/// after merging `repoMap.edges.weights.<intent>` settings overrides
+/// onto the mode preset.
+pub fn rank_files_with_weights(
+    store: &store::GraphStore,
+    seeds: &[&str],
+    affected: &[String],
+    weights: store::EdgeWeights,
+    config: SpecificityConfig,
+) -> anyhow::Result<HashMap<String, (f64, f64)>> {
+    use petgraph::graph::DiGraph;
+
+    // 1. Pull the projected file edges and the universe of files.
+    let edges = store.file_edges()?;
+    let mut paths = store.all_file_paths()?;
+    for s in seeds {
+        if !paths.contains(&s.to_string()) {
+            paths.push(s.to_string());
+        }
+    }
+    for p in affected {
+        if !paths.contains(p) {
+            paths.push(p.clone());
+        }
+    }
+
+    // 2. Build the DiGraph keyed by file path.
+    let mut g: DiGraph<String, store::EdgeKind> = DiGraph::new();
+    let mut idx_for: HashMap<String, NodeIndex> = HashMap::new();
+    for p in &paths {
+        let idx = g.add_node(p.clone());
+        idx_for.insert(p.clone(), idx);
+    }
+    for (src, tgt, kind) in edges {
+        if let (Some(&s_i), Some(&t_i)) = (idx_for.get(&src), idx_for.get(&tgt)) {
+            g.add_edge(s_i, t_i, kind);
+        }
+    }
+
+    // 3. C3 specificity at the file level: derive per-symbol IDF from
+    //    the persisted nodes table, then average over each file's
+    //    symbols. Mirrors `compute_specificity_map` but operates on
+    //    SQLite-backed metadata so MCP doesn't have to rebuild the
+    //    in-memory `RepoMap` graph.
+    let specificity_map: HashMap<NodeIndex, f64> = if config.enabled {
+        let df = store.symbol_document_frequency()?;
+        let n = paths.len().max(1) as f64;
+        let mut max_raw = 0.0f64;
+        let mut raw_by_symbol: HashMap<String, f64> = HashMap::new();
+        for (sym, count) in &df {
+            let ratio = *count as f64 / n;
+            let raw = if ratio > config.stop_symbol_threshold {
+                0.0
+            } else {
+                (n / *count as f64).ln().max(0.0)
+            };
+            max_raw = max_raw.max(raw);
+            raw_by_symbol.insert(sym.clone(), raw);
+        }
+        let mut map = HashMap::new();
+        for p in &paths {
+            let symbols = store.symbols_in_file(p).unwrap_or_default();
+            let s = if symbols.is_empty() {
+                1.0
+            } else if max_raw <= f64::EPSILON {
+                0.0
+            } else {
+                let sum: f64 = symbols
+                    .iter()
+                    .map(|name| raw_by_symbol.get(name).copied().unwrap_or(0.0))
+                    .sum();
+                (sum / symbols.len() as f64 / max_raw).clamp(0.0, 1.0)
+            };
+            if let Some(&idx) = idx_for.get(p) {
+                map.insert(idx, s);
+            }
+        }
+        map
+    } else {
+        idx_for.values().map(|&i| (i, 1.0)).collect()
+    };
+
+    // 4. Mode-weighted personalized PageRank seeded by the changed files.
+    let seed_indices: Vec<NodeIndex> = seeds
+        .iter()
+        .filter_map(|s| idx_for.get(*s).copied())
+        .collect();
+    let ranks = page_rank::rank_nodes_weighted(
+        &g,
+        &seed_indices,
+        0.85,
+        15,
+        Some(&specificity_map),
+        |kind| weights.weight(*kind),
+    );
+
+    // 5. Project back to per-affected-file scores.
+    let mut out = HashMap::new();
+    for path in affected {
+        let idx = idx_for.get(path).copied();
+        let score = idx.and_then(|i| ranks.get(&i).copied()).unwrap_or(0.0);
+        let specificity = idx
+            .and_then(|i| specificity_map.get(&i).copied())
+            .unwrap_or(1.0);
+        out.insert(path.clone(), (score, specificity));
+    }
+    Ok(out)
+}
+
 // ── RepoMap ──────────────────────────────────────────────────
+
+/// C3: per-build specificity configuration.
+///
+/// `enabled = false` skips the IDF computation entirely and emits a map
+/// of `1.0` for every node — equivalent to disabling C3 weighting
+/// without a code change. `stop_symbol_threshold` sets the file-frequency
+/// ratio above which a symbol is treated as a stop symbol (specificity
+/// 0.0). Defaults match the plan's recommendation.
+#[derive(Debug, Clone, Copy)]
+pub struct SpecificityConfig {
+    pub enabled: bool,
+    pub stop_symbol_threshold: f64,
+}
+
+impl Default for SpecificityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            stop_symbol_threshold: 0.5,
+        }
+    }
+}
 
 /// Repo reference graph + PageRank ranker.
 pub struct RepoMap {
     graph: DiGraph<FileNode, ReferenceEdge>,
+    specificity_map: HashMap<NodeIndex, f64>,
 }
 
 impl RepoMap {
     /// Build a `RepoMap` by scanning `workspace`, skipping any path matching
     /// `excludes` (see [`builder::is_excluded`]).
     pub fn build(workspace: &Path, excludes: &[String]) -> anyhow::Result<Self> {
+        Self::build_with_config(workspace, excludes, SpecificityConfig::default())
+    }
+
+    /// Variant of [`Self::build`] that takes an explicit
+    /// [`SpecificityConfig`]. Used by the workspace settings layer to
+    /// honor `repoMap.specificity.enabled` and
+    /// `repoMap.specificity.stopSymbolThreshold` without rebuilding.
+    pub fn build_with_config(
+        workspace: &Path,
+        excludes: &[String],
+        config: SpecificityConfig,
+    ) -> anyhow::Result<Self> {
         let graph = builder::build(workspace, excludes)?;
-        Ok(Self { graph })
+        let specificity_map = if config.enabled {
+            compute_specificity_map(&graph, config.stop_symbol_threshold)
+        } else {
+            graph.node_indices().map(|idx| (idx, 1.0)).collect()
+        };
+        Ok(Self {
+            graph,
+            specificity_map,
+        })
     }
 
     /// V9 §11 M3: structured per-file ranking for the planner.
@@ -147,22 +393,42 @@ impl RepoMap {
         owned: &[String],
         budget_tokens: usize,
     ) -> Vec<GraphCandidate> {
-        use petgraph::graph::NodeIndex;
-        use std::collections::HashMap;
+        self.rank_for_agent_structured_with_mode(owned, budget_tokens, store::BlastRadiusMode::All)
+    }
 
+    /// C4: mode-aware structured ranking.
+    ///
+    /// Uses the per-intent edge weight preset from `BlastRadiusMode` so
+    /// `mode=callers` ranks files by inbound `Calls` edges only,
+    /// `mode=tests` by `TestOf` only, `mode=impact` by the recommended
+    /// blend (Calls=1.0, Implements=0.9, Defines=0.8, Imports=0.5,
+    /// TestOf=0.3, others=0.2), and `mode=all` reproduces the legacy
+    /// uniform weighting.
+    pub fn rank_for_agent_structured_with_mode(
+        &self,
+        owned: &[String],
+        budget_tokens: usize,
+        mode: store::BlastRadiusMode,
+    ) -> Vec<GraphCandidate> {
         let owned_indices: Vec<NodeIndex> = self
             .graph
             .node_indices()
             .filter(|&idx| {
                 let p = self.graph[idx].path.to_string_lossy();
-                owned.iter().any(|o| {
-                    o == "." || o == "./" || crate::path_pattern::matches(o, &p)
-                })
+                owned
+                    .iter()
+                    .any(|o| o == "." || o == "./" || crate::path_pattern::matches(o, &p))
             })
             .collect();
 
-        let ranks: HashMap<NodeIndex, f64> =
-            page_rank::rank_nodes(&self.graph, &owned_indices, 0.85, 15);
+        let ranks: HashMap<NodeIndex, f64> = page_rank::rank_nodes_weighted(
+            &self.graph,
+            &owned_indices,
+            0.85,
+            15,
+            Some(&self.specificity_map),
+            |edge: &ReferenceEdge| mode.edge_weight(edge.kind),
+        );
 
         let mut sorted: Vec<NodeIndex> = self.graph.node_indices().collect();
         sorted.sort_by(|a, b| {
@@ -191,6 +457,7 @@ impl RepoMap {
             let node = &self.graph[*idx];
             let path_str = node.path.to_string_lossy().to_string();
             let rank_score = *ranks.get(idx).unwrap_or(&0.0);
+            let specificity = *self.specificity_map.get(idx).unwrap_or(&1.0);
             let confidence = if rank_idx < high_cutoff {
                 GraphConfidence::High
             } else if rank_idx < medium_cutoff {
@@ -201,10 +468,11 @@ impl RepoMap {
 
             if owned_set.contains(idx) {
                 if tokens_used + node.token_estimate <= budget_tokens {
-                    let line = format!("  [owned] {}", path_str);
+                    let line = format!("  [owned] {} [sp {:.2}]", path_str, specificity);
                     out.push(GraphCandidate {
                         path: node.path.clone(),
                         rank_score,
+                        specificity,
                         confidence,
                         decision: GraphDecision::FullAttach,
                         token_estimate: node.token_estimate,
@@ -219,10 +487,16 @@ impl RepoMap {
                 if tokens_used + sig_tokens <= budget_tokens {
                     let syms = node.symbols.clone();
                     let sym_names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
-                    let line = format!("  {} ({})", path_str, sym_names.join(", "));
+                    let line = format!(
+                        "  {} [sp {:.2}] ({})",
+                        path_str,
+                        specificity,
+                        sym_names.join(", ")
+                    );
                     out.push(GraphCandidate {
                         path: node.path.clone(),
                         rank_score,
+                        specificity,
                         confidence,
                         decision: GraphDecision::SignatureOnly,
                         token_estimate: sig_tokens,
@@ -233,10 +507,11 @@ impl RepoMap {
                     tokens_used += sig_tokens;
                 }
             } else {
-                let line = format!("  {}", path_str);
+                let line = format!("  {} [sp {:.2}]", path_str, specificity);
                 out.push(GraphCandidate {
                     path: node.path.clone(),
                     rank_score,
+                    specificity,
                     confidence,
                     decision: GraphDecision::PathOnly,
                     token_estimate: 5,
@@ -255,6 +530,7 @@ impl RepoMap {
                 target: "turn_metrics",
                 path = %c.path.display(),
                 rank_score = c.rank_score,
+                specificity = c.specificity,
                 decision = ?c.decision,
                 confidence = ?c.confidence,
                 token_estimate = c.token_estimate,
@@ -336,7 +612,6 @@ impl RepoMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     #[test]
     fn empty_workspace_builds() {
@@ -395,6 +670,178 @@ mod tests {
             assert_eq!(owned.decision, GraphDecision::FullAttach);
             assert!(owned.rendered_line.contains("[owned]"));
         }
+    }
+
+    #[test]
+    fn rank_files_with_mode_orders_by_intent() {
+        // Build a persisted graph where seed.rs is referenced by two
+        // dependents: caller.rs via `Calls` and tester.rs via `TestOf`.
+        // mode=Callers should rank caller.rs above tester.rs;
+        // mode=Tests should invert.
+        use crate::repo_map::store::{BlastRadiusMode, EdgeKind, GraphStore, NodeKind};
+        let store = GraphStore::open_memory().unwrap();
+        store
+            .upsert_node(
+                NodeKind::Function,
+                "process",
+                "seed.rs::process",
+                "seed.rs",
+                Some(1),
+                None,
+                Some("rust"),
+                None,
+            )
+            .unwrap();
+        store
+            .upsert_node(
+                NodeKind::Function,
+                "caller_fn",
+                "caller.rs::caller_fn",
+                "caller.rs",
+                Some(1),
+                None,
+                Some("rust"),
+                None,
+            )
+            .unwrap();
+        store
+            .upsert_node(
+                NodeKind::Function,
+                "test_process",
+                "tester.rs::test_process",
+                "tester.rs",
+                Some(1),
+                None,
+                Some("rust"),
+                None,
+            )
+            .unwrap();
+        store
+            .insert_edge(
+                EdgeKind::Calls,
+                "caller.rs::caller_fn",
+                "seed.rs::process",
+                "caller.rs",
+                3,
+            )
+            .unwrap();
+        store
+            .insert_edge(
+                EdgeKind::TestOf,
+                "tester.rs::test_process",
+                "seed.rs::process",
+                "tester.rs",
+                3,
+            )
+            .unwrap();
+
+        let affected = vec![
+            "caller.rs".to_string(),
+            "tester.rs".to_string(),
+            "seed.rs".to_string(),
+        ];
+        let callers = rank_files_with_mode(
+            &store,
+            &["seed.rs"],
+            &affected,
+            BlastRadiusMode::Callers,
+            SpecificityConfig::default(),
+        )
+        .unwrap();
+        let tests = rank_files_with_mode(
+            &store,
+            &["seed.rs"],
+            &affected,
+            BlastRadiusMode::Tests,
+            SpecificityConfig::default(),
+        )
+        .unwrap();
+        assert!(
+            callers["caller.rs"].0 >= callers["tester.rs"].0,
+            "Callers mode must rank Calls-reached at least as high: {callers:?}"
+        );
+        assert!(
+            tests["tester.rs"].0 >= tests["caller.rs"].0,
+            "Tests mode must rank TestOf-reached at least as high: {tests:?}"
+        );
+        // specificity in [0, 1] for every affected file.
+        for (_, sp) in callers.values() {
+            assert!((0.0..=1.0).contains(sp));
+        }
+    }
+
+    #[test]
+    fn rank_with_mode_callers_zeros_non_call_edges() {
+        // Build a tiny in-memory graph where the seed has two outgoing
+        // neighbours, one reached only by a `Calls` edge and one only by
+        // a `TestOf` edge. Under `mode=Callers`, the `TestOf`-reached
+        // node must lose all PageRank propagation (weight 0.0) and
+        // therefore rank below the `Calls`-reached node. Under
+        // `mode=Tests` the relationship inverts.
+        use crate::repo_map::store::{BlastRadiusMode, EdgeKind};
+        let mut g: DiGraph<FileNode, ReferenceEdge> = DiGraph::new();
+        let seed = g.add_node(FileNode {
+            path: PathBuf::from("seed.rs"),
+            token_estimate: 10,
+            symbols: vec![Symbol {
+                name: "seed".into(),
+                kind: "function_item".into(),
+                line: 0,
+            }],
+        });
+        let by_call = g.add_node(FileNode {
+            path: PathBuf::from("by_call.rs"),
+            token_estimate: 10,
+            symbols: vec![Symbol {
+                name: "by_call".into(),
+                kind: "function_item".into(),
+                line: 0,
+            }],
+        });
+        let by_test = g.add_node(FileNode {
+            path: PathBuf::from("by_test.rs"),
+            token_estimate: 10,
+            symbols: vec![Symbol {
+                name: "by_test".into(),
+                kind: "function_item".into(),
+                line: 0,
+            }],
+        });
+        g.add_edge(seed, by_call, ReferenceEdge::new(EdgeKind::Calls));
+        g.add_edge(seed, by_test, ReferenceEdge::new(EdgeKind::TestOf));
+
+        let specificity_map = compute_specificity_map(&g, 0.5);
+        let map = RepoMap {
+            graph: g,
+            specificity_map,
+        };
+
+        let callers = map.rank_for_agent_structured_with_mode(
+            &["seed.rs".to_string()],
+            10_000,
+            BlastRadiusMode::Callers,
+        );
+        let tests = map.rank_for_agent_structured_with_mode(
+            &["seed.rs".to_string()],
+            10_000,
+            BlastRadiusMode::Tests,
+        );
+
+        let score = |cands: &[GraphCandidate], path: &str| -> f64 {
+            cands
+                .iter()
+                .find(|c| c.path.to_string_lossy() == path)
+                .map(|c| c.rank_score)
+                .unwrap_or(0.0)
+        };
+        assert!(
+            score(&callers, "by_call.rs") > score(&callers, "by_test.rs"),
+            "mode=Callers must rank Calls-reached higher: callers={callers:?}"
+        );
+        assert!(
+            score(&tests, "by_test.rs") > score(&tests, "by_call.rs"),
+            "mode=Tests must rank TestOf-reached higher: tests={tests:?}"
+        );
     }
 
     #[test]
