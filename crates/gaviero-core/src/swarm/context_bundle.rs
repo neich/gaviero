@@ -11,9 +11,10 @@
 //! is distributed across work units.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::context_planner::types::MemoryCandidate;
-use crate::memory::MemoryStore;
+use crate::memory::{MemoryScope, MemoryStores, RetrievalConfig, retrieve_ranked};
 use crate::repo_map::store::ImpactSummary;
 
 /// Swarm-wide context bundle built once by the pipeline before running any
@@ -69,31 +70,56 @@ impl SwarmContextBundle {
 
 /// Build a [`SwarmContextBundle`] with a single shared memory query.
 ///
-/// `architectural_intent` is used as the query string — typically the
-/// concatenation of all work-unit descriptions for the current swarm run.
-/// `read_namespaces` and `memory_limit` mirror the per-unit runner settings.
+/// Goes through the central [`retrieve_ranked`] entry point (B3) so the
+/// swarm's shared-memory query benefits from the same merged-multi-scope
+/// retrieval, scope/trust scoring, and B2 rerank as chat injection /
+/// MCP / panel search. `read_namespaces` is preserved as a noop hint
+/// for tracing — Tier B retrieval is scope-based, not namespace-based.
 ///
-/// Returns an empty bundle immediately when `memory` is `None` or
-/// `read_namespaces` is empty (no DB access occurs in those cases).
+/// Returns an empty bundle immediately when `memory` is `None` or the
+/// architectural intent is empty (no DB access occurs in those cases).
 pub async fn build_bundle(
     architectural_intent: &str,
-    memory: Option<&MemoryStore>,
+    memory: Option<&std::sync::Arc<MemoryStores>>,
+    workspace_root: &Path,
     read_namespaces: &[String],
     memory_limit: usize,
 ) -> SwarmContextBundle {
-    let shared_memory = if let (Some(mem), false) = (memory, read_namespaces.is_empty()) {
-        tracing::info!(
-            target: "turn_metrics",
-            kind = "swarm_bundle",
-            namespaces = ?read_namespaces,
-            limit = memory_limit,
-            "bundle_memory_query"
-        );
-        mem.search_candidates(read_namespaces, architectural_intent, memory_limit)
+    let shared_memory: Vec<MemoryCandidate> =
+        if let Some(mem) = memory.filter(|_| !architectural_intent.trim().is_empty()) {
+            tracing::info!(
+                target: "turn_metrics",
+                kind = "swarm_bundle",
+                namespaces = ?read_namespaces,
+                limit = memory_limit,
+                "bundle_memory_query"
+            );
+            // Bundle is shared across all units in the swarm — no
+            // single owning folder. Pass folder = None so the registry
+            // walks workspace + global only (matches the bundle's
+            // intent: cross-cutting workspace knowledge, not
+            // folder-specific).
+            let scope = MemoryScope::from_context(workspace_root, None, None, None);
+            match retrieve_ranked(
+                mem,
+                &scope,
+                architectural_intent,
+                memory_limit,
+                &RetrievalConfig::default(),
+                None,
+                None,
+            )
             .await
-    } else {
-        Vec::new()
-    };
+            {
+                Ok(out) => out.items.iter().map(MemoryCandidate::from_scored).collect(),
+                Err(e) => {
+                    tracing::warn!("swarm bundle retrieval failed: {e}");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
 
     SwarmContextBundle {
         architectural_intent: architectural_intent.to_string(),
@@ -162,7 +188,8 @@ mod tests {
 
     #[tokio::test]
     async fn build_bundle_empty_when_no_memory() {
-        let bundle = build_bundle("do something", None, &["ws".to_string()], 5).await;
+        let root = std::path::PathBuf::from("/tmp");
+        let bundle = build_bundle("do something", None, &root, &["ws".to_string()], 5).await;
         assert!(bundle.shared_memory.is_empty());
         assert_eq!(bundle.architectural_intent, "do something");
     }
@@ -171,7 +198,8 @@ mod tests {
     async fn build_bundle_empty_when_no_namespaces() {
         // memory = None is the only option in unit tests; verify the
         // namespace-empty guard also short-circuits (no panic).
-        let bundle = build_bundle("do something", None, &[], 5).await;
+        let root = std::path::PathBuf::from("/tmp");
+        let bundle = build_bundle("do something", None, &root, &[], 5).await;
         assert!(bundle.shared_memory.is_empty());
     }
 }

@@ -33,6 +33,9 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
         if app.first_run_dialog.is_some() {
             app.render_first_run_dialog(frame, size);
         }
+        if app.codex_trust_dialog.is_some() {
+            app.render_codex_trust_dialog(frame, size);
+        }
         return;
     }
 
@@ -201,6 +204,8 @@ pub(super) fn side_panel_title(app: &App, fullscreen: bool) -> &'static str {
         (SidePanelMode::SwarmDashboard, true) => "SWARM (fullscreen)",
         (SidePanelMode::GitPanel, false) => "GIT",
         (SidePanelMode::GitPanel, true) => "GIT (fullscreen)",
+        (SidePanelMode::MemoryPanel, false) => "MEMORY",
+        (SidePanelMode::MemoryPanel, true) => "MEMORY (fullscreen)",
     }
 }
 
@@ -856,6 +861,10 @@ pub(super) fn render_side_panel(app: &mut App, frame: &mut Frame, area: Rect) {
                 &app.theme,
             );
         }
+        SidePanelMode::MemoryPanel => {
+            app.memory_panel
+                .render(area, frame.buffer_mut(), app.focus == Focus::SidePanel);
+        }
     }
 }
 
@@ -1185,6 +1194,135 @@ pub(super) fn render_first_run_dialog(app: &App, frame: &mut Frame, area: Rect) 
             break;
         }
         let is_title = line.trim_start().starts_with("First-time");
+        let is_hint = line.contains('[');
+        let style = if is_title {
+            title_style
+        } else if is_hint {
+            hint_style
+        } else {
+            bg_style
+        };
+        let mut cx = x + 1;
+        for ch in line.chars() {
+            if cx >= x + dialog_w - 1 {
+                break;
+            }
+            if cx < frame.area().right() {
+                frame.buffer_mut()[(cx, cy)].set_char(ch).set_style(style);
+            }
+            cx += 1;
+        }
+    }
+}
+
+/// Render the Codex MCP trust consent modal (Tier A / A5). Fires on
+/// the first `/swarm` run; answering persists to
+/// `mcp.gavieroServer.codexTrust`.
+pub(super) fn render_codex_trust_dialog(app: &App, frame: &mut Frame, area: Rect) {
+    if app.codex_trust_dialog.is_none() {
+        return;
+    }
+
+    let lines: Vec<String> = vec![
+        String::new(),
+        "  Enable Codex MCP integration?".to_string(),
+        String::new(),
+        "  Gaviero can expose its memory + graph tools to Codex".to_string(),
+        "  subprocesses via a per-worktree MCP config.".to_string(),
+        "  Writes `.codex/config.toml` with a trust_level stanza.".to_string(),
+        String::new(),
+        "  [y] Yes, trust Codex here   [n / Esc] No, skip".to_string(),
+        String::new(),
+    ];
+
+    let dialog_w: u16 = lines
+        .iter()
+        .map(|l| l.chars().count() as u16)
+        .max()
+        .unwrap_or(58)
+        .max(58)
+        + 2;
+    let dialog_h = lines.len() as u16;
+
+    if area.width < dialog_w + 4 || area.height < dialog_h + 2 {
+        return;
+    }
+
+    let x = area.x + (area.width.saturating_sub(dialog_w)) / 2;
+    let y = area.y + (area.height.saturating_sub(dialog_h)) / 2;
+
+    let bg_style = Style::default().fg(theme::TEXT_BRIGHT).bg(theme::INPUT_BG);
+    let title_style = Style::default()
+        .fg(theme::FOCUS_BORDER)
+        .bg(theme::INPUT_BG)
+        .add_modifier(Modifier::BOLD);
+    let hint_style = Style::default().fg(theme::TEXT_DIM).bg(theme::INPUT_BG);
+
+    for row in 0..dialog_h {
+        for col in 0..dialog_w {
+            let cx = x + col;
+            let cy = y + row;
+            if cx < frame.area().right() && cy < frame.area().bottom() {
+                frame.buffer_mut()[(cx, cy)]
+                    .set_char(' ')
+                    .set_style(bg_style);
+            }
+        }
+    }
+
+    for col in 0..dialog_w {
+        let cx = x + col;
+        if cx < frame.area().right() {
+            let ch = if col == 0 {
+                '┌'
+            } else if col == dialog_w - 1 {
+                '┐'
+            } else {
+                '─'
+            };
+            if y < frame.area().bottom() {
+                frame.buffer_mut()[(cx, y)]
+                    .set_char(ch)
+                    .set_style(title_style);
+            }
+            let bottom_y = y + dialog_h - 1;
+            let ch = if col == 0 {
+                '└'
+            } else if col == dialog_w - 1 {
+                '┘'
+            } else {
+                '─'
+            };
+            if bottom_y < frame.area().bottom() {
+                frame.buffer_mut()[(cx, bottom_y)]
+                    .set_char(ch)
+                    .set_style(title_style);
+            }
+        }
+    }
+    for row in 1..dialog_h.saturating_sub(1) {
+        let cy = y + row;
+        if cy < frame.area().bottom() {
+            if x < frame.area().right() {
+                frame.buffer_mut()[(x, cy)]
+                    .set_char('│')
+                    .set_style(title_style);
+            }
+            let right_x = x + dialog_w - 1;
+            if right_x < frame.area().right() {
+                frame.buffer_mut()[(right_x, cy)]
+                    .set_char('│')
+                    .set_style(title_style);
+            }
+        }
+    }
+
+    for (i, line) in lines.iter().enumerate() {
+        let cy = y + i as u16;
+        if cy >= frame.area().bottom() {
+            break;
+        }
+        let is_title = line.trim_start().starts_with("Enable Codex");
         let is_hint = line.contains('[');
         let style = if is_title {
             title_style

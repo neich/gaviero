@@ -1,12 +1,13 @@
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use ndarray::Array2;
 use ort::session::Session;
 use ort::value::TensorRef;
 use tokenizers::{Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy};
 
-use super::embedder::Embedder;
+use super::embedder::{Embedder, EmbeddingPurpose};
 use super::model_manager::{ModelInfo, ModelManager};
 
 /// Upper bound for tokenized sequence length. Caps ONNX memory (attention
@@ -14,7 +15,7 @@ use super::model_manager::{ModelInfo, ModelManager};
 /// standard retrieval-embedder context; nomic-embed-text-v1.5 and e5-small-v2
 /// both accept far less than this (the former tops out at 8192, the latter at
 /// 512), so 512 is safe for all currently-supported models.
-const MAX_SEQUENCE_LENGTH: usize = 512;
+pub const MAX_SEQUENCE_LENGTH: usize = 512;
 
 /// ONNX-based text embedder using E5, nomic-embed-text, or similar models.
 ///
@@ -54,6 +55,13 @@ impl OnnxEmbedder {
             "e5-small-v2" => {
                 embedder.prefix_query = Some("query: ".to_string());
                 embedder.prefix_document = Some("passage: ".to_string());
+            }
+            "gte-modernbert-base" => {
+                // gte-modernbert is trained with the same query/document
+                // prefixes as nomic; mismatched prefixes regress recall
+                // noticeably on the gte ablation set.
+                embedder.prefix_query = Some("search_query: ".to_string());
+                embedder.prefix_document = Some("search_document: ".to_string());
             }
             _ => {}
         }
@@ -210,42 +218,52 @@ impl OnnxEmbedder {
 
         Ok(embeddings)
     }
+
+    fn apply_prefix(&self, text: &str, purpose: EmbeddingPurpose) -> String {
+        match purpose {
+            EmbeddingPurpose::Query => match &self.prefix_query {
+                Some(prefix) => format!("{prefix}{text}"),
+                None => text.to_string(),
+            },
+            EmbeddingPurpose::Document => match &self.prefix_document {
+                Some(prefix) => format!("{prefix}{text}"),
+                None => text.to_string(),
+            },
+        }
+    }
 }
 
+#[async_trait]
 impl Embedder for OnnxEmbedder {
-    fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let results = self.run_inference(&[text])?;
-        results.into_iter().next().context("empty inference result")
+    fn name(&self) -> &str {
+        &self.model_id
     }
 
-    fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
-        let prefixed = match &self.prefix_query {
-            Some(prefix) => format!("{prefix}{text}"),
-            None => text.to_string(),
-        };
-        let results = self.run_inference(&[&prefixed])?;
-        results.into_iter().next().context("empty inference result")
-    }
-
-    fn embed_document(&self, text: &str) -> Result<Vec<f32>> {
-        let prefixed = match &self.prefix_document {
-            Some(prefix) => format!("{prefix}{text}"),
-            None => text.to_string(),
-        };
-        let results = self.run_inference(&[&prefixed])?;
-        results.into_iter().next().context("empty inference result")
-    }
-
-    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        self.run_inference(texts)
-    }
-
-    fn dimensions(&self) -> usize {
+    fn dimension(&self) -> usize {
         self.dimensions
     }
 
-    fn model_id(&self) -> &str {
-        &self.model_id
+    fn max_tokens(&self) -> usize {
+        MAX_SEQUENCE_LENGTH
+    }
+
+    async fn embed(&self, text: &str, purpose: EmbeddingPurpose) -> Result<Vec<f32>> {
+        let prefixed = self.apply_prefix(text, purpose);
+        let results = self.run_inference(&[&prefixed])?;
+        results.into_iter().next().context("empty inference result")
+    }
+
+    async fn embed_batch(
+        &self,
+        texts: &[&str],
+        purpose: EmbeddingPurpose,
+    ) -> Result<Vec<Vec<f32>>> {
+        let prefixed: Vec<String> = texts
+            .iter()
+            .map(|text| self.apply_prefix(text, purpose))
+            .collect();
+        let refs: Vec<&str> = prefixed.iter().map(|s| s.as_str()).collect();
+        self.run_inference(&refs)
     }
 }
 
@@ -253,27 +271,30 @@ impl Embedder for OnnxEmbedder {
 mod tests {
     use super::*;
 
-    #[test]
+    #[tokio::test]
     #[ignore] // Requires ONNX model to be downloaded
-    fn test_onnx_embedder() {
+    async fn test_onnx_embedder() {
         let embedder = OnnxEmbedder::from_model(&super::super::model_manager::E5_SMALL_V2)
             .expect("Failed to load model");
-        let embedding = embedder.embed("query: hello world").unwrap();
+        let embedding = embedder
+            .embed("query: hello world", EmbeddingPurpose::Query)
+            .await
+            .unwrap();
         assert_eq!(embedding.len(), 384);
         // Verify L2 normalization
         let norm: f32 = embedding.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 0.01);
     }
 
-    #[test]
+    #[tokio::test]
     #[ignore] // Requires ONNX model to be downloaded
-    fn test_nomic_embedder() {
+    async fn test_nomic_embedder() {
         let embedder =
             OnnxEmbedder::from_model(&super::super::model_manager::NOMIC_EMBED_TEXT_V1_5)
                 .expect("Failed to load nomic model");
 
         // Test query embedding
-        let query_emb = embedder.embed_query("What is Rust?").unwrap();
+        let query_emb = embedder.embed_query("What is Rust?").await.unwrap();
         assert_eq!(query_emb.len(), 768);
         let norm: f32 = query_emb.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 0.01);
@@ -281,6 +302,7 @@ mod tests {
         // Test document embedding
         let doc_emb = embedder
             .embed_document("Rust is a systems programming language")
+            .await
             .unwrap();
         assert_eq!(doc_emb.len(), 768);
     }

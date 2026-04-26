@@ -26,10 +26,11 @@ pub use types::{
 };
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::memory::MemoryStore;
+use crate::memory::MemoryStores;
 use crate::repo_map::RepoMap;
 
 /// Map a `GraphDecision` to the planner-side `GraphSelectionKind`.
@@ -47,7 +48,7 @@ fn graph_decision_to_kind(d: GraphDecision) -> GraphSelectionKind {
 /// V9 §4 type. M1 only consults `memory` and `repo_map`; M3 adds structured
 /// candidate APIs and `graph_store` (impact queries) wiring.
 pub struct ContextPlanner<'a> {
-    pub memory: Option<&'a MemoryStore>,
+    pub memory: Option<&'a Arc<MemoryStores>>,
     pub repo_map: Option<&'a RepoMap>,
     pub ledger: &'a mut SessionLedger,
     pub workspace_root: &'a Path,
@@ -134,15 +135,41 @@ impl<'a> ContextPlanner<'a> {
             }
             return;
         }
-        // M3: planner queries structured `MemoryCandidate`s directly.
+        // M3 + Tier B: planner pulls structured candidates through the
+        // central `retrieve_ranked` engine — same path as chat injection,
+        // MCP, and the memory panel — so scope/trust scoring and B2
+        // rerank are applied uniformly.
         let Some(mem) = self.memory else { return };
         if input.read_namespaces.is_empty() {
             return;
         }
         let query = input.memory_query_override.unwrap_or(input.user_message);
-        let candidates = mem
-            .search_candidates(input.read_namespaces, query, input.memory_limit)
-            .await;
+        // The planner doesn't carry an active-file path; folder = None
+        // restricts the registry walk to workspace + global. The TUI
+        // panel can extend this with `Workspace::folder_for_path` once
+        // it threads the active editor's file in.
+        let scope = crate::memory::MemoryScope::from_context(self.workspace_root, None, None, None);
+        let candidates = match crate::memory::retrieve_ranked(
+            mem,
+            &scope,
+            query,
+            input.memory_limit,
+            &crate::memory::RetrievalConfig::default(),
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(out) => out
+                .items
+                .iter()
+                .map(crate::memory::store::MemoryCandidate::from_scored)
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                tracing::warn!("planner retrieve_ranked failed: {e}");
+                return;
+            }
+        };
         if candidates.is_empty() {
             return;
         }

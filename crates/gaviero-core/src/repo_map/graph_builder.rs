@@ -17,7 +17,7 @@ use crate::tree_sitter::language_for_extension;
 
 use super::builder::{SKIP_DIRS, extract_symbols, is_excluded};
 use super::edges::{
-    extract_rust_references, is_test_file, node_kind_from_ts, resolve_and_insert_edges,
+    extract_references_for_extension, is_test_file, node_kind_from_ts, resolve_and_insert_edges,
 };
 use super::store::{EdgeKind, GraphStore, NodeKind};
 
@@ -46,10 +46,7 @@ const MAX_FILE_BYTES: u64 = 1_000_000;
 /// The graph database is stored at `{workspace}/.gaviero/code_graph.db`.
 /// `excludes` is a list of folder names or glob patterns to skip
 /// (see [`crate::repo_map::builder::is_excluded`]).
-pub fn build_graph(
-    workspace: &Path,
-    excludes: &[String],
-) -> Result<(GraphStore, BuildResult)> {
+pub fn build_graph(workspace: &Path, excludes: &[String]) -> Result<(GraphStore, BuildResult)> {
     let db_dir = workspace.join(".gaviero");
     let db_path = db_dir.join("code_graph.db");
     let store = GraphStore::open(&db_path)
@@ -162,8 +159,8 @@ fn incremental_build(
                 Some(&hash),
             )?;
 
-            // Contains edge: file contains symbol
-            store.insert_edge(EdgeKind::Contains, &rel_str, &qn, &rel_str, sym.line as i64)?;
+            // Defines edge: file defines symbol
+            store.insert_edge(EdgeKind::Defines, &rel_str, &qn, &rel_str, sym.line as i64)?;
         }
 
         changed_files.push((abs_path.clone(), rel_path.clone(), content));
@@ -179,9 +176,8 @@ fn incremental_build(
         let rel_str = rel_path.to_string_lossy().to_string();
         let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-        // Currently only Rust edge extraction is implemented
-        if ext == "rs" {
-            let refs = extract_rust_references(content);
+        let refs = extract_references_for_extension(ext, content);
+        if !refs.is_empty() {
             let _ = resolve_and_insert_edges(store, &rel_str, &rel_str, &refs);
         }
     }

@@ -26,7 +26,7 @@ enum OutputFormat {
     Json,
 }
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(name = "gaviero-cli", about = "Headless AI agent task runner")]
 struct Cli {
     /// Path to the repository / workspace root.
@@ -48,7 +48,7 @@ struct Cli {
     /// Path to a file whose contents replace every `{{PROMPT}}` placeholder in
     /// the DSL script. Also becomes the full prompt for any agent without a
     /// `prompt` field. Only valid with `--script`.
-    #[arg(long, requires = "script")]
+    #[arg(long, requires = "script", conflicts_with_all = ["task", "work_units"])]
     prompt_file: Option<PathBuf>,
 
     /// Auto-accept all changes (no interactive review).
@@ -127,7 +127,12 @@ struct Cli {
     output: Option<PathBuf>,
 
     /// Build or update the code knowledge graph, print stats, and exit.
-    /// Does not run any agents. Useful after major codebase changes.
+    /// Does not run any agents. Useful after major codebase changes,
+    /// and required once after upgrading to a build that adds typed
+    /// edges (Tier C / C4): the open-time migration defaults legacy
+    /// untyped rows to `'Imports'`, but per-intent precision (mode=
+    /// callers / tests / implementations) only fully recovers after
+    /// a `--graph` re-scan repopulates each edge with its real kind.
     #[arg(long)]
     graph: bool,
 
@@ -146,6 +151,96 @@ struct Cli {
     /// Only valid with `--script`.
     #[arg(long = "var", requires = "script")]
     vars: Vec<String>,
+
+    /// Print the N most recent retrieval manifests (Tier S / S4) and exit.
+    /// Useful for auditing what memory was injected into recent chat turns.
+    #[arg(long = "manifest-last")]
+    manifest_last: Option<usize>,
+
+    /// Print the manifest(s) for a specific turn id and exit.
+    /// Pairs with the `turn_id` logged by the chat path on injection.
+    #[arg(long = "manifest-turn")]
+    manifest_turn: Option<String>,
+
+    /// Run the Tier 1 retrieval smoke test against the workspace
+    /// `memory.db` using the given JSONL fixture and exit. Prints
+    /// recall@1/5/10 and MRR. Exit code is non-zero when recall@5
+    /// drops more than `--eval-tolerance` against the baseline (if a
+    /// baseline file exists at `<fixture>.baseline.json`).
+    #[arg(long = "eval-fixture")]
+    eval_fixture: Option<PathBuf>,
+
+    /// Recall@5 regression tolerance for `--eval-fixture` (default 0.02).
+    #[arg(long = "eval-tolerance", default_value = "0.02")]
+    eval_tolerance: f32,
+
+    /// Write the fresh report to this path. With no path supplied,
+    /// writes to `<fixture>.last.json`. Has no effect without
+    /// `--eval-fixture`.
+    #[arg(long = "eval-report-out")]
+    eval_report_out: Option<PathBuf>,
+
+    /// Update the baseline at `<fixture>.baseline.json` to the result
+    /// of this run. Use after intentional improvements to lock the
+    /// regression gate at the new value.
+    #[arg(long = "eval-update-baseline")]
+    eval_update_baseline: bool,
+
+    /// Tier B / T0: when set, a missing baseline is **not** an error —
+    /// the run prints metrics and exits 0. Off by default so CI fails
+    /// loudly the first time a fixture lands without a baseline; turn
+    /// it on for ad-hoc local runs against a fresh fixture.
+    #[arg(long = "eval-allow-missing-baseline")]
+    eval_allow_missing_baseline: bool,
+
+    /// Tier B / B2f ablation: run the fixture twice — once with the
+    /// reranker enabled, once with it disabled — and print recall@K /
+    /// MRR deltas. Uses the workspace's configured rerank model
+    /// (or `gte-reranker-modernbert-base` if none) and the workspace's
+    /// `RerankConfig` settings. Mutually exclusive with
+    /// `--eval-update-baseline` (ablation never updates the baseline;
+    /// run the off-mode separately if you want that).
+    #[arg(long = "eval-rerank-ablation", conflicts_with = "eval_update_baseline")]
+    eval_rerank_ablation: bool,
+
+    /// Tier B / T0 rescore mode: replay the fixture against the most
+    /// recent N persisted `injection_manifests`. No embedder, no
+    /// reranker, no LLM — cheap regression replay for scoring-formula
+    /// changes (B4, B3 scope multipliers). Cases whose query never
+    /// appeared in a manifest are counted as misses (`absent`).
+    #[arg(long = "eval-from-manifests")]
+    eval_from_manifests: Option<usize>,
+
+    /// Tier B / T0 bootstrap: read the most recent N injection
+    /// manifests from the workspace memory.db and emit a JSONL fixture
+    /// (one EvalCase per turn that selected a memory). Hand-prune /
+    /// re-tag before checking it in. Combine with `--eval-fixture
+    /// <path>` to set the output file.
+    #[arg(long = "eval-bootstrap-from-manifests")]
+    eval_bootstrap_from_manifests: Option<usize>,
+
+    /// Tier B / B5: run the sleeptime hygiene pass against the
+    /// workspace `memory.db` and exit. Combine with `--sleep-dry-run`
+    /// to see what *would* happen without writing.
+    #[arg(long = "sleep")]
+    sleep: bool,
+
+    /// Tier B / B5: dry-run flag for `--sleep`. No destructive writes;
+    /// audit rows still land with `dry_run = 1` for review.
+    #[arg(long = "sleep-dry-run")]
+    sleep_dry_run: bool,
+
+    /// Tier B / B6: print top-N most / least utilised memories at the
+    /// given scope level (0=Global, 1=Workspace, 2=Repo, 3=Module,
+    /// 4=Run) and exit.
+    #[arg(long = "utilization-scope")]
+    utilization_scope: Option<i32>,
+
+    #[arg(long = "utilization-top", default_value = "20")]
+    utilization_top: usize,
+
+    #[arg(long = "utilization-asc")]
+    utilization_asc: bool,
 }
 
 /// CLI observer that prints agent events to stderr.
@@ -213,7 +308,12 @@ impl AcpObserver for CliAcpObserver {
         if passed {
             eprintln!("  [{}] ✓ {}", self.agent_id, gate);
         } else {
-            eprintln!("  [{}] ✗ {} — {}", self.agent_id, gate, message.unwrap_or(""));
+            eprintln!(
+                "  [{}] ✗ {} — {}",
+                self.agent_id,
+                gate,
+                message.unwrap_or("")
+            );
         }
     }
 
@@ -352,6 +452,425 @@ fn resolve_model_spec(spec: &str, label: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
+/// Pretty-print manifest rows to stdout. Used by --manifest-last /
+/// --manifest-turn (Tier S / S4). Payload is pretty-printed JSON so the
+/// developer can eyeball the candidate pool and selection trace without
+/// external tooling.
+fn print_manifests(rows: &[gaviero_core::memory::store::InjectionManifestRow]) {
+    if rows.is_empty() {
+        println!("(no manifests)");
+        return;
+    }
+    for r in rows {
+        println!(
+            "─── manifest id={} turn={} session={} channel={} at={}",
+            r.id, r.turn_id, r.session_id, r.source_channel, r.created_at
+        );
+        match serde_json::from_str::<serde_json::Value>(&r.payload) {
+            Ok(v) => match serde_json::to_string_pretty(&v) {
+                Ok(s) => println!("{}", s),
+                Err(_) => println!("{}", r.payload),
+            },
+            Err(_) => println!("{}", r.payload),
+        }
+    }
+}
+
+/// Tier B / B5: drive the sleeptime hygiene pass from the CLI. Reuses
+/// the same `run_sleeptime` engine the writer task invokes, so the
+/// output matches what the TUI would surface during interactive use.
+async fn run_sleeptime_cli(repo: &std::path::Path, dry_run: bool) -> Result<()> {
+    let store = tokio::task::spawn_blocking({
+        let repo = repo.to_path_buf();
+        move || gaviero_core::memory::init_workspace(&repo)
+    })
+    .await
+    .context("init memory (sleeptime)")??;
+
+    let mut cfg = gaviero_core::memory::SleeptimeConfig::default();
+    cfg.dry_run = dry_run;
+    eprintln!(
+        "[gaviero-sleep] {} pass against {}",
+        if dry_run { "dry-run" } else { "live" },
+        repo.display()
+    );
+    let report = gaviero_core::memory::run_sleeptime(&store, &cfg, None).await?;
+    println!("─── Sleeptime report ────────────────────────────────");
+    println!("run_id          : {}", report.run_id);
+    println!("dry_run         : {}", report.dry_run);
+    println!("decay_flagged   : {}", report.decay_flagged);
+    println!("near_dup_merged : {}", report.near_dup_merged);
+    println!("promoted        : {}", report.promoted);
+    println!("trust_adjusted  : {}", report.trust_adjusted);
+    println!("telemetry_pruned: {}", report.telemetry_pruned);
+    Ok(())
+}
+
+/// Tier B / B6: per-scope utilization report from the CLI.
+async fn run_utilization_cli(
+    repo: &std::path::Path,
+    scope_level: i32,
+    top: usize,
+    ascending: bool,
+) -> Result<()> {
+    let store = tokio::task::spawn_blocking({
+        let repo = repo.to_path_buf();
+        move || gaviero_core::memory::init_workspace(&repo)
+    })
+    .await
+    .context("init memory (utilization)")??;
+
+    let rows = store
+        .top_utilization_in_scope(scope_level, ascending, top)
+        .await
+        .context("computing utilization")?;
+    if rows.is_empty() {
+        eprintln!(
+            "[gaviero-util] no utilisation data at scope_level={scope_level} \
+             (run a few chat turns with telemetry enabled first)"
+        );
+        return Ok(());
+    }
+    println!("─── Utilization @ scope_level={scope_level} ───────────────────");
+    println!(
+        "{:>5}  {:>9}  {:>5}  {:>5}  {:>6}  {}",
+        "id", "rate", "inj", "used", "unused", "last_used"
+    );
+    for (id, util) in rows {
+        println!(
+            "{:>5}  {:>8.2}%  {:>5}  {:>5}  {:>6}  {}",
+            id,
+            util.utilization_rate * 100.0,
+            util.times_injected,
+            util.times_used,
+            util.times_unused,
+            util.last_used_at.unwrap_or_else(|| "—".into())
+        );
+    }
+    Ok(())
+}
+
+/// Tier B / T0 bootstrap: dump the most recent N manifests from `repo`'s
+/// `memory.db` into a JSONL fixture so the dev can hand-prune it into a
+/// real Tier 1 set. Writes to `out` (or stdout if `None`).
+async fn bootstrap_eval_fixture(
+    repo: &std::path::Path,
+    n: usize,
+    out: Option<&std::path::Path>,
+) -> Result<()> {
+    use gaviero_core::memory::eval::{bootstrap_from_manifests, cases_to_jsonl};
+
+    let store = tokio::task::spawn_blocking({
+        let repo = repo.to_path_buf();
+        move || gaviero_core::memory::init_workspace(&repo)
+    })
+    .await
+    .context("init memory (eval bootstrap)")??;
+
+    let cases = bootstrap_from_manifests(&store, n).await?;
+    if cases.is_empty() {
+        anyhow::bail!(
+            "no usable manifests found at {} (tried last {n}). Run a few chat \
+             turns with manifests enabled first.",
+            repo.display()
+        );
+    }
+    let body = cases_to_jsonl(&cases)?;
+    match out {
+        Some(p) => {
+            std::fs::write(p, &body)
+                .with_context(|| format!("writing fixture to {}", p.display()))?;
+            eprintln!(
+                "[gaviero-eval] wrote {} cases to {}",
+                cases.len(),
+                p.display()
+            );
+        }
+        None => print!("{body}"),
+    }
+    Ok(())
+}
+
+/// Tier B / T0: Run a Tier 1 retrieval smoke test against `repo`'s
+/// workspace `memory.db` using the JSONL fixture. Compares against
+/// `<fixture>.baseline.json` (if present) and exits non-zero if
+/// recall@5 drops more than `cli.eval_tolerance` on any tag or globally.
+async fn run_eval_smoke_test(repo: &std::path::Path, fixture: &PathBuf, cli: &Cli) -> Result<()> {
+    use gaviero_core::memory::eval::{
+        EvalReport, build_report, load_fixture, run_live, worst_recall5_drop,
+    };
+    use gaviero_core::memory::{MemoryScope, hash_path};
+
+    let cases = load_fixture(fixture).context("loading eval fixture")?;
+    if cases.is_empty() {
+        anyhow::bail!("eval fixture {} contained no cases", fixture.display());
+    }
+
+    let store = open_eval_store(repo, "eval").await?;
+
+    let scope_ctx = MemoryScope {
+        global_db: PathBuf::new(),
+        workspace_db: PathBuf::new(),
+        repo_db: None,
+        workspace_id: hash_path(repo),
+        repo_id: Some(hash_path(repo)),
+        module_path: None,
+        run_id: None,
+    };
+
+    // Default retrieval cfg + no reranker for the smoke test path.
+    // The B2 ablation gate calls `run_live` with an explicit reranker
+    // wrapper around this same harness.
+    let report = run_live(&store, &scope_ctx, &cases, None, None, None).await?;
+    let _ = build_report; // re-export silencer for unused-import lint
+    print_eval_report(&report);
+
+    let report_out = cli
+        .eval_report_out
+        .clone()
+        .unwrap_or_else(|| fixture.with_extension("last.json"));
+    if let Ok(json) = serde_json::to_string_pretty(&report) {
+        if let Err(e) = std::fs::write(&report_out, json) {
+            tracing::warn!(
+                "failed to write eval report to {}: {}",
+                report_out.display(),
+                e
+            );
+        }
+    }
+
+    let baseline_path = fixture.with_extension("baseline.json");
+    if cli.eval_update_baseline {
+        if let Ok(json) = serde_json::to_string_pretty(&report) {
+            std::fs::write(&baseline_path, json)
+                .with_context(|| format!("writing baseline to {}", baseline_path.display()))?;
+            eprintln!(
+                "[gaviero-eval] baseline updated at {}",
+                baseline_path.display()
+            );
+        }
+        return Ok(());
+    }
+
+    if !baseline_path.exists() {
+        let msg = format!(
+            "no baseline at {}; pass --eval-update-baseline to create one, or \
+             --eval-allow-missing-baseline to skip the gate for this run.",
+            baseline_path.display()
+        );
+        if cli.eval_allow_missing_baseline {
+            eprintln!("[gaviero-eval] {msg}");
+            return Ok(());
+        }
+        anyhow::bail!("{msg}");
+    }
+
+    let baseline_json = std::fs::read_to_string(&baseline_path)
+        .with_context(|| format!("reading baseline {}", baseline_path.display()))?;
+    let baseline: EvalReport = serde_json::from_str(&baseline_json)
+        .with_context(|| format!("parsing baseline {}", baseline_path.display()))?;
+    let drop = worst_recall5_drop(&baseline, &report);
+    eprintln!(
+        "[gaviero-eval] worst recall@5 drop vs baseline: {:.3} (tolerance {:.3})",
+        drop, cli.eval_tolerance
+    );
+    if drop > cli.eval_tolerance {
+        anyhow::bail!(
+            "eval regression: recall@5 dropped by {:.3} (tolerance {:.3})",
+            drop,
+            cli.eval_tolerance
+        );
+    }
+    Ok(())
+}
+
+/// Resolve `memory.embedder.model` from the workspace settings cascade.
+/// Returns the empty string when the setting is absent or non-string —
+/// which `init_with_embedder_name` interprets as "use the legacy default
+/// (nomic)" — so eval runs match the same embedder the TUI / writer
+/// will use at retrieval time.
+fn resolve_eval_embedder(repo: &std::path::Path) -> String {
+    let mut workspace = gaviero_core::workspace::Workspace::single_folder(repo.to_path_buf());
+    workspace.ensure_settings();
+    workspace
+        .resolve_setting(
+            gaviero_core::workspace::settings::MEMORY_EMBEDDER_MODEL,
+            Some(&repo.to_path_buf()),
+        )
+        .as_str()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// B1 fix: open the eval workspace honouring the configured embedder
+/// (`memory.embedder.model`). Pre-fix, the eval CLI always opened with
+/// `init_workspace` which silently used the legacy default — so a B1
+/// regression test against the new embedder would actually be running
+/// the *old* one.
+async fn open_eval_store(
+    repo: &std::path::Path,
+    context: &'static str,
+) -> Result<std::sync::Arc<gaviero_core::memory::MemoryStore>> {
+    let embedder_name = resolve_eval_embedder(repo);
+    tokio::task::spawn_blocking({
+        let repo = repo.to_path_buf();
+        let name = embedder_name.clone();
+        move || gaviero_core::memory::init_workspace_with_embedder_name(&repo, &name)
+    })
+    .await
+    .with_context(|| format!("init memory ({context})"))?
+}
+
+/// Tier B / T0: replay the fixture against persisted manifests. No
+/// embedder, no reranker, no LLM — opens the store with a no-op
+/// embedder choice (we only read `injection_manifests`).
+async fn run_eval_from_manifests(
+    repo: &std::path::Path,
+    fixture: &PathBuf,
+    n: usize,
+) -> Result<()> {
+    use gaviero_core::memory::eval::{load_fixture, run_from_manifests};
+    let cases = load_fixture(fixture).context("loading eval fixture")?;
+    if cases.is_empty() {
+        anyhow::bail!("eval fixture {} contained no cases", fixture.display());
+    }
+    let store = open_eval_store(repo, "eval rescore").await?;
+    let report = run_from_manifests(&store, &cases, n).await?;
+    print_eval_report(&report);
+    Ok(())
+}
+
+/// Tier B / B2f: rerank ablation. Runs the fixture twice — once with
+/// the reranker enabled, once without — and prints recall@K / MRR
+/// deltas so the dev can decide whether to flip
+/// `memory.reranker.enabled = true`.
+///
+/// On `build_reranker` failure (no model file, network unavailable),
+/// the ablation aborts with a clear message — the off-mode alone is
+/// just `--eval-fixture` without this flag, so we don't double-run.
+async fn run_eval_rerank_ablation(repo: &std::path::Path, fixture: &PathBuf) -> Result<()> {
+    use gaviero_core::memory::eval::{load_fixture, run_live};
+    use gaviero_core::memory::{
+        MemoryScope, RerankConfig, Reranker, RetrievalConfig, build_reranker, hash_path,
+    };
+
+    let cases = load_fixture(fixture).context("loading eval fixture")?;
+    if cases.is_empty() {
+        anyhow::bail!("eval fixture {} contained no cases", fixture.display());
+    }
+
+    let store = open_eval_store(repo, "rerank ablation").await?;
+
+    let mut workspace = gaviero_core::workspace::Workspace::single_folder(repo.to_path_buf());
+    workspace.ensure_settings();
+    let workspace_root = repo.to_path_buf();
+    let model_name = workspace
+        .resolve_setting(
+            gaviero_core::workspace::settings::MEMORY_RERANKER_MODEL,
+            Some(&workspace_root),
+        )
+        .as_str()
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "gte-reranker-modernbert-base".to_string());
+
+    eprintln!("[gaviero-eval] loading reranker model `{model_name}`…");
+    let reranker = tokio::task::spawn_blocking({
+        let model = model_name.clone();
+        move || build_reranker(&model)
+    })
+    .await
+    .context("loading reranker (ablation)")??;
+    let Some(rr) = reranker else {
+        anyhow::bail!(
+            "rerank model `{model_name}` resolved to none — set \
+             `memory.reranker.model` to a known reranker (e.g. \
+             gte-reranker-modernbert-base) or download the model file first."
+        );
+    };
+    let rr_arc: std::sync::Arc<dyn Reranker> = rr;
+    if let Err(e) = rr_arc.warmup().await {
+        tracing::warn!(target: "memory_rerank", error = %e, "rerank warmup failed");
+    }
+
+    let scope_ctx = MemoryScope {
+        global_db: PathBuf::new(),
+        workspace_db: PathBuf::new(),
+        repo_db: None,
+        workspace_id: hash_path(repo),
+        repo_id: Some(hash_path(repo)),
+        module_path: None,
+        run_id: None,
+    };
+    let retrieval_cfg = RetrievalConfig::default();
+    let rerank_cfg = RerankConfig {
+        enabled: true,
+        ..RerankConfig::default()
+    };
+
+    eprintln!("[gaviero-eval] running OFF-mode (composite-only)…");
+    let off = run_live(&store, &scope_ctx, &cases, Some(&retrieval_cfg), None, None).await?;
+    eprintln!("[gaviero-eval] running ON-mode (rerank enabled)…");
+    let on = run_live(
+        &store,
+        &scope_ctx,
+        &cases,
+        Some(&retrieval_cfg),
+        Some(rr_arc.as_ref()),
+        Some(&rerank_cfg),
+    )
+    .await?;
+
+    println!("─── Rerank ablation (B2f) ────────────────────────────");
+    println!("model       : {model_name}");
+    println!("cases       : {}", cases.len());
+    println!("             {:>10}  {:>10}  {:>10}", "off", "on", "Δ");
+    let row = |label: &str, a: f32, b: f32| {
+        println!("{:11}  {:>10.3}  {:>10.3}  {:>+10.3}", label, a, b, b - a);
+    };
+    row("recall@1", off.recall_at_1, on.recall_at_1);
+    row("recall@5", off.recall_at_5, on.recall_at_5);
+    row("recall@10", off.recall_at_10, on.recall_at_10);
+    row("MRR", off.mrr, on.mrr);
+    let r5_delta = on.recall_at_5 - off.recall_at_5;
+    println!(
+        "\nverdict     : recall@5 Δ = {:+.3} (B2 plan target ≥ +0.030)",
+        r5_delta
+    );
+    Ok(())
+}
+
+fn print_eval_report(r: &gaviero_core::memory::eval::EvalReport) {
+    println!("─── Tier 1 retrieval eval ────────────────────────────");
+    println!("total cases : {}", r.total);
+    println!("recall@1    : {:.3}", r.recall_at_1);
+    println!("recall@5    : {:.3}", r.recall_at_5);
+    println!("recall@10   : {:.3}", r.recall_at_10);
+    println!("MRR         : {:.3}", r.mrr);
+    if !r.per_tag.is_empty() {
+        println!("per-tag recall@5:");
+        let mut tags: Vec<_> = r.per_tag.iter().collect();
+        tags.sort_by(|a, b| a.0.cmp(b.0));
+        for (tag, stats) in tags {
+            println!(
+                "  {:20} n={:3} r@5={:.3}",
+                tag, stats.total, stats.recall_at_5
+            );
+        }
+    }
+    let misses: Vec<_> = r.outcomes.iter().filter(|o| !o.hit_at(5)).collect();
+    if !misses.is_empty() {
+        println!("misses (rank > 5):");
+        for o in misses {
+            let rank = match o.rank {
+                Some(r) => format!("rank={}", r),
+                None => "absent".to_string(),
+            };
+            println!("  {} expected={} {}", o.id, o.expected_memory_id, rank);
+        }
+    }
+}
+
 fn workspace_setting_string(
     workspace: &gaviero_core::workspace::Workspace,
     key: &str,
@@ -423,6 +942,64 @@ async fn main() -> Result<()> {
 
     let repo = std::fs::canonicalize(&cli.repo)
         .with_context(|| format!("resolving repo path: {}", cli.repo.display()))?;
+
+    // ── Manifest introspection (Tier S / S4): print and exit ─────
+    if cli.manifest_last.is_some() || cli.manifest_turn.is_some() {
+        let store = tokio::task::spawn_blocking({
+            let repo = repo.clone();
+            move || gaviero_core::memory::init_workspace(&repo)
+        })
+        .await
+        .context("init memory (manifest introspection)")??;
+
+        if let Some(turn_id) = &cli.manifest_turn {
+            let rows = store
+                .manifests_for_turn(turn_id)
+                .await
+                .context("fetching manifests for turn")?;
+            print_manifests(&rows);
+        }
+        if let Some(n) = cli.manifest_last {
+            let rows = store
+                .recent_manifests(n.max(1))
+                .await
+                .context("fetching recent manifests")?;
+            print_manifests(&rows);
+        }
+        return Ok(());
+    }
+
+    // ── Tier B / T0: bootstrap a fixture from existing manifests ─
+    if let Some(n) = cli.eval_bootstrap_from_manifests {
+        return bootstrap_eval_fixture(&repo, n, cli.eval_fixture.as_deref()).await;
+    }
+
+    // ── Tier B / T0: Tier 1 retrieval smoke test ─────────────────
+    if let Some(fixture_path) = cli.eval_fixture.clone() {
+        if let Some(n) = cli.eval_from_manifests {
+            return run_eval_from_manifests(&repo, &fixture_path, n).await;
+        }
+        if cli.eval_rerank_ablation {
+            return run_eval_rerank_ablation(&repo, &fixture_path).await;
+        }
+        return run_eval_smoke_test(&repo, &fixture_path, &cli).await;
+    }
+
+    // ── Tier B / B5: sleeptime hygiene ───────────────────────────
+    if cli.sleep {
+        return run_sleeptime_cli(&repo, cli.sleep_dry_run).await;
+    }
+
+    // ── Tier B / B6: per-scope utilization report ────────────────
+    if let Some(scope_level) = cli.utilization_scope {
+        return run_utilization_cli(
+            &repo,
+            scope_level,
+            cli.utilization_top.max(1),
+            cli.utilization_asc,
+        )
+        .await;
+    }
 
     // ── --graph: build/update code knowledge graph and exit ──────
     if cli.graph {
@@ -496,11 +1073,15 @@ async fn main() -> Result<()> {
     }
 
     // Initialize memory store (graceful if it fails — offline, corrupt model, etc.)
-    let memory: Option<Arc<MemoryStore>> =
+    // CLI is headless and operates on a single repo argument (no
+    // .gaviero-workspace), so we wrap the single store with
+    // `from_single_store` for the registry interface that swarm /
+    // pipeline now expect.
+    let memory: Option<Arc<gaviero_core::memory::MemoryStores>> =
         match tokio::task::spawn_blocking(|| gaviero_core::memory::init(None)).await {
             Ok(Ok(store)) => {
                 eprintln!("[memory] ready");
-                Some(store)
+                Some(gaviero_core::memory::MemoryStores::from_single_store(store))
             }
             Ok(Err(e)) => {
                 eprintln!("[memory] disabled: {}", e);
@@ -607,7 +1188,13 @@ async fn main() -> Result<()> {
             .unwrap_or(0);
         let fmt_unit = |u: &WorkUnit| {
             let model = u.model.as_deref().unwrap_or("<fallback>");
-            format!("  {:<width$}  {:?}  {}", u.id, u.tier, model, width = name_width)
+            format!(
+                "  {:<width$}  {:?}  {}",
+                u.id,
+                u.tier,
+                model,
+                width = name_width
+            )
         };
         eprintln!("[plan] {} agent(s):", ordered.len());
         for u in &ordered {
@@ -634,6 +1221,7 @@ async fn main() -> Result<()> {
     // Execute via swarm pipeline
     // plan.max_parallel overrides the CLI flag when declared.
     let swarm_observer = CliSwarmObserver;
+    let specificity = workspace.resolve_specificity_config(Some(&repo));
     let config = gaviero_core::swarm::pipeline::SwarmConfig {
         max_parallel: cli.max_parallel,
         workspace_root: repo,
@@ -644,6 +1232,9 @@ async fn main() -> Result<()> {
         write_namespace: write_ns,
         context_files: vec![],
         excludes: cli.exclude.clone(),
+        memory_writer: None,
+        mcp_config: None,
+        specificity,
     };
 
     // --coordinated: produce a DSL plan file for review, then exit.
@@ -671,9 +1262,9 @@ async fn main() -> Result<()> {
             memory,
             &swarm_observer,
             |agent_id| {
-            Box::new(CliAcpObserver::new(agent_id, true))
-                as Box<dyn gaviero_core::observer::AcpObserver>
-        },
+                Box::new(CliAcpObserver::new(agent_id, true))
+                    as Box<dyn gaviero_core::observer::AcpObserver>
+            },
         )
         .await?;
 

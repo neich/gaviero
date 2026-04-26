@@ -131,6 +131,11 @@ pub struct Conversation {
     pub auto_approve: bool,
     /// Pending permission request waiting for user approval (y/n).
     pub pending_permission: Option<PendingPermission>,
+    /// Turn id assigned when the user message is dispatched. The same id
+    /// ties prompt-time injection manifests to the completion extractor.
+    pub pending_turn_id: Option<String>,
+    /// Module path captured at dispatch time for scoped memory writes.
+    pub pending_module_path: Option<String>,
     /// Claude's session id, captured from the first turn's `SystemInit` event.
     /// Subsequent turns pass this back via `--resume <id>` so Claude keeps
     /// conversation memory server-side and we don't re-send history.
@@ -249,6 +254,8 @@ impl AgentChatState {
             streaming_started_at: None,
             auto_approve: false,
             pending_permission: None,
+            pending_turn_id: None,
+            pending_module_path: None,
             claude_session_id: None,
             session_ledger: None,
             pending_persisted_ledger: None,
@@ -690,6 +697,8 @@ impl AgentChatState {
             streaming_started_at: None,
             auto_approve: false,
             pending_permission: None,
+            pending_turn_id: None,
+            pending_module_path: None,
             claude_session_id: None,
             session_ledger: None,
             pending_persisted_ledger: None,
@@ -709,9 +718,13 @@ impl AgentChatState {
         conv.claude_session_id = None;
         conv.session_ledger = None;
         conv.pending_persisted_ledger = None;
+        conv.pending_turn_id = None;
+        conv.pending_module_path = None;
         self.text_input.text.clear();
         self.text_input.cursor = 0;
-        self.add_system_message("Context cleared. Next turn will bootstrap fresh (chat history preserved).");
+        self.add_system_message(
+            "Context cleared. Next turn will bootstrap fresh (chat history preserved).",
+        );
     }
 
     /// Close the active conversation. If it's the last one, replace it with a fresh one.
@@ -1460,7 +1473,7 @@ impl AgentChatState {
         // If the last message matches, just update its content
         if let Some(last) = self.messages_mut().last_mut() {
             if last.role == chat_role {
-                if !content.is_empty() && last.content.is_empty() {
+                if !content.is_empty() {
                     last.content = content.to_string();
                 }
                 return;
@@ -1593,7 +1606,7 @@ impl AgentChatState {
         let msgs = &mut self.conversations[idx].messages;
         if let Some(last) = msgs.last_mut() {
             if last.role == chat_role {
-                if !content.is_empty() && last.content.is_empty() {
+                if !content.is_empty() {
                     last.content = content.to_string();
                 }
                 self.conversations[idx].is_streaming = false;
@@ -1701,6 +1714,8 @@ impl AgentChatState {
                     streaming_started_at: None,
                     auto_approve: false,
                     pending_permission: None,
+                    pending_turn_id: None,
+                    pending_module_path: None,
                     claude_session_id,
                     // M4: in-memory ledger is rehydrated at send time from
                     // `pending_persisted_ledger` once the ProviderProfile

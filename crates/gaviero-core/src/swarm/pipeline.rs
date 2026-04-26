@@ -20,7 +20,9 @@ use super::router::{TierConfig, TierRouter};
 use super::validation;
 use crate::git::{GitCoordinator, WorktreeManager};
 use crate::memory::store::file_hash;
-use crate::memory::{MemoryStore, StoreOptions};
+use crate::memory::{
+    MemoryStore, MemoryStores, StoreOptions, WriterConfig, WriterHandle, spawn_writer_task,
+};
 use crate::observer::{AcpObserver, SwarmObserver};
 use crate::types::{EntryMetadata, PrivacyLevel};
 use crate::write_gate::{WriteGatePipeline, WriteMode};
@@ -43,6 +45,17 @@ pub struct SwarmConfig {
     /// basename; entries with `/` are glob-matched against workspace-relative
     /// paths (see [`crate::path_pattern::matches`]).
     pub excludes: Vec<String>,
+    /// Optional memory writer supplied by the embedding application. When
+    /// absent, `execute` creates a local writer for best-effort memory writes.
+    pub memory_writer: Option<WriterHandle>,
+    /// Optional MCP config template. The pipeline fills in each agent's
+    /// actual worktree before spawning its subprocess backend.
+    pub mcp_config: Option<crate::mcp::McpConfigSynth>,
+    /// C3: per-build specificity configuration. Embedding applications
+    /// (TUI / CLI) should populate this from `workspace.resolve_specificity_config`
+    /// so `repoMap.specificity.enabled` and the stop-symbol threshold
+    /// take effect. Defaults to enabled with a 0.5 stop-symbol cutoff.
+    pub specificity: crate::repo_map::SpecificityConfig,
 }
 
 /// Execute a swarm of work units from a compiled plan.
@@ -59,7 +72,7 @@ pub async fn execute(
     plan: &CompiledPlan,
     config: &SwarmConfig,
     initial_state: Option<ExecutionState>,
-    memory: Option<Arc<MemoryStore>>,
+    memory: Option<Arc<MemoryStores>>,
     observer: &dyn SwarmObserver,
     make_observer: impl Fn(&str) -> Box<dyn AcpObserver> + Send + Sync,
 ) -> Result<SwarmResult> {
@@ -98,6 +111,16 @@ pub async fn execute(
     }
     let tier_router = TierRouter::new(tier_config, selected_local_model.is_some());
     let git_coordinator = Arc::new(GitCoordinator::new());
+    let memory_writer = config.memory_writer.clone().or_else(|| {
+        memory.as_ref().map(|stores| {
+            spawn_writer_task(WriterConfig {
+                stores: stores.clone(),
+                llm: None,
+                observer: None,
+                manifest_observer: None,
+            })
+        })
+    });
 
     // Execution state tracks per-node progress (populated as nodes complete)
     let mut exec_state = initial_state.unwrap_or_else(|| ExecutionState::new_from_plan(plan));
@@ -196,9 +219,10 @@ pub async fn execute(
         let single_repo_map: Arc<Option<crate::repo_map::RepoMap>> = {
             let workspace = config.workspace_root.clone();
             let excludes = config.excludes.clone();
+            let specificity = config.specificity;
             Arc::new(
                 tokio::task::spawn_blocking(move || {
-                    crate::repo_map::RepoMap::build(&workspace, &excludes)
+                    crate::repo_map::RepoMap::build_with_config(&workspace, &excludes, specificity)
                         .map_err(|e| {
                             tracing::debug!("repo_map build skipped: {}", e);
                             e
@@ -271,6 +295,7 @@ pub async fn execute(
             // Single-agent fast path: no bundle pre-fetch (1 coordinator query
             // + 1 runner query = 2, already within M7 ≤2 gate).
             pre_fetched_memory: Arc::new(None),
+            mcp_config: config.mcp_config.clone(),
         };
 
         invalidate_stale_sources(&memory, &unit, &config.workspace_root).await;
@@ -298,6 +323,7 @@ pub async fn execute(
                 .unwrap_or(&config.write_namespace);
             store_agent_result(
                 &memory,
+                &memory_writer,
                 effective_write_ns,
                 &manifest,
                 &unit,
@@ -359,9 +385,10 @@ pub async fn execute(
     let repo_map: Arc<Option<crate::repo_map::RepoMap>> = {
         let workspace = config.workspace_root.clone();
         let excludes = config.excludes.clone();
+        let specificity = config.specificity;
         Arc::new(
             tokio::task::spawn_blocking(move || {
-                crate::repo_map::RepoMap::build(&workspace, &excludes)
+                crate::repo_map::RepoMap::build_with_config(&workspace, &excludes, specificity)
                     .map_err(|e| {
                         tracing::debug!("repo_map build skipped: {}", e);
                         e
@@ -493,7 +520,8 @@ pub async fn execute(
         .join("; ");
     let bundle = build_bundle(
         &swarm_intent,
-        memory.as_deref(),
+        memory.as_ref(),
+        &config.workspace_root,
         &config.read_namespaces,
         10,
     )
@@ -602,6 +630,7 @@ pub async fn execute(
                     repo_map: repo_map.clone(),
                     impact_texts: impact_texts.clone(),
                     pre_fetched_memory: pre_fetched_memory.clone(),
+                    mcp_config: config.mcp_config.clone(),
                 };
                 let manifest = run_single_agent(
                     unit,
@@ -628,6 +657,7 @@ pub async fn execute(
                         .unwrap_or(&config.write_namespace);
                     store_agent_result(
                         &memory,
+                        &memory_writer,
                         effective_write_ns,
                         &manifest,
                         unit,
@@ -713,7 +743,7 @@ pub async fn execute(
                             unit.clone(),
                             write_gate,
                             &agent_root,
-                            mem.as_deref(),
+                            mem.as_ref(),
                             &ns,
                             obs.as_ref(),
                             val_pipeline.as_deref(),
@@ -781,6 +811,7 @@ pub async fn execute(
                                     .unwrap_or(&config.write_namespace);
                                 store_agent_result(
                                     &memory,
+                                    &memory_writer,
                                     effective_write_ns,
                                     &manifest,
                                     unit,
@@ -855,6 +886,7 @@ pub async fn execute(
                 let mut loop_ctx = LoopConditionContext {
                     config,
                     memory: &memory,
+                    memory_writer: &memory_writer,
                     observer,
                     git_coordinator: git_coordinator.clone(),
                     validation: validation_pipeline.clone(),
@@ -955,6 +987,7 @@ pub async fn execute(
                     repo_map: repo_map.clone(),
                     impact_texts: impact_texts.clone(),
                     pre_fetched_memory: pre_fetched_memory.clone(),
+                    mcp_config: config.mcp_config.clone(),
                 };
                 let manifest = run_single_agent(
                     unit,
@@ -978,6 +1011,7 @@ pub async fn execute(
                         .unwrap_or(&config.write_namespace);
                     store_agent_result(
                         &memory,
+                        &memory_writer,
                         effective_write_ns,
                         &manifest,
                         unit,
@@ -1000,6 +1034,7 @@ pub async fn execute(
                 let mut loop_ctx = LoopConditionContext {
                     config,
                     memory: &memory,
+                    memory_writer: &memory_writer,
                     observer,
                     git_coordinator: git_coordinator.clone(),
                     validation: validation_pipeline.clone(),
@@ -1100,7 +1135,7 @@ pub async fn execute(
 
     // 6. Post-execution memory consolidation (best-effort)
     if let Some(mem) = memory.as_ref() {
-        let consolidator = crate::memory::consolidation::Consolidator::new(Arc::clone(mem));
+        let consolidator = crate::memory::consolidation::Consolidator::with_stores(Arc::clone(mem));
         let repo_id = crate::memory::hash_path(&config.workspace_root);
         match consolidator.consolidate_run(&run_id, &repo_id).await {
             Ok(report) => {
@@ -1152,7 +1187,7 @@ pub async fn execute(
 struct AgentRunContext<'a> {
     workspace_root: &'a PathBuf,
     context_files: &'a [(String, String)],
-    memory: Option<Arc<MemoryStore>>,
+    memory: Option<Arc<MemoryStores>>,
     read_namespaces: &'a [String],
     swarm_observer: &'a dyn SwarmObserver,
     git_coordinator: Arc<GitCoordinator>,
@@ -1166,11 +1201,13 @@ struct AgentRunContext<'a> {
     /// `Some(text)` → planner skips per-runner DB query; `None` → fallback to
     /// per-runner query (single-agent fast path does not pre-fetch).
     pre_fetched_memory: Arc<Option<String>>,
+    mcp_config: Option<crate::mcp::McpConfigSynth>,
 }
 
 struct LoopConditionContext<'a> {
     config: &'a SwarmConfig,
-    memory: &'a Option<Arc<MemoryStore>>,
+    memory: &'a Option<Arc<MemoryStores>>,
+    memory_writer: &'a Option<WriterHandle>,
     observer: &'a dyn SwarmObserver,
     git_coordinator: Arc<GitCoordinator>,
     validation: Option<Arc<crate::validation_gate::ValidationPipeline>>,
@@ -1249,7 +1286,9 @@ fn build_iter_evidence(
     // Walk backwards; collect the most recent manifest per loop-agent id.
     let mut by_agent: std::collections::HashMap<&str, &AgentManifest> = Default::default();
     for m in all_manifests.iter().rev() {
-        if loop_set.contains(m.work_unit_id.as_str()) && !by_agent.contains_key(m.work_unit_id.as_str()) {
+        if loop_set.contains(m.work_unit_id.as_str())
+            && !by_agent.contains_key(m.work_unit_id.as_str())
+        {
             by_agent.insert(m.work_unit_id.as_str(), m);
         }
         if by_agent.len() == loop_set.len() {
@@ -1310,10 +1349,7 @@ fn build_iter_evidence(
                 out.push('\n');
             }
             if m.modified_files.len() > 20 {
-                out.push_str(&format!(
-                    "    … and {} more\n",
-                    m.modified_files.len() - 20
-                ));
+                out.push_str(&format!("    … and {} more\n", m.modified_files.len() - 20));
             }
         }
     }
@@ -1329,8 +1365,16 @@ async fn run_single_agent(
     iteration_config: &crate::iteration::IterationConfig,
     acp_observer: Box<dyn AcpObserver>,
 ) -> Result<AgentManifest> {
-    run_agent_inner(unit, worktree_mgr, ctx, tier_router, iteration_config, acp_observer, false)
-        .await
+    run_agent_inner(
+        unit,
+        worktree_mgr,
+        ctx,
+        tier_router,
+        iteration_config,
+        acp_observer,
+        false,
+    )
+    .await
 }
 
 /// Run a work unit in **read-only mode**: the write gate is configured to
@@ -1346,8 +1390,16 @@ async fn run_readonly_agent(
 ) -> Result<AgentManifest> {
     // No worktree: judge should not even see a private checkout — it inspects
     // the workspace as it stands after the iteration's workers have merged.
-    run_agent_inner(unit, None, ctx, tier_router, iteration_config, acp_observer, true)
-        .await
+    run_agent_inner(
+        unit,
+        None,
+        ctx,
+        tier_router,
+        iteration_config,
+        acp_observer,
+        true,
+    )
+    .await
 }
 
 async fn run_agent_inner(
@@ -1384,6 +1436,28 @@ async fn run_agent_inner(
         workspace_root.clone()
     };
 
+    if let Some(base_mcp) = &ctx.mcp_config {
+        let mut synth = base_mcp.clone();
+        synth.worktree = agent_root.clone();
+        match crate::mcp::synthesize_for_worktree(&synth) {
+            Ok(paths) if !paths.is_empty() => {
+                tracing::debug!(
+                    agent_id = %unit.id,
+                    files = paths.len(),
+                    "synthesized MCP config for agent worktree"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    agent_id = %unit.id,
+                    error = %e,
+                    "failed to synthesize MCP config for agent worktree"
+                );
+            }
+        }
+    }
+
     let write_mode = if read_only {
         WriteMode::RejectAll
     } else {
@@ -1402,7 +1476,7 @@ async fn run_agent_inner(
             unit.clone(),
             write_gate,
             &agent_root,
-            memory.as_deref(),
+            memory.as_ref(),
             read_namespaces,
             acp_observer.as_ref(),
             validation.as_deref(),
@@ -1674,14 +1748,20 @@ fn commit_agent_changes(
 /// `staleness_source` path recording the current file hash. On the next run,
 /// `invalidate_stale_sources` checks these hashes and marks changed entries stale.
 async fn store_agent_result(
-    memory: &Option<Arc<MemoryStore>>,
+    memory: &Option<Arc<MemoryStores>>,
+    writer: &Option<WriterHandle>,
     write_ns: &str,
     manifest: &AgentManifest,
     unit: &WorkUnit,
     run_id: &str,
     workspace_root: &std::path::Path,
 ) {
-    let Some(mem) = memory else { return };
+    if memory.is_none() {
+        return;
+    }
+    let Some(writer) = writer else {
+        return;
+    };
 
     let privacy = match unit.privacy {
         PrivacyLevel::LocalOnly => "local_only",
@@ -1730,10 +1810,7 @@ async fn store_agent_result(
         source_file: None,
         source_hash: None,
     };
-    if let Err(e) = mem
-        .store_with_options(write_ns, &key, &content, &opts)
-        .await
-    {
+    if let Err(e) = writer.store_with_options(write_ns, &key, &content, opts) {
         tracing::warn!("Failed to store agent result to memory: {}", e);
     }
 
@@ -1758,10 +1835,7 @@ async fn store_agent_result(
             source_file: Some(abs_str), // absolute path — matches check_staleness input
             source_hash: Some(hash),
         };
-        if let Err(e) = mem
-            .store_with_options(write_ns, &src_key, &src_content, &src_opts)
-            .await
-        {
+        if let Err(e) = writer.store_with_options(write_ns, &src_key, &src_content, src_opts) {
             tracing::warn!("Failed to store source snapshot for {}: {}", source_path, e);
         }
     }
@@ -1782,7 +1856,7 @@ pub async fn plan_coordinated(
     prompt: &str,
     config: &SwarmConfig,
     coordinator_config: CoordinatorConfig,
-    memory: Option<Arc<MemoryStore>>,
+    memory: Option<Arc<MemoryStores>>,
     observer: &dyn SwarmObserver,
     make_observer: impl Fn(&str) -> Box<dyn AcpObserver> + Send + Sync,
 ) -> Result<String> {
@@ -2129,7 +2203,7 @@ mod collect_file_list_tests {
 ///
 /// Best-effort: errors are logged but never propagate to the caller.
 async fn invalidate_stale_sources(
-    memory: &Option<Arc<MemoryStore>>,
+    memory: &Option<Arc<MemoryStores>>,
     unit: &WorkUnit,
     workspace_root: &std::path::Path,
 ) {
@@ -2144,7 +2218,7 @@ async fn invalidate_stale_sources(
         .map(|s| workspace_root.join(s))
         .collect();
 
-    match mem.check_staleness(&paths).await {
+    match mem.workspace().check_staleness(&paths).await {
         Ok(stale) if !stale.is_empty() => {
             let ids: Vec<i64> = stale.iter().map(|(id, _, _, _)| *id).collect();
             tracing::info!(
@@ -2152,7 +2226,7 @@ async fn invalidate_stale_sources(
                 ids.len(),
                 unit.id
             );
-            if let Err(e) = mem.mark_stale(&ids).await {
+            if let Err(e) = mem.workspace().mark_stale(&ids).await {
                 tracing::warn!("mark_stale failed for agent '{}': {}", unit.id, e);
             }
         }
@@ -2172,11 +2246,14 @@ async fn evaluate_loop_condition(
     ctx: &mut LoopConditionContext<'_>,
 ) -> bool {
     match condition {
-        super::plan::LoopUntilCondition::Verify(config) => {
-            run_verification_checks(config, &ctx.config.workspace_root, &ctx.config.excludes, None)
-                .await
-                .unwrap_or(false)
-        }
+        super::plan::LoopUntilCondition::Verify(config) => run_verification_checks(
+            config,
+            &ctx.config.workspace_root,
+            &ctx.config.excludes,
+            None,
+        )
+        .await
+        .unwrap_or(false),
         super::plan::LoopUntilCondition::Agent(agent_id) => {
             let Some(unit_template) = ctx.loop_judge_map.get(agent_id.as_str()).copied() else {
                 tracing::warn!(
@@ -2195,16 +2272,11 @@ async fn evaluate_loop_condition(
                 .coordinator_instructions
                 .contains("{{ITER_EVIDENCE}}")
             {
-                build_iter_evidence(
-                    ctx.all_manifests,
-                    ctx.loop_agent_ids,
-                    current_iter_abs,
-                )
+                build_iter_evidence(ctx.all_manifests, ctx.loop_agent_ids, current_iter_abs)
             } else {
                 String::new()
             };
-            let unit =
-                apply_iter_vars_with_evidence(unit_template, current_iter_abs, &evidence);
+            let unit = apply_iter_vars_with_evidence(unit_template, current_iter_abs, &evidence);
             invalidate_stale_sources(ctx.memory, &unit, &ctx.config.workspace_root).await;
 
             let effective_read_ns: Vec<String> = unit
@@ -2225,6 +2297,7 @@ async fn evaluate_loop_condition(
                 repo_map: ctx.repo_map.clone(),
                 impact_texts: ctx.impact_texts.clone(),
                 pre_fetched_memory: ctx.pre_fetched_memory.clone(),
+                mcp_config: ctx.config.mcp_config.clone(),
             };
 
             // Judges run in read-only mode: the write gate rejects any write
@@ -2325,6 +2398,7 @@ async fn evaluate_loop_condition(
                 let judge_ns = format!("judge/{}", worker_ns);
                 store_agent_result(
                     ctx.memory,
+                    ctx.memory_writer,
                     &judge_ns,
                     &manifest,
                     &unit,

@@ -103,6 +103,8 @@ pub enum SidePanelMode {
     SwarmDashboard,
     #[allow(dead_code)]
     GitPanel,
+    /// Tier A / A4: memory inspection panel. Activated via `Alt+m`.
+    MemoryPanel,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +158,17 @@ pub(super) enum FirstRunStep {
 pub(super) struct FirstRunDialog {
     pub step: FirstRunStep,
     pub create_settings: bool,
+}
+
+/// Codex MCP trust prompt. Fires once before the first `/swarm` run
+/// when `mcp.gavieroServer.codexTrust` is still "unknown". Answering
+/// persists the choice to `.gaviero/settings.json` and resumes the
+/// swarm command that was pending.
+#[derive(Debug, Clone)]
+pub(crate) struct CodexTrustDialog {
+    /// The `/swarm <task>` description the user submitted, replayed
+    /// after the prompt resolves (regardless of grant/deny).
+    pub pending_task: String,
 }
 
 #[derive(Debug, Clone)]

@@ -1,0 +1,16 @@
+# Tier 1 retrieval smoke test fixture (Tier B / T0).
+# One JSON object per line. Comments (#) and blank lines are ignored.
+#
+# Schema:
+#   id                  -- stable case id, e.g. "q-001"
+#   query               -- user-style question
+#   expected_memory_id  -- the row id in memory.db that *should* surface
+#                          for this query (top-1 ideal, top-5 acceptable)
+#   scope               -- "global" | "workspace" | "repo" | "module" | "run"
+#   tags                -- free-form labels for per-tag breakdown
+#
+# Seed by replaying interesting injection_manifests against a populated
+# workspace and hand-pinning the right answer per case. To bootstrap on
+# a fresh repo, leave this file with the comment block above and run
+# `gaviero-cli --eval-fixture <file> --eval-update-baseline` once you
+# have ~20 entries.

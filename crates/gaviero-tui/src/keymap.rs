@@ -22,10 +22,12 @@ pub enum Action {
     SetLeftModeFind,
     SetLeftModeChanges,
 
-    // Side panel modes (Alt+A/W/G)
+    // Side panel modes (Alt+A/W/G/M)
     SetSideModeChat,
     SetSideModeSwarm,
     SetSideModeGit,
+    /// Tier A / A4: memory inspection panel.
+    SetSideModeMemory,
 
     // Editor actions
     InsertChar(char),
@@ -140,6 +142,7 @@ impl Keymap {
             KeyCode::Char('a') if alt => Action::SetSideModeChat,
             KeyCode::Char('w') if alt => Action::SetSideModeSwarm,
             KeyCode::Char('g') if alt => Action::SetSideModeGit,
+            KeyCode::Char('m') if alt => Action::SetSideModeMemory,
             // Alt+Y: toggle auto-approve permissions for next prompt
             KeyCode::Char('y') if alt => Action::ToggleAutoApprove,
 

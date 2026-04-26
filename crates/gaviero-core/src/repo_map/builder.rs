@@ -123,11 +123,8 @@ pub const MAX_PARSE_BYTES: usize = 200_000;
 const PARSE_TIMEOUT_MICROS: u64 = 2_000_000;
 
 const BINARY_EXTENSIONS: &[&str] = &[
-    "so", "a", "dylib", "dll", "exe", "o", "wasm",
-    "pdf", "png", "jpg", "jpeg", "gif", "ico",
-    "zip", "tar", "gz", "xz", "bz2",
-    "db", "sqlite", "sqlite3",
-    "bin", "dat",
+    "so", "a", "dylib", "dll", "exe", "o", "wasm", "pdf", "png", "jpg", "jpeg", "gif", "ico",
+    "zip", "tar", "gz", "xz", "bz2", "db", "sqlite", "sqlite3", "bin", "dat",
 ];
 
 fn build_node(abs_path: &Path, rel_path: PathBuf) -> Option<FileNode> {

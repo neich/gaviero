@@ -681,10 +681,7 @@ fn template_phased_plan() {
         tier_of("final_audit"),
         gaviero_core::types::ModelTier::Expensive
     );
-    assert_eq!(
-        tier_of("phase_gate"),
-        gaviero_core::types::ModelTier::Cheap
-    );
+    assert_eq!(tier_of("phase_gate"), gaviero_core::types::ModelTier::Cheap);
     assert_eq!(
         tier_of("phase_judge"),
         gaviero_core::types::ModelTier::Cheap

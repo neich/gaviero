@@ -14,7 +14,7 @@ use crate::context_planner::{
     ContextPlanner, ModelSpec, PlannerFingerprint, PlannerInput, RuntimeConfig, SessionLedger,
     build_provider_profile,
 };
-use crate::memory::MemoryStore;
+use crate::memory::{MemoryStore, MemoryStores};
 use crate::observer::AcpObserver;
 use crate::repo_map::RepoMap;
 use crate::swarm::board::{SharedBoard, parse_discoveries};
@@ -47,7 +47,7 @@ pub async fn run_backend(
     work_unit: &WorkUnit,
     write_gate: Arc<Mutex<WriteGatePipeline>>,
     workspace_root: &Path,
-    memory: Option<&MemoryStore>,
+    memory: Option<&Arc<MemoryStores>>,
     read_namespaces: &[String],
     observer: &dyn AcpObserver,
     validation: Option<&ValidationPipeline>,
@@ -447,7 +447,7 @@ pub async fn run_backend(
 #[allow(dead_code)]
 async fn build_prompt(
     work_unit: &WorkUnit,
-    memory: Option<&MemoryStore>,
+    memory: Option<&Arc<MemoryStores>>,
     read_namespaces: &[String],
     repo_map: Option<&RepoMap>,
     impact_text: Option<&str>,
@@ -475,7 +475,10 @@ async fn build_prompt(
         let limit = work_unit.memory_read_limit.unwrap_or(5);
         // Use namespace-based search (legacy path; scoped search is used
         // when MemoryScope is provided via the pipeline).
-        let ctx = mem.search_context(read_namespaces, query, limit).await;
+        let ctx = mem
+            .workspace()
+            .search_context(read_namespaces, query, limit)
+            .await;
         if !ctx.is_empty() {
             parts.push(ctx);
         }

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/gaviero-core", "crates/gaviero-tui", "crates/gaviero-cli", "crates/gaviero-dsl", "crates/tree-sitter-gaviero"]
+members = ["crates/gaviero-core", "crates/gaviero-tui", "crates/gaviero-cli", "crates/gaviero-dsl", "crates/gaviero-mcp-shim", "crates/tree-sitter-gaviero"]
 resolver = "2"
 
 [workspace.dependencies]

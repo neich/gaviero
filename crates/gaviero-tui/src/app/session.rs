@@ -37,6 +37,49 @@ pub(super) fn handle_first_run_key(app: &mut App, key: &crossterm::event::KeyEve
     }
 }
 
+/// Consume a keystroke while the Codex trust modal is open. Persists
+/// the answer to `.gaviero/settings.json` and replays the pending
+/// `/swarm` regardless of grant/deny — denial just means Gaviero will
+/// skip Codex config synthesis at swarm time.
+pub(super) fn handle_codex_trust_key(app: &mut App, key: &crossterm::event::KeyEvent) {
+    use gaviero_core::workspace::settings as S;
+
+    let dialog = match app.codex_trust_dialog.take() {
+        Some(d) => d,
+        None => return,
+    };
+
+    let decision = match key.code {
+        crossterm::event::KeyCode::Char('y') | crossterm::event::KeyCode::Char('Y') => {
+            Some("granted")
+        }
+        crossterm::event::KeyCode::Char('n')
+        | crossterm::event::KeyCode::Char('N')
+        | crossterm::event::KeyCode::Esc => Some("denied"),
+        _ => None,
+    };
+
+    let Some(decision) = decision else {
+        // Unrecognized key — keep the dialog open.
+        app.codex_trust_dialog = Some(dialog);
+        return;
+    };
+
+    if let Some(root) = app.workspace.roots().first().map(|p| p.to_path_buf()) {
+        if let Err(e) = app.workspace.save_folder_setting(
+            &root,
+            S::MCP_GAVIERO_CODEX_TRUST,
+            serde_json::json!(decision),
+        ) {
+            tracing::warn!("persisting codexTrust failed: {e}");
+        }
+    }
+
+    app.chat_state
+        .add_system_message(&format!("Codex MCP trust: {decision}. Resuming /swarm…"));
+    super::commands::run_swarm(app, dialog.pending_task);
+}
+
 pub(super) fn apply_first_run(app: &mut App, init_memory: bool) {
     let create_settings = app
         .first_run_dialog
@@ -57,14 +100,15 @@ pub(super) fn apply_first_run(app: &mut App, init_memory: bool) {
     if init_memory {
         if let Some(root) = app.workspace.roots().first().map(|r| r.to_path_buf()) {
             let tx = app.event_tx.clone();
+            let ws = app.workspace.clone();
             tokio::spawn(async move {
                 match tokio::task::spawn_blocking(move || {
-                    gaviero_core::memory::init_workspace(&root)
+                    gaviero_core::memory::init_workspace_stores(&root, &ws)
                 })
                 .await
                 {
-                    Ok(Ok(store)) => {
-                        let _ = tx.send(Event::MemoryReady(store));
+                    Ok(Ok(stores)) => {
+                        let _ = tx.send(Event::MemoryReady(stores));
                     }
                     Ok(Err(e)) => {
                         tracing::warn!("Workspace memory init failed: {}", e);
@@ -101,7 +145,9 @@ pub(crate) async fn get_or_build_repo_map_cached(
         return Some(rm);
     }
     let root = workspace_root.clone();
-    match tokio::task::spawn_blocking(move || gaviero_core::repo_map::RepoMap::build(&root, &[])).await {
+    match tokio::task::spawn_blocking(move || gaviero_core::repo_map::RepoMap::build(&root, &[]))
+        .await
+    {
         Ok(Ok(map)) => {
             let arc = std::sync::Arc::new(map);
             let mut guard = repo_map_cache.write().await;
@@ -132,10 +178,30 @@ pub(crate) async fn compute_impact_text(
         let seed_refs: Vec<&str> = seeds.iter().map(|s| s.as_str()).collect();
         let impact = store.impact_radius(&seed_refs, 2).ok()?;
         if impact.affected_files.is_empty() {
-            None
-        } else {
-            Some(gaviero_core::repo_map::store::GraphStore::format_impact_for_prompt(&impact))
+            return None;
         }
+        // C3: rank the affected set with HippoRAG specificity and the
+        // default `mode=All` weights, then render with `[sp 0.92]`
+        // badges so the chat injection visibly carries the score.
+        let mut to_rank: Vec<String> = impact.changed_files.clone();
+        for f in &impact.affected_files {
+            if !to_rank.contains(f) {
+                to_rank.push(f.clone());
+            }
+        }
+        let ranks = gaviero_core::repo_map::rank_files_with_mode(
+            &store,
+            &seed_refs,
+            &to_rank,
+            gaviero_core::repo_map::store::BlastRadiusMode::All,
+            gaviero_core::repo_map::SpecificityConfig::default(),
+        )
+        .unwrap_or_default();
+        Some(
+            gaviero_core::repo_map::store::GraphStore::format_impact_for_prompt_ranked(
+                &impact, &ranks,
+            ),
+        )
     })
     .await
     .ok()
@@ -316,8 +382,10 @@ pub(crate) fn warm_up_repo_map(app: &App) {
     };
     let cache = app.repo_map.clone();
     tokio::spawn(async move {
-        match tokio::task::spawn_blocking(move || gaviero_core::repo_map::RepoMap::build(&root, &[]))
-            .await
+        match tokio::task::spawn_blocking(move || {
+            gaviero_core::repo_map::RepoMap::build(&root, &[])
+        })
+        .await
         {
             Ok(Ok(map)) => {
                 let mut guard = cache.write().await;
@@ -360,11 +428,7 @@ pub(super) fn try_quit(app: &mut App) {
 
     let has_pending_review = app.diff_review.is_some();
 
-    if unsaved.is_empty()
-        && streaming_agents == 0
-        && running_swarm == 0
-        && !has_pending_review
-    {
+    if unsaved.is_empty() && streaming_agents == 0 && running_swarm == 0 && !has_pending_review {
         app.should_quit = true;
     } else {
         app.quit_confirm = true;

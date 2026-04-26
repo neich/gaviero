@@ -120,6 +120,23 @@ async fn main() -> Result<()> {
     let roots = workspace.roots();
     let _file_watcher = event_loop.spawn_file_watcher(&roots).ok();
 
+    let memory_root = workspace.roots().first().map(|p| p.to_path_buf());
+    // B1: pick up `memory.embedder.model` so workspace settings drive
+    // the embedder choice. Empty/unknown → nomic.
+    let embedder_name = workspace
+        .resolve_setting(
+            gaviero_core::workspace::settings::MEMORY_EMBEDDER_MODEL,
+            memory_root.as_deref(),
+        )
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    // Snapshot the workspace for the memory bootstrap before App takes
+    // ownership — the registry needs the folder list to register
+    // per-folder DBs.
+    let workspace_for_memory = workspace.clone();
+
     // Application state
     let mut app = App::new(workspace, event_tx);
 
@@ -129,13 +146,32 @@ async fn main() -> Result<()> {
 
     app.restore_session();
 
-    // Spawn background memory initialization (non-blocking)
+    // Spawn background memory initialization (non-blocking).
+    // Constructs the multi-DB registry: global + workspace + lazy
+    // per-folder stores keyed by every folder listed in the workspace.
     {
         let tx = event_loop.tx();
+        let ws = workspace_for_memory;
         tokio::task::spawn(async move {
-            match tokio::task::spawn_blocking(|| gaviero_core::memory::init(None)).await {
-                Ok(Ok(store)) => {
-                    let _ = tx.send(event::Event::MemoryReady(store));
+            let init_result = tokio::task::spawn_blocking(move || match memory_root {
+                Some(root) => gaviero_core::memory::init_workspace_stores_with_embedder_name(
+                    &root,
+                    &ws,
+                    &embedder_name,
+                ),
+                None => {
+                    // No workspace root → fall back to a single-store
+                    // registry pointing at the legacy default DB. This
+                    // path is hit when the TUI is invoked with no
+                    // folder argument; rare but supported.
+                    gaviero_core::memory::init_with_embedder_name(None, &embedder_name)
+                        .map(gaviero_core::memory::MemoryStores::from_single_store)
+                }
+            })
+            .await;
+            match init_result {
+                Ok(Ok(stores)) => {
+                    let _ = tx.send(event::Event::MemoryReady(stores));
                 }
                 Ok(Err(e)) => {
                     tracing::warn!("Memory initialization failed: {}", e);

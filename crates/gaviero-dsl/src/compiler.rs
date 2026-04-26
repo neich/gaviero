@@ -597,8 +597,7 @@ fn apply_vars(
         if RESERVED.contains(&k.as_str()) {
             continue;
         }
-        if !agent_vars.iter().any(|(ak, _)| ak == k)
-            && !override_vars.iter().any(|(ok, _)| ok == k)
+        if !agent_vars.iter().any(|(ak, _)| ak == k) && !override_vars.iter().any(|(ok, _)| ok == k)
         {
             merged.push((k.as_str(), v.as_str()));
         }
@@ -672,44 +671,44 @@ fn compile_agent(
     //   2. `tier <name>`   — resolve through tier alias → `ClientDecl`.
     //   3. top-level `default` client.
     //   4. no client — fall through to defaults + warning.
-    let resolved_client: Option<&ClientDecl> =
-        if let Some((client_name, client_span)) = &decl.client {
-            let cd = client_map
-                .get(client_name.as_str())
-                .copied()
-                .ok_or_else(|| DslError::Compile {
-                    src: src(),
-                    span: (
-                        client_span.start,
-                        client_span.end.saturating_sub(client_span.start).max(1),
-                    )
-                        .into(),
-                    reason: format!("undefined client `{}`", client_name),
-                })?;
-            Some(cd)
-        } else if let Some((tier_name, tier_span)) = &decl.tier_ref {
-            let alias =
-                tier_alias_map
-                    .get(tier_name.as_str())
-                    .ok_or_else(|| DslError::Compile {
-                        src: src(),
-                        span: (
-                            tier_span.start,
-                            tier_span.end.saturating_sub(tier_span.start).max(1),
-                        )
-                            .into(),
-                        reason: format!(
-                            "agent `{}` references undefined tier alias `{}`",
-                            decl.name, tier_name
-                        ),
-                    })?;
-            // The alias's client_ref validity was already checked in phase 1.
-            // Re-lookup here is a contract: tier_alias_map values only reach
-            // this point if their client_ref resolves.
-            Some(client_map[alias.client_ref.as_str()])
-        } else {
-            default_client
-        };
+    let resolved_client: Option<&ClientDecl> = if let Some((client_name, client_span)) =
+        &decl.client
+    {
+        let cd = client_map
+            .get(client_name.as_str())
+            .copied()
+            .ok_or_else(|| DslError::Compile {
+                src: src(),
+                span: (
+                    client_span.start,
+                    client_span.end.saturating_sub(client_span.start).max(1),
+                )
+                    .into(),
+                reason: format!("undefined client `{}`", client_name),
+            })?;
+        Some(cd)
+    } else if let Some((tier_name, tier_span)) = &decl.tier_ref {
+        let alias = tier_alias_map
+            .get(tier_name.as_str())
+            .ok_or_else(|| DslError::Compile {
+                src: src(),
+                span: (
+                    tier_span.start,
+                    tier_span.end.saturating_sub(tier_span.start).max(1),
+                )
+                    .into(),
+                reason: format!(
+                    "agent `{}` references undefined tier alias `{}`",
+                    decl.name, tier_name
+                ),
+            })?;
+        // The alias's client_ref validity was already checked in phase 1.
+        // Re-lookup here is a contract: tier_alias_map values only reach
+        // this point if their client_ref resolves.
+        Some(client_map[alias.client_ref.as_str()])
+    } else {
+        default_client
+    };
 
     let (tier, model, effort, extra, privacy) = if let Some(cd) = resolved_client {
         let tier = cd
@@ -749,7 +748,16 @@ fn compile_agent(
     // Build scope. Paths get the same compile-time var substitution as
     // prompts/descriptions so scripts can drive output roots via --var
     // (e.g. owned ["{{OUT_DIR}}/briefing.md"] → owned ["plans/log/briefing.md"]).
-    let sub = |s: &str| apply_vars(s, script_vars, override_vars, &decl.vars, &decl.name, runtime_prompt);
+    let sub = |s: &str| {
+        apply_vars(
+            s,
+            script_vars,
+            override_vars,
+            &decl.vars,
+            &decl.name,
+            runtime_prompt,
+        )
+    };
     let scope = if let Some(sb) = &decl.scope {
         FileScope {
             owned_paths: sb.owned.iter().map(|p| sub(p)).collect(),
@@ -775,7 +783,14 @@ fn compile_agent(
             Some((s, _)) => s.as_str(),
             None => &decl.name,
         };
-        apply_vars(raw, script_vars, override_vars, &decl.vars, &decl.name, runtime_prompt)
+        apply_vars(
+            raw,
+            script_vars,
+            override_vars,
+            &decl.vars,
+            &decl.name,
+            runtime_prompt,
+        )
     };
 
     // Resolve prompt: inline string or reference to a named prompt declaration.
@@ -801,7 +816,14 @@ fn compile_agent(
     // Apply all compile-time substitutions.
     // {{ITER}} and {{PREV_ITER}} are intentionally left for runtime.
     let coordinator_instructions = match prompt_text {
-        Some(s) => apply_vars(s, script_vars, override_vars, &decl.vars, &decl.name, runtime_prompt),
+        Some(s) => apply_vars(
+            s,
+            script_vars,
+            override_vars,
+            &decl.vars,
+            &decl.name,
+            runtime_prompt,
+        ),
         None => runtime_prompt.unwrap_or("").to_string(),
     };
 
@@ -854,7 +876,16 @@ fn compile_agent(
         .memory
         .as_ref()
         .and_then(|m| m.read_query.as_ref())
-        .map(|(s, _)| apply_vars(s, script_vars, override_vars, &decl.vars, &decl.name, runtime_prompt));
+        .map(|(s, _)| {
+            apply_vars(
+                s,
+                script_vars,
+                override_vars,
+                &decl.vars,
+                &decl.name,
+                runtime_prompt,
+            )
+        });
 
     let memory_read_limit: Option<usize> = decl
         .memory
@@ -866,7 +897,16 @@ fn compile_agent(
         .memory
         .as_ref()
         .and_then(|m| m.write_content.as_ref())
-        .map(|(s, _)| apply_vars(s, script_vars, override_vars, &decl.vars, &decl.name, runtime_prompt));
+        .map(|(s, _)| {
+            apply_vars(
+                s,
+                script_vars,
+                override_vars,
+                &decl.vars,
+                &decl.name,
+                runtime_prompt,
+            )
+        });
 
     // ── Graph / impact fields ─────────────────────────────────────
     let impact_scope = decl
@@ -947,10 +987,7 @@ fn compile_extra(
                 src: NamedSource::new(filename, source.to_string()),
                 span: (
                     pair.key_span.start,
-                    pair.key_span
-                        .end
-                        .saturating_sub(pair.key_span.start)
-                        .max(1),
+                    pair.key_span.end.saturating_sub(pair.key_span.start).max(1),
                 )
                     .into(),
                 reason: format!(
@@ -2202,10 +2239,7 @@ mod tests {
             units[0].scope.owned_paths,
             vec!["plans/log/out.md", "src/x/"]
         );
-        assert_eq!(
-            units[0].scope.read_only_paths,
-            vec!["plans/log/", "src/"]
-        );
+        assert_eq!(units[0].scope.read_only_paths, vec!["plans/log/", "src/"]);
         assert_eq!(units[0].staleness_sources, vec!["plans/log/"]);
     }
 
