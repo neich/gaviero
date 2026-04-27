@@ -23,3 +23,9 @@ tmp/
 .codex
 .codex-tmp
 plans/
+
+# Local planning artifacts (top-level tier prompts and scratch files)
+/tier-*.md
+/bp.log
+/files.zip
+/gaviero.code-workspace
