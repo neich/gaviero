@@ -550,12 +550,6 @@ mod tests {
             }
             Ok(v)
         }
-        fn dimensions(&self) -> usize {
-            8
-        }
-        fn model_id(&self) -> &str {
-            "mock"
-        }
     }
 
     fn fixture() -> GavieroMcpServer {
