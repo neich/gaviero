@@ -155,6 +155,50 @@ pub enum WriterMessage {
         session_id: String,
         response: String,
     },
+    /// Tier C / C2.2: restore a single audit row by id. The handler
+    /// reconstructs the original `WriteScope` + `WriteMeta` + content
+    /// from `original_row_json` and replays them through
+    /// [`MemoryStore::store_scoped`] so dedup decides whether the
+    /// payload reinserts cleanly, dedups against a newer row, or is
+    /// already covered at a broader scope. Audit row is consumed on
+    /// success.
+    Restore {
+        deletion_id: i64,
+        ack: Option<oneshot::Sender<Result<super::store::RestoreOutcome, String>>>,
+    },
+    /// Tier C / C2.2: restore every still-pending deletion newer than
+    /// `since_sql_offset` (a SQLite relative-datetime spec like
+    /// `"-7 days"`). Each row goes through the dedup pipeline; the
+    /// per-id outcome is returned so the caller can summarise.
+    RestoreSince {
+        since_sql_offset: String,
+        ack: Option<oneshot::Sender<Result<Vec<super::store::RestoreOutcome>, String>>>,
+    },
+    /// Tier C / C2.3: bulk soft-delete by [`super::store::ForgetFilter`].
+    /// `dry_run = true` returns a populated report without writing —
+    /// the caller (TUI / CLI) shows the count, the user confirms, and
+    /// the live call goes back through the writer task. `deleted_by`
+    /// is always `UserCommand` for slash-command and CLI invocations;
+    /// the panel's per-row `d` keeps using `PanelEdit { Delete }`.
+    BulkForget {
+        filter: super::store::ForgetFilter,
+        dry_run: bool,
+        reason: Option<String>,
+        ack: Option<oneshot::Sender<Result<super::store::BulkForgetReport, String>>>,
+    },
+    /// Tier C / C2.4: `/forget-history` — redact a single history row
+    /// in-place. The handler routes through
+    /// [`super::store::MemoryStore::redact_history_row`], which is the
+    /// **only** code path authorised to disable the C1.3 immutability
+    /// trigger besides [`super::store::MemoryStore::compress_history_row`].
+    /// One-way per the plan: the audit row stores the post-redaction
+    /// tombstone, not the original transcript. `ack` carries the
+    /// audit row's id on success.
+    RedactHistory {
+        memory_id: i64,
+        reason: String,
+        ack: Option<oneshot::Sender<Result<i64, String>>>,
+    },
 }
 
 /// Discrete operation for `WriterMessage::PanelEdit` (Tier A / A4).
@@ -191,6 +235,10 @@ impl WriterMessage {
             WriterMessage::Sleeptime { .. } => "Sleeptime",
             WriterMessage::SessionConsolidate { .. } => "SessionConsolidate",
             WriterMessage::TelemetryClassify { .. } => "TelemetryClassify",
+            WriterMessage::Restore { .. } => "Restore",
+            WriterMessage::RestoreSince { .. } => "RestoreSince",
+            WriterMessage::BulkForget { .. } => "BulkForget",
+            WriterMessage::RedactHistory { .. } => "RedactHistory",
         }
     }
 }
@@ -362,6 +410,107 @@ impl WriterHandle {
         Self::await_ack(rx).await
     }
 
+    /// C2.2: restore a soft-deleted memory by audit id. Embedding +
+    /// dedup happen inside the writer task so the caller doesn't need
+    /// to hold the store mutex; ack timeout is bumped to 30s because
+    /// re-embedding restored content can dwarf the default 500ms used
+    /// for hash-only writes.
+    pub async fn restore_deletion(
+        &self,
+        deletion_id: i64,
+    ) -> Result<super::store::RestoreOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.enqueue(WriterMessage::Restore {
+            deletion_id,
+            ack: Some(tx),
+        })?;
+        Self::await_restore_ack(rx).await
+    }
+
+    /// C2.2: restore every still-pending deletion newer than
+    /// `since_sql_offset` (a SQLite relative-datetime spec, e.g.
+    /// `"-7 days"`). Returns the per-id outcome list so the caller
+    /// can render a summary.
+    pub async fn restore_deletions_since(
+        &self,
+        since_sql_offset: impl Into<String>,
+    ) -> Result<Vec<super::store::RestoreOutcome>> {
+        let (tx, rx) = oneshot::channel();
+        self.enqueue(WriterMessage::RestoreSince {
+            since_sql_offset: since_sql_offset.into(),
+            ack: Some(tx),
+        })?;
+        match tokio::time::timeout(Duration::from_secs(30), rx).await {
+            Ok(Ok(Ok(v))) => Ok(v),
+            Ok(Ok(Err(e))) => Err(anyhow!(e)),
+            Ok(Err(_)) => Err(anyhow!("writer dropped restore-since ack channel")),
+            Err(_) => Err(anyhow!("restore-since ack timeout after 30s")),
+        }
+    }
+
+    async fn await_restore_ack(
+        rx: oneshot::Receiver<Result<super::store::RestoreOutcome, String>>,
+    ) -> Result<super::store::RestoreOutcome> {
+        match tokio::time::timeout(Duration::from_secs(30), rx).await {
+            Ok(Ok(Ok(r))) => Ok(r),
+            Ok(Ok(Err(e))) => Err(anyhow!(e)),
+            Ok(Err(_)) => Err(anyhow!("writer dropped restore ack channel")),
+            Err(_) => Err(anyhow!("restore ack timeout after 30s")),
+        }
+    }
+
+    /// C2.4: enqueue a `/forget-history` redaction. The caller is
+    /// expected to have already collected the two-step `REDACT` user
+    /// confirmation; this handle just funnels the message into the
+    /// writer task. Returns the audit row id on success. The CI grep
+    /// check on `drop_history_immutable_triggers` enforces that the
+    /// store-side handler stays the only trigger-disable callsite
+    /// besides compression.
+    pub async fn redact_history(
+        &self,
+        memory_id: i64,
+        reason: impl Into<String>,
+    ) -> Result<i64> {
+        let (tx, rx) = oneshot::channel();
+        self.enqueue(WriterMessage::RedactHistory {
+            memory_id,
+            reason: reason.into(),
+            ack: Some(tx),
+        })?;
+        match tokio::time::timeout(Duration::from_secs(30), rx).await {
+            Ok(Ok(Ok(audit_id))) => Ok(audit_id),
+            Ok(Ok(Err(e))) => Err(anyhow!(e)),
+            Ok(Err(_)) => Err(anyhow!("writer dropped redact-history ack channel")),
+            Err(_) => Err(anyhow!("redact-history ack timeout after 30s")),
+        }
+    }
+
+    /// C2.3: enqueue a bulk soft-delete. `dry_run = true` returns the
+    /// preview report (counts + breakdowns) without writing; live
+    /// calls write one audit row per deleted memory. Always tagged
+    /// `DeletedBy::UserCommand`; the panel's per-row `d` action
+    /// continues to flow through [`WriterMessage::PanelEdit`].
+    pub async fn bulk_forget(
+        &self,
+        filter: super::store::ForgetFilter,
+        dry_run: bool,
+        reason: Option<String>,
+    ) -> Result<super::store::BulkForgetReport> {
+        let (tx, rx) = oneshot::channel();
+        self.enqueue(WriterMessage::BulkForget {
+            filter,
+            dry_run,
+            reason,
+            ack: Some(tx),
+        })?;
+        match tokio::time::timeout(Duration::from_secs(30), rx).await {
+            Ok(Ok(Ok(r))) => Ok(r),
+            Ok(Ok(Err(e))) => Err(anyhow!(e)),
+            Ok(Err(_)) => Err(anyhow!("writer dropped bulk-forget ack channel")),
+            Err(_) => Err(anyhow!("bulk-forget ack timeout after 30s")),
+        }
+    }
+
     /// Fire-and-forget turn-complete notification (Phase 4 will handle extraction).
     pub fn turn_complete(
         &self,
@@ -526,7 +675,7 @@ async fn writer_task(
 
 async fn process_message(
     stores: &Arc<MemoryStores>,
-    _llm: Option<&Arc<dyn ConsolidationLlm>>,
+    llm: Option<&Arc<dyn ConsolidationLlm>>,
     msg: WriterMessage,
 ) -> Result<WriteResult> {
     match msg {
@@ -636,7 +785,7 @@ async fn process_message(
             let store = stores.workspace().clone();
             process_turn_complete(
                 &store,
-                _llm,
+                llm,
                 session_id,
                 turn_id,
                 repo_id,
@@ -681,6 +830,26 @@ async fn process_message(
                         telemetry_pruned = report.telemetry_pruned,
                         "sleeptime complete"
                     );
+                    // Phase 2 (Tier B / B5): stamp `last_sleeptime_at`
+                    // so the scheduler honours the 24h gating across
+                    // process restarts. Live runs only — dry-runs
+                    // intentionally don't update the timestamp so
+                    // exploratory `--sleep-dry-run` invocations don't
+                    // suppress real passes.
+                    if !report.dry_run
+                        && let Err(e) = store
+                            .set_meta_value(
+                                "last_sleeptime_at",
+                                &chrono::Utc::now().to_rfc3339(),
+                            )
+                            .await
+                    {
+                        tracing::warn!(
+                            target: "memory_sleeptime",
+                            error = %e,
+                            "failed to stamp last_sleeptime_at"
+                        );
+                    }
                     Ok(WriteResult::Skipped)
                 }
                 Err(e) => Err(anyhow!("sleeptime: {e}")),
@@ -701,7 +870,7 @@ async fn process_message(
             let store = stores.workspace().clone();
             let res = process_session_consolidate(
                 &store,
-                _llm,
+                llm,
                 session_id,
                 repo_id,
                 module_path,
@@ -720,6 +889,89 @@ async fn process_message(
             let store = stores.workspace().clone();
             process_telemetry_classify(&store, &turn_id, &session_id, &response).await
         }
+        WriterMessage::Restore { deletion_id, ack } => {
+            // C2.2: deletions audit is per-DB, and current soft-delete
+            // call sites only land into workspace. Step 7 generalises
+            // by walking opened stores; today workspace is sufficient.
+            let store = stores.workspace().clone();
+            let res = store.restore_deletion(deletion_id).await;
+            send_ack_typed(ack, &res);
+            res.map(|outcome| match outcome {
+                super::store::RestoreOutcome::Inserted { new_memory_id, .. } => {
+                    WriteResult::Inserted(new_memory_id)
+                }
+                super::store::RestoreOutcome::Deduplicated {
+                    surviving_memory_id,
+                    ..
+                } => WriteResult::Deduplicated(surviving_memory_id),
+                super::store::RestoreOutcome::AlreadyCovered { .. } => {
+                    WriteResult::AlreadyCovered
+                }
+                super::store::RestoreOutcome::Refused { .. } => WriteResult::Skipped,
+            })
+        }
+        WriterMessage::RestoreSince {
+            since_sql_offset,
+            ack,
+        } => {
+            let store = stores.workspace().clone();
+            let res = store.restore_deletions_since(&since_sql_offset).await;
+            send_ack_typed(ack, &res);
+            res.map(|_| WriteResult::Skipped)
+        }
+        WriterMessage::RedactHistory {
+            memory_id,
+            reason,
+            ack,
+        } => {
+            let store = stores.workspace().clone();
+            let res = store.redact_history_row(memory_id, &reason).await;
+            send_ack_typed(ack, &res);
+            res.map(|audit_id| WriteResult::Inserted(audit_id))
+        }
+        WriterMessage::BulkForget {
+            filter,
+            dry_run,
+            reason,
+            ack,
+        } => {
+            let store = stores.workspace().clone();
+            let res = store
+                .bulk_forget(
+                    &filter,
+                    dry_run,
+                    reason.as_deref(),
+                    super::deletions::DeletedBy::UserCommand,
+                )
+                .await;
+            send_ack_typed(ack, &res);
+            res.map(|report| {
+                if dry_run {
+                    WriteResult::Skipped
+                } else if report.deleted == 0 {
+                    WriteResult::Skipped
+                } else {
+                    WriteResult::Inserted(report.deleted as i64)
+                }
+            })
+        }
+    }
+}
+
+/// C2.2: shared `send_ack` helper for variants whose ack carries a
+/// non-`WriteResult` payload (e.g. [`super::store::RestoreOutcome`]).
+/// Mirrors [`send_ack`] but is generic over the payload so each
+/// variant can have its own oneshot type without duplicated code.
+fn send_ack_typed<T: Clone>(
+    ack: Option<oneshot::Sender<Result<T, String>>>,
+    res: &Result<T>,
+) {
+    if let Some(tx) = ack {
+        let payload = match res {
+            Ok(v) => Ok(v.clone()),
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = tx.send(payload);
     }
 }
 
@@ -921,11 +1173,26 @@ async fn process_panel_edit(store: &Arc<MemoryStore>, op: PanelEditOp) -> Result
 
     match op {
         PanelEditOp::Delete { memory_id } => {
-            let n = store.delete_memory_by_id(memory_id).await?;
-            if n == 0 {
-                Ok(WriteResult::Skipped)
-            } else {
-                Ok(WriteResult::Inserted(memory_id))
+            // C2.1: soft-delete through the audit table so `/restore`
+            // can reinstate within the retention window. The history
+            // refusal upstream guarantees we never reach this branch
+            // for a history row, but soft_delete_memory enforces it
+            // again as belt-and-braces.
+            match store
+                .soft_delete_memory(memory_id, super::deletions::DeletedBy::Panel, None, None)
+                .await
+            {
+                Ok(audit_id) => Ok(WriteResult::Inserted(audit_id)),
+                Err(e) => {
+                    // Distinguish "row not found" (cosmetic — the
+                    // panel's view raced ahead of the user) from a
+                    // real failure.
+                    if format!("{e}").contains("not found") {
+                        Ok(WriteResult::Skipped)
+                    } else {
+                        Err(e)
+                    }
+                }
             }
         }
         PanelEditOp::Pin {
@@ -1310,12 +1577,6 @@ mod tests {
                 }
             }
             Ok(v)
-        }
-        fn dimensions(&self) -> usize {
-            8
-        }
-        fn model_id(&self) -> &str {
-            "mock"
         }
     }
 
