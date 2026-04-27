@@ -150,6 +150,13 @@ pub enum Event {
         rows: Vec<crate::panels::memory_panel::ScopeSummaryRow>,
     },
 
+    /// C2.6: loaded audit rows for the Deletions tab. Receiver
+    /// overwrites `MemoryPanelState::deletions_rows` and resets the
+    /// cursor to 0.
+    MemoryDeletionsLoaded {
+        rows: Vec<crate::panels::memory_panel::DeletionRow>,
+    },
+
     // Swarm events (constructed by TuiSwarmObserver when swarm is launched)
     SwarmPhaseChanged(String),
     SwarmAgentStateChanged {
