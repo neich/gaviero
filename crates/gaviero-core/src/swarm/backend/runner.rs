@@ -25,6 +25,37 @@ use super::super::models::{AgentManifest, AgentStatus, WorkUnit};
 use super::shared::{default_editor_system_prompt, render_swarm_prompt};
 use super::{AgentBackend, CompletionRequest, UnifiedStreamEvent};
 
+/// Hardcoded base tool surface granted to every swarm work unit whose
+/// backend supports tool use. Anything beyond this set must be opted
+/// into either by the unit's DSL `tools [...]` declaration or by the
+/// workspace-level `agent.availableTools` setting.
+const SWARM_BASE_TOOLS: &[&str] = &["Read", "Glob", "Grep", "Write", "Edit", "MultiEdit"];
+
+/// Compute the effective `--tools` list for a swarm work unit.
+///
+/// Precedence (chosen so the DSL stays the audit record for any unit
+/// that opts in explicitly):
+///   1. If `dsl_extras` is non-empty, it wins; `workspace_extras` is ignored.
+///   2. Otherwise `workspace_extras` fills in.
+/// Names already in [`SWARM_BASE_TOOLS`] are deduped silently.
+pub(super) fn resolve_swarm_tools(
+    dsl_extras: &[String],
+    workspace_extras: &[String],
+) -> Vec<String> {
+    let mut tools: Vec<String> = SWARM_BASE_TOOLS.iter().map(|s| (*s).to_string()).collect();
+    let extras: &[String] = if !dsl_extras.is_empty() {
+        dsl_extras
+    } else {
+        workspace_extras
+    };
+    for extra in extras {
+        if !tools.iter().any(|t| t == extra) {
+            tools.push(extra.clone());
+        }
+    }
+    tools
+}
+
 /// Run a work unit through any `AgentBackend`, producing an `AgentManifest`.
 ///
 /// When `validation` is provided, runs the validation pipeline after each agent
@@ -57,6 +88,11 @@ pub async fn run_backend(
     // M7: pre-fetched memory text from SwarmContextBundle. Some → planner
     // skips its own DB query. None → per-runner query (single-agent / tests).
     pre_fetched_memory: Option<&str>,
+    // Workspace-level fallback for tool grants. Used only when this
+    // unit's DSL `tools [...]` is empty — the DSL stays authoritative
+    // when present so the unit's checked-in declaration remains the
+    // audit record of which tools it can use.
+    workspace_extra_tools: &[String],
 ) -> Result<AgentManifest> {
     let agent_id = format!("agent-{}", work_unit.id);
 
@@ -158,23 +194,7 @@ pub async fn run_backend(
 
         let capabilities = backend.capabilities();
         let allowed_tools = if capabilities.tool_use {
-            let mut tools: Vec<String> = vec![
-                "Read".into(),
-                "Glob".into(),
-                "Grep".into(),
-                "Write".into(),
-                "Edit".into(),
-                "MultiEdit".into(),
-            ];
-            // DSL `agent { tools [...] }` opt-in: extras only, deduped.
-            // Grants like `Bash` intentionally bypass the write-gate scope
-            // check, so the DSL is the sole place this can happen.
-            for extra in &work_unit.extra_allowed_tools {
-                if !tools.iter().any(|t| t == extra) {
-                    tools.push(extra.clone());
-                }
-            }
-            tools
+            resolve_swarm_tools(&work_unit.extra_allowed_tools, workspace_extra_tools)
         } else {
             vec![]
         };
@@ -703,6 +723,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -742,6 +763,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -790,6 +812,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -842,6 +865,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -876,10 +900,55 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .await
         .unwrap();
 
         assert!(matches!(manifest.status, AgentStatus::Completed));
+    }
+
+    // ── resolve_swarm_tools precedence ──────────────────────────────
+
+    #[test]
+    fn resolve_swarm_tools_no_extras_returns_base_set() {
+        let tools = resolve_swarm_tools(&[], &[]);
+        assert_eq!(
+            tools,
+            vec!["Read", "Glob", "Grep", "Write", "Edit", "MultiEdit"]
+        );
+    }
+
+    #[test]
+    fn resolve_swarm_tools_dsl_extras_appended_and_deduped() {
+        let dsl = vec!["Bash".into(), "WebFetch".into(), "Read".into()];
+        let tools = resolve_swarm_tools(&dsl, &[]);
+        assert_eq!(
+            tools,
+            vec!["Read", "Glob", "Grep", "Write", "Edit", "MultiEdit", "Bash", "WebFetch"]
+        );
+    }
+
+    #[test]
+    fn resolve_swarm_tools_workspace_fills_when_dsl_empty() {
+        let workspace = vec!["Bash".into()];
+        let tools = resolve_swarm_tools(&[], &workspace);
+        assert!(tools.contains(&"Bash".to_string()));
+        assert!(tools.contains(&"Read".to_string()));
+    }
+
+    #[test]
+    fn resolve_swarm_tools_dsl_overrides_workspace() {
+        // Unit declares its own tools — workspace setting must NOT
+        // sneak Bash in. Preserves the audit invariant: when DSL is
+        // present, it is the sole source of truth for that unit.
+        let dsl = vec!["WebFetch".into()];
+        let workspace = vec!["Bash".into()];
+        let tools = resolve_swarm_tools(&dsl, &workspace);
+        assert!(tools.contains(&"WebFetch".to_string()));
+        assert!(
+            !tools.contains(&"Bash".to_string()),
+            "workspace must not override an explicit DSL declaration"
+        );
     }
 }
