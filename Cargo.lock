@@ -1161,6 +1161,7 @@ dependencies = [
  "gaviero-dsl",
  "miette",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
