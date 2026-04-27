@@ -148,6 +148,27 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
                     app.handle_consolidate_session_command();
                 } else if app.chat_state.text_input.text.trim().starts_with("/sleep") {
                     app.handle_sleep_command();
+                } else if app.chat_state.text_input.text.trim().starts_with("/restore") {
+                    app.handle_restore_command();
+                } else if app
+                    .chat_state
+                    .text_input
+                    .text
+                    .trim()
+                    .starts_with("/forget-history")
+                {
+                    app.handle_forget_history_command();
+                } else if {
+                    // Dispatch /forget* — `/forget-history` is captured
+                    // by the prior arm so this one only sees the bulk
+                    // soft-delete variants.
+                    let t = app.chat_state.text_input.text.trim();
+                    (t.starts_with("/forget-scope")
+                        || t.starts_with("/forget-type")
+                        || t.starts_with("/forget-source")
+                        || (t.starts_with("/forget") && !t.starts_with("/forget-history")))
+                } {
+                    app.handle_forget_command();
                 } else if !app.chat_state.process_slash_command() {
                     app.send_chat_message();
                 }
@@ -897,6 +918,25 @@ pub(super) fn handle_memory_panel_action(app: &mut App, action: Action) {
         }
     }
 
+    // C2.6: Deletions tab is read-only too — d/e/p/s would target
+    // already-deleted rows. Block with a hint.
+    if app.memory_panel.viewing_deletions {
+        let blocked = matches!(
+            action,
+            Action::InsertChar('d')
+                | Action::InsertChar('e')
+                | Action::InsertChar('p')
+                | Action::InsertChar('s')
+        );
+        if blocked {
+            app.memory_panel.last_error = Some((
+                "deletions tab is read-only — use `u` to restore".to_string(),
+                std::time::Instant::now(),
+            ));
+            return;
+        }
+    }
+
     match action {
         Action::Tab => app.memory_panel.focus_next(),
         Action::CursorDown => cursor_down_in_focus(app),
@@ -906,28 +946,90 @@ pub(super) fn handle_memory_panel_action(app: &mut App, action: Action) {
         // refresh users can press `r` (existing reload) or wait for
         // the standard 100ms refresh debounce.
         Action::InsertChar('1') => {
+            let left = app.memory_panel.leave_deletions_tab();
             if app
                 .memory_panel
                 .set_active_kind(gaviero_core::memory::MemoryKind::Record)
+                || left
             {
                 refresh_recent_rows_for_kind(app);
             }
         }
         Action::InsertChar('2') => {
+            let left = app.memory_panel.leave_deletions_tab();
             if app
                 .memory_panel
                 .set_active_kind(gaviero_core::memory::MemoryKind::History)
+                || left
             {
                 refresh_recent_rows_for_kind(app);
             }
         }
         Action::InsertChar('3') => {
+            let left = app.memory_panel.leave_deletions_tab();
             if app
                 .memory_panel
                 .set_active_kind(gaviero_core::memory::MemoryKind::Summary)
+                || left
             {
                 refresh_recent_rows_for_kind(app);
             }
+        }
+        // C2.6: Deletions tab. Loads the audit log and routes `u`
+        // through WriterMessage::Restore. Redactions remain visible
+        // but `u` is a no-op for them (with a hint).
+        Action::InsertChar('4') => {
+            if app.memory_panel.enter_deletions_tab() {
+                refresh_deletions_rows(app);
+            }
+        }
+        Action::InsertChar('u')
+            if app.memory_panel.viewing_deletions
+                && app.memory_panel.focused == PanelSection::RecentlyWritten =>
+        {
+            let Some(row) = app.memory_panel.deletion_under_cursor().cloned() else {
+                return;
+            };
+            if !row.restorable {
+                app.memory_panel.last_error = Some((
+                    "redactions are permanent — `u` cannot restore user_redaction rows"
+                        .to_string(),
+                    std::time::Instant::now(),
+                ));
+                return;
+            }
+            let Some(writer) = app.memory_writer.clone() else {
+                return;
+            };
+            let tx = app.event_tx.clone();
+            tokio::spawn(async move {
+                let body = match writer.restore_deletion(row.id).await {
+                    Ok(outcome) => match outcome {
+                        gaviero_core::memory::RestoreOutcome::Inserted {
+                            new_memory_id, ..
+                        } => format!("✓ restored audit {} as memory {}", row.id, new_memory_id),
+                        gaviero_core::memory::RestoreOutcome::Deduplicated {
+                            surviving_memory_id,
+                            ..
+                        } => format!(
+                            "✓ audit {} merged into existing memory {}",
+                            row.id, surviving_memory_id
+                        ),
+                        gaviero_core::memory::RestoreOutcome::AlreadyCovered { .. } => {
+                            format!("✓ audit {} covered at a broader scope", row.id)
+                        }
+                        gaviero_core::memory::RestoreOutcome::Refused { reason, .. } => {
+                            format!("✗ restore refused: {reason}")
+                        }
+                    },
+                    Err(e) => format!("restore failed: {e}"),
+                };
+                let _ = tx.send(Event::MessageComplete {
+                    conv_id: String::new(),
+                    role: "system".to_string(),
+                    content: body,
+                });
+            });
         }
         Action::InsertChar('i') if app.memory_panel.focused == PanelSection::InjectedNow => {
             app.memory_panel.load_inspect_pool();
@@ -1102,8 +1204,14 @@ fn cursor_down_in_focus(app: &mut App) {
             app.memory_panel.injected_cursor = (app.memory_panel.injected_cursor + 1).min(max);
         }
         PanelSection::RecentlyWritten => {
-            let max = app.memory_panel.recent_rows.len().saturating_sub(1);
-            app.memory_panel.recent_cursor = (app.memory_panel.recent_cursor + 1).min(max);
+            if app.memory_panel.viewing_deletions {
+                let max = app.memory_panel.deletions_rows.len().saturating_sub(1);
+                app.memory_panel.deletions_cursor =
+                    (app.memory_panel.deletions_cursor + 1).min(max);
+            } else {
+                let max = app.memory_panel.recent_rows.len().saturating_sub(1);
+                app.memory_panel.recent_cursor = (app.memory_panel.recent_cursor + 1).min(max);
+            }
         }
         _ => {}
     }
@@ -1116,7 +1224,12 @@ fn cursor_up_in_focus(app: &mut App) {
             app.memory_panel.injected_cursor = app.memory_panel.injected_cursor.saturating_sub(1);
         }
         PanelSection::RecentlyWritten => {
-            app.memory_panel.recent_cursor = app.memory_panel.recent_cursor.saturating_sub(1);
+            if app.memory_panel.viewing_deletions {
+                app.memory_panel.deletions_cursor =
+                    app.memory_panel.deletions_cursor.saturating_sub(1);
+            } else {
+                app.memory_panel.recent_cursor = app.memory_panel.recent_cursor.saturating_sub(1);
+            }
         }
         _ => {}
     }
@@ -1233,6 +1346,37 @@ fn refresh_recent_rows_for_kind(app: &mut App) {
                 .map(crate::panels::memory_panel::MemoryRow::from_scored)
                 .collect();
             let _ = tx.send(crate::event::Event::MemorySearchResults { rows: panel_rows });
+        }
+    });
+}
+
+/// C2.6: load the most recent N audit rows into the Deletions tab.
+/// Spawned as a tokio task so the TUI stays responsive; the result
+/// arrives via `Event::MemoryDeletionsLoaded`.
+fn refresh_deletions_rows(app: &mut App) {
+    let Some(mem) = app.memory.clone() else {
+        return;
+    };
+    let tx = app.event_tx.clone();
+    tokio::spawn(async move {
+        if let Ok(rows) = mem.workspace().recent_deletions(50).await {
+            let panel_rows: Vec<crate::panels::memory_panel::DeletionRow> = rows
+                .into_iter()
+                .map(|d| {
+                    let restorable = d.is_restorable();
+                    crate::panels::memory_panel::DeletionRow {
+                        id: d.id,
+                        memory_id: d.memory_id,
+                        memory_kind: d.memory_kind,
+                        memory_source: d.memory_source,
+                        deleted_at: d.deleted_at,
+                        deleted_by: d.deleted_by,
+                        reason: d.reason,
+                        restorable,
+                    }
+                })
+                .collect();
+            let _ = tx.send(crate::event::Event::MemoryDeletionsLoaded { rows: panel_rows });
         }
     });
 }
@@ -1477,6 +1621,9 @@ pub(super) fn send_chat_message(app: &mut App) {
     let auto_approve = app.chat_state.effective_auto_approve();
     app.chat_state.auto_approve_next = false;
 
+    let (agent_available_tools, agent_approved_tools) =
+        app.workspace.resolve_agent_tools(Some(&root));
+
     // M6: `resume_session_id` deprecated; ClaudeSession reads it from
     // `ContinuityHandle` instead. This construction site feeds
     // `LegacyAgentSession` (Ollama/Codex) and `ClaudeSession` both;
@@ -1487,6 +1634,8 @@ pub(super) fn send_chat_message(app: &mut App) {
         effort,
         max_tokens,
         auto_approve,
+        available_tools: Some(agent_available_tools),
+        approved_tools: Some(agent_approved_tools),
         resume_session_id,
     };
 
@@ -1522,7 +1671,7 @@ pub(super) fn send_chat_message(app: &mut App) {
     let embedder_name = app
         .memory
         .as_ref()
-        .map(|m| m.embedder().model_id().to_string())
+        .map(|m| m.embedder().name().to_string())
         .unwrap_or_else(|| "unknown".to_string());
     let reranker_name = if app
         .workspace
@@ -1669,64 +1818,47 @@ pub(super) fn send_chat_message(app: &mut App) {
             }
         };
 
-        // Tier S / S1: chat memory auto-injection. Retrieval runs on every
-        // turn; graph/replay bootstrap remains first-turn only above.
+        // Tier S / S1 + S4: chat memory auto-injection and manifest
+        // persistence. Both are owned by `context_planner::chat_memory`
+        // so CLI / headless callers reach the same path. The TUI
+        // contributes only TUI-specific bits: emitting the
+        // `ChatMemoryInjected` event for the panel and supplying
+        // workspace-resolved configs.
         let chat_injection: Option<gaviero_core::memory::ChatInjection> =
             if let Some(mem) = memory.as_ref() {
-                // Chat injection: folder context would require
-                // threading the active editor file through; for now
-                // pass None and rely on workspace + global retrieval.
-                let memory_scope =
-                    gaviero_core::memory::MemoryScope::from_context(&graph_root, None, None, None);
                 let reranker_ref: Option<&dyn gaviero_core::memory::Reranker> =
                     memory_reranker.as_deref();
-                match gaviero_core::memory::retrieval::retrieve_for_chat_with_reranker(
-                    mem,
-                    &memory_scope,
-                    &prompt,
-                    &chat_injection_config,
-                    &retrieval_cfg,
-                    reranker_ref,
-                    memory_rerank_cfg.as_ref(),
+                let outcome = gaviero_core::context_planner::perform_injection(
+                    gaviero_core::context_planner::ChatMemoryRequest {
+                        stores: mem,
+                        writer: memory_writer.as_ref(),
+                        workspace_root: &graph_root,
+                        folder_root: None,
+                        user_prompt: &prompt,
+                        turn_id: &turn_id_clone,
+                        session_id: &conv_id_clone,
+                        injection_config: &chat_injection_config,
+                        retrieval_config: &retrieval_cfg,
+                        reranker: reranker_ref,
+                        rerank_config: memory_rerank_cfg.as_ref(),
+                        manifests_enabled,
+                        capture_candidate_pool,
+                        embedder_name: &embedder_name,
+                        reranker_name: reranker_name.as_deref(),
+                    },
                 )
-                .await
-                {
-                    Ok(inj) => inj,
-                    Err(e) => {
-                        tracing::warn!("retrieve_for_chat failed: {}", e);
-                        None
-                    }
-                }
+                .await;
+                let _ = tx.send(Event::ChatMemoryInjected {
+                    conv_id: conv_id_clone.clone(),
+                    items_injected: outcome.summary.items_injected,
+                    pool_size: outcome.summary.pool_size,
+                    tokens_used: outcome.summary.tokens_used,
+                    token_budget: outcome.summary.token_budget,
+                });
+                outcome.injection
             } else {
                 None
             };
-
-        if let Some(ref inj) = chat_injection {
-            let _ = tx.send(Event::ChatMemoryInjected {
-                conv_id: conv_id_clone.clone(),
-                items_injected: inj.items.len(),
-                pool_size: inj.pool.len(),
-                tokens_used: inj.tokens_used,
-                token_budget: inj.token_budget,
-            });
-            if manifests_enabled {
-                if let Some(ref writer) = memory_writer {
-                    let payload = build_injection_manifest_payload(
-                        &prompt,
-                        inj,
-                        capture_candidate_pool,
-                        &embedder_name,
-                        reranker_name.as_deref(),
-                    );
-                    let _ =
-                        writer.enqueue(gaviero_core::memory::WriterMessage::InjectionManifest {
-                            turn_id: turn_id_clone.clone(),
-                            session_id: conv_id_clone.clone(),
-                            payload,
-                        });
-                }
-            }
-        }
 
         // V9 §11 M5: lift `PlannerSelections` into a transport `Turn` and
         // dispatch through `AgentSession`. The registry hands back a
@@ -1777,24 +1909,9 @@ pub(super) fn send_chat_message(app: &mut App) {
         selections.replay_history = replay_history;
 
         // S1: splice the chat-turn memory block as a pre-rendered
-        // MemorySelection. The provider renderers emit `content` as-is for
-        // selections with `id.is_none()` / `namespace.is_none()`.
-        if let Some(inj) = chat_injection {
-            if !inj.items.is_empty() && !inj.block.is_empty() {
-                selections
-                    .memory_selections
-                    .push(gaviero_core::context_planner::MemorySelection {
-                        id: None,
-                        namespace: None,
-                        scope_label: None,
-                        score: None,
-                        trust: None,
-                        content: inj.block,
-                        source_hash: None,
-                        updated_at: None,
-                    });
-            }
-        }
+        // MemorySelection. Provider-agnostic; lives in core so CLI
+        // callers do the same thing.
+        gaviero_core::context_planner::splice_into_selections(chat_injection, &mut selections);
 
         let transport_ctx = gaviero_core::agent_session::TransportContext {
             user_message: prompt.clone(),
@@ -1910,87 +2027,3 @@ pub(super) fn cancel_agent(app: &mut App) {
     }
 }
 
-/// Build the S4 retrieval-manifest JSON payload from a `ChatInjection`.
-///
-/// The payload is consumed by the writer task's `InjectionManifest`
-/// handler, which persists it verbatim into the `injection_manifests`
-/// table. Keep the shape stable — downstream tools (Tier B6 telemetry,
-/// CLI introspection) read it as opaque JSON.
-fn build_injection_manifest_payload(
-    query_text: &str,
-    inj: &gaviero_core::memory::ChatInjection,
-    include_pool: bool,
-    embedder_name: &str,
-    reranker_name: Option<&str>,
-) -> serde_json::Value {
-    let selected_ids: Vec<i64> = inj.items.iter().map(|m| m.id).collect();
-    // B2: bump schema_version to 2 when the reranker fired so consumers
-    // can branch on shape. Old (v1) consumers still parse v2 because
-    // every B2 field is additive and optional.
-    let any_reranked = inj.pool.iter().any(|c| c.rerank_score.is_some());
-    let schema_version = if any_reranked { 2 } else { 1 };
-    let scoring_formula_version = if any_reranked {
-        "v2-rerank-blend"
-    } else {
-        "v1-composite"
-    };
-    let mut payload = serde_json::json!({
-        "schema_version": schema_version,
-        "scoring_formula_version": scoring_formula_version,
-        "embedder_name": embedder_name,
-        "query_text": query_text,
-        "selected_ids": selected_ids,
-        "token_budget_used": inj.tokens_used,
-        "token_budget_limit": inj.token_budget,
-    });
-    if let Some(name) = reranker_name {
-        payload["reranker_name"] = serde_json::Value::String(name.to_string());
-    }
-    // B3: scope distribution summary so the panel + CLI can show
-    // cross-scope balance per turn without rescanning the pool. Order
-    // is stable (lexicographic by scope label) for deterministic
-    // diffing across replays.
-    {
-        use std::collections::BTreeMap;
-        let mut by_scope: BTreeMap<String, (u64, u64)> = BTreeMap::new();
-        for c in &inj.pool {
-            let entry = by_scope.entry(c.scope_label.clone()).or_default();
-            entry.0 += 1;
-            if c.selected {
-                entry.1 += 1;
-            }
-        }
-        let dist: Vec<serde_json::Value> = by_scope
-            .into_iter()
-            .map(|(label, (in_pool, selected))| {
-                serde_json::json!({
-                    "scope_label": label,
-                    "count_in_pool": in_pool,
-                    "count_selected": selected,
-                })
-            })
-            .collect();
-        payload["scope_distribution"] = serde_json::Value::Array(dist);
-    }
-    if include_pool {
-        let pool: Vec<serde_json::Value> = inj
-            .pool
-            .iter()
-            .map(|c| {
-                serde_json::json!({
-                    "memory_id": c.memory_id,
-                    "scope_label": c.scope_label,
-                    "namespace": c.namespace,
-                    "raw_similarity": c.raw_similarity,
-                    "composite_score": c.composite_score,
-                    "selected": c.selected,
-                    "exclusion_reason": c.exclusion_reason,
-                    "rerank_score": c.rerank_score,
-                    "blended_score": c.blended_score,
-                })
-            })
-            .collect();
-        payload["candidate_pool"] = serde_json::Value::Array(pool);
-    }
-    payload
-}
