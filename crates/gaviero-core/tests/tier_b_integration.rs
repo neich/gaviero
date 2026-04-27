@@ -62,12 +62,6 @@ impl Embedder for TestEmbedder {
         }
         Ok(vec)
     }
-    fn dimensions(&self) -> usize {
-        8
-    }
-    fn model_id(&self) -> &str {
-        "test-embedder-v1"
-    }
 }
 
 fn store() -> Arc<MemoryStore> {
