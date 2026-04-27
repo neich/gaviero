@@ -146,6 +146,10 @@ pub struct App {
     pub memory_reranker: Option<Arc<dyn gaviero_core::memory::Reranker>>,
     /// B2: cached reranker config snapshot at memory-ready time.
     pub memory_rerank_cfg: Option<gaviero_core::memory::RerankConfig>,
+    /// Tier B / B5 Phase 2: long-running auto-trigger for sleeptime
+    /// passes. Spawned in `Event::MemoryReady` next to the writer
+    /// task; held here only so a clean shutdown can join it.
+    pub memory_sleeptime_scheduler: Option<gaviero_core::memory::SleeptimeScheduler>,
 
     // Code graph cache — lazy build, invalidated on file changes.
     // `None` means "needs (re)build before next chat send".
@@ -329,6 +333,7 @@ impl App {
             memory_writer: None,
             memory_reranker: None,
             memory_rerank_cfg: None,
+            memory_sleeptime_scheduler: None,
             repo_map: Arc::new(tokio::sync::RwLock::new(None)),
             graph_workspace_root,
             git_panel: crate::panels::git_panel::GitPanelState::new(),
@@ -434,6 +439,21 @@ impl App {
     /// Handle `/sleep [--dry-run]` — Tier B / B5 sleeptime pass.
     fn handle_sleep_command(&mut self) {
         commands::handle_sleep_command(self);
+    }
+
+    /// Handle `/restore <id>` and `/restore --since <duration>` — Tier C / C2.2.
+    fn handle_restore_command(&mut self) {
+        commands::handle_restore_command(self);
+    }
+
+    /// Handle `/forget`, `/forget-scope`, `/forget-type`, `/forget-source` — Tier C / C2.3.
+    fn handle_forget_command(&mut self) {
+        commands::handle_forget_command(self);
+    }
+
+    /// Handle `/forget-history` — Tier C / C2.4 (two-step REDACT confirm).
+    fn handle_forget_history_command(&mut self) {
+        commands::handle_forget_history_command(self);
     }
 
     /// Handle `/attach [path]` command.
