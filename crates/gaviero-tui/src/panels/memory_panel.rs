@@ -33,7 +33,21 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 
 use gaviero_core::memory::store::{InjectionManifestRow, SessionLedgerTurn};
-use gaviero_core::memory::{MemorySource, ScoredMemory};
+use gaviero_core::memory::{MemoryKind, MemorySource, ScoredMemory};
+
+/// C2.6: lightweight projection of a single `deletions` audit row for
+/// the Deletions tab. Only the columns the panel actually renders.
+#[derive(Debug, Clone)]
+pub struct DeletionRow {
+    pub id: i64,
+    pub memory_id: i64,
+    pub memory_kind: String,
+    pub memory_source: String,
+    pub deleted_at: String,
+    pub deleted_by: String,
+    pub reason: Option<String>,
+    pub restorable: bool,
+}
 
 /// Panel-local color palette. Kept internal so future theme integration
 /// touches one place. Chosen to sit on dark-gray terminal backgrounds.
@@ -186,6 +200,24 @@ impl ScopeChoice {
 pub struct MemoryPanelState {
     pub focused: PanelSection,
 
+    /// C1.5: which lifecycle class the panel is currently filtered to.
+    /// Default is `Record` (the workhorse). Switching tabs (`1`/`2`/`3`
+    /// keys) changes which kind populates the Recently Written list and
+    /// gates the destructive keys — when on the History tab, the panel
+    /// rejects `d`/`e`/`p`/`s` with a "history is read-only" message,
+    /// reinforcing the C1.2 writer-task guard and the C1.3 SQL trigger
+    /// at the UI layer.
+    pub active_kind: MemoryKind,
+
+    /// C2.6: when true, the "Recently Written" section renders the
+    /// `deletions` audit log instead of the per-kind memory list.
+    /// Mutually exclusive with the per-kind tabs (1/2/3); the `4`
+    /// key toggles into this mode. `u` on a row dispatches a
+    /// `WriterMessage::Restore` (skipped silently for redactions).
+    pub viewing_deletions: bool,
+    pub deletions_rows: Vec<DeletionRow>,
+    pub deletions_cursor: usize,
+
     // ── Section 1: Injected Now ──────────────────────────────────
     /// Current turn's manifest row (may be `None` until a manifest
     /// lands). Payload JSON is parsed lazily for the detail view.
@@ -259,6 +291,10 @@ impl Default for MemoryPanelState {
     fn default() -> Self {
         Self {
             focused: PanelSection::InjectedNow,
+            active_kind: MemoryKind::Record,
+            viewing_deletions: false,
+            deletions_rows: Vec::new(),
+            deletions_cursor: 0,
             current_manifest: None,
             current_ledger: None,
             injected_cursor: 0,
@@ -293,6 +329,61 @@ impl MemoryPanelState {
     /// Cycle focus to the next section. Bound to `Tab`.
     pub fn focus_next(&mut self) {
         self.focused = self.focused.next();
+    }
+
+    /// C1.5: switch the active kind tab. Returns `true` when the kind
+    /// actually changed so callers can decide whether to refresh the
+    /// rows. Bound to `1` (Records), `2` (History), `3` (Summaries).
+    pub fn set_active_kind(&mut self, kind: MemoryKind) -> bool {
+        if self.active_kind == kind {
+            return false;
+        }
+        self.active_kind = kind;
+        // Reset cursors so we don't land on a row that no longer
+        // exists in the new tab's list.
+        self.recent_cursor = 0;
+        self.search_cursor = 0;
+        self.recent_rows.clear();
+        true
+    }
+
+    /// C1.5: convenience for the side_panel destructive-key guard.
+    /// Returns `true` when the active tab is the read-only History
+    /// tab — destructive ops should refuse and show a hint.
+    pub fn history_tab_active(&self) -> bool {
+        self.active_kind == MemoryKind::History
+    }
+
+    /// C2.6: enter the Deletions tab. Returns `true` when the mode
+    /// actually changed so callers can decide whether to refresh the
+    /// audit list. Bound to `4`.
+    pub fn enter_deletions_tab(&mut self) -> bool {
+        if self.viewing_deletions {
+            return false;
+        }
+        self.viewing_deletions = true;
+        self.deletions_cursor = 0;
+        self.deletions_rows.clear();
+        true
+    }
+
+    /// C2.6: leave the Deletions tab and reactivate the per-kind view.
+    /// Called when 1/2/3 are pressed.
+    pub fn leave_deletions_tab(&mut self) -> bool {
+        if !self.viewing_deletions {
+            return false;
+        }
+        self.viewing_deletions = false;
+        self.deletions_rows.clear();
+        true
+    }
+
+    /// C2.6: restore eligibility for the row under the cursor.
+    /// Redactions (`deleted_by = user_redaction`) are not restorable
+    /// per the plan — surfaced here so the side_panel can swallow `u`
+    /// with an explanatory message.
+    pub fn deletion_under_cursor(&self) -> Option<&DeletionRow> {
+        self.deletions_rows.get(self.deletions_cursor)
     }
 
     /// Parse the candidate pool out of the current manifest's payload.
@@ -364,6 +455,14 @@ impl MemoryPanelState {
             return;
         }
 
+        // C1.5 tab strip: one line at the very top showing the
+        // available kinds and which is active.
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(inner);
+        self.render_kind_tabs(outer[0], buf);
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -372,12 +471,55 @@ impl MemoryPanelState {
                 Constraint::Percentage(20),
                 Constraint::Percentage(15),
             ])
-            .split(inner);
+            .split(outer[1]);
 
         self.render_injected_now(chunks[0], buf, focused);
         self.render_recently_written(chunks[1], buf, focused);
         self.render_scope_summary(chunks[2], buf, focused);
         self.render_search(chunks[3], buf, focused);
+    }
+
+    /// C1.5 tab strip render. Single-line, three labels, current tab
+    /// highlighted with the accent color. Switches via `1`/`2`/`3` —
+    /// see [`super::super::app::side_panel::handle_memory_panel_action`].
+    fn render_kind_tabs(&self, area: Rect, buf: &mut Buffer) {
+        let mut spans: Vec<Span> = Vec::with_capacity(10);
+        spans.push(Span::styled(" ", Style::default()));
+        for (idx, kind) in [
+            ("1", MemoryKind::Record),
+            ("2", MemoryKind::History),
+            ("3", MemoryKind::Summary),
+        ]
+        .iter()
+        {
+            let active = !self.viewing_deletions && *kind == self.active_kind;
+            let label = match kind {
+                MemoryKind::Record => "Records",
+                MemoryKind::History => "History (read-only)",
+                MemoryKind::Summary => "Summaries",
+            };
+            let style = if active {
+                Style::default()
+                    .fg(COLOR_ACCENT)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                Style::default().fg(COLOR_MUTED)
+            };
+            spans.push(Span::styled(format!("[{idx}] {label}"), style));
+            spans.push(Span::raw("  "));
+        }
+        // C2.6: Deletions tab. Hosts the audit log; `u` restores
+        // eligible rows. Redactions are visible but marked permanent.
+        let active = self.viewing_deletions;
+        let style = if active {
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(COLOR_MUTED)
+        };
+        spans.push(Span::styled("[4] Deletions (u: restore)", style));
+        Paragraph::new(Line::from(spans)).render(area, buf);
     }
 
     fn render_injected_now(&self, area: Rect, buf: &mut Buffer, focused: bool) {
@@ -415,6 +557,12 @@ impl MemoryPanelState {
     }
 
     fn render_recently_written(&self, area: Rect, buf: &mut Buffer, focused: bool) {
+        // C2.6: when the Deletions tab is active, this section becomes
+        // the audit-log view instead of the per-kind recent list.
+        if self.viewing_deletions {
+            self.render_deletions(area, buf, focused);
+            return;
+        }
         let heading = section_heading(
             "Recently written (24h)",
             focused && self.focused == PanelSection::RecentlyWritten,
@@ -493,6 +641,61 @@ impl MemoryPanelState {
             }
         }
 
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(area, buf);
+    }
+
+    /// C2.6: render the audit-log view in place of the per-kind list.
+    /// Each line is one `deletions` row (newest first); the cursor row
+    /// gets the accent prefix. Permanent (`user_redaction`) rows show
+    /// a distinct marker so the user knows `u` won't bring them back.
+    fn render_deletions(&self, area: Rect, buf: &mut Buffer, focused: bool) {
+        let heading = section_heading(
+            "Deletions (audit log)",
+            focused && self.focused == PanelSection::RecentlyWritten,
+        );
+        let mut lines: Vec<Line> = vec![heading];
+        if self.deletions_rows.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "(no recent soft-deletes)",
+                Style::default().fg(COLOR_MUTED),
+            )));
+        } else {
+            for (i, d) in self
+                .deletions_rows
+                .iter()
+                .take(area.height.saturating_sub(2) as usize)
+                .enumerate()
+            {
+                let cursor = if i == self.deletions_cursor { ">" } else { " " };
+                let marker = if d.restorable {
+                    Span::styled("◯", Style::default().fg(COLOR_ACCENT))
+                } else {
+                    Span::styled("⛔", Style::default().fg(COLOR_WARN))
+                };
+                let body = format!(
+                    "{cursor} #{aid:>4}  mem={mid:<4}  {kind:<7}  {by:<14}  {at}  {reason}",
+                    aid = d.id,
+                    mid = d.memory_id,
+                    kind = d.memory_kind,
+                    by = d.deleted_by,
+                    at = d.deleted_at,
+                    reason = d.reason.as_deref().unwrap_or(""),
+                );
+                lines.push(Line::from(vec![
+                    marker,
+                    Span::raw(" "),
+                    Span::styled(body, Style::default().fg(COLOR_TEXT)),
+                ]));
+            }
+        }
+        if focused && self.focused == PanelSection::RecentlyWritten {
+            lines.push(Line::from(Span::styled(
+                "[u] restore  [↑/↓] navigate  [1/2/3] back to per-kind",
+                Style::default().fg(COLOR_MUTED),
+            )));
+        }
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .render(area, buf);
@@ -641,6 +844,7 @@ fn format_memory_row(row: &MemoryRow, selected: bool) -> Line<'static> {
         MemorySource::LlmConsolidated | MemorySource::SwarmConsolidated => "⟂C",
         MemorySource::McpImport => "⟂M",
         MemorySource::ToolOutput => "⟂T",
+        MemorySource::RawTranscript => "⟂H",
         MemorySource::UnknownLegacy => "⟂?",
     };
     // B6 utilization indicator: ↑ for highly-used (>0.6), ⟂ for

@@ -17,6 +17,117 @@ use super::trust_defaults::MemorySource;
 
 const SEMANTIC_DEDUP_THRESHOLD: f32 = 0.95;
 
+/// C1: a pending typed-stores migration on a single DB file.
+///
+/// Returned by [`probe_c1_migration`] when the file's `user_version`
+/// is < 10 and the next [`MemoryStore::open`] call will cross the C1
+/// boundary. The bootstrap layer (TUI / CLI) is expected to ask the
+/// user for consent — surfacing `proposed_backup_path` so the user
+/// knows where the rollback snapshot will live — before opening.
+///
+/// Plan §"Anti-patterns to avoid": "Silent migration on first run.
+/// The C1 migration is load-bearing; prompt the user on first post-
+/// upgrade start." This struct is the contract that lets the bootstrap
+/// honor that anti-pattern.
+#[derive(Debug, Clone)]
+pub struct C1MigrationProposal {
+    pub db_path: PathBuf,
+    pub proposed_backup_path: PathBuf,
+    pub current_version: u32,
+    pub target_version: u32,
+}
+
+/// C1: probe a DB file for a pending typed-stores migration without
+/// running it. Returns `Ok(None)` for fresh DBs, in-memory DBs, or
+/// already-migrated DBs. Returns `Ok(Some(proposal))` when the next
+/// open will cross the v10 boundary and a backup will be taken.
+///
+/// Probing opens a short-lived `Connection`; the file is *not* mutated.
+pub fn probe_c1_migration(db_path: &Path) -> Result<Option<C1MigrationProposal>> {
+    if !db_path.exists() {
+        return Ok(None);
+    }
+
+    MemoryStore::register_sqlite_vec();
+    let probe = Connection::open(db_path)
+        .with_context(|| format!("probing memory database: {}", db_path.display()))?;
+    let current = schema::read_user_version(&probe)?;
+    let needs = schema::needs_c1_backup(&probe);
+    drop(probe);
+
+    if !needs {
+        return Ok(None);
+    }
+
+    Ok(Some(C1MigrationProposal {
+        db_path: db_path.to_path_buf(),
+        proposed_backup_path: backup_path_for(db_path),
+        current_version: current,
+        target_version: schema::C1_SCHEMA_VERSION,
+    }))
+}
+
+/// Produce the deterministic backup-path for a given DB file.
+/// Reused by both the probe (advisory) and the open path (effective).
+fn backup_path_for(db_path: &Path) -> PathBuf {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut backup = db_path.to_path_buf();
+    let mut filename = backup
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "memory.db".to_string());
+    filename.push_str(&format!(".bak.{ts}"));
+    backup.set_file_name(filename);
+    backup
+}
+
+/// C1 (pre-migration backup): if the file at `db_path` exists and is on
+/// a pre-v10 schema, copy it sidecar to `<db_path>.bak.<unix-ts>` and
+/// return the backup path. The migration ([`schema::run_migrations`])
+/// then proceeds against the original.
+///
+/// **Consent contract**: callers that reach this path must have already
+/// secured user consent via [`probe_c1_migration`] + an interactive
+/// prompt (TUI startup) or an explicit `--accept-c1-migration` flag
+/// (CLI). The bootstrap layer is responsible for the prompt; this
+/// helper is the side-effecting half of the consent contract.
+///
+/// Failure modes are non-fatal: a missing file is a fresh DB with
+/// nothing to back up; a copy error is downgraded to a warning so the
+/// migration can still run (the user's recourse if it later corrupts
+/// is the same recourse they had before C1: their workspace VCS, file-
+/// system snapshots, etc. — better not to block startup once consent
+/// has been given).
+fn pre_c1_backup_if_needed(db_path: &Path) -> Result<Option<PathBuf>> {
+    let Some(proposal) = probe_c1_migration(db_path)? else {
+        return Ok(None);
+    };
+
+    match std::fs::copy(&proposal.db_path, &proposal.proposed_backup_path) {
+        Ok(_) => {
+            tracing::info!(
+                target: "memory_c1",
+                src = %proposal.db_path.display(),
+                dst = %proposal.proposed_backup_path.display(),
+                "took pre-C1-migration snapshot"
+            );
+            Ok(Some(proposal.proposed_backup_path))
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "memory_c1",
+                error = %e,
+                src = %proposal.db_path.display(),
+                "failed to take pre-C1 snapshot; migration will proceed without backup"
+            );
+            Ok(None)
+        }
+    }
+}
+
 /// Privacy filter for memory search operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrivacyFilter {
@@ -250,24 +361,40 @@ impl MemoryStore {
     }
 
     /// Open or create a memory store at the given path.
+    ///
+    /// C1: if the existing DB is at a pre-v10 schema, take a one-shot
+    /// snapshot of the file before running migrations. The C1 migration
+    /// is load-bearing (introduces the `memory_kind` discriminator and
+    /// the per-kind lifecycle), so the anti-pattern doc explicitly
+    /// warns against silent upgrades. The backup gives a no-questions-
+    /// asked rollback path: copy `<file>.bak.<unix-ts>` over `<file>`
+    /// to revert. Path is stamped into `_gaviero_meta.c1_backup_path`
+    /// so the TUI can surface a one-shot banner on next launch.
     pub fn open(db_path: &Path, embedder: Arc<dyn Embedder>) -> Result<Self> {
         Self::register_sqlite_vec();
+
+        // Best-effort pre-migration snapshot. We open a probe connection
+        // first so we can read user_version without applying migrations,
+        // then drop it before opening the real one.
+        let backup_path = pre_c1_backup_if_needed(db_path)?;
+
         let conn = Connection::open(db_path)
             .with_context(|| format!("opening memory database: {}", db_path.display()))?;
-        Self::init(conn, embedder, Some(db_path.to_path_buf()))
+        Self::init(conn, embedder, Some(db_path.to_path_buf()), backup_path)
     }
 
     /// Create an in-memory store (for testing).
     pub fn in_memory(embedder: Arc<dyn Embedder>) -> Result<Self> {
         Self::register_sqlite_vec();
         let conn = Connection::open_in_memory().context("opening in-memory database")?;
-        Self::init(conn, embedder, None)
+        Self::init(conn, embedder, None, None)
     }
 
     fn init(
         conn: Connection,
         embedder: Arc<dyn Embedder>,
         db_path: Option<PathBuf>,
+        c1_backup_path: Option<PathBuf>,
     ) -> Result<Self> {
         schema::run_migrations(&conn, embedder.dimensions())
             .context("running schema migrations")?;
@@ -312,6 +439,30 @@ impl MemoryStore {
                     stamp,
                     "failed to backfill _gaviero_meta.embedder_model — \
                      mismatch detection disabled until next write"
+                );
+            }
+        }
+
+        // C1: stamp the backup path so the TUI can surface a one-shot
+        // banner on next launch. Best-effort — banner is informational.
+        if let Some(backup) = &c1_backup_path {
+            let path_str = backup.display().to_string();
+            if let Err(e) = conn.execute(
+                "INSERT INTO _gaviero_meta(key, value) VALUES ('c1_backup_path', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![path_str],
+            ) {
+                tracing::warn!(
+                    target: "memory_c1",
+                    error = %e,
+                    backup = %path_str,
+                    "failed to stamp c1_backup_path — banner will not show"
+                );
+            } else {
+                tracing::info!(
+                    target: "memory_c1",
+                    backup = %path_str,
+                    "C1 typed-stores migration applied; pre-migration snapshot taken"
                 );
             }
         }
@@ -1097,6 +1248,13 @@ impl MemoryStore {
         let hash = schema::content_hash(content);
         let scope_level = scope.level_int();
         let scope_path = scope.to_path_string();
+        let kind_str = meta.kind.as_str();
+        // C1: History rows are append-only with no dedup. Each turn
+        // writes a fresh transcript row even if its content somehow
+        // hashes equal to an earlier one. Records and Summaries dedup
+        // only against same-kind rows so a record's hash does not
+        // collide with a history row carrying the same body.
+        let skip_dedup = meta.kind == super::kind::MemoryKind::History;
 
         // Compute embedding outside the lock
         let embedding = self
@@ -1109,39 +1267,46 @@ impl MemoryStore {
 
         let conn = self.conn.lock().await;
 
-        // Check for exact duplicate at same scope
-        let existing: Option<i64> = conn
-            .prepare(
-                "SELECT id FROM memories
-                 WHERE content_hash = ?1 AND scope_path = ?2",
-            )?
-            .query_row(rusqlite::params![hash, scope_path], |row| row.get(0))
-            .ok();
-
-        if let Some(id) = existing {
-            // Reinforce: bump access count and timestamp
-            reinforce_memory(&conn, id)?;
-            tracing::debug!(id, "scoped store: deduplicated at same scope");
-            return Ok(StoreResult::Deduplicated(id));
-        }
-
         let ancestor_paths = broader_scope_paths(scope);
-        for (level, ancestor_path) in &ancestor_paths {
-            let covered: bool = conn
+
+        if !skip_dedup {
+            // Check for exact duplicate at same scope (and same kind).
+            let existing: Option<i64> = conn
                 .prepare(
-                    "SELECT 1 FROM memories
-                     WHERE content_hash = ?1 AND scope_level = ?2 AND scope_path = ?3
-                     LIMIT 1",
+                    "SELECT id FROM memories
+                     WHERE content_hash = ?1 AND scope_path = ?2 AND memory_kind = ?3",
                 )?
-                .query_row(rusqlite::params![hash, level, ancestor_path], |_| Ok(true))
-                .unwrap_or(false);
-            if covered {
-                tracing::debug!(level, "scoped store: already covered at broader scope");
-                return Ok(StoreResult::AlreadyCovered);
+                .query_row(rusqlite::params![hash, scope_path, kind_str], |row| row.get(0))
+                .ok();
+
+            if let Some(id) = existing {
+                // Reinforce: bump access count and timestamp
+                reinforce_memory(&conn, id)?;
+                tracing::debug!(id, "scoped store: deduplicated at same scope");
+                return Ok(StoreResult::Deduplicated(id));
+            }
+
+            for (level, ancestor_path) in &ancestor_paths {
+                let covered: bool = conn
+                    .prepare(
+                        "SELECT 1 FROM memories
+                         WHERE content_hash = ?1 AND scope_level = ?2 AND scope_path = ?3
+                           AND memory_kind = ?4
+                         LIMIT 1",
+                    )?
+                    .query_row(
+                        rusqlite::params![hash, level, ancestor_path, kind_str],
+                        |_| Ok(true),
+                    )
+                    .unwrap_or(false);
+                if covered {
+                    tracing::debug!(level, "scoped store: already covered at broader scope");
+                    return Ok(StoreResult::AlreadyCovered);
+                }
             }
         }
 
-        if scope_level != super::scope::SCOPE_RUN {
+        if !skip_dedup && scope_level != super::scope::SCOPE_RUN {
             if let Some(id) = find_semantic_duplicate(
                 &conn,
                 content,
@@ -1163,25 +1328,27 @@ impl MemoryStore {
         }
 
         // Check for semantic coverage at any broader ancestor scope.
-        for (level, ancestor_path) in ancestor_paths {
-            if find_semantic_duplicate(
-                &conn,
-                content,
-                &embedding,
-                level,
-                &ancestor_path,
-                meta.memory_type.as_str(),
-                SEMANTIC_DEDUP_THRESHOLD,
-            )?
-            .is_some()
-            {
-                tracing::debug!(
+        if !skip_dedup {
+            for (level, ancestor_path) in ancestor_paths {
+                if find_semantic_duplicate(
+                    &conn,
+                    content,
+                    &embedding,
                     level,
-                    scope_path = %ancestor_path,
-                    threshold = SEMANTIC_DEDUP_THRESHOLD,
-                    "scoped store: semantically covered at broader scope"
-                );
-                return Ok(StoreResult::AlreadyCovered);
+                    &ancestor_path,
+                    meta.memory_type.as_str(),
+                    SEMANTIC_DEDUP_THRESHOLD,
+                )?
+                .is_some()
+                {
+                    tracing::debug!(
+                        level,
+                        scope_path = %ancestor_path,
+                        threshold = SEMANTIC_DEDUP_THRESHOLD,
+                        "scoped store: semantically covered at broader scope"
+                    );
+                    return Ok(StoreResult::AlreadyCovered);
+                }
             }
         }
 
@@ -1194,8 +1361,8 @@ impl MemoryStore {
                 namespace, key, content, embedding, model_id,
                 scope_level, scope_path, repo_id, module_path, run_id,
                 content_hash, memory_type, trust, tag,
-                importance, privacy, source, trust_score
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 'public', ?16, ?17)",
+                importance, privacy, source, trust_score, memory_kind
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 'public', ?16, ?17, ?18)",
             rusqlite::params![
                 namespace,
                 key,
@@ -1217,6 +1384,7 @@ impl MemoryStore {
                 meta.importance,
                 meta.source_kind.as_str(),
                 meta.trust_score,
+                meta.kind.as_str(),
             ],
         )
         .context("inserting scoped memory")?;
@@ -1689,6 +1857,76 @@ impl MemoryStore {
     }
 
     // ── TUI memory panel queries (Tier A / A4) ───────────────────
+
+    /// C1.5: Memories written within the last `hours` hours of a
+    /// specific `kind`, newest first. Drives the per-kind tab content
+    /// in the TUI memory panel — Records, History, or Summaries each
+    /// get their own filtered list. Composes with [`recent_memories`]
+    /// (which is unfiltered).
+    pub async fn recent_memories_by_kind(
+        &self,
+        kind: super::kind::MemoryKind,
+        hours: u32,
+        limit: usize,
+    ) -> Result<Vec<ScoredMemory>> {
+        let conn = self.conn.lock().await;
+        let since = format!("-{hours} hours");
+        let kind_str = kind.as_str();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, content, content_hash, scope_level, scope_path,
+                        repo_id, module_path, memory_type, trust, importance,
+                        access_count, created_at, updated_at, last_accessed_at,
+                        tag, namespace, key, source, trust_score
+                 FROM memories
+                 WHERE created_at >= datetime('now', ?1)
+                   AND memory_kind = ?2
+                 ORDER BY id DESC
+                 LIMIT ?3",
+            )
+            .context("preparing recent_memories_by_kind")?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![since, kind_str, limit as i64],
+                |row| {
+                    let accessed_at: Option<String> = row.get(13)?;
+                    let trust_str: String = row.get(8)?;
+                    let type_str: String = row.get(7)?;
+                    let source_str: String = row.get(17)?;
+                    let trust_score: f32 = row.get(18)?;
+                    Ok(ScoredMemory {
+                        id: row.get(0)?,
+                        content: row.get(1)?,
+                        content_hash: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        scope_level: row.get(3)?,
+                        scope_path: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                        repo_id: row.get(5)?,
+                        module_path: row.get(6)?,
+                        memory_type: MemoryType::parse_str(&type_str),
+                        trust: Trust::parse_str(&trust_str),
+                        importance: row.get(9)?,
+                        access_count: row.get(10)?,
+                        created_at: row.get(11)?,
+                        updated_at: row.get(12)?,
+                        accessed_at,
+                        tag: row.get(14)?,
+                        namespace: row.get(15)?,
+                        key: row.get(16)?,
+                        source: super::trust_defaults::MemorySource::parse_str(&source_str),
+                        trust_score,
+                        raw_similarity: 0.0,
+                        fts_rank: None,
+                        final_score: 0.0,
+                    })
+                },
+            )
+            .context("running recent_memories_by_kind")?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.context("reading recent_memories_by_kind row")?);
+        }
+        Ok(out)
+    }
 
     /// Memories written within the last `hours` hours, newest first.
     /// Drives Section 2 "Recently Written". Query is indexed on
@@ -2341,6 +2579,259 @@ impl MemoryStore {
         }
     }
 
+    /// C1: read the lifecycle class for a row. Returns `None` if the
+    /// row does not exist. Used by the writer task's panel-edit guard
+    /// to reject mutations on history rows before the SQL trigger
+    /// (C1.3) catches them at the DB level.
+    pub async fn get_memory_kind(
+        &self,
+        memory_id: i64,
+    ) -> Result<Option<super::kind::MemoryKind>> {
+        use std::str::FromStr;
+        let conn = self.conn.lock().await;
+        let row: Result<String, rusqlite::Error> = conn.query_row(
+            "SELECT memory_kind FROM memories WHERE id = ?1",
+            rusqlite::params![memory_id],
+            |r| r.get(0),
+        );
+        match row {
+            Ok(s) => Ok(super::kind::MemoryKind::from_str(&s).ok()),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(anyhow!("reading memory_kind: {e}")),
+        }
+    }
+
+    /// C1.4: read a History row's transcript, decompressing
+    /// transparently when `compressed = 1`. SHA-256 is verified against
+    /// the row's `content_hash` on every decompress; mismatch returns
+    /// an error (data-integrity alarm) rather than corrupted bytes.
+    /// Returns `Ok(None)` when no row exists for `memory_id`.
+    pub async fn read_history_content(
+        &self,
+        memory_id: i64,
+    ) -> Result<Option<String>> {
+        let conn = self.conn.lock().await;
+        let row: Result<(String, Option<Vec<u8>>, i64), rusqlite::Error> = conn.query_row(
+            "SELECT content, content_blob, compressed
+               FROM memories
+              WHERE id = ?1 AND memory_kind = 'history'",
+            rusqlite::params![memory_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        );
+        match row {
+            Ok((content, blob, compressed)) => {
+                if compressed == 0 {
+                    Ok(Some(content))
+                } else {
+                    // Compressed path: the row's own `content` column
+                    // carries the placeholder string with the embedded
+                    // SHA-256 of the original transcript. We verify
+                    // the decompressed bytes against that SHA before
+                    // returning — never propagate a mismatch.
+                    let blob = blob.ok_or_else(|| {
+                        anyhow!(
+                            "history row {memory_id} marked compressed=1 but content_blob is NULL"
+                        )
+                    })?;
+                    let expected_sha = super::compression::parse_compressed_placeholder(&content)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "history row {memory_id} marked compressed=1 but content \
+                                 is not a recognized placeholder: {content:?}"
+                            )
+                        })?;
+                    let decoded = super::compression::decompress_with_verify(
+                        &blob,
+                        &expected_sha,
+                    )?;
+                    Ok(Some(decoded))
+                }
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(anyhow!("reading history row: {e}")),
+        }
+    }
+
+    /// C1.4: opportunistic compression of one History row.
+    ///
+    /// Encodes the row's `content` to zstd, verifies the round-trip
+    /// SHA-256 against the row's `content_hash`, then in **one
+    /// transaction**: drops the C1.3 immutability triggers, UPDATEs
+    /// the row to install the blob (and a sha-prefixed placeholder in
+    /// `content`), reinstalls the triggers, and commits.
+    ///
+    /// **Trigger-disable callsite #1.** This function and the C2.4
+    /// `RedactHistory` handler are the only two places authorized to
+    /// drop the C1.3 triggers. Both perform a single UPDATE inside one
+    /// transaction with no `await` and no userspace call between drop
+    /// and reinstall — the privileged window is microseconds long. CI
+    /// grep verifies this list of callsites is closed.
+    ///
+    /// Returns `Ok(false)` when the row is already compressed, missing,
+    /// or not a history row. Returns `Ok(true)` after a successful
+    /// compression. The original `content_hash` is preserved across
+    /// the operation, so the C1 audit invariant ("content cannot
+    /// change") still holds: the canonical SHA of the decompressed
+    /// blob equals the SHA of the original transcript.
+    pub async fn compress_history_row(&self, memory_id: i64) -> Result<bool> {
+        // Read first (outside the transaction) so we can do the
+        // CPU-bound zstd encode without holding the SQLite mutex.
+        // The `content_hash` column is a normalized (trim+lowercase)
+        // hash kept for dedup; the integrity SHA we embed in the blob
+        // placeholder is the *raw* content's SHA, computed inside
+        // `compress_with_verify`.
+        let read = {
+            let conn = self.conn.lock().await;
+            let row: Result<(String, i64, i64), rusqlite::Error> = conn.query_row(
+                "SELECT content, compressed, memory_kind = 'history'
+                   FROM memories WHERE id = ?1",
+                rusqlite::params![memory_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)?)),
+            );
+            match row {
+                Ok(t) => Some(t),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => return Err(anyhow!("reading row for compression: {e}")),
+            }
+        };
+        let (content, compressed, is_history) = match read {
+            Some(t) => t,
+            None => return Ok(false),
+        };
+        if is_history == 0 || compressed != 0 {
+            return Ok(false);
+        }
+
+        // CPU-bound encode + verify, lock-free.
+        let blob = super::compression::compress_with_verify(&content)?;
+        let placeholder = super::compression::compressed_content_placeholder(&blob.sha_hex);
+
+        // Privileged write window: tight scope so the lock guard and
+        // transaction don't bleed past the commit. No `await` inside.
+        let n = {
+            let mut conn = self.conn.lock().await;
+            let tx = conn.transaction().context("compress: begin transaction")?;
+            // Drop the C1.3 triggers ONLY for the duration of this
+            // write (single UPDATE, no await between drop + reinstall).
+            schema::drop_history_immutable_triggers(&tx)
+                .context("compress: drop triggers")?;
+            let updated = tx.execute(
+                "UPDATE memories
+                    SET content = ?1,
+                        content_blob = ?2,
+                        compressed = 1,
+                        updated_at = datetime('now')
+                  WHERE id = ?3 AND memory_kind = 'history' AND compressed = 0",
+                rusqlite::params![placeholder, blob.bytes, memory_id],
+            )?;
+            // Reinstall before commit — never leave the trigger off
+            // across a commit boundary, even on success.
+            schema::install_history_immutable_triggers(&tx)
+                .context("compress: reinstall triggers")?;
+            tx.commit().context("compress: commit transaction")?;
+            updated
+        };
+
+        if n == 0 {
+            // Race: another caller compressed the row between our read
+            // and our write. Not an error.
+            return Ok(false);
+        }
+
+        // Post-commit verification: read the blob back and re-verify.
+        // Belt and braces — the in-memory verify in compress_with_verify
+        // already ran, but a defensive re-decode catches any
+        // hypothetical SQLite-side corruption (e.g. NUL truncation in
+        // the BLOB binding) before the user discovers it on read.
+        match self.read_history_content(memory_id).await {
+            Ok(Some(s)) if s == content => Ok(true),
+            Ok(Some(_)) => Err(anyhow!(
+                "post-compression verification failed on row {memory_id}: \
+                 decoded content does not equal original"
+            )),
+            Ok(None) => Err(anyhow!(
+                "post-compression verification: row {memory_id} disappeared"
+            )),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// C1.4: pick history rows older than `older_than_days` that still
+    /// hold uncompressed bodies. Returns ids ordered oldest-first,
+    /// capped at `limit`. Used by the sleeptime pass to compress in
+    /// batches without a giant transaction. Cutoff is evaluated by
+    /// SQLite's `datetime('now', '-N days')` so the comparison happens
+    /// inside the DB.
+    pub async fn list_history_rows_to_compress(
+        &self,
+        older_than_days: u32,
+        limit: usize,
+    ) -> Result<Vec<i64>> {
+        let conn = self.conn.lock().await;
+        let cutoff_expr = format!("datetime('now', '-{} days')", older_than_days);
+        let sql = format!(
+            "SELECT id FROM memories
+              WHERE memory_kind = 'history'
+                AND compressed = 0
+                AND created_at < {cutoff_expr}
+              ORDER BY created_at ASC
+              LIMIT ?1"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit as i64], |r| r.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// C1.4: byte-length of a history row's `content_blob`. Returns
+    /// `Ok(None)` for missing or non-history rows. Used by the
+    /// sleeptime telemetry to record compression-ratio per row.
+    pub async fn history_compressed_blob_len(
+        &self,
+        memory_id: i64,
+    ) -> Result<Option<usize>> {
+        let conn = self.conn.lock().await;
+        let row: Result<Option<i64>, rusqlite::Error> = conn.query_row(
+            "SELECT length(content_blob) FROM memories
+              WHERE id = ?1 AND memory_kind = 'history'",
+            rusqlite::params![memory_id],
+            |r| r.get(0),
+        );
+        match row {
+            Ok(Some(n)) => Ok(Some(n as usize)),
+            Ok(None) | Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(anyhow!("reading content_blob length: {e}")),
+        }
+    }
+
+    /// C1: locate a single row by its `tag` column and return the
+    /// triple `(id, memory_kind, content)`. Used by the C1.5 panel to
+    /// find history rows by their `history:<session>:<turn>` tag, and
+    /// by the writer-task tests to assert that the C1.2 history-row
+    /// write landed correctly. Returns `None` if no row matches.
+    pub async fn find_memory_by_tag(
+        &self,
+        tag: &str,
+    ) -> Result<Option<(i64, super::kind::MemoryKind, String)>> {
+        use std::str::FromStr;
+        let conn = self.conn.lock().await;
+        let row: Result<(i64, String, String), rusqlite::Error> = conn.query_row(
+            "SELECT id, memory_kind, content FROM memories WHERE tag = ?1 LIMIT 1",
+            rusqlite::params![tag],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        );
+        match row {
+            Ok((id, kind_str, content)) => match super::kind::MemoryKind::from_str(&kind_str) {
+                Ok(kind) => Ok(Some((id, kind, content))),
+                Err(e) => Err(anyhow!("invalid memory_kind '{kind_str}': {e}")),
+            },
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(anyhow!("finding memory by tag: {e}")),
+        }
+    }
+
     /// B6: fetch the embedding blob for a memory id (returns the row's
     /// vector as `Vec<f32>`). Used by the telemetry classifier so the
     /// per-injected-memory cosine doesn't need to re-embed.
@@ -2956,8 +3447,15 @@ impl MemoryStore {
     pub async fn delete_by_run(&self, run_id: &str) -> Result<u64> {
         let conn = self.conn.lock().await;
 
+        // C1: history rows are append-only — they outlive their owning
+        // run by design (provenance for every derived record). Filter
+        // them out of both the id-collection (so we don't try to delete
+        // their vec_memories rows either) and the final DELETE.
         let ids: Vec<i64> = conn
-            .prepare("SELECT id FROM memories WHERE run_id = ?1")?
+            .prepare(
+                "SELECT id FROM memories
+                   WHERE run_id = ?1 AND memory_kind != 'history'",
+            )?
             .query_map(rusqlite::params![run_id], |row| row.get(0))?
             .filter_map(|r| r.ok())
             .collect();
@@ -2978,7 +3476,8 @@ impl MemoryStore {
         }
 
         let count = conn.execute(
-            "DELETE FROM memories WHERE run_id = ?1",
+            "DELETE FROM memories
+               WHERE run_id = ?1 AND memory_kind != 'history'",
             rusqlite::params![run_id],
         )?;
 
@@ -3553,11 +4052,15 @@ fn find_semantic_duplicate(
     memory_type: &str,
     threshold: f32,
 ) -> Result<Option<i64>> {
+    // C1: dedup never crosses kinds. Records dedup against records,
+    // Summaries against Summaries, History never enters this path.
+    // (Caller is responsible for routing — this filter is defense.)
     let mut stmt = conn.prepare(
         "SELECT id, content, embedding FROM memories
          WHERE scope_level = ?1
            AND scope_path = ?2
            AND memory_type = ?3
+           AND memory_kind != 'history'
            AND embedding IS NOT NULL
          ORDER BY updated_at DESC
          LIMIT 128",
@@ -4843,5 +5346,172 @@ mod tests {
         assert_eq!(kind, "decay_flagged");
         assert_eq!(dry, 1);
         assert_eq!(mid, 7);
+    }
+
+    /// C1: a v9-stamped DB on disk reports a pending migration via the
+    /// public probe surface. Fresh DBs do not.
+    #[test]
+    fn c1_probe_returns_proposal_for_pre_v10_db() {
+        use rusqlite::Connection;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memory.db");
+
+        // No file yet → probe is None.
+        assert!(probe_c1_migration(&db_path).unwrap().is_none());
+
+        // Stamp a fake pre-v10 DB at v9: install the v1 schema (so the
+        // migrations machinery sees a real `memories` table) and force
+        // user_version back to 9 to mimic a pre-C1 install.
+        MemoryStore::register_sqlite_vec();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            schema::run_migrations(&conn, 8).unwrap();
+            conn.pragma_update(None, "user_version", 9_u32).unwrap();
+        }
+
+        // Probe now reports a pending v10 migration.
+        let proposal = probe_c1_migration(&db_path)
+            .unwrap()
+            .expect("v9 DB must report a pending C1 migration");
+        assert_eq!(proposal.db_path, db_path);
+        assert_eq!(proposal.current_version, 9);
+        assert_eq!(proposal.target_version, schema::C1_SCHEMA_VERSION);
+        // Backup path is sibling to db_path with `.bak.<unix-ts>` suffix.
+        let backup_name = proposal
+            .proposed_backup_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            backup_name.starts_with("memory.db.bak."),
+            "unexpected backup name: {backup_name}"
+        );
+    }
+
+    /// C1.4: end-to-end compression round-trip on a real DB row.
+    /// Seed a history row, compress it, verify the SQL trigger
+    /// reinstalls cleanly, decompress through the read path, and
+    /// confirm the content matches.
+    #[tokio::test]
+    async fn c1_compress_history_round_trip() {
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder);
+        let store = MemoryStore::in_memory(embedder).unwrap();
+
+        // Seed one history row through the public store_scoped path.
+        use crate::memory::kind::MemoryKind;
+        use crate::memory::scope::{MemoryType, WriteMeta, WriteScope};
+        use crate::memory::trust_defaults::MemorySource;
+        let scope = WriteScope::Run {
+            repo_id: "r".into(),
+            run_id: "run-1".into(),
+        };
+        let original_text = "USER: hello\nASSISTANT: world\n".repeat(40);
+        let meta = WriteMeta::for_source(MemorySource::RawTranscript)
+            .with_kind(MemoryKind::History)
+            .with_type(MemoryType::Factual)
+            .with_tag("history:s:t");
+        let id = match store.store_scoped(&scope, &original_text, &meta).await.unwrap() {
+            crate::memory::scope::StoreResult::Inserted(id) => id,
+            other => panic!("history insert produced {other:?}"),
+        };
+
+        // Sanity: read path returns the original text uncompressed.
+        let pre = store.read_history_content(id).await.unwrap().unwrap();
+        assert_eq!(pre, original_text);
+
+        // Compress. Returns true on success.
+        let did = store.compress_history_row(id).await.unwrap();
+        assert!(did, "compress should succeed on uncompressed history row");
+
+        // Read path transparently decompresses with SHA verification.
+        let post = store.read_history_content(id).await.unwrap().unwrap();
+        assert_eq!(post, original_text);
+
+        // The trigger is back in force after compression — UPDATE
+        // attempts on the row should still fail at the SQL layer.
+        let conn = store.conn.lock().await;
+        let r = conn.execute(
+            "UPDATE memories SET content = 'tampered' WHERE id = ?1",
+            rusqlite::params![id],
+        );
+        assert!(
+            r.is_err(),
+            "trigger must be reinstalled after compression: {r:?}"
+        );
+
+        // The row is now flagged compressed=1 with a placeholder
+        // content; the canonical bytes are in content_blob.
+        let (compressed, content_value, blob_len): (i64, String, i64) = conn
+            .query_row(
+                "SELECT compressed, content, length(content_blob)
+                   FROM memories WHERE id = ?1",
+                rusqlite::params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(compressed, 1);
+        assert!(content_value.starts_with("[compressed:zstd"));
+        assert!(blob_len > 0);
+        // Compression should make the blob smaller than the original
+        // for a 40-line repeated transcript.
+        assert!(
+            (blob_len as usize) < original_text.len(),
+            "blob {} should be smaller than original {}",
+            blob_len,
+            original_text.len()
+        );
+
+        drop(conn);
+
+        // Calling compress again on an already-compressed row is a
+        // no-op (returns false), not an error.
+        assert!(!store.compress_history_row(id).await.unwrap());
+    }
+
+    /// C1: opening a pre-v10 DB takes the snapshot, applies the
+    /// migration, and stamps `_gaviero_meta.c1_backup_path`. After the
+    /// open, the probe reports no further pending migration.
+    #[tokio::test]
+    async fn c1_open_pre_v10_db_takes_backup_and_migrates() {
+        use rusqlite::Connection;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memory.db");
+
+        // Seed at v9.
+        MemoryStore::register_sqlite_vec();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            schema::run_migrations(&conn, 8).unwrap();
+            conn.pragma_update(None, "user_version", 9_u32).unwrap();
+        }
+
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder);
+        let store = MemoryStore::open(&db_path, embedder).expect("open should migrate");
+
+        // Probe reports nothing pending after open.
+        assert!(probe_c1_migration(&db_path).unwrap().is_none());
+
+        // memory_kind column exists; default for new inserts is record.
+        let conn = store.conn.lock().await;
+        let has_kind: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('memories') WHERE name = 'memory_kind'")
+            .and_then(|mut s| s.query_row([], |_| Ok(true)))
+            .unwrap_or(false);
+        assert!(has_kind);
+
+        // The backup path was stamped into _gaviero_meta.
+        let backup: String = conn
+            .query_row(
+                "SELECT value FROM _gaviero_meta WHERE key = 'c1_backup_path'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("c1_backup_path stamped");
+        assert!(std::path::Path::new(&backup).exists(), "backup file present");
+        assert!(backup.ends_with(".db") == false);
+        assert!(backup.contains(".bak."));
     }
 }

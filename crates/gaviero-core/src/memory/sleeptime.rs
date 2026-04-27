@@ -48,6 +48,20 @@ pub struct SleeptimeConfig {
     pub utilization_unused_threshold: f32,
     pub trust_floor: f32,
     pub trust_ceiling_llm: f32,
+    /// C1.4: history rows older than this many days are eligible for
+    /// opportunistic zstd compression. Plan default: 90. Set to 0 to
+    /// disable the step entirely (storage savings are forfeited).
+    pub compress_history_after_days: u32,
+    /// C1.4: maximum number of history rows compressed in one
+    /// sleeptime pass. Each compression takes one short-lived
+    /// transaction with the C1.3 trigger briefly disabled — keeping
+    /// the per-pass batch bounded prevents long contention windows.
+    pub compress_history_batch: usize,
+    /// C2.5: summary rows older than this many days are routed
+    /// through `soft_delete_memory(DeletedBy::SleeptimePrune)` so
+    /// they ride the shorter 14-day audit retention. Plan default:
+    /// 365. Set to 0 to disable the prune step.
+    pub prune_summaries_after_days: u32,
 }
 
 impl Default for SleeptimeConfig {
@@ -65,6 +79,9 @@ impl Default for SleeptimeConfig {
             utilization_unused_threshold: 0.1,
             trust_floor: 0.2,
             trust_ceiling_llm: 0.9,
+            compress_history_after_days: 90,
+            compress_history_batch: 32,
+            prune_summaries_after_days: 365,
         }
     }
 }
@@ -80,6 +97,11 @@ pub struct SleeptimeReport {
     pub trust_adjusted: usize,
     pub telemetry_pruned: usize,
     pub kg_doc_refreshed: usize,
+    /// C1.4: number of history rows zstd-compressed this pass.
+    pub history_compressed: usize,
+    /// C2.5: number of stale Summary rows routed through the audit
+    /// table this pass (`deleted_by = sleeptime_prune`).
+    pub summaries_pruned: usize,
 }
 
 /// Per-operation observer. Implementations forward to the TUI panel
@@ -125,6 +147,14 @@ pub enum SleeptimeOperation {
     KgDocRefreshed {
         module_path: String,
     },
+    /// C1.4: a History row's transcript was moved into `content_blob`
+    /// as zstd bytes. `original_len` and `compressed_len` give the
+    /// per-row compression ratio for telemetry.
+    HistoryCompressed {
+        memory_id: i64,
+        original_len: usize,
+        compressed_len: usize,
+    },
 }
 
 impl SleeptimeOperation {
@@ -136,6 +166,7 @@ impl SleeptimeOperation {
             Self::TrustAdjusted { .. } => "trust_adjusted",
             Self::TelemetryPruned { .. } => "telemetry_pruned",
             Self::KgDocRefreshed { .. } => "kg_doc_refreshed",
+            Self::HistoryCompressed { .. } => "history_compressed",
         }
     }
 
@@ -144,7 +175,8 @@ impl SleeptimeOperation {
         match self {
             Self::DecayFlagged { memory_id, .. }
             | Self::Promoted { memory_id, .. }
-            | Self::TrustAdjusted { memory_id, .. } => Some(*memory_id),
+            | Self::TrustAdjusted { memory_id, .. }
+            | Self::HistoryCompressed { memory_id, .. } => Some(*memory_id),
             Self::NearDupMerged { keep_id, .. } => Some(*keep_id),
             Self::TelemetryPruned { .. } | Self::KgDocRefreshed { .. } => None,
         }
@@ -212,6 +244,20 @@ impl SleeptimeOperation {
             }),
             Self::KgDocRefreshed { module_path } => serde_json::json!({
                 "module_path": module_path,
+            }),
+            Self::HistoryCompressed {
+                memory_id,
+                original_len,
+                compressed_len,
+            } => serde_json::json!({
+                "memory_id": memory_id,
+                "original_len": original_len,
+                "compressed_len": compressed_len,
+                "ratio": if *original_len > 0 {
+                    *compressed_len as f64 / *original_len as f64
+                } else {
+                    0.0
+                },
             }),
         }
     }
@@ -334,6 +380,81 @@ pub async fn run_sleeptime(
 
     // Step 6 — KG node-doc refresh stub (Tier D1).
     // Intentionally no-op until D1 lands.
+
+    // Step 7 — C1.4 history compression. Pick history rows older than
+    // `compress_history_after_days` and zstd-encode them. Never deletes
+    // rows; only moves the body from `content` to `content_blob`.
+    // Skipped entirely on dry-run (the trigger-disable window must
+    // not fire on advisory passes).
+    if !cfg.dry_run && cfg.compress_history_after_days > 0 {
+        if let Ok(ids) = store
+            .list_history_rows_to_compress(
+                cfg.compress_history_after_days,
+                cfg.compress_history_batch,
+            )
+            .await
+        {
+            for id in ids {
+                let content = match store.read_history_content(id).await {
+                    Ok(Some(s)) => s,
+                    _ => continue,
+                };
+                let original_len = content.len();
+                match store.compress_history_row(id).await {
+                    Ok(true) => {
+                        let compressed_len = store
+                            .history_compressed_blob_len(id)
+                            .await
+                            .unwrap_or(None)
+                            .unwrap_or(0);
+                        let op = SleeptimeOperation::HistoryCompressed {
+                            memory_id: id,
+                            original_len,
+                            compressed_len,
+                        };
+                        audit(store, &run_id, &op, false).await;
+                        if let Some(o) = observer {
+                            o.on_operation(&op);
+                        }
+                        report.history_compressed += 1;
+                    }
+                    Ok(false) => { /* already compressed or not history */ }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "memory_history",
+                            memory_id = id,
+                            error = %e,
+                            "history compression failed; row left uncompressed"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 8 — C2.5 summary retention prune. Stale Summary rows are
+    // soft-deleted with `DeletedBy::SleeptimePrune` so the audit trail
+    // carries them on the shorter 14-day retention. Records and
+    // History are untouched. Skipped on dry-run; the prune-count is
+    // still computed for the report so the user sees what would
+    // happen.
+    if cfg.prune_summaries_after_days > 0 {
+        match store
+            .sleeptime_prune_old_summaries(cfg.prune_summaries_after_days, cfg.dry_run)
+            .await
+        {
+            Ok(n) => {
+                report.summaries_pruned = n;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "memory_sleeptime",
+                    error = %e,
+                    "summary retention prune failed"
+                );
+            }
+        }
+    }
 
     if let Some(o) = observer {
         o.on_complete(&report);

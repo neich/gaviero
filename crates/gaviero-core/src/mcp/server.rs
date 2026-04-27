@@ -167,20 +167,31 @@ impl GavieroMcpServer {
     ) -> Result<Json<MemorySearchOutput>, ErrorData> {
         let started = Instant::now();
         let limit = clamp_memory_search_limit(input.limit);
+        // C1.6: resolve the kind filter. Default is `record`; `any`
+        // disables filtering; explicit kinds filter to that one
+        // class. Unknown values are a loud error so subprocess agents
+        // see the contract violation instead of silently falling back.
+        let kind_filter = super::tools::resolve_memory_search_kind(input.kind.as_deref())
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
         // MCP has no active-file context → folder = None. The
         // registry's scope.levels() emits [Workspace, Global], which
         // is the correct default for an unscoped tool query.
         let scope = MemoryScope::from_context(&self.workspace_root, None, None, None);
         let reranker_ref: Option<&dyn Reranker> = self.reranker.as_deref();
-        // MCP has no active-file context, so folder = None: the
-        // registry walks workspace + global only. Folder-scoped reads
-        // require an explicit folder hint in the tool input (planned
-        // for a follow-up tool-schema change).
+        // C1.6: when filtering to a non-default kind, over-fetch so the
+        // post-filter can still return up to `limit` results. Cheap
+        // (the retrieval pipeline returns scored memories regardless)
+        // and bounded by `limit * 4` so we don't accidentally walk the
+        // whole DB for a degenerate case.
+        let fetch_limit = match kind_filter {
+            None | Some(crate::memory::MemoryKind::Record) => limit,
+            _ => (limit * 4).clamp(limit, 80),
+        };
         let out = retrieve_ranked(
             &self.stores,
             &scope,
             &input.query,
-            limit,
+            fetch_limit,
             &self.retrieval_cfg,
             reranker_ref,
             Some(&self.rerank_cfg),
@@ -188,11 +199,29 @@ impl GavieroMcpServer {
         .await
         .map_err(|e| ErrorData::internal_error(format!("retrieve_ranked: {e}"), None))?;
 
-        let results: Vec<MemorySearchResult> = out
-            .items
-            .iter()
-            .take(limit)
-            .map(|m| MemorySearchResult {
+        // C1.6: post-filter the candidate list by memory_kind. Lookup
+        // happens via the workspace store — MCP's retrieval mix is
+        // workspace+global, and the unfiltered case skips the lookup
+        // entirely. Rows whose kind cannot be resolved are dropped
+        // when a filter is active (forgive only on `any`).
+        let mut results: Vec<MemorySearchResult> = Vec::with_capacity(limit);
+        for m in out.items.iter() {
+            if results.len() >= limit {
+                break;
+            }
+            if let Some(want) = kind_filter {
+                let got = self
+                    .stores
+                    .workspace()
+                    .get_memory_kind(m.id)
+                    .await
+                    .ok()
+                    .flatten();
+                if got != Some(want) {
+                    continue;
+                }
+            }
+            results.push(MemorySearchResult {
                 id: m.id,
                 scope: format_scope(m.scope_level),
                 memory_type: m.memory_type.as_str().to_string(),
@@ -200,8 +229,8 @@ impl GavieroMcpServer {
                 importance: m.importance,
                 trust: m.trust_score,
                 refs: Vec::new(),
-            })
-            .collect();
+            });
+        }
         let out = MemorySearchOutput { results };
 
         self.observer.on_tool_call(&McpCallLogEntry {
@@ -521,12 +550,6 @@ mod tests {
             }
             Ok(v)
         }
-        fn dimensions(&self) -> usize {
-            8
-        }
-        fn model_id(&self) -> &str {
-            "mock"
-        }
     }
 
     fn fixture() -> GavieroMcpServer {
@@ -543,10 +566,110 @@ mod tests {
                 query: "anything".into(),
                 scope_hint: None,
                 limit: Some(5),
+                kind: None,
             }))
             .await
             .unwrap();
         assert!(out.0.results.is_empty());
+    }
+
+    /// C1.6: memory_search default-records-only filter excludes
+    /// history rows even when retrieval ranks them at the top.
+    #[tokio::test]
+    async fn memory_search_default_filter_excludes_history() {
+        use crate::memory::kind::MemoryKind;
+        use crate::memory::scope::{MemoryType, WriteMeta, WriteScope};
+        use crate::memory::trust_defaults::MemorySource;
+
+        let s = fixture();
+        // Seed two rows at the same scope: one record, one history,
+        // both phrased the same so retrieval ranks them similarly.
+        let scope = WriteScope::Workspace;
+        let record_meta = WriteMeta::for_source(MemorySource::UserRemember)
+            .with_type(MemoryType::Decision)
+            .with_tag("c16-record");
+        let history_meta = WriteMeta::for_source(MemorySource::RawTranscript)
+            .with_kind(MemoryKind::History)
+            .with_type(MemoryType::Factual)
+            .with_tag("c16-history");
+        let store = s.stores.workspace().clone();
+        store
+            .store_scoped(&scope, "purple elephant convention", &record_meta)
+            .await
+            .unwrap();
+        store
+            .store_scoped(&scope, "purple elephant convention seen in transcript", &history_meta)
+            .await
+            .unwrap();
+
+        // Default kind (None → Record) — only the record row survives.
+        let out = s
+            .memory_search(Parameters(MemorySearchInput {
+                query: "purple elephant convention".into(),
+                scope_hint: None,
+                limit: Some(10),
+                kind: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!out.0.results.is_empty());
+        for r in &out.0.results {
+            // History rows are RawTranscript-sourced and tagged
+            // "c16-history"; their text contains "transcript".
+            assert!(
+                !r.text.contains("transcript"),
+                "default filter must exclude history rows: {r:?}"
+            );
+        }
+
+        // Explicit kind=history — record row is excluded.
+        let out = s
+            .memory_search(Parameters(MemorySearchInput {
+                query: "purple elephant convention".into(),
+                scope_hint: None,
+                limit: Some(10),
+                kind: Some("history".into()),
+            }))
+            .await
+            .unwrap();
+        for r in &out.0.results {
+            assert!(
+                r.text.contains("transcript"),
+                "history filter must exclude record rows: {r:?}"
+            );
+        }
+
+        // kind=any — both can come through (ordering depends on
+        // retrieval scoring; we only assert at least one of each).
+        let out = s
+            .memory_search(Parameters(MemorySearchInput {
+                query: "purple elephant convention".into(),
+                scope_hint: None,
+                limit: Some(10),
+                kind: Some("any".into()),
+            }))
+            .await
+            .unwrap();
+        let any_record = out.0.results.iter().any(|r| !r.text.contains("transcript"));
+        let any_history = out.0.results.iter().any(|r| r.text.contains("transcript"));
+        assert!(any_record, "any-filter must include records");
+        assert!(any_history, "any-filter must include history");
+    }
+
+    /// C1.6: unknown kinds produce a clear MCP invalid_params error,
+    /// not a silent fallback.
+    #[tokio::test]
+    async fn memory_search_unknown_kind_is_invalid_params() {
+        let s = fixture();
+        let r = s
+            .memory_search(Parameters(MemorySearchInput {
+                query: "x".into(),
+                scope_hint: None,
+                limit: None,
+                kind: Some("episode".into()),
+            }))
+            .await;
+        assert!(r.is_err());
     }
 
     #[tokio::test]

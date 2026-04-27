@@ -182,12 +182,9 @@ impl AcpPipeline {
             .strip_prefix("claude-code:")
             .or_else(|| self.model.strip_prefix("claude:"))
             .unwrap_or(&self.model);
-        let available_tools = &["Read", "Glob", "Grep", "Write", "Edit", "MultiEdit"];
-        let approved_tools: &[&str] = if self.options.auto_approve {
-            available_tools
-        } else {
-            &["Read", "Glob", "Grep"]
-        };
+        let (available_owned, approved_owned) = self.options.resolved_tools();
+        let available_tools: Vec<&str> = available_owned.iter().map(String::as_str).collect();
+        let approved_tools: Vec<&str> = approved_owned.iter().map(String::as_str).collect();
 
         let enriched_prompt =
             shared::build_enriched_prompt(prompt, conversation_history, file_refs);
@@ -204,8 +201,8 @@ impl AcpPipeline {
             &self.workspace_root,
             &enriched_prompt,
             &system_prompt,
-            available_tools,
-            approved_tools,
+            &available_tools,
+            &approved_tools,
             &self.options,
             &attach_refs,
         )?;

@@ -1,9 +1,12 @@
 pub mod annotations;
+pub mod compression;
 pub mod consolidation;
 pub mod consolidation_llm;
+pub mod deletions;
 pub mod embedder;
 pub mod eval;
 pub mod extractor;
+pub mod kind;
 pub mod model_manager;
 pub mod observer;
 pub mod onnx_embedder;
@@ -13,8 +16,10 @@ pub mod retrieval;
 pub mod schema;
 pub mod scope;
 pub mod scoring;
+pub mod services;
 pub mod session_consolidator;
 pub mod sleeptime;
+pub mod sleeptime_scheduler;
 pub mod store;
 pub mod stores;
 pub mod telemetry;
@@ -25,7 +30,9 @@ pub use annotations::{
     AnnotationFlag, ParsedResponse, TurnAnnotations, apply_short_turn_cap, parse_and_strip,
 };
 pub use consolidation_llm::{BackendConsolidationLlm, ConsolidationLlm, NoopConsolidationLlm};
+pub use deletions::DeletedBy;
 pub use embedder::{DualEmbedder, Embedder, EmbeddingPurpose, NullEmbedder};
+pub use kind::MemoryKind;
 pub use model_manager::ModelManager;
 pub use observer::MemoryObserver;
 pub use reranker::{
@@ -41,6 +48,7 @@ pub use scope::{
     hash_path,
 };
 pub use scoring::{ScoredMemory, SearchConfig, format_memories_for_prompt};
+pub use services::{MemoryServices, ServicesOpts};
 pub use session_consolidator::{
     CandidateBrief, ConsolidationOp, ConsolidatorResponse, ExistingBrief, PROMPT_VERSION,
     PromotionRequest,
@@ -48,7 +56,11 @@ pub use session_consolidator::{
 pub use sleeptime::{
     SleeptimeConfig, SleeptimeObserver, SleeptimeOperation, SleeptimeReport, run_sleeptime,
 };
-pub use store::{MemoryStore, MemoryUtilization, StoreOptions};
+pub use sleeptime_scheduler::SleeptimeScheduler;
+pub use store::{
+    BulkForgetReport, C1MigrationProposal, ForgetFilter, MemoryStore, MemoryUtilization,
+    RestoreOutcome, StoreOptions, probe_c1_migration,
+};
 pub use stores::{EmbedderMismatch, MemoryStores};
 pub use telemetry::{
     ClassifiedItem, ClassifyConfig, TelemetryObserver, TelemetryReport, UseClass, classify_turn,

@@ -58,12 +58,6 @@ impl Embedder for TestEmbedder {
         }
         Ok(v)
     }
-    fn dimensions(&self) -> usize {
-        8
-    }
-    fn model_id(&self) -> &str {
-        self.model
-    }
 }
 
 fn embedder() -> Arc<dyn Embedder> {

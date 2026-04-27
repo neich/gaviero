@@ -241,6 +241,108 @@ struct Cli {
 
     #[arg(long = "utilization-asc")]
     utilization_asc: bool,
+
+    /// Tier C / C1: accept the typed-stores schema migration on first
+    /// post-upgrade run. Headless contexts cannot prompt the user
+    /// interactively, so an explicit opt-in is required when any
+    /// reachable `memory.db` is at a pre-v10 schema. Without this flag
+    /// the run aborts and prints the affected files plus the proposed
+    /// backup path. The TUI (`gaviero`) prompts on stdin instead.
+    #[arg(long = "accept-c1-migration")]
+    accept_c1_migration: bool,
+
+    /// Tier C / C2.2: list the most recent N audit-table deletions and
+    /// exit. Useful to find the audit id to feed `--restore-id`.
+    #[arg(long = "deletions-last")]
+    deletions_last: Option<usize>,
+
+    /// Tier C / C2.2: restore a single soft-deleted memory by audit id
+    /// and exit. Replays the captured row through the dedup pipeline.
+    /// Refused for `user_redaction` rows (one-way per the plan).
+    #[arg(long = "restore-id")]
+    restore_id: Option<i64>,
+
+    /// Tier C / C2.2: restore every still-pending deletion newer than
+    /// the given duration (e.g. `2 hours`, `7 days`, `30 minutes`) and
+    /// exit. `user_redaction` rows are skipped silently.
+    #[arg(long = "restore-since")]
+    restore_since: Option<String>,
+
+    /// Tier C / C2.3: bulk-forget filter — fuzzy match against memory
+    /// content. Records and Summaries only; History is never matched.
+    #[arg(long = "forget-query")]
+    forget_query: Option<String>,
+
+    /// Tier C / C2.3: bulk-forget every memory at the given canonical
+    /// scope path (`global`, `workspace`, `repo:<id>`,
+    /// `repo:<id>/module:<path>`, `repo:<id>/run:<id>`).
+    #[arg(long = "forget-scope")]
+    forget_scope: Option<String>,
+
+    /// Tier C / C2.3: bulk-forget every memory of the given type
+    /// (factual|procedural|decision|pattern|gotcha|convention|invariant
+    /// |preference|lesson|error).
+    #[arg(long = "forget-type")]
+    forget_type: Option<String>,
+
+    /// Tier C / C2.3: bulk-forget every memory whose write source
+    /// matches (e.g. `llm_extracted` for a factory-reset of LLM
+    /// extractions; `user_remember` for /remember writes).
+    #[arg(long = "forget-source")]
+    forget_source: Option<String>,
+
+    /// Tier C / C2.3: dry-run flag for any `--forget-*`. Prints the
+    /// matched candidate count + breakdowns and exits without
+    /// touching any row.
+    #[arg(long = "forget-dry-run")]
+    forget_dry_run: bool,
+
+    /// Tier C / C2.3: confirmation flag for any `--forget-*`. Without
+    /// this, the CLI defaults to dry-run so unscripted invocations
+    /// can't silently drop data.
+    #[arg(long = "forget-yes")]
+    forget_yes: bool,
+
+    /// Tier C / C2.3: optional reason text written to every audit row
+    /// produced by a `--forget-*` invocation. Stored in
+    /// `deletions.reason` and surfaced by the panel.
+    #[arg(long = "forget-reason")]
+    forget_reason: Option<String>,
+
+    /// Tier C / C2.4: redact a single history row in place. The
+    /// transcript is replaced with a tombstone (sha + timestamp +
+    /// reason); the row continues to exist for provenance. **One-way:
+    /// not undoable.** Requires `--redact-confirm` (literal `REDACT`)
+    /// and `--redact-reason "<text>"` to actually fire.
+    #[arg(long = "forget-history-id")]
+    forget_history_id: Option<i64>,
+
+    /// Tier C / C2.4: literal-string confirmation for
+    /// `--forget-history-id`. Must equal `REDACT` (uppercase) for the
+    /// CLI to dispatch the redaction; without it the run aborts with
+    /// a preview of the row.
+    #[arg(long = "redact-confirm")]
+    redact_confirm: Option<String>,
+
+    /// Tier C / C2.4: required reason text for `--forget-history-id`.
+    /// Stored verbatim in the tombstone marker and audit row. Must be
+    /// non-empty.
+    #[arg(long = "redact-reason")]
+    redact_reason: Option<String>,
+
+    /// Tier A / A2: write a `/remember`-style memory from headless
+    /// mode and exit. Goes through the writer task (single-consumer
+    /// invariant) — opens [`MemoryServices`] under the hood. Pair with
+    /// `--remember-scope` to override the default Repo scope.
+    #[arg(long = "remember")]
+    remember: Option<String>,
+
+    /// Tier A / A2: scope override for `--remember`. One of `run`,
+    /// `module`, `repo`, `workspace`, `global`. Defaults to `repo`
+    /// (the plan's recommended default — Run-scoped writes die with
+    /// the session).
+    #[arg(long = "remember-scope", default_value = "repo")]
+    remember_scope: String,
 }
 
 /// CLI observer that prints agent events to stderr.
@@ -479,6 +581,79 @@ fn print_manifests(rows: &[gaviero_core::memory::store::InjectionManifestRow]) {
 /// Tier B / B5: drive the sleeptime hygiene pass from the CLI. Reuses
 /// the same `run_sleeptime` engine the writer task invokes, so the
 /// output matches what the TUI would surface during interactive use.
+/// Tier A / A2 + Tier S / S2: headless `/remember`. Bootstraps a
+/// full [`MemoryServices`] (multi-DB stores + writer task), enqueues
+/// `WriterMessage::UserRemember` through the writer (single-consumer
+/// invariant), waits for the ack with a 500 ms timeout, prints the
+/// outcome, and exits cleanly.
+///
+/// `scope` is one of `run | module | repo | workspace | global`. The
+/// CLI defaults to `repo` (the plan's recommended default — Run-scoped
+/// writes die with the session, which is wrong for `/remember`).
+async fn run_remember_cli(
+    repo: &std::path::Path,
+    text: &str,
+    scope: &str,
+) -> Result<()> {
+    use gaviero_core::memory::scope::WriteScope;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("--remember: empty text");
+    }
+    // The CLI is headless — it has no focused buffer (so no Module
+    // scope) and no chat session (so no Run scope). Restrict to the
+    // three persistent levels callers can express without extra
+    // context. The TUI handles `module` / `run` via /remember-here.
+    let derived = match scope.to_ascii_lowercase().as_str() {
+        "repo" => WriteScope::Repo {
+            repo_id: gaviero_core::memory::hash_path(repo),
+        },
+        "workspace" => WriteScope::Workspace,
+        "global" => WriteScope::Global,
+        other @ ("run" | "module") => anyhow::bail!(
+            "--remember-scope {other} requires session/file context only the TUI supplies; \
+             use the `/remember-here` or `/remember-module` chat commands instead",
+        ),
+        other => anyhow::bail!(
+            "--remember-scope: expected repo|workspace|global, got {other}"
+        ),
+    };
+
+    let repo_buf = repo.to_path_buf();
+    let services = tokio::task::spawn_blocking({
+        let repo_buf = repo_buf.clone();
+        move || -> anyhow::Result<std::sync::Arc<gaviero_core::memory::MemoryServices>> {
+            let workspace = gaviero_core::workspace::Workspace::single_folder(repo_buf.clone());
+            gaviero_core::memory::MemoryServices::open(
+                &repo_buf,
+                &workspace,
+                gaviero_core::memory::ServicesOpts::default(),
+            )
+        }
+    })
+    .await
+    .context("init MemoryServices (remember)")??;
+
+    let result = services
+        .writer
+        .user_remember_scoped(derived, trimmed.to_string())
+        .await
+        .context("user_remember_scoped enqueue/ack")?;
+    println!(
+        "[gaviero-remember] {} (scope={}, len={})",
+        match result {
+            gaviero_core::memory::WriteResult::Inserted(id) => format!("inserted id={id}"),
+            gaviero_core::memory::WriteResult::Deduplicated(id) => format!("deduplicated id={id}"),
+            gaviero_core::memory::WriteResult::AlreadyCovered =>
+                "already covered by broader scope".to_string(),
+            gaviero_core::memory::WriteResult::Skipped => "skipped".to_string(),
+        },
+        scope,
+        trimmed.len(),
+    );
+    Ok(())
+}
+
 async fn run_sleeptime_cli(repo: &std::path::Path, dry_run: bool) -> Result<()> {
     let store = tokio::task::spawn_blocking({
         let repo = repo.to_path_buf();
@@ -503,6 +678,248 @@ async fn run_sleeptime_cli(repo: &std::path::Path, dry_run: bool) -> Result<()> 
     println!("promoted        : {}", report.promoted);
     println!("trust_adjusted  : {}", report.trust_adjusted);
     println!("telemetry_pruned: {}", report.telemetry_pruned);
+    Ok(())
+}
+
+/// Tier C / C2.2: list the N most recent audit rows from the
+/// workspace memory.db. Output mirrors the columns the TUI Deletions
+/// tab will surface (C2.6); use it to pick an audit id for
+/// `--restore-id`.
+async fn run_deletions_last_cli(repo: &std::path::Path, n: usize) -> Result<()> {
+    let store = tokio::task::spawn_blocking({
+        let repo = repo.to_path_buf();
+        move || gaviero_core::memory::init_workspace(&repo)
+    })
+    .await
+    .context("init memory (deletions list)")??;
+    let rows = store
+        .recent_deletions(n)
+        .await
+        .context("reading deletions audit")?;
+    if rows.is_empty() {
+        println!("[gaviero-deletions] no audit rows.");
+        return Ok(());
+    }
+    println!(
+        "{:>4}  {:>6}  {:<14}  {:<8}  {:<19}  {}",
+        "id", "mem_id", "deleted_by", "kind", "deleted_at", "reason"
+    );
+    for r in rows {
+        println!(
+            "{:>4}  {:>6}  {:<14}  {:<8}  {:<19}  {}",
+            r.id,
+            r.memory_id,
+            r.deleted_by,
+            r.memory_kind,
+            r.deleted_at,
+            r.reason.as_deref().unwrap_or("—"),
+        );
+    }
+    Ok(())
+}
+
+/// Tier C / C2.2: restore a single audit row and print the outcome.
+/// Replays the captured row through `MemoryStore::store_scoped` so the
+/// dedup pipeline decides whether the row reinserts cleanly, dedups
+/// against a newer row, or is already covered.
+async fn run_restore_id_cli(repo: &std::path::Path, audit_id: i64) -> Result<()> {
+    use gaviero_core::memory::RestoreOutcome;
+    let store = tokio::task::spawn_blocking({
+        let repo = repo.to_path_buf();
+        move || gaviero_core::memory::init_workspace(&repo)
+    })
+    .await
+    .context("init memory (restore)")??;
+    let outcome = store
+        .restore_deletion(audit_id)
+        .await
+        .with_context(|| format!("restoring audit {audit_id}"))?;
+    match outcome {
+        RestoreOutcome::Inserted {
+            deletion_id,
+            new_memory_id,
+        } => println!(
+            "[gaviero-restore] audit {deletion_id} reinstated as new memory id {new_memory_id}"
+        ),
+        RestoreOutcome::Deduplicated {
+            deletion_id,
+            surviving_memory_id,
+        } => println!(
+            "[gaviero-restore] audit {deletion_id} merged into existing memory \
+             {surviving_memory_id} (dedup hit)"
+        ),
+        RestoreOutcome::AlreadyCovered { deletion_id } => println!(
+            "[gaviero-restore] audit {deletion_id} already covered at a broader scope; \
+             nothing new written"
+        ),
+        RestoreOutcome::Refused {
+            deletion_id,
+            reason,
+        } => {
+            eprintln!("[gaviero-restore] refused for audit {deletion_id}: {reason}");
+            std::process::exit(2);
+        }
+    }
+    Ok(())
+}
+
+/// Tier C / C2.2: restore every pending deletion newer than the given
+/// human-readable duration (e.g. `2 hours`, `7 days`).
+async fn run_restore_since_cli(repo: &std::path::Path, window: &str) -> Result<()> {
+    use gaviero_core::memory::RestoreOutcome;
+    let since_offset = parse_restore_since_window(window)?;
+    let store = tokio::task::spawn_blocking({
+        let repo = repo.to_path_buf();
+        move || gaviero_core::memory::init_workspace(&repo)
+    })
+    .await
+    .context("init memory (restore-since)")??;
+    let outcomes = store
+        .restore_deletions_since(&since_offset)
+        .await
+        .with_context(|| format!("restoring deletions since {since_offset}"))?;
+    let mut inserted = 0u32;
+    let mut deduped = 0u32;
+    let mut covered = 0u32;
+    let mut refused = 0u32;
+    for o in &outcomes {
+        match o {
+            RestoreOutcome::Inserted { .. } => inserted += 1,
+            RestoreOutcome::Deduplicated { .. } => deduped += 1,
+            RestoreOutcome::AlreadyCovered { .. } => covered += 1,
+            RestoreOutcome::Refused { .. } => refused += 1,
+        }
+    }
+    println!(
+        "[gaviero-restore-since] {} processed (inserted {inserted}, deduped {deduped}, \
+         covered {covered}, refused {refused})",
+        outcomes.len()
+    );
+    Ok(())
+}
+
+/// Translate `"2 hours"` / `"7 days"` / `"30 minutes"` (singular / plural)
+/// into the SQLite relative-datetime string the store API expects.
+fn parse_restore_since_window(spec: &str) -> Result<String> {
+    let s = spec.trim();
+    if s.is_empty() {
+        return Err(anyhow::anyhow!(
+            "missing duration (e.g. `2 hours`, `7 days`, `30 minutes`)"
+        ));
+    }
+    let mut it = s.split_whitespace();
+    let n: u32 = it
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing count"))?
+        .parse()
+        .map_err(|_| anyhow::anyhow!("count must be a positive integer"))?;
+    let unit_raw = it
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing unit"))?;
+    let unit = match unit_raw.trim_end_matches('s') {
+        "minute" | "min" => "minutes",
+        "hour" | "hr" => "hours",
+        "day" => "days",
+        other => {
+            return Err(anyhow::anyhow!(
+                "unsupported unit `{other}` (use minutes / hours / days)"
+            ));
+        }
+    };
+    Ok(format!("-{n} {unit}"))
+}
+
+/// Tier C / C2.3: drive a bulk-forget from the CLI. Reuses the
+/// store's `bulk_forget` so the audit trail matches what the TUI and
+/// MCP paths produce. Defaults to dry-run unless `--forget-yes` is
+/// set, so an accidental `gaviero-cli --forget-source llm_extracted`
+/// can't silently flatten the workspace.
+async fn run_forget_cli(
+    repo: &std::path::Path,
+    filter: gaviero_core::memory::ForgetFilter,
+    dry_run: bool,
+    reason: Option<&str>,
+) -> Result<()> {
+    use gaviero_core::memory::deletions::DeletedBy;
+    let store = tokio::task::spawn_blocking({
+        let repo = repo.to_path_buf();
+        move || gaviero_core::memory::init_workspace(&repo)
+    })
+    .await
+    .context("init memory (forget)")??;
+    let report = store
+        .bulk_forget(&filter, dry_run, reason, DeletedBy::UserCommand)
+        .await
+        .context("running bulk forget")?;
+    if report.candidates.is_empty() {
+        println!("[gaviero-forget] no matches.");
+        return Ok(());
+    }
+    println!(
+        "[gaviero-forget] {} ({} candidates)",
+        if dry_run { "dry-run" } else { "live" },
+        report.candidates.len(),
+    );
+    for (k, n) in &report.kind_breakdown {
+        println!("  kind   {k:<10}  {n}");
+    }
+    for (s, n) in &report.scope_breakdown {
+        println!("  scope  {s:<32} {n}");
+    }
+    if !dry_run {
+        println!("  deleted: {} (audit rows written)", report.deleted);
+    } else {
+        println!("  re-run with --forget-yes to confirm the soft-delete.");
+    }
+    Ok(())
+}
+
+/// Tier C / C2.4: drive `/forget-history` from the CLI. Two-step
+/// confirmation is enforced via the `--redact-confirm REDACT` literal
+/// + a non-empty `--redact-reason`. Without both, the call aborts
+/// with a preview of the row.
+async fn run_forget_history_cli(
+    repo: &std::path::Path,
+    memory_id: i64,
+    redact_confirm: Option<&str>,
+    redact_reason: Option<&str>,
+) -> Result<()> {
+    let store = tokio::task::spawn_blocking({
+        let repo = repo.to_path_buf();
+        move || gaviero_core::memory::init_workspace(&repo)
+    })
+    .await
+    .context("init memory (forget-history)")??;
+
+    let body = store
+        .read_history_content(memory_id)
+        .await
+        .context("reading history row")?;
+    let Some(body) = body else {
+        eprintln!("[gaviero-redact] no history row at id {memory_id}.");
+        std::process::exit(2);
+    };
+
+    let confirmed = redact_confirm.map(|s| s == "REDACT").unwrap_or(false);
+    let reason = redact_reason.unwrap_or("").trim();
+    if !confirmed || reason.is_empty() {
+        println!(
+            "[gaviero-redact] preview of row {memory_id}:\n  {}",
+            body.lines().take(10).collect::<Vec<_>>().join("\n  ")
+        );
+        eprintln!(
+            "Re-run with `--forget-history-id {memory_id} --redact-confirm REDACT \
+             --redact-reason \"<text>\"` to redact. \
+             Redaction is one-way and CANNOT be undone."
+        );
+        std::process::exit(2);
+    }
+
+    let audit_id = store
+        .redact_history_row(memory_id, reason)
+        .await
+        .with_context(|| format!("redacting history row {memory_id}"))?;
+    println!("[gaviero-redact] row {memory_id} redacted; audit {audit_id} written.");
     Ok(())
 }
 
@@ -943,6 +1360,40 @@ async fn main() -> Result<()> {
     let repo = std::fs::canonicalize(&cli.repo)
         .with_context(|| format!("resolving repo path: {}", cli.repo.display()))?;
 
+    // ── Tier C / C1: enforce explicit consent for the typed-stores
+    // migration. Headless invocation cannot prompt; require the
+    // `--accept-c1-migration` flag if any reachable memory.db is at a
+    // pre-v10 schema. Plan §"Anti-patterns to avoid": no silent
+    // migration on first run.
+    {
+        let workspace = gaviero_core::workspace::Workspace::single_folder(repo.clone());
+        let pending = gaviero_core::memory::MemoryStores::probe_pending_c1_migrations(
+            &repo, &workspace,
+        )
+        .context("probing for pending C1 typed-stores migration")?;
+        if !pending.is_empty() && !cli.accept_c1_migration {
+            eprintln!(
+                "Gaviero's memory schema requires a one-time typed-stores upgrade (C1)."
+            );
+            eprintln!("Affected databases:");
+            for p in &pending {
+                eprintln!(
+                    "  - {}  (v{} → v{})",
+                    p.db_path.display(),
+                    p.current_version,
+                    p.target_version
+                );
+                eprintln!("    backup → {}", p.proposed_backup_path.display());
+            }
+            eprintln!();
+            eprintln!(
+                "Re-run with `--accept-c1-migration` to proceed. Each DB will be \
+                 snapshotted to the path shown above before migration."
+            );
+            std::process::exit(2);
+        }
+    }
+
     // ── Manifest introspection (Tier S / S4): print and exit ─────
     if cli.manifest_last.is_some() || cli.manifest_turn.is_some() {
         let store = tokio::task::spawn_blocking({
@@ -985,9 +1436,90 @@ async fn main() -> Result<()> {
         return run_eval_smoke_test(&repo, &fixture_path, &cli).await;
     }
 
+    // ── Tier A / A2: headless `/remember` ────────────────────────
+    if let Some(text) = cli.remember.as_deref() {
+        return run_remember_cli(&repo, text, &cli.remember_scope).await;
+    }
+
     // ── Tier B / B5: sleeptime hygiene ───────────────────────────
     if cli.sleep {
         return run_sleeptime_cli(&repo, cli.sleep_dry_run).await;
+    }
+
+    // ── Tier C / C2.2: deletions list / restore ──────────────────
+    if let Some(n) = cli.deletions_last {
+        return run_deletions_last_cli(&repo, n.max(1)).await;
+    }
+    if let Some(audit_id) = cli.restore_id {
+        return run_restore_id_cli(&repo, audit_id).await;
+    }
+    if let Some(window) = cli.restore_since.as_deref() {
+        return run_restore_since_cli(&repo, window).await;
+    }
+
+    // ── Tier C / C2.4: /forget-history ───────────────────────────
+    if let Some(id) = cli.forget_history_id {
+        return run_forget_history_cli(
+            &repo,
+            id,
+            cli.redact_confirm.as_deref(),
+            cli.redact_reason.as_deref(),
+        )
+        .await;
+    }
+
+    // ── Tier C / C2.3: bulk forget ───────────────────────────────
+    {
+        use gaviero_core::memory::ForgetFilter;
+        use gaviero_core::memory::scope::MemoryType;
+        use gaviero_core::memory::trust_defaults::MemorySource;
+        let dry_run = cli.forget_dry_run || !cli.forget_yes;
+        let reason = cli.forget_reason.as_deref();
+        if let Some(q) = cli.forget_query.as_deref() {
+            return run_forget_cli(&repo, ForgetFilter::ByQuery(q.to_string()), dry_run, reason)
+                .await;
+        }
+        if let Some(scope_path) = cli.forget_scope.as_deref() {
+            let scope_level = if scope_path == "global" {
+                gaviero_core::memory::scope::SCOPE_GLOBAL
+            } else if scope_path == "workspace" {
+                gaviero_core::memory::scope::SCOPE_WORKSPACE
+            } else if scope_path.contains("/run:") {
+                gaviero_core::memory::scope::SCOPE_RUN
+            } else if scope_path.contains("/module:") {
+                gaviero_core::memory::scope::SCOPE_MODULE
+            } else {
+                gaviero_core::memory::scope::SCOPE_REPO
+            };
+            return run_forget_cli(
+                &repo,
+                ForgetFilter::ByScope {
+                    scope_level,
+                    scope_path: scope_path.to_string(),
+                },
+                dry_run,
+                reason,
+            )
+            .await;
+        }
+        if let Some(t) = cli.forget_type.as_deref() {
+            return run_forget_cli(
+                &repo,
+                ForgetFilter::ByType(MemoryType::parse_str(&t.to_lowercase())),
+                dry_run,
+                reason,
+            )
+            .await;
+        }
+        if let Some(s) = cli.forget_source.as_deref() {
+            return run_forget_cli(
+                &repo,
+                ForgetFilter::BySource(MemorySource::parse_str(&s.to_lowercase())),
+                dry_run,
+                reason,
+            )
+            .await;
+        }
     }
 
     // ── Tier B / B6: per-scope utilization report ────────────────
@@ -1222,6 +1754,7 @@ async fn main() -> Result<()> {
     // plan.max_parallel overrides the CLI flag when declared.
     let swarm_observer = CliSwarmObserver;
     let specificity = workspace.resolve_specificity_config(Some(&repo));
+    let (swarm_extra_tools, _) = workspace.resolve_agent_tools(Some(&repo));
     let config = gaviero_core::swarm::pipeline::SwarmConfig {
         max_parallel: cli.max_parallel,
         workspace_root: repo,
@@ -1235,6 +1768,7 @@ async fn main() -> Result<()> {
         memory_writer: None,
         mcp_config: None,
         specificity,
+        swarm_extra_tools,
     };
 
     // --coordinated: produce a DSL plan file for review, then exit.

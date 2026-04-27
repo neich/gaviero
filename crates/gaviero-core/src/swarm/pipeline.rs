@@ -56,6 +56,16 @@ pub struct SwarmConfig {
     /// so `repoMap.specificity.enabled` and the stop-symbol threshold
     /// take effect. Defaults to enabled with a 0.5 stop-symbol cutoff.
     pub specificity: crate::repo_map::SpecificityConfig,
+    /// Workspace-level fallback for swarm tool grants. Populate from
+    /// `agent.availableTools` (see `Workspace::resolve_agent_tools`).
+    /// Names beyond the swarm base set
+    /// (`Read,Glob,Grep,Write,Edit,MultiEdit`) act as implicit
+    /// `extra_allowed_tools` for any work unit whose DSL leaves
+    /// `tools [...]` unset. DSL declarations always take precedence:
+    /// when a unit declares any `tools`, the workspace fallback is
+    /// ignored entirely for that unit so the DSL remains the audit
+    /// record. Empty = no fallback (legacy behaviour).
+    pub swarm_extra_tools: Vec<String>,
 }
 
 /// Execute a swarm of work units from a compiled plan.
@@ -81,6 +91,25 @@ pub async fn execute(
         max_parallel = config.max_parallel,
         "swarm.execute starting"
     );
+
+    // Surface workspace-level Bash grant so the security-sensitive
+    // weakening of "DSL is the sole place Bash can be granted" is
+    // visible in the log every swarm run rather than buried in
+    // settings. DSL grants are already part of the unit's checked-in
+    // declaration so they don't need a runtime warning.
+    if config
+        .swarm_extra_tools
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case("Bash"))
+    {
+        tracing::warn!(
+            target: "swarm",
+            extras = ?config.swarm_extra_tools,
+            "agent.availableTools grants Bash to swarm units (workspace-level fallback). \
+             Per-unit DSL `tools [...]` overrides this. Bash bypasses Write Gate \
+             scope validation; remove from settings if unintended."
+        );
+    }
 
     // Extract work units in topological order from the plan graph
     let work_units = plan
@@ -296,6 +325,7 @@ pub async fn execute(
             // + 1 runner query = 2, already within M7 ≤2 gate).
             pre_fetched_memory: Arc::new(None),
             mcp_config: config.mcp_config.clone(),
+            swarm_extras: &config.swarm_extra_tools,
         };
 
         invalidate_stale_sources(&memory, &unit, &config.workspace_root).await;
@@ -631,6 +661,7 @@ pub async fn execute(
                     impact_texts: impact_texts.clone(),
                     pre_fetched_memory: pre_fetched_memory.clone(),
                     mcp_config: config.mcp_config.clone(),
+                    swarm_extras: &config.swarm_extra_tools,
                 };
                 let manifest = run_single_agent(
                     unit,
@@ -715,6 +746,7 @@ pub async fn execute(
                 let router = tier_router.clone();
                 let iteration_config = plan.iteration_config.clone();
                 let pfm = pre_fetched_memory.clone();
+                let swarm_extras = config.swarm_extra_tools.clone();
                 if let Ok(backend) = resolve_backend_for_unit(&router, &unit) {
                     observer.on_tier_dispatch(unit_id, unit.tier, backend.name());
                 }
@@ -751,6 +783,7 @@ pub async fn execute(
                             (*rm).as_ref(),
                             agent_impact.as_deref(),
                             (*pfm).as_deref(),
+                            &swarm_extras,
                             |candidate| resolve_backend_for_unit(&router, candidate),
                         )
                         .await
@@ -988,6 +1021,7 @@ pub async fn execute(
                     impact_texts: impact_texts.clone(),
                     pre_fetched_memory: pre_fetched_memory.clone(),
                     mcp_config: config.mcp_config.clone(),
+                    swarm_extras: &config.swarm_extra_tools,
                 };
                 let manifest = run_single_agent(
                     unit,
@@ -1202,6 +1236,10 @@ struct AgentRunContext<'a> {
     /// per-runner query (single-agent fast path does not pre-fetch).
     pre_fetched_memory: Arc<Option<String>>,
     mcp_config: Option<crate::mcp::McpConfigSynth>,
+    /// Workspace-resolved extras for swarm tool grants (see
+    /// `SwarmConfig::swarm_extra_tools`). Borrowed from `SwarmConfig`
+    /// for the duration of the swarm run.
+    swarm_extras: &'a [String],
 }
 
 struct LoopConditionContext<'a> {
@@ -1484,6 +1522,7 @@ async fn run_agent_inner(
             (*repo_map).as_ref(),
             impact_text.as_deref(),
             pre_fetched_memory_text.as_deref(),
+            ctx.swarm_extras,
             |candidate| {
                 let backend = resolve_backend_for_unit(tier_router, candidate)?;
                 swarm_observer.on_tier_dispatch(&candidate.id, candidate.tier, backend.name());
@@ -2298,6 +2337,7 @@ async fn evaluate_loop_condition(
                 impact_texts: ctx.impact_texts.clone(),
                 pre_fetched_memory: ctx.pre_fetched_memory.clone(),
                 mcp_config: ctx.config.mcp_config.clone(),
+                swarm_extras: &ctx.config.swarm_extra_tools,
             };
 
             // Judges run in read-only mode: the write gate rejects any write

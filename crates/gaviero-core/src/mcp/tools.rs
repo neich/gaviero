@@ -28,6 +28,15 @@ pub struct MemorySearchInput {
     /// budget in the calling subprocess.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    /// Tier C / C1.6: lifecycle-class filter. One of `"record"`
+    /// (default), `"history"`, `"summary"`, or `"any"`. Records are
+    /// the workhorse facts; History is the immutable raw transcript
+    /// log (audit data, not normally injected); Summaries are the
+    /// session consolidator's output. Subprocess agents should default
+    /// to `record` and only opt into `history` or `any` for
+    /// audit/forensic queries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 /// A single `memory_search` result row. Field set is the minimum
@@ -135,6 +144,35 @@ pub fn clamp_blast_depth(depth: Option<u32>) -> u32 {
     depth.unwrap_or(2).clamp(1, 5)
 }
 
+/// C1.6: resolve the optional `memory_search.kind` parameter to a
+/// concrete filter. Returns:
+/// - `Ok(Some(MemoryKind))` to filter by exactly that kind (the
+///   common case — `"record"` is the documented default and the
+///   strongly-recommended choice).
+/// - `Ok(None)` for `"any"` (explicit unfiltered cross-kind search).
+/// - `Err(...)` for unknown values so subprocess agents see a clear
+///   error rather than silently falling through to the default.
+pub fn resolve_memory_search_kind(
+    kind: Option<&str>,
+) -> std::result::Result<Option<crate::memory::MemoryKind>, String> {
+    use std::str::FromStr;
+    match kind {
+        None | Some("record") => Ok(Some(crate::memory::MemoryKind::Record)),
+        Some("any") => Ok(None),
+        Some(other) => crate::memory::MemoryKind::from_str(other)
+            .map(Some)
+            .map_err(|e| {
+                format!(
+                    "memory_search.kind: unknown value {other:?}; expected \
+                     'record' | 'history' | 'summary' | 'any' ({e})"
+                )
+            }),
+    }
+}
+
+/// C1.6: default kind constant for documentation / tests.
+pub const MEMORY_SEARCH_DEFAULT_KIND: &str = "record";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +200,57 @@ mod tests {
         assert_eq!(input.query, "foo");
         assert!(input.scope_hint.is_none());
         assert!(input.limit.is_none());
+        // C1.6: kind defaults to None on the wire (resolver maps it
+        // to Record at call time).
+        assert!(input.kind.is_none());
+    }
+
+    #[test]
+    fn memory_search_input_round_trips_kind_field() {
+        let input: MemorySearchInput =
+            serde_json::from_str(r#"{"query":"foo","kind":"history"}"#).unwrap();
+        assert_eq!(input.kind.as_deref(), Some("history"));
+    }
+
+    /// C1.6: the resolver defines the contract for memory_search.kind:
+    /// missing or "record" → Record; "history"/"summary" → that kind;
+    /// "any" → no filter; unknown → loud error.
+    #[test]
+    fn resolve_memory_search_kind_default_is_record() {
+        use crate::memory::MemoryKind;
+        assert_eq!(
+            resolve_memory_search_kind(None).unwrap(),
+            Some(MemoryKind::Record)
+        );
+        assert_eq!(
+            resolve_memory_search_kind(Some("record")).unwrap(),
+            Some(MemoryKind::Record)
+        );
+    }
+
+    #[test]
+    fn resolve_memory_search_kind_explicit_kinds() {
+        use crate::memory::MemoryKind;
+        assert_eq!(
+            resolve_memory_search_kind(Some("history")).unwrap(),
+            Some(MemoryKind::History)
+        );
+        assert_eq!(
+            resolve_memory_search_kind(Some("summary")).unwrap(),
+            Some(MemoryKind::Summary)
+        );
+    }
+
+    #[test]
+    fn resolve_memory_search_kind_any_returns_no_filter() {
+        assert_eq!(resolve_memory_search_kind(Some("any")).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_memory_search_kind_rejects_unknown() {
+        let err = resolve_memory_search_kind(Some("episode")).unwrap_err();
+        assert!(err.contains("episode"), "{err}");
+        assert!(err.contains("expected"), "{err}");
     }
 
     #[test]
@@ -169,5 +258,7 @@ mod tests {
         assert_eq!(TOOL_MEMORY_SEARCH, "memory_search");
         assert_eq!(TOOL_BLAST_RADIUS, "blast_radius");
         assert_eq!(TOOL_NODE_DOC, "node_doc");
+        // C1.6: documented default kind is record.
+        assert_eq!(MEMORY_SEARCH_DEFAULT_KIND, "record");
     }
 }

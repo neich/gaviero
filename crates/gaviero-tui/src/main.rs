@@ -29,6 +29,61 @@ struct Cli {
     path: PathBuf,
 }
 
+/// C1: synchronous yes/no prompt on stdin/stderr asking the user to
+/// consent to the typed-stores migration. Runs before raw mode is
+/// enabled so plain stdin works. Returns `Ok(true)` on consent.
+///
+/// Inputs are interpreted permissively:
+/// - `y`, `yes`, blank line on a TTY default → consent
+/// - `n`, `no`, anything else → decline
+/// - EOF (e.g., `</dev/null`) → decline (treat headless TUI invocation
+///   as "no consent" rather than silently migrating).
+fn prompt_c1_consent(
+    proposals: &[gaviero_core::memory::C1MigrationProposal],
+) -> Result<bool> {
+    use std::io::{BufRead, Write};
+
+    let mut stderr = std::io::stderr().lock();
+    writeln!(
+        stderr,
+        "\nGaviero's memory schema is upgrading to typed stores (C1)."
+    )?;
+    writeln!(
+        stderr,
+        "This is a one-time, load-bearing migration. A backup of each affected"
+    )?;
+    writeln!(
+        stderr,
+        "memory.db will be taken automatically before the migration runs."
+    )?;
+    writeln!(stderr)?;
+    writeln!(stderr, "Affected databases:")?;
+    for p in proposals {
+        writeln!(
+            stderr,
+            "  - {}  (v{} → v{})",
+            p.db_path.display(),
+            p.current_version,
+            p.target_version
+        )?;
+        writeln!(stderr, "    backup → {}", p.proposed_backup_path.display())?;
+    }
+    writeln!(stderr)?;
+    write!(stderr, "Continue? [y/N] ")?;
+    stderr.flush()?;
+    drop(stderr);
+
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    let n = stdin.lock().read_line(&mut line)?;
+    if n == 0 {
+        // EOF — treat as decline.
+        return Ok(false);
+    }
+    let answer = line.trim().to_ascii_lowercase();
+    Ok(matches!(answer.as_str(), "y" | "yes"))
+}
+
 /// Restore the host terminal to a sane state. Called on every exit path:
 /// normal exit, `?` early returns, and panics.
 fn restore_terminal() {
@@ -81,6 +136,32 @@ async fn main() -> Result<()> {
     } else {
         gaviero_core::workspace::Workspace::single_folder(path)
     };
+
+    // C1: prompt the user for consent on a pending typed-stores
+    // migration BEFORE entering raw mode. If the user declines, exit
+    // cleanly without taking the snapshot or migrating. The plan's
+    // anti-pattern explicitly forbids silent migration here — a yes/no
+    // stdin prompt is the minimum non-silent surface.
+    {
+        let workspace_root = workspace
+            .roots()
+            .first()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let pending = gaviero_core::memory::MemoryStores::probe_pending_c1_migrations(
+            &workspace_root,
+            &workspace,
+        )
+        .context("probing for pending C1 typed-stores migration")?;
+        if !pending.is_empty() && !prompt_c1_consent(&pending)? {
+            eprintln!(
+                "Aborted. Memory schema upgrade declined; \
+                 Gaviero will not start until the upgrade is accepted \
+                 or the affected memory.db files are removed."
+            );
+            return Ok(());
+        }
+    }
 
     // Install panic hook BEFORE entering raw mode so that any panic
     // (including inside ratatui, crossterm, or our own code) restores

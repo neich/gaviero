@@ -112,6 +112,7 @@ pub(crate) fn run_swarm(app: &mut App, task_desc: String) {
     let mcp_config = mcp_config_for_workspace(app, &root);
     let excludes = parse_exclude_patterns(&app.workspace);
     let specificity = app.workspace.resolve_specificity_config(Some(&root));
+    let (swarm_extra_tools, _) = app.workspace.resolve_agent_tools(Some(&root));
 
     tokio::spawn(async move {
         use gaviero_core::swarm::{pipeline, planner};
@@ -167,6 +168,7 @@ pub(crate) fn run_swarm(app: &mut App, task_desc: String) {
             memory_writer,
             mcp_config: Some(mcp_config),
             specificity,
+            swarm_extra_tools,
         };
 
         let observer = TuiSwarmObserver { tx: tx.clone() };
@@ -289,6 +291,7 @@ pub(super) fn handle_run_script_command(app: &mut App) {
     let memory_writer = app.memory_writer.clone();
     let mcp_config = mcp_config_for_workspace(app, &root);
     let specificity = app.workspace.resolve_specificity_config(Some(&root));
+    let (swarm_extra_tools, _) = app.workspace.resolve_agent_tools(Some(&root));
 
     tokio::spawn(async move {
         use gaviero_core::swarm::pipeline;
@@ -308,6 +311,7 @@ pub(super) fn handle_run_script_command(app: &mut App) {
             memory_writer,
             mcp_config: Some(mcp_config),
             specificity,
+            swarm_extra_tools,
         };
 
         let observer = TuiSwarmObserver { tx: tx.clone() };
@@ -421,6 +425,7 @@ pub(super) fn handle_coordinated_swarm_command(app: &mut App) {
     let memory_writer = app.memory_writer.clone();
     let mcp_config = mcp_config_for_workspace(app, &root);
     let specificity = app.workspace.resolve_specificity_config(Some(&root));
+    let (swarm_extra_tools, _) = app.workspace.resolve_agent_tools(Some(&root));
 
     tokio::spawn(async move {
         use gaviero_core::swarm::{coordinator, pipeline};
@@ -438,6 +443,7 @@ pub(super) fn handle_coordinated_swarm_command(app: &mut App) {
             memory_writer,
             mcp_config: Some(mcp_config),
             specificity,
+            swarm_extra_tools,
         };
 
         let coord_config = coordinator::CoordinatorConfig {
@@ -700,6 +706,491 @@ pub(super) fn handle_sleep_command(app: &mut App) {
             "Sleeptime queued."
         });
     }
+}
+
+/// Tier C / C2.3: `/forget`, `/forget-scope`, `/forget-type`,
+/// `/forget-source` — bulk soft-delete with mandatory two-shot
+/// confirmation (`--yes` flag) and `--dry-run` preview. Always tagged
+/// `DeletedBy::UserCommand`; the audit row carries the optional
+/// `--reason` text. Never matches history rows.
+pub(super) fn handle_forget_command(app: &mut App) {
+    use gaviero_core::memory::ForgetFilter;
+    use gaviero_core::memory::scope::MemoryType;
+    use gaviero_core::memory::trust_defaults::MemorySource;
+
+    let input = app.chat_state.take_input();
+    let trimmed = input.trim();
+    app.chat_state.add_user_message(trimmed);
+
+    let (variant, rest) = if let Some(r) = trimmed.strip_prefix("/forget-scope") {
+        ("scope", r)
+    } else if let Some(r) = trimmed.strip_prefix("/forget-type") {
+        ("type", r)
+    } else if let Some(r) = trimmed.strip_prefix("/forget-source") {
+        ("source", r)
+    } else if let Some(r) = trimmed.strip_prefix("/forget") {
+        ("query", r)
+    } else {
+        return;
+    };
+
+    let (flags, args) = parse_forget_flags(rest);
+    let confirmed = flags.contains("--yes");
+    let dry_run = flags.contains("--dry-run") || !confirmed;
+
+    if args.trim().is_empty() {
+        app.chat_state.add_system_message(
+            "Usage:\n\
+             /forget <query>            — fuzzy match (records and summaries; never history)\n\
+             /forget-scope <scope_path> — every row at that scope (e.g. workspace, repo:<id>)\n\
+             /forget-type <type>        — factual|procedural|decision|pattern|gotcha|...\n\
+             /forget-source <source>    — user_remember|llm_extracted|llm_consolidated|...\n\
+             Append --dry-run to preview, --yes to confirm. \
+             Optional --reason \"<text>\" attaches to the audit rows.",
+        );
+        return;
+    }
+
+    let (reason, body) = extract_reason_flag(&args);
+    let body = body.trim().to_string();
+
+    let filter = match variant {
+        "query" => ForgetFilter::ByQuery(body.clone()),
+        "scope" => ForgetFilter::ByScope {
+            scope_level: scope_level_for_path(&body),
+            scope_path: body.clone(),
+        },
+        "type" => ForgetFilter::ByType(MemoryType::parse_str(body.trim().to_lowercase().as_str())),
+        "source" => {
+            ForgetFilter::BySource(MemorySource::parse_str(body.trim().to_lowercase().as_str()))
+        }
+        _ => unreachable!(),
+    };
+
+    let Some(writer) = app.memory_writer.clone() else {
+        app.chat_state
+            .add_system_message("Memory writer not initialised; cannot run /forget.");
+        return;
+    };
+
+    let tx = app.event_tx.clone();
+    let header = if dry_run {
+        format!("/forget {variant} (dry-run): \"{body}\"")
+    } else {
+        format!("/forget {variant} (live): \"{body}\"")
+    };
+    tokio::spawn(async move {
+        let body_msg = match writer.bulk_forget(filter, dry_run, reason).await {
+            Ok(report) => format_forget_report(&header, &report, dry_run),
+            Err(e) => format!("/forget failed: {e}"),
+        };
+        let _ = tx.send(Event::MessageComplete {
+            conv_id: String::new(),
+            role: "system".to_string(),
+            content: body_msg,
+        });
+    });
+}
+
+/// Pull recognized flag tokens (`--dry-run`, `--yes`) off the front of
+/// `rest`, returning the residual argument text. Multiple flags allowed
+/// in any order; unknown `--*` tokens are kept in the body so the
+/// caller can complain if they want.
+fn parse_forget_flags(rest: &str) -> (std::collections::HashSet<&'static str>, String) {
+    let mut flags = std::collections::HashSet::new();
+    let mut residual: Vec<&str> = Vec::new();
+    for tok in rest.split_whitespace() {
+        match tok {
+            "--dry-run" => {
+                flags.insert("--dry-run");
+            }
+            "--yes" => {
+                flags.insert("--yes");
+            }
+            other => residual.push(other),
+        }
+    }
+    (flags, residual.join(" "))
+}
+
+/// Pull a `--reason "<text>"` argument off `args`. Reason quoting is
+/// shell-style: `--reason X` for one-word reasons, `--reason "X Y Z"`
+/// for multi-word ones. Returns `(reason, body_without_reason)`.
+fn extract_reason_flag(args: &str) -> (Option<String>, String) {
+    let s = args.trim();
+    let Some(idx) = s.find("--reason") else {
+        return (None, s.to_string());
+    };
+    let before = s[..idx].trim();
+    let after = s[idx + "--reason".len()..].trim_start();
+    if let Some(rest_q) = after.strip_prefix('"') {
+        if let Some(end) = rest_q.find('"') {
+            let reason = &rest_q[..end];
+            let tail = rest_q[end + 1..].trim();
+            let body = if tail.is_empty() {
+                before.to_string()
+            } else {
+                format!("{before} {tail}")
+            };
+            return (Some(reason.to_string()), body);
+        }
+    }
+    let mut iter = after.split_whitespace();
+    let first = iter.next().unwrap_or("").to_string();
+    let tail: Vec<&str> = iter.collect();
+    let body = if tail.is_empty() {
+        before.to_string()
+    } else {
+        format!("{before} {}", tail.join(" "))
+    };
+    (Some(first), body)
+}
+
+fn scope_level_for_path(path: &str) -> i32 {
+    if path == "global" {
+        gaviero_core::memory::scope::SCOPE_GLOBAL
+    } else if path == "workspace" {
+        gaviero_core::memory::scope::SCOPE_WORKSPACE
+    } else if path.contains("/run:") {
+        gaviero_core::memory::scope::SCOPE_RUN
+    } else if path.contains("/module:") {
+        gaviero_core::memory::scope::SCOPE_MODULE
+    } else {
+        gaviero_core::memory::scope::SCOPE_REPO
+    }
+}
+
+fn format_forget_report(
+    header: &str,
+    report: &gaviero_core::memory::BulkForgetReport,
+    dry_run: bool,
+) -> String {
+    if report.candidates.is_empty() {
+        return format!("{header}\nNothing matched. (Records and summaries only — history is excluded by design.)");
+    }
+    let kinds: Vec<String> = report
+        .kind_breakdown
+        .iter()
+        .map(|(k, n)| format!("{k}={n}"))
+        .collect();
+    let scopes: Vec<String> = report
+        .scope_breakdown
+        .iter()
+        .map(|(s, n)| format!("{s}={n}"))
+        .collect();
+    if dry_run {
+        format!(
+            "{header}\n  matches: {}\n  kinds:   {}\n  scopes:  {}\n  Re-run with --yes to confirm. \
+             /restore <audit-id> can undo each row within the retention window.",
+            report.candidates.len(),
+            kinds.join(", "),
+            scopes.join(", "),
+        )
+    } else {
+        format!(
+            "{header}\n  deleted: {} (audit ids written; use /restore <id> to undo)\n  kinds:   {}\n  scopes:  {}",
+            report.deleted,
+            kinds.join(", "),
+            scopes.join(", "),
+        )
+    }
+}
+
+/// Tier C / C2.4: `/forget-history` — two-step-confirmed redaction
+/// of a single history row. Three chances to back out:
+///   1. `/forget-history <memory_id>` (or `--turn <turn_id>`) — prints
+///      the row, asks for the id again with `--confirm <id>`.
+///   2. `/forget-history --confirm <id>` — asks for the literal word
+///      `REDACT` plus a reason, via `--confirm <id> REDACT <reason>`.
+///   3. Sends the [`WriterMessage::RedactHistory`] message and
+///      reports the audit id.
+///
+/// Settings gate: `memory.forget.allowHistoryRedaction` (default
+/// `true`) — workspaces under strict audit can disable the path
+/// entirely.
+pub(super) fn handle_forget_history_command(app: &mut App) {
+    use gaviero_core::workspace::settings as S;
+
+    let input = app.chat_state.take_input();
+    let trimmed = input.trim();
+    app.chat_state.add_user_message(trimmed);
+
+    let workspace_root = app
+        .workspace
+        .roots()
+        .first()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let allow = app
+        .workspace
+        .resolve_setting(S::MEMORY_FORGET_ALLOW_HISTORY_REDACTION, Some(&workspace_root))
+        .as_bool()
+        .unwrap_or(true);
+    if !allow {
+        app.chat_state.add_system_message(
+            "/forget-history is disabled in this workspace \
+             (memory.forget.allowHistoryRedaction = false). \
+             History rows are immutable.",
+        );
+        return;
+    }
+
+    let rest = trimmed
+        .strip_prefix("/forget-history")
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if rest.is_empty() {
+        app.chat_state.add_system_message(
+            "Usage:\n\
+             /forget-history <memory_id>                 — preview the row\n\
+             /forget-history --confirm <memory_id>       — second-step prompt\n\
+             /forget-history --confirm <memory_id> REDACT <reason>\n\
+                                                          — execute the redaction\n\
+             Redaction is one-way: the transcript is replaced with a tombstone \
+             (sha + timestamp + reason). The row continues to exist; only its \
+             content is wiped. Use /forget on derived records if you want \
+             reversible deletion instead.",
+        );
+        return;
+    }
+
+    let Some(writer) = app.memory_writer.clone() else {
+        app.chat_state
+            .add_system_message("Memory writer not initialised; cannot run /forget-history.");
+        return;
+    };
+    let Some(memory) = app.memory.clone() else {
+        app.chat_state
+            .add_system_message("Memory store not initialised; cannot run /forget-history.");
+        return;
+    };
+
+    let tx = app.event_tx.clone();
+    let words: Vec<&str> = rest.split_whitespace().collect();
+    let confirm_idx = words.iter().position(|w| *w == "--confirm");
+
+    // Step 1: preview-only.
+    if confirm_idx.is_none() {
+        let id_str = words.first().copied().unwrap_or("");
+        let Ok(id) = id_str.parse::<i64>() else {
+            app.chat_state.add_system_message(
+                "/forget-history: expected a numeric memory id (`/forget-history <id>`).",
+            );
+            return;
+        };
+        tokio::spawn(async move {
+            let body = match memory.workspace().read_history_content(id).await {
+                Ok(Some(content)) => format!(
+                    "/forget-history (preview) row {id}:\n  {}\n\
+                     Type `/forget-history --confirm {id}` to proceed to the second-step prompt. \
+                     This redaction CANNOT be undone.",
+                    content.lines().take(5).collect::<Vec<_>>().join("\n  ")
+                ),
+                Ok(None) => format!(
+                    "/forget-history: no history row at id {id} (already redacted? wrong id?)"
+                ),
+                Err(e) => format!("/forget-history preview failed: {e}"),
+            };
+            let _ = tx.send(Event::MessageComplete {
+                conv_id: String::new(),
+                role: "system".to_string(),
+                content: body,
+            });
+        });
+        return;
+    }
+
+    // Step 2/3: confirm form: `--confirm <id> [REDACT <reason...>]`.
+    let confirm_idx = confirm_idx.unwrap();
+    let id_word = words.get(confirm_idx + 1).copied().unwrap_or("");
+    let Ok(id) = id_word.parse::<i64>() else {
+        app.chat_state
+            .add_system_message("/forget-history --confirm: missing or non-numeric memory id.");
+        return;
+    };
+    let redact_idx = words.iter().position(|w| *w == "REDACT");
+    let Some(redact_idx) = redact_idx else {
+        // Step 2: print the literal-REDACT prompt and wait for the user.
+        app.chat_state.add_system_message(&format!(
+            "/forget-history (step 2): about to redact memory id {id}. \
+             Type `/forget-history --confirm {id} REDACT <reason>` to proceed. \
+             This redaction CANNOT be undone."
+        ));
+        return;
+    };
+    let reason = words[redact_idx + 1..].join(" ").trim().to_string();
+    if reason.is_empty() {
+        app.chat_state.add_system_message(
+            "/forget-history --confirm: a non-empty reason is required after REDACT.",
+        );
+        return;
+    }
+
+    tokio::spawn(async move {
+        let body = match writer.redact_history(id, reason).await {
+            Ok(audit_id) => format!(
+                "✓ /forget-history: row {id} redacted; audit {audit_id} written. \
+                 The transcript has been permanently replaced with a tombstone."
+            ),
+            Err(e) => format!("/forget-history failed: {e}"),
+        };
+        let _ = tx.send(Event::MessageComplete {
+            conv_id: String::new(),
+            role: "system".to_string(),
+            content: body,
+        });
+    });
+}
+
+/// Tier C / C2.2: `/restore <id>` and `/restore --since <duration>`.
+/// Replays soft-deleted rows through the dedup pipeline. Refused for
+/// `user_redaction` audit rows (see C2.4). `--since` accepts SQLite
+/// relative-datetime fragments (`2 hours`, `7 days`, `30 minutes`).
+pub(super) fn handle_restore_command(app: &mut App) {
+    let input = app.chat_state.take_input();
+    let trimmed = input.trim();
+    app.chat_state.add_user_message(trimmed);
+
+    let rest = trimmed
+        .strip_prefix("/restore")
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if rest.is_empty() {
+        app.chat_state.add_system_message(
+            "Usage: /restore <deletion-id>\n       /restore --since <N hours|N days|N minutes>",
+        );
+        return;
+    }
+
+    let Some(writer) = app.memory_writer.clone() else {
+        app.chat_state
+            .add_system_message("Memory writer not initialised; cannot restore.");
+        return;
+    };
+
+    let tx = app.event_tx.clone();
+
+    if let Some(window) = rest.strip_prefix("--since") {
+        let since_offset = match parse_restore_since_window(window.trim()) {
+            Ok(s) => s,
+            Err(e) => {
+                app.chat_state
+                    .add_system_message(&format!("/restore --since: {e}"));
+                return;
+            }
+        };
+        tokio::spawn(async move {
+            let body = match writer.restore_deletions_since(&since_offset).await {
+                Ok(outcomes) if outcomes.is_empty() => {
+                    "/restore: no soft-deleted rows in that window.".to_string()
+                }
+                Ok(outcomes) => format_restore_summary(&outcomes),
+                Err(e) => format!("/restore --since failed: {e}"),
+            };
+            let _ = tx.send(Event::MessageComplete {
+                conv_id: String::new(),
+                role: "system".to_string(),
+                content: body,
+            });
+        });
+        return;
+    }
+
+    let id: i64 = match rest.parse() {
+        Ok(v) => v,
+        Err(_) => {
+            app.chat_state.add_system_message(
+                "/restore: expected a numeric audit id or `--since <duration>`.",
+            );
+            return;
+        }
+    };
+
+    tokio::spawn(async move {
+        let body = match writer.restore_deletion(id).await {
+            Ok(outcome) => format_restore_outcome(&outcome),
+            Err(e) => format!("/restore failed: {e}"),
+        };
+        let _ = tx.send(Event::MessageComplete {
+            conv_id: String::new(),
+            role: "system".to_string(),
+            content: body,
+        });
+    });
+}
+
+/// Parse `/restore --since <N> <unit>` into the SQLite relative-
+/// datetime fragment that the store API expects (e.g. `"-2 hours"`).
+/// Accepts singular and plural unit names, leading minus is added by
+/// us so the user spec stays positive.
+fn parse_restore_since_window(spec: &str) -> Result<String, String> {
+    let s = spec.trim();
+    if s.is_empty() {
+        return Err("missing duration (e.g. `2 hours`, `7 days`)".into());
+    }
+    let mut it = s.split_whitespace();
+    let n: u32 = it
+        .next()
+        .ok_or_else(|| "missing count".to_string())?
+        .parse()
+        .map_err(|_| "count must be a positive integer".to_string())?;
+    let unit_raw = it.next().ok_or_else(|| "missing unit".to_string())?;
+    let unit = match unit_raw.trim_end_matches('s') {
+        "minute" | "min" => "minutes",
+        "hour" | "hr" => "hours",
+        "day" => "days",
+        other => return Err(format!("unsupported unit `{other}` (use minutes / hours / days)")),
+    };
+    Ok(format!("-{n} {unit}"))
+}
+
+fn format_restore_outcome(o: &gaviero_core::memory::RestoreOutcome) -> String {
+    use gaviero_core::memory::RestoreOutcome::*;
+    match o {
+        Inserted {
+            deletion_id,
+            new_memory_id,
+        } => format!(
+            "✓ /restore: audit {deletion_id} reinstated as new memory id {new_memory_id}."
+        ),
+        Deduplicated {
+            deletion_id,
+            surviving_memory_id,
+        } => format!(
+            "✓ /restore: audit {deletion_id} merged into existing memory {surviving_memory_id} (dedup hit)."
+        ),
+        AlreadyCovered { deletion_id } => format!(
+            "✓ /restore: audit {deletion_id} already covered at a broader scope; nothing new written."
+        ),
+        Refused {
+            deletion_id,
+            reason,
+        } => format!("✗ /restore refused for audit {deletion_id}: {reason}"),
+    }
+}
+
+fn format_restore_summary(outcomes: &[gaviero_core::memory::RestoreOutcome]) -> String {
+    use gaviero_core::memory::RestoreOutcome::*;
+    let mut inserted = 0u32;
+    let mut deduped = 0u32;
+    let mut covered = 0u32;
+    let mut refused = 0u32;
+    for o in outcomes {
+        match o {
+            Inserted { .. } => inserted += 1,
+            Deduplicated { .. } => deduped += 1,
+            AlreadyCovered { .. } => covered += 1,
+            Refused { .. } => refused += 1,
+        }
+    }
+    format!(
+        "/restore --since: {} processed (inserted {inserted}, deduped {deduped}, covered {covered}, refused {refused}).",
+        outcomes.len()
+    )
 }
 
 /// Tier B / B1: `/reembed` — re-embed every memory under the currently

@@ -59,16 +59,6 @@ pub trait Embedder: Send + Sync {
         }
         Ok(out)
     }
-
-    /// Backward-compatible alias for existing store code.
-    fn dimensions(&self) -> usize {
-        self.dimension()
-    }
-
-    /// Backward-compatible alias for existing store code.
-    fn model_id(&self) -> &str {
-        self.name()
-    }
 }
 
 /// Deterministic local test/fallback embedder.
@@ -173,8 +163,8 @@ impl Embedder for DualEmbedder {
             Ok(comparison) => {
                 tracing::debug!(
                     target: "memory_embedder_ab",
-                    primary = self.primary.model_id(),
-                    comparison = self.comparison.model_id(),
+                    primary = self.primary.name(),
+                    comparison = self.comparison.name(),
                     primary_dim = primary.len(),
                     comparison_dim = comparison.len(),
                     purpose = ?purpose,
@@ -184,7 +174,7 @@ impl Embedder for DualEmbedder {
             Err(e) => {
                 tracing::warn!(
                     target: "memory_embedder_ab",
-                    comparison = self.comparison.model_id(),
+                    comparison = self.comparison.name(),
                     error = %e,
                     "dual embedder comparison failed"
                 );
@@ -203,8 +193,8 @@ impl Embedder for DualEmbedder {
             Ok(comparison) => {
                 tracing::debug!(
                     target: "memory_embedder_ab",
-                    primary = self.primary.model_id(),
-                    comparison = self.comparison.model_id(),
+                    primary = self.primary.name(),
+                    comparison = self.comparison.name(),
                     primary_count = primary.len(),
                     comparison_count = comparison.len(),
                     purpose = ?purpose,
@@ -214,7 +204,7 @@ impl Embedder for DualEmbedder {
             Err(e) => {
                 tracing::warn!(
                     target: "memory_embedder_ab",
-                    comparison = self.comparison.model_id(),
+                    comparison = self.comparison.name(),
                     error = %e,
                     "dual embedder batch comparison failed"
                 );

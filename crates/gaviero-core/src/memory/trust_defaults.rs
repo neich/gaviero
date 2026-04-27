@@ -30,6 +30,10 @@ pub enum MemorySource {
     McpImport,
     /// Compiler / test / tool output captured as memory.
     ToolOutput,
+    /// Tier C / C1: raw turn transcript (the History row itself, not
+    /// any derived Memory). Trust is 1.0 because it *is* the source of
+    /// truth — every derived record traces back here.
+    RawTranscript,
     /// Pre-A3 row with no recorded source.
     UnknownLegacy,
 }
@@ -45,6 +49,7 @@ impl MemorySource {
             Self::SwarmConsolidated => "swarm_consolidated",
             Self::McpImport => "mcp_import",
             Self::ToolOutput => "tool_output",
+            Self::RawTranscript => "raw_transcript",
             Self::UnknownLegacy => "unknown_legacy",
         }
     }
@@ -59,6 +64,7 @@ impl MemorySource {
             "swarm_consolidated" => Self::SwarmConsolidated,
             "mcp_import" => Self::McpImport,
             "tool_output" => Self::ToolOutput,
+            "raw_transcript" => Self::RawTranscript,
             _ => Self::UnknownLegacy,
         }
     }
@@ -77,6 +83,10 @@ impl MemorySource {
     pub fn default_trust(&self) -> f32 {
         match self {
             Self::UserRemember | Self::UserPanel => 1.0,
+            // C1: a History row's content is the verbatim transcript.
+            // Whatever derives from it can be wrong; the row itself
+            // is by definition correct.
+            Self::RawTranscript => 1.0,
             Self::ToolOutput => 0.85,
             Self::LlmConsolidated | Self::SwarmConsolidated => 0.75,
             Self::UnknownLegacy => 0.75,
@@ -107,6 +117,7 @@ mod tests {
             MemorySource::SwarmConsolidated,
             MemorySource::McpImport,
             MemorySource::ToolOutput,
+            MemorySource::RawTranscript,
             MemorySource::UnknownLegacy,
         ] {
             assert_eq!(MemorySource::parse_str(s.as_str()), s);

@@ -58,6 +58,10 @@ pub struct ClaudeSession {
     effort: String,
     max_tokens: u32,
     auto_approve: bool,
+    /// Snapshotted from `AgentOptions::available_tools` at construction
+    /// so per-turn spawn doesn't need to re-resolve workspace settings.
+    available_tools: Option<Vec<String>>,
+    approved_tools: Option<Vec<String>>,
     profile: ProviderProfile,
     /// Resume handle, initialized from `options.resume_session_id` at
     /// construction. M6: set once and used as input to `AcpSession::spawn`
@@ -95,6 +99,8 @@ impl ClaudeSession {
         let effort = args.options.effort.clone();
         let max_tokens = args.options.max_tokens;
         let auto_approve = args.options.auto_approve;
+        let available_tools = args.options.available_tools.clone();
+        let approved_tools = args.options.approved_tools.clone();
 
         Self {
             write_gate: args.write_gate,
@@ -105,6 +111,8 @@ impl ClaudeSession {
             effort,
             max_tokens,
             auto_approve,
+            available_tools,
+            approved_tools,
             profile: args.profile,
             handle,
         }
@@ -185,17 +193,16 @@ impl ClaudeSession {
                 effort: self.effort.clone(),
                 max_tokens: self.max_tokens,
                 auto_approve: self.auto_approve,
+                available_tools: self.available_tools.clone(),
+                approved_tools: self.approved_tools.clone(),
                 resume_session_id,
             }
         };
 
         // ── Tool permission configuration ─────────────────────────────────
-        let available_tools = &["Read", "Glob", "Grep", "Write", "Edit", "MultiEdit"];
-        let approved_tools: &[&str] = if self.auto_approve {
-            available_tools
-        } else {
-            &["Read", "Glob", "Grep"]
-        };
+        let (available_owned, approved_owned) = options.resolved_tools();
+        let available_tools: Vec<&str> = available_owned.iter().map(String::as_str).collect();
+        let approved_tools: Vec<&str> = approved_owned.iter().map(String::as_str).collect();
 
         // System prompt (same as legacy path — from ClaudeCodeBackend capabilities).
         let system_prompt = shared::default_editor_system_prompt(
@@ -217,8 +224,8 @@ impl ClaudeSession {
             &self.workspace_root,
             &final_prompt,
             &system_prompt,
-            available_tools,
-            approved_tools,
+            &available_tools,
+            &approved_tools,
             &options,
             &attach_refs,
         )?;

@@ -10,10 +10,15 @@
 //! and wraps the legacy concatenated strings in single-entry `MemorySelection`
 //! / `GraphSelection` records. M3 will widen to one entry per ranked item.
 
+pub mod chat_memory;
 pub mod compaction;
 pub mod ledger;
 pub mod types;
 
+pub use chat_memory::{
+    ChatMemoryOutcome, ChatMemoryRequest, PostTurnRequest, enqueue_post_turn, perform_injection,
+    splice_into_selections,
+};
 pub use compaction::{CompactionPolicy, compact_replay, should_compact};
 pub use ledger::{
     CompactionRecord, ContentDigest, GraphDecision, PlannerFingerprint, Role, SessionLedger,

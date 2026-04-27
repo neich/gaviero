@@ -72,13 +72,13 @@ pub async fn reembed_all(
     batch_size: usize,
     progress: Option<ProgressFn>,
 ) -> Result<ReembedReport> {
-    if new_embedder.dimensions() != store.embedder().dimensions() {
+    if new_embedder.dimension() != store.embedder().dimension() {
         anyhow::bail!(
             "re-embed aborted: new embedder ({}, dim={}) does not match schema dim={} — \
              schema migration is out of scope for B1",
-            new_embedder.model_id(),
-            new_embedder.dimensions(),
-            store.embedder().dimensions()
+            new_embedder.name(),
+            new_embedder.dimension(),
+            store.embedder().dimension()
         );
     }
 
@@ -101,7 +101,7 @@ pub async fn reembed_all(
         backup_path,
     };
 
-    let new_model_id = new_embedder.model_id().to_string();
+    let new_model_id = new_embedder.name().to_string();
     let batch_size = batch_size.max(1);
     let mut done = 0usize;
 

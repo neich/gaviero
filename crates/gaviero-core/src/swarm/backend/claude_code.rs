@@ -50,11 +50,17 @@ impl AgentBackend for ClaudeCodeBackend {
 
         // M6: `resume_session_id` deprecated; swarm work units are one-shot
         // (no resume), so this is always None. Allow stays until M10.
+        // Tool surface defaults to the legacy hardcoded set — swarm
+        // backends pre-date the workspace-driven config and don't have
+        // a workspace handle here. Override via the `agent.*Tools`
+        // settings is plumbed for chat sessions (see TUI side_panel).
         #[allow(deprecated)]
         let options = AgentOptions {
             effort: request.effort.unwrap_or_else(|| "off".to_string()),
             max_tokens: request.max_tokens.unwrap_or(16384),
             auto_approve: request.auto_approve,
+            available_tools: None,
+            approved_tools: None,
             resume_session_id: None,
         };
 

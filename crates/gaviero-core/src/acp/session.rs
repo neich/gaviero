@@ -38,6 +38,15 @@ pub struct AgentOptions {
     /// When true, pass `--dangerously-skip-permissions` so the subprocess never
     /// pauses for permission prompts. Intended for single-prompt "yes to all" mode.
     pub auto_approve: bool,
+    /// Tool surface offered to the subprocess via `--tools`. `None`
+    /// keeps the legacy hardcoded list (`Read,Glob,Grep,Write,Edit,
+    /// MultiEdit`). Hosts that read `agent.availableTools` from
+    /// workspace settings populate this with the resolved value.
+    pub available_tools: Option<Vec<String>>,
+    /// Subset of `available_tools` auto-approved via `--allowedTools`.
+    /// `None` keeps the legacy default (`Read,Glob,Grep`, or the full
+    /// available set when `auto_approve` is true).
+    pub approved_tools: Option<Vec<String>>,
     /// When `Some`, resume the Claude session with the given id (Claude's
     /// `--resume <id>` flag) so model context (prior messages, read file
     /// cache) carries across turns. When `None`, a fresh one-shot session
@@ -63,8 +72,49 @@ impl Default for AgentOptions {
             effort: "off".to_string(),
             max_tokens: 16384,
             auto_approve: false,
+            available_tools: None,
+            approved_tools: None,
             resume_session_id: None,
         }
+    }
+}
+
+/// Hardcoded fallback tool surface for callers that haven't been
+/// migrated to populate `AgentOptions::available_tools` from workspace
+/// settings. Matches the pre-config behaviour: read-only browse + Write
+/// Gate-routed edits, no shell.
+pub const DEFAULT_AVAILABLE_TOOLS: &[&str] =
+    &["Read", "Glob", "Grep", "Write", "Edit", "MultiEdit"];
+
+/// Hardcoded fallback approved-tool subset (see `DEFAULT_AVAILABLE_TOOLS`).
+pub const DEFAULT_APPROVED_TOOLS: &[&str] = &["Read", "Glob", "Grep"];
+
+impl AgentOptions {
+    /// Resolve the effective `(available, approved)` tool lists for the
+    /// subprocess spawn. If `available_tools` is unset, falls back to
+    /// [`DEFAULT_AVAILABLE_TOOLS`]. If `approved_tools` is unset, the
+    /// approved list defaults to the full available set when
+    /// `auto_approve` is true, otherwise to [`DEFAULT_APPROVED_TOOLS`]
+    /// filtered to the available set.
+    pub fn resolved_tools(&self) -> (Vec<String>, Vec<String>) {
+        let available: Vec<String> = match self.available_tools.as_ref() {
+            Some(list) => list.clone(),
+            None => DEFAULT_AVAILABLE_TOOLS.iter().map(|s| s.to_string()).collect(),
+        };
+        let approved: Vec<String> = match self.approved_tools.as_ref() {
+            Some(list) => list
+                .iter()
+                .filter(|name| available.iter().any(|a| a == *name))
+                .cloned()
+                .collect(),
+            None if self.auto_approve => available.clone(),
+            None => DEFAULT_APPROVED_TOOLS
+                .iter()
+                .map(|s| s.to_string())
+                .filter(|name| available.contains(name))
+                .collect(),
+        };
+        (available, approved)
     }
 }
 
@@ -435,6 +485,37 @@ mod tests {
         let held_path = on_disk.to_path_buf();
         drop(file);
         assert!(!held_path.exists(), "tempfile should be cleaned up on drop");
+    }
+
+    #[test]
+    fn resolved_tools_falls_back_to_legacy_defaults() {
+        let opts = AgentOptions::default();
+        let (available, approved) = opts.resolved_tools();
+        assert_eq!(available, DEFAULT_AVAILABLE_TOOLS);
+        assert_eq!(approved, DEFAULT_APPROVED_TOOLS);
+    }
+
+    #[test]
+    fn resolved_tools_auto_approve_promotes_full_set_when_unset() {
+        let opts = AgentOptions {
+            auto_approve: true,
+            ..AgentOptions::default()
+        };
+        let (available, approved) = opts.resolved_tools();
+        assert_eq!(available, approved, "auto_approve approves everything available");
+    }
+
+    #[test]
+    fn resolved_tools_honours_explicit_available_list_with_bash() {
+        let opts = AgentOptions {
+            available_tools: Some(vec!["Read".into(), "Bash".into()]),
+            approved_tools: Some(vec!["Read".into(), "Bash".into(), "Edit".into()]),
+            ..AgentOptions::default()
+        };
+        let (available, approved) = opts.resolved_tools();
+        assert_eq!(available, vec!["Read".to_string(), "Bash".to_string()]);
+        // "Edit" silently dropped — not in the available set.
+        assert_eq!(approved, vec!["Read".to_string(), "Bash".to_string()]);
     }
 }
 
