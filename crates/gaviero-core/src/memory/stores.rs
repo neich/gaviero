@@ -227,7 +227,7 @@ impl MemoryStores {
     pub fn for_tests_in_memory(embedder: Arc<dyn Embedder>) -> Result<Arc<Self>> {
         let store = Arc::new(MemoryStore::in_memory(embedder.clone())?);
         Ok(Arc::new(Self {
-            embedder_name: embedder.model_id().to_string(),
+            embedder_name: embedder.name().to_string(),
             embedder,
             global: store.clone(),
             workspace: store.clone(),
@@ -246,7 +246,7 @@ impl MemoryStores {
     pub fn from_single_store(store: Arc<MemoryStore>) -> Arc<Self> {
         let embedder = store.embedder().clone();
         Arc::new(Self {
-            embedder_name: embedder.model_id().to_string(),
+            embedder_name: embedder.name().to_string(),
             embedder,
             global: store.clone(),
             workspace: store.clone(),
@@ -451,7 +451,7 @@ impl MemoryStores {
     /// return one [`EmbedderMismatch`] per DB whose stamp differs from
     /// the configured embedder.
     pub async fn detect_mismatches(&self) -> Vec<EmbedderMismatch> {
-        let configured = self.embedder.model_id().to_string();
+        let configured = self.embedder.name().to_string();
         let mut out = Vec::new();
         for store in self.opened_stores().await {
             if let Some(stored) = store.detect_embedder_mismatch().await {
@@ -844,12 +844,6 @@ mod tests {
                 }
             }
             Ok(vec)
-        }
-        fn dimensions(&self) -> usize {
-            8
-        }
-        fn model_id(&self) -> &str {
-            "mock"
         }
     }
 
