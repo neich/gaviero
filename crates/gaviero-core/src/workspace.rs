@@ -22,6 +22,15 @@ pub mod settings {
     pub const AGENT_OLLAMA_BASE_URL: &str = "agent.ollamaBaseUrl";
     /// Token budget for graph-based source-code context injection in simple chat. 0 disables.
     pub const AGENT_GRAPH_BUDGET_TOKENS: &str = "agent.graphBudgetTokens";
+    /// Tool surface offered to the Claude subprocess via `--tools`.
+    /// Anything outside this list is unavailable to the agent regardless
+    /// of `--allowedTools`. Default omits `Bash` so agent writes flow
+    /// through the Write Gate; opt in per-workspace to enable shell.
+    pub const AGENT_AVAILABLE_TOOLS: &str = "agent.availableTools";
+    /// Subset of `agent.availableTools` auto-approved without a permission
+    /// prompt (passed via `--allowedTools`). Anything available but not
+    /// approved triggers a `PermissionRequest` that the host must answer.
+    pub const AGENT_APPROVED_TOOLS: &str = "agent.approvedTools";
 
     // Memory settings
     /// The namespace to write memories to.
@@ -145,6 +154,14 @@ pub mod settings {
     pub const MEMORY_REMEMBER_SHOW_SCOPE_BADGE: &str = "memory.remember.showScopeBadge";
     pub const MEMORY_REMEMBER_SHOW_SIMILARITY_ON_REINFORCE: &str =
         "memory.remember.showSimilarityOnReinforce";
+
+    // /forget + audit table retention (Tier C / C2)
+    pub const MEMORY_FORGET_USER_RETENTION_DAYS: &str = "memory.forget.userDeletionRetentionDays";
+    pub const MEMORY_FORGET_SLEEP_RETENTION_DAYS: &str =
+        "memory.forget.sleeptimePruneRetentionDays";
+    pub const MEMORY_FORGET_REQUIRE_CONFIRM_BULK: &str = "memory.forget.requireConfirmForBulk";
+    pub const MEMORY_FORGET_ALLOW_HISTORY_REDACTION: &str =
+        "memory.forget.allowHistoryRedaction";
 
     // MCP server + external-memory migration (Tier A / A5)
     pub const MCP_GAVIERO_ENABLED: &str = "mcp.gavieroServer.enabled";
@@ -570,6 +587,35 @@ impl Workspace {
         }
     }
 
+    /// Resolve the agent tool surface for the given workspace root.
+    ///
+    /// Returns `(available, approved)`. `available` becomes `--tools`
+    /// on the Claude subprocess; `approved` becomes `--allowedTools`
+    /// (auto-approved). Anything in `approved` not also in `available`
+    /// is dropped — Claude rejects unknown tools in `--allowedTools`.
+    pub fn resolve_agent_tools(&self, root: Option<&Path>) -> (Vec<String>, Vec<String>) {
+        let available: Vec<String> = self
+            .resolve_setting(settings::AGENT_AVAILABLE_TOOLS, root)
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let approved: Vec<String> = self
+            .resolve_setting(settings::AGENT_APPROVED_TOOLS, root)
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .filter(|name| available.iter().any(|a| a == name))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (available, approved)
+    }
+
     /// Tier B / B3: resolve the retrieval-engine config (mode + pool
     /// caps) from `memory.retrieval.*`. The returned struct is what the
     /// central `retrieve_ranked` engine consumes.
@@ -760,6 +806,12 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::AGENT_EFFORT => serde_json::json!("off"),
         settings::AGENT_MAX_TOKENS => serde_json::json!(16384),
         settings::AGENT_GRAPH_BUDGET_TOKENS => serde_json::json!(40000),
+        settings::AGENT_AVAILABLE_TOOLS => {
+            serde_json::json!(["Read", "Glob", "Grep", "Write", "Edit", "MultiEdit"])
+        }
+        settings::AGENT_APPROVED_TOOLS => {
+            serde_json::json!(["Read", "Glob", "Grep"])
+        }
 
         // Chat memory injection (S1)
         settings::MEMORY_CHAT_INJECTION_ENABLED => serde_json::json!(true),
@@ -822,6 +874,12 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::MEMORY_REMEMBER_DEFAULT_SCOPE => serde_json::json!("repo"),
         settings::MEMORY_REMEMBER_SHOW_SCOPE_BADGE => serde_json::json!(true),
         settings::MEMORY_REMEMBER_SHOW_SIMILARITY_ON_REINFORCE => serde_json::json!(true),
+
+        // /forget + audit retention (Tier C / C2)
+        settings::MEMORY_FORGET_USER_RETENTION_DAYS => serde_json::json!(30),
+        settings::MEMORY_FORGET_SLEEP_RETENTION_DAYS => serde_json::json!(14),
+        settings::MEMORY_FORGET_REQUIRE_CONFIRM_BULK => serde_json::json!(true),
+        settings::MEMORY_FORGET_ALLOW_HISTORY_REDACTION => serde_json::json!(true),
 
         // MCP server (A5)
         settings::MCP_GAVIERO_ENABLED => serde_json::json!(true),
