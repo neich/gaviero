@@ -57,6 +57,11 @@ pub struct SleeptimeConfig {
     /// transaction with the C1.3 trigger briefly disabled — keeping
     /// the per-pass batch bounded prevents long contention windows.
     pub compress_history_batch: usize,
+    /// C2.5: summary rows older than this many days are routed
+    /// through `soft_delete_memory(DeletedBy::SleeptimePrune)` so
+    /// they ride the shorter 14-day audit retention. Plan default:
+    /// 365. Set to 0 to disable the prune step.
+    pub prune_summaries_after_days: u32,
 }
 
 impl Default for SleeptimeConfig {
@@ -76,6 +81,7 @@ impl Default for SleeptimeConfig {
             trust_ceiling_llm: 0.9,
             compress_history_after_days: 90,
             compress_history_batch: 32,
+            prune_summaries_after_days: 365,
         }
     }
 }
@@ -93,6 +99,9 @@ pub struct SleeptimeReport {
     pub kg_doc_refreshed: usize,
     /// C1.4: number of history rows zstd-compressed this pass.
     pub history_compressed: usize,
+    /// C2.5: number of stale Summary rows routed through the audit
+    /// table this pass (`deleted_by = sleeptime_prune`).
+    pub summaries_pruned: usize,
 }
 
 /// Per-operation observer. Implementations forward to the TUI panel
@@ -419,6 +428,30 @@ pub async fn run_sleeptime(
                         );
                     }
                 }
+            }
+        }
+    }
+
+    // Step 8 — C2.5 summary retention prune. Stale Summary rows are
+    // soft-deleted with `DeletedBy::SleeptimePrune` so the audit trail
+    // carries them on the shorter 14-day retention. Records and
+    // History are untouched. Skipped on dry-run; the prune-count is
+    // still computed for the report so the user sees what would
+    // happen.
+    if cfg.prune_summaries_after_days > 0 {
+        match store
+            .sleeptime_prune_old_summaries(cfg.prune_summaries_after_days, cfg.dry_run)
+            .await
+        {
+            Ok(n) => {
+                report.summaries_pruned = n;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "memory_sleeptime",
+                    error = %e,
+                    "summary retention prune failed"
+                );
             }
         }
     }
