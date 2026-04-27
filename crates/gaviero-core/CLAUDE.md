@@ -41,7 +41,7 @@ Network tests (Ollama, model downloads) are `#[ignore]` by default.
 
 **Swarm** (`swarm/`): tier execution (local/cheap/expensive), parallel fan-out, verification gates, scope validation, dependency DAG, checkpoint/resume, conflict resolution.
 
-**Memory** (`memory/`): SQLite + sqlite-vec, nomic-embed-text-v1.5 ONNX. Cascading scope search (global → workspace → repo → module → run), early-terminate at 0.70 confidence. 3-phase consolidation: triage → decay/prune → cross-scope promotion.
+**Memory** (`memory/`): SQLite + sqlite-vec, ONNX embedder via pluggable `Embedder` trait (default `gte-modernbert-base`; legacy `nomic-embed-text-v1.5` selectable). Multi-DB registry (global / workspace / per-folder). Single-consumer writer task owns all writes. Merged multi-scope retrieval with optional cross-encoder reranker; the legacy 0.70 cascading early-exit is retained behind `memory.retrieval.mode = "cascade"` as a kill-switch only. Three-cadence consolidation: per-turn extractor (S3) → per-session consolidator (B5) → idle/weekly sleeptime pass (B5: decay sweep, near-dup merge, cross-scope promotion, trust re-scoring, history compression, summary prune). Per-injection `injection_manifests` capture the full candidate pool. Soft-delete via `/forget` writes to a `deletions` audit table; History rows are immutable except via the C2.4 redaction path.
 
 **ACP** (`acp/`): Claude subprocess — session factory, argv/tempfile prompt spill, streaming file-block extraction.
 
@@ -51,10 +51,11 @@ Network tests (Ollama, model downloads) are `#[ignore]` by default.
 
 - Lock discipline: never hold Mutex across I/O, parsing, or embedding.
 - `AgentBackend` trait is object-safe; all backends in `swarm/backend/` implement it.
-- Embedding model: nomic-embed-text-v1.5, cosine similarity.
-- Memory writes require explicit `WriteScope` — never infer.
-- Scoring: 50% similarity + 20% importance + 15% recency + 15% base, scaled by scope/trust weights.
-- Hybrid search: RRF merges vector (0.7) + FTS (0.3).
+- Embedder is pluggable (`Embedder` trait); default `gte-modernbert-base` (768 dim). Cosine similarity.
+- Memory writes require explicit `WriteScope` — never infer. All writes flow through the writer task (`WriterMessage` mpsc).
+- Scoring: 50% similarity + 20% importance + 15% recency + 15% base, scaled by scope/trust weights. B4 recency floor + decay-exempt types (Decision/Convention/Invariant/Preference) protect reference memories from age-out.
+- Hybrid search: RRF merges vector (0.7) + FTS (0.3); merged multi-scope retrieval (B3) is the default.
+- Optional cross-encoder reranker (B2) blends with composite score; off by default until eval gates green.
 
 ## Dependencies
 
