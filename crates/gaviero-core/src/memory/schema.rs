@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Increment when adding a new migration.
-const CURRENT_VERSION: u32 = 12;
+const CURRENT_VERSION: u32 = 13;
 
 /// First schema version where the `memory_kind` discriminator exists.
 /// Used by [`needs_c1_backup`] to decide whether to take a one-shot
@@ -71,6 +71,9 @@ pub fn run_migrations(conn: &Connection, embedding_dims: usize) -> Result<()> {
     }
     if version < 12 {
         migrate_v12(conn).context("migration v12")?;
+    }
+    if version < 13 {
+        migrate_v13(conn).context("migration v13")?;
     }
 
     // Stamp the current version
@@ -753,6 +756,57 @@ fn migrate_v12(conn: &Connection) -> Result<()> {
     )
     .context("creating history-compression index")?;
 
+    Ok(())
+}
+
+/// v13 (Tier C / C2.1): `deletions` audit table.
+///
+/// Every soft-delete (user `/forget`, panel `d`, sleeptime merge,
+/// sleeptime prune, user redaction) writes one row here before the
+/// memory row is hard-deleted from `memories`. The audit row carries
+/// the full serialized memory in `original_row_json` so `/restore`
+/// (C2.2) can reinstate it within the configured retention window.
+///
+/// Schema fields:
+/// - `id`                — auto pk
+/// - `memory_id`         — original `memories.id` (no FK; the source
+///                         row is gone after hard-delete)
+/// - `memory_content_hash` — for join-back / dedup-on-restore
+/// - `memory_kind`       — record | history | summary (history only
+///                         appears via C2.4's `user_redaction` path)
+/// - `memory_source`     — write-origin from `memories.source`
+/// - `memory_trust`      — trust_score at the time of deletion
+/// - `deleted_at`        — ISO-8601 UTC
+/// - `deleted_by`        — one of the documented operations:
+///                         `user_command` (slash command bulk),
+///                         `panel` (TUI per-row d),
+///                         `sleeptime_merge` (B5 near-dup loser),
+///                         `sleeptime_prune` (B5 retention prune),
+///                         `user_redaction` (C2.4 /forget-history)
+/// - `reason`            — optional human note (`/forget --reason`)
+/// - `original_row_json` — full row dump; for sleeptime merges this
+///                         additionally carries `merged_into` so the
+///                         restore path knows the surviving id.
+fn migrate_v13(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS deletions (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id          INTEGER NOT NULL,
+            memory_content_hash TEXT,
+            memory_kind        TEXT    NOT NULL,
+            memory_source      TEXT    NOT NULL,
+            memory_trust       REAL    NOT NULL,
+            deleted_at         TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            deleted_by         TEXT    NOT NULL,
+            reason             TEXT,
+            original_row_json  TEXT    NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_deletions_deleted_at ON deletions(deleted_at);
+        CREATE INDEX IF NOT EXISTS idx_deletions_memory_id ON deletions(memory_id);
+        CREATE INDEX IF NOT EXISTS idx_deletions_deleted_by ON deletions(deleted_by);
+        CREATE INDEX IF NOT EXISTS idx_deletions_kind ON deletions(memory_kind);",
+    )
+    .context("creating deletions audit table")?;
     Ok(())
 }
 
