@@ -136,6 +136,7 @@ impl IterationEngine {
         repo_map: Option<&RepoMap>,
         impact_text: Option<&str>,
         pre_fetched_memory: Option<&str>,
+        workspace_extra_tools: &[String],
     ) -> IterationResult {
         let n_attempts = match &self.config.strategy {
             Strategy::SinglePass => 1,
@@ -183,6 +184,7 @@ impl IterationEngine {
                 repo_map,
                 impact_text,
                 pre_fetched_memory,
+                workspace_extra_tools,
             )
             .await
             {
@@ -257,6 +259,7 @@ impl IterationEngine {
         repo_map: Option<&RepoMap>,
         impact_text: Option<&str>,
         pre_fetched_memory: Option<&str>,
+        workspace_extra_tools: &[String],
         resolve_backend: F,
     ) -> IterationResult
     where
@@ -322,6 +325,7 @@ impl IterationEngine {
                     repo_map,
                     impact_text,
                     pre_fetched_memory,
+                    workspace_extra_tools,
                 )
                 .await
                 {
@@ -520,6 +524,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &[],
             )
             .await;
         assert_eq!(result.attempts_run, 1);
@@ -549,6 +554,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &[],
             )
             .await;
         assert_eq!(result.attempts_run, 1);
@@ -579,6 +585,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &[],
                 {
                     let seen_models = Arc::clone(&seen_models);
                     move |unit| {
@@ -639,6 +646,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &[],
                 {
                     let seen_models = Arc::clone(&seen_models);
                     move |unit| {
