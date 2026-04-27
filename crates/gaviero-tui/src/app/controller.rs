@@ -230,15 +230,21 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                         )
                         .as_bool()
                         .unwrap_or(true);
-                    if extractor_enabled && let Some(writer) = app.memory_writer.as_ref() {
-                        if let Some(transcript) = super::chat_memory::build_turn_transcript(
+                    if let Some(writer) = app.memory_writer.as_ref()
+                        && let Some(transcript) = super::chat_memory::build_turn_transcript(
                             app,
                             &conv_id,
                             &visible_content,
-                        ) {
-                            let (turn_id, module_path) = if let Some(idx) =
-                                app.chat_state.find_conv_idx(&conv_id)
-                            {
+                        )
+                    {
+                        // Conversation-state shuffle stays here (TUI
+                        // owns `pending_turn_id` / `pending_module_path`).
+                        // The actual writer enqueueing is provider-
+                        // agnostic and lives in
+                        // `context_planner::chat_memory`, so CLI /
+                        // headless callers reach it too.
+                        let (turn_id, module_path) =
+                            if let Some(idx) = app.chat_state.find_conv_idx(&conv_id) {
                                 let conv = &mut app.chat_state.conversations[idx];
                                 let turn_id = conv.pending_turn_id.take().unwrap_or_else(|| {
                                     format!(
@@ -265,36 +271,30 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                                     None,
                                 )
                             };
-                            let repo_id = gaviero_core::memory::hash_path(&workspace_root);
-                            let _ = writer.turn_complete(
-                                conv_id.clone(),
-                                turn_id.clone(),
-                                repo_id,
+                        let repo_id = gaviero_core::memory::hash_path(&workspace_root);
+                        let telemetry_enabled = app
+                            .workspace
+                            .resolve_setting(
+                                gaviero_core::workspace::settings::MEMORY_TELEMETRY_ENABLED,
+                                Some(&workspace_root),
+                            )
+                            .as_bool()
+                            .unwrap_or(true);
+                        gaviero_core::context_planner::enqueue_post_turn(
+                            gaviero_core::context_planner::PostTurnRequest {
+                                writer,
+                                session_id: &conv_id,
+                                turn_id: &turn_id,
+                                repo_id: &repo_id,
                                 module_path,
-                                conv_id.clone(),
+                                run_id: &conv_id,
                                 transcript,
-                                annotations_value,
-                            );
-                            // Tier B / B6: post-turn retrieval-use telemetry.
-                            // Fire-and-forget — never blocks the user.
-                            // Skipped automatically inside the writer when
-                            // the response is below `minResponseTokens`.
-                            let telemetry_enabled = app
-                                .workspace
-                                .resolve_setting(
-                                    gaviero_core::workspace::settings::MEMORY_TELEMETRY_ENABLED,
-                                    Some(&workspace_root),
-                                )
-                                .as_bool()
-                                .unwrap_or(true);
-                            if telemetry_enabled {
-                                let _ = writer.telemetry_classify(
-                                    turn_id,
-                                    conv_id.clone(),
-                                    visible_content.clone(),
-                                );
-                            }
-                        }
+                                annotations: annotations_value,
+                                response_text: visible_content.clone(),
+                                extractor_enabled,
+                                telemetry_enabled,
+                            },
+                        );
                     }
                 }
             }
@@ -514,6 +514,10 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
         Event::MemoryScopeSummary { rows } => {
             app.memory_panel.scope_summary = rows;
         }
+        Event::MemoryDeletionsLoaded { rows } => {
+            app.memory_panel.deletions_rows = rows;
+            app.memory_panel.deletions_cursor = 0;
+        }
         Event::ChatMemoryInjected {
             conv_id,
             items_injected,
@@ -732,13 +736,20 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             > = std::sync::Arc::new(super::observers::TuiManifestObserver {
                 tx: app.event_tx.clone(),
             });
-            let writer =
-                gaviero_core::memory::spawn_writer_task(gaviero_core::memory::WriterConfig {
-                    stores: stores.clone(),
+            // Tier S / S2: the writer task is spawned exactly once per
+            // bootstrap, via `MemoryServices`. No other call site of
+            // `spawn_writer_task` is permitted — see
+            // `gaviero_core::memory::services` for the rationale.
+            let services = gaviero_core::memory::MemoryServices::from_stores(
+                stores.clone(),
+                gaviero_core::memory::ServicesOpts {
+                    embedder_name: None,
                     llm,
                     observer: Some(memory_observer),
                     manifest_observer: Some(manifest_observer),
-                });
+                },
+            );
+            let writer = services.writer.clone();
 
             // B4: apply recency-floor / decay-exempt-types overrides
             // from workspace settings to every store in the registry.
@@ -880,7 +891,62 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             }
 
             app.memory = Some(stores.clone());
-            app.memory_writer = Some(writer);
+            app.memory_writer = Some(writer.clone());
+
+            // Tier B / B5 Phase 2: auto-triggered sleeptime. Resolves
+            // `memory.sleeptime.*` settings, spawns the scheduler
+            // task. Default policy: 60s polling tick, fires
+            // `WriterMessage::Sleeptime` when the system has been idle
+            // for `min_idle_minutes` AND `last_sleeptime_at` is >24h
+            // old, or unconditionally when `weekly_force_run` and >7d.
+            let sleeptime_enabled = app
+                .workspace
+                .resolve_setting(
+                    gaviero_core::workspace::settings::MEMORY_SLEEPTIME_ENABLED,
+                    Some(&workspace_root),
+                )
+                .as_bool()
+                .unwrap_or(true);
+            if sleeptime_enabled {
+                let mut sleep_cfg = gaviero_core::memory::SleeptimeConfig::default();
+                if let Some(v) = app
+                    .workspace
+                    .resolve_setting(
+                        gaviero_core::workspace::settings::MEMORY_SLEEPTIME_MIN_IDLE_MINUTES,
+                        Some(&workspace_root),
+                    )
+                    .as_u64()
+                {
+                    sleep_cfg.min_idle_minutes = v as usize;
+                }
+                if let Some(v) = app
+                    .workspace
+                    .resolve_setting(
+                        gaviero_core::workspace::settings::MEMORY_SLEEPTIME_WEEKLY_FORCE_RUN,
+                        Some(&workspace_root),
+                    )
+                    .as_bool()
+                {
+                    sleep_cfg.weekly_force_run = v;
+                }
+                if let Some(v) = app
+                    .workspace
+                    .resolve_setting(
+                        gaviero_core::workspace::settings::MEMORY_SLEEPTIME_FIRST_RUN_REQUIRE_CONFIRM,
+                        Some(&workspace_root),
+                    )
+                    .as_bool()
+                {
+                    sleep_cfg.first_run_require_confirm = v;
+                }
+                let scheduler = gaviero_core::memory::SleeptimeScheduler::spawn(
+                    stores.clone(),
+                    writer,
+                    sleep_cfg,
+                    std::time::Duration::from_secs(60),
+                );
+                app.memory_sleeptime_scheduler = Some(scheduler);
+            }
 
             // B1: detect stale `_gaviero_meta.embedder_model` stamps
             // across every opened store and surface a chat hint per
