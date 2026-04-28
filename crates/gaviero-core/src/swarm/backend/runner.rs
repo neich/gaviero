@@ -14,7 +14,7 @@ use crate::context_planner::{
     ContextPlanner, ModelSpec, PlannerFingerprint, PlannerInput, RuntimeConfig, SessionLedger,
     build_provider_profile,
 };
-use crate::memory::{MemoryStore, MemoryStores};
+use crate::memory::MemoryStores;
 use crate::observer::AcpObserver;
 use crate::repo_map::RepoMap;
 use crate::swarm::board::{SharedBoard, parse_discoveries};
