@@ -47,22 +47,17 @@ pub struct GraphSlice {
 }
 
 impl SwarmContextBundle {
-    /// Render `shared_memory` into the legacy `[Memory context]:` block
-    /// format.  Returns `None` when there are no candidates.
-    ///
-    /// Called once per work unit to produce the `pre_fetched_memory_context`
-    /// string for the planner.  Rendering happens here (pipeline side) so
-    /// each runner's planner short-circuits its DB query.
+    /// Render `shared_memory` into the caveman `Mem:` block. Returns `None`
+    /// when there are no candidates. Called once per work unit to produce
+    /// `pre_fetched_memory_context` for the planner; rendering happens here
+    /// so each runner's planner short-circuits its DB query.
     pub fn memory_text_for_prompt(&self) -> Option<String> {
         if self.shared_memory.is_empty() {
             return None;
         }
-        let mut block = String::from("[Memory context]:\n");
+        let mut block = String::from("Mem:\n");
         for m in &self.shared_memory {
-            block.push_str(&format!(
-                "- [{}] {} (score: {:.2})\n",
-                m.namespace, m.content, m.score
-            ));
+            block.push_str(&format!("{}|{}|s{:.2}\n", m.namespace, m.content, m.score));
         }
         Some(block)
     }
@@ -163,10 +158,10 @@ mod tests {
             per_unit_graph: HashMap::new(),
         };
         let text = bundle.memory_text_for_prompt().unwrap();
-        assert!(text.starts_with("[Memory context]:\n"));
-        assert!(text.contains("[ws]"));
+        assert!(text.starts_with("Mem:\n"));
+        assert!(text.contains("ws|"));
         assert!(text.contains("use anyhow"));
-        assert!(text.contains("0.85"));
+        assert!(text.contains("s0.85"));
     }
 
     #[test]
