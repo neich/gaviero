@@ -163,10 +163,10 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
                     // by the prior arm so this one only sees the bulk
                     // soft-delete variants.
                     let t = app.chat_state.text_input.text.trim();
-                    (t.starts_with("/forget-scope")
+                    t.starts_with("/forget-scope")
                         || t.starts_with("/forget-type")
                         || t.starts_with("/forget-source")
-                        || (t.starts_with("/forget") && !t.starts_with("/forget-history")))
+                        || (t.starts_with("/forget") && !t.starts_with("/forget-history"))
                 } {
                     app.handle_forget_command();
                 } else if !app.chat_state.process_slash_command() {
@@ -1600,10 +1600,20 @@ pub(super) fn send_chat_message(app: &mut App) {
         .map(|l| l.is_first_turn())
         .unwrap_or(true);
 
-    // Conversation history is only inlined on the first turn. On resumed
-    // turns Claude already has it and re-sending wastes tokens + risks
-    // Claude's Read-tool size limits on the prompt tempfile.
-    let context: Vec<(String, String)> = if is_first_turn {
+    // Conversation history is only inlined on the first turn AND when the
+    // conversation's `transcript_inline_mode` allows it. On resumed turns
+    // Claude already has the history and re-sending wastes tokens + risks
+    // Claude's Read-tool size limits on the prompt tempfile. After
+    // /reset (Suppress) the user explicitly asked to start fresh, so the
+    // visible transcript stays in the panel but does not re-enter the prompt.
+    let inline_mode = app.chat_state.conversations[app.chat_state.active_conv]
+        .transcript_inline_mode;
+    let inline_transcript = match inline_mode {
+        crate::panels::agent_chat::TranscriptInlineMode::Auto => is_first_turn,
+        crate::panels::agent_chat::TranscriptInlineMode::Suppress => false,
+        crate::panels::agent_chat::TranscriptInlineMode::Force => true,
+    };
+    let context: Vec<(String, String)> = if inline_transcript {
         app.chat_state
             .context_messages()
             .into_iter()
