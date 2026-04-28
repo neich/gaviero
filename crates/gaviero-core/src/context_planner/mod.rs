@@ -438,12 +438,12 @@ mod tests {
             memory_query_override: None,
             memory_limit: 5,
             file_ref_blobs: &[],
-            pre_fetched_impact_text: Some("[Impact analysis] foo.rs touches bar.rs"),
+            pre_fetched_impact_text: Some("Imp: foo.rs touches bar.rs"),
             pre_fetched_graph_context: None,
             pre_fetched_memory_context: None,
         };
         let sel = planner.plan(&input).await.unwrap();
         assert_eq!(sel.graph_selections.len(), 1);
-        assert!(sel.graph_selections[0].content.contains("Impact"));
+        assert!(sel.graph_selections[0].content.contains("Imp:"));
     }
 }
