@@ -468,7 +468,7 @@ impl RepoMap {
 
             if owned_set.contains(idx) {
                 if tokens_used + node.token_estimate <= budget_tokens {
-                    let line = format!("  [owned] {} [sp {:.2}]", path_str, specificity);
+                    let line = format!("  OWN {} (s{:.2})", path_str, specificity);
                     out.push(GraphCandidate {
                         path: node.path.clone(),
                         rank_score,
@@ -488,7 +488,7 @@ impl RepoMap {
                     let syms = node.symbols.clone();
                     let sym_names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
                     let line = format!(
-                        "  {} [sp {:.2}] ({})",
+                        "  {} (s{:.2}) ({})",
                         path_str,
                         specificity,
                         sym_names.join(", ")
@@ -507,7 +507,7 @@ impl RepoMap {
                     tokens_used += sig_tokens;
                 }
             } else {
-                let line = format!("  {} [sp {:.2}]", path_str, specificity);
+                let line = format!("  {} (s{:.2})", path_str, specificity);
                 out.push(GraphCandidate {
                     path: node.path.clone(),
                     rank_score,
@@ -594,7 +594,7 @@ impl RepoMap {
         let repo_outline = if outline_lines.is_empty() {
             String::new()
         } else {
-            format!("## Repository context:\n{}", outline_lines.join("\n"))
+            format!("Repo:\n{}", outline_lines.join("\n"))
         };
 
         // `graph_selection` aggregate event is emitted by
@@ -668,7 +668,7 @@ mod tests {
             .find(|c| c.path.to_string_lossy().contains("main.rs"));
         if let Some(owned) = owned {
             assert_eq!(owned.decision, GraphDecision::FullAttach);
-            assert!(owned.rendered_line.contains("[owned]"));
+            assert!(owned.rendered_line.contains("OWN "));
         }
     }
 
@@ -862,7 +862,7 @@ mod tests {
         let expected_outline = if lines.is_empty() {
             String::new()
         } else {
-            format!("## Repository context:\n{}", lines.join("\n"))
+            format!("Repo:\n{}", lines.join("\n"))
         };
         let plan = map.rank_for_agent(&["main.rs".to_string()], 10_000);
         assert_eq!(plan.repo_outline, expected_outline);
