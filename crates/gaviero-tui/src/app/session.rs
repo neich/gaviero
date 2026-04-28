@@ -309,9 +309,12 @@ mod tests {
     }
 
     #[test]
-    fn render_chat_selections_first_turn_concatenates_graph_then_memory_then_prompt() {
-        // Pins the chat adapter ordering against pre-M2 chat behavior:
-        // graph block, then memory block, then user prompt — joined by "\n\n".
+    fn render_chat_selections_first_turn_puts_prompt_before_graph_then_memory() {
+        // Pins the post-fix chat-adapter ordering: user prompt FIRST, then
+        // graph block, then memory block — joined by "\n\n". Putting the
+        // prompt at the top keeps it inside Claude's default 2000-line Read
+        // window when this blob is later spilled to a tempfile on
+        // bootstrap-heavy first turns.
         let mut sel = PlannerSelections::default();
         sel.graph_selections
             .push(gaviero_core::context_planner::GraphSelection {
@@ -336,7 +339,7 @@ mod tests {
                 updated_at: None,
             });
         let out = render_chat_selections(&sel, "do the thing");
-        assert_eq!(out, "[Graph] outline\n\n[Memory] context\n\ndo the thing");
+        assert_eq!(out, "do the thing\n\n[Graph] outline\n\n[Memory] context");
     }
 }
 
@@ -358,6 +361,7 @@ pub(crate) fn render_chat_selections(
     user_prompt: &str,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
+    parts.push(user_prompt.to_string());
 
     if let Some(block) =
         gaviero_core::swarm::backend::shared::render_graph_block(&selections.graph_selections)
@@ -369,7 +373,6 @@ pub(crate) fn render_chat_selections(
     {
         parts.push(block);
     }
-    parts.push(user_prompt.to_string());
 
     parts.join("\n\n")
 }
