@@ -21,7 +21,7 @@ use super::validation;
 use crate::git::{GitCoordinator, WorktreeManager};
 use crate::memory::store::file_hash;
 use crate::memory::{
-    MemoryStore, MemoryStores, StoreOptions, WriterConfig, WriterHandle, spawn_writer_task,
+    MemoryStores, StoreOptions, WriterConfig, WriterHandle, spawn_writer_task,
 };
 use crate::observer::{AcpObserver, SwarmObserver};
 use crate::types::{EntryMetadata, PrivacyLevel};
