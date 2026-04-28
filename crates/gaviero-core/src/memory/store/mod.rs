@@ -19,22 +19,18 @@ pub use deletions_ops::{BulkForgetReport, ForgetFilter, RestoreOutcome};
 pub use manifest::InjectionManifestRow;
 pub use telemetry_ops::MemoryUtilization;
 
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use rusqlite::Connection;
 use tokio::sync::Mutex;
 use tracing;
 
 use super::embedder::Embedder;
 use super::schema;
-use super::scope::{
-    MemoryScope, MemoryType, ScopeFilter, StoreResult, Trust, WriteMeta, WriteScope,
-};
-use super::scoring::{self, ScoredMemory, SearchConfig};
-use super::trust_defaults::MemorySource;
+use super::scope::{MemoryType, Trust, WriteScope};
+use super::scoring::{self, ScoredMemory};
 
 pub(crate) const SEMANTIC_DEDUP_THRESHOLD: f32 = 0.95;
 
@@ -1163,6 +1159,9 @@ pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::scope::{MemoryScope, StoreResult, WriteMeta};
+    use super::super::scoring::SearchConfig;
+    use super::super::trust_defaults::MemorySource;
 
     /// Mock embedder that produces deterministic vectors from content hash.
     struct MockEmbedder;
