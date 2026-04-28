@@ -216,9 +216,12 @@ impl AgentSession for LegacyAgentSession {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<UnifiedStreamEvent>> + Send>>> {
         // Reconstruct the legacy enriched prompt from the Turn's structured
         // selections. `render_graph_block` + `render_memory_block` live in
-        // `swarm::backend::shared` (introduced in M3) and are byte-identical
-        // to the pre-M3 chat output.
+        // `swarm::backend::shared` (introduced in M3). The user message is
+        // placed FIRST so it survives Claude's default 2000-line Read
+        // truncation when the assembled blob is spilled to a tempfile on
+        // bootstrap-heavy first turns (mirrors `ClaudeSession::run_claude_turn`).
         let mut parts: Vec<String> = Vec::new();
+        parts.push(turn.user_message.clone());
         if let Some(block) =
             crate::swarm::backend::shared::render_graph_block(&turn.graph_selections)
         {
@@ -229,7 +232,6 @@ impl AgentSession for LegacyAgentSession {
         {
             parts.push(block);
         }
-        parts.push(turn.user_message.clone());
         let enriched_prompt = parts.join("\n\n");
 
         // Lift `replay_history` back into the legacy `Vec<(String, String)>`
@@ -314,7 +316,7 @@ mod tests {
                 path: Some(PathBuf::from("src/lib.rs")),
                 kind: GraphSelectionKind::FullContent,
                 token_estimate: 500,
-                content: "  [owned] src/lib.rs".to_string(),
+                content: "  OWN src/lib.rs".to_string(),
                 rank_score: Some(0.6),
                 confidence: Some(crate::repo_map::GraphConfidence::High),
                 symbols: vec![],
