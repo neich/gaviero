@@ -685,16 +685,16 @@ impl GraphStore {
         let badge = |path: &str| -> String {
             ranks
                 .get(path)
-                .map(|(_, sp)| format!("{path} [sp {sp:.2}]"))
+                .map(|(_, sp)| format!("{path} (s{sp:.2})"))
                 .unwrap_or_else(|| path.to_string())
         };
 
         let mut lines = Vec::new();
-        lines.push("[Impact analysis]:".to_string());
+        lines.push("Imp:".to_string());
 
         if !result.changed_files.is_empty() {
             let labelled: Vec<String> = result.changed_files.iter().map(|p| badge(p)).collect();
-            lines.push(format!("Changed: {}", labelled.join(", ")));
+            lines.push(format!("chg: {}", labelled.join(", ")));
         }
 
         let non_changed: Vec<String> = result
@@ -704,19 +704,16 @@ impl GraphStore {
             .map(|p| badge(p))
             .collect();
         if !non_changed.is_empty() {
-            lines.push(format!("Affected dependents: {}", non_changed.join(", ")));
+            lines.push(format!("dep: {}", non_changed.join(", ")));
         }
 
         if !result.affected_tests.is_empty() {
             let labelled: Vec<String> = result.affected_tests.iter().map(|p| badge(p)).collect();
-            lines.push(format!("Affected tests: {}", labelled.join(", ")));
+            lines.push(format!("tst: {}", labelled.join(", ")));
         }
 
         if !result.test_gaps.is_empty() {
-            lines.push(format!(
-                "Test gaps (no coverage): {}",
-                result.test_gaps.join(", ")
-            ));
+            lines.push(format!("gaps: {}", result.test_gaps.join(", ")));
         }
 
         lines.join("\n")
@@ -725,10 +722,10 @@ impl GraphStore {
     /// Format impact result as a prompt-friendly string.
     pub fn format_impact_for_prompt(result: &ImpactSummary) -> String {
         let mut lines = Vec::new();
-        lines.push("[Impact analysis]:".to_string());
+        lines.push("Imp:".to_string());
 
         if !result.changed_files.is_empty() {
-            lines.push(format!("Changed: {}", result.changed_files.join(", ")));
+            lines.push(format!("chg: {}", result.changed_files.join(", ")));
         }
 
         let non_changed: Vec<&str> = result
@@ -738,21 +735,15 @@ impl GraphStore {
             .map(|s| s.as_str())
             .collect();
         if !non_changed.is_empty() {
-            lines.push(format!("Affected dependents: {}", non_changed.join(", ")));
+            lines.push(format!("dep: {}", non_changed.join(", ")));
         }
 
         if !result.affected_tests.is_empty() {
-            lines.push(format!(
-                "Affected tests: {}",
-                result.affected_tests.join(", ")
-            ));
+            lines.push(format!("tst: {}", result.affected_tests.join(", ")));
         }
 
         if !result.test_gaps.is_empty() {
-            lines.push(format!(
-                "Test gaps (no coverage): {}",
-                result.test_gaps.join(", ")
-            ));
+            lines.push(format!("gaps: {}", result.test_gaps.join(", ")));
         }
 
         lines.join("\n")
@@ -1387,9 +1378,9 @@ mod tests {
         ranks.insert("tests/auth_test.rs".into(), (0.2, 0.05));
 
         let text = GraphStore::format_impact_for_prompt_ranked(&result, &ranks);
-        assert!(text.contains("src/auth.rs [sp 0.92]"), "{text}");
-        assert!(text.contains("src/api.rs [sp 0.71]"), "{text}");
-        assert!(text.contains("tests/auth_test.rs [sp 0.05]"), "{text}");
+        assert!(text.contains("src/auth.rs (s0.92)"), "{text}");
+        assert!(text.contains("src/api.rs (s0.71)"), "{text}");
+        assert!(text.contains("tests/auth_test.rs (s0.05)"), "{text}");
     }
 
     #[test]
@@ -1406,8 +1397,9 @@ mod tests {
             truncated: false,
         };
         let text = GraphStore::format_impact_for_prompt(&result);
-        assert!(text.contains("Changed: src/auth.rs"));
-        assert!(text.contains("Affected dependents: src/api.rs"));
-        assert!(text.contains("Affected tests: tests/auth_test.rs"));
+        assert!(text.contains("Imp:"));
+        assert!(text.contains("chg: src/auth.rs"));
+        assert!(text.contains("dep: src/api.rs"));
+        assert!(text.contains("tst: tests/auth_test.rs"));
     }
 }
