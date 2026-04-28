@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use crate::memory::{MemoryStore, MemoryStores, WriterHandle};
+use crate::memory::{MemoryStores, WriterHandle};
 use crate::swarm::models::{AgentManifest, AgentStatus, WorkUnit};
 use crate::types::ModelTier;
 
