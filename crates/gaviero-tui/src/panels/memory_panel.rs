@@ -38,6 +38,7 @@ use gaviero_core::memory::{MemoryKind, MemorySource, ScoredMemory};
 /// C2.6: lightweight projection of a single `deletions` audit row for
 /// the Deletions tab. Only the columns the panel actually renders.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // projection populated from DB rows; some fields surface only in future panel views
 pub struct DeletionRow {
     pub id: i64,
     pub memory_id: i64,
@@ -69,6 +70,7 @@ pub struct ScopeSummaryRow {
 /// `ScoredMemory` — keeps the panel's state small so 100-entry pools
 /// don't balloon `App`.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // projection populated from ScoredMemory; some fields surface only in future panel views
 pub struct MemoryRow {
     pub id: i64,
     pub scope_level: i32,
@@ -224,6 +226,7 @@ pub struct MemoryPanelState {
     pub current_manifest: Option<InjectionManifestRow>,
     /// Latest ledger row for the current turn (session_thread + open
     /// questions surfaced near the manifest).
+    #[allow(dead_code)] // populated by the manifest observer; surfaced in a future panel view
     pub current_ledger: Option<SessionLedgerTurn>,
     /// Cursor index into `manifest_selected_items`.
     pub injected_cursor: usize,
@@ -275,6 +278,7 @@ pub struct MemoryPanelState {
 /// the entry survived to the rerank stage. Older v1 manifests parse
 /// fine because both are optional.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // decoded from manifest payloads; some fields surface only in future panel views
 pub struct ManifestPoolEntry {
     pub memory_id: i64,
     pub scope_label: String,
