@@ -306,7 +306,7 @@ pub fn format_memories_for_prompt(memories: &[ScoredMemory]) -> String {
         return String::new();
     }
 
-    let mut ctx = String::from("[Memory context]:\n");
+    let mut ctx = String::from("Mem:\n");
     for m in memories {
         let scope_label = match m.scope_level {
             0 => "global",
@@ -317,7 +317,7 @@ pub fn format_memories_for_prompt(memories: &[ScoredMemory]) -> String {
             _ => "unknown",
         };
         ctx.push_str(&format!(
-            "- [{}:{}] {} (score: {:.2})\n",
+            "{}:{}|{}|s{:.2}\n",
             scope_label,
             m.memory_type.as_str(),
             m.content,
@@ -553,8 +553,9 @@ mod tests {
             final_score: 0.75,
         }];
         let output = format_memories_for_prompt(&memories);
-        assert!(output.contains("[repo:factual]"));
+        assert!(output.starts_with("Mem:\n"), "{output}");
+        assert!(output.contains("repo:factual|"));
         assert!(output.contains("test memory"));
-        assert!(output.contains("0.75"));
+        assert!(output.contains("s0.75"));
     }
 }
