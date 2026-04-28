@@ -108,6 +108,9 @@ No background tasks mutate the `App` struct directly. All state changes flow thr
 | Editor | Ctrl+F | Find in file |
 | Workspace | Alt+1/2/3/4 | Focus left / editor / right / terminal |
 | Workspace | Alt+a / Alt+w / Alt+g | Chat / Swarm / Git panel |
+| Terminal | Ctrl+J / F4 | Toggle bottom panel |
+| Terminal | Ctrl+T | New terminal tab (when focus is on terminal) |
+| Terminal | Ctrl+W | Close active terminal tab |
 | Diff review | `]h` / `[h` | Next / previous hunk |
 | Diff review | `a` / `r` | Accept / reject current hunk |
 | Diff review | `A` / `R` | Accept / reject all |
