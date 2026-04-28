@@ -6,7 +6,7 @@
 //! - `impl Trait for Type` → Implements edges
 //! - Test files/calls → TestOf edges
 
-use super::store::{BlastRadiusMode, EdgeKind, GraphStore, NodeKind};
+use super::store::{EdgeKind, GraphStore, NodeKind};
 
 /// A raw reference extracted from source code, before cross-file resolution.
 #[derive(Debug, Clone)]
@@ -635,6 +635,7 @@ pub fn node_kind_from_ts(ts_kind: &str, file_path: &str) -> NodeKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::store::BlastRadiusMode;
 
     #[test]
     fn extract_use_statements() {
