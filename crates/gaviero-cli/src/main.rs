@@ -5,7 +5,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use gaviero_core::memory::MemoryStore;
 use gaviero_core::observer::{AcpObserver, SwarmObserver};
 use gaviero_core::swarm::models::{AgentStatus, SwarmResult, WorkUnit};
 
