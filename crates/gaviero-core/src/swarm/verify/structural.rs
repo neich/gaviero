@@ -342,7 +342,6 @@ pub fn extract_expected_symbols(instructions: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     #[test]
     fn test_verify_valid_rust_file() {
