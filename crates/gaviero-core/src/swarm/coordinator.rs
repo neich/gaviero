@@ -17,7 +17,7 @@ use super::planner::extract_json;
 use super::validation;
 use super::verify::VerificationStrategy;
 use crate::memory::MemoryStores;
-use crate::memory::store::{MemoryStore, PrivacyFilter};
+use crate::memory::store::PrivacyFilter;
 use crate::types::{FileScope, ModelTier, PrivacyLevel};
 
 /// Configuration for the coordinator.
