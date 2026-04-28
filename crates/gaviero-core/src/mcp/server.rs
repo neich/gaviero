@@ -80,6 +80,7 @@ pub struct GavieroMcpServer {
     /// split into a snapshotted projection (edges + file list + DF) to
     /// allow concurrent reads.
     graph_cache: Arc<tokio::sync::Mutex<Option<crate::repo_map::store::GraphStore>>>,
+    #[allow(dead_code)] // populated and dispatched via the `#[tool_router]` macro
     tool_router: ToolRouter<Self>,
 }
 
