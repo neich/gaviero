@@ -109,6 +109,47 @@ impl std::fmt::Debug for PendingPermission {
     }
 }
 
+/// Whether the next first-turn dispatch should re-inline the visible chat
+/// transcript into the spilled prompt.
+///
+/// `is_first_turn` (from `SessionLedger::is_first_turn`) gates *bootstrap
+/// context* — graph + memory blocks the agent needs because Claude has no
+/// server-side session yet. That signal alone used to also gate transcript
+/// inlining, which is what made `/reset` ineffective: the cached
+/// `claude_session_id` got dropped, but the next turn cheerfully re-sent
+/// every prior user/assistant turn, defeating the user's intent. This flag
+/// splits the two concerns:
+///
+/// * `Auto` — default. Inline the transcript when it's a first turn (e.g.
+///   on app launch or after rehydrate-from-disk where `--resume` may not
+///   work yet).
+/// * `Suppress` — skip transcript inlining on the next first turn, even
+///   when bootstrap context is needed. Set by `/reset` and `/clear`.
+///   Cleared back to `Auto` once Claude opens a fresh session
+///   (handled in the SystemInit event path) so subsequent resets behave
+///   the same way.
+/// * `Force` — reserved for callers that always want the transcript in;
+///   not wired up today, but the explicit variant keeps the semantics
+///   readable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptInlineMode {
+    Auto,
+    Suppress,
+    /// Reserved variant: callers that want to *guarantee* transcript
+    /// inlining regardless of `is_first_turn`. No call site sets this
+    /// today; the variant exists so the read site in `side_panel.rs`
+    /// has a stable shape and a future "include transcript anyway" toggle
+    /// is a one-line change rather than a refactor.
+    #[allow(dead_code)]
+    Force,
+}
+
+impl Default for TranscriptInlineMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
 /// One conversation (tab) in the chat panel.
 #[derive(Debug)]
 pub struct Conversation {
@@ -154,6 +195,9 @@ pub struct Conversation {
     /// if the model/toolset has changed since the save. Consumed (taken)
     /// once rehydration runs.
     pub pending_persisted_ledger: Option<gaviero_core::context_planner::ledger::PersistedLedger>,
+    /// Controls whether the visible chat transcript is re-inlined into the
+    /// next first-turn prompt. See [`TranscriptInlineMode`].
+    pub transcript_inline_mode: TranscriptInlineMode,
 }
 
 /// Global agent settings read from workspace settings.
@@ -259,6 +303,7 @@ impl AgentChatState {
             claude_session_id: None,
             session_ledger: None,
             pending_persisted_ledger: None,
+            transcript_inline_mode: TranscriptInlineMode::Auto,
         };
         Self {
             conversations: vec![conv],
@@ -702,6 +747,7 @@ impl AgentChatState {
             claude_session_id: None,
             session_ledger: None,
             pending_persisted_ledger: None,
+            transcript_inline_mode: TranscriptInlineMode::Auto,
         };
         self.conversations.push(conv);
         self.active_conv = self.conversations.len() - 1;
@@ -720,10 +766,17 @@ impl AgentChatState {
         conv.pending_persisted_ledger = None;
         conv.pending_turn_id = None;
         conv.pending_module_path = None;
+        // Suppress the visible transcript on the next first-turn dispatch.
+        // Bootstrap context (graph + memory) still flows; only the
+        // re-inlining of prior user/assistant turns is skipped, matching
+        // the user-facing meaning of "/reset". The SystemInit handler in
+        // controller.rs flips this back to `Auto` once Claude opens the
+        // fresh session, so subsequent /reset invocations behave the same.
+        conv.transcript_inline_mode = TranscriptInlineMode::Suppress;
         self.text_input.text.clear();
         self.text_input.cursor = 0;
         self.add_system_message(
-            "Context cleared. Next turn will bootstrap fresh (chat history preserved).",
+            "Context cleared. Next turn will bootstrap fresh (chat history preserved in panel; not re-sent to the agent).",
         );
     }
 
@@ -1722,6 +1775,11 @@ impl AgentChatState {
                     // is known. Initially None (lazy-init still triggers).
                     session_ledger: None,
                     pending_persisted_ledger: pending_ledger,
+                    // Rehydrate-from-disk: this is exactly the case where
+                    // re-inlining the transcript is load-bearing — Claude's
+                    // server-side session may be gone, and `--resume` may
+                    // refuse the stale id. Default `Auto` preserves that.
+                    transcript_inline_mode: TranscriptInlineMode::Auto,
                 });
             }
         }
@@ -2656,5 +2714,43 @@ mod tests {
 
         assert!(!state.process_slash_command());
         assert!(state.conversations[state.active_conv].messages.is_empty());
+    }
+
+    #[test]
+    fn reset_conversation_suppresses_transcript_inlining_until_next_session() {
+        let mut state = AgentChatState::new();
+        // Pre-condition: a fresh conversation defaults to Auto so the
+        // very first dispatch (when there's no transcript anyway) and
+        // any rehydrate-from-disk case retain the historical behaviour.
+        assert_eq!(
+            state.conversations[state.active_conv].transcript_inline_mode,
+            TranscriptInlineMode::Auto
+        );
+
+        // Simulate a few prior turns so context_messages() has something
+        // to inline.
+        state.add_user_message("first user msg");
+        state.finalize_message("assistant", "first assistant reply");
+
+        state.text_input.text = "/reset".to_string();
+        assert!(state.process_slash_command());
+
+        // Post-/reset: transcript inlining is suppressed even though
+        // session_ledger was cleared (so is_first_turn would be true again).
+        assert_eq!(
+            state.conversations[state.active_conv].transcript_inline_mode,
+            TranscriptInlineMode::Suppress
+        );
+        // Visible chat history is preserved in the panel.
+        assert!(
+            state.conversations[state.active_conv]
+                .messages
+                .iter()
+                .any(|m| m.role == ChatRole::User && m.content == "first user msg"),
+            "panel transcript must survive /reset"
+        );
+        // Session handle was dropped so bootstrap context will fire.
+        assert!(state.conversations[state.active_conv].claude_session_id.is_none());
+        assert!(state.conversations[state.active_conv].session_ledger.is_none());
     }
 }
