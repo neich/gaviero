@@ -26,7 +26,6 @@ use anyhow::Result;
 
 use super::scope::{MemoryScope, SCOPE_GLOBAL, SCOPE_MODULE, SCOPE_REPO, SCOPE_WORKSPACE};
 use super::scoring::{ScoredMemory, SearchConfig};
-use super::store::MemoryStore;
 use super::stores::MemoryStores;
 
 /// Settings block for chat-turn memory injection.
