@@ -21,10 +21,15 @@ pub fn build_enriched_prompt(
     conversation_history: &[(String, String)],
     file_refs: &[(String, String)],
 ) -> String {
+    // `prompt` at TOP keeps user question inside Claude Read 2000-line window
+    // when blob is spilled to .gaviero/tmp/prompt-*.md on bootstrap turns.
+    // Scaffolding labels use caveman sigils (U:/A:/Files:/@path) per project
+    // convention — saves tokens; agent infers structure from indentation.
     let mut parts = Vec::new();
+    parts.push(prompt.to_string());
 
     if !conversation_history.is_empty() {
-        parts.push("Previous conversation:\n".to_string());
+        parts.push("\nPrevConv:\n".to_string());
         for (role, content) in conversation_history {
             let truncated: String = content.chars().take(HISTORY_TRUNCATION_CHARS).collect();
             let ellipsis = if content.chars().count() > HISTORY_TRUNCATION_CHARS {
@@ -32,23 +37,35 @@ pub fn build_enriched_prompt(
             } else {
                 ""
             };
-            parts.push(format!("[{}]: {}{}\n", role, truncated, ellipsis));
+            let sigil = role_sigil(role);
+            parts.push(format!("{}: {}{}\n", sigil, truncated, ellipsis));
         }
-        parts.push("---\n".to_string());
     }
 
     if !file_refs.is_empty() {
-        parts.push("Referenced files:\n".to_string());
+        parts.push("\nFiles:\n".to_string());
         for (path, content) in file_refs {
-            parts.push(format!(
-                "--- {} ---\n{}\n--- end {} ---\n",
-                path, content, path
-            ));
+            parts.push(format!("@{}\n{}\n/@{}\n", path, content, path));
         }
     }
 
-    parts.push(prompt.to_string());
     parts.join("\n")
+}
+
+/// Caveman role sigil for transcript turns. `user` → `U`, `assistant` → `A`,
+/// `system` → `S`. Falls back to the first uppercase letter for unknown roles
+/// so future role names degrade gracefully.
+fn role_sigil(role: &str) -> String {
+    match role {
+        "user" => "U".to_string(),
+        "assistant" => "A".to_string(),
+        "system" => "S".to_string(),
+        other => other
+            .chars()
+            .next()
+            .map(|c| c.to_ascii_uppercase().to_string())
+            .unwrap_or_else(|| "?".to_string()),
+    }
 }
 
 pub fn default_editor_system_prompt(capabilities: &Capabilities) -> String {
@@ -256,7 +273,7 @@ pub fn render_graph_block(
             .map(|g| g.content.clone())
             .collect();
         if !lines.is_empty() {
-            chunks.push(format!("## Repository context:\n{}", lines.join("\n")));
+            chunks.push(format!("Repo:\n{}", lines.join("\n")));
         }
     }
     for g in pre_rendered {
@@ -288,13 +305,11 @@ pub fn render_memory_block(
     let mut chunks: Vec<String> = Vec::new();
 
     if !structured.is_empty() {
-        let mut block = String::from("[Memory context]:\n");
+        let mut block = String::from("Mem:\n");
         for m in structured {
             let ns = m.namespace.as_deref().unwrap_or("");
             let score = m.score.unwrap_or(0.0);
-            // Trailing newline matches the legacy
-            // `MemoryStore::search_context` format exactly.
-            block.push_str(&format!("- [{}] {} (score: {:.2})\n", ns, m.content, score));
+            block.push_str(&format!("{}|{}|s{:.2}\n", ns, m.content, score));
         }
         chunks.push(block);
     }
@@ -331,10 +346,13 @@ mod tests {
             &[("src/lib.rs".into(), "fn demo() {}".into())],
         );
 
-        assert!(prompt.contains("Previous conversation"));
-        assert!(prompt.contains("[user]: first question"));
-        assert!(prompt.contains("--- src/lib.rs ---"));
-        assert!(prompt.contains("Implement it"));
+        // Caveman scaffolding: PrevConv:/U:/A: sigils, @path/@/path file fences.
+        assert!(prompt.contains("PrevConv:"));
+        assert!(prompt.contains("U: first question"));
+        assert!(prompt.contains("@src/lib.rs\n"));
+        assert!(prompt.contains("/@src/lib.rs"));
+        // Prompt at TOP, not appended after context.
+        assert!(prompt.starts_with("Implement it"));
     }
 
     #[test]
@@ -543,17 +561,16 @@ mod tests {
     }
 
     #[test]
-    fn m3_structured_graph_renders_same_block_as_legacy() {
-        // V9 §11 M3 acceptance: prompt formatting is a final rendering step;
-        // structured per-file selections must collapse into the same
-        // "## Repository context:\n  line1\n  line2" block the legacy
-        // `rank_for_agent` produces.
+    fn m3_structured_graph_renders_caveman_block() {
+        // Structured per-file selections collapse into the caveman `Repo:` block.
+        // Per-row sigils (`OWN`, `(s0.92)`) live in `repo_map::rank_for_agent_structured`;
+        // here we pin the block header + line concatenation.
         let scope = FileScope::default();
         let mut sel = PlannerSelections::default();
         sel.graph_selections.push(structured_graph_selection(
             "src/lib.rs",
             crate::repo_map::GraphDecision::FullAttach,
-            "  [owned] src/lib.rs",
+            "  OWN src/lib.rs",
             500,
         ));
         sel.graph_selections.push(structured_graph_selection(
@@ -564,15 +581,13 @@ mod tests {
         ));
 
         let rendered = render_swarm_prompt(&sel, &scope, "the task");
-        let expected =
-            "## Repository context:\n  [owned] src/lib.rs\n  src/util.rs (foo, bar)\n\nthe task";
+        let expected = "Repo:\n  OWN src/lib.rs\n  src/util.rs (foo, bar)\n\nthe task";
         assert_eq!(rendered, expected);
     }
 
     #[test]
-    fn m3_structured_memory_renders_same_block_as_legacy() {
-        // Pins the legacy `MemoryStore::search_context` per-entry format
-        // verbatim including the trailing newline.
+    fn m3_structured_memory_renders_caveman_block() {
+        // Caveman per-entry format: `{ns}|{content}|s{score:.2}\n`.
         let scope = FileScope::default();
         let mut sel = PlannerSelections::default();
         sel.memory_selections.push(structured_memory_selection(
@@ -589,22 +604,19 @@ mod tests {
         ));
 
         let rendered = render_swarm_prompt(&sel, &scope, "the task");
-        // The legacy memory block ends with `\n` per entry; parts.join("\n\n")
+        // Memory block ends with `\n` after the last entry; `parts.join("\n\n")`
         // therefore produces three consecutive newlines before the task.
-        // Preserving this is part of the byte-identity guarantee — Claude's
-        // tokenizer sees the same surface form pre- and post-M3.
-        let expected = "[Memory context]:\n\
-                        - [workspace] remember to use git2 (score: 3.05)\n\
-                        - [workspace] tests must hit real db (score: 2.42)\n\
+        let expected = "Mem:\n\
+                        workspace|remember to use git2|s3.05\n\
+                        workspace|tests must hit real db|s2.42\n\
                         \n\nthe task";
         assert_eq!(rendered, expected);
     }
 
     #[test]
-    fn m3_mixed_structured_full_pipeline_byte_matches_legacy() {
-        // End-to-end byte-identity: structured graph + structured memory +
-        // scope clause + task. Compare against the same string the
-        // pre-M3 `runner::build_prompt` produced.
+    fn m3_mixed_structured_full_pipeline_caveman() {
+        // End-to-end caveman rendering: structured graph + structured memory +
+        // scope clause + task.
         let scope = FileScope {
             owned_paths: vec!["src/lib.rs".into()],
             ..Default::default()
@@ -613,7 +625,7 @@ mod tests {
         sel.graph_selections.push(structured_graph_selection(
             "src/lib.rs",
             crate::repo_map::GraphDecision::FullAttach,
-            "  [owned] src/lib.rs",
+            "  OWN src/lib.rs",
             500,
         ));
         sel.memory_selections.push(structured_memory_selection(
@@ -624,10 +636,8 @@ mod tests {
         ));
 
         let rendered = render_swarm_prompt(&sel, &scope, "do the task");
-        // Memory block trailing `\n` + `\n\n` part separator → three newlines
-        // before [File scope]. Same with scope's trailing `\n` before task.
-        let expected = "## Repository context:\n  [owned] src/lib.rs\n\n\
-                        [Memory context]:\n- [repo] key invariant (score: 1.50)\n\
+        let expected = "Repo:\n  OWN src/lib.rs\n\n\
+                        Mem:\nrepo|key invariant|s1.50\n\
                         \n\n[File scope]:\n**Owned paths** (read/write):\n- `src/lib.rs`\n\
                         \n\ndo the task";
         assert_eq!(rendered, expected);

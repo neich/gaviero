@@ -113,10 +113,10 @@ impl MemoryStore {
                     memory_count = results.len(),
                     "memory_selection"
                 );
-                let mut ctx = String::from("[Memory context]:\n");
+                let mut ctx = String::from("Mem:\n");
                 for r in &results {
                     ctx.push_str(&format!(
-                        "- [{}] {} (score: {:.2})\n",
+                        "{}|{}|s{:.2}\n",
                         r.entry.namespace, r.entry.content, r.score
                     ));
                 }
@@ -146,10 +146,10 @@ impl MemoryStore {
             .await
         {
             Ok(results) if !results.is_empty() => {
-                let mut ctx = String::from("[Memory context]:\n");
+                let mut ctx = String::from("Mem:\n");
                 for r in &results {
                     ctx.push_str(&format!(
-                        "- [{}] {} (score: {:.2})\n",
+                        "{}|{}|s{:.2}\n",
                         r.entry.namespace, r.entry.content, r.score
                     ));
                 }

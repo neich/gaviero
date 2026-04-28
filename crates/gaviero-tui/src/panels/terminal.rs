@@ -423,6 +423,7 @@ pub fn is_terminal_escape_key(key: &KeyEvent) -> bool {
         (KeyCode::F(4), false, false, false)         // F4 — toggle terminal
         | (KeyCode::Char('j'), true, false, false)   // Ctrl+J — toggle terminal
         | (KeyCode::Char('q'), true, false, false)    // Ctrl+Q — quit
+        | (KeyCode::Char('t'), true, false, false)    // Ctrl+T — new terminal tab
         | (KeyCode::Char('w'), true, false, false)    // Ctrl+W — close terminal tab
         | (KeyCode::Char('b'), true, false, false)    // Ctrl+B — toggle file tree
         | (KeyCode::Char('p'), true, false, false)    // Ctrl+P — toggle side panel

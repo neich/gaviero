@@ -364,6 +364,18 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                     );
                     conv.claude_session_id = Some(session_id.clone());
                 }
+                // /reset flipped `transcript_inline_mode` to `Suppress` so
+                // the just-dispatched first-turn-after-reset wouldn't
+                // re-inline the transcript. Claude has now opened a fresh
+                // session, so reset back to `Auto` — future first-turn
+                // dispatches in this conversation (e.g. after another
+                // /reset) start from the same default.
+                if conv.transcript_inline_mode
+                    == crate::panels::agent_chat::TranscriptInlineMode::Suppress
+                {
+                    conv.transcript_inline_mode =
+                        crate::panels::agent_chat::TranscriptInlineMode::Auto;
+                }
                 // M1: keep the planner ledger in sync. `record_continuity_handle`
                 // mirrors `claude_session_id`; `record_turn_dispatched` flips
                 // `is_first_turn()` for subsequent sends — equivalent to
@@ -1326,25 +1338,6 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
                 app.focus = Focus::Editor;
             }
         }
-        Action::NewTerminal => {
-            let root = app
-                .workspace
-                .roots()
-                .first()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            match app.terminal_manager.create_tab(&root) {
-                Ok(id) => {
-                    app.terminal_manager.switch_tab(id);
-                    app.panel_visible.terminal = true;
-                    app.focus = Focus::Terminal;
-                }
-                Err(e) => {
-                    app.status_message =
-                        Some((format!("Terminal: {}", e), std::time::Instant::now()));
-                }
-            }
-        }
         Action::CloseTerminal => {
             if app.focus == Focus::Terminal {
                 if let Some(id) = app.terminal_manager.active_tab() {
@@ -1361,6 +1354,24 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
         Action::NewTab => {
             if app.focus == Focus::SidePanel {
                 app.chat_state.new_conversation();
+            } else if app.focus == Focus::Terminal {
+                let root = app
+                    .workspace
+                    .roots()
+                    .first()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                match app.terminal_manager.create_tab(&root) {
+                    Ok(id) => {
+                        app.terminal_manager.switch_tab(id);
+                        app.panel_visible.terminal = true;
+                        app.focus = Focus::Terminal;
+                    }
+                    Err(e) => {
+                        app.status_message =
+                            Some((format!("Terminal: {}", e), std::time::Instant::now()));
+                    }
+                }
             } else {
                 app.buffers.push(Buffer::empty());
                 app.active_buffer = app.buffers.len() - 1;
@@ -1451,6 +1462,14 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
         Action::ToggleFullscreen => app.toggle_fullscreen(),
         Action::SwitchLayout(n) => app.switch_layout(n),
         Action::FindInBuffer => {
+            if app.focus == Focus::FileTree {
+                if !app.panel_visible.file_tree {
+                    app.panel_visible.file_tree = true;
+                }
+                app.left_panel = LeftPanelMode::Search;
+                app.search_panel.focus_input();
+                return;
+            }
             app.find_bar_active = true;
             app.find_input.select_all();
             app.focus = Focus::Editor;

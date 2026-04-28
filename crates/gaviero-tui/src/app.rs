@@ -20,7 +20,7 @@ use crate::panels::status_bar::StatusBar;
 use crate::theme::{self, Theme};
 use crate::widgets::tabs::TabBar;
 
-use gaviero_core::memory::{MemoryStore, WriterHandle};
+use gaviero_core::memory::WriterHandle;
 use gaviero_core::repo_map::RepoMap;
 use gaviero_core::session_state::{self, SessionState, TabState};
 use gaviero_core::types::WriteProposal;

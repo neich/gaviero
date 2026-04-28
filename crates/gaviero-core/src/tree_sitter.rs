@@ -31,7 +31,12 @@ const LANGUAGE_REGISTRY: &[(&[&str], &str, Option<GrammarFn>)] = &[
     ),
     (&["css"], "css", Some(|| tree_sitter_css::LANGUAGE.into())),
     (
-        &["json"],
+        // `gaviero-workspace` is JSON content with a project-specific
+        // extension (multi-folder workspace files; see `Workspace::load`
+        // in `gaviero-core::workspace`). Aliasing it to the JSON grammar
+        // gives editors syntax highlighting, indentation, and structural
+        // validation for free — same as opening `*.json` directly.
+        &["json", "gaviero-workspace"],
         "json",
         Some(|| tree_sitter_json::LANGUAGE.into()),
     ),
@@ -282,6 +287,18 @@ mod tests {
     fn test_unknown_extension() {
         assert!(language_for_extension("xyz").is_none());
         assert!(language_for_extension("").is_none());
+    }
+
+    #[test]
+    fn gaviero_workspace_extension_aliases_json() {
+        // Multi-folder workspace files use `.gaviero-workspace`; they're
+        // JSON in disguise. The language registry must route them through
+        // the JSON grammar so highlighting + structural validation work.
+        assert!(language_for_extension("gaviero-workspace").is_some());
+        assert_eq!(
+            language_name_for_extension("gaviero-workspace"),
+            Some("json")
+        );
     }
 
     #[test]

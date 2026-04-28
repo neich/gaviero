@@ -126,16 +126,19 @@ impl ClaudeSession {
     async fn run_claude_turn(&self, turn: &Turn, resume_session_id: Option<String>) -> Result<()> {
         // ── Reconstruct legacy inputs from Turn ──────────────────────────
 
-        // Enriched prompt: graph block → memory block → user message (byte-identical
-        // to `LegacyAgentSession::send_turn` and the pre-M5 chat path).
+        // Enriched prompt: user message FIRST, then graph block, then memory
+        // block. Placing the user's request at the top (rather than the legacy
+        // graph → memory → user-msg order) keeps it inside Claude's default
+        // 2000-line Read window when this blob is later spilled to
+        // `.gaviero/tmp/prompt-*.md` on bootstrap-heavy first turns.
         let mut parts: Vec<String> = Vec::new();
+        parts.push(turn.user_message.clone());
         if let Some(block) = shared::render_graph_block(&turn.graph_selections) {
             parts.push(block);
         }
         if let Some(block) = shared::render_memory_block(&turn.memory_selections) {
             parts.push(block);
         }
-        parts.push(turn.user_message.clone());
         let enriched_prompt = parts.join("\n\n");
 
         // Split FileAttachment into (path, content) text refs vs bare-path

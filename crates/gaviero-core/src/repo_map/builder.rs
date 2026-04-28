@@ -177,8 +177,18 @@ pub fn extract_symbols(ext: &str, content: &str) -> Vec<Symbol> {
     if parser.set_language(&language).is_err() {
         return Vec::new();
     }
-    parser.set_timeout_micros(PARSE_TIMEOUT_MICROS);
-    let Some(tree) = parser.parse(content, None) else {
+    let bytes = content.as_bytes();
+    let len = bytes.len();
+    let started = std::time::Instant::now();
+    let mut deadline = |_: &tree_sitter::ParseState| -> bool {
+        started.elapsed().as_micros() as u64 > PARSE_TIMEOUT_MICROS
+    };
+    let opts = tree_sitter::ParseOptions::new().progress_callback(&mut deadline);
+    let Some(tree) = parser.parse_with_options(
+        &mut |i, _| if i < len { &bytes[i..] } else { &[] },
+        None,
+        Some(opts),
+    ) else {
         return Vec::new();
     };
 

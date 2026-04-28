@@ -869,7 +869,7 @@ mod tests {
 
     #[test]
     fn test_checkout() {
-        let (dir, repo) = init_test_repo();
+        let (_dir, repo) = init_test_repo();
         repo.create_branch("other").unwrap();
         repo.checkout("other").unwrap();
 

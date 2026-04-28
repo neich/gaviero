@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::memory::MemoryStores;
-use crate::memory::store::{MemoryStore, PrivacyFilter};
+use crate::memory::store::PrivacyFilter;
 
 /// Configuration for context building.
 #[derive(Debug, Clone)]
@@ -231,14 +231,14 @@ mod tests {
     fn test_format_context() {
         let ctx = RepoContext {
             file_list: vec!["src/main.rs".into(), "src/lib.rs".into()],
-            memory_summaries: "[Memory context]:\n- prior auth refactor\n".into(),
+            memory_summaries: "Mem:\nworkspace|prior auth refactor|s0.85\n".into(),
             key_files: vec![("src/main.rs".into(), "fn main() {}".into())],
             estimated_tokens: 100,
         };
         let formatted = format_context(&ctx);
         assert!(formatted.contains("WORKSPACE FILES:"));
         assert!(formatted.contains("src/main.rs"));
-        assert!(formatted.contains("[Memory context]"));
+        assert!(formatted.contains("Mem:"));
         assert!(formatted.contains("KEY FILE CONTENTS:"));
     }
 
