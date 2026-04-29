@@ -110,7 +110,7 @@ pub(crate) fn run_swarm(app: &mut App, task_desc: String) {
     let memory = app.memory.clone();
     let memory_writer = app.memory_writer.clone();
     let mcp_config = mcp_config_for_workspace(app, &root);
-    let excludes = parse_exclude_patterns(&app.workspace);
+    let excludes = parse_exclude_patterns(&app.workspace, Some(&root));
     let specificity = app.workspace.resolve_specificity_config(Some(&root));
     let (swarm_extra_tools, _) = app.workspace.resolve_agent_tools(Some(&root));
 

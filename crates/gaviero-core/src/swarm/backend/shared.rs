@@ -75,12 +75,27 @@ pub fn default_editor_system_prompt(capabilities: &Capabilities) -> String {
         "You do not have direct repo tools in this session, so rely on the provided prompt context and referenced files."
     };
 
+    // The in-band file-block channel exists only for backends whose native
+    // stream cannot carry tool calls (Codex, Ollama). Backends that emit
+    // native tool-use events (Claude) edit files via Write/Edit/MultiEdit
+    // and must NOT be instructed about the in-band marker — instructing
+    // them causes the model to quote the marker back in prose, which the
+    // parser cannot reliably distinguish from a real proposal.
+    let file_clause = if capabilities.supports_file_blocks {
+        "When proposing file changes, emit complete <file path=\"relative/path\">...</file> \
+         blocks so the editor can review them before applying.\n\n"
+    } else if capabilities.tool_use {
+        "When you need to change files, use the Write, Edit, or MultiEdit tools. \
+         Do not paste file contents inline as a substitute for a tool call — only the \
+         tool-call channel is reviewed by the editor.\n\n"
+    } else {
+        ""
+    };
+
     format!(
-        "You are a coding assistant working inside the gaviero editor.\n\n{}\n\
-         When proposing file changes, emit complete <file path=\"relative/path\">...</file> blocks \
-         so the editor can review them before applying.\n\n\
-         {ann}",
+        "You are a coding assistant working inside the gaviero editor.\n\n{}\n{}{ann}",
         tool_clause,
+        file_clause,
         ann = TURN_ANNOTATIONS_CONVENTION,
     )
 }

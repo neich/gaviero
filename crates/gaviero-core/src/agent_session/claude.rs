@@ -233,11 +233,21 @@ impl ClaudeSession {
             &attach_refs,
         )?;
 
-        // ── Streaming loop (identical to send_prompt_via_claude) ──────────
+        // ── Streaming loop ────────────────────────────────────────────────
+        //
+        // Claude file edits flow through native Write/Edit/MultiEdit tool
+        // calls (snapshot+revert below). The in-band <file ...> parser is
+        // intentionally NOT invoked on this path — instructing the model
+        // about it produced false-positive proposals when prose quoted the
+        // marker. The text stream is now treated as opaque assistant prose.
         let mut full_text = String::new();
-        let mut file_scan_pos: usize = 0;
         let mut in_thinking = false;
-        let mut file_snapshots: HashMap<PathBuf, String> = HashMap::new();
+        // `None` means the file did not exist at snapshot time → revert via
+        // unlink. `Some(s)` means the file existed with content `s` → revert
+        // by overwriting with `s`. Distinguishing these two cases is what
+        // prevents a rejected new-file proposal from leaving an empty stub
+        // on disk.
+        let mut file_snapshots: HashMap<PathBuf, Option<String>> = HashMap::new();
         let mut read_count: usize = 0;
         let mut idle_count: u32 = 0;
 
@@ -289,36 +299,6 @@ impl ClaudeSession {
                                 }
                                 full_text.push_str(&text);
                                 self.observer.on_stream_chunk(&text);
-
-                                while let Some((rel_path, content, end)) =
-                                    crate::acp::protocol::find_next_file_block(
-                                        &full_text,
-                                        file_scan_pos,
-                                    )
-                                {
-                                    tracing::info!(
-                                        "Detected <file> block: path={}, content_len={}",
-                                        rel_path.display(),
-                                        content.len()
-                                    );
-                                    file_scan_pos = end;
-                                    if let Err(e) = propose_write(
-                                        &self.write_gate,
-                                        self.observer.as_ref(),
-                                        &self.workspace_root,
-                                        &self.agent_id,
-                                        &rel_path,
-                                        &content,
-                                    )
-                                    .await
-                                    {
-                                        tracing::error!(
-                                            "Failed to create proposal for {}: {}",
-                                            rel_path.display(),
-                                            e
-                                        );
-                                    }
-                                }
                             }
                             StreamEvent::ToolUseStart { tool_name, .. } => {
                                 if tool_name == "Read" {
@@ -351,14 +331,35 @@ impl ClaudeSession {
                                                 self.workspace_root.join(fp)
                                             };
                                             if !file_snapshots.contains_key(&abs_path) {
-                                                let content = tokio::fs::read_to_string(&abs_path)
-                                                    .await
-                                                    .unwrap_or_default();
+                                                let content = match tokio::fs::read_to_string(
+                                                    &abs_path,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(s) => Some(s),
+                                                    Err(e)
+                                                        if e.kind()
+                                                            == std::io::ErrorKind::NotFound =>
+                                                    {
+                                                        None
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            "Snapshot read of {} failed ({}); treating as did-not-exist",
+                                                            abs_path.display(),
+                                                            e
+                                                        );
+                                                        None
+                                                    }
+                                                };
                                                 tracing::info!(
-                                                    "Snapshot before tool {}: {} ({} bytes)",
+                                                    "Snapshot before tool {}: {} ({})",
                                                     tu.name,
                                                     abs_path.display(),
-                                                    content.len()
+                                                    match &content {
+                                                        Some(s) => format!("{} bytes", s.len()),
+                                                        None => "did not exist".to_string(),
+                                                    }
                                                 );
                                                 file_snapshots.insert(abs_path, content);
                                             }
@@ -489,27 +490,6 @@ impl ClaudeSession {
             self.observer.on_stream_chunk("\n</think>\n");
         }
 
-        // Catch any <file> blocks that completed after the last ContentDelta.
-        let remaining = crate::acp::protocol::parse_file_blocks(&full_text[file_scan_pos..]);
-        for (rel_path, content) in remaining {
-            if let Err(e) = propose_write(
-                &self.write_gate,
-                self.observer.as_ref(),
-                &self.workspace_root,
-                &self.agent_id,
-                &rel_path,
-                &content,
-            )
-            .await
-            {
-                tracing::error!(
-                    "Failed to create proposal for {}: {}",
-                    rel_path.display(),
-                    e
-                );
-            }
-        }
-
         // Wait for subprocess to finish.
         self.observer.on_streaming_status("Finalizing...");
         match tokio::time::timeout(PROCESS_WAIT_TIMEOUT, session.wait()).await {
@@ -543,20 +523,39 @@ impl ClaudeSession {
                 total,
                 if total == 1 { "" } else { "s" }
             ));
-            let snapshots: Vec<(PathBuf, String)> = file_snapshots.into_iter().collect();
+            let snapshots: Vec<(PathBuf, Option<String>)> = file_snapshots.into_iter().collect();
             for (i, (abs_path, original)) in snapshots.iter().enumerate() {
-                let current = tokio::fs::read_to_string(abs_path)
-                    .await
-                    .unwrap_or_default();
-                if current == *original {
+                // Read current on-disk state. ENOENT here means the tool
+                // ultimately did not produce a file at this path (e.g. a
+                // failed Write). Treat as "no change" against a missing
+                // baseline.
+                let current = match tokio::fs::read_to_string(abs_path).await {
+                    Ok(s) => Some(s),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Post-tool read of {} failed ({}); skipping",
+                            abs_path.display(),
+                            e
+                        );
+                        continue;
+                    }
+                };
+                if current.as_deref() == original.as_deref() {
                     tracing::info!("Snapshot unchanged: {}", abs_path.display());
                     continue;
                 }
                 tracing::info!(
-                    "File changed by tool: {} (orig={} bytes, new={} bytes)",
+                    "File changed by tool: {} (orig={}, new={})",
                     abs_path.display(),
-                    original.len(),
-                    current.len()
+                    match original {
+                        Some(s) => format!("{} bytes", s.len()),
+                        None => "did not exist".to_string(),
+                    },
+                    match &current {
+                        Some(s) => format!("{} bytes", s.len()),
+                        None => "did not exist".to_string(),
+                    },
                 );
                 if total > 1 {
                     self.observer.on_streaming_status(&format!(
@@ -565,20 +564,50 @@ impl ClaudeSession {
                         total
                     ));
                 }
-                if let Err(e) = tokio::fs::write(abs_path, original).await {
+                // Revert to the snapshotted state. The proposal carries the
+                // tool's intended change; review will re-apply it on accept.
+                //
+                // Critical: if the file did NOT exist at snapshot time, we
+                // must UNLINK it — not write an empty string. Otherwise
+                // rejecting a new-file proposal leaves a zero-byte stub on
+                // disk (the bug that produced the `x` file in the audit).
+                let revert_result = match original {
+                    Some(orig) => tokio::fs::write(abs_path, orig).await,
+                    None => match tokio::fs::remove_file(abs_path).await {
+                        Ok(()) => Ok(()),
+                        // Already gone (tool removed it itself, or a peer
+                        // task cleaned up). Idempotent revert.
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(e) => Err(e),
+                    },
+                };
+                if let Err(e) = revert_result {
                     tracing::error!("Failed to revert {}: {}", abs_path.display(), e);
                     continue;
                 }
                 let rel_path = abs_path
                     .strip_prefix(&self.workspace_root)
                     .unwrap_or(abs_path.as_path());
+                // The tool may have removed an existing file. Without a
+                // proposal carrying "→ deleted", the user has no way to
+                // review or accept the deletion. For now we still skip
+                // the propose_write call when the new state is None — this
+                // matches existing behaviour (deletions were never proposed).
+                // A later milestone can introduce a "DeleteProposal" type.
+                let Some(new_content) = current.as_deref() else {
+                    tracing::warn!(
+                        "Tool deleted {} — deletion proposals not yet supported, leaving as reverted",
+                        abs_path.display()
+                    );
+                    continue;
+                };
                 if let Err(e) = propose_write(
                     &self.write_gate,
                     self.observer.as_ref(),
                     &self.workspace_root,
                     &self.agent_id,
                     rel_path,
-                    &current,
+                    new_content,
                 )
                 .await
                 {

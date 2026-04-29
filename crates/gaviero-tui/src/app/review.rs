@@ -1,5 +1,77 @@
 use super::*;
 
+/// Outcome of applying a proposal to disk.
+///
+/// `Stale` means the file on disk no longer matches the content the proposal
+/// was diffed against — applying would silently overwrite the user's (or
+/// another agent's) edit. The caller surfaces this and skips the write.
+enum ApplyOutcome {
+    Written,
+    Stale { path: std::path::PathBuf },
+    Failed { path: std::path::PathBuf, error: String },
+}
+
+/// Apply a proposal's new content to disk, with two safeguards:
+///
+/// 1. **Stale check.** If `expected_old` is `Some` it must match the current
+///    on-disk content; otherwise we abort to avoid silently overwriting an
+///    edit that landed after the proposal was created. `None` means the
+///    proposal expected the path to NOT exist (new-file proposal): we abort
+///    if the path now exists.
+///
+/// 2. **Parent-dir creation.** When the proposal is a new-file create and
+///    the path's parent directory is missing, we create it before writing.
+///    Without this, accepting a new-file proposal in batch mode used to
+///    fail silently with a `tracing::error!` and no user feedback.
+fn apply_proposal_to_disk(
+    path: &std::path::Path,
+    expected_old: Option<&str>,
+    new_content: &str,
+) -> ApplyOutcome {
+    use std::path::PathBuf;
+
+    let on_disk = match std::fs::read_to_string(path) {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return ApplyOutcome::Failed {
+                path: path.to_path_buf(),
+                error: e.to_string(),
+            };
+        }
+    };
+
+    if on_disk.as_deref() != expected_old {
+        return ApplyOutcome::Stale {
+            path: path.to_path_buf(),
+        };
+    }
+
+    // New-file proposal: ensure parent directory exists. The original
+    // verbatim std::fs::write call failed silently when accepting a
+    // proposal whose parent directory hadn't been created yet.
+    if expected_old.is_none()
+        && let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return ApplyOutcome::Failed {
+            path: PathBuf::from(parent),
+            error: format!("creating parent directory: {}", e),
+        };
+    }
+
+    if let Err(e) = std::fs::write(path, new_content) {
+        return ApplyOutcome::Failed {
+            path: path.to_path_buf(),
+            error: e.to_string(),
+        };
+    }
+
+    ApplyOutcome::Written
+}
+
 pub(super) fn handle_review_action(app: &mut App, action: &Action) -> bool {
     let review = match &mut app.diff_review {
         Some(r) => r,
@@ -108,14 +180,32 @@ pub(super) fn finalize_current_review(app: &mut App) {
     }
     let content = gaviero_core::write_gate::assemble_final_content(&proposal);
     let path = proposal.file_path.clone();
-
-    if let Err(e) = std::fs::write(&path, &content) {
-        tracing::error!("Failed to write finalized file {}: {}", path.display(), e);
+    let expected_old = if proposal.original_content.is_empty() && !path.exists() {
+        None
     } else {
-        for buf in &mut app.buffers {
-            if buf.path.as_deref() == Some(path.as_path()) {
-                let _ = buf.reload();
+        Some(proposal.original_content.as_str())
+    };
+
+    match apply_proposal_to_disk(&path, expected_old, &content) {
+        ApplyOutcome::Written => {
+            for buf in &mut app.buffers {
+                if buf.path.as_deref() == Some(path.as_path()) {
+                    let _ = buf.reload();
+                }
             }
+        }
+        ApplyOutcome::Stale { path } => {
+            tracing::warn!(
+                "Refusing to apply stale proposal for {} — disk changed since proposal was created",
+                path.display()
+            );
+            app.status_message = Some((
+                format!("Stale: {} changed on disk; review skipped", path.display()),
+                std::time::Instant::now(),
+            ));
+        }
+        ApplyOutcome::Failed { path, error } => {
+            tracing::error!("Failed to write finalized file {}: {}", path.display(), error);
         }
     }
 
@@ -244,19 +334,38 @@ pub(super) fn handle_batch_review_action(app: &mut App, action: &Action) -> bool
             true
         }
         Action::InsertChar('a') => {
-            let br = app.batch_review.as_mut().unwrap();
-            if let Some(proposal) = br.proposals.get(br.selected_index) {
-                let path = proposal.path.clone();
-                let content = proposal.new_content.clone();
-                if let Err(e) = std::fs::write(&path, &content) {
-                    tracing::error!("Failed to write {}: {}", path.display(), e);
-                } else {
+            let (path, content, expected_old) = {
+                let br = app.batch_review.as_ref().unwrap();
+                match br.proposals.get(br.selected_index) {
+                    Some(p) => (p.path.clone(), p.new_content.clone(), p.old_content.clone()),
+                    None => return true,
+                }
+            };
+            let outcome = apply_proposal_to_disk(&path, expected_old.as_deref(), &content);
+            match outcome {
+                ApplyOutcome::Written => {
                     for buf in &mut app.buffers {
                         if buf.path.as_deref() == Some(path.as_path()) {
                             let _ = buf.reload();
                         }
                     }
                 }
+                ApplyOutcome::Stale { path: stale_path } => {
+                    tracing::warn!(
+                        "Refusing to apply stale proposal for {} — disk changed since proposal",
+                        stale_path.display()
+                    );
+                    app.status_message = Some((
+                        format!("Stale: {} changed on disk; not applied", stale_path.display()),
+                        std::time::Instant::now(),
+                    ));
+                    return true;
+                }
+                ApplyOutcome::Failed { path: fp, error } => {
+                    tracing::error!("Failed to write {}: {}", fp.display(), error);
+                }
+            }
+            {
                 let br = app.batch_review.as_mut().unwrap();
                 br.proposals.remove(br.selected_index);
                 if br.selected_index >= br.proposals.len() && br.selected_index > 0 {
@@ -306,11 +415,26 @@ pub(super) fn finalize_batch_review(app: &mut App) {
     };
 
     let mut written = Vec::new();
+    let mut stale = Vec::new();
+    let mut failed = Vec::new();
     for proposal in &br.proposals {
-        if let Err(e) = std::fs::write(&proposal.path, &proposal.new_content) {
-            tracing::error!("Failed to write {}: {}", proposal.path.display(), e);
-        } else {
-            written.push(proposal.path.clone());
+        match apply_proposal_to_disk(
+            &proposal.path,
+            proposal.old_content.as_deref(),
+            &proposal.new_content,
+        ) {
+            ApplyOutcome::Written => written.push(proposal.path.clone()),
+            ApplyOutcome::Stale { path } => {
+                tracing::warn!(
+                    "Refusing to apply stale proposal for {} — disk changed since proposal",
+                    path.display()
+                );
+                stale.push(path);
+            }
+            ApplyOutcome::Failed { path, error } => {
+                tracing::error!("Failed to write {}: {}", path.display(), error);
+                failed.push(path);
+            }
         }
     }
 
@@ -323,10 +447,14 @@ pub(super) fn finalize_batch_review(app: &mut App) {
     }
 
     app.left_panel = LeftPanelMode::FileTree;
-    app.status_message = Some((
-        format!("{} file(s) written", written.len()),
-        std::time::Instant::now(),
-    ));
+    let mut summary = format!("{} file(s) written", written.len());
+    if !stale.is_empty() {
+        summary.push_str(&format!(", {} stale (skipped)", stale.len()));
+    }
+    if !failed.is_empty() {
+        summary.push_str(&format!(", {} failed", failed.len()));
+    }
+    app.status_message = Some((summary, std::time::Instant::now()));
 }
 
 pub(super) fn cancel_batch_review(app: &mut App) {
@@ -898,5 +1026,59 @@ pub(super) fn render_changes_diff(app: &mut App, frame: &mut Frame, area: Rect) 
                     .set_style(line_style);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ApplyOutcome, apply_proposal_to_disk};
+
+    #[test]
+    fn apply_writes_when_disk_matches_expected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "old\n").unwrap();
+        let outcome = apply_proposal_to_disk(&path, Some("old\n"), "new\n");
+        assert!(matches!(outcome, ApplyOutcome::Written));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+    }
+
+    #[test]
+    fn apply_refuses_stale_when_disk_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "user-edit\n").unwrap();
+        // Proposal expected "old\n" but user edited to "user-edit\n".
+        let outcome = apply_proposal_to_disk(&path, Some("old\n"), "agent-new\n");
+        assert!(matches!(outcome, ApplyOutcome::Stale { .. }));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "user-edit\n");
+    }
+
+    #[test]
+    fn apply_refuses_when_proposal_expected_new_but_path_now_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("created-since.rs");
+        std::fs::write(&path, "raced\n").unwrap();
+        let outcome = apply_proposal_to_disk(&path, None, "agent-new\n");
+        assert!(matches!(outcome, ApplyOutcome::Stale { .. }));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "raced\n");
+    }
+
+    #[test]
+    fn apply_creates_parent_dir_for_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/deep/file.rs");
+        let outcome = apply_proposal_to_disk(&path, None, "fn main() {}\n");
+        assert!(matches!(outcome, ApplyOutcome::Written));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn main() {}\n");
+    }
+
+    #[test]
+    fn apply_creates_new_file_when_expected_old_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("brand-new.rs");
+        let outcome = apply_proposal_to_disk(&path, None, "hi\n");
+        assert!(matches!(outcome, ApplyOutcome::Written));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hi\n");
     }
 }

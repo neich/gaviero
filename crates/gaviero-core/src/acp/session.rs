@@ -136,14 +136,17 @@ pub struct AcpSession {
 /// Decide whether a prompt of `prompt_len + system_prompt_len` bytes should
 /// be passed via argv or a tempfile. Extracted so tests can exercise the
 /// decision without spawning a subprocess.
-pub(crate) fn would_use_tempfile(prompt_len: usize, system_prompt_len: usize) -> bool {
+pub fn would_use_tempfile(prompt_len: usize, system_prompt_len: usize) -> bool {
     prompt_len + system_prompt_len >= ARGV_THRESHOLD
 }
 
 /// Write `prompt` to a workspace-local tempfile and return (NamedTempFile,
 /// short argv to use instead of the full prompt). The argv tells Claude to
 /// read the file via its `@`-syntax and follow its instructions.
-fn spill_prompt_to_tempfile(cwd: &Path, prompt: &str) -> Result<(tempfile::NamedTempFile, String)> {
+pub fn spill_prompt_to_tempfile(
+    cwd: &Path,
+    prompt: &str,
+) -> Result<(tempfile::NamedTempFile, String)> {
     let dir: PathBuf = cwd.join(TEMP_SUBDIR);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating tempdir {}", dir.display()))?;
 

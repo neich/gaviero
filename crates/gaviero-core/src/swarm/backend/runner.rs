@@ -542,6 +542,10 @@ pub(crate) async fn propose_write(
             return Ok(false);
         }
         if gate.proposal_for_path(&abs_path).is_some() {
+            tracing::warn!(
+                "Dropping later proposal for {} — earlier proposal already pending review",
+                rel_path.display()
+            );
             return Ok(false);
         }
         if gate
@@ -549,6 +553,10 @@ pub(crate) async fn propose_write(
             .iter()
             .any(|p| p.file_path == abs_path)
         {
+            tracing::warn!(
+                "Dropping later deferred proposal for {} — earlier proposal already queued",
+                rel_path.display()
+            );
             return Ok(false);
         }
         (gate.next_id(), gate.is_deferred())

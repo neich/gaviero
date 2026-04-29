@@ -13,7 +13,7 @@ use crate::swarm::backend::AgentBackend as _;
 use crate::swarm::backend::{CompletionRequest, executor, shared};
 use crate::write_gate::WriteGatePipeline;
 
-use super::protocol::{StreamEvent, find_next_file_block, parse_file_blocks};
+use super::protocol::StreamEvent;
 use super::session::{AcpSession, AgentOptions};
 
 /// How long to wait for the next stream event before sending a keepalive status.
@@ -64,9 +64,11 @@ impl AcpPipeline {
     /// Send a user prompt and process the streaming response.
     ///
     /// `@path/to/file` references in the prompt are resolved: the file
-    /// contents are read and prepended as context. After the subprocess
-    /// completes, any `<file>` blocks in the response are parsed and
-    /// routed through the Write Gate as proposals.
+    /// contents are read and prepended as context. File edits flow through
+    /// the backend's native channel (Claude tool calls; in-band marker
+    /// for Codex/Ollama) — no in-band parsing is performed on the Claude
+    /// path, since instructing Claude about an in-band marker caused the
+    /// model to quote it back in prose and create false-positive proposals.
     // M6: `resume_session_id` is deprecated for new code but still read here
     // for the Ollama/Codex instrumentation path via `LegacyAgentSession`.
     // This allow stays until M10 deletes the field.
@@ -207,14 +209,17 @@ impl AcpPipeline {
             &attach_refs,
         )?;
 
-        // Accumulate the full response text; detect <file> blocks incrementally
+        // Accumulate the full response text. The in-band <file> parser is
+        // intentionally NOT invoked on this Claude path — file edits flow
+        // through native Write/Edit/MultiEdit tool calls (snapshot+revert).
         let mut full_text = String::new();
-        let mut file_scan_pos: usize = 0; // how far we've scanned for complete blocks
         let mut in_thinking = false;
 
         // Track files that Write/Edit tools will modify — snapshot BEFORE CLI executes them.
-        // Key: absolute path, Value: original content at the time of snapshot.
-        let mut file_snapshots: HashMap<PathBuf, String> = HashMap::new();
+        // `None` means the file did not exist at snapshot time; on revert we unlink
+        // rather than writing an empty string (which would leave a zero-byte stub
+        // for rejected new-file proposals).
+        let mut file_snapshots: HashMap<PathBuf, Option<String>> = HashMap::new();
 
         // M0 instrumentation: count Read tool invocations per turn so baselines
         // can measure graph pre-attach effectiveness (M7 target).
@@ -276,25 +281,6 @@ impl AcpPipeline {
                                 }
                                 full_text.push_str(&text);
                                 self.observer.on_stream_chunk(&text);
-
-                                // Detect complete <file> blocks as they arrive (fallback path)
-                                while let Some((rel_path, content, end)) =
-                                    find_next_file_block(&full_text, file_scan_pos)
-                                {
-                                    tracing::info!(
-                                        "Detected <file> block: path={}, content_len={}",
-                                        rel_path.display(),
-                                        content.len()
-                                    );
-                                    file_scan_pos = end;
-                                    if let Err(e) = self.propose_write(&rel_path, &content).await {
-                                        tracing::error!(
-                                            "Failed to create proposal for {}: {}",
-                                            rel_path.display(),
-                                            e
-                                        );
-                                    }
-                                }
                             }
                             StreamEvent::ToolUseStart { tool_name, .. } => {
                                 // M0 instrumentation: count Read invocations per turn.
@@ -342,14 +328,35 @@ impl AcpPipeline {
                                                 self.workspace_root.join(fp)
                                             };
                                             if !file_snapshots.contains_key(&abs_path) {
-                                                let content = tokio::fs::read_to_string(&abs_path)
-                                                    .await
-                                                    .unwrap_or_default();
+                                                let content = match tokio::fs::read_to_string(
+                                                    &abs_path,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(s) => Some(s),
+                                                    Err(e)
+                                                        if e.kind()
+                                                            == std::io::ErrorKind::NotFound =>
+                                                    {
+                                                        None
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            "Snapshot read of {} failed ({}); treating as did-not-exist",
+                                                            abs_path.display(),
+                                                            e
+                                                        );
+                                                        None
+                                                    }
+                                                };
                                                 tracing::info!(
-                                                    "Snapshot before tool {}: {} ({} bytes)",
+                                                    "Snapshot before tool {}: {} ({})",
                                                     tu.name,
                                                     abs_path.display(),
-                                                    content.len()
+                                                    match &content {
+                                                        Some(s) => format!("{} bytes", s.len()),
+                                                        None => "did not exist".to_string(),
+                                                    }
                                                 );
                                                 file_snapshots.insert(abs_path, content);
                                             }
@@ -490,18 +497,6 @@ impl AcpPipeline {
             self.observer.on_stream_chunk("\n</think>\n");
         }
 
-        // Catch any <file> blocks that completed after the last ContentDelta (fallback)
-        let remaining = parse_file_blocks(&full_text[file_scan_pos..]);
-        for (rel_path, content) in remaining {
-            if let Err(e) = self.propose_write(&rel_path, &content).await {
-                tracing::error!(
-                    "Failed to create proposal for {}: {}",
-                    rel_path.display(),
-                    e
-                );
-            }
-        }
-
         // Wait for subprocess to finish (tools have now been executed).
         // Use a timeout to avoid blocking indefinitely if the process hangs.
         self.observer.on_streaming_status("Finalizing...");
@@ -543,18 +538,33 @@ impl AcpPipeline {
                 if total == 1 { "" } else { "s" }
             ));
             for (i, (abs_path, original)) in file_snapshots.iter().enumerate() {
-                let current = tokio::fs::read_to_string(&abs_path)
-                    .await
-                    .unwrap_or_default();
-                if current == *original {
+                let current = match tokio::fs::read_to_string(&abs_path).await {
+                    Ok(s) => Some(s),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Post-tool read of {} failed ({}); skipping",
+                            abs_path.display(),
+                            e
+                        );
+                        continue;
+                    }
+                };
+                if current.as_deref() == original.as_deref() {
                     tracing::info!("Snapshot unchanged: {}", abs_path.display());
                     continue;
                 }
                 tracing::info!(
-                    "File changed by tool: {} (orig={} bytes, new={} bytes)",
+                    "File changed by tool: {} (orig={}, new={})",
                     abs_path.display(),
-                    original.len(),
-                    current.len()
+                    match original {
+                        Some(s) => format!("{} bytes", s.len()),
+                        None => "did not exist".to_string(),
+                    },
+                    match &current {
+                        Some(s) => format!("{} bytes", s.len()),
+                        None => "did not exist".to_string(),
+                    },
                 );
 
                 if total > 1 {
@@ -565,9 +575,19 @@ impl AcpPipeline {
                     ));
                 }
 
-                // Revert the file to its original content on disk.
-                // The proposal stores both versions; review mode will re-apply if accepted.
-                if let Err(e) = tokio::fs::write(&abs_path, &original).await {
+                // Revert to the snapshotted state. If the file did NOT exist
+                // at snapshot time, UNLINK rather than writing an empty
+                // string — otherwise rejecting a new-file proposal leaves a
+                // zero-byte stub on disk.
+                let revert_result = match original {
+                    Some(orig) => tokio::fs::write(&abs_path, orig).await,
+                    None => match tokio::fs::remove_file(&abs_path).await {
+                        Ok(()) => Ok(()),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(e) => Err(e),
+                    },
+                };
+                if let Err(e) = revert_result {
                     tracing::error!("Failed to revert {}: {}", abs_path.display(), e);
                     continue;
                 }
@@ -576,7 +596,14 @@ impl AcpPipeline {
                 let rel_path = abs_path
                     .strip_prefix(&self.workspace_root)
                     .unwrap_or(abs_path.as_path());
-                if let Err(e) = self.propose_write(rel_path, &current).await {
+                let Some(new_content) = current.as_deref() else {
+                    tracing::warn!(
+                        "Tool deleted {} — deletion proposals not yet supported, leaving as reverted",
+                        abs_path.display()
+                    );
+                    continue;
+                };
+                if let Err(e) = self.propose_write(rel_path, new_content).await {
                     tracing::error!(
                         "Failed to create proposal for {}: {}",
                         abs_path.display(),
@@ -639,7 +666,11 @@ pub(crate) async fn propose_write(
             return Ok(());
         }
         if gate.proposal_for_path(&abs_path).is_some() {
-            tracing::debug!("Skipping duplicate proposal for {}", rel_path.display());
+            tracing::warn!(
+                "Dropping later proposal for {} — an earlier proposal for this path is already pending review. \
+                 If the agent is correcting itself, the user is reviewing stale content.",
+                rel_path.display()
+            );
             return Ok(());
         }
         // Also check deferred proposals for duplicates
@@ -648,8 +679,9 @@ pub(crate) async fn propose_write(
             .iter()
             .any(|p| p.file_path == abs_path)
         {
-            tracing::debug!(
-                "Skipping duplicate deferred proposal for {}",
+            tracing::warn!(
+                "Dropping later deferred proposal for {} — an earlier proposal for this path is already queued. \
+                 If the agent is correcting itself, the user is reviewing stale content.",
                 rel_path.display()
             );
             return Ok(());
