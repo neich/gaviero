@@ -386,9 +386,15 @@ pub(super) fn handle_coordinated_swarm_command(app: &mut App) {
         let refs = parse_file_references(&task_desc);
         let mut enriched = task_desc.clone();
         let mut ctx_files: Vec<(String, String)> = Vec::new();
+        let all_roots: Vec<std::path::PathBuf> = {
+            let r: Vec<_> = app.workspace.roots().iter().map(|p| p.to_path_buf()).collect();
+            if r.is_empty() { vec![root.clone()] } else { r }
+        };
         for rel_path in &refs {
-            let abs_path = root.join(rel_path);
-            if let Ok(content) = std::fs::read_to_string(&abs_path) {
+            let found = all_roots.iter().find_map(|r| {
+                std::fs::read_to_string(r.join(rel_path)).ok()
+            });
+            if let Some(content) = found {
                 let tag = format!("@{}", rel_path);
                 let replacement = format!(
                     "\n[File: {}]\n{}\n[End of file: {}]",
