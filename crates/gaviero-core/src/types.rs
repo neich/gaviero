@@ -113,6 +113,10 @@ pub struct WriteProposal {
     pub proposed_content: String,
     pub structural_hunks: Vec<StructuralHunk>,
     pub status: ProposalStatus,
+    /// True when accepting the proposal should remove the file from disk
+    /// rather than write `proposed_content`. Set by `propose_delete` for
+    /// tool-driven deletions; finalize paths branch on this flag.
+    pub is_deletion: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
