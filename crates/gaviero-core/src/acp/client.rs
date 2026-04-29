@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 use crate::observer::AcpObserver;
 use crate::swarm::backend::AgentBackend as _;
 use crate::swarm::backend::{CompletionRequest, executor, shared};
-use crate::write_gate::WriteGatePipeline;
+use crate::write_gate::{AutoAcceptAction, WriteGatePipeline};
 
 use super::protocol::StreamEvent;
 use super::session::{AcpSession, AgentOptions};
@@ -575,6 +575,31 @@ impl AcpPipeline {
                     ));
                 }
 
+                // Drift check: between the post-tool read above and the
+                // revert below, a concurrent writer may have changed disk.
+                // Skip revert + proposal if so to avoid clobbering.
+                let on_disk_now = match tokio::fs::read_to_string(&abs_path).await {
+                    Ok(s) => Some(s),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Drift-check read of {} failed ({}); skipping revert",
+                            abs_path.display(),
+                            e
+                        );
+                        continue;
+                    }
+                };
+                if on_disk_now.as_deref() != current.as_deref() {
+                    let msg = format!(
+                        "⚠ Disk drifted on {} between tool completion and revert — skipping revert and proposal to avoid clobbering a concurrent write.",
+                        abs_path.display()
+                    );
+                    tracing::warn!("{}", msg);
+                    self.observer.on_message_complete("system", &msg);
+                    continue;
+                }
+
                 // Revert to the snapshotted state. If the file did NOT exist
                 // at snapshot time, UNLINK rather than writing an empty
                 // string — otherwise rejecting a new-file proposal leaves a
@@ -592,18 +617,30 @@ impl AcpPipeline {
                     continue;
                 }
 
-                // Now create a proposal through the write gate (in Deferred mode)
+                // Now create a proposal through the write gate (in Deferred mode).
+                // Two paths: the tool wrote new/changed content (propose_write),
+                // or the tool deleted a previously existing file (propose_delete).
                 let rel_path = abs_path
                     .strip_prefix(&self.workspace_root)
                     .unwrap_or(abs_path.as_path());
-                let Some(new_content) = current.as_deref() else {
-                    tracing::warn!(
-                        "Tool deleted {} — deletion proposals not yet supported, leaving as reverted",
-                        abs_path.display()
-                    );
-                    continue;
+                let proposal_result = match (&current, original) {
+                    (Some(new_content), _) => {
+                        self.propose_write(rel_path, new_content).await
+                    }
+                    (None, Some(orig)) => {
+                        propose_delete(
+                            &self.write_gate,
+                            self.observer.as_ref(),
+                            &self.workspace_root,
+                            &self.agent_id,
+                            rel_path,
+                            orig,
+                        )
+                        .await
+                    }
+                    (None, None) => Ok(()), // file never existed; nothing to propose
                 };
-                if let Err(e) = self.propose_write(rel_path, new_content).await {
+                if let Err(e) = proposal_result {
                     tracing::error!(
                         "Failed to create proposal for {}: {}",
                         abs_path.display(),
@@ -740,16 +777,109 @@ pub(crate) async fn propose_write(
         observer.on_proposal_deferred(&abs_path, old, proposed_content);
     }
 
-    // 5. If AutoAccept mode, write to disk outside lock
-    if let Some((path, content)) = auto_accept_result {
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .context("creating parent directories")?;
+    // 5. If AutoAccept mode, perform the disk action outside the lock.
+    if let Some(action) = auto_accept_result {
+        match action {
+            AutoAcceptAction::Write { path, content } => {
+                if let Some(parent) = path.parent() {
+                    tokio::fs::create_dir_all(parent)
+                        .await
+                        .context("creating parent directories")?;
+                }
+                tokio::fs::write(&path, &content)
+                    .await
+                    .context("writing auto-accepted file")?;
+            }
+            AutoAcceptAction::Delete { path } => match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).context("removing auto-accepted file"),
+            },
         }
-        tokio::fs::write(&path, &content)
-            .await
-            .context("writing auto-accepted file")?;
+    }
+
+    Ok(())
+}
+
+/// Create a deletion proposal through the Write Gate. Mirrors `propose_write`
+/// but the proposal carries `is_deletion = true` and an empty proposed
+/// content; on accept, the finalize path removes the file from disk.
+///
+/// Skips silently when scope rejects the path or an earlier proposal for the
+/// same path is already pending — same dedup contract as `propose_write`.
+pub(crate) async fn propose_delete(
+    write_gate: &Arc<Mutex<WriteGatePipeline>>,
+    observer: &dyn AcpObserver,
+    workspace_root: &Path,
+    agent_id: &str,
+    rel_path: &Path,
+    original_content: &str,
+) -> Result<()> {
+    let abs_path = workspace_root.join(rel_path);
+
+    let (id, is_deferred) = {
+        let mut gate = write_gate.lock().await;
+        let path_str = rel_path.to_string_lossy();
+        if !gate.is_scope_allowed(agent_id, &path_str) {
+            tracing::warn!("Scope rejected for delete of {}", rel_path.display());
+            return Ok(());
+        }
+        if gate.proposal_for_path(&abs_path).is_some() {
+            tracing::warn!(
+                "Dropping delete proposal for {} — earlier proposal already pending review",
+                rel_path.display()
+            );
+            return Ok(());
+        }
+        if gate
+            .pending_proposals()
+            .iter()
+            .any(|p| p.file_path == abs_path)
+        {
+            tracing::warn!(
+                "Dropping delete proposal for {} — earlier proposal already queued",
+                rel_path.display()
+            );
+            return Ok(());
+        }
+        (gate.next_id(), gate.is_deferred())
+    };
+
+    let proposal =
+        WriteGatePipeline::build_delete_proposal(id, agent_id, &abs_path, original_content);
+
+    tracing::info!(
+        "propose_delete: {} — {} bytes, is_deferred={}, inserting",
+        rel_path.display(),
+        original_content.len(),
+        is_deferred
+    );
+
+    let auto_accept_result = {
+        let mut gate = write_gate.lock().await;
+        gate.insert_proposal(proposal)
+    };
+
+    if is_deferred {
+        // Surface as a deferred proposal with proposed_content=empty; the
+        // batch-review render branches on `is_deletion` for the label.
+        observer.on_proposal_deferred(&abs_path, Some(original_content), "");
+    }
+
+    if let Some(action) = auto_accept_result {
+        match action {
+            AutoAcceptAction::Delete { path } => match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).context("removing auto-accepted file"),
+            },
+            AutoAcceptAction::Write { .. } => {
+                tracing::error!(
+                    "build_delete_proposal returned a Write action for {} — bug",
+                    rel_path.display()
+                );
+            }
+        }
     }
 
     Ok(())
