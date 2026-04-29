@@ -365,6 +365,33 @@ impl Workspace {
         self.folders.iter().map(|f| f.path.as_path()).collect()
     }
 
+    /// Return paths to the `.claude` and `.gaviero` configuration folders
+    /// near the workspace file. Each name is searched first in the directory
+    /// containing the workspace file, then one level up. The first existing
+    /// match per name wins. Empty in single-folder mode (no workspace file).
+    pub fn config_roots(&self) -> Vec<PathBuf> {
+        let Some(workspace_dir) = self.workspace_path.as_deref().and_then(Path::parent) else {
+            return Vec::new();
+        };
+        let parent_dir = workspace_dir.parent();
+        let resolve = |name: &str| -> Option<PathBuf> {
+            let same = workspace_dir.join(name);
+            if same.is_dir() {
+                return Some(same);
+            }
+            let up = parent_dir?.join(name);
+            up.is_dir().then_some(up)
+        };
+        let mut out = Vec::new();
+        if let Some(p) = resolve(".claude") {
+            out.push(p);
+        }
+        if let Some(p) = resolve(".gaviero") {
+            out.push(p);
+        }
+        out
+    }
+
     /// Return workspace folders.
     pub fn folders(&self) -> &[WorkspaceFolder] {
         &self.folders
@@ -1035,6 +1062,61 @@ mod tests {
 
         let ws2 = Workspace::load(&ws_path).unwrap();
         assert_eq!(ws2.roots().len(), 1);
+    }
+
+    #[test]
+    fn config_roots_finds_dot_dirs_at_workspace_file_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws_path = dir.path().join("project.gaviero-workspace");
+        fs::write(&ws_path, r#"{"folders":[],"settings":{}}"#).unwrap();
+        fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        fs::create_dir_all(dir.path().join(".gaviero")).unwrap();
+
+        let ws = Workspace::load(&ws_path).unwrap();
+        let roots = ws.config_roots();
+        assert_eq!(roots.len(), 2);
+        assert!(roots[0].ends_with(".claude"));
+        assert!(roots[1].ends_with(".gaviero"));
+    }
+
+    #[test]
+    fn config_roots_falls_back_to_parent_level() {
+        let outer = tempfile::tempdir().unwrap();
+        let inner = outer.path().join("nested");
+        fs::create_dir_all(&inner).unwrap();
+        let ws_path = inner.join("project.gaviero-workspace");
+        fs::write(&ws_path, r#"{"folders":[],"settings":{}}"#).unwrap();
+        fs::create_dir_all(outer.path().join(".gaviero")).unwrap();
+
+        let ws = Workspace::load(&ws_path).unwrap();
+        let roots = ws.config_roots();
+        assert_eq!(roots.len(), 1);
+        assert!(roots[0].starts_with(outer.path()));
+        assert!(roots[0].ends_with(".gaviero"));
+    }
+
+    #[test]
+    fn config_roots_prefers_same_level_over_parent() {
+        let outer = tempfile::tempdir().unwrap();
+        let inner = outer.path().join("nested");
+        fs::create_dir_all(&inner).unwrap();
+        let ws_path = inner.join("project.gaviero-workspace");
+        fs::write(&ws_path, r#"{"folders":[],"settings":{}}"#).unwrap();
+        fs::create_dir_all(outer.path().join(".claude")).unwrap();
+        fs::create_dir_all(inner.join(".claude")).unwrap();
+
+        let ws = Workspace::load(&ws_path).unwrap();
+        let roots = ws.config_roots();
+        assert_eq!(roots.len(), 1);
+        assert!(roots[0].starts_with(&inner));
+    }
+
+    #[test]
+    fn config_roots_empty_for_single_folder_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".gaviero")).unwrap();
+        let ws = Workspace::single_folder(dir.path().to_path_buf());
+        assert!(ws.config_roots().is_empty());
     }
 
     #[test]
