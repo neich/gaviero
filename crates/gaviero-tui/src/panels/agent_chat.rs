@@ -2033,7 +2033,8 @@ impl AgentChatState {
             return;
         }
 
-        let width = area.width as usize;
+        // Subtract 1 to leave room for the scrollbar column on the right edge.
+        let width = area.width.saturating_sub(1) as usize;
         let browse_bg = theme::BROWSE_BG; // highlight bg for browsed message
 
         // Build rendered lines from messages: (style, text, message_index)
