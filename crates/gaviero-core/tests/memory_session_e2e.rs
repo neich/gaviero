@@ -1279,9 +1279,15 @@ async fn e2e_full_dev_session_simulation() -> Result<()> {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Spin until the writer has drained all enqueued messages or the
-/// timeout elapses. Reports each polling step into `r` so a hang is
-/// visible in the diagnostic output.
+/// Spin until the writer has drained all enqueued messages **and** all
+/// in-flight processing has completed, or the timeout elapses.
+///
+/// `queue_depth()` reaches 0 when a message is *dequeued* from the MPSC
+/// channel, but `on_write_committed` fires only after `process_message`
+/// finishes (which includes ONNX embedding). For a single message the two
+/// events can be far apart — checking depth alone races. We therefore
+/// require both `depth == 0` **and** `committed + failed >= enqueued` before
+/// returning.
 async fn wait_for_writer_drain(
     env: &E2eEnv,
     r: &mut TestReport,
@@ -1297,11 +1303,18 @@ async fn wait_for_writer_drain(
         }
         if depth == 0 {
             let (enq, com, fail, last_fail) = env.write_counters.snapshot();
-            r.kv("writer_enq/com/fail", format!("{enq}/{com}/{fail}"));
-            if let Some(msg) = last_fail {
-                r.kv("writer_last_failure", msg);
+            // All dequeued messages have also been committed or failed.
+            if com + fail >= enq {
+                r.kv("writer_enq/com/fail", format!("{enq}/{com}/{fail}"));
+                if let Some(msg) = last_fail {
+                    r.kv("writer_last_failure", msg);
+                }
+                return Ok(());
             }
-            return Ok(());
+            // depth is 0 but some process_message calls are still running
+            // (drained increments before process_message completes); keep
+            // polling until every enqueued message has produced a commit or
+            // fail event.
         }
         if Instant::now() >= deadline {
             let (enq, com, fail, last_fail) = env.write_counters.snapshot();
