@@ -178,16 +178,28 @@ pub struct App {
 
 impl App {
     pub fn new(workspace: Workspace, event_tx: mpsc::UnboundedSender<Event>) -> Self {
-        let excludes = parse_exclude_patterns(&workspace);
+        let excludes = parse_exclude_patterns(&workspace, None);
         let git_allow = parse_git_allow_list(&workspace);
-        let roots: Vec<&Path> = workspace.roots();
+        let config_roots = workspace.config_roots();
+        let mut roots: Vec<&Path> = config_roots.iter().map(|p| p.as_path()).collect();
+        roots.extend(workspace.roots());
         let file_tree = FileTreeState::from_roots(&roots, &excludes, &git_allow);
 
-        // Detect first run: no .gaviero/settings.json for any workspace root.
-        let is_first_run = roots
+        // Detect first run: no .gaviero/settings.json anywhere we look.
+        // A workspace counts as configured if either:
+        //   - a workspace folder has its own .gaviero/settings.json, or
+        //   - a .gaviero/ sits next to (or one level above) the workspace
+        //     file (returned by Workspace::config_roots()).
+        let folder_configured = workspace
+            .roots()
             .first()
-            .map(|root| !root.join(".gaviero").join("settings.json").exists())
+            .map(|root| root.join(".gaviero").join("settings.json").exists())
             .unwrap_or(false);
+        let workspace_file_configured = config_roots
+            .iter()
+            .any(|p| p.file_name().is_some_and(|n| n == ".gaviero")
+                && p.join("settings.json").exists());
+        let is_first_run = !folder_configured && !workspace_file_configured;
 
         let theme = Theme::load(Path::new("themes/default.toml"))
             .unwrap_or_else(|_| Theme::builtin_default());
@@ -924,9 +936,9 @@ pub(crate) fn collapse_file_blocks(text: &str) -> String {
     result
 }
 
-fn parse_exclude_patterns(workspace: &Workspace) -> Vec<String> {
+fn parse_exclude_patterns(workspace: &Workspace, root: Option<&std::path::Path>) -> Vec<String> {
     use gaviero_core::workspace::settings;
-    let val = workspace.resolve_setting(settings::FILES_EXCLUDE, None);
+    let val = workspace.resolve_setting(settings::FILES_EXCLUDE, root);
     let mut patterns = Vec::new();
     if let Some(obj) = val.as_object() {
         for (pattern, enabled) in obj {
@@ -1000,7 +1012,6 @@ fn save_clipboard_image_as_png(img: &arboard::ImageData) -> anyhow::Result<std::
 
 fn list_workspace_files(root: &std::path::Path, limit: usize, excludes: &[String]) -> Vec<String> {
     let mut files = Vec::new();
-    let walker = std::fs::read_dir(root);
     fn walk(
         dir: &std::path::Path,
         prefix: &str,
@@ -1019,34 +1030,50 @@ fn list_workspace_files(root: &std::path::Path, limit: usize, excludes: &[String
             if name == ".git" {
                 continue;
             }
-            if matches_exclude(&name, excludes) {
+            let rel_path = format!("{}{}", prefix, name);
+            if matches_exclude(&rel_path, excludes) {
                 continue;
             }
-            let path = format!("{}{}", prefix, name);
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                walk(&entry.path(), &format!("{}/", path), files, limit, excludes);
+                walk(&entry.path(), &format!("{}/", rel_path), files, limit, excludes);
             } else {
-                files.push(path);
+                files.push(rel_path);
             }
         }
     }
-    if walker.is_ok() {
+    if std::fs::read_dir(root).is_ok() {
         walk(root, "", &mut files, limit, excludes);
     }
     files
 }
 
-/// Match a single path component against the `files.exclude` pattern set.
-/// Mirrors `FileTreeState::is_excluded` (panels/file_tree.rs) so `@` autocomplete
-/// and the file tree agree on what's hidden.
-fn matches_exclude(name: &str, excludes: &[String]) -> bool {
+/// Match a relative path against the `files.exclude` pattern set using gitignore-style rules:
+/// - `*` matches any sequence within a single path segment
+/// - `**` matches any sequence including `/`
+/// - `?` matches one non-`/` character
+/// - Patterns without `/` match any path component at any depth (like gitignore)
+/// - Trailing `/` constrains to directories only
+/// - Leading `/` anchors the match to the workspace root
+fn matches_exclude(rel_path: &str, excludes: &[String]) -> bool {
+    use gaviero_core::path_pattern;
+
+    let name = rel_path.rsplit('/').next().unwrap_or(rel_path);
+
     for pattern in excludes {
-        let pat = pattern.trim_start_matches("**/");
-        if name == pat {
-            return true;
-        }
-        if name.starts_with('.') && pattern == ".*" {
-            return true;
+        let body = pattern.trim_start_matches('/').trim_end_matches('/');
+        if body.contains('/') {
+            // Pattern contains a slash in its body → matched against the full relative path.
+            // Strip leading '/' (root-anchor) before matching.
+            let p = pattern.trim_start_matches('/');
+            if path_pattern::matches(p, rel_path) {
+                return true;
+            }
+        } else {
+            // No slash in body → matches any path component at any depth.
+            let p = pattern.trim_end_matches('/');
+            if path_pattern::matches(p, name) {
+                return true;
+            }
         }
     }
     false
