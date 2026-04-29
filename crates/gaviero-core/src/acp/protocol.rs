@@ -223,7 +223,7 @@ pub fn parse_stream_line(line: &str) -> Result<StreamEvent> {
 /// Also rejects malformed paths (empty, absolute, or containing `..`
 /// traversal segments) — silently advancing past the offending opener.
 pub fn find_next_file_block(text: &str, from: usize) -> Option<(PathBuf, String, usize)> {
-    let regions = fenced_code_regions(text);
+    let regions = code_suppression_regions(text);
     let mut start = from;
     loop {
         let rel = text[start..].find("<file path=\"")?;
@@ -281,7 +281,7 @@ pub fn find_next_file_block(text: &str, from: usize) -> Option<(PathBuf, String,
 /// blocks are skipped, and paths that are empty / absolute / contain `..`
 /// traversal segments are rejected.
 pub fn parse_file_blocks(text: &str) -> Vec<(PathBuf, String)> {
-    let regions = fenced_code_regions(text);
+    let regions = code_suppression_regions(text);
     let mut results = Vec::new();
     let mut search_from = 0;
 
@@ -397,6 +397,76 @@ fn region_end_containing(regions: &[(usize, usize)], pos: usize) -> Option<usize
 
 /// Compute byte ranges of fenced markdown code blocks in `text`.
 ///
+/// Combined suppression regions: union of fenced code blocks and inline
+/// code spans. `<file>` openers inside any of these are skipped.
+///
+/// Inline-span coverage was added because triple-fence skipping alone wasn't
+/// enough — when the agent quoted the format back inside single-backtick
+/// inline spans (e.g. `` `<file path="x">y</file>` ``), the parser still
+/// picked it up and produced a real proposal. Same bug class as the fenced
+/// case, just a different markdown construct.
+fn code_suppression_regions(text: &str) -> Vec<(usize, usize)> {
+    let mut regions = fenced_code_regions(text);
+    regions.extend(inline_code_regions(text));
+    regions
+}
+
+/// Find inline code spans (paired backtick runs of equal length).
+///
+/// Mirrors CommonMark inline code semantics conservatively: a backtick run
+/// of length N is closed by the next backtick run of length N. Unmatched
+/// runs are treated as literal backticks (no region emitted).
+///
+/// Spans may cross newlines (CommonMark allows it). We don't attempt to
+/// honour escaped backticks (`\``) — chat output rarely contains them, and
+/// the conservative direction here is to over-suppress.
+fn inline_code_regions(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut regions = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'`' {
+            i += 1;
+            continue;
+        }
+        let run_start = i;
+        let mut run_len = 0;
+        while i < bytes.len() && bytes[i] == b'`' {
+            run_len += 1;
+            i += 1;
+        }
+        // Look for a closing run of exactly `run_len` backticks.
+        let mut j = i;
+        let mut close_end: Option<usize> = None;
+        while j < bytes.len() {
+            if bytes[j] != b'`' {
+                j += 1;
+                continue;
+            }
+            let close_start = j;
+            let mut close_len = 0;
+            while j < bytes.len() && bytes[j] == b'`' {
+                close_len += 1;
+                j += 1;
+            }
+            if close_len == run_len {
+                close_end = Some(j);
+                break;
+            }
+            // Different length — keep scanning. `close_start` not used,
+            // but kept for clarity; `j` already advanced past the run.
+            let _ = close_start;
+        }
+        if let Some(end) = close_end {
+            regions.push((run_start, end));
+            i = end;
+        }
+        // Unmatched opener: leave `i` past the opening run; treat the
+        // backticks as literal.
+    }
+    regions
+}
+
 /// Each range is `[line_start, close_line_end_exclusive)` and covers from
 /// the opening fence line through the closing fence line. Unclosed fences
 /// extend to EOF. Recognises both ``` and ~~~ fences and tolerates up to
@@ -664,6 +734,68 @@ bbb
         let text = "<file path=\"a<b\">x</file>";
         let blocks = parse_file_blocks(text);
         assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn test_parse_file_blocks_skips_inline_backtick_span() {
+        // The format-quoting incident: an opener wrapped in single
+        // backticks must NOT produce a real proposal.
+        let text = "Format example: `<file path=\"x\">y</file>` end.";
+        let blocks = parse_file_blocks(text);
+        assert!(
+            blocks.is_empty(),
+            "inline single-backtick spans must suppress openers"
+        );
+    }
+
+    #[test]
+    fn test_parse_file_blocks_skips_inline_double_backtick_span() {
+        // Double-backtick spans wrap content that itself contains a
+        // backtick. The opener inside must still be suppressed.
+        let text = "See ``<file path=\"x\">contains ` tick</file>`` here.";
+        let blocks = parse_file_blocks(text);
+        assert!(
+            blocks.is_empty(),
+            "inline double-backtick spans must suppress openers"
+        );
+    }
+
+    #[test]
+    fn test_parse_file_blocks_inline_then_real() {
+        // Inline-quoted example is ignored; real unfenced block after it
+        // is still picked up.
+        let text = "Use `<file path=\"a.rs\">ex</file>` like so.\n\
+                    <file path=\"b.rs\">\n\
+                    fn main() {}\n\
+                    </file>";
+        let blocks = parse_file_blocks(text);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].0, PathBuf::from("b.rs"));
+        assert_eq!(blocks[0].1, "fn main() {}");
+    }
+
+    #[test]
+    fn test_parse_file_blocks_unmatched_inline_tick_does_not_swallow_real_block() {
+        // A stray unmatched backtick must not suppress a later real block.
+        let text = "stray ` tick\n<file path=\"r.rs\">code</file>";
+        let blocks = parse_file_blocks(text);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].0, PathBuf::from("r.rs"));
+    }
+
+    #[test]
+    fn test_inline_code_regions_pairs_runs_of_equal_length() {
+        let text = "a `b` c ``d`` e ``` f ```";
+        let regions = inline_code_regions(text);
+        assert_eq!(regions.len(), 3, "expected three paired runs");
+    }
+
+    #[test]
+    fn test_inline_code_regions_unmatched_run_is_dropped() {
+        // Single unmatched backtick produces no region.
+        let text = "stray ` and nothing else";
+        let regions = inline_code_regions(text);
+        assert!(regions.is_empty());
     }
 
     #[test]
