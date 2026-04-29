@@ -93,6 +93,44 @@ pub fn word_wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// Strip ANSI escape sequences from text so it is safe to write into ratatui cells.
+///
+/// Raw escape codes written char-by-char corrupt the terminal display — they bypass
+/// ratatui's style model and change terminal attributes mid-render. Call this on any
+/// text that originated from an external process before storing it for display.
+pub fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if c.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if c == '\x07' || c == '\x1b' {
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    chars.next();
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +165,25 @@ mod tests {
         let lines = word_wrap("日本語テスト", 6);
         assert_eq!(lines.len(), 2);
         assert_eq!(UnicodeWidthStr::width(lines[0].as_str()), 6);
+    }
+
+    #[test]
+    fn test_strip_ansi_csi() {
+        assert_eq!(strip_ansi("\x1b[32mgreen\x1b[0m"), "green");
+    }
+
+    #[test]
+    fn test_strip_ansi_plain() {
+        assert_eq!(strip_ansi("hello world"), "hello world");
+    }
+
+    #[test]
+    fn test_strip_ansi_osc() {
+        assert_eq!(strip_ansi("\x1b]0;title\x07text"), "text");
+    }
+
+    #[test]
+    fn test_strip_ansi_bold_reset() {
+        assert_eq!(strip_ansi("\x1b[1mbold\x1b[0m normal"), "bold normal");
     }
 }

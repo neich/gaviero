@@ -1037,44 +1037,7 @@ fn word_wrap_line(text: &str, width: usize) -> Vec<String> {
 }
 
 /// Strip ANSI/VT100 escape sequences from a string.
-/// Prevents raw escape chars from corrupting the ratatui cell buffer when
-/// rendered character-by-character via `render_text`.
-pub fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            // Skip until end of escape sequence (a letter or `m`/`J`/`K` etc.)
-            match chars.peek() {
-                Some('[') => {
-                    chars.next(); // consume '['
-                    // consume until alphabetic char
-                    for c in chars.by_ref() {
-                        if c.is_ascii_alphabetic() {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    chars.next(); // consume ']'
-                    // OSC sequence — ends at BEL (\x07) or ST (\x1b\\)
-                    for c in chars.by_ref() {
-                        if c == '\x07' || c == '\x1b' {
-                            break;
-                        }
-                    }
-                }
-                _ => {
-                    // Single-char escape — skip next char
-                    chars.next();
-                }
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
+pub use crate::widgets::render_utils::strip_ansi;
 
 /// Parse a unified diff string into classified lines for rendering.
 pub fn parse_diff(text: &str) -> Vec<(DiffLineKind, String)> {

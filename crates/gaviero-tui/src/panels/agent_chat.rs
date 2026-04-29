@@ -1565,10 +1565,11 @@ impl AgentChatState {
             return;
         };
         self.conversations[idx].streaming_status = "Writing...".to_string();
+        let clean = crate::widgets::render_utils::strip_ansi(text);
         let msgs = &mut self.conversations[idx].messages;
         if let Some(last) = msgs.last_mut() {
             if last.role == ChatRole::Assistant {
-                last.content.push_str(text);
+                last.content.push_str(&clean);
                 if idx == self.active_conv {
                     self.scroll_to_bottom();
                 }
@@ -1577,7 +1578,7 @@ impl AgentChatState {
         }
         msgs.push(ChatMessage {
             role: ChatRole::Assistant,
-            content: text.to_string(),
+            content: clean,
             tool_calls: Vec::new(),
         });
         if idx == self.active_conv {
@@ -1656,11 +1657,12 @@ impl AgentChatState {
             _ => ChatRole::System,
         };
 
+        let clean = crate::widgets::render_utils::strip_ansi(content);
         let msgs = &mut self.conversations[idx].messages;
         if let Some(last) = msgs.last_mut() {
             if last.role == chat_role {
-                if !content.is_empty() {
-                    last.content = content.to_string();
+                if !clean.is_empty() {
+                    last.content = clean.clone();
                 }
                 self.conversations[idx].is_streaming = false;
                 self.conversations[idx].streaming_status.clear();
@@ -1672,10 +1674,10 @@ impl AgentChatState {
             }
         }
 
-        if !content.is_empty() {
+        if !clean.is_empty() {
             self.conversations[idx].messages.push(ChatMessage {
                 role: chat_role,
-                content: content.to_string(),
+                content: clean,
                 tool_calls: Vec::new(),
             });
         }

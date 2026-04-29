@@ -1,5 +1,47 @@
 use super::*;
 
+/// Build a unique display label per root. Starts from `display_name()`; if two
+/// or more roots share that label, disambiguates by appending the parent dir
+/// name, then by appending the absolute path. Empty label only if the root
+/// has no usable name at all (single-folder fallback case).
+fn unique_root_labels(roots: &[(String, std::path::PathBuf)]) -> Vec<String> {
+    let mut labels: Vec<String> = roots.iter().map(|(n, _)| n.clone()).collect();
+    loop {
+        let mut counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for l in &labels {
+            *counts.entry(l.as_str()).or_insert(0) += 1;
+        }
+        let dupes: std::collections::HashSet<String> = counts
+            .iter()
+            .filter(|(_, c)| **c > 1)
+            .map(|(l, _)| l.to_string())
+            .collect();
+        if dupes.is_empty() {
+            break;
+        }
+        let mut changed = false;
+        for (i, label) in labels.iter_mut().enumerate() {
+            if !dupes.contains(label.as_str()) {
+                continue;
+            }
+            let path = &roots[i].1;
+            let parent = path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str());
+            if let Some(p) = parent.filter(|p| !p.is_empty()) {
+                *label = format!("{}/{}", p, label);
+                changed = true;
+            } else {
+                *label = path.to_string_lossy().to_string();
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    labels
+}
+
 pub(super) fn handle_chat_action(app: &mut App, action: Action) {
     // Only clear the output text selection on non-selection keypresses.
     // SelectUp/SelectDown extend it; Copy reads it.
@@ -1457,12 +1499,6 @@ pub(super) fn refresh_chat_autocomplete(app: &mut App) {
     if !app.chat_state.autocomplete.active {
         return;
     }
-    let root = app
-        .workspace
-        .roots()
-        .first()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
 
     let at_pos = app.chat_state.autocomplete.at_pos;
     let is_run_path_context = {
@@ -1470,8 +1506,37 @@ pub(super) fn refresh_chat_autocomplete(app: &mut App) {
         at_pos <= text.len() && text[..at_pos].trim() == "/run"
     };
 
-    let excludes = parse_exclude_patterns(&app.workspace, Some(&root));
-    let files: Vec<String> = list_workspace_files(&root, 2000, &excludes)
+    let folders = app.workspace.folders();
+    let roots: Vec<(String, std::path::PathBuf)> = if folders.is_empty() {
+        vec![(String::new(), std::path::PathBuf::from("."))]
+    } else {
+        folders
+            .iter()
+            .map(|f| (f.display_name().to_string(), f.path.clone()))
+            .collect()
+    };
+    let multi_root = roots.len() > 1;
+    let labels = unique_root_labels(&roots);
+
+    const TOTAL_LIMIT: usize = 10_000;
+    let per_root = TOTAL_LIMIT / roots.len().max(1);
+    let mut seen = std::collections::HashSet::new();
+    let mut files: Vec<String> = Vec::new();
+    for ((_, root), label) in roots.iter().zip(labels.iter()) {
+        let excludes = parse_exclude_patterns(&app.workspace, Some(root));
+        for f in list_workspace_files(root, per_root, &excludes) {
+            let display = if multi_root && !label.is_empty() {
+                format!("{}/{}", label, f)
+            } else {
+                f
+            };
+            if seen.insert(display.clone()) {
+                files.push(display);
+            }
+        }
+    }
+
+    let files: Vec<String> = files
         .into_iter()
         .filter(|f| !is_run_path_context || f.ends_with(".gaviero"))
         .collect();
@@ -1520,12 +1585,54 @@ pub(super) fn send_chat_message(app: &mut App) {
     let tx = app.event_tx.clone();
     let wg = app.write_gate.clone();
 
+    let named_roots: Vec<(String, std::path::PathBuf)> = {
+        let folders = app.workspace.folders();
+        if folders.is_empty() {
+            vec![(String::new(), root.clone())]
+        } else {
+            folders
+                .iter()
+                .map(|f| (f.display_name().to_string(), f.path.clone()))
+                .collect()
+        }
+    };
+    let multi_root = named_roots.len() > 1;
+    let labels = unique_root_labels(&named_roots);
     let refs = crate::panels::agent_chat::parse_file_references(&prompt);
     let mut file_refs: Vec<(String, String)> = Vec::new();
     for rel_path in &refs {
-        let abs_path = root.join(rel_path);
-        if let Ok(content) = std::fs::read_to_string(&abs_path) {
-            file_refs.push((rel_path.clone(), content));
+        // If multi-root and the ref starts with "<label>/", resolve it to that root only.
+        // Labels can themselves contain '/', so we match the longest label first.
+        let mut resolved = false;
+        if multi_root {
+            let mut idxs: Vec<usize> = (0..labels.len()).collect();
+            idxs.sort_by_key(|&i| std::cmp::Reverse(labels[i].len()));
+            for i in idxs {
+                let label = &labels[i];
+                if label.is_empty() {
+                    continue;
+                }
+                if let Some(tail) = rel_path
+                    .strip_prefix(label)
+                    .and_then(|t| t.strip_prefix('/'))
+                {
+                    let abs_path = named_roots[i].1.join(tail);
+                    if let Ok(content) = std::fs::read_to_string(&abs_path) {
+                        file_refs.push((rel_path.clone(), content));
+                        resolved = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !resolved {
+            for (_, r) in &named_roots {
+                let abs_path = r.join(rel_path);
+                if let Ok(content) = std::fs::read_to_string(&abs_path) {
+                    file_refs.push((rel_path.clone(), content));
+                    break;
+                }
+            }
         }
     }
 
