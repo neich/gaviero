@@ -442,6 +442,9 @@ pub fn is_terminal_escape_key(key: &KeyEvent) -> bool {
         // Alt+Up/Down — terminal resize
         | (KeyCode::Up, false, true, false)           // Alt+Up — grow terminal
         | (KeyCode::Down, false, true, false)         // Alt+Down — shrink terminal
+        // Alt+O/I — cycle terminal tabs (forward/back)
+        | (KeyCode::Char('o'), false, true, false)
+        | (KeyCode::Char('i'), false, true, false)
         // Shift+PageUp/PageDown — page scroll in terminal
         | (KeyCode::PageUp, false, false, true)       // Shift+PageUp — page scroll back
         | (KeyCode::PageDown, false, false, true)     // Shift+PageDown — page scroll forward
