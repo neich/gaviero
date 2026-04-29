@@ -939,6 +939,22 @@ pub(super) fn handle_memory_panel_action(app: &mut App, action: Action) {
 
     match action {
         Action::Tab => app.memory_panel.focus_next(),
+        Action::CycleTabForward => {
+            let to_deletions = app.memory_panel.cycle_kind_tab(true);
+            if to_deletions {
+                refresh_deletions_rows(app);
+            } else {
+                refresh_recent_rows_for_kind(app);
+            }
+        }
+        Action::CycleTabBack => {
+            let to_deletions = app.memory_panel.cycle_kind_tab(false);
+            if to_deletions {
+                refresh_deletions_rows(app);
+            } else {
+                refresh_recent_rows_for_kind(app);
+            }
+        }
         Action::CursorDown => cursor_down_in_focus(app),
         Action::CursorUp => cursor_up_in_focus(app),
         // C1.5: kind-tab switching. Refresh of `recent_rows` is
@@ -1454,7 +1470,7 @@ pub(super) fn refresh_chat_autocomplete(app: &mut App) {
         at_pos <= text.len() && text[..at_pos].trim() == "/run"
     };
 
-    let excludes = parse_exclude_patterns(&app.workspace);
+    let excludes = parse_exclude_patterns(&app.workspace, Some(&root));
     let files: Vec<String> = list_workspace_files(&root, 2000, &excludes)
         .into_iter()
         .filter(|f| !is_run_path_context || f.ends_with(".gaviero"))
