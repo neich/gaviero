@@ -1137,7 +1137,20 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             ) {
                 app.terminal_selection.clear();
             }
-            app.terminal_manager.process_event(term_event);
+            // When the shell exits, close the tab rather than letting
+            // render_terminal re-spawn it on the next frame.
+            if let gaviero_core::terminal::TerminalEvent::PtyExited { id, .. } = &term_event {
+                let exited_id = *id;
+                app.terminal_manager.close_tab(exited_id);
+                if app.terminal_manager.is_empty() {
+                    app.panel_visible.terminal = false;
+                    if app.focus == Focus::Terminal {
+                        app.focus = Focus::Editor;
+                    }
+                }
+            } else {
+                app.terminal_manager.process_event(term_event);
+            }
         }
         Event::Tick => {
             app.terminal_manager.tick();
