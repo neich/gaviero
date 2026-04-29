@@ -217,55 +217,86 @@ pub fn parse_stream_line(line: &str) -> Result<StreamEvent> {
 
 /// Try to extract the next complete `<file>` block starting at `from` offset.
 /// Returns `(path, content, end_position)` if a complete block is found.
+///
+/// Skips opener candidates inside fenced markdown code blocks (``` and ~~~)
+/// so illustrative examples in chat prose aren't applied as real proposals.
+/// Also rejects malformed paths (empty, absolute, or containing `..`
+/// traversal segments) — silently advancing past the offending opener.
 pub fn find_next_file_block(text: &str, from: usize) -> Option<(PathBuf, String, usize)> {
-    let search = &text[from..];
+    let regions = fenced_code_regions(text);
+    let mut start = from;
+    loop {
+        let rel = text[start..].find("<file path=\"")?;
+        let tag_start = start + rel;
 
-    let tag_start = search.find("<file path=\"")?;
-    let tag_start = from + tag_start;
-    let after_attr = tag_start + "<file path=\"".len();
+        if let Some(end) = region_end_containing(&regions, tag_start) {
+            start = end;
+            continue;
+        }
 
-    let quote_end = text[after_attr..].find('"')?;
-    let path_str = &text[after_attr..after_attr + quote_end];
+        let after_attr = tag_start + "<file path=\"".len();
+        let quote_end = text[after_attr..].find('"')?;
+        let path_str = &text[after_attr..after_attr + quote_end];
 
-    let tag_close = after_attr + quote_end + 1;
-    if tag_close >= text.len() || text.as_bytes()[tag_close] != b'>' {
-        return None;
+        if !is_valid_proposal_path(path_str) {
+            tracing::warn!(
+                "Skipping file-block proposal with invalid path attribute: {:?}",
+                path_str
+            );
+            start = after_attr + quote_end + 1;
+            continue;
+        }
+
+        let tag_close = after_attr + quote_end + 1;
+        if tag_close >= text.len() || text.as_bytes()[tag_close] != b'>' {
+            return None;
+        }
+        let mut content_start = tag_close + 1;
+
+        // Strip leading newline
+        if text[content_start..].starts_with('\n') {
+            content_start += 1;
+        }
+
+        let close_pos = text[content_start..].find("</file>")?;
+        let mut content_end = content_start + close_pos;
+
+        // Strip trailing newline
+        if content_end > content_start && text.as_bytes()[content_end - 1] == b'\n' {
+            content_end -= 1;
+        }
+
+        let content = text[content_start..content_end].to_string();
+        let block_end = content_start + close_pos + "</file>".len();
+        return Some((PathBuf::from(path_str), content, block_end));
     }
-    let mut content_start = tag_close + 1;
-
-    // Strip leading newline
-    if text[content_start..].starts_with('\n') {
-        content_start += 1;
-    }
-
-    let close_pos = text[content_start..].find("</file>")?;
-    let mut content_end = content_start + close_pos;
-
-    // Strip trailing newline
-    if content_end > content_start && text.as_bytes()[content_end - 1] == b'\n' {
-        content_end -= 1;
-    }
-
-    let content = text[content_start..content_end].to_string();
-    let block_end = content_start + close_pos + "</file>".len();
-
-    Some((PathBuf::from(path_str), content, block_end))
 }
 
 /// Extract `<file path="...">content</file>` blocks from text.
 ///
 /// The system prompt instructs Claude to output proposed file changes
 /// in this format. We parse them and route each through the Write Gate.
+///
+/// Same protections as [`find_next_file_block`]: openers inside fenced code
+/// blocks are skipped, and paths that are empty / absolute / contain `..`
+/// traversal segments are rejected.
 pub fn parse_file_blocks(text: &str) -> Vec<(PathBuf, String)> {
+    let regions = fenced_code_regions(text);
     let mut results = Vec::new();
     let mut search_from = 0;
 
     loop {
         // Find opening tag: <file path="...">
-        let Some(tag_start) = text[search_from..].find("<file path=\"") else {
+        let Some(rel) = text[search_from..].find("<file path=\"") else {
             break;
         };
-        let tag_start = search_from + tag_start;
+        let tag_start = search_from + rel;
+
+        if let Some(end) = region_end_containing(&regions, tag_start) {
+            search_from = end;
+            continue;
+        }
+
         let after_attr = tag_start + "<file path=\"".len();
 
         // Find closing quote of path attribute
@@ -273,6 +304,15 @@ pub fn parse_file_blocks(text: &str) -> Vec<(PathBuf, String)> {
             break;
         };
         let path_str = &text[after_attr..after_attr + quote_end];
+
+        if !is_valid_proposal_path(path_str) {
+            tracing::warn!(
+                "Skipping file-block proposal with invalid path attribute: {:?}",
+                path_str
+            );
+            search_from = after_attr + quote_end + 1;
+            continue;
+        }
 
         // Find end of opening tag (the `>`)
         let tag_close = after_attr + quote_end + 1;
@@ -310,6 +350,136 @@ pub fn parse_file_blocks(text: &str) -> Vec<(PathBuf, String)> {
     }
 
     results
+}
+
+/// Whether `path_str` is acceptable as a proposal target.
+///
+/// Reject empty, absolute, traversal (`..`), and any embedded control
+/// characters / quotes / angle brackets. The checks ensure that the
+/// resulting `workspace_root.join(path)` stays inside the workspace and
+/// can't be subverted by hallucinated paths in chat output.
+fn is_valid_proposal_path(path_str: &str) -> bool {
+    if path_str.is_empty() {
+        return false;
+    }
+    if path_str.chars().any(|c| {
+        c == '\0'
+            || c == '"'
+            || c == '<'
+            || c == '>'
+            || c == '\n'
+            || c == '\r'
+            || ((c as u32) < 0x20 && c != '\t')
+    }) {
+        return false;
+    }
+    let p = std::path::Path::new(path_str);
+    if p.is_absolute() {
+        return false;
+    }
+    for comp in p.components() {
+        match comp {
+            std::path::Component::ParentDir
+            | std::path::Component::Prefix(_)
+            | std::path::Component::RootDir => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+fn region_end_containing(regions: &[(usize, usize)], pos: usize) -> Option<usize> {
+    regions
+        .iter()
+        .find(|(s, e)| pos >= *s && pos < *e)
+        .map(|(_, e)| *e)
+}
+
+/// Compute byte ranges of fenced markdown code blocks in `text`.
+///
+/// Each range is `[line_start, close_line_end_exclusive)` and covers from
+/// the opening fence line through the closing fence line. Unclosed fences
+/// extend to EOF. Recognises both ``` and ~~~ fences and tolerates up to
+/// 3 leading spaces of indentation per CommonMark.
+///
+/// The parser uses these regions to suppress `<file>` openers found inside
+/// fenced examples — the most common source of accidental proposals when
+/// the agent quotes the format back to the user.
+fn fenced_code_regions(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut regions = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let line_start = i;
+        let mut p = i;
+        let mut indent = 0;
+        while p < bytes.len() && bytes[p] == b' ' && indent < 3 {
+            p += 1;
+            indent += 1;
+        }
+        let fence_char = if p + 3 <= bytes.len() && &bytes[p..p + 3] == b"```" {
+            Some(b'`')
+        } else if p + 3 <= bytes.len() && &bytes[p..p + 3] == b"~~~" {
+            Some(b'~')
+        } else {
+            None
+        };
+        if let Some(fc) = fence_char {
+            let mut fence_len = 0;
+            while p + fence_len < bytes.len() && bytes[p + fence_len] == fc {
+                fence_len += 1;
+            }
+            let after_open_line = match bytes[p + fence_len..].iter().position(|&b| b == b'\n') {
+                Some(n) => p + fence_len + n + 1,
+                None => bytes.len(),
+            };
+            let mut k = after_open_line;
+            let mut close_end = bytes.len();
+            while k < bytes.len() {
+                let ls = k;
+                let mut q = ls;
+                let mut ind = 0;
+                while q < bytes.len() && bytes[q] == b' ' && ind < 3 {
+                    q += 1;
+                    ind += 1;
+                }
+                if q + fence_len <= bytes.len()
+                    && bytes[q..q + fence_len].iter().all(|&c| c == fc)
+                {
+                    let after = q + fence_len;
+                    let line_end = bytes[after..]
+                        .iter()
+                        .position(|&b| b == b'\n')
+                        .map(|n| after + n)
+                        .unwrap_or(bytes.len());
+                    if bytes[after..line_end]
+                        .iter()
+                        .all(|&b| b == b' ' || b == b'\t')
+                    {
+                        close_end = line_end;
+                        k = if line_end < bytes.len() {
+                            line_end + 1
+                        } else {
+                            bytes.len()
+                        };
+                        break;
+                    }
+                }
+                k = match bytes[ls..].iter().position(|&b| b == b'\n') {
+                    Some(n) => ls + n + 1,
+                    None => bytes.len(),
+                };
+            }
+            regions.push((line_start, close_end));
+            i = k;
+            continue;
+        }
+        i = match bytes[i..].iter().position(|&b| b == b'\n') {
+            Some(n) => i + n + 1,
+            None => bytes.len(),
+        };
+    }
+    regions
 }
 
 #[cfg(test)]
@@ -411,5 +581,121 @@ bbb
         let text = "No file blocks here.";
         let blocks = parse_file_blocks(text);
         assert!(blocks.is_empty());
+    }
+
+    // Regression: triple-backtick fenced examples must not be parsed as
+    // real proposals — common failure mode when the agent quotes the
+    // format back to the user. See acp/protocol.rs::fenced_code_regions.
+    #[test]
+    fn test_parse_file_blocks_skips_triple_backtick_fence() {
+        let text = "Format example:\n\
+                    ```\n\
+                    <file path=\"src/example.rs\">illustrative body</file>\n\
+                    ```\n\
+                    end.";
+        let blocks = parse_file_blocks(text);
+        assert!(
+            blocks.is_empty(),
+            "fenced examples must not parse; got {blocks:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_file_blocks_skips_tilde_fence() {
+        let text = "Format example:\n\
+                    ~~~\n\
+                    <file path=\"src/example.rs\">illustrative body</file>\n\
+                    ~~~\n\
+                    end.";
+        let blocks = parse_file_blocks(text);
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn test_parse_file_blocks_skips_fenced_with_lang_tag() {
+        // Code-fence info string after the opener (```xml, ```rust, etc.)
+        // is the typical form when explaining the format.
+        let text = "```xml\n<file path=\"a.rs\">ex</file>\n```";
+        let blocks = parse_file_blocks(text);
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn test_parse_file_blocks_fenced_then_real() {
+        // Fenced example is ignored; the unfenced block after it is real.
+        let text = "Example:\n\
+                    ```xml\n\
+                    <file path=\"a.rs\">ex</file>\n\
+                    ```\n\
+                    Real:\n\
+                    <file path=\"b.rs\">\n\
+                    fn main() {}\n\
+                    </file>";
+        let blocks = parse_file_blocks(text);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].0, PathBuf::from("b.rs"));
+        assert_eq!(blocks[0].1, "fn main() {}");
+    }
+
+    #[test]
+    fn test_parse_file_blocks_rejects_empty_path() {
+        let text = "<file path=\"\">junk</file>\n<file path=\"v.rs\">code</file>";
+        let blocks = parse_file_blocks(text);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].0, PathBuf::from("v.rs"));
+    }
+
+    #[test]
+    fn test_parse_file_blocks_rejects_absolute_path() {
+        let text = "<file path=\"/etc/passwd\">root</file>";
+        let blocks = parse_file_blocks(text);
+        assert!(blocks.is_empty(), "absolute paths must be rejected");
+    }
+
+    #[test]
+    fn test_parse_file_blocks_rejects_traversal() {
+        let text = "<file path=\"../../etc/passwd\">root</file>";
+        let blocks = parse_file_blocks(text);
+        assert!(blocks.is_empty(), "traversal paths must be rejected");
+    }
+
+    #[test]
+    fn test_parse_file_blocks_rejects_path_with_angle_brackets() {
+        let text = "<file path=\"a<b\">x</file>";
+        let blocks = parse_file_blocks(text);
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn test_find_next_file_block_skips_fenced_block() {
+        let text = "Format:\n\
+                    ```\n\
+                    <file path=\"ex.rs\">ex</file>\n\
+                    ```\n\
+                    Then:\n\
+                    <file path=\"real.rs\">code</file>";
+        let result = find_next_file_block(text, 0);
+        assert!(result.is_some(), "real block should be found");
+        let (path, content, _end) = result.unwrap();
+        assert_eq!(path, PathBuf::from("real.rs"));
+        assert_eq!(content, "code");
+    }
+
+    #[test]
+    fn test_find_next_file_block_rejects_absolute_path_returns_next_valid() {
+        let text = "<file path=\"/etc/passwd\">root</file>\n<file path=\"ok.rs\">x</file>";
+        let result = find_next_file_block(text, 0);
+        assert!(result.is_some());
+        let (path, _content, _end) = result.unwrap();
+        assert_eq!(path, PathBuf::from("ok.rs"));
+    }
+
+    #[test]
+    fn test_fenced_code_regions_unclosed_extends_to_eof() {
+        let text = "before\n```\ndangling forever";
+        let regions = fenced_code_regions(text);
+        assert_eq!(regions.len(), 1);
+        let (_, e) = regions[0];
+        assert_eq!(e, text.len());
     }
 }
