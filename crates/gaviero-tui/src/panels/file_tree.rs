@@ -93,7 +93,7 @@ impl FileTreeState {
                     if is_git_dir && !self.git_allow_list.is_empty() {
                         self.is_allowed_in_git(&name)
                     } else {
-                        !self.is_excluded(&name)
+                        true
                     }
                 })
                 .map(|e| {
@@ -139,13 +139,7 @@ impl FileTreeState {
     fn compact_single_child(&self, entry: &mut FileTreeEntry) {
         for _ in 0..10 {
             let sub_entries: Vec<_> = match std::fs::read_dir(&entry.path) {
-                Ok(rd) => rd
-                    .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        let name = e.file_name().to_string_lossy().to_string();
-                        !self.is_excluded(&name)
-                    })
-                    .collect(),
+                Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
                 Err(_) => break,
             };
             if sub_entries.len() == 1 && sub_entries[0].path().is_dir() {
@@ -156,21 +150,6 @@ impl FileTreeState {
                 break;
             }
         }
-    }
-
-    /// Check if a filename matches any exclude pattern.
-    /// All patterns come from user settings — no hardcoded defaults.
-    fn is_excluded(&self, name: &str) -> bool {
-        for pattern in &self.exclude_patterns {
-            let pat = pattern.trim_start_matches("**/");
-            if name == pat {
-                return true;
-            }
-            if name.starts_with('.') && pattern == ".*" {
-                return true;
-            }
-        }
-        false
     }
 
     /// Check if entry is allowed inside a `.git` directory.
