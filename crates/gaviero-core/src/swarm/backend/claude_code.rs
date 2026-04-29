@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use futures::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::acp::protocol::{StreamEvent, find_next_file_block, parse_file_blocks};
+use crate::acp::protocol::StreamEvent;
 use crate::acp::session::{AcpSession, AgentOptions};
 
 use super::shared::request_prompt;
@@ -114,7 +114,11 @@ impl AgentBackend for ClaudeCodeBackend {
             extended_thinking: true,
             max_context_tokens: 200_000,
             supports_system_prompt: true,
-            supports_file_blocks: true,
+            // Claude proposes file edits via native Write/Edit/MultiEdit
+            // tool calls — never via in-band <file> markup. Setting this
+            // false suppresses the file-block instruction in the system
+            // prompt (see swarm::backend::shared::default_editor_system_prompt).
+            supports_file_blocks: false,
         }
     }
 
@@ -137,17 +141,18 @@ impl AgentBackend for ClaudeCodeBackend {
 }
 
 /// Drive the ACP session to completion, sending unified events through the channel.
+///
+/// Claude proposals flow through native tool calls (`Write`/`Edit`/`MultiEdit`),
+/// not through in-band file-block markup. The text stream is forwarded as
+/// `TextDelta` only; no in-band parser runs here.
 async fn drive_session(
     mut session: AcpSession,
     tx: tokio::sync::mpsc::Sender<Result<UnifiedStreamEvent>>,
 ) -> Result<()> {
-    let mut full_text = String::new();
-    let mut file_scan_pos: usize = 0;
-
     loop {
         match session.next_event().await {
             Ok(Some(event)) => {
-                let unified = map_acp_event(&event, &mut full_text, &mut file_scan_pos);
+                let unified = map_acp_event(&event);
                 for ev in unified {
                     if tx.send(Ok(ev)).await.is_err() {
                         return Ok(()); // receiver dropped
@@ -160,16 +165,6 @@ async fn drive_session(
                 }
             }
             Ok(None) => {
-                // Process exited without ResultEvent
-                if !full_text.is_empty() {
-                    // Emit any remaining file blocks
-                    let remaining = parse_file_blocks(&full_text[file_scan_pos..]);
-                    for (path, content) in remaining {
-                        let _ = tx
-                            .send(Ok(UnifiedStreamEvent::FileBlock { path, content }))
-                            .await;
-                    }
-                }
                 let _ = tx
                     .send(Ok(UnifiedStreamEvent::Done(StopReason::EndTurn)))
                     .await;
@@ -187,38 +182,21 @@ async fn drive_session(
         }
     }
 
-    // Drain remaining file blocks from accumulated text
-    let remaining = parse_file_blocks(&full_text[file_scan_pos..]);
-    for (path, content) in remaining {
-        let _ = tx
-            .send(Ok(UnifiedStreamEvent::FileBlock { path, content }))
-            .await;
-    }
-
     let _ = session.wait().await;
     Ok(())
 }
 
 /// Map a single ACP protocol event into zero or more unified events.
 ///
-/// This is a pure function (aside from accumulating `full_text`) for testability.
-pub fn map_acp_event(
-    event: &StreamEvent,
-    full_text: &mut String,
-    file_scan_pos: &mut usize,
-) -> Vec<UnifiedStreamEvent> {
+/// Pure function for testability. Claude file edits flow exclusively through
+/// native tool calls (`Write`/`Edit`/`MultiEdit`); this mapper never emits
+/// `UnifiedStreamEvent::FileBlock` from text content.
+pub fn map_acp_event(event: &StreamEvent) -> Vec<UnifiedStreamEvent> {
     let mut out = Vec::new();
 
     match event {
         StreamEvent::ContentDelta(text) => {
-            full_text.push_str(text);
             out.push(UnifiedStreamEvent::TextDelta(text.clone()));
-
-            // Detect complete <file> blocks incrementally
-            while let Some((path, content, end)) = find_next_file_block(full_text, *file_scan_pos) {
-                *file_scan_pos = end;
-                out.push(UnifiedStreamEvent::FileBlock { path, content });
-            }
         }
         StreamEvent::ToolUseStart {
             tool_name,
@@ -239,13 +217,7 @@ pub fn map_acp_event(
                 args_chunk: json.clone(),
             });
         }
-        StreamEvent::AssistantMessage { text, tool_uses } => {
-            // If we didn't get content deltas, use the complete text
-            if full_text.is_empty() && !text.is_empty() {
-                *full_text = text.clone();
-                // Don't emit TextDelta here — the runner already got the deltas
-                // or will use full_text at completion.
-            }
+        StreamEvent::AssistantMessage { tool_uses, .. } => {
             // Emit ToolCallEnd for each tool use (the full input is available)
             for tu in tool_uses {
                 out.push(UnifiedStreamEvent::ToolCallEnd {
@@ -294,35 +266,21 @@ pub fn map_acp_event(
 mod tests {
     use super::*;
     use crate::acp::protocol::ToolUseInfo;
-    use std::path::PathBuf;
 
     // Test 6: ACP → Unified event mapping (all variants)
     #[test]
     fn test_map_content_delta() {
-        let mut text = String::new();
-        let mut pos = 0;
-        let events = map_acp_event(
-            &StreamEvent::ContentDelta("hello".into()),
-            &mut text,
-            &mut pos,
-        );
+        let events = map_acp_event(&StreamEvent::ContentDelta("hello".into()));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0], UnifiedStreamEvent::TextDelta("hello".into()));
-        assert_eq!(text, "hello");
     }
 
     #[test]
     fn test_map_tool_use_start() {
-        let mut text = String::new();
-        let mut pos = 0;
-        let events = map_acp_event(
-            &StreamEvent::ToolUseStart {
-                tool_name: "Read".into(),
-                tool_use_id: "t1".into(),
-            },
-            &mut text,
-            &mut pos,
-        );
+        let events = map_acp_event(&StreamEvent::ToolUseStart {
+            tool_name: "Read".into(),
+            tool_use_id: "t1".into(),
+        });
         assert_eq!(events.len(), 1);
         assert_eq!(
             events[0],
@@ -335,13 +293,7 @@ mod tests {
 
     #[test]
     fn test_map_tool_input_delta() {
-        let mut text = String::new();
-        let mut pos = 0;
-        let events = map_acp_event(
-            &StreamEvent::ToolInputDelta(r#"{"file_path":"#.into()),
-            &mut text,
-            &mut pos,
-        );
+        let events = map_acp_event(&StreamEvent::ToolInputDelta(r#"{"file_path":"#.into()));
         assert_eq!(events.len(), 1);
         assert!(
             matches!(&events[0], UnifiedStreamEvent::ToolCallDelta { args_chunk, .. } if args_chunk == r#"{"file_path":"#)
@@ -350,18 +302,12 @@ mod tests {
 
     #[test]
     fn test_map_result_success() {
-        let mut text = String::new();
-        let mut pos = 0;
-        let events = map_acp_event(
-            &StreamEvent::ResultEvent {
-                is_error: false,
-                result_text: "ok".into(),
-                duration_ms: Some(1500),
-                cost_usd: Some(0.02),
-            },
-            &mut text,
-            &mut pos,
-        );
+        let events = map_acp_event(&StreamEvent::ResultEvent {
+            is_error: false,
+            result_text: "ok".into(),
+            duration_ms: Some(1500),
+            cost_usd: Some(0.02),
+        });
         assert_eq!(events.len(), 2);
         assert!(
             matches!(&events[0], UnifiedStreamEvent::Usage(u) if u.cost_usd == Some(0.02) && u.duration_ms == Some(1500))
@@ -371,18 +317,12 @@ mod tests {
 
     #[test]
     fn test_map_result_error() {
-        let mut text = String::new();
-        let mut pos = 0;
-        let events = map_acp_event(
-            &StreamEvent::ResultEvent {
-                is_error: true,
-                result_text: "rate limit".into(),
-                duration_ms: None,
-                cost_usd: None,
-            },
-            &mut text,
-            &mut pos,
-        );
+        let events = map_acp_event(&StreamEvent::ResultEvent {
+            is_error: true,
+            result_text: "rate limit".into(),
+            duration_ms: None,
+            cost_usd: None,
+        });
         assert_eq!(events.len(), 2);
         assert_eq!(events[0], UnifiedStreamEvent::Error("rate limit".into()));
         assert_eq!(events[1], UnifiedStreamEvent::Done(StopReason::Error));
@@ -390,46 +330,28 @@ mod tests {
 
     #[test]
     fn test_map_system_init_filtered() {
-        let mut text = String::new();
-        let mut pos = 0;
-        let events = map_acp_event(
-            &StreamEvent::SystemInit {
-                session_id: "s1".into(),
-                model: "sonnet".into(),
-            },
-            &mut text,
-            &mut pos,
-        );
+        let events = map_acp_event(&StreamEvent::SystemInit {
+            session_id: "s1".into(),
+            model: "sonnet".into(),
+        });
         assert!(events.is_empty());
     }
 
     #[test]
     fn test_map_unknown_filtered() {
-        let mut text = String::new();
-        let mut pos = 0;
-        let events = map_acp_event(
-            &StreamEvent::Unknown(serde_json::json!({"type": "foo"})),
-            &mut text,
-            &mut pos,
-        );
+        let events = map_acp_event(&StreamEvent::Unknown(serde_json::json!({"type": "foo"})));
         assert!(events.is_empty());
     }
 
     #[test]
     fn test_map_assistant_message_emits_tool_end() {
-        let mut text = String::new();
-        let mut pos = 0;
-        let events = map_acp_event(
-            &StreamEvent::AssistantMessage {
-                text: "done".into(),
-                tool_uses: vec![ToolUseInfo {
-                    name: "Read".into(),
-                    input: serde_json::json!({"file_path": "src/lib.rs"}),
-                }],
-            },
-            &mut text,
-            &mut pos,
-        );
+        let events = map_acp_event(&StreamEvent::AssistantMessage {
+            text: "done".into(),
+            tool_uses: vec![ToolUseInfo {
+                name: "Read".into(),
+                input: serde_json::json!({"file_path": "src/lib.rs"}),
+            }],
+        });
         assert_eq!(events.len(), 1);
         assert_eq!(
             events[0],
@@ -437,58 +359,29 @@ mod tests {
         );
     }
 
-    // Test 7: File block detection in text stream
+    // Regression: in-band file-block markup in the assistant text stream
+    // must NOT produce FileBlock events on the Claude path. Claude file
+    // edits flow through native tool calls only.
     #[test]
-    fn test_file_block_detection_in_stream() {
-        let mut text = String::new();
-        let mut pos = 0;
-
-        // First chunk: partial text with file block
-        let chunk = "Here:\n<file path=\"src/main.rs\">\nfn main() {}\n</file>\nDone.";
-        let events = map_acp_event(
-            &StreamEvent::ContentDelta(chunk.into()),
-            &mut text,
-            &mut pos,
+    fn test_text_stream_does_not_emit_file_blocks() {
+        let chunk = "Here:\n<example path=\"a.rs\">body</example>\nDone.";
+        let events = map_acp_event(&StreamEvent::ContentDelta(chunk.into()));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], UnifiedStreamEvent::TextDelta(_)));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, UnifiedStreamEvent::FileBlock { .. })),
+            "Claude path must never emit FileBlock from text"
         );
-
-        // Should have TextDelta + FileBlock
-        assert!(events.len() >= 2);
-        assert_eq!(events[0], UnifiedStreamEvent::TextDelta(chunk.into()));
-        assert!(matches!(
-            &events[1],
-            UnifiedStreamEvent::FileBlock { path, content }
-                if path == &PathBuf::from("src/main.rs") && content.contains("fn main()")
-        ));
     }
 
-    // Test 8: Partial file block across chunks
     #[test]
-    fn test_partial_file_block_across_chunks() {
-        let mut text = String::new();
-        let mut pos = 0;
-
-        // First chunk: opening tag only
-        let events1 = map_acp_event(
-            &StreamEvent::ContentDelta("<file path=\"src/lib.rs\">\nmod".into()),
-            &mut text,
-            &mut pos,
+    fn test_capabilities_disable_in_band_file_blocks() {
+        let backend = ClaudeCodeBackend::new("sonnet");
+        assert!(
+            !backend.capabilities().supports_file_blocks,
+            "Claude must not advertise in-band file-block support"
         );
-        // No FileBlock yet — block is incomplete
-        assert_eq!(events1.len(), 1); // just TextDelta
-        assert!(matches!(&events1[0], UnifiedStreamEvent::TextDelta(_)));
-
-        // Second chunk: closes the block
-        let events2 = map_acp_event(
-            &StreamEvent::ContentDelta(" tests;\n</file>".into()),
-            &mut text,
-            &mut pos,
-        );
-        // Now we should get TextDelta + FileBlock
-        assert!(events2.len() >= 2);
-        assert!(events2.iter().any(|e| matches!(
-            e,
-            UnifiedStreamEvent::FileBlock { path, content }
-                if path == &PathBuf::from("src/lib.rs") && content.contains("mod tests;")
-        )));
     }
 }
