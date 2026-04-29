@@ -519,9 +519,11 @@ pub(super) fn select_path_in_tree(app: &mut App, path: &std::path::Path) {
 }
 
 pub(super) fn refresh_file_tree(app: &mut App) {
-    let excludes = parse_exclude_patterns(&app.workspace);
+    let excludes = parse_exclude_patterns(&app.workspace, None);
     let git_allow = parse_git_allow_list(&app.workspace);
-    let roots: Vec<&std::path::Path> = app.workspace.roots();
+    let config_roots = app.workspace.config_roots();
+    let mut roots: Vec<&std::path::Path> = config_roots.iter().map(|p| p.as_path()).collect();
+    roots.extend(app.workspace.roots());
     let expanded = app.file_tree.expanded_paths();
     let selected = app.file_tree.scroll.selected;
     app.file_tree = FileTreeState::from_roots(&roots, &excludes, &git_allow);
