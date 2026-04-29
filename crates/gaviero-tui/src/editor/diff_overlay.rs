@@ -428,6 +428,7 @@ mod tests {
             proposed_content: proposed.into(),
             structural_hunks,
             status: ProposalStatus::Pending,
+            is_deletion: false,
         }
     }
 

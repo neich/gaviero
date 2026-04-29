@@ -25,6 +25,9 @@ pub struct ReviewProposal {
     pub new_content: String,
     pub additions: usize,
     pub deletions: usize,
+    /// True when accepting the proposal removes the file from disk rather
+    /// than writing `new_content`.
+    pub is_deletion: bool,
 }
 
 pub struct BatchReviewState {

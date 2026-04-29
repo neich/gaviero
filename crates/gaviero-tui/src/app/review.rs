@@ -11,7 +11,8 @@ enum ApplyOutcome {
     Failed { path: std::path::PathBuf, error: String },
 }
 
-/// Apply a proposal's new content to disk, with two safeguards:
+/// Apply a proposal to disk, with stale-check, atomic-ish write, and
+/// (for writes) parent-dir creation:
 ///
 /// 1. **Stale check.** If `expected_old` is `Some` it must match the current
 ///    on-disk content; otherwise we abort to avoid silently overwriting an
@@ -23,10 +24,23 @@ enum ApplyOutcome {
 ///    the path's parent directory is missing, we create it before writing.
 ///    Without this, accepting a new-file proposal in batch mode used to
 ///    fail silently with a `tracing::error!` and no user feedback.
+///
+/// 3. **Delete vs write.** When `is_deletion` is true the function calls
+///    `fs::remove_file` instead of writing. `new_content` is ignored in
+///    that branch.
+///
+/// 4. **TOCTOU narrowing.** New-file creates use `O_EXCL` so a path that
+///    materialised between the stale-check and the write fails cleanly
+///    instead of clobbering. Existing-file writes go through a sibling
+///    tempfile + atomic `rename`, with a re-read drift check immediately
+///    before the rename. The rename itself is atomic on POSIX same-fs
+///    moves; the re-read narrows (does not fully close) the window
+///    between the initial stale-check and the rename.
 fn apply_proposal_to_disk(
     path: &std::path::Path,
     expected_old: Option<&str>,
     new_content: &str,
+    is_deletion: bool,
 ) -> ApplyOutcome {
     use std::path::PathBuf;
 
@@ -47,29 +61,122 @@ fn apply_proposal_to_disk(
         };
     }
 
-    // New-file proposal: ensure parent directory exists. The original
-    // verbatim std::fs::write call failed silently when accepting a
-    // proposal whose parent directory hadn't been created yet.
-    if expected_old.is_none()
-        && let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-        && !parent.exists()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        return ApplyOutcome::Failed {
-            path: PathBuf::from(parent),
-            error: format!("creating parent directory: {}", e),
+    if is_deletion {
+        return match std::fs::remove_file(path) {
+            Ok(()) => ApplyOutcome::Written,
+            // Already gone — treat as success (idempotent delete).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ApplyOutcome::Written,
+            Err(e) => ApplyOutcome::Failed {
+                path: path.to_path_buf(),
+                error: e.to_string(),
+            },
         };
     }
 
-    if let Err(e) = std::fs::write(path, new_content) {
+    // New-file proposal: ensure parent directory exists, then create
+    // exclusively so a concurrent writer that materialised the path
+    // between the stale-check and now fails the open with AlreadyExists
+    // (we surface it as Stale).
+    if expected_old.is_none() {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            return ApplyOutcome::Failed {
+                path: PathBuf::from(parent),
+                error: format!("creating parent directory: {}", e),
+            };
+        }
+        return match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(mut f) => {
+                use std::io::Write;
+                if let Err(e) = f.write_all(new_content.as_bytes()) {
+                    let _ = std::fs::remove_file(path);
+                    return ApplyOutcome::Failed {
+                        path: path.to_path_buf(),
+                        error: e.to_string(),
+                    };
+                }
+                ApplyOutcome::Written
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => ApplyOutcome::Stale {
+                path: path.to_path_buf(),
+            },
+            Err(e) => ApplyOutcome::Failed {
+                path: path.to_path_buf(),
+                error: e.to_string(),
+            },
+        };
+    }
+
+    // Existing-file overwrite: tempfile-then-rename, with a final drift
+    // check immediately before the rename. This narrows the TOCTOU
+    // window left open by the simple read-then-write pattern.
+    let tmp_path = temp_sibling_path(path);
+    if let Err(e) = std::fs::write(&tmp_path, new_content) {
+        return ApplyOutcome::Failed {
+            path: tmp_path,
+            error: e.to_string(),
+        };
+    }
+    let recheck = match std::fs::read_to_string(path) {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            return ApplyOutcome::Failed {
+                path: path.to_path_buf(),
+                error: format!("re-reading before rename: {}", e),
+            };
+        }
+    };
+    if recheck.as_deref() != expected_old {
+        let _ = std::fs::remove_file(&tmp_path);
+        return ApplyOutcome::Stale {
+            path: path.to_path_buf(),
+        };
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
         return ApplyOutcome::Failed {
             path: path.to_path_buf(),
-            error: e.to_string(),
+            error: format!("rename {}: {}", tmp_path.display(), e),
         };
     }
 
     ApplyOutcome::Written
+}
+
+/// Build a sibling tempfile path for the atomic rename pattern. The path
+/// is a hidden dotfile next to `target`, suffixed with the pid and a
+/// monotonic nanosecond stamp so concurrent finalize calls don't collide.
+fn temp_sibling_path(target: &std::path::Path) -> std::path::PathBuf {
+    use std::ffi::OsString;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let stem = target
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_else(|| OsString::from("file"));
+    let mut name = OsString::from(".gaviero-tmp-");
+    name.push(&stem);
+    name.push(format!("-{}-{}", pid, nanos));
+    parent.join(name)
 }
 
 pub(super) fn handle_review_action(app: &mut App, action: &Action) -> bool {
@@ -178,6 +285,7 @@ pub(super) fn finalize_current_review(app: &mut App) {
             hunk.status = gaviero_core::types::HunkStatus::Accepted;
         }
     }
+    let is_deletion = proposal.is_deletion;
     let content = gaviero_core::write_gate::assemble_final_content(&proposal);
     let path = proposal.file_path.clone();
     let expected_old = if proposal.original_content.is_empty() && !path.exists() {
@@ -186,7 +294,7 @@ pub(super) fn finalize_current_review(app: &mut App) {
         Some(proposal.original_content.as_str())
     };
 
-    match apply_proposal_to_disk(&path, expected_old, &content) {
+    match apply_proposal_to_disk(&path, expected_old, &content, is_deletion) {
         ApplyOutcome::Written => {
             for buf in &mut app.buffers {
                 if buf.path.as_deref() == Some(path.as_path()) {
@@ -199,13 +307,15 @@ pub(super) fn finalize_current_review(app: &mut App) {
                 "Refusing to apply stale proposal for {} — disk changed since proposal was created",
                 path.display()
             );
-            app.status_message = Some((
-                format!("Stale: {} changed on disk; review skipped", path.display()),
-                std::time::Instant::now(),
-            ));
+            let msg = format!("⚠ Stale: {} changed on disk; review skipped", path.display());
+            app.chat_state.add_system_message(&msg);
+            app.status_message = Some((msg, std::time::Instant::now()));
         }
         ApplyOutcome::Failed { path, error } => {
             tracing::error!("Failed to write finalized file {}: {}", path.display(), error);
+            let msg = format!("✖ Failed to apply {}: {}", path.display(), error);
+            app.chat_state.add_system_message(&msg);
+            app.status_message = Some((msg, std::time::Instant::now()));
         }
     }
 
@@ -260,6 +370,7 @@ pub(super) fn enter_batch_review(app: &mut App, proposals: Vec<WriteProposal>) {
                 new_content: p.proposed_content,
                 additions,
                 deletions,
+                is_deletion: p.is_deletion,
             }
         })
         .collect();
@@ -334,14 +445,20 @@ pub(super) fn handle_batch_review_action(app: &mut App, action: &Action) -> bool
             true
         }
         Action::InsertChar('a') => {
-            let (path, content, expected_old) = {
+            let (path, content, expected_old, is_deletion) = {
                 let br = app.batch_review.as_ref().unwrap();
                 match br.proposals.get(br.selected_index) {
-                    Some(p) => (p.path.clone(), p.new_content.clone(), p.old_content.clone()),
+                    Some(p) => (
+                        p.path.clone(),
+                        p.new_content.clone(),
+                        p.old_content.clone(),
+                        p.is_deletion,
+                    ),
                     None => return true,
                 }
             };
-            let outcome = apply_proposal_to_disk(&path, expected_old.as_deref(), &content);
+            let outcome =
+                apply_proposal_to_disk(&path, expected_old.as_deref(), &content, is_deletion);
             match outcome {
                 ApplyOutcome::Written => {
                     for buf in &mut app.buffers {
@@ -355,14 +472,19 @@ pub(super) fn handle_batch_review_action(app: &mut App, action: &Action) -> bool
                         "Refusing to apply stale proposal for {} — disk changed since proposal",
                         stale_path.display()
                     );
-                    app.status_message = Some((
-                        format!("Stale: {} changed on disk; not applied", stale_path.display()),
-                        std::time::Instant::now(),
-                    ));
+                    let msg = format!(
+                        "⚠ Stale: {} changed on disk; not applied",
+                        stale_path.display()
+                    );
+                    app.chat_state.add_system_message(&msg);
+                    app.status_message = Some((msg, std::time::Instant::now()));
                     return true;
                 }
                 ApplyOutcome::Failed { path: fp, error } => {
                     tracing::error!("Failed to write {}: {}", fp.display(), error);
+                    let msg = format!("✖ Failed to apply {}: {}", fp.display(), error);
+                    app.chat_state.add_system_message(&msg);
+                    app.status_message = Some((msg, std::time::Instant::now()));
                 }
             }
             {
@@ -422,6 +544,7 @@ pub(super) fn finalize_batch_review(app: &mut App) {
             &proposal.path,
             proposal.old_content.as_deref(),
             &proposal.new_content,
+            proposal.is_deletion,
         ) {
             ApplyOutcome::Written => written.push(proposal.path.clone()),
             ApplyOutcome::Stale { path } => {
@@ -429,10 +552,19 @@ pub(super) fn finalize_batch_review(app: &mut App) {
                     "Refusing to apply stale proposal for {} — disk changed since proposal",
                     path.display()
                 );
+                app.chat_state.add_system_message(&format!(
+                    "⚠ Stale: {} changed on disk; skipped",
+                    path.display()
+                ));
                 stale.push(path);
             }
             ApplyOutcome::Failed { path, error } => {
                 tracing::error!("Failed to write {}: {}", path.display(), error);
+                app.chat_state.add_system_message(&format!(
+                    "✖ Failed to apply {}: {}",
+                    path.display(),
+                    error
+                ));
                 failed.push(path);
             }
         }
@@ -537,8 +669,20 @@ pub(super) fn render_review_file_list(app: &mut App, frame: &mut Frame, area: Re
         let adds = format!(" +{}", proposal.additions);
         let dels = format!(" -{}", proposal.deletions);
 
+        let (status_char, status_color) = if proposal.is_deletion {
+            ('D', theme::ERROR)
+        } else if proposal.old_content.is_none() {
+            ('A', theme::SUCCESS)
+        } else {
+            ('M', theme::WARNING)
+        };
+
         let spans = vec![
-            Span::styled(format!(" {}", filename), name_style),
+            Span::styled(
+                format!(" {} ", status_char),
+                Style::default().fg(status_color),
+            ),
+            Span::styled(filename.to_string(), name_style),
             Span::styled(adds, Style::default().fg(theme::SUCCESS)),
             Span::styled(dels, Style::default().fg(theme::ERROR)),
         ];
@@ -602,10 +746,18 @@ pub(super) fn render_batch_review_diff(app: &mut App, frame: &mut Frame, area: R
     }
     let scroll = br.diff_scroll;
 
-    let header = format!(" {} ", proposal.path.display());
-    let header_style = Style::default()
-        .fg(theme::FOCUS_BORDER)
-        .add_modifier(Modifier::BOLD);
+    let header = if proposal.is_deletion {
+        format!(" {} (DELETE) ", proposal.path.display())
+    } else {
+        format!(" {} ", proposal.path.display())
+    };
+    let header_style = if proposal.is_deletion {
+        Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(theme::FOCUS_BORDER)
+            .add_modifier(Modifier::BOLD)
+    };
     for (i, ch) in header.chars().enumerate() {
         let x = area.x + i as u16;
         if x < area.right() && area.y < area.bottom() {
@@ -1031,14 +1183,14 @@ pub(super) fn render_changes_diff(app: &mut App, frame: &mut Frame, area: Rect) 
 
 #[cfg(test)]
 mod tests {
-    use super::{ApplyOutcome, apply_proposal_to_disk};
+    use super::{ApplyOutcome, apply_proposal_to_disk, temp_sibling_path};
 
     #[test]
     fn apply_writes_when_disk_matches_expected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.rs");
         std::fs::write(&path, "old\n").unwrap();
-        let outcome = apply_proposal_to_disk(&path, Some("old\n"), "new\n");
+        let outcome = apply_proposal_to_disk(&path, Some("old\n"), "new\n", false);
         assert!(matches!(outcome, ApplyOutcome::Written));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
     }
@@ -1049,7 +1201,7 @@ mod tests {
         let path = dir.path().join("a.rs");
         std::fs::write(&path, "user-edit\n").unwrap();
         // Proposal expected "old\n" but user edited to "user-edit\n".
-        let outcome = apply_proposal_to_disk(&path, Some("old\n"), "agent-new\n");
+        let outcome = apply_proposal_to_disk(&path, Some("old\n"), "agent-new\n", false);
         assert!(matches!(outcome, ApplyOutcome::Stale { .. }));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "user-edit\n");
     }
@@ -1059,7 +1211,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("created-since.rs");
         std::fs::write(&path, "raced\n").unwrap();
-        let outcome = apply_proposal_to_disk(&path, None, "agent-new\n");
+        let outcome = apply_proposal_to_disk(&path, None, "agent-new\n", false);
         assert!(matches!(outcome, ApplyOutcome::Stale { .. }));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "raced\n");
     }
@@ -1068,7 +1220,7 @@ mod tests {
     fn apply_creates_parent_dir_for_new_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested/deep/file.rs");
-        let outcome = apply_proposal_to_disk(&path, None, "fn main() {}\n");
+        let outcome = apply_proposal_to_disk(&path, None, "fn main() {}\n", false);
         assert!(matches!(outcome, ApplyOutcome::Written));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn main() {}\n");
     }
@@ -1077,8 +1229,87 @@ mod tests {
     fn apply_creates_new_file_when_expected_old_is_none() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("brand-new.rs");
-        let outcome = apply_proposal_to_disk(&path, None, "hi\n");
+        let outcome = apply_proposal_to_disk(&path, None, "hi\n", false);
         assert!(matches!(outcome, ApplyOutcome::Written));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hi\n");
+    }
+
+    #[test]
+    fn apply_deletes_when_is_deletion_and_disk_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doomed.rs");
+        std::fs::write(&path, "fn doomed() {}\n").unwrap();
+        let outcome = apply_proposal_to_disk(&path, Some("fn doomed() {}\n"), "", true);
+        assert!(matches!(outcome, ApplyOutcome::Written));
+        assert!(!path.exists(), "file should have been removed");
+    }
+
+    #[test]
+    fn apply_delete_refuses_when_disk_drifted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doomed.rs");
+        std::fs::write(&path, "user-edit\n").unwrap();
+        let outcome = apply_proposal_to_disk(&path, Some("fn doomed() {}\n"), "", true);
+        assert!(matches!(outcome, ApplyOutcome::Stale { .. }));
+        assert!(path.exists(), "file should be preserved on stale-skip");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "user-edit\n");
+    }
+
+    #[test]
+    fn apply_delete_is_idempotent_when_already_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("already-gone.rs");
+        // expected_old=None mirrors a delete proposal whose original snapshot
+        // recorded the file as nonexistent — degenerate but allowed.
+        let outcome = apply_proposal_to_disk(&path, None, "", true);
+        assert!(matches!(outcome, ApplyOutcome::Written));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn apply_existing_file_leaves_no_temp_file() {
+        // The tempfile-then-rename path must not leave the sibling tempfile
+        // behind on a successful write.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "old\n").unwrap();
+        let outcome = apply_proposal_to_disk(&path, Some("old\n"), "new\n", false);
+        assert!(matches!(outcome, ApplyOutcome::Written));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+        // No leftover tempfile in the directory.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(entries.len(), 1, "expected only the target file, got {:?}", entries);
+    }
+
+    #[test]
+    fn apply_new_file_fails_atomically_when_path_materialised() {
+        // The new-file branch uses O_EXCL — if the path appeared between the
+        // initial stale-check and the open, we surface Stale rather than
+        // clobbering. We can't easily race this in a single thread, so we
+        // simulate it by pre-creating the file and asserting Stale.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raced.rs");
+        std::fs::write(&path, "raced\n").unwrap();
+        let outcome = apply_proposal_to_disk(&path, None, "agent-new\n", false);
+        assert!(matches!(outcome, ApplyOutcome::Stale { .. }));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "raced\n");
+    }
+
+    #[test]
+    fn temp_sibling_path_is_in_same_dir_and_distinct() {
+        let target = std::path::Path::new("/tmp/some/dir/file.rs");
+        let tmp = temp_sibling_path(target);
+        assert_eq!(tmp.parent(), target.parent());
+        assert_ne!(tmp.file_name(), target.file_name());
+        assert!(
+            tmp.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".gaviero-tmp-")
+        );
     }
 }

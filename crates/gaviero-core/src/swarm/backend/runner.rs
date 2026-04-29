@@ -19,7 +19,7 @@ use crate::observer::AcpObserver;
 use crate::repo_map::RepoMap;
 use crate::swarm::board::{SharedBoard, parse_discoveries};
 use crate::validation_gate::ValidationPipeline;
-use crate::write_gate::WriteGatePipeline;
+use crate::write_gate::{AutoAcceptAction, WriteGatePipeline};
 
 use super::super::models::{AgentManifest, AgentStatus, WorkUnit};
 use super::shared::{default_editor_system_prompt, render_swarm_prompt};
@@ -598,11 +598,22 @@ pub(crate) async fn propose_write(
         observer.on_proposal_deferred(&abs_path, old, proposed_content);
     }
 
-    // 5. Auto-accept: write to disk
-    if let Some((path, content)) = auto_accept_result {
-        tokio::fs::write(&path, &content)
-            .await
-            .map_err(|e| anyhow::anyhow!("writing auto-accepted file: {}", e))?;
+    // 5. Auto-accept: perform the disk action outside the lock.
+    if let Some(action) = auto_accept_result {
+        match action {
+            AutoAcceptAction::Write { path, content } => {
+                tokio::fs::write(&path, &content)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("writing auto-accepted file: {}", e))?;
+            }
+            AutoAcceptAction::Delete { path } => match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(anyhow::anyhow!("removing auto-accepted file: {}", e));
+                }
+            },
+        }
     }
 
     Ok(true)
