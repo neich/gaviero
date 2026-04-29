@@ -1402,14 +1402,28 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
         }
         Action::CycleTabForward => {
             if app.focus == Focus::SidePanel {
-                app.chat_state.next_conversation();
+                if app.side_panel == SidePanelMode::MemoryPanel {
+                    app.handle_memory_panel_action(Action::CycleTabForward);
+                } else {
+                    app.chat_state.next_conversation();
+                }
+            } else if app.focus == Focus::Terminal {
+                app.terminal_manager.cycle_tab(1);
+                app.needs_full_redraw = true;
             } else {
                 app.cycle_tab(1);
             }
         }
         Action::CycleTabBack => {
             if app.focus == Focus::SidePanel {
-                app.chat_state.prev_conversation();
+                if app.side_panel == SidePanelMode::MemoryPanel {
+                    app.handle_memory_panel_action(Action::CycleTabBack);
+                } else {
+                    app.chat_state.prev_conversation();
+                }
+            } else if app.focus == Focus::Terminal {
+                app.terminal_manager.cycle_tab(-1);
+                app.needs_full_redraw = true;
             } else {
                 app.cycle_tab(-1);
             }
