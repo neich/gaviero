@@ -28,7 +28,8 @@ use futures::Stream;
 use tokio::sync::Mutex;
 
 use crate::acp::client::{
-    PROCESS_WAIT_TIMEOUT, STREAM_IDLE_TIMEOUT, format_tool_summary, is_auth_error, propose_write,
+    PROCESS_WAIT_TIMEOUT, STREAM_IDLE_TIMEOUT, format_tool_summary, is_auth_error, propose_delete,
+    propose_write,
 };
 use crate::acp::protocol::StreamEvent;
 use crate::acp::session::{AcpSession, AgentOptions};
@@ -564,6 +565,32 @@ impl ClaudeSession {
                         total
                     ));
                 }
+                // Drift check: between the post-tool read above and this
+                // revert, another writer (a peer agent, the user, or a
+                // background task) may have changed the file. If we revert
+                // blindly we'd clobber that write. Re-read and bail out if
+                // the on-disk content no longer matches `current`.
+                let on_disk_now = match tokio::fs::read_to_string(abs_path).await {
+                    Ok(s) => Some(s),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Drift-check read of {} failed ({}); skipping revert",
+                            abs_path.display(),
+                            e
+                        );
+                        continue;
+                    }
+                };
+                if on_disk_now.as_deref() != current.as_deref() {
+                    let msg = format!(
+                        "⚠ Disk drifted on {} between tool completion and revert — skipping revert and proposal to avoid clobbering a concurrent write.",
+                        abs_path.display()
+                    );
+                    tracing::warn!("{}", msg);
+                    self.observer.on_message_complete("system", &msg);
+                    continue;
+                }
                 // Revert to the snapshotted state. The proposal carries the
                 // tool's intended change; review will re-apply it on accept.
                 //
@@ -588,29 +615,36 @@ impl ClaudeSession {
                 let rel_path = abs_path
                     .strip_prefix(&self.workspace_root)
                     .unwrap_or(abs_path.as_path());
-                // The tool may have removed an existing file. Without a
-                // proposal carrying "→ deleted", the user has no way to
-                // review or accept the deletion. For now we still skip
-                // the propose_write call when the new state is None — this
-                // matches existing behaviour (deletions were never proposed).
-                // A later milestone can introduce a "DeleteProposal" type.
-                let Some(new_content) = current.as_deref() else {
-                    tracing::warn!(
-                        "Tool deleted {} — deletion proposals not yet supported, leaving as reverted",
-                        abs_path.display()
-                    );
-                    continue;
+                // Two paths: write/edit (`current=Some`) goes through
+                // `propose_write`; delete (`current=None`, `original=Some`)
+                // goes through `propose_delete`. `(None, None)` means the
+                // file never existed — nothing to propose.
+                let proposal_result = match (current.as_deref(), original.as_deref()) {
+                    (Some(new_content), _) => {
+                        propose_write(
+                            &self.write_gate,
+                            self.observer.as_ref(),
+                            &self.workspace_root,
+                            &self.agent_id,
+                            rel_path,
+                            new_content,
+                        )
+                        .await
+                    }
+                    (None, Some(orig)) => {
+                        propose_delete(
+                            &self.write_gate,
+                            self.observer.as_ref(),
+                            &self.workspace_root,
+                            &self.agent_id,
+                            rel_path,
+                            orig,
+                        )
+                        .await
+                    }
+                    (None, None) => Ok(()),
                 };
-                if let Err(e) = propose_write(
-                    &self.write_gate,
-                    self.observer.as_ref(),
-                    &self.workspace_root,
-                    &self.agent_id,
-                    rel_path,
-                    new_content,
-                )
-                .await
-                {
+                if let Err(e) = proposal_result {
                     tracing::error!(
                         "Failed to create proposal for {}: {}",
                         abs_path.display(),
