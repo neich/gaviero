@@ -371,6 +371,45 @@ impl MemoryPanelState {
         true
     }
 
+    /// Cycle the kind-tab strip by one step.
+    ///
+    /// Tab order: Records(0) → History(1) → Summaries(2) → Deletions(3) → Records.
+    /// Returns `true` when the new active tab is the Deletions tab so the
+    /// caller knows which refresh to trigger.
+    pub fn cycle_kind_tab(&mut self, forward: bool) -> bool {
+        let idx = if self.viewing_deletions {
+            3
+        } else {
+            match self.active_kind {
+                MemoryKind::History => 1,
+                MemoryKind::Summary => 2,
+                _ => 0,
+            }
+        };
+        let new_idx = if forward { (idx + 1) % 4 } else { (idx + 3) % 4 };
+        match new_idx {
+            0 => {
+                self.leave_deletions_tab();
+                self.set_active_kind(MemoryKind::Record);
+                false
+            }
+            1 => {
+                self.leave_deletions_tab();
+                self.set_active_kind(MemoryKind::History);
+                false
+            }
+            2 => {
+                self.leave_deletions_tab();
+                self.set_active_kind(MemoryKind::Summary);
+                false
+            }
+            _ => {
+                self.enter_deletions_tab();
+                true
+            }
+        }
+    }
+
     /// C2.6: leave the Deletions tab and reactivate the per-kind view.
     /// Called when 1/2/3 are pressed.
     pub fn leave_deletions_tab(&mut self) -> bool {
@@ -441,7 +480,7 @@ impl MemoryPanelState {
     pub fn render(&self, area: Rect, buf: &mut Buffer, focused: bool) {
         let block = Block::default()
             .title(if focused {
-                "MEMORY (focused — Tab cycles section)"
+                "MEMORY (Tab: section | Alt+i/o: kind tab)"
             } else {
                 "MEMORY"
             })
