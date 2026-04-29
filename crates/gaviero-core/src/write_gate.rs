@@ -4,7 +4,19 @@ use std::path::{Path, PathBuf};
 use crate::diff_engine::compute_hunks;
 use crate::observer::WriteGateObserver;
 use crate::tree_sitter::{enrich_hunks, language_for_extension};
-use crate::types::{FileScope, HunkStatus, ProposalStatus, WriteProposal};
+use crate::types::{
+    DiffHunk, FileScope, HunkStatus, HunkType, ProposalStatus, StructuralHunk, WriteProposal,
+};
+
+/// Action returned by `insert_proposal` / `finalize` when the gate is in
+/// AutoAccept mode. The caller performs the disk I/O outside the lock.
+#[derive(Clone, Debug)]
+pub enum AutoAcceptAction {
+    /// Write `content` to `path`.
+    Write { path: PathBuf, content: String },
+    /// Remove `path` from disk.
+    Delete { path: PathBuf },
+}
 
 /// Controls how proposals are handled.
 #[derive(Clone, Debug, PartialEq)]
@@ -115,13 +127,56 @@ impl WriteGatePipeline {
             proposed_content: proposed_content.to_string(),
             structural_hunks,
             status: ProposalStatus::Pending,
+            is_deletion: false,
+        }
+    }
+
+    /// Build a deletion proposal: original content is the file as it existed
+    /// before the tool removed it; proposed content is empty. The hunk list
+    /// renders as a single full-file removal so reviewers see exactly what
+    /// they're losing. `is_deletion` distinguishes "delete the file" from
+    /// "write an empty file" at finalize time.
+    pub fn build_delete_proposal(
+        id: u64,
+        source: &str,
+        file_path: &Path,
+        original_content: &str,
+    ) -> WriteProposal {
+        let hunk = if original_content.is_empty() {
+            None
+        } else {
+            let original_lines = original_content.lines().count().max(1);
+            let diff_hunk = DiffHunk {
+                original_range: (0, original_lines),
+                proposed_range: (0, 0),
+                original_text: original_content.to_string(),
+                proposed_text: String::new(),
+                hunk_type: HunkType::Removed,
+            };
+            Some(StructuralHunk {
+                diff_hunk,
+                enclosing_node: None,
+                description: format!("Delete file ({} lines)", original_lines),
+                status: HunkStatus::Pending,
+            })
+        };
+
+        WriteProposal {
+            id,
+            source: source.to_string(),
+            file_path: file_path.to_path_buf(),
+            original_content: original_content.to_string(),
+            proposed_content: String::new(),
+            structural_hunks: hunk.into_iter().collect(),
+            status: ProposalStatus::Pending,
+            is_deletion: true,
         }
     }
 
     /// Insert a proposal into the pipeline.
-    /// Returns `Some((path, content))` if the mode auto-accepts (caller writes to disk).
+    /// Returns `Some(action)` if the mode auto-accepts (caller performs disk I/O).
     /// Returns `None` if the proposal is queued for interactive review, deferred, or rejected.
-    pub fn insert_proposal(&mut self, proposal: WriteProposal) -> Option<(PathBuf, String)> {
+    pub fn insert_proposal(&mut self, proposal: WriteProposal) -> Option<AutoAcceptAction> {
         match self.mode {
             WriteMode::Interactive => {
                 self.observer.on_proposal_created(&proposal);
@@ -135,10 +190,16 @@ impl WriteGatePipeline {
                     hunk.status = HunkStatus::Accepted;
                 }
                 proposal.status = ProposalStatus::Accepted;
-                let result = assemble_final_content(&proposal);
                 let path = proposal.file_path.clone();
                 self.observer.on_proposal_finalized(&path.to_string_lossy());
-                Some((path, result))
+                if proposal.is_deletion {
+                    Some(AutoAcceptAction::Delete { path })
+                } else {
+                    Some(AutoAcceptAction::Write {
+                        path,
+                        content: assemble_final_content(&proposal),
+                    })
+                }
             }
             WriteMode::RejectAll => {
                 // Silently discard
@@ -226,14 +287,21 @@ impl WriteGatePipeline {
         }
     }
 
-    /// Finalize a proposal: assemble content from accepted hunks, remove from pipeline.
-    /// Returns `(path, final_content)` for the caller to write to disk.
-    pub fn finalize(&mut self, proposal_id: u64) -> Option<(PathBuf, String)> {
+    /// Finalize a proposal: remove from pipeline and emit the disk action.
+    /// For writes, assembles content from accepted hunks. For deletions, the
+    /// caller removes the file. Returns `None` if the proposal id is unknown.
+    pub fn finalize(&mut self, proposal_id: u64) -> Option<AutoAcceptAction> {
         let proposal = self.proposals.remove(&proposal_id)?;
-        let content = assemble_final_content(&proposal);
         let path = proposal.file_path.clone();
         self.observer.on_proposal_finalized(&path.to_string_lossy());
-        Some((path, content))
+        if proposal.is_deletion {
+            Some(AutoAcceptAction::Delete { path })
+        } else {
+            Some(AutoAcceptAction::Write {
+                path,
+                content: assemble_final_content(&proposal),
+            })
+        }
     }
 
     /// Get an immutable reference to a proposal.
@@ -432,10 +500,14 @@ mod tests {
             "fn new() {}\n",
         );
         let result = pipeline.insert_proposal(proposal);
-        assert!(result.is_some(), "AutoAccept should return content");
-        let (path, content) = result.unwrap();
-        assert_eq!(path, PathBuf::from("src/main.rs"));
-        assert!(content.contains("new"));
+        let action = result.expect("AutoAccept should return an action");
+        match action {
+            AutoAcceptAction::Write { path, content } => {
+                assert_eq!(path, PathBuf::from("src/main.rs"));
+                assert!(content.contains("new"));
+            }
+            AutoAcceptAction::Delete { .. } => panic!("expected Write, got Delete"),
+        }
         assert_eq!(finalized.load(Ordering::SeqCst), 1);
     }
 
@@ -534,11 +606,14 @@ mod tests {
         pipeline.insert_proposal(proposal);
         pipeline.accept_all(id);
 
-        let result = pipeline.finalize(id);
-        assert!(result.is_some());
-        let (_path, content) = result.unwrap();
-        assert!(content.contains("BBB"));
-        assert!(!content.contains("bbb"));
+        let action = pipeline.finalize(id).expect("finalize returned None");
+        match action {
+            AutoAcceptAction::Write { content, .. } => {
+                assert!(content.contains("BBB"));
+                assert!(!content.contains("bbb"));
+            }
+            AutoAcceptAction::Delete { .. } => panic!("expected Write, got Delete"),
+        }
         assert_eq!(finalized.load(Ordering::SeqCst), 1);
         assert!(pipeline.get_proposal(id).is_none());
     }
@@ -559,12 +634,63 @@ mod tests {
         pipeline.accept_hunk(id, 0); // BBB accepted
         pipeline.reject_hunk(id, 1); // EEE rejected, keep eee
 
-        let result = pipeline.finalize(id).unwrap();
-        let content = result.1;
+        let action = pipeline.finalize(id).unwrap();
+        let content = match action {
+            AutoAcceptAction::Write { content, .. } => content,
+            AutoAcceptAction::Delete { .. } => panic!("expected Write, got Delete"),
+        };
         assert!(content.contains("BBB"));
         assert!(content.contains("eee"));
         assert!(!content.contains("bbb"));
         assert!(!content.contains("EEE"));
+    }
+
+    #[test]
+    fn test_build_delete_proposal_round_trip() {
+        let (mut pipeline, _c, _u, finalized) = make_pipeline(WriteMode::Interactive);
+        let id = pipeline.next_id();
+        let proposal = WriteGatePipeline::build_delete_proposal(
+            id,
+            "test-agent",
+            Path::new("src/stale.rs"),
+            "fn doomed() {}\n",
+        );
+        assert!(proposal.is_deletion);
+        assert_eq!(proposal.proposed_content, "");
+        assert_eq!(proposal.structural_hunks.len(), 1);
+        assert_eq!(
+            proposal.structural_hunks[0].diff_hunk.hunk_type,
+            HunkType::Removed
+        );
+
+        pipeline.insert_proposal(proposal);
+        pipeline.accept_all(id);
+
+        match pipeline.finalize(id) {
+            Some(AutoAcceptAction::Delete { path }) => {
+                assert_eq!(path, PathBuf::from("src/stale.rs"));
+            }
+            other => panic!("expected Delete action, got {:?}", other),
+        }
+        assert_eq!(finalized.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_auto_accept_delete_returns_delete_action() {
+        let (mut pipeline, _c, _u, _f) = make_pipeline(WriteMode::AutoAccept);
+        let id = pipeline.next_id();
+        let proposal = WriteGatePipeline::build_delete_proposal(
+            id,
+            "test-agent",
+            Path::new("src/stale.rs"),
+            "fn doomed() {}\n",
+        );
+        match pipeline.insert_proposal(proposal) {
+            Some(AutoAcceptAction::Delete { path }) => {
+                assert_eq!(path, PathBuf::from("src/stale.rs"));
+            }
+            other => panic!("expected Delete action, got {:?}", other),
+        }
     }
 
     #[test]
