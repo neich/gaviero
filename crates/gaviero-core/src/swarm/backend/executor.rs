@@ -148,6 +148,7 @@ pub async fn complete_to_write_gate(
         "backend_dispatch"
     );
     let backend_name = backend.name().to_string();
+    let in_band_file_blocks = backend.capabilities().supports_file_blocks;
     let workspace_root = request.workspace_root.clone();
     let mut stream = backend.stream_completion(request).await?;
     let mut modified_files = HashSet::new();
@@ -184,6 +185,26 @@ pub async fn complete_to_write_gate(
             UnifiedStreamEvent::ToolCallDelta { .. } => {}
             UnifiedStreamEvent::ToolCallEnd { .. } => {}
             UnifiedStreamEvent::FileBlock { path, content } => {
+                // Capability invariant: backends that advertise
+                // `supports_file_blocks=false` must not emit FileBlock events.
+                // This guards against a future regression silently re-enabling
+                // the in-band parser path that produced the "garbled chat →
+                // proposal" incidents on the Claude backend.
+                debug_assert!(
+                    in_band_file_blocks,
+                    "backend '{}' advertises supports_file_blocks=false but emitted a FileBlock for {}",
+                    backend_name,
+                    path.display()
+                );
+                if !in_band_file_blocks {
+                    tracing::error!(
+                        "Dropping FileBlock from backend '{}' for {} — backend declared supports_file_blocks=false. \
+                         This is a backend bug; tool calls are the only edit channel.",
+                        backend_name,
+                        path.display()
+                    );
+                    continue;
+                }
                 if propose_write(
                     agent_id,
                     &path,
@@ -272,8 +293,11 @@ fn validate_request(backend: &dyn AgentBackend, request: &CompletionRequest) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::observer::AcpObserver;
+    use crate::observer::{AcpObserver, WriteGateObserver};
+    use crate::swarm::backend::Capabilities;
     use crate::swarm::backend::mock::MockBackend;
+    use crate::types::WriteProposal;
+    use crate::write_gate::WriteMode;
 
     struct NoopObserver;
 
@@ -289,6 +313,13 @@ mod tests {
             _new_content: &str,
         ) {
         }
+    }
+
+    struct NoopWriteGateObserver;
+    impl WriteGateObserver for NoopWriteGateObserver {
+        fn on_proposal_created(&self, _proposal: &WriteProposal) {}
+        fn on_proposal_updated(&self, _proposal_id: u64) {}
+        fn on_proposal_finalized(&self, _path: &str) {}
     }
 
     #[tokio::test]
@@ -319,6 +350,100 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.text, "hello world");
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "supports_file_blocks=false")]
+    async fn fileblock_from_capability_disabled_backend_trips_debug_assert() {
+        // A backend that declares `supports_file_blocks=false` MUST NOT emit
+        // FileBlock events. If it does, the executor trips a debug_assert
+        // (and in release silently drops + logs). This test pins that the
+        // guard is in place — without it, the in-band parser path that bit
+        // the Claude backend could be silently re-enabled by a future regression.
+        let backend = MockBackend::new(
+            "no-fileblocks",
+            vec![
+                UnifiedStreamEvent::FileBlock {
+                    path: PathBuf::from("foo.rs"),
+                    content: "fn x() {}".into(),
+                },
+                UnifiedStreamEvent::Done(StopReason::EndTurn),
+            ],
+        )
+        .with_capabilities(Capabilities {
+            supports_file_blocks: false,
+            ..Capabilities::default()
+        });
+
+        let request = CompletionRequest {
+            prompt: "test".into(),
+            system_prompt: None,
+            workspace_root: PathBuf::from("/tmp"),
+            allowed_tools: vec![],
+            file_attachments: vec![],
+            conversation_history: vec![],
+            file_refs: vec![],
+            effort: None,
+            extra: Vec::new(),
+            max_tokens: None,
+            auto_approve: true,
+        };
+
+        let gate = Arc::new(Mutex::new(WriteGatePipeline::new(
+            WriteMode::RejectAll,
+            Box::new(NoopWriteGateObserver),
+        )));
+        let _ = complete_to_write_gate(&backend, request, &NoopObserver, gate, "agent-x").await;
+    }
+
+    #[tokio::test]
+    async fn fileblock_handled_when_capability_enabled() {
+        // Sanity counter-test: with `supports_file_blocks=true` the executor
+        // routes the FileBlock through propose_write without panicking.
+        let backend = MockBackend::new(
+            "supports-fileblocks",
+            vec![
+                UnifiedStreamEvent::FileBlock {
+                    path: PathBuf::from("foo.rs"),
+                    content: "fn x() {}".into(),
+                },
+                UnifiedStreamEvent::Done(StopReason::EndTurn),
+            ],
+        )
+        .with_capabilities(Capabilities {
+            supports_file_blocks: true,
+            ..Capabilities::default()
+        });
+
+        let workspace = tempfile::tempdir().unwrap();
+        let request = CompletionRequest {
+            prompt: "test".into(),
+            system_prompt: None,
+            workspace_root: workspace.path().to_path_buf(),
+            allowed_tools: vec![],
+            file_attachments: vec![],
+            conversation_history: vec![],
+            file_refs: vec![],
+            effort: None,
+            extra: Vec::new(),
+            max_tokens: None,
+            auto_approve: true,
+        };
+
+        // RejectAll mode: gate discards the proposal (no disk write), but
+        // propose_write still returns Ok(true) once the proposal exists, so
+        // the FileBlock arm of the executor records the modified path. The
+        // assertion is "we got here without panicking" — this is the
+        // counter-test to `..._trips_debug_assert` above.
+        let gate = Arc::new(Mutex::new(WriteGatePipeline::new(
+            WriteMode::RejectAll,
+            Box::new(NoopWriteGateObserver),
+        )));
+        let outcome = complete_to_write_gate(&backend, request, &NoopObserver, gate, "agent-x")
+            .await
+            .unwrap();
+        assert_eq!(outcome.modified_files.len(), 1);
     }
 
     #[tokio::test]
