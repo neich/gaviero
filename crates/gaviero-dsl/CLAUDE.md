@@ -14,9 +14,9 @@ cargo clippy -p gaviero-dsl
 | File | Purpose |
 |---|---|
 | `lexer.rs` | Logos tokenizer |
-| `ast.rs` | AST types: `Script`, `Item`, `AgentDecl`, `WorkflowDecl`, `PromptDecl`, `TierAlias`, blocks |
+| `ast.rs` | AST types: `Script`, `Item`, `AgentDecl`, `WorkflowDecl`, `PromptDecl`, `TierAlias`, blocks. **Authoritative** for DSL surface — read here before extending docs. |
 | `parser.rs` | Chumsky parser → AST |
-| `compiler.rs` | Semantic analysis: `compile_ast_with_vars()` → `CompiledPlan` |
+| `compiler.rs` | Semantic analysis → `CompiledPlan` (scope-overlap + dependency-cycle checks) |
 | `error.rs` | Miette diagnostics with source spans |
 
 ## Public API
@@ -26,26 +26,25 @@ compile(source, filename, workflow, runtime_prompt) -> Result<CompiledPlan>
 compile_with_vars(source, filename, workflow, runtime_prompt, override_vars) -> Result<CompiledPlan>
 ```
 
-`compile_with_vars` backs `gaviero-cli --var KEY=VALUE`. Overrides beat script-level `vars {}` but lose to agent-level `vars {}`.
+`compile_with_vars` backs `gaviero-cli --var KEY=VALUE`. Var precedence: agent-level `vars {}` > CLI `--var` overrides > script-level `vars {}`.
 
-## DSL Features
+## DSL Surface (high-level)
 
-- **Top-level items**: `client`, `agent`, `workflow`, `prompt`, `vars`, `tier <alias> <client-ref>`.
-- **`prompt <name> #" ... "#`**: reusable named prompts referenced by agents via `prompt some-name`. Substitutes `{{AGENT}}`, `{{PROMPT}}`, and any in-scope vars.
-- **`vars { KEY "value" ... }`**: compile-time substitution applied across agent prompts, descriptions, memory content, AND scope paths (owned / read_only / staleness_sources).
-- **`tier <alias> <client-ref>`**: routing label so agents can say `tier expensive` instead of binding to a specific client — re-pointable at launch.
-- **`client`**: `tier`, `model`, `privacy`, `effort` (off/auto/low/medium/high/xhigh/max), `default`, and `extra { "k" "v" }` pass-through for provider-specific keys.
-- **Scope glob patterns**: `owned ["plans/claude-*.md"]` and `owned ["plans/codex-*.md"]` are disjoint; overlap is computed by `gaviero_core::path_pattern::paths_overlap`. Overlap within the same `loop { agents [...] }` group is allowed.
-- **Blocks**: `scope {}`, `memory {}`, `verify {}`, `context {}`, `loop {}`.
-- **Workflows**: ordered `steps`, `depends_on`, `max_parallel`, loop `until agent <judge>` with `stability`, `iter_start`, `max_iterations`, `judge_timeout`, `strict_judge`.
-- **Context selection**: `callers_of`, `tests_for`, `depth` (repo-map-driven).
-- **Verification**: `impact_scope`, `impact_tests`.
+- Top-level items: `client`, `agent`, `workflow`, `prompt`, `vars`, `tier <alias> <client-ref>`.
+- `prompt <name> #" ... "#` — reusable named prompts; substitutes `{{AGENT}}`, `{{PROMPT}}`, and in-scope vars.
+- `vars {}` — compile-time substitution across prompts, descriptions, memory content, and scope paths.
+- `tier <alias> <client-ref>` — re-pointable routing label so agents say `tier expensive` instead of binding to a specific client.
+- `client {}` fields: `tier`, `model`, `privacy`, `effort`, `default`, `extra { "k" "v" }` (provider-specific pass-through).
+- Scope glob patterns enforced via `gaviero_core::path_pattern::paths_overlap`. Disjoint globs allowed; overlap within the same `loop { agents [...] }` group is allowed.
+- Workflow blocks: `steps`, `depends_on`, `max_parallel`, `loop { until agent <judge> ... }` with `stability`, `iter_start`, `max_iterations`, `judge_timeout`, `strict_judge`.
+
+For exact field names and shapes, read `ast.rs`.
 
 ## Conventions
 
 - Errors carry source spans. Always propagate span info.
-- Compiler validates scope overlaps and dependency cycles at compile time.
-- Provider-neutral model strings (resolved at runtime by `gaviero-core`).
+- Compiler validates scope overlaps and dependency cycles at compile time. Never bypass these checks.
+- Provider-neutral model strings — resolved at runtime by `gaviero-core`.
 - `vars` substitution is single-pass: `{{FOO}}` expands; nested refs inside values do not.
 
 ## Dependencies
@@ -56,4 +55,5 @@ compile_with_vars(source, filename, workflow, runtime_prompt, override_vars) -> 
 
 ## See Also
 
-[ARCHITECTURE.md](../../ARCHITECTURE.md) — compilation pipeline, output types, scope validation.
+- [README.md](README.md) — language reference, examples
+- [ARCHITECTURE.md](ARCHITECTURE.md) — compilation pipeline, output types, scope validation

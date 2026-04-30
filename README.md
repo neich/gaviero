@@ -144,6 +144,7 @@ Model routing is automatic — the coordinator annotates each subtask with a tie
 | Coordinator | Opus | Planning, decomposition, verification |
 | Expensive | Sonnet | Complex multi-file semantic changes |
 | Cheap | Haiku | Focused single-file tasks |
+| Codex | `codex:<model>` | OpenAI Codex execution (e.g. `codex:gpt-5-codex`) |
 | Mechanical | Ollama (local) | Rote/trivial changes (falls back to Haiku) |
 
 Individual work units can override the tier with an explicit `model` field.
@@ -158,7 +159,7 @@ You can also define work units manually:
 
 ### Semantic memory
 
-Agents can store and retrieve knowledge across sessions. Memory is backed by ONNX embeddings and SQLite, organized in a five-level scope hierarchy:
+Agents can store and retrieve knowledge across sessions. Memory is backed by ONNX embeddings (`gte-modernbert-base`, 768-dim) and SQLite, organized in a five-level scope hierarchy:
 
 ```
 global        personal cross-workspace knowledge
@@ -168,7 +169,11 @@ global        personal cross-workspace knowledge
                  └─ run        single swarm execution (consolidated upward on completion)
 ```
 
-Searches cascade from the narrowest scope outward, stopping early when confidence is high (RRF hybrid vector + keyword search). This means a module-level result beats a global one when it's more relevant.
+Retrieval uses **merged multi-scope** search by default: RRF hybrid combining vector similarity (0.7) and full-text search (0.3) across all relevant scopes simultaneously. A legacy narrowest-scope-first cascading mode is available via `memory.retrieval.mode = "cascade"` in settings.
+
+Memory consolidates on three cadences: per-turn extraction, per-session consolidation, and an idle/weekly sleeptime pass (decay sweep, near-duplicate merge, cross-scope promotion, trust re-scoring, history compression).
+
+Writes use a multi-database registry (global, workspace, per-folder). Deletions via `/forget` are soft-deleted to an audit table rather than erased.
 
 Store context from the chat panel:
 ```
@@ -220,8 +225,12 @@ In coordinated mode, model selection is automatic — Opus plans the task, then 
 | `--no-iterate` | Single pass only — disables retry loop |
 | `--resume` | Skip already-completed agents from a prior run |
 | `--trace FILE` | Write DEBUG-level JSON trace log |
+| `--coordinator-model NAME` | Coordinator model for `--coordinated` planning (default: `--model` or opus) |
+| `--ollama-base-url URL` | Ollama server URL (default: `http://localhost:11434`) |
 | `--graph` | Build/update code knowledge graph and exit |
 | `--exclude PATTERN` | Exclude folders from repo-map scanning (repeatable, comma-separated) |
+| `--manifest-last N` | Print the N most recent memory retrieval manifests and exit |
+| `--manifest-turn ID` | Print the retrieval manifest for a specific turn id and exit |
 
 ## Workflow Scripts (DSL)
 
@@ -323,14 +332,15 @@ Color schemes live in `themes/` as TOML files. The default theme is One Dark ins
 
 ## Architecture
 
-Gaviero is a Cargo workspace of five crates:
+Gaviero is a Cargo workspace of six crates:
 
 | Crate | Purpose |
 |---|---|
-| **gaviero-core** | All runtime logic: write gate, diffs, tree-sitter (16 languages), agent orchestration, swarm pipeline, context ranking, semantic memory, git/worktrees, terminal PTY |
+| **gaviero-core** | All runtime logic: write gate, diffs, tree-sitter (16 languages), agent orchestration, swarm pipeline, context ranking, semantic memory, MCP server, git/worktrees, terminal PTY |
 | **gaviero-tui** | Terminal UI: event loop, panels, editor, chat, diff review, session restore |
 | **gaviero-cli** | Headless CLI: task argument parsing, observer wiring |
 | **gaviero-dsl** | Compiler for `.gaviero` workflow scripts → execution plans |
+| **gaviero-mcp-shim** | stdio↔Unix-socket bridge that connects subprocess agents (Claude Code, Codex) to core's in-process MCP server |
 | **tree-sitter-gaviero** | Tree-sitter grammar for `.gaviero` files |
 
 Core is the source of truth — it has no UI dependencies. The TUI and CLI both delegate all logic to core through public APIs.
@@ -340,6 +350,7 @@ Core is the source of truth — it has no UI dependencies. The TUI and CLI both 
 - [crates/gaviero-tui/README.md](crates/gaviero-tui/README.md) — editor usage, panels, commands
 - [crates/gaviero-cli/README.md](crates/gaviero-cli/README.md) — CLI modes, flags, examples
 - [crates/gaviero-dsl/README.md](crates/gaviero-dsl/README.md) — language syntax, examples, compilation
+- [crates/gaviero-mcp-shim/README.md](crates/gaviero-mcp-shim/README.md) — MCP shim binary
 
 For complete architectural details including data flow, module maps, and inter-crate boundaries, see [ARCHITECTURE.md](ARCHITECTURE.md).
 

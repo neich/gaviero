@@ -2,6 +2,8 @@
 
 Full-screen terminal editor. Rendering + event routing only. All runtime logic delegates to `gaviero-core`.
 
+Binary: `gaviero`
+
 ---
 
 ## 1. Module Layout
@@ -10,7 +12,7 @@ Full-screen terminal editor. Rendering + event routing only. All runtime logic d
 gaviero-tui/src/
 ├─ main.rs                 Terminal setup, panic handler, event loop
 ├─ app.rs                  App struct (state + layout + focus)
-├─ event.rs                Event enum (43+ variants), source plumbing
+├─ event.rs                Event enum (45+ variants), source plumbing
 ├─ keymap.rs               Action enum, keybindings, chord system
 ├─ theme.rs                One Dark palette, timing constants
 ├─ editor/
@@ -27,23 +29,32 @@ gaviero-tui/src/
 │  ├─ git_panel.rs         Staging, commit, branch picker
 │  ├─ terminal.rs          Embedded PTY render (tui-term)
 │  ├─ status_bar.rs        Mode / file / branch / agent status
-│  └─ search.rs            SearchPanelState, live results
+│  ├─ search.rs            SearchPanelState, live results
+│  └─ memory_panel.rs      Memory inspection / management (Tier A4):
+│                           Injected Now / Recently Written /
+│                           Scope Summary / Search; Tab cycles focus,
+│                           destructive ops enqueue WriterMessage::PanelEdit
 ├─ widgets/
 │  ├─ tabs.rs              TabBar
 │  ├─ scrollbar.rs         Custom scrollbar
 │  ├─ scroll_state.rs      Viewport-aware offset + selection
 │  ├─ text_input.rs        Line input with cursor/selection/undo
-│  └─ render_utils.rs      Shared helpers
+│  └─ render_utils.rs      Shared helpers (incl. strip_ansi)
 └─ app/
    ├─ controller.rs        Top-level event handling + action dispatch
    ├─ layout.rs            5-area layout computation
    ├─ render.rs            Draw orchestration
    ├─ left_panel.rs        Left panel modes (tree / search / changes / review)
    ├─ review.rs            Diff acceptance flows
-   ├─ side_panel.rs        Side panel modes (chat / swarm / git)
-   ├─ commands.rs          Slash commands (/run, /swarm, /cswarm, /remember, …)
+   ├─ side_panel.rs        Side panel modes (chat / swarm / git / memory)
+   ├─ commands.rs          Slash commands (/run, /swarm, /cswarm,
+   │                       /remember, /forget, /attach, …)
    ├─ editing.rs           Editor + find-bar interactions
    ├─ session.rs           Session restore/save (session_state bridge)
+   ├─ chat_memory.rs       build_turn_transcript +
+   │                       consolidate_conversation: feeds the per-turn S3
+   │                       extractor and the per-conversation Consolidator
+   │                       through WriterHandle / WriterMessage::TurnComplete
    ├─ state.rs             Shared enums/structs
    └─ observers.rs         WriteGateObserver / AcpObserver / SwarmObserver
                            impls bridging to Event
@@ -55,7 +66,7 @@ gaviero-tui/src/
 
 ### `App`
 
-Owns tabs, panel states, focus, theme, and event channel sender. The main loop calls `app.render(frame)` then `app.handle_event(event)` exclusively from one task.
+Owns tabs, panel states, focus, theme, the workspace handle, optional `MemoryStores` + `WriterHandle`, and the event channel sender. The main loop calls `app.render(frame)` then `app.handle_event(event)` exclusively from one task.
 
 ### Focus
 
@@ -69,14 +80,15 @@ pub enum Focus { Editor, FileTree, SidePanel, Terminal }
 
 ```rust
 pub enum LeftPanelMode  { FileTree(..), Search(..), Changes(..), Review(..) }
-pub enum SidePanelMode  { AgentChat(..), SwarmDashboard(..), GitPanel(..) }
+pub enum SidePanelMode  { AgentChat(..), SwarmDashboard(..), GitPanel(..),
+                          Memory(..) }
 ```
 
 Proposals auto-switch the left panel to `Review`; the user navigates hunks with `]h`/`[h`, accepts/rejects with `a`/`r` (or `A`/`R` for all), finalizes with `f`, aborts with `q`.
 
 ### Observer bridges (`app/observers.rs`)
 
-Three trait implementations hold an `mpsc::UnboundedSender<Event>` and translate core callbacks into `Event` variants.
+The TUI implements `WriteGateObserver`, `AcpObserver`, `SwarmObserver`, `MemoryObserver`, and `ManifestObserver`. Each holds an `mpsc::UnboundedSender<Event>` and translates core callbacks into `Event` variants — including `MemoryWriteCommitted` and `ManifestPersisted` events that drive the memory panel's "Recently Written" and "Injected Now" sections.
 
 ---
 
@@ -89,7 +101,9 @@ Three trait implementations hold an `mpsc::UnboundedSender<Event>` and translate
             ├───────── terminal bridge (PTY thread)
             ├───────── WriteGateObserver impl
             ├───────── AcpObserver impl
-            └───────── SwarmObserver impl
+            ├───────── SwarmObserver impl
+            ├───────── MemoryObserver impl
+            └───────── ManifestObserver impl
                            │
                            ▼
               mpsc::unbounded_channel<Event>
@@ -115,7 +129,7 @@ Golden rule: **no background task mutates `App` directly**. External sources pus
 ├──────┬───────────────────────┬──────────────────┤
 │ Left │      Editor           │   Side Panel     │
 │Panel │  (ropey + view)       │ chat / swarm /   │
-│      │                       │ git              │
+│      │                       │ git / memory     │
 ├──────┴───────────────────────┴──────────────────┤
 │              Terminal (embedded PTY)            │
 ├─────────────────────────────────────────────────┤
@@ -136,14 +150,15 @@ Computed by `app/layout.rs::compute_layout(full_area, …)`.
 
 ---
 
-## 6. Commands (slash commands)
+## 6. Slash Commands
 
 | Command | Handler | Effect |
 |---|---|---|
 | `/run <file.gaviero> [prompt]` | `commands.rs::handle_run` | `gaviero_dsl::compile` then `swarm::pipeline::execute` |
-| `/swarm <text>` | `handle_swarm` | Natural-language swarm planning + execute |
+| `/swarm <text>` | `handle_swarm` | Coordinator plans + executes |
 | `/cswarm <text>` | `handle_cswarm` | Coordinator-only: emit `.gaviero` plan file |
-| `/remember <text>` | `handle_remember` | `MemoryStore::store_scoped` |
+| `/remember <text>` | `handle_remember` | `WriterHandle::send(Store…)` |
+| `/forget <…>` | `handle_forget` | Soft-delete via `WriterMessage::Forget`; writes `deletions` audit row |
 | `/attach <path>` / `/detach <path>` | chat attachments | |
 | `/set-model <spec>` | override next message model | |
 | `/clear` | clear conversation | |
@@ -152,27 +167,39 @@ All handlers run async; results arrive through the observer event channel.
 
 ---
 
-## 7. Session Persistence
+## 7. Chat ↔ Memory Bridge (`app/chat_memory.rs`)
 
-`app/session.rs` bridges to `gaviero_core::session_state`: `SessionState` carries workspace path, open tabs (`TabState`), current tab, panel modes, terminal visibility, and `StoredConversation` history. `ConversationIndex` + `StoredConversation` JSON files live under `.gaviero/state/`. `load_session` on startup, `save_session` on timer and shutdown.
+Two helpers tie the chat path to the memory writer:
+
+- `build_turn_transcript(app, conv_id, assistant_content)` — formats `USER: … \n\n ASSISTANT: …` for the per-turn S3 extractor. Skip conditions match `store_chat_turn`.
+- `consolidate_conversation(app, conv_id)` — fires when a conversation is closed. Spawns a tokio task that runs `Consolidator::consolidate_run` (per-run triage + decay + cross-scope promotion) using the `WriterHandle`.
+
+Both flow through `WriterHandle` — the panel never touches the SQLite Mutex directly.
 
 ---
 
-## 8. Concurrency
+## 8. Session Persistence
 
-Single-threaded UI + async producers. No Mutex in TUI state. Observer `Arc`s are cloned into core tasks; events flow one-way into the main loop channel.
+`app/session.rs` bridges `gaviero_core::session_state`: `SessionState` carries workspace path, open tabs (`TabState`), current tab, panel modes, terminal visibility, and `StoredConversation` history. `ConversationIndex` + `StoredConversation` JSON files live under `.gaviero/state/`. `load_session` on startup, `save_session` on timer and shutdown.
 
 ---
 
-## 9. Error Handling
+## 9. Concurrency
+
+Single-threaded UI + async producers. No Mutex in TUI state. Observer `Arc`s are cloned into core tasks; events flow one-way into the main loop channel. Memory panel destructive operations enqueue `WriterMessage::PanelEdit` and await a 500ms oneshot ack; until the ack fires the panel renders a pending spinner.
+
+---
+
+## 10. Error Handling
 
 - User-facing failures appear in the status bar or a transient alert.
 - Swarm / ACP errors arrive as `Event::SwarmCompleted(failed)` / `Event::AcpTaskCompleted(Err)` and render into the relevant side panel.
+- Memory errors surface through `MemoryObserver` events.
 - Panic handler in `main.rs` restores the terminal before unwinding.
 
 ---
 
-## 10. Dependencies
+## 11. Dependencies
 
 - `ratatui 0.30` + `crossterm 0.29`
 - `ropey` — rope buffer
@@ -183,7 +210,7 @@ Single-threaded UI + async producers. No Mutex in TUI state. Observer `Arc`s are
 
 ---
 
-## 11. API Surface
+## 12. API Surface
 
 No public library API. Binary entry is `main.rs`; everything else is crate-private.
 

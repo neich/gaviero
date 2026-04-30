@@ -14,21 +14,21 @@ cargo run -p gaviero-tui       # launch editor
 
 ## Module Structure
 
-- `app.rs` — `App` struct, layout, focus, event dispatch
-- `event.rs` — 43+ event variants; crossterm / notify / tick sources
+- `app.rs`, `app/` — `App` struct, layout, focus, event dispatch, observer wiring, chat-memory bridge (`app/chat_memory.rs`)
+- `event.rs` — event variants from crossterm / notify / tick / core observer callbacks
 - `keymap.rs` — keybindings: Ctrl = editor, Alt = workspace layering
 - `editor/` — Ropey buffer, view, diff overlay, syntax highlight
-- `panels/` — file tree, agent chat, swarm dashboard, git, terminal, search
+- `panels/` — `file_tree`, `agent_chat`, `swarm_dashboard`, `git_panel`, `terminal`, `search`, `memory_panel` (memory inspection / management), `status_bar`, `chat_markdown`
 - `widgets/` — tabs, scrollbar, text input, render utils
 - `theme.rs` — One Dark colors, timing constants
 
 ## Observer Bridge
 
-TUI implements `WriteGateObserver`, `AcpObserver`, `SwarmObserver` (from `gaviero-core`). Each holds an event channel sender — core callbacks become `Event` variants processed on the main loop.
+TUI implements `WriteGateObserver`, `AcpObserver`, `SwarmObserver` from `gaviero-core`. Each holds an event channel sender — core callbacks become `Event` variants processed on the main loop. No background task mutates `App` directly.
 
 ## Conventions
 
-- Single event channel: all external sources → one `mpsc::unbounded_channel<Event>`. No background task mutates `App` directly.
+- Single event channel: all external sources → one `mpsc::unbounded_channel<Event>`.
 - Main loop: `draw → recv → handle → repeat`.
 - Diff overlay keys: `]h`/`[h` navigate, `a`/`r` accept/reject, `A`/`R` all, `f` finalize, `q` exit.
 
@@ -42,4 +42,4 @@ TUI implements `WriteGateObserver`, `AcpObserver`, `SwarmObserver` (from `gavier
 
 ## See Also
 
-[ARCHITECTURE.md](../../ARCHITECTURE.md) — event loop, layout, panel patterns.
+[ARCHITECTURE.md](ARCHITECTURE.md) — event loop, layout, panel patterns.

@@ -10,13 +10,16 @@ Compiler for `.gaviero` scripts. Source text → AST → `CompiledPlan` DAG cons
 gaviero-dsl/src/
 ├─ lib.rs       Public entry points: compile, compile_with_vars
 ├─ lexer.rs     Logos tokenizer (shebang, strings, raw blocks, idents)
-├─ ast.rs       Syntax tree types (Script, Item, Agent/Workflow/Client,
-│               PromptDecl, TierAlias, Vars, blocks)
+├─ ast.rs       Syntax tree types: Script, Item, Agent/Workflow/Client,
+│               PromptDecl, TierAlias, Vars, blocks. Authoritative for the
+│               DSL surface — read here before extending docs
 ├─ parser.rs    Chumsky parser combinators → Script
 ├─ compiler.rs  Semantic analysis: resolve vars/prompts/tiers, apply
 │               substitutions, validate scopes, build CompiledPlan
-└─ error.rs     DslError / DslErrors — miette diagnostics with spans
+└─ error.rs     DslError / DslErrors — miette diagnostics with source spans
 ```
+
+Tests in `tests/compile.rs`. 12 example scripts in `examples/` cover every advanced feature (`prompt`, top-level `vars`, `tier`-alias, loops, `extra` pass-through, glob-disjoint scopes).
 
 ---
 
@@ -35,8 +38,8 @@ AST (Script { items: Vec<Item> })
     1. index Items   (clients, agents, workflows, prompts, vars, tiers)
     2. duplicate-name checks (carrying spans)
     3. select workflow (by name if given, else single, else error)
-    4. merge vars      (CLI overrides > script vars > agent vars; AGENT
-                        and PROMPT are reserved)
+    4. merge vars      (agent-level > CLI --var > script-level;
+                        AGENT and PROMPT are reserved)
     5. resolve prompt refs (PromptSource::Ref → PromptDecl.content)
     6. resolve tier aliases (TierAlias → ClientDecl)
     7. apply_vars over prompts, descriptions, scope paths, memory fields
@@ -70,7 +73,7 @@ pub fn compile_with_vars(
 ```
 
 - `workflow`: select by name when the file declares multiple.
-- `runtime_prompt`: substitutes every `{{PROMPT}}`; also acts as full prompt for agents without a `prompt` field.
+- `runtime_prompt`: substitutes every `{{PROMPT}}`; also acts as the full prompt for agents without a `prompt` field.
 - `override_vars`: replace entries in the top-level `vars {}` (used by `gaviero-cli --var KEY=VALUE`). Agent-level `vars` still win; `AGENT` and `PROMPT` are reserved.
 
 Output is `gaviero_core::swarm::plan::CompiledPlan` — no transformation needed before execution.
@@ -166,13 +169,13 @@ Precedence (high → low) for a `{{KEY}}` token:
 - `scope { owned [...] read_only [...] }` path lists,
 - `memory { staleness_sources read_query write_content }`.
 
-This lets agents declare `DOC_NAME` once and use it in both their prompt body and their scope paths.
+Substitution is single-pass — `{{FOO}}` expands once; nested refs inside values do not.
 
 ---
 
 ## 6. Scope Validation
 
-`compiler.rs` delegates to `gaviero_core::path_pattern::patterns_overlap` for pairwise checks across every `owned` path. Glob-disjoint siblings are accepted: `plans/claude-*.md` does not overlap `plans/codex-*.md`. Concrete prefix / substring / subdirectory cases remain flagged (e.g., `src/` overlaps `src/foo.rs`).
+`compiler.rs` delegates to `gaviero_core::path_pattern::patterns_overlap` for pairwise checks across every `owned` path. Glob-disjoint siblings are accepted: `plans/claude-*.md` does not overlap `plans/codex-*.md`. Concrete prefix / substring / subdirectory cases remain flagged (e.g., `src/` overlaps `src/foo.rs`). Overlap within the same `loop { agents [...] }` group is allowed (intra-loop scope sharing is intentional).
 
 The same matcher backs `scope_enforcer::is_scope_allowed` at runtime, so compile-time and runtime agree.
 
@@ -284,4 +287,4 @@ Compilation is single-threaded, no async, no locks. All errors return `Result`; 
 
 ---
 
-See [CLAUDE.md](CLAUDE.md) for build & conventions, and the examples in `examples/` (`plan_refinement.gaviero`, `update_docs.gaviero`, `phased_plan.gaviero`) for `prompt`, `vars`, `tier`-alias, loop, and `extra` usage.
+See [CLAUDE.md](CLAUDE.md) for build & conventions, and the examples in `examples/` (`plan_refinement.gaviero`, `update_docs.gaviero`, `phased_plan.gaviero`, `security_audit_memory.gaviero`, `sync_memory.gaviero`, …) for `prompt`, `vars`, `tier`-alias, loop, and `extra` usage.

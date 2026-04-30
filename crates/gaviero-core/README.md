@@ -10,7 +10,8 @@ Core runtime library for Gaviero. All execution logic — agent orchestration, w
 - **Swarm orchestration** — Multi-agent coordination with tier routing, scoped execution, and dependency graphs
 - **Write gates** — Diff review and interactive acceptance before changes touch disk
 - **Iteration & validation** — Retry loops with syntax checking, compilation, and test-based verification
-- **Semantic memory** — Hierarchical scoped embeddings (ONNX, SQLite) for cross-session knowledge
+- **Semantic memory** — Five-level scoped embeddings (`gte-modernbert-base`, SQLite) with merged multi-scope RRF retrieval, three-cadence consolidation, soft-delete, and optional cross-encoder reranking
+- **In-process MCP server** — Exposes `memory_search`, `blast_radius`, and `node_doc` read-only tools to subprocess agents (Claude Code, Codex) over a Unix socket; the `gaviero-mcp-shim` binary bridges agent stdio to the socket
 - **Git & worktrees** — Repository operations and isolated execution contexts
 - **Workspace settings** — Configuration cascade (project → user → defaults)
 - **Terminal management** — PTY lifecycle and interactive shell sessions
@@ -97,14 +98,15 @@ println!("{}", plan.to_gaviero_script()?);  // Reviewable .gaviero format
 | Module | Purpose |
 |---|---|
 | `acp/` | Claude subprocess protocol (ACP), session factory, prompt enrichment, file block routing |
-| `swarm/` | Multi-agent orchestration, tier routing, DAG execution, verification, git merge, backends |
-| `agent_session/` | Per-agent session lifecycle, state tracking, ACP session wiring |
-| `context_planner/` | Context selection planning: repo-map queries, callers_of, tests_for resolution |
+| `mcp/` | In-process MCP server (read-only tools: `memory_search`, `blast_radius`, `node_doc`); config synthesis and external-server detection |
+| `swarm/` | Multi-agent orchestration, tier routing, DAG execution, verification, git merge, backends, replanner, calibration, context bundles |
+| `agent_session/` | Per-agent session lifecycle: claude, codex_exec, codex_app_server (dual-mode Codex), ollama, registry |
+| `context_planner/` | Context selection: repo-map queries, callers_of, tests_for, chat memory, compaction, ledger |
 | `session_state/` | Persistent session state (checkpoint/resume, history) |
 | `iteration/` | Retry loops, escalation, best-of-N strategy |
 | `validation_gate/` | Syntax validation (tree-sitter), compilation checks (cargo), test verification |
 | `write_gate/` | Diff review, hunk acceptance/rejection, scope enforcement |
-| `memory/` | 5-level hierarchical scoped embeddings (ONNX + SQLite + RRF search) |
+| `memory/` | Five-level hierarchical scoped embeddings (`gte-modernbert-base`, SQLite, RRF hybrid); three-cadence consolidation, soft-delete, multi-DB registry, optional reranker |
 | `repo_map/` | PageRank-based context ranking, code graph, symbol resolution |
 | `path_pattern/` | Glob-style path pattern matching and scope overlap detection for DSL validation |
 | `workspace/` | Settings cascade, namespace resolution, project configuration |
@@ -121,8 +123,9 @@ println!("{}", plan.to_gaviero_script()?);  // Reviewable .gaviero format
 - **Provider-neutral** — model strings are resolved at runtime, not compile-time
 - **Lock discipline** — no Mutex held across I/O, embedding, or parsing
 - **Memory writes** — always require explicit `WriteScope`; never infer scope level
-- **Scoring** — 50% similarity + 20% importance + 15% recency + 15% base, scaled by scope/trust
-- **Cascading search** — narrowest scope first, early exit at 0.70 confidence threshold
+- **Scoring** — 50% similarity + 20% importance + 15% recency + 15% base, scaled by scope/trust weights; decay-exempt types (Decision/Convention/Invariant/Preference) are recency-floored
+- **Retrieval** — merged multi-scope by default: RRF hybrid (vector 0.7 + FTS 0.3) across all scopes simultaneously. Narrowest-scope-first cascading with 0.70 early-exit is the legacy mode (`memory.retrieval.mode = "cascade"`)
+- **MCP tools** — read-only by construction; no write tools are exposed to subprocess agents
 
 ## See Also
 
