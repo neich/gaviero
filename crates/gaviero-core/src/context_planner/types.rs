@@ -67,7 +67,7 @@ pub struct ProviderProfile {
 /// keep them in sync (M10 will collapse the duplication).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSpec {
-    /// Raw provider prefix (`"claude"`, `"claude-code"`, `"codex"`, `"codex-cli"`,
+    /// Raw provider prefix (`"claude"`, `"claude-code"`, `"codex"`,
     /// `"ollama"`, `"local"`, or `""` if no prefix was supplied — defaults to Claude).
     pub provider_prefix: String,
     /// Model name without the prefix.
@@ -88,7 +88,6 @@ impl ModelSpec {
             "ollama",
             "local",
             "codex-app-server",
-            "codex-cli",
             "codex",
             "claude-code",
             "claude",
@@ -115,7 +114,7 @@ impl ModelSpec {
         match self.provider_prefix.as_str() {
             "ollama" | "local" => Provider::Ollama,
             "codex-app-server" => Provider::CodexAppServer,
-            "codex" | "codex-cli" => Provider::Codex,
+            "codex" => Provider::Codex,
             // Bare or claude-prefixed → Claude.
             _ => Provider::Claude,
         }
@@ -177,7 +176,7 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             model: spec.model.clone(),
             // `codex exec` stays StatelessReplay (V9 §5). M8 adds the
             // `codex-app-server:` prefix for ProcessBound; the plain `codex:`
-            // and `codex-cli:` prefixes retain this arm unchanged.
+            // prefix retains this arm unchanged.
             continuity_mode: ContinuityMode::StatelessReplay,
             supports_tool_use: true,
             supports_native_resume: false,
@@ -398,7 +397,6 @@ mod tests {
             ("claude:opus", "claude", "opus", Provider::Claude),
             ("sonnet", "", "sonnet", Provider::Claude),
             ("codex:gpt-5.5", "codex", "gpt-5.5", Provider::Codex),
-            ("codex-cli:o4-mini", "codex-cli", "o4-mini", Provider::Codex),
             (
                 "ollama:qwen2.5-coder:7b",
                 "ollama",
