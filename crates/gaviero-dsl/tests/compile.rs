@@ -566,12 +566,12 @@ fn template_plan_refinement() {
 
     // Init agents: vars (MODEL_NAME, PLANS) substituted at compile time; no ITER
     assert!(
-        cinit.coordinator_instructions.contains("claude-plan-v1.md"),
-        "claude-init prompt should reference claude-plan-v1.md"
+        cinit.coordinator_instructions.contains("claude-init-v1.md"),
+        "claude-init prompt should reference claude-init-v1.md"
     );
     assert!(
-        xinit.coordinator_instructions.contains("codex-plan-v1.md"),
-        "codex-init prompt should reference codex-plan-v1.md"
+        xinit.coordinator_instructions.contains("codex-init-v1.md"),
+        "codex-init prompt should reference codex-init-v1.md"
     );
     assert!(
         !cinit.coordinator_instructions.contains("{{ITER}}"),
@@ -582,27 +582,27 @@ fn template_plan_refinement() {
     assert!(
         crefine
             .coordinator_instructions
-            .contains("claude-plan-v{{ITER}}.md"),
-        "claude-refine should reference claude-plan-v{{ITER}}.md"
+            .contains("claude-refine-plan-v{{ITER}}.md"),
+        "claude-refine should reference claude-refine-plan-v{{ITER}}.md"
     );
     assert!(
         xrefine
             .coordinator_instructions
-            .contains("codex-plan-v{{ITER}}.md"),
-        "codex-refine should reference codex-plan-v{{ITER}}.md"
+            .contains("codex-refine-plan-v{{ITER}}.md"),
+        "codex-refine should reference codex-refine-plan-v{{ITER}}.md"
     );
     assert!(
         crefine
             .coordinator_instructions
-            .contains("claude-plan-v{{PREV_ITER}}.md"),
-        "claude-refine should reference claude-plan-v{{PREV_ITER}}.md"
+            .contains("claude-refine-plan-v{{PREV_ITER}}.md"),
+        "claude-refine should reference claude-refine-plan-v{{PREV_ITER}}.md"
     );
 
     // Summary file also uses ITER
     assert!(
         crefine
             .coordinator_instructions
-            .contains("claude-summary-v{{ITER}}.md"),
+            .contains("claude-refine-summary-v{{ITER}}.md"),
         "claude-refine should reference summary file"
     );
 
@@ -698,7 +698,7 @@ fn template_phased_plan() {
             .clone()
     };
     assert_eq!(dep("phase_executor"), vec!["analyse_plan"]);
-    assert_eq!(dep("phase_gate"), vec!["phase_executor"]);
+    assert_eq!(dep("phase_gate"), vec!["phase_executor", "analyse_plan"]);
     assert_eq!(dep("final_audit"), vec!["phase_gate"]);
 
     // OUT_DIR is compile-time substituted in prompts AND scope paths;
