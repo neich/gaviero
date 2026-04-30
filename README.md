@@ -304,7 +304,7 @@ Settings cascade through these priority levels (highest to lowest):
 {
   "editor": { "tabSize": 4, "insertSpaces": true },
   "files": { "exclude": { "target": true, "node_modules": true } },
-  "agent": { "model": "sonnet", "maxTokens": 16384 },
+  "agent": { "model": "claude:sonnet", "maxTokens": 16384 },
   "memory": { "namespace": "my-project" },
   "panels": { "fileTree": { "width": 25 }, "terminal": { "splitPercent": 30 } }
 }
@@ -322,7 +322,7 @@ For multi-folder projects, create a `.gaviero-workspace` file:
     { "path": "/home/user/frontend", "name": "Frontend" },
     { "path": "/home/user/backend", "name": "Backend" }
   ],
-  "settings": { "agent": { "model": "sonnet" } }
+  "settings": { "agent": { "model": "claude:sonnet" } }
 }
 ```
 
