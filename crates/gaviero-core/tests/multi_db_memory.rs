@@ -1225,13 +1225,3 @@ async fn bootstrap_init_workspace_stores_with_two_folders_writes_to_correct_dbs(
     assert!(library_root.path().join(".gaviero/memory.db").exists());
     assert!(workspace_root.path().join(".gaviero/memory.db").exists());
 }
-
-// Ensure WorkspaceFolder is reachable via the public API for downstream
-// crates that need to construct workspaces programmatically.
-#[allow(dead_code)]
-fn _assert_workspace_folder_public() {
-    let _ = WorkspaceFolder {
-        path: PathBuf::new(),
-        name: None,
-    };
-}

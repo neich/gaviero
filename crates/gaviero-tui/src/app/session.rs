@@ -208,34 +208,26 @@ pub(crate) async fn compute_impact_text(
     .flatten()
 }
 
-/// Legacy chat graph-context builder. M1 helper kept as a parity reference
-/// during M2 development; remove in M10. Production chat path now uses
-/// `get_or_build_repo_map_cached` + `compute_impact_text` driven by the
-/// `ContextPlanner`.
-#[allow(dead_code)]
-pub(crate) async fn build_graph_context(
-    repo_map_cache: std::sync::Arc<
-        tokio::sync::RwLock<Option<std::sync::Arc<gaviero_core::repo_map::RepoMap>>>,
-    >,
-    workspace_root: std::path::PathBuf,
-    seeds: Vec<String>,
-    budget_tokens: usize,
+/// Render chat prompt text from planner selections using the chat ordering:
+/// user message first, then graph, then memory.
+pub(crate) fn render_chat_selections(
+    selections: &gaviero_core::context_planner::PlannerSelections,
+    user_message: &str,
 ) -> String {
-    if seeds.is_empty() || budget_tokens == 0 {
-        return String::new();
+    let mut parts: Vec<String> = vec![user_message.to_string()];
+
+    if let Some(graph) =
+        gaviero_core::swarm::backend::shared::render_graph_block(&selections.graph_selections)
+    {
+        parts.push(graph);
     }
-    let repo_map = get_or_build_repo_map_cached(repo_map_cache, workspace_root.clone()).await;
-    let mut sections: Vec<String> = Vec::new();
-    if let Some(rm) = &repo_map {
-        let plan = rm.rank_for_agent(&seeds, budget_tokens);
-        if !plan.repo_outline.is_empty() {
-            sections.push(plan.repo_outline);
-        }
+    if let Some(memory) =
+        gaviero_core::swarm::backend::shared::render_memory_block(&selections.memory_selections)
+    {
+        parts.push(memory);
     }
-    if let Some(text) = compute_impact_text(workspace_root, seeds).await {
-        sections.push(text);
-    }
-    sections.join("\n\n")
+
+    parts.join("\n\n")
 }
 
 #[cfg(test)]
@@ -341,40 +333,6 @@ mod tests {
         let out = render_chat_selections(&sel, "do the thing");
         assert_eq!(out, "do the thing\n\n[Graph] outline\n\n[Memory] context");
     }
-}
-
-/// Render planner selections back into the legacy chat enriched-prompt string.
-///
-/// **Byte-identical guarantee** (M1, preserved through M3) — the output of
-/// this function for selections produced by
-/// [`gaviero_core::context_planner::ContextPlanner::plan`] must equal the
-/// chat path's pre-M1 `parts.join("\n\n")` assembly.
-///
-/// **M5 status: parity reference.** The chat path now dispatches through
-/// `AgentSession`, whose legacy shim does its own rendering inside
-/// `agent_session::LegacyAgentSession::send_turn` (calling the same
-/// `swarm::backend::shared::render_{graph,memory}_block` helpers). This
-/// function is retained for tests and as a parity reference until M10.
-#[allow(dead_code)]
-pub(crate) fn render_chat_selections(
-    selections: &gaviero_core::context_planner::PlannerSelections,
-    user_prompt: &str,
-) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    parts.push(user_prompt.to_string());
-
-    if let Some(block) =
-        gaviero_core::swarm::backend::shared::render_graph_block(&selections.graph_selections)
-    {
-        parts.push(block);
-    }
-    if let Some(block) =
-        gaviero_core::swarm::backend::shared::render_memory_block(&selections.memory_selections)
-    {
-        parts.push(block);
-    }
-
-    parts.join("\n\n")
 }
 
 /// Spawn a background task that (re)builds `RepoMap` and writes it into `app.repo_map`.

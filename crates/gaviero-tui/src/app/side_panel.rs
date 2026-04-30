@@ -1230,9 +1230,7 @@ fn commit_panel_prompt(app: &mut App) {
                     }
                 }
                 ScopeChoice::Run => {
-                    let run_id = app.chat_state.conversations[app.chat_state.active_conv]
-                        .id
-                        .clone();
+                    let run_id = app.chat_state.active_conversation_id().to_string();
                     WriteScope::Run { repo_id, run_id }
                 }
             };
@@ -1545,9 +1543,7 @@ pub(super) fn refresh_chat_autocomplete(app: &mut App) {
 }
 
 pub(super) fn send_chat_message(app: &mut App) {
-    let conv_id = app.chat_state.conversations[app.chat_state.active_conv]
-        .id
-        .clone();
+    let conv_id = app.chat_state.active_conversation_id().to_string();
     let prompt = app.chat_state.take_input();
     let root = app
         .workspace
@@ -1574,7 +1570,7 @@ pub(super) fn send_chat_message(app: &mut App) {
 
     app.chat_state.add_user_message(&prompt);
     {
-        let conv = &mut app.chat_state.conversations[app.chat_state.active_conv];
+        let conv = app.chat_state.active_conversation_mut();
         conv.pending_turn_id = Some(turn_id.clone());
         conv.pending_module_path = pending_module_path;
         conv.is_streaming = true;
@@ -1674,7 +1670,7 @@ pub(super) fn send_chat_message(app: &mut App) {
         &runtime,
     );
     {
-        let conv = &mut app.chat_state.conversations[app.chat_state.active_conv];
+        let conv = app.chat_state.active_conversation_mut();
         let current_fp =
             gaviero_core::context_planner::PlannerFingerprint::from_profile(&provider_profile);
         // Step 1: rehydrate or lazy-init the ledger.
@@ -1714,10 +1710,12 @@ pub(super) fn send_chat_message(app: &mut App) {
     // would silently accept the old session, defeating the invalidation.
     let resume_session_id = app
         .chat_state
-        .conversations
-        .get(app.chat_state.active_conv)
-        .and_then(|c| c.claude_session_id.clone());
-    let is_first_turn = app.chat_state.conversations[app.chat_state.active_conv]
+        .active_conversation()
+        .claude_session_id
+        .clone();
+    let is_first_turn = app
+        .chat_state
+        .active_conversation()
         .session_ledger
         .as_ref()
         .map(|l| l.is_first_turn())
@@ -1729,7 +1727,9 @@ pub(super) fn send_chat_message(app: &mut App) {
     // Claude's Read-tool size limits on the prompt tempfile. After
     // /reset (Suppress) the user explicitly asked to start fresh, so the
     // visible transcript stays in the panel but does not re-enter the prompt.
-    let inline_mode = app.chat_state.conversations[app.chat_state.active_conv]
+    let inline_mode = app
+        .chat_state
+        .active_conversation()
         .transcript_inline_mode;
     let inline_transcript = match inline_mode {
         crate::panels::agent_chat::TranscriptInlineMode::Auto => is_first_turn,
@@ -1853,7 +1853,9 @@ pub(super) fn send_chat_message(app: &mut App) {
     // M2 (no mutation), so a clone is safe. The canonical ledger lives on
     // the Conversation and is updated by the SystemInit event handler in
     // the controller — same lifecycle as `claude_session_id`.
-    let ledger_snapshot = app.chat_state.conversations[app.chat_state.active_conv]
+    let ledger_snapshot = app
+        .chat_state
+        .active_conversation()
         .session_ledger
         .clone()
         .expect("session_ledger initialized above");
@@ -2107,9 +2109,7 @@ pub(super) fn send_chat_message(app: &mut App) {
         }
     });
     app.acp_tasks.insert(
-        app.chat_state.conversations[app.chat_state.active_conv]
-            .id
-            .clone(),
+        app.chat_state.active_conversation_id().to_string(),
         task,
     );
 }
@@ -2148,15 +2148,13 @@ pub(super) fn chat_paste_from_clipboard(app: &mut App) {
 }
 
 pub(super) fn cancel_agent(app: &mut App) {
-    let conv_id = app.chat_state.conversations[app.chat_state.active_conv]
-        .id
-        .clone();
+    let conv_id = app.chat_state.active_conversation_id().to_string();
     if let Some(task) = app.acp_tasks.remove(&conv_id) {
         task.abort();
-        app.chat_state.conversations[app.chat_state.active_conv].is_streaming = false;
-        app.chat_state.conversations[app.chat_state.active_conv].streaming_started_at = None;
+        let conv = app.chat_state.active_conversation_mut();
+        conv.is_streaming = false;
+        conv.streaming_started_at = None;
         app.chat_state
             .finalize_message("system", "Cancelled by user.");
     }
 }
-

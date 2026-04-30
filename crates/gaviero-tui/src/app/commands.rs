@@ -576,9 +576,7 @@ fn resolve_remember_scope(
 
     match variant {
         "here" => {
-            let run_id = app.chat_state.conversations[app.chat_state.active_conv]
-                .id
-                .clone();
+            let run_id = app.chat_state.active_conversation_id().to_string();
             Ok((WriteScope::Run { repo_id, run_id }, "Run", None))
         }
         "module" => {
@@ -620,9 +618,7 @@ fn resolve_remember_scope(
                 .unwrap_or_else(|| "repo".to_string());
             match default.to_ascii_lowercase().as_str() {
                 "run" => {
-                    let run_id = app.chat_state.conversations[app.chat_state.active_conv]
-                        .id
-                        .clone();
+                    let run_id = app.chat_state.active_conversation_id().to_string();
                     Ok((WriteScope::Run { repo_id, run_id }, "Run", None))
                 }
                 "module" => resolve_remember_scope(app, "module"),
@@ -649,9 +645,7 @@ pub(super) fn handle_consolidate_session_command(app: &mut App) {
         return;
     };
 
-    let conv_id = app.chat_state.conversations[app.chat_state.active_conv]
-        .id
-        .clone();
+    let conv_id = app.chat_state.active_conversation_id().to_string();
     let workspace_root = app
         .workspace
         .roots()
@@ -664,7 +658,9 @@ pub(super) fn handle_consolidate_session_command(app: &mut App) {
     // transcript. Good enough for an explicit /consolidate-session
     // trigger; the idle-trigger path (Tier B5 follow-up) uses the same
     // helper.
-    let transcript: String = app.chat_state.conversations[app.chat_state.active_conv]
+    let transcript: String = app
+        .chat_state
+        .active_conversation()
         .messages
         .iter()
         .map(|m| format!("{:?}: {}", m.role, m.content))
@@ -1375,9 +1371,7 @@ pub(super) fn handle_remember_command(app: &mut App) {
     let writer = writer.clone();
     let content = text.to_string();
     let tx = app.event_tx.clone();
-    let conv_id = app.chat_state.conversations[app.chat_state.active_conv]
-        .id
-        .clone();
+    let conv_id = app.chat_state.active_conversation_id().to_string();
     let memory = app.memory.clone();
     let show_badge = app
         .workspace

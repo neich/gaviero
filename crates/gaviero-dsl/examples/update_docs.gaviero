@@ -123,6 +123,7 @@ The fixed context injected into every AI prompt. It must contain:
         GUIDELINES #"
 - Be concise and imperative — this is read by AI agents, not humans.
 - Do NOT include information that can be derived from reading the code.
+- ALWAYS add embedded URLs to code locations, docs, or external references for any non-trivial rule or convention.
 - Include section headers: Build & Test, Conventions, Architecture, Rules, Dependencies.
 - For workspace projects, include links to per-crate CLAUDE.md files.
         "#
@@ -198,7 +199,7 @@ The deep technical description of a crate/project. It must contain:
         "#
         GUIDELINES #"
 - Be technically precise. Include ASCII diagrams where helpful.
-- Reference actual type names, function names, and file paths.
+- Reference actual type names, function names, and file paths. ALWAYS add embedded URLs to code locations for any non-trivial design element (function, traits, files, etc.).
 - Include section headers: Topology, Modules, Abstractions, Data Flow, Concurrency, Error Handling, API.
 - Link to CLAUDE.md for implementation conventions and rules.
 - For workspace projects, include per-crate ARCHITECTURE.md and explain inter-crate dependencies.

@@ -120,9 +120,7 @@ impl ClaudeSession {
 
     /// Reconstruct the enriched prompt and all legacy inputs from the
     /// structured `Turn`, then run the Claude subprocess loop. This is the
-    /// core of the Claude streaming path, extracted from
-    /// `AcpPipeline::send_prompt_via_claude` (M6 parity reference kept there
-    /// as `#[allow(dead_code)]` until M10).
+    /// core of the Claude streaming path.
     async fn run_claude_turn(&self, turn: &Turn, resume_session_id: Option<String>) -> Result<()> {
         // ── Reconstruct legacy inputs from Turn ──────────────────────────
 

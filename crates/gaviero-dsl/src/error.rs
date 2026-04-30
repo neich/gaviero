@@ -4,7 +4,6 @@ use thiserror::Error;
 
 /// A single DSL error with source location.
 #[derive(Debug, Error, Diagnostic)]
-#[allow(dead_code)]
 pub enum DslError {
     /// Lexer found a character that matches no token.
     #[error("unexpected character")]

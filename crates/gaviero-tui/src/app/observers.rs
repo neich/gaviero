@@ -25,7 +25,6 @@ impl WriteGateObserver for TuiWriteGateObserver {
     }
 }
 
-#[allow(dead_code)]
 pub(super) struct TuiSwarmObserver {
     pub tx: mpsc::UnboundedSender<Event>,
 }
