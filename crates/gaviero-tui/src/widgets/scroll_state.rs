@@ -40,11 +40,7 @@ impl ScrollState {
         self.viewport = viewport;
     }
 
-    /// Current cached viewport.
-    #[allow(dead_code)]
-    pub fn viewport(&self) -> usize {
-        self.viewport
-    }
+
 
     /// Move selection up by one. Adjusts scroll to keep selection visible.
     pub fn move_up(&mut self) {
@@ -60,17 +56,15 @@ impl ScrollState {
         self.ensure_visible();
     }
 
-    /// Jump selection up by a page.
-    #[allow(dead_code)]
-    pub fn page_up(&mut self) {
-        self.selected = self.selected.saturating_sub(self.viewport);
-        self.ensure_visible();
-    }
-
-    /// Jump selection down by a page.
-    #[allow(dead_code)]
+    /// Move selection down by one viewport page. Adjusts scroll to keep selection visible.
     pub fn page_down(&mut self, item_count: usize) {
-        self.selected = (self.selected + self.viewport).min(item_count.saturating_sub(1));
+        if item_count == 0 {
+            self.selected = 0;
+            self.offset = 0;
+            return;
+        }
+        let page = self.viewport.max(1);
+        self.selected = (self.selected + page).min(item_count - 1);
         self.ensure_visible();
     }
 
@@ -86,9 +80,21 @@ impl ScrollState {
     }
 
     /// Select a specific item (e.g. from a mouse click). Clamps to valid range.
-    #[allow(dead_code)]
     pub fn select(&mut self, index: usize, item_count: usize) {
         self.selected = index.min(item_count.saturating_sub(1));
+    }
+
+    /// Clamp `selected` and `offset` to a list of `item_count` items.
+    pub fn clamp(&mut self, item_count: usize) {
+        if item_count == 0 {
+            self.selected = 0;
+            self.offset = 0;
+            return;
+        }
+        let last = item_count - 1;
+        self.selected = self.selected.min(last);
+        self.offset = self.offset.min(last);
+        self.ensure_visible();
     }
 
     /// Ensure the selected item is within the visible viewport.
@@ -100,17 +106,6 @@ impl ScrollState {
             self.offset = self.selected;
         } else if self.selected >= self.offset + self.viewport {
             self.offset = self.selected - self.viewport + 1;
-        }
-    }
-
-    /// Clamp selection to valid range (call after item_count changes).
-    #[allow(dead_code)]
-    pub fn clamp(&mut self, item_count: usize) {
-        if item_count == 0 {
-            self.selected = 0;
-            self.offset = 0;
-        } else if self.selected >= item_count {
-            self.selected = item_count - 1;
         }
     }
 
