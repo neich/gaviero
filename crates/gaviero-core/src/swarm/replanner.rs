@@ -25,7 +25,7 @@ pub enum ReplanDecision {
 
 /// Replanner configuration.
 pub struct Replanner {
-    /// Model used for replanning (typically "opus").
+    /// Model used for replanning (typically `claude:opus`).
     pub coordinator_model: String,
     /// Maximum number of replan iterations for a single run.
     pub max_replans: u8,
