@@ -460,65 +460,6 @@ pub async fn run_backend(
     })
 }
 
-/// Build the base prompt (repo context + impact analysis + memory context + scope clause + task description).
-// Legacy parity reference. Kept until M10 per V9 §0 rule 6 so the swarm
-// adapter (`render_swarm_prompt` + `ContextPlanner::plan`) can be diffed
-// against this function during M2-M9. Do not delete before M10.
-#[allow(dead_code)]
-async fn build_prompt(
-    work_unit: &WorkUnit,
-    memory: Option<&Arc<MemoryStores>>,
-    read_namespaces: &[String],
-    repo_map: Option<&RepoMap>,
-    impact_text: Option<&str>,
-) -> String {
-    let mut parts = Vec::new();
-
-    // Repo map context (prepended first for maximum LLM attention)
-    if let Some(rm) = repo_map {
-        let ctx = rm.rank_for_agent(&work_unit.scope.owned_paths, 8_000);
-        if !ctx.repo_outline.is_empty() {
-            parts.push(ctx.repo_outline);
-        }
-    }
-
-    // Impact analysis from code knowledge graph (pre-computed by pipeline)
-    if let Some(text) = impact_text {
-        parts.push(text.to_string());
-    }
-
-    if let Some(mem) = memory {
-        let query = work_unit
-            .memory_read_query
-            .as_deref()
-            .unwrap_or(&work_unit.description);
-        let limit = work_unit.memory_read_limit.unwrap_or(5);
-        // Use namespace-based search (legacy path; scoped search is used
-        // when MemoryScope is provided via the pipeline).
-        let ctx = mem
-            .workspace()
-            .search_context(read_namespaces, query, limit)
-            .await;
-        if !ctx.is_empty() {
-            parts.push(ctx);
-        }
-    }
-
-    let scope_clause = work_unit.scope.to_prompt_clause();
-    if !scope_clause.is_empty() {
-        parts.push(format!("[File scope]:\n{}", scope_clause));
-    }
-
-    let task_text = if work_unit.coordinator_instructions.is_empty() {
-        &work_unit.description
-    } else {
-        &work_unit.coordinator_instructions
-    };
-    parts.push(task_text.clone());
-
-    parts.join("\n\n")
-}
-
 /// Create a write proposal through the Write Gate.
 ///
 /// Returns `Ok(true)` if a proposal was created, `Ok(false)` if skipped
