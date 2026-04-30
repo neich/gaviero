@@ -346,16 +346,34 @@ impl AgentChatState {
         self.cli_model_options.as_deref().unwrap_or(&[])
     }
 
+    /// Active conversation accessor guarded by the state invariant:
+    /// `active_conv` must always point to an existing conversation.
+    pub fn active_conversation(&self) -> &Conversation {
+        self.conversations.get(self.active_conv).expect(
+            "active_conv out of bounds; invariant broken (no active conversation at index)",
+        )
+    }
+
+    /// Mutable active conversation accessor guarded by the same invariant.
+    pub fn active_conversation_mut(&mut self) -> &mut Conversation {
+        self.conversations.get_mut(self.active_conv).expect(
+            "active_conv out of bounds; invariant broken (no active conversation at index)",
+        )
+    }
+
+    /// ID of the active conversation.
+    pub fn active_conversation_id(&self) -> &str {
+        &self.active_conversation().id
+    }
+
     /// Is the active conversation currently streaming?
     pub fn active_conv_streaming(&self) -> bool {
-        self.conversations[self.active_conv].is_streaming
+        self.active_conversation().is_streaming
     }
 
     /// Is the active conversation waiting for a permission decision?
     pub fn active_conv_pending_permission(&self) -> bool {
-        self.conversations[self.active_conv]
-            .pending_permission
-            .is_some()
+        self.active_conversation().pending_permission.is_some()
     }
 
     /// Store a pending permission request on the named conversation.
@@ -367,7 +385,7 @@ impl AgentChatState {
 
     /// Respond to the active conversation's pending permission and clear it.
     pub fn respond_active_permission(&mut self, allow: bool) {
-        let conv = &mut self.conversations[self.active_conv];
+        let conv = self.active_conversation_mut();
         if let Some(perm) = conv.pending_permission.take() {
             let _ = perm.respond.send(allow);
         }
@@ -380,12 +398,12 @@ impl AgentChatState {
 
     /// Whether auto-approve is effective (persistent conversation flag OR one-shot).
     pub fn effective_auto_approve(&self) -> bool {
-        self.conversations[self.active_conv].auto_approve || self.auto_approve_next
+        self.active_conversation().auto_approve || self.auto_approve_next
     }
 
     /// Get the effective model for the active conversation.
     pub fn effective_model(&self) -> &str {
-        self.conversations[self.active_conv]
+        self.active_conversation()
             .model_override
             .as_deref()
             .unwrap_or(&self.agent_settings.model)
@@ -393,7 +411,7 @@ impl AgentChatState {
 
     /// Get the effective effort level for the active conversation.
     pub fn effective_effort(&self) -> &str {
-        self.conversations[self.active_conv]
+        self.active_conversation()
             .effort_override
             .as_deref()
             .unwrap_or(&self.agent_settings.effort)
@@ -401,7 +419,7 @@ impl AgentChatState {
 
     /// Get the effective write namespace for the active conversation.
     pub fn effective_write_namespace(&self) -> &str {
-        self.conversations[self.active_conv]
+        self.active_conversation()
             .namespace_override
             .as_deref()
             .unwrap_or(&self.agent_settings.write_namespace)
@@ -677,35 +695,28 @@ impl AgentChatState {
     }
 
     pub fn add_system_message(&mut self, content: &str) {
-        self.conversations[self.active_conv]
-            .messages
-            .push(ChatMessage {
-                role: ChatRole::System,
-                content: content.to_string(),
-                tool_calls: Vec::new(),
-            });
+        self.active_conversation_mut().messages.push(ChatMessage {
+            role: ChatRole::System,
+            content: content.to_string(),
+            tool_calls: Vec::new(),
+        });
         self.scroll_to_bottom();
     }
 
     // ── Active conversation helpers ─────────────────────────────
 
     fn messages(&self) -> &Vec<ChatMessage> {
-        &self.conversations[self.active_conv].messages
+        &self.active_conversation().messages
     }
 
     fn messages_mut(&mut self) -> &mut Vec<ChatMessage> {
-        &mut self.conversations[self.active_conv].messages
-    }
-
-    #[allow(dead_code)]
-    pub fn active_conversation(&self) -> &Conversation {
-        &self.conversations[self.active_conv]
+        &mut self.active_conversation_mut().messages
     }
 
     /// Create a new conversation and switch to it.
     /// Start renaming the active conversation. Puts current title into the input field.
     pub fn start_rename(&mut self) {
-        let title = self.conversations[self.active_conv].title.clone();
+        let title = self.active_conversation().title.clone();
         self.text_input.text = title;
         self.text_input.cursor = self.text_input.char_count();
         self.renaming = true;
@@ -715,7 +726,7 @@ impl AgentChatState {
     pub fn confirm_rename(&mut self) {
         let new_title = self.text_input.text.trim().to_string();
         if !new_title.is_empty() {
-            self.conversations[self.active_conv].title = new_title;
+            self.active_conversation_mut().title = new_title;
         }
         self.text_input.text.clear();
         self.text_input.cursor = 0;
@@ -760,7 +771,7 @@ impl AgentChatState {
     /// turn bootstraps fresh. Visible chat history, attachments, scroll, and
     /// input are preserved.
     pub fn reset_conversation(&mut self) {
-        let conv = &mut self.conversations[self.active_conv];
+        let conv = self.active_conversation_mut();
         conv.claude_session_id = None;
         conv.session_ledger = None;
         conv.pending_persisted_ledger = None;
@@ -1072,7 +1083,7 @@ impl AgentChatState {
 
     /// Get user messages from the active conversation (chronological, owned).
     fn active_user_messages(&self) -> Vec<String> {
-        self.conversations[self.active_conv]
+        self.active_conversation()
             .messages
             .iter()
             .filter(|m| m.role == ChatRole::User)
@@ -1124,7 +1135,7 @@ impl AgentChatState {
 
     /// Enter browse mode, selecting the last message.
     pub fn enter_browse_mode(&mut self) {
-        let msg_count = self.conversations[self.active_conv].messages.len();
+        let msg_count = self.active_conversation().messages.len();
         if msg_count == 0 {
             return;
         }
@@ -1284,7 +1295,7 @@ impl AgentChatState {
 
     /// Move to the next message in browse mode.
     pub fn browse_down(&mut self) {
-        let msg_count = self.conversations[self.active_conv].messages.len();
+        let msg_count = self.active_conversation().messages.len();
         if self.browsed_msg + 1 < msg_count {
             self.browsed_msg += 1;
         }
@@ -1292,7 +1303,7 @@ impl AgentChatState {
 
     /// Get the content of the currently browsed message.
     pub fn browsed_message_content(&self) -> Option<String> {
-        self.conversations[self.active_conv]
+        self.active_conversation()
             .messages
             .get(self.browsed_msg)
             .map(|m| m.content.clone())
@@ -1497,7 +1508,7 @@ impl AgentChatState {
 
     pub fn add_user_message(&mut self, text: &str) {
         // Auto-title: set title from first user message (truncated)
-        let conv = &mut self.conversations[self.active_conv];
+        let conv = self.active_conversation_mut();
         if conv.title == "New Chat" && conv.messages.is_empty() {
             let title: String = text.chars().take(30).collect();
             conv.title = if text.chars().count() > 30 {
@@ -1712,6 +1723,7 @@ impl AgentChatState {
         let index = ss::load_conversation_index(workspace_key);
 
         self.conversations.clear();
+        self.active_conv = 0;
         for summary in &index.conversations {
             if let Some(stored) = ss::load_conversation(workspace_key, &summary.id) {
                 let messages = stored
@@ -1796,6 +1808,9 @@ impl AgentChatState {
         // Ensure at least one conversation exists
         if self.conversations.is_empty() {
             self.new_conversation();
+        } else if self.active_conv >= self.conversations.len() {
+            // Persisted `active_id` may be missing/stale; force a valid index.
+            self.active_conv = 0;
         }
 
         self.scroll_pinned_to_bottom = true;
