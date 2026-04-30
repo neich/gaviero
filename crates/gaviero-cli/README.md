@@ -92,15 +92,18 @@ The CLI supports provider-aware model specifications:
 
 ### Model spec formats
 
-- **Claude** — `sonnet`, `opus`, `haiku` or `claude:sonnet`, `claude:haiku`
-- **Ollama/local** — `ollama:qwen2.5-coder:7b` or `local:model-name`
+All specs require a provider prefix: `provider:model`.
+
+- **Claude** — `claude:sonnet`, `claude:opus`, `claude:haiku`, `claude:opusplan`, `claude:sonnet[1m]`
+- **Codex** — `codex:gpt-5.5`
+- **Ollama / local** — `ollama:qwen2.5-coder:7b`, `local:qwen2.5-coder:14b`
 
 ### Priority resolution
 
 ```
 1. --model flag (if provided)
 2. workspace agent.model setting
-3. default: sonnet
+3. default: claude:sonnet
 ```
 
 For coordinated planning, override the coordinator model:
@@ -132,7 +135,7 @@ Ollama server URL precedence:
 | `--work-units` | `<json>` | Explicit work unit definitions |
 | `--coordinated` | — | Generate reviewable plan, don't execute |
 | `--output` | `<path>` | Save generated plan to file (`--coordinated`) |
-| `--model` | `<spec>` | Model: `sonnet`, `opus`, `codex:<m>`, `ollama:<m>` (default: sonnet) |
+| `--model` | `<spec>` | Model: `claude:<m>`, `codex:<m>`, `ollama:<m>`, `local:<m>` (default: `claude:sonnet`) |
 | `--coordinator-model` | `<spec>` | Planner model for `--coordinated` |
 | `--ollama-base-url` | `<url>` | Ollama server URL |
 | `--auto-accept` | — | Skip interactive review, apply changes directly |
