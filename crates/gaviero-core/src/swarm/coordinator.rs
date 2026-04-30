@@ -480,50 +480,6 @@ async fn run_coordinator_request(
     Ok(response.text)
 }
 
-/// Extract a human-readable detail string from tool input JSON.
-#[allow(dead_code)]
-pub(crate) fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
-    // Try full JSON parse first
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(input_json) {
-        let arg = match tool_name {
-            "Read" | "read" => v
-                .get("file_path")
-                .or_else(|| v.get("path"))
-                .and_then(|v| v.as_str()),
-            "Glob" | "glob" => v.get("pattern").and_then(|v| v.as_str()),
-            "Grep" | "grep" => v.get("pattern").and_then(|v| v.as_str()),
-            "Write" | "write" | "Edit" | "edit" => v
-                .get("file_path")
-                .or_else(|| v.get("path"))
-                .and_then(|v| v.as_str()),
-            "Bash" | "bash" => v
-                .get("command")
-                .and_then(|v| v.as_str())
-                .map(|s| if s.len() > 60 { &s[..60] } else { s }),
-            _ => None,
-        };
-        if let Some(arg) = arg {
-            return format!("[{}] {}", tool_name, arg);
-        }
-    }
-
-    // Fallback: extract first string value from partial JSON
-    // Look for "file_path":"...", "pattern":"...", etc.
-    for key in &["file_path", "path", "pattern", "command"] {
-        let needle = format!("\"{}\":\"", key);
-        if let Some(pos) = input_json.find(&needle) {
-            let start = pos + needle.len();
-            let rest = &input_json[start..];
-            let end = rest.find('"').unwrap_or(rest.len().min(80));
-            let val = &rest[..end];
-            if !val.is_empty() {
-                return format!("[{}] {}", tool_name, val);
-            }
-        }
-    }
-
-    format!("[{}]", tool_name)
-}
 
 fn extract_run_id(prompt: &str) -> Option<String> {
     for word in prompt.split_whitespace() {
