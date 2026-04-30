@@ -218,7 +218,7 @@ pub struct AgentSettings {
 impl Default for AgentSettings {
     fn default() -> Self {
         Self {
-            model: "sonnet".to_string(),
+            model: "claude:sonnet".to_string(),
             effort: "off".to_string(),
             max_tokens: 16384,
             ollama_base_url: "http://localhost:11434".to_string(),
@@ -458,24 +458,22 @@ impl AgentChatState {
                     let current = self.effective_model().to_string();
                     let options = self.model_options().to_vec();
                     let list = if options.is_empty() {
-                        "sonnet, opus, haiku, opusplan, sonnet[1m], opus[1m], ollama:qwen2.5-coder:7b"
+                        "claude:sonnet, claude:opus, claude:haiku, claude:opusplan, \
+                         claude:sonnet[1m], claude:opus[1m], codex:<model>, \
+                         ollama:qwen2.5-coder:7b"
                             .to_string()
                     } else {
                         options.join(", ")
                     };
                     self.add_system_message(&format!(
-                        "Current model: {}\nAvailable: {}\nUsage: /model <name>\n\
-                         Use `ollama:<model>` for local models.",
+                        "Current model: {}\nAvailable: {}\nUsage: /model <provider:model>\n\
+                         Specs require a provider prefix: `claude:`, `codex:`, `ollama:`, \
+                         or `local:`.",
                         current, list
                     ));
                 } else {
-                    let model = match arg {
-                        "sonnet" | "claude-sonnet" => "sonnet",
-                        "opus" | "claude-opus" => "opus",
-                        "haiku" | "claude-haiku" => "haiku",
-                        other => other, // Allow arbitrary model strings
-                    };
-                    self.conversations[self.active_conv].model_override = Some(model.to_string());
+                    let model = normalize_model_spec(arg);
+                    self.conversations[self.active_conv].model_override = Some(model.clone());
                     self.add_system_message(&format!("Model set to: {}", model));
                 }
                 self.text_input.text.clear();
@@ -614,30 +612,52 @@ impl AgentChatState {
             }
             "/help" => {
                 self.add_system_message(
-                    "Available commands:\n\
-                     /model <name>      — Set model (sonnet, opus, haiku, opusplan, sonnet[1m], opus[1m], codex:<model>, ollama:<model>)\n\
-                     /effort <level>    — Set effort/reasoning level for Claude + Codex (off, auto, low, medium, high, xhigh, max)\n\
-                     /namespace <name>  — Set memory namespace (or show current)\n\
-                     /autoapprove       — Toggle auto-approve for this conversation (/yolo)\n\
-                     /attach <path>     — Attach a file (text or image)\n\
-                     /attach            — List current attachments\n\
-                     /detach <name|all> — Remove attachment(s)\n\
-                     /reset             — Clear agent context (keeps visible chat history)\n\
-                     /compact [N]       — Keep last N messages (default 6), discard older\n\
-                     /context           — Show estimated context usage\n\
-                     /run <path>        — Execute a .gaviero DSL script (supports `client { effort ... extra { ... } }` and top-level `tier <name> <client>` aliases)\n\
-                     /swarm <task>      — Plan and execute a multi-agent swarm\n\
-                     /cswarm <task>     — Coordinated swarm (provider-aware coordinator planning)\n\
-                     /undo-swarm        — Revert all changes from the last /cswarm run\n\
-                     /help              — Show this help\n\n\
+                    "Available commands:\n\n\
+                     Conversation:\n\
+                     /model <provider:model>  — Set model. Examples: claude:sonnet, claude:opus, claude:haiku, claude:opusplan, claude:sonnet[1m], claude:opus[1m], codex:<model>, ollama:<model>\n\
+                     /effort <level>          — Set effort/reasoning level for Claude + Codex (off, auto, low, medium, high, xhigh, max). Alias: /thinking\n\
+                     /namespace <name>        — Set memory namespace (or show current). Alias: /ns\n\
+                     /autoapprove             — Toggle auto-approve for this conversation. Alias: /yolo\n\
+                     /reset                   — Clear agent context (keeps visible chat history). Alias: /clear\n\
+                     /compact [N]             — Keep last N messages (default 6), discard older\n\
+                     /context                 — Show estimated context usage\n\n\
+                     Files & scripts:\n\
+                     /attach <path>           — Attach a file (text or image)\n\
+                     /attach                  — List current attachments\n\
+                     /detach <name|all>       — Remove attachment(s)\n\
+                     /run <path>              — Execute a .gaviero DSL script (supports `client { effort ... extra { ... } }` and top-level `tier <name> <client>` aliases)\n\n\
+                     Swarm:\n\
+                     /swarm <task>            — Plan and execute a multi-agent swarm\n\
+                     /cswarm <task>           — Coordinated swarm (provider-aware coordinator planning)\n\
+                     /undo-swarm              — Revert all changes from the last /cswarm run\n\n\
+                     Memory:\n\
+                     /remember <text>         — Store a memory at the default scope\n\
+                     /remember-here <text>    — Store at run scope (dies with session)\n\
+                     /remember-module <text>  — Store at module scope (current file's dir)\n\
+                     /remember-workspace <text>\n                              — Store at workspace scope\n\
+                     /remember-global <text>  — Store at global scope\n\
+                     /consolidate-session     — Run end-of-session consolidator over the active conversation\n\
+                     /sleep [--dry-run]       — Trigger the sleeptime maintenance pass\n\
+                     /reembed                 — Re-embed every memory under the configured embedder (takes a backup first)\n\
+                     /forget <query>          — Soft-delete records matching a fuzzy query (never history)\n\
+                     /forget-scope <path>     — Soft-delete every row at a scope (e.g. workspace, repo:<id>)\n\
+                     /forget-type <type>      — Soft-delete by type (factual|procedural|decision|pattern|gotcha|...)\n\
+                     /forget-source <source>  — Soft-delete by source (user_remember|llm_extracted|llm_consolidated|...)\n\
+                     \u{00a0}\u{00a0}(append --dry-run to preview, --yes to confirm, --reason \"<text>\" to annotate the audit)\n\
+                     /forget-history <id>     — Preview a history row\n\
+                     /forget-history --confirm <id> [REDACT <reason>]\n                              — Redact a history row (one-way; tombstone replaces the transcript)\n\
+                     /restore <deletion-id>   — Replay a soft-deleted row through the dedup pipeline\n\
+                     /restore --since <N minutes|N hours|N days>\n                              — Replay every soft-deletion in the window\n\n\
+                     Help:\n\
+                     /help                    — Show this help\n\n\
                      Keyboard shortcuts:\n\
-                     F2                 — Rename active conversation tab\n\
-                     Ctrl+T             — New conversation tab\n\
-                     Ctrl+C             — Cancel streaming / enter browse mode\n\
-                     Ctrl+V             — Paste text, or attach clipboard image\n\
-                     Alt+Enter          — Insert newline in input\n\
-                     PageUp / PageDown  — Scroll chat history\n\
-                     Esc                — Clear input / return to editor\n\n\
+                     F2                       — Rename active conversation tab\n\
+                     Ctrl+T                   — New conversation tab\n\
+                     Ctrl+C                   — Cancel streaming / enter browse mode\n\
+                     Ctrl+V                   — Paste text, or attach clipboard image\n\
+                     Alt+Enter                — Insert newline in input\n\
+                     PageUp / PageDown        — Scroll chat history\n\
+                     Esc                      — Clear input / return to editor\n\n\
                      Use @filename to reference workspace files in your prompt.\n\
                      Use /attach to attach files from outside the workspace.",
                 );
@@ -682,14 +702,15 @@ impl AgentChatState {
     /// Context window size in tokens for the effective model.
     fn context_limit_tokens(&self) -> usize {
         let model = self.effective_model();
-        // Trailing `[1m]` (e.g. `sonnet[1m]`, `claude-opus-4-7[1m]`) selects
-        // the 1M-token extended context variant — see Claude Code model-config
-        // docs. Strip the suffix before matching the base alias.
+        // Trailing `[1m]` (e.g. `claude:sonnet[1m]`, `claude:claude-opus-4-7[1m]`)
+        // selects the 1M-token extended context variant — see Claude Code
+        // model-config docs. Strip the suffix before matching the base alias.
         if model.ends_with("[1m]") {
             return 1_000_000;
         }
-        match model {
-            "opus" | "sonnet" | "haiku" => 200_000,
+        let base = model.strip_prefix("claude:").unwrap_or(model);
+        match base {
+            "opus" | "sonnet" | "haiku" | "opusplan" => 200_000,
             _ => 200_000,
         }
     }
@@ -2618,6 +2639,34 @@ impl AgentChatState {
     }
 }
 
+/// Normalize a user-typed model spec to canonical `provider:model` form.
+///
+/// Already-prefixed specs (`claude:`, `codex:`, `ollama:`, `local:`) pass
+/// through unchanged. Bare names are auto-prefixed with `claude:` so old
+/// muscle memory (`/model opus`) keeps working, but the stored value is
+/// always the canonical form.
+fn normalize_model_spec(arg: &str) -> String {
+    let trimmed = arg.trim();
+    if trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    if let Some((prefix, _)) = trimmed.split_once(':') {
+        // Only treat known providers as "already prefixed"; otherwise the
+        // colon is part of the model name (e.g. ollama-style tags).
+        if matches!(prefix, "claude" | "codex" | "ollama" | "local") {
+            return trimmed.to_string();
+        }
+    }
+    // Back-compat aliases for the legacy bare/dashed shorthand.
+    let canonical = match trimmed {
+        "claude-sonnet" => "sonnet",
+        "claude-opus" => "opus",
+        "claude-haiku" => "haiku",
+        other => other,
+    };
+    format!("claude:{}", canonical)
+}
+
 /// Parse `@path/to/file` references from input text.
 /// Returns a list of relative file paths referenced.
 pub fn parse_file_references(text: &str) -> Vec<String> {
@@ -2700,11 +2749,36 @@ mod tests {
     #[test]
     fn effective_model_prefers_conversation_override() {
         let mut state = AgentChatState::new();
-        state.agent_settings.model = "sonnet".to_string();
+        state.agent_settings.model = "claude:sonnet".to_string();
         state.conversations[state.active_conv].model_override =
             Some("ollama:qwen2.5-coder:7b".to_string());
 
         assert_eq!(state.effective_model(), "ollama:qwen2.5-coder:7b");
+    }
+
+    #[test]
+    fn normalize_model_spec_keeps_prefixed_specs_unchanged() {
+        for spec in [
+            "claude:opus",
+            "claude:sonnet[1m]",
+            "codex:gpt-5.5",
+            "ollama:qwen2.5-coder:7b",
+            "local:qwen2.5-coder:14b",
+        ] {
+            assert_eq!(normalize_model_spec(spec), spec);
+        }
+    }
+
+    #[test]
+    fn normalize_model_spec_auto_prefixes_bare_claude_aliases() {
+        assert_eq!(normalize_model_spec("opus"), "claude:opus");
+        assert_eq!(normalize_model_spec("sonnet"), "claude:sonnet");
+        assert_eq!(normalize_model_spec("haiku"), "claude:haiku");
+        assert_eq!(normalize_model_spec("opusplan"), "claude:opusplan");
+        // Dashed legacy aliases collapse to canonical Claude alias.
+        assert_eq!(normalize_model_spec("claude-opus"), "claude:opus");
+        assert_eq!(normalize_model_spec("claude-sonnet"), "claude:sonnet");
+        assert_eq!(normalize_model_spec("claude-haiku"), "claude:haiku");
     }
 
     #[test]
