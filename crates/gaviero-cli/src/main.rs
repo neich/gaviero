@@ -59,7 +59,7 @@ struct Cli {
     max_parallel: usize,
 
     /// Model spec to use for synthetic task execution and as the default runtime model.
-    /// Examples: sonnet, opus, haiku, claude:sonnet, codex:gpt-5-codex, ollama:qwen2.5-coder:7b.
+    /// Examples: sonnet, opus, haiku, claude:sonnet, codex:gpt-5.5, ollama:qwen2.5-coder:7b.
     /// Defaults to workspace agent.model, then sonnet.
     #[arg(long)]
     model: Option<String>,

@@ -269,7 +269,7 @@ IDLE/WEEKLY  sleeptime.rs + sleeptime_scheduler.rs (B5): decay sweep
 `AgentBackend` produces `Stream<Item = Result<UnifiedStreamEvent>>`. Implementations:
 
 - `ClaudeCodeBackend` — Claude via ACP subprocess.
-- `CodexBackend` — dual-mode: `codex:`/`codex-cli:` (exec) and `codex-app:` (app-server). Mode selected in `agent_session/registry.rs`.
+- `CodexBackend` — dual-mode: `codex:` (exec) and `codex-app:` (app-server). Mode selected in `agent_session/registry.rs`.
 - `OllamaStreamBackend` — Ollama HTTP SSE.
 - `MockBackend` — tests.
 

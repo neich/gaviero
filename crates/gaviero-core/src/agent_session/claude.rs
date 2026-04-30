@@ -45,14 +45,14 @@ use super::{AgentSession, Turn};
 
 // ── ClaudeSession ─────────────────────────────────────────────────────────────
 
-/// M6 `AgentSession` implementation for Claude Code (`claude-code:` / `claude:`
-/// model prefix). Owns the subprocess lifecycle for one turn and drives resume
+/// M6 `AgentSession` implementation for Claude Code (`claude:` model prefix).
+/// Owns the subprocess lifecycle for one turn and drives resume
 /// via `ContinuityHandle::ClaudeSessionId` rather than the deprecated
 /// `AgentOptions::resume_session_id` field.
 pub struct ClaudeSession {
     write_gate: Arc<Mutex<WriteGatePipeline>>,
     observer: Box<dyn AcpObserver>,
-    /// Claude model name, stripped of `claude-code:` / `claude:` prefix.
+    /// Claude model name, stripped of `claude:` prefix.
     claude_model: String,
     workspace_root: PathBuf,
     agent_id: String,
@@ -77,12 +77,11 @@ impl ClaudeSession {
     /// args. Called exclusively by `registry::create_session` for Claude
     /// providers (`ContinuityMode::NativeResume`).
     pub(super) fn new(args: SessionConstruction) -> Self {
-        // Strip provider prefix — `claude-code:sonnet` → `sonnet`,
-        // `claude:haiku` → `haiku`, bare `sonnet` → `sonnet`.
+        // Strip provider prefix — `claude:haiku` → `haiku`,
+        // bare `sonnet` → `sonnet`.
         let claude_model = args
             .model
-            .strip_prefix("claude-code:")
-            .or_else(|| args.model.strip_prefix("claude:"))
+            .strip_prefix("claude:")
             .unwrap_or(&args.model)
             .to_string();
 

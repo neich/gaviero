@@ -27,7 +27,7 @@ pub enum Item {
 ///
 /// ```text
 /// client opus_deep { model "opus" effort xhigh }
-/// client codex_fast { model "codex:gpt-5-codex" effort medium }
+/// client codex_fast { model "codex:gpt-5.5" effort medium }
 /// tier expensive opus_deep
 /// tier cheap codex_fast
 /// ```

@@ -62,12 +62,12 @@ pub struct ProviderProfile {
 
 /// Parsed `<prefix>:<model>` model spec.
 ///
-/// Constructed from the user-facing `model: String` (e.g. `"claude-code:sonnet"`).
+/// Constructed from the user-facing `model: String` (e.g. `"claude:sonnet"`).
 /// Parsing mirrors `swarm/backend/shared.rs::backend_config_for_model` —
 /// keep them in sync (M10 will collapse the duplication).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSpec {
-    /// Raw provider prefix (`"claude"`, `"claude-code"`, `"codex"`, `"codex-cli"`,
+    /// Raw provider prefix (`"claude"`, `"codex"`,
     /// `"ollama"`, `"local"`, or `""` if no prefix was supplied — defaults to Claude).
     pub provider_prefix: String,
     /// Model name without the prefix.
@@ -88,9 +88,7 @@ impl ModelSpec {
             "ollama",
             "local",
             "codex-app-server",
-            "codex-cli",
             "codex",
-            "claude-code",
             "claude",
         ] {
             let with_colon = format!("{}:", prefix);
@@ -115,15 +113,14 @@ impl ModelSpec {
         match self.provider_prefix.as_str() {
             "ollama" | "local" => Provider::Ollama,
             "codex-app-server" => Provider::CodexAppServer,
-            "codex" | "codex-cli" => Provider::Codex,
+            "codex" => Provider::Codex,
             // Bare or claude-prefixed → Claude.
             _ => Provider::Claude,
         }
     }
 }
 
-/// Logical provider category. Distinct from `provider_prefix` because
-/// multiple prefixes (`"claude"` / `"claude-code"`) map to the same provider.
+/// Logical provider category. Distinct from `provider_prefix`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     Claude,
@@ -177,7 +174,7 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             model: spec.model.clone(),
             // `codex exec` stays StatelessReplay (V9 §5). M8 adds the
             // `codex-app-server:` prefix for ProcessBound; the plain `codex:`
-            // and `codex-cli:` prefixes retain this arm unchanged.
+            // prefix retains this arm unchanged.
             continuity_mode: ContinuityMode::StatelessReplay,
             supports_tool_use: true,
             supports_native_resume: false,
@@ -389,16 +386,10 @@ mod tests {
     #[test]
     fn model_spec_parses_known_prefixes() {
         let cases = [
-            (
-                "claude-code:sonnet",
-                "claude-code",
-                "sonnet",
-                Provider::Claude,
-            ),
+            ("claude:sonnet", "claude", "sonnet", Provider::Claude),
             ("claude:opus", "claude", "opus", Provider::Claude),
             ("sonnet", "", "sonnet", Provider::Claude),
-            ("codex:gpt-5-codex", "codex", "gpt-5-codex", Provider::Codex),
-            ("codex-cli:o4-mini", "codex-cli", "o4-mini", Provider::Codex),
+            ("codex:gpt-5.5", "codex", "gpt-5.5", Provider::Codex),
             (
                 "ollama:qwen2.5-coder:7b",
                 "ollama",
@@ -420,19 +411,19 @@ mod tests {
         // Pins V9 §5 provider mapping table.
         let runtime = RuntimeConfig::default();
 
-        let claude = build_provider_profile(&ModelSpec::parse("claude-code:sonnet"), &runtime);
+        let claude = build_provider_profile(&ModelSpec::parse("claude:sonnet"), &runtime);
         assert_eq!(claude.continuity_mode, ContinuityMode::NativeResume);
         assert!(claude.supports_native_resume);
         assert!(claude.supports_tool_use);
         assert_eq!(claude.max_context_tokens, Some(200_000));
 
-        let codex = build_provider_profile(&ModelSpec::parse("codex:gpt-5-codex"), &runtime);
+        let codex = build_provider_profile(&ModelSpec::parse("codex:gpt-5.5"), &runtime);
         assert_eq!(codex.continuity_mode, ContinuityMode::StatelessReplay);
         assert!(!codex.supports_native_resume);
 
         // M8: codex-app-server: → ProcessBound (V9 §5 table).
         let codex_as =
-            build_provider_profile(&ModelSpec::parse("codex-app-server:gpt-5-codex"), &runtime);
+            build_provider_profile(&ModelSpec::parse("codex-app-server:gpt-5.5"), &runtime);
         assert_eq!(codex_as.continuity_mode, ContinuityMode::ProcessBound);
         assert!(codex_as.supports_native_resume);
         assert_eq!(codex_as.provider, "codex");

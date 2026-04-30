@@ -24,7 +24,7 @@ use super::{AgentSession, LegacyAgentSession, Turn};
 
 // ── CodexExecSession ──────────────────────────────────────────────────────────
 
-/// M8 `AgentSession` for Codex `exec` mode (`codex:` / `codex-cli:` prefixes).
+/// M8 `AgentSession` for Codex `exec` mode (`codex:` prefix).
 ///
 /// A named wrapper over [`LegacyAgentSession`] so the registry can route
 /// Codex exec separately from other `StatelessReplay` providers (e.g. Ollama).

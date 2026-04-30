@@ -419,7 +419,7 @@ pub(super) fn handle_coordinated_swarm_command(app: &mut App) {
     // Coordinator model resolution:
     //   1. explicit agent.coordinator.model setting
     //   2. chat's effective model (honors per-conv override + agent.model workspace setting)
-    // This lets users set `agent.model = codex:gpt-5-codex` and have swarm coordination
+    // This lets users set `agent.model = codex:gpt-5.5` and have swarm coordination
     // route through Codex too, without a separate coordinator setting.
     let coordinator_model = app
         .workspace

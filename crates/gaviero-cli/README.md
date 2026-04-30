@@ -92,7 +92,7 @@ The CLI supports provider-aware model specifications:
 
 ### Model spec formats
 
-- **Claude** — `sonnet`, `opus`, `haiku` or `claude:sonnet`, `claude-code:haiku`
+- **Claude** — `sonnet`, `opus`, `haiku` or `claude:sonnet`, `claude:haiku`
 - **Ollama/local** — `ollama:qwen2.5-coder:7b` or `local:model-name`
 
 ### Priority resolution

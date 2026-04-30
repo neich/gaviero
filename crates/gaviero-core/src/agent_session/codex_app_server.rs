@@ -172,7 +172,7 @@ impl CodexAppServerSession {
             anyhow::anyhow!(
                 "spawning codex app-server: {e}\n\
                  Ensure `codex` is on PATH and OPENAI_API_KEY is set.\n\
-                 Use `codex:` / `codex-cli:` prefix to fall back to `codex exec`."
+                 Use `codex:` prefix to fall back to `codex exec`."
             )
         })?;
 

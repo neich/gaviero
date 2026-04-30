@@ -36,7 +36,7 @@ pub trait AgentBackend: Send + Sync {
     /// Runtime capability reporting.
     fn capabilities(&self) -> Capabilities;
 
-    /// Human-readable backend name (e.g. "claude-code:sonnet", "ollama:qwen2.5-coder:7b").
+    /// Human-readable backend name (e.g. "claude:sonnet", "ollama:qwen2.5-coder:7b").
     fn name(&self) -> &str;
 
     /// Health check. Returns `Ok(())` if the backend is reachable.
@@ -177,7 +177,7 @@ pub fn create_backend(config: &BackendConfig) -> Result<Box<dyn AgentBackend>> {
             Ok(Box::new(claude_code::ClaudeCodeBackend::new(m)))
         }
         BackendConfig::Codex { model } => {
-            let m = model.as_deref().unwrap_or("gpt-5-codex");
+            let m = model.as_deref().unwrap_or("gpt-5.5");
             Ok(Box::new(codex::CodexBackend::new(m)))
         }
         BackendConfig::Ollama { model, base_url } => {

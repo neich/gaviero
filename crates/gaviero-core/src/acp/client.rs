@@ -181,8 +181,7 @@ impl AcpPipeline {
     ) -> Result<()> {
         let claude_model = self
             .model
-            .strip_prefix("claude-code:")
-            .or_else(|| self.model.strip_prefix("claude:"))
+            .strip_prefix("claude:")
             .unwrap_or(&self.model);
         let (available_owned, approved_owned) = self.options.resolved_tools();
         let available_tools: Vec<&str> = available_owned.iter().map(String::as_str).collect();

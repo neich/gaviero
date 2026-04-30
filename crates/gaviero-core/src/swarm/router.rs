@@ -166,11 +166,7 @@ impl TierRouter {
         }
 
         if shared::is_codex_model(model) {
-            let resolved_model = model
-                .strip_prefix("codex-cli:")
-                .or_else(|| model.strip_prefix("codex:"))
-                .unwrap_or(model)
-                .to_string();
+            let resolved_model = model.strip_prefix("codex:").unwrap_or(model).to_string();
             return ResolvedBackend::Codex {
                 model: resolved_model,
             };
@@ -233,12 +229,11 @@ fn routing_match(
 }
 
 /// Route a bare (non-Ollama) model spec into the correct `ResolvedBackend` variant
-/// based on its prefix. `codex:` / `codex-cli:` map to Codex; everything else to Claude.
+/// based on its prefix. `codex:` maps to Codex; everything else to Claude.
 fn api_backend_for_spec(model_spec: &str) -> ResolvedBackend {
     if shared::is_codex_model(model_spec) {
         let stripped = model_spec
-            .strip_prefix("codex-cli:")
-            .or_else(|| model_spec.strip_prefix("codex:"))
+            .strip_prefix("codex:")
             .unwrap_or(model_spec)
             .to_string();
         ResolvedBackend::Codex { model: stripped }
@@ -401,12 +396,12 @@ mod tests {
         let unit = test_unit(
             ModelTier::Cheap,
             PrivacyLevel::Public,
-            Some("codex:gpt-5-codex"),
+            Some("codex:gpt-5.5"),
         );
         assert_eq!(
             router.resolve(&unit),
             ResolvedBackend::Codex {
-                model: "gpt-5-codex".into()
+                model: "gpt-5.5".into()
             }
         );
     }
@@ -417,7 +412,7 @@ mod tests {
         let unit = test_unit(
             ModelTier::Cheap,
             PrivacyLevel::LocalOnly,
-            Some("codex:gpt-5-codex"),
+            Some("codex:gpt-5.5"),
         );
         assert!(matches!(
             router.resolve(&unit),
