@@ -66,7 +66,7 @@ pub struct AgentEntry {
     pub modified_files: Vec<String>,
     /// Model tier for this agent (set by tier routing).
     pub model_tier: Option<ModelTier>,
-    /// Backend description (e.g. "sonnet", "haiku", "ollama:qwen2.5").
+    /// Backend description (e.g. "claude:sonnet", "claude:haiku", "ollama:qwen2.5").
     pub backend: Option<String>,
     /// Rolling activity log for the detail pane.
     pub activity: Vec<ActivityLine>,
