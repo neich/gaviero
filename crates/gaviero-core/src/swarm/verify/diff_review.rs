@@ -25,7 +25,7 @@ pub struct DiffReviewConfig {
 impl Default for DiffReviewConfig {
     fn default() -> Self {
         Self {
-            review_model: "sonnet".into(),
+            review_model: "claude:sonnet".into(),
             ollama_base_url: None,
             max_diff_tokens: 16384,
             batch_strategy: BatchStrategy::PerDependencyTier,
