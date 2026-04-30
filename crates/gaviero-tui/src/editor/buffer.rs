@@ -2372,6 +2372,23 @@ fn format_toml(content: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn collect_numbers(
+        node: gaviero_core::Node,
+        source: &[u8],
+        out: &mut Vec<String>,
+    ) {
+        if node.kind() == "number" {
+            if let Ok(s) = std::str::from_utf8(&source[node.start_byte()..node.end_byte()]) {
+                out.push(s.to_string());
+            }
+        }
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                collect_numbers(child, source, out);
+            }
+        }
+    }
+
     #[test]
     fn test_empty_buffer() {
         let buf = Buffer::empty();
@@ -2622,20 +2639,5 @@ mod tests {
         let mut numbers = Vec::new();
         collect_numbers(root, source_bytes, &mut numbers);
         assert_eq!(numbers, vec!["5", "100", "200"]);
-    }
-}
-
-/// Collect text of all "number" nodes in the tree via DFS.
-#[allow(dead_code)]
-fn collect_numbers(node: gaviero_core::Node, source: &[u8], out: &mut Vec<String>) {
-    if node.kind() == "number" {
-        if let Ok(text) = node.utf8_text(source) {
-            out.push(text.to_string());
-        }
-    }
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            collect_numbers(child, source, out);
-        }
     }
 }
