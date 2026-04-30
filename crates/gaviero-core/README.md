@@ -32,7 +32,7 @@ Most tests run offline. Some (marked `#[ignore]`) require network for Ollama hea
 
 Model selection uses a unified convention across chat and swarm execution:
 
-- **Claude models** — `sonnet`, `opus`, `haiku` (shorthand) or `claude:sonnet`, `claude-code:haiku` (explicit)
+- **Claude models** — `sonnet`, `opus`, `haiku` (shorthand) or `claude:sonnet`, `claude:haiku` (explicit)
 - **Codex** — `codex:<model>` (e.g., `codex:gpt-5.4`) — routed to the Codex backend
 - **Ollama/local** — `ollama:qwen2.5-coder:7b` or `local:model-name`
 - **Default** — unprefixed names route to Claude for backward compatibility

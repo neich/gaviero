@@ -269,7 +269,7 @@ mod tests {
 
     fn fixture_ledger() -> SessionLedger {
         let profile = build_provider_profile(
-            &ModelSpec::parse("claude-code:sonnet"),
+            &ModelSpec::parse("claude:sonnet"),
             &RuntimeConfig::default(),
         );
         let fp = PlannerFingerprint::from_profile(&profile);
@@ -362,7 +362,7 @@ mod tests {
 
         let back: PersistedLedger = serde_json::from_str(&json).unwrap();
         let profile = crate::context_planner::types::build_provider_profile(
-            &crate::context_planner::types::ModelSpec::parse("claude-code:sonnet"),
+            &crate::context_planner::types::ModelSpec::parse("claude:sonnet"),
             &crate::context_planner::types::RuntimeConfig::default(),
         );
         let restored = SessionLedger::from_persisted(back, &profile);

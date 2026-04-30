@@ -28,7 +28,7 @@ impl ClaudeCodeBackend {
     pub fn new(model: &str) -> Self {
         Self {
             model: model.to_string(),
-            display_name: format!("claude-code:{}", model),
+            display_name: format!("claude:{}", model),
         }
     }
 }

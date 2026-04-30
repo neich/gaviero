@@ -36,7 +36,7 @@ pub trait AgentBackend: Send + Sync {
     /// Runtime capability reporting.
     fn capabilities(&self) -> Capabilities;
 
-    /// Human-readable backend name (e.g. "claude-code:sonnet", "ollama:qwen2.5-coder:7b").
+    /// Human-readable backend name (e.g. "claude:sonnet", "ollama:qwen2.5-coder:7b").
     fn name(&self) -> &str;
 
     /// Health check. Returns `Ok(())` if the backend is reachable.

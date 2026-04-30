@@ -304,7 +304,7 @@ mod tests {
 
     fn fixture_profile() -> ProviderProfile {
         build_provider_profile(
-            &ModelSpec::parse("claude-code:sonnet"),
+            &ModelSpec::parse("claude:sonnet"),
             &RuntimeConfig::default(),
         )
     }

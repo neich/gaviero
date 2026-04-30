@@ -173,7 +173,7 @@ agent reviewer {
 
 Provider-neutral: resolved at runtime by gaviero-core.
 
-- **Claude** — `sonnet`, `opus`, `haiku` (shorthand) or `claude:sonnet`, `claude-code:haiku` (explicit)
+- **Claude** — `sonnet`, `opus`, `haiku` (shorthand) or `claude:sonnet`, `claude:haiku` (explicit)
 - **Codex** — `codex:<model>` (e.g., `codex:gpt-5.4`)
 - **Ollama/local** — `ollama:qwen2.5-coder:7b` or `local:model-name`
 

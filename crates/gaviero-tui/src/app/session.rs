@@ -255,7 +255,7 @@ mod tests {
         // planner emits empty memory + graph selections, and the
         // renderer therefore produces just the user prompt string.
         let profile = build_provider_profile(
-            &ModelSpec::parse("claude-code:sonnet"),
+            &ModelSpec::parse("claude:sonnet"),
             &RuntimeConfig::default(),
         );
         let fp = PlannerFingerprint::from_profile(&profile);

@@ -9,7 +9,6 @@ const HISTORY_TRUNCATION_CHARS: usize = 2000;
 const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
 const SUPPORTED_PROVIDER_PREFIXES: &[&str] = &[
     "claude",
-    "claude-code",
     "codex",
     "ollama",
     "local",
@@ -159,10 +158,7 @@ pub fn backend_config_for_model(model_spec: &str, ollama_base_url: Option<&str>)
         };
     }
 
-    let claude_model = trimmed
-        .strip_prefix("claude-code:")
-        .or_else(|| trimmed.strip_prefix("claude:"))
-        .unwrap_or(trimmed);
+    let claude_model = trimmed.strip_prefix("claude:").unwrap_or(trimmed);
 
     BackendConfig::ClaudeCode {
         model: if claude_model.is_empty() {
@@ -181,7 +177,7 @@ pub fn validate_model_spec(model_spec: &str) -> Result<()> {
 
     if let Some((prefix, remainder)) = trimmed.split_once(':') {
         match prefix {
-            "ollama" | "local" | "claude" | "claude-code" | "codex" => {
+            "ollama" | "local" | "claude" | "codex" => {
                 if remainder.trim().is_empty() {
                     anyhow::bail!("model spec '{}' is missing a model name", trimmed);
                 }
@@ -395,7 +391,6 @@ mod tests {
             "sonnet",
             "opus",
             "claude:sonnet",
-            "claude-code:haiku",
             "ollama:qwen2.5-coder:7b",
             "local:qwen2.5-coder:14b",
             "codex:gpt-5.5",

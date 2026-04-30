@@ -62,12 +62,12 @@ pub struct ProviderProfile {
 
 /// Parsed `<prefix>:<model>` model spec.
 ///
-/// Constructed from the user-facing `model: String` (e.g. `"claude-code:sonnet"`).
+/// Constructed from the user-facing `model: String` (e.g. `"claude:sonnet"`).
 /// Parsing mirrors `swarm/backend/shared.rs::backend_config_for_model` —
 /// keep them in sync (M10 will collapse the duplication).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSpec {
-    /// Raw provider prefix (`"claude"`, `"claude-code"`, `"codex"`,
+    /// Raw provider prefix (`"claude"`, `"codex"`,
     /// `"ollama"`, `"local"`, or `""` if no prefix was supplied — defaults to Claude).
     pub provider_prefix: String,
     /// Model name without the prefix.
@@ -89,7 +89,6 @@ impl ModelSpec {
             "local",
             "codex-app-server",
             "codex",
-            "claude-code",
             "claude",
         ] {
             let with_colon = format!("{}:", prefix);
@@ -121,8 +120,7 @@ impl ModelSpec {
     }
 }
 
-/// Logical provider category. Distinct from `provider_prefix` because
-/// multiple prefixes (`"claude"` / `"claude-code"`) map to the same provider.
+/// Logical provider category. Distinct from `provider_prefix`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     Claude,
@@ -388,12 +386,7 @@ mod tests {
     #[test]
     fn model_spec_parses_known_prefixes() {
         let cases = [
-            (
-                "claude-code:sonnet",
-                "claude-code",
-                "sonnet",
-                Provider::Claude,
-            ),
+            ("claude:sonnet", "claude", "sonnet", Provider::Claude),
             ("claude:opus", "claude", "opus", Provider::Claude),
             ("sonnet", "", "sonnet", Provider::Claude),
             ("codex:gpt-5.5", "codex", "gpt-5.5", Provider::Codex),
@@ -418,7 +411,7 @@ mod tests {
         // Pins V9 §5 provider mapping table.
         let runtime = RuntimeConfig::default();
 
-        let claude = build_provider_profile(&ModelSpec::parse("claude-code:sonnet"), &runtime);
+        let claude = build_provider_profile(&ModelSpec::parse("claude:sonnet"), &runtime);
         assert_eq!(claude.continuity_mode, ContinuityMode::NativeResume);
         assert!(claude.supports_native_resume);
         assert!(claude.supports_tool_use);
