@@ -73,11 +73,11 @@ Example `.gaviero/settings.json`:
     "insertSpaces": true
   },
   "agent": {
-    "model": "sonnet",
+    "model": "claude:sonnet",
     "maxTokens": 16384,
     "ollamaBaseUrl": "http://localhost:11434",
     "coordinator": {
-      "model": "opus"
+      "model": "claude:opus"
     }
   },
   "memory": {
