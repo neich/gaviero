@@ -175,20 +175,29 @@ pub fn validate_model_spec(model_spec: &str) -> Result<()> {
         anyhow::bail!("model spec cannot be empty");
     }
 
-    if let Some((prefix, remainder)) = trimmed.split_once(':') {
-        match prefix {
-            "ollama" | "local" | "claude" | "codex" => {
-                if remainder.trim().is_empty() {
-                    anyhow::bail!("model spec '{}' is missing a model name", trimmed);
-                }
+    let Some((prefix, remainder)) = trimmed.split_once(':') else {
+        anyhow::bail!(
+            "model spec '{}' is missing a provider prefix; \
+             use the canonical `provider:model` form \
+             (e.g. `claude:opus`, `codex:gpt-5`, `ollama:qwen2.5-coder:7b`). \
+             Supported prefixes: {}",
+            trimmed,
+            SUPPORTED_PROVIDER_PREFIXES.join(", ")
+        );
+    };
+
+    match prefix {
+        "ollama" | "local" | "claude" | "codex" => {
+            if remainder.trim().is_empty() {
+                anyhow::bail!("model spec '{}' is missing a model name", trimmed);
             }
-            _ => {
-                anyhow::bail!(
-                    "unknown model prefix '{}'; supported prefixes: {}",
-                    prefix,
-                    SUPPORTED_PROVIDER_PREFIXES.join(", ")
-                );
-            }
+        }
+        _ => {
+            anyhow::bail!(
+                "unknown model prefix '{}'; supported prefixes: {}",
+                prefix,
+                SUPPORTED_PROVIDER_PREFIXES.join(", ")
+            );
         }
     }
 
@@ -363,8 +372,8 @@ mod tests {
     }
 
     #[test]
-    fn test_backend_config_for_model_defaults_to_claude() {
-        let config = backend_config_for_model("sonnet", None);
+    fn test_backend_config_for_model_parses_claude_prefix() {
+        let config = backend_config_for_model("claude:sonnet", None);
         assert_eq!(
             config,
             BackendConfig::ClaudeCode {
@@ -388,9 +397,10 @@ mod tests {
     #[test]
     fn test_validate_model_spec_accepts_supported_forms() {
         for spec in [
-            "sonnet",
-            "opus",
             "claude:sonnet",
+            "claude:opus",
+            "claude:opusplan",
+            "claude:sonnet[1m]",
             "ollama:qwen2.5-coder:7b",
             "local:qwen2.5-coder:14b",
             "codex:gpt-5.5",
@@ -424,6 +434,17 @@ mod tests {
         assert!(validate_model_spec("ollama:").is_err());
         let err = validate_model_spec("openai:gpt-4.1").unwrap_err();
         assert!(err.to_string().contains("unknown model prefix"));
+    }
+
+    #[test]
+    fn test_validate_model_spec_rejects_bare_names_without_provider_prefix() {
+        for spec in ["sonnet", "opus", "haiku", "opusplan", "gpt-5.5", "qwen2.5"] {
+            let err = validate_model_spec(spec).unwrap_err();
+            assert!(
+                err.to_string().contains("provider prefix"),
+                "expected `provider prefix` complaint for `{spec}`, got: {err}"
+            );
+        }
     }
 
     // ── M1 byte-identity adapter tests ────────────────────────────
