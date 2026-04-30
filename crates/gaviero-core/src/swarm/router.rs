@@ -401,12 +401,12 @@ mod tests {
         let unit = test_unit(
             ModelTier::Cheap,
             PrivacyLevel::Public,
-            Some("codex:gpt-5-codex"),
+            Some("codex:gpt-5.5"),
         );
         assert_eq!(
             router.resolve(&unit),
             ResolvedBackend::Codex {
-                model: "gpt-5-codex".into()
+                model: "gpt-5.5".into()
             }
         );
     }
@@ -417,7 +417,7 @@ mod tests {
         let unit = test_unit(
             ModelTier::Cheap,
             PrivacyLevel::LocalOnly,
-            Some("codex:gpt-5-codex"),
+            Some("codex:gpt-5.5"),
         );
         assert!(matches!(
             router.resolve(&unit),

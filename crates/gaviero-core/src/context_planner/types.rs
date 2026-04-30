@@ -397,7 +397,7 @@ mod tests {
             ),
             ("claude:opus", "claude", "opus", Provider::Claude),
             ("sonnet", "", "sonnet", Provider::Claude),
-            ("codex:gpt-5-codex", "codex", "gpt-5-codex", Provider::Codex),
+            ("codex:gpt-5.5", "codex", "gpt-5.5", Provider::Codex),
             ("codex-cli:o4-mini", "codex-cli", "o4-mini", Provider::Codex),
             (
                 "ollama:qwen2.5-coder:7b",
@@ -426,13 +426,13 @@ mod tests {
         assert!(claude.supports_tool_use);
         assert_eq!(claude.max_context_tokens, Some(200_000));
 
-        let codex = build_provider_profile(&ModelSpec::parse("codex:gpt-5-codex"), &runtime);
+        let codex = build_provider_profile(&ModelSpec::parse("codex:gpt-5.5"), &runtime);
         assert_eq!(codex.continuity_mode, ContinuityMode::StatelessReplay);
         assert!(!codex.supports_native_resume);
 
         // M8: codex-app-server: → ProcessBound (V9 §5 table).
         let codex_as =
-            build_provider_profile(&ModelSpec::parse("codex-app-server:gpt-5-codex"), &runtime);
+            build_provider_profile(&ModelSpec::parse("codex-app-server:gpt-5.5"), &runtime);
         assert_eq!(codex_as.continuity_mode, ContinuityMode::ProcessBound);
         assert!(codex_as.supports_native_resume);
         assert_eq!(codex_as.provider, "codex");

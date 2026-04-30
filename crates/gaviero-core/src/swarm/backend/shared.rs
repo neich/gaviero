@@ -402,7 +402,7 @@ mod tests {
             "claude-code:haiku",
             "ollama:qwen2.5-coder:7b",
             "local:qwen2.5-coder:14b",
-            "codex:gpt-5-codex",
+            "codex:gpt-5.5",
             "codex-cli:o4-mini",
         ] {
             validate_model_spec(spec).unwrap();
@@ -411,11 +411,11 @@ mod tests {
 
     #[test]
     fn test_backend_config_for_model_parses_codex_prefix() {
-        let config = backend_config_for_model("codex:gpt-5-codex", None);
+        let config = backend_config_for_model("codex:gpt-5.5", None);
         assert_eq!(
             config,
             BackendConfig::Codex {
-                model: Some("gpt-5-codex".into())
+                model: Some("gpt-5.5".into())
             }
         );
     }

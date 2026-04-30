@@ -177,7 +177,7 @@ pub fn create_backend(config: &BackendConfig) -> Result<Box<dyn AgentBackend>> {
             Ok(Box::new(claude_code::ClaudeCodeBackend::new(m)))
         }
         BackendConfig::Codex { model } => {
-            let m = model.as_deref().unwrap_or("gpt-5-codex");
+            let m = model.as_deref().unwrap_or("gpt-5.5");
             Ok(Box::new(codex::CodexBackend::new(m)))
         }
         BackendConfig::Ollama { model, base_url } => {

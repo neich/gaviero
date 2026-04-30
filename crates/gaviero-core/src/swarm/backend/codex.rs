@@ -26,7 +26,7 @@ use super::{
     AgentBackend, Capabilities, CompletionRequest, StopReason, TokenUsage, UnifiedStreamEvent,
 };
 
-const DEFAULT_CODEX_MODEL: &str = "gpt-5-codex";
+const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
 
 /// Backend that spawns the Codex CLI as a subprocess.
 pub struct CodexBackend {
@@ -296,9 +296,9 @@ mod tests {
 
     #[test]
     fn test_backend_name_contains_model() {
-        let b = CodexBackend::new("gpt-5-codex");
+        let b = CodexBackend::new("gpt-5.5");
         assert!(b.name().contains("codex"));
-        assert!(b.name().contains("gpt-5-codex"));
+        assert!(b.name().contains("gpt-5.5"));
     }
 
     #[test]
@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn test_capabilities_file_blocks_supported() {
-        let b = CodexBackend::new("gpt-5-codex");
+        let b = CodexBackend::new("gpt-5.5");
         let caps = b.capabilities();
         assert!(caps.supports_file_blocks);
         assert!(caps.supports_system_prompt);
