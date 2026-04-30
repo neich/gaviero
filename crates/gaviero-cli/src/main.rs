@@ -59,13 +59,14 @@ struct Cli {
     max_parallel: usize,
 
     /// Model spec to use for synthetic task execution and as the default runtime model.
-    /// Examples: sonnet, opus, haiku, claude:sonnet, codex:gpt-5.5, ollama:qwen2.5-coder:7b.
-    /// Defaults to workspace agent.model, then sonnet.
+    /// Canonical form is `provider:model` — e.g. `claude:sonnet`, `claude:opus`,
+    /// `codex:gpt-5.5`, `ollama:qwen2.5-coder:7b`. Defaults to workspace agent.model,
+    /// then `claude:sonnet`.
     #[arg(long)]
     model: Option<String>,
 
     /// Model spec to use for coordinated planning.
-    /// Defaults to --model, then workspace agent.coordinator.model, then sonnet.
+    /// Defaults to --model, then workspace agent.coordinator.model, then `claude:sonnet`.
     #[arg(long)]
     coordinator_model: Option<String>,
 
@@ -1308,7 +1309,7 @@ fn resolve_execution_model(
         .or_else(|| {
             workspace_setting_string(workspace, gaviero_core::workspace::settings::AGENT_MODEL)
         })
-        .unwrap_or_else(|| "sonnet".to_string());
+        .unwrap_or_else(|| "claude:sonnet".to_string());
     resolve_model_spec(&candidate, "execution")
 }
 
@@ -2087,7 +2088,7 @@ mod tests {
             "execution-model",
             r#"{
               "agent": {
-                "model": "opus"
+                "model": "claude:opus"
               }
             }"#,
         );
@@ -2113,7 +2114,7 @@ mod tests {
             "coordinator-model",
             r#"{
               "agent": {
-                "model": "haiku",
+                "model": "claude:haiku",
                 "coordinator": {
                   "model": "claude:sonnet"
                 }
@@ -2127,7 +2128,7 @@ mod tests {
         let execution = resolve_execution_model(&cli, &workspace).unwrap();
         let coordinator = resolve_coordinator_model(&cli, &workspace, &execution).unwrap();
 
-        assert_eq!(execution, "haiku");
+        assert_eq!(execution, "claude:haiku");
         assert_eq!(coordinator, "claude:sonnet");
 
         let _ = fs::remove_dir_all(root);
