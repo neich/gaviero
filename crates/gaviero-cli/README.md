@@ -148,6 +148,14 @@ Ollama server URL precedence:
 | `--trace` | `<file>` | Write DEBUG-level JSON trace log |
 | `--graph` | — | Build/update code knowledge graph and exit |
 | `--exclude` | `<pattern>` | Exclude folders from repo-map scanning (repeatable, comma-separated) |
+| `--manifest-last` | `<n>` | Print the N most recent retrieval manifests and exit |
+| `--manifest-turn` | `<id>` | Print the retrieval manifest for a specific turn id and exit |
+| `--eval-fixture` | `<path>` | Run retrieval smoke test against a JSONL fixture; prints recall@K and MRR |
+| `--eval-tolerance` | `<f>` | Recall@5 regression tolerance for `--eval-fixture` (default 0.02) |
+| `--eval-report-out` | `<path>` | Write eval report to file (defaults to `<fixture>.last.json`) |
+| `--eval-update-baseline` | — | Update the baseline file from this run's results |
+| `--eval-rerank-ablation` | — | Run fixture twice with/without reranker and print recall/MRR deltas |
+| `--eval-from-manifests` | `<n>` | Rescore fixture against N persisted manifests (no embedder/LLM) |
 
 ## Output
 

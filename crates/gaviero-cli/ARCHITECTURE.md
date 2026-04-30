@@ -2,18 +2,22 @@
 
 Headless runner. `clap` front end + observer wiring; all runtime work delegates to `gaviero-core` and `gaviero-dsl`.
 
+Binary: `gaviero-cli`
+
 ---
 
 ## 1. Design
 
 Intentionally minimal:
-- Parse flags with `clap`.
-- Construct one input plan (one of four shapes).
-- Wire `AcpObserver` / `SwarmObserver` to stderr.
-- Delegate to `gaviero_core::swarm::pipeline::execute` or `swarm::coordinator`.
-- Write results to stdout (text or JSON).
+- Parse flags with `clap` (single `Cli` struct, derive macro).
+- Pick exactly one operating mode — execution, coordinated planning, repo-map build, eval, sleeptime, memory administration, or `/remember`.
+- Wire stderr observers (`AcpObserver`, `SwarmObserver`, write-gate logging).
+- Delegate to `gaviero_core` / `gaviero_dsl`.
+- Write results to stdout (text or JSON) unless `--output <path>` is set.
 
-Single source file: `src/main.rs` (~1 KLOC) containing `Cli`, `CliAcpObserver`, `CliSwarmObserver`, and `run()`.
+Single source file: `src/main.rs` (~2.1 KLOC) containing `Cli`, `CliAcpObserver`, `CliSwarmObserver`, `OutputFormat`, mode dispatch, and `run()`. Tests in `tests/remember_cli.rs`.
+
+The `Cli` struct is the authoritative flag list — read it before adding flags here.
 
 ---
 
@@ -23,16 +27,29 @@ Single source file: `src/main.rs` (~1 KLOC) containing `Cli`, `CliAcpObserver`, 
 parse Cli (clap)
    │
    ├─ open Workspace + settings (`gaviero_core::workspace`)
-   ├─ init MemoryStore (best-effort; continues on failure)
+   ├─ probe C1 migration; refuse without --accept-c1-migration
+   ├─ init MemoryStores (best-effort; --no-memory bypasses)
    │
-   ├─ input mode:
-   │     ┌─ --task <text>          → synthetic WorkUnit (full repo scope)
-   │     ├─ --work-units <json>    → Vec<WorkUnit> (serde)
-   │     ├─ --script <path>        → gaviero_dsl::compile_with_vars(...)
-   │     └─ --graph                → build/update repo-map, print stats, exit
+   ├─ admin / one-shot modes (each exits before agent dispatch):
+   │     --remember <text>                 → WriterHandle store, exit
+   │     --graph                           → repo-map build/refresh, stats, exit
+   │     --manifest-last / --manifest-turn → print injection_manifests, exit
+   │     --eval-fixture / --eval-from-… /  → run eval harness, write report, exit
+   │       --eval-bootstrap-from-manifests
+   │     --sleep [+ --sleep-dry-run]       → run_sleeptime, exit
+   │     --utilization-scope               → print top/bottom-N utilization, exit
+   │     --deletions-last                  → list audit rows, exit
+   │     --restore-id / --restore-since    → replay deletion through dedup, exit
+   │     --forget-* (+ --forget-yes)       → soft-delete via writer task, exit
+   │     --forget-history-id (REDACT)      → C2.4 in-place redaction, exit
    │
-   ├─ apply iteration overrides  (--max-retries, --attempts,
-   │                              --test-first, --escalate-after, --no-iterate)
+   ├─ task input mode:
+   │     --task <text>          → synthetic WorkUnit (full repo scope)
+   │     --work-units <json>    → Vec<WorkUnit> (serde)
+   │     --script <path>        → gaviero_dsl::compile_with_vars(...)
+   │
+   ├─ apply iteration overrides (--max-retries, --attempts,
+   │                             --test-first, --escalate-after, --no-iterate)
    │
    ├─ --coordinated?
    │     yes → swarm::coordinator::plan_coordinated → write .gaviero, exit
@@ -47,7 +64,7 @@ parse Cli (clap)
 
 ### `--task <text>`
 
-Creates a synthetic `WorkUnit` with scope `owned_paths = ["."]`, `tier=Cheap`, `privacy=Public`, model from `--model` or workspace default. Wrapped in a single-node `CompiledPlan::from_work_units(vec![unit])`.
+Creates a synthetic `WorkUnit` with scope `owned_paths = ["."]`, `tier = Cheap`, `privacy = Public`, model from `--model` or workspace default. Wrapped in a single-node `CompiledPlan::from_work_units(vec![unit])`.
 
 ### `--work-units <json>`
 
@@ -63,12 +80,8 @@ let plan = gaviero_dsl::compile_with_vars(
 ```
 
 - `--workflow <name>` selects a workflow when the script declares multiple.
-- `--prompt-file <path>` reads the file's contents and supplies them as `runtime_prompt` (substituted for every `{{PROMPT}}`; also used as the full prompt for agents without a `prompt` field).
-- `--var KEY=VALUE` (repeatable) overrides entries in the script's top-level `vars {}`; CLI overrides beat script-level vars but not agent-level vars.
-
-### `--graph`
-
-Builds or refreshes the code knowledge graph (`gaviero_core::repo_map`), prints statistics, then exits without running agents. Honours `--exclude` (comma-separated or repeated, bare names match basename at any depth; `/`-containing values are globs).
+- `--prompt-file <path>` reads file contents and supplies them as `runtime_prompt` (replaces every `{{PROMPT}}`; also acts as the full prompt for agents without a `prompt` field).
+- `--var KEY=VALUE` (repeatable) overrides entries in the script's top-level `vars {}`. Precedence: agent-level `vars {}` > CLI `--var` > script-level `vars {}`.
 
 ---
 
@@ -76,13 +89,13 @@ Builds or refreshes the code knowledge graph (`gaviero_core::repo_map`), prints 
 
 ### `CliAcpObserver`
 
-Prints stream chunks, tool calls, validation results, retries, and deferred proposals to stderr. Mirrors the agent-chat output the TUI renders, so CI logs are readable.
+Prints stream chunks (verbose only), tool calls, validation results, retries, and deferred proposals to stderr. Lines are prefixed `[{agent_id}]` for multi-agent tracing.
 
 ### `CliSwarmObserver`
 
 Prints phase, agent state, tier start/dispatch, merge conflicts, cost updates, and completion to stderr.
 
-All events route to stderr so stdout stays clean for structured output (`--format json`).
+All observer events route to stderr so stdout stays clean for structured output (`--format json`).
 
 ---
 
@@ -94,11 +107,12 @@ Model spec passed via `--model` (or the DSL `client` decl) is parsed by `gaviero
 sonnet | opus | haiku       → claude:<same>
 claude:<name>               → Claude API (ACP)
 ollama:<name>               → Ollama HTTP SSE
-codex:<name>                → Codex (codex exec / app-server)
+codex:<name>                → Codex exec
+codex-app:<name>            → Codex app-server
 local:<url>                 → OpenAI-compatible endpoint
 ```
 
-Validation via `validate_model_spec`. `--coordinator-model` picks the planner model for `--coordinated`. `--ollama-base-url` overrides the Ollama endpoint (defaults to workspace setting, then `http://localhost:11434`).
+Validated by `validate_model_spec`. `--coordinator-model` picks the planner model for `--coordinated`. `--ollama-base-url` overrides the Ollama endpoint (defaults to workspace setting, then `http://localhost:11434`).
 
 `TierRouter` maps `(ModelTier, PrivacyLevel)` to a concrete backend; `PrivacyScanner` can promote a unit to `LocalOnly` based on glob matches against sensitive paths.
 
@@ -124,7 +138,7 @@ Applied after the `CompiledPlan` is produced, before `pipeline::execute`.
 gaviero-cli --task "..." --coordinated --model claude:opus
 ```
 
-Calls `swarm::coordinator::plan_coordinated(task, workspace, memory, coordinator_model)` which emits a `CompiledPlan`. The plan is serialised back to `.gaviero` form and written to `--output` or `tmp/gaviero_plan_<timestamp>.gaviero`. No agents run — the output is meant for review before a subsequent `--script` invocation.
+Calls `swarm::coordinator::plan_coordinated(task, workspace, memory, coordinator_model)`, which emits a `CompiledPlan`. The plan is serialised back to `.gaviero` form and written to `--output` (or `tmp/gaviero_plan_<timestamp>.gaviero`). No agents run — the output is meant for review before a subsequent `--script` invocation.
 
 ---
 
@@ -136,7 +150,26 @@ Calls `swarm::coordinator::plan_coordinated(task, workspace, memory, coordinator
 
 ## 9. Memory Integration
 
-`MemoryStore::init` is best-effort; failure is non-fatal and logged. `--namespace` overrides the write namespace (default: settings → folder name), `--read-ns` adds additional read namespaces (repeatable). `--no-memory` bypasses memory entirely.
+`MemoryStores::open` is best-effort; failure is non-fatal and logged. `--namespace` overrides the write namespace (default: settings → folder name); `--read-ns` adds additional read namespaces (repeatable). `--no-memory` bypasses memory entirely.
+
+Headless contexts cannot prompt interactively, so a pending C1 typed-stores migration aborts the run unless `--accept-c1-migration` is set; the CLI prints the affected DB files plus the proposed backup path. The TUI (`gaviero`) prompts on stdin instead.
+
+`--remember <text>` writes a single memory through `MemoryServices` + the writer task (single-consumer invariant). `--remember-scope` overrides the default `repo` scope (`run | module | repo | workspace | global`).
+
+### Memory administration (one-shot, all exit before any agent runs)
+
+| Flag | Purpose |
+|---|---|
+| `--manifest-last N` / `--manifest-turn <id>` | Print recent `injection_manifests` for audit |
+| `--eval-fixture <path>` (+ `--eval-tolerance`, `--eval-report-out`, `--eval-update-baseline`, `--eval-allow-missing-baseline`, `--eval-rerank-ablation`) | Recall@K / MRR regression harness |
+| `--eval-from-manifests N` | Cheap rescore replay against persisted manifests |
+| `--eval-bootstrap-from-manifests N` | Emit a JSONL fixture from recent manifests |
+| `--sleep` (+ `--sleep-dry-run`) | Run idle/weekly sleeptime hygiene pass |
+| `--utilization-scope <0..4>` (+ `--utilization-top`, `--utilization-asc`) | Print most/least-utilised memories at a level |
+| `--deletions-last N` | List `deletions` audit rows |
+| `--restore-id <i64>` / `--restore-since <duration>` | Replay deletion(s) through dedup |
+| `--forget-query` / `--forget-scope` / `--forget-type` / `--forget-source` (+ `--forget-dry-run`, `--forget-yes`, `--forget-reason`) | Bulk soft-delete; `--forget-yes` required to commit (default is dry-run) |
+| `--forget-history-id <i64>` (+ `--redact-confirm REDACT`, `--redact-reason "<text>"`) | C2.4 in-place History redaction (one-way, not undoable) |
 
 ---
 
@@ -144,18 +177,20 @@ Calls `swarm::coordinator::plan_coordinated(task, workspace, memory, coordinator
 
 - `--format text` (default): human-readable summary (phases, manifests, merge results, cost, duration).
 - `--format json`: structured `SwarmResult` JSON for CI ingestion.
-- `--output <path>`: write to a file instead of stdout.
+- `--output <path>`: write to a file instead of stdout (also used by `--coordinated`).
 
 | Code | Meaning |
 |---|---|
 | 0 | success |
-| 1 | failure (agent, validation, merge, or abort) |
+| 1 | failure (agent, validation, merge, eval-regression, abort) |
 | 2 | argument error (invalid flags) |
-| 3 | setup error (workspace / memory init / panic) |
+| 3 | setup error (workspace / memory init / panic / pending C1 migration) |
 
 ---
 
 ## 11. Flag Reference
+
+The `Cli` struct in `src/main.rs` is authoritative. Summary by section:
 
 ### Input
 ```
@@ -169,7 +204,8 @@ Calls `swarm::coordinator::plan_coordinated(task, workspace, memory, coordinator
 
 ### Execution
 ```
---model <spec>             sonnet / opus / claude:X / codex:X / ollama:X / local:URL
+--model <spec>             sonnet / opus / claude:X / codex:X / codex-app:X /
+                           ollama:X / local:URL
 --coordinator-model <spec> planner model for --coordinated
 --ollama-base-url <url>    override Ollama endpoint
 --auto-accept              skip interactive review
@@ -182,17 +218,20 @@ Calls `swarm::coordinator::plan_coordinated(task, workspace, memory, coordinator
 --max-parallel N           parallel agents (currently sequential)
 ```
 
-### Memory
+### Memory — scope
 ```
 --namespace <name>         write namespace
 --read-ns <name>           additional read namespace (repeatable)
 --no-memory                disable memory
+--accept-c1-migration      consent to v10 typed-stores split
+--remember <text>          one-shot /remember from headless mode
+--remember-scope <level>   run / module / repo (default) / workspace / global
 ```
 
 ### Repo map
 ```
 --graph                    build/update code knowledge graph and exit
---exclude <glob>           folder/glob to skip (comma-separated or repeatable)
+--exclude <name|glob>      folder/glob to skip (comma-separated or repeatable)
 ```
 
 ### Coordination
@@ -201,10 +240,40 @@ Calls `swarm::coordinator::plan_coordinated(task, workspace, memory, coordinator
 --output <path>            output path for --coordinated (default: tmp/...)
 ```
 
+### Manifests / eval
+```
+--manifest-last N
+--manifest-turn <id>
+--eval-fixture <path> [--eval-tolerance F] [--eval-report-out <path>]
+                      [--eval-update-baseline] [--eval-allow-missing-baseline]
+                      [--eval-rerank-ablation]
+--eval-from-manifests N
+--eval-bootstrap-from-manifests N
+```
+
+### Hygiene
+```
+--sleep [--sleep-dry-run]
+--utilization-scope 0..4 [--utilization-top N] [--utilization-asc]
+```
+
+### Deletions / restore / forget / redact
+```
+--deletions-last N
+--restore-id <i64>
+--restore-since <duration>
+--forget-query <text>      / --forget-scope <path> / --forget-type <t>
+                           / --forget-source <s>
+                           [--forget-dry-run | --forget-yes]
+                           [--forget-reason "<text>"]
+--forget-history-id <i64>  --redact-confirm REDACT --redact-reason "<text>"
+```
+
 ### Output / diagnostics
 ```
 --format <text|json>       output format
 --trace <path>             JSON trace log (enables DEBUG tracing)
+--verbose / -v             INFO (-v) / DEBUG (-vv) tracing to stderr
 --repo <path>              repository / workspace root (default: .)
 ```
 
@@ -212,7 +281,7 @@ Calls `swarm::coordinator::plan_coordinated(task, workspace, memory, coordinator
 
 ## 12. Error Reporting
 
-Compilation errors (`miette::Report` from `gaviero-dsl`) print with source spans to stderr. Runtime errors surface through observer callbacks; fatal errors use `anyhow::Context` all the way up and exit with the appropriate code.
+Compilation errors (`miette::Report` from `gaviero-dsl`) print with source spans to stderr. Runtime errors surface through observer callbacks; fatal errors use `anyhow::Context` all the way up and exit with the appropriate code. Pending-C1-migration aborts print the affected files and proposed backup path.
 
 ---
 

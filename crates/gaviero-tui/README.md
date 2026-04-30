@@ -24,6 +24,7 @@ The TUI combines multiple editing and collaboration features:
 - **Git panel** — Stage/unstage, commit, branch management, diff review
 - **Agent chat** — Talk to Claude agents with file context and streaming output
 - **Swarm dashboard** — Monitor multi-agent tasks, view logs, check timing and cost
+- **Memory panel** — Inspect stored memories, query by scope, trigger consolidation, audit retrieval manifests
 - **Search panel** — Workspace-wide search with results navigation
 - **Embedded terminal** — Full PTY shell with OSC 133 support
 - **Session restore** — Persistent tabs, layout, and conversation history
