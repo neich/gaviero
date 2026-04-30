@@ -26,17 +26,6 @@ pub fn write_text(buf: &mut Buffer, x: u16, y: u16, x_max: u16, text: &str, styl
     cx
 }
 
-/// Fill a row from `x` to `x + width` with spaces in the given style.
-#[allow(dead_code)]
-pub fn fill_row(buf: &mut Buffer, x: u16, y: u16, width: u16, style: Style) {
-    if y >= buf.area().bottom() {
-        return;
-    }
-    let x_max = (x + width).min(buf.area().right());
-    for cx in x..x_max {
-        buf[(cx, y)].set_char(' ').set_style(style);
-    }
-}
 
 /// Word-wrap text into lines that fit within `width` display columns.
 ///
