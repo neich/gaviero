@@ -829,7 +829,7 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::FILE_TREE_WIDTH => serde_json::json!(30),
         settings::SIDE_PANEL_WIDTH => serde_json::json!(40),
         settings::TERMINAL_SPLIT_PERCENT => serde_json::json!(30),
-        settings::AGENT_MODEL => serde_json::json!("sonnet"),
+        settings::AGENT_MODEL => serde_json::json!("claude:sonnet"),
         settings::AGENT_EFFORT => serde_json::json!("off"),
         settings::AGENT_MAX_TOKENS => serde_json::json!(16384),
         settings::AGENT_GRAPH_BUDGET_TOKENS => serde_json::json!(40000),

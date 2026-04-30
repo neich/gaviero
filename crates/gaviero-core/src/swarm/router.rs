@@ -17,9 +17,9 @@ pub struct TierConfig {
 impl Default for TierConfig {
     fn default() -> Self {
         Self {
-            cheap_model: "haiku".into(),
+            cheap_model: "claude:haiku".into(),
             cheap_max_parallel: 6,
-            expensive_model: "sonnet".into(),
+            expensive_model: "claude:sonnet".into(),
             expensive_max_parallel: 3,
             local: LocalConfig::default(),
         }
@@ -313,11 +313,11 @@ mod tests {
     #[test]
     fn test_model_override_bypasses_tier() {
         let router = TierRouter::new(TierConfig::default(), false);
-        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, Some("opus"));
+        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, Some("claude:opus"));
         assert_eq!(
             router.resolve(&unit),
             ResolvedBackend::Claude {
-                model: "opus".into()
+                model: "claude:opus".into()
             }
         );
     }
@@ -349,7 +349,7 @@ mod tests {
         assert_eq!(
             router.resolve(&unit),
             ResolvedBackend::Claude {
-                model: "sonnet".into()
+                model: "claude:sonnet".into()
             }
         );
     }
@@ -361,7 +361,7 @@ mod tests {
         assert_eq!(
             router.resolve(&unit),
             ResolvedBackend::Claude {
-                model: "haiku".into()
+                model: "claude:haiku".into()
             }
         );
     }
@@ -373,7 +373,7 @@ mod tests {
         assert_eq!(
             router.resolve(&unit),
             ResolvedBackend::Claude {
-                model: "haiku".into()
+                model: "claude:haiku".into()
             }
         );
     }
@@ -423,7 +423,7 @@ mod tests {
     #[test]
     fn test_local_only_model_override_blocked() {
         let router = TierRouter::new(TierConfig::default(), true);
-        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::LocalOnly, Some("sonnet"));
+        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::LocalOnly, Some("claude:sonnet"));
         assert!(matches!(
             router.resolve(&unit),
             ResolvedBackend::Blocked { .. }
@@ -441,7 +441,7 @@ mod tests {
         assert_eq!(
             esc,
             ResolvedBackend::Claude {
-                model: "sonnet".into()
+                model: "claude:sonnet".into()
             }
         );
 
@@ -458,7 +458,7 @@ mod tests {
         assert_eq!(
             router.resolve(&unit),
             ResolvedBackend::Claude {
-                model: "sonnet".into()
+                model: "claude:sonnet".into()
             }
         );
     }

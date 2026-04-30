@@ -20,7 +20,7 @@ cargo clippy -p gaviero-cli
 
 ## Key Flags
 
-- `--model <spec>` — `sonnet` / `opus` / `haiku` / `claude:X` / `codex:X` / `ollama:X` / `local:X` (defaults to workspace `agent.model`, then `sonnet`)
+- `--model <spec>` — `claude:X` / `codex:X` / `ollama:X` / `local:X` (provider:model required; defaults to workspace `agent.model`, then `claude:sonnet`)
 - `--coordinator-model <spec>` — model used for coordinated planning
 - `--ollama-base-url <url>` — override Ollama endpoint
 - `--workflow <name>` — pick a workflow when the script defines several

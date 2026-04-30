@@ -58,7 +58,7 @@ Create a file `refactor.gaviero`:
 ```gaviero
 client reasoning {
     tier  expensive
-    model "sonnet"
+    model "claude:sonnet"
 }
 
 client local_exec {

@@ -91,8 +91,8 @@ const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Cheap, fast model used for both the agent turns and the extractor LLM.
-/// `haiku` keeps cost / latency low for E2E iteration.
-const E2E_AGENT_MODEL: &str = "haiku";
+/// `claude:haiku` keeps cost / latency low for E2E iteration.
+const E2E_AGENT_MODEL: &str = "claude:haiku";
 
 // ── Reporting ────────────────────────────────────────────────────────────────
 

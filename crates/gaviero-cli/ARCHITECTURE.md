@@ -101,18 +101,17 @@ All observer events route to stderr so stdout stays clean for structured output 
 
 ## 5. Model Resolution
 
-Model spec passed via `--model` (or the DSL `client` decl) is parsed by `gaviero_core::swarm::backend::shared::backend_config_for_model`:
+Model spec passed via `--model` (or the DSL `client` decl) is parsed by `gaviero_core::swarm::backend::shared::backend_config_for_model`. Specs are required to be in canonical `provider:model` form — `validate_model_spec` rejects bare names without a provider prefix.
 
 ```
-sonnet | opus | haiku       → claude:<same>
 claude:<name>               → Claude API (ACP)
 ollama:<name>               → Ollama HTTP SSE
+local:<name>                → Ollama HTTP SSE (alias)
 codex:<name>                → Codex exec
 codex-app:<name>            → Codex app-server
-local:<url>                 → OpenAI-compatible endpoint
 ```
 
-Validated by `validate_model_spec`. `--coordinator-model` picks the planner model for `--coordinated`. `--ollama-base-url` overrides the Ollama endpoint (defaults to workspace setting, then `http://localhost:11434`).
+`--coordinator-model` picks the planner model for `--coordinated`. `--ollama-base-url` overrides the Ollama endpoint (defaults to workspace setting, then `http://localhost:11434`).
 
 `TierRouter` maps `(ModelTier, PrivacyLevel)` to a concrete backend; `PrivacyScanner` can promote a unit to `LocalOnly` based on glob matches against sensitive paths.
 
@@ -204,8 +203,8 @@ The `Cli` struct in `src/main.rs` is authoritative. Summary by section:
 
 ### Execution
 ```
---model <spec>             sonnet / opus / claude:X / codex:X / codex-app:X /
-                           ollama:X / local:URL
+--model <spec>             claude:X / codex:X / codex-app:X /
+                           ollama:X / local:X (provider:model required)
 --coordinator-model <spec> planner model for --coordinated
 --ollama-base-url <url>    override Ollama endpoint
 --auto-accept              skip interactive review

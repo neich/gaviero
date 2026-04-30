@@ -31,7 +31,7 @@ pub struct CoordinatorConfig {
 impl Default for CoordinatorConfig {
     fn default() -> Self {
         Self {
-            model: "opus".into(),
+            model: "claude:opus".into(),
             ollama_base_url: None,
             max_context_tokens: 80000,
         }

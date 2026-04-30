@@ -225,7 +225,7 @@ impl App {
         let agent_model = workspace
             .resolve_setting(settings::AGENT_MODEL, None)
             .as_str()
-            .unwrap_or("sonnet")
+            .unwrap_or("claude:sonnet")
             .to_string();
         let agent_effort = workspace
             .resolve_setting(settings::AGENT_EFFORT, None)

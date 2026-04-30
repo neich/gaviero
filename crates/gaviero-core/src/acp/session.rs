@@ -525,8 +525,10 @@ mod tests {
 /// Query `claude --help` for the model options documented by the CLI.
 ///
 /// Parses the `--model` flag description and extracts all single-quoted
-/// strings (aliases and full model names). Returns an empty Vec if the
-/// CLI is unavailable or the help text format changes.
+/// strings (aliases and full model names), then prefixes them with
+/// `claude:` so callers receive the canonical `provider:model` form.
+/// Returns an empty Vec if the CLI is unavailable or the help text
+/// format changes.
 pub fn discover_model_options() -> Vec<String> {
     let output = std::process::Command::new("claude")
         .arg("--help")
@@ -552,7 +554,7 @@ pub fn discover_model_options() -> Vec<String> {
                 if let Some(end) = rest.iter().position(|&b| b == b'\'') {
                     let name = std::str::from_utf8(&rest[..end]).unwrap_or("");
                     if !name.is_empty() {
-                        models.push(name.to_string());
+                        models.push(format!("claude:{}", name));
                     }
                     rest = &rest[end + 1..];
                 } else {

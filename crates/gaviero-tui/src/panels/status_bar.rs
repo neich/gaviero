@@ -12,7 +12,7 @@ pub struct StatusBar<'a> {
     pub buffer: Option<&'a EditorBuffer>,
     pub theme: &'a Theme,
     pub focus_label: &'a str,
-    /// e.g. "sonnet" or "opus|t:25000"
+    /// e.g. "claude:sonnet" or "claude:opus|t:25000"
     pub model_info: &'a str,
     /// Panel-specific context or transient message shown in the middle.
     pub context_info: &'a str,
