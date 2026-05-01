@@ -83,6 +83,15 @@ impl FormatLevel {
     }
 }
 
+/// Per-line diff classification for a buffer opened in diff-view mode.
+/// Indices into this vec are 1:1 with rope lines.
+pub struct DiffView {
+    pub kinds: Vec<crate::editor::diff::DiffKind>,
+    /// HEAD content snapshot (for reference / re-diff if needed).
+    #[allow(dead_code)]
+    pub original_text: String,
+}
+
 pub struct Buffer {
     pub text: Rope,
     pub path: Option<PathBuf>,
@@ -108,6 +117,11 @@ pub struct Buffer {
     /// Pre-computed search match ranges: Vec<(line, start_col, end_col)>.
     /// Recomputed when search_highlight changes.
     pub search_matches: Vec<(usize, usize, usize)>,
+    /// When true, all mutating operations are no-ops. Set on diff-view buffers.
+    pub read_only: bool,
+    /// When set, the buffer is rendered as a unified diff: each rope line is
+    /// tinted by `diff_view.kinds[i]` (Added=green / Removed=red / Context=plain).
+    pub diff_view: Option<DiffView>,
 }
 
 impl Buffer {
@@ -131,6 +145,8 @@ impl Buffer {
             format_level: FormatLevel::default(),
             search_highlight: None,
             search_matches: Vec::new(),
+            read_only: false,
+            diff_view: None,
         }
     }
 
@@ -175,6 +191,73 @@ impl Buffer {
             format_level: FormatLevel::default(),
             search_highlight: None,
             search_matches: Vec::new(),
+            read_only: false,
+            diff_view: None,
+        })
+    }
+
+    /// Open a buffer in read-only diff-view mode. The rope is built so that
+    /// each line is one of (context | added | removed) — tree-sitter still
+    /// parses it as source code (the per-line classification lives separately
+    /// in `diff_view.kinds`, no `+`/`-` prefix is mixed into the text), so
+    /// syntax highlighting works on context/added lines naturally.
+    pub fn open_diff_view(path: &Path, original: String, current: String) -> Result<Self> {
+        use crate::editor::diff::{DiffKind, build_simple_diff};
+
+        let old_lines: Vec<&str> = original.lines().collect();
+        let new_lines: Vec<&str> = current.lines().collect();
+        let diff = build_simple_diff(&old_lines, &new_lines);
+
+        let mut text_buf = String::new();
+        let mut kinds = Vec::with_capacity(diff.len());
+        for (kind, line) in &diff {
+            text_buf.push_str(line);
+            text_buf.push('\n');
+            kinds.push(*kind);
+        }
+        let text = Rope::from_str(&text_buf);
+
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let language = gaviero_core::tree_sitter::language_for_extension(ext);
+        let lang_name =
+            gaviero_core::tree_sitter::language_name_for_extension(ext).map(|s| s.to_string());
+
+        let (tree, parser) = if let Some(ref lang) = language {
+            let mut parser = Parser::new();
+            parser
+                .set_language(lang)
+                .context("setting tree-sitter language")?;
+            let tree = parser.parse(&text_buf, None);
+            (tree, Some(parser))
+        } else {
+            (None, None)
+        };
+
+        let _ = DiffKind::Context; // keep import used even if `kinds` is empty
+
+        Ok(Self {
+            text,
+            path: Some(path.to_path_buf()),
+            language,
+            lang_name,
+            tree,
+            modified: false,
+            cursor: Cursor::default(),
+            scroll: Scroll::default(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            parser,
+            tab_width: 4,
+            indent_unit: "    ".to_string(),
+            indent_query: None,
+            format_level: FormatLevel::default(),
+            search_highlight: None,
+            search_matches: Vec::new(),
+            read_only: true,
+            diff_view: Some(DiffView {
+                kinds,
+                original_text: original,
+            }),
         })
     }
 
@@ -189,6 +272,9 @@ impl Buffer {
 
     /// Apply a transaction: modify rope, update tree, push undo.
     pub fn apply(&mut self, transaction: Transaction) {
+        if self.read_only {
+            return;
+        }
         for change in &transaction.changes {
             self.notify_tree_edit(change);
             match change {
@@ -210,6 +296,9 @@ impl Buffer {
 
     /// Undo the last transaction.
     pub fn undo(&mut self) -> bool {
+        if self.read_only {
+            return false;
+        }
         let Some(transaction) = self.undo_stack.pop() else {
             return false;
         };
@@ -255,6 +344,9 @@ impl Buffer {
 
     /// Redo the last undone transaction.
     pub fn redo(&mut self) -> bool {
+        if self.read_only {
+            return false;
+        }
         let Some(transaction) = self.redo_stack.pop() else {
             return false;
         };
