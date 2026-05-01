@@ -445,12 +445,17 @@ impl AgentChatState {
             return false;
         }
 
-        // Record the command in the conversation history
-        self.add_user_message(&input);
-
         let parts: Vec<&str> = input.splitn(2, ' ').collect();
         let cmd = parts[0];
         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+
+        // /rename is a pure UI op (mutates the tab title) and must never
+        // appear in the transcript — otherwise add_user_message would
+        // auto-title a fresh conversation to the slash command text and
+        // mangle the rename target.
+        if cmd != "/rename" {
+            self.add_user_message(&input);
+        }
 
         match cmd {
             "/model" => {
@@ -571,6 +576,24 @@ impl AgentChatState {
                 self.reset_conversation();
                 true
             }
+            "/rename" => {
+                if arg.is_empty() {
+                    // Bare /rename → start interactive rename (same as F2).
+                    self.text_input.text.clear();
+                    self.text_input.cursor = 0;
+                    self.start_rename();
+                } else {
+                    let old = self.active_conversation().title.clone();
+                    self.active_conversation_mut().title = arg.to_string();
+                    self.text_input.text.clear();
+                    self.text_input.cursor = 0;
+                    self.add_system_message(&format!(
+                        "Renamed conversation: \"{}\" → \"{}\"",
+                        old, arg
+                    ));
+                }
+                true
+            }
             "/namespace" | "/ns" => {
                 if arg.is_empty() {
                     let write = self.effective_write_namespace().to_string();
@@ -618,6 +641,7 @@ impl AgentChatState {
                      /effort <level>          — Set effort/reasoning level for Claude + Codex (off, auto, low, medium, high, xhigh, max). Alias: /thinking\n\
                      /namespace <name>        — Set memory namespace (or show current). Alias: /ns\n\
                      /autoapprove             — Toggle auto-approve for this conversation. Alias: /yolo\n\
+                     /rename [new title]      — Rename the active conversation tab (bare form starts interactive rename, same as F2)\n\
                      /reset                   — Clear agent context (keeps visible chat history). Alias: /clear\n\
                      /compact [N]             — Keep last N messages (default 6), discard older\n\
                      /context                 — Show estimated context usage\n\n\
@@ -2797,6 +2821,37 @@ mod tests {
             Some("ollama:qwen2.5-coder:7b")
         );
         assert!(state.text_input.text.is_empty());
+    }
+
+    #[test]
+    fn process_slash_command_rename_with_arg_renames_active_tab() {
+        let mut state = AgentChatState::new();
+        let original = state.active_conversation().title.clone();
+        state.text_input.text = "/rename my refactor branch".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+
+        let handled = state.process_slash_command();
+
+        assert!(handled);
+        assert_eq!(state.active_conversation().title, "my refactor branch");
+        assert_ne!(state.active_conversation().title, original);
+        assert!(state.text_input.text.is_empty());
+        assert!(!state.renaming);
+    }
+
+    #[test]
+    fn process_slash_command_rename_bare_starts_interactive_rename() {
+        let mut state = AgentChatState::new();
+        let title = state.active_conversation().title.clone();
+        state.text_input.text = "/rename".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+
+        let handled = state.process_slash_command();
+
+        assert!(handled);
+        assert!(state.renaming);
+        // Interactive rename pre-fills the input with the current title (same as F2).
+        assert_eq!(state.text_input.text, title);
     }
 
     #[test]
