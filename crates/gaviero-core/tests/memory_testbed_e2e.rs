@@ -24,8 +24,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+use gaviero_core::context_planner::chat_memory::{ChatMemoryRequest, perform_injection};
 use gaviero_core::memory::{
-    ChatInjectionConfig, ScopeMix, WriteResult, retrieval::retrieve_for_chat, scope::MemoryScope,
+    ChatInjectionConfig, RetrievalConfig, ScopeMix, WriteResult, scope::MemoryScope,
 };
 
 use support::classifier::{self, PromptDigest, Section, SectionKind};
@@ -123,7 +124,15 @@ async fn e2e_reset_residual_zero() -> Result<()> {
         token_budget: 2000,
         min_similarity: 0.0,
     };
+    let retrieval_cfg = RetrievalConfig::default();
     let memory_scope = MemoryScope::from_context(&env.repo, Some(&env.repo), None, None);
+
+    // Pre-/reset session identifier — t1, t2, t3 share it; t4 gets a
+    // fresh one to model the /reset transport-layer drop. Manifest
+    // rows carry whichever session_id was active at write time, so
+    // tests can validate the per-turn ↔ per-session relation.
+    let pre_reset_session = format!("session-pre-{}", uuid_like());
+    let post_reset_session = format!("session-post-{}", uuid_like());
 
     // ── t1 ──
     r.section("turn t1 (cold)");
@@ -135,13 +144,15 @@ async fn e2e_reset_residual_zero() -> Result<()> {
         /* resume */ None,
         /* simulated_history */ None,
         &injection_cfg,
+        &retrieval_cfg,
         &memory_scope,
+        &pre_reset_session,
     )
     .await?;
+    wait_for_writer_drain(&env, r, WRITER_DRAIN_TIMEOUT).await?;
     r.kv("session_id", outcome_t1.session_id.as_deref().unwrap_or("?"));
     r.kv("elapsed_ms", outcome_t1.elapsed.as_millis());
-    history_after_t1 =
-        append_to_history("", &user_t1, &outcome_t1.assistant_text);
+    history_after_t1 = append_to_history("", &user_t1, &outcome_t1.assistant_text);
 
     let resume_id_t1 = outcome_t1.session_id.clone();
 
@@ -155,13 +166,15 @@ async fn e2e_reset_residual_zero() -> Result<()> {
         resume_id_t1.clone(),
         Some(history_after_t1.clone()),
         &injection_cfg,
+        &retrieval_cfg,
         &memory_scope,
+        &pre_reset_session,
     )
     .await?;
+    wait_for_writer_drain(&env, r, WRITER_DRAIN_TIMEOUT).await?;
     r.kv("session_id", outcome_t2.session_id.as_deref().unwrap_or("?"));
     r.kv("elapsed_ms", outcome_t2.elapsed.as_millis());
-    history_after_t2 =
-        append_to_history(&history_after_t1, &user_t2, &outcome_t2.assistant_text);
+    history_after_t2 = append_to_history(&history_after_t1, &user_t2, &outcome_t2.assistant_text);
 
     // ── t3 ── continuation, history = t1+t2 transcripts
     r.section("turn t3 (continuation)");
@@ -173,22 +186,25 @@ async fn e2e_reset_residual_zero() -> Result<()> {
         outcome_t2.session_id.clone(),
         Some(history_after_t2.clone()),
         &injection_cfg,
+        &retrieval_cfg,
         &memory_scope,
+        &pre_reset_session,
     )
     .await?;
+    wait_for_writer_drain(&env, r, WRITER_DRAIN_TIMEOUT).await?;
     r.kv("session_id", outcome_t3.session_id.as_deref().unwrap_or("?"));
     r.kv("elapsed_ms", outcome_t3.elapsed.as_millis());
-    history_after_t3 =
-        append_to_history(&history_after_t2, &user_t3, &outcome_t3.assistant_text);
+    history_after_t3 = append_to_history(&history_after_t2, &user_t3, &outcome_t3.assistant_text);
     let _ = history_after_t3; // retained for diagnostic symmetry
 
     // ── /reset ── transport-layer model: drop resume_session_id +
-    //              drop simulated history. Bootstrap context (memory
-    //              block) intentionally still flows on the post-reset
-    //              turn — this is documented behaviour, and the test
-    //              measures whether *anything else* leaks through.
+    //              drop simulated history + cycle the session id.
+    //              Bootstrap context (memory block) intentionally
+    //              still flows on the post-reset turn — this is
+    //              documented behaviour, and the test measures
+    //              whether *anything else* leaks through.
 
-    // ── t4 ── identical to t1, cold
+    // ── t4 ── identical to t1, cold, fresh session_id
     r.section("turn t4 (post-reset, identical to t1)");
     let outcome_t4 = drive_turn(
         &env,
@@ -198,9 +214,12 @@ async fn e2e_reset_residual_zero() -> Result<()> {
         /* resume */ None,
         /* simulated_history */ None,
         &injection_cfg,
+        &retrieval_cfg,
         &memory_scope,
+        &post_reset_session,
     )
     .await?;
+    wait_for_writer_drain(&env, r, WRITER_DRAIN_TIMEOUT).await?;
     r.kv("session_id", outcome_t4.session_id.as_deref().unwrap_or("?"));
     r.kv("elapsed_ms", outcome_t4.elapsed.as_millis());
 
@@ -279,35 +298,100 @@ async fn e2e_reset_residual_zero() -> Result<()> {
     }
     r.line("    ✓ PASS: no t2/t3-only history sections survive into t4");
 
-    // ── SLO 3: manifest stability ──────────────────────────────────
+    // ── SLO 3: manifest stability (now a hard assertion) ───────────
+    //
+    // The chat-injection writer pipeline is wired (perform_injection
+    // enqueues WriterMessage::InjectionManifest per turn), and the
+    // writer was drained between every turn, so we expect exactly 4
+    // manifest rows with stable selected_ids across t1↔t4 (cold turns
+    // with identical user message).
     r.section("SLO 3 — manifest stability");
     let store = env
         .services
         .stores
         .get(&env.repo_scope().target_store())
         .await?;
-    let manifests = store.recent_manifests(8).await?;
+    let manifests = store.recent_manifests(16).await?;
     r.kv("manifest_rows", manifests.len());
-    if manifests.len() < 2 {
-        r.line(
-            "    ⊘ SKIP: manifest emission requires the chat-injection writer pipeline; \
-             retrieve_for_chat direct call does not enqueue. Documented limitation; \
-             ensure_injection-wired version is a follow-up.",
+    if manifests.len() < 4 {
+        anyhow::bail!(
+            "SLO 3 violated: expected ≥4 manifest rows (one per turn), got {}",
+            manifests.len()
         );
-    } else {
-        let newest_ids = extract_selected_ids(&manifests[0].payload)?;
-        let oldest_ids = extract_selected_ids(manifests.last().unwrap().payload.as_str())?;
-        r.kv("newest_selected_ids", format!("{:?}", newest_ids));
-        r.kv("oldest_selected_ids", format!("{:?}", oldest_ids));
-        if newest_ids != oldest_ids {
-            anyhow::bail!(
-                "SLO 3 violated: manifest selected_ids drifted across runs (newest={:?}, oldest={:?})",
-                newest_ids,
-                oldest_ids,
-            );
-        }
-        r.line("    ✓ PASS: newest and oldest manifest selected_ids are equal");
     }
+
+    // Group manifests by turn_id so we can compare t1 ↔ t4 directly
+    // rather than relying on the newest/oldest insertion order, which
+    // can be perturbed by writer reordering across drains.
+    let mut by_turn: std::collections::HashMap<String, Vec<i64>> =
+        std::collections::HashMap::new();
+    for row in &manifests {
+        let ids = extract_selected_ids(&row.payload)?;
+        by_turn.entry(row.turn_id.clone()).or_default().extend(ids);
+    }
+    let t1_ids = by_turn.get("t1").cloned().unwrap_or_default();
+    let t2_ids = by_turn.get("t2").cloned().unwrap_or_default();
+    let t3_ids = by_turn.get("t3").cloned().unwrap_or_default();
+    let t4_ids = by_turn.get("t4").cloned().unwrap_or_default();
+    r.kv("manifest(t1).selected_ids", format!("{:?}", t1_ids));
+    r.kv("manifest(t2).selected_ids", format!("{:?}", t2_ids));
+    r.kv("manifest(t3).selected_ids", format!("{:?}", t3_ids));
+    r.kv("manifest(t4).selected_ids", format!("{:?}", t4_ids));
+
+    if t1_ids.is_empty() {
+        anyhow::bail!(
+            "SLO 3 violated: no manifest emitted for turn t1 (writer pipeline misfire)"
+        );
+    }
+    if t4_ids.is_empty() {
+        anyhow::bail!(
+            "SLO 3 violated: no manifest emitted for turn t4 (writer pipeline misfire)"
+        );
+    }
+    if t1_ids != t4_ids {
+        anyhow::bail!(
+            "SLO 3 violated: manifest selected_ids drifted t1→t4 (t1={:?}, t4={:?})",
+            t1_ids,
+            t4_ids,
+        );
+    }
+    r.line("    ✓ PASS: t1 and t4 manifest selected_ids are equal");
+
+    // Cross-session sanity: pre-reset turns use pre_reset_session,
+    // post-reset uses post_reset_session. Manifest rows carry the
+    // session id verbatim, so the segregation must show.
+    let mut by_session: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for row in &manifests {
+        by_session
+            .entry(row.session_id.clone())
+            .or_default()
+            .insert(row.turn_id.clone());
+    }
+    for (sid, turns) in &by_session {
+        r.kv(&format!("session({sid}).turns"), format!("{:?}", turns));
+    }
+    let pre = by_session
+        .get(&pre_reset_session)
+        .cloned()
+        .unwrap_or_default();
+    let post = by_session
+        .get(&post_reset_session)
+        .cloned()
+        .unwrap_or_default();
+    if pre.len() != 3 || !pre.contains("t1") || !pre.contains("t2") || !pre.contains("t3") {
+        anyhow::bail!(
+            "SLO 3 violated: pre-reset session expected to carry t1+t2+t3, got {:?}",
+            pre
+        );
+    }
+    if post.len() != 1 || !post.contains("t4") {
+        anyhow::bail!(
+            "SLO 3 violated: post-reset session expected to carry only t4, got {:?}",
+            post
+        );
+    }
+    r.line("    ✓ PASS: pre-reset session = {t1,t2,t3}; post-reset session = {t4}");
 
     Ok(())
 }
@@ -323,22 +407,38 @@ async fn drive_turn(
     resume_session_id: Option<String>,
     simulated_history: Option<String>,
     injection_cfg: &ChatInjectionConfig,
+    retrieval_cfg: &RetrievalConfig,
     memory_scope: &MemoryScope,
+    session_id: &str,
 ) -> Result<TurnOutcome> {
-    // Mirror the production chat-injection path: retrieve memory,
-    // assemble enriched prompt = user + memory_block + history.
-    let injection = retrieve_for_chat(
-        &env.services.stores,
-        memory_scope,
-        user_msg,
-        injection_cfg,
-    )
-    .await
-    .context("retrieve_for_chat")?;
+    // Run the full production chat-injection pipeline: retrieve_for_chat
+    // + the WriterMessage::InjectionManifest enqueue. This is what
+    // promotes SLO 3 from SKIP to a hard assertion in PR1's known-
+    // limitation list — every turn now writes a manifest row that
+    // the test can read back.
+    let outcome = perform_injection(ChatMemoryRequest {
+        stores: &env.services.stores,
+        writer: Some(&env.services.writer),
+        workspace_root: &env.repo,
+        folder_root: Some(&env.repo),
+        user_prompt: user_msg,
+        turn_id,
+        session_id,
+        injection_config: injection_cfg,
+        retrieval_config: retrieval_cfg,
+        reranker: None,
+        rerank_config: None,
+        manifests_enabled: true,
+        capture_candidate_pool: true,
+        embedder_name: env.services.stores.embedder_name(),
+        reranker_name: None,
+    })
+    .await;
+    let _ = memory_scope; // scope is derived inside perform_injection
 
     let mut parts: Vec<String> = Vec::new();
     parts.push(user_msg.to_string());
-    if let Some(inj) = injection.as_ref() {
+    if let Some(inj) = outcome.injection.as_ref() {
         if !inj.block.is_empty() {
             parts.push(String::new());
             parts.push(inj.block.clone());
