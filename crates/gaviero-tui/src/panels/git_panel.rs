@@ -134,6 +134,81 @@ impl GitPanelState {
         }
     }
 
+    /// Map a row offset within the rendered panel area (and that area's
+    /// height) to a hit-tested target. Mirrors the layout in `render`.
+    /// Returns the (region, index) of the file row at `rel_y`, or None if
+    /// the row is a header / branch line / commit input / outside the file
+    /// list. Selecting that file is the caller's responsibility.
+    pub fn hit_test_file(
+        &self,
+        rel_y: u16,
+        area_height: u16,
+    ) -> Option<(GitRegion, usize)> {
+        if area_height < 6 {
+            return None;
+        }
+        let tab_bar_height: u16 = if self.repo_tabs.len() >= 2 { 1 } else { 0 };
+        let commit_height: u16 = 3;
+        let content_height = area_height.saturating_sub(tab_bar_height);
+        let available = content_height.saturating_sub(commit_height + 1);
+        let unstaged_files = (available / 2).max(2).saturating_sub(1);
+        let staged_files = available.saturating_sub(unstaged_files + 2);
+
+        let mut y: u16 = 0;
+        if tab_bar_height > 0 {
+            if rel_y == y {
+                return None;
+            }
+            y += 1;
+        }
+        // Branch line.
+        if rel_y == y {
+            return None;
+        }
+        y += 1;
+        // Unstaged header.
+        if rel_y == y {
+            return None;
+        }
+        y += 1;
+        // Unstaged file rows.
+        let unstaged_start = y;
+        let unstaged_end = y + unstaged_files;
+        if rel_y >= unstaged_start && rel_y < unstaged_end {
+            let idx = (rel_y - unstaged_start) as usize;
+            if idx < self.unstaged.len() {
+                return Some((GitRegion::Unstaged, idx));
+            }
+            return None;
+        }
+        y = unstaged_end;
+        // Staged header.
+        if rel_y == y {
+            return None;
+        }
+        y += 1;
+        // Staged file rows.
+        let staged_start = y;
+        let staged_end = y + staged_files;
+        if rel_y >= staged_start && rel_y < staged_end {
+            let idx = (rel_y - staged_start) as usize;
+            if idx < self.staged.len() {
+                return Some((GitRegion::Staged, idx));
+            }
+        }
+        None
+    }
+
+    /// Apply a hit-test result by setting the active region/selection.
+    pub fn select_file(&mut self, region: GitRegion, idx: usize) {
+        self.region = region;
+        match region {
+            GitRegion::Unstaged => self.unstaged_selected = idx,
+            GitRegion::Staged => self.staged_selected = idx,
+            GitRegion::CommitInput => {}
+        }
+    }
+
     /// Get the path of the currently selected file, if any.
     pub fn selected_path(&self) -> Option<&str> {
         match self.region {
