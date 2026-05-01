@@ -62,6 +62,7 @@ impl AgentBackend for ClaudeCodeBackend {
             available_tools: None,
             approved_tools: None,
             resume_session_id: None,
+            ..AgentOptions::default()
         };
 
         // Claude Code doesn't yet consume `extra { ... }` keys. Log them so
