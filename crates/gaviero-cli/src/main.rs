@@ -235,6 +235,23 @@ struct Cli {
     #[arg(long = "eval-scope-matrix-scopes", default_value = "repo,module,run")]
     eval_scope_matrix_scopes: String,
 
+    /// Tier T1 / T2 corpus seeding: walk every `gold_must` File entry
+    /// in the supplied `--eval-fixture` and write one Record memory
+    /// per file to the workspace store. Each memory's content is the
+    /// repo-relative path plus the file's leading rustdoc and the
+    /// names of its top-level `pub` symbols, so substring-matching
+    /// gold refs (File / Symbol) actually surface. Repeatable: a
+    /// second run dedupes against existing rows. Use to make
+    /// --eval-scope-matrix produce non-zero Recall@K against a fresh
+    /// workspace memory.db without weeks of organic usage.
+    #[arg(long = "seed-corpus-from-paths")]
+    seed_corpus_from_paths: bool,
+
+    /// Maximum chars taken from each file's leading rustdoc when
+    /// seeding via `--seed-corpus-from-paths`. Default 480.
+    #[arg(long = "seed-corpus-doc-chars", default_value = "480")]
+    seed_corpus_doc_chars: usize,
+
     /// Tier B / B5: run the sleeptime hygiene pass against the
     /// workspace `memory.db` and exit. Combine with `--sleep-dry-run`
     /// to see what *would* happen without writing.
@@ -1154,6 +1171,254 @@ async fn open_eval_store(
     .with_context(|| format!("init memory ({context})"))?
 }
 
+/// Tier T2 corpus seeding. Walks every `GoldRef::File` entry in
+/// `fixture`'s `gold_must` set and writes one Record memory per file
+/// at repo scope. Memory content format:
+///
+/// ```text
+/// File <repo-relative path>
+/// <leading rustdoc, truncated to doc_chars>
+/// Symbols: name1, name2, ...
+/// ```
+///
+/// The substring-rich content lets corpus `gold_must` File / Symbol
+/// refs actually match the seeded rows when retrieval scores them by
+/// content (which is how the metric helpers in memory::eval work).
+///
+/// Idempotent: re-running dedupes against existing rows via the
+/// writer task's normal store_with_options dedup path.
+async fn run_seed_corpus_from_paths(
+    repo: &std::path::Path,
+    fixture: &PathBuf,
+    doc_chars: usize,
+) -> Result<()> {
+    use gaviero_core::memory::eval::{GoldRef, load_fixture};
+    use gaviero_core::memory::scope::WriteScope;
+    use gaviero_core::memory::writer::WriterMessage;
+    use gaviero_core::repo_map::builder::extract_symbols;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    let cases = load_fixture(fixture).context("loading eval fixture")?;
+    if cases.is_empty() {
+        eprintln!(
+            "[gaviero-seed] fixture {} has 0 cases; nothing to seed.",
+            fixture.display()
+        );
+        return Ok(());
+    }
+
+    // Collect the set of file paths from every case's gold_must File
+    // entries. Dedupe so a path referenced by N cases yields one row.
+    let mut paths: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for case in &cases {
+        for r in &case.gold_must {
+            if let GoldRef::File(p) = r {
+                if !p.ends_with('/') {
+                    paths.insert(p.clone());
+                }
+            }
+        }
+    }
+    eprintln!(
+        "[gaviero-seed] fixture {}: {} cases → {} unique gold_must File paths",
+        fixture.display(),
+        cases.len(),
+        paths.len()
+    );
+    if paths.is_empty() {
+        eprintln!("[gaviero-seed] no File gold refs to seed; exiting.");
+        return Ok(());
+    }
+
+    // Aggregate counter observer: per-write timing is not interesting,
+    // but we want totals for the end-of-run summary because the
+    // fire-and-forget enqueue path doesn't return per-call ack.
+    #[derive(Default)]
+    struct SeedCounters {
+        enqueued: AtomicUsize,
+        committed: AtomicUsize,
+        failed: AtomicUsize,
+        last_failure: Mutex<Option<String>>,
+    }
+    impl gaviero_core::memory::MemoryObserver for SeedCounters {
+        fn on_write_enqueued(&self, _kind: &str) {
+            self.enqueued.fetch_add(1, Ordering::Relaxed);
+        }
+        fn on_write_committed(
+            &self,
+            _kind: &str,
+            _result: &gaviero_core::memory::WriteResult,
+        ) {
+            self.committed.fetch_add(1, Ordering::Relaxed);
+        }
+        fn on_write_failed(&self, kind: &str, error: &str) {
+            self.failed.fetch_add(1, Ordering::Relaxed);
+            let mut g = self.last_failure.lock().unwrap();
+            *g = Some(format!("{kind}: {error}"));
+        }
+    }
+    let counters = std::sync::Arc::new(SeedCounters::default());
+
+    let repo_buf = repo.to_path_buf();
+    let observer: std::sync::Arc<dyn gaviero_core::memory::MemoryObserver> = counters.clone();
+    let services = tokio::task::spawn_blocking({
+        let repo_buf = repo_buf.clone();
+        move || -> anyhow::Result<std::sync::Arc<gaviero_core::memory::MemoryServices>> {
+            let workspace = gaviero_core::workspace::Workspace::single_folder(repo_buf.clone());
+            let opts = gaviero_core::memory::ServicesOpts {
+                embedder_name: None,
+                llm: None,
+                observer: Some(observer),
+                manifest_observer: None,
+            };
+            gaviero_core::memory::MemoryServices::open(&repo_buf, &workspace, opts)
+        }
+    })
+    .await
+    .context("init MemoryServices (seed-corpus)")??;
+
+    let scope = WriteScope::Repo {
+        repo_id: gaviero_core::memory::hash_path(repo),
+    };
+
+    let mut enqueued_local = 0usize;
+    let mut skipped_missing = 0usize;
+    let mut skipped_unsupported = 0usize;
+
+    for rel_path in &paths {
+        let abs = repo.join(rel_path);
+        if !abs.exists() {
+            eprintln!("[gaviero-seed]   ⨯ missing on disk: {rel_path}");
+            skipped_missing += 1;
+            continue;
+        }
+        let source = match std::fs::read_to_string(&abs) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[gaviero-seed]   ⨯ unreadable {rel_path}: {e}");
+                skipped_missing += 1;
+                continue;
+            }
+        };
+        let ext = abs
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if ext.is_empty() {
+            skipped_unsupported += 1;
+            continue;
+        }
+
+        let leading_doc = extract_leading_doc(&source, doc_chars);
+        let symbols = extract_symbols(ext, &source);
+        let symbol_names: Vec<String> = symbols.iter().map(|s| s.name.clone()).collect();
+
+        let mut content = String::new();
+        content.push_str(&format!("File {rel_path}\n"));
+        if !leading_doc.is_empty() {
+            content.push_str(&leading_doc);
+            content.push('\n');
+        }
+        if !symbol_names.is_empty() {
+            content.push_str("Symbols: ");
+            content.push_str(&symbol_names.join(", "));
+            content.push('\n');
+        }
+
+        // Fire-and-forget. ack: None → no per-call timeout. The
+        // writer task processes each message at its own pace; we
+        // drain after the loop. ONNX embedding can take 100ms+ per
+        // message on a cold model and the legacy `user_remember_scoped`
+        // path's 500ms ack timeout cannot accommodate that under
+        // back-pressure, so we route through the raw enqueue API.
+        let msg = WriterMessage::UserRemember {
+            namespace: "user_remember".into(),
+            key: "user_remember".into(),
+            content,
+            metadata: None,
+            scope: Some(scope.clone()),
+            ack: None,
+        };
+        if let Err(e) = services.writer.enqueue(msg) {
+            eprintln!("[gaviero-seed]   ⨯ enqueue failed for {rel_path}: {e}");
+            continue;
+        }
+        enqueued_local += 1;
+    }
+
+    eprintln!(
+        "[gaviero-seed] enqueued {enqueued_local} writes; draining writer task…"
+    );
+
+    // Drain: loop until queue_depth == 0 AND committed+failed >= enqueued.
+    let drain_timeout = Duration::from_secs(120);
+    let deadline = Instant::now() + drain_timeout;
+    loop {
+        let depth = services.writer.queue_depth();
+        let enq = counters.enqueued.load(Ordering::Relaxed);
+        let com = counters.committed.load(Ordering::Relaxed);
+        let fail = counters.failed.load(Ordering::Relaxed);
+        if depth == 0 && com + fail >= enq {
+            break;
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "[gaviero-seed] drain timeout: depth={depth} enq={enq} com={com} fail={fail}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let enq = counters.enqueued.load(Ordering::Relaxed);
+    let com = counters.committed.load(Ordering::Relaxed);
+    let fail = counters.failed.load(Ordering::Relaxed);
+    let last_fail = counters.last_failure.lock().unwrap().clone();
+    eprintln!("[gaviero-seed] done.");
+    eprintln!(
+        "  enqueued={enq}  committed={com}  failed={fail}  \
+         skipped_missing={skipped_missing}  skipped_unsupported={skipped_unsupported}"
+    );
+    if let Some(msg) = last_fail {
+        eprintln!("  last_failure={msg}");
+    }
+    if com == 0 && fail == 0 {
+        eprintln!("  (note: no commits and no failures — observer wiring likely broken)");
+    }
+    Ok(())
+}
+
+/// Extract the leading `//!` rustdoc block from a Rust source file,
+/// or an equivalent `///`-prefixed first comment for non-Rust files
+/// where the convention applies. Returns up to `max_chars` characters.
+fn extract_leading_doc(source: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("//!") {
+            out.push_str(rest.trim_start());
+            out.push(' ');
+        } else if let Some(rest) = trimmed.strip_prefix("///") {
+            out.push_str(rest.trim_start());
+            out.push(' ');
+        } else if trimmed.is_empty() && out.is_empty() {
+            // Skip blank header lines before doc starts.
+            continue;
+        } else {
+            break;
+        }
+        if out.len() >= max_chars {
+            break;
+        }
+    }
+    if out.len() > max_chars {
+        out.truncate(max_chars);
+    }
+    out.trim().to_string()
+}
+
 /// Tier T1 / T1.3: scope-matrix runner. Loads `fixture`, runs each
 /// case against the live store at every scope in `scopes_csv`, and
 /// prints a table with Recall / Precision / NDCG / blast metrics so
@@ -1198,16 +1463,20 @@ fn print_scope_matrix(
 ) {
     println!("─── T1.3 scope matrix ─────────────────────────────────────");
     println!("scopes probed: {}", scopes.join(", "));
+    // `r@5` (legacy) keys on `expected_memory_id` and is N/A for gold-set
+    // corpora. `1-under` is its gold-set equivalent: 1 - mean(|G_must \ R| / |G_must|).
     println!(
-        "{:<10}  {:>5}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}",
-        "scope", "n", "r@5", "p@5", "p@10", "ndcg5", "ndcg10", "leak", "over", "forbid"
+        "{:<10}  {:>5}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}",
+        "scope", "n", "r@5", "1-under", "p@5", "p@10", "ndcg5", "ndcg10", "leak", "over", "forbid"
     );
     for (label, r) in results {
+        let gold_recall = (1.0 - r.under_retrieval).clamp(0.0, 1.0);
         println!(
-            "{:<10}  {:>5}  {:>6.3}  {:>6.3}  {:>6.3}  {:>6.3}  {:>6.3}  {:>6.3}  {:>6.3}  {:>6.3}",
+            "{:<10}  {:>5}  {:>6.3}  {:>6.3}  {:>6.3}  {:>6.3}  {:>6.3}  {:>6.3}  {:>6.3}  {:>6.3}  {:>6.3}",
             label,
             r.total,
             r.recall_at_5,
+            gold_recall,
             r.precision_at_5,
             r.precision_at_10,
             r.ndcg_at_5,
@@ -1517,6 +1786,14 @@ async fn main() -> Result<()> {
         }
         if cli.eval_rerank_ablation {
             return run_eval_rerank_ablation(&repo, &fixture_path).await;
+        }
+        if cli.seed_corpus_from_paths {
+            return run_seed_corpus_from_paths(
+                &repo,
+                &fixture_path,
+                cli.seed_corpus_doc_chars,
+            )
+            .await;
         }
         if cli.eval_scope_matrix {
             return run_eval_scope_matrix(&repo, &fixture_path, &cli.eval_scope_matrix_scopes)
