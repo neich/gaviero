@@ -71,3 +71,6 @@ chrono = "0.4.44"
 
 [dev-dependencies]
 wiremock = "0.6"
+# Tier T1 / T1.6: snapshot regression baseline for prompt structure.
+# Snapshots live under crates/gaviero-core/tests/snapshots/.
+insta = { version = "1", features = ["yaml"] }
