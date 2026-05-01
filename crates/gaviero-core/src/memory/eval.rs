@@ -1084,6 +1084,141 @@ mod tests {
     }
 
     #[test]
+    fn t2_code_prompts_corpus_loads_with_expected_distribution() {
+        // Tier T2 corpus: 30 hand-graded code prompts. The fixture's
+        // structural integrity is asserted here so a typo in a path or
+        // a count drift fails fast at `cargo test --lib`.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("eval")
+            .join("code_prompts.jsonl");
+        let cases = load_fixture(&path).expect("code_prompts.jsonl loads");
+        assert_eq!(cases.len(), 30, "corpus must have exactly 30 cases");
+
+        // Distribution: 8 refactor / 7 bugfix / 8 feature / 7 explain.
+        let mut by_kind: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for c in &cases {
+            let k = match c.kind {
+                Some(CaseKind::Refactor) => "refactor",
+                Some(CaseKind::Bugfix) => "bugfix",
+                Some(CaseKind::Feature) => "feature",
+                Some(CaseKind::Explain) => "explain",
+                None => "missing",
+            };
+            *by_kind.entry(k.into()).or_default() += 1;
+        }
+        assert_eq!(by_kind.get("refactor").copied().unwrap_or(0), 8);
+        assert_eq!(by_kind.get("bugfix").copied().unwrap_or(0), 7);
+        assert_eq!(by_kind.get("feature").copied().unwrap_or(0), 8);
+        assert_eq!(by_kind.get("explain").copied().unwrap_or(0), 7);
+        assert_eq!(by_kind.get("missing").copied().unwrap_or(0), 0);
+
+        // Every case must carry at least one gold_must reference.
+        for c in &cases {
+            assert!(
+                !c.gold_must.is_empty(),
+                "case {} has empty gold_must",
+                c.id
+            );
+        }
+    }
+
+    #[test]
+    fn t2_code_prompts_corpus_file_refs_resolve_on_disk() {
+        // Repo root: walk up from gaviero-core until we see crates/.
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = manifest
+            .parent() // crates/
+            .and_then(|p| p.parent()) // workspace root
+            .expect("workspace root from manifest");
+        let path = manifest.join("eval").join("code_prompts.jsonl");
+        let cases = load_fixture(&path).expect("code_prompts.jsonl loads");
+        for c in &cases {
+            for r in c.gold_must.iter().chain(c.gold_neutral.iter()) {
+                if let GoldRef::File(p) = r {
+                    let abs = repo_root.join(p);
+                    assert!(
+                        abs.exists(),
+                        "case {}: file ref `{p}` does not exist on disk (looked at {})",
+                        c.id,
+                        abs.display()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn t2_code_prompts_corpus_symbol_refs_resolve_in_workspace() {
+        // For every Symbol gold ref, confirm the identifier appears
+        // as a definition site somewhere under crates/. Cheap regex
+        // (substring) over the file set — not a full tree-sitter
+        // parse, but rejects typos and renames at low cost.
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest.join("eval").join("code_prompts.jsonl");
+        let cases = load_fixture(&path).expect("code_prompts.jsonl loads");
+
+        let mut symbols: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for c in &cases {
+            for r in c.gold_must.iter().chain(c.gold_neutral.iter()) {
+                if let GoldRef::Symbol(s) = r {
+                    symbols.insert(s.clone());
+                }
+            }
+        }
+
+        // Slurp every .rs under crates/gaviero-core/src once.
+        let crate_src = manifest.join("src");
+        let mut haystacks: Vec<String> = Vec::new();
+        for entry in walk_rs_files(&crate_src) {
+            if let Ok(s) = std::fs::read_to_string(&entry) {
+                haystacks.push(s);
+            }
+        }
+        let blob = haystacks.join("\n\n");
+
+        for sym in &symbols {
+            // Match a definition site: pub fn / pub struct / pub enum /
+            // pub trait / pub const / pub async fn followed by the
+            // symbol name. This is corpus-narrow; tighter than a raw
+            // substring match because it rejects mere call sites.
+            let patterns = [
+                format!("pub fn {sym}"),
+                format!("pub async fn {sym}"),
+                format!("pub struct {sym}"),
+                format!("pub enum {sym}"),
+                format!("pub trait {sym}"),
+                format!("pub const {sym}"),
+                format!("fn {sym}"),
+                format!("struct {sym}"),
+                format!("enum {sym}"),
+                format!("trait {sym}"),
+            ];
+            let found = patterns.iter().any(|p| blob.contains(p));
+            assert!(
+                found,
+                "symbol ref `{sym}` not found as a definition site under crates/gaviero-core/src",
+            );
+        }
+    }
+
+    fn walk_rs_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(root) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    out.extend(walk_rs_files(&p));
+                } else if p.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
     fn empty_template_fixture_loads_to_zero_cases_with_finite_report() {
         // The checked-in tier1.jsonl is comments-only by design.
         // load_fixture must return an empty Vec; build_report on it
