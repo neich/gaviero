@@ -99,6 +99,16 @@ fn restore_terminal() {
     let _ = execute!(std::io::stdout(), crossterm::cursor::Show);
 }
 
+/// Decide whether an incoming event requires a redraw. A bare `Event::Tick`
+/// only advances the spinner while streaming; outside of that it carries no
+/// visible state change, so dropping the redraw is what cuts idle CPU.
+fn event_requires_render(event: &event::Event, app: &App) -> bool {
+    match event {
+        event::Event::Tick => app.chat_state.active_conv_streaming(),
+        _ => true,
+    }
+}
+
 /// RAII guard that restores the terminal when dropped — covers `?` returns
 /// and normal scope exit.
 struct TerminalGuard;
@@ -272,15 +282,28 @@ async fn main() -> Result<()> {
     // this means the MessageComplete event sits behind many intermediate events,
     // each causing an unnecessary render. Draining processes them all at once,
     // so the UI jumps straight to the final state.
+    //
+    // Render is gated on `needs_render`: a Tick by itself is a no-op except for
+    // spinner animation while streaming, so 30 fps redraws on a quiet TUI are
+    // pure waste. We only draw on the first frame, after a non-Tick event, or
+    // on a Tick taken while the active conversation is streaming.
+    let mut needs_render = true;
     loop {
         if app.needs_full_redraw {
             terminal.clear()?;
             app.needs_full_redraw = false;
+            needs_render = true;
         }
-        terminal.draw(|frame| app.render(frame))?;
+        if needs_render {
+            terminal.draw(|frame| app.render(frame))?;
+            needs_render = false;
+        }
 
         // Block until at least one event arrives
         if let Some(event) = event_rx.recv().await {
+            if event_requires_render(&event, &app) {
+                needs_render = true;
+            }
             app.handle_event(event);
         }
 
@@ -289,7 +312,12 @@ async fn main() -> Result<()> {
         // can process them (e.g., rapid file-watcher events).
         for _ in 0..64 {
             match event_rx.try_recv() {
-                Ok(event) => app.handle_event(event),
+                Ok(event) => {
+                    if event_requires_render(&event, &app) {
+                        needs_render = true;
+                    }
+                    app.handle_event(event);
+                }
                 Err(_) => break,
             }
         }
