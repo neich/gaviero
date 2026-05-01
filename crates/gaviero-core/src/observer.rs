@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Instant;
 
 use crate::swarm::coordinator::TaskDAG;
 use crate::swarm::models::{AgentStatus, SwarmResult};
@@ -86,6 +87,40 @@ pub struct ChatInjectionSummary {
     pub pool_size: usize,
     pub tokens_used: usize,
     pub token_budget: usize,
+}
+
+/// Observer trait fired once per `AcpSession::spawn` call, after the
+/// argv-vs-tempfile spill decision has been computed but before the
+/// subprocess is launched. Captures the exact prompt + system-prompt
+/// bytes the runtime would otherwise drop on `AcpSession::drop`
+/// (because the spilled tempfile is owned by `_prompt_tempfile`).
+///
+/// Production callers leave `AgentOptions::prompt_observer` as `None`
+/// and pay nothing (single `Option::is_some` check). Tests opt in by
+/// setting the field and reading captured events.
+///
+/// Errors from the observer are not surfaced. The hook is
+/// fire-and-forget; the subprocess spawn proceeds regardless.
+pub trait PromptObserver: Send + Sync {
+    fn on_prompt(&self, ev: PromptEvent);
+}
+
+/// Event payload emitted by [`PromptObserver::on_prompt`].
+///
+/// `prompt` carries the exact bytes that would land in
+/// `.gaviero/tmp/prompt-*.md` when `used_tempfile == true`, or the
+/// argv contents when `used_tempfile == false`. `system_prompt` is the
+/// `--append-system-prompt` argv contents (always passed via argv,
+/// never spilled).
+#[derive(Debug, Clone)]
+pub struct PromptEvent {
+    pub turn_id: String,
+    pub resume_session_id: Option<String>,
+    pub prompt: String,
+    pub system_prompt: String,
+    pub used_tempfile: bool,
+    pub argv_threshold: usize,
+    pub captured_at: Instant,
 }
 
 /// Observer trait for swarm orchestration events.
