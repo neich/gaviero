@@ -53,6 +53,12 @@ use self::state::{
 /// Gutter column width used for mouse hit-testing in diff review mode.
 const DIFF_GUTTER_WIDTH: u16 = 5;
 
+/// One git repo + its display name (workspace folder name).
+pub struct GitRepoEntry {
+    pub name: String,
+    pub repo: gaviero_core::git::GitRepo,
+}
+
 // ── App ──────────────────────────────────────────────────────────
 
 pub struct App {
@@ -162,7 +168,9 @@ pub struct App {
 
     // Git panel (M4)
     pub git_panel: crate::panels::git_panel::GitPanelState,
-    pub git_repo: Option<gaviero_core::git::GitRepo>,
+    /// One git repo per workspace folder root that opens successfully.
+    /// Empty when no folder root is a git repository.
+    pub git_repos: Vec<GitRepoEntry>,
 
     // Memory panel (Tier A / A4)
     pub memory_panel: crate::panels::memory_panel::MemoryPanelState,
@@ -252,11 +260,18 @@ impl App {
         let write_namespace = workspace.resolve_namespace(None);
         let read_namespaces = workspace.resolve_read_namespaces(None);
 
-        // Open git repo for git panel (M4)
-        let git_repo = workspace
-            .roots()
-            .first()
-            .and_then(|r| gaviero_core::git::GitRepo::open(r).ok());
+        // Open git repos for git panel (M4): one per workspace folder root that
+        // is a git repository. In single-folder mode this collapses to one entry.
+        let git_repos: Vec<GitRepoEntry> = workspace
+            .folders()
+            .iter()
+            .filter_map(|f| {
+                gaviero_core::git::GitRepo::open(&f.path).ok().map(|repo| GitRepoEntry {
+                    name: f.display_name().to_string(),
+                    repo,
+                })
+            })
+            .collect();
 
         // Primary workspace root for code-graph context (first root).
         let graph_workspace_root = workspace.roots().first().map(|p| p.to_path_buf());
@@ -355,7 +370,7 @@ impl App {
             git_panel: crate::panels::git_panel::GitPanelState::new(),
             memory_panel: crate::panels::memory_panel::MemoryPanelState::new(),
             mcp_server: None,
-            git_repo,
+            git_repos,
             terminal_manager: gaviero_core::terminal::TerminalManager::new(
                 gaviero_core::terminal::TerminalConfig::default(),
             ),
