@@ -610,11 +610,11 @@ pub(super) fn handle_git_panel_action(app: &mut App, action: Action) {
             Action::CursorDown | Action::InsertChar('j') => app.git_panel.branch_picker_down(),
             Action::Enter => {
                 if let Some(name) = app.git_panel.selected_branch_name() {
-                    if let Some(repo) = &app.git_repo {
-                        if let Err(e) = repo.checkout(&name) {
+                    if let Some(entry) = app.git_repos.get(app.git_panel.active_repo) {
+                        if let Err(e) = entry.repo.checkout(&name) {
                             app.git_panel.error_message = Some(format!("{}", e));
                         }
-                        app.git_panel.refresh(repo);
+                        app.git_panel.refresh(&entry.repo);
                     }
                 }
                 app.git_panel.close_branch_picker();
@@ -633,42 +633,42 @@ pub(super) fn handle_git_panel_action(app: &mut App, action: Action) {
         Action::Tab => app.git_panel.cycle_region(),
         Action::InsertChar('s') if app.git_panel.region != GitRegion::CommitInput => {
             if let Some(path) = app.git_panel.selected_path().map(|s| s.to_string()) {
-                if let Some(repo) = &app.git_repo {
-                    if let Err(e) = repo.stage_file(&path) {
+                if let Some(entry) = app.git_repos.get(app.git_panel.active_repo) {
+                    if let Err(e) = entry.repo.stage_file(&path) {
                         app.git_panel.error_message = Some(format!("{}", e));
                     }
-                    app.git_panel.refresh(repo);
+                    app.git_panel.refresh(&entry.repo);
                 }
             }
         }
         Action::InsertChar('u') if app.git_panel.region != GitRegion::CommitInput => {
             if let Some(path) = app.git_panel.selected_path().map(|s| s.to_string()) {
-                if let Some(repo) = &app.git_repo {
-                    if let Err(e) = repo.unstage_file(&path) {
+                if let Some(entry) = app.git_repos.get(app.git_panel.active_repo) {
+                    if let Err(e) = entry.repo.unstage_file(&path) {
                         app.git_panel.error_message = Some(format!("{}", e));
                     }
-                    app.git_panel.refresh(repo);
+                    app.git_panel.refresh(&entry.repo);
                 }
             }
         }
         Action::InsertChar('d') if app.git_panel.region != GitRegion::CommitInput => {
             if let Some(path) = app.git_panel.selected_path().map(|s| s.to_string()) {
-                if let Some(repo) = &app.git_repo {
-                    if let Err(e) = repo.discard_changes(&path) {
+                if let Some(entry) = app.git_repos.get(app.git_panel.active_repo) {
+                    if let Err(e) = entry.repo.discard_changes(&path) {
                         app.git_panel.error_message = Some(format!("{}", e));
                     }
-                    app.git_panel.refresh(repo);
+                    app.git_panel.refresh(&entry.repo);
                     app.refresh_file_tree();
                 }
             }
         }
         Action::InsertChar('c') if app.git_panel.region != GitRegion::CommitInput => {
             if !app.git_panel.commit_input.is_empty() {
-                if let Some(repo) = &app.git_repo {
-                    match repo.commit(&app.git_panel.commit_input.text) {
+                if let Some(entry) = app.git_repos.get(app.git_panel.active_repo) {
+                    match entry.repo.commit(&app.git_panel.commit_input.text) {
                         Ok(_) => {
                             app.git_panel.commit_input.clear();
-                            app.git_panel.refresh(repo);
+                            app.git_panel.refresh(&entry.repo);
                             app.refresh_file_tree();
                         }
                         Err(e) => {
@@ -682,11 +682,11 @@ pub(super) fn handle_git_panel_action(app: &mut App, action: Action) {
         }
         Action::InsertChar('a') if app.git_panel.region != GitRegion::CommitInput => {
             if !app.git_panel.commit_input.is_empty() {
-                if let Some(repo) = &app.git_repo {
-                    match repo.amend(&app.git_panel.commit_input.text) {
+                if let Some(entry) = app.git_repos.get(app.git_panel.active_repo) {
+                    match entry.repo.amend(&app.git_panel.commit_input.text) {
                         Ok(_) => {
                             app.git_panel.commit_input.clear();
-                            app.git_panel.refresh(repo);
+                            app.git_panel.refresh(&entry.repo);
                         }
                         Err(e) => {
                             app.git_panel.error_message = Some(format!("{}", e));
@@ -727,11 +727,11 @@ pub(super) fn handle_git_panel_action(app: &mut App, action: Action) {
         }
         Action::Enter if app.git_panel.region == GitRegion::CommitInput => {
             if !app.git_panel.commit_input.is_empty() {
-                if let Some(repo) = &app.git_repo {
-                    match repo.commit(&app.git_panel.commit_input.text) {
+                if let Some(entry) = app.git_repos.get(app.git_panel.active_repo) {
+                    match entry.repo.commit(&app.git_panel.commit_input.text) {
                         Ok(_) => {
                             app.git_panel.commit_input.clear();
-                            app.git_panel.refresh(repo);
+                            app.git_panel.refresh(&entry.repo);
                             app.refresh_file_tree();
                         }
                         Err(e) => {
@@ -743,7 +743,10 @@ pub(super) fn handle_git_panel_action(app: &mut App, action: Action) {
         }
         Action::Enter => {
             if let Some(rel_path) = app.git_panel.selected_path().map(|s| s.to_string()) {
-                let root = app.workspace.roots().first().map(|p| p.to_path_buf());
+                let root = app
+                    .git_repos
+                    .get(app.git_panel.active_repo)
+                    .and_then(|e| e.repo.workdir().map(|p| p.to_path_buf()));
                 if let Some(root) = root {
                     let abs_path = root.join(&rel_path);
                     if abs_path.exists() {
@@ -784,14 +787,15 @@ pub(super) fn handle_git_panel_action(app: &mut App, action: Action) {
 }
 
 pub(super) fn git_head_content(app: &App, rel_path: &str) -> Option<String> {
-    let repo = app.git_repo.as_ref()?;
-    let head = repo.head_file_content(rel_path).ok()?;
-    Some(head)
+    let entry = app.git_repos.get(app.git_panel.active_repo)?;
+    entry.repo.head_file_content(rel_path).ok()
 }
 
 pub(super) fn refresh_git_panel(app: &mut App) {
-    if let Some(repo) = &app.git_repo {
-        app.git_panel.refresh(repo);
+    let names: Vec<String> = app.git_repos.iter().map(|e| e.name.clone()).collect();
+    app.git_panel.set_repo_tabs(names);
+    if let Some(entry) = app.git_repos.get(app.git_panel.active_repo) {
+        app.git_panel.refresh(&entry.repo);
     }
 }
 
