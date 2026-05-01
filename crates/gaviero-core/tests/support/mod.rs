@@ -32,3 +32,4 @@ pub mod classifier;
 pub mod env;
 pub mod orchestrator;
 pub mod prompt_capture;
+pub mod scripts;

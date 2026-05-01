@@ -219,6 +219,22 @@ struct Cli {
     #[arg(long = "eval-bootstrap-from-manifests")]
     eval_bootstrap_from_manifests: Option<usize>,
 
+    /// Tier T1 / T1.3 scope-matrix runner: re-run `--eval-fixture`
+    /// against multiple scope hints (default: repo, module, run) and
+    /// print Recall@K / Precision@K / blast_leakage per scope. Answers
+    /// "does narrower scope improve Precision@K?". Each scope swaps
+    /// into every case's `scope` before retrieval; gold-set fields on
+    /// the case populate the new T1.3 metrics (Precision@5/10,
+    /// NDCG@5/10, over/under retrieval, forbid hit rate, blast
+    /// leakage). Cases without gold sets contribute 0 to those.
+    #[arg(long = "eval-scope-matrix")]
+    eval_scope_matrix: bool,
+
+    /// Override the scope chain probed by `--eval-scope-matrix`.
+    /// Comma-separated; defaults to `repo,module,run`.
+    #[arg(long = "eval-scope-matrix-scopes", default_value = "repo,module,run")]
+    eval_scope_matrix_scopes: String,
+
     /// Tier B / B5: run the sleeptime hygiene pass against the
     /// workspace `memory.db` and exit. Combine with `--sleep-dry-run`
     /// to see what *would* happen without writing.
@@ -1138,6 +1154,71 @@ async fn open_eval_store(
     .with_context(|| format!("init memory ({context})"))?
 }
 
+/// Tier T1 / T1.3: scope-matrix runner. Loads `fixture`, runs each
+/// case against the live store at every scope in `scopes_csv`, and
+/// prints a table with Recall / Precision / NDCG / blast metrics so
+/// the dev can see whether narrowing scope improves Precision@K.
+async fn run_eval_scope_matrix(
+    repo: &std::path::Path,
+    fixture: &PathBuf,
+    scopes_csv: &str,
+) -> Result<()> {
+    use gaviero_core::memory::eval::{load_fixture, run_scope_matrix};
+    use gaviero_core::memory::MemoryScope;
+    use gaviero_core::memory::hash_path;
+
+    let cases = load_fixture(fixture).context("loading eval fixture")?;
+    if cases.is_empty() {
+        eprintln!(
+            "[gaviero-eval] fixture {} has 0 cases; nothing to score.",
+            fixture.display()
+        );
+        return Ok(());
+    }
+    let scopes: Vec<String> = scopes_csv
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if scopes.is_empty() {
+        anyhow::bail!("--eval-scope-matrix-scopes resolved to empty list");
+    }
+
+    let store = open_eval_store(repo, "scope matrix").await?;
+    let _ = hash_path(repo);
+    let scope_ctx = MemoryScope::from_context(repo, Some(repo), None, None);
+    let results = run_scope_matrix(&store, &scope_ctx, &cases, &scopes, None, None, None).await?;
+    print_scope_matrix(&scopes, &results);
+    Ok(())
+}
+
+fn print_scope_matrix(
+    scopes: &[String],
+    results: &[(String, gaviero_core::memory::eval::EvalReport)],
+) {
+    println!("─── T1.3 scope matrix ─────────────────────────────────────");
+    println!("scopes probed: {}", scopes.join(", "));
+    println!(
+        "{:<10}  {:>5}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}",
+        "scope", "n", "r@5", "p@5", "p@10", "ndcg5", "ndcg10", "leak", "over", "forbid"
+    );
+    for (label, r) in results {
+        println!(
+            "{:<10}  {:>5}  {:>6.3}  {:>6.3}  {:>6.3}  {:>6.3}  {:>6.3}  {:>6.3}  {:>6.3}  {:>6.3}",
+            label,
+            r.total,
+            r.recall_at_5,
+            r.precision_at_5,
+            r.precision_at_10,
+            r.ndcg_at_5,
+            r.ndcg_at_10,
+            r.blast_leakage,
+            r.over_retrieval,
+            r.forbid_hit_rate,
+        );
+    }
+}
+
 /// Tier B / T0: replay the fixture against persisted manifests. No
 /// embedder, no reranker, no LLM — opens the store with a no-op
 /// embedder choice (we only read `injection_manifests`).
@@ -1283,7 +1364,11 @@ fn print_eval_report(r: &gaviero_core::memory::eval::EvalReport) {
                 Some(r) => format!("rank={}", r),
                 None => "absent".to_string(),
             };
-            println!("  {} expected={} {}", o.id, o.expected_memory_id, rank);
+            let expected = o
+                .expected_memory_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "<gold-set>".into());
+            println!("  {} expected={} {}", o.id, expected, rank);
         }
     }
 }
@@ -1432,6 +1517,10 @@ async fn main() -> Result<()> {
         }
         if cli.eval_rerank_ablation {
             return run_eval_rerank_ablation(&repo, &fixture_path).await;
+        }
+        if cli.eval_scope_matrix {
+            return run_eval_scope_matrix(&repo, &fixture_path, &cli.eval_scope_matrix_scopes)
+                .await;
         }
         return run_eval_smoke_test(&repo, &fixture_path, &cli).await;
     }
