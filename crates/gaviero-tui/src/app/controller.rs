@@ -15,7 +15,7 @@ fn invalidate_repo_map(app: &App) {
 pub(super) fn handle_event(app: &mut App, event: Event) {
     match event {
         Event::Key(key) => {
-            if app.focus == Focus::Terminal {
+            if app.focus == Focus::Terminal && !app.has_active_review() {
                 if let Some(inst) = app.terminal_manager.active_instance() {
                     if inst.spawned {
                         use crate::panels::terminal::{is_terminal_escape_key, key_event_to_bytes};
@@ -152,6 +152,9 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             app.handle_action(action);
         }
         Event::Paste(text) => {
+            if app.has_active_review() {
+                return;
+            }
             if app.focus == Focus::Terminal {
                 if let Some(inst) = app.terminal_manager.active_instance_mut() {
                     if inst.spawned {
@@ -1198,11 +1201,16 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
 }
 
 pub(super) fn handle_action(app: &mut App, action: Action) {
-    if app.diff_review.is_some() && app.handle_review_action(&action) {
-        return;
-    }
-
-    if app.batch_review.is_some() && app.handle_batch_review_action(&action) {
+    // While a review is pending, the only honored inputs are the
+    // review-specific actions (accept/reject/navigate/dismiss). All other
+    // actions are swallowed so the terminal, editor, and side panels stay
+    // locked until the user finishes the review.
+    if app.has_active_review() {
+        if app.diff_review.is_some() {
+            app.handle_review_action(&action);
+        } else if app.batch_review.is_some() {
+            app.handle_batch_review_action(&action);
+        }
         return;
     }
 

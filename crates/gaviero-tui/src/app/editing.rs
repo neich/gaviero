@@ -259,6 +259,11 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
     let col = mouse.column;
     let row = mouse.row;
 
+    if app.has_active_review() {
+        handle_mouse_review(app, mouse);
+        return;
+    }
+
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(ref mut review) = app.diff_review {
@@ -816,6 +821,91 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
     }
 }
 
+/// Mouse handling while a review is pending. Only review-relevant
+/// interactions are honored: clicking a hunk gutter to toggle accept/reject,
+/// clicking a row in the batch-review file list, and scrolling the diff or
+/// the file list. Every other branch (focus changes, editor cursor, terminal
+/// selection, side-panel clicks, etc.) is intentionally dropped so the rest
+/// of the UI stays locked until the user finishes the review.
+fn handle_mouse_review(app: &mut App, mouse: crossterm::event::MouseEvent) {
+    let col = mouse.column;
+    let row = mouse.row;
+
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(ref mut review) = app.diff_review {
+                if review.is_interactive()
+                    && app.layout.editor_area.contains((col, row).into())
+                    && col < app.layout.editor_area.x + DIFF_GUTTER_WIDTH
+                {
+                    let relative_row = (row - app.layout.editor_area.y) as usize;
+                    if let Some(hunk_idx) = diff_overlay::hunk_at_row(review, relative_row) {
+                        let current = review
+                            .proposal
+                            .structural_hunks
+                            .get(hunk_idx)
+                            .map(|h| h.status.clone());
+                        match current {
+                            Some(gaviero_core::types::HunkStatus::Accepted) => {
+                                review.reject_hunk(hunk_idx);
+                            }
+                            _ => {
+                                review.accept_hunk(hunk_idx);
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+
+            if let (Some(area), Some(ref mut br)) =
+                (app.layout.file_tree_area, app.batch_review.as_mut())
+            {
+                if app.left_panel == LeftPanelMode::Review && area.contains((col, row).into()) {
+                    let relative_row = row.saturating_sub(area.y) as usize;
+                    let idx = br.scroll_offset + relative_row;
+                    if idx < br.proposals.len() {
+                        br.selected_index = idx;
+                        br.diff_scroll = 0;
+                    }
+                }
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            if let Some(ref mut br) = app.batch_review {
+                if app.layout.editor_area.contains((col, row).into()) {
+                    br.diff_scroll = br.diff_scroll.saturating_sub(3);
+                } else if let Some(area) = app.layout.file_tree_area {
+                    if area.contains((col, row).into()) {
+                        br.scroll_offset = br.scroll_offset.saturating_sub(3);
+                    }
+                }
+            } else if let Some(ref mut review) = app.diff_review {
+                if app.layout.editor_area.contains((col, row).into()) {
+                    review.scroll_top = review.scroll_top.saturating_sub(3);
+                }
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if let Some(ref mut br) = app.batch_review {
+                if app.layout.editor_area.contains((col, row).into()) {
+                    br.diff_scroll += 3;
+                } else if let Some(area) = app.layout.file_tree_area {
+                    if area.contains((col, row).into()) {
+                        let max = br.proposals.len().saturating_sub(1);
+                        br.scroll_offset = (br.scroll_offset + 3).min(max);
+                    }
+                }
+            } else if let Some(ref mut review) = app.diff_review {
+                if app.layout.editor_area.contains((col, row).into()) {
+                    review.scroll_top += 3;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(super) fn scroll_panel_to_row(app: &mut App, target: ScrollbarTarget, row: u16) {
     match target {
         ScrollbarTarget::Editor => {
@@ -950,7 +1040,7 @@ pub(super) fn set_cursor_from_mouse(app: &mut App, col: u16, row: u16) {
 }
 
 pub(super) fn handle_paste(app: &mut App, text: &str) {
-    if app.diff_review.is_some() {
+    if app.has_active_review() {
         return;
     }
     match app.focus {
