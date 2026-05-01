@@ -91,6 +91,33 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 return;
             }
 
+            // Bulk op confirm modals — fully block all other input.
+            if let Some(bulk) = app.bulk_op_state.clone() {
+                use crossterm::event::KeyCode;
+                match &bulk {
+                    BulkOpState::ConfirmDelete { paths } => {
+                        if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                            let p = paths.clone();
+                            app.execute_bulk_delete(&p);
+                        } else {
+                            app.bulk_op_state = None;
+                        }
+                        return;
+                    }
+                    BulkOpState::ConfirmMove { paths, dest_dir } => {
+                        if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                            let p = paths.clone();
+                            let d = dest_dir.clone();
+                            app.execute_bulk_move(&p, &d);
+                        } else {
+                            app.bulk_op_state = None;
+                        }
+                        return;
+                    }
+                    BulkOpState::SelectingDest { .. } => {} // handled below
+                }
+            }
+
             if app.tree_dialog.is_some() {
                 app.handle_dialog_key(&key);
                 return;
@@ -101,6 +128,15 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 && app.left_panel == LeftPanelMode::FileTree
             {
                 app.handle_move_key(&key);
+                return;
+            }
+
+            // Bulk move destination selection — user navigates the file tree.
+            if matches!(app.bulk_op_state, Some(BulkOpState::SelectingDest { .. }))
+                && app.focus == Focus::FileTree
+                && app.left_panel == LeftPanelMode::FileTree
+            {
+                app.handle_bulk_move_key(&key);
                 return;
             }
 
