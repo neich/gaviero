@@ -343,7 +343,6 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                                 if let Some(path) = app.file_tree.selected_path() {
                                     let path = path.to_path_buf();
                                     app.open_file(&path);
-                                    app.focus = Focus::Editor;
                                 }
                             } else {
                                 app.file_tree.toggle_expand();

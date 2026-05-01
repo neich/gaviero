@@ -191,6 +191,17 @@ pub struct TreeDialog {
     pub original_path: Option<PathBuf>,
 }
 
+/// State for bulk operations on selected files in the EXPLORER panel.
+#[derive(Debug, Clone)]
+pub enum BulkOpState {
+    /// Waiting for [y/n] to confirm deletion of the listed paths.
+    ConfirmDelete { paths: Vec<PathBuf> },
+    /// User is navigating the file tree to pick a destination directory.
+    SelectingDest { paths: Vec<PathBuf> },
+    /// Waiting for [y/n] to confirm moving the listed paths to `dest_dir`.
+    ConfirmMove { paths: Vec<PathBuf>, dest_dir: PathBuf },
+}
+
 impl TreeDialog {
     pub(super) fn new(kind: TreeDialogKind, target_dir: PathBuf) -> Self {
         Self {

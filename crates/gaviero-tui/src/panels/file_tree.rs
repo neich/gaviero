@@ -5,6 +5,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Widget},
 };
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::theme;
@@ -26,6 +27,8 @@ pub struct FileTreeState {
     pub scroll: ScrollState,
     pub exclude_patterns: Vec<String>,
     pub git_allow_list: Vec<String>,
+    /// Paths currently marked by the user (via `s` key) for bulk operations.
+    pub selected_paths: HashSet<PathBuf>,
 }
 
 impl FileTreeState {
@@ -58,6 +61,7 @@ impl FileTreeState {
             scroll: ScrollState::new(),
             exclude_patterns: exclude_patterns.to_vec(),
             git_allow_list: git_allow_list.to_vec(),
+            selected_paths: HashSet::new(),
         };
 
         // Load children for all root entries
@@ -286,6 +290,34 @@ impl FileTreeState {
         }
     }
 
+    /// Toggle the selection mark on the currently highlighted entry.
+    pub fn toggle_selection(&mut self) {
+        let Some(entry) = self.entries.get(self.scroll.selected) else {
+            return;
+        };
+        let path = entry.path.clone();
+        if !self.selected_paths.remove(&path) {
+            self.selected_paths.insert(path);
+        }
+    }
+
+    /// Clear all selection marks.
+    pub fn clear_selection(&mut self) {
+        self.selected_paths.clear();
+    }
+
+    /// True when at least one path is selected.
+    pub fn has_selection(&self) -> bool {
+        !self.selected_paths.is_empty()
+    }
+
+    /// Return selected paths sorted for deterministic operation order.
+    pub fn selected_paths_sorted(&self) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = self.selected_paths.iter().cloned().collect();
+        v.sort();
+        v
+    }
+
     /// Render the file tree into the given area.
     /// NOTE: takes &mut self to auto-scroll the selection into view.
     /// `move_source` highlights the file being moved (SelectingDest / Confirming states).
@@ -329,9 +361,10 @@ impl FileTreeState {
                 " "
             };
 
-            let is_selected = i == self.scroll.selected;
+            let is_cursor = i == self.scroll.selected;
+            let is_marked = self.selected_paths.contains(&entry.path);
             let is_move_source = move_source.map(|s| s == entry.path).unwrap_or(false);
-            let style = if is_selected {
+            let style = if is_cursor {
                 Style::default()
                     .fg(theme::SELECTED_BRIGHT)
                     .add_modifier(Modifier::BOLD)
@@ -341,13 +374,18 @@ impl FileTreeState {
                     .fg(theme::WARNING)
                     .add_modifier(Modifier::BOLD)
                     .bg(theme::INPUT_BG)
+            } else if is_marked {
+                Style::default()
+                    .fg(theme::NUMERIC_ORANGE)
+                    .add_modifier(Modifier::BOLD)
             } else if entry.is_dir {
                 Style::default().fg(theme::FOCUS_BORDER)
             } else {
                 Style::default().fg(theme::TEXT_FG)
             };
 
-            let text = format!("{}{}{}", indent, icon, entry.name);
+            let mark = if is_marked { "●" } else { " " };
+            let text = format!("{}{}{}{}", mark, indent, icon, entry.name);
             let line = Line::from(Span::styled(text, style));
 
             let line_area = Rect {

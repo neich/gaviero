@@ -42,9 +42,10 @@ mod state;
 
 use self::observers::{TuiAcpObserver, TuiSwarmObserver, TuiWriteGateObserver};
 use self::state::{
-    BatchReviewState, ChangesEntry, ChangesState, CodexTrustDialog, DiffKind, FirstRunDialog,
-    FirstRunStep, Focus, LayoutAreas, LayoutPreset, LeftPanelMode, MoveState, PanelVisibility,
-    ReviewProposal, ScrollbarTarget, SidePanelMode, TreeDialog, TreeDialogKind, build_simple_diff,
+    BatchReviewState, BulkOpState, ChangesEntry, ChangesState, CodexTrustDialog, DiffKind,
+    FirstRunDialog, FirstRunStep, Focus, LayoutAreas, LayoutPreset, LeftPanelMode, MoveState,
+    PanelVisibility, ReviewProposal, ScrollbarTarget, SidePanelMode, TreeDialog, TreeDialogKind,
+    build_simple_diff,
 };
 
 // ── Constants ────────────────────────────────────────────────────
@@ -111,6 +112,8 @@ pub struct App {
     tree_dialog: Option<TreeDialog>,
     // File move state (multi-step: select source → select dest → confirm)
     move_state: Option<MoveState>,
+    // Bulk operation state (delete / move multiple selected files)
+    pub bulk_op_state: Option<BulkOpState>,
 
     // Editor find bar (Ctrl+F)
     pub find_bar_active: bool,
@@ -319,6 +322,7 @@ impl App {
             status_message: None,
             tree_dialog: None,
             move_state: None,
+            bulk_op_state: None,
             find_bar_active: false,
             find_input: crate::widgets::text_input::TextInput::new(),
             preview_visible: false,
@@ -658,6 +662,30 @@ impl App {
 
     fn render_move_panel_info(&self, frame: &mut Frame, tree_area: Rect) {
         left_panel::render_move_panel_info(self, frame, tree_area);
+    }
+
+    fn handle_bulk_move_key(&mut self, key: &crossterm::event::KeyEvent) {
+        left_panel::handle_bulk_move_key(self, key);
+    }
+
+    fn execute_bulk_delete(&mut self, paths: &[std::path::PathBuf]) {
+        left_panel::execute_bulk_delete(self, paths);
+    }
+
+    fn execute_bulk_move(
+        &mut self,
+        paths: &[std::path::PathBuf],
+        dest_dir: &std::path::PathBuf,
+    ) {
+        left_panel::execute_bulk_move(self, paths, dest_dir);
+    }
+
+    fn render_bulk_op_dialog(&self, frame: &mut Frame, area: Rect) {
+        render::render_bulk_op_dialog(self, frame, area);
+    }
+
+    fn render_bulk_dest_hint(&self, frame: &mut Frame, area: Rect) {
+        render::render_bulk_dest_hint(self, frame, area);
     }
 
     fn handle_dialog_key(&mut self, key: &crossterm::event::KeyEvent) {

@@ -136,11 +136,33 @@ pub(super) fn handle_file_tree_action(app: &mut App, action: Action) {
                 app.file_tree.toggle_expand();
             }
         }
+        Action::InsertChar('s') => {
+            app.file_tree.toggle_selection();
+        }
+        Action::Quit => {
+            if app.file_tree.has_selection() {
+                app.file_tree.clear_selection();
+            }
+        }
         Action::InsertChar('n') => app.start_tree_dialog(TreeDialogKind::NewFile),
         Action::InsertChar('N') => app.start_tree_dialog(TreeDialogKind::NewFolder),
         Action::InsertChar('r') => app.start_tree_dialog(TreeDialogKind::Rename),
-        Action::InsertChar('d') | Action::Delete => app.start_tree_dialog(TreeDialogKind::Delete),
-        Action::InsertChar('m') => app.start_move(),
+        Action::InsertChar('d') | Action::Delete => {
+            if app.file_tree.has_selection() {
+                let paths = app.file_tree.selected_paths_sorted();
+                app.bulk_op_state = Some(BulkOpState::ConfirmDelete { paths });
+            } else {
+                app.start_tree_dialog(TreeDialogKind::Delete);
+            }
+        }
+        Action::InsertChar('m') => {
+            if app.file_tree.has_selection() {
+                let paths = app.file_tree.selected_paths_sorted();
+                app.bulk_op_state = Some(BulkOpState::SelectingDest { paths });
+            } else {
+                app.start_move();
+            }
+        }
         _ => {}
     }
 }
@@ -516,6 +538,96 @@ pub(super) fn select_path_in_tree(app: &mut App, path: &std::path::Path) {
             return;
         }
     }
+}
+
+/// Handle keyboard navigation while picking a destination for a bulk move.
+pub(super) fn handle_bulk_move_key(app: &mut App, key: &crossterm::event::KeyEvent) {
+    use crossterm::event::KeyCode;
+
+    let paths = match &app.bulk_op_state {
+        Some(BulkOpState::SelectingDest { paths }) => paths.clone(),
+        _ => return,
+    };
+
+    match key.code {
+        KeyCode::Esc => {
+            app.bulk_op_state = None;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.file_tree.move_up();
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.file_tree.move_down();
+        }
+        KeyCode::Enter => {
+            if let Some(path) = app.file_tree.selected_path() {
+                if path.is_dir() {
+                    let dest_dir = path.to_path_buf();
+                    app.bulk_op_state = Some(BulkOpState::ConfirmMove { paths, dest_dir });
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Execute a bulk delete: remove all `paths` from disk and close any open buffers.
+pub(super) fn execute_bulk_delete(app: &mut App, paths: &[std::path::PathBuf]) {
+    let mut deleted_count = 0;
+    for path in paths {
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+        match result {
+            Ok(()) => {
+                deleted_count += 1;
+                app.buffers.retain(|b| b.path.as_deref() != Some(path.as_path()));
+            }
+            Err(e) => tracing::error!("bulk delete {}: {}", path.display(), e),
+        }
+    }
+    if app.active_buffer >= app.buffers.len() && !app.buffers.is_empty() {
+        app.active_buffer = app.buffers.len() - 1;
+    }
+    app.file_tree.clear_selection();
+    app.bulk_op_state = None;
+    app.refresh_file_tree();
+    app.status_message = Some((
+        format!("Deleted {} item(s)", deleted_count),
+        std::time::Instant::now(),
+    ));
+}
+
+/// Execute a bulk move: rename all `paths` into `dest_dir`.
+pub(super) fn execute_bulk_move(
+    app: &mut App,
+    paths: &[std::path::PathBuf],
+    dest_dir: &std::path::PathBuf,
+) {
+    let mut moved_count = 0;
+    for src in paths {
+        let Some(file_name) = src.file_name() else {
+            continue;
+        };
+        let dest = dest_dir.join(file_name);
+        match std::fs::rename(src, &dest) {
+            Ok(()) => moved_count += 1,
+            Err(e) => tracing::error!("bulk move {} → {}: {}", src.display(), dest.display(), e),
+        }
+    }
+    app.file_tree.clear_selection();
+    app.bulk_op_state = None;
+    app.refresh_file_tree();
+    let dest_name = dest_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("?");
+    app.status_message = Some((
+        format!("Moved {} item(s) → {}", moved_count, dest_name),
+        std::time::Instant::now(),
+    ));
 }
 
 pub(super) fn refresh_file_tree(app: &mut App) {

@@ -36,6 +36,12 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
         if app.codex_trust_dialog.is_some() {
             app.render_codex_trust_dialog(frame, size);
         }
+        if matches!(
+            app.bulk_op_state,
+            Some(BulkOpState::ConfirmDelete { .. } | BulkOpState::ConfirmMove { .. })
+        ) {
+            app.render_bulk_op_dialog(frame, size);
+        }
         return;
     }
 
@@ -148,6 +154,12 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
     if app.first_run_dialog.is_some() {
         app.render_first_run_dialog(frame, size);
     }
+    if matches!(
+        app.bulk_op_state,
+        Some(BulkOpState::ConfirmDelete { .. } | BulkOpState::ConfirmMove { .. })
+    ) {
+        app.render_bulk_op_dialog(frame, size);
+    }
 }
 
 pub(super) fn render_fullscreen(app: &mut App, frame: &mut Frame, area: Rect, panel: Focus) {
@@ -225,6 +237,9 @@ pub(super) fn render_left_panel_content(
             }
             if app.move_state.is_some() {
                 app.render_move_panel_info(frame, area);
+            }
+            if matches!(app.bulk_op_state, Some(BulkOpState::SelectingDest { .. })) {
+                app.render_bulk_dest_hint(frame, area);
             }
         }
         LeftPanelMode::Search => {
@@ -1342,4 +1357,224 @@ pub(super) fn render_codex_trust_dialog(app: &App, frame: &mut Frame, area: Rect
             cx += 1;
         }
     }
+}
+
+// ── Shared helper ────────────────────────────────────────────────────────────
+
+/// Draw a centred modal box with lines of text over the given `area`.
+/// Lines whose trimmed text starts with `title_tag` get `title_style`;
+/// lines that contain `[` get `hint_style`; others get `bg_style`.
+fn draw_modal_box(
+    frame: &mut Frame,
+    area: Rect,
+    lines: &[String],
+    title_tag: &str,
+    bg_style: Style,
+    title_style: Style,
+    hint_style: Style,
+) {
+    let dialog_w: u16 = lines
+        .iter()
+        .map(|l| l.chars().count() as u16)
+        .max()
+        .unwrap_or(40)
+        .max(40)
+        + 2;
+    let dialog_h = lines.len() as u16;
+
+    if area.width < dialog_w + 4 || area.height < dialog_h + 2 {
+        return;
+    }
+
+    let x = area.x + (area.width.saturating_sub(dialog_w)) / 2;
+    let y = area.y + (area.height.saturating_sub(dialog_h)) / 2;
+
+    for row in 0..dialog_h {
+        for col in 0..dialog_w {
+            let (cx, cy) = (x + col, y + row);
+            if cx < frame.area().right() && cy < frame.area().bottom() {
+                frame.buffer_mut()[(cx, cy)].set_char(' ').set_style(bg_style);
+            }
+        }
+    }
+
+    for col in 0..dialog_w {
+        let cx = x + col;
+        let (top_ch, bot_ch) = if col == 0 {
+            ('┌', '└')
+        } else if col == dialog_w - 1 {
+            ('┐', '┘')
+        } else {
+            ('─', '─')
+        };
+        if cx < frame.area().right() {
+            if y < frame.area().bottom() {
+                frame.buffer_mut()[(cx, y)].set_char(top_ch).set_style(title_style);
+            }
+            let by = y + dialog_h - 1;
+            if by < frame.area().bottom() {
+                frame.buffer_mut()[(cx, by)].set_char(bot_ch).set_style(title_style);
+            }
+        }
+    }
+
+    for row in 1..dialog_h.saturating_sub(1) {
+        let cy = y + row;
+        if cy < frame.area().bottom() {
+            if x < frame.area().right() {
+                frame.buffer_mut()[(x, cy)].set_char('│').set_style(title_style);
+            }
+            let rx = x + dialog_w - 1;
+            if rx < frame.area().right() {
+                frame.buffer_mut()[(rx, cy)].set_char('│').set_style(title_style);
+            }
+        }
+    }
+
+    for (i, line) in lines.iter().enumerate() {
+        let cy = y + i as u16;
+        if cy >= frame.area().bottom() {
+            break;
+        }
+        let is_title = line.trim_start().starts_with(title_tag);
+        let is_hint = line.contains('[');
+        let style = if is_title {
+            title_style
+        } else if is_hint {
+            hint_style
+        } else {
+            bg_style
+        };
+        let mut cx = x + 1;
+        for ch in line.chars() {
+            if cx >= x + dialog_w - 1 {
+                break;
+            }
+            if cx < frame.area().right() {
+                frame.buffer_mut()[(cx, cy)].set_char(ch).set_style(style);
+            }
+            cx += 1;
+        }
+    }
+}
+
+// ── Bulk operation dialogs ────────────────────────────────────────────────────
+
+/// Modal confirm dialog for bulk delete / move operations.
+pub(super) fn render_bulk_op_dialog(app: &App, frame: &mut Frame, area: Rect) {
+    let Some(state) = &app.bulk_op_state else {
+        return;
+    };
+
+    let bg_style = Style::default().fg(theme::TEXT_BRIGHT).bg(theme::INPUT_BG);
+    let title_style = Style::default()
+        .fg(theme::FOCUS_BORDER)
+        .bg(theme::INPUT_BG)
+        .add_modifier(Modifier::BOLD);
+    let hint_style = Style::default().fg(theme::TEXT_DIM).bg(theme::INPUT_BG);
+
+    let mut lines: Vec<String> = vec![String::new()];
+
+    match state {
+        BulkOpState::ConfirmDelete { paths } => {
+            lines.push(format!("  Delete {} item(s)?", paths.len()));
+            lines.push(String::new());
+            for path in paths.iter().take(10) {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                lines.push(format!("    • {}", name));
+            }
+            if paths.len() > 10 {
+                lines.push(format!("    … and {} more", paths.len() - 10));
+            }
+            lines.push(String::new());
+            lines.push("  [y] Delete   [n / Esc] Cancel".to_string());
+        }
+        BulkOpState::ConfirmMove { paths, dest_dir } => {
+            let dest = dest_dir.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            lines.push(format!("  Move {} item(s) → '{}'?", paths.len(), dest));
+            lines.push(String::new());
+            for path in paths.iter().take(10) {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                lines.push(format!("    • {}", name));
+            }
+            if paths.len() > 10 {
+                lines.push(format!("    … and {} more", paths.len() - 10));
+            }
+            lines.push(String::new());
+            lines.push("  [y] Move   [n / Esc] Cancel".to_string());
+        }
+        BulkOpState::SelectingDest { .. } => return,
+    }
+
+    lines.push(String::new());
+
+    // Title tag matches the first word of the title line so both "Delete" and "Move" get styled.
+    let title_tag = match state {
+        BulkOpState::ConfirmDelete { .. } => "Delete",
+        BulkOpState::ConfirmMove { .. } => "Move",
+        _ => "",
+    };
+
+    draw_modal_box(frame, area, &lines, title_tag, bg_style, title_style, hint_style);
+}
+
+/// Info hint bar shown at the bottom of the file-tree panel while the user
+/// picks a destination for a bulk move.
+pub(super) fn render_bulk_dest_hint(app: &App, frame: &mut Frame, tree_area: Rect) {
+    let Some(BulkOpState::SelectingDest { paths }) = &app.bulk_op_state else {
+        return;
+    };
+
+    let hint_height: u16 = 2;
+    if tree_area.height < hint_height + 2 {
+        return;
+    }
+
+    let y = tree_area.bottom() - hint_height;
+    let width = tree_area.width.saturating_sub(1);
+
+    let bg_style = Style::default().fg(theme::TEXT_BRIGHT).bg(theme::INPUT_BG);
+    let sep_style = Style::default().fg(theme::NUMERIC_ORANGE).bg(theme::INPUT_BG);
+    let label_style = Style::default()
+        .fg(theme::NUMERIC_ORANGE)
+        .bg(theme::INPUT_BG)
+        .add_modifier(Modifier::BOLD);
+    let dim_style = Style::default().fg(theme::TEXT_DIM).bg(theme::INPUT_BG);
+
+    for row in 0..hint_height {
+        for col in 0..width {
+            let (cx, cy) = (tree_area.x + col, y + row);
+            if cx < frame.area().right() && cy < frame.area().bottom() {
+                frame.buffer_mut()[(cx, cy)].set_char(' ').set_style(bg_style);
+            }
+        }
+    }
+
+    for col in 0..width {
+        let cx = tree_area.x + col;
+        if cx < frame.area().right() && y < frame.area().bottom() {
+            frame.buffer_mut()[(cx, y)].set_char('─').set_style(sep_style);
+        }
+    }
+
+    let input_y = y + 1;
+    if input_y >= frame.area().bottom() {
+        return;
+    }
+
+    let mut cx = tree_area.x;
+    let mut write = |text: &str, style: Style| {
+        for ch in text.chars() {
+            if cx < tree_area.x + width && cx < frame.area().right() {
+                frame.buffer_mut()[(cx, input_y)].set_char(ch).set_style(style);
+                cx += 1;
+            }
+        }
+    };
+
+    write(&format!("MOVE {}  ", paths.len()), label_style);
+    write(
+        "Navigate, Enter: select folder  Esc: cancel",
+        dim_style,
+    );
 }
