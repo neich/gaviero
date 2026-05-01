@@ -369,18 +369,39 @@ impl Workspace {
     /// near the workspace file. Each name is searched first in the directory
     /// containing the workspace file, then one level up. The first existing
     /// match per name wins. Empty in single-folder mode (no workspace file).
+    ///
+    /// Candidates whose parent directory is itself a workspace folder root
+    /// are skipped — the `.claude`/`.gaviero` dir is already visible inside
+    /// that folder's tree, so adding it again would duplicate the entry.
     pub fn config_roots(&self) -> Vec<PathBuf> {
         let Some(workspace_dir) = self.workspace_path.as_deref().and_then(Path::parent) else {
             return Vec::new();
         };
         let parent_dir = workspace_dir.parent();
+        let folder_roots: Vec<PathBuf> = self
+            .folders
+            .iter()
+            .map(|f| canonicalize_path(&f.path))
+            .collect();
+        let is_folder_root = |dir: &Path| -> bool {
+            let canonical = canonicalize_path(dir);
+            folder_roots.iter().any(|r| r == &canonical)
+        };
         let resolve = |name: &str| -> Option<PathBuf> {
-            let same = workspace_dir.join(name);
-            if same.is_dir() {
-                return Some(same);
+            if !is_folder_root(workspace_dir) {
+                let same = workspace_dir.join(name);
+                if same.is_dir() {
+                    return Some(same);
+                }
             }
-            let up = parent_dir?.join(name);
-            up.is_dir().then_some(up)
+            let up_dir = parent_dir?;
+            if !is_folder_root(up_dir) {
+                let up = up_dir.join(name);
+                if up.is_dir() {
+                    return Some(up);
+                }
+            }
+            None
         };
         let mut out = Vec::new();
         if let Some(p) = resolve(".claude") {
@@ -1117,6 +1138,67 @@ mod tests {
         fs::create_dir_all(dir.path().join(".gaviero")).unwrap();
         let ws = Workspace::single_folder(dir.path().to_path_buf());
         assert!(ws.config_roots().is_empty());
+    }
+
+    #[test]
+    fn config_roots_skips_dirs_already_inside_a_folder_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws_path = dir.path().join("project.gaviero-workspace");
+        let folder = canonicalize_path(dir.path()).to_string_lossy().to_string();
+        let body = format!(
+            r#"{{"folders":[{{"path":"{}"}}],"settings":{{}}}}"#,
+            folder.replace('\\', "\\\\")
+        );
+        fs::write(&ws_path, body).unwrap();
+        fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        fs::create_dir_all(dir.path().join(".gaviero")).unwrap();
+
+        let ws = Workspace::load(&ws_path).unwrap();
+        assert!(
+            ws.config_roots().is_empty(),
+            "config dirs at folder root should not be re-listed"
+        );
+    }
+
+    #[test]
+    fn config_roots_skips_parent_level_dirs_already_inside_a_folder_root() {
+        let outer = tempfile::tempdir().unwrap();
+        let inner = outer.path().join("nested");
+        fs::create_dir_all(&inner).unwrap();
+        let ws_path = inner.join("project.gaviero-workspace");
+        let folder = canonicalize_path(outer.path()).to_string_lossy().to_string();
+        let body = format!(
+            r#"{{"folders":[{{"path":"{}"}}],"settings":{{}}}}"#,
+            folder.replace('\\', "\\\\")
+        );
+        fs::write(&ws_path, body).unwrap();
+        fs::create_dir_all(outer.path().join(".gaviero")).unwrap();
+
+        let ws = Workspace::load(&ws_path).unwrap();
+        assert!(
+            ws.config_roots().is_empty(),
+            "parent-level config dir already inside a folder root should not be re-listed"
+        );
+    }
+
+    #[test]
+    fn config_roots_kept_when_no_folder_root_owns_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws_path = dir.path().join("project.gaviero-workspace");
+        let other = dir.path().join("other");
+        fs::create_dir_all(&other).unwrap();
+        let folder = canonicalize_path(&other).to_string_lossy().to_string();
+        let body = format!(
+            r#"{{"folders":[{{"path":"{}"}}],"settings":{{}}}}"#,
+            folder.replace('\\', "\\\\")
+        );
+        fs::write(&ws_path, body).unwrap();
+        fs::create_dir_all(dir.path().join(".gaviero")).unwrap();
+
+        let ws = Workspace::load(&ws_path).unwrap();
+        let roots = ws.config_roots();
+        assert_eq!(roots.len(), 1);
+        assert!(roots[0].ends_with(".gaviero"));
     }
 
     #[test]
