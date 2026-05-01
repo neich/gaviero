@@ -99,6 +99,10 @@ pub const SELECTED_BRIGHT: Color = Color::White;
 pub const PANEL_HEADER_FOCUSED_FG: Color = Color::Rgb(230, 235, 245);
 /// Unfocused panel header dimmed foreground.
 pub const PANEL_HEADER_UNFOCUSED_FG: Color = Color::Rgb(120, 128, 145);
+/// Editor header background when the active buffer is a read-only diff view.
+pub const DIFF_VIEW_HEADER_BG: Color = Color::Rgb(214, 134, 50);
+/// Editor header foreground for diff-view headers (paired with the orange bg).
+pub const DIFF_VIEW_HEADER_FG: Color = Color::Black;
 
 // ── Magic Number Constants ──────────────────────────────────────
 

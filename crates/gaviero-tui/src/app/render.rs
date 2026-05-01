@@ -101,12 +101,18 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
         .get(app.active_buffer)
         .map(|b| b.display_name().to_string())
         .unwrap_or_else(|| "EDITOR".to_string());
-    let (_editor_header, editor_content) = App::render_panel_header(
+    let editor_header_override = app
+        .buffers
+        .get(app.active_buffer)
+        .filter(|b| b.diff_view.is_some())
+        .map(|_| (theme::DIFF_VIEW_HEADER_BG, theme::DIFF_VIEW_HEADER_FG));
+    let (_editor_header, editor_content) = render_panel_header_styled(
         frame,
         editor_full_area,
         &editor_title,
         editor_focused,
         false,
+        editor_header_override,
     );
 
     let (actual_editor_area, preview_area) =
@@ -264,10 +270,11 @@ pub(super) fn current_move_source(app: &App) -> Option<std::path::PathBuf> {
 }
 
 pub(super) fn render_tab_bar(app: &App, frame: &mut Frame, area: Rect) {
-    let titles: Vec<(String, bool)> = app
+    // Buffers opened in diff-view mode are colored orange in the tab bar.
+    let titles: Vec<(String, bool, bool)> = app
         .buffers
         .iter()
-        .map(|b| (b.display_name().to_string(), b.modified))
+        .map(|b| (b.display_name().to_string(), b.modified, b.diff_view.is_some()))
         .collect();
     let tab_bar = TabBar {
         titles: &titles,
@@ -683,6 +690,20 @@ pub(super) fn render_panel_header(
     focused: bool,
     show_cycle_arrow: bool,
 ) -> (Rect, Rect) {
+    render_panel_header_styled(frame, area, title, focused, show_cycle_arrow, None)
+}
+
+/// Like `render_panel_header` but allows callers to override the header
+/// `(bg, fg)`. Used by the editor when showing a read-only diff-view buffer
+/// — the orange header signals that the tab is non-editable.
+pub(super) fn render_panel_header_styled(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    focused: bool,
+    show_cycle_arrow: bool,
+    color_override: Option<(Color, Color)>,
+) -> (Rect, Rect) {
     if area.height < 2 {
         return (Rect::default(), area);
     }
@@ -700,11 +721,13 @@ pub(super) fn render_panel_header(
         height: area.height - 1,
     };
 
-    let (bg, fg) = if focused {
-        (theme::FOCUSED_SELECTION_BG, theme::PANEL_HEADER_FOCUSED_FG)
-    } else {
-        (theme::CODE_BLOCK_BG, theme::PANEL_HEADER_UNFOCUSED_FG)
-    };
+    let (bg, fg) = color_override.unwrap_or_else(|| {
+        if focused {
+            (theme::FOCUSED_SELECTION_BG, theme::PANEL_HEADER_FOCUSED_FG)
+        } else {
+            (theme::CODE_BLOCK_BG, theme::PANEL_HEADER_UNFOCUSED_FG)
+        }
+    });
     let style = Style::default().fg(fg).bg(bg);
 
     let buf = frame.buffer_mut();

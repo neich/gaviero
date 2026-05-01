@@ -68,12 +68,17 @@ fn bundled_highlight_query(lang: &str, _file: &str) -> Result<String> {
 }
 
 /// Run highlights for a visible viewport range. Returns styled spans sorted by position.
+/// `with_errors = false` suppresses the red+underline overlay for ERROR/MISSING
+/// nodes — used by diff-view buffers whose rope contains both old and new
+/// lines concatenated, where tree-sitter reliably emits spurious ERROR nodes
+/// even though the underlying file parses cleanly.
 pub fn run_highlights(
     tree: &Tree,
     source: &ropey::Rope,
     config: &HighlightConfig,
     theme: &Theme,
     visible_range: std::ops::Range<usize>,
+    with_errors: bool,
 ) -> Vec<StyledSpan> {
     let mut cursor = QueryCursor::new();
     cursor.set_byte_range(visible_range.clone());
@@ -123,10 +128,12 @@ pub fn run_highlights(
 
     // Append error spans AFTER the sorted syntax spans so they render last
     // and visually override normal colors (red + underline = parse error marker).
-    let error_style = Style::default()
-        .fg(Color::Rgb(224, 108, 117))
-        .add_modifier(Modifier::UNDERLINED);
-    collect_error_spans(tree.root_node(), &visible_range, &mut spans, error_style);
+    if with_errors {
+        let error_style = Style::default()
+            .fg(Color::Rgb(224, 108, 117))
+            .add_modifier(Modifier::UNDERLINED);
+        collect_error_spans(tree.root_node(), &visible_range, &mut spans, error_style);
+    }
 
     spans
 }
@@ -198,7 +205,7 @@ mod tests {
         let tree = parser.parse(source, None).unwrap();
 
         let theme = Theme::builtin_default();
-        let spans = run_highlights(&tree, &rope, &config, &theme, 0..source.len());
+        let spans = run_highlights(&tree, &rope, &config, &theme, 0..source.len(), true);
         eprintln!("Spans produced: {}", spans.len());
         for s in &spans {
             eprintln!("  byte {}..{} => {:?}", s.start_byte, s.end_byte, s.style);
@@ -225,7 +232,7 @@ mod tests {
         let tree = parser.parse(source, None).unwrap();
 
         let theme = Theme::builtin_default();
-        let spans = run_highlights(&tree, &rope, &config, &theme, 0..source.len());
+        let spans = run_highlights(&tree, &rope, &config, &theme, 0..source.len(), true);
         assert!(
             !spans.is_empty(),
             "should produce highlight spans for Python code"
@@ -249,7 +256,7 @@ mod tests {
         let tree = parser.parse(source, None).unwrap();
 
         let theme = Theme::builtin_default();
-        let spans = run_highlights(&tree, &rope, &config, &theme, 0..source.len());
+        let spans = run_highlights(&tree, &rope, &config, &theme, 0..source.len(), true);
         assert!(
             !spans.is_empty(),
             "should produce highlight spans for YAML code"
@@ -272,7 +279,7 @@ mod tests {
         let tree = parser.parse(source, None).unwrap();
 
         let theme = Theme::builtin_default();
-        let spans = run_highlights(&tree, &rope, &config, &theme, 0..source.len());
+        let spans = run_highlights(&tree, &rope, &config, &theme, 0..source.len(), true);
         assert!(
             !spans.is_empty(),
             "should produce highlight spans for Kotlin code"
@@ -295,7 +302,7 @@ mod tests {
         let tree = parser.parse(source, None).unwrap();
 
         let theme = Theme::builtin_default();
-        let spans = run_highlights(&tree, &rope, &config, &theme, 0..source.len());
+        let spans = run_highlights(&tree, &rope, &config, &theme, 0..source.len(), true);
         assert!(
             !spans.is_empty(),
             "should produce highlight spans for gaviero code"
@@ -338,7 +345,7 @@ mod tests {
         let tree = parser.parse(source, None).unwrap();
 
         let theme = Theme::builtin_default();
-        let spans = run_highlights(&tree, &rope, &config, &theme, 0..source.len());
+        let spans = run_highlights(&tree, &rope, &config, &theme, 0..source.len(), true);
         eprintln!("JSON spans ({}):", spans.len());
         for s in &spans {
             let text = &source[s.start_byte..s.end_byte];

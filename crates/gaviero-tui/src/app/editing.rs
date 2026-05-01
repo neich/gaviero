@@ -83,15 +83,21 @@ pub(super) fn ensure_editor_cursor_visible(app: &mut App) {
 }
 
 pub(super) fn handle_editor_action(app: &mut App, action: Action) {
+    let read_only = app
+        .buffers
+        .get(app.active_buffer)
+        .map(|b| b.read_only)
+        .unwrap_or(false);
+
     match action {
         Action::Copy => {
             app.clipboard_copy();
             return;
         }
-        Action::Cut => {
+        Action::Cut if !read_only => {
             app.clipboard_cut();
         }
-        Action::Paste => {
+        Action::Paste if !read_only => {
             app.clipboard_paste();
         }
         Action::SelectAll => {
@@ -99,7 +105,7 @@ pub(super) fn handle_editor_action(app: &mut App, action: Action) {
                 buf.select_all();
             }
         }
-        Action::FormatBuffer => {
+        Action::FormatBuffer if !read_only => {
             if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
                 let msg = if buf.selection_range().is_some() {
                     buf.format_selection()
@@ -109,11 +115,43 @@ pub(super) fn handle_editor_action(app: &mut App, action: Action) {
                 app.status_message = Some((msg, std::time::Instant::now()));
             }
         }
-        Action::CycleFormatLevel => {
+        Action::CycleFormatLevel if !read_only => {
             if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
                 let msg = buf.cycle_format_level();
                 app.status_message = Some((msg, std::time::Instant::now()));
             }
+        }
+        _ if read_only => {
+            // Read-only buffer: only allow non-mutating navigation / selection.
+            let area = app.layout.editor_area;
+            let Some(buf) = app.buffers.get_mut(app.active_buffer) else {
+                return;
+            };
+            let line_count = buf.line_count();
+            let gutter_w = gutter_width(line_count) as usize;
+            let vp_h = area.height as usize;
+            let vp_w = (area.width as usize).saturating_sub(gutter_w);
+            match action {
+                Action::CursorUp => buf.move_cursor_up(),
+                Action::CursorDown => buf.move_cursor_down(),
+                Action::CursorLeft => buf.move_cursor_left(),
+                Action::CursorRight => buf.move_cursor_right(),
+                Action::WordLeft => buf.move_word_left(),
+                Action::WordRight => buf.move_word_right(),
+                Action::SelectLeft => buf.select_left(),
+                Action::SelectRight => buf.select_right(),
+                Action::SelectUp => buf.select_up(),
+                Action::SelectDown => buf.select_down(),
+                Action::SelectWordLeft => buf.select_word_left(),
+                Action::SelectWordRight => buf.select_word_right(),
+                Action::PageUp => buf.page_up(vp_h),
+                Action::PageDown => buf.page_down(vp_h),
+                Action::Home => buf.move_cursor_home(),
+                Action::End => buf.move_cursor_end(),
+                Action::GoToLineEnd => buf.move_cursor_end(),
+                _ => {}
+            }
+            buf.ensure_cursor_visible(vp_h, vp_w);
         }
         _ => {
             let area = app.layout.editor_area;
@@ -477,6 +515,18 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                         }
                     }
 
+                    if app.side_panel == SidePanelMode::GitPanel {
+                        let rel_y = row.saturating_sub(area.y);
+                        if let Some((region, idx)) =
+                            app.git_panel.hit_test_file(rel_y, area.height)
+                        {
+                            app.git_panel.select_file(region, idx);
+                            super::side_panel::open_selected_git_file(app);
+                            app.needs_full_redraw = true;
+                            return;
+                        }
+                    }
+
                     let scrollbar_x = area.x + area.width.saturating_sub(1);
                     if col == scrollbar_x {
                         app.scrollbar_dragging = Some(ScrollbarTarget::Chat);
@@ -510,10 +560,10 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 }
             }
             if app.layout.tab_area.contains((col, row).into()) {
-                let titles: Vec<(String, bool)> = app
+                let titles: Vec<(String, bool, bool)> = app
                     .buffers
                     .iter()
-                    .map(|b| (b.display_name().to_string(), b.modified))
+                    .map(|b| (b.display_name().to_string(), b.modified, false))
                     .collect();
                 let tab_bar = TabBar {
                     titles: &titles,
@@ -1185,6 +1235,56 @@ pub(super) fn handle_file_changed(app: &mut App, path: &Path) {
     app.active_buffer = buf_idx;
     app.focus = Focus::Editor;
     app.diff_review = Some(DiffReviewState::new(proposal, DiffSource::External));
+}
+
+/// Open a read-only diff view of `path` as a regular editor tab. The buffer
+/// holds the unified diff (each line tagged context/added/removed) and is
+/// rendered with green/red row tints; syntax highlighting is preserved. If
+/// a diff-view tab for the same path is already open, it is reused (and
+/// recomputed against the latest contents). A separate writable buffer for
+/// the same path can coexist as another tab.
+pub(super) fn open_diff_view(
+    app: &mut App,
+    path: &Path,
+    original: String,
+    current: String,
+) {
+    // Reuse an existing diff-view tab for the same path if any.
+    for (i, b) in app.buffers.iter().enumerate() {
+        if b.diff_view.is_some() && b.path.as_deref() == Some(path) {
+            app.active_buffer = i;
+            app.needs_full_redraw = true;
+            return;
+        }
+    }
+
+    match Buffer::open_diff_view(path, original, current) {
+        Ok(mut buf) => {
+            use gaviero_core::workspace::settings;
+            let lang = buf.lang_name.as_deref();
+            let tab_size = if let Some(lang) = lang {
+                app.workspace
+                    .resolve_language_setting(settings::TAB_SIZE, lang, None)
+            } else {
+                app.workspace.resolve_setting(settings::TAB_SIZE, None)
+            };
+            buf.tab_width = tab_size.as_u64().unwrap_or(4) as u8;
+
+            if let (Some(lang_name), Some(language)) = (&buf.lang_name, &buf.language) {
+                if !app.highlight_configs.contains_key(lang_name) {
+                    if let Ok(config) = load_highlight_config(language.clone(), lang_name) {
+                        app.highlight_configs.insert(lang_name.clone(), config);
+                    }
+                }
+            }
+            app.buffers.push(buf);
+            app.active_buffer = app.buffers.len() - 1;
+            app.needs_full_redraw = true;
+        }
+        Err(e) => {
+            tracing::error!("Failed to open diff view for {}: {}", path.display(), e);
+        }
+    }
 }
 
 pub(super) fn open_file(app: &mut App, path: &Path) {

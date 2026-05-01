@@ -4,8 +4,15 @@ use unicode_width::UnicodeWidthChar;
 use crate::theme::{CURRENT_LINE_BG, SEARCH_HIGHLIGHT_BG, SELECTION_BG};
 
 use super::buffer::Buffer;
+use super::diff::DiffKind;
 use super::highlight::{HighlightConfig, StyledSpan, run_highlights};
 use crate::theme::Theme;
+
+/// Per-line backgrounds used to tint a diff-view buffer's rendered lines.
+const DIFF_ADD_BG: Color = Color::Rgb(40, 65, 42);
+const DIFF_REM_BG: Color = Color::Rgb(65, 40, 40);
+const DIFF_ADD_GUTTER_FG: Color = Color::Rgb(80, 200, 80);
+const DIFF_REM_GUTTER_FG: Color = Color::Rgb(220, 80, 80);
 
 pub struct EditorView<'a> {
     pub buffer: &'a Buffer,
@@ -91,17 +98,38 @@ impl<'a> EditorView<'a> {
 
     fn render_gutter(&self, line_idx: usize, x: u16, y: u16, gutter_width: u16, buf: &mut RataBuf) {
         let is_current = line_idx == self.buffer.cursor.line;
-        let style = if is_current {
-            self.theme.ui_style("line_number.active")
-        } else {
-            self.theme.ui_style("line_number")
+        let diff_kind = self
+            .buffer
+            .diff_view
+            .as_ref()
+            .and_then(|dv| dv.kinds.get(line_idx).copied());
+
+        // In diff view, recolor the gutter and replace the trailing space
+        // with a `+` / `-` / ` ` indicator. Regular gutter otherwise.
+        let style = match diff_kind {
+            Some(DiffKind::Added) => ratatui::style::Style::default().fg(DIFF_ADD_GUTTER_FG),
+            Some(DiffKind::Removed) => ratatui::style::Style::default().fg(DIFF_REM_GUTTER_FG),
+            Some(DiffKind::Context) | None if is_current => self.theme.ui_style("line_number.active"),
+            _ => self.theme.ui_style("line_number"),
         };
 
-        let num_str = format!(
-            "{:>width$} ",
-            line_idx + 1,
-            width = (gutter_width as usize) - 1
-        );
+        let num_str = match diff_kind {
+            Some(DiffKind::Added) => format!(
+                "{:>width$}+",
+                line_idx + 1,
+                width = (gutter_width as usize) - 1
+            ),
+            Some(DiffKind::Removed) => format!(
+                "{:>width$}-",
+                line_idx + 1,
+                width = (gutter_width as usize) - 1
+            ),
+            _ => format!(
+                "{:>width$} ",
+                line_idx + 1,
+                width = (gutter_width as usize) - 1
+            ),
+        };
         let x_max = (x + gutter_width).min(buf.area().right());
         for (i, ch) in num_str.chars().enumerate() {
             let cx = x + i as u16;
@@ -124,11 +152,19 @@ impl<'a> EditorView<'a> {
         let left_col = self.buffer.scroll.left_col;
         let is_current = line_idx == self.buffer.cursor.line;
 
-        // Background for current line
-        let line_bg = if is_current {
-            Some(CURRENT_LINE_BG)
-        } else {
-            None
+        // Diff-view tint takes precedence over the current-line highlight.
+        let diff_kind = self
+            .buffer
+            .diff_view
+            .as_ref()
+            .and_then(|dv| dv.kinds.get(line_idx).copied());
+
+        // Background for current line / diff line
+        let line_bg = match diff_kind {
+            Some(DiffKind::Added) => Some(DIFF_ADD_BG),
+            Some(DiffKind::Removed) => Some(DIFF_REM_BG),
+            _ if is_current => Some(CURRENT_LINE_BG),
+            _ => None,
         };
 
         // Determine the effective background for this row
@@ -306,12 +342,17 @@ impl<'a> EditorView<'a> {
             None => return Vec::new(),
         };
 
+        // Diff-view buffers concatenate old + new lines so tree-sitter
+        // (correctly) emits ERROR nodes throughout — suppress the parse-error
+        // underline overlay there.
+        let with_errors = self.buffer.diff_view.is_none();
         run_highlights(
             tree,
             &self.buffer.text,
             config,
             self.theme,
             start_byte..end_byte,
+            with_errors,
         )
     }
 

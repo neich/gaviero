@@ -7,9 +7,15 @@ use ratatui::{
 };
 
 pub struct TabBar<'a> {
-    pub titles: &'a [(String, bool)], // (name, modified)
+    /// (name, modified, is_diff_view). `is_diff_view = true` indicates the
+    /// buffer is currently shown as a read-only diff overlay; the tab is
+    /// rendered in orange to signal it cannot be edited.
+    pub titles: &'a [(String, bool, bool)],
     pub active: usize,
 }
+
+/// Orange used for read-only diff-view tabs (e.g. git panel diff preview).
+const DIFF_VIEW_FG: Color = Color::Rgb(214, 134, 50);
 
 impl<'a> TabBar<'a> {
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
@@ -24,7 +30,7 @@ impl<'a> TabBar<'a> {
         }
 
         let mut x = area.x;
-        for (i, (title, modified)) in self.titles.iter().enumerate() {
+        for (i, (title, modified, is_diff_view)) in self.titles.iter().enumerate() {
             let is_active = i == self.active;
             let prefix = if *modified { "● " } else { "" };
             let label = format!(" {}{} ", prefix, title);
@@ -48,7 +54,18 @@ impl<'a> TabBar<'a> {
                 break;
             }
 
-            let style = if is_active {
+            let style = if *is_diff_view {
+                let bg = if is_active {
+                    Color::Rgb(55, 60, 70)
+                } else {
+                    Color::Rgb(35, 39, 46)
+                };
+                let mut s = Style::default().fg(DIFF_VIEW_FG).bg(bg);
+                if is_active {
+                    s = s.add_modifier(Modifier::BOLD);
+                }
+                s
+            } else if is_active {
                 Style::default()
                     .fg(Color::White)
                     .bg(Color::Rgb(55, 60, 70))
@@ -82,7 +99,7 @@ impl<'a> TabBar<'a> {
     /// Return the tab index at the given x coordinate, for mouse click handling.
     pub fn tab_at_x(&self, click_x: u16, area_x: u16) -> Option<usize> {
         let mut x = area_x;
-        for (i, (title, modified)) in self.titles.iter().enumerate() {
+        for (i, (title, modified, _)) in self.titles.iter().enumerate() {
             let prefix = if *modified { "● " } else { "" };
             let label_len = (format!(" {}{} ", prefix, title).len() as u16) + 1; // +1 for separator
             if click_x >= x && click_x < x + label_len {

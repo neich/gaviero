@@ -742,31 +742,7 @@ pub(super) fn handle_git_panel_action(app: &mut App, action: Action) {
             }
         }
         Action::Enter => {
-            if let Some(rel_path) = app.git_panel.selected_path().map(|s| s.to_string()) {
-                let root = app
-                    .git_repos
-                    .get(app.git_panel.active_repo)
-                    .and_then(|e| e.repo.workdir().map(|p| p.to_path_buf()));
-                if let Some(root) = root {
-                    let abs_path = root.join(&rel_path);
-                    if abs_path.exists() {
-                        let original = app.git_head_content(&rel_path).unwrap_or_default();
-                        let current = std::fs::read_to_string(&abs_path).unwrap_or_default();
-
-                        if original != current {
-                            let proposal = WriteGatePipeline::build_proposal(
-                                0, "git-diff", &abs_path, &original, &current,
-                            );
-                            app.open_file(&abs_path);
-                            app.focus = Focus::Editor;
-                            app.diff_review = Some(DiffReviewState::new(proposal, DiffSource::Acp));
-                        } else {
-                            app.open_file(&abs_path);
-                            app.focus = Focus::Editor;
-                        }
-                    }
-                }
-            }
+            open_selected_git_file(app);
         }
         Action::InsertChar('b') if app.git_panel.region != GitRegion::CommitInput => {
             app.git_panel.toggle_branch_picker();
@@ -797,6 +773,34 @@ pub(super) fn refresh_git_panel(app: &mut App) {
     if let Some(entry) = app.git_repos.get(app.git_panel.active_repo) {
         app.git_panel.refresh(&entry.repo);
     }
+}
+
+/// Open a read-only diff-view tab for the file currently selected in the git
+/// panel. If the file is unchanged vs HEAD, opens the file as a normal
+/// editable buffer instead. Used by both the Enter key and mouse clicks.
+pub(super) fn open_selected_git_file(app: &mut App) {
+    let Some(rel_path) = app.git_panel.selected_path().map(|s| s.to_string()) else {
+        return;
+    };
+    let Some(root) = app
+        .git_repos
+        .get(app.git_panel.active_repo)
+        .and_then(|e| e.repo.workdir().map(|p| p.to_path_buf()))
+    else {
+        return;
+    };
+    let abs_path = root.join(&rel_path);
+    if !abs_path.exists() {
+        return;
+    }
+    let original = app.git_head_content(&rel_path).unwrap_or_default();
+    let current = std::fs::read_to_string(&abs_path).unwrap_or_default();
+    if original != current {
+        crate::app::editing::open_diff_view(app, &abs_path, original, current);
+    } else {
+        app.open_file(&abs_path);
+    }
+    app.focus = Focus::Editor;
 }
 
 /// A4: handle a TUI action while the memory panel is focused.
