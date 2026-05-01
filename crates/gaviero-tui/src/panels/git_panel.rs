@@ -40,6 +40,13 @@ pub struct GitPanelState {
     pub branch_picker_open: bool,
     pub branch_filter: String,
     pub branch_selected: usize,
+
+    /// Index into the host `git_repos` vec for the active tab. Stays at 0
+    /// when there is only one repository (or none); gets cycled by Alt+i/o.
+    pub active_repo: usize,
+    /// Repo display names for tab rendering. Mirrors `app.git_repos` order;
+    /// updated by `set_repo_tabs` whenever the host vec changes.
+    pub repo_tabs: Vec<String>,
 }
 
 impl GitPanelState {
@@ -57,7 +64,40 @@ impl GitPanelState {
             branch_picker_open: false,
             branch_filter: String::new(),
             branch_selected: 0,
+            active_repo: 0,
+            repo_tabs: Vec::new(),
         }
+    }
+
+    /// Sync the tab labels from the host's `git_repos` vec. Clamps
+    /// `active_repo` if the new list is shorter than before.
+    pub fn set_repo_tabs(&mut self, names: Vec<String>) {
+        self.repo_tabs = names;
+        if self.active_repo >= self.repo_tabs.len() {
+            self.active_repo = self.repo_tabs.len().saturating_sub(1);
+        }
+    }
+
+    /// Cycle the active repo tab. `delta` is +1 for forward, -1 for back.
+    /// Wraps around. No-op when there are fewer than two repos.
+    pub fn cycle_repo(&mut self, delta: i32) {
+        let n = self.repo_tabs.len();
+        if n < 2 {
+            return;
+        }
+        let cur = self.active_repo as i32;
+        let mut next = (cur + delta).rem_euclid(n as i32);
+        if next < 0 {
+            next += n as i32;
+        }
+        self.active_repo = next as usize;
+        // Reset transient state that belongs to the previous repo.
+        self.unstaged_selected = 0;
+        self.staged_selected = 0;
+        self.region = GitRegion::Unstaged;
+        self.commit_input.clear();
+        self.error_message = None;
+        self.close_branch_picker();
     }
 
     /// Reload file status and branch info from the repository.
@@ -230,14 +270,22 @@ impl GitPanelState {
             }
         }
 
+        let mut y = area.y;
+
+        // ── Repo tab bar (only when 2+ repos) ──
+        let tab_bar_height: u16 = if self.repo_tabs.len() >= 2 { 1 } else { 0 };
+        if tab_bar_height > 0 && y < area.y + area.height {
+            self.render_repo_tabs(area.x, y, area.width, buf);
+            y += 1;
+        }
+
         // Layout: branch line (1) + unstaged header (1) + unstaged files + staged header (1)
         //         + staged files + separator (1) + commit input (2)
         let commit_height: u16 = 3; // input + hint + separator
-        let available = area.height.saturating_sub(commit_height + 1); // -1 for branch line
+        let content_height = area.height.saturating_sub(tab_bar_height);
+        let available = content_height.saturating_sub(commit_height + 1); // -1 for branch line
         let unstaged_files = (available / 2).max(2).saturating_sub(1); // -1 for header
         let staged_files = available.saturating_sub(unstaged_files + 2); // -2 for headers
-
-        let mut y = area.y;
 
         // ── Branch line ──
         let branch_text = format!(" {} {}", '\u{E0A0}', self.current_branch); // git branch icon
@@ -503,6 +551,60 @@ impl GitPanelState {
                 let text = format!(" {}{}", marker, branch.name);
                 let style = Style::default().fg(picker_fg).bg(line_bg);
                 self.render_line(buf, area.x, by, area.width, &text, style);
+            }
+        }
+    }
+
+    fn render_repo_tabs(&self, x: u16, y: u16, width: u16, buf: &mut RataBuf) {
+        let bg = theme::PANEL_BG;
+        let active_style = Style::default()
+            .fg(theme::TEXT_BRIGHT)
+            .bg(theme::TAB_BG)
+            .add_modifier(Modifier::BOLD);
+        let inactive_style = Style::default().fg(theme::TEXT_DIM).bg(bg);
+        let sep_style = Style::default().fg(theme::BORDER_DIM).bg(bg);
+
+        // Pre-clear with panel bg.
+        let clear = Style::default().bg(bg);
+        for col in 0..width {
+            let cx = x + col;
+            if cx < buf.area().right() && y < buf.area().bottom() {
+                buf[(cx, y)].set_char(' ').set_style(clear);
+            }
+        }
+
+        let mut cur = x;
+        let right = x + width;
+        for (i, name) in self.repo_tabs.iter().enumerate() {
+            let label = format!(" {} ", name);
+            let label_len = label.chars().count() as u16;
+            if cur + label_len > right {
+                if cur + 3 <= right && y < buf.area().bottom() {
+                    let dots = "...";
+                    for (j, ch) in dots.chars().enumerate() {
+                        let cx = cur + j as u16;
+                        if cx < buf.area().right() {
+                            buf[(cx, y)].set_char(ch).set_style(inactive_style);
+                        }
+                    }
+                }
+                break;
+            }
+            let style = if i == self.active_repo {
+                active_style
+            } else {
+                inactive_style
+            };
+            for (j, ch) in label.chars().enumerate() {
+                let cx = cur + j as u16;
+                if cx < buf.area().right() && y < buf.area().bottom() {
+                    buf[(cx, y)].set_char(ch).set_style(style);
+                }
+            }
+            cur += label_len;
+            if cur < right && y < buf.area().bottom() {
+                buf[(cur, y)].set_char('│').set_style(sep_style);
+                cur += 1;
             }
         }
     }
