@@ -12,6 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 
 use super::protocol::{StreamEvent, parse_stream_line};
+use crate::observer::{PromptEvent, PromptObserver};
 
 /// If the enriched prompt + system prompt combined exceed this size, pass the
 /// prompt to Claude through a workspace-local tempfile via `@`-reference
@@ -26,7 +27,7 @@ const ARGV_THRESHOLD: usize = 32_768;
 const TEMP_SUBDIR: &str = ".gaviero/tmp";
 
 /// Options for the Claude agent subprocess.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentOptions {
     /// Effort level for the CLI (off, low, medium, high, xhigh, max, auto).
     /// "off" and "auto" mean don't pass --effort (use CLI / model default).
@@ -61,6 +62,37 @@ pub struct AgentOptions {
         note = "M6: use ContinuityHandle::ClaudeSessionId via SessionLedger; removal in M10"
     )]
     pub resume_session_id: Option<String>,
+    /// Test-only: when set, fires once per `AcpSession::spawn` with the
+    /// exact prompt + system-prompt bytes that the runtime would
+    /// otherwise hand to argv or spill to `.gaviero/tmp/prompt-*.md`.
+    /// Production callers leave this `None` and pay nothing.
+    pub prompt_observer: Option<Arc<dyn PromptObserver>>,
+    /// Stable per-turn id threaded into [`PromptEvent::turn_id`]. The
+    /// orchestrator owns generation; `None` propagates as an empty
+    /// string, in which case the `RecordingPromptObserver` fallback
+    /// (T1.2) substitutes a "current turn id" mutex.
+    pub turn_id: Option<String>,
+}
+
+impl std::fmt::Debug for AgentOptions {
+    // M6: `resume_session_id` deprecated; keep visible in Debug for
+    // diagnostics until M10 removal.
+    #[allow(deprecated)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentOptions")
+            .field("effort", &self.effort)
+            .field("max_tokens", &self.max_tokens)
+            .field("auto_approve", &self.auto_approve)
+            .field("available_tools", &self.available_tools)
+            .field("approved_tools", &self.approved_tools)
+            .field("resume_session_id", &self.resume_session_id)
+            .field(
+                "prompt_observer",
+                &self.prompt_observer.as_ref().map(|_| "<set>"),
+            )
+            .field("turn_id", &self.turn_id)
+            .finish()
+    }
 }
 
 impl Default for AgentOptions {
@@ -75,6 +107,8 @@ impl Default for AgentOptions {
             available_tools: None,
             approved_tools: None,
             resume_session_id: None,
+            prompt_observer: None,
+            turn_id: None,
         }
     }
 }
@@ -198,6 +232,22 @@ impl AcpSession {
         // spilled to a workspace-local `.gaviero/tmp/prompt-*.md` file and
         // referenced via `@path` so the argv stays tiny.
         let use_tempfile = would_use_tempfile(prompt.len(), system_prompt.len());
+
+        // T1.1: fire the test-only PromptObserver once with the exact
+        // bytes that would land in argv or `.gaviero/tmp/prompt-*.md`.
+        // Symmetric across both branches; production leaves this `None`.
+        if let Some(obs) = options.prompt_observer.as_ref() {
+            obs.on_prompt(PromptEvent {
+                turn_id: options.turn_id.clone().unwrap_or_default(),
+                resume_session_id: options.resume_session_id.clone(),
+                prompt: prompt.to_string(),
+                system_prompt: system_prompt.to_string(),
+                used_tempfile: use_tempfile,
+                argv_threshold: ARGV_THRESHOLD,
+                captured_at: std::time::Instant::now(),
+            });
+        }
+
         let (prompt_tempfile, argv_prompt): (Option<tempfile::NamedTempFile>, String) =
             if use_tempfile {
                 let (file, wrapper) = spill_prompt_to_tempfile(cwd, prompt)?;
@@ -506,6 +556,49 @@ mod tests {
         };
         let (available, approved) = opts.resolved_tools();
         assert_eq!(available, approved, "auto_approve approves everything available");
+    }
+
+    #[test]
+    fn agent_options_size_is_bounded() {
+        // Sanity: AgentOptions is cloned per turn. The two new fields
+        // (Option<Arc<dyn _>>, Option<String>) must not balloon it past
+        // a sensible budget. 256 B leaves slack for future extension.
+        assert!(
+            std::mem::size_of::<AgentOptions>() <= 256,
+            "AgentOptions = {} B (budget 256 B)",
+            std::mem::size_of::<AgentOptions>()
+        );
+    }
+
+    #[derive(Default)]
+    struct CapturingObserver {
+        events: std::sync::Mutex<Vec<PromptEvent>>,
+    }
+
+    impl PromptObserver for CapturingObserver {
+        fn on_prompt(&self, ev: PromptEvent) {
+            self.events.lock().unwrap().push(ev);
+        }
+    }
+
+    #[test]
+    fn agent_options_default_observer_is_none() {
+        let opts = AgentOptions::default();
+        assert!(opts.prompt_observer.is_none());
+        assert!(opts.turn_id.is_none());
+    }
+
+    #[test]
+    fn agent_options_debug_does_not_leak_observer_pointer() {
+        let obs: Arc<dyn PromptObserver> = Arc::new(CapturingObserver::default());
+        let opts = AgentOptions {
+            prompt_observer: Some(obs),
+            turn_id: Some("turn-7".into()),
+            ..AgentOptions::default()
+        };
+        let s = format!("{:?}", opts);
+        assert!(s.contains("prompt_observer: Some(\"<set>\")"));
+        assert!(s.contains("turn_id: Some(\"turn-7\")"));
     }
 
     #[test]
