@@ -1770,6 +1770,7 @@ pub(super) fn send_chat_message(app: &mut App) {
         available_tools: Some(agent_available_tools),
         approved_tools: Some(agent_approved_tools),
         resume_session_id,
+        ..gaviero_core::acp::session::AgentOptions::default()
     };
 
     let memory = app.memory.clone();

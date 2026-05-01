@@ -197,6 +197,7 @@ impl ClaudeSession {
                 available_tools: self.available_tools.clone(),
                 approved_tools: self.approved_tools.clone(),
                 resume_session_id,
+                ..AgentOptions::default()
             }
         };
 
