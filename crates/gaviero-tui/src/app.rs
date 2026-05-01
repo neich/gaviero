@@ -540,6 +540,14 @@ impl App {
         review::cancel_batch_review(self);
     }
 
+    /// True while a single-file diff overlay or a multi-file batch review is
+    /// pending the user's accept/dismiss decision. While active the rest of
+    /// the UI (terminal, editor, side panels) is locked: the only inputs
+    /// honored are the review-specific keys and clicks.
+    pub(crate) fn has_active_review(&self) -> bool {
+        self.diff_review.is_some() || self.batch_review.is_some()
+    }
+
     /// Render the review file list in the left panel.
     fn render_review_file_list(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
         review::render_review_file_list(self, frame, area, focused);
