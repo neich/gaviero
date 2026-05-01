@@ -1459,10 +1459,17 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
         }
         Action::CycleTabForward => {
             if app.focus == Focus::SidePanel {
-                if app.side_panel == SidePanelMode::MemoryPanel {
-                    app.handle_memory_panel_action(Action::CycleTabForward);
-                } else {
-                    app.chat_state.next_conversation();
+                match app.side_panel {
+                    SidePanelMode::MemoryPanel => {
+                        app.handle_memory_panel_action(Action::CycleTabForward);
+                    }
+                    SidePanelMode::GitPanel => {
+                        app.git_panel.cycle_repo(1);
+                        app.refresh_git_panel();
+                    }
+                    _ => {
+                        app.chat_state.next_conversation();
+                    }
                 }
             } else if app.focus == Focus::Terminal {
                 app.terminal_manager.cycle_tab(1);
@@ -1473,10 +1480,17 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
         }
         Action::CycleTabBack => {
             if app.focus == Focus::SidePanel {
-                if app.side_panel == SidePanelMode::MemoryPanel {
-                    app.handle_memory_panel_action(Action::CycleTabBack);
-                } else {
-                    app.chat_state.prev_conversation();
+                match app.side_panel {
+                    SidePanelMode::MemoryPanel => {
+                        app.handle_memory_panel_action(Action::CycleTabBack);
+                    }
+                    SidePanelMode::GitPanel => {
+                        app.git_panel.cycle_repo(-1);
+                        app.refresh_git_panel();
+                    }
+                    _ => {
+                        app.chat_state.prev_conversation();
+                    }
                 }
             } else if app.focus == Focus::Terminal {
                 app.terminal_manager.cycle_tab(-1);
