@@ -46,32 +46,11 @@
 // Both prompts and scope paths substitute {{OUT_DIR}} at compile time, so
 // a single --var override relocates every output the script produces.
 
-client opus {
-    tier expensive
-    model "claude:opus"
-    effort high
-    extra {
-        // analyse_plan, phase_executor, and final_audit all do multi-document
-        // synthesis — request a larger extended-thinking budget so Opus can
-        // reason over the full plan + prior phase logs without running out.
-        // Backends that don't consume the key ignore it (logged at debug).
-        "thinking_budget" "8000"
-    }
-}
-
-// `default` covers agents that don't declare `tier` or `client` explicitly.
-// Every agent in this script sets a tier, so this is purely defensive —
-// a misspelled `tier expensive` in a fork would fall back to sonnet rather
-// than trigger the "no client declared" warning + haiku default.
-client sonnet {
-    tier cheap
-    model "claude:sonnet"
-    effort medium
-    default
-}
-
-tier expensive opus
-tier cheap     sonnet
+// Shared client library. Agents bind to concrete clients (`client opus`
+// for the deep-reasoning steps, `client sonnet` for the cheap gate /
+// judge). Swap to a different profile by editing the `client` field on
+// each agent below.
+include "clients.gaviero"
 
 vars {
     OUT_DIR "plans/log"
@@ -249,7 +228,7 @@ prompt audit-body #"
 
 agent analyse_plan {
     description "Extract phases from plan: {{PROMPT}}"
-    tier expensive
+    client opus
     scope {
         owned     ["{{OUT_DIR}}/00-briefing.md"]
         read_only ["src/" "tests/" "Cargo.toml" "CLAUDE.md" "ARCHITECTURE.md"]
@@ -270,7 +249,7 @@ agent analyse_plan {
 // because phase_executor and phase_gate share the same loop group.
 agent phase_executor {
     description "Execute phase {{ITER}} from briefing"
-    tier expensive
+    client opus
     depends_on [analyse_plan]
     scope {
         owned     ["src/" "tests/" "{{OUT_DIR}}/phase-*.md"]
@@ -282,7 +261,7 @@ agent phase_executor {
 
 agent phase_gate {
     description "Gate verdict after phase {{ITER}}"
-    tier cheap
+    client sonnet
     depends_on [phase_executor]
     scope {
         owned     ["{{OUT_DIR}}/gate-*.md"]
@@ -294,7 +273,7 @@ agent phase_gate {
 
 agent phase_judge {
     description "Judge whether all briefing phases are done"
-    tier cheap
+    client sonnet
     scope {
         read_only ["{{OUT_DIR}}/"]
     }
@@ -303,7 +282,7 @@ agent phase_judge {
 
 agent final_audit {
     description "Final integration audit: {{PROMPT}}"
-    tier expensive
+    client opus
     depends_on [phase_gate]
     scope {
         owned     ["{{OUT_DIR}}/99-audit.md"]
