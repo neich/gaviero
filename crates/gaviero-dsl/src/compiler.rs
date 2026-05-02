@@ -1128,6 +1128,14 @@ fn extract_loop_configs(wf: Option<&WorkflowDecl>) -> Vec<LoopConfig> {
                     strict_judge: lb.strict_judge,
                     stability: lb.stability.max(1),
                     judge_timeout_secs: lb.judge_timeout_secs,
+                    branch_chain: match lb.branch_chain {
+                        BranchChainLit::None => {
+                            gaviero_core::swarm::plan::BranchChainMode::None
+                        }
+                        BranchChainLit::Stacked => {
+                            gaviero_core::swarm::plan::BranchChainMode::Stacked
+                        }
+                    },
                 })
             } else {
                 None

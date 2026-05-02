@@ -345,6 +345,12 @@ fn example_codebase_review() {
     assert_eq!(plan.loop_configs[0].max_iterations, 24);
     // max_parallel 1 — sequential is the whole point of this example.
     assert_eq!(plan.max_parallel, Some(1));
+    // The loop must use stacked mode — without it, iter N's replan_module
+    // doesn't see iter N-1's source edits (chain anchor isn't established).
+    assert_eq!(
+        plan.loop_configs[0].branch_chain,
+        gaviero_core::swarm::plan::BranchChainMode::Stacked
+    );
 
     // test_audit depends on the loop body so it runs AFTER iterations settle.
     let test_audit = units.iter().find(|u| u.id == "test_audit").unwrap();

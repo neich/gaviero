@@ -74,6 +74,28 @@ pub enum LoopUntilCondition {
     Command(String),
 }
 
+/// How successive iterations of a loop relate to each other in git terms.
+///
+/// The DSL surface mirrors this enum (`branch_chain stacked` /
+/// `branch_chain none`) on the `loop {}` block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BranchChainMode {
+    /// Default — each iteration runs in a fresh worktree from the
+    /// workflow's pre-swarm HEAD; branch is reused (`gaviero/{id}`) and
+    /// overwritten each iteration. Source mutations DO NOT carry across
+    /// iterations under this mode.
+    #[default]
+    None,
+    /// Each iteration's worktree HEAD is set to the previous iteration's
+    /// last committed branch tip; iterations get distinct branch names
+    /// (`gaviero/{id}-iter{N}`) so prior commits survive. Use this for
+    /// loops whose body agents mutate source code that later iterations
+    /// must observe. Branch chain is preserved after the workflow exits;
+    /// the merge phase intentionally skips stacked-loop manifests.
+    Stacked,
+}
+
 /// Configuration for an explicit `loop { ... }` block in a workflow.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopConfig {
@@ -100,6 +122,10 @@ pub struct LoopConfig {
     /// 0 disables the timeout. Only meaningful for `until agent <name>`.
     #[serde(default = "default_judge_timeout_secs")]
     pub judge_timeout_secs: u32,
+    /// Whether iterations chain branches. Default `None` matches the
+    /// pre-existing reset-each-iteration behaviour.
+    #[serde(default)]
+    pub branch_chain: BranchChainMode,
 }
 
 fn default_iter_start() -> u32 {

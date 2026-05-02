@@ -105,6 +105,8 @@ pub enum Token {
     KwJudgeTimeout,
     #[token("strict_judge")]
     KwStrictJudge,
+    #[token("branch_chain")]
+    KwBranchChain,
     #[token("command")]
     KwCommand,
 
@@ -233,6 +235,7 @@ impl fmt::Display for Token {
             Token::KwStability => write!(f, "stability"),
             Token::KwJudgeTimeout => write!(f, "judge_timeout"),
             Token::KwStrictJudge => write!(f, "strict_judge"),
+            Token::KwBranchChain => write!(f, "branch_chain"),
             Token::KwCommand => write!(f, "command"),
             Token::KwImpactScope => write!(f, "impact_scope"),
             Token::KwImpactTests => write!(f, "impact_tests"),

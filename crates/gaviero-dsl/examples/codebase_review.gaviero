@@ -37,6 +37,16 @@
 //   This costs more tokens than the precomputed-then-apply shape, but
 //   that's the trade — correctness over throughput.
 //
+// Cross-iteration state propagation:
+//   The `branch_chain stacked` setting on the loop is load-bearing. Without
+//   it, gaviero's worktree provisioner resets each iteration to the workspace's
+//   main HEAD — replan iteration 2 would never see iteration 1's edits and
+//   the rolling-state property would be fictional. With stacked mode,
+//   iteration N's worktree HEAD = iteration N-1's last committed branch tip,
+//   so source mutations carry forward. Each iteration's body agents commit
+//   to per-iteration branches `gaviero/<agent_id>-iter<N>` that survive in
+//   the repo's refs as the deliverable chain.
+//
 // Tier policy:
 //   * Hard reasoning per iteration (replan, execute, test_audit) — opus.
 //   * Coordination/verdict (verify_module, module_judge, final_verify) — sonnet.
@@ -568,6 +578,20 @@ workflow codebase_review {
             stability      1
             judge_timeout  60
             strict_judge   true
+            // branch_chain stacked: each iteration's body agents commit to
+            // their own per-iteration branches `gaviero/{id}-iter{N}`,
+            // chained so iteration N's worktree is provisioned at iteration
+            // N-1's last branch tip. This is the ONLY mode under which
+            // replan_module sees iteration N-1's source edits — without
+            // it, every iteration's worktree is freshly provisioned from
+            // the workspace's main HEAD and prior commits are invisible.
+            //
+            // The chain `iter-1 ← iter-2 ← … ← iter-N` survives in the
+            // repo's refs after the workflow exits (the merge phase
+            // intentionally skips stacked branches). Push them as a
+            // stacked PR series for review, or fast-forward main onto
+            // the last iteration's tip if you want a flat history.
+            branch_chain   stacked
             until agent    module_judge
         }
         test_audit
