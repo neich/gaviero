@@ -323,6 +323,26 @@ pub enum UntilCondition {
     Command(String, Span),
 }
 
+/// How successive iterations of a `loop {}` block relate to each other in
+/// terms of git branches and worktree HEAD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchChainLit {
+    /// Default — each iteration runs in a worktree provisioned from the
+    /// workflow's pre-swarm HEAD; the branch is reused (`gaviero/{id}`)
+    /// and overwritten each iteration. Suitable for loops whose agents
+    /// only write artifacts in non-tracked / non-source paths
+    /// (`phased_plan`, `plan_refinement`).
+    None,
+    /// Each iteration's worktree HEAD is the previous iteration's last
+    /// committed branch tip; iterations get distinct branch names of the
+    /// form `gaviero/{id}-iter{N}`. Source-mutating loops MUST use this
+    /// mode — otherwise prior iterations' edits are wiped on each
+    /// re-provision. Final state: the chain `iter-1 ← iter-2 ← … ← iter-N`
+    /// remains in the repository's refs after the workflow exits; merge
+    /// is intentionally skipped so the chain is the deliverable.
+    Stacked,
+}
+
 /// The `loop { ... }` block inside a workflow's `steps` list.
 ///
 /// ```text
@@ -354,6 +374,10 @@ pub struct LoopBlock {
     /// When `true` (default), unparseable judge output is treated as a hard
     /// failure; when `false`, legacy silent-FAIL behaviour.
     pub strict_judge: bool,
+    /// How iterations relate to each other in git terms. See
+    /// [`BranchChainLit`] for the semantics. Defaults to `None` (the
+    /// legacy reset-each-iteration behaviour).
+    pub branch_chain: BranchChainLit,
     pub span: Span,
 }
 
