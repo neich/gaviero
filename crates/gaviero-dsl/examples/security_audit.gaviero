@@ -4,13 +4,13 @@
 // runs security-focused tests to prove the fixes hold.
 
 client opus {
-    tier reasoning
-    model "claude-opus-4-7"
+    tier expensive
+    model "claude:opus"
 }
 
 client sonnet {
-    tier execution
-    model "claude-sonnet-4-6"
+    tier cheap
+    model "claude:sonnet"
 }
 
 agent scan {
