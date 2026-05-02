@@ -4,13 +4,13 @@
 // A final verification agent runs the full suite to catch regressions.
 
 client opus {
-    tier coordinator
-    model "claude-opus-4-7"
+    tier expensive
+    model "claude:opus"
 }
 
 client sonnet {
-    tier execution
-    model "claude-sonnet-4-6"
+    tier cheap
+    model "claude:sonnet"
 }
 
 agent write_tests {
