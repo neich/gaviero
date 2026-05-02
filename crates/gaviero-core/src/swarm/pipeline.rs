@@ -603,6 +603,22 @@ pub async fn execute(
                 .map(move |id| (id.clone(), lc.iter_start))
         })
         .collect();
+
+    // Agents that participate in a stacked-mode loop are dispatched
+    // entirely inside the loop block (so iteration 1 also runs with the
+    // per-iteration branch + chain anchor). The tier dispatch below
+    // skips them.
+    let stacked_loop_agents: std::collections::HashSet<String> = plan
+        .loop_configs
+        .iter()
+        .filter(|lc| {
+            matches!(
+                lc.branch_chain,
+                crate::swarm::plan::BranchChainMode::Stacked
+            )
+        })
+        .flat_map(|lc| lc.agent_ids.iter().cloned())
+        .collect();
     let loop_judge_map: std::collections::HashMap<&str, &WorkUnit> = plan
         .loop_judge_units
         .iter()
@@ -619,6 +635,12 @@ pub async fn execute(
                 // Skip if already completed (resume support)
                 if exec_state.status(unit_id) == NodeStatus::Completed {
                     tracing::info!("Skipping completed node '{}' (resume)", unit_id);
+                    continue;
+                }
+                // Stacked-mode loop body agents: tier dispatch hands them
+                // off to the loop block so all iterations (including #1)
+                // run with the per-iteration branch + chain anchor.
+                if stacked_loop_agents.contains(unit_id) {
                     continue;
                 }
 
@@ -713,10 +735,16 @@ pub async fn execute(
 
             // Register all agents as Pending before spawning
             for unit_id in tier {
+                if stacked_loop_agents.contains(unit_id) {
+                    continue;
+                }
                 observer.on_agent_state_changed(unit_id, &AgentStatus::Pending, "queued");
             }
 
             for unit_id in tier {
+                if stacked_loop_agents.contains(unit_id) {
+                    continue;
+                }
                 let unit = (*unit_map
                     .get(unit_id.as_str())
                     .with_context(|| format!("work unit '{}' not found", unit_id))?)
@@ -913,6 +941,139 @@ pub async fn execute(
         let mut loop_terminated = false;
         let stability_target = loop_config.stability.max(1);
         let mut consecutive_pass: u32 = 0;
+
+        // Stacked-mode chain anchor: the SHA each next agent's worktree
+        // is based on. Starts at the pre-swarm HEAD; advances to each
+        // committed branch's tip as iterations progress. Only consulted
+        // when `loop_config.branch_chain == Stacked`.
+        let stacked = matches!(
+            loop_config.branch_chain,
+            crate::swarm::plan::BranchChainMode::Stacked
+        );
+        let mut chain_anchor: Option<String> = if stacked {
+            // Default to the workspace's HEAD as the first iteration's base.
+            // pre_swarm_sha was computed earlier in execute() — but it's not
+            // in scope here. Use the worktree manager's head_commit() if
+            // available, else fall back to plain `provision()` semantics.
+            worktree_mgr
+                .as_ref()
+                .and_then(|_mgr| {
+                    // Resolve the workspace HEAD via git directly.
+                    std::process::Command::new("git")
+                        .args(["rev-parse", "HEAD"])
+                        .current_dir(&config.workspace_root)
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::null())
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .filter(|s| !s.is_empty())
+                })
+        } else {
+            None
+        };
+        if stacked && chain_anchor.is_none() {
+            tracing::warn!(
+                "branch_chain=stacked requested but workspace HEAD couldn't be resolved; \
+                 falling back to legacy reset-each-iteration provisioning"
+            );
+        }
+
+        // Stacked mode: iteration #1 runs HERE (the tier dispatch above
+        // skipped these agents). Each body agent gets `gaviero/{id}-iter{N}`
+        // chained off the running anchor; the anchor advances after every
+        // committed agent so the next agent in this iteration (and the
+        // first agent of iteration 2) chains off the latest tip.
+        if stacked && chain_anchor.is_some() {
+            tracing::info!(
+                "Loop iteration 1/{} (stacked) for agents {:?}",
+                loop_config.max_iterations,
+                loop_config.agent_ids
+            );
+            observer.on_loop_iteration_started(
+                1,
+                loop_config.max_iterations,
+                &loop_config.agent_ids,
+            );
+            observer.on_phase_changed("loop iteration 1");
+            let iter_abs = loop_config.iter_start;
+            for agent_id in &loop_config.agent_ids {
+                let unit_template = match unit_map.get(agent_id.as_str()) {
+                    Some(u) => u,
+                    None => continue,
+                };
+                let iter_unit = apply_iter_vars(unit_template, iter_abs);
+                let unit = &iter_unit;
+
+                observer.on_agent_state_changed(agent_id, &AgentStatus::Running, &unit.description);
+                invalidate_stale_sources(&memory, unit, &config.workspace_root).await;
+                let effective_read_ns: Vec<String> = unit
+                    .read_namespaces
+                    .as_deref()
+                    .unwrap_or(config.read_namespaces.as_slice())
+                    .to_vec();
+                let agent_ctx = AgentRunContext {
+                    workspace_root: &config.workspace_root,
+                    context_files: &config.context_files,
+                    memory: memory.clone(),
+                    read_namespaces: &effective_read_ns,
+                    swarm_observer: observer,
+                    git_coordinator: git_coordinator.clone(),
+                    validation: validation_pipeline.clone(),
+                    board: Some(shared_board.clone()),
+                    repo_map: repo_map.clone(),
+                    impact_texts: impact_texts.clone(),
+                    pre_fetched_memory: pre_fetched_memory.clone(),
+                    mcp_config: config.mcp_config.clone(),
+                    swarm_extras: &config.swarm_extra_tools,
+                };
+                let branch = format!("gaviero/{}-iter{}", agent_id, iter_abs);
+                let base_sha = chain_anchor.clone().unwrap();
+                let manifest = run_single_agent_with_branch(
+                    unit,
+                    worktree_mgr.as_mut(),
+                    &agent_ctx,
+                    &tier_router,
+                    &plan.iteration_config,
+                    make_observer(agent_id),
+                    BranchOverride { branch, base_sha },
+                )
+                .await?;
+                if matches!(manifest.status, AgentStatus::Completed) {
+                    let b = bus.lock().await;
+                    b.broadcast(
+                        &manifest.work_unit_id,
+                        &format!("completed: {}", manifest.summary.as_deref().unwrap_or("")),
+                    );
+                    drop(b);
+                    let effective_write_ns = unit
+                        .write_namespace
+                        .as_deref()
+                        .unwrap_or(&config.write_namespace);
+                    store_agent_result(
+                        &memory,
+                        &memory_writer,
+                        effective_write_ns,
+                        &manifest,
+                        unit,
+                        &run_id,
+                        &config.workspace_root,
+                    )
+                    .await;
+                    if let Some(ref branch_name) = manifest.branch {
+                        if let Some(ref mgr) = worktree_mgr {
+                            if let Some(tip) = mgr.branch_tip(branch_name) {
+                                chain_anchor = Some(tip);
+                            }
+                        }
+                    }
+                }
+                exec_state.record_result(agent_id, manifest.clone());
+                all_manifests.push(manifest);
+            }
+        }
+
         for iteration in 1..loop_config.max_iterations {
             let current_iter_abs = loop_config.iter_start + iteration - 1;
             let condition_met = {
@@ -1023,15 +1184,34 @@ pub async fn execute(
                     mcp_config: config.mcp_config.clone(),
                     swarm_extras: &config.swarm_extra_tools,
                 };
-                let manifest = run_single_agent(
-                    unit,
-                    worktree_mgr.as_mut(),
-                    &agent_ctx,
-                    &tier_router,
-                    &plan.iteration_config,
-                    make_observer(agent_id),
-                )
-                .await?;
+                // Stacked mode: each agent in this iteration runs on its
+                // own per-iteration branch, based on the previous agent's
+                // tip (or the previous iteration's tip if this is the
+                // first agent of a new iteration).
+                let manifest = if stacked && chain_anchor.is_some() {
+                    let branch = format!("gaviero/{}-iter{}", agent_id, iter_abs);
+                    let base_sha = chain_anchor.clone().unwrap();
+                    run_single_agent_with_branch(
+                        unit,
+                        worktree_mgr.as_mut(),
+                        &agent_ctx,
+                        &tier_router,
+                        &plan.iteration_config,
+                        make_observer(agent_id),
+                        BranchOverride { branch, base_sha },
+                    )
+                    .await?
+                } else {
+                    run_single_agent(
+                        unit,
+                        worktree_mgr.as_mut(),
+                        &agent_ctx,
+                        &tier_router,
+                        &plan.iteration_config,
+                        make_observer(agent_id),
+                    )
+                    .await?
+                };
 
                 if matches!(manifest.status, AgentStatus::Completed) {
                     let b = bus.lock().await;
@@ -1053,6 +1233,19 @@ pub async fn execute(
                         &config.workspace_root,
                     )
                     .await;
+
+                    // Advance the stacked chain anchor: the next agent
+                    // (this iteration's next agent OR the next iteration's
+                    // first agent) chains off this commit.
+                    if stacked {
+                        if let Some(ref branch_name) = manifest.branch {
+                            if let Some(ref mgr) = worktree_mgr {
+                                if let Some(tip) = mgr.branch_tip(branch_name) {
+                                    chain_anchor = Some(tip);
+                                }
+                            }
+                        }
+                    }
                 }
                 exec_state.record_result(agent_id, manifest.clone());
                 all_manifests.push(manifest);
@@ -1114,9 +1307,29 @@ pub async fn execute(
     if config.use_worktrees {
         observer.on_phase_changed("merging");
 
+        // Stacked-loop iterations produce branches like `gaviero/{id}-iter{N}`
+        // that form a deliberate chain in the repo's refs — they are the
+        // deliverable, NOT something to merge back. Skip them here.
+        let is_stacked_iter_branch = |branch: &str| -> bool {
+            // Match `gaviero/<anything>-iter<digits>` shape.
+            if let Some(rest) = branch.strip_prefix("gaviero/") {
+                if let Some(idx) = rest.rfind("-iter") {
+                    let suffix = &rest[idx + "-iter".len()..];
+                    return !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit());
+                }
+            }
+            false
+        };
         for manifest in &all_manifests {
             if let Some(ref branch) = manifest.branch {
                 if matches!(manifest.status, AgentStatus::Completed) {
+                    if is_stacked_iter_branch(branch) {
+                        tracing::debug!(
+                            "skipping merge of stacked iteration branch '{}'",
+                            branch
+                        );
+                        continue;
+                    }
                     let mut result = merge::merge_branch(&config.workspace_root, branch)?;
                     if !result.success && !result.conflicts.is_empty() {
                         let files: Vec<String> = result
@@ -1394,6 +1607,16 @@ fn build_iter_evidence(
     out
 }
 
+/// Override the worktree branch + base SHA for a single agent invocation.
+/// Used by stacked-mode loop iterations to chain off the previous
+/// iteration's tip instead of falling through to `WorktreeManager::provision`'s
+/// default reset-from-HEAD behaviour.
+#[derive(Debug, Clone)]
+pub struct BranchOverride {
+    pub branch: String,
+    pub base_sha: String,
+}
+
 /// Run a single agent, optionally in a worktree.
 async fn run_single_agent(
     unit: &WorkUnit,
@@ -1411,6 +1634,31 @@ async fn run_single_agent(
         iteration_config,
         acp_observer,
         false,
+        None,
+    )
+    .await
+}
+
+/// Like [`run_single_agent`] but provisions the worktree at a specific
+/// branch + base SHA. Sets the resulting manifest's branch to the override.
+async fn run_single_agent_with_branch(
+    unit: &WorkUnit,
+    worktree_mgr: Option<&mut WorktreeManager>,
+    ctx: &AgentRunContext<'_>,
+    tier_router: &TierRouter,
+    iteration_config: &crate::iteration::IterationConfig,
+    acp_observer: Box<dyn AcpObserver>,
+    override_branch: BranchOverride,
+) -> Result<AgentManifest> {
+    run_agent_inner(
+        unit,
+        worktree_mgr,
+        ctx,
+        tier_router,
+        iteration_config,
+        acp_observer,
+        false,
+        Some(override_branch),
     )
     .await
 }
@@ -1436,6 +1684,7 @@ async fn run_readonly_agent(
         iteration_config,
         acp_observer,
         true,
+        None,
     )
     .await
 }
@@ -1448,6 +1697,7 @@ async fn run_agent_inner(
     iteration_config: &crate::iteration::IterationConfig,
     acp_observer: Box<dyn AcpObserver>,
     read_only: bool,
+    branch_override: Option<BranchOverride>,
 ) -> Result<AgentManifest> {
     let workspace_root = ctx.workspace_root;
     let context_files = ctx.context_files;
@@ -1461,17 +1711,24 @@ async fn run_agent_inner(
     let impact_text = ctx.impact_texts.get(&unit.id).cloned();
     let pre_fetched_memory_text = (*ctx.pre_fetched_memory).clone();
     let in_worktree = worktree_mgr.is_some();
-    let agent_root = if let Some(mgr) = worktree_mgr {
-        let handle = mgr.provision(&unit.id)?;
+    let (agent_root, override_branch_name) = if let Some(mgr) = worktree_mgr {
+        let handle = if let Some(ref ov) = branch_override {
+            mgr.provision_with_base(&unit.id, &ov.branch, &ov.base_sha)?
+        } else {
+            mgr.provision(&unit.id)?
+        };
         let path = handle.path.clone();
         if !context_files.is_empty() {
             if let Err(e) = mgr.inject_context_files(&unit.id, context_files) {
                 tracing::warn!("Failed to inject context files for {}: {}", unit.id, e);
             }
         }
-        path
+        (
+            path,
+            branch_override.as_ref().map(|ov| ov.branch.clone()),
+        )
     } else {
-        workspace_root.clone()
+        (workspace_root.clone(), None)
     };
 
     if let Some(base_mcp) = &ctx.mcp_config {
@@ -1556,7 +1813,12 @@ async fn run_agent_inner(
                 vec![]
             });
         manifest.modified_files = changed;
-        manifest.branch = Some(format!("gaviero/{}", unit.id));
+        // When the caller provided a per-iteration branch override (stacked
+        // mode), record THAT branch name on the manifest so the merge phase
+        // can treat it correctly and downstream iterations can chain off it.
+        manifest.branch = Some(
+            override_branch_name.unwrap_or_else(|| format!("gaviero/{}", unit.id)),
+        );
     }
 
     Ok(manifest)
