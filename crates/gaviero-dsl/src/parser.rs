@@ -77,6 +77,7 @@ enum LoopField {
     Stability(u32),
     JudgeTimeout(u32),
     StrictJudge(bool),
+    BranchChain(BranchChainLit),
 }
 
 #[derive(Debug)]
@@ -741,6 +742,13 @@ where
         just(Token::KwStrictJudge)
             .ignore_then(bool_lit)
             .map(LoopField::StrictJudge),
+        // branch_chain <stacked|none>
+        just(Token::KwBranchChain)
+            .ignore_then(select! {
+                Token::Ident(s) if s == "stacked" => BranchChainLit::Stacked,
+                Token::Ident(s) if s == "none"    => BranchChainLit::None,
+            })
+            .map(LoopField::BranchChain),
     ));
 
     let loop_block = just(Token::KwLoop)
@@ -758,6 +766,7 @@ where
             let mut stability = None;
             let mut judge_timeout_secs = None;
             let mut strict_judge = None;
+            let mut branch_chain: Option<BranchChainLit> = None;
             for f in fields {
                 match f {
                     LoopField::Agents(v) => agents = v,
@@ -779,6 +788,9 @@ where
                     LoopField::StrictJudge(b) => {
                         strict_judge.get_or_insert(b);
                     }
+                    LoopField::BranchChain(v) => {
+                        branch_chain.get_or_insert(v);
+                    }
                 }
             }
             LoopBlock {
@@ -795,6 +807,7 @@ where
                 stability: stability.unwrap_or(1),
                 judge_timeout_secs: judge_timeout_secs.unwrap_or(120),
                 strict_judge: strict_judge.unwrap_or(true),
+                branch_chain: branch_chain.unwrap_or(BranchChainLit::None),
                 span: e.span(),
             }
         });
@@ -1411,6 +1424,59 @@ mod tests {
                 assert_eq!(lb.agents[1].0, "b");
                 assert_eq!(lb.max_iterations, 5);
                 assert!(matches!(&lb.until, UntilCondition::Verify(vb) if vb.compile && vb.test));
+            } else {
+                panic!("expected Loop step");
+            }
+        }
+    }
+
+    #[test]
+    fn loop_branch_chain_default_is_none() {
+        let src = r#"
+            agent a { description "a" }
+            agent j { description "j" }
+            workflow w {
+                steps [
+                    loop {
+                        agents [a]
+                        max_iterations 3
+                        until agent j
+                    }
+                ]
+            }
+        "#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        if let Item::Workflow(w) = &ast.unwrap().items[2] {
+            let (steps, _) = w.steps.as_ref().unwrap();
+            if let StepItem::Loop(lb) = &steps[0] {
+                assert!(matches!(lb.branch_chain, BranchChainLit::None));
+            }
+        }
+    }
+
+    #[test]
+    fn loop_branch_chain_stacked_parses() {
+        let src = r#"
+            agent a { description "a" }
+            agent j { description "j" }
+            workflow w {
+                steps [
+                    loop {
+                        agents [a]
+                        max_iterations 3
+                        branch_chain stacked
+                        until agent j
+                    }
+                ]
+            }
+        "#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        if let Item::Workflow(w) = &ast.unwrap().items[2] {
+            let (steps, _) = w.steps.as_ref().unwrap();
+            if let StepItem::Loop(lb) = &steps[0] {
+                assert!(matches!(lb.branch_chain, BranchChainLit::Stacked));
             } else {
                 panic!("expected Loop step");
             }
