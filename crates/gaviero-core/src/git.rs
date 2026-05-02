@@ -552,13 +552,52 @@ impl WorktreeManager {
     /// The branch is named `gaviero/{agent_id}`.
     pub fn provision(&mut self, agent_id: &str) -> Result<WorktreeHandle> {
         let branch = format!("gaviero/{}", agent_id);
-        let name = format!("gaviero-{}", agent_id);
-        let wt_path = self.worktree_base.join(&name);
-
-        // Resolve HEAD to a concrete commit SHA (avoids "invalid reference: HEAD")
         let commit = self
             .head_commit()
             .context("repo must have at least one commit for worktree isolation")?;
+        self.provision_inner(agent_id, &branch, &commit, /* delete_existing_branch = */ true)
+    }
+
+    /// Provision a worktree on a specific branch and base SHA, leaving any
+    /// existing siblings alone. Used by stacked loop iterations:
+    ///
+    /// - `branch` is the per-iteration name (e.g. `gaviero/exec-iter3`).
+    /// - `base_sha` is the previous iteration's branch tip — the new
+    ///   worktree is created at exactly that commit, so prior iterations'
+    ///   commits are visible in this iteration's working tree.
+    /// - The worktree directory uses `agent_id-iter<N>` so concurrent
+    ///   stacked iterations don't collide on disk. Caller passes the full
+    ///   branch name; the directory name is derived from the branch
+    ///   (replacing `/` with `-`).
+    ///
+    /// Existing branches matching `branch` are still cleaned up — the
+    /// caller picks unique per-iteration names so this is benign.
+    pub fn provision_with_base(
+        &mut self,
+        agent_id: &str,
+        branch: &str,
+        base_sha: &str,
+    ) -> Result<WorktreeHandle> {
+        self.provision_inner(agent_id, branch, base_sha, /* delete_existing_branch = */ false)
+    }
+
+    /// Internal: do the actual worktree provisioning. `delete_existing_branch`
+    /// controls whether an existing branch with this name is force-deleted
+    /// before the new worktree is created (true for the legacy reset-each-
+    /// iteration path; false for stacked mode where the previous-iteration
+    /// branch must survive as the chain anchor).
+    fn provision_inner(
+        &mut self,
+        agent_id: &str,
+        branch: &str,
+        commit: &str,
+        delete_existing_branch: bool,
+    ) -> Result<WorktreeHandle> {
+        // Worktree dir name derived from the branch so per-iteration
+        // worktrees don't collide. `gaviero/foo-iter3` → `gaviero-foo-iter3`.
+        let name = branch.replace('/', "-");
+        let wt_path = self.worktree_base.join(&name);
+        let _ = agent_id; // currently unused after refactor; preserved for caller ergonomics
 
         // Ensure base directory exists
         std::fs::create_dir_all(&self.worktree_base).with_context(|| {
@@ -568,7 +607,7 @@ impl WorktreeManager {
             )
         })?;
 
-        // Clean up stale state from previous runs
+        // Clean up stale state from previous runs (this iteration's slot only)
         if wt_path.exists() {
             let _ = self.remove_worktree(&name);
             if wt_path.exists() {
@@ -584,19 +623,22 @@ impl WorktreeManager {
             .stderr(std::process::Stdio::null())
             .status();
 
-        // Delete stale branch if it exists (from a previous run)
-        let _ = Command::new("git")
-            .args(["branch", "-D", &branch])
-            .current_dir(&self.repo_dir)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        if delete_existing_branch {
+            // Legacy reset-each-iteration mode: nuke any prior branch with
+            // the same name so this iteration starts clean from `commit`.
+            let _ = Command::new("git")
+                .args(["branch", "-D", branch])
+                .current_dir(&self.repo_dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
 
         // Create worktree with a new branch based on the resolved commit
         let output = Command::new("git")
-            .args(["worktree", "add", "-b", &branch])
+            .args(["worktree", "add", "-b", branch])
             .arg(&wt_path)
-            .arg(&commit)
+            .arg(commit)
             .current_dir(&self.repo_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -606,19 +648,39 @@ impl WorktreeManager {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!(
-                "failed to create worktree for '{}': {}",
+                "failed to create worktree for '{}' (branch '{}'): {}",
                 agent_id,
+                branch,
                 stderr.trim(),
             );
         }
 
         let handle = WorktreeHandle {
             path: wt_path,
-            branch,
+            branch: branch.to_string(),
             name,
         };
         self.active.push(handle.clone());
         Ok(handle)
+    }
+
+    /// Resolve the tip SHA of a branch (used by the loop executor to chain
+    /// stacked iterations: iteration N+1's worktree base = `branch_tip` of
+    /// iteration N's branch). Returns `None` if the branch doesn't exist.
+    pub fn branch_tip(&self, branch: &str) -> Option<String> {
+        let output = Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet"])
+            .arg(branch)
+            .current_dir(&self.repo_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if sha.is_empty() { None } else { Some(sha) }
     }
 
     /// Remove a worktree by name.
@@ -910,5 +972,71 @@ mod tests {
         // Worktree directory should be removed
         assert!(!handle.path.exists() || true); // git worktree remove may leave the dir
         assert!(wm.active_worktrees().is_empty());
+    }
+
+    /// Stacked-mode chain mechanic: provision_with_base must use the
+    /// supplied SHA as the new branch's base AND must NOT delete the prior
+    /// branch (the chain anchor must survive). branch_tip resolves to the
+    /// expected commit after the worktree is created.
+    #[test]
+    fn test_worktree_provision_with_base_preserves_chain() {
+        use std::fs;
+        use std::process::Command;
+
+        let (dir, _repo) = init_test_repo();
+        let repo_path = dir.path().to_path_buf();
+        let mut wm = WorktreeManager::new(repo_path.clone());
+
+        // Create iter1 branch from current HEAD, commit a file.
+        let head = wm.head_commit().expect("head");
+        let h1 = wm
+            .provision_with_base("agent", "gaviero/agent-iter1", &head)
+            .expect("provision iter1");
+        fs::write(h1.path.join("a.txt"), "iter1\n").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&h1.path)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "iter1 commit"])
+            .current_dir(&h1.path)
+            .status()
+            .unwrap();
+
+        let iter1_tip = wm
+            .branch_tip("gaviero/agent-iter1")
+            .expect("iter1 branch tip");
+        assert_ne!(iter1_tip, head, "iter1 should advance HEAD");
+
+        // Create iter2 chained off iter1's tip; iter1 branch must still exist.
+        let h2 = wm
+            .provision_with_base("agent", "gaviero/agent-iter2", &iter1_tip)
+            .expect("provision iter2");
+
+        // iter2's worktree HEAD == iter1's tip (i.e. iter1's commit is visible)
+        let iter2_head = String::from_utf8_lossy(
+            &Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&h2.path)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        assert_eq!(iter2_head, iter1_tip, "iter2's HEAD chains off iter1");
+
+        // iter1 branch is still resolvable — chain anchor preserved.
+        assert!(
+            wm.branch_tip("gaviero/agent-iter1").is_some(),
+            "iter1 branch must survive after iter2 provisioning"
+        );
+
+        // The file from iter1 is visible in iter2's worktree.
+        assert!(
+            h2.path.join("a.txt").exists(),
+            "iter1's file should be visible in iter2's worktree (chain established)"
+        );
     }
 }
