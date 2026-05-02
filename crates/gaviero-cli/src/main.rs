@@ -1993,9 +1993,6 @@ async fn main() -> Result<()> {
 
     // Parse work units
     let mut plan = if let Some(ref script_path) = cli.script {
-        let source = std::fs::read_to_string(script_path)
-            .with_context(|| format!("reading script: {}", script_path.display()))?;
-        let filename = script_path.display().to_string();
         let runtime_prompt = if let Some(ref p) = cli.prompt_file {
             Some(
                 std::fs::read_to_string(p)
@@ -2005,9 +2002,10 @@ async fn main() -> Result<()> {
             None
         };
         let override_vars = parse_var_overrides(&cli.vars)?;
-        gaviero_dsl::compile_with_vars(
-            &source,
-            &filename,
+        // compile_file resolves any `include "..."` directives transitively,
+        // so multi-file scripts (shared clients/prompts/etc.) work here.
+        gaviero_dsl::compile_file(
+            script_path,
             None,
             runtime_prompt.as_deref(),
             &override_vars,
