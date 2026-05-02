@@ -8,8 +8,8 @@
 //   gaviero-cli --script refactor_codebase.gaviero \
 //     --task "replace all anyhow::Result with typed error enums per module"
 
-client sonnet { tier cheap     model "claude-sonnet-4-6" effort medium }
-client opus   { tier expensive model "claude-opus-4-7"   effort high }
+client sonnet { tier cheap     model "claude:sonnet" effort medium }
+client opus   { tier expensive model "claude:opus"   effort high }
 
 // Tier aliases let downstream agents reference routing labels instead of
 // concrete profiles — a launch-time `--tier expensive=<other_client>` flag
