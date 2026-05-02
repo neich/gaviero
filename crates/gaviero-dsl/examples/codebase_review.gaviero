@@ -1,0 +1,583 @@
+// Template: Critical codebase review with rolling per-module replan-then-apply
+//
+// Shape:
+//
+//   inventory             (opus)         — discovers modules, writes inventory.md
+//     ↓
+//   loop {                                — sequential per-module loop
+//     replan_module       (opus)         — RE-reads current state (post any prior
+//                                          iterations' edits) and writes the plan
+//                                          for module {{ITER}}: findings + apply list.
+//                                          Earlier iterations' applied changes are
+//                                          part of the input here, so this iteration's
+//                                          plan reflects the codebase as it now is.
+//     execute_module      (opus)         — applies every accepted finding for
+//                                          THIS module in one focused agent turn.
+//     verify_module       (sonnet)       — runs targeted tests for the module;
+//                                          on failure marks the iteration STOP.
+//     until agent module_judge (sonnet)  — exits when iteration count == MODULE_COUNT
+//                                          or any verify ends with VERDICT: STOP.
+//     max_iterations 24
+//   }
+//     ↓
+//   test_audit            (opus)         — final pass: proposes missing integration
+//                                          tests (now that the codebase has settled).
+//     ↓
+//   final_verify          (sonnet)       — full test suite + git-diff summary;
+//                                          writes final-verification.md
+//
+// Why this shape vs "plan everything → apply everything":
+//   The user's constraint is that applying a change in module N invalidates
+//   the plan for modules N+1…M. So the only correct order is sequential
+//   replan-apply per module — no precomputed apply manifest. Each
+//   `replan_module` iteration sees the CURRENT codebase (including any
+//   edits from prior iterations), so it can drop findings that are now
+//   obsolete and add findings that the prior iteration uncovered.
+//
+//   This costs more tokens than the precomputed-then-apply shape, but
+//   that's the trade — correctness over throughput.
+//
+// Tier policy:
+//   * Hard reasoning per iteration (replan, execute, test_audit) — opus.
+//   * Coordination/verdict (verify_module, module_judge, final_verify) — sonnet.
+//
+// Halt-propagation:
+//   * inventory writes `MODULE_COUNT: <integer>`. If unreviewable, ends with
+//     `VERDICT: STOP: <reason>` and downstream phases short-circuit.
+//   * verify_module ends each iteration with `VERDICT: PASS` or `VERDICT: STOP`.
+//     STOP halts the outer loop. The next replan iteration would have read
+//     a broken codebase, so refusing to advance is the right call.
+//
+// Usage:
+//   gaviero-cli --script codebase_review.gaviero
+//   gaviero-cli --script codebase_review.gaviero --var OUT_DIR=reviews/2026-05
+//   gaviero-cli --script codebase_review.gaviero --var APPLY_FILTER="critical,high"
+
+include "clients.gaviero"
+
+vars {
+    OUT_DIR        "reviews/latest"
+    // Severity filter applied per-iteration when replan_module decides
+    // which findings to include in this iteration's APPLY_LIST.
+    //   "all"               → every finding for this module
+    //   "critical,high"     → critical and high only (default)
+    //   "critical"          → critical only
+    APPLY_FILTER   "critical,high"
+}
+
+// ── Prompts ──────────────────────────────────────────────────────────────────
+
+prompt inventory-body #"
+    You are producing a structured inventory of a repository for a downstream
+    critical-review pipeline.
+
+    STEP 1 — discover modules.
+      Identify every distinct module/library/crate/app in the workspace. Use
+      whatever signal is most reliable for this language (Cargo workspace
+      members, package.json workspaces, top-level apps/ + libs/ folders, etc.).
+      Do NOT include vendored, generated, or third-party code (target/, dist/,
+      node_modules/, .gaviero/, etc.).
+
+    STEP 2 — order the modules from leaf to root.
+      The replan-apply loop runs modules in the order you list them. Put
+      foundational/shared modules first (libraries with no internal deps),
+      then their consumers, then top-level apps. Reasoning: applying a
+      simplification in a leaf module is harmless if it later turns out
+      to be wrong; applying one in a high-fan-out module first risks
+      forcing every downstream replan to re-do work.
+
+    STEP 3 — write {{OUT_DIR}}/inventory.md with this exact structure:
+
+        # Repository inventory
+
+        MODULE_COUNT: <integer>
+
+        ## Module 1 — <name>
+        Path: <relative path from repo root>
+        Purpose: <one paragraph, inferred from code + README>
+        Languages: <e.g. Rust, TypeScript>
+        Internal deps: <list of other module names this one imports from>
+        Key entry points: <file paths>
+
+        ## Module 2 — <name>
+        ...
+
+        (repeat for every module, in leaf-to-root order)
+
+        ## Global assessment
+        - Architecture: how do these modules fit together? Dependency direction?
+          Cycles or layering violations?
+        - Boundaries: are public APIs between modules well-defined, or do
+          modules reach into each other's internals?
+        - Cross-cutting concerns: logging, error handling, config — consistent
+          across modules or fragmented?
+        - Hot spots: which modules are doing the most? Which look stale?
+
+        VERDICT: PROCEED
+
+    The `MODULE_COUNT` line is parsed by the loop judge — be exact.
+    Each module heading must be `## Module <N> — <name>`, numbered from 1.
+
+    If the repo isn't reviewable in this shape (no recognisable modules,
+    workspace is empty, etc.), replace the final line with:
+        VERDICT: STOP: <one paragraph explaining why>
+"#
+
+prompt replan-body #"
+    You are producing the per-module review-and-apply plan for module
+    {{ITER}}, RE-READING the current codebase state. Earlier iterations of
+    this loop may have already modified the workspace; your job is to plan
+    against what's there NOW, not what was there at inventory time.
+
+    STEP 0 — halt check.
+      Read {{OUT_DIR}}/inventory.md. If its last line is `VERDICT: STOP: …`
+      or if iteration {{ITER}} > MODULE_COUNT, write a single line to
+      {{OUT_DIR}}/plan-{{ITER}}.md:
+
+          HALTED: nothing to plan (inventory STOP or module count exceeded)
+
+      and exit without further analysis.
+
+      If iteration {{ITER}} > 1, also read
+      {{OUT_DIR}}/verify-{{PREV_ITER}}.md. If its last line is
+      `VERDICT: STOP: …`, write `HALTED: <quote stop reason>` to
+      plan-{{ITER}}.md and exit. The previous iteration broke something
+      and the codebase is unsafe to plan against.
+
+    STEP 1 — locate your module.
+      From {{OUT_DIR}}/inventory.md, read the section headed
+      `## Module {{ITER}} — …`. That is your subject for this iteration.
+
+    STEP 2 — read all prior iteration logs (if any).
+      For each k in 1..{{ITER}}-1, read {{OUT_DIR}}/apply-<k>.md and
+      {{OUT_DIR}}/plan-<k>.md. These tell you what changed in earlier
+      modules and what was deferred. Use them to:
+        - Skip findings that are now obsolete (the prior iteration removed
+          the offending code, renamed the API, etc.).
+        - Add findings that the prior iteration UNCOVERED (e.g. removing
+          a leaky abstraction in a leaf module exposes a sibling antipattern
+          in this module).
+        - Reconsider findings that depended on assumptions that no longer
+          hold (the type the proposal restructures was just deleted).
+
+    STEP 3 — deep analysis of THIS module's CURRENT state.
+      Read every source file in the module's path AS IT EXISTS NOW.
+      Form a critical opinion on:
+
+      - **Antipatterns**: god objects, mutable global state, deep inheritance,
+        primitive obsession, hidden dependencies, magic numbers/strings,
+        leaky abstractions, premature optimisation, copy-paste proliferation.
+      - **Code simplification**: functions/classes/types that do too many
+        things, nested control flow that can flatten, dead code, dead
+        config, dead deps. Be specific — name file:line.
+      - **Repetition**: duplicated logic across files (within this module
+        AND with already-modified earlier modules), near-duplicates that
+        differ only in inline parameters, parallel implementations of the
+        same idea. Propose a single consolidation site for each.
+      - **Overcomplexity**: functions longer than ~50 lines, modules longer
+        than ~500 lines, types with >10 fields, match arms with >5 branches
+        each themselves complex. Propose a smaller reshape.
+
+    STEP 4 — write {{OUT_DIR}}/plan-{{ITER}}.md with this exact structure:
+
+        # Plan — Module {{ITER}} — <name>
+
+        ## Context delta from prior iterations
+        - Findings from inventory time that no longer apply (and why)
+        - New issues uncovered by what earlier iterations changed
+        - Anything in this module that was assumed safe and isn't anymore
+
+        ## Findings (this iteration)
+        For each finding:
+
+            ### F<N>: <short title>
+            Severity: critical | high | medium | low
+            Category: antipattern | simplification | duplication | overcomplexity
+            Location: <file:line[-line]>
+            Problem: <2-3 sentences>
+            Proposed change: <concrete edit, including which files would be
+                touched and roughly how the result would look>
+            Risk: <1 sentence — what could break if applied>
+            Cross-module impact: <what downstream modules might need replanning;
+                empty if local to this module>
+
+        ## Skipped (judgment calls)
+        Issues you considered but won't flag — one line each, with reason.
+
+        ## Apply list
+
+            APPLY_FILTER: {{APPLY_FILTER}}
+            APPLY_COUNT: <integer>
+
+            APPLY_LIST:
+            1. F<id> — <severity> — <title>
+            2. F<id> — <severity> — <title>
+            ...
+
+        Selection rule:
+          - "all"               → every finding above
+          - "critical,high"     → critical and high severity only (default)
+          - "critical"          → only critical
+        Use APPLY_FILTER="{{APPLY_FILTER}}" to pick the cut. Be opinionated —
+        if a high finding is unsafe to apply without first doing other work
+        flagged here, demote it (move it to Skipped with a reason).
+
+    Be terse and specific. Vague suggestions ("clean up error handling")
+    are not findings.
+"#
+
+prompt execute-body #"
+    You are applying every accepted change for module {{ITER}} in this turn.
+
+    STEP 0 — halt check.
+      Read {{OUT_DIR}}/plan-{{ITER}}.md. If it starts with `HALTED:`, write
+      a single line to {{OUT_DIR}}/apply-{{ITER}}.md:
+
+          HALTED: <quote the plan's halt reason>
+
+      and exit without modifying any source files.
+
+    STEP 1 — read your apply list.
+      Parse the APPLY_LIST in {{OUT_DIR}}/plan-{{ITER}}.md. Process the
+      findings IN THE ORDER LISTED — earlier findings in the list may
+      simplify code that later findings depend on.
+
+    STEP 2 — apply, finding by finding.
+      For each finding in APPLY_LIST:
+        a. Re-read the finding's full details from plan-{{ITER}}.md.
+        b. Make the edits. Touch only files within the module's path
+           (consult inventory.md for the path) AND only under src/ or
+           crates/. Tests are off-limits in this phase — the test_audit
+           phase owns tests/.
+        c. If a finding's proposed change requires touching tests/, SKIP
+           it and record the reason in DEVIATIONS ("requires tests/ edits,
+           deferred to test_audit").
+        d. After the edits for this finding, run a targeted compile check
+           (cargo check -p <crate> for Rust, equivalent for the language).
+        e. If the change can't be applied as proposed (the code has moved
+           since planning), DO NOT improvise — skip it and record the
+           reason in DEVIATIONS below.
+
+    STEP 3 — write {{OUT_DIR}}/apply-{{ITER}}.md with:
+
+        # Apply — Module {{ITER}}
+
+        ## Findings applied
+        - F<id>: <title> — <one line: what was changed>
+        - ...
+
+        ## Findings skipped
+        - F<id>: <title> — <reason: code moved, dep-of-dep failed, etc.>
+        - ...
+
+        ## Files modified
+        <list of paths touched, deduplicated>
+
+        ## DEVIATIONS
+        Anything you did differently from the proposal text in plan-{{ITER}}.md.
+        Empty if everything was applied as written.
+
+        ## DISCOVERIES
+        Anything this iteration revealed that should change downstream
+        modules' plans. The next replan iteration reads this section
+        explicitly. Be specific:
+          - "Removed type X used by module Y" → tells module Y's replan to
+            check call sites.
+          - "Found duplicate of <pattern> in module Z" → replan for module Z
+            should consider consolidating with this module's version.
+          - "" (empty) is fine if nothing crossed module boundaries.
+"#
+
+prompt verify-body #"
+    You are gating the outer loop after iteration {{ITER}}. Cheap pass:
+    just confirm the codebase still compiles and the module's targeted
+    tests pass.
+
+    Read:
+      - {{OUT_DIR}}/apply-{{ITER}}.md (especially DEVIATIONS / DISCOVERIES)
+      - The git diff for files modified in this iteration
+
+    Run targeted tests for the affected module (cargo test -p <crate>,
+    equivalent for the language). Do NOT run the full workspace suite —
+    final_verify handles that.
+
+    Write {{OUT_DIR}}/verify-{{ITER}}.md. End with exactly one of:
+
+        VERDICT: PASS
+        VERDICT: STOP: <one-paragraph reason>
+
+    Return STOP when:
+      - The module's targeted tests fail and the failure isn't trivially
+        fixable.
+      - apply-{{ITER}}.md starts with `HALTED:` — propagate.
+      - DISCOVERIES section reveals that something further down the line
+        is now broken (e.g. removed a public API that downstream modules
+        use, but couldn't update them this iteration).
+      - The module's compile is broken in a way that would corrupt the
+        next iteration's replan.
+
+    Return PASS otherwise. Minor TODOs in apply-{{ITER}}.md don't justify
+    STOP — surfacing them in DEVIATIONS is enough; downstream replans will
+    see them.
+"#
+
+prompt module-judge-body #"
+    You decide whether the per-module loop is finished.
+
+    {{ITER_EVIDENCE}}
+
+    Read {{OUT_DIR}}/inventory.md and parse the `MODULE_COUNT: <N>` line.
+
+    Return PASS (loop exits) when ANY of:
+      1. Iteration {{ITER}} >= MODULE_COUNT — every module has been planned
+         and applied.
+      2. The latest plan-{{ITER}}.md or apply-{{ITER}}.md starts with
+         `HALTED:`.
+      3. The latest verify-{{ITER}}.md ends with `VERDICT: STOP:`.
+
+    Return FAIL — the next iteration runs replan_module then execute_module
+    then verify_module for module {{ITER}}+1.
+
+    Output format — emit exactly one fenced JSON object as your last output:
+
+    ```json
+    {"verdict": "pass" | "fail", "reason": "<one short paragraph>"}
+    ```
+"#
+
+prompt test-audit-body #"
+    You are auditing the test suite for missing integration coverage. The
+    codebase has now settled — every module has been replanned and applied.
+
+    Bias toward integration tests over unit tests. Unit-test gaps are
+    cheap to find and often noise; integration-test gaps are where real
+    behavioural regressions live.
+
+    1. Read {{OUT_DIR}}/inventory.md and every {{OUT_DIR}}/apply-*.md
+       (skip any that start with `HALTED:`). They tell you what each
+       module does and what was just changed.
+    2. Read the existing tests/ directory and any in-crate test modules.
+    3. For each module, identify:
+       - Public-API surface that has no integration coverage.
+       - Cross-module workflows (A → B → C) that exist in code but
+         have no end-to-end test.
+       - Error/edge paths that are reachable but unexercised.
+       - Tests that are unit tests in disguise of integration tests
+         (heavy mocking of the very thing they should be testing).
+       - Tests that became invalid because of the changes just applied.
+
+    4. Write {{OUT_DIR}}/test-audit.md with structure:
+
+        # Test audit
+
+        ## Coverage gaps
+        For each:
+
+            ### T<N>: <short title>
+            Severity: critical | high | medium | low
+            Module: <name>
+            Surface: <function/endpoint/workflow that lacks coverage>
+            Proposed test: <one paragraph — what it would assert and how>
+            Why integration not unit: <1 sentence>
+
+        ## Tests to retire or rewrite
+        Existing tests that aren't pulling weight (over-mocked, tautological,
+        testing private internals, broken by recent applied changes). Same
+        finding format with `Action: retire | rewrite`.
+
+        ## Implementation
+        Write the proposed integration tests now (in tests/ or per-crate
+        test modules). Stick to severity=critical and severity=high — the
+        rest stay as proposals for a future pass. Run them after writing.
+        Record results below as `Tests added: <N> passing, <M> failing`.
+
+    Be terse. Vague suggestions ("add more tests for foo") are not findings.
+"#
+
+prompt final-verify-body #"
+    Final integration audit across every module change that landed plus
+    the integration tests just added.
+
+    Read:
+      - {{OUT_DIR}}/inventory.md
+      - Every {{OUT_DIR}}/plan-*.md, apply-*.md, verify-*.md
+      - {{OUT_DIR}}/test-audit.md
+      - The full git diff vs the pre-swarm SHA
+
+    Run the complete test suite (cargo test --workspace, npm test, etc.).
+
+    Write {{OUT_DIR}}/final-verification.md with:
+      - Modules processed: which iterations ran, which halted, which were
+        skipped (mid-loop STOP).
+      - Findings landed vs deferred: rough count by severity.
+      - Test results: pass/fail counts; regressions vs pre-swarm baseline.
+      - Lint/clippy diffs: any new warnings introduced.
+      - Cross-module DISCOVERIES that didn't get picked up by a later
+        iteration (potential follow-up review).
+
+    End with one of:
+
+        VERDICT: ACCEPT — review applied cleanly, merge as-is
+        VERDICT: REJECT — <which iterations to revert + why>
+        VERDICT: HALTED — <where the loop stopped + what's pending>
+"#
+
+// ── Agents ───────────────────────────────────────────────────────────────────
+
+agent inventory {
+    description "Inventory modules in leaf-to-root order"
+    client opus
+    scope {
+        owned     ["{{OUT_DIR}}/inventory.md"]
+        read_only ["src/" "crates/" "Cargo.toml" "package.json" "README.md" "ARCHITECTURE.md"]
+    }
+    prompt inventory-body
+    max_retries 1
+
+    memory {
+        read_ns    ["architecture" "review-history"]
+        read_query "repository structure and module boundaries"
+        read_limit 10
+    }
+}
+
+// One generic per-module replanner — runs once per outer loop iteration,
+// re-reading the current codebase (post any prior-iteration edits).
+// Owns every plan-N.md slot via a glob; the validator allows overlap with
+// execute_module / verify_module because they share the same loop group.
+agent replan_module {
+    description "Replan module {{ITER}} against the current codebase state"
+    client opus
+    depends_on [inventory]
+    scope {
+        owned     ["{{OUT_DIR}}/plan-*.md"]
+        read_only ["{{OUT_DIR}}/" "src/" "crates/" "tests/" "Cargo.toml" "ARCHITECTURE.md"]
+    }
+    prompt replan-body
+    max_retries 2
+}
+
+// One generic per-module executor — applies the entire APPLY_LIST from
+// this iteration's plan in a single agent turn. Wide owned scope is the
+// cost of not knowing the module's path until runtime; the validator
+// accepts overlap with replan_module / verify_module because they share
+// the same loop group.
+// Owned scope is src/ + crates/ + the per-iteration apply log. Tests/ is
+// deliberately NOT in here even though some findings might touch tests:
+// the test_audit phase owns tests/ end-to-end (test changes belong there,
+// not in the per-module apply pass). If a finding's proposed change
+// requires touching tests, execute_module skips it and records the
+// reason in DEVIATIONS.
+agent execute_module {
+    description "Apply changes for module {{ITER}}"
+    client opus
+    depends_on [replan_module]
+    scope {
+        owned     ["src/" "crates/" "{{OUT_DIR}}/apply-*.md"]
+        read_only ["{{OUT_DIR}}/" "tests/" "Cargo.toml"]
+    }
+    prompt execute-body
+    max_retries 2
+}
+
+agent verify_module {
+    description "Verify module {{ITER}} compiles and targeted tests pass"
+    client sonnet
+    depends_on [execute_module]
+    scope {
+        owned     ["{{OUT_DIR}}/verify-*.md"]
+        read_only ["{{OUT_DIR}}/" "src/" "crates/" "tests/"]
+    }
+    prompt verify-body
+    max_retries 1
+}
+
+agent module_judge {
+    description "Judge whether all modules have been planned and applied"
+    client sonnet
+    scope {
+        read_only ["{{OUT_DIR}}/"]
+    }
+    prompt module-judge-body
+}
+
+agent test_audit {
+    description "Audit tests + add critical/high integration coverage"
+    client opus
+    // Wait for the loop to settle. depends_on a loop body agent works
+    // because the workflow's `steps` list injects implicit ordering
+    // barriers between adjacent steps.
+    depends_on [verify_module]
+    scope {
+        owned     ["{{OUT_DIR}}/test-audit.md" "tests/"]
+        read_only ["{{OUT_DIR}}/" "src/" "crates/" "Cargo.toml"]
+    }
+    prompt test-audit-body
+    max_retries 1
+}
+
+agent final_verify {
+    description "Final integration audit across all applied changes"
+    client sonnet
+    depends_on [test_audit]
+    scope {
+        owned     ["{{OUT_DIR}}/final-verification.md"]
+        read_only ["{{OUT_DIR}}/" "src/" "crates/" "tests/"]
+    }
+    prompt final-verify-body
+    max_retries 1
+
+    memory {
+        write_ns      "review-history"
+        importance    0.9
+        write_content #"
+            Codebase review (replan-per-module) — {{SUMMARY}}
+        "#
+        staleness_sources ["src/" "crates/"]
+    }
+}
+
+// ── Workflow ─────────────────────────────────────────────────────────────────
+//
+// One outer dynamic-count loop: replan_module → execute_module → verify_module.
+// stability 1 because the judge is a deterministic counter — no need to
+// re-confirm a PASS verdict.
+//
+// strict_judge true to surface unparseable judge output as a hard failure
+// rather than silently treating it as FAIL (which would prematurely exit
+// the loop and leave most modules unprocessed).
+//
+// max_iterations 24 is a safety cap, not the actual count. Most repos have
+// well under 24 modules; if yours has more, raise this. If MODULE_COUNT
+// exceeds max_iterations the cap wins — the test_audit and final_verify
+// phases still run on whatever was processed.
+//
+// max_parallel 1 because the whole point is sequential: each iteration
+// MUST see prior iterations' edits. No fan-out.
+//
+// Workflow-level verify { compile true clippy true test true } is the
+// runtime safety net — catches a broken build at workflow exit even if
+// verify_module said PASS.
+
+workflow codebase_review {
+    steps [
+        inventory
+        loop {
+            agents         [replan_module execute_module verify_module]
+            max_iterations 24
+            stability      1
+            judge_timeout  60
+            strict_judge   true
+            until agent    module_judge
+        }
+        test_audit
+        final_verify
+    ]
+    max_parallel 1
+    verify { compile true clippy true test true }
+
+    memory {
+        read_ns  ["architecture" "review-history" "refactor-history"]
+        write_ns "review-history"
+    }
+}

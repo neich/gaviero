@@ -21,6 +21,29 @@ pub enum Item {
     /// A top-level `tier <name> <client>` alias — a named routing label
     /// that resolves to a concrete client profile. See [`TierAlias`].
     TierAlias(TierAlias),
+    /// `include "path"` — splices the items of another `.gaviero` file into
+    /// the current script's top-level. Resolved by `compile_file` before
+    /// the compiler runs; the compiler should never observe `Include`
+    /// items in a flattened script.
+    Include(IncludeDecl),
+}
+
+/// A top-level `include "path"` declaration.
+///
+/// ```text
+/// include "lib/clients.gaviero"
+/// include "../shared/prompts.gaviero"
+/// ```
+///
+/// Path is resolved relative to the directory of the file containing this
+/// `include` statement. Cycles are rejected. Includes may appear anywhere at
+/// top level; their position has no semantic effect since all top-level
+/// items are merged into a single namespace before compilation.
+#[derive(Debug, Clone)]
+pub struct IncludeDecl {
+    pub path: String,
+    pub path_span: Span,
+    pub span: Span,
 }
 
 /// Top-level `tier <name> <client-ref>` declaration.
@@ -45,6 +68,11 @@ pub struct TierAlias {
     pub client_ref: String,
     pub client_ref_span: Span,
     pub span: Span,
+    /// Index into the `sources` vec passed to `compile_ast_with_sources`.
+    /// Set to 0 by the parser; updated by the include resolver when an item
+    /// originates from an included file.
+    #[doc(hidden)]
+    pub file_id: u32,
 }
 
 /// A top-level named prompt declaration.
@@ -66,6 +94,8 @@ pub struct PromptDecl {
     pub content: String,
     pub content_span: Span,
     pub span: Span,
+    #[doc(hidden)]
+    pub file_id: u32,
 }
 
 /// How an agent's `prompt` field is specified.
@@ -115,6 +145,8 @@ pub struct ClientDecl {
     pub privacy: Option<(PrivacyLit, Span)>,
     pub is_default: bool,
     pub span: Span,
+    #[doc(hidden)]
+    pub file_id: u32,
 }
 
 /// A single `key value` pair inside a client's `extra { ... }` block.
@@ -172,6 +204,8 @@ pub struct AgentDecl {
     /// need to run `cargo check` / `cargo test` / etc.
     pub tools: Vec<String>,
     pub span: Span,
+    #[doc(hidden)]
+    pub file_id: u32,
 }
 
 /// The `context { ... }` block inside an agent declaration.
@@ -355,6 +389,8 @@ pub struct WorkflowDecl {
     pub escalate_after: Option<(u32, Span)>,
     pub verify: Option<VerifyBlock>,
     pub span: Span,
+    #[doc(hidden)]
+    pub file_id: u32,
 }
 
 // ── value literals ────────────────────────────────────────────────────────

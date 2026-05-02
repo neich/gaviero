@@ -14,6 +14,10 @@
       "members": [
         {
           "type": "SYMBOL",
+          "name": "include_declaration"
+        },
+        {
+          "type": "SYMBOL",
           "name": "client_declaration"
         },
         {
@@ -35,6 +39,19 @@
         {
           "type": "SYMBOL",
           "name": "vars_block"
+        }
+      ]
+    },
+    "include_declaration": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "include"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "_string_value"
         }
       ]
     },
@@ -447,6 +464,19 @@
         {
           "type": "SYMBOL",
           "name": "vars_block"
+        },
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "tools"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "string_list"
+            }
+          ]
         }
       ]
     },

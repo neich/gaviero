@@ -138,6 +138,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_top_level_include() {
+        let mut parser = tree_sitter::Parser::new();
+        let lang: tree_sitter::Language = LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        let src = r#"
+            include "lib/clients.gaviero"
+            include "../shared/prompts.gaviero"
+            agent a { prompt "x" }
+            workflow w { steps [a] }
+        "#;
+        let tree = parser.parse(src, None).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "parse tree: {}",
+            tree.root_node().to_sexp()
+        );
+    }
+
+    #[test]
     fn parse_vars_block_top_level_and_agent() {
         let mut parser = tree_sitter::Parser::new();
         let lang: tree_sitter::Language = LANGUAGE.into();

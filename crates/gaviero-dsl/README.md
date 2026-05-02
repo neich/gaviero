@@ -110,6 +110,35 @@ workflow refactor_auth {
 
 ## Language Reference
 
+### Include
+
+Splice another `.gaviero` file's top-level declarations into the current
+script. Useful for sharing `client {}` profiles, `prompt` templates, and
+`tier` aliases across multiple workflow scripts:
+
+```gaviero
+include "lib/clients.gaviero"
+include "lib/prompts.gaviero"
+
+agent worker {
+    tier expensive          // resolved via lib/clients.gaviero
+    prompt analyse-body     // declared in lib/prompts.gaviero
+}
+
+workflow main { steps [worker] }
+```
+
+- Paths are resolved relative to the directory of the file containing the
+  `include`. `"lib/x.gaviero"` from `/proj/main.gaviero` reads `/proj/lib/x.gaviero`.
+- Cycles are rejected at compile time. Importing the same file from two
+  different paths is idempotent — its items are merged exactly once.
+- Duplicate top-level names across files are hard errors with both spans
+  shown. Either rename or prefix names per library to avoid collisions.
+- Includes work only when compiling from a real file path:
+  `gaviero-cli --script main.gaviero` or `gaviero_dsl::compile_file(path, …)`.
+  Inline `compile()` (used by tests / fenced markdown blocks) rejects them
+  because there's no anchoring directory to resolve against.
+
 ### Client Block
 
 Declares a model, tier, effort level, and optional provider-specific extras:
@@ -117,7 +146,7 @@ Declares a model, tier, effort level, and optional provider-specific extras:
 ```gaviero
 client opus {
     tier      expensive
-    model     "claude-opus-4-7"
+    model     "claude:opus"
     privacy   public
     effort    high
     extra {
@@ -171,9 +200,12 @@ agent reviewer {
 
 ### Model Strings
 
-Provider-neutral: resolved at runtime by gaviero-core.
+Canonical form is `provider:model`. Bare names (no `:`) are rejected at
+compile-dispatch time by `gaviero-core`.
 
-- **Claude** — `sonnet`, `opus`, `haiku` (shorthand) or `claude:sonnet`, `claude:haiku` (explicit)
+- **Claude** — `claude:sonnet`, `claude:opus`, `claude:haiku`,
+  `claude:opusplan`, `claude:sonnet[1m]`, or any versioned form like
+  `claude:claude-opus-4-7`
 - **Codex** — `codex:<model>` (e.g., `codex:gpt-5.4`)
 - **Ollama/local** — `ollama:qwen2.5-coder:7b` or `local:model-name`
 

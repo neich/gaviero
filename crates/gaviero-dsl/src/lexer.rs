@@ -15,6 +15,8 @@ pub enum Token {
     KwAgent,
     #[token("workflow")]
     KwWorkflow,
+    #[token("include")]
+    KwInclude,
 
     // ── Field keywords ───────────────────────────────────────────
     #[token("vars")]
@@ -191,6 +193,7 @@ impl fmt::Display for Token {
             Token::KwClient => write!(f, "client"),
             Token::KwAgent => write!(f, "agent"),
             Token::KwWorkflow => write!(f, "workflow"),
+            Token::KwInclude => write!(f, "include"),
             Token::KwTier => write!(f, "tier"),
             Token::KwModel => write!(f, "model"),
             Token::KwEffort => write!(f, "effort"),

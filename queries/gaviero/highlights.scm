@@ -4,6 +4,7 @@
 "workflow" @keyword
 "prompt" @keyword
 "vars" @keyword
+"include" @keyword.import
 
 ; ── Declaration names ─────────────────────────────────────────
 (client_declaration (identifier) @type)

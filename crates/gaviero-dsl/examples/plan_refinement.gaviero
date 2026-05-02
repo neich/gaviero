@@ -11,40 +11,16 @@
 //     `codex exec`; Claude logs unknown keys at `tracing::debug` level
 //     (the key list it consumes is documented in backend/claude_code.rs).
 //
-// The refine phase is where the planners do the heavy lifting, so the two
-// expensive profiles are tuned for deep reasoning; the cheap judge can stay
-// light since its job is a structured pass/fail verdict.
+// Shared client library — provides opus, sonnet (default),
+// codex-5-4 (codex:gpt-5.4), and codex-5-5 (codex:gpt-5.5). Agents below
+// bind to concrete clients (`client opus`, `client codex-5-4`,
+// `client sonnet`) because the script's whole point is to run two
+// specific providers in parallel and have a third arbitrate convergence.
+//
+// To pin the codex side to a different snapshot, change `client codex-5-4`
+// on the codex-init / codex-refine agents to `client codex-5-5`.
+include "clients.gaviero"
 
-client opus {
-    tier expensive
-    model "claude:opus"
-    privacy public
-    effort auto
-    extra {
-        // Request a larger extended-thinking budget for the deep-synthesis
-        // refine pass. Claude will consume this once the backend promotes
-        // the key; until then it is logged as "ignored" (see step 3 plan).
-        "thinking_budget" "8000"
-    }
-    default
-}
-
-client codex {
-    tier expensive
-    model "codex:gpt-5.4"
-    privacy public
-    // xhigh would clamp to Codex's `high` — ask for high directly so the
-    // intent is explicit.
-    effort high
-}
-
-client sonnet {
-    tier cheap
-    model "claude:sonnet"
-    privacy public
-    // The judge emits a short JSON verdict — no deep reasoning needed.
-    effort low
-}
 
 // ── Shared configuration ──────────────────────────────────────────────────────
 //
@@ -206,7 +182,7 @@ agent claude-init {
 agent codex-init {
     vars { MODEL_NAME "codex" }
     description "Initial plan (Codex): {{PROMPT}}"
-    client codex
+    client codex-5-4
     scope {
         owned ["{{OUT_DIR}}/codex-init-*.md"]
     }
@@ -234,7 +210,7 @@ agent claude-refine {
 agent codex-refine {
     vars { MODEL_NAME "codex" PEER_NAME "claude" }
     description "Refine plan (Codex): {{PROMPT}}"
-    client codex
+    client codex-5-4
     scope {
         owned     ["{{OUT_DIR}}/codex-refine-*.md"]
         read_only ["{{OUT_DIR}}/"]

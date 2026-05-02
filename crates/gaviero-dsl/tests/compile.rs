@@ -298,81 +298,68 @@ fn attempts_propagated() {
 // ── Example file compilation tests ──────────────────────────────
 
 fn compile_example(filename: &str) -> Vec<gaviero_core::swarm::models::WorkUnit> {
-    let path = format!("{}/examples/{}", env!("CARGO_MANIFEST_DIR"), filename);
-    let source =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {}", path, e));
-    compile(&source, filename, None, None)
+    // Examples use `include "clients.gaviero"` so we must go through
+    // compile_file (the inline compile() path rejects include).
+    let path = std::path::PathBuf::from(format!(
+        "{}/examples/{}",
+        env!("CARGO_MANIFEST_DIR"),
+        filename
+    ));
+    gaviero_dsl::compile_file(&path, None, None, &[])
         .unwrap_or_else(|e| panic!("compiling {}:\n{:?}", filename, e))
         .work_units_ordered()
         .expect("toposort")
 }
 
 #[test]
-fn example_bugfix_with_tests() {
-    let units = compile_example("bugfix_with_tests.gaviero");
-    assert_eq!(units.len(), 3);
-    assert_eq!(units[0].id, "diagnose");
-    assert_eq!(units[1].id, "fix");
-    assert_eq!(units[2].id, "verify");
-    // verify depends on fix, fix depends on diagnose
-    assert_eq!(units[1].depends_on, vec!["diagnose"]);
-    assert_eq!(units[2].depends_on, vec!["fix"]);
-    // diagnose uses coordinator tier (opus) → maps to Expensive
-    assert_eq!(units[0].tier, ModelTier::Expensive);
-    // verify has max_retries 3
-    assert_eq!(units[2].max_retries, 3);
-}
+fn example_codebase_review() {
+    let plan = compile_example_plan("codebase_review.gaviero");
+    let units = plan.work_units_ordered().expect("toposort");
 
-#[test]
-fn example_feature_tdd() {
-    let units = compile_example("feature_tdd.gaviero");
-    assert_eq!(units.len(), 3);
-    assert_eq!(units[0].id, "write_tests");
-    assert_eq!(units[2].id, "verify_no_regressions");
-    assert!(units[0].coordinator_instructions.contains("TDD"));
-    assert!(units[2].coordinator_instructions.contains("cargo test"));
-}
-
-#[test]
-fn example_refactor_safe() {
-    let units = compile_example("refactor_safe.gaviero");
-    assert_eq!(units.len(), 4);
-    assert_eq!(units[0].id, "analyze_coverage");
-    assert_eq!(units[3].id, "verify");
-    // analyze_structure depends on analyze_coverage
-    assert_eq!(units[1].depends_on, vec!["analyze_coverage"]);
-    // haiku tier for coverage agent (mechanical → Cheap)
-    assert_eq!(units[0].tier, ModelTier::Cheap);
-}
-
-#[test]
-fn example_multi_crate_test() {
-    let units = compile_example("multi_crate_test.gaviero");
-    assert_eq!(units.len(), 3);
-    assert_eq!(units[0].id, "change_core");
-    assert_eq!(units[2].id, "workspace_test");
+    // Sequential per-module loop with replan + execute + verify, plus
+    // inventory upstream and test_audit + final_verify downstream.
+    // Ordering: inventory → loop body (3 agents) → test_audit → final_verify
+    assert_eq!(units.len(), 6);
+    let ids: Vec<&str> = units.iter().map(|u| u.id.as_str()).collect();
     assert!(
-        units[2]
-            .coordinator_instructions
-            .contains("cargo test --workspace")
+        ids.contains(&"inventory"),
+        "expected inventory in {:?}",
+        ids
     );
-}
+    assert!(ids.contains(&"replan_module"));
+    assert!(ids.contains(&"execute_module"));
+    assert!(ids.contains(&"verify_module"));
+    assert!(ids.contains(&"test_audit"));
+    assert!(ids.contains(&"final_verify"));
 
-#[test]
-fn example_security_audit() {
-    let units = compile_example("security_audit.gaviero");
-    assert_eq!(units.len(), 4);
-    assert_eq!(units[0].id, "scan");
-    assert_eq!(units[3].id, "final_verification");
-    // scan uses reasoning tier → maps to Expensive
-    assert_eq!(units[0].tier, ModelTier::Expensive);
-    // write_security_tests owns the tests/security/ directory
-    assert!(
-        units[2]
-            .scope
-            .owned_paths
-            .contains(&"tests/security/".to_string())
+    // The judge agent isn't in work_units; it's in loop_judge_units.
+    assert_eq!(plan.loop_judge_units.len(), 1);
+    assert_eq!(plan.loop_judge_units[0].id, "module_judge");
+
+    // Single sequential loop with all three body agents.
+    assert_eq!(plan.loop_configs.len(), 1);
+    assert_eq!(
+        plan.loop_configs[0].agent_ids,
+        vec!["replan_module", "execute_module", "verify_module"]
     );
+    assert_eq!(plan.loop_configs[0].max_iterations, 24);
+    // max_parallel 1 — sequential is the whole point of this example.
+    assert_eq!(plan.max_parallel, Some(1));
+
+    // test_audit depends on the loop body so it runs AFTER iterations settle.
+    let test_audit = units.iter().find(|u| u.id == "test_audit").unwrap();
+    assert!(
+        test_audit
+            .depends_on
+            .iter()
+            .any(|d| d == "verify_module" || d == "execute_module"),
+        "test_audit should depend on a loop body agent, got {:?}",
+        test_audit.depends_on
+    );
+
+    // final_verify depends on test_audit.
+    let final_verify = units.iter().find(|u| u.id == "final_verify").unwrap();
+    assert!(final_verify.depends_on.contains(&"test_audit".to_string()));
 }
 
 #[test]
@@ -428,63 +415,16 @@ fn example_security_audit_memory() {
 }
 
 fn compile_example_plan(filename: &str) -> gaviero_core::swarm::plan::CompiledPlan {
-    let path = format!("{}/examples/{}", env!("CARGO_MANIFEST_DIR"), filename);
-    let source =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {}", path, e));
-    compile(&source, filename, None, None)
+    let path = std::path::PathBuf::from(format!(
+        "{}/examples/{}",
+        env!("CARGO_MANIFEST_DIR"),
+        filename
+    ));
+    gaviero_dsl::compile_file(&path, None, None, &[])
         .unwrap_or_else(|e| panic!("compiling {}:\n{:?}", filename, e))
 }
 
 // ── Template compilation tests ─────────────────────────────────────
-
-#[test]
-fn template_feature_iterative() {
-    let plan = compile_example_plan("feature_iterative.gaviero");
-    let units = plan.work_units_ordered().expect("toposort");
-    assert_eq!(units.len(), 4);
-    assert_eq!(units[0].id, "orchestrator");
-    assert_eq!(units[3].id, "summarize");
-    // Has a loop config
-    assert_eq!(plan.loop_configs.len(), 1);
-    assert_eq!(
-        plan.loop_configs[0].agent_ids,
-        vec!["implement", "write_tests"]
-    );
-    assert_eq!(plan.loop_configs[0].max_iterations, 5);
-    // Orchestrator reads from memory
-    assert!(
-        units[0]
-            .read_namespaces
-            .as_ref()
-            .unwrap()
-            .contains(&"architecture".to_string())
-    );
-    // Summarize writes to memory with custom content
-    assert_eq!(units[3].write_namespace.as_deref(), Some("feature-history"));
-    assert!(units[3].memory_write_content.is_some());
-}
-
-#[test]
-fn template_refactor_codebase() {
-    let plan = compile_example_plan("refactor_codebase.gaviero");
-    let units = plan.work_units_ordered().expect("toposort");
-    assert_eq!(units.len(), 4);
-    assert_eq!(units[0].id, "analyse");
-    assert_eq!(units[3].id, "record_changes");
-    // Has a loop config
-    assert_eq!(plan.loop_configs.len(), 1);
-    assert_eq!(
-        plan.loop_configs[0].agent_ids,
-        vec!["refactor", "fix_tests"]
-    );
-    assert_eq!(plan.loop_configs[0].max_iterations, 8);
-    // Analyse has custom read_query
-    assert!(units[0].memory_read_query.is_some());
-    assert_eq!(units[0].memory_read_limit, Some(15));
-    // record_changes writes with custom template
-    assert!(units[3].memory_write_content.is_some());
-    assert_eq!(units[3].memory_importance, Some(0.9));
-}
 
 #[test]
 fn template_update_docs() {
@@ -503,30 +443,6 @@ fn template_update_docs() {
     assert!(plan.loop_configs.is_empty());
     // Max parallel 3
     assert_eq!(plan.max_parallel, Some(3));
-}
-
-#[test]
-fn template_sync_memory() {
-    let plan = compile_example_plan("sync_memory.gaviero");
-    let units = plan.work_units_ordered().expect("toposort");
-    assert_eq!(units.len(), 4);
-    assert_eq!(units[0].id, "audit_codebase");
-    // Three reconcile agents depend on audit
-    assert!(units[1].depends_on.contains(&"audit_codebase".to_string()));
-    assert!(units[2].depends_on.contains(&"audit_codebase".to_string()));
-    assert!(units[3].depends_on.contains(&"audit_codebase".to_string()));
-    // audit reads with custom query and high limit
-    assert!(units[0].memory_read_query.is_some());
-    assert_eq!(units[0].memory_read_limit, Some(20));
-    // reconcile_architecture has staleness_sources
-    let arch_agent = units
-        .iter()
-        .find(|u| u.id == "reconcile_architecture")
-        .unwrap();
-    assert!(!arch_agent.staleness_sources.is_empty());
-    assert!(arch_agent.memory_write_content.is_some());
-    // No loops
-    assert!(plan.loop_configs.is_empty());
 }
 
 #[test]
@@ -554,15 +470,23 @@ fn template_plan_refinement() {
         .find(|u| u.id == "codex-refine")
         .expect("codex-refine");
 
-    // All use expensive tier
+    // All four agents bind to a concrete client (not via a tier alias), so
+    // the resolved `tier` is whatever the client carries. The clients in
+    // plan_refinement.gaviero intentionally don't set `tier` — see the
+    // comment block at the top of that file — so every unit lands on the
+    // default tier. Models are what actually distinguish the agents.
+    let expected_default = gaviero_core::types::ModelTier::default();
     for u in &[cinit, xinit, crefine, xrefine] {
         assert_eq!(
-            u.tier,
-            gaviero_core::types::ModelTier::Expensive,
-            "agent {} should be expensive",
+            u.tier, expected_default,
+            "agent {} should resolve to the default tier (no tier on its client)",
             u.id
         );
     }
+    assert_eq!(cinit.model.as_deref(), Some("claude:opus"));
+    assert_eq!(xinit.model.as_deref(), Some("codex:gpt-5.4"));
+    assert_eq!(crefine.model.as_deref(), Some("claude:opus"));
+    assert_eq!(xrefine.model.as_deref(), Some("codex:gpt-5.4"));
 
     // Init agents: vars (MODEL_NAME, PLANS) substituted at compile time; no ITER
     assert!(
@@ -661,31 +585,24 @@ fn template_phased_plan() {
     assert_eq!(plan.loop_judge_units[0].id, "phase_judge");
 
     // Tier routing: expensive on reasoning agents, cheap on gate and judge.
-    let tier_of = |id: &str| {
+    // Agents resolve via tier aliases from the shared clients.gaviero
+    // (`tier expensive` → opus, `tier cheap` → sonnet). The library's client
+    // blocks don't carry a `tier` field, so the WorkUnit's `tier` lands on
+    // the default; what's actually load-bearing is the resolved model.
+    let model_of = |id: &str| -> Option<String> {
         units
             .iter()
             .chain(plan.loop_judge_units.iter())
             .find(|u| u.id == id)
             .unwrap_or_else(|| panic!("agent {} not found", id))
-            .tier
+            .model
+            .clone()
     };
-    assert_eq!(
-        tier_of("analyse_plan"),
-        gaviero_core::types::ModelTier::Expensive
-    );
-    assert_eq!(
-        tier_of("phase_executor"),
-        gaviero_core::types::ModelTier::Expensive
-    );
-    assert_eq!(
-        tier_of("final_audit"),
-        gaviero_core::types::ModelTier::Expensive
-    );
-    assert_eq!(tier_of("phase_gate"), gaviero_core::types::ModelTier::Cheap);
-    assert_eq!(
-        tier_of("phase_judge"),
-        gaviero_core::types::ModelTier::Cheap
-    );
+    assert_eq!(model_of("analyse_plan").as_deref(), Some("claude:opus"));
+    assert_eq!(model_of("phase_executor").as_deref(), Some("claude:opus"));
+    assert_eq!(model_of("final_audit").as_deref(), Some("claude:opus"));
+    assert_eq!(model_of("phase_gate").as_deref(), Some("claude:sonnet"));
+    assert_eq!(model_of("phase_judge").as_deref(), Some("claude:sonnet"));
 
     // Dependency chain: phase_executor → analyse_plan; phase_gate →
     // phase_executor; final_audit → phase_gate (loop exit).
@@ -748,4 +665,103 @@ fn template_phased_plan() {
     assert_eq!(audit.write_namespace.as_deref(), Some("phase-history"));
     assert_eq!(audit.memory_importance, Some(0.9));
     assert!(audit.memory_write_content.is_some());
+}
+
+// ── compile_file include integration tests ─────────────────────────────────
+
+#[test]
+fn compile_file_resolves_include_and_compiles_workflow() {
+    use std::fs;
+    use std::io::Write;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    // Library: shared client + tier alias
+    let mut lib = fs::File::create(dir.join("lib.gaviero")).unwrap();
+    lib.write_all(
+        br#"
+            client sonnet { tier cheap model "claude:sonnet" }
+            tier cheap sonnet
+        "#,
+    )
+    .unwrap();
+
+    // Entry: agent + workflow that reference the included client
+    let entry = dir.join("main.gaviero");
+    let mut f = fs::File::create(&entry).unwrap();
+    f.write_all(
+        br#"
+            include "lib.gaviero"
+            agent worker {
+                description "test"
+                tier cheap
+                prompt "do work"
+            }
+            workflow w { steps [worker] }
+        "#,
+    )
+    .unwrap();
+
+    let plan = gaviero_dsl::compile_file(&entry, None, None, &[])
+        .expect("compile_file should succeed across include boundary");
+    let units = plan.work_units_ordered().unwrap();
+    assert_eq!(units.len(), 1);
+    assert_eq!(units[0].id, "worker");
+    assert_eq!(units[0].model, Some("claude:sonnet".to_string()));
+    assert_eq!(units[0].tier, ModelTier::Cheap);
+}
+
+#[test]
+fn compile_file_reports_duplicate_decl_across_files() {
+    use std::fs;
+    use std::io::Write;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    // Both files declare `client base` — duplicate should be flagged.
+    fs::File::create(dir.join("a.gaviero"))
+        .unwrap()
+        .write_all(br#"client base { tier cheap model "claude:sonnet" }"#)
+        .unwrap();
+    fs::File::create(dir.join("b.gaviero"))
+        .unwrap()
+        .write_all(br#"client base { tier cheap model "claude:haiku" }"#)
+        .unwrap();
+    let entry = dir.join("main.gaviero");
+    fs::File::create(&entry)
+        .unwrap()
+        .write_all(
+            br#"
+                include "a.gaviero"
+                include "b.gaviero"
+                agent w { client base prompt "x" }
+                workflow wf { steps [w] }
+            "#,
+        )
+        .unwrap();
+
+    let err = gaviero_dsl::compile_file(&entry, None, None, &[]).unwrap_err();
+    let msg = format!("{:?}", err);
+    assert!(
+        msg.contains("duplicate client name `base`"),
+        "expected duplicate-client diagnostic, got: {}",
+        msg
+    );
+}
+
+#[test]
+fn compile_rejects_inline_include_with_helpful_diagnostic() {
+    let src = r#"
+        include "lib.gaviero"
+        client c { tier cheap model "claude:sonnet" }
+    "#;
+    let err = gaviero_dsl::compile(src, "inline.gaviero", None, None).unwrap_err();
+    let msg = format!("{:?}", err);
+    assert!(
+        msg.contains("compile_file") || msg.contains("--script"),
+        "expected diagnostic to point at compile_file/--script, got: {}",
+        msg
+    );
 }

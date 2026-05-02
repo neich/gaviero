@@ -3,6 +3,7 @@ pub mod compiler;
 pub mod error;
 pub mod lexer;
 pub mod parser;
+pub mod resolver;
 
 // Re-export `CompiledPlan` as the primary output type.
 pub use gaviero_core::swarm::plan::CompiledPlan;
@@ -84,4 +85,26 @@ pub fn compile_with_vars(
         override_vars,
     )
     .map_err(|e| miette::Report::new(e))
+}
+
+/// Compile a `.gaviero` script from disk, resolving any `include "..."`
+/// statements transitively. This is the entry point you want for scripts
+/// that share `client {}` / `prompt {}` / `vars {}` across files.
+///
+/// `entry_path` is the top-level script. `include` paths are resolved
+/// relative to the directory of the file containing the `include`. Cycles
+/// are rejected with a diagnostic anchored at the offending statement.
+///
+/// For inline scripts that don't need includes, use [`compile`] /
+/// [`compile_with_vars`] — those paths reject `include` statements with a
+/// diagnostic pointing the caller here.
+pub fn compile_file(
+    entry_path: &std::path::Path,
+    workflow: Option<&str>,
+    runtime_prompt: Option<&str>,
+    override_vars: &[(String, String)],
+) -> Result<CompiledPlan, miette::Report> {
+    let (script, sources) = resolver::resolve(entry_path).map_err(miette::Report::new)?;
+    compiler::compile_ast_with_sources(&script, &sources, workflow, runtime_prompt, override_vars)
+        .map_err(miette::Report::new)
 }

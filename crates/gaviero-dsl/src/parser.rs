@@ -315,6 +315,7 @@ where
                 privacy,
                 is_default,
                 span: e.span(),
+                file_id: 0,
             }
         });
 
@@ -657,6 +658,7 @@ where
                 vars,
                 tools,
                 span: e.span(),
+                file_id: 0,
             }
         });
 
@@ -899,6 +901,7 @@ where
                 escalate_after,
                 verify,
                 span: e.span(),
+                file_id: 0,
             }
         });
 
@@ -918,6 +921,7 @@ where
                 content,
                 content_span,
                 span: e.span(),
+                file_id: 0,
             },
         );
 
@@ -938,12 +942,23 @@ where
                 client_ref,
                 client_ref_span,
                 span: e.span(),
+                file_id: 0,
             },
         );
+
+    // ── top-level include: `include "path"` ──────────────────────
+    let include_decl = just(Token::KwInclude)
+        .ignore_then(string.map_with(|s, e| (s, e.span())))
+        .map_with(|(path, path_span), e| IncludeDecl {
+            path,
+            path_span,
+            span: e.span(),
+        });
 
     // ── top-level ─────────────────────────────────────────────────
 
     let item = choice((
+        include_decl.map(Item::Include),
         client_decl.map(Item::Client),
         agent_decl.map(Item::Agent),
         workflow_decl.map(Item::Workflow),

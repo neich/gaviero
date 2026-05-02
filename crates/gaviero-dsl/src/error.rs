@@ -36,6 +36,19 @@ pub enum DslError {
         span: SourceSpan,
         reason: String,
     },
+
+    /// Failure resolving an `include "..."` directive (path missing,
+    /// I/O error, cycle detected). Reports the span of the include
+    /// statement in its containing file.
+    #[error("{reason}")]
+    #[diagnostic(code(gaviero::dsl::include))]
+    Include {
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("here")]
+        span: SourceSpan,
+        reason: String,
+    },
 }
 
 /// Container for one or more DSL errors.

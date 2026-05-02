@@ -256,7 +256,17 @@ pub(super) fn handle_run_script_command(app: &mut App) {
 
     let source = extract_gaviero_block(&raw);
     let filename = resolved.display().to_string();
-    let compiled = match gaviero_dsl::compile(&source, &filename, None, runtime_prompt.as_deref()) {
+    // When the file is a pure .gaviero script (no markdown wrapping), use
+    // compile_file so `include "..."` directives resolve relative to the
+    // script's directory. When the script was extracted from a markdown
+    // block, fall back to inline compile — includes aren't supported there
+    // because there's no anchoring file path inside a doc fence.
+    let compiled = if source == raw {
+        gaviero_dsl::compile_file(&resolved, None, runtime_prompt.as_deref(), &[])
+    } else {
+        gaviero_dsl::compile(&source, &filename, None, runtime_prompt.as_deref())
+    };
+    let compiled = match compiled {
         Ok(c) => c,
         Err(report) => {
             app.chat_state
