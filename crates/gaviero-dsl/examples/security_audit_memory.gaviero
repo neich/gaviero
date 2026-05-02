@@ -1,39 +1,25 @@
-// Security audit workflow demonstrating the memory {} block.
+// Reference example for the `memory {}` block. Use as a pattern catalog,
+// not as a runnable security-audit workflow — for a real audit, prompt an
+// agent directly. The agents here exist mainly to give the memory blocks
+// realistic context.
 //
-// Features shown:
+// What this file demonstrates:
 //   - workflow-level memory defaults (read_ns, write_ns)
-//   - per-agent memory overrides (write_ns overrides workflow default)
+//   - per-agent overrides (agent write_ns overrides workflow's)
 //   - additive read_ns merge (workflow ns + agent-specific ns)
 //   - importance weighting
 //   - staleness_sources for automatic cache invalidation
-//   - privacy interaction (local_only client writes are filtered from public agents)
+//   - privacy interaction (local_only client writes are filtered out of
+//     public agents reading the same namespace)
 
 // ── Clients ──────────────────────────────────────────────────────────────────
-
-client opus {
-    tier expensive
-    model "claude:opus"
-    privacy public
-}
-
-client sonnet {
-    tier expensive
-    model "claude:sonnet"
-    privacy public
-}
-
-client haiku {
-    tier cheap
-    model "claude:haiku"
-    privacy public
-}
-
-// local_only: results written with privacy=local_only are invisible to
-// public-tier agents reading the same namespace via search_context_filtered.
-client local {
-    tier cheap
-    privacy local_only
-}
+//
+// Pulls in the shared client library. The privacy-interaction bullet at
+// the top of this file refers to a `privacy local_only` client; if you
+// want to demonstrate that, add one locally:
+//   client local { privacy local_only }
+// and bind the relevant agent to it.
+include "clients.gaviero"
 
 // ── Agents ───────────────────────────────────────────────────────────────────
 
@@ -92,7 +78,7 @@ primary reference. Apply minimal, targeted fixes without refactoring.
 
 agent write_tests {
     description "Write security regression tests"
-    client haiku
+    client sonnet
     depends_on [fix]
     scope {
         owned    ["tests/security/"]
