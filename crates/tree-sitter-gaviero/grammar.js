@@ -10,6 +10,7 @@ module.exports = grammar({
 
     _definition: ($) =>
       choice(
+        $.include_declaration,
         $.client_declaration,
         $.agent_declaration,
         $.workflow_declaration,
@@ -17,6 +18,13 @@ module.exports = grammar({
         $.tier_alias_declaration,
         $.vars_block,
       ),
+
+    // ── Include ──────────────────────────────────────────────────
+    // include "path/to/lib.gaviero"
+    // Path is resolved relative to the including file's directory by the
+    // gaviero-dsl resolver. Cycle detection happens at compile time.
+    include_declaration: ($) =>
+      seq("include", $._string_value),
 
     // ── Comments ─────────────────────────────────────────────────
     comment: (_) => token(seq("//", /.*/)),
