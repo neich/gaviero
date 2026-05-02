@@ -1,0 +1,34 @@
+// `tier` is intentionally omitted from each client below: every agent in this
+// script binds to a concrete client by name (e.g. `client opus`), so a tier
+// label on the client block would be dead metadata. Tier labels only matter
+// when paired with a top-level `tier <alias> <client>` declaration *and*
+// agents that reference the alias via `tier <name>`.
+
+client opus {
+    model "claude:opus"
+    privacy public
+    effort max
+    default
+}
+
+client sonnet {
+    model "claude:sonnet"
+    privacy public
+    // The judge emits a short JSON verdict — no deep reasoning needed.
+    effort normal
+}
+
+client codex-5-5 {
+    model "codex:gpt-5.5"
+    privacy public
+    // xhigh would clamp to Codex's `high` — ask for high directly so the
+    // intent is explicit.
+    effort high
+}
+
+client codex-5-4 {
+    model "codex:gpt-5.4"
+    privacy public
+    effort medium
+}
+
