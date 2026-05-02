@@ -4,18 +4,18 @@
 // Two parallel analysis agents feed into the refactor agent.
 
 client opus {
-    tier coordinator
-    model "claude-opus-4-7"
+    tier expensive
+    model "claude:opus"
 }
 
 client sonnet {
-    tier execution
-    model "claude-sonnet-4-6"
+    tier cheap
+    model "claude:sonnet"
 }
 
 client haiku {
-    tier mechanical
-    model "claude-haiku-4-5"
+    tier cheap
+    model "claude:haiku"
     privacy local_only
 }
 

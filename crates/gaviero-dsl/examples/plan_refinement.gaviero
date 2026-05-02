@@ -17,7 +17,7 @@
 
 client opus {
     tier expensive
-    model "claude-opus-4-7"
+    model "claude:opus"
     privacy public
     effort auto
     extra {
@@ -40,7 +40,7 @@ client codex {
 
 client sonnet {
     tier cheap
-    model "claude-sonnet-4-6"
+    model "claude:sonnet"
     privacy public
     // The judge emits a short JSON verdict — no deep reasoning needed.
     effort low

@@ -48,7 +48,7 @@
 
 client opus {
     tier expensive
-    model "claude-opus-4-7"
+    model "claude:opus"
     effort high
     extra {
         // analyse_plan, phase_executor, and final_audit all do multi-document
@@ -65,7 +65,7 @@ client opus {
 // than trigger the "no client declared" warning + haiku default.
 client sonnet {
     tier cheap
-    model "claude-sonnet-4-6"
+    model "claude:sonnet"
     effort medium
     default
 }

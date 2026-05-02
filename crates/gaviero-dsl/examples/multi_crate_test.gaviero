@@ -4,8 +4,8 @@
 // then verifies tests pass across the entire workspace.
 
 client sonnet {
-    tier execution
-    model "claude-sonnet-4-6"
+    tier cheap
+    model "claude:sonnet"
 }
 
 agent change_core {

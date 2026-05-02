@@ -11,27 +11,27 @@
 // ── Clients ──────────────────────────────────────────────────────────────────
 
 client opus {
-    tier coordinator
-    model "claude-opus-4-7"
+    tier expensive
+    model "claude:opus"
     privacy public
 }
 
 client sonnet {
-    tier reasoning
-    model "claude-sonnet-4-6"
+    tier expensive
+    model "claude:sonnet"
     privacy public
 }
 
 client haiku {
-    tier execution
-    model "claude-haiku-4-5-20251001"
+    tier cheap
+    model "claude:haiku"
     privacy public
 }
 
 // local_only: results written with privacy=local_only are invisible to
 // public-tier agents reading the same namespace via search_context_filtered.
 client local {
-    tier mechanical
+    tier cheap
     privacy local_only
 }
 

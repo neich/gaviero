@@ -9,8 +9,8 @@
 // Usage:
 //   gaviero-cli --script sync_memory.gaviero
 
-client sonnet { tier cheap     model "claude-sonnet-4-6" }
-client opus   { tier expensive model "claude-opus-4-7" }
+client sonnet { tier cheap     model "claude:sonnet" }
+client opus   { tier expensive model "claude:opus" }
 
 // ── Phase 1: Audit current state ─────────────────────────────────────────────
 
