@@ -45,7 +45,33 @@ pub fn compile_ast_with_vars(
     runtime_prompt: Option<&str>,
     override_vars: &[(String, String)],
 ) -> Result<CompiledPlan, DslErrors> {
-    let src = || NamedSource::new(filename, source.to_string());
+    let sources = vec![(filename.to_string(), source.to_string())];
+    compile_ast_with_sources(script, &sources, workflow, runtime_prompt, override_vars)
+}
+
+/// Compile a script that may have been assembled from multiple files (one per
+/// `include` directive). `sources[i]` corresponds to `file_id == i` on each
+/// top-level declaration, so per-file diagnostics point at the original file
+/// the user wrote.
+///
+/// `sources[0]` is the entry file. Callers that don't use includes can pass a
+/// single-element slice; [`compile_ast_with_vars`] is the convenience wrapper.
+pub fn compile_ast_with_sources(
+    script: &Script,
+    sources: &[(String, String)],
+    workflow: Option<&str>,
+    runtime_prompt: Option<&str>,
+    override_vars: &[(String, String)],
+) -> Result<CompiledPlan, DslErrors> {
+    assert!(!sources.is_empty(), "compile requires at least one source");
+    let src_for = |fid: u32| -> NamedSource<String> {
+        let idx = fid as usize;
+        let (filename, content) = &sources[idx];
+        NamedSource::new(filename, content.clone())
+    };
+    // Entry-file convenience used for errors that aren't attributable to a
+    // particular declaration (e.g. workflow-not-found, multiple-workflows).
+    let src = || src_for(0);
 
     // ── Phase 1: index declarations ───────────────────────────────
 
@@ -67,7 +93,7 @@ pub fn compile_ast_with_vars(
             Item::Client(c) => {
                 if client_map.insert(c.name.as_str(), c).is_some() {
                     errors.push(DslError::Compile {
-                        src: src(),
+                        src: src_for(c.file_id),
                         span: (
                             c.name_span.start,
                             c.name_span.end.saturating_sub(c.name_span.start),
@@ -80,7 +106,7 @@ pub fn compile_ast_with_vars(
                 if c.is_default {
                     if default_client.is_some() {
                         errors.push(DslError::Compile {
-                            src: src(),
+                            src: src_for(c.file_id),
                             span: (
                                 c.name_span.start,
                                 c.name_span.end.saturating_sub(c.name_span.start),
@@ -96,7 +122,7 @@ pub fn compile_ast_with_vars(
             Item::Agent(a) => {
                 if agent_map.insert(a.name.as_str(), a).is_some() {
                     errors.push(DslError::Compile {
-                        src: src(),
+                        src: src_for(a.file_id),
                         span: (
                             a.name_span.start,
                             a.name_span.end.saturating_sub(a.name_span.start),
@@ -109,7 +135,7 @@ pub fn compile_ast_with_vars(
             Item::Workflow(w) => {
                 if workflow_map.insert(w.name.as_str(), w).is_some() {
                     errors.push(DslError::Compile {
-                        src: src(),
+                        src: src_for(w.file_id),
                         span: (
                             w.name_span.start,
                             w.name_span.end.saturating_sub(w.name_span.start),
@@ -125,7 +151,7 @@ pub fn compile_ast_with_vars(
                     .is_some()
                 {
                     errors.push(DslError::Compile {
-                        src: src(),
+                        src: src_for(p.file_id),
                         span: (
                             p.name_span.start,
                             p.name_span.end.saturating_sub(p.name_span.start),
@@ -138,7 +164,7 @@ pub fn compile_ast_with_vars(
             Item::TierAlias(ta) => {
                 if tier_alias_map.insert(ta.name.as_str(), ta).is_some() {
                     errors.push(DslError::Compile {
-                        src: src(),
+                        src: src_for(ta.file_id),
                         span: (
                             ta.name_span.start,
                             ta.name_span.end.saturating_sub(ta.name_span.start).max(1),
@@ -147,6 +173,24 @@ pub fn compile_ast_with_vars(
                         reason: format!("duplicate tier alias `{}`", ta.name),
                     });
                 }
+            }
+            Item::Include(inc) => {
+                // The include resolver should have replaced these with the
+                // included file's items. Reaching here means a caller invoked
+                // `compile`/`compile_with_vars` (which don't resolve includes)
+                // on a script that uses them — direct them to `compile_file`.
+                errors.push(DslError::Compile {
+                    src: src(),
+                    span: (
+                        inc.span.start,
+                        inc.span.end.saturating_sub(inc.span.start).max(1),
+                    )
+                        .into(),
+                    reason:
+                        "`include` is only supported when compiling from a file path; \
+                         use `gaviero_dsl::compile_file` (or `gaviero-cli --script`)"
+                            .to_string(),
+                });
             }
         }
     }
@@ -158,7 +202,7 @@ pub fn compile_ast_with_vars(
     for ta in tier_alias_map.values() {
         if !client_map.contains_key(ta.client_ref.as_str()) {
             errors.push(DslError::Compile {
-                src: src(),
+                src: src_for(ta.file_id),
                 span: (
                     ta.client_ref_span.start,
                     ta.client_ref_span
@@ -210,7 +254,7 @@ pub fn compile_ast_with_vars(
         Option<usize>,
         Option<&MemoryBlock>,
     ) = if let Some(wf) = selected_workflow {
-        let agents = ordered_agents_from_workflow(wf, &agent_map, source, filename)?;
+        let agents = ordered_agents_from_workflow(wf, &agent_map, sources)?;
         let mp = wf.max_parallel.as_ref().map(|(n, _)| *n);
         (agents, mp, wf.memory.as_ref())
     } else {
@@ -229,7 +273,7 @@ pub fn compile_ast_with_vars(
     };
 
     let loop_judge_decls = match selected_workflow {
-        Some(wf) => collect_loop_judge_agents(wf, &agent_map, &agent_order, source, filename)?,
+        Some(wf) => collect_loop_judge_agents(wf, &agent_map, &agent_order, sources)?,
         None => Vec::new(),
     };
 
@@ -249,8 +293,7 @@ pub fn compile_ast_with_vars(
             &script_vars,
             override_vars,
             workflow_memory,
-            source,
-            filename,
+            sources,
             runtime_prompt,
         ) {
             Ok(wu) => work_units.push(wu),
@@ -268,8 +311,7 @@ pub fn compile_ast_with_vars(
             &script_vars,
             override_vars,
             workflow_memory,
-            source,
-            filename,
+            sources,
             runtime_prompt,
         ) {
             Ok(wu) => loop_judge_units.push(wu),
@@ -285,7 +327,7 @@ pub fn compile_ast_with_vars(
                 for (dep_name, dep_span) in deps {
                     if !agent_map.contains_key(dep_name.as_str()) {
                         compile_errors.push(DslError::Compile {
-                            src: src(),
+                            src: src_for(decl.file_id),
                             span: (
                                 dep_span.start,
                                 dep_span.end.saturating_sub(dep_span.start).max(1),
@@ -310,12 +352,13 @@ pub fn compile_ast_with_vars(
 
     if let Some(cycle) = detect_cycle(&work_units) {
         let cycle_agent = agent_map.get(cycle[0].as_str());
+        let cycle_fid = cycle_agent.map(|a| a.file_id).unwrap_or(0);
         let span = cycle_agent
             .and_then(|a| a.depends_on.as_ref())
             .map(|(_, s)| (s.start, s.end.saturating_sub(s.start).max(1)))
             .unwrap_or((0, 1));
         return Err(DslErrors::single(DslError::Compile {
-            src: src(),
+            src: src_for(cycle_fid),
             span: span.into(),
             reason: format!("dependency cycle detected: {}", cycle.join(" -> ")),
         }));
@@ -453,10 +496,12 @@ fn detect_cycle(work_units: &[WorkUnit]) -> Option<Vec<String>> {
 fn ordered_agents_from_workflow<'a>(
     wf: &WorkflowDecl,
     agent_map: &HashMap<&str, &'a AgentDecl>,
-    source: &str,
-    filename: &str,
+    sources: &[(String, String)],
 ) -> Result<Vec<&'a AgentDecl>, DslErrors> {
-    let src = || NamedSource::new(filename, source.to_string());
+    let src = || {
+        let (filename, content) = &sources[wf.file_id as usize];
+        NamedSource::new(filename, content.clone())
+    };
 
     let steps = match &wf.steps {
         Some((s, _)) => s,
@@ -514,10 +559,12 @@ fn collect_loop_judge_agents<'a>(
     wf: &WorkflowDecl,
     agent_map: &HashMap<&str, &'a AgentDecl>,
     primary_agents: &[&'a AgentDecl],
-    source: &str,
-    filename: &str,
+    sources: &[(String, String)],
 ) -> Result<Vec<&'a AgentDecl>, DslErrors> {
-    let src = || NamedSource::new(filename, source.to_string());
+    let src = || {
+        let (filename, content) = &sources[wf.file_id as usize];
+        NamedSource::new(filename, content.clone())
+    };
 
     let Some((steps, _)) = &wf.steps else {
         return Ok(Vec::new());
@@ -642,11 +689,13 @@ fn compile_agent(
     script_vars: &[(String, String)],
     override_vars: &[(String, String)],
     workflow_memory: Option<&MemoryBlock>,
-    source: &str,
-    filename: &str,
+    sources: &[(String, String)],
     runtime_prompt: Option<&str>,
 ) -> Result<WorkUnit, DslError> {
-    let src = || NamedSource::new(filename, source.to_string());
+    let src = || {
+        let (filename, content) = &sources[decl.file_id as usize];
+        NamedSource::new(filename, content.clone())
+    };
 
     // ── Reject mutually-exclusive client + tier ──────────────────
     //
@@ -718,7 +767,7 @@ fn compile_agent(
             .unwrap_or_default();
         let model = cd.model.as_ref().map(|(m, _)| m.clone());
         let effort = cd.effort.as_ref().map(|(e, _)| e.clone());
-        let extra = compile_extra(&cd.extra, &cd.name, source, filename)?;
+        let extra = compile_extra(&cd.extra, &cd.name, sources, cd.file_id)?;
         let privacy = cd
             .privacy
             .as_ref()
@@ -973,8 +1022,8 @@ fn compile_agent(
 fn compile_extra(
     pairs: &[ExtraPair],
     client_name: &str,
-    source: &str,
-    filename: &str,
+    sources: &[(String, String)],
+    client_file_id: u32,
 ) -> Result<Vec<(String, String)>, DslError> {
     let mut seen: HashMap<&str, &Span> = HashMap::new();
     let mut out: Vec<(String, String)> = Vec::with_capacity(pairs.len());
@@ -983,8 +1032,9 @@ fn compile_extra(
         if let Some(_first) = seen.insert(pair.key.as_str(), &pair.key_span) {
             // HashMap::insert returns the *previous* span; `pair.key_span` is
             // the second occurrence, which is what we want to point at.
+            let (filename, content) = &sources[client_file_id as usize];
             return Err(DslError::Compile {
-                src: NamedSource::new(filename, source.to_string()),
+                src: NamedSource::new(filename, content.clone()),
                 span: (
                     pair.key_span.start,
                     pair.key_span.end.saturating_sub(pair.key_span.start).max(1),
