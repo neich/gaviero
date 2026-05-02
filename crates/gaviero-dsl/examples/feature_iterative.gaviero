@@ -8,8 +8,8 @@
 //   gaviero-cli --script feature_iterative.gaviero \
 //     --task "add rate limiting middleware with per-user and per-endpoint quotas"
 
-client sonnet { tier cheap     model "claude-sonnet-4-6" effort medium }
-client opus   { tier expensive model "claude-opus-4-7"   effort high }
+client sonnet { tier cheap     model "claude:sonnet" effort medium }
+client opus   { tier expensive model "claude:opus"   effort high }
 
 // Tier aliases let agents bind to a role (`tier expensive`) instead of a
 // concrete profile (`client opus`). A CLI override can then swap the binding
