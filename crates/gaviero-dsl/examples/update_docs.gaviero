@@ -9,10 +9,10 @@
 // Usage:
 //   gaviero-cli --script update_docs.gaviero
 
-client sonnet { tier cheap     model "claude-sonnet-4-6" effort medium default }
+client sonnet { tier cheap     model "claude:sonnet" effort medium default }
 client opus {
     tier expensive
-    model "claude-opus-4-7"
+    model "claude:opus"
     effort high
     extra {
         // CLAUDE.md and ARCHITECTURE.md synthesis reads the whole workspace
