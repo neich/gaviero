@@ -13,15 +13,15 @@
 //                                          plan reflects the codebase as it now is.
 //     execute_module      (opus)         — applies every accepted finding for
 //                                          THIS module in one focused agent turn.
-//     verify_module       (sonnet)       — runs targeted tests for the module;
-//                                          on failure marks the iteration STOP.
-//     until agent module_judge (sonnet)  — exits when iteration count == MODULE_COUNT
-//                                          or any verify ends with VERDICT: STOP.
+//     until agent module_judge (sonnet)  — exits when the latest apply-N.md starts
+//                                          with `HALTED:` (replan_module emits that
+//                                          when iter > MODULE_COUNT or upstream
+//                                          halt-propagation tripped).
 //     max_iterations 24
 //   }
 //     ↓
-//   test_audit            (opus)         — final pass: proposes missing integration
-//                                          tests (now that the codebase has settled).
+//   test_audit            (opus)         — proposes + writes integration tests
+//                                          against the now-settled codebase.
 //     ↓
 //   final_verify          (sonnet)       — full test suite + git-diff summary;
 //                                          writes final-verification.md
@@ -37,6 +37,15 @@
 //   This costs more tokens than the precomputed-then-apply shape, but
 //   that's the trade — correctness over throughput.
 //
+// Why no per-iteration verify_module agent:
+//   The previous version had a `verify_module` agent inside the loop body
+//   that ran `cargo test -p <crate>` and emitted VERDICT: PASS / STOP. It
+//   was a probabilistic failure point (sonnet sometimes didn't write the
+//   expected verify-N.md file at all) AND it duplicated the workflow-level
+//   `verify { compile true clippy true test true }` safety net that runs
+//   at workflow exit. Dropping it simplifies the loop body and removes
+//   the most fragile termination signal.
+//
 // Cross-iteration state propagation:
 //   The `branch_chain stacked` setting on the loop is load-bearing. Without
 //   it, gaviero's worktree provisioner resets each iteration to the workspace's
@@ -49,14 +58,15 @@
 //
 // Tier policy:
 //   * Hard reasoning per iteration (replan, execute, test_audit) — opus.
-//   * Coordination/verdict (verify_module, module_judge, final_verify) — sonnet.
+//   * Coordination/verdict (module_judge, final_verify) — sonnet.
 //
 // Halt-propagation:
 //   * inventory writes `MODULE_COUNT: <integer>`. If unreviewable, ends with
 //     `VERDICT: STOP: <reason>` and downstream phases short-circuit.
-//   * verify_module ends each iteration with `VERDICT: PASS` or `VERDICT: STOP`.
-//     STOP halts the outer loop. The next replan iteration would have read
-//     a broken codebase, so refusing to advance is the right call.
+//   * replan_module's STEP 0 emits `HALTED:` to plan-{{ITER}}.md when
+//     `{{ITER}} > MODULE_COUNT` (or inventory said STOP). execute_module
+//     propagates the HALTED line into apply-{{ITER}}.md. module_judge keys
+//     off that single signal — any HALTED apply-N.md exits the loop.
 //
 // Usage:
 //   gaviero-cli --script codebase_review.gaviero
@@ -125,7 +135,7 @@ prompt inventory-body #"
 
         VERDICT: PROCEED
 
-    The `MODULE_COUNT` line is parsed by the loop judge — be exact.
+    The `MODULE_COUNT` line is parsed by replan_module's halt check — be exact.
     Each module heading must be `## Module <N> — <name>`, numbered from 1.
 
     If the repo isn't reviewable in this shape (no recognisable modules,
@@ -146,13 +156,13 @@ prompt replan-body #"
 
           HALTED: nothing to plan (inventory STOP or module count exceeded)
 
-      and exit without further analysis.
+      and exit without further analysis. The `HALTED:` token is the loop's
+      termination signal — module_judge keys off it.
 
-      If iteration {{ITER}} > 1, also read
-      {{OUT_DIR}}/verify-{{PREV_ITER}}.md. If its last line is
-      `VERDICT: STOP: …`, write `HALTED: <quote stop reason>` to
-      plan-{{ITER}}.md and exit. The previous iteration broke something
-      and the codebase is unsafe to plan against.
+      If iteration {{ITER}} > 1, also read {{OUT_DIR}}/apply-{{PREV_ITER}}.md.
+      If it starts with `HALTED:`, write `HALTED: <quote prior reason>` to
+      plan-{{ITER}}.md and exit. Halts propagate forward; no iteration may
+      plan against a halted predecessor.
 
     STEP 1 — locate your module.
       From {{OUT_DIR}}/inventory.md, read the section headed
@@ -245,7 +255,9 @@ prompt execute-body #"
 
           HALTED: <quote the plan's halt reason>
 
-      and exit without modifying any source files.
+      and exit without modifying any source files. The `HALTED:` token MUST
+      propagate verbatim to apply-{{ITER}}.md — module_judge reads that file
+      to detect loop termination.
 
     STEP 1 — read your apply list.
       Parse the APPLY_LIST in {{OUT_DIR}}/plan-{{ITER}}.md. Process the
@@ -298,55 +310,27 @@ prompt execute-body #"
           - "" (empty) is fine if nothing crossed module boundaries.
 "#
 
-prompt verify-body #"
-    You are gating the outer loop after iteration {{ITER}}. Cheap pass:
-    just confirm the codebase still compiles and the module's targeted
-    tests pass.
-
-    Read:
-      - {{OUT_DIR}}/apply-{{ITER}}.md (especially DEVIATIONS / DISCOVERIES)
-      - The git diff for files modified in this iteration
-
-    Run targeted tests for the affected module (cargo test -p <crate>,
-    equivalent for the language). Do NOT run the full workspace suite —
-    final_verify handles that.
-
-    Write {{OUT_DIR}}/verify-{{ITER}}.md. End with exactly one of:
-
-        VERDICT: PASS
-        VERDICT: STOP: <one-paragraph reason>
-
-    Return STOP when:
-      - The module's targeted tests fail and the failure isn't trivially
-        fixable.
-      - apply-{{ITER}}.md starts with `HALTED:` — propagate.
-      - DISCOVERIES section reveals that something further down the line
-        is now broken (e.g. removed a public API that downstream modules
-        use, but couldn't update them this iteration).
-      - The module's compile is broken in a way that would corrupt the
-        next iteration's replan.
-
-    Return PASS otherwise. Minor TODOs in apply-{{ITER}}.md don't justify
-    STOP — surfacing them in DEVIATIONS is enough; downstream replans will
-    see them.
-"#
-
 prompt module-judge-body #"
     You decide whether the per-module loop is finished.
 
     {{ITER_EVIDENCE}}
 
-    Read {{OUT_DIR}}/inventory.md and parse the `MODULE_COUNT: <N>` line.
+    Read {{OUT_DIR}}/apply-{{ITER}}.md. The first line tells you everything
+    you need:
 
-    Return PASS (loop exits) when ANY of:
-      1. Iteration {{ITER}} >= MODULE_COUNT — every module has been planned
-         and applied.
-      2. The latest plan-{{ITER}}.md or apply-{{ITER}}.md starts with
-         `HALTED:`.
-      3. The latest verify-{{ITER}}.md ends with `VERDICT: STOP:`.
+      - If it starts with `HALTED:` → emit PASS (loop exits).
+        The replan/execute pair stamps `HALTED:` as the first line whenever
+        iteration {{ITER}} has nothing to do (count exceeded, inventory STOP,
+        upstream halt). That is the canonical termination signal.
 
-    Return FAIL — the next iteration runs replan_module then execute_module
-    then verify_module for module {{ITER}}+1.
+      - Otherwise → emit FAIL (loop runs another iteration).
+        The next iteration's replan_module will re-evaluate against the
+        current codebase and either plan module {{ITER}}+1 or emit `HALTED:`
+        itself, terminating the loop on its own halt check.
+
+    Do NOT try to read inventory.md, count modules yourself, or second-guess
+    apply-{{ITER}}.md's first-line marker. The halt-propagation chain is the
+    single source of truth.
 
     Output format — emit exactly one fenced JSON object as your last output:
 
@@ -410,15 +394,14 @@ prompt final-verify-body #"
 
     Read:
       - {{OUT_DIR}}/inventory.md
-      - Every {{OUT_DIR}}/plan-*.md, apply-*.md, verify-*.md
+      - Every {{OUT_DIR}}/plan-*.md and apply-*.md
       - {{OUT_DIR}}/test-audit.md
       - The full git diff vs the pre-swarm SHA
 
     Run the complete test suite (cargo test --workspace, npm test, etc.).
 
     Write {{OUT_DIR}}/final-verification.md with:
-      - Modules processed: which iterations ran, which halted, which were
-        skipped (mid-loop STOP).
+      - Modules processed: which iterations ran, which halted.
       - Findings landed vs deferred: rough count by severity.
       - Test results: pass/fail counts; regressions vs pre-swarm baseline.
       - Lint/clippy diffs: any new warnings introduced.
@@ -454,7 +437,7 @@ agent inventory {
 // One generic per-module replanner — runs once per outer loop iteration,
 // re-reading the current codebase (post any prior-iteration edits).
 // Owns every plan-N.md slot via a glob; the validator allows overlap with
-// execute_module / verify_module because they share the same loop group.
+// execute_module because they share the same loop group.
 agent replan_module {
     description "Replan module {{ITER}} against the current codebase state"
     client opus
@@ -470,8 +453,7 @@ agent replan_module {
 // One generic per-module executor — applies the entire APPLY_LIST from
 // this iteration's plan in a single agent turn. Wide owned scope is the
 // cost of not knowing the module's path until runtime; the validator
-// accepts overlap with replan_module / verify_module because they share
-// the same loop group.
+// accepts overlap with replan_module because they share the same loop group.
 // Owned scope is src/ + crates/ + the per-iteration apply log. Tests/ is
 // deliberately NOT in here even though some findings might touch tests:
 // the test_audit phase owns tests/ end-to-end (test changes belong there,
@@ -490,20 +472,8 @@ agent execute_module {
     max_retries 2
 }
 
-agent verify_module {
-    description "Verify module {{ITER}} compiles and targeted tests pass"
-    client sonnet
-    depends_on [execute_module]
-    scope {
-        owned     ["{{OUT_DIR}}/verify-*.md"]
-        read_only ["{{OUT_DIR}}/" "src/" "crates/" "tests/"]
-    }
-    prompt verify-body
-    max_retries 1
-}
-
 agent module_judge {
-    description "Judge whether all modules have been planned and applied"
+    description "Judge whether the per-module loop is finished"
     client sonnet
     scope {
         read_only ["{{OUT_DIR}}/"]
@@ -514,10 +484,11 @@ agent module_judge {
 agent test_audit {
     description "Audit tests + add critical/high integration coverage"
     client opus
-    // Wait for the loop to settle. depends_on a loop body agent works
-    // because the workflow's `steps` list injects implicit ordering
-    // barriers between adjacent steps.
-    depends_on [verify_module]
+    // depends_on a loop body agent — the runtime defers any tier whose
+    // units transitively depend on a loop body until AFTER the explicit
+    // loop's iterations have all run, so test_audit sees the settled
+    // post-loop state of apply-*.md (not the pre-loop empty state).
+    depends_on [execute_module]
     scope {
         owned     ["{{OUT_DIR}}/test-audit.md" "tests/"]
         read_only ["{{OUT_DIR}}/" "src/" "crates/" "Cargo.toml"]
@@ -541,7 +512,8 @@ agent final_verify {
         write_ns      "review-history"
         importance    0.9
         write_content #"
-            Codebase review (replan-per-module) — {{SUMMARY}}
+            Codebase review (replan-per-module) — applied: see
+            {{OUT_DIR}}/final-verification.md
         "#
         staleness_sources ["src/" "crates/"]
     }
@@ -549,31 +521,36 @@ agent final_verify {
 
 // ── Workflow ─────────────────────────────────────────────────────────────────
 //
-// One outer dynamic-count loop: replan_module → execute_module → verify_module.
-// stability 1 because the judge is a deterministic counter — no need to
-// re-confirm a PASS verdict.
+// One outer dynamic-count loop: replan_module → execute_module.
+// stability 1 because module_judge is a deterministic apply-N.md probe — no
+// re-confirmation needed.
 //
 // strict_judge true to surface unparseable judge output as a hard failure
 // rather than silently treating it as FAIL (which would prematurely exit
 // the loop and leave most modules unprocessed).
 //
+// iter_start 1 is explicit even though it's the default — surfaces the
+// invariant that {{ITER}} starts at 1 (matching `## Module 1 — …` in
+// inventory.md).
+//
 // max_iterations 24 is a safety cap, not the actual count. Most repos have
-// well under 24 modules; if yours has more, raise this. If MODULE_COUNT
-// exceeds max_iterations the cap wins — the test_audit and final_verify
-// phases still run on whatever was processed.
+// well under 24 modules; if yours has more, raise this. Loop termination is
+// driven by replan_module's HALTED stamp — once iteration {{ITER}} exceeds
+// MODULE_COUNT, replan emits HALTED, execute propagates it, module_judge
+// PASSes, and the loop exits well before max_iterations.
 //
 // max_parallel 1 because the whole point is sequential: each iteration
 // MUST see prior iterations' edits. No fan-out.
 //
 // Workflow-level verify { compile true clippy true test true } is the
-// runtime safety net — catches a broken build at workflow exit even if
-// verify_module said PASS.
+// runtime safety net — catches a broken build at workflow exit.
 
 workflow codebase_review {
     steps [
         inventory
         loop {
-            agents         [replan_module execute_module verify_module]
+            agents         [replan_module execute_module]
+            iter_start     1
             max_iterations 24
             stability      1
             judge_timeout  60
