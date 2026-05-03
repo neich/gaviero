@@ -992,26 +992,69 @@ pub async fn execute(
             loop_config.branch_chain,
             crate::swarm::plan::BranchChainMode::Stacked
         );
+        // Iteration 1's chain anchor must include any commits produced by
+        // the loop body's transitive non-stacked predecessors (e.g. a
+        // pre-loop `inventory` agent whose output the body's prompt expects
+        // to read). Those agents commit to their own `gaviero/{id}` branches
+        // and the merge phase doesn't run until workflow exit, so workspace
+        // HEAD does NOT contain their outputs. Anchoring iter 1 at workspace
+        // HEAD therefore made every body iteration start blind to its own
+        // prerequisites — the silent failure mode that produced the all-
+        // HALTED 24-iteration run.
         let mut chain_anchor: Option<String> = if stacked {
-            // Default to the workspace's HEAD as the first iteration's base.
-            // pre_swarm_sha was computed earlier in execute() — but it's not
-            // in scope here. Use the worktree manager's head_commit() if
-            // available, else fall back to plain `provision()` semantics.
-            worktree_mgr
-                .as_ref()
-                .and_then(|_mgr| {
-                    // Resolve the workspace HEAD via git directly.
-                    std::process::Command::new("git")
-                        .args(["rev-parse", "HEAD"])
-                        .current_dir(&config.workspace_root)
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::null())
-                        .output()
-                        .ok()
-                        .filter(|o| o.status.success())
-                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                        .filter(|s| !s.is_empty())
-                })
+            let body_set: std::collections::HashSet<&str> =
+                loop_config.agent_ids.iter().map(String::as_str).collect();
+            // Walk depends_on transitively from each body agent, collecting
+            // dep ids that are NOT themselves loop body agents.
+            let mut visited: std::collections::HashSet<String> = Default::default();
+            let mut queue: Vec<String> =
+                loop_config.agent_ids.iter().cloned().collect();
+            while let Some(id) = queue.pop() {
+                if let Some(unit) = unit_map.get(id.as_str()) {
+                    for d in &unit.depends_on {
+                        if body_set.contains(d.as_str()) {
+                            continue;
+                        }
+                        if visited.insert(d.clone()) {
+                            queue.push(d.clone());
+                        }
+                    }
+                }
+            }
+            // Pull each predecessor's committed branch from its manifest.
+            let dep_branches: Vec<String> = all_manifests
+                .iter()
+                .filter(|m| visited.contains(&m.work_unit_id))
+                .filter(|m| matches!(m.status, AgentStatus::Completed))
+                .filter_map(|m| m.branch.clone())
+                .collect();
+            match dep_branches.len() {
+                0 => {
+                    // No pre-loop deps — anchor at workspace HEAD.
+                    worktree_mgr.as_ref().and_then(|mgr| mgr.head_commit().ok())
+                }
+                1 => {
+                    // Single predecessor — chain off its committed tip so
+                    // iter 1 sees its outputs.
+                    let branch = &dep_branches[0];
+                    worktree_mgr.as_ref().and_then(|mgr| mgr.branch_tip(branch))
+                }
+                n => {
+                    // Multi-dep case: composing N parallel branches into a
+                    // single base requires merge-conflict semantics that
+                    // belong in the merge phase, not here. Bail with a
+                    // pointer to the consolidation pattern.
+                    anyhow::bail!(
+                        "loop with branch_chain=stacked has {} non-stacked predecessor agents \
+                         ({}); the runtime currently supports 0 or 1 pre-loop dependencies. \
+                         Either consolidate the predecessors into one agent, or add a \
+                         synthesizing dep agent that depends_on all of them and combines \
+                         their outputs into a single branch.",
+                        n,
+                        dep_branches.join(", ")
+                    );
+                }
+            }
         } else {
             None
         };
