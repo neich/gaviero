@@ -529,7 +529,7 @@ impl WorktreeManager {
     }
 
     /// Get the current HEAD commit SHA (full hash).
-    fn head_commit(&self) -> Result<String> {
+    pub fn head_commit(&self) -> Result<String> {
         let output = Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(&self.repo_dir)
