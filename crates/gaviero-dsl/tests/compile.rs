@@ -316,10 +316,15 @@ fn example_codebase_review() {
     let plan = compile_example_plan("codebase_review.gaviero");
     let units = plan.work_units_ordered().expect("toposort");
 
-    // Sequential per-module loop with replan + execute + verify, plus
-    // inventory upstream and test_audit + final_verify downstream.
-    // Ordering: inventory → loop body (3 agents) → test_audit → final_verify
-    assert_eq!(units.len(), 6);
+    // Sequential per-module loop with replan + execute, plus inventory
+    // upstream and test_audit + final_verify downstream. The previous
+    // shape included a per-iteration verify_module agent; that proved
+    // fragile (sonnet sometimes never wrote the expected verify-N.md)
+    // and duplicated the workflow-level `verify {compile true ...}`
+    // safety net. The current shape relies on halt-propagation through
+    // apply-{{ITER}}.md instead.
+    // Ordering: inventory → loop body (2 agents) → test_audit → final_verify
+    assert_eq!(units.len(), 5);
     let ids: Vec<&str> = units.iter().map(|u| u.id.as_str()).collect();
     assert!(
         ids.contains(&"inventory"),
@@ -328,7 +333,7 @@ fn example_codebase_review() {
     );
     assert!(ids.contains(&"replan_module"));
     assert!(ids.contains(&"execute_module"));
-    assert!(ids.contains(&"verify_module"));
+    assert!(!ids.contains(&"verify_module"), "verify_module was removed");
     assert!(ids.contains(&"test_audit"));
     assert!(ids.contains(&"final_verify"));
 
@@ -336,13 +341,14 @@ fn example_codebase_review() {
     assert_eq!(plan.loop_judge_units.len(), 1);
     assert_eq!(plan.loop_judge_units[0].id, "module_judge");
 
-    // Single sequential loop with all three body agents.
+    // Single sequential loop with the two body agents.
     assert_eq!(plan.loop_configs.len(), 1);
     assert_eq!(
         plan.loop_configs[0].agent_ids,
-        vec!["replan_module", "execute_module", "verify_module"]
+        vec!["replan_module", "execute_module"]
     );
     assert_eq!(plan.loop_configs[0].max_iterations, 24);
+    assert_eq!(plan.loop_configs[0].iter_start, 1);
     // max_parallel 1 — sequential is the whole point of this example.
     assert_eq!(plan.max_parallel, Some(1));
     // The loop must use stacked mode — without it, iter N's replan_module
@@ -352,14 +358,12 @@ fn example_codebase_review() {
         gaviero_core::swarm::plan::BranchChainMode::Stacked
     );
 
-    // test_audit depends on the loop body so it runs AFTER iterations settle.
+    // test_audit depends on the loop body so it runs AFTER iterations settle
+    // (gated by the post-loop tier dispatch in `swarm::pipeline`).
     let test_audit = units.iter().find(|u| u.id == "test_audit").unwrap();
     assert!(
-        test_audit
-            .depends_on
-            .iter()
-            .any(|d| d == "verify_module" || d == "execute_module"),
-        "test_audit should depend on a loop body agent, got {:?}",
+        test_audit.depends_on.iter().any(|d| d == "execute_module"),
+        "test_audit should depend on execute_module, got {:?}",
         test_audit.depends_on
     );
 
