@@ -619,6 +619,43 @@ pub async fn execute(
         })
         .flat_map(|lc| lc.agent_ids.iter().cloned())
         .collect();
+
+    // Loop body units (across all loop configs, regardless of branch_chain
+    // mode) plus their transitive descendants in the depends_on graph.
+    // These post-loop units are deferred from the first tier-dispatch pass
+    // and re-dispatched in tier order AFTER the explicit-loops block has
+    // run. Without this, a unit like `test_audit depends_on [execute_module]`
+    // dispatches as soon as its tier is reached — which is BEFORE
+    // execute_module's loop iterations 2..N actually run, so test_audit sees
+    // an empty workspace state. The deferral makes "depends on a loop body
+    // agent" mean "depends on the loop body having fully iterated".
+    let loop_body_agents: std::collections::HashSet<String> = plan
+        .loop_configs
+        .iter()
+        .flat_map(|lc| lc.agent_ids.iter().cloned())
+        .collect();
+    let post_loop_units: std::collections::HashSet<String> = {
+        let mut deps_of: std::collections::HashMap<&str, Vec<&str>> =
+            std::collections::HashMap::new();
+        for u in &work_units {
+            for d in &u.depends_on {
+                deps_of.entry(d.as_str()).or_default().push(u.id.as_str());
+            }
+        }
+        let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut queue: Vec<&str> = loop_body_agents.iter().map(String::as_str).collect();
+        while let Some(id) = queue.pop() {
+            if let Some(children) = deps_of.get(id) {
+                for &c in children {
+                    if out.insert(c.to_string()) {
+                        queue.push(c);
+                    }
+                }
+            }
+        }
+        out
+    };
+
     let loop_judge_map: std::collections::HashMap<&str, &WorkUnit> = plan
         .loop_judge_units
         .iter()
@@ -640,7 +677,10 @@ pub async fn execute(
                 // Stacked-mode loop body agents: tier dispatch hands them
                 // off to the loop block so all iterations (including #1)
                 // run with the per-iteration branch + chain anchor.
-                if stacked_loop_agents.contains(unit_id) {
+                // Post-loop units (transitively depend on a loop body agent)
+                // are deferred to the post-loop dispatch phase that runs
+                // AFTER the explicit-loops block.
+                if stacked_loop_agents.contains(unit_id) || post_loop_units.contains(unit_id) {
                     continue;
                 }
 
@@ -733,16 +773,18 @@ pub async fn execute(
             // Parallel execution within tier
             let mut handles = Vec::new();
 
-            // Register all agents as Pending before spawning
+            // Register all agents as Pending before spawning. Skip stacked
+            // loop body agents (handled by the loop block) and post-loop
+            // units (deferred to the post-loop dispatch phase).
             for unit_id in tier {
-                if stacked_loop_agents.contains(unit_id) {
+                if stacked_loop_agents.contains(unit_id) || post_loop_units.contains(unit_id) {
                     continue;
                 }
                 observer.on_agent_state_changed(unit_id, &AgentStatus::Pending, "queued");
             }
 
             for unit_id in tier {
-                if stacked_loop_agents.contains(unit_id) {
+                if stacked_loop_agents.contains(unit_id) || post_loop_units.contains(unit_id) {
                     continue;
                 }
                 let unit = (*unit_map
@@ -974,9 +1016,22 @@ pub async fn execute(
             None
         };
         if stacked && chain_anchor.is_none() {
-            tracing::warn!(
-                "branch_chain=stacked requested but workspace HEAD couldn't be resolved; \
-                 falling back to legacy reset-each-iteration provisioning"
+            // Hard-fail rather than silently degrading: the previous
+            // warn-and-fall-through path produced runs where iteration #1
+            // was silently skipped and iterations 2..N ran via the
+            // non-stacked legacy path, generating an off-by-one in
+            // {{ITER}} (Module 1 unprocessed) and no per-iteration branches
+            // in the repo's refs. Stacked is load-bearing for any workflow
+            // whose iterations must see prior iterations' edits — failing
+            // loudly forces the user to resolve the underlying issue
+            // (worktrees disabled, repo has no commits, etc.) instead of
+            // shipping a malformed deliverable.
+            anyhow::bail!(
+                "loop with branch_chain=stacked requires a resolvable workspace HEAD and \
+                 usable git worktrees, but neither was available (worktrees enabled = {}). \
+                 Ensure the workspace is a git repo with at least one commit and that \
+                 worktrees are enabled in SwarmConfig.",
+                config.use_worktrees
             );
         }
 
@@ -985,7 +1040,10 @@ pub async fn execute(
         // chained off the running anchor; the anchor advances after every
         // committed agent so the next agent in this iteration (and the
         // first agent of iteration 2) chains off the latest tip.
-        if stacked && chain_anchor.is_some() {
+        //
+        // The `chain_anchor.is_some()` guard the previous version had here
+        // is gone — the bail above guarantees Some when we reach this point.
+        if stacked {
             tracing::info!(
                 "Loop iteration 1/{} (stacked) for agents {:?}",
                 loop_config.max_iterations,
@@ -1299,6 +1357,98 @@ pub async fn execute(
                     loop_config.max_iterations,
                     loop_config.agent_ids
                 );
+            }
+        }
+    }
+
+    // 3c. Post-loop tier dispatch.
+    //
+    // Run units that were deferred from the first tier-dispatch pass because
+    // they transitively depend on a loop body agent. They walk the same tiers
+    // in dependency order. Sequential-only — these units are always linked
+    // by `depends_on` chains so parallel fan-out wouldn't help, and the
+    // workflow-author intent (test_audit then final_verify) is sequential.
+    if !post_loop_units.is_empty() {
+        observer.on_phase_changed("post-loop");
+        for tier in tiers.iter() {
+            for unit_id in tier {
+                if !post_loop_units.contains(unit_id) {
+                    continue;
+                }
+                if exec_state.status(unit_id) == NodeStatus::Completed {
+                    continue;
+                }
+                let unit = unit_map
+                    .get(unit_id.as_str())
+                    .with_context(|| format!("post-loop unit '{}' not found", unit_id))?;
+
+                exec_state.set_status(unit_id, NodeStatus::Running);
+                observer.on_agent_state_changed(unit_id, &AgentStatus::Running, &unit.description);
+                invalidate_stale_sources(&memory, unit, &config.workspace_root).await;
+
+                let effective_read_ns: Vec<String> = unit
+                    .read_namespaces
+                    .as_deref()
+                    .unwrap_or(config.read_namespaces.as_slice())
+                    .to_vec();
+                let agent_ctx = AgentRunContext {
+                    workspace_root: &config.workspace_root,
+                    context_files: &config.context_files,
+                    memory: memory.clone(),
+                    read_namespaces: &effective_read_ns,
+                    swarm_observer: observer,
+                    git_coordinator: git_coordinator.clone(),
+                    validation: validation_pipeline.clone(),
+                    board: Some(shared_board.clone()),
+                    repo_map: repo_map.clone(),
+                    impact_texts: impact_texts.clone(),
+                    pre_fetched_memory: pre_fetched_memory.clone(),
+                    mcp_config: config.mcp_config.clone(),
+                    swarm_extras: &config.swarm_extra_tools,
+                };
+                let manifest = run_single_agent(
+                    unit,
+                    worktree_mgr.as_mut(),
+                    &agent_ctx,
+                    &tier_router,
+                    &plan.iteration_config,
+                    make_observer(unit_id),
+                )
+                .await?;
+
+                let failed = matches!(manifest.status, AgentStatus::Failed(_));
+                if matches!(manifest.status, AgentStatus::Completed) {
+                    let b = bus.lock().await;
+                    b.broadcast(
+                        &manifest.work_unit_id,
+                        &format!("completed: {}", manifest.summary.as_deref().unwrap_or("")),
+                    );
+                    let effective_write_ns = unit
+                        .write_namespace
+                        .as_deref()
+                        .unwrap_or(&config.write_namespace);
+                    store_agent_result(
+                        &memory,
+                        &memory_writer,
+                        effective_write_ns,
+                        &manifest,
+                        unit,
+                        &run_id,
+                        &config.workspace_root,
+                    )
+                    .await;
+                }
+                exec_state.record_result(unit_id, manifest.clone());
+                if let Err(e) = exec_state.save(&plan_hash) {
+                    tracing::warn!("Failed to save execution state checkpoint: {}", e);
+                }
+                all_manifests.push(manifest);
+                if failed {
+                    // A post-loop failure aborts further post-loop dispatch
+                    // (e.g. final_verify shouldn't run if test_audit failed)
+                    // but is otherwise non-fatal — merge/teardown still run.
+                    break;
+                }
             }
         }
     }
