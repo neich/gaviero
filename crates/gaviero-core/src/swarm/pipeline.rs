@@ -2618,6 +2618,21 @@ mod tests {
         let bare = "```\n{\"pass\":false}\n```";
         assert_eq!(parse_judge_verdict(bare), Some(JudgeVerdict::Fail));
     }
+
+    #[test]
+    fn judge_verdict_parser_strips_turn_annotations_sidecar() {
+        // Subprocess agents append a <turn_annotations> JSON sidecar after
+        // every reply; the verdict should still parse cleanly when this
+        // block trails the verdict block (the sidecar's "decision" type
+        // tokens must not be confused for a verdict).
+        let text = "Reasoning.\n\n```json\n{\"verdict\":\"fail\",\"reason\":\"halted not seen\"}\n```\n\n<turn_annotations>\n{\"v\":1,\"flags\":[{\"type\":\"decision\",\"importance\":0.8,\"scope\":\"repo\",\"text\":\"…\",\"refs\":[]}]}\n</turn_annotations>";
+        assert_eq!(parse_judge_verdict(text), Some(JudgeVerdict::Fail));
+
+        // No fenced verdict at all — just prose ending in a sidecar. The
+        // line-scan PASS/FAIL fallback should still find the verdict.
+        let prose = "Looking at apply-1.md. First line: 'HALTED: nothing to plan'.\nVERDICT: PASS\n<turn_annotations>{\"v\":1,\"flags\":[]}</turn_annotations>";
+        assert_eq!(parse_judge_verdict(prose), Some(JudgeVerdict::Pass));
+    }
 }
 
 /// Collect a list of git-tracked files in the workspace for coordinator context.
@@ -2909,9 +2924,17 @@ async fn evaluate_loop_condition(
             condition_met
         }
         super::plan::LoopUntilCondition::Command(cmd) => {
+            // Substitute {{ITER}}/{{PREV_ITER}} so iteration-aware probes
+            // (e.g. `git show gaviero/foo-iter{{ITER}}:path/file.md`) can be
+            // expressed without going through an LLM judge.
+            let iter_str = current_iter_abs.to_string();
+            let prev_str = current_iter_abs.saturating_sub(1).to_string();
+            let expanded = cmd
+                .replace("{{ITER}}", &iter_str)
+                .replace("{{PREV_ITER}}", &prev_str);
             // Run the shell command; exit code 0 = condition met
             let result = tokio::process::Command::new("sh")
-                .args(["-c", cmd])
+                .args(["-c", expanded.as_str()])
                 .current_dir(&ctx.config.workspace_root)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -2923,7 +2946,14 @@ async fn evaluate_loop_condition(
 }
 
 fn parse_judge_verdict(text: &str) -> Option<JudgeVerdict> {
-    let trimmed = text.trim();
+    // Subprocess agents (notably Claude Code) append a
+    // `<turn_annotations>{…}</turn_annotations>` sidecar after every reply.
+    // The sidecar JSON contains literal "decision"/"importance" tokens which
+    // are not the judge's verdict and which can shadow the trailing fenced
+    // block the prompt asks for. Strip these blocks before parsing so the
+    // verdict-shaped output the prompt requested is what the parser sees.
+    let stripped = strip_turn_annotations(text);
+    let trimmed = stripped.trim();
     if trimmed.is_empty() {
         return None;
     }
@@ -2946,6 +2976,32 @@ fn parse_judge_verdict(text: &str) -> Option<JudgeVerdict> {
 
     // 3. Line scan, last-to-first: VERDICT-style line wins over incidental tokens.
     trimmed.lines().rev().find_map(parse_judge_verdict_line)
+}
+
+/// Remove every `<turn_annotations>...</turn_annotations>` block from `text`,
+/// returning a borrowed view when nothing was stripped and an owned `String`
+/// when at least one block was present. The sidecar is editor metadata, not
+/// part of the verdict the judge prompt asked for.
+fn strip_turn_annotations(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains("<turn_annotations>") {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find("<turn_annotations>") {
+        out.push_str(&rest[..open]);
+        let after_open = &rest[open..];
+        if let Some(close) = after_open.find("</turn_annotations>") {
+            rest = &after_open[close + "</turn_annotations>".len()..];
+        } else {
+            // Unterminated tag — drop the rest as it's clearly the sidecar
+            // and not the verdict.
+            rest = "";
+            break;
+        }
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
 }
 
 /// Extract the contents of the first ```json … ``` or ``` … ``` fenced block

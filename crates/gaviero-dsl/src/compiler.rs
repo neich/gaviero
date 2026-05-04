@@ -422,7 +422,7 @@ pub fn compile_ast_with_sources(
 
     // ── Phase 8: extract LoopConfigs from workflow steps ────────
 
-    let loop_configs = extract_loop_configs(selected_workflow);
+    let loop_configs = extract_loop_configs(selected_workflow, &script_vars, override_vars);
 
     let mut plan = CompiledPlan::from_work_units(work_units, workflow_max_parallel);
     plan.iteration_config = iteration_config;
@@ -1106,7 +1106,11 @@ fn build_verification_config(wf: &WorkflowDecl) -> gaviero_core::swarm::plan::Ve
         .unwrap_or_default()
 }
 
-fn extract_loop_configs(wf: Option<&WorkflowDecl>) -> Vec<LoopConfig> {
+fn extract_loop_configs(
+    wf: Option<&WorkflowDecl>,
+    script_vars: &[(String, String)],
+    override_vars: &[(String, String)],
+) -> Vec<LoopConfig> {
     let wf = match wf {
         Some(w) => w,
         None => return Vec::new(),
@@ -1122,7 +1126,7 @@ fn extract_loop_configs(wf: Option<&WorkflowDecl>) -> Vec<LoopConfig> {
             if let StepItem::Loop(lb) = step {
                 Some(LoopConfig {
                     agent_ids: lb.agents.iter().map(|(n, _)| n.clone()).collect(),
-                    until: map_until_condition(&lb.until),
+                    until: map_until_condition(&lb.until, script_vars, override_vars),
                     max_iterations: lb.max_iterations,
                     iter_start: lb.iter_start,
                     strict_judge: lb.strict_judge,
@@ -1144,7 +1148,11 @@ fn extract_loop_configs(wf: Option<&WorkflowDecl>) -> Vec<LoopConfig> {
         .collect()
 }
 
-fn map_until_condition(cond: &UntilCondition) -> LoopUntilCondition {
+fn map_until_condition(
+    cond: &UntilCondition,
+    script_vars: &[(String, String)],
+    override_vars: &[(String, String)],
+) -> LoopUntilCondition {
     match cond {
         UntilCondition::Verify(vb) => {
             LoopUntilCondition::Verify(gaviero_core::swarm::plan::VerificationConfig {
@@ -1155,7 +1163,13 @@ fn map_until_condition(cond: &UntilCondition) -> LoopUntilCondition {
             })
         }
         UntilCondition::Agent(name, _) => LoopUntilCondition::Agent(name.clone()),
-        UntilCondition::Command(cmd, _) => LoopUntilCondition::Command(cmd.clone()),
+        UntilCondition::Command(cmd, _) => {
+            // Substitute script-level + CLI override vars so probes can
+            // refer to {{OUT_DIR}} etc. {{ITER}} / {{PREV_ITER}} are
+            // reserved and substituted later by the runtime per iteration.
+            let expanded = apply_vars(cmd, script_vars, override_vars, &[], "", None);
+            LoopUntilCondition::Command(expanded)
+        }
     }
 }
 
