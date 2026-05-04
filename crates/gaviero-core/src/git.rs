@@ -538,12 +538,29 @@ pub struct WorktreeHandle {
 
 impl WorktreeManager {
     pub fn new(repo_dir: PathBuf) -> Self {
-        let worktree_base = std::env::temp_dir().join("gaviero-worktrees").join(
-            repo_dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("repo"),
-        );
+        // /tmp is often a small tmpfs (RAM-backed) on Linux. Stacked-loop
+        // workflows like codebase_review.gaviero spin up one worktree per
+        // iteration body agent (~14 for a 6-module review) and each carries
+        // its own target/ — that's tens of GB. Default off /tmp; let users
+        // override with GAVIERO_WORKTREE_BASE for repos that prefer a fast
+        // tmpfs or a different volume.
+        let repo_name = repo_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("repo");
+        let base_root = std::env::var("GAVIERO_WORKTREE_BASE")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var("XDG_CACHE_HOME").ok().map(|x| {
+                    PathBuf::from(x).join("gaviero-worktrees")
+                })
+            })
+            .or_else(|| {
+                dirs::home_dir().map(|h| h.join(".cache").join("gaviero-worktrees"))
+            })
+            .unwrap_or_else(|| std::env::temp_dir().join("gaviero-worktrees"));
+        let worktree_base = base_root.join(repo_name);
         Self {
             repo_dir,
             worktree_base,
@@ -605,22 +622,28 @@ impl WorktreeManager {
     ///   branch name; the directory name is derived from the branch
     ///   (replacing `/` with `-`).
     ///
-    /// Existing branches matching `branch` are still cleaned up — the
-    /// caller picks unique per-iteration names so this is benign.
+    /// Force-deletes any existing branch matching `branch` so a re-run of
+    /// the same workflow doesn't trip on stale per-iteration refs. The
+    /// chain is anchored on `base_sha` (a commit), not on the previous
+    /// iteration's branch *name*, so dropping the same-named slot from a
+    /// prior run is safe.
     pub fn provision_with_base(
         &mut self,
         agent_id: &str,
         branch: &str,
         base_sha: &str,
     ) -> Result<WorktreeHandle> {
-        self.provision_inner(agent_id, branch, base_sha, /* delete_existing_branch = */ false)
+        self.provision_inner(agent_id, branch, base_sha, /* delete_existing_branch = */ true)
     }
 
     /// Internal: do the actual worktree provisioning. `delete_existing_branch`
     /// controls whether an existing branch with this name is force-deleted
-    /// before the new worktree is created (true for the legacy reset-each-
-    /// iteration path; false for stacked mode where the previous-iteration
-    /// branch must survive as the chain anchor).
+    /// before the new worktree is created. Both legacy single-instance
+    /// provisioning and stacked-loop iterations now set this to true: the
+    /// chain anchor for stacked mode is a commit SHA, not the iteration's
+    /// own branch name, so dropping a stale same-named ref from a prior
+    /// run is safe and avoids `git worktree add -b` failing with "branch
+    /// already exists" on re-runs.
     fn provision_inner(
         &mut self,
         agent_id: &str,
@@ -690,6 +713,21 @@ impl WorktreeManager {
             );
         }
 
+        // Point cargo at a per-repo shared target dir so all worktrees
+        // reuse one build cache. Without this, every worktree builds the
+        // dep graph from scratch (~2 GB × N worktrees for a non-trivial
+        // Rust repo). With it, the first cargo invocation in any worktree
+        // populates the cache; subsequent invocations across all worktrees
+        // hit the same fingerprints and reuse them.
+        //
+        // Implemented via .cargo/config.toml [build] target-dir rather
+        // than CARGO_TARGET_DIR so it picks up regardless of how the
+        // agent spawns cargo (env var would have to thread through every
+        // subprocess layer: gaviero → claude/codex → bash → cargo).
+        // Per-invocation env vars still override config.toml, so anyone
+        // who wants per-worktree isolation can set CARGO_TARGET_DIR.
+        let _ = self.write_cargo_target_config(&wt_path);
+
         let handle = WorktreeHandle {
             path: wt_path,
             branch: branch.to_string(),
@@ -697,6 +735,73 @@ impl WorktreeManager {
         };
         self.active.push(handle.clone());
         Ok(handle)
+    }
+
+    /// Absolute path to the per-repo shared cargo target directory.
+    ///
+    /// Lives next to the worktrees (under `worktree_base`) so cleaning up
+    /// `worktree_base` also reclaims the build cache for that repo.
+    pub fn cargo_target_dir(&self) -> PathBuf {
+        self.worktree_base.join(".cargo-target")
+    }
+
+    /// Write `<wt_path>/.cargo/config.toml` so any cargo invocation rooted
+    /// in this worktree writes/reads from the per-repo shared target dir.
+    /// Also adds `.cargo/` to the worktree's per-worktree info/exclude so
+    /// `git add -A` (used by `commit_agent_changes`) doesn't sweep our
+    /// runtime config into the agent's commits.
+    fn write_cargo_target_config(&self, wt_path: &Path) -> Result<()> {
+        let target_dir = self.cargo_target_dir();
+        std::fs::create_dir_all(&target_dir).with_context(|| {
+            format!("creating shared cargo target dir: {}", target_dir.display())
+        })?;
+        let cargo_dir = wt_path.join(".cargo");
+        std::fs::create_dir_all(&cargo_dir).with_context(|| {
+            format!("creating worktree .cargo dir: {}", cargo_dir.display())
+        })?;
+        // target-dir must be an absolute path so cargo resolves it the
+        // same way regardless of where in the worktree it runs from.
+        // Use forward-slashes for cross-platform consistency (toml
+        // accepts both; backslashes need escaping).
+        let abs = target_dir.to_string_lossy().replace('\\', "/");
+        let body = format!("[build]\ntarget-dir = \"{}\"\n", abs);
+        std::fs::write(cargo_dir.join("config.toml"), body).with_context(|| {
+            format!("writing {}/.cargo/config.toml", wt_path.display())
+        })?;
+
+        // Per-worktree gitignore via info/exclude. Path comes from
+        // `git rev-parse --git-path` which resolves correctly whether the
+        // worktree's .git is a file (linked worktree) or directory (main).
+        if let Ok(out) = Command::new("git")
+            .args(["rev-parse", "--git-path", "info/exclude"])
+            .current_dir(wt_path)
+            .output()
+        {
+            if out.status.success() {
+                let rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !rel.is_empty() {
+                    let exclude_path = if Path::new(&rel).is_absolute() {
+                        PathBuf::from(&rel)
+                    } else {
+                        wt_path.join(&rel)
+                    };
+                    if let Some(parent) = exclude_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let existing =
+                        std::fs::read_to_string(&exclude_path).unwrap_or_default();
+                    if !existing.lines().any(|l| l.trim() == ".cargo/") {
+                        let mut new_body = existing;
+                        if !new_body.is_empty() && !new_body.ends_with('\n') {
+                            new_body.push('\n');
+                        }
+                        new_body.push_str(".cargo/\n");
+                        let _ = std::fs::write(&exclude_path, new_body);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Resolve the tip SHA of a branch (used by the loop executor to chain
@@ -1073,5 +1178,128 @@ mod tests {
             h2.path.join("a.txt").exists(),
             "iter1's file should be visible in iter2's worktree (chain established)"
         );
+    }
+
+    /// Every worktree gets a `.cargo/config.toml` pointing at the per-repo
+    /// shared target dir. Sharing this across worktrees means the second
+    /// worktree's `cargo check` reuses fingerprints from the first instead
+    /// of doing a cold rebuild — turns ~17×|target| into 1×|target| for
+    /// stacked-loop workflows like codebase_review.gaviero.
+    #[test]
+    fn test_worktree_provision_writes_shared_cargo_target_config() {
+        let (dir, _repo) = init_test_repo();
+        let mut wm = WorktreeManager::new(dir.path().to_path_buf());
+
+        let h1 = wm.provision("agent_one").expect("provision agent_one");
+        let h2 = wm.provision("agent_two").expect("provision agent_two");
+
+        let cfg1 = std::fs::read_to_string(h1.path.join(".cargo/config.toml"))
+            .expect("agent_one .cargo/config.toml exists");
+        let cfg2 = std::fs::read_to_string(h2.path.join(".cargo/config.toml"))
+            .expect("agent_two .cargo/config.toml exists");
+
+        // Both config files must point at exactly the same target-dir.
+        assert_eq!(cfg1, cfg2, "all worktrees in a repo share one target-dir");
+
+        // The target-dir line must be present and an absolute path —
+        // cargo's [build] target-dir resolves relative paths against the
+        // .cargo/config.toml's own directory, which would defeat sharing.
+        let expected_abs = wm.cargo_target_dir();
+        assert!(expected_abs.is_absolute(), "shared target dir is absolute");
+        let abs_str = expected_abs.to_string_lossy().replace('\\', "/");
+        assert!(
+            cfg1.contains(&format!("target-dir = \"{}\"", abs_str)),
+            "config.toml references the shared target dir; got: {}",
+            cfg1,
+        );
+
+        // Sanity: the shared dir was actually created on disk.
+        assert!(expected_abs.exists(), "shared target dir created at provision time");
+
+        // Critical: .cargo/config.toml must be ignored by git so the
+        // agent's `git add -A; git commit` step doesn't sweep it into
+        // every per-iteration branch. Verify by asking git for the
+        // ignore status of the file.
+        use std::process::Command;
+        let status = Command::new("git")
+            .args(["status", "--porcelain", "--ignored"])
+            .current_dir(&h1.path)
+            .output()
+            .expect("git status");
+        let stdout = String::from_utf8_lossy(&status.stdout);
+        // Either the line is absent (clean tree) or it appears with the
+        // `!!` ignored marker. It MUST NOT appear with `??` (untracked,
+        // would be added) or `A ` (staged).
+        for line in stdout.lines() {
+            if line.contains(".cargo/") || line.contains(".cargo\\") {
+                assert!(
+                    line.starts_with("!!"),
+                    ".cargo/config.toml must be ignored, found: {}",
+                    line,
+                );
+            }
+        }
+        // Also confirm git check-ignore agrees.
+        let check = Command::new("git")
+            .args(["check-ignore", ".cargo/config.toml"])
+            .current_dir(&h1.path)
+            .output()
+            .expect("git check-ignore");
+        assert!(
+            check.status.success(),
+            "git check-ignore must report .cargo/config.toml as ignored"
+        );
+    }
+
+    /// Re-running a workflow must not fail because per-iteration branches
+    /// from a prior run already exist. provision_with_base must force-
+    /// delete the same-named branch slot before recreating it; the chain
+    /// anchor is `base_sha` (a commit), not the iteration's own branch
+    /// name, so dropping the stale ref is safe.
+    #[test]
+    fn test_worktree_provision_with_base_replaces_stale_branch() {
+        use std::process::Command;
+
+        let (dir, _repo) = init_test_repo();
+        let repo_path = dir.path().to_path_buf();
+        let mut wm = WorktreeManager::new(repo_path.clone());
+        let head = wm.head_commit().expect("head");
+
+        // First run: create the iter1 branch + worktree, then tear down the
+        // worktree handle (simulating workflow exit) but leave the branch
+        // ref behind (per stacked-mode design — branches survive runs).
+        let h1 = wm
+            .provision_with_base("agent", "gaviero/agent-iter1", &head)
+            .expect("first provision succeeds");
+        let _ = wm.remove_worktree(&h1.name);
+
+        // Branch ref should still be present after the worktree teardown.
+        assert!(
+            wm.branch_tip("gaviero/agent-iter1").is_some(),
+            "branch survives worktree removal"
+        );
+
+        // Second run: a new WorktreeManager (fresh CLI invocation) tries
+        // to provision the same per-iteration branch. Pre-fix this would
+        // fail with `git worktree add -b`: "a branch named ... already
+        // exists". Post-fix: provision_with_base force-deletes the stale
+        // slot and succeeds.
+        let mut wm2 = WorktreeManager::new(repo_path);
+        let h1_again = wm2
+            .provision_with_base("agent", "gaviero/agent-iter1", &head)
+            .expect("re-running against existing branch must succeed");
+
+        // Sanity: new worktree is checked out and points at HEAD.
+        let new_head = String::from_utf8_lossy(
+            &Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&h1_again.path)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        assert_eq!(new_head, head, "re-provisioned worktree HEAD = base_sha");
     }
 }
