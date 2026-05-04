@@ -187,15 +187,30 @@ pub fn apply_short_turn_cap(flags: &mut [AnnotationFlag], elapsed_ms: u64) {
     }
 }
 
-/// Find the last `<turn_annotations>...</turn_annotations>` span that
-/// is **not** inside a fenced-code block. Returns
+/// Find the outermost `<turn_annotations>...</turn_annotations>` span
+/// that is **not** inside a fenced-code block. Returns
 /// `(offset_of_open_tag, offset_of_close_tag)` — the close tag offset
 /// points at the `<` of `</turn_annotations>`.
 ///
-/// Strategy: pick the last close tag, walk back to the nearest open tag
-/// before it, then count triple-backtick fences before the open tag; if
-/// odd (we're inside a fence), walk to the previous close tag and
-/// retry. LLM responses are small, so quadratic worst-case is cheap.
+/// Strategy:
+/// 1. Pick the LAST close tag (sidecar convention places it trailing).
+/// 2. Collect every non-fenced open-tag offset before that close.
+/// 3. Walk those candidates EARLIEST → LATEST and accept the first one
+///    whose enclosed body parses as JSON.
+///
+/// The earliest-first walk is important: when a flag's `text` field
+/// literally contains the substring `<turn_annotations>` (e.g. a memory
+/// note documenting the sidecar convention), the latest open before
+/// the real close is the in-body literal — not the wrapper open. Walking
+/// earliest first finds the real wrapper, whose body parses as JSON
+/// despite the literal substring being just a string value inside.
+///
+/// If no candidate yields a JSON-valid body we fall back to the LATEST
+/// non-fenced open paired with the close — preserves prior behaviour
+/// for malformed-JSON sidecars (`parse_and_strip` still surfaces a
+/// `parse_error` and strips the block so it never reaches the user).
+/// If no non-fenced open exists for a given close, retry with the next
+/// earlier close.
 fn find_annotation_span(response: &str) -> Option<(usize, usize)> {
     let open_tag = "<turn_annotations>";
     let close_tag = "</turn_annotations>";
@@ -203,32 +218,50 @@ fn find_annotation_span(response: &str) -> Option<(usize, usize)> {
     let mut search_end = response.len();
     loop {
         let close_off = response[..search_end].rfind(close_tag)?;
-        // Find the nearest open tag before this close.
-        let open_off = response[..close_off].rfind(open_tag)?;
-        // Count `` ``` `` line-openers before open_off to detect fenced
-        // state. A line begins after a newline (or at start).
-        let mut fences = 0usize;
-        let mut i = 0usize;
-        while i < open_off {
-            let line_start = i;
-            let nl = response[i..open_off].find('\n').map(|n| i + n);
-            let line_end = nl.unwrap_or(open_off);
-            let line = &response[line_start..line_end];
-            if line.trim_start().starts_with("```") {
-                fences += 1;
-            }
-            match nl {
-                Some(pos) => i = pos + 1,
-                None => break,
+        let candidates: Vec<usize> = response[..close_off]
+            .match_indices(open_tag)
+            .filter(|(off, _)| !is_inside_fence(response, *off))
+            .map(|(off, _)| off)
+            .collect();
+        if candidates.is_empty() {
+            // Every open tag before this close is fenced. Retry from
+            // before this close.
+            search_end = close_off;
+            continue;
+        }
+        for &open_off in &candidates {
+            let body = &response[open_off + open_tag.len()..close_off];
+            if serde_json::from_str::<serde_json::Value>(body.trim()).is_ok() {
+                return Some((open_off, close_off));
             }
         }
-        if fences % 2 == 0 {
-            return Some((open_off, close_off));
-        }
-        // Inside a fence — this match is the convention-example, not
-        // the real sidecar. Retry from before this close tag.
-        search_end = close_off;
+        // No candidate produced JSON-valid output. Use the latest
+        // candidate so a malformed-JSON sidecar still gets stripped
+        // from the visible text (parse_and_strip records a parse_error).
+        let latest = *candidates.last().unwrap();
+        return Some((latest, close_off));
     }
+}
+
+/// True iff `position` falls inside a triple-backtick fenced code block,
+/// detected by counting line-leading ``` openers before `position`.
+fn is_inside_fence(response: &str, position: usize) -> bool {
+    let mut fences = 0usize;
+    let mut i = 0usize;
+    while i < position {
+        let line_start = i;
+        let nl = response[i..position].find('\n').map(|n| i + n);
+        let line_end = nl.unwrap_or(position);
+        let line = &response[line_start..line_end];
+        if line.trim_start().starts_with("```") {
+            fences += 1;
+        }
+        match nl {
+            Some(pos) => i = pos + 1,
+            None => break,
+        }
+    }
+    fences % 2 != 0
 }
 
 #[cfg(test)]
@@ -323,6 +356,47 @@ mod tests {
             !p.stripped.contains("\"real\""),
             "real block must be stripped"
         );
+    }
+
+    #[test]
+    fn parse_and_strip_pairs_outer_wrapper_when_body_contains_literal_open_tag() {
+        // Regression: a flag's `text` field contains the literal substring
+        // `<turn_annotations>` (as in a memory note documenting the
+        // sidecar convention). The previous rfind-anchored open detection
+        // mis-paired the close with the in-body literal, truncating the
+        // visible reply at the literal and over-keeping the prefix.
+        let resp = "Here is my reply.\n\n<turn_annotations>\n\
+            {\"v\":1,\"flags\":[{\"type\":\"gotcha\",\"importance\":0.8,\
+            \"scope\":\"repo\",\"text\":\"agents append <turn_annotations> sidecars\"}]}\n\
+            </turn_annotations>";
+        let p = parse_and_strip(resp);
+        let ann = p.annotations.expect("real wrapper must parse");
+        assert_eq!(ann.flags.len(), 1);
+        assert!(ann.flags[0].text.contains("sidecars"));
+        // Visible reply must include all of the prose preceding the
+        // wrapper and none of the sidecar body — including the literal
+        // substring inside the flag's text field.
+        assert!(p.stripped.contains("Here is my reply."));
+        assert!(!p.stripped.contains("\"flags\""));
+        assert!(!p.stripped.contains("sidecars"));
+    }
+
+    #[test]
+    fn parse_and_strip_pairs_outer_wrapper_with_two_in_body_literals() {
+        // Two literal `<turn_annotations>` substrings inside the wrapper
+        // body must not shadow the real outer open.
+        let resp = "Reply text.\n<turn_annotations>\n\
+            {\"v\":1,\"flags\":[\
+            {\"type\":\"convention\",\"importance\":0.5,\"scope\":\"repo\",\
+            \"text\":\"first <turn_annotations> mention\"},\
+            {\"type\":\"gotcha\",\"importance\":0.7,\"scope\":\"repo\",\
+            \"text\":\"second <turn_annotations> mention\"}\
+            ]}\n</turn_annotations>";
+        let p = parse_and_strip(resp);
+        let ann = p.annotations.expect("real wrapper must parse");
+        assert_eq!(ann.flags.len(), 2);
+        assert!(p.stripped.contains("Reply text."));
+        assert!(!p.stripped.contains("\"flags\""));
     }
 
     #[test]
