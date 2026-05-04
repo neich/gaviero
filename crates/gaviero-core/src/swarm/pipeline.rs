@@ -2425,6 +2425,59 @@ pub fn revert_swarm(
     Ok(())
 }
 
+/// Outcome of [`cleanup_gaviero_branches`].
+#[derive(Debug, Clone, Default)]
+pub struct BranchCleanupReport {
+    /// Branches matched the `gaviero/` prefix and were eligible for deletion.
+    pub matched: Vec<String>,
+    /// Branches actually deleted (empty when `dry_run` is true).
+    pub deleted: Vec<String>,
+    /// Branches skipped because they are currently checked out.
+    pub skipped_current: Vec<String>,
+}
+
+/// Delete local branches whose name starts with `gaviero/`. These are the
+/// per-agent / per-iteration branches produced by swarm runs (see
+/// `WorktreeManager::provision`). Stacked-loop runs leave them behind by
+/// design — the merge phase intentionally skips per-iteration branches.
+///
+/// - `dry_run = true`: enumerate matching branches without deleting.
+/// - The currently checked-out branch (if it happens to match) is always
+///   skipped — `git branch -D` would refuse it anyway.
+/// - `git worktree prune` is invoked first so dead worktree refs don't
+///   block branch deletion.
+pub fn cleanup_gaviero_branches(
+    workspace_root: &std::path::Path,
+    dry_run: bool,
+) -> Result<BranchCleanupReport> {
+    let _ = crate::git::worktree_prune(workspace_root);
+
+    let matched = crate::git::list_local_branches_with_prefix(workspace_root, "gaviero/")?;
+    let current = crate::git::GitRepo::open(workspace_root)
+        .ok()
+        .and_then(|r| r.current_branch().ok());
+
+    let mut report = BranchCleanupReport {
+        matched: matched.clone(),
+        ..Default::default()
+    };
+
+    for branch in matched {
+        if Some(&branch) == current.as_ref() {
+            report.skipped_current.push(branch);
+            continue;
+        }
+        if dry_run {
+            continue;
+        }
+        match crate::git::delete_branch(workspace_root, &branch) {
+            Ok(()) => report.deleted.push(branch),
+            Err(e) => tracing::warn!("Could not delete branch {}: {}", branch, e),
+        }
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
