@@ -476,6 +476,41 @@ pub fn delete_branch(repo_dir: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
+/// List local branch names whose name starts with `prefix`.
+///
+/// Uses `git2` directly. Returns names in repository order.
+pub fn list_local_branches_with_prefix(repo_dir: &Path, prefix: &str) -> Result<Vec<String>> {
+    let repo = git2::Repository::discover(repo_dir)
+        .with_context(|| format!("opening git repo at {}", repo_dir.display()))?;
+    let mut out = Vec::new();
+    let branches = repo
+        .branches(Some(git2::BranchType::Local))
+        .context("iterating local branches")?;
+    for b in branches {
+        let (branch, _) = b.context("reading branch entry")?;
+        if let Some(name) = branch.name().context("decoding branch name")? {
+            if name.starts_with(prefix) {
+                out.push(name.to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Run `git worktree prune` to clean up worktree references whose
+/// directories no longer exist on disk.
+pub fn worktree_prune(repo_dir: &Path) -> Result<()> {
+    let status = Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(repo_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("git worktree prune")?;
+    anyhow::ensure!(status.success(), "git worktree prune failed");
+    Ok(())
+}
+
 /// Manages git worktrees for parallel agent execution.
 ///
 /// Each agent gets its own worktree with a dedicated branch, allowing

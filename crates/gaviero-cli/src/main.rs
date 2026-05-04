@@ -136,6 +136,19 @@ struct Cli {
     #[arg(long)]
     graph: bool,
 
+    /// Delete local branches matching `gaviero/*` (left over from prior
+    /// swarm runs — agent worktrees and stacked-loop iteration branches).
+    /// Dry-run by default: prints the matching branches and exits.
+    /// Pass `--force` to actually delete. The currently checked-out branch
+    /// is always skipped, and `git worktree prune` is run first.
+    #[arg(long = "cleanup-branches")]
+    cleanup_branches: bool,
+
+    /// With `--cleanup-branches`, actually delete the matched branches
+    /// (without this flag the command only previews).
+    #[arg(long, requires = "cleanup_branches")]
+    force: bool,
+
     /// Folder name or glob pattern to exclude from repo-map scanning.
     /// Can be specified multiple times and/or as a comma-separated list
     /// (e.g. `--exclude node_modules,docs/**`). A bare name like `node_modules`
@@ -1897,6 +1910,40 @@ async fn main() -> Result<()> {
             cli.utilization_asc,
         )
         .await;
+    }
+
+    // ── --cleanup-branches: delete leftover gaviero/* branches and exit ──
+    if cli.cleanup_branches {
+        let report = gaviero_core::swarm::pipeline::cleanup_gaviero_branches(&repo, !cli.force)
+            .context("cleaning up gaviero/* branches")?;
+
+        if report.matched.is_empty() {
+            eprintln!("[cleanup] no gaviero/* branches found in {}", repo.display());
+            return Ok(());
+        }
+
+        if cli.force {
+            eprintln!("[cleanup] deleted {} branch(es):", report.deleted.len());
+            for b in &report.deleted {
+                eprintln!("  - {}", b);
+            }
+            for b in &report.skipped_current {
+                eprintln!("  ! skipped (current branch): {}", b);
+            }
+        } else {
+            eprintln!(
+                "[cleanup] would delete {} branch(es) (dry-run; pass --force to execute):",
+                report.matched.len() - report.skipped_current.len()
+            );
+            for b in &report.matched {
+                if report.skipped_current.contains(b) {
+                    eprintln!("  ! skipped (current branch): {}", b);
+                } else {
+                    eprintln!("  - {}", b);
+                }
+            }
+        }
+        return Ok(());
     }
 
     // ── --graph: build/update code knowledge graph and exit ──────
