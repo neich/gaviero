@@ -337,9 +337,23 @@ fn example_codebase_review() {
     assert!(ids.contains(&"test_audit"));
     assert!(ids.contains(&"final_verify"));
 
-    // The judge agent isn't in work_units; it's in loop_judge_units.
-    assert_eq!(plan.loop_judge_units.len(), 1);
-    assert_eq!(plan.loop_judge_units[0].id, "module_judge");
+    // The loop now uses an `until command "..."` shell probe instead of
+    // an LLM judge — no entries in loop_judge_units.
+    assert_eq!(plan.loop_judge_units.len(), 0);
+    assert!(matches!(
+        &plan.loop_configs[0].until,
+        gaviero_core::swarm::plan::LoopUntilCondition::Command(cmd)
+            if cmd.contains("apply-{{ITER}}.md") && cmd.contains("HALTED:")
+    ));
+    // {{OUT_DIR}} should have been substituted at compile time.
+    if let gaviero_core::swarm::plan::LoopUntilCondition::Command(cmd) =
+        &plan.loop_configs[0].until
+    {
+        assert!(
+            cmd.contains("reviews/latest"),
+            "expected OUT_DIR=reviews/latest substituted in command, got: {cmd}"
+        );
+    }
 
     // Single sequential loop with the two body agents.
     assert_eq!(plan.loop_configs.len(), 1);
