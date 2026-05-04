@@ -13,10 +13,11 @@
 //                                          plan reflects the codebase as it now is.
 //     execute_module      (opus)         — applies every accepted finding for
 //                                          THIS module in one focused agent turn.
-//     until agent module_judge (sonnet)  — exits when the latest apply-N.md starts
-//                                          with `HALTED:` (replan_module emits that
-//                                          when iter > MODULE_COUNT or upstream
-//                                          halt-propagation tripped).
+//     until command "..."                — deterministic shell probe of the
+//                                          per-iteration apply-N.md branch tip.
+//                                          Exits when the file starts with
+//                                          `HALTED:`. No LLM round-trip — the
+//                                          halt signal is a string-prefix check.
 //     max_iterations 24
 //   }
 //     ↓
@@ -65,8 +66,9 @@
 //     `VERDICT: STOP: <reason>` and downstream phases short-circuit.
 //   * replan_module's STEP 0 emits `HALTED:` to plan-{{ITER}}.md when
 //     `{{ITER}} > MODULE_COUNT` (or inventory said STOP). execute_module
-//     propagates the HALTED line into apply-{{ITER}}.md. module_judge keys
-//     off that single signal — any HALTED apply-N.md exits the loop.
+//     propagates the HALTED line into apply-{{ITER}}.md. The loop's
+//     `until command` checks that file's branch tip directly — no LLM
+//     judge, no string-format ambiguity.
 //
 // Usage:
 //   gaviero-cli --script codebase_review.gaviero
@@ -310,35 +312,6 @@ prompt execute-body #"
           - "" (empty) is fine if nothing crossed module boundaries.
 "#
 
-prompt module-judge-body #"
-    You decide whether the per-module loop is finished.
-
-    {{ITER_EVIDENCE}}
-
-    Read {{OUT_DIR}}/apply-{{ITER}}.md. The first line tells you everything
-    you need:
-
-      - If it starts with `HALTED:` → emit PASS (loop exits).
-        The replan/execute pair stamps `HALTED:` as the first line whenever
-        iteration {{ITER}} has nothing to do (count exceeded, inventory STOP,
-        upstream halt). That is the canonical termination signal.
-
-      - Otherwise → emit FAIL (loop runs another iteration).
-        The next iteration's replan_module will re-evaluate against the
-        current codebase and either plan module {{ITER}}+1 or emit `HALTED:`
-        itself, terminating the loop on its own halt check.
-
-    Do NOT try to read inventory.md, count modules yourself, or second-guess
-    apply-{{ITER}}.md's first-line marker. The halt-propagation chain is the
-    single source of truth.
-
-    Output format — emit exactly one fenced JSON object as your last output:
-
-    ```json
-    {"verdict": "pass" | "fail", "reason": "<one short paragraph>"}
-    ```
-"#
-
 prompt test-audit-body #"
     You are auditing the test suite for missing integration coverage. The
     codebase has now settled — every module has been replanned and applied.
@@ -472,15 +445,6 @@ agent execute_module {
     max_retries 2
 }
 
-agent module_judge {
-    description "Judge whether the per-module loop is finished"
-    client sonnet
-    scope {
-        read_only ["{{OUT_DIR}}/"]
-    }
-    prompt module-judge-body
-}
-
 agent test_audit {
     description "Audit tests + add critical/high integration coverage"
     client opus
@@ -522,12 +486,6 @@ agent final_verify {
 // ── Workflow ─────────────────────────────────────────────────────────────────
 //
 // One outer dynamic-count loop: replan_module → execute_module.
-// stability 1 because module_judge is a deterministic apply-N.md probe — no
-// re-confirmation needed.
-//
-// strict_judge true to surface unparseable judge output as a hard failure
-// rather than silently treating it as FAIL (which would prematurely exit
-// the loop and leave most modules unprocessed).
 //
 // iter_start 1 is explicit even though it's the default — surfaces the
 // invariant that {{ITER}} starts at 1 (matching `## Module 1 — …` in
@@ -536,8 +494,8 @@ agent final_verify {
 // max_iterations 24 is a safety cap, not the actual count. Most repos have
 // well under 24 modules; if yours has more, raise this. Loop termination is
 // driven by replan_module's HALTED stamp — once iteration {{ITER}} exceeds
-// MODULE_COUNT, replan emits HALTED, execute propagates it, module_judge
-// PASSes, and the loop exits well before max_iterations.
+// MODULE_COUNT, replan emits HALTED, execute propagates it, the `until
+// command` probe matches, and the loop exits well before max_iterations.
 //
 // max_parallel 1 because the whole point is sequential: each iteration
 // MUST see prior iterations' edits. No fan-out.
@@ -552,9 +510,6 @@ workflow codebase_review {
             agents         [replan_module execute_module]
             iter_start     1
             max_iterations 24
-            stability      1
-            judge_timeout  60
-            strict_judge   true
             // branch_chain stacked: each iteration's body agents commit to
             // their own per-iteration branches `gaviero/{id}-iter{N}`,
             // chained so iteration N's worktree is provisioned at iteration
@@ -569,7 +524,11 @@ workflow codebase_review {
             // stacked PR series for review, or fast-forward main onto
             // the last iteration's tip if you want a flat history.
             branch_chain   stacked
-            until agent    module_judge
+            // Deterministic loop termination: read the current iteration's
+            // apply-N.md from execute_module's per-iteration branch tip and
+            // exit when the first line starts with `HALTED:`. {{ITER}} is
+            // substituted by the runtime before sh -c. No LLM judge.
+            until command  "git show gaviero/execute_module-iter{{ITER}}:{{OUT_DIR}}/apply-{{ITER}}.md 2>/dev/null | head -n 1 | grep -q '^HALTED:'"
         }
         test_audit
         final_verify
