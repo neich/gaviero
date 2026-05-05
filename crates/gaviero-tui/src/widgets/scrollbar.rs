@@ -10,6 +10,7 @@ const TRACK_FG: Color = Color::Rgb(60, 65, 75);
 const TRACK_BG: Color = Color::Rgb(36, 40, 47);
 const THUMB_FG: Color = Color::Rgb(110, 118, 135);
 const THUMB_BG: Color = Color::Rgb(80, 86, 100);
+const DIFF_MARKER_FG: Color = Color::Rgb(220, 80, 80);
 
 /// Render a vertical scrollbar on the right edge of `area`.
 ///
@@ -27,6 +28,38 @@ pub fn render_scrollbar(
     visible_items: usize,
     scroll_offset: usize,
 ) {
+    render_scrollbar_inner(area, buf, total_items, visible_items, scroll_offset, &[]);
+}
+
+/// Render a vertical scrollbar with red marks at the rows that map to
+/// `diff_indices` (item indices that contain a diff change). The marks make it
+/// easy to navigate to changes that lie outside the current viewport.
+pub fn render_scrollbar_with_diff_markers(
+    area: Rect,
+    buf: &mut Buffer,
+    total_items: usize,
+    visible_items: usize,
+    scroll_offset: usize,
+    diff_indices: &[usize],
+) {
+    render_scrollbar_inner(
+        area,
+        buf,
+        total_items,
+        visible_items,
+        scroll_offset,
+        diff_indices,
+    );
+}
+
+fn render_scrollbar_inner(
+    area: Rect,
+    buf: &mut Buffer,
+    total_items: usize,
+    visible_items: usize,
+    scroll_offset: usize,
+    diff_indices: &[usize],
+) {
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -36,6 +69,8 @@ pub fn render_scrollbar(
 
     let track_style = Style::default().fg(TRACK_FG).bg(TRACK_BG);
     let thumb_style = Style::default().fg(THUMB_FG).bg(THUMB_BG);
+    let diff_track_style = Style::default().fg(DIFF_MARKER_FG).bg(TRACK_BG);
+    let diff_thumb_style = Style::default().fg(DIFF_MARKER_FG).bg(THUMB_BG);
 
     let (thumb_start, thumb_size) = if total_items <= visible_items {
         (0, track_height)
@@ -51,13 +86,36 @@ pub fn render_scrollbar(
 
     let thumb_end = thumb_start + thumb_size;
 
-    for row in 0..track_height {
+    let mut rows_with_diff = vec![false; track_height];
+    if !diff_indices.is_empty() && total_items > 0 && track_height > 0 {
+        for &idx in diff_indices {
+            if idx < total_items {
+                let row = (idx * track_height) / total_items.max(1);
+                if row < track_height {
+                    rows_with_diff[row] = true;
+                }
+            }
+        }
+    }
+
+    for (row, &has_diff) in rows_with_diff.iter().enumerate() {
         let y = area.y + row as u16;
         if x < buf.area.right() && y < buf.area.bottom() {
-            if row >= thumb_start && row < thumb_end {
-                buf[(x, y)].set_char('█').set_style(thumb_style);
-            } else {
-                buf[(x, y)].set_char('│').set_style(track_style);
+            let in_thumb = row >= thumb_start && row < thumb_end;
+
+            match (in_thumb, has_diff) {
+                (true, true) => {
+                    buf[(x, y)].set_char('█').set_style(diff_thumb_style);
+                }
+                (true, false) => {
+                    buf[(x, y)].set_char('█').set_style(thumb_style);
+                }
+                (false, true) => {
+                    buf[(x, y)].set_char('▎').set_style(diff_track_style);
+                }
+                (false, false) => {
+                    buf[(x, y)].set_char('│').set_style(track_style);
+                }
             }
         }
     }
