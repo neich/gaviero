@@ -1838,6 +1838,7 @@ pub(super) fn send_chat_message(app: &mut App) {
         .graph_workspace_root
         .clone()
         .unwrap_or_else(|| root.clone());
+    let graph_excludes = parse_exclude_patterns(&app.workspace, Some(&graph_root));
 
     // Seed paths for graph ranking: explicit @file refs + active buffer (if any), made relative to workspace root.
     let mut graph_seeds: Vec<String> = refs.clone();
@@ -1889,13 +1890,22 @@ pub(super) fn send_chat_message(app: &mut App) {
         // user message (V9 §11 M2 acceptance: "turn 2+ transmits only
         // new user message").
         let repo_map_arc = if is_first_turn {
-            crate::app::session::get_or_build_repo_map_cached(repo_map_cache, graph_root.clone())
-                .await
+            crate::app::session::get_or_build_repo_map_cached(
+                repo_map_cache,
+                graph_root.clone(),
+                graph_excludes.clone(),
+            )
+            .await
         } else {
             None
         };
         let impact_text = if is_first_turn {
-            crate::app::session::compute_impact_text(graph_root.clone(), graph_seeds.clone()).await
+            crate::app::session::compute_impact_text(
+                graph_root.clone(),
+                graph_seeds.clone(),
+                graph_excludes.clone(),
+            )
+            .await
         } else {
             None
         };
