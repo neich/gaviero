@@ -439,9 +439,25 @@ impl AgentChatState {
     }
 
     /// Process slash commands in input. Returns true if a command was handled.
+    ///
+    /// A leading `//` (double slash) is the explicit "send raw to agent"
+    /// marker — used for Claude Code skills like `//init` or custom commands
+    /// in `~/.claude/commands/`. The marker is stripped before forwarding
+    /// so the agent sees the canonical single-slash form.
+    ///
+    /// Single-slash unknown commands still produce a local "Unknown command"
+    /// error so typos don't silently leak to the agent.
     pub fn process_slash_command(&mut self) -> bool {
         let input = self.text_input.text.trim().to_string();
         if !input.starts_with('/') {
+            return false;
+        }
+
+        // Explicit pass-through: `//foo bar` → forward `/foo bar` verbatim.
+        if let Some(rest) = input.strip_prefix("//") {
+            let forwarded = format!("/{}", rest);
+            self.text_input.text = forwarded;
+            self.text_input.cursor = self.text_input.char_count();
             return false;
         }
 
@@ -674,6 +690,10 @@ impl AgentChatState {
                      /restore --since <N minutes|N hours|N days>\n                              — Replay every soft-deletion in the window\n\n\
                      Help:\n\
                      /help                    — Show this help\n\n\
+                     Pass-through to agent:\n\
+                     //<command>              — Forward `/<command>` verbatim to the agent\n\
+                     \u{00a0}\u{00a0}(use this for Claude Code skills like `//init`, or commands\n\
+                     \u{00a0}\u{00a0}defined in ~/.claude/commands/)\n\n\
                      Keyboard shortcuts:\n\
                      F2                       — Rename active conversation tab\n\
                      Ctrl+T                   — New conversation tab\n\
@@ -691,7 +711,9 @@ impl AgentChatState {
             }
             _ => {
                 self.add_system_message(&format!(
-                    "Unknown command: {}. Type /help for available commands.",
+                    "Unknown command: {}. Type /help for available commands. \
+                     Prefix with `//` to send a slash command directly to the agent \
+                     (e.g. `//init` for Claude Code skills).",
                     cmd
                 ));
                 self.text_input.text.clear();
@@ -2852,6 +2874,47 @@ mod tests {
         assert!(state.renaming);
         // Interactive rename pre-fills the input with the current title (same as F2).
         assert_eq!(state.text_input.text, title);
+    }
+
+    #[test]
+    fn process_slash_command_double_slash_forwards_stripped_to_agent() {
+        // `//foo bar` is the explicit "send raw to agent" marker.
+        // process_slash_command must return false (so the caller falls
+        // through to send_chat_message) AND rewrite the input buffer
+        // to the canonical single-slash form. send_chat_message owns
+        // add_user_message on the forwarded path, so nothing may be
+        // appended to the conversation here.
+        let mut state = AgentChatState::new();
+        state.text_input.text = "//init please".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+
+        let handled = state.process_slash_command();
+
+        assert!(!handled);
+        assert_eq!(state.text_input.text, "/init please");
+        assert!(state.conversations[state.active_conv].messages.is_empty());
+    }
+
+    #[test]
+    fn process_slash_command_unknown_single_slash_reports_error() {
+        // Single-slash unknown commands must NOT silently leak to the
+        // agent — typos like `/modle` should produce a local error.
+        let mut state = AgentChatState::new();
+        state.text_input.text = "/modle".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+
+        let handled = state.process_slash_command();
+
+        assert!(handled);
+        assert!(state.text_input.text.is_empty());
+        let messages = &state.conversations[state.active_conv].messages;
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.role == ChatRole::System && m.content.contains("Unknown command")),
+            "expected an Unknown-command system message, got {:?}",
+            messages
+        );
     }
 
     #[test]
