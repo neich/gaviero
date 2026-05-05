@@ -328,7 +328,12 @@ impl AcpSession {
         cmd.current_dir(cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .stdin(Stdio::piped());
+            .stdin(Stdio::piped())
+            // Without this, dropping `Child` (e.g. when the host task is
+            // aborted on Ctrl+C) leaves an orphaned `claude` subprocess that
+            // keeps issuing tool calls and editing files. Cancellation must be
+            // transactional: kill the child, then revert tool snapshots.
+            .kill_on_drop(true);
 
         tracing::info!(
             "Spawning claude: model={}, cwd={}, prompt_len={}, via_tempfile={}",
