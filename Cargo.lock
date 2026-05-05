@@ -1280,6 +1280,7 @@ dependencies = [
  "streaming-iterator",
  "tempfile",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",
