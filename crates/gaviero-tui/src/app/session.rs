@@ -136,6 +136,7 @@ pub(crate) async fn get_or_build_repo_map_cached(
         tokio::sync::RwLock<Option<std::sync::Arc<gaviero_core::repo_map::RepoMap>>>,
     >,
     workspace_root: std::path::PathBuf,
+    excludes: Vec<String>,
 ) -> Option<std::sync::Arc<gaviero_core::repo_map::RepoMap>> {
     let cached = {
         let guard = repo_map_cache.read().await;
@@ -145,8 +146,10 @@ pub(crate) async fn get_or_build_repo_map_cached(
         return Some(rm);
     }
     let root = workspace_root.clone();
-    match tokio::task::spawn_blocking(move || gaviero_core::repo_map::RepoMap::build(&root, &[]))
-        .await
+    match tokio::task::spawn_blocking(move || {
+        gaviero_core::repo_map::RepoMap::build(&root, &excludes)
+    })
+    .await
     {
         Ok(Ok(map)) => {
             let arc = std::sync::Arc::new(map);
@@ -168,13 +171,14 @@ pub(crate) async fn get_or_build_repo_map_cached(
 pub(crate) async fn compute_impact_text(
     workspace_root: std::path::PathBuf,
     seeds: Vec<String>,
+    excludes: Vec<String>,
 ) -> Option<String> {
     if seeds.is_empty() {
         return None;
     }
     tokio::task::spawn_blocking(move || {
         let (store, _) =
-            gaviero_core::repo_map::graph_builder::build_graph(&workspace_root, &[]).ok()?;
+            gaviero_core::repo_map::graph_builder::build_graph(&workspace_root, &excludes).ok()?;
         let seed_refs: Vec<&str> = seeds.iter().map(|s| s.as_str()).collect();
         let impact = store.impact_radius(&seed_refs, 2).ok()?;
         if impact.affected_files.is_empty() {
@@ -342,9 +346,10 @@ pub(crate) fn warm_up_repo_map(app: &App) {
         return;
     };
     let cache = app.repo_map.clone();
+    let excludes = super::parse_exclude_patterns(&app.workspace, Some(&root));
     tokio::spawn(async move {
         match tokio::task::spawn_blocking(move || {
-            gaviero_core::repo_map::RepoMap::build(&root, &[])
+            gaviero_core::repo_map::RepoMap::build(&root, &excludes)
         })
         .await
         {
