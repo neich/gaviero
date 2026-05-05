@@ -86,14 +86,34 @@ impl<'a> EditorView<'a> {
             self.render_cursor(code_area, buf);
         }
 
-        // Render scrollbar on the right edge
-        crate::widgets::scrollbar::render_scrollbar(
-            area,
-            buf,
-            line_count,
-            area.height as usize,
-            self.buffer.scroll.top_line,
-        );
+        // Render scrollbar on the right edge. In diff-view mode, mark the rows
+        // that contain Added/Removed lines in red so the user can navigate to
+        // changes that lie outside the current viewport.
+        if let Some(dv) = self.buffer.diff_view.as_ref() {
+            let diff_indices: Vec<usize> = dv
+                .kinds
+                .iter()
+                .enumerate()
+                .filter(|(_, k)| !matches!(k, DiffKind::Context))
+                .map(|(i, _)| i)
+                .collect();
+            crate::widgets::scrollbar::render_scrollbar_with_diff_markers(
+                area,
+                buf,
+                line_count,
+                area.height as usize,
+                self.buffer.scroll.top_line,
+                &diff_indices,
+            );
+        } else {
+            crate::widgets::scrollbar::render_scrollbar(
+                area,
+                buf,
+                line_count,
+                area.height as usize,
+                self.buffer.scroll.top_line,
+            );
+        }
     }
 
     fn render_gutter(&self, line_idx: usize, x: u16, y: u16, gutter_width: u16, buf: &mut RataBuf) {

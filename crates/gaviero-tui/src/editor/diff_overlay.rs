@@ -392,6 +392,21 @@ pub fn render_diff_overlay(
             buf[(x, y)].set_style(line_style);
         }
     }
+
+    let diff_indices: Vec<usize> = diff_lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| matches!(l.kind, DiffLineKind::Added | DiffLineKind::Removed))
+        .map(|(i, _)| i)
+        .collect();
+    crate::widgets::scrollbar::render_scrollbar_with_diff_markers(
+        area,
+        buf,
+        diff_lines.len(),
+        area.height as usize,
+        scroll_top,
+        &diff_indices,
+    );
 }
 
 /// Find which hunk index is at a given row in the diff view.

@@ -1632,6 +1632,13 @@ impl AgentChatState {
         self.user_scrolled_during_stream = false;
     }
 
+    fn auto_scroll_during_stream(&mut self) {
+        self.browse_mode = false;
+        if !self.user_scrolled_during_stream {
+            self.scroll_pinned_to_bottom = true;
+        }
+    }
+
     // ── Conversation-ID-targeted methods (for parallel streaming) ──
 
     pub fn find_conv_idx(&self, conv_id: &str) -> Option<usize> {
@@ -1649,7 +1656,7 @@ impl AgentChatState {
             if last.role == ChatRole::Assistant {
                 last.content.push_str(&clean);
                 if idx == self.active_conv {
-                    self.scroll_to_bottom();
+                    self.auto_scroll_during_stream();
                 }
                 return;
             }
@@ -1660,7 +1667,7 @@ impl AgentChatState {
             tool_calls: Vec::new(),
         });
         if idx == self.active_conv {
-            self.scroll_to_bottom();
+            self.auto_scroll_during_stream();
         }
     }
 
@@ -1709,7 +1716,7 @@ impl AgentChatState {
             if last.role == ChatRole::Assistant {
                 last.content.push_str(&summary);
                 if idx == self.active_conv {
-                    self.scroll_to_bottom();
+                    self.auto_scroll_during_stream();
                 }
                 return;
             }
@@ -1721,7 +1728,7 @@ impl AgentChatState {
             tool_calls: Vec::new(),
         });
         if idx == self.active_conv {
-            self.scroll_to_bottom();
+            self.auto_scroll_during_stream();
         }
     }
 

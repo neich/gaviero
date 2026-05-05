@@ -825,6 +825,29 @@ pub(super) fn render_batch_review_diff(app: &mut App, frame: &mut Frame, area: R
             }
         }
     }
+
+    if area.height > 1 {
+        let content_area = Rect {
+            x: area.x,
+            y: area.y + 1,
+            width: area.width,
+            height: area.height - 1,
+        };
+        let diff_indices: Vec<usize> = diff_lines
+            .iter()
+            .enumerate()
+            .filter(|(_, (k, _))| !matches!(k, DiffKind::Context))
+            .map(|(i, _)| i)
+            .collect();
+        crate::widgets::scrollbar::render_scrollbar_with_diff_markers(
+            content_area,
+            frame.buffer_mut(),
+            diff_lines.len(),
+            content_height,
+            scroll,
+            &diff_indices,
+        );
+    }
 }
 
 pub(super) fn refresh_git_changes(app: &mut App) {
@@ -1178,6 +1201,29 @@ pub(super) fn render_changes_diff(app: &mut App, frame: &mut Frame, area: Rect) 
                     .set_style(line_style);
             }
         }
+    }
+
+    if area.height > 1 {
+        let content_area = Rect {
+            x: area.x,
+            y: area.y + 1,
+            width: area.width,
+            height: area.height - 1,
+        };
+        let diff_indices: Vec<usize> = diff_lines
+            .iter()
+            .enumerate()
+            .filter(|(_, (k, _))| !matches!(k, DiffKind::Context))
+            .map(|(i, _)| i)
+            .collect();
+        crate::widgets::scrollbar::render_scrollbar_with_diff_markers(
+            content_area,
+            frame.buffer_mut(),
+            diff_lines.len(),
+            content_height,
+            scroll,
+            &diff_indices,
+        );
     }
 }
 

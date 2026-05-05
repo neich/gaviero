@@ -279,21 +279,10 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
 
                 if has_visual_lines {
                     if !app.chat_state.move_up_visual(first_w, panel_w) {
-                        if app.chat_state.history_index.is_some()
-                            || app.chat_state.text_input.text.is_empty()
-                        {
-                            app.chat_state.history_up();
-                        } else {
-                            app.chat_state.scroll_offset =
-                                app.chat_state.scroll_offset.saturating_sub(1);
-                        }
+                        app.chat_state.history_up();
                     }
-                } else if app.chat_state.history_index.is_some()
-                    || app.chat_state.text_input.text.is_empty()
-                {
-                    app.chat_state.history_up();
                 } else {
-                    app.chat_state.scroll_offset = app.chat_state.scroll_offset.saturating_sub(1);
+                    app.chat_state.history_up();
                 }
             }
         }
@@ -301,6 +290,7 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
             let streaming = app.chat_state.active_conv_streaming();
             if streaming {
                 app.chat_state.scroll_offset += 1;
+                app.chat_state.user_scrolled_during_stream = true;
             } else {
                 let prompt_len = 2;
                 let panel_w = app
@@ -337,6 +327,9 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
         }
         Action::PageDown => {
             app.chat_state.scroll_offset = app.chat_state.scroll_offset.saturating_add(20);
+            if app.chat_state.active_conv_streaming() {
+                app.chat_state.user_scrolled_during_stream = true;
+            }
         }
         Action::Quit => {
             if !app.chat_state.text_input.text.is_empty() {
