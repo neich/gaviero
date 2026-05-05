@@ -54,6 +54,7 @@ fn construction_for(model_spec: &str) -> SessionConstruction {
         agent_id: "test-agent".to_string(),
         options: AgentOptions::default(),
         profile,
+        cancel_token: tokio_util::sync::CancellationToken::new(),
     }
 }
 
@@ -93,4 +94,18 @@ fn local_spec_routes_to_stateless_replay_session() {
     // `local:` is treated as ollama by the planner per V9 §11 M9.
     let session = create_session(construction_for("local:llama3"));
     assert_eq!(session.continuity_mode(), ContinuityMode::StatelessReplay);
+}
+
+#[test]
+fn cancel_token_field_is_propagated_into_construction() {
+    // Construction is side-effect-free, but the registry must accept a
+    // pre-fired token without spawning anything. Future regressions would
+    // remove the field or stop forwarding it.
+    let token = tokio_util::sync::CancellationToken::new();
+    token.cancel();
+    let mut args = construction_for("claude:sonnet");
+    args.cancel_token = token.clone();
+    let session = create_session(args);
+    assert_eq!(session.continuity_mode(), ContinuityMode::NativeResume);
+    assert!(token.is_cancelled());
 }
