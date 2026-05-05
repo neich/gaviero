@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use crossterm::event::{MouseButton, MouseEventKind};
 use ratatui::Frame;
@@ -57,6 +58,17 @@ const DIFF_GUTTER_WIDTH: u16 = 5;
 pub struct GitRepoEntry {
     pub name: String,
     pub repo: gaviero_core::git::GitRepo,
+}
+
+/// Per-conversation handle for an in-flight chat turn. The cancel token is
+/// the primary signal — `cancel_agent` fires it and the session shuts down
+/// transactionally (kill subprocess, run revert path). The JoinHandle is
+/// kept around only so the App can `abort()` it on shutdown if it never
+/// completes; routine cancel does not call `abort()` because that would
+/// race the task's revert path.
+pub struct AcpTaskHandle {
+    pub join: tokio::task::JoinHandle<()>,
+    pub cancel: CancellationToken,
 }
 
 // ── App ──────────────────────────────────────────────────────────
@@ -140,7 +152,12 @@ pub struct App {
 
     // Agent chat
     pub chat_state: AgentChatState,
-    acp_tasks: HashMap<String, tokio::task::JoinHandle<()>>,
+    /// Per-conversation streaming task + cancel handle. The token signals
+    /// the in-task `tokio::select!` to bail; the task always exits cleanly
+    /// after it observes the signal (running revert / cleanup paths). The
+    /// JoinHandle is retained only as a last-resort `abort()` target — the
+    /// token is the primary cancel mechanism.
+    acp_tasks: HashMap<String, AcpTaskHandle>,
 
     // Memory
     pub memory: Option<Arc<gaviero_core::memory::MemoryStores>>,
