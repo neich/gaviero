@@ -883,7 +883,20 @@ impl SwarmDashboardState {
         }
 
         if total > viewport {
-            render_scrollbar(content_area, buf, total, viewport, scroll);
+            let diff_indices: Vec<usize> = wrapped_lines
+                .iter()
+                .enumerate()
+                .filter(|(_, (k, _))| matches!(k, DiffLineKind::Added | DiffLineKind::Removed))
+                .map(|(i, _)| i)
+                .collect();
+            crate::widgets::scrollbar::render_scrollbar_with_diff_markers(
+                content_area,
+                buf,
+                total,
+                viewport,
+                scroll,
+                &diff_indices,
+            );
         }
     }
 }
