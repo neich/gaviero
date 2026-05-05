@@ -290,7 +290,8 @@ fn spawn_persistent(
     cmd.current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::null()) // Persistent sessions don't capture stderr
-        .stdin(Stdio::piped());
+        .stdin(Stdio::piped())
+        .kill_on_drop(true);
 
     tracing::info!(
         "Spawning persistent claude session: model={}, cwd={}",
