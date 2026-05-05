@@ -340,10 +340,12 @@ impl FileTreeState {
         let inner = block.inner(area);
         block.render(area, buf);
 
-        // Auto-scroll to keep selection visible
+        // Auto-scroll only when the selection has been changed since the last
+        // render. Wheel scrolling moves the offset independently, so the
+        // selected item may scroll off-screen — that's intentional.
         let viewport = inner.height as usize;
         self.scroll.set_viewport(viewport);
-        self.scroll.ensure_visible();
+        self.scroll.ensure_visible_on_render();
 
         let visible_entries = self
             .entries
