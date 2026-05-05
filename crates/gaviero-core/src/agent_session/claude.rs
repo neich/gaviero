@@ -26,6 +26,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use futures::Stream;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use crate::acp::client::{
     PROCESS_WAIT_TIMEOUT, STREAM_IDLE_TIMEOUT, format_tool_summary, is_auth_error, propose_delete,
@@ -70,6 +71,11 @@ pub struct ClaudeSession {
     /// callback (`on_claude_session_started`) rather than in-struct — the
     /// TUI controller remains the authoritative updater in M6.
     handle: Option<ContinuityHandle>,
+    /// Host-owned cancellation signal. When fired (e.g. by the TUI's
+    /// `cancel_agent`), the streaming loop breaks out, the subprocess is
+    /// killed, and the snapshot revert path runs so no half-applied tool
+    /// edits remain on disk.
+    cancel_token: CancellationToken,
 }
 
 impl ClaudeSession {
@@ -115,6 +121,7 @@ impl ClaudeSession {
             approved_tools,
             profile: args.profile,
             handle,
+            cancel_token: args.cancel_token,
         }
     }
 
@@ -249,9 +256,22 @@ impl ClaudeSession {
         let mut file_snapshots: HashMap<PathBuf, Option<String>> = HashMap::new();
         let mut read_count: usize = 0;
         let mut idle_count: u32 = 0;
+        let mut cancelled = false;
 
         loop {
-            let next = tokio::time::timeout(STREAM_IDLE_TIMEOUT, session.next_event()).await;
+            // Cancellation is checked first (`biased`) so a token fired while
+            // a tool call is mid-flight wins immediately over any newly
+            // arrived stream event. The subprocess is killed synchronously
+            // below — `kill_on_drop` is only the safety net for surprise
+            // task aborts.
+            let next = tokio::select! {
+                biased;
+                _ = self.cancel_token.cancelled() => {
+                    cancelled = true;
+                    break;
+                }
+                n = tokio::time::timeout(STREAM_IDLE_TIMEOUT, session.next_event()) => n,
+            };
 
             match next {
                 Err(_elapsed) => {
@@ -489,17 +509,31 @@ impl ClaudeSession {
             self.observer.on_stream_chunk("\n</think>\n");
         }
 
-        // Wait for subprocess to finish.
-        self.observer.on_streaming_status("Finalizing...");
-        match tokio::time::timeout(PROCESS_WAIT_TIMEOUT, session.wait()).await {
-            Ok(Ok(status)) => tracing::info!("Claude subprocess exited: {}", status),
-            Ok(Err(e)) => tracing::warn!("Error waiting for claude subprocess: {}", e),
-            Err(_) => {
-                tracing::warn!(
-                    "Claude subprocess did not exit within {}s, killing",
-                    PROCESS_WAIT_TIMEOUT.as_secs()
-                );
-                session.kill();
+        if cancelled {
+            // Transactional cancel: kill the subprocess immediately so no
+            // further tool calls fire, then fall through to the snapshot
+            // revert path so any tool edits already on disk are rolled back
+            // (and surfaced as proposals — never auto-applied).
+            tracing::info!("Claude session cancelled by host — killing subprocess");
+            session.kill();
+            self.observer
+                .on_streaming_status("Cancelling — reverting in-flight edits...");
+            // Reap the subprocess so we don't leave a zombie. SIGKILL on the
+            // child means this should be near-instant; bound it anyway.
+            let _ = tokio::time::timeout(PROCESS_WAIT_TIMEOUT, session.wait()).await;
+        } else {
+            // Wait for subprocess to finish.
+            self.observer.on_streaming_status("Finalizing...");
+            match tokio::time::timeout(PROCESS_WAIT_TIMEOUT, session.wait()).await {
+                Ok(Ok(status)) => tracing::info!("Claude subprocess exited: {}", status),
+                Ok(Err(e)) => tracing::warn!("Error waiting for claude subprocess: {}", e),
+                Err(_) => {
+                    tracing::warn!(
+                        "Claude subprocess did not exit within {}s, killing",
+                        PROCESS_WAIT_TIMEOUT.as_secs()
+                    );
+                    session.kill();
+                }
             }
         }
 
@@ -650,6 +684,14 @@ impl ClaudeSession {
                     );
                 }
             }
+        }
+
+        if cancelled {
+            // Surface a terminal message so the chat finalises cleanly. The
+            // observer side has already torn down the streaming task; this
+            // is what gets rendered as the conversation's last entry.
+            self.observer
+                .on_message_complete("system", "Cancelled by user.");
         }
 
         Ok(())

@@ -1866,6 +1866,12 @@ pub(super) fn send_chat_message(app: &mut App) {
 
     let conv_id_clone = conv_id.clone();
     let turn_id_clone = turn_id.clone();
+    // Per-turn cancellation token. The host (`cancel_agent`) fires this on
+    // Ctrl+C; the session observes it and runs revert/cleanup before
+    // returning. Cloned into the spawned task and into `SessionConstruction`.
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let task_cancel = cancel_token.clone();
+    let session_cancel = cancel_token.clone();
     let task = tokio::spawn(async move {
         {
             let mut gate = wg.lock().await;
@@ -2085,17 +2091,40 @@ pub(super) fn send_chat_message(app: &mut App) {
                 agent_id: "claude-chat".to_string(),
                 options,
                 profile: provider_profile_clone,
+                cancel_token: session_cancel,
             },
         );
-        if let Err(e) = session.send_turn(turn).await {
-            tracing::error!("send_turn error: {}", e);
-            let _ = tx.send(Event::MessageComplete {
-                conv_id: conv_id.clone(),
-                role: "system".to_string(),
-                content: format!("Error: {}", e),
-            });
+        // Outer select! is the safety net for transports that don't yet
+        // observe the token internally (e.g. codex/ollama sessions). When
+        // the token fires, dropping the session triggers `kill_on_drop` on
+        // their child processes. Claude observes the token directly inside
+        // `run_claude_turn` and finishes its revert path before returning,
+        // so this branch never wins for Claude.
+        let send_result = tokio::select! {
+            biased;
+            _ = task_cancel.cancelled() => {
+                tracing::info!("Chat turn cancelled by user — dropping session");
+                drop(session);
+                let _ = tx.send(Event::MessageComplete {
+                    conv_id: conv_id.clone(),
+                    role: "system".to_string(),
+                    content: "Cancelled by user.".to_string(),
+                });
+                None
+            }
+            r = session.send_turn(turn) => Some((session, r)),
+        };
+        if let Some((session, result)) = send_result {
+            if let Err(e) = result {
+                tracing::error!("send_turn error: {}", e);
+                let _ = tx.send(Event::MessageComplete {
+                    conv_id: conv_id.clone(),
+                    role: "system".to_string(),
+                    content: format!("Error: {}", e),
+                });
+            }
+            session.close().await;
         }
-        session.close().await;
 
         let proposals = {
             let mut gate = wg.lock().await;
@@ -2122,7 +2151,10 @@ pub(super) fn send_chat_message(app: &mut App) {
     });
     app.acp_tasks.insert(
         app.chat_state.active_conversation_id().to_string(),
-        task,
+        crate::app::AcpTaskHandle {
+            join: task,
+            cancel: cancel_token,
+        },
     );
 }
 
@@ -2161,12 +2193,32 @@ pub(super) fn chat_paste_from_clipboard(app: &mut App) {
 
 pub(super) fn cancel_agent(app: &mut App) {
     let conv_id = app.chat_state.active_conversation_id().to_string();
-    if let Some(task) = app.acp_tasks.remove(&conv_id) {
-        task.abort();
-        let conv = app.chat_state.active_conversation_mut();
-        conv.is_streaming = false;
-        conv.streaming_started_at = None;
-        app.chat_state
-            .finalize_message("system", "Cancelled by user.");
+    // Transactional cancel: signal the streaming task via its CancellationToken
+    // and let it shut down cleanly — the Claude session observes the token
+    // mid-stream, kills the subprocess, and runs the snapshot revert path so
+    // no half-applied tool edits remain on disk. The "Cancelled by user."
+    // chat message is emitted by the task once revert completes (or by the
+    // outer select! arm for non-Claude transports), so we don't finalize it
+    // here. We do NOT call `JoinHandle::abort()` — that would race the
+    // revert path. The handle stays in `acp_tasks` until the task completes
+    // (the spawn site removes it via the message-complete event flow on
+    // shutdown; for now it lingers, which is harmless).
+    if let Some(handle) = app.acp_tasks.get(&conv_id) {
+        if !handle.cancel.is_cancelled() {
+            handle.cancel.cancel();
+            let conv = app.chat_state.active_conversation_mut();
+            conv.is_streaming = false;
+            conv.streaming_started_at = None;
+        } else {
+            // Second Ctrl+C: escalate to abort as escape hatch when graceful
+            // cancel hangs (e.g. revert blocked on disk I/O). `kill_on_drop`
+            // on the subprocess Command still runs.
+            tracing::warn!("cancel_agent: token already fired — escalating to abort");
+            if let Some(handle) = app.acp_tasks.remove(&conv_id) {
+                handle.join.abort();
+                app.chat_state
+                    .finalize_message("system", "Cancelled by user (forced).");
+            }
+        }
     }
 }

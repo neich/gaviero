@@ -11,6 +11,7 @@ path = "src/main.rs"
 gaviero-core = { path = "../gaviero-core" }
 gaviero-dsl = { path = "../gaviero-dsl" }
 tokio = { workspace = true }
+tokio-util = "0.7"
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }

@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use crate::acp::session::AgentOptions;
 use crate::context_planner::ProviderProfile;
@@ -44,6 +45,11 @@ pub struct SessionConstruction {
     pub agent_id: String,
     pub options: AgentOptions,
     pub profile: ProviderProfile,
+    /// Cancellation signal owned by the host (e.g. the TUI). When fired, the
+    /// session must kill any subprocess, run revert / cleanup paths, and
+    /// return — no more tool calls, no more file edits. Defaulted via
+    /// [`CancellationToken::new`] when the caller does not need cancel.
+    pub cancel_token: CancellationToken,
 }
 
 /// Pick a transport session for the given profile.
