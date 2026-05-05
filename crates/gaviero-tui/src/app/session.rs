@@ -419,7 +419,8 @@ pub(super) fn restore_session(app: &mut App) {
 
     app.file_tree.restore_expanded(&state.tree_expanded);
     if state.tree_selected < app.file_tree.entries.len() {
-        app.file_tree.scroll.selected = state.tree_selected;
+        let count = app.file_tree.entries.len();
+        app.file_tree.scroll.set_selected(state.tree_selected, count);
     }
 
     for tab in &state.tabs {
