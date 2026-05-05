@@ -410,7 +410,7 @@ impl SwarmDashboardState {
         };
 
         self.scroll.set_viewport(table_area.height as usize);
-        self.scroll.ensure_visible();
+        self.scroll.ensure_visible_on_render();
         self.render_agent_table(table_area, buf, bg, table_sel_bg);
         self.render_separator(area.x, sep_y, area.width, buf, bg);
 

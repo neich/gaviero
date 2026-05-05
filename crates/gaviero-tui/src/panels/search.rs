@@ -247,7 +247,7 @@ impl SearchPanelState {
         let results_start = area.y + 2;
         let viewport = (area.height as usize).saturating_sub(2);
         self.scroll.set_viewport(viewport);
-        self.scroll.ensure_visible();
+        self.scroll.ensure_visible_on_render();
 
         for idx in self.scroll.visible_range(self.results.len(), viewport) {
             let row = idx - self.scroll.offset;

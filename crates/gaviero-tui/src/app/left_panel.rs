@@ -534,7 +534,8 @@ pub(super) fn confirm_tree_dialog(app: &mut App) {
 pub(super) fn select_path_in_tree(app: &mut App, path: &std::path::Path) {
     for (i, entry) in app.file_tree.entries.iter().enumerate() {
         if entry.path == path {
-            app.file_tree.scroll.selected = i;
+            let count = app.file_tree.entries.len();
+            app.file_tree.scroll.select(i, count);
             return;
         }
     }
@@ -640,5 +641,6 @@ pub(super) fn refresh_file_tree(app: &mut App) {
     let selected = app.file_tree.scroll.selected;
     app.file_tree = FileTreeState::from_roots(&roots, &excludes, &git_allow);
     app.file_tree.restore_expanded(&expanded);
-    app.file_tree.scroll.selected = selected.min(app.file_tree.entries.len().saturating_sub(1));
+    let count = app.file_tree.entries.len();
+    app.file_tree.scroll.set_selected(selected, count);
 }
