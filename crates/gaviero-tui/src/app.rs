@@ -400,6 +400,19 @@ impl App {
         controller::handle_event(self, event);
     }
 
+    pub fn agent_chat_visible(&self) -> bool {
+        self.side_panel == SidePanelMode::AgentChat
+            && (self.panel_visible.side_panel || self.fullscreen_panel == Some(Focus::SidePanel))
+    }
+
+    pub fn is_active_chat_conversation(&self, conv_id: &str) -> bool {
+        self.chat_state.active_conversation_id() == conv_id
+    }
+
+    pub fn active_agent_chat_stream_visible(&self) -> bool {
+        self.agent_chat_visible() && self.chat_state.active_conv_streaming()
+    }
+
     fn handle_action(&mut self, action: Action) {
         controller::handle_action(self, action);
     }

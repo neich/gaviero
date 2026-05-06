@@ -6,7 +6,7 @@
 //! in the response text (detected and routed through the Write Gate), matching
 //! the pattern used by the Claude Code backend.
 //!
-//! Codex is invoked with `sandbox=read-only` and `approval_policy=never` so that
+//! Codex is invoked with `--sandbox read-only` and `--ask-for-approval never` so that
 //! tool-use stays non-interactive; the model emits proposed writes as `<file>`
 //! blocks rather than touching disk directly.
 
@@ -68,26 +68,8 @@ impl AgentBackend for CodexBackend {
         let combined_prompt = format!("{system_prompt}\n\n{user_prompt}");
 
         let mut cmd = Command::new("codex");
-        cmd.arg("exec")
-            .arg("--skip-git-repo-check")
-            .arg("--model")
-            .arg(&self.model)
-            .arg("--config")
-            .arg("approval_policy=never")
-            .arg("--config")
-            .arg("sandbox=read-only");
-
-        if let Some(codex_effort) = map_effort_to_codex(request.effort.as_deref()) {
-            cmd.arg("--config")
-                .arg(format!("model_reasoning_effort={codex_effort}"));
-        }
-
-        // Forward every `extra { k v }` pair as a `-c k=v` override to codex.
-        // Codex treats `--config` args as TOML-shaped overrides and silently
-        // ignores unknown keys, so this is a safe pass-through: users opt in
-        // explicitly via the DSL.
-        for (k, v) in &request.extra {
-            cmd.arg("--config").arg(format!("{k}={v}"));
+        for arg in codex_exec_args(&self.model, request.effort.as_deref(), &request.extra) {
+            cmd.arg(arg);
         }
 
         cmd.arg(&combined_prompt)
@@ -192,6 +174,35 @@ impl AgentBackend for CodexBackend {
             anyhow::bail!("codex --version exited with {}", output.status)
         }
     }
+}
+
+fn codex_exec_args(model: &str, effort: Option<&str>, extra: &[(String, String)]) -> Vec<String> {
+    let mut args = vec![
+        "exec".to_string(),
+        "--skip-git-repo-check".to_string(),
+        "--model".to_string(),
+        model.to_string(),
+        "--ask-for-approval".to_string(),
+        "never".to_string(),
+        "--sandbox".to_string(),
+        "read-only".to_string(),
+    ];
+
+    if let Some(codex_effort) = map_effort_to_codex(effort) {
+        args.push("--config".to_string());
+        args.push(format!("model_reasoning_effort={codex_effort}"));
+    }
+
+    // Forward every `extra { k v }` pair as a `-c k=v` override to codex.
+    // Codex treats `--config` args as TOML-shaped overrides and silently
+    // ignores unknown keys, so this is a safe pass-through: users opt in
+    // explicitly via the DSL.
+    for (k, v) in extra {
+        args.push("--config".to_string());
+        args.push(format!("{k}={v}"));
+    }
+
+    args
 }
 
 /// Read stdout in chunks and emit TextDelta + FileBlock events.
@@ -314,6 +325,17 @@ mod tests {
         assert!(caps.supports_file_blocks);
         assert!(caps.supports_system_prompt);
         assert!(caps.streaming);
+    }
+
+    #[test]
+    fn test_codex_exec_args_force_read_only_review_channel() {
+        let args = codex_exec_args("gpt-5.5", Some("high"), &[]);
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--ask-for-approval", "never"])
+        );
+        assert!(args.windows(2).any(|w| w == ["--sandbox", "read-only"]));
+        assert!(!args.iter().any(|a| a == "sandbox=read-only"));
     }
 
     #[test]

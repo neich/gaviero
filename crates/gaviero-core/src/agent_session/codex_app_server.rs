@@ -72,7 +72,8 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::context_planner::{ContinuityHandle, ContinuityMode};
-use crate::swarm::backend::{StopReason, TokenUsage, UnifiedStreamEvent};
+use crate::swarm::backend::shared::default_editor_system_prompt;
+use crate::swarm::backend::{Capabilities, StopReason, TokenUsage, UnifiedStreamEvent};
 
 use super::registry::SessionConstruction;
 use super::{AgentSession, Turn};
@@ -84,6 +85,51 @@ static NEXT_RPC_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_id() -> u64 {
     NEXT_RPC_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn codex_file_block_capabilities() -> Capabilities {
+    Capabilities {
+        tool_use: true,
+        streaming: true,
+        vision: false,
+        extended_thinking: false,
+        max_context_tokens: 200_000,
+        supports_system_prompt: true,
+        supports_file_blocks: true,
+    }
+}
+
+fn codex_file_block_developer_instructions() -> String {
+    default_editor_system_prompt(&codex_file_block_capabilities())
+}
+
+fn thread_start_params(model: &str, cwd: &PathBuf) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "cwd": cwd.to_string_lossy(),
+        "approvalPolicy": "never",
+        "sandbox": "read-only",
+        "developerInstructions": codex_file_block_developer_instructions(),
+    })
+}
+
+fn thread_resume_params(thread_id: &str, cwd: &PathBuf) -> serde_json::Value {
+    serde_json::json!({
+        "threadId": thread_id,
+        "cwd": cwd.to_string_lossy(),
+        "approvalPolicy": "never",
+        "sandbox": "read-only",
+        "developerInstructions": codex_file_block_developer_instructions(),
+    })
+}
+
+fn turn_start_params(thread_id: &str, user_message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "threadId": thread_id,
+        "input": [{ "type": "text", "text": user_message }],
+        "approvalPolicy": "never",
+        "sandboxPolicy": { "type": "readOnly", "networkAccess": false },
+    })
 }
 
 /// Serialize a JSON-RPC 2.0 request (with `id`, expects a response).
@@ -276,10 +322,7 @@ impl AgentSession for CodexAppServerSession {
         let req = rpc_request(
             "turn/start",
             next_id(),
-            serde_json::json!({
-                "threadId": thread_id,
-                "input": [{ "type": "text", "text": turn.user_message }],
-            }),
+            turn_start_params(&thread_id, &turn.user_message),
         );
         if let Err(e) = write_msg(&mut inner.stdin, &req).await {
             tracing::warn!("codex app-server: stdin write failed (crash?): {e}");
@@ -339,16 +382,9 @@ async fn handshake(
     // 3. thread/start or thread/resume
     let (method, params) = match existing_handle {
         Some(ContinuityHandle::CodexThreadId(id)) => {
-            ("thread/resume", serde_json::json!({ "threadId": id }))
+            ("thread/resume", thread_resume_params(id, cwd))
         }
-        _ => (
-            "thread/start",
-            serde_json::json!({
-                "model": model,
-                "cwd": cwd.to_string_lossy(),
-                "approvalPolicy": "never",
-            }),
-        ),
+        _ => ("thread/start", thread_start_params(model, cwd)),
     };
 
     let thread_req_id = next_id();
@@ -585,6 +621,35 @@ mod tests {
     // Helper: parse and assert event list + done flag.
     fn parse(line: &str) -> (Vec<UnifiedStreamEvent>, bool) {
         parse_rpc_event(line)
+    }
+
+    #[test]
+    fn thread_start_policy_forces_file_blocks_and_read_only() {
+        let params = thread_start_params("gpt-5.5", &PathBuf::from("/tmp/work"));
+        assert_eq!(params["approvalPolicy"], "never");
+        assert_eq!(params["sandbox"], "read-only");
+        let instructions = params["developerInstructions"].as_str().unwrap();
+        assert!(instructions.contains("All code edits must be proposed"));
+        assert!(instructions.contains("<file path=\"relative/path\">...</file>"));
+    }
+
+    #[test]
+    fn thread_resume_policy_reasserts_file_blocks_and_read_only() {
+        let params = thread_resume_params("thread-1", &PathBuf::from("/tmp/work"));
+        assert_eq!(params["threadId"], "thread-1");
+        assert_eq!(params["approvalPolicy"], "never");
+        assert_eq!(params["sandbox"], "read-only");
+        let instructions = params["developerInstructions"].as_str().unwrap();
+        assert!(instructions.contains("All code edits must be proposed"));
+    }
+
+    #[test]
+    fn turn_start_policy_reasserts_read_only_sandbox() {
+        let params = turn_start_params("thread-1", "hello");
+        assert_eq!(params["threadId"], "thread-1");
+        assert_eq!(params["approvalPolicy"], "never");
+        assert_eq!(params["sandboxPolicy"]["type"], "readOnly");
+        assert_eq!(params["sandboxPolicy"]["networkAccess"], false);
     }
 
     #[test]
