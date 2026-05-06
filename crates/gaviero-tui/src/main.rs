@@ -14,9 +14,13 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use app::App;
 use event::EventLoop;
+
+const CHAT_STREAM_RENDER_INTERVAL: Duration = Duration::from_millis(100);
+const CHAT_SPINNER_RENDER_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Parser)]
 #[command(
@@ -99,13 +103,70 @@ fn restore_terminal() {
     let _ = execute!(std::io::stdout(), crossterm::cursor::Show);
 }
 
-/// Decide whether an incoming event requires a redraw. A bare `Event::Tick`
-/// only advances the spinner while streaming; outside of that it carries no
-/// visible state change, so dropping the redraw is what cuts idle CPU.
-fn event_requires_render(event: &event::Event, app: &App) -> bool {
-    match event {
-        event::Event::Tick => app.chat_state.active_conv_streaming(),
-        _ => true,
+/// Coalesces expensive Agent Chat streaming redraws while leaving state
+/// updates immediate. Keyboard, mouse, resize, terminal, review, and lifecycle
+/// events still repaint immediately; only visible active chat stream output and
+/// spinner-only ticks are budgeted.
+struct RenderScheduler {
+    last_chat_render: Instant,
+    pending_chat_render: bool,
+}
+
+impl RenderScheduler {
+    fn new() -> Self {
+        Self {
+            last_chat_render: Instant::now()
+                .checked_sub(CHAT_STREAM_RENDER_INTERVAL)
+                .unwrap_or_else(Instant::now),
+            pending_chat_render: false,
+        }
+    }
+
+    fn should_render(&mut self, event: &event::Event, app: &App) -> bool {
+        match event {
+            event::Event::StreamChunk { conv_id, .. }
+            | event::Event::ToolCallStarted { conv_id, .. }
+            | event::Event::StreamingStatus { conv_id, .. } => {
+                self.should_render_chat_stream_event(conv_id, app)
+            }
+            event::Event::Tick => self.should_render_tick(app),
+            _ => true,
+        }
+    }
+
+    fn should_render_chat_stream_event(&mut self, conv_id: &str, app: &App) -> bool {
+        if !app.agent_chat_visible() || !app.is_active_chat_conversation(conv_id) {
+            return false;
+        }
+
+        if self.last_chat_render.elapsed() >= CHAT_STREAM_RENDER_INTERVAL {
+            true
+        } else {
+            self.pending_chat_render = true;
+            false
+        }
+    }
+
+    fn should_render_tick(&mut self, app: &App) -> bool {
+        if !app.active_agent_chat_stream_visible() {
+            self.pending_chat_render = false;
+            return false;
+        }
+
+        if self.pending_chat_render
+            && self.last_chat_render.elapsed() >= CHAT_STREAM_RENDER_INTERVAL
+        {
+            return true;
+        }
+
+        self.last_chat_render.elapsed() >= CHAT_SPINNER_RENDER_INTERVAL
+    }
+
+    fn record_render(&mut self, app: &App) {
+        if app.agent_chat_visible() {
+            self.last_chat_render = Instant::now();
+            self.pending_chat_render = false;
+        }
     }
 }
 
@@ -283,10 +344,10 @@ async fn main() -> Result<()> {
     // each causing an unnecessary render. Draining processes them all at once,
     // so the UI jumps straight to the final state.
     //
-    // Render is gated on `needs_render`: a Tick by itself is a no-op except for
-    // spinner animation while streaming, so 30 fps redraws on a quiet TUI are
-    // pure waste. We only draw on the first frame, after a non-Tick event, or
-    // on a Tick taken while the active conversation is streaming.
+    // Render is gated on `needs_render`: chat stream events update state
+    // immediately, but expensive Agent Chat repainting is coalesced to a small
+    // budget. Most non-chat events still draw immediately.
+    let mut render_scheduler = RenderScheduler::new();
     let mut needs_render = true;
     loop {
         if app.needs_full_redraw {
@@ -296,12 +357,13 @@ async fn main() -> Result<()> {
         }
         if needs_render {
             terminal.draw(|frame| app.render(frame))?;
+            render_scheduler.record_render(&app);
             needs_render = false;
         }
 
         // Block until at least one event arrives
         if let Some(event) = event_rx.recv().await {
-            if event_requires_render(&event, &app) {
+            if render_scheduler.should_render(&event, &app) {
                 needs_render = true;
             }
             app.handle_event(event);
@@ -313,7 +375,7 @@ async fn main() -> Result<()> {
         for _ in 0..64 {
             match event_rx.try_recv() {
                 Ok(event) => {
-                    if event_requires_render(&event, &app) {
+                    if render_scheduler.should_render(&event, &app) {
                         needs_render = true;
                     }
                     app.handle_event(event);
