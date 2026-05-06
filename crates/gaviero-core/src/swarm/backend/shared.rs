@@ -7,12 +7,7 @@ use super::{AgentBackend, BackendConfig, Capabilities, CompletionRequest, create
 
 const HISTORY_TRUNCATION_CHARS: usize = 2000;
 const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
-const SUPPORTED_PROVIDER_PREFIXES: &[&str] = &[
-    "claude",
-    "codex",
-    "ollama",
-    "local",
-];
+const SUPPORTED_PROVIDER_PREFIXES: &[&str] = &["claude", "codex", "ollama", "local"];
 
 pub fn build_enriched_prompt(
     prompt: &str,
@@ -80,8 +75,10 @@ pub fn default_editor_system_prompt(capabilities: &Capabilities) -> String {
     // them causes the model to quote the marker back in prose, which the
     // parser cannot reliably distinguish from a real proposal.
     let file_clause = if capabilities.supports_file_blocks {
-        "When proposing file changes, emit complete <file path=\"relative/path\">...</file> \
-         blocks so the editor can review them before applying.\n\n"
+        "All code edits must be proposed as complete <file path=\"relative/path\">...</file> \
+         blocks so the editor can review them before applying. Do not edit files directly, \
+         and do not emit partial file fragments; include the complete final content for each \
+         edited file.\n\n"
     } else if capabilities.tool_use {
         "When you need to change files, use the Write, Edit, or MultiEdit tools. \
          Do not paste file contents inline as a substitute for a tool call — only the \
