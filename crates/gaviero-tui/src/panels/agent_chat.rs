@@ -8,6 +8,7 @@ use ratatui::{
 };
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use unicode_width::UnicodeWidthChar;
@@ -17,6 +18,10 @@ use crate::app::collapse_file_blocks;
 use crate::theme;
 use crate::theme::Theme;
 use crate::widgets::text_input::TextInput;
+
+const CHAT_RENDER_TRACE_ENV: &str = "GAVIERO_CHAT_RENDER_TRACE";
+const CHAT_RENDER_TRACE_MS_ENV: &str = "GAVIERO_CHAT_RENDER_TRACE_MS";
+const DEFAULT_CHAT_RENDER_TRACE_MS: u128 = 16;
 
 // ── Data types ──────────────────────────────────────────────────
 
@@ -52,6 +57,31 @@ pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
     pub tool_calls: Vec<String>,
+}
+
+fn chat_render_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(CHAT_RENDER_TRACE_ENV)
+            .map(|value| {
+                let value = value.trim();
+                !value.is_empty()
+                    && value != "0"
+                    && !value.eq_ignore_ascii_case("false")
+                    && !value.eq_ignore_ascii_case("off")
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn chat_render_trace_threshold_ms() -> u128 {
+    static THRESHOLD_MS: OnceLock<u128> = OnceLock::new();
+    *THRESHOLD_MS.get_or_init(|| {
+        std::env::var(CHAT_RENDER_TRACE_MS_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<u128>().ok())
+            .unwrap_or(DEFAULT_CHAT_RENDER_TRACE_MS)
+    })
 }
 
 // ── Chat state ──────────────────────────────────────────────────
@@ -349,16 +379,16 @@ impl AgentChatState {
     /// Active conversation accessor guarded by the state invariant:
     /// `active_conv` must always point to an existing conversation.
     pub fn active_conversation(&self) -> &Conversation {
-        self.conversations.get(self.active_conv).expect(
-            "active_conv out of bounds; invariant broken (no active conversation at index)",
-        )
+        self.conversations
+            .get(self.active_conv)
+            .expect("active_conv out of bounds; invariant broken (no active conversation at index)")
     }
 
     /// Mutable active conversation accessor guarded by the same invariant.
     pub fn active_conversation_mut(&mut self) -> &mut Conversation {
-        self.conversations.get_mut(self.active_conv).expect(
-            "active_conv out of bounds; invariant broken (no active conversation at index)",
-        )
+        self.conversations
+            .get_mut(self.active_conv)
+            .expect("active_conv out of bounds; invariant broken (no active conversation at index)")
     }
 
     /// ID of the active conversation.
@@ -2127,6 +2157,29 @@ impl AgentChatState {
         // Subtract 1 to leave room for the scrollbar column on the right edge.
         let width = area.width.saturating_sub(1) as usize;
         let browse_bg = theme::BROWSE_BG; // highlight bg for browsed message
+        let trace_enabled = chat_render_trace_enabled();
+        let trace_started_at = trace_enabled.then(Instant::now);
+        let (trace_message_count, trace_content_bytes) = if trace_enabled {
+            let messages = self.messages();
+            (
+                messages.len(),
+                messages
+                    .iter()
+                    .map(|message| message.content.len())
+                    .sum::<usize>(),
+            )
+        } else {
+            (0, 0)
+        };
+        let trace_streaming_status = if trace_enabled && self.active_conv_streaming() {
+            Some(
+                self.conversations[self.active_conv]
+                    .streaming_status
+                    .clone(),
+            )
+        } else {
+            None
+        };
 
         // Build rendered lines from messages: (style, text, message_index)
         let mut lines: Vec<(Style, String, Option<usize>)> = Vec::new();
@@ -2317,6 +2370,24 @@ impl AgentChatState {
 
         // Scrollbar
         crate::widgets::scrollbar::render_scrollbar(area, buf, total, viewport, self.scroll_offset);
+
+        if let Some(started_at) = trace_started_at {
+            let elapsed_ms = started_at.elapsed().as_millis();
+            if elapsed_ms >= chat_render_trace_threshold_ms() {
+                tracing::warn!(
+                    target: "agent_chat_render",
+                    elapsed_ms,
+                    message_count = trace_message_count,
+                    content_bytes = trace_content_bytes,
+                    rendered_line_count = total,
+                    width,
+                    height = viewport,
+                    streaming = self.active_conv_streaming(),
+                    streaming_status = %trace_streaming_status.as_deref().unwrap_or(""),
+                    "slow agent chat render"
+                );
+            }
+        }
     }
 
     fn render_input(&self, area: Rect, buf: &mut RataBuf, focused: bool, _theme: &Theme) {
@@ -2967,7 +3038,15 @@ mod tests {
             "panel transcript must survive /reset"
         );
         // Session handle was dropped so bootstrap context will fire.
-        assert!(state.conversations[state.active_conv].claude_session_id.is_none());
-        assert!(state.conversations[state.active_conv].session_ledger.is_none());
+        assert!(
+            state.conversations[state.active_conv]
+                .claude_session_id
+                .is_none()
+        );
+        assert!(
+            state.conversations[state.active_conv]
+                .session_ledger
+                .is_none()
+        );
     }
 }
