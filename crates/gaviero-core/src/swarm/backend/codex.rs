@@ -6,9 +6,11 @@
 //! in the response text (detected and routed through the Write Gate), matching
 //! the pattern used by the Claude Code backend.
 //!
-//! Codex is invoked with `--sandbox read-only` and `--ask-for-approval never` so that
-//! tool-use stays non-interactive; the model emits proposed writes as `<file>`
-//! blocks rather than touching disk directly.
+//! Codex is invoked with `--sandbox read-only` and `--config approval_policy=never`
+//! so that tool-use stays non-interactive; the model emits proposed writes as
+//! `<file>` blocks rather than touching disk directly. `--ask-for-approval` only
+//! exists on the top-level `codex` command, not on `codex exec`, so the approval
+//! policy must be set via the TOML config override.
 
 use std::pin::Pin;
 use std::process::Stdio;
@@ -182,8 +184,8 @@ fn codex_exec_args(model: &str, effort: Option<&str>, extra: &[(String, String)]
         "--skip-git-repo-check".to_string(),
         "--model".to_string(),
         model.to_string(),
-        "--ask-for-approval".to_string(),
-        "never".to_string(),
+        "--config".to_string(),
+        "approval_policy=never".to_string(),
         "--sandbox".to_string(),
         "read-only".to_string(),
     ];
@@ -332,10 +334,10 @@ mod tests {
         let args = codex_exec_args("gpt-5.5", Some("high"), &[]);
         assert!(
             args.windows(2)
-                .any(|w| w == ["--ask-for-approval", "never"])
+                .any(|w| w == ["--config", "approval_policy=never"])
         );
         assert!(args.windows(2).any(|w| w == ["--sandbox", "read-only"]));
-        assert!(!args.iter().any(|a| a == "sandbox=read-only"));
+        assert!(!args.iter().any(|a| a == "--ask-for-approval"));
     }
 
     #[test]
