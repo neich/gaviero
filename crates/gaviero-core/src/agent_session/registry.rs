@@ -42,6 +42,13 @@ pub struct SessionConstruction {
     pub model: String,
     pub ollama_base_url: Option<String>,
     pub workspace_root: PathBuf,
+    /// Sibling workspace folders (workspace-mode multi-folder). The session
+    /// forwards each as a `--add-dir` flag to the underlying CLI so the model
+    /// can read/write across folders, not only the primary cwd. Empty in
+    /// single-folder mode and per-agent swarm worktrees. The primary
+    /// `workspace_root` is *not* duplicated here — callers pass only the
+    /// sibling folders.
+    pub additional_roots: Vec<PathBuf>,
     pub agent_id: String,
     pub options: AgentOptions,
     pub profile: ProviderProfile,
