@@ -161,10 +161,12 @@ pub enum Token {
     RBracket,
 
     // ── Literals ─────────────────────────────────────────────────
-    /// Double-quoted string: `"hello world"`
-    #[regex(r#""[^"]*""#, |lex| {
+    /// Double-quoted string: `"hello world"`. Supports `\"` to embed a
+    /// quote and `\\` to embed a backslash; any other `\x` sequence is
+    /// preserved as a literal backslash followed by `x`.
+    #[regex(r#""([^"\\]|\\.)*""#, |lex| {
         let s = lex.slice();
-        s[1..s.len() - 1].to_owned()
+        decode_string_literal(&s[1..s.len() - 1])
     })]
     Str(String),
 
@@ -264,6 +266,31 @@ impl fmt::Display for Token {
             Token::Ident(s) => write!(f, "{}", s),
         }
     }
+}
+
+/// Decode a double-quoted string body (content between the surrounding
+/// `"`). Recognises `\"` and `\\` as escape sequences; every other
+/// backslash sequence is preserved as a literal backslash followed by the
+/// next character so that paths and regexes round-trip unchanged.
+fn decode_string_literal(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Callback for `#"..."#` raw strings.
@@ -512,6 +539,30 @@ mod tests {
         assert!(errs.is_empty(), "lex errors: {:?}", errs);
         assert_eq!(toks.len(), 1);
         assert!(matches!(toks[0].0, Token::KwVars));
+    }
+
+    #[test]
+    fn quoted_string_with_escaped_quote() {
+        let (toks, errs) = lex(r#""he said \"hi\"""#);
+        assert!(errs.is_empty(), "lex errors: {:?}", errs);
+        assert_eq!(toks.len(), 1);
+        assert!(matches!(&toks[0].0, Token::Str(s) if s == r#"he said "hi""#));
+    }
+
+    #[test]
+    fn quoted_string_with_escaped_backslash() {
+        let (toks, errs) = lex(r#""a\\b""#);
+        assert!(errs.is_empty(), "lex errors: {:?}", errs);
+        assert_eq!(toks.len(), 1);
+        assert!(matches!(&toks[0].0, Token::Str(s) if s == r"a\b"));
+    }
+
+    #[test]
+    fn quoted_string_preserves_unrecognised_escape() {
+        let (toks, errs) = lex(r#""path\to\file""#);
+        assert!(errs.is_empty(), "lex errors: {:?}", errs);
+        assert_eq!(toks.len(), 1);
+        assert!(matches!(&toks[0].0, Token::Str(s) if s == r"path\to\file"));
     }
 
     #[test]
