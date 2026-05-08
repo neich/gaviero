@@ -925,6 +925,32 @@
               "name": "boolean"
             }
           ]
+        },
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "branch_chain"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "branch_chain_value"
+            }
+          ]
+        }
+      ]
+    },
+    "branch_chain_value": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "stacked"
+        },
+        {
+          "type": "STRING",
+          "value": "none"
         }
       ]
     },
@@ -1300,8 +1326,20 @@
             "value": "\""
           },
           {
-            "type": "PATTERN",
-            "value": "[^\"]*"
+            "type": "REPEAT",
+            "content": {
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "PATTERN",
+                  "value": "[^\"\\\\]"
+                },
+                {
+                  "type": "PATTERN",
+                  "value": "\\\\."
+                }
+              ]
+            }
           },
           {
             "type": "STRING",
