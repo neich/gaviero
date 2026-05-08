@@ -99,27 +99,60 @@ fn codex_file_block_capabilities() -> Capabilities {
     }
 }
 
-fn codex_file_block_developer_instructions() -> String {
-    default_editor_system_prompt(&codex_file_block_capabilities())
+fn codex_file_block_developer_instructions(
+    cwd: &PathBuf,
+    additional_roots: &[PathBuf],
+) -> String {
+    let base = default_editor_system_prompt(&codex_file_block_capabilities());
+    if additional_roots.is_empty() {
+        return base;
+    }
+    // Workspace-mode multi-folder: the codex app-server protocol takes a
+    // single `cwd` field, and the only protocol-level "additional writable
+    // roots" is `WorkspaceWriteSandboxPolicy.writableRoots` — which would
+    // require switching the sandbox to write-mode and bypass the Write
+    // Gate. Instead, surface the sibling folders as a workspace hint in
+    // the developer instructions so the model knows it can read/edit
+    // across them. File edits still flow through `<file>` proposals.
+    let mut hint = String::from("\n\nWorkspace folders (workspace-mode):\n");
+    hint.push_str(&format!("  primary: {}\n", cwd.to_string_lossy()));
+    for r in additional_roots {
+        if r.as_os_str().is_empty() || r == cwd {
+            continue;
+        }
+        hint.push_str(&format!("  sibling: {}\n", r.to_string_lossy()));
+    }
+    hint.push_str(
+        "Read freely from any folder above. File edits across any folder are emitted as <file path=\"...\"> ... </file> proposals — gaviero routes them through its review queue.\n",
+    );
+    format!("{base}{hint}")
 }
 
-fn thread_start_params(model: &str, cwd: &PathBuf) -> serde_json::Value {
+fn thread_start_params(
+    model: &str,
+    cwd: &PathBuf,
+    additional_roots: &[PathBuf],
+) -> serde_json::Value {
     serde_json::json!({
         "model": model,
         "cwd": cwd.to_string_lossy(),
         "approvalPolicy": "never",
         "sandbox": "read-only",
-        "developerInstructions": codex_file_block_developer_instructions(),
+        "developerInstructions": codex_file_block_developer_instructions(cwd, additional_roots),
     })
 }
 
-fn thread_resume_params(thread_id: &str, cwd: &PathBuf) -> serde_json::Value {
+fn thread_resume_params(
+    thread_id: &str,
+    cwd: &PathBuf,
+    additional_roots: &[PathBuf],
+) -> serde_json::Value {
     serde_json::json!({
         "threadId": thread_id,
         "cwd": cwd.to_string_lossy(),
         "approvalPolicy": "never",
         "sandbox": "read-only",
-        "developerInstructions": codex_file_block_developer_instructions(),
+        "developerInstructions": codex_file_block_developer_instructions(cwd, additional_roots),
     })
 }
 
@@ -164,6 +197,12 @@ struct AppServerInner {
 pub struct CodexAppServerSession {
     model: String,
     workspace_root: PathBuf,
+    /// Sibling workspace folders (workspace-mode multi-folder). The codex
+    /// app-server RPC has no `--add-dir` analog while in `read-only`
+    /// sandbox, so these are passed through `developerInstructions` as a
+    /// workspace hint. File edits still flow through the in-band `<file>`
+    /// proposal channel and gaviero's Write Gate.
+    additional_roots: Vec<PathBuf>,
     inner: Option<AppServerInner>,
     handle: Option<ContinuityHandle>,
 }
@@ -189,6 +228,7 @@ impl CodexAppServerSession {
         Self {
             model,
             workspace_root: args.workspace_root,
+            additional_roots: args.additional_roots,
             inner: None,
             handle,
         }
@@ -242,6 +282,7 @@ impl CodexAppServerSession {
                 &mut lines,
                 &self.model,
                 &self.workspace_root,
+                &self.additional_roots,
                 &self.handle,
             ),
         )
@@ -355,6 +396,7 @@ async fn handshake(
     lines: &mut Lines<BufReader<ChildStdout>>,
     model: &str,
     cwd: &PathBuf,
+    additional_roots: &[PathBuf],
     existing_handle: &Option<ContinuityHandle>,
 ) -> Result<String> {
     // 1. initialize
@@ -381,10 +423,14 @@ async fn handshake(
 
     // 3. thread/start or thread/resume
     let (method, params) = match existing_handle {
-        Some(ContinuityHandle::CodexThreadId(id)) => {
-            ("thread/resume", thread_resume_params(id, cwd))
-        }
-        _ => ("thread/start", thread_start_params(model, cwd)),
+        Some(ContinuityHandle::CodexThreadId(id)) => (
+            "thread/resume",
+            thread_resume_params(id, cwd, additional_roots),
+        ),
+        _ => (
+            "thread/start",
+            thread_start_params(model, cwd, additional_roots),
+        ),
     };
 
     let thread_req_id = next_id();
@@ -625,22 +671,53 @@ mod tests {
 
     #[test]
     fn thread_start_policy_forces_file_blocks_and_read_only() {
-        let params = thread_start_params("gpt-5.5", &PathBuf::from("/tmp/work"));
+        let params = thread_start_params("gpt-5.5", &PathBuf::from("/tmp/work"), &[]);
         assert_eq!(params["approvalPolicy"], "never");
         assert_eq!(params["sandbox"], "read-only");
         let instructions = params["developerInstructions"].as_str().unwrap();
         assert!(instructions.contains("All code edits must be proposed"));
         assert!(instructions.contains("<file path=\"relative/path\">...</file>"));
+        // Single-folder mode: no workspace-folders hint appended.
+        assert!(!instructions.contains("Workspace folders"));
     }
 
     #[test]
     fn thread_resume_policy_reasserts_file_blocks_and_read_only() {
-        let params = thread_resume_params("thread-1", &PathBuf::from("/tmp/work"));
+        let params = thread_resume_params("thread-1", &PathBuf::from("/tmp/work"), &[]);
         assert_eq!(params["threadId"], "thread-1");
         assert_eq!(params["approvalPolicy"], "never");
         assert_eq!(params["sandbox"], "read-only");
         let instructions = params["developerInstructions"].as_str().unwrap();
         assert!(instructions.contains("All code edits must be proposed"));
+    }
+
+    #[test]
+    fn thread_start_appends_sibling_folders_to_developer_instructions() {
+        let extras = vec![
+            PathBuf::from("/tmp/sibling-a"),
+            PathBuf::from("/tmp/sibling-b"),
+        ];
+        let params = thread_start_params("gpt-5.5", &PathBuf::from("/tmp/work"), &extras);
+        let instructions = params["developerInstructions"].as_str().unwrap();
+        assert!(instructions.contains("Workspace folders"));
+        assert!(instructions.contains("primary: /tmp/work"));
+        assert!(instructions.contains("sibling: /tmp/sibling-a"));
+        assert!(instructions.contains("sibling: /tmp/sibling-b"));
+    }
+
+    #[test]
+    fn thread_start_skips_empty_or_duplicate_sibling_folders() {
+        let extras = vec![
+            PathBuf::new(),
+            PathBuf::from("/tmp/work"), // same as cwd; should be skipped
+            PathBuf::from("/tmp/sibling"),
+        ];
+        let params = thread_start_params("gpt-5.5", &PathBuf::from("/tmp/work"), &extras);
+        let instructions = params["developerInstructions"].as_str().unwrap();
+        // The cwd appears once as "primary"; not as a sibling line.
+        let sibling_lines = instructions.matches("sibling:").count();
+        assert_eq!(sibling_lines, 1, "only /tmp/sibling is a real sibling");
+        assert!(instructions.contains("sibling: /tmp/sibling"));
     }
 
     #[test]
