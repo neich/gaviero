@@ -197,6 +197,65 @@ pub enum Event {
     Tick,
 }
 
+/// Path components that are always dropped on the file-watcher path,
+/// regardless of `files.exclude`. These are directories whose contents are
+/// virtually never useful as editor signals (build artefacts, VCS internals,
+/// gaviero's own swarm worktrees) and would otherwise flood the unbounded
+/// event channel during a build.
+const ALWAYS_SKIP_COMPONENTS: &[&str] = &["target", "node_modules", ".git"];
+
+/// Decide whether a notify event path should be dropped before it reaches
+/// the main loop. Skips paths under one of `ALWAYS_SKIP_COMPONENTS`,
+/// gaviero's own `.gaviero/worktrees/` subtree, or any user `files.exclude`
+/// pattern. Paths outside every workspace root pass through unchanged —
+/// notify can deliver `~/.cache/...` events on Linux and we don't want to
+/// silently swallow them.
+fn path_is_excluded(path: &Path, roots: &[PathBuf], exclude_patterns: &[String]) -> bool {
+    let rel = roots
+        .iter()
+        .filter_map(|root| path.strip_prefix(root).ok().map(|r| (root, r)))
+        .max_by_key(|(root, _)| root.as_os_str().len())
+        .map(|(_, rel)| rel);
+    let Some(rel) = rel else {
+        return false;
+    };
+
+    let mut saw_dot_gaviero = false;
+    for component in rel.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        let Some(name) = name.to_str() else { continue };
+        if ALWAYS_SKIP_COMPONENTS.contains(&name) {
+            return true;
+        }
+        if saw_dot_gaviero && name == "worktrees" {
+            return true;
+        }
+        saw_dot_gaviero = name == ".gaviero";
+    }
+
+    if !exclude_patterns.is_empty() {
+        // `matches_exclude` is a leaf matcher: a pattern like `build/` only
+        // matches the literal `build` path, not `build/output.txt`. Walk the
+        // relative path up so a watcher event under an excluded directory
+        // still gets dropped. Cheap because rel paths inside a workspace are
+        // shallow (a handful of components at most).
+        let mut current: Option<&Path> = Some(rel);
+        while let Some(p) = current {
+            if !p.as_os_str().is_empty() {
+                let s = p.to_string_lossy();
+                if crate::app::matches_exclude(&s, exclude_patterns) {
+                    return true;
+                }
+            }
+            current = p.parent();
+        }
+    }
+
+    false
+}
+
 pub struct EventLoop {
     tx: mpsc::UnboundedSender<Event>,
     rx: Option<mpsc::UnboundedReceiver<Event>>,
@@ -267,31 +326,52 @@ impl EventLoop {
     }
 
     /// Spawn a file-system watcher on the given paths.
-    /// Returns the watcher handle — it must be kept alive for watching to continue.
+    ///
+    /// `exclude_patterns` is the resolved `files.exclude` set (gitignore-style
+    /// patterns). Any event whose path matches a pattern, or whose path
+    /// contains one of the always-skip components below, is dropped before it
+    /// reaches the unified event channel. Without this filter, a single
+    /// `cargo test` writes thousands of files under `target/` and floods the
+    /// main loop into apparent freeze.
+    ///
+    /// Returns the watcher handle — it must be kept alive for watching to
+    /// continue.
     pub fn spawn_file_watcher(
         &self,
         paths: &[&Path],
+        exclude_patterns: Vec<String>,
     ) -> notify::Result<notify::RecommendedWatcher> {
         use notify::{RecursiveMode, Watcher, event::ModifyKind};
 
         let tx = self.tx.clone();
+        let roots: Vec<PathBuf> = paths.iter().map(|p| p.to_path_buf()).collect();
         let mut watcher = notify::RecommendedWatcher::new(
             move |res: Result<notify::Event, notify::Error>| {
-                if let Ok(event) = res {
-                    match event.kind {
-                        notify::EventKind::Modify(ModifyKind::Data(_))
-                        | notify::EventKind::Modify(ModifyKind::Any) => {
-                            for path in event.paths {
-                                let _ = tx.send(Event::FileChanged(path));
+                let Ok(event) = res else { return };
+                match event.kind {
+                    notify::EventKind::Modify(ModifyKind::Data(_))
+                    | notify::EventKind::Modify(ModifyKind::Any) => {
+                        for path in event.paths {
+                            if path_is_excluded(&path, &roots, &exclude_patterns) {
+                                continue;
                             }
+                            let _ = tx.send(Event::FileChanged(path));
                         }
-                        notify::EventKind::Create(_)
-                        | notify::EventKind::Remove(_)
-                        | notify::EventKind::Modify(ModifyKind::Name(_)) => {
+                    }
+                    notify::EventKind::Create(_)
+                    | notify::EventKind::Remove(_)
+                    | notify::EventKind::Modify(ModifyKind::Name(_)) => {
+                        // FileTreeChanged carries no path, so coalesce: drop the
+                        // event entirely if every reported path is excluded.
+                        let any_visible = event
+                            .paths
+                            .iter()
+                            .any(|p| !path_is_excluded(p, &roots, &exclude_patterns));
+                        if any_visible {
                             let _ = tx.send(Event::FileTreeChanged);
                         }
-                        _ => {}
                     }
+                    _ => {}
                 }
             },
             notify::Config::default(),
@@ -334,5 +414,98 @@ impl EventLoop {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_is_excluded_skips_target_dir() {
+        let root = PathBuf::from("/ws");
+        let roots = vec![root.clone()];
+        assert!(path_is_excluded(
+            &root.join("target/debug/build/foo.rmeta"),
+            &roots,
+            &[],
+        ));
+        assert!(path_is_excluded(
+            &root.join("crates/x/target/release/x"),
+            &roots,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn path_is_excluded_skips_dot_git_and_node_modules() {
+        let root = PathBuf::from("/ws");
+        let roots = vec![root.clone()];
+        assert!(path_is_excluded(&root.join(".git/objects/abc"), &roots, &[]));
+        assert!(path_is_excluded(
+            &root.join("node_modules/foo/index.js"),
+            &roots,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn path_is_excluded_skips_gaviero_worktrees_only() {
+        let root = PathBuf::from("/ws");
+        let roots = vec![root.clone()];
+        // gaviero's own swarm worktrees → drop.
+        assert!(path_is_excluded(
+            &root.join(".gaviero/worktrees/abc/src/lib.rs"),
+            &roots,
+            &[],
+        ));
+        // Other .gaviero contents (settings, code_graph.db) are real signals.
+        assert!(!path_is_excluded(
+            &root.join(".gaviero/settings.json"),
+            &roots,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn path_is_excluded_honors_user_patterns() {
+        let root = PathBuf::from("/ws");
+        let roots = vec![root.clone()];
+        let patterns = vec!["**/*.log".to_string(), "build/".to_string()];
+        assert!(path_is_excluded(&root.join("a/b/c.log"), &roots, &patterns));
+        assert!(path_is_excluded(
+            &root.join("build/output.txt"),
+            &roots,
+            &patterns,
+        ));
+        assert!(!path_is_excluded(
+            &root.join("src/main.rs"),
+            &roots,
+            &patterns,
+        ));
+    }
+
+    #[test]
+    fn path_is_excluded_passes_through_paths_outside_roots() {
+        let roots = vec![PathBuf::from("/ws")];
+        // Notify on Linux can deliver `~/.cache/...` events; we don't want
+        // to silently drop them just because they're not under a root.
+        assert!(!path_is_excluded(
+            &PathBuf::from("/home/u/.cache/gaviero/log"),
+            &roots,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn path_is_excluded_passes_through_normal_source_files() {
+        let root = PathBuf::from("/ws");
+        let roots = vec![root.clone()];
+        assert!(!path_is_excluded(
+            &root.join("crates/foo/src/lib.rs"),
+            &roots,
+            &[],
+        ));
+        assert!(!path_is_excluded(&root.join("README.md"), &roots, &[]));
     }
 }

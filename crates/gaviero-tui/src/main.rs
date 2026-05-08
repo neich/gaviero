@@ -270,7 +270,15 @@ async fn main() -> Result<()> {
     event_loop.spawn_crossterm_reader();
     event_loop.spawn_tick_timer();
     let roots = workspace.roots();
-    let _file_watcher = event_loop.spawn_file_watcher(&roots).ok();
+    // Drop file-watcher events under `target/`, `.git/`, `node_modules/`,
+    // gaviero's own `.gaviero/worktrees/`, and anything matching the
+    // user's `files.exclude`. Without this filter a single `cargo test`
+    // floods notify with thousands of events and the main loop wedges
+    // inside synchronous file-tree + git-status refresh.
+    let watcher_excludes = app::parse_exclude_patterns(&workspace, None);
+    let _file_watcher = event_loop
+        .spawn_file_watcher(&roots, watcher_excludes)
+        .ok();
 
     let memory_root = workspace.roots().first().map(|p| p.to_path_buf());
     // B1: pick up `memory.embedder.model` so workspace settings drive
