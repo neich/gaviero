@@ -79,6 +79,7 @@ async fn try_plan(
             prompt: user_prompt.to_string(),
             system_prompt: Some(system_prompt.to_string()),
             workspace_root: workspace_root.to_path_buf(),
+            additional_roots: vec![],
             allowed_tools: vec![],
             file_attachments: vec![],
             conversation_history: vec![],
