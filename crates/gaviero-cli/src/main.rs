@@ -2017,13 +2017,21 @@ async fn main() -> Result<()> {
         eprintln!("[model] execution={}", execution_model);
     }
 
-    // Initialize memory store (graceful if it fails — offline, corrupt model, etc.)
-    // CLI is headless and operates on a single repo argument (no
-    // .gaviero-workspace), so we wrap the single store with
-    // `from_single_store` for the registry interface that swarm /
-    // pipeline now expect.
-    let memory: Option<Arc<gaviero_core::memory::MemoryStores>> =
-        match tokio::task::spawn_blocking(|| gaviero_core::memory::init(None)).await {
+    // Initialize memory store at `<repo>/.gaviero/memory.db` (graceful if it
+    // fails — offline, corrupt model, etc.). The CLI is headless and operates
+    // on a single repo argument (no `.gaviero-workspace`), so we wrap the
+    // workspace-local single store with `from_single_store` for the registry
+    // interface that swarm / pipeline expect. Every other CLI handler (eval,
+    // sleep, forget, deletions, remember) already initialises through
+    // `init_workspace`; this site previously used `init(None)` which silently
+    // routed memory to the global default DB, ignoring `--repo`.
+    let memory: Option<Arc<gaviero_core::memory::MemoryStores>> = {
+        let repo_for_init = repo.clone();
+        match tokio::task::spawn_blocking(move || {
+            gaviero_core::memory::init_workspace(&repo_for_init)
+        })
+        .await
+        {
             Ok(Ok(store)) => {
                 eprintln!("[memory] ready");
                 Some(gaviero_core::memory::MemoryStores::from_single_store(store))
@@ -2036,7 +2044,8 @@ async fn main() -> Result<()> {
                 eprintln!("[memory] init panicked: {}", e);
                 None
             }
-        };
+        }
+    };
 
     // Parse work units
     let mut plan = if let Some(ref script_path) = cli.script {
@@ -2336,7 +2345,7 @@ async fn main() -> Result<()> {
     if result.success {
         Ok(())
     } else {
-        std::process::exit(1);
+        anyhow::bail!("swarm execution reported failure")
     }
 }
 
