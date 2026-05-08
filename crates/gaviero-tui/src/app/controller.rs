@@ -1,14 +1,14 @@
 use super::*;
 
-/// Mark the cached `RepoMap` as stale; the next chat send will rebuild it.
-///
-/// Cheap: acquires the lock briefly and writes `None`. Avoids rebuilding
-/// eagerly on every file save — rebuild cost is paid only when next needed.
+/// Mark every cached per-folder `RepoMap` as stale; the next chat send
+/// will rebuild whichever folder it actually queries. Conservative —
+/// invalidates all entries because the saved file might belong to any
+/// folder. Cheap: acquires the lock briefly and clears the HashMap.
 fn invalidate_repo_map(app: &App) {
     let cache = app.repo_map.clone();
     tokio::spawn(async move {
         let mut guard = cache.write().await;
-        *guard = None;
+        guard.clear();
     });
 }
 
@@ -261,14 +261,6 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                         .first()
                         .map(|p| p.to_path_buf())
                         .unwrap_or_else(|| std::path::PathBuf::from("."));
-                    let extractor_enabled = app
-                        .workspace
-                        .resolve_setting(
-                            gaviero_core::workspace::settings::MEMORY_EXTRACTOR_ENABLED,
-                            Some(&workspace_root),
-                        )
-                        .as_bool()
-                        .unwrap_or(true);
                     if let Some(writer) = app.memory_writer.as_ref()
                         && let Some(transcript) = super::chat_memory::build_turn_transcript(
                             app,
@@ -282,7 +274,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                         // agnostic and lives in
                         // `context_planner::chat_memory`, so CLI /
                         // headless callers reach it too.
-                        let (turn_id, module_path) =
+                        let (turn_id, module_path, focused_folder) =
                             if let Some(idx) = app.chat_state.find_conv_idx(&conv_id) {
                                 let conv = &mut app.chat_state.conversations[idx];
                                 let turn_id = conv.pending_turn_id.take().unwrap_or_else(|| {
@@ -296,7 +288,8 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                                     )
                                 });
                                 let module_path = conv.pending_module_path.take();
-                                (turn_id, module_path)
+                                let focused_folder = conv.pending_focused_folder.take();
+                                (turn_id, module_path, focused_folder)
                             } else {
                                 (
                                     format!(
@@ -308,14 +301,30 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                                             .unwrap_or(0)
                                     ),
                                     None,
+                                    None,
                                 )
                             };
-                        let repo_id = gaviero_core::memory::hash_path(&workspace_root);
+                        // Memory scope root: the focused folder the planner
+                        // used at dispatch time, else the workspace primary.
+                        // Reads (planner) and writes (here) must hash the
+                        // same path so they land in the same per-folder DB.
+                        let scope_root = focused_folder
+                            .as_ref()
+                            .unwrap_or(&workspace_root);
+                        let repo_id = gaviero_core::memory::hash_path(scope_root);
+                        let extractor_enabled = app
+                            .workspace
+                            .resolve_setting(
+                                gaviero_core::workspace::settings::MEMORY_EXTRACTOR_ENABLED,
+                                Some(scope_root),
+                            )
+                            .as_bool()
+                            .unwrap_or(true);
                         let telemetry_enabled = app
                             .workspace
                             .resolve_setting(
                                 gaviero_core::workspace::settings::MEMORY_TELEMETRY_ENABLED,
-                                Some(&workspace_root),
+                                Some(scope_root),
                             )
                             .as_bool()
                             .unwrap_or(true);
