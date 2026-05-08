@@ -261,6 +261,23 @@ pub struct PlannerInput<'a> {
     /// its own memory query and uses this verbatim as the single memory
     /// selection. M2 / M3 removes this carrier.
     pub pre_fetched_memory_context: Option<&'a str>,
+
+    /// Workspace-wide opt-in: additional folder paths to query memory
+    /// against, on top of the planner's own `workspace_root`. When non-
+    /// empty, `collect_memory` retrieves once per folder (each yielding
+    /// folder + workspace + global candidates) and dedupes by
+    /// content_hash. Empty in single-folder mode and on focused-folder
+    /// chat dispatch (today's default). The TUI sets this when the user
+    /// arms `/workspace`, listing every other workspace folder.
+    pub extra_folder_paths: &'a [&'a std::path::Path],
+
+    /// Workspace-wide opt-in: additional repo maps to rank graph
+    /// candidates against, on top of `ContextPlanner.repo_map`. The
+    /// planner ranks each map separately and merges results by
+    /// `rank_score` under the existing `graph_budget_tokens`. Empty in
+    /// single-folder mode. Length matches `extra_folder_paths` in chat
+    /// usage but the planner does not require alignment.
+    pub extra_repo_maps: &'a [&'a crate::repo_map::RepoMap],
 }
 
 /// Memory selection record.

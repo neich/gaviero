@@ -153,27 +153,76 @@ impl<'a> ContextPlanner<'a> {
         // restricts the registry walk to workspace + global. The TUI
         // panel can extend this with `Workspace::folder_for_path` once
         // it threads the active editor's file in.
-        let scope = crate::memory::MemoryScope::from_context(self.workspace_root, None, None, None);
-        let candidates = match crate::memory::retrieve_ranked(
-            mem,
-            &scope,
-            query,
-            input.memory_limit,
-            &crate::memory::RetrievalConfig::default(),
-            None,
-            None,
-        )
-        .await
-        {
-            Ok(out) => out
-                .items
-                .iter()
-                .map(crate::memory::store::MemoryCandidate::from_scored)
-                .collect::<Vec<_>>(),
-            Err(e) => {
-                tracing::warn!("planner retrieve_ranked failed: {e}");
-                return;
+        //
+        // Workspace-wide opt-in (`PlannerInput::extra_folder_paths`):
+        // when non-empty, fan out retrieval per folder (each scope
+        // yields folder + workspace + global candidates), dedupe by
+        // canonical id, and re-truncate to `memory_limit`. Workspace +
+        // global rows duplicate naturally across passes; the dedup
+        // collapses them. This lets `/workspace` in the chat panel ask
+        // the planner for memory across every workspace folder without
+        // changing `MemoryScope`'s single-repo shape.
+        let cfg = crate::memory::RetrievalConfig::default();
+        let candidates = if input.extra_folder_paths.is_empty() {
+            let scope = crate::memory::MemoryScope::from_context(
+                self.workspace_root,
+                None,
+                None,
+                None,
+            );
+            match crate::memory::retrieve_ranked(mem, &scope, query, input.memory_limit, &cfg, None, None).await {
+                Ok(out) => out
+                    .items
+                    .iter()
+                    .map(crate::memory::store::MemoryCandidate::from_scored)
+                    .collect::<Vec<_>>(),
+                Err(e) => {
+                    tracing::warn!("planner retrieve_ranked failed: {e}");
+                    return;
+                }
             }
+        } else {
+            // Build one scope per folder (planner's workspace_root +
+            // each extra). Oversample per scope: limit*2 keeps the
+            // dedup pool meaningful without ballooning total work.
+            let per_scope_limit = input.memory_limit.saturating_mul(2).max(input.memory_limit);
+            let mut roots: Vec<&std::path::Path> = Vec::with_capacity(input.extra_folder_paths.len() + 1);
+            roots.push(self.workspace_root);
+            for p in input.extra_folder_paths {
+                if !roots.iter().any(|r| *r == *p) {
+                    roots.push(*p);
+                }
+            }
+            let mut merged: Vec<crate::memory::store::MemoryCandidate> = Vec::new();
+            let mut seen_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+            for root in roots {
+                let scope = crate::memory::MemoryScope::from_context(root, Some(root), None, None);
+                match crate::memory::retrieve_ranked(mem, &scope, query, per_scope_limit, &cfg, None, None).await {
+                    Ok(out) => {
+                        for item in &out.items {
+                            let cand = crate::memory::store::MemoryCandidate::from_scored(item);
+                            if seen_ids.insert(cand.id) {
+                                merged.push(cand);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "memory",
+                            root = %root.display(),
+                            error = %e,
+                            "planner retrieve_ranked (workspace-wide) failed for folder"
+                        );
+                    }
+                }
+            }
+            merged.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            merged.truncate(input.memory_limit);
+            merged
         };
         if candidates.is_empty() {
             return;
@@ -223,6 +272,16 @@ impl<'a> ContextPlanner<'a> {
         // M3: planner queries `Vec<GraphCandidate>` directly and records
         // per-file decisions in the ledger (V9 §11 M3 acceptance: "Ledger
         // distinguishes attached vs outline-only files").
+        //
+        // Workspace-wide opt-in (`PlannerInput::extra_repo_maps`): rank
+        // candidates against each map and merge by `rank_score`. The
+        // token budget is shared across the merged set — first sort by
+        // score, then greedily admit until the budget is consumed. This
+        // lets `/workspace` surface graph context from every workspace
+        // folder without forcing the TUI to flatten N maps into one.
+        // No primary map → nothing to rank. Extras alone aren't useful
+        // without a primary anchor in today's chat path; the TUI always
+        // builds the focused/primary folder's map first.
         let Some(rm) = self.repo_map else { return };
         if input.seed_paths.is_empty() || input.graph_budget_tokens == 0 {
             return;
@@ -232,7 +291,51 @@ impl<'a> ContextPlanner<'a> {
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
-        let candidates = rm.rank_for_agent_structured(&seeds, input.graph_budget_tokens);
+        let candidates = if input.extra_repo_maps.is_empty() {
+            rm.rank_for_agent_structured(&seeds, input.graph_budget_tokens)
+        } else {
+            // Oversample per map (each gets its own budget pass), then
+            // sort merged by rank_score and greedily admit under the
+            // total budget. Per-map budget = total / (1 + extras),
+            // floored at 1 to avoid empty oversamples on tiny budgets.
+            let map_count = 1 + input.extra_repo_maps.len();
+            let per_map_budget = input
+                .graph_budget_tokens
+                .saturating_div(map_count.max(1))
+                .max(1);
+            let mut merged: Vec<crate::repo_map::GraphCandidate> = Vec::new();
+            let mut seen_paths: std::collections::HashSet<std::path::PathBuf> =
+                std::collections::HashSet::new();
+            for c in rm.rank_for_agent_structured(&seeds, per_map_budget) {
+                if seen_paths.insert(c.path.clone()) {
+                    merged.push(c);
+                }
+            }
+            for extra in input.extra_repo_maps {
+                for c in extra.rank_for_agent_structured(&seeds, per_map_budget) {
+                    if seen_paths.insert(c.path.clone()) {
+                        merged.push(c);
+                    }
+                }
+            }
+            merged.sort_by(|a, b| {
+                b.rank_score
+                    .partial_cmp(&a.rank_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            // Greedy budget admit.
+            let mut admitted = Vec::with_capacity(merged.len());
+            let mut used: usize = 0;
+            for c in merged {
+                let cost = c.token_estimate;
+                if used.saturating_add(cost) > input.graph_budget_tokens {
+                    continue;
+                }
+                used = used.saturating_add(cost);
+                admitted.push(c);
+            }
+            admitted
+        };
         if candidates.is_empty() {
             return;
         }
@@ -334,6 +437,8 @@ mod tests {
             pre_fetched_impact_text: None,
             pre_fetched_graph_context: None,
             pre_fetched_memory_context: None,
+            extra_folder_paths: &[],
+            extra_repo_maps: &[],
         };
         let sel = planner.plan(&input).await.unwrap();
         assert!(sel.memory_selections.is_empty());
@@ -372,6 +477,8 @@ mod tests {
             pre_fetched_impact_text: None,
             pre_fetched_graph_context: None,
             pre_fetched_memory_context: None,
+            extra_folder_paths: &[],
+            extra_repo_maps: &[],
         };
         let sel = planner.plan(&input).await.unwrap();
         // StatelessReplay emits Some(_) on first turn even when empty —
@@ -406,6 +513,8 @@ mod tests {
             pre_fetched_impact_text: Some("ignored on follow-up"),
             pre_fetched_graph_context: None,
             pre_fetched_memory_context: None,
+            extra_folder_paths: &[],
+            extra_repo_maps: &[],
         };
         let sel = planner.plan(&input).await.unwrap();
         assert!(sel.memory_selections.is_empty());
@@ -414,6 +523,84 @@ mod tests {
             "graph must skip on follow-up turn"
         );
         assert!(!sel.metadata.is_first_turn);
+    }
+
+    /// Workspace-wide opt-in: planner ranks against primary + extras and
+    /// merges by `rank_score`. Pin the contract so a future refactor of
+    /// `collect_graph` doesn't silently drop one half of the merge.
+    #[tokio::test]
+    async fn workspace_wide_extra_repo_maps_contribute_to_graph_selections() {
+        use crate::repo_map::RepoMap;
+        use std::fs;
+
+        let primary_dir = tempfile::tempdir().unwrap();
+        let extra_dir = tempfile::tempdir().unwrap();
+        // Each folder gets one source file with a distinct symbol so we
+        // can assert merged selections include paths from both.
+        fs::write(
+            primary_dir.path().join("primary.rs"),
+            "pub fn primary_thing() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            extra_dir.path().join("extra.rs"),
+            "pub fn extra_thing() {}\n",
+        )
+        .unwrap();
+        let primary_map = RepoMap::build(primary_dir.path(), &[]).unwrap();
+        let extra_map = RepoMap::build(extra_dir.path(), &[]).unwrap();
+
+        let profile = fixture_profile();
+        let fp = PlannerFingerprint::from_profile(&profile);
+        let mut ledger = SessionLedger::new(&profile, fp);
+        let workspace = primary_dir.path().to_path_buf();
+        let mut planner = ContextPlanner {
+            memory: None,
+            repo_map: Some(&primary_map),
+            ledger: &mut ledger,
+            workspace_root: &workspace,
+        };
+        let extras: [&RepoMap; 1] = [&extra_map];
+        let extra_paths: [&std::path::Path; 1] = [extra_dir.path()];
+        let seeds = [
+            std::path::PathBuf::from("primary.rs"),
+            std::path::PathBuf::from("extra.rs"),
+        ];
+        let input = PlannerInput {
+            user_message: "what does the workspace do?",
+            explicit_refs: &[],
+            seed_paths: &seeds,
+            provider_profile: &profile,
+            read_namespaces: &[],
+            graph_budget_tokens: 16_000,
+            memory_query_override: None,
+            memory_limit: 5,
+            file_ref_blobs: &[],
+            pre_fetched_impact_text: None,
+            pre_fetched_graph_context: None,
+            pre_fetched_memory_context: None,
+            extra_folder_paths: &extra_paths,
+            extra_repo_maps: &extras,
+        };
+        let sel = planner.plan(&input).await.unwrap();
+        // Exact rank counts are an implementation detail of
+        // rank_for_agent_structured; what we pin is "extras contribute
+        // at least one selection" — i.e. paths from both folders show
+        // up in the merged set when the budget is generous.
+        let rendered: String = sel
+            .graph_selections
+            .iter()
+            .map(|g| g.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("primary.rs"),
+            "expected primary folder file in graph selections, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("extra.rs"),
+            "expected extra folder file in graph selections (workspace-wide merge), got: {rendered}"
+        );
     }
 
     #[tokio::test]
@@ -441,6 +628,8 @@ mod tests {
             pre_fetched_impact_text: Some("Imp: foo.rs touches bar.rs"),
             pre_fetched_graph_context: None,
             pre_fetched_memory_context: None,
+            extra_folder_paths: &[],
+            extra_repo_maps: &[],
         };
         let sel = planner.plan(&input).await.unwrap();
         assert_eq!(sel.graph_selections.len(), 1);

@@ -1552,6 +1552,39 @@ pub(super) fn send_chat_message(app: &mut App) {
         .first()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
+    // Prefer the active buffer's workspace folder as the planner / memory
+    // scope root: if the user is editing `frontend/Cargo.toml`, scope graph
+    // and memory queries to the `frontend` folder rather than the whole
+    // workspace. Falls back to `None` when there's no buffer or the buffer
+    // is outside every workspace folder; downstream code then uses `root`.
+    // The CLI cwd (`SessionConstruction.workspace_root`) is *not* affected —
+    // the agent still runs from the primary `root` and reaches siblings via
+    // `--add-dir`, so cross-folder reads/edits still work.
+    let active_buffer_path = app
+        .buffers
+        .get(app.active_buffer)
+        .and_then(|b| b.path.clone());
+    // `/workspace` arms a one-shot opt-out: when set, ignore the focused
+    // buffer's folder and let the planner fall back to the workspace
+    // primary scope for this turn. Self-clears on dispatch.
+    let workspace_wide = {
+        let conv = app.chat_state.active_conversation_mut();
+        let armed = conv.workspace_wide_next;
+        conv.workspace_wide_next = false;
+        armed
+    };
+    let focused_folder: Option<std::path::PathBuf> = if workspace_wide {
+        None
+    } else {
+        active_buffer_path
+            .as_deref()
+            .and_then(|p| app.workspace.folder_for_path(p))
+            .map(|p| p.to_path_buf())
+    };
+    // Strip the buffer's path against the focused folder so the module path
+    // is relative to the right repo. Falls back to `root` so single-folder
+    // workspaces (and buffers outside every folder) keep behaving as before.
+    let module_path_root = focused_folder.as_ref().unwrap_or(&root);
     let turn_id = format!(
         "{}-{}",
         conv_id,
@@ -1560,11 +1593,9 @@ pub(super) fn send_chat_message(app: &mut App) {
             .map(|d| d.as_millis())
             .unwrap_or(0)
     );
-    let pending_module_path = app
-        .buffers
-        .get(app.active_buffer)
-        .and_then(|b| b.path.as_deref())
-        .and_then(|p| p.strip_prefix(&root).ok())
+    let pending_module_path = active_buffer_path
+        .as_deref()
+        .and_then(|p| p.strip_prefix(module_path_root).ok())
         .and_then(|rel| rel.parent())
         .map(|p| p.to_string_lossy().to_string())
         .filter(|p| !p.is_empty());
@@ -1574,6 +1605,7 @@ pub(super) fn send_chat_message(app: &mut App) {
         let conv = app.chat_state.active_conversation_mut();
         conv.pending_turn_id = Some(turn_id.clone());
         conv.pending_module_path = pending_module_path;
+        conv.pending_focused_folder = focused_folder.clone();
         conv.is_streaming = true;
         conv.streaming_status = "Connecting...".to_string();
         conv.streaming_started_at = Some(std::time::Instant::now());
@@ -1849,11 +1881,40 @@ pub(super) fn send_chat_message(app: &mut App) {
                 .collect()
         }
     };
-    let graph_root = app
-        .graph_workspace_root
-        .clone()
-        .unwrap_or_else(|| root.clone());
+    // Planner scope root: focused folder (active buffer's folder) takes
+    // precedence over the workspace-wide graph root, so first-turn graph
+    // and memory blocks narrow to the folder the user is actually editing.
+    // Both fall back to the primary `root` for single-folder workspaces.
+    // When `/workspace` was armed, `focused_folder` is forced to None
+    // above so the planner falls back to the workspace primary, AND
+    // every other folder is forwarded as a planner extra so memory +
+    // graph context spans the whole workspace.
+    let graph_root = focused_folder.clone().unwrap_or_else(|| {
+        app.graph_workspace_root
+            .clone()
+            .unwrap_or_else(|| root.clone())
+    });
     let graph_excludes = parse_exclude_patterns(&app.workspace, Some(&graph_root));
+    // Owned storage for the planner's `extra_folder_paths` / `extra_repo_maps`
+    // slices. Only populated when `/workspace` armed the next turn AND the
+    // workspace is multi-folder. Each entry is a folder path different from
+    // `graph_root` (the planner's primary). The repo maps are built lazily
+    // inside the spawn task because building blocks; the path list is
+    // captured eagerly so the task knows which folders to fetch.
+    let extra_workspace_folders: Vec<std::path::PathBuf> = if workspace_wide {
+        app.workspace
+            .folders()
+            .iter()
+            .map(|f| f.path.clone())
+            .filter(|p| p != &graph_root)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let extra_workspace_excludes: Vec<Vec<String>> = extra_workspace_folders
+        .iter()
+        .map(|p| parse_exclude_patterns(&app.workspace, Some(p)))
+        .collect();
 
     // Seed paths for graph ranking: explicit @file refs + active buffer (if any), made relative to workspace root.
     let mut graph_seeds: Vec<String> = refs.clone();
@@ -1912,7 +1973,7 @@ pub(super) fn send_chat_message(app: &mut App) {
         // new user message").
         let repo_map_arc = if is_first_turn {
             crate::app::session::get_or_build_repo_map_cached(
-                repo_map_cache,
+                repo_map_cache.clone(),
                 graph_root.clone(),
                 graph_excludes.clone(),
             )
@@ -1920,6 +1981,31 @@ pub(super) fn send_chat_message(app: &mut App) {
         } else {
             None
         };
+        // Workspace-wide extras: build / fetch a repo map per sibling
+        // folder. Only on first turn (planner skips bootstrap context
+        // on follow-ups) AND when `/workspace` was armed (otherwise the
+        // list is empty). Each lookup is a HashMap hit on warm cache.
+        let extra_repo_map_arcs: Vec<std::sync::Arc<gaviero_core::repo_map::RepoMap>> =
+            if is_first_turn && !extra_workspace_folders.is_empty() {
+                let mut out = Vec::with_capacity(extra_workspace_folders.len());
+                for (i, folder) in extra_workspace_folders.iter().enumerate() {
+                    if let Some(rm) = crate::app::session::get_or_build_repo_map_cached(
+                        repo_map_cache.clone(),
+                        folder.clone(),
+                        extra_workspace_excludes
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
+                    .await
+                    {
+                        out.push(rm);
+                    }
+                }
+                out
+            } else {
+                Vec::new()
+            };
         let impact_text = if is_first_turn {
             crate::app::session::compute_impact_text(
                 graph_root.clone(),
@@ -1944,6 +2030,14 @@ pub(super) fn send_chat_message(app: &mut App) {
         };
 
         let mut local_ledger = ledger_snapshot;
+        // Borrow slices for the planner. Owned storage above lives for
+        // the duration of the spawned task so these references are safe.
+        let extra_folder_path_refs: Vec<&std::path::Path> =
+            extra_workspace_folders.iter().map(|p| p.as_path()).collect();
+        let extra_repo_map_refs: Vec<&gaviero_core::repo_map::RepoMap> = extra_repo_map_arcs
+            .iter()
+            .map(|a| a.as_ref())
+            .collect();
         let planner_input = gaviero_core::context_planner::PlannerInput {
             user_message: &prompt,
             explicit_refs: &[],
@@ -1957,6 +2051,8 @@ pub(super) fn send_chat_message(app: &mut App) {
             pre_fetched_impact_text: impact_text.as_deref(),
             pre_fetched_graph_context: None,
             pre_fetched_memory_context: None,
+            extra_folder_paths: &extra_folder_path_refs,
+            extra_repo_maps: &extra_repo_map_refs,
         };
 
         let selections = {
