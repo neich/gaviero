@@ -9,6 +9,7 @@ logos        = { workspace = true }
 chumsky      = { workspace = true }
 miette       = { workspace = true }
 thiserror    = { workspace = true }
+tracing      = { workspace = true }
 
 [dev-dependencies]
 tempfile     = "3"
