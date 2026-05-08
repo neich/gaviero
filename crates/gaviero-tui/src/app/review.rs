@@ -342,7 +342,7 @@ pub(super) fn enter_batch_review(app: &mut App, proposals: Vec<WriteProposal>) {
         return;
     }
 
-    let review_proposals: Vec<ReviewProposal> = proposals
+    let mut review_proposals: Vec<ReviewProposal> = proposals
         .into_iter()
         .map(|p| {
             let old_lines = p.original_content.lines().count();
@@ -374,6 +374,21 @@ pub(super) fn enter_batch_review(app: &mut App, proposals: Vec<WriteProposal>) {
             }
         })
         .collect();
+
+    // Sort by (folder root, path) so files belonging to the same workspace
+    // root cluster together. Render emits a folder header between groups
+    // when the workspace has more than one root.
+    review_proposals.sort_by(|a, b| {
+        let fa = app
+            .workspace
+            .folder_for_worktree_path(&a.path)
+            .map(|p| p.to_path_buf());
+        let fb = app
+            .workspace
+            .folder_for_worktree_path(&b.path)
+            .map(|p| p.to_path_buf());
+        fa.cmp(&fb).then_with(|| a.path.cmp(&b.path))
+    });
 
     let initial_diff = if let Some(p) = review_proposals.first() {
         let old_lines: Vec<&str> = p.old_content.as_deref().unwrap_or("").lines().collect();
@@ -603,6 +618,53 @@ pub(super) fn cancel_batch_review(app: &mut App) {
     ));
 }
 
+/// One row in the rendered review-file-list: either a folder-group header
+/// or a proposal row. Headers are non-selectable and appear above each
+/// group when the workspace has more than one root.
+enum ReviewRow<'a> {
+    Header(&'a str),
+    Entry(usize),
+}
+
+/// Build the rendered row sequence for the batch review file list.
+///
+/// In single-folder workspaces, returns one Entry per proposal in order.
+/// In multi-folder workspaces, walks the (already folder-sorted) proposals
+/// and inserts a Header row whenever the folder root changes.
+fn build_review_rows<'a>(
+    proposals: &[ReviewProposal],
+    workspace: &'a gaviero_core::workspace::Workspace,
+) -> Vec<ReviewRow<'a>> {
+    let folders = workspace.folders();
+    let mut rows = Vec::with_capacity(proposals.len() + folders.len());
+
+    if folders.len() <= 1 {
+        for i in 0..proposals.len() {
+            rows.push(ReviewRow::Entry(i));
+        }
+        return rows;
+    }
+
+    let mut current_folder: Option<&std::path::Path> = None;
+    for (i, p) in proposals.iter().enumerate() {
+        let folder = workspace.folder_for_worktree_path(&p.path);
+        if folder != current_folder {
+            let label = folder
+                .and_then(|root| {
+                    folders
+                        .iter()
+                        .find(|f| f.path.as_path() == root)
+                        .map(|f| f.display_name())
+                })
+                .unwrap_or("(other)");
+            rows.push(ReviewRow::Header(label));
+            current_folder = folder;
+        }
+        rows.push(ReviewRow::Entry(i));
+    }
+    rows
+}
+
 pub(super) fn render_review_file_list(app: &mut App, frame: &mut Frame, area: Rect, focused: bool) {
     use ratatui::style::Modifier;
     use ratatui::text::{Line, Span};
@@ -620,6 +682,12 @@ pub(super) fn render_review_file_list(app: &mut App, frame: &mut Frame, area: Re
     let inner = block.inner(area);
     block.render(area, frame.buffer_mut());
 
+    let multi_root = app.workspace.folders().len() > 1;
+    let rows = build_review_rows(
+        app.batch_review.as_ref().map(|r| r.proposals.as_slice()).unwrap_or(&[]),
+        &app.workspace,
+    );
+
     let br = match &mut app.batch_review {
         Some(r) => r,
         None => return,
@@ -627,87 +695,109 @@ pub(super) fn render_review_file_list(app: &mut App, frame: &mut Frame, area: Re
 
     let visible = inner.height as usize;
 
+    // Scroll is in render-row space (header rows count toward scrolling).
+    let selected_row = rows
+        .iter()
+        .position(|r| matches!(r, ReviewRow::Entry(i) if *i == br.selected_index))
+        .unwrap_or(0);
+
     if visible > 0 {
-        if br.selected_index < br.scroll_offset {
-            br.scroll_offset = br.selected_index;
-        } else if br.selected_index >= br.scroll_offset + visible {
-            br.scroll_offset = br.selected_index - visible + 1;
+        if selected_row < br.scroll_offset {
+            br.scroll_offset = selected_row;
+        } else if selected_row >= br.scroll_offset + visible {
+            br.scroll_offset = selected_row - visible + 1;
         }
     }
 
     let scroll = br.scroll_offset;
 
-    for (row, (i, proposal)) in br
-        .proposals
-        .iter()
-        .enumerate()
-        .skip(scroll)
-        .take(visible)
-        .enumerate()
-    {
-        let y = inner.y + row as u16;
+    for (row_idx, row) in rows.iter().enumerate().skip(scroll).take(visible) {
+        let y = inner.y + (row_idx - scroll) as u16;
         if y >= inner.bottom() {
             break;
         }
 
-        let is_selected = i == br.selected_index;
-        let filename = proposal
-            .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("?");
+        match row {
+            ReviewRow::Header(label) => {
+                let header_text = format!(" ▾ {}", label);
+                let line = Line::from(Span::styled(
+                    header_text,
+                    Style::default()
+                        .fg(theme::TEXT_DIM)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                let line_area = Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                };
+                Widget::render(line, line_area, frame.buffer_mut());
+            }
+            ReviewRow::Entry(i) => {
+                let proposal = &br.proposals[*i];
+                let is_selected = *i == br.selected_index;
+                let filename = proposal
+                    .path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("?");
 
-        let name_style = if is_selected {
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD)
-                .bg(theme::SELECTION_BG)
-        } else {
-            Style::default().fg(theme::TEXT_FG)
-        };
+                let name_style = if is_selected {
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                        .bg(theme::SELECTION_BG)
+                } else {
+                    Style::default().fg(theme::TEXT_FG)
+                };
 
-        let adds = format!(" +{}", proposal.additions);
-        let dels = format!(" -{}", proposal.deletions);
+                let adds = format!(" +{}", proposal.additions);
+                let dels = format!(" -{}", proposal.deletions);
 
-        let (status_char, status_color) = if proposal.is_deletion {
-            ('D', theme::ERROR)
-        } else if proposal.old_content.is_none() {
-            ('A', theme::SUCCESS)
-        } else {
-            ('M', theme::WARNING)
-        };
+                let (status_char, status_color) = if proposal.is_deletion {
+                    ('D', theme::ERROR)
+                } else if proposal.old_content.is_none() {
+                    ('A', theme::SUCCESS)
+                } else {
+                    ('M', theme::WARNING)
+                };
 
-        let spans = vec![
-            Span::styled(
-                format!(" {} ", status_char),
-                Style::default().fg(status_color),
-            ),
-            Span::styled(filename.to_string(), name_style),
-            Span::styled(adds, Style::default().fg(theme::SUCCESS)),
-            Span::styled(dels, Style::default().fg(theme::ERROR)),
-        ];
+                let prefix = if multi_root { "  " } else { "" };
+                let spans = vec![
+                    Span::raw(prefix),
+                    Span::styled(
+                        format!(" {} ", status_char),
+                        Style::default().fg(status_color),
+                    ),
+                    Span::styled(filename.to_string(), name_style),
+                    Span::styled(adds, Style::default().fg(theme::SUCCESS)),
+                    Span::styled(dels, Style::default().fg(theme::ERROR)),
+                ];
 
-        let line = Line::from(spans);
-        let line_area = Rect {
-            x: inner.x,
-            y,
-            width: inner.width,
-            height: 1,
-        };
+                let line = Line::from(spans);
+                let line_area = Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                };
 
-        if is_selected {
-            for x in inner.x..inner.right() {
-                frame.buffer_mut()[(x, y)].set_bg(theme::SELECTION_BG);
+                if is_selected {
+                    for x in inner.x..inner.right() {
+                        frame.buffer_mut()[(x, y)].set_bg(theme::SELECTION_BG);
+                    }
+                }
+
+                Widget::render(line, line_area, frame.buffer_mut());
             }
         }
-
-        Widget::render(line, line_area, frame.buffer_mut());
     }
 
     crate::widgets::scrollbar::render_scrollbar(
         inner,
         frame.buffer_mut(),
-        br.proposals.len(),
+        rows.len(),
         visible,
         scroll,
     );
