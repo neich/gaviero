@@ -33,6 +33,11 @@ pub struct AcpPipeline {
     model: String,
     ollama_base_url: Option<String>,
     workspace_root: PathBuf,
+    /// Sibling workspace folders (workspace-mode multi-folder). Forwarded
+    /// to the codex/ollama backend via `CompletionRequest::additional_roots`
+    /// so the CLI sees one `--add-dir` per folder. Empty in single-folder
+    /// mode.
+    additional_roots: Vec<PathBuf>,
     agent_id: String,
     options: AgentOptions,
 }
@@ -44,6 +49,7 @@ impl AcpPipeline {
         model: impl Into<String>,
         ollama_base_url: Option<String>,
         workspace_root: impl Into<PathBuf>,
+        additional_roots: Vec<PathBuf>,
         agent_id: impl Into<String>,
         options: AgentOptions,
     ) -> Self {
@@ -53,6 +59,7 @@ impl AcpPipeline {
             model: model.into(),
             ollama_base_url,
             workspace_root: workspace_root.into(),
+            additional_roots,
             agent_id: agent_id.into(),
             options,
         }
@@ -121,6 +128,7 @@ impl AcpPipeline {
                 prompt: prompt.to_string(),
                 system_prompt: Some(shared::default_editor_system_prompt(&caps)),
                 workspace_root: self.workspace_root.clone(),
+                additional_roots: self.additional_roots.clone(),
                 allowed_tools: if caps.tool_use {
                     vec![
                         "Read".into(),
