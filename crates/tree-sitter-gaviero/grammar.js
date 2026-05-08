@@ -160,7 +160,10 @@ module.exports = grammar({
         seq("stability", $.integer),
         seq("judge_timeout", $.integer),
         seq("strict_judge", $.boolean),
+        seq("branch_chain", $.branch_chain_value),
       ),
+
+    branch_chain_value: (_) => choice("stacked", "none"),
 
     // ── Until clause (3 variants) ────────────────────────────────
     until_clause: ($) => seq("until", $._until_condition),
@@ -219,7 +222,8 @@ module.exports = grammar({
     // ── Literals ─────────────────────────────────────────────────
     _string_value: ($) => choice($.string, $.raw_string),
 
-    string: (_) => token(seq('"', /[^"]*/, '"')),
+    string: (_) =>
+      token(seq('"', repeat(choice(/[^"\\]/, /\\./)), '"')),
 
     // Raw string: #"..."#
     raw_string: (_) =>
