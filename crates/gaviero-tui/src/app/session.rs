@@ -133,17 +133,22 @@ pub(super) fn apply_first_run(app: &mut App, init_memory: bool) {
 /// TUI no longer owns bootstrap policy").
 pub(crate) async fn get_or_build_repo_map_cached(
     repo_map_cache: std::sync::Arc<
-        tokio::sync::RwLock<Option<std::sync::Arc<gaviero_core::repo_map::RepoMap>>>,
+        tokio::sync::RwLock<
+            std::collections::HashMap<
+                std::path::PathBuf,
+                std::sync::Arc<gaviero_core::repo_map::RepoMap>,
+            >,
+        >,
     >,
     workspace_root: std::path::PathBuf,
     excludes: Vec<String>,
 ) -> Option<std::sync::Arc<gaviero_core::repo_map::RepoMap>> {
-    let cached = {
+    // Cache hit on the per-folder slot.
+    {
         let guard = repo_map_cache.read().await;
-        guard.clone()
-    };
-    if let Some(rm) = cached {
-        return Some(rm);
+        if let Some(rm) = guard.get(&workspace_root) {
+            return Some(rm.clone());
+        }
     }
     let root = workspace_root.clone();
     match tokio::task::spawn_blocking(move || {
@@ -154,7 +159,7 @@ pub(crate) async fn get_or_build_repo_map_cached(
         Ok(Ok(map)) => {
             let arc = std::sync::Arc::new(map);
             let mut guard = repo_map_cache.write().await;
-            *guard = Some(arc.clone());
+            guard.insert(workspace_root, arc.clone());
             Some(arc)
         }
         _ => None,
@@ -286,6 +291,8 @@ mod tests {
             pre_fetched_impact_text: Some("[Impact] should be ignored"),
             pre_fetched_graph_context: Some("[Graph] should be ignored"),
             pre_fetched_memory_context: Some("[Memory] should be ignored"),
+            extra_folder_paths: &[],
+            extra_repo_maps: &[],
         };
         let selections = planner.plan(&input).await.unwrap();
         assert!(
@@ -339,14 +346,18 @@ mod tests {
     }
 }
 
-/// Spawn a background task that (re)builds `RepoMap` and writes it into `app.repo_map`.
-/// Safe to call multiple times — each invocation replaces the cached map.
+/// Spawn a background task that (re)builds `RepoMap` and writes it into
+/// `app.repo_map` under the primary workspace folder key. Safe to call
+/// multiple times — each invocation replaces that folder's cached map.
+/// Other folders are warmed up lazily on first use via
+/// [`get_or_build_repo_map_cached`].
 pub(crate) fn warm_up_repo_map(app: &App) {
     let Some(root) = app.graph_workspace_root.clone() else {
         return;
     };
     let cache = app.repo_map.clone();
     let excludes = super::parse_exclude_patterns(&app.workspace, Some(&root));
+    let key = root.clone();
     tokio::spawn(async move {
         match tokio::task::spawn_blocking(move || {
             gaviero_core::repo_map::RepoMap::build(&root, &excludes)
@@ -355,7 +366,7 @@ pub(crate) fn warm_up_repo_map(app: &App) {
         {
             Ok(Ok(map)) => {
                 let mut guard = cache.write().await;
-                *guard = Some(std::sync::Arc::new(map));
+                guard.insert(key, std::sync::Arc::new(map));
                 tracing::info!("repo_map warmed up");
             }
             Ok(Err(e)) => {
