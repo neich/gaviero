@@ -207,6 +207,21 @@ pub struct Conversation {
     pub pending_turn_id: Option<String>,
     /// Module path captured at dispatch time for scoped memory writes.
     pub pending_module_path: Option<String>,
+    /// Workspace folder root the planner used for this dispatched turn —
+    /// derived from the active buffer's path when one is open. The
+    /// controller reads this back to hash `repo_id` against the same
+    /// folder, so memory reads (planner) and writes (post-turn) land in
+    /// the same per-folder DB. `None` means the active buffer was outside
+    /// every workspace folder (or no buffer was open) and the primary
+    /// workspace root was used.
+    pub pending_focused_folder: Option<std::path::PathBuf>,
+    /// One-shot flag toggled by `/workspace`. When `true`, the next
+    /// dispatched turn ignores the focused folder and falls back to the
+    /// workspace-wide default scope (`app.graph_workspace_root`). The
+    /// flag self-clears after `send_chat_message` consumes it. Useful when
+    /// the user knows the prompt is genuinely cross-folder and the
+    /// active-buffer heuristic would narrow incorrectly.
+    pub workspace_wide_next: bool,
     /// Claude's session id, captured from the first turn's `SystemInit` event.
     /// Subsequent turns pass this back via `--resume <id>` so Claude keeps
     /// conversation memory server-side and we don't re-send history.
@@ -330,6 +345,8 @@ impl AgentChatState {
             pending_permission: None,
             pending_turn_id: None,
             pending_module_path: None,
+            pending_focused_folder: None,
+            workspace_wide_next: false,
             claude_session_id: None,
             session_ledger: None,
             pending_persisted_ledger: None,
@@ -679,6 +696,28 @@ impl AgentChatState {
                 self.text_input.cursor = 0;
                 true
             }
+            "/workspace" | "/ws" => {
+                // Per-turn one-shot. Mirrors `auto_approve_next`: toggling
+                // the flag arms the next dispatched turn to use workspace-
+                // wide planner scope, then `send_chat_message` clears it.
+                // Calling `/workspace` again before sending toggles back
+                // off, so the user can change their mind without a separate
+                // command.
+                let conv = &mut self.conversations[self.active_conv];
+                conv.workspace_wide_next = !conv.workspace_wide_next;
+                let msg = if conv.workspace_wide_next {
+                    "Workspace-wide scope: ARMED for next prompt. \
+                     The planner will ignore the focused buffer's folder and use \
+                     the workspace primary scope. (Run /workspace again to cancel.)"
+                } else {
+                    "Workspace-wide scope: cleared. Next prompt will use the \
+                     focused folder default again."
+                };
+                self.add_system_message(msg);
+                self.text_input.text.clear();
+                self.text_input.cursor = 0;
+                true
+            }
             "/help" => {
                 self.add_system_message(
                     "Available commands:\n\n\
@@ -687,6 +726,7 @@ impl AgentChatState {
                      /effort <level>          — Set effort/reasoning level for Claude + Codex (off, auto, low, medium, high, xhigh, max). Alias: /thinking\n\
                      /namespace <name>        — Set memory namespace (or show current). Alias: /ns\n\
                      /autoapprove             — Toggle auto-approve for this conversation. Alias: /yolo\n\
+                     /workspace               — Arm workspace-wide planner scope for the next prompt only (multi-folder workspaces). Default scope follows the active buffer's folder; use this when the prompt genuinely spans folders. Alias: /ws\n\
                      /rename [new title]      — Rename the active conversation tab (bare form starts interactive rename, same as F2)\n\
                      /reset                   — Clear agent context (keeps visible chat history). Alias: /clear\n\
                      /compact [N]             — Keep last N messages (default 6), discard older\n\
@@ -852,6 +892,8 @@ impl AgentChatState {
             pending_permission: None,
             pending_turn_id: None,
             pending_module_path: None,
+            pending_focused_folder: None,
+            workspace_wide_next: false,
             claude_session_id: None,
             session_ledger: None,
             pending_persisted_ledger: None,
@@ -874,6 +916,7 @@ impl AgentChatState {
         conv.pending_persisted_ledger = None;
         conv.pending_turn_id = None;
         conv.pending_module_path = None;
+        conv.pending_focused_folder = None;
         // Suppress the visible transcript on the next first-turn dispatch.
         // Bootstrap context (graph + memory) still flows; only the
         // re-inlining of prior user/assistant turns is skipped, matching
@@ -1887,6 +1930,8 @@ impl AgentChatState {
                     pending_permission: None,
                     pending_turn_id: None,
                     pending_module_path: None,
+                    pending_focused_folder: None,
+            workspace_wide_next: false,
                     claude_session_id,
                     // M4: in-memory ledger is rehydrated at send time from
                     // `pending_persisted_ledger` once the ProviderProfile
@@ -3002,6 +3047,70 @@ mod tests {
 
         assert!(!state.process_slash_command());
         assert!(state.conversations[state.active_conv].messages.is_empty());
+    }
+
+    #[test]
+    fn process_slash_command_workspace_arms_one_shot_flag() {
+        let mut state = AgentChatState::new();
+        // Default: not armed.
+        assert!(!state.conversations[state.active_conv].workspace_wide_next);
+
+        state.text_input.text = "/workspace".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+        let handled = state.process_slash_command();
+
+        assert!(handled);
+        assert!(state.text_input.text.is_empty());
+        assert!(state.conversations[state.active_conv].workspace_wide_next);
+        // ARMED message landed in the transcript so the user sees the state.
+        let messages = &state.conversations[state.active_conv].messages;
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.role == ChatRole::System && m.content.contains("ARMED")),
+            "expected ARMED system message, got {:?}",
+            messages
+        );
+    }
+
+    #[test]
+    fn process_slash_command_workspace_toggles_off_on_second_invocation() {
+        // Mirror of /autoapprove: a second invocation before dispatch flips
+        // the flag back to off so the user can change their mind without a
+        // separate command.
+        let mut state = AgentChatState::new();
+        state.text_input.text = "/workspace".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+        state.process_slash_command();
+        assert!(state.conversations[state.active_conv].workspace_wide_next);
+
+        state.text_input.text = "/workspace".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+        let handled = state.process_slash_command();
+
+        assert!(handled);
+        assert!(!state.conversations[state.active_conv].workspace_wide_next);
+        let last = state.conversations[state.active_conv]
+            .messages
+            .last()
+            .expect("at least one message after toggle-off");
+        assert_eq!(last.role, ChatRole::System);
+        assert!(
+            last.content.contains("cleared"),
+            "expected 'cleared' message on toggle-off, got {:?}",
+            last.content
+        );
+    }
+
+    #[test]
+    fn process_slash_command_ws_alias_matches_workspace() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "/ws".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+        let handled = state.process_slash_command();
+
+        assert!(handled);
+        assert!(state.conversations[state.active_conv].workspace_wide_next);
     }
 
     #[test]
