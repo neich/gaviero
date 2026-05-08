@@ -1834,6 +1834,21 @@ pub(super) fn send_chat_message(app: &mut App) {
     let ollama_base_url = app.chat_state.agent_settings.ollama_base_url.clone();
     let graph_budget_tokens = app.chat_state.agent_settings.graph_budget_tokens;
     let repo_map_cache = app.repo_map.clone();
+    // In workspace mode (multi-folder), every sibling folder is forwarded to
+    // the agent CLI as a `--add-dir`. The primary cwd is `root`; siblings are
+    // every other folder. Empty in single-folder mode.
+    let additional_roots: Vec<std::path::PathBuf> = {
+        let folders = app.workspace.folders();
+        if folders.len() <= 1 {
+            Vec::new()
+        } else {
+            folders
+                .iter()
+                .map(|f| f.path.clone())
+                .filter(|p| p != &root)
+                .collect()
+        }
+    };
     let graph_root = app
         .graph_workspace_root
         .clone()
@@ -2088,6 +2103,7 @@ pub(super) fn send_chat_message(app: &mut App) {
                 model,
                 ollama_base_url: Some(ollama_base_url),
                 workspace_root: root,
+                additional_roots,
                 agent_id: "claude-chat".to_string(),
                 options,
                 profile: provider_profile_clone,
