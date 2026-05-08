@@ -1022,7 +1022,10 @@ pub(crate) fn collapse_file_blocks(text: &str) -> String {
     result
 }
 
-fn parse_exclude_patterns(workspace: &Workspace, root: Option<&std::path::Path>) -> Vec<String> {
+pub(crate) fn parse_exclude_patterns(
+    workspace: &Workspace,
+    root: Option<&std::path::Path>,
+) -> Vec<String> {
     use gaviero_core::workspace::settings;
     let val = workspace.resolve_setting(settings::FILES_EXCLUDE, root);
     let mut patterns = Vec::new();
@@ -1140,7 +1143,7 @@ fn list_workspace_files(root: &std::path::Path, limit: usize, excludes: &[String
 /// - Patterns without `/` match any path component at any depth (like gitignore)
 /// - Trailing `/` constrains to directories only
 /// - Leading `/` anchors the match to the workspace root
-fn matches_exclude(rel_path: &str, excludes: &[String]) -> bool {
+pub(crate) fn matches_exclude(rel_path: &str, excludes: &[String]) -> bool {
     use gaviero_core::path_pattern;
 
     let name = rel_path.rsplit('/').next().unwrap_or(rel_path);
