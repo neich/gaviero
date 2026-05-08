@@ -157,6 +157,11 @@ pub async fn run_backend(
         // M7: use bundle-pre-fetched memory when available; planner
         // short-circuits its DB query when this field is Some.
         pre_fetched_memory_context: pre_fetched_memory,
+        // Swarm sub-agents always run in a single per-agent worktree;
+        // the workspace-wide multi-folder fan-out is a chat-only
+        // feature behind the TUI's `/workspace` command.
+        extra_folder_paths: &[],
+        extra_repo_maps: &[],
     };
 
     let selections = {
