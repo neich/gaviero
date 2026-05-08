@@ -222,6 +222,79 @@ mod tests {
     }
 
     #[test]
+    fn parse_loop_with_branch_chain() {
+        let mut parser = tree_sitter::Parser::new();
+        let lang: tree_sitter::Language = LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        let src = r#"
+            agent impl { description "i" }
+            agent judge { description "j" }
+            workflow w {
+                steps [
+                    loop {
+                        agents [impl]
+                        branch_chain stacked
+                        until agent judge
+                    }
+                ]
+            }
+        "#;
+        let tree = parser.parse(src, None).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "parse tree: {}",
+            tree.root_node().to_sexp()
+        );
+    }
+
+    #[test]
+    fn parse_string_with_escaped_quote() {
+        let mut parser = tree_sitter::Parser::new();
+        let lang: tree_sitter::Language = LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        let src = r#"agent x { description "say \"hi\"" }"#;
+        let tree = parser.parse(src, None).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "parse tree: {}",
+            tree.root_node().to_sexp()
+        );
+    }
+
+    /// Cross-grammar compatibility: every `.gaviero` example shipped with
+    /// `gaviero-dsl` must parse cleanly here. Catches drift between the
+    /// authoritative grammar in `gaviero-dsl/src/parser.rs` and this one.
+    #[test]
+    fn parse_dsl_examples() {
+        let mut parser = tree_sitter::Parser::new();
+        let lang: tree_sitter::Language = LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+
+        let examples_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../gaviero-dsl/examples");
+        let entries = std::fs::read_dir(&examples_dir)
+            .unwrap_or_else(|e| panic!("read examples dir {}: {}", examples_dir.display(), e));
+
+        let mut count = 0;
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|s| s.to_str()) != Some("gaviero") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap();
+            let tree = parser.parse(&src, None).unwrap();
+            assert!(
+                !tree.root_node().has_error(),
+                "tree-sitter rejected `{}`:\n{}",
+                path.display(),
+                tree.root_node().to_sexp()
+            );
+            count += 1;
+        }
+        assert!(count > 0, "no .gaviero examples found in {}", examples_dir.display());
+    }
+
+    #[test]
     fn invalid_gaviero_syntax_produces_error_nodes() {
         let mut parser = tree_sitter::Parser::new();
         let lang: tree_sitter::Language = LANGUAGE.into();
