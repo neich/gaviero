@@ -11,6 +11,10 @@
 //! `<file>` blocks rather than touching disk directly. `--ask-for-approval` only
 //! exists on the top-level `codex` command, not on `codex exec`, so the approval
 //! policy must be set via the TOML config override.
+//!
+//! Workspace-mode multi-folder is plumbed via `request.additional_roots`: every
+//! sibling folder beyond the cwd is forwarded as a `--add-dir <path>` flag so
+//! the model can read/write across the whole workspace.
 
 use std::pin::Pin;
 use std::process::Stdio;
@@ -70,7 +74,12 @@ impl AgentBackend for CodexBackend {
         let combined_prompt = format!("{system_prompt}\n\n{user_prompt}");
 
         let mut cmd = Command::new("codex");
-        for arg in codex_exec_args(&self.model, request.effort.as_deref(), &request.extra) {
+        for arg in codex_exec_args(
+            &self.model,
+            request.effort.as_deref(),
+            &request.extra,
+            &request.additional_roots,
+        ) {
             cmd.arg(arg);
         }
 
@@ -178,7 +187,12 @@ impl AgentBackend for CodexBackend {
     }
 }
 
-fn codex_exec_args(model: &str, effort: Option<&str>, extra: &[(String, String)]) -> Vec<String> {
+fn codex_exec_args(
+    model: &str,
+    effort: Option<&str>,
+    extra: &[(String, String)],
+    additional_roots: &[std::path::PathBuf],
+) -> Vec<String> {
     let mut args = vec![
         "exec".to_string(),
         "--skip-git-repo-check".to_string(),
@@ -189,6 +203,17 @@ fn codex_exec_args(model: &str, effort: Option<&str>, extra: &[(String, String)]
         "--sandbox".to_string(),
         "read-only".to_string(),
     ];
+
+    // Workspace-mode multi-folder: each sibling folder is added as a writable
+    // root. The primary cwd reaches codex via `Command::current_dir`; these
+    // are the *additional* roots beyond it. Skips empty paths defensively.
+    for root in additional_roots {
+        if root.as_os_str().is_empty() {
+            continue;
+        }
+        args.push("--add-dir".to_string());
+        args.push(root.to_string_lossy().into_owned());
+    }
 
     if let Some(codex_effort) = map_effort_to_codex(effort) {
         args.push("--config".to_string());
@@ -331,13 +356,39 @@ mod tests {
 
     #[test]
     fn test_codex_exec_args_force_read_only_review_channel() {
-        let args = codex_exec_args("gpt-5.5", Some("high"), &[]);
+        let args = codex_exec_args("gpt-5.5", Some("high"), &[], &[]);
         assert!(
             args.windows(2)
                 .any(|w| w == ["--config", "approval_policy=never"])
         );
         assert!(args.windows(2).any(|w| w == ["--sandbox", "read-only"]));
         assert!(!args.iter().any(|a| a == "--ask-for-approval"));
+    }
+
+    #[test]
+    fn test_codex_exec_args_emits_add_dir_for_each_additional_root() {
+        let extras = [
+            std::path::PathBuf::from("/tmp/sibling-a"),
+            std::path::PathBuf::from("/tmp/sibling-b"),
+        ];
+        let args = codex_exec_args("gpt-5.5", None, &[], &extras);
+        let count = args.windows(2).filter(|w| w[0] == "--add-dir").count();
+        assert_eq!(count, 2, "one --add-dir per additional root");
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--add-dir", "/tmp/sibling-a"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--add-dir", "/tmp/sibling-b"])
+        );
+    }
+
+    #[test]
+    fn test_codex_exec_args_skips_empty_additional_root() {
+        let extras = [std::path::PathBuf::new()];
+        let args = codex_exec_args("gpt-5.5", None, &[], &extras);
+        assert!(!args.iter().any(|a| a == "--add-dir"));
     }
 
     #[test]

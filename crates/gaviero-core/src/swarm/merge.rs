@@ -202,6 +202,7 @@ async fn resolve_single_file(
                     .to_string(),
             ),
             workspace_root: repo_dir.to_path_buf(),
+            additional_roots: vec![],
             allowed_tools: vec![],
             file_attachments: vec![],
             conversation_history: vec![],

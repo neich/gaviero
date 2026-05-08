@@ -331,6 +331,7 @@ pub async fn run_one_claude_turn(
         &[],
         &options,
         &[],
+        &[],
     )
     .context("spawning AcpSession")?;
 

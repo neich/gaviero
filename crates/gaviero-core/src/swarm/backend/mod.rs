@@ -126,6 +126,11 @@ pub struct CompletionRequest {
     pub system_prompt: Option<String>,
     /// Workspace root directory (used by subprocess backends for --add-dir).
     pub workspace_root: PathBuf,
+    /// Additional workspace folders the agent should be able to read/write,
+    /// in workspace-mode multi-folder setups. Subprocess backends emit one
+    /// `--add-dir` per entry on top of `workspace_root`. Empty for single-folder
+    /// workspaces and for swarm sub-agents (which run in per-agent worktrees).
+    pub additional_roots: Vec<PathBuf>,
     /// Tools the agent is allowed to use (e.g. ["Read", "Write", "Edit"]).
     pub allowed_tools: Vec<String>,
     /// Files to attach (images, documents) via CLI flags.
@@ -217,6 +222,7 @@ mod tests {
             prompt: "test".into(),
             system_prompt: None,
             workspace_root: PathBuf::from("/tmp"),
+            additional_roots: vec![],
             allowed_tools: vec![],
             file_attachments: vec![],
             conversation_history: vec![],
@@ -258,6 +264,7 @@ mod tests {
             prompt: "test".into(),
             system_prompt: None,
             workspace_root: PathBuf::from("/tmp"),
+            additional_roots: vec![],
             allowed_tools: vec![],
             file_attachments: vec![],
             conversation_history: vec![],

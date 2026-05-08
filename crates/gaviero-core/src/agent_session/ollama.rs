@@ -67,6 +67,7 @@ impl OllamaSession {
                 args.model,
                 args.ollama_base_url,
                 args.workspace_root,
+                args.additional_roots,
                 args.agent_id,
                 args.options,
                 args.profile,

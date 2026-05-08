@@ -47,6 +47,11 @@ impl AgentBackend for ClaudeCodeBackend {
             .iter()
             .map(|p| p.as_path())
             .collect();
+        let additional_roots: Vec<&std::path::Path> = request
+            .additional_roots
+            .iter()
+            .map(|p| p.as_path())
+            .collect();
 
         // M6: `resume_session_id` deprecated; swarm work units are one-shot
         // (no resume), so this is always None. Allow stays until M10.
@@ -87,6 +92,7 @@ impl AgentBackend for ClaudeCodeBackend {
             &allowed_tools,
             &options,
             &file_attachments,
+            &additional_roots,
         )?;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<UnifiedStreamEvent>>(64);

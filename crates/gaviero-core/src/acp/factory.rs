@@ -169,6 +169,7 @@ impl AcpSessionFactory {
             tools,
             &self.default_options,
             &[],
+            &[],
         )
     }
 

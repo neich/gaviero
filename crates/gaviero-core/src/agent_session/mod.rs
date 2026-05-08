@@ -182,6 +182,7 @@ impl LegacyAgentSession {
         model: String,
         ollama_base_url: Option<String>,
         workspace_root: PathBuf,
+        additional_roots: Vec<PathBuf>,
         agent_id: String,
         options: AgentOptions,
         profile: ProviderProfile,
@@ -197,6 +198,7 @@ impl LegacyAgentSession {
             model,
             ollama_base_url,
             workspace_root,
+            additional_roots,
             agent_id,
             options,
         );

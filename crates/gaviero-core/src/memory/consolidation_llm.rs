@@ -49,6 +49,7 @@ impl ConsolidationLlm for BackendConsolidationLlm {
             prompt,
             system_prompt: None,
             workspace_root: self.workspace_root.clone(),
+            additional_roots: Vec::new(),
             allowed_tools: Vec::new(),
             file_attachments: Vec::new(),
             conversation_history: Vec::new(),

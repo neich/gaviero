@@ -56,6 +56,11 @@ pub struct ClaudeSession {
     /// Claude model name, stripped of `claude:` prefix.
     claude_model: String,
     workspace_root: PathBuf,
+    /// Sibling workspace folders (workspace-mode multi-folder). Forwarded to
+    /// the Claude CLI as repeated `--add-dir` flags so the model can
+    /// read/write across folders, not just the primary cwd. Empty in
+    /// single-folder mode and per-agent swarm worktrees.
+    additional_roots: Vec<PathBuf>,
     agent_id: String,
     effort: String,
     max_tokens: u32,
@@ -113,6 +118,7 @@ impl ClaudeSession {
             observer: args.observer,
             claude_model,
             workspace_root: args.workspace_root,
+            additional_roots: args.additional_roots,
             agent_id: args.agent_id,
             effort,
             max_tokens,
@@ -227,6 +233,8 @@ impl ClaudeSession {
             shared::build_enriched_prompt(&enriched_prompt, &conversation_history, &file_refs);
 
         let attach_refs: Vec<&Path> = file_attachments.iter().map(|p| p.as_path()).collect();
+        let additional_root_refs: Vec<&Path> =
+            self.additional_roots.iter().map(|p| p.as_path()).collect();
 
         let mut session = AcpSession::spawn(
             &self.claude_model,
@@ -237,6 +245,7 @@ impl ClaudeSession {
             &approved_tools,
             &options,
             &attach_refs,
+            &additional_root_refs,
         )?;
 
         // ── Streaming loop ────────────────────────────────────────────────

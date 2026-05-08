@@ -203,6 +203,7 @@ pub async fn run_backend(
             prompt,
             system_prompt: Some(default_editor_system_prompt(&capabilities)),
             workspace_root: workspace_root.to_path_buf(),
+            additional_roots: vec![],
             allowed_tools,
             file_attachments: vec![],
             conversation_history: vec![],

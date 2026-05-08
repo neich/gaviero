@@ -215,6 +215,12 @@ impl AcpSession {
     /// `approved_tools` controls which of those are auto-approved without
     /// a permission prompt (`--allowedTools`). Tools in `available_tools`
     /// but not in `approved_tools` will trigger `PermissionRequest` events.
+    ///
+    /// `additional_roots` adds extra writable folders alongside `cwd` via
+    /// repeated `--add-dir` flags. Used in workspace-mode multi-folder
+    /// setups so Claude can read/write sibling folders, not just the
+    /// primary cwd. Empty for single-folder workspaces and per-agent
+    /// swarm worktrees.
     // M6: reads `options.resume_session_id` (deprecated); allow stays until M10.
     #[allow(deprecated)]
     pub fn spawn(
@@ -226,6 +232,7 @@ impl AcpSession {
         approved_tools: &[&str],
         options: &AgentOptions,
         file_attachments: &[&Path],
+        additional_roots: &[&Path],
     ) -> Result<Self> {
         // Decide argv vs tempfile for the prompt. Small prompts take the
         // zero-overhead argv path; anything that might approach ARG_MAX is
@@ -321,6 +328,17 @@ impl AcpSession {
         }
 
         cmd.arg("--add-dir").arg(cwd);
+
+        // Workspace-mode multi-folder: each sibling folder is added as a
+        // writable root. `--add-dir` is repeatable on the Claude CLI; the
+        // first one (cwd above) anchors path resolution, additional ones
+        // extend the writable scope so cross-folder edits don't fail.
+        for extra in additional_roots {
+            if extra.as_os_str().is_empty() || *extra == cwd {
+                continue;
+            }
+            cmd.arg("--add-dir").arg(extra);
+        }
 
         // Pass prompt as positional arg so stdin stays open for permission responses.
         cmd.arg("--").arg(&argv_prompt);

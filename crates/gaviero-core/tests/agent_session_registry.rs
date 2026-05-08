@@ -51,6 +51,7 @@ fn construction_for(model_spec: &str) -> SessionConstruction {
         model: model_spec.to_string(),
         ollama_base_url: None,
         workspace_root: std::env::temp_dir(),
+        additional_roots: vec![],
         agent_id: "test-agent".to_string(),
         options: AgentOptions::default(),
         profile,
