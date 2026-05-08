@@ -177,9 +177,14 @@ pub struct App {
     /// task; held here only so a clean shutdown can join it.
     pub memory_sleeptime_scheduler: Option<gaviero_core::memory::SleeptimeScheduler>,
 
-    // Code graph cache — lazy build, invalidated on file changes.
-    // `None` means "needs (re)build before next chat send".
-    pub repo_map: Arc<tokio::sync::RwLock<Option<Arc<RepoMap>>>>,
+    // Code graph cache — lazy build per workspace folder, invalidated on
+    // file changes. Keyed by canonical folder root path so workspace-wide
+    // chat (`/workspace`) can fetch a map per folder. The previous Option
+    // shape was a single workspace-primary cell — promoted to HashMap to
+    // support per-folder caches while keeping today's path (single-folder
+    // chat dispatch) working: callers still ask for the focused folder's
+    // map and get a one-entry cache miss on first use.
+    pub repo_map: Arc<tokio::sync::RwLock<std::collections::HashMap<std::path::PathBuf, Arc<RepoMap>>>>,
     /// Workspace root path used for graph rebuilds (first root).
     pub graph_workspace_root: Option<std::path::PathBuf>,
 
@@ -382,7 +387,7 @@ impl App {
             memory_reranker: None,
             memory_rerank_cfg: None,
             memory_sleeptime_scheduler: None,
-            repo_map: Arc::new(tokio::sync::RwLock::new(None)),
+            repo_map: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             graph_workspace_root,
             git_panel: crate::panels::git_panel::GitPanelState::new(),
             memory_panel: crate::panels::memory_panel::MemoryPanelState::new(),
