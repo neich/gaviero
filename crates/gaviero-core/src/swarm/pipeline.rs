@@ -245,88 +245,23 @@ pub async fn execute(
                     crate::validation_gate::ValidationPipeline::fast_only(),
                 ))
             };
-        let single_repo_map: Arc<Option<crate::repo_map::RepoMap>> = {
-            let workspace = config.workspace_root.clone();
-            let excludes = config.excludes.clone();
-            let specificity = config.specificity;
-            Arc::new(
-                tokio::task::spawn_blocking(move || {
-                    crate::repo_map::RepoMap::build_with_config(&workspace, &excludes, specificity)
-                        .map_err(|e| {
-                            tracing::debug!("repo_map build skipped: {}", e);
-                            e
-                        })
-                        .ok()
-                })
-                .await
-                .unwrap_or(None),
-            )
-        };
-        // Pre-compute impact analysis for the single agent
-        let single_impact_text: Option<String> = {
-            let workspace = config.workspace_root.clone();
-            let excludes = config.excludes.clone();
-            let owned_paths = unit.scope.owned_paths.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::repo_map::graph_builder::build_graph(&workspace, &excludes)
-                    .map(|(store, result)| {
-                        tracing::info!(
-                            "code graph: {} nodes, {} edges ({} files changed, {} unchanged)",
-                            result.total_nodes,
-                            result.total_edges,
-                            result.files_changed,
-                            result.files_unchanged,
-                        );
-                        let owned: Vec<&str> = owned_paths.iter().map(|s| s.as_str()).collect();
-                        if owned.is_empty() {
-                            return None;
-                        }
-                        store.impact_radius(&owned, 3).ok().and_then(|impact| {
-                            if impact.affected_files.is_empty() {
-                                None
-                            } else {
-                                Some(
-                                    crate::repo_map::store::GraphStore::format_impact_for_prompt(
-                                        &impact,
-                                    ),
-                                )
-                            }
-                        })
-                    })
-                    .unwrap_or(None)
-            })
-            .await
-            .unwrap_or(None)
-        };
+        let analysis =
+            WorkspaceAnalysis::build(config, std::slice::from_ref(&unit)).await;
 
-        let effective_read_ns: Vec<String> = unit
-            .read_namespaces
-            .as_deref()
-            .unwrap_or(config.read_namespaces.as_slice())
-            .to_vec();
-        let agent_ctx = AgentRunContext {
-            workspace_root: &config.workspace_root,
-            context_files: &config.context_files,
-            memory: memory.clone(),
-            read_namespaces: &effective_read_ns,
-            swarm_observer: observer,
-            git_coordinator: git_coordinator.clone(),
-            validation: single_validation.clone(),
-            board: None,
-            repo_map: single_repo_map.clone(),
-            impact_texts: Arc::new({
-                let mut map = std::collections::HashMap::new();
-                if let Some(text) = single_impact_text.clone() {
-                    map.insert(unit.id.clone(), text);
-                }
-                map
-            }),
-            // Single-agent fast path: no bundle pre-fetch (1 coordinator query
-            // + 1 runner query = 2, already within M7 ≤2 gate).
-            pre_fetched_memory: Arc::new(None),
-            mcp_config: config.mcp_config.clone(),
-            swarm_extras: &config.swarm_extra_tools,
-        };
+        let effective_read_ns = effective_read_namespaces(&unit, config);
+        // Single-agent fast path: no shared board, no bundle pre-fetch
+        // (coordinator + runner = 2 queries, already within M7 ≤2 gate).
+        let agent_ctx = AgentRunContext::for_run(
+            config,
+            &effective_read_ns,
+            observer,
+            memory.clone(),
+            git_coordinator.clone(),
+            single_validation.clone(),
+            None,
+            &analysis,
+            Arc::new(None),
+        );
 
         invalidate_stale_sources(&memory, &unit, &config.workspace_root).await;
 
@@ -409,128 +344,19 @@ pub async fn execute(
             ))
         };
 
-    // Build repo map once for context optimization (best-effort; failures are non-fatal).
-    // Runs on a blocking thread to avoid starving the async executor during workspace scan.
+    // Build repo map + per-unit impact texts once for the whole swarm.
+    // Both phases run on blocking threads inside `WorkspaceAnalysis::build`
+    // (workspace scan + rusqlite GraphStore are !Send / CPU-heavy).
     tracing::info!("repo_map: scanning workspace");
-    let repo_map: Arc<Option<crate::repo_map::RepoMap>> = {
-        let workspace = config.workspace_root.clone();
-        let excludes = config.excludes.clone();
-        let specificity = config.specificity;
-        Arc::new(
-            tokio::task::spawn_blocking(move || {
-                crate::repo_map::RepoMap::build_with_config(&workspace, &excludes, specificity)
-                    .map_err(|e| {
-                        tracing::debug!("repo_map build skipped: {}", e);
-                        e
-                    })
-                    .ok()
-                    .inspect(|_| tracing::info!("repo_map: done"))
-            })
-            .await
-            .unwrap_or(None),
-        )
-    };
-
-    // Build code knowledge graph and pre-compute impact analysis + context queries per agent.
-    // GraphStore uses rusqlite (!Send), so we compute all texts upfront and share them as a
-    // Send-safe HashMap. Runs on a blocking thread for the same reason as repo_map above.
     tracing::info!("code graph: indexing workspace");
     let units_for_graph: Vec<WorkUnit> = work_units
         .iter()
         .chain(plan.loop_judge_units.iter())
         .cloned()
         .collect();
-    let impact_texts: Arc<std::collections::HashMap<String, String>> = {
-        let workspace = config.workspace_root.clone();
-        let excludes = config.excludes.clone();
-        Arc::new(
-            tokio::task::spawn_blocking(move || {
-                let mut map = std::collections::HashMap::new();
-                match crate::repo_map::graph_builder::build_graph(&workspace, &excludes) {
-                    Ok((store, result)) => {
-                        tracing::info!(
-                            "code graph: {} nodes, {} edges ({} files changed, {} unchanged)",
-                            result.total_nodes,
-                            result.total_edges,
-                            result.files_changed,
-                            result.files_unchanged,
-                        );
-                        for wu in &units_for_graph {
-                            let mut sections: Vec<String> = Vec::new();
-
-                            let owned: Vec<&str> =
-                                wu.scope.owned_paths.iter().map(|s| s.as_str()).collect();
-                            if !owned.is_empty() {
-                                let depth = if wu.impact_scope {
-                                    wu.context_depth.max(3) as usize
-                                } else {
-                                    3
-                                };
-                                if let Ok(impact) = store.impact_radius(&owned, depth) {
-                                    if !impact.affected_files.is_empty() {
-                                        sections.push(
-                                            crate::repo_map::store::GraphStore::format_impact_for_prompt(
-                                                &impact,
-                                            ),
-                                        );
-                                    }
-                                }
-                            }
-
-                            if !wu.context_callers_of.is_empty() {
-                                let refs: Vec<&str> =
-                                    wu.context_callers_of.iter().map(|s| s.as_str()).collect();
-                                if let Ok(impact) =
-                                    store.impact_radius(&refs, wu.context_depth as usize)
-                                {
-                                    let callers: Vec<&str> = impact
-                                        .affected_files
-                                        .iter()
-                                        .filter(|f| !wu.context_callers_of.contains(f))
-                                        .map(|s| s.as_str())
-                                        .collect();
-                                    if !callers.is_empty() {
-                                        sections.push(format!(
-                                            "[Callers of {:?}]:\n{}",
-                                            wu.context_callers_of,
-                                            callers.join(", ")
-                                        ));
-                                    }
-                                }
-                            }
-
-                            if !wu.context_tests_for.is_empty() {
-                                let refs: Vec<&str> =
-                                    wu.context_tests_for.iter().map(|s| s.as_str()).collect();
-                                if let Ok(impact) =
-                                    store.impact_radius(&refs, wu.context_depth as usize)
-                                {
-                                    if !impact.affected_tests.is_empty() {
-                                        sections.push(format!(
-                                            "[Tests for {:?}]:\n{}",
-                                            wu.context_tests_for,
-                                            impact.affected_tests.join(", ")
-                                        ));
-                                    }
-                                }
-                            }
-
-                            if !sections.is_empty() {
-                                map.insert(wu.id.clone(), sections.join("\n\n"));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!("code graph build skipped: {}", e);
-                    }
-                }
-                tracing::info!("code graph: done");
-                map
-            })
-            .await
-            .unwrap_or_default(),
-        )
-    };
+    let analysis = WorkspaceAnalysis::build(config, &units_for_graph).await;
+    let repo_map = analysis.repo_map.clone();
+    let impact_texts = analysis.impact_texts.clone();
 
     tracing::info!("memory bundle: querying");
     // M7: Build SwarmContextBundle — one shared memory query for all work units.
@@ -704,27 +530,19 @@ pub async fn execute(
 
                 invalidate_stale_sources(&memory, unit, &config.workspace_root).await;
 
-                let effective_read_ns: Vec<String> = unit
-                    .read_namespaces
-                    .as_deref()
-                    .unwrap_or(config.read_namespaces.as_slice())
-                    .to_vec();
+                let effective_read_ns = effective_read_namespaces(unit, config);
 
-                let agent_ctx = AgentRunContext {
-                    workspace_root: &config.workspace_root,
-                    context_files: &config.context_files,
-                    memory: memory.clone(),
-                    read_namespaces: &effective_read_ns,
-                    swarm_observer: observer,
-                    git_coordinator: git_coordinator.clone(),
-                    validation: validation_pipeline.clone(),
-                    board: Some(shared_board.clone()),
-                    repo_map: repo_map.clone(),
-                    impact_texts: impact_texts.clone(),
-                    pre_fetched_memory: pre_fetched_memory.clone(),
-                    mcp_config: config.mcp_config.clone(),
-                    swarm_extras: &config.swarm_extra_tools,
-                };
+                let agent_ctx = AgentRunContext::for_run(
+                    config,
+                    &effective_read_ns,
+                    observer,
+                    memory.clone(),
+                    git_coordinator.clone(),
+                    validation_pipeline.clone(),
+                    Some(shared_board.clone()),
+                    &analysis,
+                    pre_fetched_memory.clone(),
+                );
                 let manifest = run_single_agent(
                     unit,
                     worktree_mgr.as_mut(),
@@ -1109,26 +927,18 @@ pub async fn execute(
 
                 observer.on_agent_state_changed(agent_id, &AgentStatus::Running, &unit.description);
                 invalidate_stale_sources(&memory, unit, &config.workspace_root).await;
-                let effective_read_ns: Vec<String> = unit
-                    .read_namespaces
-                    .as_deref()
-                    .unwrap_or(config.read_namespaces.as_slice())
-                    .to_vec();
-                let agent_ctx = AgentRunContext {
-                    workspace_root: &config.workspace_root,
-                    context_files: &config.context_files,
-                    memory: memory.clone(),
-                    read_namespaces: &effective_read_ns,
-                    swarm_observer: observer,
-                    git_coordinator: git_coordinator.clone(),
-                    validation: validation_pipeline.clone(),
-                    board: Some(shared_board.clone()),
-                    repo_map: repo_map.clone(),
-                    impact_texts: impact_texts.clone(),
-                    pre_fetched_memory: pre_fetched_memory.clone(),
-                    mcp_config: config.mcp_config.clone(),
-                    swarm_extras: &config.swarm_extra_tools,
-                };
+                let effective_read_ns = effective_read_namespaces(unit, config);
+                let agent_ctx = AgentRunContext::for_run(
+                    config,
+                    &effective_read_ns,
+                    observer,
+                    memory.clone(),
+                    git_coordinator.clone(),
+                    validation_pipeline.clone(),
+                    Some(shared_board.clone()),
+                    &analysis,
+                    pre_fetched_memory.clone(),
+                );
                 let branch = format!("gaviero/{}-iter{}", agent_id, iter_abs);
                 let base_sha = chain_anchor.clone().unwrap();
                 let manifest = run_single_agent_with_branch(
@@ -1264,27 +1074,19 @@ pub async fn execute(
 
                 invalidate_stale_sources(&memory, unit, &config.workspace_root).await;
 
-                let effective_read_ns: Vec<String> = unit
-                    .read_namespaces
-                    .as_deref()
-                    .unwrap_or(config.read_namespaces.as_slice())
-                    .to_vec();
+                let effective_read_ns = effective_read_namespaces(unit, config);
 
-                let agent_ctx = AgentRunContext {
-                    workspace_root: &config.workspace_root,
-                    context_files: &config.context_files,
-                    memory: memory.clone(),
-                    read_namespaces: &effective_read_ns,
-                    swarm_observer: observer,
-                    git_coordinator: git_coordinator.clone(),
-                    validation: validation_pipeline.clone(),
-                    board: Some(shared_board.clone()),
-                    repo_map: repo_map.clone(),
-                    impact_texts: impact_texts.clone(),
-                    pre_fetched_memory: pre_fetched_memory.clone(),
-                    mcp_config: config.mcp_config.clone(),
-                    swarm_extras: &config.swarm_extra_tools,
-                };
+                let agent_ctx = AgentRunContext::for_run(
+                    config,
+                    &effective_read_ns,
+                    observer,
+                    memory.clone(),
+                    git_coordinator.clone(),
+                    validation_pipeline.clone(),
+                    Some(shared_board.clone()),
+                    &analysis,
+                    pre_fetched_memory.clone(),
+                );
                 // Stacked mode: each agent in this iteration runs on its
                 // own per-iteration branch, based on the previous agent's
                 // tip (or the previous iteration's tip if this is the
@@ -1429,26 +1231,18 @@ pub async fn execute(
                 observer.on_agent_state_changed(unit_id, &AgentStatus::Running, &unit.description);
                 invalidate_stale_sources(&memory, unit, &config.workspace_root).await;
 
-                let effective_read_ns: Vec<String> = unit
-                    .read_namespaces
-                    .as_deref()
-                    .unwrap_or(config.read_namespaces.as_slice())
-                    .to_vec();
-                let agent_ctx = AgentRunContext {
-                    workspace_root: &config.workspace_root,
-                    context_files: &config.context_files,
-                    memory: memory.clone(),
-                    read_namespaces: &effective_read_ns,
-                    swarm_observer: observer,
-                    git_coordinator: git_coordinator.clone(),
-                    validation: validation_pipeline.clone(),
-                    board: Some(shared_board.clone()),
-                    repo_map: repo_map.clone(),
-                    impact_texts: impact_texts.clone(),
-                    pre_fetched_memory: pre_fetched_memory.clone(),
-                    mcp_config: config.mcp_config.clone(),
-                    swarm_extras: &config.swarm_extra_tools,
-                };
+                let effective_read_ns = effective_read_namespaces(unit, config);
+                let agent_ctx = AgentRunContext::for_run(
+                    config,
+                    &effective_read_ns,
+                    observer,
+                    memory.clone(),
+                    git_coordinator.clone(),
+                    validation_pipeline.clone(),
+                    Some(shared_board.clone()),
+                    &analysis,
+                    pre_fetched_memory.clone(),
+                );
                 let manifest = run_single_agent(
                     unit,
                     worktree_mgr.as_mut(),
@@ -1646,6 +1440,190 @@ struct AgentRunContext<'a> {
     /// `SwarmConfig::swarm_extra_tools`). Borrowed from `SwarmConfig`
     /// for the duration of the swarm run.
     swarm_extras: &'a [String],
+}
+
+impl<'a> AgentRunContext<'a> {
+    /// Build an `AgentRunContext` from the swarm's shared state. Single
+    /// construction site for both the single-agent fast path (with `board =
+    /// None`, `pre_fetched_memory = Arc::new(None)`) and the multi-agent /
+    /// loop / readonly paths (which pass `Some(shared_board)` and the
+    /// pre-fetched bundle text).
+    #[allow(clippy::too_many_arguments)]
+    fn for_run(
+        config: &'a SwarmConfig,
+        read_namespaces: &'a [String],
+        observer: &'a dyn SwarmObserver,
+        memory: Option<Arc<MemoryStores>>,
+        git_coordinator: Arc<GitCoordinator>,
+        validation: Option<Arc<crate::validation_gate::ValidationPipeline>>,
+        board: Option<Arc<SharedBoard>>,
+        analysis: &WorkspaceAnalysis,
+        pre_fetched_memory: Arc<Option<String>>,
+    ) -> Self {
+        Self {
+            workspace_root: &config.workspace_root,
+            context_files: &config.context_files,
+            memory,
+            read_namespaces,
+            swarm_observer: observer,
+            git_coordinator,
+            validation,
+            board,
+            repo_map: analysis.repo_map.clone(),
+            impact_texts: analysis.impact_texts.clone(),
+            pre_fetched_memory,
+            mcp_config: config.mcp_config.clone(),
+            swarm_extras: &config.swarm_extra_tools,
+        }
+    }
+}
+
+/// Repo map + per-unit impact texts derived from the code knowledge graph.
+/// Computed once per swarm run; cloned cheaply (`Arc`) into every
+/// `AgentRunContext`.
+struct WorkspaceAnalysis {
+    repo_map: Arc<Option<crate::repo_map::RepoMap>>,
+    impact_texts: Arc<std::collections::HashMap<String, String>>,
+}
+
+impl WorkspaceAnalysis {
+    /// Build the repo map and per-unit impact texts. Both phases run on
+    /// blocking threads to avoid starving the async executor; failures are
+    /// logged at debug level and yield empty results so single-agent and
+    /// multi-agent runs degrade identically.
+    async fn build(config: &SwarmConfig, units: &[WorkUnit]) -> Self {
+        let repo_map: Arc<Option<crate::repo_map::RepoMap>> = {
+            let workspace = config.workspace_root.clone();
+            let excludes = config.excludes.clone();
+            let specificity = config.specificity;
+            Arc::new(
+                tokio::task::spawn_blocking(move || {
+                    crate::repo_map::RepoMap::build_with_config(&workspace, &excludes, specificity)
+                        .map_err(|e| {
+                            tracing::debug!("repo_map build skipped: {}", e);
+                            e
+                        })
+                        .ok()
+                        .inspect(|_| tracing::info!("repo_map: done"))
+                })
+                .await
+                .unwrap_or(None),
+            )
+        };
+
+        let units_for_graph: Vec<WorkUnit> = units.to_vec();
+        let impact_texts: Arc<std::collections::HashMap<String, String>> = {
+            let workspace = config.workspace_root.clone();
+            let excludes = config.excludes.clone();
+            Arc::new(
+                tokio::task::spawn_blocking(move || {
+                    let mut map = std::collections::HashMap::new();
+                    match crate::repo_map::graph_builder::build_graph(&workspace, &excludes) {
+                        Ok((store, result)) => {
+                            tracing::info!(
+                                "code graph: {} nodes, {} edges ({} files changed, {} unchanged)",
+                                result.total_nodes,
+                                result.total_edges,
+                                result.files_changed,
+                                result.files_unchanged,
+                            );
+                            for wu in &units_for_graph {
+                                let mut sections: Vec<String> = Vec::new();
+
+                                let owned: Vec<&str> =
+                                    wu.scope.owned_paths.iter().map(|s| s.as_str()).collect();
+                                if !owned.is_empty() {
+                                    let depth = if wu.impact_scope {
+                                        wu.context_depth.max(3) as usize
+                                    } else {
+                                        3
+                                    };
+                                    if let Ok(impact) = store.impact_radius(&owned, depth) {
+                                        if !impact.affected_files.is_empty() {
+                                            sections.push(
+                                                crate::repo_map::store::GraphStore::format_impact_for_prompt(
+                                                    &impact,
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+
+                                if !wu.context_callers_of.is_empty() {
+                                    let refs: Vec<&str> = wu
+                                        .context_callers_of
+                                        .iter()
+                                        .map(|s| s.as_str())
+                                        .collect();
+                                    if let Ok(impact) =
+                                        store.impact_radius(&refs, wu.context_depth as usize)
+                                    {
+                                        let callers: Vec<&str> = impact
+                                            .affected_files
+                                            .iter()
+                                            .filter(|f| !wu.context_callers_of.contains(f))
+                                            .map(|s| s.as_str())
+                                            .collect();
+                                        if !callers.is_empty() {
+                                            sections.push(format!(
+                                                "[Callers of {:?}]:\n{}",
+                                                wu.context_callers_of,
+                                                callers.join(", ")
+                                            ));
+                                        }
+                                    }
+                                }
+
+                                if !wu.context_tests_for.is_empty() {
+                                    let refs: Vec<&str> = wu
+                                        .context_tests_for
+                                        .iter()
+                                        .map(|s| s.as_str())
+                                        .collect();
+                                    if let Ok(impact) =
+                                        store.impact_radius(&refs, wu.context_depth as usize)
+                                    {
+                                        if !impact.affected_tests.is_empty() {
+                                            sections.push(format!(
+                                                "[Tests for {:?}]:\n{}",
+                                                wu.context_tests_for,
+                                                impact.affected_tests.join(", ")
+                                            ));
+                                        }
+                                    }
+                                }
+
+                                if !sections.is_empty() {
+                                    map.insert(wu.id.clone(), sections.join("\n\n"));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("code graph build skipped: {}", e);
+                        }
+                    }
+                    tracing::info!("code graph: done");
+                    map
+                })
+                .await
+                .unwrap_or_default(),
+            )
+        };
+
+        Self {
+            repo_map,
+            impact_texts,
+        }
+    }
+}
+
+/// Resolve the effective read-namespace list for a work unit: the unit's
+/// own list if set, otherwise the swarm-config default.
+fn effective_read_namespaces(unit: &WorkUnit, config: &SwarmConfig) -> Vec<String> {
+    unit.read_namespaces
+        .as_deref()
+        .unwrap_or(config.read_namespaces.as_slice())
+        .to_vec()
 }
 
 struct LoopConditionContext<'a> {
@@ -2841,27 +2819,22 @@ async fn evaluate_loop_condition(
             let unit = apply_iter_vars_with_evidence(unit_template, current_iter_abs, &evidence);
             invalidate_stale_sources(ctx.memory, &unit, &ctx.config.workspace_root).await;
 
-            let effective_read_ns: Vec<String> = unit
-                .read_namespaces
-                .as_deref()
-                .unwrap_or(ctx.config.read_namespaces.as_slice())
-                .to_vec();
-
-            let agent_ctx = AgentRunContext {
-                workspace_root: &ctx.config.workspace_root,
-                context_files: &ctx.config.context_files,
-                memory: ctx.memory.clone(),
-                read_namespaces: &effective_read_ns,
-                swarm_observer: ctx.observer,
-                git_coordinator: ctx.git_coordinator.clone(),
-                validation: ctx.validation.clone(),
-                board: Some(ctx.shared_board.clone()),
+            let effective_read_ns = effective_read_namespaces(&unit, ctx.config);
+            let analysis = WorkspaceAnalysis {
                 repo_map: ctx.repo_map.clone(),
                 impact_texts: ctx.impact_texts.clone(),
-                pre_fetched_memory: ctx.pre_fetched_memory.clone(),
-                mcp_config: ctx.config.mcp_config.clone(),
-                swarm_extras: &ctx.config.swarm_extra_tools,
             };
+            let agent_ctx = AgentRunContext::for_run(
+                ctx.config,
+                &effective_read_ns,
+                ctx.observer,
+                ctx.memory.clone(),
+                ctx.git_coordinator.clone(),
+                ctx.validation.clone(),
+                Some(ctx.shared_board.clone()),
+                &analysis,
+                ctx.pre_fetched_memory.clone(),
+            );
 
             // Judges run in read-only mode: the write gate rejects any write
             // proposals the backend tries to emit. See `run_readonly_agent`.
