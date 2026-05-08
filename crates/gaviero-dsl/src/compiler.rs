@@ -63,7 +63,13 @@ pub fn compile_ast_with_sources(
     runtime_prompt: Option<&str>,
     override_vars: &[(String, String)],
 ) -> Result<CompiledPlan, DslErrors> {
-    assert!(!sources.is_empty(), "compile requires at least one source");
+    if sources.is_empty() {
+        return Err(DslErrors::single(DslError::Compile {
+            src: NamedSource::new("<input>", String::new()),
+            span: (0, 0).into(),
+            reason: "compile requires at least one source file".into(),
+        }));
+    }
     let src_for = |fid: u32| -> NamedSource<String> {
         let idx = fid as usize;
         let (filename, content) = &sources[idx];
@@ -659,8 +665,10 @@ fn apply_vars(
     }
     for (k, v) in agent_vars {
         if RESERVED.contains(&k.as_str()) {
-            eprintln!(
-                "⚠ agent `{agent_name}`: vars key `{k}` shadows a reserved variable and will be ignored"
+            tracing::warn!(
+                agent = agent_name,
+                key = %k,
+                "agent vars key shadows a reserved variable and will be ignored"
             );
             continue;
         }
@@ -778,11 +786,9 @@ fn compile_agent(
         // No explicit client, no tier alias, no default — warn if any
         // clients are declared, then fall back to defaults.
         if !client_map.is_empty() {
-            eprintln!(
-                "⚠ agent `{}`: no client declared and no default client set; \
-                 falling back to tier=Cheap/model=None. \
-                 Declare a default client with `default` in the client block.",
-                decl.name
+            tracing::warn!(
+                agent = %decl.name,
+                "no client declared and no default client set; falling back to tier=Cheap/model=None. Declare a default client with `default` in the client block."
             );
         }
         (
