@@ -13,12 +13,12 @@
 //
 // Shared client library — provides opus, sonnet (default),
 // codex-5-4 (codex:gpt-5.4), and codex-5-5 (codex:gpt-5.5). Agents below
-// bind to concrete clients (`client opus`, `client codex-5-4`,
+// bind to concrete clients (`client opus`, `client codex-5-5`,
 // `client sonnet`) because the script's whole point is to run two
 // specific providers in parallel and have a third arbitrate convergence.
 //
-// To pin the codex side to a different snapshot, change `client codex-5-4`
-// on the codex-init / codex-refine agents to `client codex-5-5`.
+// To pin the codex side to an earlier snapshot, change `client codex-5-5`
+// on the codex-init / codex-refine agents to `client codex-5-4`.
 include "clients.gaviero"
 
 
@@ -50,38 +50,60 @@ prompt init-body #"
 
     Think from first principles. Do NOT read any existing files in {{OUT_DIR}}/.
 
-    Cover all of the following:
-    - Motivation and goals
-    - Proposed architecture and component breakdown
-    - Implementation steps (ordered, concrete)
-    - Data structures and API surface
-    - Risks and mitigations
-    - Alternatives considered and why rejected
-    - **Phase decomposition for automated execution.** Partition the work into
-      phases sized to land as a single reviewable PR (not per-sub-step,
-      not per-whole-tier). For each phase specify:
+    The plan is for a frontier AI executor that will implement it
+    directly. Write in declarative, committed voice:
+      - Say what to build, why, and how — nothing else.
+      - Do NOT include synthesis notes, peer comparisons, rejected
+        alternatives, or any meta-narrative about the planning process.
+      - Commit to a design. No hedging, no "we could", no "one option is".
+      - If you considered an alternative and rejected it: do NOT add an
+        "Alternatives Considered" section. If the rejection implies a
+        hard constraint at implementation time, inline it as a rule in
+        the relevant section (e.g. "All local inference goes through
+        ollama; direct ONNX is disallowed: VRAM contention."). Otherwise
+        drop the alternative — the refine phase will rediscover it if
+        it matters.
+
+    The plan MUST contain (in this order, with these exact headings):
+    - `## Motivation and goals`
+    - `## Architecture and component breakdown`
+    - `## Implementation steps` (ordered, concrete)
+    - `## Data structures and API surface`
+    - `## Risks and mitigations`
+    - `## Operator Decisions` — forward-looking design decisions the
+      executor must make at implementation time based on runtime
+      observation or external constraints. Each item: one bullet,
+      written as a conditional or actionable instruction (e.g. "If
+      observed VRAM pressure < 4GB, set keep_alive=5m; else 0"). If
+      nothing belongs here, write "None — plan is review-ready." Keep
+      this list under ~10 bullets.
+    - `## Phase decomposition` — partition the work into phases sized
+      to land as a single reviewable PR (not per-sub-step, not
+      per-whole-tier). For each phase specify:
         * owned files / crates (what this phase writes),
         * read-only dependencies (what this phase must read),
-        * concrete pass/fail acceptance signals (compile, clippy lint, named
-          tests, grep regressions — prefer mechanical signals over prose),
-        * entanglement: which earlier phases' decisions must remain visible
-          to this phase's executor (drives whether prior-phase logs must be
-          read in full or just the gate verdicts).
-      Call out when two candidate phases share enough surface that they
-      should be merged rather than split.
-    - **Execution shape for `phased_plan.gaviero`.** Recommend either:
-        (a) one `phased_plan.gaviero` loop invocation covering all phases, or
-        (b) N separate invocations with a human review checkpoint between
-            top-level items,
-      and state the tradeoff explicitly (resume granularity, diff-review
-      size, cross-phase entanglement, gate cost). If (a), specify the
-      minimum `phase_executor.owned` scope union that the DSL needs
-      (widening beyond the default template is a real cost — call it out).
-      If (b), specify the natural split boundaries and what each invocation's
-      `{{PROMPT}}` should carry.
+        * concrete pass/fail acceptance signals (compile, clippy lint,
+          named tests, grep regressions — prefer mechanical signals
+          over prose),
+        * entanglement: which earlier phases' decisions must remain
+          visible to this phase's executor (drives whether prior-phase
+          logs must be read in full or just the gate verdicts).
+      Call out when two candidate phases share enough surface that
+      they should be merged rather than split.
+    - `## Execution shape` — recommend either:
+        (a) one `phased_plan.gaviero` loop invocation covering all
+            phases, or
+        (b) N separate invocations with a human review checkpoint
+            between top-level items,
+      and state the tradeoff explicitly (resume granularity,
+      diff-review size, cross-phase entanglement, gate cost). If (a),
+      specify the minimum `phase_executor.owned` scope union that the
+      DSL needs (widening beyond the default template is a real cost
+      — call it out). If (b), specify the natural split boundaries
+      and what each invocation's `{{PROMPT}}` should carry.
 
-    Write your plan to {{OUT_DIR}}/{{MODEL_NAME}}-init-v{{INIT_VER}}.md using
-    clear markdown with headings. Do not hedge — commit to a design.
+    Write your plan to {{OUT_DIR}}/{{MODEL_NAME}}-init-v{{INIT_VER}}.md
+    using clear markdown with headings.
 "#
 
 prompt refine-body #"
@@ -89,69 +111,181 @@ prompt refine-body #"
 
     {{PROMPT}}
 
-    The previous pair lives in either `-init-v1.md` (iteration 1) or
-    `-refine-plan-v{{PREV_ITER}}.md` (later iterations). If `{{PREV_ITER}}` is
-    `1`, read the `-init-v1.md` files; otherwise read the `-refine-plan-…`
-    files.
+    The plan file is for a frontier AI executor that will implement
+    it directly and has no knowledge of the iteration history. Write
+    the plan in declarative, committed voice. Hard rules — failing
+    any of these makes the plan unfit for the executor:
+      - Say what to build, why, and how — nothing else.
+      - Do NOT write "we chose X over Y", "the previous version
+        proposed Z", "this iteration adopts...", or "stronger than
+        the alternative".
+      - Do NOT reference peer plans, model names, version numbers
+        (v{{PREV_ITER}}, v{{ITER}}), refinement passes, or synthesis
+        notes anywhere in the plan file.
+      - Do NOT include `## Synthesis Notes`, `## Alternatives
+        Considered`, or any other iteration-metadata section in the
+        plan file.
+      - If a rejected alternative implies a hard implementation
+        constraint, inline it as a rule in the relevant section
+        ("All local inference goes through ollama; direct ONNX is
+        disallowed: VRAM contention."), not as a comparison.
+    All synthesis history, peer comparisons, rejected alternatives,
+    convergence declarations, and version references go in the
+    **summary** file (step 6) — never the plan file.
 
-    1. Read {{OUT_DIR}}/{{MODEL_NAME}}-init-v{{PREV_ITER}}.md (if it exists) or
-       {{OUT_DIR}}/{{MODEL_NAME}}-refine-plan-v{{PREV_ITER}}.md, and the peer's
-       equivalent {{OUT_DIR}}/{{PEER_NAME}}-…-v{{PREV_ITER}}.md, in full.
-    2. Analyse the pair: what does each get right? What does each miss,
-       oversimplify, or get wrong? Where do they conflict?
-    3. Synthesise a new plan taking the strongest elements of both,
-       resolving conflicts with explicit reasoning, and improving on both.
-    4. Write your refined plan to
-       {{OUT_DIR}}/{{MODEL_NAME}}-refine-plan-v{{ITER}}.md. Begin with a
-       '## Synthesis Notes' section: the pair you read, what you adopted from
-       each, what you changed or discarded.
-       The refined plan MUST retain (or introduce, if absent from the pair)
-       a '## Phase decomposition' section and an '## Execution shape' section
-       as specified by the init-phase brief:
-         - Phase decomposition: per-phase owned files/crates, read-only
-           dependencies, mechanical pass/fail signals, and cross-phase
-           entanglement notes.
-         - Execution shape: single `phased_plan.gaviero` loop invocation vs
-           N invocations with human checkpoints, with the tradeoff stated
-           and the required scope / `{{PROMPT}}` structure spelled out.
-       If the v{{PREV_ITER}} pair disagrees on these, resolve the conflict
-       in Synthesis Notes and commit to one shape.
-    5. Write a concise summary (under 300 words) to
-       {{OUT_DIR}}/{{MODEL_NAME}}-refine-summary-v{{ITER}}.md covering the main
-       differences between the two v{{PREV_ITER}} plans and the key choices
-       made in this version. Write it for a human skimming the evolution.
+    Inputs to read:
+    1. The previous pair of plans (both in full):
+         - {{OUT_DIR}}/{{MODEL_NAME}}-init-v{{PREV_ITER}}.md (when
+           {{PREV_ITER}} = 1) or
+           {{OUT_DIR}}/{{MODEL_NAME}}-refine-plan-v{{PREV_ITER}}.md
+           (when {{PREV_ITER}} >= 2).
+         - The peer equivalent
+           {{OUT_DIR}}/{{PEER_NAME}}-…-v{{PREV_ITER}}.md.
+    2. **If {{PREV_ITER}} >= 2**, also read both prior summaries:
+         - {{OUT_DIR}}/{{MODEL_NAME}}-refine-summary-v{{PREV_ITER}}.md
+         - {{OUT_DIR}}/{{PEER_NAME}}-refine-summary-v{{PREV_ITER}}.md
+       Use them ONLY to focus your gap analysis: what each side
+       adopted, what each deferred, what's still disputed. The
+       summaries MUST NOT shape the voice or content of the new plan
+       file — they are iteration metadata and they belong in the
+       summary file, not the plan.
+
+    Then:
+    3. Analyse the pair. Where do the two plans agree? Where do they
+       conflict? What does each miss or oversimplify?
+    4. Decide whether the pair has converged. Convergence means the
+       two plans agree on the core architecture, the major
+       implementation steps, and the operational choices that have a
+       material effect on the result. Editorial differences (wording,
+       section ordering, naming, prose length) and remaining
+       low-impact items listed in `## Operator Decisions` DO NOT
+       block convergence.
+         - **If the pair has converged**: do NOT introduce new
+           structural sections, new tests, new taxonomies, or new
+           operational refinements just to make visible progress.
+           Copy your previous plan
+           ({{OUT_DIR}}/{{MODEL_NAME}}-refine-plan-v{{PREV_ITER}}.md
+           or {{OUT_DIR}}/{{MODEL_NAME}}-init-v{{PREV_ITER}}.md on
+           the first refine pass) into v{{ITER}} verbatim — same
+           sections, same prose, same Operator Decisions list. Byte
+           stability across iterations is the desired outcome.
+           Declare convergence in the summary file (step 6).
+         - **If the pair has NOT converged**: synthesise a new plan
+           taking the strongest elements of both and resolving
+           conflicts on their merits. Make the minimum changes
+           needed to close the genuine disagreements — do not invent
+           additional improvements beyond what the gaps demand.
+    5. Write the refined plan to
+       {{OUT_DIR}}/{{MODEL_NAME}}-refine-plan-v{{ITER}}.md. It MUST
+       contain exactly these sections, in this order, with these
+       headings:
+         - `## Motivation and goals`
+         - `## Architecture and component breakdown`
+         - `## Implementation steps`
+         - `## Data structures and API surface`
+         - `## Risks and mitigations`
+         - `## Operator Decisions` — forward-looking design decisions
+           the executor must make at implementation time based on
+           runtime observation or external constraints. Each item:
+           one bullet, written as a conditional or actionable
+           instruction (e.g. "If observed VRAM pressure < 4GB, set
+           keep_alive=5m; else 0"). If nothing belongs here, write
+           "None — plan is review-ready." Carry items forward across
+           iterations unless they have been resolved; cap ~10
+           bullets — drop the least material if pressure builds.
+         - `## Phase decomposition` — per-phase owned files/crates,
+           read-only dependencies, mechanical pass/fail signals
+           (compile, clippy lint, named tests, grep regressions),
+           and cross-phase entanglement notes. Call out phases that
+           share enough surface to be merged.
+         - `## Execution shape` — recommend (a) one
+           `phased_plan.gaviero` invocation or (b) N invocations with
+           human checkpoints; state the tradeoff (resume granularity,
+           diff-review size, cross-phase entanglement, gate cost);
+           specify the required `phase_executor.owned` scope union
+           (for a) or the natural split boundaries and each
+           invocation's `{{PROMPT}}` (for b).
+    6. Write the iteration summary to
+       {{OUT_DIR}}/{{MODEL_NAME}}-refine-summary-v{{ITER}}.md. The
+       summary is the deliberate home for ALL iteration metadata.
+       Keep it under ~600 words. Use this structure:
+         - **Convergence status** (one sentence, leads the file). If
+           this version is a no-material-change convergence copy,
+           say so explicitly here — e.g. "Converged with peer at
+           v{{PREV_ITER}}; this version is a no-material-change
+           copy." The judge keys off that phrasing. Otherwise
+           summarise the remaining disagreements in one sentence.
+         - **Synthesis notes**: which pair you read, what you adopted
+           from each, what you changed or discarded, what you
+           rejected.
+         - **Alternatives considered and rejected**: design
+           alternatives you weighed (different architectures,
+           libraries, sequencing) with one-line rejection reasons.
+           Empty if none.
+         - **Operator Decisions digest**: one line per item from the
+           plan's `## Operator Decisions` section, plus a note on
+           whether the list grew, shrunk, or stayed the same vs
+           v{{PREV_ITER}}.
+       Write it for a human skimming the iteration evolution.
 "#
 
 prompt judge-body #"
-    You are deciding whether two independently refined architecture plans have
-    converged for:
+    You are deciding whether two independently refined architecture plans
+    have converged for:
 
     {{PROMPT}}
 
     {{ITER_EVIDENCE}}
 
     The digest above lists what the refine agents actually changed this
-    iteration. Use it to focus your reading — if a file is not listed there
-    it did not change this pass.
+    iteration. Use it to focus your reading — if a file is not listed
+    there it did not change this pass.
 
-    1. Read {{OUT_DIR}}/claude-refine-plan-v{{ITER}}.md and
+    Evaluate in two passes — start cheap, only escalate to the full
+    plans on borderline calls. The plan files are large; reading them
+    all every iteration is expensive and risks hitting the judge
+    timeout.
+
+    Pass 1 (cheap, always do this):
+    1. Read {{OUT_DIR}}/claude-refine-summary-v{{ITER}}.md and
+       {{OUT_DIR}}/codex-refine-summary-v{{ITER}}.md in full. Each is
+       under ~600 words and carries the convergence status, synthesis
+       notes, rejected alternatives, and Operator Decisions digest
+       for this iteration. The plans themselves are kept deliberately
+       free of this metadata.
+    2. From the summaries alone, classify the iteration:
+       - **Convergence shortcut — PASS**: both summaries' leading
+         "Convergence status" sentence declares convergence. Look for
+         phrasing like "Converged with peer at v{{PREV_ITER}}", "no
+         material changes", or "this version is a no-material-change
+         copy". If both refine agents agreed they are done, stop here
+         and return PASS.
+       - **Material divergence shortcut — FAIL**: either summary
+         describes a material design change (a new or removed phase,
+         a flipped major implementation choice, a different core
+         architecture, a new execution shape). Stop here and return
+         FAIL.
+       - **Borderline**: continue to Pass 2.
+
+    Pass 2 (deep, only on borderline):
+    3. Read {{OUT_DIR}}/claude-refine-plan-v{{ITER}}.md and
        {{OUT_DIR}}/codex-refine-plan-v{{ITER}}.md in full.
-    2. Read {{OUT_DIR}}/claude-refine-summary-v{{ITER}}.md and
-       {{OUT_DIR}}/codex-refine-summary-v{{ITER}}.md.
-    3. If useful, compare against v{{PREV_ITER}} to judge whether the latest
-       changes are still material.
-    4. Return PASS only if:
-       - the two current plans agree on the core architecture and major
-         implementation steps,
-       - any remaining differences are low-impact editorial refinements,
-       - the newest iteration made minor refinements rather than material
-         design changes.
-    5. Otherwise return FAIL.
+    4. If you still need it, compare against v{{PREV_ITER}} to judge
+       whether a specific difference is material.
+    5. Return PASS if the two current plans agree on the core
+       architecture and the major implementation steps. Remaining
+       differences in wording, section ordering, prose length, or
+       items listed under each plan's `## Operator Decisions` DO NOT
+       block convergence — those are post-process work for the human
+       reviewer and are expected to remain.
+    6. Otherwise return FAIL.
 
-    Output format — emit exactly one fenced JSON object as your last output:
+    Output format — emit exactly one fenced JSON object as your last
+    output. Keep the reason terse (one short sentence) so the response
+    fits inside the judge timeout:
 
     ```json
-    {"verdict": "pass" | "fail", "reason": "<one short paragraph>"}
+    {"verdict": "pass" | "fail", "reason": "<one short sentence>"}
     ```
 
     A plain `VERDICT: PASS` / `VERDICT: FAIL` line is also accepted as a
@@ -182,7 +316,7 @@ agent claude-init {
 agent codex-init {
     vars { MODEL_NAME "codex" }
     description "Initial plan (Codex): {{PROMPT}}"
-    client codex-5-4
+    client codex-5-5
     scope {
         owned ["{{OUT_DIR}}/codex-init-*.md"]
     }
@@ -210,7 +344,7 @@ agent claude-refine {
 agent codex-refine {
     vars { MODEL_NAME "codex" PEER_NAME "claude" }
     description "Refine plan (Codex): {{PROMPT}}"
-    client codex-5-4
+    client codex-5-5
     scope {
         owned     ["{{OUT_DIR}}/codex-refine-*.md"]
         read_only ["{{OUT_DIR}}/"]
@@ -239,23 +373,44 @@ agent convergence-judge {
 // Phase 1 (parallel): claude-init and codex-init each write an independent v1
 // plan from first principles with no cross-reading.
 //
-// Phase 2 (loop up to x10): claude-refine and codex-refine repeatedly read the
-// previous pair (v{{PREV_ITER}}) and write a new synthesised plan (v{{ITER}})
-// plus a summary of choices made.
+// Phase 2 (loop up to x5): claude-refine and codex-refine repeatedly read the
+// previous pair — full plans, plus (on iter ≥ 2) both prior summaries to focus
+// gap analysis — and write a new synthesised plan (v{{ITER}}) plus a summary
+// of choices made.
 //
-// After each pass, convergence-judge evaluates the latest pair. Judge-control
-// knobs (all optional; shown here with explicit values for documentation):
+// Plan/summary contract: the plan file is for a frontier AI executor and
+// contains ONLY deliverable content (motivation, architecture, steps, data
+// structures, risks, operator decisions, phase decomposition, execution
+// shape). No synthesis notes, no rejected alternatives, no peer references,
+// no version numbers anywhere in the plan body. All iteration metadata —
+// convergence status, synthesis history, rejected alternatives, operator-
+// decisions digest — lives in the summary file. The refine prompt allows
+// agents to declare convergence in the summary ("no material changes —
+// copy v{{PREV_ITER}} verbatim"), which lets the judge's cheap summary-only
+// pass PASS without reading the full plans.
 //
-//   stability 2      → require 2 consecutive PASS verdicts before exiting.
-//                      A single PASS is treated as provisional: the refine
-//                      agents run one more pass and the judge re-evaluates.
-//                      This guards against a flaky "looks good" verdict on
-//                      a plan that is still materially evolving.
-//   judge_timeout 90 → hard cap each judge invocation at 90s (0 disables).
-//   strict_judge true → unparseable judge output fails the iteration loudly
-//                       instead of silently being treated as FAIL. The judge
-//                       prompt above commits to a JSON-object verdict, so
-//                       any drift is worth surfacing.
+// Post-convergence the workflow leaves both claude-refine-plan-v{N}.md and
+// codex-refine-plan-v{N}.md on disk. Neither is designated canonical here
+// — the human operator picks one to hand off to the executor.
+//
+// After each pass, convergence-judge evaluates the latest pair. The judge
+// prompt does a cheap summary-only pass first and only deep-reads the full
+// plans on borderline cases. Judge-control knobs (all optional; shown here
+// with explicit values for documentation):
+//
+//   stability 2       → require 2 consecutive PASS verdicts before exiting.
+//                       A single PASS is treated as provisional: the refine
+//                       agents run one more pass and the judge re-evaluates.
+//                       This guards against a flaky "looks good" verdict on
+//                       a plan that is still materially evolving.
+//   judge_timeout 180 → hard cap each judge invocation at 180s (0 disables).
+//                       Wide enough that even the deep-read borderline path
+//                       can finish on the largest plan files.
+//   strict_judge false → an unparseable judge response is treated as FAIL
+//                        rather than a hard error. A timeout on the final
+//                        loop check therefore can't bury the run; the loop
+//                        just exits with max_iterations exhausted and the
+//                        latest pair available for human review.
 //
 // The judge prompt also uses `{{ITER_EVIDENCE}}`: the runtime substitutes a
 // bounded digest of the refine agents' most recent summaries and modified
@@ -264,7 +419,7 @@ agent convergence-judge {
 // iter_start 2: loop iteration 1 → ITER=2, PREV_ITER=1 (reads v1 init plans)
 //               loop iteration 2 → ITER=3, PREV_ITER=2
 //               ...
-//               loop iteration 10 → ITER=11, PREV_ITER=10
+//               loop iteration 5 → ITER=6, PREV_ITER=5
 
 workflow feature-plan-refinement {
     steps [
@@ -272,11 +427,11 @@ workflow feature-plan-refinement {
         codex-init
         loop {
             agents         [claude-refine codex-refine]
-            max_iterations 10
+            max_iterations 5
             iter_start     2
             stability      2
-            judge_timeout  90
-            strict_judge   true
+            judge_timeout  180
+            strict_judge   false
             until agent    convergence-judge
         }
     ]

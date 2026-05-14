@@ -508,9 +508,9 @@ fn template_plan_refinement() {
         );
     }
     assert_eq!(cinit.model.as_deref(), Some("claude:opus"));
-    assert_eq!(xinit.model.as_deref(), Some("codex:gpt-5.4"));
+    assert_eq!(xinit.model.as_deref(), Some("codex:gpt-5.5"));
     assert_eq!(crefine.model.as_deref(), Some("claude:opus"));
-    assert_eq!(xrefine.model.as_deref(), Some("codex:gpt-5.4"));
+    assert_eq!(xrefine.model.as_deref(), Some("codex:gpt-5.5"));
 
     // Init agents: vars (MODEL_NAME, PLANS) substituted at compile time; no ITER
     assert!(
@@ -558,16 +558,16 @@ fn template_plan_refinement() {
     assert_eq!(crefine.write_namespace.as_deref(), Some("plan-evolution"));
     assert_eq!(xrefine.write_namespace.as_deref(), Some("plan-evolution"));
 
-    // Loop config: 2 refine agents, 10 iterations, iter_start=2,
+    // Loop config: 2 refine agents, 5 iterations, iter_start=2,
     // plus the new judge-control knobs (stability, judge_timeout, strict_judge).
     assert_eq!(plan.loop_configs.len(), 1);
     let lc = &plan.loop_configs[0];
     assert_eq!(lc.agent_ids, vec!["claude-refine", "codex-refine"]);
-    assert_eq!(lc.max_iterations, 10);
+    assert_eq!(lc.max_iterations, 5);
     assert_eq!(lc.iter_start, 2);
     assert_eq!(lc.stability, 2);
-    assert_eq!(lc.judge_timeout_secs, 90);
-    assert!(lc.strict_judge);
+    assert_eq!(lc.judge_timeout_secs, 180);
+    assert!(!lc.strict_judge);
 
     // Judge agent is compiled into the aux list, not the main DAG.
     assert_eq!(plan.loop_judge_units.len(), 1);
