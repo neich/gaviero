@@ -21,7 +21,7 @@ use std::process::Stdio;
 
 use anyhow::{Context, Result};
 use futures::Stream;
-use tokio::io::{AsyncReadExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -33,6 +33,20 @@ use super::{
 };
 
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
+
+/// Prompts at or above this size are piped to `codex exec` via stdin
+/// instead of appended as a positional argv. Linux's `MAX_ARG_STRLEN`
+/// is 128 KB per argument; 32 KB keeps comfortable headroom for the
+/// rest of the argv (flags, `--config` keys, `--add-dir` roots) and
+/// matches the threshold the ACP/Claude path uses for symmetry.
+const ARGV_THRESHOLD: usize = 32_768;
+
+/// Whether a prompt of `len` bytes should be piped via stdin rather
+/// than passed as a positional argv. Extracted so tests can exercise
+/// the decision without spawning a subprocess.
+fn would_use_stdin(len: usize) -> bool {
+    len >= ARGV_THRESHOLD
+}
 
 /// Backend that spawns the Codex CLI as a subprocess.
 pub struct CodexBackend {
@@ -83,22 +97,55 @@ impl AgentBackend for CodexBackend {
             cmd.arg(arg);
         }
 
-        cmd.arg(&combined_prompt)
-            .current_dir(&request.workspace_root)
+        // Small prompts ride argv (zero-overhead, simpler); large prompts
+        // pipe via stdin so we don't hit MAX_ARG_STRLEN (E2BIG). codex
+        // exec reads the prompt from stdin when no positional argument
+        // is supplied.
+        let use_stdin = would_use_stdin(combined_prompt.len());
+        if !use_stdin {
+            cmd.arg(&combined_prompt);
+        }
+        cmd.current_dir(&request.workspace_root)
             .env("NO_COLOR", "1")
-            .stdin(Stdio::null())
+            .stdin(if use_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
+        let prompt_len = combined_prompt.len();
         let mut child = cmd.spawn().map_err(|e| {
-            anyhow::anyhow!(
-                "spawning codex subprocess: {e}\n\
-                 The `codex` CLI binary was not found on PATH. \
-                 Install it from https://github.com/openai/codex, \
-                 or switch provider by setting agent.model to a `claude:...` / `ollama:...` spec."
-            )
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "spawning codex subprocess: {e}\n\
+                     The `codex` CLI binary was not found on PATH. \
+                     Install it from https://github.com/openai/codex, \
+                     or switch provider by setting agent.model to a `claude:...` / `ollama:...` spec."
+                )
+            } else {
+                anyhow::anyhow!(
+                    "spawning codex subprocess (prompt {} bytes via {}): {e}",
+                    prompt_len,
+                    if use_stdin { "stdin" } else { "argv" },
+                )
+            }
         })?;
+
+        // For the stdin path, hand the prompt to codex and close stdin
+        // before we drive stdout — codex won't start streaming until it
+        // sees EOF on its input.
+        if use_stdin {
+            let mut stdin = child.stdin.take().context("codex stdin unavailable")?;
+            stdin
+                .write_all(combined_prompt.as_bytes())
+                .await
+                .context("writing codex prompt to stdin")?;
+            stdin.shutdown().await.context("closing codex stdin")?;
+        }
+
         let stdout = child.stdout.take().context("codex stdout unavailable")?;
         let stderr = child.stderr.take().context("codex stderr unavailable")?;
 
@@ -430,5 +477,19 @@ mod tests {
         let msg = format_exit_error(&err, "auth failure\n");
         assert!(msg.contains("bad"));
         assert!(msg.contains("auth failure"));
+    }
+
+    #[test]
+    fn small_prompt_passes_via_argv() {
+        assert!(!would_use_stdin(0));
+        assert!(!would_use_stdin(1_000));
+        assert!(!would_use_stdin(ARGV_THRESHOLD - 1));
+    }
+
+    #[test]
+    fn large_prompt_passes_via_stdin() {
+        assert!(would_use_stdin(ARGV_THRESHOLD));
+        assert!(would_use_stdin(100_000));
+        assert!(would_use_stdin(1_000_000));
     }
 }
