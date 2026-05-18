@@ -1144,12 +1144,17 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                             "denied" | "untrusted" => gaviero_core::mcp::TrustConsent::Denied,
                             _ => gaviero_core::mcp::TrustConsent::Unknown,
                         };
+                        let context7 = super::commands::resolve_context7_config(
+                            app,
+                            Some(&workspace_root_for_mcp),
+                        );
                         let synth = gaviero_core::mcp::McpConfigSynth {
                             worktree: workspace_root_for_mcp.clone(),
                             socket_path: socket_path.clone(),
                             shim_binary,
                             codex_trust,
                             enabled: true,
+                            context7,
                         };
                         if let Err(e) = gaviero_core::mcp::synthesize_for_worktree(&synth) {
                             tracing::warn!(
