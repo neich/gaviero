@@ -1111,6 +1111,13 @@ pub(super) fn handle_paste(app: &mut App, text: &str) {
             }
         }
         Focus::SidePanel => {
+            // Many terminals intercept Ctrl+V / Ctrl+Shift+V themselves and
+            // forward an empty bracketed-paste payload when the clipboard
+            // holds an image (no text representation). Prefer attaching the
+            // image in that case so the paste still works.
+            if text.is_empty() && super::side_panel::try_attach_clipboard_image(app) {
+                return;
+            }
             app.chat_state.insert_str(text);
         }
         _ => {}
