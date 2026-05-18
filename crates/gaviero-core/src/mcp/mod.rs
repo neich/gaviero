@@ -25,7 +25,7 @@ pub mod server;
 pub mod tools;
 
 pub use config_synth::{
-    McpConfigSynth, TrustConsent, claude_mcp_config_json, codex_mcp_config_toml,
+    Context7Config, McpConfigSynth, TrustConsent, claude_mcp_config_json, codex_mcp_config_toml,
     synthesize_for_worktree,
 };
 pub use external_memory::{
