@@ -2,24 +2,35 @@
 //!
 //! Splits an assembled prompt into a [`PromptDigest`] keyed by
 //! [`SectionKind`]. Detection is structural string matching against
-//! the literal markers the prompt assembler already emits — no regex.
+//! the XML section tags the prompt assembler emits — no regex.
 //!
-//! Marker sources (kept in sync; if the renderer changes its tags, the
+//! Tag sources (kept in sync; if the renderer changes its tags, the
 //! tests in this module must be updated):
 //!
+//! - `<user_message>...</user_message>` ←
+//!   `crates/gaviero-core/src/swarm/backend/shared.rs::render_swarm_prompt`
+//!   and `crates/gaviero-core/src/agent_session/claude.rs::run_claude_turn`
 //! - `<project_memory>...</project_memory>` ←
+//!   `crates/gaviero-core/src/swarm/backend/shared.rs::render_memory_block`
+//!   (structured swarm path) and
 //!   `crates/gaviero-core/src/memory/retrieval.rs::render_block`
-//! - `\nPrevConv:\n` ←
-//!   `crates/gaviero-core/src/swarm/backend/shared.rs::build_enriched_prompt`
-//! - `\nFiles:\n` ← same source as `PrevConv:`
-//! - `\nRepo:\n` ←
+//!   (chat-injection path)
+//! - `<repo_outline>...</repo_outline>` ←
 //!   `crates/gaviero-core/src/swarm/backend/shared.rs::render_graph_block`
-//!   (caveman-style header used on the swarm path; chat-injection path
-//!   does not render graph context)
+//! - `<prev_conv>...</prev_conv>` and `<file_refs>...</file_refs>` ←
+//!   `crates/gaviero-core/src/swarm/backend/shared.rs::build_enriched_prompt`
+//! - `<file_scope>...</file_scope>` ←
+//!   `crates/gaviero-core/src/swarm/backend/shared.rs::render_swarm_prompt`
+//!
+//! ## Fallback for untagged user messages
+//!
+//! When no `<user_message>` tag is present (test harnesses that
+//! pre-build prompts manually), leading text before the first tagged
+//! section is classified as `UserMessage`.
 //!
 //! ## On `Other`
 //!
-//! Anything outside the recognised markers lands in `Other`. A non-trivial
+//! Anything outside the recognised tags lands in `Other`. A non-trivial
 //! `Other` bucket is itself diagnostic — it means the assembler emitted
 //! content the heuristic doesn't recognise. Callers should treat large
 //! `Other` ranges as a signal to extend this module.
@@ -43,6 +54,7 @@ pub enum SectionKind {
     GraphSelections,
     FileRefs,
     ReplayHistory,
+    FileScope,
     Wrapper,
     Other,
 }
@@ -68,13 +80,28 @@ pub struct PromptDigest {
     pub sections: Vec<Section>,
 }
 
-const PROJECT_MEMORY_OPEN: &str = "<project_memory>";
-const PROJECT_MEMORY_CLOSE: &str = "</project_memory>";
-const PREV_CONV_MARKER: &str = "\nPrevConv:\n";
-const FILES_MARKER: &str = "\nFiles:\n";
-const REPO_MARKER: &str = "\nRepo:\n";
 const WRAPPER_PREFIX: &str = "Read the full prompt at @";
 const WRAPPER_MAX_BYTES: usize = 256;
+
+/// (kind, open tag, close tag). All section types are paired XML tags;
+/// detection is a literal substring search for the open tag followed by
+/// its matching close tag.
+const TAG_TABLE: &[(SectionKind, &str, &str)] = &[
+    (SectionKind::UserMessage, "<user_message>", "</user_message>"),
+    (
+        SectionKind::MemorySelections,
+        "<project_memory>",
+        "</project_memory>",
+    ),
+    (
+        SectionKind::GraphSelections,
+        "<repo_outline>",
+        "</repo_outline>",
+    ),
+    (SectionKind::ReplayHistory, "<prev_conv>", "</prev_conv>"),
+    (SectionKind::FileRefs, "<file_refs>", "</file_refs>"),
+    (SectionKind::FileScope, "<file_scope>", "</file_scope>"),
+];
 
 pub fn classify(turn_id: &str, prompt: &str) -> PromptDigest {
     let total_bytes = prompt.len();
@@ -90,54 +117,34 @@ pub fn classify(turn_id: &str, prompt: &str) -> PromptDigest {
         };
     }
 
+    // Find every (kind, start, end) tag pair. Each section's byte range
+    // is closed-exact: start = first byte of opening tag, end = byte
+    // past the closing tag. Multiple instances of the same tag pair are
+    // all captured (memory + file_refs can repeat across paths).
     let mut hits: Vec<(SectionKind, usize, usize)> = Vec::new();
-
-    if let Some(open) = prompt.find(PROJECT_MEMORY_OPEN) {
-        let body_start = open;
-        if let Some(close_rel) = prompt[body_start..].find(PROJECT_MEMORY_CLOSE) {
-            let end = body_start + close_rel + PROJECT_MEMORY_CLOSE.len();
-            hits.push((SectionKind::MemorySelections, open, end));
-        }
-    }
-
-    let bare_markers: [(SectionKind, &str); 3] = [
-        (SectionKind::ReplayHistory, PREV_CONV_MARKER),
-        (SectionKind::FileRefs, FILES_MARKER),
-        (SectionKind::GraphSelections, REPO_MARKER),
-    ];
-    for (kind, marker) in bare_markers {
-        if let Some(pos) = prompt.find(marker) {
-            // Section starts after the leading newline so the marker
-            // itself is part of the body (preserved literally).
-            let start = pos + 1;
-            hits.push((kind, start, total_bytes));
+    for (kind, open, close) in TAG_TABLE.iter().copied() {
+        let mut cursor = 0;
+        while let Some(rel_open) = prompt[cursor..].find(open) {
+            let open_at = cursor + rel_open;
+            let body_start = open_at + open.len();
+            if let Some(rel_close) = prompt[body_start..].find(close) {
+                let end = body_start + rel_close + close.len();
+                hits.push((kind, open_at, end));
+                cursor = end;
+            } else {
+                break;
+            }
         }
     }
 
     hits.sort_by(|a, b| a.1.cmp(&b.1));
 
-    // Trim each marker-driven section to end at the next marker start
-    // (or at `total_bytes` if it's the last). Memory's range is exact;
-    // bare-line markers run to the next section header.
-    let mut sections: Vec<Section> = Vec::new();
-    for (i, (kind, start, end_hint)) in hits.iter().copied().enumerate() {
-        let end = match kind {
-            SectionKind::MemorySelections => end_hint,
-            _ => hits
-                .iter()
-                .skip(i + 1)
-                .map(|(_, s, _)| *s)
-                .min()
-                .unwrap_or(total_bytes)
-                .max(start),
-        };
-        if end <= start {
-            continue;
-        }
-        sections.push(make_section(kind, start, end, prompt));
-    }
+    let mut sections: Vec<Section> = hits
+        .into_iter()
+        .map(|(kind, start, end)| make_section(kind, start, end, prompt))
+        .collect();
 
-    fill_gaps_with_user_or_other(prompt, &mut sections, turn_id);
+    fill_gaps_with_user_or_other(prompt, &mut sections);
 
     sections.sort_by(|a, b| match a.byte_range.0.cmp(&b.byte_range.0) {
         Ordering::Equal => a.byte_range.1.cmp(&b.byte_range.1),
@@ -176,38 +183,54 @@ fn sha_hex(s: &str) -> String {
     out
 }
 
-/// Walk the prompt, filling gaps between marker-driven sections.
+/// Walk the prompt, filling gaps between tagged sections.
 ///
-/// The leading run before any marker section becomes `UserMessage`
-/// (the user's question). Any other gap becomes `Other` so the
-/// caller can spot unrecognised ranges.
-fn fill_gaps_with_user_or_other(prompt: &str, sections: &mut Vec<Section>, _turn_id: &str) {
+/// When no `<user_message>` tag is present, the leading run before any
+/// tagged section is reclassified as `UserMessage` so test harnesses
+/// that pre-build prompts manually (without going through the production
+/// renderer) still attribute their leading text correctly. Whitespace-only
+/// gaps (the `\n\n` separators between tagged sections the renderer emits)
+/// are skipped. Any other non-trivial gap becomes `Other` so the caller
+/// can spot unrecognised ranges.
+fn fill_gaps_with_user_or_other(prompt: &str, sections: &mut Vec<Section>) {
     sections.sort_by_key(|s| s.byte_range.0);
+
+    let has_user_message = sections
+        .iter()
+        .any(|s| s.kind == SectionKind::UserMessage);
 
     let total = prompt.len();
     let mut cursor = 0usize;
-    let mut leading_user_taken = false;
+    let mut leading_user_taken = has_user_message;
     let mut additions: Vec<Section> = Vec::new();
     for s in sections.iter() {
         if s.byte_range.0 > cursor {
-            let kind = if !leading_user_taken {
-                leading_user_taken = true;
-                SectionKind::UserMessage
-            } else {
-                SectionKind::Other
-            };
-            additions.push(make_section(kind, cursor, s.byte_range.0, prompt));
+            let gap = &prompt[cursor..s.byte_range.0];
+            let is_whitespace_only = gap.chars().all(char::is_whitespace);
+            if !is_whitespace_only {
+                let kind = if !leading_user_taken {
+                    leading_user_taken = true;
+                    SectionKind::UserMessage
+                } else {
+                    SectionKind::Other
+                };
+                additions.push(make_section(kind, cursor, s.byte_range.0, prompt));
+            }
         }
         cursor = s.byte_range.1;
     }
     if cursor < total {
-        let kind = if !leading_user_taken {
-            // No marker sections at all — entire prompt is user text.
-            SectionKind::UserMessage
-        } else {
-            SectionKind::Other
-        };
-        additions.push(make_section(kind, cursor, total, prompt));
+        let trailing = &prompt[cursor..total];
+        let is_whitespace_only = trailing.chars().all(char::is_whitespace);
+        if !is_whitespace_only {
+            let kind = if !leading_user_taken {
+                // No tagged sections at all — entire prompt is user text.
+                SectionKind::UserMessage
+            } else {
+                SectionKind::Other
+            };
+            additions.push(make_section(kind, cursor, total, prompt));
+        }
     }
     sections.extend(additions);
 }
@@ -257,7 +280,9 @@ mod tests {
     }
 
     #[test]
-    fn classify_user_then_memory_block() {
+    fn classify_untagged_user_then_memory_block() {
+        // Test-harness path: prompt assembled manually without a
+        // <user_message> wrapper. Leading text falls back to UserMessage.
         let prompt =
             "User question?\n<project_memory>\n[repo] decision: x|s0.9\n</project_memory>";
         let d = classify("t-mem", prompt);
@@ -274,8 +299,20 @@ mod tests {
     }
 
     #[test]
-    fn classify_history_and_files_markers_are_caveman_bare_lines() {
-        let prompt = "ask\n\nPrevConv:\nU: q\nA: a\n\nFiles:\n@src/lib.rs\nfn x() {}\n/@src/lib.rs\n";
+    fn classify_tagged_user_then_memory_block() {
+        // Production path: <user_message> wraps the actual prompt and
+        // takes precedence over the leading-text fallback.
+        let prompt = "<user_message>\nUser question?\n</user_message>\n\n<project_memory>\n[repo] decision: x|s0.9\n</project_memory>";
+        let d = classify("t-tagged", prompt);
+        assert_eq!(
+            kinds(&d),
+            vec![SectionKind::UserMessage, SectionKind::MemorySelections]
+        );
+    }
+
+    #[test]
+    fn classify_prev_conv_and_file_refs_tags() {
+        let prompt = "<user_message>\nask\n</user_message>\n\n<prev_conv>\nU: q\nA: a\n</prev_conv>\n\n<file_refs>\n@src/lib.rs\nfn x() {}\n/@src/lib.rs\n</file_refs>";
         let d = classify("t-hist-files", prompt);
         assert_eq!(
             kinds(&d),
@@ -288,29 +325,32 @@ mod tests {
     }
 
     #[test]
-    fn classify_repo_graph_marker_recognised() {
-        let prompt = "ask\n\nRepo:\n  crates/foo.rs (s1.00)\n";
+    fn classify_repo_outline_tag_recognised() {
+        let prompt = "<user_message>\nask\n</user_message>\n\n<repo_outline>\n  crates/foo.rs (s1.00)\n</repo_outline>";
         let d = classify("t-repo", prompt);
         assert!(kinds(&d).contains(&SectionKind::GraphSelections));
     }
 
     #[test]
+    fn classify_file_scope_tag_recognised() {
+        let prompt = "<user_message>\nask\n</user_message>\n\n<file_scope>\n**Owned paths** (read/write):\n- `src/lib.rs`\n</file_scope>";
+        let d = classify("t-scope", prompt);
+        assert!(kinds(&d).contains(&SectionKind::FileScope));
+    }
+
+    #[test]
     fn classify_full_prompt_keeps_section_order() {
         let prompt = concat!(
-            "User question?\n",
-            "<project_memory>\n[repo] decision: x|s0.9\n</project_memory>\n",
-            "\n",
-            "Repo:\n  crates/foo.rs (s1.00)\n",
-            "\n",
-            "PrevConv:\nU: prev\nA: prev\n",
-            "\n",
-            "Files:\n@src/lib.rs\nfn x() {}\n/@src/lib.rs\n",
+            "<user_message>\nUser question?\n</user_message>\n\n",
+            "<project_memory>\n[repo] decision: x|s0.9\n</project_memory>\n\n",
+            "<repo_outline>\n  crates/foo.rs (s1.00)\n</repo_outline>\n\n",
+            "<prev_conv>\nU: prev\nA: prev\n</prev_conv>\n\n",
+            "<file_refs>\n@src/lib.rs\nfn x() {}\n/@src/lib.rs\n</file_refs>",
         );
         let d = classify("t-full", prompt);
         let order = kinds(&d);
         assert_eq!(order[0], SectionKind::UserMessage);
         assert_eq!(order[1], SectionKind::MemorySelections);
-        // Subsequent sections appear in marker order: Repo:, PrevConv:, Files:
         let rest = &order[2..];
         assert!(rest.contains(&SectionKind::GraphSelections));
         assert!(rest.contains(&SectionKind::ReplayHistory));
