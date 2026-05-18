@@ -86,15 +86,33 @@ fn chat_render_trace_threshold_ms() -> u128 {
 
 // ── Chat state ──────────────────────────────────────────────────
 
-/// Autocomplete state for @file references.
+/// What the autocomplete popup is completing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutocompleteMode {
+    /// `@path` references inside the prompt body — workspace files only,
+    /// inserts `@path ` on accept.
+    FileRef,
+    /// `/attach <path>` argument — workspace files plus filesystem listing
+    /// when the partial starts with `/` or `~`, inserts the bare path.
+    AttachPath,
+}
+
+/// Autocomplete state for @file references or /attach path arguments.
 #[derive(Debug)]
 pub struct FileAutocomplete {
     /// Whether the autocomplete popup is visible.
     pub active: bool,
-    /// The partial text after @ being matched.
+    /// The partial text being matched (excludes any leading `@`).
     pub query: String,
-    /// Byte offset of the @ in the input string.
+    /// Byte offset where the inserted path will be anchored. For [`FileRef`]
+    /// this points at the `@`; for [`AttachPath`] it points at the first
+    /// character of the path argument (after `/attach `).
+    ///
+    /// [`FileRef`]: AutocompleteMode::FileRef
+    /// [`AttachPath`]: AutocompleteMode::AttachPath
     pub at_pos: usize,
+    /// What kind of completion is active.
+    pub mode: AutocompleteMode,
     /// Filtered file paths matching the query.
     pub matches: Vec<String>,
     /// Currently selected index in the matches list.
@@ -107,6 +125,7 @@ impl FileAutocomplete {
             active: false,
             query: String::new(),
             at_pos: 0,
+            mode: AutocompleteMode::FileRef,
             matches: Vec::new(),
             selected: 0,
         }
@@ -116,6 +135,7 @@ impl FileAutocomplete {
         self.active = false;
         self.query.clear();
         self.at_pos = 0;
+        self.mode = AutocompleteMode::FileRef;
         self.matches.clear();
         self.selected = 0;
     }
@@ -1513,35 +1533,54 @@ impl AgentChatState {
 
     // ── @file autocomplete ─────────────────────────────────────
 
-    /// Check if cursor is inside an @reference and update autocomplete state.
+    /// Check if cursor is inside an @reference or a `/attach` argument and
+    /// update autocomplete state accordingly. The actual match list is
+    /// populated by the caller (which holds the workspace file list).
     fn update_autocomplete(&mut self) {
         let byte_pos = self.text_input.cursor_byte_offset();
-        let before_cursor = &self.text_input.text[..byte_pos];
+        let text = &self.text_input.text;
+        let before_cursor = &text[..byte_pos];
 
-        // Find the last '@' before cursor that isn't preceded by a non-whitespace char
+        // ── /attach <path> completion ────────────────────────────────────
+        //
+        // Only kicks in on a single-line input starting with `/attach `
+        // and when the cursor is in the argument span (so `/attach foo`
+        // with the cursor at the very end completes `foo`).
+        if let Some(rest) = before_cursor.strip_prefix("/attach ") {
+            // Bail if the argument spans a newline (e.g. user moved the
+            // cursor into a multi-line prompt body).
+            if !rest.contains('\n') {
+                let arg_start = "/attach ".len();
+                self.autocomplete.active = true;
+                self.autocomplete.mode = AutocompleteMode::AttachPath;
+                self.autocomplete.at_pos = arg_start;
+                self.autocomplete.query = rest.to_string();
+                self.autocomplete.selected = 0;
+                return;
+            }
+        }
+
+        // ── @path reference completion ──────────────────────────────────
         let at_pos = before_cursor.rfind('@');
         match at_pos {
             Some(pos) => {
-                // Check that @ is at start or preceded by whitespace
                 if pos > 0 {
-                    let prev_byte = self.text_input.text.as_bytes()[pos - 1];
+                    let prev_byte = text.as_bytes()[pos - 1];
                     if prev_byte != b' ' && prev_byte != b'\n' && prev_byte != b'\t' {
                         self.autocomplete.reset();
                         return;
                     }
                 }
-                // Extract the query (text after @)
                 let query = &before_cursor[pos + 1..];
-                // Deactivate if query contains spaces (completed reference)
                 if query.contains(' ') {
                     self.autocomplete.reset();
                     return;
                 }
                 self.autocomplete.active = true;
+                self.autocomplete.mode = AutocompleteMode::FileRef;
                 self.autocomplete.at_pos = pos;
                 self.autocomplete.query = query.to_string();
                 self.autocomplete.selected = 0;
-                // Matches will be updated by the caller (App) which has access to file list
             }
             None => {
                 self.autocomplete.reset();
@@ -1584,15 +1623,26 @@ impl AgentChatState {
             .selected
             .min(self.autocomplete.matches.len() - 1);
         let path = self.autocomplete.matches[selected].clone();
-        let at_pos = self.autocomplete.at_pos;
+        let anchor = self.autocomplete.at_pos;
 
-        // Replace @query with @path
         let cursor_byte = self.text_input.cursor_byte_offset();
         let after_cursor = self.text_input.text[cursor_byte..].to_string();
-        self.text_input.text.truncate(at_pos);
-        self.text_input.text.push('@');
-        self.text_input.text.push_str(&path);
-        self.text_input.text.push(' ');
+        self.text_input.text.truncate(anchor);
+
+        match self.autocomplete.mode {
+            AutocompleteMode::FileRef => {
+                // Replace `@<query>` with `@<path> ` (trailing space keeps
+                // typing fluid after accept).
+                self.text_input.text.push('@');
+                self.text_input.text.push_str(&path);
+                self.text_input.text.push(' ');
+            }
+            AutocompleteMode::AttachPath => {
+                // Replace just the path argument; no trailing space because
+                // `/attach <path>` has no further tokens.
+                self.text_input.text.push_str(&path);
+            }
+        }
         self.text_input.cursor = self.text_input.char_count();
         self.text_input.text.push_str(&after_cursor);
 
@@ -2736,8 +2786,12 @@ impl AgentChatState {
                 }
             }
 
-            // Write path with @ prefix indicator
-            let display = format!(" @{}", path);
+            // Prefix only relevant for @file refs — the /attach popup shows
+            // bare paths so they line up with what gets inserted on accept.
+            let display = match self.autocomplete.mode {
+                AutocompleteMode::FileRef => format!(" @{}", path),
+                AutocompleteMode::AttachPath => format!(" {}", path),
+            };
             for (ci, ch) in display.chars().enumerate() {
                 let cx = area.x + ci as u16;
                 if cx < area.x + area.width && cx < buf.area().right() && y < buf.area().bottom() {
@@ -3157,5 +3211,57 @@ mod tests {
                 .session_ledger
                 .is_none()
         );
+    }
+
+    #[test]
+    fn update_autocomplete_recognises_attach_argument() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "/attach pat".to_string();
+        state.text_input.cursor = state.text_input.text.chars().count();
+        state.update_autocomplete();
+
+        assert!(state.autocomplete.active);
+        assert_eq!(state.autocomplete.mode, AutocompleteMode::AttachPath);
+        assert_eq!(state.autocomplete.query, "pat");
+        assert_eq!(state.autocomplete.at_pos, "/attach ".len());
+    }
+
+    #[test]
+    fn update_autocomplete_attach_accept_replaces_argument_only() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "/attach scre".to_string();
+        state.text_input.cursor = state.text_input.text.chars().count();
+        state.update_autocomplete();
+        state.autocomplete.matches = vec!["/tmp/screenshot.png".to_string()];
+        state.autocomplete.selected = 0;
+        state.accept_autocomplete();
+
+        assert_eq!(state.text_input.text, "/attach /tmp/screenshot.png");
+        assert!(!state.autocomplete.active);
+    }
+
+    #[test]
+    fn update_autocomplete_still_handles_at_references() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "check @src/lib".to_string();
+        state.text_input.cursor = state.text_input.text.chars().count();
+        state.update_autocomplete();
+
+        assert!(state.autocomplete.active);
+        assert_eq!(state.autocomplete.mode, AutocompleteMode::FileRef);
+        assert_eq!(state.autocomplete.query, "src/lib");
+        assert_eq!(state.autocomplete.at_pos, "check ".len());
+    }
+
+    #[test]
+    fn update_autocomplete_at_accept_keeps_at_prefix_and_trailing_space() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "@src/li".to_string();
+        state.text_input.cursor = state.text_input.text.chars().count();
+        state.update_autocomplete();
+        state.autocomplete.matches = vec!["src/lib.rs".to_string()];
+        state.accept_autocomplete();
+
+        assert_eq!(state.text_input.text, "@src/lib.rs ");
     }
 }
