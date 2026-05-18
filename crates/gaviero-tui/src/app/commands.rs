@@ -71,12 +71,51 @@ fn mcp_config_for_workspace(
         _ => gaviero_core::mcp::TrustConsent::Unknown,
     };
 
+    let context7 = resolve_context7_config(app, Some(root));
+
     gaviero_core::mcp::McpConfigSynth {
         worktree: root.to_path_buf(),
         socket_path: root.join(".gaviero/mcp.sock"),
         shim_binary,
         codex_trust,
         enabled,
+        context7,
+    }
+}
+
+pub(crate) fn resolve_context7_config(
+    app: &App,
+    root: Option<&std::path::Path>,
+) -> gaviero_core::mcp::Context7Config {
+    use gaviero_core::workspace::settings as S;
+
+    let defaults = gaviero_core::mcp::Context7Config::default();
+    let enabled = app
+        .workspace
+        .resolve_setting(S::MCP_CONTEXT7_ENABLED, root)
+        .as_bool()
+        .unwrap_or(defaults.enabled);
+    let command = app
+        .workspace
+        .resolve_setting(S::MCP_CONTEXT7_COMMAND, root)
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or(defaults.command);
+    let args = app
+        .workspace
+        .resolve_setting(S::MCP_CONTEXT7_ARGS, root)
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+        .unwrap_or(defaults.args);
+    gaviero_core::mcp::Context7Config {
+        enabled,
+        command,
+        args,
     }
 }
 
