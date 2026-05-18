@@ -613,6 +613,9 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                         _ => {
                             app.chat_state.scroll_offset =
                                 app.chat_state.scroll_offset.saturating_sub(3);
+                            if app.chat_state.active_conv_streaming() {
+                                app.chat_state.user_scrolled_during_stream = true;
+                            }
                         }
                     }
                 }
@@ -686,6 +689,9 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                         _ => {
                             app.chat_state.scroll_offset =
                                 app.chat_state.scroll_offset.saturating_add(3);
+                            if app.chat_state.active_conv_streaming() {
+                                app.chat_state.user_scrolled_during_stream = true;
+                            }
                         }
                     }
                 }
@@ -979,20 +985,19 @@ pub(super) fn scroll_panel_to_row(app: &mut App, target: ScrollbarTarget, row: u
                 .min(max_scroll as f64) as usize;
         }
         ScrollbarTarget::Chat => {
-            let Some(area) = app.layout.side_panel_area else {
+            let Some(area) = app.chat_state.conv_area_cache else {
                 return;
             };
-            let conv_height = area.height.saturating_sub(4) as usize;
-            if conv_height == 0 {
+            let track_height = area.height as usize;
+            let total = app.chat_state.rendered_lines_cache.len();
+            if track_height == 0 || total <= track_height {
                 return;
             }
-            let total = app.chat_state.scroll_offset + conv_height + 10;
-            if total <= conv_height {
-                return;
-            }
-            let max_scroll = total.saturating_sub(conv_height);
-            let row_in_track = row.saturating_sub(area.y + 1) as usize;
-            let fraction = row_in_track as f64 / conv_height.saturating_sub(1).max(1) as f64;
+            let max_scroll = total - track_height;
+            let row_in_track = row
+                .saturating_sub(area.y)
+                .min(area.height.saturating_sub(1)) as usize;
+            let fraction = row_in_track as f64 / track_height.saturating_sub(1).max(1) as f64;
             app.chat_state.scroll_offset = (fraction * max_scroll as f64)
                 .round()
                 .min(max_scroll as f64) as usize;
