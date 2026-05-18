@@ -170,6 +170,13 @@ pub mod settings {
     pub const MCP_GAVIERO_SHIM_BINARY: &str = "mcp.gavieroServer.shimBinary";
     pub const MCP_GAVIERO_CODEX_TRUST: &str = "mcp.gavieroServer.codexTrust";
 
+    // context7 docs-lookup MCP server (default-on; injected into every
+    // swarm worktree's .mcp.json + .codex/config.toml alongside the
+    // gaviero shim). Disable for offline or privacy-sensitive work.
+    pub const MCP_CONTEXT7_ENABLED: &str = "mcp.context7.enabled";
+    pub const MCP_CONTEXT7_COMMAND: &str = "mcp.context7.command";
+    pub const MCP_CONTEXT7_ARGS: &str = "mcp.context7.args";
+
     // TUI memory panel (Tier A / A4)
     pub const UI_MEMORY_PANEL_RECENT_WINDOW_HOURS: &str = "ui.memoryPanel.recentWindowHours";
 }
@@ -937,6 +944,13 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::MCP_GAVIERO_DISABLE_EXTERNAL => serde_json::json!(true),
         settings::MCP_GAVIERO_SHIM_BINARY => serde_json::json!("gaviero-mcp-shim"),
         settings::MCP_GAVIERO_CODEX_TRUST => serde_json::json!("unknown"),
+
+        // context7 docs-lookup MCP server: default-on; uses `npx` so it
+        // works out of the box on any Node-equipped host. Users without
+        // Node, or running offline, set enabled=false to suppress.
+        settings::MCP_CONTEXT7_ENABLED => serde_json::json!(true),
+        settings::MCP_CONTEXT7_COMMAND => serde_json::json!("npx"),
+        settings::MCP_CONTEXT7_ARGS => serde_json::json!(["-y", "@upstash/context7-mcp"]),
 
         // Memory panel (A4)
         settings::UI_MEMORY_PANEL_RECENT_WINDOW_HOURS => serde_json::json!(24),
