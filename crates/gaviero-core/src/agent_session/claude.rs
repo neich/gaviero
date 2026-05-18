@@ -137,13 +137,19 @@ impl ClaudeSession {
     async fn run_claude_turn(&self, turn: &Turn, resume_session_id: Option<String>) -> Result<()> {
         // ── Reconstruct legacy inputs from Turn ──────────────────────────
 
-        // Enriched prompt: user message FIRST, then graph block, then memory
-        // block. Placing the user's request at the top (rather than the legacy
-        // graph → memory → user-msg order) keeps it inside Claude's default
-        // 2000-line Read window when this blob is later spilled to
-        // `.gaviero/tmp/prompt-*.md` on bootstrap-heavy first turns.
+        // Enriched prompt: user message FIRST (wrapped in <user_message>),
+        // then graph block, then memory block. Placing the user's request at
+        // the top (rather than the legacy graph → memory → user-msg order)
+        // keeps it inside Claude's default 2000-line Read window when this
+        // blob is later spilled to `.gaviero/tmp/prompt-*.md` on
+        // bootstrap-heavy first turns. The XML tag gives the agent an
+        // unambiguous boundary between the user's request and the injected
+        // context that follows.
         let mut parts: Vec<String> = Vec::new();
-        parts.push(turn.user_message.clone());
+        parts.push(format!(
+            "<user_message>\n{}\n</user_message>",
+            turn.user_message
+        ));
         if let Some(block) = shared::render_graph_block(&turn.graph_selections) {
             parts.push(block);
         }
