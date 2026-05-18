@@ -322,10 +322,16 @@ impl AcpSession {
             cmd.arg("--tools").arg(available_tools.join(","));
         }
 
-        // Attach files (images, documents) via --file flag
-        for file_path in file_attachments {
-            cmd.arg("--file").arg(file_path);
-        }
+        // NOTE: Claude CLI's `--file` flag is for downloading remote file
+        // resources (format `file_id:relative_path`), not for attaching
+        // local images or documents. Passing local paths there fails with
+        // "Session token required for file downloads". Local attachments
+        // are mentioned inside the prompt body by `agent_session::claude`
+        // (so the model invokes its `Read` tool) and their parent
+        // directories are widened into `additional_roots` so the tool is
+        // allowed to access them. `file_attachments` here is kept for log
+        // parity but does not produce argv.
+        let _ = file_attachments;
 
         cmd.arg("--add-dir").arg(cwd);
 
