@@ -145,21 +145,15 @@ impl ClaudeSession {
         // bootstrap-heavy first turns. The XML tag gives the agent an
         // unambiguous boundary between the user's request and the injected
         // context that follows.
-        let mut parts: Vec<String> = Vec::new();
-        parts.push(format!(
-            "<user_message>\n{}\n</user_message>",
-            turn.user_message
-        ));
-        if let Some(block) = shared::render_graph_block(&turn.graph_selections) {
-            parts.push(block);
-        }
-        if let Some(block) = shared::render_memory_block(&turn.memory_selections) {
-            parts.push(block);
-        }
-        let enriched_prompt = parts.join("\n\n");
-
         // Split FileAttachment into (path, content) text refs vs bare-path
-        // image/document attachments (routed via `--file`).
+        // image/document attachments. Bare paths used to ride on Claude's
+        // `--file` flag, but that flag is for downloading remote file
+        // resources (format `file_id:relative_path`); using it for local
+        // paths errors out with "Session token required for file downloads".
+        // Instead, we mention them inside the user message so Claude calls
+        // its `Read` tool (which handles PNG/JPG/GIF/WEBP/SVG natively) and
+        // we widen `--add-dir` to include each parent so the tool is
+        // allowed to access them.
         let mut file_refs: Vec<(String, String)> = Vec::new();
         let mut file_attachments: Vec<PathBuf> = Vec::new();
         for f in &turn.file_refs {
@@ -168,6 +162,22 @@ impl ClaudeSession {
                 None => file_attachments.push(f.path.clone()),
             }
         }
+
+        let user_message_with_attachments =
+            embed_attachment_refs(&turn.user_message, &file_attachments);
+
+        let mut parts: Vec<String> = Vec::new();
+        parts.push(format!(
+            "<user_message>\n{}\n</user_message>",
+            user_message_with_attachments
+        ));
+        if let Some(block) = shared::render_graph_block(&turn.graph_selections) {
+            parts.push(block);
+        }
+        if let Some(block) = shared::render_memory_block(&turn.memory_selections) {
+            parts.push(block);
+        }
+        let enriched_prompt = parts.join("\n\n");
 
         // Conversation history from replay payload (StatelessReplay only;
         // NativeResume sends empty history because Claude keeps it server-side).
@@ -238,9 +248,23 @@ impl ClaudeSession {
         let final_prompt =
             shared::build_enriched_prompt(&enriched_prompt, &conversation_history, &file_refs);
 
+        // Widen `--add-dir` with each unique parent so Claude's Read tool
+        // can reach attachments that live outside the workspace (e.g.
+        // clipboard images saved under `$XDG_CACHE_HOME/gaviero/attachments`
+        // or screenshots in `/tmp`). The workspace root is already added
+        // implicitly by `AcpSession::spawn`, so we skip it here.
+        let extra_attachment_roots: Vec<PathBuf> = collect_attachment_parents(
+            &file_attachments,
+            &self.workspace_root,
+            &self.additional_roots,
+        );
         let attach_refs: Vec<&Path> = file_attachments.iter().map(|p| p.as_path()).collect();
-        let additional_root_refs: Vec<&Path> =
-            self.additional_roots.iter().map(|p| p.as_path()).collect();
+        let additional_root_refs: Vec<&Path> = self
+            .additional_roots
+            .iter()
+            .chain(extra_attachment_roots.iter())
+            .map(|p| p.as_path())
+            .collect();
 
         let mut session = AcpSession::spawn(
             &self.claude_model,
@@ -713,6 +737,51 @@ impl ClaudeSession {
     }
 }
 
+/// Append an `<attached_files>` block to the user message listing the
+/// absolute paths of any bare-path file attachments, plus a one-line
+/// instruction so the model invokes its `Read` tool to view them. Returns
+/// the original message unchanged when `attachments` is empty.
+fn embed_attachment_refs(user_message: &str, attachments: &[PathBuf]) -> String {
+    if attachments.is_empty() {
+        return user_message.to_string();
+    }
+    let paths = attachments
+        .iter()
+        .map(|p| format!("- {}", p.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{user_message}\n\n<attached_files>\n{paths}\n</attached_files>\nUse the Read tool to view the attached file(s) above."
+    )
+}
+
+/// Return the unique parent directories of `attachments`, skipping any that
+/// equal `workspace_root` (already added by `AcpSession::spawn`) or are
+/// already present in `additional_roots`.
+fn collect_attachment_parents(
+    attachments: &[PathBuf],
+    workspace_root: &Path,
+    additional_roots: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for path in attachments {
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        if parent.as_os_str().is_empty() || parent == workspace_root {
+            continue;
+        }
+        if additional_roots.iter().any(|p| p == parent) {
+            continue;
+        }
+        if out.iter().any(|p| p == parent) {
+            continue;
+        }
+        out.push(parent.to_path_buf());
+    }
+    out
+}
+
 // ── AgentSession impl ─────────────────────────────────────────────────────────
 
 #[async_trait::async_trait]
@@ -746,5 +815,61 @@ impl AgentSession for ClaudeSession {
     async fn close(self: Box<Self>) {
         // Subprocess is spawned per send_turn and torn down when that future
         // resolves — nothing to release here in M6.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{collect_attachment_parents, embed_attachment_refs};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn embed_attachment_refs_returns_original_when_no_attachments() {
+        let msg = "look at this";
+        assert_eq!(embed_attachment_refs(msg, &[]), msg);
+    }
+
+    #[test]
+    fn embed_attachment_refs_appends_paths_and_read_tool_hint() {
+        let msg = "what is in the screenshots?";
+        let attachments = vec![
+            PathBuf::from("/tmp/a.png"),
+            PathBuf::from("/var/foo/b.jpg"),
+        ];
+        let out = embed_attachment_refs(msg, &attachments);
+        assert!(out.contains("what is in the screenshots?"));
+        assert!(out.contains("<attached_files>"));
+        assert!(out.contains("- /tmp/a.png"));
+        assert!(out.contains("- /var/foo/b.jpg"));
+        assert!(out.contains("</attached_files>"));
+        assert!(out.contains("Use the Read tool"));
+    }
+
+    #[test]
+    fn collect_attachment_parents_skips_workspace_root_and_dedupes() {
+        let workspace = PathBuf::from("/work/proj");
+        let additional = vec![PathBuf::from("/work/lib")];
+        let attachments = vec![
+            PathBuf::from("/work/proj/notes.md"), // under workspace → skip
+            PathBuf::from("/tmp/a.png"),
+            PathBuf::from("/tmp/b.png"),          // dedup
+            PathBuf::from("/work/lib/c.png"),     // already in additional → skip
+            PathBuf::from("/home/me/d.png"),
+        ];
+        let parents = collect_attachment_parents(&attachments, &workspace, &additional);
+        let parents: Vec<&Path> = parents.iter().map(|p| p.as_path()).collect();
+        assert_eq!(
+            parents,
+            vec![Path::new("/tmp"), Path::new("/home/me")]
+        );
+    }
+
+    #[test]
+    fn collect_attachment_parents_ignores_pathless_entries() {
+        let workspace = PathBuf::from("/work");
+        let attachments = vec![PathBuf::from("just-a-filename")];
+        let parents = collect_attachment_parents(&attachments, &workspace, &[]);
+        // `Path::parent` returns Some("") for a bare filename → skipped.
+        assert!(parents.is_empty());
     }
 }
