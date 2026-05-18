@@ -1499,6 +1499,26 @@ pub(super) fn refresh_chat_autocomplete(app: &mut App) {
         return;
     }
 
+    // `/attach` mode supports absolute and `~/`-rooted filesystem listings
+    // so the user can attach screenshots / tempfiles outside the workspace
+    // without typing the full path. Plain (relative) partials fall through
+    // to the shared workspace-file path used by `@` and `/run`.
+    if app.chat_state.autocomplete.mode == crate::panels::agent_chat::AutocompleteMode::AttachPath
+    {
+        let query = app.chat_state.autocomplete.query.clone();
+        let trimmed = query.trim_start();
+        if trimmed.starts_with('/') || trimmed.starts_with("~/") || trimmed == "~" {
+            let matches = list_filesystem_matches(trimmed);
+            app.chat_state.autocomplete.matches = matches;
+            if app.chat_state.autocomplete.selected
+                >= app.chat_state.autocomplete.matches.len()
+            {
+                app.chat_state.autocomplete.selected = 0;
+            }
+            return;
+        }
+    }
+
     let at_pos = app.chat_state.autocomplete.at_pos;
     let is_run_path_context = {
         let text = &app.chat_state.text_input.text;
@@ -1541,6 +1561,63 @@ pub(super) fn refresh_chat_autocomplete(app: &mut App) {
         .collect();
 
     app.chat_state.update_autocomplete_matches(&files);
+}
+
+/// List up to 50 directory entries matching the user's typed prefix.
+///
+/// The query is split into a parent directory (everything up to and
+/// including the last `/`) and a filename prefix; entries in the parent
+/// whose names start with the prefix are returned as absolute paths with
+/// a trailing `/` for subdirectories. `~` is expanded against `$HOME`.
+fn list_filesystem_matches(query: &str) -> Vec<String> {
+    const MAX_ENTRIES: usize = 50;
+    let expanded = expand_tilde(query);
+    let (parent, prefix) = match expanded.rfind('/') {
+        Some(idx) => (&expanded[..=idx], &expanded[idx + 1..]),
+        None => return Vec::new(),
+    };
+    let dir = if parent.is_empty() { "/" } else { parent };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(it) => it,
+        Err(_) => return Vec::new(),
+    };
+    let mut matches: Vec<String> = Vec::new();
+    let display_prefix = display_dir_prefix(query);
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !prefix.is_empty() && !name_str.starts_with(prefix) {
+            continue;
+        }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let suffix = if is_dir { "/" } else { "" };
+        matches.push(format!("{}{}{}", display_prefix, name_str, suffix));
+        if matches.len() >= MAX_ENTRIES {
+            break;
+        }
+    }
+    matches.sort();
+    matches
+}
+
+fn expand_tilde(query: &str) -> String {
+    if let Some(rest) = query.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return format!("{}/{}", home.display(), rest);
+        }
+    } else if query == "~"
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.display().to_string();
+    }
+    query.to_string()
+}
+
+fn display_dir_prefix(query: &str) -> String {
+    match query.rfind('/') {
+        Some(idx) => query[..=idx].to_string(),
+        None => String::new(),
+    }
 }
 
 pub(super) fn send_chat_message(app: &mut App) {
@@ -2271,35 +2348,56 @@ pub(super) fn send_chat_message(app: &mut App) {
 }
 
 pub(super) fn chat_paste_from_clipboard(app: &mut App) {
-    if let Some(cb) = &mut app.clipboard {
-        if let Ok(img) = cb.get_image() {
-            if img.width > 0 && img.height > 0 {
-                match save_clipboard_image_as_png(&img) {
-                    Ok(path) => {
-                        let display_name = path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "clipboard.png".to_string());
-                        app.chat_state
-                            .add_attachment(path, crate::panels::agent_chat::AttachmentKind::Image);
-                        app.chat_state.add_system_message(&format!(
-                            "Pasted clipboard image: {} ({}x{})",
-                            display_name, img.width, img.height
-                        ));
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to save clipboard image: {}", e);
-                    }
-                }
-            }
-        }
+    if try_attach_clipboard_image(app) {
+        return;
     }
 
     let text = app.get_clipboard();
     if !text.is_empty() {
         app.chat_state.insert_str(&text);
         app.refresh_chat_autocomplete();
+    }
+}
+
+/// Try to read an image from the system clipboard and attach it as an
+/// `Image` attachment. Returns true on success. Failures are logged at
+/// `debug!` (expected when the clipboard holds text), with `warn!` for the
+/// PNG-save error path so the user can find it in `~/.cache/gaviero/log`.
+pub(super) fn try_attach_clipboard_image(app: &mut App) -> bool {
+    let cb = match app.clipboard.as_mut() {
+        Some(cb) => cb,
+        None => return false,
+    };
+    let img = match cb.get_image() {
+        Ok(img) => img,
+        Err(e) => {
+            tracing::debug!("Clipboard image fetch failed: {}", e);
+            return false;
+        }
+    };
+    if img.width == 0 || img.height == 0 {
+        return false;
+    }
+    match save_clipboard_image_as_png(&img) {
+        Ok(path) => {
+            let display_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "clipboard.png".to_string());
+            app.chat_state
+                .add_attachment(path, crate::panels::agent_chat::AttachmentKind::Image);
+            app.chat_state.add_system_message(&format!(
+                "Pasted clipboard image: {} ({}x{})",
+                display_name, img.width, img.height
+            ));
+            true
+        }
+        Err(e) => {
+            tracing::warn!("Failed to save clipboard image: {}", e);
+            app.chat_state
+                .add_system_message(&format!("Could not save pasted image: {}", e));
+            false
+        }
     }
 }
 
@@ -2332,5 +2430,62 @@ pub(super) fn cancel_agent(app: &mut App) {
                     .finalize_message("system", "Cancelled by user (forced).");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{display_dir_prefix, expand_tilde, list_filesystem_matches};
+
+    #[test]
+    fn list_filesystem_matches_lists_entries_in_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("alpha.txt"), b"x").unwrap();
+        std::fs::write(tmp.path().join("alphabet.png"), b"x").unwrap();
+        std::fs::write(tmp.path().join("beta.txt"), b"x").unwrap();
+
+        let query = format!("{}/al", tmp.path().display());
+        let matches = list_filesystem_matches(&query);
+
+        assert!(matches.iter().any(|m| m.ends_with("/alpha.txt")));
+        assert!(matches.iter().any(|m| m.ends_with("/alphabet.png")));
+        assert!(!matches.iter().any(|m| m.ends_with("/beta.txt")));
+    }
+
+    #[test]
+    fn list_filesystem_matches_appends_slash_to_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(tmp.path().join("subdir")).unwrap();
+
+        let query = format!("{}/sub", tmp.path().display());
+        let matches = list_filesystem_matches(&query);
+
+        assert!(matches.iter().any(|m| m.ends_with("/subdir/")));
+    }
+
+    #[test]
+    fn list_filesystem_matches_empty_when_query_has_no_slash() {
+        // Without a `/` we can't pick a parent directory — caller is expected
+        // to gate this path with the `starts_with("/") || starts_with("~/")`
+        // check, but we still bail safely if invoked directly.
+        assert!(list_filesystem_matches("just-a-name").is_empty());
+    }
+
+    #[test]
+    fn expand_tilde_expands_home_prefixed_queries() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let expected = format!("{}/Downloads", home.display());
+        assert_eq!(expand_tilde("~/Downloads"), expected);
+        assert_eq!(expand_tilde("~"), home.display().to_string());
+        assert_eq!(expand_tilde("/etc/hosts"), "/etc/hosts");
+    }
+
+    #[test]
+    fn display_dir_prefix_keeps_path_through_last_slash() {
+        assert_eq!(display_dir_prefix("/tmp/sc"), "/tmp/");
+        assert_eq!(display_dir_prefix("~/Downloads/scre"), "~/Downloads/");
+        assert_eq!(display_dir_prefix("noslash"), "");
     }
 }
