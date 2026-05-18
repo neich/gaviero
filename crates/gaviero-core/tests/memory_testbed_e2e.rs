@@ -436,21 +436,23 @@ async fn drive_turn(
     .await;
     let _ = memory_scope; // scope is derived inside perform_injection
 
+    // Mirror the production tagged-prompt format
+    // (`shared::build_enriched_prompt` + `agent_session::claude::run_claude_turn`):
+    // <user_message> wraps the user prompt, <prev_conv> wraps history,
+    // and the injection's <project_memory> block passes through verbatim.
     let mut parts: Vec<String> = Vec::new();
-    parts.push(user_msg.to_string());
+    parts.push(format!("<user_message>\n{}\n</user_message>", user_msg));
     if let Some(inj) = outcome.injection.as_ref() {
         if !inj.block.is_empty() {
-            parts.push(String::new());
             parts.push(inj.block.clone());
         }
     }
     if let Some(history) = simulated_history.as_ref() {
         if !history.trim().is_empty() {
-            parts.push(String::new());
-            parts.push(format!("\nPrevConv:\n{}", history.trim_end()));
+            parts.push(format!("<prev_conv>\n{}\n</prev_conv>", history.trim_end()));
         }
     }
-    let enriched_prompt = parts.join("\n");
+    let enriched_prompt = parts.join("\n\n");
 
     run_turn(
         &env.repo,
@@ -464,7 +466,9 @@ async fn drive_turn(
 }
 
 fn append_to_history(prev: &str, user_msg: &str, assistant_msg: &str) -> String {
-    // Caveman PrevConv: convention from build_enriched_prompt.
+    // U:/A: sigil convention from build_enriched_prompt — these lines
+    // are the body inside the <prev_conv> tag the testbed assembles in
+    // `drive_turn`.
     let mut out = String::from(prev);
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
