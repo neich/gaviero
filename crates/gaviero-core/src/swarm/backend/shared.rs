@@ -16,13 +16,14 @@ pub fn build_enriched_prompt(
 ) -> String {
     // `prompt` at TOP keeps user question inside Claude Read 2000-line window
     // when blob is spilled to .gaviero/tmp/prompt-*.md on bootstrap turns.
-    // Scaffolding labels use caveman sigils (U:/A:/Files:/@path) per project
-    // convention — saves tokens; agent infers structure from indentation.
+    // Section boundaries use XML tags so the agent can distinguish injected
+    // context from the user's actual request; the tag is the marker, the body
+    // keeps the caveman U:/A:/@path scaffolding to stay token-cheap.
     let mut parts = Vec::new();
     parts.push(prompt.to_string());
 
     if !conversation_history.is_empty() {
-        parts.push("\nPrevConv:\n".to_string());
+        let mut body = String::new();
         for (role, content) in conversation_history {
             let truncated: String = content.chars().take(HISTORY_TRUNCATION_CHARS).collect();
             let ellipsis = if content.chars().count() > HISTORY_TRUNCATION_CHARS {
@@ -31,18 +32,20 @@ pub fn build_enriched_prompt(
                 ""
             };
             let sigil = role_sigil(role);
-            parts.push(format!("{}: {}{}\n", sigil, truncated, ellipsis));
+            body.push_str(&format!("{}: {}{}\n", sigil, truncated, ellipsis));
         }
+        parts.push(format!("<prev_conv>\n{}</prev_conv>", body));
     }
 
     if !file_refs.is_empty() {
-        parts.push("\nFiles:\n".to_string());
+        let mut body = String::new();
         for (path, content) in file_refs {
-            parts.push(format!("@{}\n{}\n/@{}\n", path, content, path));
+            body.push_str(&format!("@{}\n{}\n/@{}\n", path, content, path));
         }
+        parts.push(format!("<file_refs>\n{}</file_refs>", body));
     }
 
-    parts.join("\n")
+    parts.join("\n\n")
 }
 
 /// Caveman role sigil for transcript turns. `user` → `U`, `assistant` → `A`,
@@ -253,10 +256,10 @@ pub fn render_swarm_prompt(
 
     let scope_clause = scope.to_prompt_clause();
     if !scope_clause.is_empty() {
-        parts.push(format!("[File scope]:\n{}", scope_clause));
+        parts.push(format!("<file_scope>\n{}</file_scope>", scope_clause));
     }
 
-    parts.push(task_text.to_string());
+    parts.push(format!("<user_message>\n{}\n</user_message>", task_text));
 
     parts.join("\n\n")
 }
@@ -286,7 +289,7 @@ pub fn render_graph_block(
             .map(|g| g.content.clone())
             .collect();
         if !lines.is_empty() {
-            chunks.push(format!("Repo:\n{}", lines.join("\n")));
+            chunks.push(format!("<repo_outline>\n{}\n</repo_outline>", lines.join("\n")));
         }
     }
     for g in pre_rendered {
@@ -318,13 +321,13 @@ pub fn render_memory_block(
     let mut chunks: Vec<String> = Vec::new();
 
     if !structured.is_empty() {
-        let mut block = String::from("Mem:\n");
+        let mut body = String::new();
         for m in structured {
             let ns = m.namespace.as_deref().unwrap_or("");
             let score = m.score.unwrap_or(0.0);
-            block.push_str(&format!("{}|{}|s{:.2}\n", ns, m.content, score));
+            body.push_str(&format!("{}|{}|s{:.2}\n", ns, m.content, score));
         }
-        chunks.push(block);
+        chunks.push(format!("<project_memory>\n{}</project_memory>", body));
     }
     for m in pre_rendered {
         if !m.content.is_empty() {
@@ -359,11 +362,11 @@ mod tests {
             &[("src/lib.rs".into(), "fn demo() {}".into())],
         );
 
-        // Caveman scaffolding: PrevConv:/U:/A: sigils, @path/@/path file fences.
-        assert!(prompt.contains("PrevConv:"));
-        assert!(prompt.contains("U: first question"));
-        assert!(prompt.contains("@src/lib.rs\n"));
-        assert!(prompt.contains("/@src/lib.rs"));
+        // XML tags mark section boundaries; caveman body (U:/A: sigils, @path
+        // fences) stays inside so the agent can distinguish injected context
+        // from the user's actual request without paying for verbose markers.
+        assert!(prompt.contains("<prev_conv>\nU: first question\n</prev_conv>"));
+        assert!(prompt.contains("<file_refs>\n@src/lib.rs\nfn demo() {}\n/@src/lib.rs\n</file_refs>"));
         // Prompt at TOP, not appended after context.
         assert!(prompt.starts_with("Implement it"));
     }
@@ -444,47 +447,17 @@ mod tests {
         }
     }
 
-    // ── M1 byte-identity adapter tests ────────────────────────────
+    // ── Tagged-prompt format tests ────────────────────────────────
     //
-    // These pin the V9 §11 M1 acceptance gate ("M0 metrics unchanged"):
-    // `render_swarm_prompt` consuming planner-produced selections must
-    // emit the exact same string the legacy `runner::build_prompt` produced
-    // for matching inputs.
+    // The renderer is no longer byte-identical to the legacy
+    // `runner::build_prompt` — XML section tags were introduced to give the
+    // agent unambiguous boundaries between injected context and the user's
+    // request. These tests pin the new format directly.
 
     use crate::context_planner::{
         GraphSelection, GraphSelectionKind, MemorySelection, PlannerSelections,
     };
     use crate::types::FileScope;
-
-    fn legacy_build_prompt_equivalent(
-        graph_outline: Option<&str>,
-        impact_text: Option<&str>,
-        memory_ctx: Option<&str>,
-        scope: &FileScope,
-        task_text: &str,
-    ) -> String {
-        // Mirror runner.rs:340-389 build_prompt parts assembly exactly.
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(o) = graph_outline {
-            if !o.is_empty() {
-                parts.push(o.to_string());
-            }
-        }
-        if let Some(t) = impact_text {
-            parts.push(t.to_string());
-        }
-        if let Some(m) = memory_ctx {
-            if !m.is_empty() {
-                parts.push(m.to_string());
-            }
-        }
-        let scope_clause = scope.to_prompt_clause();
-        if !scope_clause.is_empty() {
-            parts.push(format!("[File scope]:\n{}", scope_clause));
-        }
-        parts.push(task_text.to_string());
-        parts.join("\n\n")
-    }
 
     fn graph_outline_selection(content: &str, tokens: usize) -> GraphSelection {
         GraphSelection {
@@ -513,18 +486,18 @@ mod tests {
     }
 
     #[test]
-    fn render_swarm_prompt_byte_matches_legacy_minimal() {
+    fn render_swarm_prompt_wraps_user_message_only_when_no_context() {
         let scope = FileScope::default();
         let task = "do the thing";
         let selections = PlannerSelections::default();
 
         let rendered = render_swarm_prompt(&selections, &scope, task);
-        let legacy = legacy_build_prompt_equivalent(None, None, None, &scope, task);
-        assert_eq!(rendered, legacy);
+        let expected = "<user_message>\ndo the thing\n</user_message>";
+        assert_eq!(rendered, expected);
     }
 
     #[test]
-    fn render_swarm_prompt_byte_matches_legacy_with_graph_and_scope() {
+    fn render_swarm_prompt_wraps_graph_scope_and_user_message() {
         let scope = FileScope {
             owned_paths: vec!["src/lib.rs".into()],
             ..Default::default()
@@ -537,8 +510,12 @@ mod tests {
             .push(graph_outline_selection(outline, 2000));
 
         let rendered = render_swarm_prompt(&selections, &scope, task);
-        let legacy = legacy_build_prompt_equivalent(Some(outline), None, None, &scope, task);
-        assert_eq!(rendered, legacy);
+        // Pre-rendered graph content passes through verbatim (no auto-wrap),
+        // while scope and user message are wrapped in their tags.
+        let expected = "[Repo outline]\nfile1.rs\nfile2.rs\n\n\
+                        <file_scope>\n**Owned paths** (read/write):\n- `src/lib.rs`\n</file_scope>\n\n\
+                        <user_message>\nimplement foo\n</user_message>";
+        assert_eq!(rendered, expected);
     }
 
     fn structured_graph_selection(
@@ -583,10 +560,11 @@ mod tests {
     }
 
     #[test]
-    fn m3_structured_graph_renders_caveman_block() {
-        // Structured per-file selections collapse into the caveman `Repo:` block.
-        // Per-row sigils (`OWN`, `(s0.92)`) live in `repo_map::rank_for_agent_structured`;
-        // here we pin the block header + line concatenation.
+    fn structured_graph_renders_repo_outline_tag() {
+        // Structured per-file selections collapse into a single
+        // `<repo_outline>` block. Per-row sigils (`OWN`, `(s0.92)`) live in
+        // `repo_map::rank_for_agent_structured`; here we pin the tag wrapper
+        // + line concatenation.
         let scope = FileScope::default();
         let mut sel = PlannerSelections::default();
         sel.graph_selections.push(structured_graph_selection(
@@ -603,13 +581,14 @@ mod tests {
         ));
 
         let rendered = render_swarm_prompt(&sel, &scope, "the task");
-        let expected = "Repo:\n  OWN src/lib.rs\n  src/util.rs (foo, bar)\n\nthe task";
+        let expected = "<repo_outline>\n  OWN src/lib.rs\n  src/util.rs (foo, bar)\n</repo_outline>\n\n\
+                        <user_message>\nthe task\n</user_message>";
         assert_eq!(rendered, expected);
     }
 
     #[test]
-    fn m3_structured_memory_renders_caveman_block() {
-        // Caveman per-entry format: `{ns}|{content}|s{score:.2}\n`.
+    fn structured_memory_renders_project_memory_tag() {
+        // Per-entry format inside the tag: `{ns}|{content}|s{score:.2}\n`.
         let scope = FileScope::default();
         let mut sel = PlannerSelections::default();
         sel.memory_selections.push(structured_memory_selection(
@@ -626,19 +605,17 @@ mod tests {
         ));
 
         let rendered = render_swarm_prompt(&sel, &scope, "the task");
-        // Memory block ends with `\n` after the last entry; `parts.join("\n\n")`
-        // therefore produces three consecutive newlines before the task.
-        let expected = "Mem:\n\
+        let expected = "<project_memory>\n\
                         workspace|remember to use git2|s3.05\n\
                         workspace|tests must hit real db|s2.42\n\
-                        \n\nthe task";
+                        </project_memory>\n\n\
+                        <user_message>\nthe task\n</user_message>";
         assert_eq!(rendered, expected);
     }
 
     #[test]
-    fn m3_mixed_structured_full_pipeline_caveman() {
-        // End-to-end caveman rendering: structured graph + structured memory +
-        // scope clause + task.
+    fn mixed_structured_full_pipeline_tagged() {
+        // End-to-end tagged rendering: graph + memory + scope + user message.
         let scope = FileScope {
             owned_paths: vec!["src/lib.rs".into()],
             ..Default::default()
@@ -658,17 +635,19 @@ mod tests {
         ));
 
         let rendered = render_swarm_prompt(&sel, &scope, "do the task");
-        let expected = "Repo:\n  OWN src/lib.rs\n\n\
-                        Mem:\nrepo|key invariant|s1.50\n\
-                        \n\n[File scope]:\n**Owned paths** (read/write):\n- `src/lib.rs`\n\
-                        \n\ndo the task";
+        let expected = "<repo_outline>\n  OWN src/lib.rs\n</repo_outline>\n\n\
+                        <project_memory>\nrepo|key invariant|s1.50\n</project_memory>\n\n\
+                        <file_scope>\n**Owned paths** (read/write):\n- `src/lib.rs`\n</file_scope>\n\n\
+                        <user_message>\ndo the task\n</user_message>";
         assert_eq!(rendered, expected);
     }
 
     #[test]
-    fn render_swarm_prompt_byte_matches_legacy_full_inputs() {
-        // Pins the full insertion order: graph_outline → impact → memory → scope → task.
-        // Exact same order runner::build_prompt uses.
+    fn pre_rendered_blocks_pass_through_unchanged() {
+        // Pre-rendered graph/memory selections (id/path = None) already
+        // carry their own framing — the renderer must not double-wrap them.
+        // The chat-injection path is the producer today; this pins the
+        // contract so additions to that path don't get auto-wrapped.
         let scope = FileScope {
             owned_paths: vec!["src/lib.rs".into()],
             read_only_paths: vec!["Cargo.toml".into()],
@@ -676,7 +655,7 @@ mod tests {
         };
         let outline = "[Repo outline]\nlib.rs";
         let impact = "[Impact analysis] lib.rs touches main.rs";
-        let memory = "[Memory context]:\n- past lesson";
+        let memory = "<project_memory>\n- [repo] lesson: past lesson\n</project_memory>";
         let task = "do task";
 
         let mut selections = PlannerSelections::default();
@@ -689,11 +668,11 @@ mod tests {
         selections.memory_selections.push(memory_selection(memory));
 
         let rendered = render_swarm_prompt(&selections, &scope, task);
-        let legacy =
-            legacy_build_prompt_equivalent(Some(outline), Some(impact), Some(memory), &scope, task);
-        assert_eq!(
-            rendered, legacy,
-            "swarm adapter must be byte-identical to legacy build_prompt"
+        let expected = format!(
+            "{outline}\n\n{impact}\n\n{memory}\n\n\
+             <file_scope>\n**Owned paths** (read/write):\n- `src/lib.rs`\n**Read-only paths**:\n- `Cargo.toml`\n</file_scope>\n\n\
+             <user_message>\n{task}\n</user_message>"
         );
+        assert_eq!(rendered, expected);
     }
 }
