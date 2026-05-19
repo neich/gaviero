@@ -194,6 +194,50 @@ pub struct StoredConversation {
     /// but kept as an explicit top-level field per V9 §4 line 420.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuity_handle: Option<crate::context_planner::types::ContinuityHandle>,
+    /// T1: latest server-reported token usage for this conversation.
+    /// Persisted so the context-window indicator survives restart and
+    /// reflects the actual session prefix size on resume rather than
+    /// dropping back to the visible-panel char-count estimate. Absent in
+    /// records written before T1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_token_usage: Option<StoredTokenUsage>,
+}
+
+/// Serializable mirror of [`crate::acp::protocol::TokenUsage`] for on-disk
+/// persistence in [`StoredConversation`]. Mirrors the provider-reported
+/// shape exactly so the TUI can rehydrate it without conversion logic.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StoredTokenUsage {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+}
+
+impl From<&crate::acp::protocol::TokenUsage> for StoredTokenUsage {
+    fn from(u: &crate::acp::protocol::TokenUsage) -> Self {
+        Self {
+            input_tokens: u.input_tokens,
+            cache_creation_input_tokens: u.cache_creation_input_tokens,
+            cache_read_input_tokens: u.cache_read_input_tokens,
+            output_tokens: u.output_tokens,
+        }
+    }
+}
+
+impl From<StoredTokenUsage> for crate::acp::protocol::TokenUsage {
+    fn from(s: StoredTokenUsage) -> Self {
+        Self {
+            input_tokens: s.input_tokens,
+            cache_creation_input_tokens: s.cache_creation_input_tokens,
+            cache_read_input_tokens: s.cache_read_input_tokens,
+            output_tokens: s.output_tokens,
+        }
+    }
 }
 
 /// Index of all conversations for a workspace (lightweight, no messages).
@@ -418,6 +462,7 @@ mod tests {
             effort_override: None,
             session_ledger: Some(persisted.clone()),
             continuity_handle: Some(ContinuityHandle::ClaudeSessionId("abc".into())),
+            last_token_usage: None,
         };
 
         let json = serde_json::to_string(&stored).unwrap();
@@ -429,5 +474,49 @@ mod tests {
             Some(ContinuityHandle::ClaudeSessionId(id)) => assert_eq!(id, "abc"),
             _ => panic!("variant lost"),
         }
+    }
+
+    #[test]
+    fn t1_stored_token_usage_round_trips() {
+        // T1: persisted token usage must survive serde so the context
+        // indicator reflects the resumed session immediately after a TUI
+        // restart (not 0% / ~0% until the first post-restart turn).
+        let stored = StoredConversation {
+            id: "c1".into(),
+            title: "T".into(),
+            messages: Vec::new(),
+            created: 1000,
+            updated: 2000,
+            model_override: None,
+            effort_override: None,
+            session_ledger: None,
+            continuity_handle: None,
+            last_token_usage: Some(StoredTokenUsage {
+                input_tokens: 1500,
+                cache_creation_input_tokens: 3000,
+                cache_read_input_tokens: 42_000,
+                output_tokens: 200,
+            }),
+        };
+        let json = serde_json::to_string(&stored).unwrap();
+        let back: StoredConversation = serde_json::from_str(&json).unwrap();
+        let u = back.last_token_usage.expect("usage present");
+        assert_eq!(u.input_tokens, 1500);
+        assert_eq!(u.cache_creation_input_tokens, 3000);
+        assert_eq!(u.cache_read_input_tokens, 42_000);
+        assert_eq!(u.output_tokens, 200);
+    }
+
+    #[test]
+    fn t1_stored_conversation_forward_compatible_without_token_usage() {
+        // A record written pre-T1 (no `last_token_usage` field) must
+        // deserialize cleanly with `None`. Same forward-compat pattern as
+        // the M4 ledger field.
+        let json = r#"{
+            "id":"c","title":"T","messages":[],
+            "created":1,"updated":2
+        }"#;
+        let stored: StoredConversation = serde_json::from_str(json).unwrap();
+        assert!(stored.last_token_usage.is_none());
     }
 }
