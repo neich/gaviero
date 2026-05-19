@@ -2052,6 +2052,8 @@ pub(super) fn send_chat_message(app: &mut App) {
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let task_cancel = cancel_token.clone();
     let session_cancel = cancel_token.clone();
+    let topology_config = app.workspace.resolve_topology_config(Some(&graph_root));
+    let topology_cache = app.topology_cache.clone();
     let task = tokio::spawn(async move {
         {
             let mut gate = wg.lock().await;
@@ -2076,25 +2078,44 @@ pub(super) fn send_chat_message(app: &mut App) {
         // user message (V9 §11 M2 acceptance: "turn 2+ transmits only
         // new user message").
         //
-        // `bootstrap_context` ANDs in the one-shot `/lite` opt-out so the
-        // user can force minimal-context dispatch on first turn too.
-        let bootstrap_context = is_first_turn && !lite_turn;
-        let repo_map_arc = if bootstrap_context {
-            crate::app::session::get_or_build_repo_map_cached(
-                repo_map_cache.clone(),
-                graph_root.clone(),
-                graph_excludes.clone(),
-            )
-            .await
-        } else {
-            None
+        // `/lite` skips ranked graph, memory, and impact; shallow topology
+        // still runs on first turn when `agent.topology.enabled` is true.
+        let bootstrap_graph = is_first_turn && !lite_turn;
+        let bootstrap_topology = is_first_turn && topology_config.enabled;
+
+        let repo_map_fut = async {
+            if bootstrap_graph {
+                crate::app::session::get_or_build_repo_map_cached(
+                    repo_map_cache.clone(),
+                    graph_root.clone(),
+                    graph_excludes.clone(),
+                )
+                .await
+            } else {
+                None
+            }
         };
+        let topology_fut = async {
+            if bootstrap_topology {
+                crate::app::session::get_or_build_topology_cached(
+                    topology_cache.clone(),
+                    graph_root.clone(),
+                    graph_excludes.clone(),
+                    topology_config.clone(),
+                )
+                .await
+            } else {
+                None
+            }
+        };
+        let (repo_map_arc, primary_topology) = tokio::join!(repo_map_fut, topology_fut);
+
         // Workspace-wide extras: build / fetch a repo map per sibling
         // folder. Only on first turn (planner skips bootstrap context
         // on follow-ups) AND when `/workspace` was armed (otherwise the
         // list is empty). Each lookup is a HashMap hit on warm cache.
         let extra_repo_map_arcs: Vec<std::sync::Arc<gaviero_core::repo_map::RepoMap>> =
-            if bootstrap_context && !extra_workspace_folders.is_empty() {
+            if bootstrap_graph && !extra_workspace_folders.is_empty() {
                 let mut out = Vec::with_capacity(extra_workspace_folders.len());
                 for (i, folder) in extra_workspace_folders.iter().enumerate() {
                     if let Some(rm) = crate::app::session::get_or_build_repo_map_cached(
@@ -2114,7 +2135,36 @@ pub(super) fn send_chat_message(app: &mut App) {
             } else {
                 Vec::new()
             };
-        let impact_text = if bootstrap_context {
+
+        let mut extra_topology_owned: Vec<(String, String)> = Vec::new();
+        if bootstrap_topology && !extra_workspace_folders.is_empty() {
+            for (i, folder) in extra_workspace_folders.iter().enumerate() {
+                let label = folder
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("folder")
+                    .to_string();
+                if let Some(body) = crate::app::session::get_or_build_topology_cached(
+                    topology_cache.clone(),
+                    folder.clone(),
+                    extra_workspace_excludes
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_default(),
+                    topology_config.clone(),
+                )
+                .await
+                {
+                    extra_topology_owned.push((label, body));
+                }
+            }
+        }
+        let extra_topology_refs: Vec<(&str, &str)> = extra_topology_owned
+            .iter()
+            .map(|(label, body)| (label.as_str(), body.as_str()))
+            .collect();
+
+        let impact_text = if bootstrap_graph {
             crate::app::session::compute_impact_text(
                 graph_root.clone(),
                 graph_seeds.clone(),
@@ -2125,13 +2175,13 @@ pub(super) fn send_chat_message(app: &mut App) {
             None
         };
 
-        let seed_paths_buf: Vec<std::path::PathBuf> = if bootstrap_context {
+        let seed_paths_buf: Vec<std::path::PathBuf> = if bootstrap_graph {
             graph_seeds.iter().map(std::path::PathBuf::from).collect()
         } else {
             Vec::new()
         };
-        let read_ns_for_planner: &[String] = if bootstrap_context { &read_ns } else { &[] };
-        let budget_for_planner: usize = if bootstrap_context {
+        let read_ns_for_planner: &[String] = if bootstrap_graph { &read_ns } else { &[] };
+        let budget_for_planner: usize = if bootstrap_graph {
             graph_budget_tokens
         } else {
             0
@@ -2161,6 +2211,9 @@ pub(super) fn send_chat_message(app: &mut App) {
             pre_fetched_memory_context: None,
             extra_folder_paths: &extra_folder_path_refs,
             extra_repo_maps: &extra_repo_map_refs,
+            topology_config: topology_config.clone(),
+            pre_fetched_topology: primary_topology.as_deref(),
+            extra_topology_blocks: &extra_topology_refs,
         };
 
         let selections = {
@@ -2197,7 +2250,8 @@ pub(super) fn send_chat_message(app: &mut App) {
         // `ChatMemoryInjected` event for the panel and supplying
         // workspace-resolved configs.
         let chat_injection: Option<gaviero_core::memory::ChatInjection> =
-            if let Some(mem) = memory.as_ref() {
+            if bootstrap_graph && memory.is_some() {
+                let mem = memory.as_ref().expect("checked above");
                 let reranker_ref: Option<&dyn gaviero_core::memory::Reranker> =
                     memory_reranker.as_deref();
                 let outcome = gaviero_core::context_planner::perform_injection(
