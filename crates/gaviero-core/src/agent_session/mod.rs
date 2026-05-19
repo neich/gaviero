@@ -23,6 +23,65 @@
 //! `send_turn` reconstructs the legacy inputs from a `Turn` and calls
 //! the existing pipeline; V9 §0 rule 6 forbids deleting the legacy path
 //! before M10 parity is proven.
+//!
+//! ## Adding a new CLI agent provider with Claude-equivalent behavior
+//!
+//! Every provider must surface the same three contracts the user sees in
+//! Claude: visible reasoning/tool activity, file edits routed through the
+//! Write Gate review flow, and post-turn `<turn_annotations>` memory
+//! extraction. Two integration patterns are supported; pick one — don't
+//! invent a third observer wiring path.
+//!
+//! ### Pattern A — one-shot subprocess (no native session state)
+//!
+//! Implement `swarm::backend::AgentBackend` in
+//! `crates/gaviero-core/src/swarm/backend/<name>.rs`. Reuse
+//! `AcpPipeline::send_prompt` → `swarm::backend::executor::complete_to_write_gate`,
+//! which drives the observer (reasoning, tool starts, status, token usage,
+//! `on_message_complete`) and routes `UnifiedStreamEvent::FileBlock`
+//! events through the Write Gate. Wrap the backend in `LegacyAgentSession`
+//! inside `registry::create_session`. Used today by `codex:` (exec) and
+//! `ollama:`/`local:`.
+//!
+//! ### Pattern B — process-bound, native session protocol
+//!
+//! Implement `AgentSession` directly so `send_turn` returns a
+//! `Stream<Item = Result<UnifiedStreamEvent>>`. Register the model-spec
+//! prefix in `registry::create_session`; the registry wraps the result in
+//! `ObservedStreamSession`, which drains the stream and calls the same
+//! observer callbacks Pattern A uses. Used today by `codex-app-server:`.
+//!
+//! ### Provider checklist
+//!
+//! 1. Emit `UnifiedStreamEvent::TextDelta` for visible reply text and
+//!    `ThinkingDelta` for reasoning. Pattern B's wrapper frames reasoning
+//!    with `<think>` / `</think>` automatically; Pattern A's executor does
+//!    the same.
+//! 2. Emit `ToolCallStart` for every tool/command launch — drives the chat
+//!    panel's "Using X..." indicator.
+//! 3. Include `swarm::backend::shared::default_editor_system_prompt` in the
+//!    developer/system instructions so the model is taught the `<file>`
+//!    block convention (when `Capabilities::supports_file_blocks`) and the
+//!    `<turn_annotations>` sidecar (always). Both Pattern A and Pattern B
+//!    rely on the same system prompt.
+//! 4. File edits flow through one of two channels and no others: the
+//!    backend's native tool-call channel (only when the prompt teaches
+//!    tool use, not `<file>`) — e.g. Claude's Write/Edit/MultiEdit — OR
+//!    in-band `<file path="…">…</file>` blocks parsed by the wrapper /
+//!    executor. Backends that advertise `supports_file_blocks=false` must
+//!    not emit `FileBlock`; `complete_to_write_gate` debug-asserts this
+//!    invariant.
+//! 5. Emit `Usage` once per turn so the TUI status bar's token counter
+//!    updates.
+//! 6. Terminate with `Done`. The wrapper / executor calls
+//!    `on_message_complete` immediately after, which is what
+//!    `controller.rs::Event::MessageComplete` keys off to invoke
+//!    `enqueue_post_turn` for memory extraction.
+//!
+//! No additional observer plumbing is needed. Permission requests are not
+//! supported through `UnifiedStreamEvent`; providers that need on-request
+//! approvals must run with `approvalPolicy: "never"` until a future event
+//! variant is added.
 
 pub mod claude;
 pub mod codex_app_server;
