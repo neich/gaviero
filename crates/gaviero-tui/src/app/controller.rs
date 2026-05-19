@@ -446,6 +446,79 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 }
             }
         }
+        Event::CursorSessionStarted {
+            conv_id,
+            session_id,
+        } => {
+            // Mirror of the Claude resume-handling logic but stores the
+            // chat id on the typed ledger handle instead of a legacy
+            // mirror field. The TUI reads the handle back from the
+            // ledger when building `AgentOptions::resume_session_id` for
+            // the next turn.
+            if let Some(conv) = app
+                .chat_state
+                .conversations
+                .iter_mut()
+                .find(|c| c.id == conv_id)
+            {
+                let prior_id = conv
+                    .session_ledger
+                    .as_ref()
+                    .and_then(|l| l.continuity_handle.as_ref())
+                    .and_then(|h| match h {
+                        gaviero_core::context_planner::ContinuityHandle::CursorThreadId(id) => {
+                            Some(id.clone())
+                        }
+                        _ => None,
+                    });
+                let was_resume_attempt = prior_id.is_some();
+                let resume_failed =
+                    was_resume_attempt && prior_id.as_deref() != Some(session_id.as_str());
+
+                if resume_failed {
+                    tracing::warn!(
+                        target: "turn_metrics",
+                        conv_id = %conv_id,
+                        asked_id = %prior_id.clone().unwrap_or_default(),
+                        got_id = %session_id,
+                        "cursor resume rejected — forcing bootstrap on next turn"
+                    );
+                    if let Some(ref mut ledger) = conv.session_ledger {
+                        ledger.record_resume_failure();
+                    }
+                }
+                if prior_id.as_deref() != Some(session_id.as_str()) {
+                    tracing::info!(
+                        "Captured Cursor session id for conv {}: {}",
+                        conv_id,
+                        session_id
+                    );
+                }
+                // Same /reset transcript-inline flip as the Claude path —
+                // the user asked for a fresh session and Cursor has now
+                // opened one, so restore the Auto default for future
+                // first-turn dispatches.
+                if conv.transcript_inline_mode
+                    == crate::panels::agent_chat::TranscriptInlineMode::Suppress
+                {
+                    conv.transcript_inline_mode =
+                        crate::panels::agent_chat::TranscriptInlineMode::Auto;
+                }
+                if let Some(ref mut ledger) = conv.session_ledger {
+                    ledger.record_continuity_handle(
+                        gaviero_core::context_planner::ContinuityHandle::CursorThreadId(
+                            session_id,
+                        ),
+                    );
+                    if !resume_failed {
+                        ledger.record_resume_success();
+                    }
+                    if ledger.is_first_turn() {
+                        ledger.record_turn_dispatched();
+                    }
+                }
+            }
+        }
         Event::MemoryWriteEnqueued { kind: _ } => {
             // Count only; the committed callback drives the refresh.
             app.memory_panel.write_activity_counter =

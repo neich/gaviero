@@ -196,13 +196,15 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
         Provider::Cursor => ProviderProfile {
             provider: "cursor".to_string(),
             model: spec.model.clone(),
-            // Phase 1 ships StatelessReplay; the underlying CLI supports
-            // `--resume <chat-id>` so a follow-up milestone flips this to
-            // `NativeResume` once `ContinuityHandle::CursorThreadId` is
-            // plumbed through the session lifecycle.
-            continuity_mode: ContinuityMode::StatelessReplay,
+            // `agent --resume <chat-id>` carries the prior thread's
+            // server-side state across turns, so the planner can omit
+            // replay history and rely on Cursor's continuity. The
+            // session updates the handle from the `system.init` event
+            // every turn so an expired thread cleanly falls back to a
+            // fresh chat id.
+            continuity_mode: ContinuityMode::NativeResume,
             supports_tool_use: true,
-            supports_native_resume: false,
+            supports_native_resume: true,
             // Cursor's hosted models vary by account; 200k is a safe upper
             // bound that matches Claude / Codex.
             max_context_tokens: Some(200_000),
@@ -456,13 +458,13 @@ mod tests {
     }
 
     #[test]
-    fn cursor_profile_is_stateless_replay_with_tool_use() {
+    fn cursor_profile_is_native_resume_with_tool_use() {
         let runtime = RuntimeConfig::default();
         let profile = build_provider_profile(&ModelSpec::parse("cursor:auto"), &runtime);
         assert_eq!(profile.provider, "cursor");
-        assert_eq!(profile.continuity_mode, ContinuityMode::StatelessReplay);
+        assert_eq!(profile.continuity_mode, ContinuityMode::NativeResume);
         assert!(profile.supports_tool_use);
-        assert!(!profile.supports_native_resume);
+        assert!(profile.supports_native_resume);
         assert_eq!(profile.max_context_tokens, Some(200_000));
     }
 

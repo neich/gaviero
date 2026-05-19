@@ -81,6 +81,16 @@ pub enum Event {
         session_id: String,
     },
 
+    /// Cursor emitted its chat / thread id (first `system.init` event of a
+    /// turn). The controller stores it on the `Conversation`'s
+    /// `SessionLedger` as a `ContinuityHandle::CursorThreadId` so the next
+    /// turn can pass `--resume <session_id>` and avoid re-sending
+    /// conversation history.
+    CursorSessionStarted {
+        conv_id: String,
+        session_id: String,
+    },
+
     /// Fired once per chat turn after `retrieve_for_chat` selects the memories
     /// that will be spliced into the prompt. Summary is surfaced in the
     /// status bar and (Tier A4) the memory panel. Mirrors S4's manifest data
