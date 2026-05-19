@@ -603,6 +603,17 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 ));
             }
         }
+        Event::TurnTokenUsage { conv_id, usage } => {
+            if let Some(idx) = app.chat_state.find_conv_idx(&conv_id) {
+                app.chat_state.conversations[idx].last_token_usage = Some(usage);
+            } else {
+                tracing::debug!(
+                    target: "turn_metrics",
+                    conv_id = %conv_id,
+                    "TurnTokenUsage for unknown conv_id — dropped"
+                );
+            }
+        }
         Event::AcpTaskCompleted { conv_id, proposals } => {
             tracing::info!(
                 "ACP task completed for conv {} with {} proposals",
