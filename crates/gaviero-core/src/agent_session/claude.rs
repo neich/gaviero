@@ -428,8 +428,22 @@ impl ClaudeSession {
                             StreamEvent::ResultEvent {
                                 is_error,
                                 result_text,
+                                usage,
                                 ..
                             } => {
+                                if let Some(u) = usage.as_ref() {
+                                    tracing::info!(
+                                        target: "turn_metrics",
+                                        provider = "claude",
+                                        input_tokens = u.input_tokens,
+                                        cache_creation = u.cache_creation_input_tokens,
+                                        cache_read = u.cache_read_input_tokens,
+                                        output_tokens = u.output_tokens,
+                                        prefix_tokens = u.prefix_tokens(),
+                                        "turn_token_usage"
+                                    );
+                                    self.observer.on_turn_token_usage(u);
+                                }
                                 if is_error {
                                     let msg = if is_auth_error(&result_text) {
                                         format!(
