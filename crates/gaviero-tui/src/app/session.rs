@@ -131,6 +131,39 @@ pub(super) fn apply_first_run(app: &mut App, init_memory: bool) {
 /// hand the planner a `&RepoMap` reference and let the planner own
 /// rank_for_agent itself (V9 §11 M2: "Chat consumes PlannerSelections;
 /// TUI no longer owns bootstrap policy").
+/// Cached shallow directory topology for `<repo_topology>`.
+pub(crate) async fn get_or_build_topology_cached(
+    topology_cache: std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<std::path::PathBuf, String>>,
+    >,
+    workspace_root: std::path::PathBuf,
+    excludes: Vec<String>,
+    cfg: gaviero_core::repo_map::TopologyConfig,
+) -> Option<String> {
+    if !cfg.enabled {
+        return None;
+    }
+    {
+        let guard = topology_cache.read().await;
+        if let Some(body) = guard.get(&workspace_root) {
+            return Some(body.clone());
+        }
+    }
+    let root = workspace_root.clone();
+    match tokio::task::spawn_blocking(move || {
+        gaviero_core::repo_map::build_folder_topology(&root, &excludes, &cfg)
+    })
+    .await
+    {
+        Ok(Ok(body)) if !body.is_empty() => {
+            let mut guard = topology_cache.write().await;
+            guard.insert(workspace_root, body.clone());
+            Some(body)
+        }
+        _ => None,
+    }
+}
+
 pub(crate) async fn get_or_build_repo_map_cached(
     repo_map_cache: std::sync::Arc<
         tokio::sync::RwLock<
@@ -293,6 +326,9 @@ mod tests {
             pre_fetched_memory_context: Some("[Memory] should be ignored"),
             extra_folder_paths: &[],
             extra_repo_maps: &[],
+            topology_config: gaviero_core::repo_map::TopologyConfig::default(),
+            pre_fetched_topology: None,
+            extra_topology_blocks: &[],
         };
         let selections = planner.plan(&input).await.unwrap();
         assert!(
