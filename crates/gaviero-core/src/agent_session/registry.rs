@@ -238,8 +238,15 @@ impl AgentSession for ObservedStreamSession {
 pub fn create_session(args: SessionConstruction) -> Box<dyn AgentSession> {
     match args.profile.continuity_mode {
         ContinuityMode::NativeResume => {
-            // M6: Claude — per-provider session owns the subprocess lifecycle.
-            Box::new(ClaudeSession::new(args))
+            if args.profile.provider == "cursor" {
+                // Cursor's `agent --resume <chat-id>` is the native-resume
+                // mechanism; the chat session captures the chat id from the
+                // `system.init` event and feeds it back via `options.resume_session_id`.
+                Box::new(CursorSession::new(args))
+            } else {
+                // M6: Claude — per-provider session owns the subprocess lifecycle.
+                Box::new(ClaudeSession::new(args))
+            }
         }
         ContinuityMode::ProcessBound => {
             // M8: Codex app-server returns normalized stream events. Drive
@@ -288,11 +295,6 @@ pub fn create_session(args: SessionConstruction) -> Box<dyn AgentSession> {
                 // registry can route them independently and M10 has separate
                 // deletion targets.
                 Box::new(CodexExecSession::new(args))
-            } else if args.profile.provider == "cursor" {
-                // Cursor CLI — drives its own snapshot+revert loop against
-                // the `agent -p` NDJSON stream, mirroring Claude's chat
-                // session shape rather than the legacy AcpPipeline shim.
-                Box::new(CursorSession::new(args))
             } else {
                 // M9: Ollama (and future StatelessReplay providers) get a
                 // bounded session that applies compaction before forwarding
