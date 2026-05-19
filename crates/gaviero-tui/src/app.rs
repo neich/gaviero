@@ -185,6 +185,9 @@ pub struct App {
     // chat dispatch) working: callers still ask for the focused folder's
     // map and get a one-entry cache miss on first use.
     pub repo_map: Arc<tokio::sync::RwLock<std::collections::HashMap<std::path::PathBuf, Arc<RepoMap>>>>,
+    /// Shallow directory topology cache (per folder root).
+    pub topology_cache:
+        Arc<tokio::sync::RwLock<std::collections::HashMap<std::path::PathBuf, String>>>,
     /// Workspace root path used for graph rebuilds (first root).
     pub graph_workspace_root: Option<std::path::PathBuf>,
 
@@ -388,6 +391,7 @@ impl App {
             memory_rerank_cfg: None,
             memory_sleeptime_scheduler: None,
             repo_map: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            topology_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             graph_workspace_root,
             git_panel: crate::panels::git_panel::GitPanelState::new(),
             memory_panel: crate::panels::memory_panel::MemoryPanelState::new(),
