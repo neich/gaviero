@@ -53,6 +53,8 @@ pub enum ResolvedBackend {
     Claude { model: String },
     /// Route to the Codex CLI with the specified model.
     Codex { model: String },
+    /// Route to the Cursor CLI with the specified model.
+    Cursor { model: String },
     /// Route to Ollama local model.
     Ollama { model: String, base_url: String },
     /// Blocked — cannot dispatch (privacy constraint, unavailable backend).
@@ -102,6 +104,10 @@ impl TierRouter {
             }
             ResolvedBackend::Codex { model } => {
                 let model_spec = format!("codex:{}", model);
+                shared::create_backend_for_model(&model_spec, None).map_err(|e| e.to_string())
+            }
+            ResolvedBackend::Cursor { model } => {
+                let model_spec = format!("cursor:{}", model);
                 shared::create_backend_for_model(&model_spec, None).map_err(|e| e.to_string())
             }
             ResolvedBackend::Ollama { model, base_url } => {
@@ -172,6 +178,13 @@ impl TierRouter {
             };
         }
 
+        if shared::is_cursor_model(model) {
+            let resolved_model = model.strip_prefix("cursor:").unwrap_or(model).to_string();
+            return ResolvedBackend::Cursor {
+                model: resolved_model,
+            };
+        }
+
         ResolvedBackend::Claude {
             model: model.to_string(),
         }
@@ -237,6 +250,12 @@ fn api_backend_for_spec(model_spec: &str) -> ResolvedBackend {
             .unwrap_or(model_spec)
             .to_string();
         ResolvedBackend::Codex { model: stripped }
+    } else if shared::is_cursor_model(model_spec) {
+        let stripped = model_spec
+            .strip_prefix("cursor:")
+            .unwrap_or(model_spec)
+            .to_string();
+        ResolvedBackend::Cursor { model: stripped }
     } else {
         ResolvedBackend::Claude {
             model: model_spec.to_string(),
@@ -251,10 +270,16 @@ pub fn validate_privacy(unit: &WorkUnit) -> Result<(), String> {
     if unit.privacy == PrivacyLevel::LocalOnly {
         if let Some(ref model) = unit.model {
             // Only local models are acceptable for LocalOnly units.
-            // Claude and Codex are both API-backed and therefore not allowed.
+            // Claude, Codex, and Cursor are all API-backed and therefore not allowed.
             if shared::is_codex_model(model) {
                 return Err(format!(
                     "unit '{}': LocalOnly privacy with Codex API model override '{}'",
+                    unit.id, model
+                ));
+            }
+            if shared::is_cursor_model(model) {
+                return Err(format!(
+                    "unit '{}': LocalOnly privacy with Cursor API model override '{}'",
                     unit.id, model
                 ));
             }
@@ -418,6 +443,37 @@ mod tests {
             router.resolve(&unit),
             ResolvedBackend::Blocked { .. }
         ));
+    }
+
+    #[test]
+    fn test_cursor_model_override_routes_to_cursor_backend() {
+        let router = TierRouter::new(TierConfig::default(), false);
+        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, Some("cursor:auto"));
+        assert_eq!(
+            router.resolve(&unit),
+            ResolvedBackend::Cursor {
+                model: "auto".into()
+            }
+        );
+    }
+
+    #[test]
+    fn test_cursor_blocked_under_local_only() {
+        let router = TierRouter::new(TierConfig::default(), true);
+        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::LocalOnly, Some("cursor:auto"));
+        // Privacy check fires before the override resolves to a backend.
+        assert!(matches!(
+            router.resolve(&unit),
+            ResolvedBackend::Blocked { .. }
+        ));
+    }
+
+    #[test]
+    fn test_validate_privacy_rejects_cursor_on_local_only_units() {
+        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::LocalOnly, Some("cursor:auto"));
+        let err = validate_privacy(&unit).expect_err("cursor override must be rejected");
+        assert!(err.contains("Cursor"));
+        assert!(err.contains("cursor:auto"));
     }
 
     #[test]
