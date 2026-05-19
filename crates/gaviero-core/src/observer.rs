@@ -76,6 +76,17 @@ pub trait AcpObserver: Send + Sync {
     /// Default no-op — observers that don't care about injection telemetry
     /// pay nothing.
     fn on_memory_injected(&self, _summary: &ChatInjectionSummary) {}
+
+    /// Fired once per chat turn when the provider reports authoritative
+    /// token usage for the turn. For Claude this is parsed from the
+    /// `usage` object on the `result` NDJSON event; other providers will
+    /// fire it from their equivalent (e.g. Codex's `turn/completed
+    /// tokenUsage`). `usage.prefix_tokens()` is the actual context size the
+    /// model was conditioned on — use this in place of char-count
+    /// heuristics for context-window indicators.
+    ///
+    /// Default no-op so observers without a usage display pay nothing.
+    fn on_turn_token_usage(&self, _usage: &crate::acp::protocol::TokenUsage) {}
 }
 
 /// Lightweight summary of a chat memory injection decision. Handed to

@@ -237,14 +237,19 @@ pub fn map_acp_event(event: &StreamEvent) -> Vec<UnifiedStreamEvent> {
             result_text,
             duration_ms,
             cost_usd,
+            usage,
         } => {
             if *is_error {
                 out.push(UnifiedStreamEvent::Error(result_text.clone()));
                 out.push(UnifiedStreamEvent::Done(StopReason::Error));
             } else {
+                let (input_tokens, output_tokens) = match usage {
+                    Some(u) => (u.prefix_tokens(), u.output_tokens),
+                    None => (0, 0),
+                };
                 out.push(UnifiedStreamEvent::Usage(TokenUsage {
-                    input_tokens: 0,
-                    output_tokens: 0,
+                    input_tokens,
+                    output_tokens,
                     cost_usd: *cost_usd,
                     duration_ms: *duration_ms,
                 }));
@@ -314,6 +319,7 @@ mod tests {
             result_text: "ok".into(),
             duration_ms: Some(1500),
             cost_usd: Some(0.02),
+            usage: None,
         });
         assert_eq!(events.len(), 2);
         assert!(
@@ -323,12 +329,39 @@ mod tests {
     }
 
     #[test]
+    fn test_map_result_success_propagates_usage_tokens() {
+        // T1: when Claude reports a `usage` object, the swarm path must
+        // surface input/output tokens (input = full prefix size) instead
+        // of zero — otherwise downstream cost estimators are blind.
+        let events = map_acp_event(&StreamEvent::ResultEvent {
+            is_error: false,
+            result_text: "ok".into(),
+            duration_ms: Some(1500),
+            cost_usd: Some(0.02),
+            usage: Some(crate::acp::protocol::TokenUsage {
+                input_tokens: 100,
+                cache_creation_input_tokens: 200,
+                cache_read_input_tokens: 5_000,
+                output_tokens: 42,
+            }),
+        });
+        match &events[0] {
+            UnifiedStreamEvent::Usage(u) => {
+                assert_eq!(u.input_tokens, 5_300, "prefix = 100+200+5000");
+                assert_eq!(u.output_tokens, 42);
+            }
+            other => panic!("expected Usage event, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_map_result_error() {
         let events = map_acp_event(&StreamEvent::ResultEvent {
             is_error: true,
             result_text: "rate limit".into(),
             duration_ms: None,
             cost_usd: None,
+            usage: None,
         });
         assert_eq!(events.len(), 2);
         assert_eq!(events[0], UnifiedStreamEvent::Error("rate limit".into()));

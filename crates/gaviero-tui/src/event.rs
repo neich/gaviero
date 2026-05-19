@@ -94,6 +94,16 @@ pub enum Event {
         token_budget: usize,
     },
 
+    /// Fired once per chat turn with the provider's authoritative token
+    /// usage (Claude `result.usage` today). The controller stores the
+    /// latest reading on the matching conversation so the status bar /
+    /// chat panel can show real context-window pressure instead of the
+    /// visible-panel char-count estimate.
+    TurnTokenUsage {
+        conv_id: String,
+        usage: gaviero_core::acp::protocol::TokenUsage,
+    },
+
     /// A4: writer task enqueued a write. Panel counts events for the
     /// "activity" pulse indicator but does not re-query yet.
     MemoryWriteEnqueued {

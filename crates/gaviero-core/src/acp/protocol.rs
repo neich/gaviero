@@ -14,6 +14,43 @@ pub struct ToolUseInfo {
     pub input: Value,
 }
 
+/// Token usage for one chat turn, normalised to a single-iteration view.
+///
+/// Claude Code's `result.usage` is the **sum across all internal API
+/// iterations** within a turn — when Claude makes N tool-call rounds,
+/// each round re-sends the same cached prefix and the top-level
+/// `cache_read_input_tokens` accumulates N copies of it. That sum is
+/// useful for billing but is not the context window size.
+///
+/// To get a meaningful "context window used" indicator, the parser
+/// looks at the per-iteration `iterations` array (when present) and
+/// stores the **last iteration's** per-call values into the
+/// `input_tokens` / `cache_creation_input_tokens` /
+/// `cache_read_input_tokens` fields. Their sum (`prefix_tokens()`) is
+/// then the actual prefix the model saw at the end of the turn —
+/// bounded by the model's context window.
+///
+/// `output_tokens` stays as the summed top-level total ("tokens
+/// generated this turn"), since output isn't re-sent across iterations.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+impl TokenUsage {
+    /// Tokens the model was conditioned on at the end of the turn
+    /// (fresh input + cache writes + cache reads, for the last
+    /// iteration). Bounded by the model's context window.
+    pub fn prefix_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_creation_input_tokens)
+            .saturating_add(self.cache_read_input_tokens)
+    }
+}
+
 /// Parsed event from one NDJSON line of `claude --print --output-format stream-json`.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
@@ -48,6 +85,10 @@ pub enum StreamEvent {
         result_text: String,
         duration_ms: Option<u64>,
         cost_usd: Option<f64>,
+        /// Server-reported token usage. `None` when the `usage` object was
+        /// absent or unparseable. Present means Claude told us exactly how
+        /// many tokens the session was conditioned on this turn.
+        usage: Option<TokenUsage>,
     },
 
     /// Permission request — Claude wants to execute a tool and needs user approval.
@@ -74,6 +115,52 @@ fn required_str(v: &Value, key: &str) -> Result<String> {
 /// Used for dispatch/discriminant fields where "unknown" is a valid fallback.
 fn opt_str<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(|t| t.as_str()).unwrap_or("")
+}
+
+/// Parse a Claude Code `usage` object into a single-iteration
+/// [`TokenUsage`].
+///
+/// When the object carries an `iterations` array (multi-tool-call
+/// turns), the last entry's per-call prefix breakdown is used for
+/// `input_tokens` / `cache_creation_input_tokens` /
+/// `cache_read_input_tokens` so `prefix_tokens()` reflects the actual
+/// context window used at end-of-turn — not the sum of every cached
+/// re-send. `output_tokens` stays as the top-level total (output isn't
+/// re-sent across iterations).
+///
+/// Falls back to top-level fields when `iterations` is absent or empty
+/// (single-iteration turns, older Claude Code releases).
+fn parse_usage_object(obj: &serde_json::Map<String, Value>) -> TokenUsage {
+    let top_u64 = |k: &str| obj.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
+    let last_iter = obj
+        .get("iterations")
+        .and_then(|i| i.as_array())
+        .and_then(|arr| arr.last())
+        .and_then(|it| it.as_object());
+
+    let (input_tokens, cache_creation_input_tokens, cache_read_input_tokens) = match last_iter
+    {
+        Some(it) => {
+            let get = |k: &str| it.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
+            (
+                get("input_tokens"),
+                get("cache_creation_input_tokens"),
+                get("cache_read_input_tokens"),
+            )
+        }
+        None => (
+            top_u64("input_tokens"),
+            top_u64("cache_creation_input_tokens"),
+            top_u64("cache_read_input_tokens"),
+        ),
+    };
+
+    TokenUsage {
+        input_tokens,
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
+        output_tokens: top_u64("output_tokens"),
+    }
 }
 
 /// Parse a single NDJSON line into a StreamEvent.
@@ -176,19 +263,35 @@ pub fn parse_stream_line(line: &str) -> Result<StreamEvent> {
             Ok(StreamEvent::AssistantMessage { text, tool_uses })
         }
 
-        // Final result:
-        // {"type":"result","subtype":"success","result":"...","duration_ms":1234,"cost_usd":0.01}
+        // Final result. The top-level `usage` is summed across the
+        // `iterations` array (one entry per internal API call within
+        // the turn); the last iteration's per-call breakdown is what
+        // the model saw at end-of-turn. See `TokenUsage` docs.
+        //
+        // {"type":"result","subtype":"success","result":"...","duration_ms":1234,
+        //  "cost_usd":0.01,
+        //  "usage":{
+        //    "input_tokens":..,                "cache_creation_input_tokens":..,
+        //    "cache_read_input_tokens":..,     "output_tokens":..,
+        //    "iterations":[{"input_tokens":..,"cache_creation_input_tokens":..,
+        //                   "cache_read_input_tokens":..,"output_tokens":..}, ...]
+        //  }}
         "result" => {
             let is_error = v.get("subtype").and_then(|s| s.as_str()) == Some("error");
             let result_text = required_str(&v, "result")?;
             let duration_ms = v.get("duration_ms").and_then(|d| d.as_u64());
             let cost_usd = v.get("cost_usd").and_then(|c| c.as_f64());
+            let usage = v
+                .get("usage")
+                .and_then(|u| u.as_object())
+                .map(parse_usage_object);
 
             Ok(StreamEvent::ResultEvent {
                 is_error,
                 result_text,
                 duration_ms,
                 cost_usd,
+                usage,
             })
         }
 
@@ -605,13 +708,115 @@ mod tests {
                 result_text,
                 duration_ms,
                 cost_usd,
+                usage,
             } => {
                 assert!(!is_error);
                 assert_eq!(result_text, "Done!");
                 assert_eq!(duration_ms, Some(5000));
                 assert!((cost_usd.unwrap() - 0.01).abs() < f64::EPSILON);
+                assert!(usage.is_none(), "no usage object in line → None");
             }
             _ => panic!("Expected ResultEvent, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_result_with_usage() {
+        let line = r#"{"type":"result","subtype":"success","result":"ok",
+            "duration_ms":1234,"cost_usd":0.05,
+            "usage":{"input_tokens":1500,"cache_creation_input_tokens":3000,
+                     "cache_read_input_tokens":42000,"output_tokens":200}}"#;
+        let event = parse_stream_line(line).unwrap();
+        match event {
+            StreamEvent::ResultEvent { usage: Some(u), .. } => {
+                assert_eq!(u.input_tokens, 1500);
+                assert_eq!(u.cache_creation_input_tokens, 3000);
+                assert_eq!(u.cache_read_input_tokens, 42_000);
+                assert_eq!(u.output_tokens, 200);
+                assert_eq!(u.prefix_tokens(), 1500 + 3000 + 42_000);
+            }
+            other => panic!("expected ResultEvent with usage, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_result_partial_usage_defaults_zero() {
+        // Forward-compat: if Claude drops or renames a field, treat absent as 0
+        // rather than fail the whole event.
+        let line = r#"{"type":"result","subtype":"success","result":"ok",
+            "usage":{"input_tokens":100,"output_tokens":10}}"#;
+        let event = parse_stream_line(line).unwrap();
+        match event {
+            StreamEvent::ResultEvent { usage: Some(u), .. } => {
+                assert_eq!(u.input_tokens, 100);
+                assert_eq!(u.cache_creation_input_tokens, 0);
+                assert_eq!(u.cache_read_input_tokens, 0);
+                assert_eq!(u.output_tokens, 10);
+            }
+            other => panic!("expected ResultEvent with usage, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_result_uses_last_iteration_prefix_not_summed_total() {
+        // Claude Code's top-level `usage` is summed across `iterations`.
+        // When a turn includes N tool-call rounds each carrying the same
+        // ~50K cached prefix, the top-level `cache_read_input_tokens`
+        // accumulates N copies. Picking that up as "context window
+        // used" produces values orders of magnitude larger than the
+        // model's actual context — e.g. 5083K on a 200K-window model.
+        //
+        // The parser must use the **last iteration's** per-call breakdown
+        // instead, so `prefix_tokens()` stays bounded by the context
+        // window.
+        let line = r#"{"type":"result","subtype":"success","result":"ok",
+            "usage":{
+                "input_tokens":50, "cache_creation_input_tokens":12000,
+                "cache_read_input_tokens":150000, "output_tokens":300,
+                "iterations":[
+                    {"input_tokens":20,"cache_creation_input_tokens":12000,
+                     "cache_read_input_tokens":30000,"output_tokens":100},
+                    {"input_tokens":15,"cache_creation_input_tokens":0,
+                     "cache_read_input_tokens":42000,"output_tokens":80},
+                    {"input_tokens":15,"cache_creation_input_tokens":0,
+                     "cache_read_input_tokens":78000,"output_tokens":120}
+                ]
+            }}"#;
+        let event = parse_stream_line(line).unwrap();
+        match event {
+            StreamEvent::ResultEvent { usage: Some(u), .. } => {
+                // Last iteration's prefix — what the model actually saw.
+                assert_eq!(u.input_tokens, 15);
+                assert_eq!(u.cache_creation_input_tokens, 0);
+                assert_eq!(u.cache_read_input_tokens, 78_000);
+                assert_eq!(u.prefix_tokens(), 78_015);
+                // output stays as the summed top-level total — output
+                // isn't re-sent across iterations, so summing is fine.
+                assert_eq!(u.output_tokens, 300);
+            }
+            other => panic!("expected ResultEvent with usage, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_result_empty_iterations_falls_back_to_top_level() {
+        // Defensive: if the array is empty for some reason, treat the
+        // usage as a single-iteration turn and read top-level fields.
+        let line = r#"{"type":"result","subtype":"success","result":"ok",
+            "usage":{
+                "input_tokens":5, "cache_creation_input_tokens":12735,
+                "cache_read_input_tokens":17922, "output_tokens":8,
+                "iterations":[]
+            }}"#;
+        let event = parse_stream_line(line).unwrap();
+        match event {
+            StreamEvent::ResultEvent { usage: Some(u), .. } => {
+                assert_eq!(u.input_tokens, 5);
+                assert_eq!(u.cache_creation_input_tokens, 12_735);
+                assert_eq!(u.cache_read_input_tokens, 17_922);
+                assert_eq!(u.output_tokens, 8);
+            }
+            other => panic!("expected ResultEvent with usage, got {:?}", other),
         }
     }
 

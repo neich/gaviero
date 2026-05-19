@@ -589,8 +589,16 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
 
     let model = app.chat_state.effective_model().to_string();
     let effort = app.chat_state.effective_effort();
-    let (_chars, ctx_pct) = app.chat_state.estimate_context();
-    let model_info = format!("{}|{} ctx:{}%", model, effort, ctx_pct);
+    let (tokens, _ctx_pct) = app.chat_state.estimate_context();
+    let ctx_size = if tokens >= 1000 {
+        format!("{}K", tokens / 1000)
+    } else {
+        tokens.to_string()
+    };
+    // Indicator is always a local word-count estimate (`~` prefix). Provider
+    // usage is shown via `/context` when available — see
+    // `AgentChatState::estimate_context` for why we don't surface it here.
+    let model_info = format!("{}|{} ctx:~{}", model, effort, ctx_size);
 
     let current_buffer = if app.focus == Focus::Editor {
         app.buffers.get(app.active_buffer)
