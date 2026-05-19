@@ -12,11 +12,13 @@
 //! is about auto-approving Bash commands, not about deferring write
 //! proposals. Probe-confirmed against `agent 2026.05.16-…`.
 //!
-//! **Continuity (phase 1):** `StatelessReplay`. The `system.init` event
-//! carries a `session_id` that we surface via
-//! [`AcpObserver::on_cursor_session_started`] so the ledger can persist
-//! it; a follow-up milestone re-uses it as `--resume <id>` to promote
-//! the session to `NativeResume`.
+//! **Continuity:** `NativeResume`. The `system.init` event carries a
+//! `session_id` (Cursor's chat / thread id) that we surface via
+//! [`AcpObserver::on_cursor_session_started`]. The TUI persists it on the
+//! conversation's [`crate::context_planner::SessionLedger`] as a
+//! [`ContinuityHandle::CursorThreadId`]; on the next turn the chat path
+//! reads the handle back and passes the id to `agent --resume <id>` so
+//! Cursor retains model context server-side.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -69,9 +71,14 @@ pub struct CursorSession {
     additional_roots: Vec<PathBuf>,
     agent_id: String,
     profile: ProviderProfile,
-    /// Phase 1 holds the captured `session_id` only for ledger persistence
-    /// via `on_cursor_session_started`. A follow-up milestone reads it
-    /// back to pass `--resume <id>` on subsequent turns.
+    /// Resume handle, seeded at construction from
+    /// [`crate::acp::session::AgentOptions::resume_session_id`]. On each
+    /// turn it's read back to add `--resume <id>` to the argv so Cursor
+    /// resumes the prior chat. The `system.init` event arrives with the
+    /// authoritative id (which may differ from the requested one if the
+    /// prior session expired); we update the handle in place and surface
+    /// it through [`AcpObserver::on_cursor_session_started`] so the TUI
+    /// can persist it on the ledger.
     handle: Option<ContinuityHandle>,
     cancel_token: CancellationToken,
 }
@@ -79,13 +86,24 @@ pub struct CursorSession {
 impl CursorSession {
     /// Construct a new `CursorSession`. Called exclusively by
     /// `registry::create_session` for Cursor providers
-    /// (`ContinuityMode::StatelessReplay && profile.provider == "cursor"`).
+    /// (`ContinuityMode::NativeResume && profile.provider == "cursor"`).
     pub(super) fn new(args: SessionConstruction) -> Self {
         let cursor_model = args
             .model
             .strip_prefix("cursor:")
             .unwrap_or(&args.model)
             .to_string();
+
+        // The TUI feeds the prior chat id back via the (deprecated)
+        // `resume_session_id` field on `AgentOptions`. Allow stays until
+        // M10 retires the field across all provider sessions.
+        #[allow(deprecated)]
+        let handle = args
+            .options
+            .resume_session_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|id| ContinuityHandle::CursorThreadId(id.to_string()));
 
         Self {
             write_gate: args.write_gate,
@@ -95,7 +113,7 @@ impl CursorSession {
             additional_roots: args.additional_roots,
             agent_id: args.agent_id,
             profile: args.profile,
-            handle: None,
+            handle,
             cancel_token: args.cancel_token,
         }
     }
@@ -187,8 +205,19 @@ impl CursorSession {
         );
 
         // ── Spawn subprocess ────────────────────────────────────────────
+        //
+        // Resume id: extracted from the typed handle the TUI persisted on
+        // the prior turn (`ContinuityHandle::CursorThreadId`). The first
+        // turn of a new conversation passes `None`; the `system.init`
+        // event below installs the freshly minted id so subsequent turns
+        // round-trip server-side context via `--resume <id>`.
+        let resume_id: Option<String> = match &self.handle {
+            Some(ContinuityHandle::CursorThreadId(id)) if !id.is_empty() => Some(id.clone()),
+            _ => None,
+        };
+
         let mut cmd = Command::new("agent");
-        for arg in cursor_argv(&self.cursor_model, &self.workspace_root, None) {
+        for arg in cursor_argv(&self.cursor_model, &self.workspace_root, resume_id.as_deref()) {
             cmd.arg(arg);
         }
         cmd.arg(&combined_prompt)
