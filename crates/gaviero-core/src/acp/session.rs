@@ -695,9 +695,11 @@ pub fn discover_model_options() -> Vec<String> {
 /// model picker receives canonical `provider:model` strings.
 ///
 /// On failure — binary missing, not logged in, free-tier "named models
-/// unavailable" banner — falls back to `["cursor:auto"]` so the picker
-/// still has a usable entry. `auto` is always the first entry on success
-/// too so users see the safe default first.
+/// unavailable" banner — falls back to `["cursor:composer-2.5"]` (the
+/// default for paid plans). `cursor:composer-2.5` is pinned at the top
+/// on success too so it's the obvious selection; `cursor:auto`, when
+/// present in the CLI's list, follows immediately after for free-tier
+/// users.
 pub fn discover_cursor_model_options() -> Vec<String> {
     let output = std::process::Command::new("agent")
         .arg("--list-models")
@@ -705,7 +707,12 @@ pub fn discover_cursor_model_options() -> Vec<String> {
         .stderr(Stdio::null())
         .output();
 
-    let fallback = || vec!["cursor:auto".to_string()];
+    // Default fallback model — mirrors `swarm::backend::cursor::DEFAULT_CURSOR_MODEL`
+    // so a future change to the constant doesn't silently re-introduce
+    // `auto` as the picker's default.
+    let default_pin = "cursor:composer-2.5".to_string();
+    let auto_alt = "cursor:auto".to_string();
+    let fallback = || vec![default_pin.clone()];
     let Ok(output) = output else {
         return fallback();
     };
@@ -719,14 +726,25 @@ pub fn discover_cursor_model_options() -> Vec<String> {
         return fallback();
     }
 
-    // Pin `cursor:auto` at the top — it's the only model free-tier
-    // accounts can use, so making it the obvious first option avoids
-    // user confusion when paid-tier rows look enabled but aren't.
-    let auto = "cursor:auto".to_string();
-    let mut deduped: Vec<String> = Vec::with_capacity(parsed.len() + 1);
-    deduped.push(auto.clone());
+    pin_cursor_picker_order(parsed, &default_pin, &auto_alt)
+}
+
+/// Pin order: default first, then `auto` (free-tier safe option), then
+/// the remainder in `--list-models` order. Dedup preserves the order
+/// established above. Extracted so tests can pin the rule without
+/// shelling out to the `agent` CLI.
+fn pin_cursor_picker_order(
+    parsed: Vec<String>,
+    default_pin: &str,
+    auto_alt: &str,
+) -> Vec<String> {
+    let mut deduped: Vec<String> = Vec::with_capacity(parsed.len() + 2);
+    deduped.push(default_pin.to_string());
+    if parsed.iter().any(|m| m == auto_alt) {
+        deduped.push(auto_alt.to_string());
+    }
     for m in parsed {
-        if m != auto && !deduped.contains(&m) {
+        if !deduped.contains(&m) {
             deduped.push(m);
         }
     }
@@ -765,7 +783,7 @@ fn parse_cursor_list_models(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod discover_cursor_tests {
-    use super::parse_cursor_list_models;
+    use super::{parse_cursor_list_models, pin_cursor_picker_order};
 
     #[test]
     fn parses_real_world_list_models_output() {
@@ -791,5 +809,57 @@ mod discover_cursor_tests {
         assert!(out.contains(&"cursor:auto".to_string()));
         assert!(out.contains(&"cursor:working-id".to_string()));
         assert!(!out.iter().any(|m| m.contains("bad")));
+    }
+
+    #[test]
+    fn pin_order_puts_default_first_then_auto_then_rest() {
+        // Real CLI ordering shows `auto` first and `composer-2.5`
+        // somewhere later. The picker order must surface the default
+        // (`composer-2.5`) first so it's the obvious selection, then
+        // keep `auto` available right after as the free-tier fallback.
+        let parsed = vec![
+            "cursor:auto".to_string(),
+            "cursor:composer-2-fast".to_string(),
+            "cursor:gpt-5.2".to_string(),
+            "cursor:composer-2.5".to_string(),
+            "cursor:claude-4.6-opus-high-thinking".to_string(),
+        ];
+        let out = pin_cursor_picker_order(parsed, "cursor:composer-2.5", "cursor:auto");
+        assert_eq!(out[0], "cursor:composer-2.5");
+        assert_eq!(out[1], "cursor:auto");
+        // Remaining models follow in their input order, minus the two
+        // pinned slots which were de-duplicated.
+        assert_eq!(out[2], "cursor:composer-2-fast");
+        assert_eq!(out[3], "cursor:gpt-5.2");
+        assert_eq!(out[4], "cursor:claude-4.6-opus-high-thinking");
+        assert_eq!(out.len(), 5);
+    }
+
+    #[test]
+    fn pin_order_skips_auto_when_not_in_parsed_list() {
+        // Paid-tier accounts that don't have `auto` listed (or a future
+        // CLI release that drops the alias) must still get the default
+        // at the top — no spurious `auto` entry inserted.
+        let parsed = vec![
+            "cursor:composer-2.5".to_string(),
+            "cursor:gpt-5.2".to_string(),
+        ];
+        let out = pin_cursor_picker_order(parsed, "cursor:composer-2.5", "cursor:auto");
+        assert_eq!(out[0], "cursor:composer-2.5");
+        assert_eq!(out[1], "cursor:gpt-5.2");
+        assert_eq!(out.len(), 2);
+        assert!(!out.iter().any(|m| m == "cursor:auto"));
+    }
+
+    #[test]
+    fn pin_order_inserts_default_even_when_absent_from_parsed_list() {
+        // If the CLI's list doesn't include the default model, we still
+        // surface it so the user can attempt it — the runtime will
+        // route the request and surface any "model unavailable" error.
+        let parsed = vec!["cursor:auto".to_string(), "cursor:gpt-5.2".to_string()];
+        let out = pin_cursor_picker_order(parsed, "cursor:composer-2.5", "cursor:auto");
+        assert_eq!(out[0], "cursor:composer-2.5");
+        assert_eq!(out[1], "cursor:auto");
+        assert_eq!(out[2], "cursor:gpt-5.2");
     }
 }
