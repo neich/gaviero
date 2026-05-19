@@ -15,6 +15,8 @@
 //!   (structured swarm path) and
 //!   `crates/gaviero-core/src/memory/retrieval.rs::render_block`
 //!   (chat-injection path)
+//! - `<repo_topology>...</repo_topology>` ←
+//!   `crates/gaviero-core/src/swarm/backend/shared.rs::render_graph_block`
 //! - `<repo_outline>...</repo_outline>` ←
 //!   `crates/gaviero-core/src/swarm/backend/shared.rs::render_graph_block`
 //! - `<prev_conv>...</prev_conv>` and `<file_refs>...</file_refs>` ←
@@ -51,6 +53,7 @@ use sha2::{Digest, Sha256};
 pub enum SectionKind {
     UserMessage,
     MemorySelections,
+    Topology,
     GraphSelections,
     FileRefs,
     ReplayHistory,
@@ -92,6 +95,11 @@ const TAG_TABLE: &[(SectionKind, &str, &str)] = &[
         SectionKind::MemorySelections,
         "<project_memory>",
         "</project_memory>",
+    ),
+    (
+        SectionKind::Topology,
+        "<repo_topology>",
+        "</repo_topology>",
     ),
     (
         SectionKind::GraphSelections,
@@ -322,6 +330,13 @@ mod tests {
                 SectionKind::FileRefs,
             ]
         );
+    }
+
+    #[test]
+    fn classify_repo_topology_tag_recognised() {
+        let prompt = "<user_message>\nask\n</user_message>\n\n<repo_topology>\n  crates/\n</repo_topology>";
+        let d = classify("t-topo", prompt);
+        assert!(kinds(&d).contains(&SectionKind::Topology));
     }
 
     #[test]
