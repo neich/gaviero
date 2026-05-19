@@ -13,8 +13,11 @@
 //! * **Codex** — `<worktree>/.codex/config.toml`; Codex reads it when
 //!   the worktree is a trusted project. First-time use requires user
 //!   consent (shown in the TUI via [`TrustConsent`]).
+//! * **Cursor** — `<worktree>/.cursor/mcp.json`; same JSON schema as
+//!   Claude's `.mcp.json` (`{"mcpServers":{...}}`). Cursor's CLI picks
+//!   it up automatically when the worktree is the cwd; no trust gate.
 //!
-//! Both configs are per-worktree, not per-user, so swarm worktrees
+//! All configs are per-worktree, not per-user, so swarm worktrees
 //! get isolated MCP wiring that cleans up with the worktree itself.
 
 use std::path::{Path, PathBuf};
@@ -129,6 +132,18 @@ pub fn claude_mcp_config_json(synth: &McpConfigSynth) -> Result<String> {
     Ok(serde_json::to_string_pretty(&body).context("serialising .mcp.json")?)
 }
 
+/// Build the `.cursor/mcp.json` body for the Cursor CLI.
+///
+/// Cursor uses the same `{"mcpServers":{...}}` schema as Claude's
+/// `.mcp.json` (confirmed against cursor.com/docs/cli/mcp +
+/// cursor.com/docs/mcp), so this is a thin alias over
+/// [`claude_mcp_config_json`]. Kept as a separate function so a
+/// future Cursor-only key (e.g. `transport`, `env_passthrough`)
+/// becomes an additive change without touching the Claude path.
+pub fn cursor_mcp_config_json(synth: &McpConfigSynth) -> Result<String> {
+    claude_mcp_config_json(synth)
+}
+
 fn gaviero_server_entry(synth: &McpConfigSynth) -> serde_json::Value {
     serde_json::json!({
         "command": synth.shim_binary,
@@ -210,9 +225,20 @@ pub fn synthesize_for_worktree(synth: &McpConfigSynth) -> Result<Vec<PathBuf>> {
 
     // Claude: <worktree>/.mcp.json
     let claude_path = synth.worktree.join(".mcp.json");
-    let claude_body = claude_mcp_config_json_merged(synth, &claude_path)?;
+    let claude_body = mcp_json_servers_merged(synth, &claude_path)?;
     write_if_changed(&claude_path, &claude_body)?;
     written.push(claude_path);
+
+    // Cursor: <worktree>/.cursor/mcp.json — same schema as Claude's
+    // `.mcp.json`, so the merge helper handles preserving any user
+    // entries the same way.
+    let cursor_dir = synth.worktree.join(".cursor");
+    std::fs::create_dir_all(&cursor_dir)
+        .with_context(|| format!("creating {}", cursor_dir.display()))?;
+    let cursor_path = cursor_dir.join("mcp.json");
+    let cursor_body = mcp_json_servers_merged(synth, &cursor_path)?;
+    write_if_changed(&cursor_path, &cursor_body)?;
+    written.push(cursor_path);
 
     // Codex: <worktree>/.codex/config.toml — only when trust is
     // explicitly granted. Plan defaults to asking on first swarm.
@@ -229,7 +255,11 @@ pub fn synthesize_for_worktree(synth: &McpConfigSynth) -> Result<Vec<PathBuf>> {
     Ok(written)
 }
 
-fn claude_mcp_config_json_merged(synth: &McpConfigSynth, path: &Path) -> Result<String> {
+/// Merge our gaviero (and optionally context7) entries into an existing
+/// `{"mcpServers":{...}}` document at `path`, preserving any
+/// user-authored entries. Used for both `.mcp.json` (Claude) and
+/// `.cursor/mcp.json` because both files share the same schema.
+fn mcp_json_servers_merged(synth: &McpConfigSynth, path: &Path) -> Result<String> {
     let mut root = std::fs::read_to_string(path)
         .ok()
         .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
@@ -249,7 +279,7 @@ fn claude_mcp_config_json_merged(synth: &McpConfigSynth, path: &Path) -> Result<
     }
 
     serde_json::to_string_pretty(&serde_json::Value::Object(root))
-        .context("serialising merged .mcp.json")
+        .context("serialising merged mcp servers JSON")
 }
 
 /// Write `body` to `path` only when the contents differ — avoids
@@ -306,22 +336,80 @@ mod tests {
     }
 
     #[test]
-    fn synth_writes_claude_always_codex_only_on_granted() {
+    fn synth_writes_claude_and_cursor_always_codex_only_on_granted() {
         let dir = tempdir().unwrap();
         let mut synth = fixture(dir.path().to_path_buf());
 
-        // Trust unknown → only Claude config written.
+        // Trust unknown → Claude + Cursor configs written, Codex skipped.
         synth.codex_trust = TrustConsent::Unknown;
         let files = synthesize_for_worktree(&synth).unwrap();
-        assert_eq!(files.len(), 1);
-        assert!(files[0].ends_with(".mcp.json"));
+        assert_eq!(files.len(), 2);
+        assert!(
+            files.iter().any(|p| p.ends_with(".mcp.json")),
+            "expected .mcp.json among {:?}",
+            files
+        );
+        assert!(
+            files.iter().any(|p| p.ends_with(".cursor/mcp.json")),
+            "expected .cursor/mcp.json among {:?}",
+            files
+        );
         assert!(!dir.path().join(".codex/config.toml").exists());
 
-        // Trust granted → both files.
+        // Trust granted → all three configs.
         synth.codex_trust = TrustConsent::Granted;
         let files = synthesize_for_worktree(&synth).unwrap();
-        assert_eq!(files.len(), 2);
+        assert_eq!(files.len(), 3);
+        assert!(dir.path().join(".cursor/mcp.json").exists());
         assert!(dir.path().join(".codex/config.toml").exists());
+    }
+
+    #[test]
+    fn cursor_config_contains_gaviero_server_block() {
+        let synth = fixture(PathBuf::from("/tmp/wt"));
+        let body = cursor_mcp_config_json(&synth).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // Same schema as Claude — `mcpServers` is the top-level key.
+        assert!(v["mcpServers"]["gaviero"]["command"].is_string());
+        assert_eq!(
+            v["mcpServers"]["gaviero"]["args"][0].as_str().unwrap(),
+            "--socket"
+        );
+    }
+
+    #[test]
+    fn cursor_config_matches_claude_schema_byte_for_byte() {
+        // Cursor's mcp.json uses the same {"mcpServers":{...}} schema
+        // as Claude's .mcp.json, so the two functions must agree on the
+        // body. If a future Cursor-only field is added, this test will
+        // fail loudly and the implementor must consciously diverge.
+        let synth = fixture(PathBuf::from("/tmp/wt"));
+        assert_eq!(
+            claude_mcp_config_json(&synth).unwrap(),
+            cursor_mcp_config_json(&synth).unwrap()
+        );
+    }
+
+    #[test]
+    fn merged_cursor_config_preserves_user_servers() {
+        let dir = tempdir().unwrap();
+        let cursor_path = dir.path().join(".cursor/mcp.json");
+        std::fs::create_dir_all(cursor_path.parent().unwrap()).unwrap();
+        let existing = serde_json::json!({
+            "mcpServers": {
+                "user-cursor-server": { "command": "user-bin", "args": [] }
+            }
+        });
+        std::fs::write(&cursor_path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+
+        let synth = fixture(dir.path().to_path_buf());
+        synthesize_for_worktree(&synth).unwrap();
+        let body = std::fs::read_to_string(&cursor_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // User entry preserved, gaviero + context7 added alongside.
+        assert!(v["mcpServers"]["user-cursor-server"].is_object());
+        assert!(v["mcpServers"]["gaviero"].is_object());
+        assert!(v["mcpServers"]["context7"].is_object());
     }
 
     #[test]
