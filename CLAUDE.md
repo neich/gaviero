@@ -2,6 +2,12 @@
 
 Terminal editor + headless CLI. AI agent orchestration. Rust 2024.
 
+## Plan Production
+
+When drafting implementation plans, assume the implementors are Claude Code Opus 4.7 or Codex 5.5 unless the user explicitly says they will implement the work themselves.
+
+Plans should be written for agent execution by default: concrete work units, ownership boundaries, expected files/modules, verification steps, and any sequencing constraints.
+
 ## Build & Test
 
 ```bash
@@ -24,29 +30,9 @@ Six crates — see per-crate CLAUDE.md for details:
 
 Architecture: pipeline logic in core. TUI/CLI are thin wrappers with observers. DSL depends on core. Subprocess agents (Claude Code, Codex) reach core's MCP tools via the shim over `<workspace>/.gaviero/mcp.sock`.
 
-## Conventions
+## Agent Runtime Parity
 
-- `anyhow::Result` everywhere. `thiserror` for DSL domain errors.
-- Tokio runtime. Never hold Mutex across I/O or CPU work.
-- `tracing` for logging: `debug!`/`info!`/`warn!`/`error!`.
-- `serde` derive on all boundary types.
-- Tree-sitter re-exports from `gaviero-core::lib.rs`. Never import `tree-sitter` downstream.
-- Agent writes flow through Write Gate. Agents get read-only tools.
-- `git2` only. Never shell out to `git`.
+All interactive coding providers should expose the same user-facing contract:
 
-## Rules
-
-- Never bypass scope validation. Agents stay within `FileScope`.
-- Scope overlap is enforced via `gaviero-core::path_pattern` — disjoint glob patterns are allowed; literal-prefix overlap is not.
-- Never hold WriteGatePipeline Mutex across diff, tree-sitter, or disk I/O.
-- Embedding runs outside SQLite Mutex. Lock protects DB I/O only. All memory writes flow through the single-consumer writer task (`WriterMessage` mpsc).
-- MCP server (`gaviero-core::mcp`) is read-only by construction. Never add a write tool there; writes go through the Write Gate or the memory writer task.
-- Swarm branches: `gaviero/{work_unit_id}`.
-- Worktrees: `.gaviero/worktrees/{id}/`, cleanup via `Drop`.
-- Memory writes require explicit `WriteScope`. Never infer scope.
-- Default retrieval is merged multi-scope hybrid (RRF: vector 0.7 + FTS 0.3). The legacy narrow→wide cascade with 0.70 early-exit is a kill-switch behind `memory.retrieval.mode = "cascade"`; do not assume it's the active path.
-
-## See Also
-
-- [ARCHITECTURE.md](ARCHITECTURE.md) — system design, data flow, subsystems
-- [.gaviero/docs-inventory.md](.gaviero/docs-inventory.md) — documentation status, gaps, TODOs
+- Agent activity is observable while it runs. Reasoning deltas, tool starts, streaming status, file proposal summaries, completion, and token usage must flow through `AcpObserver` or an equivalent adapter.
+- File edits never bypass review. Native edit-capable providers use their tool-call channel; text-only or stream-only providers emit complete `<file path="relative/path">...
