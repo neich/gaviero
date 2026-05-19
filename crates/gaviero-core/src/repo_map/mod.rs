@@ -24,6 +24,9 @@ pub mod edges;
 pub mod graph_builder;
 pub mod page_rank;
 pub mod store;
+pub mod topology;
+
+pub use topology::{TopologyConfig, build_folder_topology};
 
 // ── Graph types ──────────────────────────────────────────────
 
