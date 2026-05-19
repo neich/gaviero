@@ -242,6 +242,14 @@ pub struct Conversation {
     /// the user knows the prompt is genuinely cross-folder and the
     /// active-buffer heuristic would narrow incorrectly.
     pub workspace_wide_next: bool,
+    /// One-shot flag toggled by `/lite`. When `true`, the next dispatched
+    /// turn skips all bootstrap context injection — graph (`<repo_outline>`),
+    /// memory (`<project_memory>`), and impact analysis — even on the first
+    /// turn. The user message + visible transcript still go through.
+    /// Primarily for providers with hard argv limits (cursor: 96 KB) where
+    /// the default ~12 K-token graph block still pushes the prompt over.
+    /// Self-clears after `send_chat_message` consumes it.
+    pub lite_next: bool,
     /// Claude's session id, captured from the first turn's `SystemInit` event.
     /// Subsequent turns pass this back via `--resume <id>` so Claude keeps
     /// conversation memory server-side and we don't re-send history.
@@ -295,7 +303,7 @@ impl Default for AgentSettings {
             ollama_base_url: "http://localhost:11434".to_string(),
             write_namespace: "default".to_string(),
             read_namespaces: vec!["default".to_string()],
-            graph_budget_tokens: 40_000,
+            graph_budget_tokens: 12_000,
         }
     }
 }
@@ -373,6 +381,7 @@ impl AgentChatState {
             pending_module_path: None,
             pending_focused_folder: None,
             workspace_wide_next: false,
+            lite_next: false,
             claude_session_id: None,
             session_ledger: None,
             pending_persisted_ledger: None,
@@ -800,6 +809,29 @@ impl AgentChatState {
                 self.text_input.cursor = 0;
                 true
             }
+            "/lite" | "/minimal" => {
+                // Per-turn one-shot. Same toggle pattern as `/workspace`:
+                // arms the next dispatched turn to skip every bootstrap
+                // context block (graph, memory, impact). Self-clears on
+                // dispatch. Use this when the provider has a hard argv
+                // limit (cursor: 96 KB) and the default graph budget
+                // still pushes the prompt over.
+                let conv = &mut self.conversations[self.active_conv];
+                conv.lite_next = !conv.lite_next;
+                let msg = if conv.lite_next {
+                    "Minimal context: ARMED for next prompt. \
+                     The planner will skip graph (<repo_outline>), memory \
+                     (<project_memory>), and impact analysis even on the \
+                     first turn. (Run /lite again to cancel.)"
+                } else {
+                    "Minimal context: cleared. Next prompt will include \
+                     bootstrap context normally."
+                };
+                self.add_system_message(msg);
+                self.text_input.text.clear();
+                self.text_input.cursor = 0;
+                true
+            }
             "/help" => {
                 self.add_system_message(
                     "Available commands:\n\n\
@@ -809,6 +841,7 @@ impl AgentChatState {
                      /namespace <name>        — Set memory namespace (or show current). Alias: /ns\n\
                      /autoapprove             — Toggle auto-approve for this conversation. Alias: /yolo\n\
                      /workspace               — Arm workspace-wide planner scope for the next prompt only (multi-folder workspaces). Default scope follows the active buffer's folder; use this when the prompt genuinely spans folders. Alias: /ws\n\
+                     /lite                    — Arm minimal-context mode for the next prompt only: skips graph (<repo_outline>), memory (<project_memory>), and impact analysis even on the first turn. Use this when the provider has a hard argv limit (cursor: 96 KB). Alias: /minimal\n\
                      /rename [new title]      — Rename the active conversation tab (bare form starts interactive rename, same as F2)\n\
                      /reset                   — Clear agent context (keeps visible chat history). Alias: /clear\n\
                      /compact [N]             — Keep last N messages (default 6), discard older\n\
@@ -1014,6 +1047,7 @@ impl AgentChatState {
             pending_module_path: None,
             pending_focused_folder: None,
             workspace_wide_next: false,
+            lite_next: false,
             claude_session_id: None,
             session_ledger: None,
             pending_persisted_ledger: None,
@@ -2091,7 +2125,8 @@ impl AgentChatState {
                     pending_turn_id: None,
                     pending_module_path: None,
                     pending_focused_folder: None,
-            workspace_wide_next: false,
+                    workspace_wide_next: false,
+                    lite_next: false,
                     claude_session_id,
                     // M4: in-memory ledger is rehydrated at send time from
                     // `pending_persisted_ledger` once the ProviderProfile
@@ -3008,7 +3043,7 @@ fn normalize_model_spec(arg: &str) -> String {
     if let Some((prefix, _)) = trimmed.split_once(':') {
         // Only treat known providers as "already prefixed"; otherwise the
         // colon is part of the model name (e.g. ollama-style tags).
-        if matches!(prefix, "claude" | "codex" | "ollama" | "local") {
+        if matches!(prefix, "claude" | "codex" | "cursor" | "ollama" | "local") {
             return trimmed.to_string();
         }
     }
@@ -3117,6 +3152,9 @@ mod tests {
             "claude:opus",
             "claude:sonnet[1m]",
             "codex:gpt-5.5",
+            "cursor:auto",
+            "cursor:composer-2.5",
+            "cursor:claude-4.6-opus-high-thinking",
             "ollama:qwen2.5-coder:7b",
             "local:qwen2.5-coder:14b",
         ] {
@@ -3152,6 +3190,28 @@ mod tests {
             Some("ollama:qwen2.5-coder:7b")
         );
         assert!(state.text_input.text.is_empty());
+    }
+
+    #[test]
+    fn process_slash_command_model_preserves_cursor_prefix_verbatim() {
+        // Regression: `/model cursor:composer-2.5` previously fell through
+        // `normalize_model_spec`'s unknown-prefix branch and was stored
+        // as `claude:cursor:composer-2.5`. Pin the canonical-prefix
+        // pass-through so any future provider added to the chat input
+        // path must also extend the `matches!` guard above.
+        let mut state = AgentChatState::new();
+        state.text_input.text = "/model cursor:composer-2.5".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+
+        let handled = state.process_slash_command();
+
+        assert!(handled);
+        assert_eq!(
+            state.conversations[state.active_conv]
+                .model_override
+                .as_deref(),
+            Some("cursor:composer-2.5")
+        );
     }
 
     #[test]
@@ -3297,6 +3357,65 @@ mod tests {
 
         assert!(handled);
         assert!(state.conversations[state.active_conv].workspace_wide_next);
+    }
+
+    #[test]
+    fn process_slash_command_lite_arms_one_shot_flag() {
+        let mut state = AgentChatState::new();
+        assert!(!state.conversations[state.active_conv].lite_next);
+
+        state.text_input.text = "/lite".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+        let handled = state.process_slash_command();
+
+        assert!(handled);
+        assert!(state.text_input.text.is_empty());
+        assert!(state.conversations[state.active_conv].lite_next);
+        let messages = &state.conversations[state.active_conv].messages;
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.role == ChatRole::System && m.content.contains("ARMED")),
+            "expected ARMED system message, got {:?}",
+            messages
+        );
+    }
+
+    #[test]
+    fn process_slash_command_lite_toggles_off_on_second_invocation() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "/lite".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+        state.process_slash_command();
+        assert!(state.conversations[state.active_conv].lite_next);
+
+        state.text_input.text = "/lite".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+        let handled = state.process_slash_command();
+
+        assert!(handled);
+        assert!(!state.conversations[state.active_conv].lite_next);
+        let last = state.conversations[state.active_conv]
+            .messages
+            .last()
+            .expect("at least one message after toggle-off");
+        assert_eq!(last.role, ChatRole::System);
+        assert!(
+            last.content.contains("cleared"),
+            "expected 'cleared' message on toggle-off, got {:?}",
+            last.content
+        );
+    }
+
+    #[test]
+    fn process_slash_command_minimal_alias_matches_lite() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "/minimal".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+        let handled = state.process_slash_command();
+
+        assert!(handled);
+        assert!(state.conversations[state.active_conv].lite_next);
     }
 
     #[test]
