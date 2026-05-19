@@ -277,7 +277,7 @@ impl App {
         let agent_graph_budget_tokens = workspace
             .resolve_setting(settings::AGENT_GRAPH_BUDGET_TOKENS, None)
             .as_u64()
-            .unwrap_or(40_000) as usize;
+            .unwrap_or(12_000) as usize;
 
         let write_namespace = workspace.resolve_namespace(None);
         let read_namespaces = workspace.resolve_read_namespaces(None);
