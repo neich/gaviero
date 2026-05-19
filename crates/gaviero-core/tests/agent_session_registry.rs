@@ -91,6 +91,15 @@ fn ollama_spec_routes_to_stateless_replay_session() {
 }
 
 #[test]
+fn cursor_spec_routes_to_stateless_replay_session() {
+    // Cursor's phase-1 profile is StatelessReplay; this pins the routing
+    // dispatch so a future refactor can't mis-match the `cursor:` prefix
+    // to OllamaSession or LegacyAgentSession.
+    let session = create_session(construction_for("cursor:auto"));
+    assert_eq!(session.continuity_mode(), ContinuityMode::StatelessReplay);
+}
+
+#[test]
 fn local_spec_routes_to_stateless_replay_session() {
     // `local:` is treated as ollama by the planner per V9 §11 M9.
     let session = create_session(construction_for("local:llama3"));

@@ -68,6 +68,13 @@ pub trait AcpObserver: Send + Sync {
     /// retains model context. Default no-op for observers that don't care.
     fn on_claude_session_started(&self, _session_id: &str) {}
 
+    /// Called once per Cursor turn with the chat / thread id captured
+    /// from the `system.init` event. Default no-op — phase 1 wires this
+    /// up for ledger persistence; a follow-up milestone reads it back
+    /// to pass `--resume <id>` so the Cursor session can be promoted to
+    /// `NativeResume`.
+    fn on_cursor_session_started(&self, _session_id: &str) {}
+
     /// Fired once per chat turn immediately after the prompt assembler has
     /// decided which memories to inject. Carries a summary snapshot
     /// (`items_injected`, `tokens_used`, `token_budget`) for UI / logging.

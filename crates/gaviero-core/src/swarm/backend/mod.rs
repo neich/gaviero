@@ -6,6 +6,7 @@
 
 pub mod claude_code;
 pub mod codex;
+pub mod cursor;
 pub mod executor;
 pub mod mock;
 pub mod ollama;
@@ -164,6 +165,9 @@ pub enum BackendConfig {
     Codex {
         model: Option<String>,
     },
+    Cursor {
+        model: Option<String>,
+    },
     Ollama {
         model: String,
         base_url: Option<String>,
@@ -184,6 +188,10 @@ pub fn create_backend(config: &BackendConfig) -> Result<Box<dyn AgentBackend>> {
         BackendConfig::Codex { model } => {
             let m = model.as_deref().unwrap_or("gpt-5.5");
             Ok(Box::new(codex::CodexBackend::new(m)))
+        }
+        BackendConfig::Cursor { model } => {
+            let m = model.as_deref().unwrap_or(cursor::DEFAULT_CURSOR_MODEL);
+            Ok(Box::new(cursor::CursorBackend::new(m)))
         }
         BackendConfig::Ollama { model, base_url } => {
             let url = base_url.as_deref().unwrap_or("http://localhost:11434");

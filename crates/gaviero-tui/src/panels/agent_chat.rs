@@ -411,6 +411,11 @@ impl AgentChatState {
     fn model_options(&mut self) -> &[String] {
         if self.cli_model_options.is_none() {
             let mut options = gaviero_core::acp::session::discover_model_options();
+            for cursor_model in gaviero_core::acp::session::discover_cursor_model_options() {
+                if !options.iter().any(|opt| opt == &cursor_model) {
+                    options.push(cursor_model);
+                }
+            }
             let ollama_example = "ollama:qwen2.5-coder:7b".to_string();
             if !options.iter().any(|opt| opt == &ollama_example) {
                 options.push(ollama_example);

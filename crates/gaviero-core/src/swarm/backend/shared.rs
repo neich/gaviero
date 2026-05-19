@@ -7,7 +7,7 @@ use super::{AgentBackend, BackendConfig, Capabilities, CompletionRequest, create
 
 const HISTORY_TRUNCATION_CHARS: usize = 2000;
 const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
-const SUPPORTED_PROVIDER_PREFIXES: &[&str] = &["claude", "codex", "ollama", "local"];
+const SUPPORTED_PROVIDER_PREFIXES: &[&str] = &["claude", "codex", "cursor", "ollama", "local"];
 
 pub fn build_enriched_prompt(
     prompt: &str,
@@ -158,6 +158,17 @@ pub fn backend_config_for_model(model_spec: &str, ollama_base_url: Option<&str>)
         };
     }
 
+    if let Some(model) = trimmed.strip_prefix("cursor:") {
+        let m = model.trim();
+        return BackendConfig::Cursor {
+            model: if m.is_empty() {
+                None
+            } else {
+                Some(m.to_string())
+            },
+        };
+    }
+
     let claude_model = trimmed.strip_prefix("claude:").unwrap_or(trimmed);
 
     BackendConfig::ClaudeCode {
@@ -187,7 +198,7 @@ pub fn validate_model_spec(model_spec: &str) -> Result<()> {
     };
 
     match prefix {
-        "ollama" | "local" | "claude" | "codex" => {
+        "ollama" | "local" | "claude" | "codex" | "cursor" => {
             if remainder.trim().is_empty() {
                 anyhow::bail!("model spec '{}' is missing a model name", trimmed);
             }
@@ -220,6 +231,10 @@ pub fn is_ollama_model(model_spec: &str) -> bool {
 pub fn is_codex_model(model_spec: &str) -> bool {
     let t = model_spec.trim();
     t.starts_with("codex:")
+}
+
+pub fn is_cursor_model(model_spec: &str) -> bool {
+    model_spec.trim().starts_with("cursor:")
 }
 
 /// Render planner selections back into the legacy single-string prompt swarm
@@ -404,9 +419,32 @@ mod tests {
             "ollama:qwen2.5-coder:7b",
             "local:qwen2.5-coder:14b",
             "codex:gpt-5.5",
+            "cursor:auto",
+            "cursor:gpt-5.2",
+            "cursor:claude-4.6-opus-high-thinking",
         ] {
             validate_model_spec(spec).unwrap();
         }
+    }
+
+    #[test]
+    fn test_backend_config_for_model_parses_cursor_prefix() {
+        let config = backend_config_for_model("cursor:auto", None);
+        assert_eq!(
+            config,
+            BackendConfig::Cursor {
+                model: Some("auto".into())
+            }
+        );
+    }
+
+    #[test]
+    fn test_is_cursor_model_recognises_prefix() {
+        assert!(is_cursor_model("cursor:auto"));
+        assert!(is_cursor_model("cursor:gpt-5.2"));
+        assert!(!is_cursor_model("claude:sonnet"));
+        assert!(!is_cursor_model("codex:gpt-5"));
+        assert!(!is_cursor_model("auto"));
     }
 
     #[test]

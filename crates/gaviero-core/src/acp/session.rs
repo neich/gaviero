@@ -689,3 +689,107 @@ pub fn discover_model_options() -> Vec<String> {
 
     Vec::new()
 }
+
+/// Query the Cursor CLI (`agent --list-models`) for the model ids the
+/// current account can route to, prefixed with `cursor:` so the TUI's
+/// model picker receives canonical `provider:model` strings.
+///
+/// On failure — binary missing, not logged in, free-tier "named models
+/// unavailable" banner — falls back to `["cursor:auto"]` so the picker
+/// still has a usable entry. `auto` is always the first entry on success
+/// too so users see the safe default first.
+pub fn discover_cursor_model_options() -> Vec<String> {
+    let output = std::process::Command::new("agent")
+        .arg("--list-models")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+
+    let fallback = || vec!["cursor:auto".to_string()];
+    let Ok(output) = output else {
+        return fallback();
+    };
+    if !output.status.success() {
+        return fallback();
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let parsed = parse_cursor_list_models(&text);
+    if parsed.is_empty() {
+        return fallback();
+    }
+
+    // Pin `cursor:auto` at the top — it's the only model free-tier
+    // accounts can use, so making it the obvious first option avoids
+    // user confusion when paid-tier rows look enabled but aren't.
+    let auto = "cursor:auto".to_string();
+    let mut deduped: Vec<String> = Vec::with_capacity(parsed.len() + 1);
+    deduped.push(auto.clone());
+    for m in parsed {
+        if m != auto && !deduped.contains(&m) {
+            deduped.push(m);
+        }
+    }
+    deduped
+}
+
+/// Parse the body of `agent --list-models` / `agent models` into
+/// `cursor:<id>` strings. Extracted so the unit tests can exercise the
+/// parsing without depending on a Cursor CLI being installed in CI.
+fn parse_cursor_list_models(text: &str) -> Vec<String> {
+    let mut models: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("Available models") {
+            continue;
+        }
+        if !trimmed.contains(" - ") {
+            continue;
+        }
+        let id = trimmed.split(" - ").next().unwrap_or("").trim();
+        if id.is_empty() {
+            continue;
+        }
+        // Defensive validation: model ids are ASCII alnum + `_.-`. Skip
+        // anything else so a future banner row can't poison the list.
+        if !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+        {
+            continue;
+        }
+        models.push(format!("cursor:{}", id));
+    }
+    models
+}
+
+#[cfg(test)]
+mod discover_cursor_tests {
+    use super::parse_cursor_list_models;
+
+    #[test]
+    fn parses_real_world_list_models_output() {
+        let sample = "Available models\n\nauto - Auto\ncomposer-2-fast - Composer 2 Fast (default)\ngpt-5.2 - GPT-5.2\nclaude-4.6-opus-high-thinking - Opus 4.6 1M Thinking\n";
+        let out = parse_cursor_list_models(sample);
+        assert!(out.contains(&"cursor:auto".to_string()));
+        assert!(out.contains(&"cursor:composer-2-fast".to_string()));
+        assert!(out.contains(&"cursor:gpt-5.2".to_string()));
+        assert!(out.contains(&"cursor:claude-4.6-opus-high-thinking".to_string()));
+    }
+
+    #[test]
+    fn skips_informational_lines_without_dash_separator() {
+        let sample = "Available models\n\nFree plans only have Auto.\nauto - Auto\n";
+        let out = parse_cursor_list_models(sample);
+        assert_eq!(out, vec!["cursor:auto".to_string()]);
+    }
+
+    #[test]
+    fn skips_ids_with_invalid_characters() {
+        let sample = "auto - Auto\nbad model id - Should Be Skipped\nworking-id - Kept\n";
+        let out = parse_cursor_list_models(sample);
+        assert!(out.contains(&"cursor:auto".to_string()));
+        assert!(out.contains(&"cursor:working-id".to_string()));
+        assert!(!out.iter().any(|m| m.contains("bad")));
+    }
+}

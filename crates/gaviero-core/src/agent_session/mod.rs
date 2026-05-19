@@ -86,6 +86,7 @@
 pub mod claude;
 pub mod codex_app_server;
 pub mod codex_exec;
+pub mod cursor;
 pub mod ollama;
 pub mod registry;
 
