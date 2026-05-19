@@ -16,7 +16,7 @@ use crate::context_planner::{
 };
 use crate::memory::MemoryStores;
 use crate::observer::AcpObserver;
-use crate::repo_map::RepoMap;
+use crate::repo_map::{RepoMap, TopologyConfig, build_folder_topology};
 use crate::swarm::board::{SharedBoard, parse_discoveries};
 use crate::validation_gate::ValidationPipeline;
 use crate::write_gate::{AutoAcceptAction, WriteGatePipeline};
@@ -142,6 +142,16 @@ pub async fn run_backend(
         8_000
     };
 
+    // v1: swarm uses default topology settings (not workspace cascade).
+    let topology_config = TopologyConfig::default();
+    let topology_body = if topology_config.enabled {
+        build_folder_topology(workspace_root, &[], &topology_config)
+            .ok()
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+
     let planner_input = PlannerInput {
         user_message: &work_unit.description,
         explicit_refs: &[],
@@ -162,6 +172,9 @@ pub async fn run_backend(
         // feature behind the TUI's `/workspace` command.
         extra_folder_paths: &[],
         extra_repo_maps: &[],
+        topology_config,
+        pre_fetched_topology: topology_body.as_deref(),
+        extra_topology_blocks: &[],
     };
 
     let selections = {
