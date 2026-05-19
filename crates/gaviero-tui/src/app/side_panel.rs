@@ -1818,11 +1818,29 @@ pub(super) fn send_chat_message(app: &mut App) {
     // it when the model changed since save. Reading earlier would leak
     // the stale id into `AgentOptions::resume_session_id` and Claude
     // would silently accept the old session, defeating the invalidation.
-    let resume_session_id = app
-        .chat_state
-        .active_conversation()
-        .claude_session_id
-        .clone();
+    //
+    // Cursor stores its resume id exclusively on the typed ledger handle
+    // (`ContinuityHandle::CursorThreadId`) — no legacy mirror — so
+    // branch on the resolved provider here.
+    let resume_session_id = match provider_profile.provider.as_str() {
+        "cursor" => app
+            .chat_state
+            .active_conversation()
+            .session_ledger
+            .as_ref()
+            .and_then(|l| l.continuity_handle.as_ref())
+            .and_then(|h| match h {
+                gaviero_core::context_planner::ContinuityHandle::CursorThreadId(id) => {
+                    Some(id.clone())
+                }
+                _ => None,
+            }),
+        _ => app
+            .chat_state
+            .active_conversation()
+            .claude_session_id
+            .clone(),
+    };
     let is_first_turn = app
         .chat_state
         .active_conversation()
