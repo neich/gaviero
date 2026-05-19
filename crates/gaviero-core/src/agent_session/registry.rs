@@ -35,6 +35,7 @@ use crate::context_planner::ContinuityMode;
 use super::claude::ClaudeSession;
 use super::codex_app_server::CodexAppServerSession;
 use super::codex_exec::CodexExecSession;
+use super::cursor::CursorSession;
 use super::ollama::OllamaSession;
 use super::{AgentSession, Turn};
 
@@ -287,6 +288,11 @@ pub fn create_session(args: SessionConstruction) -> Box<dyn AgentSession> {
                 // registry can route them independently and M10 has separate
                 // deletion targets.
                 Box::new(CodexExecSession::new(args))
+            } else if args.profile.provider == "cursor" {
+                // Cursor CLI — drives its own snapshot+revert loop against
+                // the `agent -p` NDJSON stream, mirroring Claude's chat
+                // session shape rather than the legacy AcpPipeline shim.
+                Box::new(CursorSession::new(args))
             } else {
                 // M9: Ollama (and future StatelessReplay providers) get a
                 // bounded session that applies compaction before forwarding
