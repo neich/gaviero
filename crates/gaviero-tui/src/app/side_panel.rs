@@ -1650,6 +1650,15 @@ pub(super) fn send_chat_message(app: &mut App) {
         conv.workspace_wide_next = false;
         armed
     };
+    // `/lite` arms a one-shot bootstrap suppression: when set, skip graph,
+    // memory, and impact injection even on the first turn. Self-clears on
+    // dispatch. Used to fit under argv-limited providers (cursor: 96 KB).
+    let lite_turn = {
+        let conv = app.chat_state.active_conversation_mut();
+        let armed = conv.lite_next;
+        conv.lite_next = false;
+        armed
+    };
     let focused_folder: Option<std::path::PathBuf> = if workspace_wide {
         None
     } else {
@@ -2066,7 +2075,11 @@ pub(super) fn send_chat_message(app: &mut App) {
         // come back empty and `render_chat_selections` emits just the
         // user message (V9 §11 M2 acceptance: "turn 2+ transmits only
         // new user message").
-        let repo_map_arc = if is_first_turn {
+        //
+        // `bootstrap_context` ANDs in the one-shot `/lite` opt-out so the
+        // user can force minimal-context dispatch on first turn too.
+        let bootstrap_context = is_first_turn && !lite_turn;
+        let repo_map_arc = if bootstrap_context {
             crate::app::session::get_or_build_repo_map_cached(
                 repo_map_cache.clone(),
                 graph_root.clone(),
@@ -2081,7 +2094,7 @@ pub(super) fn send_chat_message(app: &mut App) {
         // on follow-ups) AND when `/workspace` was armed (otherwise the
         // list is empty). Each lookup is a HashMap hit on warm cache.
         let extra_repo_map_arcs: Vec<std::sync::Arc<gaviero_core::repo_map::RepoMap>> =
-            if is_first_turn && !extra_workspace_folders.is_empty() {
+            if bootstrap_context && !extra_workspace_folders.is_empty() {
                 let mut out = Vec::with_capacity(extra_workspace_folders.len());
                 for (i, folder) in extra_workspace_folders.iter().enumerate() {
                     if let Some(rm) = crate::app::session::get_or_build_repo_map_cached(
@@ -2101,7 +2114,7 @@ pub(super) fn send_chat_message(app: &mut App) {
             } else {
                 Vec::new()
             };
-        let impact_text = if is_first_turn {
+        let impact_text = if bootstrap_context {
             crate::app::session::compute_impact_text(
                 graph_root.clone(),
                 graph_seeds.clone(),
@@ -2112,13 +2125,13 @@ pub(super) fn send_chat_message(app: &mut App) {
             None
         };
 
-        let seed_paths_buf: Vec<std::path::PathBuf> = if is_first_turn {
+        let seed_paths_buf: Vec<std::path::PathBuf> = if bootstrap_context {
             graph_seeds.iter().map(std::path::PathBuf::from).collect()
         } else {
             Vec::new()
         };
-        let read_ns_for_planner: &[String] = if is_first_turn { &read_ns } else { &[] };
-        let budget_for_planner: usize = if is_first_turn {
+        let read_ns_for_planner: &[String] = if bootstrap_context { &read_ns } else { &[] };
+        let budget_for_planner: usize = if bootstrap_context {
             graph_budget_tokens
         } else {
             0

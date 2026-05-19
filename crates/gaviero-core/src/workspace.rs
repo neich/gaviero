@@ -860,7 +860,7 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::AGENT_MODEL => serde_json::json!("claude:sonnet"),
         settings::AGENT_EFFORT => serde_json::json!("off"),
         settings::AGENT_MAX_TOKENS => serde_json::json!(16384),
-        settings::AGENT_GRAPH_BUDGET_TOKENS => serde_json::json!(40000),
+        settings::AGENT_GRAPH_BUDGET_TOKENS => serde_json::json!(12000),
         settings::AGENT_AVAILABLE_TOOLS => {
             serde_json::json!(["Read", "Glob", "Grep", "Write", "Edit", "MultiEdit"])
         }

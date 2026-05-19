@@ -36,10 +36,12 @@ use super::{
     AgentBackend, Capabilities, CompletionRequest, StopReason, TokenUsage, UnifiedStreamEvent,
 };
 
-/// Default Cursor model when the spec is `cursor:` with no model name.
-/// `auto` is the only model available to free-tier accounts and is also
-/// the safest cross-tier default.
-pub(crate) const DEFAULT_CURSOR_MODEL: &str = "auto";
+/// Default Cursor model when no model is supplied with the `cursor:`
+/// prefix. `composer-2.5` is Cursor's current general-purpose default
+/// (paid plans). Free-tier accounts must explicitly opt in to
+/// `cursor:auto` since named models reject with "Named models
+/// unavailable Free plans can only use Auto" on free accounts.
+pub(crate) const DEFAULT_CURSOR_MODEL: &str = "composer-2.5";
 
 /// The Cursor CLI takes its prompt as a positional argv (no `--prompt-file`
 /// or stdin fallback documented). Linux's `MAX_ARG_STRLEN` is 128 KB per
@@ -667,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_model_falls_back_to_auto() {
+    fn empty_model_falls_back_to_default() {
         let b = CursorBackend::new("");
         assert!(b.name().ends_with(DEFAULT_CURSOR_MODEL));
     }
