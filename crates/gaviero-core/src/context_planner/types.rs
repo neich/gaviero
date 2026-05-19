@@ -40,6 +40,12 @@ pub enum ContinuityMode {
 pub enum ContinuityHandle {
     ClaudeSessionId(String),
     CodexThreadId(String),
+    /// Cursor CLI session id captured from the `system.init` event. The
+    /// chat path passes it back via `--resume <id>` on subsequent turns
+    /// once the Cursor session is promoted to `NativeResume` in a later
+    /// milestone; today (phase 1) the field round-trips through persisted
+    /// `StoredConversation` records but is not consumed by the session.
+    CursorThreadId(String),
     // Future providers: add a variant here.
 }
 
@@ -89,6 +95,7 @@ impl ModelSpec {
             "local",
             "codex-app-server",
             "codex",
+            "cursor",
             "claude",
         ] {
             let with_colon = format!("{}:", prefix);
@@ -114,6 +121,7 @@ impl ModelSpec {
             "ollama" | "local" => Provider::Ollama,
             "codex-app-server" => Provider::CodexAppServer,
             "codex" => Provider::Codex,
+            "cursor" => Provider::Cursor,
             // Bare or claude-prefixed → Claude.
             _ => Provider::Claude,
         }
@@ -128,6 +136,9 @@ pub enum Provider {
     Codex,
     /// `codex app-server` — `ProcessBound` continuity (M8).
     CodexAppServer,
+    /// Cursor CLI — `StatelessReplay` in phase 1 (a later milestone
+    /// promotes it to `NativeResume` via `--resume <chat-id>`).
+    Cursor,
     Ollama,
 }
 
@@ -181,6 +192,20 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             // M0 Finding I: Codex backend doesn't surface usage today;
             // value is informational until M8/M9 wire budgeting.
             max_context_tokens: None,
+        },
+        Provider::Cursor => ProviderProfile {
+            provider: "cursor".to_string(),
+            model: spec.model.clone(),
+            // Phase 1 ships StatelessReplay; the underlying CLI supports
+            // `--resume <chat-id>` so a follow-up milestone flips this to
+            // `NativeResume` once `ContinuityHandle::CursorThreadId` is
+            // plumbed through the session lifecycle.
+            continuity_mode: ContinuityMode::StatelessReplay,
+            supports_tool_use: true,
+            supports_native_resume: false,
+            // Cursor's hosted models vary by account; 200k is a safe upper
+            // bound that matches Claude / Codex.
+            max_context_tokens: Some(200_000),
         },
         Provider::Ollama => ProviderProfile {
             provider: "ollama".to_string(),
@@ -407,6 +432,13 @@ mod tests {
             ("claude:opus", "claude", "opus", Provider::Claude),
             ("sonnet", "", "sonnet", Provider::Claude),
             ("codex:gpt-5.5", "codex", "gpt-5.5", Provider::Codex),
+            ("cursor:auto", "cursor", "auto", Provider::Cursor),
+            (
+                "cursor:claude-4.6-opus-high-thinking",
+                "cursor",
+                "claude-4.6-opus-high-thinking",
+                Provider::Cursor,
+            ),
             (
                 "ollama:qwen2.5-coder:7b",
                 "ollama",
@@ -421,6 +453,29 @@ mod tests {
             assert_eq!(spec.model, model, "model mismatch for {}", raw);
             assert_eq!(spec.provider(), provider, "provider mismatch for {}", raw);
         }
+    }
+
+    #[test]
+    fn cursor_profile_is_stateless_replay_with_tool_use() {
+        let runtime = RuntimeConfig::default();
+        let profile = build_provider_profile(&ModelSpec::parse("cursor:auto"), &runtime);
+        assert_eq!(profile.provider, "cursor");
+        assert_eq!(profile.continuity_mode, ContinuityMode::StatelessReplay);
+        assert!(profile.supports_tool_use);
+        assert!(!profile.supports_native_resume);
+        assert_eq!(profile.max_context_tokens, Some(200_000));
+    }
+
+    #[test]
+    fn cursor_thread_id_continuity_handle_round_trips() {
+        let h = ContinuityHandle::CursorThreadId("abc-thread".to_string());
+        let json = serde_json::to_string(&h).unwrap();
+        assert!(
+            json.contains("CursorThreadId"),
+            "variant tag must be explicit so persisted state remains self-describing"
+        );
+        let back: ContinuityHandle = serde_json::from_str(&json).unwrap();
+        assert_eq!(h, back);
     }
 
     #[test]
