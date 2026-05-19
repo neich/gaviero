@@ -90,6 +90,7 @@ impl<'a> ContextPlanner<'a> {
         // because each attempt builds a fresh ledger.
         if is_first_turn {
             self.collect_memory(input, &mut selections).await;
+            self.collect_topology(input, &mut selections);
             self.collect_graph(input, &mut selections);
             self.collect_pre_fetched_impact(input, &mut selections);
         }
@@ -250,6 +251,58 @@ impl<'a> ContextPlanner<'a> {
             });
         }
         out.metadata.memory_count = candidates.len();
+    }
+
+    fn collect_topology(&self, input: &PlannerInput<'_>, out: &mut PlannerSelections) {
+        if !input.topology_config.enabled {
+            return;
+        }
+
+        let mut blocks: Vec<String> = Vec::new();
+
+        if let Some(body) = input.pre_fetched_topology {
+            if !body.is_empty() {
+                blocks.push(body.to_string());
+            }
+        } else {
+            match crate::repo_map::build_folder_topology(
+                self.workspace_root,
+                &[],
+                &input.topology_config,
+            ) {
+                Ok(body) if !body.is_empty() => blocks.push(body),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("topology build failed: {e}"),
+            }
+        }
+
+        for (label, body) in input.extra_topology_blocks {
+            if body.is_empty() {
+                continue;
+            }
+            blocks.push(format!("--- {label} ---\n{body}"));
+        }
+
+        if blocks.is_empty() {
+            return;
+        }
+
+        let content = blocks.join("\n\n");
+        let tokens = content.len().div_ceil(4);
+        out.graph_selections.push(GraphSelection {
+            path: None,
+            kind: GraphSelectionKind::Topology,
+            token_estimate: tokens,
+            content,
+            rank_score: None,
+            confidence: None,
+            symbols: Vec::new(),
+            content_digest: None,
+        });
+        out.metadata.graph_token_estimate = out
+            .metadata
+            .graph_token_estimate
+            .saturating_add(tokens);
     }
 
     fn collect_graph(&mut self, input: &PlannerInput<'_>, out: &mut PlannerSelections) {
@@ -439,6 +492,12 @@ mod tests {
             pre_fetched_memory_context: None,
             extra_folder_paths: &[],
             extra_repo_maps: &[],
+            topology_config: crate::repo_map::TopologyConfig {
+                enabled: false,
+                ..crate::repo_map::TopologyConfig::default()
+            },
+            pre_fetched_topology: None,
+            extra_topology_blocks: &[],
         };
         let sel = planner.plan(&input).await.unwrap();
         assert!(sel.memory_selections.is_empty());
@@ -479,6 +538,9 @@ mod tests {
             pre_fetched_memory_context: None,
             extra_folder_paths: &[],
             extra_repo_maps: &[],
+            topology_config: crate::repo_map::TopologyConfig::default(),
+            pre_fetched_topology: None,
+            extra_topology_blocks: &[],
         };
         let sel = planner.plan(&input).await.unwrap();
         // StatelessReplay emits Some(_) on first turn even when empty —
@@ -515,6 +577,9 @@ mod tests {
             pre_fetched_memory_context: None,
             extra_folder_paths: &[],
             extra_repo_maps: &[],
+            topology_config: crate::repo_map::TopologyConfig::default(),
+            pre_fetched_topology: None,
+            extra_topology_blocks: &[],
         };
         let sel = planner.plan(&input).await.unwrap();
         assert!(sel.memory_selections.is_empty());
@@ -581,6 +646,9 @@ mod tests {
             pre_fetched_memory_context: None,
             extra_folder_paths: &extra_paths,
             extra_repo_maps: &extras,
+            topology_config: crate::repo_map::TopologyConfig::default(),
+            pre_fetched_topology: None,
+            extra_topology_blocks: &[],
         };
         let sel = planner.plan(&input).await.unwrap();
         // Exact rank counts are an implementation detail of
@@ -630,9 +698,82 @@ mod tests {
             pre_fetched_memory_context: None,
             extra_folder_paths: &[],
             extra_repo_maps: &[],
+            topology_config: crate::repo_map::TopologyConfig {
+                enabled: false,
+                ..crate::repo_map::TopologyConfig::default()
+            },
+            pre_fetched_topology: None,
+            extra_topology_blocks: &[],
         };
         let sel = planner.plan(&input).await.unwrap();
         assert_eq!(sel.graph_selections.len(), 1);
         assert!(sel.graph_selections[0].content.contains("Imp:"));
+    }
+
+    #[tokio::test]
+    async fn pre_fetched_topology_on_first_turn_only() {
+        let profile = fixture_profile();
+        let fp = PlannerFingerprint::from_profile(&profile);
+        let mut ledger = SessionLedger::new(&profile, fp);
+        let workspace = std::path::PathBuf::from("/tmp");
+        let mut planner = ContextPlanner {
+            memory: None,
+            repo_map: None,
+            ledger: &mut ledger,
+            workspace_root: &workspace,
+        };
+        let topo = ". (workspace: tmp)\n  src/";
+        let input = PlannerInput {
+            user_message: "hi",
+            explicit_refs: &[],
+            seed_paths: &[],
+            provider_profile: &profile,
+            read_namespaces: &[],
+            graph_budget_tokens: 0,
+            memory_query_override: None,
+            memory_limit: 5,
+            file_ref_blobs: &[],
+            pre_fetched_impact_text: None,
+            pre_fetched_graph_context: None,
+            pre_fetched_memory_context: None,
+            extra_folder_paths: &[],
+            extra_repo_maps: &[],
+            topology_config: crate::repo_map::TopologyConfig::default(),
+            pre_fetched_topology: Some(topo),
+            extra_topology_blocks: &[],
+        };
+        let sel = planner.plan(&input).await.unwrap();
+        assert_eq!(sel.graph_selections.len(), 1);
+        assert_eq!(sel.graph_selections[0].kind, GraphSelectionKind::Topology);
+        assert!(sel.graph_selections[0].content.contains("src/"));
+
+        ledger.record_turn_dispatched();
+        let mut planner2 = ContextPlanner {
+            memory: None,
+            repo_map: None,
+            ledger: &mut ledger,
+            workspace_root: &workspace,
+        };
+        let input2 = PlannerInput {
+            user_message: "hi again",
+            explicit_refs: &[],
+            seed_paths: &[],
+            provider_profile: &profile,
+            read_namespaces: &[],
+            graph_budget_tokens: 0,
+            memory_query_override: None,
+            memory_limit: 5,
+            file_ref_blobs: &[],
+            pre_fetched_impact_text: None,
+            pre_fetched_graph_context: None,
+            pre_fetched_memory_context: None,
+            extra_folder_paths: &[],
+            extra_repo_maps: &[],
+            topology_config: crate::repo_map::TopologyConfig::default(),
+            pre_fetched_topology: Some(topo),
+            extra_topology_blocks: &[],
+        };
+        let sel2 = planner2.plan(&input2).await.unwrap();
+        assert!(sel2.graph_selections.is_empty());
     }
 }

@@ -286,16 +286,34 @@ pub fn render_swarm_prompt(
 pub fn render_graph_block(
     graph_selections: &[crate::context_planner::GraphSelection],
 ) -> Option<String> {
+    use crate::context_planner::GraphSelectionKind;
+
+    let topology: Vec<&crate::context_planner::GraphSelection> = graph_selections
+        .iter()
+        .filter(|g| g.kind == GraphSelectionKind::Topology)
+        .collect();
     let structured: Vec<&crate::context_planner::GraphSelection> = graph_selections
         .iter()
         .filter(|g| g.path.is_some())
         .collect();
     let pre_rendered: Vec<&crate::context_planner::GraphSelection> = graph_selections
         .iter()
-        .filter(|g| g.path.is_none())
+        .filter(|g| {
+            g.path.is_none()
+                && g.kind != GraphSelectionKind::Topology
+        })
         .collect();
 
     let mut chunks: Vec<String> = Vec::new();
+
+    for g in topology {
+        if !g.content.is_empty() {
+            chunks.push(format!(
+                "<repo_topology>\n{}\n</repo_topology>",
+                g.content
+            ));
+        }
+    }
 
     if !structured.is_empty() {
         let lines: Vec<String> = structured
@@ -595,6 +613,33 @@ mod tests {
             source_hash: None,
             updated_at: None,
         }
+    }
+
+    #[test]
+    fn topology_renders_before_repo_outline() {
+        let scope = FileScope::default();
+        let mut sel = PlannerSelections::default();
+        sel.graph_selections.push(GraphSelection {
+            path: None,
+            kind: GraphSelectionKind::Topology,
+            token_estimate: 100,
+            content: "  crates/\n    gaviero-core/".to_string(),
+            rank_score: None,
+            confidence: None,
+            symbols: Vec::new(),
+            content_digest: None,
+        });
+        sel.graph_selections.push(structured_graph_selection(
+            "src/lib.rs",
+            crate::repo_map::GraphDecision::OutlineOnly,
+            "  OWN src/lib.rs",
+            50,
+        ));
+
+        let rendered = render_swarm_prompt(&sel, &scope, "task");
+        let topo_pos = rendered.find("<repo_topology>").unwrap();
+        let outline_pos = rendered.find("<repo_outline>").unwrap();
+        assert!(topo_pos < outline_pos);
     }
 
     #[test]

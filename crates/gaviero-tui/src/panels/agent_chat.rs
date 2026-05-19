@@ -820,12 +820,13 @@ impl AgentChatState {
                 conv.lite_next = !conv.lite_next;
                 let msg = if conv.lite_next {
                     "Minimal context: ARMED for next prompt. \
-                     The planner will skip graph (<repo_outline>), memory \
-                     (<project_memory>), and impact analysis even on the \
-                     first turn. (Run /lite again to cancel.)"
+                     Skips ranked graph (<repo_outline>), memory \
+                     (<project_memory>), and impact on the first turn; \
+                     keeps shallow folder map (<repo_topology>). \
+                     (Run /lite again to cancel.)"
                 } else {
                     "Minimal context: cleared. Next prompt will include \
-                     bootstrap context normally."
+                     full bootstrap context normally."
                 };
                 self.add_system_message(msg);
                 self.text_input.text.clear();
@@ -841,7 +842,7 @@ impl AgentChatState {
                      /namespace <name>        — Set memory namespace (or show current). Alias: /ns\n\
                      /autoapprove             — Toggle auto-approve for this conversation. Alias: /yolo\n\
                      /workspace               — Arm workspace-wide planner scope for the next prompt only (multi-folder workspaces). Default scope follows the active buffer's folder; use this when the prompt genuinely spans folders. Alias: /ws\n\
-                     /lite                    — Arm minimal-context mode for the next prompt only: skips graph (<repo_outline>), memory (<project_memory>), and impact analysis even on the first turn. Use this when the provider has a hard argv limit (cursor: 96 KB). Alias: /minimal\n\
+                     /lite                    — Arm minimal-context for the next prompt: skips <repo_outline>, <project_memory>, and impact on the first turn; keeps <repo_topology>. Use when argv is tight (cursor: 96 KB). Alias: /minimal\n\
                      /rename [new title]      — Rename the active conversation tab (bare form starts interactive rename, same as F2)\n\
                      /reset                   — Clear agent context (keeps visible chat history). Alias: /clear\n\
                      /compact [N]             — Keep last N messages (default 6), discard older\n\

@@ -22,6 +22,11 @@ pub mod settings {
     pub const AGENT_OLLAMA_BASE_URL: &str = "agent.ollamaBaseUrl";
     /// Token budget for graph-based source-code context injection in simple chat. 0 disables.
     pub const AGENT_GRAPH_BUDGET_TOKENS: &str = "agent.graphBudgetTokens";
+
+    pub const AGENT_TOPOLOGY_ENABLED: &str = "agent.topology.enabled";
+    pub const AGENT_TOPOLOGY_MAX_DEPTH: &str = "agent.topology.maxDepth";
+    pub const AGENT_TOPOLOGY_MAX_DIRS: &str = "agent.topology.maxDirs";
+    pub const AGENT_TOPOLOGY_TOKEN_BUDGET: &str = "agent.topology.tokenBudget";
     /// Tool surface offered to the Claude subprocess via `--tools`.
     /// Anything outside this list is unavailable to the agent regardless
     /// of `--allowedTools`. Default omits `Bash` so agent writes flow
@@ -600,6 +605,33 @@ impl Workspace {
     /// The returned `ChatInjectionConfig` is the effective config after per-
     /// folder → workspace → user → defaults resolution. Callers at the chat
     /// entry point hand this to `memory::retrieve_for_chat`.
+    /// Resolve shallow `<repo_topology>` settings for the workspace root.
+    pub fn resolve_topology_config(&self, root: Option<&Path>) -> crate::repo_map::TopologyConfig {
+        let enabled = self
+            .resolve_setting(settings::AGENT_TOPOLOGY_ENABLED, root)
+            .as_bool()
+            .unwrap_or(true);
+        let max_depth = self
+            .resolve_setting(settings::AGENT_TOPOLOGY_MAX_DEPTH, root)
+            .as_u64()
+            .unwrap_or(2)
+            .min(u8::MAX as u64) as u8;
+        let max_dirs = self
+            .resolve_setting(settings::AGENT_TOPOLOGY_MAX_DIRS, root)
+            .as_u64()
+            .unwrap_or(64) as usize;
+        let max_token_budget = self
+            .resolve_setting(settings::AGENT_TOPOLOGY_TOKEN_BUDGET, root)
+            .as_u64()
+            .unwrap_or(600) as usize;
+        crate::repo_map::TopologyConfig {
+            enabled,
+            max_depth,
+            max_dirs,
+            max_token_budget,
+        }
+    }
+
     pub fn resolve_chat_injection_config(
         &self,
         root: Option<&Path>,

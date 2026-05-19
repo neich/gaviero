@@ -28,6 +28,7 @@ gaviero-core/src/
 ├─ repo_map/             Code knowledge graph (typed edges: Calls / Imports /
 │  ├─ store.rs           Tests / Implements), personalized PageRank,
 │  ├─ builder.rs         BlastRadiusMode, ImpactSummary, EdgeWeights,
+│  ├─ topology.rs        Shallow dir map for `<repo_topology>` (no tree-sitter)
 │  ├─ graph_builder.rs   SpecificityConfig
 │  └─ pagerank.rs
 ├─ acp/                  Claude subprocess (legacy ACP transport)
@@ -307,6 +308,8 @@ PlannerInput ──► ContextPlanner::plan ──► PlannerSelections
 ```
 
 The planner is the single owner of memory queries, graph selection, replay, and continuity. `ContinuityMode` ∈ `Stateless | StatelessReplay | ProcessBound`. `LegacyAgentSession` wraps `AcpPipeline` for byte-identical migration; per-provider impls replace it progressively (M5 shim ⇒ M6 Claude ⇒ M8 Codex ⇒ M9 Ollama ⇒ M10 deletion target).
+
+**Two-layer graph context (first turn):** `<repo_topology>` is a cheap filesystem-only folder map (`repo_map/topology.rs`, `agent.topology.*` budget, default 600 tokens). `<repo_outline>` is the ranked PageRank file list (`agent.graphBudgetTokens`, default 12k). `/lite` keeps topology and drops outline, memory, and impact. Mid-turn relational context stays on MCP `blast_radius`.
 
 `chat_memory::perform_injection` runs the per-turn retrieval inline; `chat_memory::enqueue_post_turn` schedules the S3 extractor + transcript writer through `WriterHandle`.
 

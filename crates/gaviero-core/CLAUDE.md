@@ -26,7 +26,7 @@ Network/model tests (Ollama, embedder downloads) are `#[ignore]` by default.
 | `scope_enforcer` | `FileScope` enforcement on agent proposals |
 | `path_pattern` | Glob-aware scope overlap detection (backs DSL scope validation) |
 | `session_state` | Checkpointable session state for resume |
-| `repo_map` | Code knowledge graph (tree-sitter driven) |
+| `repo_map` | Code knowledge graph (tree-sitter) + shallow `topology.rs` for `<repo_topology>` |
 | `tree_sitter` | 16-language registry, query loader |
 | `diff_engine` | Unified diff generation/application |
 | `git` | `git2` wrapper, worktrees, branches |

@@ -305,6 +305,17 @@ pub struct PlannerInput<'a> {
     /// single-folder mode. Length matches `extra_folder_paths` in chat
     /// usage but the planner does not require alignment.
     pub extra_repo_maps: &'a [&'a crate::repo_map::RepoMap],
+
+    /// Shallow directory map settings (`agent.topology.*`).
+    pub topology_config: crate::repo_map::TopologyConfig,
+
+    /// Pre-built topology body (chat/swarm prefetch). When `Some`, the
+    /// planner skips `build_folder_topology` for the primary root.
+    pub pre_fetched_topology: Option<&'a str>,
+
+    /// Additional topology blocks for multi-root `/workspace` mode.
+    /// Each entry is `(folder_label, body)` without XML tags.
+    pub extra_topology_blocks: &'a [(&'a str, &'a str)],
 }
 
 /// Memory selection record.
@@ -343,6 +354,8 @@ pub enum GraphSelectionKind {
     SignatureOnly,
     OutlineOnly,
     FullContent,
+    /// Shallow directory map (`<repo_topology>`).
+    Topology,
 }
 
 /// Graph selection record.
