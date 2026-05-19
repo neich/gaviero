@@ -91,12 +91,12 @@ fn ollama_spec_routes_to_stateless_replay_session() {
 }
 
 #[test]
-fn cursor_spec_routes_to_stateless_replay_session() {
-    // Cursor's phase-1 profile is StatelessReplay; this pins the routing
-    // dispatch so a future refactor can't mis-match the `cursor:` prefix
-    // to OllamaSession or LegacyAgentSession.
+fn cursor_spec_routes_to_native_resume_session() {
+    // Cursor's `agent --resume <chat-id>` makes it NativeResume; this
+    // pins the routing dispatch so a future refactor can't mis-match the
+    // `cursor:` prefix to ClaudeSession or OllamaSession.
     let session = create_session(construction_for("cursor:auto"));
-    assert_eq!(session.continuity_mode(), ContinuityMode::StatelessReplay);
+    assert_eq!(session.continuity_mode(), ContinuityMode::NativeResume);
 }
 
 #[test]
