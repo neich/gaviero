@@ -173,6 +173,13 @@ impl AcpObserver for TuiAcpObserver {
             token_budget: summary.token_budget,
         });
     }
+
+    fn on_turn_token_usage(&self, usage: &gaviero_core::acp::protocol::TokenUsage) {
+        let _ = self.tx.send(Event::TurnTokenUsage {
+            conv_id: self.conv_id.clone(),
+            usage: usage.clone(),
+        });
+    }
 }
 
 /// A4: forwards `MemoryObserver` callbacks from the writer task to the
