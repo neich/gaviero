@@ -1,0 +1,10 @@
+// Default tier bindings for update_docs.gaviero (Claude opus + sonnet).
+//
+// Override at runtime without editing the workflow:
+//   gaviero-cli --script update_docs.gaviero \
+//     --tiers-file crates/gaviero-dsl/examples/profiles/doc-codex.gaviero
+
+tier inventory          opus
+tier writer_deep        opus
+tier writer_standard    sonnet
+tier recorder           sonnet
