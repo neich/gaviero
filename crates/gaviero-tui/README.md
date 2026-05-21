@@ -70,7 +70,8 @@ Example `.gaviero/settings.json`:
 {
   "editor": {
     "tabSize": 4,
-    "insertSpaces": true
+    "insertSpaces": true,
+    "wordWrap": false
   },
   "agent": {
     "model": "claude:sonnet",
