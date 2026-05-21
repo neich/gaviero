@@ -19,10 +19,10 @@ Binary name: `gaviero`
 
 The TUI combines multiple editing and collaboration features:
 
-- **Multi-tab editor** — Ropey-based rope buffer with syntax highlighting, undo/redo, search
+- **Multi-tab editor** — Ropey-based rope buffer with syntax highlighting, word wrap, undo/redo, search
 - **File tree** — Navigate and open files from a left panel
 - **Git panel** — Stage/unstage, commit, branch management, diff review
-- **Agent chat** — Talk to Claude agents with file context and streaming output
+- **Agent chat** — Talk to Claude agents with file context, streaming output, and context-pressure indicators
 - **Swarm dashboard** — Monitor multi-agent tasks, view logs, check timing and cost
 - **Memory panel** — Inspect stored memories, query by scope, trigger consolidation, audit retrieval manifests
 - **Search panel** — Workspace-wide search with results navigation
@@ -45,15 +45,20 @@ Type these in the agent chat panel to control execution:
 
 | Command | Purpose |
 |---|---|
-| `/model <spec>` | Switch active model (e.g., `sonnet`, `ollama:qwen2.5-coder:7b`) |
+| `/model <spec>` | Switch active model (e.g., `claude:sonnet`, `ollama:qwen2.5-coder:7b`) |
+| `/set-model <spec>` | Alias for `/model` |
 | `/run <file.gaviero>` | Compile and execute a DSL workflow |
 | `/run <file> <prompt>` | Execute with runtime prompt substitution |
 | `/swarm <task>` | Immediate multi-agent swarm (auto-decomposed) |
-| `/cswarm <task>` | Generate a reviewable coordinated plan (.gaviero file) |
+| `/cswarm <task>` | Generate a reviewable coordinated plan (`.gaviero` file) |
 | `/undo-swarm` | Revert the last swarm result |
 | `/remember <text>` | Store a fact in semantic memory |
+| `/forget <query>` | Soft-delete memories matching the query |
 | `/attach <path>` | Include a file in chat context |
 | `/detach <name\|all>` | Remove attachments |
+| `/lite` | Send a minimal-context turn (topology kept; outline, memory, and impact dropped) |
+| `/clear` | Clear conversation history |
+| `/compact` | Trim conversation history while preserving key context |
 
 ## Configuration
 
@@ -87,6 +92,8 @@ Example `.gaviero/settings.json`:
 }
 ```
 
+Toggle word wrap at runtime with **Alt+Z**; the status bar shows a `[W]` indicator when it is active.
+
 ## API / Architecture
 
 The TUI implements three observer interfaces from `gaviero-core`:
@@ -101,21 +108,33 @@ Each observer sends events to the main event loop as `Event` variants, which are
 
 No background tasks mutate the `App` struct directly. All state changes flow through the event channel.
 
-### Key keybindings
+### Keybindings
 
 | Context | Keys | Action |
 |---|---|---|
+| Workspace | Alt+1 / Alt+2 / Alt+3 / Alt+4 | Focus left panel / editor / side panel / terminal |
+| Workspace | Ctrl+b | Show/hide file tree |
+| Workspace | Ctrl+p | Show/hide side panel |
+| Workspace | F11 | Toggle fullscreen for current panel |
+| Workspace | Alt+Shift+1–6 | Switch layout preset |
+| Side panels | Alt+a | Agent Chat panel |
+| Side panels | Alt+w | Swarm Dashboard panel |
+| Side panels | Alt+g | Git panel |
+| Left panel modes | Alt+e | Explorer (file tree) |
+| Left panel modes | Alt+f | Find (workspace search) |
+| Left panel modes | Alt+c | Changes (git diff list) |
 | Editor | Ctrl+S | Save |
 | Editor | Ctrl+Z / Ctrl+Y | Undo / Redo |
 | Editor | Ctrl+F | Find in file |
-| Workspace | Alt+1/2/3/4 | Focus left / editor / right / terminal |
-| Workspace | Alt+a / Alt+w / Alt+g | Chat / Swarm / Git panel |
-| Terminal | Ctrl+J / F4 | Toggle bottom panel |
-| Terminal | Ctrl+T | New terminal tab (when focus is on terminal) |
-| Terminal | Ctrl+W | Close active terminal tab |
+| Editor | F3 | Next match (in-file) / workspace search (no find bar) |
+| Editor | Alt+Z | Toggle word wrap |
+| Editor | Ctrl+T / Ctrl+W | New tab / close tab |
+| Editor | Alt+[ / Alt+] | Cycle tabs |
+| Terminal | Ctrl+J / F4 | Toggle bottom terminal panel |
 | Diff review | `]h` / `[h` | Next / previous hunk |
 | Diff review | `a` / `r` | Accept / reject current hunk |
 | Diff review | `A` / `R` | Accept / reject all |
 | Diff review | `f` | Finalize (write to disk) |
+| Diff review | `q` | Exit review |
 
 See the root [README.md](../../README.md) for a complete keybinding reference.
