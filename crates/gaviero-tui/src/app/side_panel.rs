@@ -2249,7 +2249,7 @@ pub(super) fn send_chat_message(app: &mut App) {
         // contributes only TUI-specific bits: emitting the
         // `ChatMemoryInjected` event for the panel and supplying
         // workspace-resolved configs.
-        let chat_injection: Option<gaviero_core::memory::ChatInjection> =
+        let (chat_injection, memory_tok) =
             if bootstrap_graph && memory.is_some() {
                 let mem = memory.as_ref().expect("checked above");
                 let reranker_ref: Option<&dyn gaviero_core::memory::Reranker> =
@@ -2281,9 +2281,9 @@ pub(super) fn send_chat_message(app: &mut App) {
                     tokens_used: outcome.summary.tokens_used,
                     token_budget: outcome.summary.token_budget,
                 });
-                outcome.injection
+                (outcome.injection, outcome.summary.tokens_used)
             } else {
-                None
+                (None, 0)
             };
 
         // V9 §11 M5: lift `PlannerSelections` into a transport `Turn` and
@@ -2338,6 +2338,26 @@ pub(super) fn send_chat_message(app: &mut App) {
         // MemorySelection. Provider-agnostic; lives in core so CLI
         // callers do the same thing.
         gaviero_core::context_planner::splice_into_selections(chat_injection, &mut selections);
+
+        let file_ref_tok: usize = selections
+            .file_refs
+            .iter()
+            .filter_map(|f| f.content.as_ref())
+            .map(|c| c.len().div_ceil(4))
+            .sum();
+        let bootstrap_measured = if bootstrap_graph || bootstrap_topology {
+            selections
+                .metadata
+                .graph_token_estimate
+                .saturating_add(memory_tok)
+                .saturating_add(file_ref_tok)
+        } else {
+            0
+        };
+        let _ = tx.send(crate::event::Event::TurnBootstrapMeasured {
+            conv_id: conv_id_clone.clone(),
+            tokens: bootstrap_measured,
+        });
 
         let transport_ctx = gaviero_core::agent_session::TransportContext {
             user_message: prompt.clone(),
