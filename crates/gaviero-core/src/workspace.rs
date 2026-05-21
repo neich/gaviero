@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 pub mod settings {
     pub const TAB_SIZE: &str = "editor.tabSize";
     pub const INSERT_SPACES: &str = "editor.insertSpaces";
+    pub const WORD_WRAP: &str = "editor.wordWrap";
     pub const FORMAT_ON_SAVE: &str = "editor.formatOnSave";
     pub const FILES_EXCLUDE: &str = "files.exclude";
     pub const FILE_TREE_WIDTH: &str = "panels.fileTree.width";
