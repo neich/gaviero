@@ -589,16 +589,14 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
 
     let model = app.chat_state.effective_model().to_string();
     let effort = app.chat_state.effective_effort();
-    let (tokens, _ctx_pct) = app.chat_state.estimate_context();
-    let ctx_size = if tokens >= 1000 {
-        format!("{}K", tokens / 1000)
+    let pressure = app.chat_state.context_pressure();
+    let approx = if pressure.is_approximate() { "~" } else { "" };
+    let ctx_size = if pressure.tokens >= 1000 {
+        format!("{}{}K", approx, pressure.tokens / 1000)
     } else {
-        tokens.to_string()
+        format!("{}{}", approx, pressure.tokens)
     };
-    // Indicator is always a local word-count estimate (`~` prefix). Provider
-    // usage is shown via `/context` when available — see
-    // `AgentChatState::estimate_context` for why we don't surface it here.
-    let model_info = format!("{}|{} ctx:~{}", model, effort, ctx_size);
+    let model_info = format!("{}|{} ctx:{}", model, effort, ctx_size);
 
     let current_buffer = if app.focus == Focus::Editor {
         app.buffers.get(app.active_buffer)
@@ -914,28 +912,10 @@ pub(super) fn render_side_panel(app: &mut App, frame: &mut Frame, area: Rect) {
     }
 }
 
-pub(super) fn update_cursor_position(app: &App, frame: &mut Frame, editor_area: Rect) {
-    if app.diff_review.is_some() {
-        return;
-    }
-    if app.focus != Focus::Editor || app.buffers.is_empty() {
-        return;
-    }
-
-    let buf = &app.buffers[app.active_buffer];
-    let gutter_w = gutter_width(buf.line_count());
-    let cursor_line = buf.cursor.line;
-    let cursor_col = buf.cursor.col;
-    let top = buf.scroll.top_line;
-    let left = buf.scroll.left_col;
-
-    if cursor_line >= top && cursor_line < top + editor_area.height as usize && cursor_col >= left {
-        let x = editor_area.x + gutter_w + (cursor_col - left) as u16;
-        let y = editor_area.y + (cursor_line - top) as u16;
-        if x < editor_area.right() && y < editor_area.bottom() {
-            frame.set_cursor_position((x, y));
-        }
-    }
+pub(super) fn update_cursor_position(_app: &App, _frame: &mut Frame, _editor_area: Rect) {
+    // Editor caret is drawn in-buffer by `EditorView::render_cursor` (styled cell).
+    // Do not call `frame.set_cursor_position` here — it duplicates the caret and uses
+    // logical line/col, which is wrong when word wrap maps to visual rows.
 }
 
 pub(super) fn render_quit_confirm(app: &App, frame: &mut Frame, area: Rect) {
