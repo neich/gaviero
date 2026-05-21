@@ -64,6 +64,7 @@ pub enum Action {
     DeleteWordBack,
     FormatBuffer,
     CycleFormatLevel,
+    ToggleWordWrap,
     FindInBuffer,
     SearchInWorkspace,
 
@@ -113,6 +114,7 @@ impl Keymap {
             KeyCode::Char('w') if ctrl => Action::CloseTab,
             KeyCode::Char('s') if ctrl => Action::Save,
             KeyCode::Char('f') if ctrl => Action::FindInBuffer,
+            KeyCode::Char('z') if alt => Action::ToggleWordWrap,
 
             KeyCode::Char('z') if ctrl => Action::Undo,
             KeyCode::Char('y') if ctrl => Action::Redo,
