@@ -1,8 +1,9 @@
-// `tier` is intentionally omitted from each client below: every agent in this
-// script binds to a concrete client by name (e.g. `client opus`), so a tier
-// label on the client block would be dead metadata. Tier labels only matter
-// when paired with a top-level `tier <alias> <client>` declaration *and*
-// agents that reference the alias via `tier <name>`.
+// Shared client profiles for example workflows.
+//
+// Model strings use the canonical `provider:model` form (validated at
+// dispatch by gaviero-core). `tier` is omitted here: these examples bind
+// agents to concrete clients by name (`client opus`). Add top-level
+// `tier <alias> <client>` declarations when you want re-pointable routing.
 
 client opus {
     model "claude:opus"
@@ -15,7 +16,7 @@ client sonnet {
     model "claude:sonnet"
     privacy public
     // The judge emits a short JSON verdict — no deep reasoning needed.
-    effort normal
+    effort medium
 }
 
 client codex-5-5 {
@@ -32,3 +33,8 @@ client codex-5-4 {
     effort medium
 }
 
+client composer {
+    model "cursor:composer-2.5"
+    privacy public
+    effort medium
+}
