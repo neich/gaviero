@@ -19,7 +19,7 @@ gaviero-dsl/src/
 └─ error.rs     DslError / DslErrors — miette diagnostics with source spans
 ```
 
-Tests in `tests/compile.rs`. 12 example scripts in `examples/` cover every advanced feature (`prompt`, top-level `vars`, `tier`-alias, loops, `extra` pass-through, glob-disjoint scopes).
+Tests in `tests/compile.rs`. Six example scripts in `examples/` cover every advanced feature (`include`, `prompt`, top-level `vars`, `tier`-alias, loops with `branch_chain`, judge controls, `extra` pass-through, glob-disjoint scopes, `memory {}`).
 
 ---
 
@@ -69,12 +69,14 @@ pub fn compile_with_vars(
     workflow: Option<&str>,
     runtime_prompt: Option<&str>,
     override_vars: &[(String, String)],
+    override_tiers: &[(String, String)],
 ) -> Result<CompiledPlan, miette::Report>;
 ```
 
 - `workflow`: select by name when the file declares multiple.
 - `runtime_prompt`: substitutes every `{{PROMPT}}`; also acts as the full prompt for agents without a `prompt` field.
 - `override_vars`: replace entries in the top-level `vars {}` (used by `gaviero-cli --var KEY=VALUE`). Agent-level `vars` still win; `AGENT` and `PROMPT` are reserved.
+- `override_tiers`: replace `tier <alias> <client>` bindings (used by `gaviero-cli --tiers-file`). CLI profile beats script/includes. `load_tier_overrides(path)` parses profile files.
 
 Output is `gaviero_core::swarm::plan::CompiledPlan` — no transformation needed before execution.
 
@@ -258,7 +260,7 @@ src/foo.rs   *.rs   **/*.py                 // path globs
 
 ### Loop
 
-`agents`, `max_iterations`, `iter_start`, `stability`, `judge_timeout`, `strict_judge`, `until verify { ... }` | `until agent <name>` | `until command <string>`.
+`agents`, `max_iterations`, `iter_start`, `stability`, `judge_timeout`, `strict_judge`, `branch_chain` (`none` | `stacked`), `until { compile … }` | `until agent <name>` | `until command <string>`.
 
 ---
 
@@ -287,4 +289,4 @@ Compilation is single-threaded, no async, no locks. All errors return `Result`; 
 
 ---
 
-See [CLAUDE.md](CLAUDE.md) for build & conventions, and the examples in `examples/` (`plan_refinement.gaviero`, `update_docs.gaviero`, `phased_plan.gaviero`, `security_audit_memory.gaviero`, `sync_memory.gaviero`, …) for `prompt`, `vars`, `tier`-alias, loop, and `extra` usage.
+See [CLAUDE.md](CLAUDE.md) for build & conventions, and the examples in `examples/` (`clients.gaviero`, `plan_refinement.gaviero`, `phased_plan.gaviero`, `codebase_review.gaviero`, `update_docs.gaviero`, `security_audit_memory.gaviero`) for `include`, `prompt`, `vars`, loops, `branch_chain`, and `memory` usage.
