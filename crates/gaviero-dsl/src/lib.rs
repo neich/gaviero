@@ -4,6 +4,7 @@ pub mod error;
 pub mod lexer;
 pub mod parser;
 pub mod resolver;
+pub mod tiers;
 
 // Re-export `CompiledPlan` as the primary output type.
 pub use gaviero_core::swarm::plan::CompiledPlan;
@@ -11,6 +12,7 @@ pub use gaviero_core::swarm::plan::CompiledPlan;
 #[allow(deprecated)]
 pub use compiler::CompiledScript;
 pub use error::{DslError, DslErrors};
+pub use tiers::load_tier_overrides;
 
 /// Compile a `.gaviero` DSL script into a [`CompiledPlan`].
 ///
@@ -35,7 +37,7 @@ pub fn compile(
     workflow: Option<&str>,
     runtime_prompt: Option<&str>,
 ) -> Result<CompiledPlan, miette::Report> {
-    compile_with_vars(source, filename, workflow, runtime_prompt, &[])
+    compile_with_vars(source, filename, workflow, runtime_prompt, &[], &[])
 }
 
 /// Like [`compile`] but accepts variable overrides that take precedence over
@@ -49,6 +51,7 @@ pub fn compile_with_vars(
     workflow: Option<&str>,
     runtime_prompt: Option<&str>,
     override_vars: &[(String, String)],
+    override_tiers: &[(String, String)],
 ) -> Result<CompiledPlan, miette::Report> {
     use miette::NamedSource;
 
@@ -83,6 +86,7 @@ pub fn compile_with_vars(
         workflow,
         runtime_prompt,
         override_vars,
+        override_tiers,
     )
     .map_err(|e| miette::Report::new(e))
 }
@@ -103,8 +107,16 @@ pub fn compile_file(
     workflow: Option<&str>,
     runtime_prompt: Option<&str>,
     override_vars: &[(String, String)],
+    override_tiers: &[(String, String)],
 ) -> Result<CompiledPlan, miette::Report> {
     let (script, sources) = resolver::resolve(entry_path).map_err(miette::Report::new)?;
-    compiler::compile_ast_with_sources(&script, &sources, workflow, runtime_prompt, override_vars)
-        .map_err(miette::Report::new)
+    compiler::compile_ast_with_sources(
+        &script,
+        &sources,
+        workflow,
+        runtime_prompt,
+        override_vars,
+        override_tiers,
+    )
+    .map_err(miette::Report::new)
 }
