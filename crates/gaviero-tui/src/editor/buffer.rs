@@ -104,6 +104,8 @@ pub struct Buffer {
     pub undo_stack: Vec<Transaction>,
     pub redo_stack: Vec<Transaction>,
     parser: Option<Parser>,
+    /// When true, long lines wrap to the viewport width instead of horizontal scroll.
+    pub word_wrap: bool,
     /// Tab display width (from settings, default 4).
     pub tab_width: u8,
     /// String used for one indent level (from settings, default "    ").
@@ -139,6 +141,7 @@ impl Buffer {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             parser: None,
+            word_wrap: false,
             tab_width: 4,
             indent_unit: "    ".to_string(),
             indent_query: None,
@@ -185,6 +188,7 @@ impl Buffer {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             parser,
+            word_wrap: false,
             tab_width: 4,
             indent_unit: "    ".to_string(),
             indent_query: None,
@@ -247,6 +251,7 @@ impl Buffer {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             parser,
+            word_wrap: false,
             tab_width: 4,
             indent_unit: "    ".to_string(),
             indent_query: None,
@@ -485,6 +490,66 @@ impl Buffer {
         char_idx
     }
 
+    /// Convert a char-index column to a visual column (expanding tabs).
+    pub fn char_col_to_visual(&self, line: usize, char_col: usize) -> usize {
+        let tab_width = self.tab_width as usize;
+        let rope_line = self.text.line(line);
+        let mut visual = 0;
+        for (i, ch) in rope_line.chars().enumerate() {
+            if i >= char_col || ch == '\n' || ch == '\r' {
+                break;
+            }
+            if ch == '\t' {
+                visual = (visual / tab_width + 1) * tab_width;
+            } else {
+                visual += UnicodeWidthChar::width(ch).unwrap_or(1);
+            }
+        }
+        visual
+    }
+
+    pub fn wrap_layout(&self, content_width: usize) -> super::wrap::WrapLayout {
+        super::wrap::WrapLayout::build(self, content_width)
+    }
+
+    /// Lines used for vertical scroll (visual rows when wrap is on, else logical).
+    pub fn scroll_line_count(&self, content_width: usize) -> usize {
+        if self.word_wrap && content_width > 0 {
+            self.wrap_layout(content_width).len()
+        } else {
+            self.line_count()
+        }
+    }
+
+    pub fn toggle_word_wrap(&mut self) -> bool {
+        self.word_wrap = !self.word_wrap;
+        self.scroll.left_col = 0;
+        self.word_wrap
+    }
+
+    fn move_cursor_vertical_wrapped(&mut self, delta: i32, content_width: usize, select: bool) {
+        let layout = self.wrap_layout(content_width);
+        if layout.segments.is_empty() {
+            return;
+        }
+        let (vline, seg_col) = layout.cursor_segment(self.cursor.line, self.cursor.col);
+        let target_vline = if delta < 0 {
+            vline.saturating_sub(1)
+        } else {
+            (vline + 1).min(layout.len().saturating_sub(1))
+        };
+        if target_vline == vline {
+            return;
+        }
+        let seg = &layout.segments[target_vline];
+        let target_col = seg_col.min(seg.end_col.saturating_sub(seg.start_col));
+        self.cursor.line = seg.logical_line;
+        self.cursor.col = seg.start_col + target_col;
+        if !select {
+            self.cursor.anchor = None;
+        }
+    }
+
     /// Get the leading whitespace of the current line.
     fn current_line_indent(&self) -> String {
         let line = self.text.line(self.cursor.line);
@@ -583,7 +648,11 @@ impl Buffer {
     }
 
     /// Move cursor in a direction.
-    pub fn move_cursor_up(&mut self) {
+    pub fn move_cursor_up(&mut self, content_width: usize) {
+        if self.word_wrap && content_width > 0 {
+            self.move_cursor_vertical_wrapped(-1, content_width, false);
+            return;
+        }
         if self.cursor.line > 0 {
             self.cursor.line -= 1;
             self.cursor.col = self.cursor.col.min(self.line_len(self.cursor.line));
@@ -591,7 +660,11 @@ impl Buffer {
         self.cursor.anchor = None;
     }
 
-    pub fn move_cursor_down(&mut self) {
+    pub fn move_cursor_down(&mut self, content_width: usize) {
+        if self.word_wrap && content_width > 0 {
+            self.move_cursor_vertical_wrapped(1, content_width, false);
+            return;
+        }
         if self.cursor.line < self.text.len_lines().saturating_sub(1) {
             self.cursor.line += 1;
             self.cursor.col = self.cursor.col.min(self.line_len(self.cursor.line));
@@ -631,16 +704,24 @@ impl Buffer {
     }
 
     /// Select (shift+arrow) variants — set anchor then move.
-    pub fn select_up(&mut self) {
+    pub fn select_up(&mut self, content_width: usize) {
         self.ensure_anchor();
+        if self.word_wrap && content_width > 0 {
+            self.move_cursor_vertical_wrapped(-1, content_width, true);
+            return;
+        }
         if self.cursor.line > 0 {
             self.cursor.line -= 1;
             self.cursor.col = self.cursor.col.min(self.line_len(self.cursor.line));
         }
     }
 
-    pub fn select_down(&mut self) {
+    pub fn select_down(&mut self, content_width: usize) {
         self.ensure_anchor();
+        if self.word_wrap && content_width > 0 {
+            self.move_cursor_vertical_wrapped(1, content_width, true);
+            return;
+        }
         if self.cursor.line < self.text.len_lines().saturating_sub(1) {
             self.cursor.line += 1;
             self.cursor.col = self.cursor.col.min(self.line_len(self.cursor.line));
@@ -747,14 +828,40 @@ impl Buffer {
     }
 
     /// Page up/down — move cursor and viewport by viewport_height lines.
-    pub fn page_up(&mut self, viewport_height: usize) {
+    pub fn page_up(&mut self, viewport_height: usize, content_width: usize) {
+        if self.word_wrap && content_width > 0 {
+            let layout = self.wrap_layout(content_width);
+            let (vline, _) = layout.cursor_segment(self.cursor.line, self.cursor.col);
+            let target = vline.saturating_sub(viewport_height);
+            if let Some(seg) = layout.segment_at(target) {
+                self.cursor.line = seg.logical_line;
+                self.cursor.col = seg.start_col;
+            }
+            self.cursor.anchor = None;
+            self.scroll.top_line = self.scroll.top_line.saturating_sub(viewport_height);
+            return;
+        }
         self.cursor.line = self.cursor.line.saturating_sub(viewport_height);
         self.cursor.col = self.cursor.col.min(self.line_len(self.cursor.line));
         self.cursor.anchor = None;
         self.scroll.top_line = self.scroll.top_line.saturating_sub(viewport_height);
     }
 
-    pub fn page_down(&mut self, viewport_height: usize) {
+    pub fn page_down(&mut self, viewport_height: usize, content_width: usize) {
+        if self.word_wrap && content_width > 0 {
+            let layout = self.wrap_layout(content_width);
+            let (vline, _) = layout.cursor_segment(self.cursor.line, self.cursor.col);
+            let max_v = layout.len().saturating_sub(1);
+            let target = (vline + viewport_height).min(max_v);
+            if let Some(seg) = layout.segment_at(target) {
+                self.cursor.line = seg.logical_line;
+                self.cursor.col = seg.start_col;
+            }
+            self.cursor.anchor = None;
+            let max_scroll = layout.len().saturating_sub(viewport_height);
+            self.scroll.top_line = (self.scroll.top_line + viewport_height).min(max_scroll);
+            return;
+        }
         let max_line = self.text.len_lines().saturating_sub(1);
         self.cursor.line = (self.cursor.line + viewport_height).min(max_line);
         self.cursor.col = self.cursor.col.min(self.line_len(self.cursor.line));
@@ -763,10 +870,25 @@ impl Buffer {
     }
 
     /// Ensure the cursor is visible in the viewport.
-    pub fn ensure_cursor_visible(&mut self, viewport_height: usize, viewport_width: usize) {
-        // Vertical — keep at least MARGIN lines of context above/below cursor
+    pub fn ensure_cursor_visible(&mut self, viewport_height: usize, content_width: usize) {
         const VERTICAL_SCROLL_MARGIN: usize = 3;
         let margin = VERTICAL_SCROLL_MARGIN.min(viewport_height / 2);
+
+        if self.word_wrap && content_width > 0 {
+            self.scroll.left_col = 0;
+            let layout = self.wrap_layout(content_width);
+            let (vline, _) = layout.cursor_segment(self.cursor.line, self.cursor.col);
+            if vline < self.scroll.top_line + margin {
+                self.scroll.top_line = vline.saturating_sub(margin);
+            }
+            if vline + margin >= self.scroll.top_line + viewport_height {
+                self.scroll.top_line = (vline + margin + 1).saturating_sub(viewport_height);
+            }
+            let max_scroll = layout.len().saturating_sub(viewport_height);
+            self.scroll.top_line = self.scroll.top_line.min(max_scroll);
+            return;
+        }
+
         if self.cursor.line < self.scroll.top_line + margin {
             self.scroll.top_line = self.cursor.line.saturating_sub(margin);
         }
@@ -774,14 +896,14 @@ impl Buffer {
             self.scroll.top_line = (self.cursor.line + margin + 1).saturating_sub(viewport_height);
         }
 
-        // Horizontal scroll margin — keep cursor this far from the edge
         const HORIZONTAL_SCROLL_MARGIN: usize = 8;
-        let margin = HORIZONTAL_SCROLL_MARGIN;
-        if self.cursor.col < self.scroll.left_col {
-            self.scroll.left_col = self.cursor.col;
+        let h_margin = HORIZONTAL_SCROLL_MARGIN;
+        let visual_col = self.char_col_to_visual(self.cursor.line, self.cursor.col);
+        if visual_col < self.scroll.left_col {
+            self.scroll.left_col = visual_col;
         }
-        if self.cursor.col >= self.scroll.left_col + viewport_width.saturating_sub(margin) {
-            self.scroll.left_col = self.cursor.col.saturating_sub(viewport_width - margin - 1);
+        if visual_col >= self.scroll.left_col + content_width.saturating_sub(h_margin) {
+            self.scroll.left_col = visual_col.saturating_sub(content_width.saturating_sub(h_margin + 1));
         }
     }
 
@@ -2541,7 +2663,7 @@ mod tests {
         buf.text = Rope::from_str("hello\nworld\n");
         buf.move_cursor_right();
         assert_eq!(buf.cursor.col, 1);
-        buf.move_cursor_down();
+        buf.move_cursor_down(80);
         assert_eq!(buf.cursor.line, 1);
         buf.move_cursor_end();
         assert_eq!(buf.cursor.col, 5);
