@@ -53,6 +53,7 @@ Gaviero works as a standalone editor even without AI features. Use it for everyd
 | Ctrl+h or Ctrl+Backspace | Delete word backward |
 | Ctrl+Delete | Delete to end of line |
 | F5 | Format buffer |
+| Alt+z | Toggle word wrap |
 
 ### Finding text
 
@@ -302,7 +303,7 @@ Settings cascade through these priority levels (highest to lowest):
 
 ```json
 {
-  "editor": { "tabSize": 4, "insertSpaces": true },
+  "editor": { "tabSize": 4, "insertSpaces": true, "wordWrap": false },
   "files": { "exclude": { "target": true, "node_modules": true } },
   "agent": { "model": "claude:sonnet", "maxTokens": 16384 },
   "memory": { "namespace": "my-project" },

@@ -132,6 +132,7 @@ Ollama server URL precedence:
 | `--script` | `<path>` | `.gaviero` DSL workflow file |
 | `--prompt-file` | `<path>` | File whose contents replace `{{PROMPT}}` in DSL script (requires `--script`) |
 | `--var` | `KEY=VALUE` | Override a `vars {}` entry in a DSL script (repeatable, requires `--script`) |
+| `--tiers-file` | `<path>` | Tier profile (only `tier <role> <client>` lines); overrides tier bindings from the script (requires `--script`) |
 | `--work-units` | `<json>` | Explicit work unit definitions |
 | `--coordinated` | — | Generate reviewable plan, don't execute |
 | `--output` | `<path>` | Save generated plan to file (`--coordinated`) |

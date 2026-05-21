@@ -32,7 +32,7 @@ pub fn compile_ast(
     workflow: Option<&str>,
     runtime_prompt: Option<&str>,
 ) -> Result<CompiledPlan, DslErrors> {
-    compile_ast_with_vars(script, source, filename, workflow, runtime_prompt, &[])
+    compile_ast_with_vars(script, source, filename, workflow, runtime_prompt, &[], &[])
 }
 
 /// Like [`compile_ast`] but accepts additional variable overrides that take
@@ -44,9 +44,17 @@ pub fn compile_ast_with_vars(
     workflow: Option<&str>,
     runtime_prompt: Option<&str>,
     override_vars: &[(String, String)],
+    override_tiers: &[(String, String)],
 ) -> Result<CompiledPlan, DslErrors> {
     let sources = vec![(filename.to_string(), source.to_string())];
-    compile_ast_with_sources(script, &sources, workflow, runtime_prompt, override_vars)
+    compile_ast_with_sources(
+        script,
+        &sources,
+        workflow,
+        runtime_prompt,
+        override_vars,
+        override_tiers,
+    )
 }
 
 /// Compile a script that may have been assembled from multiple files (one per
@@ -62,6 +70,7 @@ pub fn compile_ast_with_sources(
     workflow: Option<&str>,
     runtime_prompt: Option<&str>,
     override_vars: &[(String, String)],
+    override_tiers: &[(String, String)],
 ) -> Result<CompiledPlan, DslErrors> {
     if sources.is_empty() {
         return Err(DslErrors::single(DslError::Compile {
@@ -201,12 +210,23 @@ pub fn compile_ast_with_sources(
         }
     }
 
-    // ── Validate tier alias client references ─────────────────────
+    // ── Effective tier bindings (script/profile + CLI `--tiers-file`) ──
     //
-    // Done here (not inside compile_agent) so the error is attached to the
-    // alias declaration rather than each agent that references it.
-    for ta in tier_alias_map.values() {
-        if !client_map.contains_key(ta.client_ref.as_str()) {
+    // CLI overrides win over `tier` lines from the script and its includes.
+    let mut effective_tier_bindings: HashMap<String, String> = tier_alias_map
+        .values()
+        .map(|ta| (ta.name.clone(), ta.client_ref.clone()))
+        .collect();
+    for (alias, client_ref) in override_tiers {
+        effective_tier_bindings.insert(alias.clone(), client_ref.clone());
+    }
+
+    // Validate every binding resolves to a declared client.
+    for (alias, client_ref) in &effective_tier_bindings {
+        if client_map.contains_key(client_ref.as_str()) {
+            continue;
+        }
+        if let Some(ta) = tier_alias_map.get(alias.as_str()) {
             errors.push(DslError::Compile {
                 src: src_for(ta.file_id),
                 span: (
@@ -219,7 +239,17 @@ pub fn compile_ast_with_sources(
                     .into(),
                 reason: format!(
                     "tier alias `{}` references undefined client `{}`",
-                    ta.name, ta.client_ref
+                    alias, client_ref
+                ),
+            });
+        } else {
+            errors.push(DslError::Compile {
+                src: src(),
+                span: (0, 0).into(),
+                reason: format!(
+                    "tier override `{}` → `{}` references undefined client `{}` \
+                     (declare the client in the main script, usually via `include`)",
+                    alias, client_ref, client_ref
                 ),
             });
         }
@@ -293,7 +323,7 @@ pub fn compile_ast_with_sources(
         match compile_agent(
             decl,
             &client_map,
-            &tier_alias_map,
+            &effective_tier_bindings,
             default_client,
             &prompt_map,
             &script_vars,
@@ -311,7 +341,7 @@ pub fn compile_ast_with_sources(
         match compile_agent(
             decl,
             &client_map,
-            &tier_alias_map,
+            &effective_tier_bindings,
             default_client,
             &prompt_map,
             &script_vars,
@@ -691,7 +721,7 @@ fn apply_vars(
 fn compile_agent(
     decl: &AgentDecl,
     client_map: &HashMap<&str, &ClientDecl>,
-    tier_alias_map: &HashMap<&str, &TierAlias>,
+    effective_tier_bindings: &HashMap<String, String>,
     default_client: Option<&ClientDecl>,
     prompt_map: &HashMap<&str, &str>,
     script_vars: &[(String, String)],
@@ -745,7 +775,7 @@ fn compile_agent(
             })?;
         Some(cd)
     } else if let Some((tier_name, tier_span)) = &decl.tier_ref {
-        let alias = tier_alias_map
+        let client_ref = effective_tier_bindings
             .get(tier_name.as_str())
             .ok_or_else(|| DslError::Compile {
                 src: src(),
@@ -759,10 +789,21 @@ fn compile_agent(
                     decl.name, tier_name
                 ),
             })?;
-        // The alias's client_ref validity was already checked in phase 1.
-        // Re-lookup here is a contract: tier_alias_map values only reach
-        // this point if their client_ref resolves.
-        Some(client_map[alias.client_ref.as_str()])
+        let cd = client_map.get(client_ref.as_str()).ok_or_else(|| {
+            DslError::Compile {
+                src: src(),
+                span: (
+                    tier_span.start,
+                    tier_span.end.saturating_sub(tier_span.start).max(1),
+                )
+                    .into(),
+                reason: format!(
+                    "tier alias `{}` references undefined client `{}`",
+                    tier_name, client_ref
+                ),
+            }
+        })?;
+        Some(*cd)
     } else {
         default_client
     };

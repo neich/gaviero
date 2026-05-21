@@ -7,11 +7,13 @@
 // No verification loop needed: documentation changes don't break builds.
 //
 // Usage:
-//   gaviero-cli --script update_docs.gaviero
+//   gaviero-cli --script crates/gaviero-dsl/examples/update_docs.gaviero
+//
+// Swap model combinations via a tiers profile (semantic role → client):
+//   gaviero-cli --script .../update_docs.gaviero \
+//     --tiers-file .../profiles/doc-codex.gaviero
 
-// Clients (opus, sonnet, haiku, codex, local) and tier aliases
-// (cheap → sonnet, expensive → opus) come from the shared library.
-// To tune opus reasoning depth, override locally (see clients.gaviero).
+// Client pool + default tier bindings (override with --tiers-file).
 include "clients.gaviero"
 
 // ── Shared configuration ──────────────────────────────────────────────────────
@@ -20,7 +22,7 @@ include "clients.gaviero"
 // and applied across all agents.
 
 vars {
-    CRATES_LIST          "gaviero-core gaviero-dsl gaviero-tui gaviero-cli"
+    CRATES_LIST          "gaviero-core gaviero-dsl gaviero-tui gaviero-cli gaviero-mcp-shim tree-sitter-gaviero"
     ROOT_DOCS            "CLAUDE.md README.md ARCHITECTURE.md"
     INVENTORY_REPORT     ".gaviero/docs-inventory.md"
 }
@@ -67,7 +69,7 @@ prompt doc_write_body #"
 
 agent inventory {
     description "Inventory all crates and their documentation state"
-    client opus
+    tier inventory
     scope {
         read_only [
             "src/" "crates/" "Cargo.toml"
@@ -109,7 +111,7 @@ The fixed context injected into every AI prompt. It must contain:
         "#
     }
     description "Rewrite {{DOC_NAME}} for all crates: {{PROMPT}}"
-    client opus
+    tier writer_deep
     depends_on [inventory]
     scope {
         owned     [
@@ -118,6 +120,8 @@ The fixed context injected into every AI prompt. It must contain:
             "crates/gaviero-dsl/{{DOC_NAME}}"
             "crates/gaviero-tui/{{DOC_NAME}}"
             "crates/gaviero-cli/{{DOC_NAME}}"
+            "crates/gaviero-mcp-shim/{{DOC_NAME}}"
+            "crates/tree-sitter-gaviero/{{DOC_NAME}}"
         ]
         read_only ["src/" "crates/" "Cargo.toml" ".gaviero/"]
     }
@@ -147,7 +151,7 @@ The user-facing description of each crate/project. It must contain:
         "#
     }
     description "Rewrite {{DOC_NAME}} for all crates: {{PROMPT}}"
-    client sonnet
+    tier writer_standard
     depends_on [inventory]
     scope {
         owned     [
@@ -156,6 +160,8 @@ The user-facing description of each crate/project. It must contain:
             "crates/gaviero-dsl/{{DOC_NAME}}"
             "crates/gaviero-tui/{{DOC_NAME}}"
             "crates/gaviero-cli/{{DOC_NAME}}"
+            "crates/gaviero-mcp-shim/{{DOC_NAME}}"
+            "crates/tree-sitter-gaviero/{{DOC_NAME}}"
         ]
         read_only ["src/" "crates/" "Cargo.toml" ".gaviero/"]
     }
@@ -186,7 +192,7 @@ The deep technical description of a crate/project. It must contain:
         "#
     }
     description "Rewrite {{DOC_NAME}} for all crates: {{PROMPT}}"
-    client opus
+    tier writer_deep
     depends_on [inventory]
     scope {
         owned     [
@@ -195,6 +201,8 @@ The deep technical description of a crate/project. It must contain:
             "crates/gaviero-dsl/{{DOC_NAME}}"
             "crates/gaviero-tui/{{DOC_NAME}}"
             "crates/gaviero-cli/{{DOC_NAME}}"
+            "crates/gaviero-mcp-shim/{{DOC_NAME}}"
+            "crates/tree-sitter-gaviero/{{DOC_NAME}}"
         ]
         read_only ["src/" "crates/" "Cargo.toml" ".gaviero/"]
     }
@@ -209,7 +217,7 @@ agent record_docs_update {
         REVIEW_SCOPE "CLAUDE.md (AI context), README.md (user guide), ARCHITECTURE.md (technical design)"
     }
     description "Record documentation update to memory: {{PROMPT}}"
-    client sonnet
+    tier recorder
     depends_on [write_claude_md write_readme_md write_architecture_md]
     scope {
         read_only ["CLAUDE.md" "README.md" "ARCHITECTURE.md" "crates/"]

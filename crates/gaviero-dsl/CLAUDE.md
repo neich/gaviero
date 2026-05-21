@@ -23,10 +23,14 @@ cargo clippy -p gaviero-dsl
 
 ```rust
 compile(source, filename, workflow, runtime_prompt) -> Result<CompiledPlan>
-compile_with_vars(source, filename, workflow, runtime_prompt, override_vars) -> Result<CompiledPlan>
+compile_with_vars(source, filename, workflow, runtime_prompt, override_vars, override_tiers) -> Result<CompiledPlan>
+compile_file(entry_path, workflow, runtime_prompt, override_vars, override_tiers) -> Result<CompiledPlan>
+load_tier_overrides(path) -> Result<Vec<(String, String)>>
 ```
 
 `compile_with_vars` backs `gaviero-cli --var KEY=VALUE`. Var precedence: agent-level `vars {}` > CLI `--var` overrides > script-level `vars {}`.
+
+`load_tier_overrides` + `override_tiers` backs `gaviero-cli --tiers-file <profile.gaviero>`. Tier precedence: CLI `--tiers-file` > script/includes `tier` lines.
 
 ## DSL Surface (high-level)
 

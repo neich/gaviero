@@ -305,7 +305,7 @@ fn compile_example(filename: &str) -> Vec<gaviero_core::swarm::models::WorkUnit>
         env!("CARGO_MANIFEST_DIR"),
         filename
     ));
-    gaviero_dsl::compile_file(&path, None, None, &[])
+    gaviero_dsl::compile_file(&path, None, None, &[], &[])
         .unwrap_or_else(|e| panic!("compiling {}:\n{:?}", filename, e))
         .work_units_ordered()
         .expect("toposort")
@@ -444,7 +444,7 @@ fn compile_example_plan(filename: &str) -> gaviero_core::swarm::plan::CompiledPl
         env!("CARGO_MANIFEST_DIR"),
         filename
     ));
-    gaviero_dsl::compile_file(&path, None, None, &[])
+    gaviero_dsl::compile_file(&path, None, None, &[], &[])
         .unwrap_or_else(|e| panic!("compiling {}:\n{:?}", filename, e))
 }
 
@@ -455,6 +455,13 @@ fn template_update_docs() {
     let plan = compile_example_plan("update_docs.gaviero");
     let units = plan.work_units_ordered().expect("toposort");
     assert_eq!(units.len(), 5);
+    let inventory = units.iter().find(|u| u.id == "inventory").expect("inventory");
+    assert_eq!(inventory.model.as_deref(), Some("claude:opus"));
+    let readme = units
+        .iter()
+        .find(|u| u.id == "write_readme_md")
+        .expect("write_readme_md");
+    assert_eq!(readme.model.as_deref(), Some("claude:sonnet"));
     assert_eq!(units[0].id, "inventory");
     // Three write agents depend on inventory
     assert!(units[1].depends_on.contains(&"inventory".to_string()));
@@ -467,6 +474,24 @@ fn template_update_docs() {
     assert!(plan.loop_configs.is_empty());
     // Max parallel 3
     assert_eq!(plan.max_parallel, Some(3));
+}
+
+#[test]
+fn update_docs_tiers_file_overrides_profile() {
+    let examples = std::path::PathBuf::from(format!("{}/examples", env!("CARGO_MANIFEST_DIR")));
+    let entry = examples.join("update_docs.gaviero");
+    let codex_profile = examples.join("profiles/doc-codex.gaviero");
+    let overrides = gaviero_dsl::load_tier_overrides(&codex_profile)
+        .expect("load codex tiers profile");
+    let plan = gaviero_dsl::compile_file(&entry, None, None, &[], &overrides)
+        .expect("compile with --tiers-file overrides");
+    let inventory = plan
+        .work_units_ordered()
+        .expect("toposort")
+        .into_iter()
+        .find(|u| u.id == "inventory")
+        .expect("inventory");
+    assert_eq!(inventory.model.as_deref(), Some("codex:gpt-5.5"));
 }
 
 #[test]
@@ -608,11 +633,10 @@ fn template_phased_plan() {
     assert_eq!(plan.loop_judge_units.len(), 1);
     assert_eq!(plan.loop_judge_units[0].id, "phase_judge");
 
-    // Tier routing: expensive on reasoning agents, cheap on gate and judge.
-    // Agents resolve via tier aliases from the shared clients.gaviero
-    // (`tier expensive` → opus, `tier cheap` → sonnet). The library's client
-    // blocks don't carry a `tier` field, so the WorkUnit's `tier` lands on
-    // the default; what's actually load-bearing is the resolved model.
+    // Model routing: reasoning agents use opus, gate/judge use sonnet via
+    // concrete `client` bindings in phased_plan.gaviero (included clients.gaviero
+    // omits `tier` on client blocks). WorkUnit `tier` is the default; the
+    // resolved `model` string is what backends use.
     let model_of = |id: &str| -> Option<String> {
         units
             .iter()
@@ -727,7 +751,7 @@ fn compile_file_resolves_include_and_compiles_workflow() {
     )
     .unwrap();
 
-    let plan = gaviero_dsl::compile_file(&entry, None, None, &[])
+    let plan = gaviero_dsl::compile_file(&entry, None, None, &[], &[])
         .expect("compile_file should succeed across include boundary");
     let units = plan.work_units_ordered().unwrap();
     assert_eq!(units.len(), 1);
@@ -766,7 +790,7 @@ fn compile_file_reports_duplicate_decl_across_files() {
         )
         .unwrap();
 
-    let err = gaviero_dsl::compile_file(&entry, None, None, &[]).unwrap_err();
+    let err = gaviero_dsl::compile_file(&entry, None, None, &[], &[]).unwrap_err();
     let msg = format!("{:?}", err);
     assert!(
         msg.contains("duplicate client name `base`"),

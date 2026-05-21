@@ -71,13 +71,18 @@ pub(super) fn update_find_highlight(app: &mut App) {
     app.ensure_editor_cursor_visible();
 }
 
+/// Viewport height and code-area width (gutter + scrollbar excluded).
+pub(super) fn editor_viewport(buf_line_count: usize, area: Rect) -> (usize, usize) {
+    let gutter_w = gutter_width(buf_line_count) as usize;
+    let vp_h = area.height as usize;
+    let vp_w = (area.width as usize).saturating_sub(gutter_w + 1);
+    (vp_h, vp_w)
+}
+
 pub(super) fn ensure_editor_cursor_visible(app: &mut App) {
     let area = app.layout.editor_area;
     if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
-        let line_count = buf.line_count();
-        let gutter_w = gutter_width(line_count) as usize;
-        let vp_h = area.height as usize;
-        let vp_w = (area.width as usize).saturating_sub(gutter_w);
+        let (vp_h, vp_w) = editor_viewport(buf.line_count(), area);
         buf.ensure_cursor_visible(vp_h, vp_w);
     }
 }
@@ -127,25 +132,22 @@ pub(super) fn handle_editor_action(app: &mut App, action: Action) {
             let Some(buf) = app.buffers.get_mut(app.active_buffer) else {
                 return;
             };
-            let line_count = buf.line_count();
-            let gutter_w = gutter_width(line_count) as usize;
-            let vp_h = area.height as usize;
-            let vp_w = (area.width as usize).saturating_sub(gutter_w);
+            let (vp_h, vp_w) = editor_viewport(buf.line_count(), area);
             match action {
-                Action::CursorUp => buf.move_cursor_up(),
-                Action::CursorDown => buf.move_cursor_down(),
+                Action::CursorUp => buf.move_cursor_up(vp_w),
+                Action::CursorDown => buf.move_cursor_down(vp_w),
                 Action::CursorLeft => buf.move_cursor_left(),
                 Action::CursorRight => buf.move_cursor_right(),
                 Action::WordLeft => buf.move_word_left(),
                 Action::WordRight => buf.move_word_right(),
                 Action::SelectLeft => buf.select_left(),
                 Action::SelectRight => buf.select_right(),
-                Action::SelectUp => buf.select_up(),
-                Action::SelectDown => buf.select_down(),
+                Action::SelectUp => buf.select_up(vp_w),
+                Action::SelectDown => buf.select_down(vp_w),
                 Action::SelectWordLeft => buf.select_word_left(),
                 Action::SelectWordRight => buf.select_word_right(),
-                Action::PageUp => buf.page_up(vp_h),
-                Action::PageDown => buf.page_down(vp_h),
+                Action::PageUp => buf.page_up(vp_h, vp_w),
+                Action::PageDown => buf.page_down(vp_h, vp_w),
                 Action::Home => buf.move_cursor_home(),
                 Action::End => buf.move_cursor_end(),
                 Action::GoToLineEnd => buf.move_cursor_end(),
@@ -158,10 +160,7 @@ pub(super) fn handle_editor_action(app: &mut App, action: Action) {
             let Some(buf) = app.buffers.get_mut(app.active_buffer) else {
                 return;
             };
-            let line_count = buf.line_count();
-            let gutter_w = gutter_width(line_count) as usize;
-            let vp_h = area.height as usize;
-            let vp_w = (area.width as usize).saturating_sub(gutter_w);
+            let (vp_h, vp_w) = editor_viewport(buf.line_count(), area);
             match action {
                 Action::Tab => buf.insert_tab(),
                 Action::InsertChar(ch) => buf.insert_char(ch),
@@ -172,20 +171,20 @@ pub(super) fn handle_editor_action(app: &mut App, action: Action) {
                     buf.delete();
                 }
                 Action::Enter => buf.insert_newline(),
-                Action::CursorUp => buf.move_cursor_up(),
-                Action::CursorDown => buf.move_cursor_down(),
+                Action::CursorUp => buf.move_cursor_up(vp_w),
+                Action::CursorDown => buf.move_cursor_down(vp_w),
                 Action::CursorLeft => buf.move_cursor_left(),
                 Action::CursorRight => buf.move_cursor_right(),
                 Action::WordLeft => buf.move_word_left(),
                 Action::WordRight => buf.move_word_right(),
                 Action::SelectLeft => buf.select_left(),
                 Action::SelectRight => buf.select_right(),
-                Action::SelectUp => buf.select_up(),
-                Action::SelectDown => buf.select_down(),
+                Action::SelectUp => buf.select_up(vp_w),
+                Action::SelectDown => buf.select_down(vp_w),
                 Action::SelectWordLeft => buf.select_word_left(),
                 Action::SelectWordRight => buf.select_word_right(),
-                Action::PageUp => buf.page_up(vp_h),
-                Action::PageDown => buf.page_down(vp_h),
+                Action::PageUp => buf.page_up(vp_h, vp_w),
+                Action::PageDown => buf.page_down(vp_h, vp_w),
                 Action::Home => buf.move_cursor_home(),
                 Action::End => buf.move_cursor_end(),
                 Action::Undo => {
@@ -207,14 +206,7 @@ pub(super) fn handle_editor_action(app: &mut App, action: Action) {
         }
     }
 
-    let area = app.layout.editor_area;
-    if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
-        let line_count = buf.line_count();
-        let gutter_w = gutter_width(line_count) as usize;
-        let vp_h = area.height as usize;
-        let vp_w = (area.width as usize).saturating_sub(gutter_w);
-        buf.ensure_cursor_visible(vp_h, vp_w);
-    }
+    ensure_editor_cursor_visible(app);
 }
 
 pub(super) fn clipboard_copy(app: &mut App) {
@@ -706,7 +698,9 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 } else if let Some(ref mut review) = app.diff_review {
                     review.scroll_top += 3;
                 } else if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
-                    let max = buf.line_count().saturating_sub(1);
+                    let (_, content_w) =
+                        editor_viewport(buf.line_count(), app.layout.editor_area);
+                    let max = buf.scroll_line_count(content_w).saturating_sub(1);
                     buf.scroll.top_line = (buf.scroll.top_line + 3).min(max);
                 }
             }
@@ -973,7 +967,8 @@ pub(super) fn scroll_panel_to_row(app: &mut App, target: ScrollbarTarget, row: u
             if track_height == 0 {
                 return;
             }
-            let total = buf.line_count();
+            let (_, content_w) = editor_viewport(buf.line_count(), area);
+            let total = buf.scroll_line_count(content_w);
             if total <= track_height {
                 return;
             }
@@ -1084,13 +1079,24 @@ pub(super) fn set_cursor_from_mouse(app: &mut App, col: u16, row: u16) {
     let area = app.layout.editor_area;
     let gutter_w = gutter_width(buf.line_count());
     if col >= area.x + gutter_w {
+        let (_, content_w) = editor_viewport(buf.line_count(), area);
         let visual_col = (col - area.x - gutter_w) as usize + buf.scroll.left_col;
-        let click_line = (row - area.y) as usize + buf.scroll.top_line;
-        let max_line = buf.line_count().saturating_sub(1);
-        buf.cursor.line = click_line.min(max_line);
-        let char_col = buf.visual_to_char_col(buf.cursor.line, visual_col);
-        let line_len = buf.line_len(buf.cursor.line);
-        buf.cursor.col = char_col.min(line_len);
+        let click_row = (row - area.y) as usize + buf.scroll.top_line;
+        if buf.word_wrap && content_w > 0 {
+            let layout = buf.wrap_layout(content_w);
+            if let Some(seg) = layout.segment_at(click_row) {
+                buf.cursor.line = seg.logical_line;
+                let base_visual = buf.char_col_to_visual(seg.logical_line, seg.start_col);
+                let char_col = buf.visual_to_char_col(seg.logical_line, base_visual + visual_col);
+                buf.cursor.col = char_col.min(buf.line_len(buf.cursor.line));
+            }
+        } else {
+            let max_line = buf.line_count().saturating_sub(1);
+            buf.cursor.line = click_row.min(max_line);
+            let char_col = buf.visual_to_char_col(buf.cursor.line, visual_col);
+            let line_len = buf.line_len(buf.cursor.line);
+            buf.cursor.col = char_col.min(line_len);
+        }
     }
 }
 
@@ -1103,10 +1109,7 @@ pub(super) fn handle_paste(app: &mut App, text: &str) {
             if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
                 buf.paste_text(text);
                 let area = app.layout.editor_area;
-                let line_count = buf.line_count();
-                let gutter_w = gutter_width(line_count) as usize;
-                let vp_h = area.height as usize;
-                let vp_w = (area.width as usize).saturating_sub(gutter_w);
+                let (vp_h, vp_w) = editor_viewport(buf.line_count(), area);
                 buf.ensure_cursor_visible(vp_h, vp_w);
             }
         }
@@ -1281,6 +1284,8 @@ pub(super) fn open_diff_view(
                 app.workspace.resolve_setting(settings::TAB_SIZE, None)
             };
             buf.tab_width = tab_size.as_u64().unwrap_or(4) as u8;
+            let word_wrap = app.workspace.resolve_setting(settings::WORD_WRAP, None);
+            buf.word_wrap = word_wrap.as_bool().unwrap_or(false);
 
             if let (Some(lang_name), Some(language)) = (&buf.lang_name, &buf.language) {
                 if !app.highlight_configs.contains_key(lang_name) {
@@ -1331,6 +1336,8 @@ pub(super) fn open_file(app: &mut App, path: &Path) {
             } else {
                 "\t".to_string()
             };
+            let word_wrap = app.workspace.resolve_setting(settings::WORD_WRAP, None);
+            buf.word_wrap = word_wrap.as_bool().unwrap_or(false);
 
             if let (Some(lang_name), Some(language)) = (&buf.lang_name, &buf.language) {
                 if !app.highlight_configs.contains_key(lang_name) {

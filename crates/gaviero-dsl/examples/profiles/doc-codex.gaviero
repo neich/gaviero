@@ -1,0 +1,6 @@
+// Codex tier bindings for update_docs.gaviero.
+
+tier inventory          codex-5-5
+tier writer_deep        codex-5-5
+tier writer_standard    codex-5-4
+tier recorder           codex-5-4

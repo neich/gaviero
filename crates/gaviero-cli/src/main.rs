@@ -165,6 +165,14 @@ struct Cli {
     #[arg(long = "var", requires = "script")]
     vars: Vec<String>,
 
+    /// Tier profile for a DSL script: a `.gaviero` file containing only
+    /// `tier <role> <client>` bindings. Overrides tier lines from the script
+    /// and its `include`s (e.g. `profiles/doc-default.gaviero`). Agents must
+    /// `include "clients.gaviero"` (or equivalent) so named clients exist.
+    /// Only valid with `--script`.
+    #[arg(long = "tiers-file", requires = "script")]
+    tiers_file: Option<PathBuf>,
+
     /// Print the N most recent retrieval manifests (Tier S / S4) and exit.
     /// Useful for auditing what memory was injected into recent chat turns.
     #[arg(long = "manifest-last")]
@@ -2058,6 +2066,27 @@ async fn main() -> Result<()> {
             None
         };
         let override_vars = parse_var_overrides(&cli.vars)?;
+        let override_tiers = if let Some(ref tiers_path) = cli.tiers_file {
+            let tiers_path = if tiers_path.is_absolute() {
+                tiers_path.clone()
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(tiers_path)
+            };
+            let bindings = gaviero_dsl::load_tier_overrides(&tiers_path).map_err(|report| {
+                eprintln!("{:?}", report);
+                anyhow::anyhow!("tiers profile failed: {}", tiers_path.display())
+            })?;
+            eprintln!(
+                "[tiers] profile {} ({} binding(s))",
+                tiers_path.display(),
+                bindings.len()
+            );
+            bindings
+        } else {
+            Vec::new()
+        };
         // compile_file resolves any `include "..."` directives transitively,
         // so multi-file scripts (shared clients/prompts/etc.) work here.
         gaviero_dsl::compile_file(
@@ -2065,6 +2094,7 @@ async fn main() -> Result<()> {
             None,
             runtime_prompt.as_deref(),
             &override_vars,
+            &override_tiers,
         )
         .map_err(|report| {
             eprintln!("{:?}", report);

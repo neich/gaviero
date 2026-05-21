@@ -104,11 +104,18 @@ pub enum Event {
         token_budget: usize,
     },
 
+    /// Measured gaviero bootstrap tokens for the turn about to be sent
+    /// (topology + graph outline + memory injection + `@file` refs).
+    /// Drives the status-bar composite estimate until provider usage arrives.
+    TurnBootstrapMeasured {
+        conv_id: String,
+        tokens: usize,
+    },
+
     /// Fired once per chat turn with the provider's authoritative token
     /// usage (Claude `result.usage` today). The controller stores the
-    /// latest reading on the matching conversation so the status bar /
-    /// chat panel can show real context-window pressure instead of the
-    /// visible-panel char-count estimate.
+    /// latest reading on the matching conversation so the status bar can
+    /// show real context-window pressure (`prefix_tokens()`).
     TurnTokenUsage {
         conv_id: String,
         usage: gaviero_core::acp::protocol::TokenUsage,

@@ -53,18 +53,21 @@ impl<'a> EditorView<'a> {
             height: area.height,
         };
 
+        let content_width = code_area.width as usize;
+        let layout = self.buffer.wrap_layout(content_width);
+        let scroll_lines = layout.len();
+
         // Compute highlights for visible range
         let spans = self.compute_highlights(code_area.height as usize);
 
-        // Render each visible line
+        // Render each visible line (logical or wrapped visual row)
         let top = self.buffer.scroll.top_line;
         let default_style = self.theme.default_style();
         for row in 0..area.height as usize {
-            let line_idx = top + row;
+            let visual_idx = top + row;
             let y = area.y + row as u16;
 
-            if line_idx >= line_count {
-                // Clear rows beyond end of file (gutter + code area)
+            if visual_idx >= scroll_lines {
                 for col in 0..area.width {
                     let cx = area.x + col;
                     if cx < buf.area().right() {
@@ -74,16 +77,30 @@ impl<'a> EditorView<'a> {
                 continue;
             }
 
-            // Gutter: line number
-            self.render_gutter(line_idx, area.x, y, gutter_width, buf);
-
-            // Code line
-            self.render_code_line(line_idx, &spans, code_area.x, y, code_area.width, buf);
+            let seg = &layout.segments[visual_idx];
+            self.render_gutter(
+                seg.logical_line,
+                seg.start_col == 0,
+                area.x,
+                y,
+                gutter_width,
+                buf,
+            );
+            self.render_code_line(
+                seg.logical_line,
+                seg.start_col,
+                seg.end_col,
+                &spans,
+                code_area.x,
+                y,
+                code_area.width,
+                buf,
+            );
         }
 
         // Render cursor if focused
         if self.focused {
-            self.render_cursor(code_area, buf);
+            self.render_cursor(code_area, &layout, buf);
         }
 
         // Render scrollbar on the right edge. In diff-view mode, mark the rows
@@ -100,7 +117,7 @@ impl<'a> EditorView<'a> {
             crate::widgets::scrollbar::render_scrollbar_with_diff_markers(
                 area,
                 buf,
-                line_count,
+                scroll_lines,
                 area.height as usize,
                 self.buffer.scroll.top_line,
                 &diff_indices,
@@ -109,14 +126,22 @@ impl<'a> EditorView<'a> {
             crate::widgets::scrollbar::render_scrollbar(
                 area,
                 buf,
-                line_count,
+                scroll_lines,
                 area.height as usize,
                 self.buffer.scroll.top_line,
             );
         }
     }
 
-    fn render_gutter(&self, line_idx: usize, x: u16, y: u16, gutter_width: u16, buf: &mut RataBuf) {
+    fn render_gutter(
+        &self,
+        line_idx: usize,
+        show_line_number: bool,
+        x: u16,
+        y: u16,
+        gutter_width: u16,
+        buf: &mut RataBuf,
+    ) {
         let is_current = line_idx == self.buffer.cursor.line;
         let diff_kind = self
             .buffer
@@ -133,22 +158,26 @@ impl<'a> EditorView<'a> {
             _ => self.theme.ui_style("line_number"),
         };
 
-        let num_str = match diff_kind {
-            Some(DiffKind::Added) => format!(
-                "{:>width$}+",
-                line_idx + 1,
-                width = (gutter_width as usize) - 1
-            ),
-            Some(DiffKind::Removed) => format!(
-                "{:>width$}-",
-                line_idx + 1,
-                width = (gutter_width as usize) - 1
-            ),
-            _ => format!(
-                "{:>width$} ",
-                line_idx + 1,
-                width = (gutter_width as usize) - 1
-            ),
+        let num_str = if !show_line_number {
+            " ".repeat(gutter_width as usize)
+        } else {
+            match diff_kind {
+                Some(DiffKind::Added) => format!(
+                    "{:>width$}+",
+                    line_idx + 1,
+                    width = (gutter_width as usize) - 1
+                ),
+                Some(DiffKind::Removed) => format!(
+                    "{:>width$}-",
+                    line_idx + 1,
+                    width = (gutter_width as usize) - 1
+                ),
+                _ => format!(
+                    "{:>width$} ",
+                    line_idx + 1,
+                    width = (gutter_width as usize) - 1
+                ),
+            }
         };
         let x_max = (x + gutter_width).min(buf.area().right());
         for (i, ch) in num_str.chars().enumerate() {
@@ -162,6 +191,8 @@ impl<'a> EditorView<'a> {
     fn render_code_line(
         &self,
         line_idx: usize,
+        segment_start: usize,
+        segment_end: usize,
         spans: &[StyledSpan],
         x: u16,
         y: u16,
@@ -169,7 +200,11 @@ impl<'a> EditorView<'a> {
         buf: &mut RataBuf,
     ) {
         let line = self.buffer.text.line(line_idx);
-        let left_col = self.buffer.scroll.left_col;
+        let left_col = if self.buffer.word_wrap {
+            0
+        } else {
+            self.buffer.scroll.left_col
+        };
         let is_current = line_idx == self.buffer.cursor.line;
 
         // Diff-view tint takes precedence over the current-line highlight.
@@ -204,10 +239,26 @@ impl<'a> EditorView<'a> {
 
         let tab_width = self.buffer.tab_width as usize;
         let mut char_idx: usize = 0; // index into rope chars (for selection/byte offset)
-        let mut visual_col: usize = 0; // visual column (tabs expand)
+        // Wrapped segments always start at display column 0; non-wrap uses absolute
+        // visual columns so horizontal scroll (left_col) can offset the line.
+        let mut visual_col: usize = 0;
 
         for ch in line.chars() {
             if ch == '\n' || ch == '\r' {
+                break;
+            }
+            if char_idx < segment_start {
+                if !self.buffer.word_wrap {
+                    if ch == '\t' {
+                        visual_col = (visual_col / tab_width + 1) * tab_width;
+                    } else {
+                        visual_col += UnicodeWidthChar::width(ch).unwrap_or(1);
+                    }
+                }
+                char_idx += 1;
+                continue;
+            }
+            if char_idx >= segment_end {
                 break;
             }
 
@@ -282,26 +333,41 @@ impl<'a> EditorView<'a> {
         }
     }
 
-    fn render_cursor(&self, code_area: Rect, buf: &mut RataBuf) {
+    fn render_cursor(
+        &self,
+        code_area: Rect,
+        layout: &super::wrap::WrapLayout,
+        buf: &mut RataBuf,
+    ) {
         let cursor_line = self.buffer.cursor.line;
         let cursor_col = self.buffer.cursor.col;
         let top = self.buffer.scroll.top_line;
-        let left = self.buffer.scroll.left_col;
+        let left = if self.buffer.word_wrap {
+            0
+        } else {
+            self.buffer.scroll.left_col
+        };
 
-        if cursor_line >= self.buffer.line_count()
-            || cursor_line < top
-            || cursor_line >= top + code_area.height as usize
-        {
+        let (vline, _) = layout.cursor_segment(cursor_line, cursor_col);
+        if vline < top || vline >= top + code_area.height as usize {
             return;
         }
 
-        let visual_col = self.char_col_to_visual(cursor_line, cursor_col);
-        if visual_col < left {
+        let seg = match layout.segment_at(vline) {
+            Some(s) => s,
+            None => return,
+        };
+        let visual_col = self.buffer.char_col_to_visual(cursor_line, cursor_col);
+        let base_visual = self
+            .buffer
+            .char_col_to_visual(seg.logical_line, seg.start_col);
+        let rel_visual = visual_col.saturating_sub(base_visual);
+        if rel_visual < left {
             return;
         }
 
-        let screen_row = (cursor_line - top) as u16;
-        let screen_col = (visual_col - left) as u16;
+        let screen_row = (vline - top) as u16;
+        let screen_col = (rel_visual - left) as u16;
 
         if screen_col < code_area.width {
             let x = code_area.x + screen_col;
@@ -312,24 +378,6 @@ impl<'a> EditorView<'a> {
                 cell.set_style(cursor_style);
             }
         }
-    }
-
-    /// Convert a char-index column to a visual column (expanding tabs).
-    fn char_col_to_visual(&self, line_idx: usize, char_col: usize) -> usize {
-        let tab_width = self.buffer.tab_width as usize;
-        let line = self.buffer.text.line(line_idx);
-        let mut visual = 0;
-        for (i, ch) in line.chars().enumerate() {
-            if i >= char_col || ch == '\n' || ch == '\r' {
-                break;
-            }
-            if ch == '\t' {
-                visual = (visual / tab_width + 1) * tab_width;
-            } else {
-                visual += UnicodeWidthChar::width(ch).unwrap_or(1);
-            }
-        }
-        visual
     }
 
     fn compute_highlights(&self, viewport_height: usize) -> Vec<StyledSpan> {

@@ -676,6 +676,11 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 ));
             }
         }
+        Event::TurnBootstrapMeasured { conv_id, tokens } => {
+            if let Some(idx) = app.chat_state.find_conv_idx(&conv_id) {
+                app.chat_state.conversations[idx].last_bootstrap_tokens = tokens;
+            }
+        }
         Event::TurnTokenUsage { conv_id, usage } => {
             if let Some(idx) = app.chat_state.find_conv_idx(&conv_id) {
                 app.chat_state.conversations[idx].last_token_usage = Some(usage);
@@ -1641,6 +1646,16 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
         Action::TogglePreview => {
             app.preview_visible = !app.preview_visible;
             app.preview_scroll = 0;
+        }
+        Action::ToggleWordWrap => {
+            if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
+                let on = buf.toggle_word_wrap();
+                app.status_message = Some((
+                    format!("Word wrap {}", if on { "on" } else { "off" }),
+                    std::time::Instant::now(),
+                ));
+                app.ensure_editor_cursor_visible();
+            }
         }
         Action::ToggleFullscreen => app.toggle_fullscreen(),
         Action::SwitchLayout(n) => app.switch_layout(n),

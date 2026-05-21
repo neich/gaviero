@@ -34,6 +34,7 @@ cargo clippy -p gaviero-cli
 - `--namespace <name>` / `--read-ns <name>` — memory scope control (`--read-ns` repeatable)
 - `--no-memory` — disable memory subsystem for this run
 - `--var KEY=VALUE` — override script-level `vars {}` (repeatable; `--script` only)
+- `--tiers-file <path>` — tier profile (only `tier <role> <client>` lines); overrides bindings from script/includes (`--script` only)
 - `--prompt-file <path>` — file contents replace every `{{PROMPT}}` and become the default prompt for agents with no `prompt` field (`--script` only)
 - `--trace-log <path>` — structured JSON trace
 - `--plan-output <path>` — output `.gaviero` path (`--coordinated` only)
