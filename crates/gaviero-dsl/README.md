@@ -248,6 +248,7 @@ compile-dispatch time by `gaviero-core`.
   `claude:opusplan`, `claude:sonnet[1m]`, or any versioned form like
   `claude:claude-opus-4-7`
 - **Codex** — `codex:<model>` (e.g., `codex:gpt-5.5`, `codex:gpt-5.4`)
+- **Cursor** — `cursor:<model>` (e.g., `cursor:claude-4-sonnet`)
 - **Ollama/local** — `ollama:qwen2.5-coder:7b` or `local:model-name`
 
 ### Scope Block
@@ -412,7 +413,7 @@ The output is a `.gaviero` file you can inspect, edit, and then execute.
 ### Entry points
 
 ```rust
-use gaviero_dsl::{compile, compile_file, compile_with_vars};
+use gaviero_dsl::{compile, compile_file, compile_with_vars, load_tier_overrides};
 
 // Inline script (no `include` statements)
 let plan = compile(source, filename, workflow_name, runtime_prompt)?;
@@ -429,6 +430,10 @@ let plan = compile_file(
 // CLI-level var overrides (beat script-level vars {}; agent-level vars still win)
 let overrides = vec![("PLANS".to_string(), "output".to_string())];
 let plan = compile_with_vars(source, filename, workflow_name, runtime_prompt, &overrides, &[])?;
+
+// Load a tier-overrides profile (backs --tiers-file)
+let tiers = load_tier_overrides(std::path::Path::new("profiles/doc-codex.gaviero"))?;
+let plan = compile_with_vars(source, filename, workflow_name, runtime_prompt, &[], &tiers)?;
 ```
 
 ### Return type
@@ -450,6 +455,8 @@ pub struct CompiledPlan {
 - Tokenization via `logos` lexer
 - Parsing via `chumsky` parser combinators
 - Semantic validation (scope overlaps, cycles)
+- Include resolution with cycle detection (`resolver.rs`)
+- Tier-override loading for `--tiers-file` profiles (`tiers.rs`)
 - Compilation to `CompiledPlan` DAG
 
 **What it does NOT do:**
