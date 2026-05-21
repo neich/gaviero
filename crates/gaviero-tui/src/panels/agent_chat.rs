@@ -274,9 +274,37 @@ pub struct Conversation {
     /// Latest server-reported token usage for this conversation (Claude
     /// `result.usage` today). Updated once per turn from
     /// `Event::TurnTokenUsage`. `None` before the first turn completes,
-    /// or for providers that don't surface usage. `estimate_context` prefers
-    /// this over the visible-panel char count when available.
+    /// or for providers that don't surface usage.
     pub last_token_usage: Option<gaviero_core::acp::protocol::TokenUsage>,
+    /// Gaviero bootstrap measured on the last send (`TurnBootstrapMeasured`):
+    /// topology, graph outline, memory block, `@file` refs. Zero on follow-up
+    /// turns that skip bootstrap. Used by the status-bar composite estimate.
+    pub last_bootstrap_tokens: usize,
+}
+
+/// Context-window pressure shown in the status bar and `/context`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextBarSource {
+    /// `last_token_usage.prefix_tokens()` from the provider (Claude/Cursor).
+    ProviderPrefix,
+    /// Transcript + last bootstrap + hidden provider overhead (Codex exec, pre-result).
+    CompositeEstimate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextPressure {
+    pub tokens: usize,
+    pub pct: usize,
+    pub source: ContextBarSource,
+    pub transcript_tokens: usize,
+    pub bootstrap_tokens: usize,
+    pub hidden_overhead_tokens: usize,
+}
+
+impl ContextPressure {
+    pub fn is_approximate(self) -> bool {
+        self.source == ContextBarSource::CompositeEstimate
+    }
 }
 
 /// Global agent settings read from workspace settings.
@@ -387,6 +415,7 @@ impl AgentChatState {
             pending_persisted_ledger: None,
             transcript_inline_mode: TranscriptInlineMode::Auto,
             last_token_usage: None,
+            last_bootstrap_tokens: 0,
         };
         Self {
             conversations: vec![conv],
@@ -665,42 +694,34 @@ impl AgentChatState {
             }
             "/context" => {
                 let limit = self.context_limit_tokens();
+                let pressure = self.context_pressure();
                 let (input_words, output_words) = self.count_transcript_words();
-                let total_words =
-                    input_words + output_words + SYSTEM_PROMPT_OVERHEAD_WORDS;
-                let tokens_est = words_to_tokens(total_words);
-                let pct = if limit > 0 {
-                    (tokens_est * 100 / limit).min(100)
-                } else {
-                    0
+                let source_label = match pressure.source {
+                    ContextBarSource::ProviderPrefix => "provider prefix (authoritative)",
+                    ContextBarSource::CompositeEstimate => "composite estimate",
                 };
                 let mut msg = format!(
-                    "Local estimate (word-count of visible transcript × 1.3):\n  input: {} words | output: {} words | overhead: {} words\n  total: {} words ≈ ~{} tokens (~{}% of {} limit)",
+                    "Status bar: {} tokens — {} (~{}% of {} limit)\n\
+                     Composite parts:\n  transcript: {} tok (visible chat × 1.3)\n  \
+                     bootstrap: {} tok (last measured gaviero injection)\n  \
+                     hidden overhead: {} tok (provider system/tools allowance)\n\
+                     Transcript words: {} input | {} output",
+                    pressure.tokens,
+                    source_label,
+                    pressure.pct,
+                    limit,
+                    pressure.transcript_tokens,
+                    pressure.bootstrap_tokens,
+                    pressure.hidden_overhead_tokens,
                     input_words,
                     output_words,
-                    SYSTEM_PROMPT_OVERHEAD_WORDS,
-                    total_words,
-                    tokens_est,
-                    pct,
-                    limit
                 );
-                // When the provider reported usage, append it for comparison.
-                // The two numbers measure different things: the local estimate
-                // is what the user wrote; the provider number is what the
-                // model was conditioned on (includes built-in system + tools
-                // + tool_result echoes + auto-loaded CLAUDE.md + gaviero
-                // injections — typically 20–80K above the local estimate).
                 if let Some(u) = self
                     .conversations
                     .get(self.active_conv)
                     .and_then(|c| c.last_token_usage.as_ref())
                 {
                     let prefix = u.prefix_tokens() as usize;
-                    let prov_pct = if limit > 0 {
-                        (prefix * 100 / limit).min(100)
-                    } else {
-                        0
-                    };
                     let total = u.input_tokens
                         + u.cache_creation_input_tokens
                         + u.cache_read_input_tokens;
@@ -710,14 +731,13 @@ impl AgentChatState {
                         0
                     };
                     msg.push_str(&format!(
-                        "\n\nProvider reports (authoritative — includes hidden system + tools + echoes):\n  prefix: {} / {} tokens ({}% of limit)\n  input: {} | cache_creation: {} | cache_read: {} | output: {}\n  cache hit ratio: {}% (high = cheap, low = expensive)",
+                        "\n\nProvider usage (last turn):\n  prefix: {} | output: {}\n  \
+                         input: {} | cache_creation: {} | cache_read: {} | cache hit: {}%",
                         prefix,
-                        limit,
-                        prov_pct,
+                        u.output_tokens,
                         u.input_tokens,
                         u.cache_creation_input_tokens,
                         u.cache_read_input_tokens,
-                        u.output_tokens,
                         cache_hit_pct,
                     ));
                 }
@@ -909,32 +929,59 @@ impl AgentChatState {
         }
     }
 
-    /// Estimate context size in (tokens, percent of limit).
+    /// Context-window pressure for the status bar and `/context`.
     ///
-    /// **Always word-counts the visible transcript** — user input + assistant
-    /// output + tool-call payloads + a small system-prompt overhead — and
-    /// converts via `tokens ≈ words × 1.3`. The provider's `result.usage` is
-    /// deliberately NOT used here even when available: it includes hidden
-    /// context the user cannot see or control (Claude's built-in system
-    /// prompt + tool definitions, ~17–20K tokens; tool_result echoes that
-    /// re-send file content per iteration; auto-loaded `CLAUDE.md` files;
-    /// graph/memory injection blocks gaviero adds). That number is
-    /// authoritative for context-window pressure but unpredictable from the
-    /// chat panel — the indicator should track what the user wrote.
-    ///
-    /// Use `/context` to see both the local estimate AND the provider's
-    /// authoritative reading side-by-side when available.
-    pub fn estimate_context(&self) -> (usize, usize) {
+    /// When the provider reports usage, uses `prefix_tokens()` (last
+    /// iteration's conditioned prefix — authoritative for Claude). Otherwise
+    /// composites visible transcript + measured bootstrap + a provider-specific
+    /// hidden-overhead allowance (built-in system/tools/CLAUDE.md).
+    pub fn context_pressure(&self) -> ContextPressure {
+        let conv = &self.conversations[self.active_conv];
         let limit = self.context_limit_tokens();
-        let (input_words, output_words) = self.count_transcript_words();
-        let total_words = input_words + output_words + SYSTEM_PROMPT_OVERHEAD_WORDS;
-        let tokens_est = words_to_tokens(total_words);
+        let transcript_tokens = self.transcript_token_estimate();
+        let bootstrap_tokens = conv.last_bootstrap_tokens;
+        let hidden_overhead_tokens = hidden_provider_overhead_tokens(self.effective_model());
+
+        let composite = transcript_tokens
+            .saturating_add(bootstrap_tokens)
+            .saturating_add(hidden_overhead_tokens);
+
+        let (tokens, source) = if let Some(u) = &conv.last_token_usage {
+            let prefix = u.prefix_tokens() as usize;
+            if prefix > 0 {
+                (prefix, ContextBarSource::ProviderPrefix)
+            } else {
+                (composite, ContextBarSource::CompositeEstimate)
+            }
+        } else {
+            (composite, ContextBarSource::CompositeEstimate)
+        };
+
         let pct = if limit > 0 {
-            (tokens_est * 100 / limit).min(100)
+            (tokens * 100 / limit).min(100)
         } else {
             0
         };
-        (tokens_est, pct)
+
+        ContextPressure {
+            tokens,
+            pct,
+            source,
+            transcript_tokens,
+            bootstrap_tokens,
+            hidden_overhead_tokens,
+        }
+    }
+
+    /// Back-compat tuple for call sites that only need tokens + percent.
+    pub fn estimate_context(&self) -> (usize, usize) {
+        let p = self.context_pressure();
+        (p.tokens, p.pct)
+    }
+
+    fn transcript_token_estimate(&self) -> usize {
+        let (input_words, output_words) = self.count_transcript_words();
+        words_to_tokens(input_words.saturating_add(output_words))
     }
 
     /// Word counts for the active conversation's visible transcript,
@@ -958,10 +1005,9 @@ impl AgentChatState {
             match msg.role {
                 ChatRole::User => input += count_words(&msg.content),
                 ChatRole::Assistant => {
+                    // Tool names are already inlined in `content` as `[tool]`
+                    // markers — do not count `tool_calls` again.
                     output += count_words(&msg.content);
-                    for tc in &msg.tool_calls {
-                        output += count_words(tc);
-                    }
                 }
                 ChatRole::System => {}
             }
@@ -970,7 +1016,7 @@ impl AgentChatState {
     }
 
     /// Context window size in tokens for the effective model.
-    fn context_limit_tokens(&self) -> usize {
+    pub fn context_limit_tokens(&self) -> usize {
         let model = self.effective_model();
         // Trailing `[1m]` (e.g. `claude:sonnet[1m]`, `claude:claude-opus-4-7[1m]`)
         // selects the 1M-token extended context variant — see Claude Code
@@ -978,9 +1024,10 @@ impl AgentChatState {
         if model.ends_with("[1m]") {
             return 1_000_000;
         }
-        let base = model.strip_prefix("claude:").unwrap_or(model);
-        match base {
-            "opus" | "sonnet" | "haiku" | "opusplan" => 200_000,
+        let provider = model.split_once(':').map(|(p, _)| p).unwrap_or("claude");
+        match provider {
+            "ollama" | "local" => 8_192,
+            "claude" | "codex" | "cursor" => 200_000,
             _ => 200_000,
         }
     }
@@ -1054,6 +1101,7 @@ impl AgentChatState {
             pending_persisted_ledger: None,
             transcript_inline_mode: TranscriptInlineMode::Auto,
             last_token_usage: None,
+            last_bootstrap_tokens: 0,
         };
         self.conversations.push(conv);
         self.active_conv = self.conversations.len() - 1;
@@ -1078,6 +1126,7 @@ impl AgentChatState {
         // indicator falls back to the char estimate until the first
         // post-reset turn reports fresh numbers.
         conv.last_token_usage = None;
+        conv.last_bootstrap_tokens = 0;
         // Suppress the visible transcript on the next first-turn dispatch.
         // Bootstrap context (graph + memory) still flows; only the
         // re-inlining of prior user/assistant turns is skipped, matching
@@ -2140,6 +2189,7 @@ impl AgentChatState {
                     // refuse the stale id. Default `Auto` preserves that.
                     transcript_inline_mode: TranscriptInlineMode::Auto,
                     last_token_usage: pending_usage,
+                    last_bootstrap_tokens: 0,
                 });
             }
         }
@@ -3010,12 +3060,17 @@ impl AgentChatState {
     }
 }
 
-/// Fixed-word allowance for the system prompt + bootstrap injections
-/// (memory, graph, file refs) that the user never sees in the transcript
-/// but the model still receives every turn. Calibrated as a coarse
-/// approximation — the heuristic only matters until the provider reports
-/// authoritative usage.
-const SYSTEM_PROMPT_OVERHEAD_WORDS: usize = 100;
+/// Hidden provider context (built-in system prompt, tool schemas, auto-loaded
+/// project docs) not visible in the chat panel. Used only in the composite
+/// estimate when `prefix_tokens()` is unavailable.
+fn hidden_provider_overhead_tokens(model: &str) -> usize {
+    let provider = model.split_once(':').map(|(p, _)| p).unwrap_or("claude");
+    match provider {
+        "ollama" | "local" => 512,
+        "codex" | "cursor" => 12_000,
+        _ => 18_000,
+    }
+}
 
 /// Count words by splitting on Unicode whitespace. Empty/whitespace-only
 /// input yields 0.
@@ -3564,9 +3619,10 @@ mod tests {
     }
 
     #[test]
-    fn count_transcript_words_counts_assistant_tool_calls_as_output() {
+    fn count_transcript_words_ignores_orphan_tool_calls_vec() {
         let mut state = AgentChatState::new();
         state.add_user_message("edit the file");
+        // Synthetic push without inline `[tool]` marker — only `content` counts.
         push_assistant(
             &mut state,
             "done it",
@@ -3574,10 +3630,8 @@ mod tests {
         );
 
         let (input, output) = state.count_transcript_words();
-        assert_eq!(input, 3, "'edit the file' → 3 words");
-        // "done it" (2) + "Write src/main.rs" (2; the path is one
-        // whitespace-bounded token).
-        assert_eq!(output, 4);
+        assert_eq!(input, 3);
+        assert_eq!(output, 2);
     }
 
     #[test]
@@ -3598,39 +3652,51 @@ mod tests {
     }
 
     #[test]
-    fn estimate_context_word_counts_visible_transcript() {
+    fn context_pressure_composite_includes_transcript_bootstrap_and_hidden() {
         let mut state = AgentChatState::new();
         state.add_user_message("one two three");
         push_assistant(&mut state, "four five", Vec::new());
+        state.conversations[state.active_conv].last_bootstrap_tokens = 12_000;
 
-        // 3 input + 2 output + 100 overhead = 105 words → 136 tokens.
-        let (tokens, _pct) = state.estimate_context();
-        assert_eq!(tokens, words_to_tokens(3 + 2 + SYSTEM_PROMPT_OVERHEAD_WORDS));
+        let p = state.context_pressure();
+        assert_eq!(p.source, ContextBarSource::CompositeEstimate);
+        let expected = words_to_tokens(5)
+            .saturating_add(12_000)
+            .saturating_add(hidden_provider_overhead_tokens("claude:sonnet"));
+        assert_eq!(p.tokens, expected);
     }
 
     #[test]
-    fn estimate_context_ignores_provider_reported_usage() {
-        // The indicator deliberately tracks what the user wrote, not what
-        // the model was conditioned on. Provider data is surfaced only via
-        // `/context`. Guards against a future regression that re-couples
-        // the status bar to `last_token_usage` (the same coupling that
-        // produced 130 → 88K on first turn).
+    fn context_pressure_uses_provider_prefix_when_reported() {
         let mut state = AgentChatState::new();
         state.add_user_message("a b c d e");
         state.conversations[state.active_conv].last_token_usage =
             Some(gaviero_core::acp::protocol::TokenUsage {
                 input_tokens: 500,
                 cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 87_500, // 88K provider reading
+                cache_read_input_tokens: 87_500,
                 output_tokens: 42,
             });
 
-        let (tokens, _pct) = state.estimate_context();
-        // 5 input + 0 output + 100 overhead = 105 words → 136 tokens.
-        assert_eq!(
-            tokens,
-            words_to_tokens(5 + SYSTEM_PROMPT_OVERHEAD_WORDS),
-            "indicator must word-count the transcript even when provider data is present"
+        let p = state.context_pressure();
+        assert_eq!(p.source, ContextBarSource::ProviderPrefix);
+        assert_eq!(p.tokens, 88_000);
+        assert!(!p.is_approximate());
+    }
+
+    #[test]
+    fn count_transcript_words_no_double_count_tool_calls_in_content() {
+        let mut state = AgentChatState::new();
+        state.add_user_message("edit the file");
+        push_assistant(
+            &mut state,
+            "done it\n[Write src/main.rs]",
+            vec!["Write src/main.rs".to_string()],
         );
+
+        let (input, output) = state.count_transcript_words();
+        assert_eq!(input, 3);
+        // Content only: "done it" + "[Write src/main.rs]" → 4 words (not 6).
+        assert_eq!(output, 4);
     }
 }
