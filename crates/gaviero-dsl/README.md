@@ -14,8 +14,8 @@ cargo clippy -p gaviero-dsl
 
 **Client** — Define model, tier, effort, and optional provider-specific extras:
 ```gaviero
-client reasoning { tier expensive model "claude-opus-4-7" effort high default }
-client fast      { tier cheap     model "claude-sonnet-4-6" effort low }
+client reasoning { tier expensive model "claude:opus"   effort high default }
+client fast      { tier cheap     model "claude:sonnet" effort low }
 ```
 
 **Tier alias** — Name a routing label and bind it to a client:
@@ -108,6 +108,30 @@ workflow refactor_auth {
 }
 ```
 
+### Example scripts in `examples/`
+
+Six workflows ship with the crate. They use `include "clients.gaviero"` and must be
+compiled via `compile_file` or `gaviero-cli --script` (inline `compile()` rejects
+includes).
+
+| File | Demonstrates |
+|------|----------------|
+| `clients.gaviero` | Shared profiles: `claude:opus`, `claude:sonnet`, `codex:gpt-5.5`, `codex:gpt-5.4` |
+| `plan_refinement.gaviero` | Dual-model plan refinement; judge loop with `stability`, `judge_timeout`, `{{ITER_EVIDENCE}}` |
+| `phased_plan.gaviero` | Dynamic phase extraction; per-iteration executor, gate, and judge |
+| `codebase_review.gaviero` | Rolling replan/apply loop; `branch_chain stacked`; `until command` termination |
+| `update_docs.gaviero` | Parallel doc rewrite; semantic `tier` roles + `profiles/*.gaviero`; `--tiers-file` |
+| `security_audit_memory.gaviero` | `memory {}` overrides, additive `read_ns`, `staleness_sources` |
+
+```bash
+gaviero-cli --script crates/gaviero-dsl/examples/plan_refinement.gaviero \
+    --prompt "Add workspace settings cascade"
+
+gaviero-cli --script crates/gaviero-dsl/examples/update_docs.gaviero
+gaviero-cli --script crates/gaviero-dsl/examples/update_docs.gaviero \
+    --tiers-file crates/gaviero-dsl/examples/profiles/doc-codex.gaviero
+```
+
 ## Language Reference
 
 ### Include
@@ -170,6 +194,23 @@ tier expensive opus
 
 Agents using `tier expensive` are re-routed by changing one line.
 
+**Tiers profile file** — put bindings in a separate file and select it at runtime:
+
+```gaviero
+// profiles/doc-codex.gaviero — tier lines only
+tier inventory       codex-5-5
+tier writer_standard codex-5-4
+```
+
+```bash
+gaviero-cli --script update_docs.gaviero \
+    --tiers-file profiles/doc-codex.gaviero
+```
+
+The main script must still `include` the client pool (`clients.gaviero`). `--tiers-file`
+overrides `tier` lines from the script and its includes; precedence is CLI profile >
+included profile > script.
+
 ### Top-level Vars
 
 Script-level substitution applied to agent prompts, descriptions, and scope paths before compilation:
@@ -206,7 +247,7 @@ compile-dispatch time by `gaviero-core`.
 - **Claude** — `claude:sonnet`, `claude:opus`, `claude:haiku`,
   `claude:opusplan`, `claude:sonnet[1m]`, or any versioned form like
   `claude:claude-opus-4-7`
-- **Codex** — `codex:<model>` (e.g., `codex:gpt-5.4`)
+- **Codex** — `codex:<model>` (e.g., `codex:gpt-5.5`, `codex:gpt-5.4`)
 - **Ollama/local** — `ollama:qwen2.5-coder:7b` or `local:model-name`
 
 ### Scope Block
@@ -260,6 +301,23 @@ memory {
 }
 ```
 
+`write_content` also supports `{{SUMMARY}}`, `{{FILES}}`, `{{AGENT}}`, and
+`{{DESCRIPTION}}` (filled in by the runtime after the agent completes).
+
+### Agent tools
+
+Request extra tools beyond the runner's default read-only set:
+
+```gaviero
+agent checker {
+    client sonnet
+    tools ["Bash"]    // forwarded verbatim to the backend via --allowedTools
+    prompt "Run cargo check and report errors."
+}
+```
+
+Shell-capable tools bypass write-gate guarantees — use sparingly.
+
 ### Verification Block
 
 Specify post-execution checks:
@@ -290,24 +348,36 @@ workflow review_and_fix {
 
 ### Explicit Loops
 
-Repeat a workflow or agent with exit conditions:
+Repeat a sequence of agents with exit conditions:
 
 ```gaviero
 loop {
+    agents         [fixer verifier]
     max_iterations 5
-    steps [fixer verifier]
-    until verification {
-        compile  true
-        test     true
-    }
+    iter_start     1
+    stability      1
+    judge_timeout  120
+    strict_judge   true
+    branch_chain   stacked    // none (default) | stacked — see examples/codebase_review.gaviero
+    until agent    reviewer
 }
 ```
 
+Loop fields:
+- `agents [...]` — body agents executed each iteration (in order)
+- `iter_start N` — first value of `{{ITER}}` (default `1`); `{{PREV_ITER}}` is `ITER - 1`
+- `stability K` — require K consecutive judge PASSes before exit (`until agent` only)
+- `judge_timeout N` — hard cap per judge invocation in seconds (`0` disables)
+- `strict_judge true|false` — unparseable judge output: hard error vs silent FAIL
+- `branch_chain stacked` — chain per-iteration git branches so iteration N sees
+  iteration N−1's source edits (required for source-mutating rolling loops)
+
 Exit conditions:
-- `until verification { ... }` — verification-based exit
+- `until { compile true test true clippy false impact_tests true }` — verification-based exit
 - `until agent reviewer` — run a judge agent on-demand; emit `PASS` / `FAIL`,
-  `VERDICT: PASS|FAIL`, or JSON like `{"pass": true}`
-- `until command "cargo test"` — shell command exit status
+  `VERDICT: PASS|FAIL`, or JSON like `{"verdict":"pass","reason":"…"}`. The runtime
+  may inject `{{ITER_EVIDENCE}}` into the judge prompt (digest of what changed).
+- `until command "cargo test"` — shell command; exit status 0 means condition met
 
 ## Running Workflows
 
@@ -342,14 +412,23 @@ The output is a `.gaviero` file you can inspect, edit, and then execute.
 ### Entry points
 
 ```rust
-use gaviero_dsl::{compile, compile_with_vars};
+use gaviero_dsl::{compile, compile_file, compile_with_vars};
 
-// Basic compilation
+// Inline script (no `include` statements)
 let plan = compile(source, filename, workflow_name, runtime_prompt)?;
 
-// With CLI-level var overrides (beat script-level vars {}, lose to agent-level vars {})
+// From disk — resolves `include "…"` transitively
+let plan = compile_file(
+    std::path::Path::new("examples/plan_refinement.gaviero"),
+    Some("feature-plan-refinement"),
+    Some("runtime prompt text"),
+    &[],
+    &[],
+)?;
+
+// CLI-level var overrides (beat script-level vars {}; agent-level vars still win)
 let overrides = vec![("PLANS".to_string(), "output".to_string())];
-let plan = compile_with_vars(source, filename, workflow_name, runtime_prompt, &overrides)?;
+let plan = compile_with_vars(source, filename, workflow_name, runtime_prompt, &overrides, &[])?;
 ```
 
 ### Return type
