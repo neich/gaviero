@@ -11,7 +11,8 @@ Core runtime library for Gaviero. All execution logic — agent orchestration, w
 - **Write gates** — Diff review and interactive acceptance before changes touch disk
 - **Iteration & validation** — Retry loops with syntax checking, compilation, and test-based verification
 - **Semantic memory** — Five-level scoped embeddings (`gte-modernbert-base`, SQLite) with merged multi-scope RRF retrieval, three-cadence consolidation, soft-delete, and optional cross-encoder reranking
-- **In-process MCP server** — Exposes `memory_search`, `blast_radius`, and `node_doc` read-only tools to subprocess agents (Claude Code, Codex) over a Unix socket; the `gaviero-mcp-shim` binary bridges agent stdio to the socket
+- **In-process MCP server** — Exposes `memory_search`, `blast_radius`, and `node_doc` read-only tools to subprocess agents (Claude Code, Codex, Cursor) over a Unix socket; the `gaviero-mcp-shim` binary bridges agent stdio to the socket
+- **Repo map** — PageRank-based context ranking plus shallow filesystem topology for two-layer `<repo_topology>` + `<repo_outline>` context bundles
 - **Git & worktrees** — Repository operations and isolated execution contexts
 - **Workspace settings** — Configuration cascade (project → user → defaults)
 - **Terminal management** — PTY lifecycle and interactive shell sessions
@@ -30,12 +31,12 @@ Most tests run offline. Some (marked `#[ignore]`) require network for Ollama hea
 
 ## Provider Model Strings
 
-Model selection uses a unified convention across chat and swarm execution:
+Model selection uses a unified convention across chat and swarm execution. All specs require a `provider:model` prefix — bare names are rejected by `validate_model_spec`.
 
-- **Claude models** — `sonnet`, `opus`, `haiku` (shorthand) or `claude:sonnet`, `claude:haiku` (explicit)
+- **Claude** — `claude:sonnet`, `claude:opus`, `claude:haiku` (shorthand) or versioned forms like `claude:claude-opus-4-7`
 - **Codex** — `codex:<model>` (e.g., `codex:gpt-5.4`) — routed to the Codex backend
+- **Cursor** — `cursor:<model>` — routed to the Cursor backend
 - **Ollama/local** — `ollama:qwen2.5-coder:7b` or `local:model-name`
-- **Default** — unprefixed names route to Claude for backward compatibility
 
 Ollama server URL is configured via `SwarmConfig.ollama_base_url` or workspace setting `agent.ollamaBaseUrl`.
 
@@ -48,7 +49,7 @@ Ollama server URL is configured via `SwarmConfig.ollama_base_url` or workspace s
 | **Chat** | `acp::client::AcpPipeline` | Single-turn agent execution with prompt enrichment |
 | **Swarm** | `swarm::pipeline::execute()` | Multi-agent orchestration from compiled plans |
 | **Planning** | `swarm::pipeline::plan_coordinated()` | Generate reviewable `.gaviero` plans |
-| **Backend** | `swarm::backend::AgentBackend` trait | Provider abstraction (Claude, Ollama, mock) |
+| **Backend** | `swarm::backend::AgentBackend` trait | Provider abstraction (Claude, Codex, Cursor, Ollama, mock) |
 | **Routing** | `swarm::router::TierRouter` | Model tier resolution (local/cheap/expensive) |
 | **Iteration** | `iteration::IterationEngine` | Retry loops with verification feedback |
 | **Write Gate** | `write_gate::WriteGatePipeline` | Diff review + file application |
@@ -98,16 +99,16 @@ println!("{}", plan.to_gaviero_script()?);  // Reviewable .gaviero format
 | Module | Purpose |
 |---|---|
 | `acp/` | Claude subprocess protocol (ACP), session factory, prompt enrichment, file block routing |
+| `agent_session/` | Per-agent session lifecycle: claude, codex_exec, codex_app_server (dual-mode Codex), cursor, ollama, registry |
 | `mcp/` | In-process MCP server (read-only tools: `memory_search`, `blast_radius`, `node_doc`); config synthesis and external-server detection |
 | `swarm/` | Multi-agent orchestration, tier routing, DAG execution, verification, git merge, backends, replanner, calibration, context bundles |
-| `agent_session/` | Per-agent session lifecycle: claude, codex_exec, codex_app_server (dual-mode Codex), ollama, registry |
 | `context_planner/` | Context selection: repo-map queries, callers_of, tests_for, chat memory, compaction, ledger |
 | `session_state/` | Persistent session state (checkpoint/resume, history) |
 | `iteration/` | Retry loops, escalation, best-of-N strategy |
 | `validation_gate/` | Syntax validation (tree-sitter), compilation checks (cargo), test verification |
 | `write_gate/` | Diff review, hunk acceptance/rejection, scope enforcement |
 | `memory/` | Five-level hierarchical scoped embeddings (`gte-modernbert-base`, SQLite, RRF hybrid); three-cadence consolidation, soft-delete, multi-DB registry, optional reranker |
-| `repo_map/` | PageRank-based context ranking, code graph, symbol resolution |
+| `repo_map/` | PageRank-based context ranking, code graph, symbol resolution; shallow `topology.rs` for `<repo_topology>` filesystem map |
 | `path_pattern/` | Glob-style path pattern matching and scope overlap detection for DSL validation |
 | `workspace/` | Settings cascade, namespace resolution, project configuration |
 | `git/` | Git2 wrapper, worktree management, merge + conflict resolution |
@@ -116,6 +117,8 @@ println!("{}", plan.to_gaviero_script()?);  // Reviewable .gaviero format
 | `diff_engine/` | Hunk computation, context extraction |
 | `indent/` | Smart indentation (tree-sitter + hybrid + bracket strategies) |
 | `scope_enforcer/` | File path validation, write boundary enforcement |
+| `observer/` | `WriteGateObserver`, `AcpObserver`, `SwarmObserver` traits |
+| `types/` | Shared boundary types (`FileScope`, `WriteProposal`, `ModelTier`, …) |
 
 ## Design Notes
 
