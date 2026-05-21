@@ -14,7 +14,7 @@ Binary name: `gaviero-cli`
 
 ## Overview
 
-Gaviero CLI provides three ways to define work:
+Gaviero CLI provides four ways to define work:
 
 1. **Single task** — Simple task description with auto-generated scope
 2. **Workflow script** — Compiled `.gaviero` DSL file with agents and verification
@@ -88,7 +88,7 @@ gaviero-cli --script tmp/plan.gaviero
 
 ## Model Routing
 
-The CLI supports provider-aware model specifications:
+The CLI supports provider-aware model specifications.
 
 ### Model spec formats
 
@@ -96,6 +96,7 @@ All specs require a provider prefix: `provider:model`.
 
 - **Claude** — `claude:sonnet`, `claude:opus`, `claude:haiku`, `claude:opusplan`, `claude:sonnet[1m]`
 - **Codex** — `codex:gpt-5.5`
+- **Cursor** — `cursor:<model>` (e.g., `cursor:claude-4-sonnet`)
 - **Ollama / local** — `ollama:qwen2.5-coder:7b`, `local:qwen2.5-coder:14b`
 
 ### Priority resolution
@@ -125,6 +126,10 @@ Ollama server URL precedence:
 
 ## Flag Reference
 
+The authoritative flag list is the `Cli` struct in `src/main.rs`. Flags are grouped below by function.
+
+### Core execution
+
 | Flag | Argument | Purpose |
 |---|---|---|
 | `--repo` | `<path>` | Workspace root (default: current directory) |
@@ -136,9 +141,20 @@ Ollama server URL precedence:
 | `--work-units` | `<json>` | Explicit work unit definitions |
 | `--coordinated` | — | Generate reviewable plan, don't execute |
 | `--output` | `<path>` | Save generated plan to file (`--coordinated`) |
-| `--model` | `<spec>` | Model: `claude:<m>`, `codex:<m>`, `ollama:<m>`, `local:<m>` (default: `claude:sonnet`) |
+| `--workflow` | `<name>` | Pick a specific workflow when the script defines several |
+
+### Model selection
+
+| Flag | Argument | Purpose |
+|---|---|---|
+| `--model` | `<spec>` | Model: `claude:<m>`, `codex:<m>`, `cursor:<m>`, `ollama:<m>`, `local:<m>` (default: `claude:sonnet`) |
 | `--coordinator-model` | `<spec>` | Planner model for `--coordinated` |
 | `--ollama-base-url` | `<url>` | Ollama server URL |
+
+### Execution control
+
+| Flag | Argument | Purpose |
+|---|---|---|
 | `--auto-accept` | — | Skip interactive review, apply changes directly |
 | `--max-parallel` | `<n>` | Override workflow parallelism |
 | `--max-retries` | `<n>` | Retry limit for validation feedback |
@@ -146,20 +162,80 @@ Ollama server URL precedence:
 | `--test-first` | — | Generate failing tests before code changes |
 | `--no-iterate` | — | Single-pass execution, no retries |
 | `--resume` | — | Resume from saved checkpoint |
-| `--namespace` | `<ns>` | Memory write namespace |
-| `--read-ns` | `<ns>` | Additional read namespaces (repeatable) |
+| `--verbose` | — | Verbose progress output |
+
+### Output
+
+| Flag | Argument | Purpose |
+|---|---|---|
 | `--format` | `text\|json` | Output format |
 | `--trace` | `<file>` | Write DEBUG-level JSON trace log |
-| `--graph` | — | Build/update code knowledge graph and exit |
-| `--exclude` | `<pattern>` | Exclude folders from repo-map scanning (repeatable, comma-separated) |
+
+### Memory
+
+| Flag | Argument | Purpose |
+|---|---|---|
+| `--namespace` | `<ns>` | Memory write namespace |
+| `--read-ns` | `<ns>` | Additional read namespaces (repeatable) |
+| `--no-memory` | — | Disable memory subsystem for this run |
+| `--remember` | `<text>` | Store a memory and exit |
+| `--remember-scope` | `<scope>` | Scope for `--remember` (default: repo) |
+
+### Memory admin
+
+| Flag | Argument | Purpose |
+|---|---|---|
 | `--manifest-last` | `<n>` | Print the N most recent retrieval manifests and exit |
 | `--manifest-turn` | `<id>` | Print the retrieval manifest for a specific turn id and exit |
+| `--deletions-last` | `<n>` | Print the N most recently soft-deleted memories and exit |
+| `--restore-id` | `<id>` | Restore a specific soft-deleted memory by id |
+| `--restore-since` | `<date>` | Restore all memories soft-deleted since a given date |
+| `--forget-history-id` | `<id>` | Redact a history row by id |
+| `--redact-confirm` | — | Required confirmation flag for redaction |
+| `--redact-reason` | `<text>` | Reason string stored in the audit table |
+| `--accept-c1-migration` | — | Accept and run the C1 typed-stores migration |
+
+### Sleeptime
+
+| Flag | Argument | Purpose |
+|---|---|---|
+| `--sleep` | — | Run the sleeptime consolidation pass and exit |
+| `--sleep-dry-run` | — | Simulate sleeptime pass without writing |
+
+### Utilization reporting
+
+| Flag | Argument | Purpose |
+|---|---|---|
+| `--utilization-scope` | `<scope>` | Scope to report memory utilization for |
+| `--utilization-top` | `<n>` | Show the top N entries |
+| `--utilization-asc` | — | Sort ascending instead of descending |
+
+### Repo-map
+
+| Flag | Argument | Purpose |
+|---|---|---|
+| `--graph` | — | Build/update code knowledge graph and exit |
+| `--exclude` | `<pattern>` | Exclude folders from repo-map scanning (repeatable, comma-separated) |
+
+### Branch cleanup
+
+| Flag | Argument | Purpose |
+|---|---|---|
+| `--cleanup-branches` | — | Delete stale `gaviero/*` git branches and exit |
+| `--force` | — | Skip confirmation when cleaning up branches |
+
+### Eval
+
+| Flag | Argument | Purpose |
+|---|---|---|
 | `--eval-fixture` | `<path>` | Run retrieval smoke test against a JSONL fixture; prints recall@K and MRR |
 | `--eval-tolerance` | `<f>` | Recall@5 regression tolerance for `--eval-fixture` (default 0.02) |
 | `--eval-report-out` | `<path>` | Write eval report to file (defaults to `<fixture>.last.json`) |
 | `--eval-update-baseline` | — | Update the baseline file from this run's results |
 | `--eval-rerank-ablation` | — | Run fixture twice with/without reranker and print recall/MRR deltas |
 | `--eval-from-manifests` | `<n>` | Rescore fixture against N persisted manifests (no embedder/LLM) |
+| `--eval-allow-missing-baseline` | — | Do not fail when the baseline file does not exist |
+| `--eval-bootstrap-from-manifests` | — | Bootstrap the baseline file from persisted manifests |
 
 ## Output
 
@@ -208,6 +284,19 @@ gaviero-cli \
   --task "Refactor database schema" \
   --attempts 3 \
   --format json > results.json
+```
+
+### Store a memory from the CLI
+
+```bash
+gaviero-cli --remember "The auth module uses bcrypt for password hashing" \
+  --remember-scope repo
+```
+
+### Clean up stale swarm branches
+
+```bash
+gaviero-cli --repo ~/my-project --cleanup-branches --force
 ```
 
 ## See Also

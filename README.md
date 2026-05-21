@@ -16,6 +16,7 @@ cargo build --release
 Or to see all binaries:
 - `gaviero` — interactive TUI editor
 - `gaviero-cli` — headless command-line runner
+- `gaviero-mcp-shim` — stdio↔socket bridge for subprocess agent MCP access
 
 For full architecture and module details, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -108,11 +109,14 @@ Useful commands you can type in the chat:
 
 | Command | What it does |
 |---|---|
-| `/model <name>` | Switch Claude model |
-| `/compact` | Trim conversation history |
+| `/model <spec>` | Switch active model (e.g., `claude:sonnet`, `cursor:claude-4-sonnet`) |
+| `/lite` | Send a minimal-context turn (topology kept; outline, memory, impact dropped) |
+| `/compact` | Trim conversation history while preserving key context |
+| `/clear` | Clear conversation history |
 | `/remember <text>` | Store a fact in semantic memory |
+| `/forget <query>` | Soft-delete memories matching the query |
 | `/attach <path>` | Attach a file to the conversation |
-| `/detach <path>` | Remove an attachment |
+| `/detach <name\|all>` | Remove an attachment |
 
 ### The Write Gate
 
@@ -146,11 +150,12 @@ Model routing is automatic — the coordinator annotates each subtask with a tie
 | Expensive | Sonnet | Complex multi-file semantic changes |
 | Cheap | Haiku | Focused single-file tasks |
 | Codex | `codex:<model>` | OpenAI Codex execution (e.g. `codex:gpt-5-codex`) |
+| Cursor | `cursor:<model>` | Cursor-based execution (e.g. `cursor:claude-4-sonnet`) |
 | Mechanical | Ollama (local) | Rote/trivial changes (falls back to Haiku) |
 
 Individual work units can override the tier with an explicit `model` field.
 
-The **Swarm Dashboard** (Ctrl+2) shows real-time status: which agents are running, their output, elapsed time, and cost.
+The **Swarm Dashboard** (Alt+w) shows real-time status: which agents are running, their output, elapsed time, and cost.
 
 You can also define work units manually:
 
@@ -200,7 +205,7 @@ gaviero-cli --repo ~/my-project \
   --max-parallel 4
 ```
 
-In coordinated mode, model selection is automatic — Opus plans the task, then each subtask is routed to the appropriate model tier (see [Swarm mode](#swarm-mode)). The `--model` flag only applies to non-coordinated single-agent runs.
+In coordinated mode, model selection is automatic — Opus plans the task, then each subtask is routed to the appropriate model tier (see [Multi-Agent Coordination](#multi-agent-coordination)). The `--model` flag only applies to non-coordinated single-agent runs.
 
 ### CLI flags
 
@@ -211,35 +216,47 @@ In coordinated mode, model selection is automatic — Opus plans the task, then 
 | `--script FILE` | Compile and execute a `.gaviero` workflow file |
 | `--prompt-file FILE` | File contents replace `{{PROMPT}}` in DSL script (requires `--script`) |
 | `--var KEY=VALUE` | Override a `vars {}` entry in a DSL script (repeatable, requires `--script`) |
+| `--tiers-file FILE` | Tier profile override (requires `--script`) |
 | `--work-units JSON` | WorkUnit array for multi-agent tasks |
 | `--coordinated` | Use Opus to plan, then tier-routed execution (ignores `--model`) |
 | `--output PATH` | Output path for generated plan file (`--coordinated` only) |
 | `--auto-accept` | Skip interactive review |
 | `--max-parallel N` | Parallel agent limit (default: 1) |
-| `--model NAME` | Model spec: `sonnet`, `opus`, `codex:<model>`, `ollama:<model>` (default: sonnet) |
+| `--model NAME` | Model spec: `claude:<m>`, `codex:<m>`, `cursor:<m>`, `ollama:<m>`, `local:<m>` (default: `claude:sonnet`) |
 | `--namespace NS` | Memory write namespace |
 | `--read-ns NS` | Additional read namespaces (repeatable) |
+| `--no-memory` | Disable memory subsystem for this run |
+| `--remember TEXT` | Store a memory and exit |
+| `--remember-scope SCOPE` | Scope for `--remember` |
 | `--format text\|json` | Output format |
 | `--max-retries N` | Inner validation-feedback retries (default: 5) |
 | `--attempts N` | Independent attempts for BestOfN strategy (default: 1) |
 | `--test-first` | Generate failing tests before editing (TDD) |
 | `--no-iterate` | Single pass only — disables retry loop |
 | `--resume` | Skip already-completed agents from a prior run |
+| `--verbose` | Verbose progress output |
 | `--trace FILE` | Write DEBUG-level JSON trace log |
-| `--coordinator-model NAME` | Coordinator model for `--coordinated` planning (default: `--model` or opus) |
+| `--coordinator-model NAME` | Coordinator model for `--coordinated` planning |
 | `--ollama-base-url URL` | Ollama server URL (default: `http://localhost:11434`) |
 | `--graph` | Build/update code knowledge graph and exit |
 | `--exclude PATTERN` | Exclude folders from repo-map scanning (repeatable, comma-separated) |
+| `--cleanup-branches` | Delete stale `gaviero/*` git branches and exit |
+| `--force` | Skip confirmation (use with `--cleanup-branches`) |
 | `--manifest-last N` | Print the N most recent memory retrieval manifests and exit |
 | `--manifest-turn ID` | Print the retrieval manifest for a specific turn id and exit |
+| `--sleep` | Run the sleeptime memory consolidation pass and exit |
+| `--sleep-dry-run` | Simulate sleeptime pass without writing |
+| `--accept-c1-migration` | Accept the C1 typed-stores schema migration |
+
+See [crates/gaviero-cli/README.md](crates/gaviero-cli/README.md) for the full flag reference including eval, utilization, and redaction flags.
 
 ## Workflow Scripts (DSL)
 
 Define reusable multi-agent workflows in `.gaviero` files. The Gaviero DSL compiles declarative workflows into execution plans run by the swarm engine. Learn more in [crates/gaviero-dsl/README.md](crates/gaviero-dsl/README.md).
 
 ```gaviero
-client sonnet { tier cheap     model "claude-sonnet-4-6" effort low  default }
-client opus   { tier expensive model "claude-opus-4-7"   effort high }
+client sonnet { tier cheap     model "claude:sonnet" effort low  default }
+client opus   { tier expensive model "claude:opus"   effort high }
 
 tier cheap     sonnet
 tier expensive opus
@@ -327,6 +344,8 @@ For multi-folder projects, create a `.gaviero-workspace` file:
 }
 ```
 
+Pass the workspace file to the editor: `gaviero path/to/project.gaviero-workspace`.
+
 ### Themes
 
 Color schemes live in `themes/` as TOML files. The default theme is One Dark inspired.
@@ -341,7 +360,7 @@ Gaviero is a Cargo workspace of six crates:
 | **gaviero-tui** | Terminal UI: event loop, panels, editor, chat, diff review, session restore |
 | **gaviero-cli** | Headless CLI: task argument parsing, observer wiring |
 | **gaviero-dsl** | Compiler for `.gaviero` workflow scripts → execution plans |
-| **gaviero-mcp-shim** | stdio↔Unix-socket bridge that connects subprocess agents (Claude Code, Codex) to core's in-process MCP server |
+| **gaviero-mcp-shim** | stdio↔Unix-socket bridge that connects subprocess agents (Claude Code, Codex, Cursor) to core's in-process MCP server |
 | **tree-sitter-gaviero** | Tree-sitter grammar for `.gaviero` files |
 
 Core is the source of truth — it has no UI dependencies. The TUI and CLI both delegate all logic to core through public APIs.
@@ -352,6 +371,7 @@ Core is the source of truth — it has no UI dependencies. The TUI and CLI both 
 - [crates/gaviero-cli/README.md](crates/gaviero-cli/README.md) — CLI modes, flags, examples
 - [crates/gaviero-dsl/README.md](crates/gaviero-dsl/README.md) — language syntax, examples, compilation
 - [crates/gaviero-mcp-shim/README.md](crates/gaviero-mcp-shim/README.md) — MCP shim binary
+- [crates/tree-sitter-gaviero/README.md](crates/tree-sitter-gaviero/README.md) — tree-sitter grammar
 
 For complete architectural details including data flow, module maps, and inter-crate boundaries, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -366,7 +386,7 @@ For complete architectural details including data flow, module maps, and inter-c
 Detailed documentation and development instructions:
 - Build and test: see [CLAUDE.md](CLAUDE.md)
 - Module structure and subsystems: see [ARCHITECTURE.md](ARCHITECTURE.md)
-- For feature requests or bug reports: https://github.com/anthropics/claude-code/issues
+- For feature requests or bug reports: open an issue in this repository
 
 ## License
 
