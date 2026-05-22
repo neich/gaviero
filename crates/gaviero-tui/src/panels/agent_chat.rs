@@ -2414,9 +2414,15 @@ impl AgentChatState {
                 format!("  {}  ", title)
             };
 
-            for ch in label.chars() {
+            let bullet_style = Style::default().fg(theme::SUCCESS).bg(bg);
+            for (idx, ch) in label.chars().enumerate() {
+                let (out_ch, out_style) = if idx == 0 && conv.is_streaming {
+                    ('●', bullet_style)
+                } else {
+                    (ch, style)
+                };
                 if x < area.x + area.width && x < buf.area().right() {
-                    buf[(x, area.y)].set_char(ch).set_style(style);
+                    buf[(x, area.y)].set_char(out_ch).set_style(out_style);
                     x += 1;
                 }
             }

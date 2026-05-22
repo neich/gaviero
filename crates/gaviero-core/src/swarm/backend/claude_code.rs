@@ -205,14 +205,12 @@ pub fn map_acp_event(event: &StreamEvent) -> Vec<UnifiedStreamEvent> {
         StreamEvent::ContentDelta(text) => {
             out.push(UnifiedStreamEvent::TextDelta(text.clone()));
         }
-        StreamEvent::ToolUseStart {
-            tool_name,
-            tool_use_id,
-        } => {
-            out.push(UnifiedStreamEvent::ToolCallStart {
-                id: tool_use_id.clone(),
-                name: tool_name.clone(),
-            });
+        StreamEvent::ToolUseStart { .. } => {
+            // ACP streams `tool_use_start` before the input JSON has finished
+            // arriving, so we have no args to attach. Defer the unified
+            // `ToolCallStart` to `AssistantMessage`, which carries each
+            // tool_use with its full input — the only point where we can emit
+            // a rich summary downstream.
         }
         StreamEvent::ToolInputDelta(json) => {
             // We don't have a tool_use_id in scope for ToolInputDelta.
@@ -225,8 +223,15 @@ pub fn map_acp_event(event: &StreamEvent) -> Vec<UnifiedStreamEvent> {
             });
         }
         StreamEvent::AssistantMessage { tool_uses, .. } => {
-            // Emit ToolCallEnd for each tool use (the full input is available)
+            // `tool_uses` carries the full input JSON per call. Emit a single
+            // ToolCallStart-with-args per tool plus the matching ToolCallEnd
+            // so downstream observers can format a rich summary.
             for tu in tool_uses {
+                out.push(UnifiedStreamEvent::ToolCallStart {
+                    id: tu.name.clone(),
+                    name: tu.name.clone(),
+                    args: tu.input.clone(),
+                });
                 out.push(UnifiedStreamEvent::ToolCallEnd {
                     id: tu.name.clone(),
                 });
@@ -288,19 +293,15 @@ mod tests {
     }
 
     #[test]
-    fn test_map_tool_use_start() {
+    fn test_map_tool_use_start_defers_until_assistant_message() {
+        // ToolUseStart fires before input JSON has finished arriving, so
+        // claude_code.rs holds emission until AssistantMessage where each
+        // tool_use carries full input. ToolUseStart itself emits no events.
         let events = map_acp_event(&StreamEvent::ToolUseStart {
             tool_name: "Read".into(),
             tool_use_id: "t1".into(),
         });
-        assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0],
-            UnifiedStreamEvent::ToolCallStart {
-                id: "t1".into(),
-                name: "Read".into(),
-            }
-        );
+        assert!(events.is_empty());
     }
 
     #[test]
@@ -385,16 +386,25 @@ mod tests {
 
     #[test]
     fn test_map_assistant_message_emits_tool_end() {
+        let input = serde_json::json!({"file_path": "src/lib.rs"});
         let events = map_acp_event(&StreamEvent::AssistantMessage {
             text: "done".into(),
             tool_uses: vec![ToolUseInfo {
                 name: "Read".into(),
-                input: serde_json::json!({"file_path": "src/lib.rs"}),
+                input: input.clone(),
             }],
         });
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         assert_eq!(
             events[0],
+            UnifiedStreamEvent::ToolCallStart {
+                id: "Read".into(),
+                name: "Read".into(),
+                args: input,
+            }
+        );
+        assert_eq!(
+            events[1],
             UnifiedStreamEvent::ToolCallEnd { id: "Read".into() }
         );
     }

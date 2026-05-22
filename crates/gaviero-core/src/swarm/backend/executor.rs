@@ -37,6 +37,7 @@ pub async fn complete_to_text(
         "backend_dispatch"
     );
     let backend_name = backend.name().to_string();
+    let workspace_root = request.workspace_root.clone();
     let mut stream = backend.stream_completion(request).await?;
     let mut outcome = CompletionOutcome::default();
     let mut in_thinking = false;
@@ -69,12 +70,14 @@ pub async fn complete_to_text(
                     obs.on_stream_chunk(&text);
                 }
             }
-            UnifiedStreamEvent::ToolCallStart { name, .. } => {
+            UnifiedStreamEvent::ToolCallStart { name, args, .. } => {
                 if name == "Read" {
                     read_count += 1;
                 }
                 if let Some(obs) = observer {
-                    obs.on_tool_call_started(&name);
+                    let summary =
+                        crate::acp::client::format_tool_summary(&name, &args, &workspace_root);
+                    obs.on_tool_call_started(&summary);
                     obs.on_streaming_status(&format!("Using {}...", name));
                 }
             }
@@ -176,11 +179,13 @@ pub async fn complete_to_write_gate(
                 }
                 observer.on_stream_chunk(&text);
             }
-            UnifiedStreamEvent::ToolCallStart { name, .. } => {
+            UnifiedStreamEvent::ToolCallStart { name, args, .. } => {
                 if name == "Read" {
                     read_count += 1;
                 }
-                observer.on_tool_call_started(&name);
+                let summary =
+                    crate::acp::client::format_tool_summary(&name, &args, &workspace_root);
+                observer.on_tool_call_started(&summary);
                 observer.on_streaming_status(&format!("Using {}...", name));
             }
             UnifiedStreamEvent::ToolCallDelta { .. } => {}
