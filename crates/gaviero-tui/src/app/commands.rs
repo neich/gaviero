@@ -301,7 +301,14 @@ pub(super) fn handle_run_script_command(app: &mut App) {
     // block, fall back to inline compile — includes aren't supported there
     // because there's no anchoring file path inside a doc fence.
     let compiled = if source == raw {
-        gaviero_dsl::compile_file(&resolved, None, runtime_prompt.as_deref(), &[], &[])
+        gaviero_dsl::compile_file(
+            &resolved,
+            None,
+            runtime_prompt.as_deref(),
+            &[],
+            &[],
+            &[],
+        )
     } else {
         gaviero_dsl::compile(&source, &filename, None, runtime_prompt.as_deref())
     };
