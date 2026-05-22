@@ -56,6 +56,11 @@ pub struct SessionConstruction {
     /// sibling folders.
     pub additional_roots: Vec<PathBuf>,
     pub agent_id: String,
+    /// Conversation that owns this session. Stamped onto every `WriteProposal`
+    /// the session emits so the gate can drain / mode-switch per conversation
+    /// when multiple providers run in parallel. `None` for non-conversational
+    /// callers (CLI batch ops, internal tooling).
+    pub conv_id: Option<String>,
     pub options: AgentOptions,
     pub profile: ProviderProfile,
     /// Cancellation signal owned by the host (e.g. the TUI). When fired, the
@@ -90,6 +95,7 @@ struct ObservedStreamSession {
     write_gate: Arc<Mutex<WriteGatePipeline>>,
     workspace_root: PathBuf,
     agent_id: String,
+    conv_id: Option<String>,
     scan_text_file_blocks: bool,
 }
 
@@ -132,6 +138,7 @@ impl ObservedStreamSession {
                                 self.observer.as_ref(),
                                 &self.workspace_root,
                                 &self.agent_id,
+                                self.conv_id.as_deref(),
                                 &path,
                                 &content,
                             )
@@ -159,6 +166,7 @@ impl ObservedStreamSession {
                         self.observer.as_ref(),
                         &self.workspace_root,
                         &self.agent_id,
+                        self.conv_id.as_deref(),
                         &path,
                         &content,
                     )
@@ -261,6 +269,7 @@ pub fn create_session(args: SessionConstruction) -> Box<dyn AgentSession> {
                 workspace_root,
                 additional_roots,
                 agent_id,
+                conv_id,
                 options,
                 profile,
                 cancel_token,
@@ -275,6 +284,7 @@ pub fn create_session(args: SessionConstruction) -> Box<dyn AgentSession> {
                 workspace_root: workspace_root.clone(),
                 additional_roots,
                 agent_id: agent_id.clone(),
+                conv_id: conv_id.clone(),
                 options,
                 profile,
                 cancel_token,
@@ -286,6 +296,7 @@ pub fn create_session(args: SessionConstruction) -> Box<dyn AgentSession> {
                 write_gate,
                 workspace_root,
                 agent_id,
+                conv_id,
                 scan_text_file_blocks: true,
             })
         }
@@ -424,6 +435,7 @@ mod tests {
             write_gate,
             workspace_root,
             agent_id: "test-agent".into(),
+            conv_id: None,
             scan_text_file_blocks,
         }
     }
