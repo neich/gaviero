@@ -1,6 +1,7 @@
 pub mod ast;
 pub mod compiler;
 pub mod reviewers;
+pub mod workflow_params;
 pub mod error;
 pub mod lexer;
 pub mod parser;
@@ -47,9 +48,10 @@ pub fn compile(
 ///   lose to agent-level vars.
 /// - `override_tiers` — `--tiers-file` bindings. Replace top-level `tier`
 ///   declarations.
-/// - `override_params` — `--param NAME=VALUE` workflow-parameter overrides
-///   (today only rosters; format `id=provider:model[@effort],...`). Required
-///   workflow params without a default fail compilation when absent here.
+/// - `override_params` — `--param NAME=VALUE` workflow-parameter overrides.
+///   Roster params: `id=provider:model[@effort],...`. Client params:
+///   `provider:model[@effort]`. Required params without an in-script default
+///   fail compilation when absent here.
 pub fn compile_with_vars(
     source: &str,
     filename: &str,
