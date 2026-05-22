@@ -357,6 +357,25 @@
     }
   },
   {
+    "type": "param_declaration",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "reviewer_list",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "privacy_value",
     "named": true,
     "fields": {}
@@ -417,6 +436,10 @@
         },
         {
           "type": "string",
+          "named": true
+        },
+        {
+          "type": "tier_value",
           "named": true
         }
       ]
@@ -783,6 +806,10 @@
           "named": true
         },
         {
+          "type": "param_declaration",
+          "named": true
+        },
+        {
           "type": "step_list",
           "named": true
         },
@@ -983,6 +1010,10 @@
   },
   {
     "type": "owned",
+    "named": false
+  },
+  {
+    "type": "param",
     "named": false
   },
   {

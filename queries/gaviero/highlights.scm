@@ -29,6 +29,8 @@
 "max_retries" @keyword
 "steps" @keyword
 "max_parallel" @keyword
+"param" @keyword
+"template" @keyword
 
 ; ── Memory block keywords ─────────────────────────────────────
 "memory" @keyword
@@ -57,11 +59,16 @@
 "loop" @keyword
 "until" @keyword
 "agents" @keyword
+"reviewers" @keyword
+"template_init" @keyword
+"template_refine" @keyword
+"consensus_mode" @keyword
 "max_iterations" @keyword
 "iter_start" @keyword
 "stability" @keyword
 "judge_timeout" @keyword
 "strict_judge" @keyword
+"branch_chain" @keyword
 "command" @keyword
 
 ; ── Scope keywords ────────────────────────────────────────────

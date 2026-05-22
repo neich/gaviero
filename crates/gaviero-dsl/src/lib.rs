@@ -38,14 +38,18 @@ pub fn compile(
     workflow: Option<&str>,
     runtime_prompt: Option<&str>,
 ) -> Result<CompiledPlan, miette::Report> {
-    compile_with_vars(source, filename, workflow, runtime_prompt, &[], &[])
+    compile_with_vars(source, filename, workflow, runtime_prompt, &[], &[], &[])
 }
 
-/// Like [`compile`] but accepts variable overrides that take precedence over
-/// the script-level `vars {}` block (agent-level vars still win over these).
+/// Like [`compile`] but accepts variable / tier / param overrides.
 ///
-/// Useful for CLI flags like `--var KEY=VALUE` that let callers override
-/// output paths or other script-wide settings without editing the script.
+/// - `override_vars` — `--var KEY=VALUE` overrides. Beat script-level `vars {}`,
+///   lose to agent-level vars.
+/// - `override_tiers` — `--tiers-file` bindings. Replace top-level `tier`
+///   declarations.
+/// - `override_params` — `--param NAME=VALUE` workflow-parameter overrides
+///   (today only rosters; format `id=provider:model[@effort],...`). Required
+///   workflow params without a default fail compilation when absent here.
 pub fn compile_with_vars(
     source: &str,
     filename: &str,
@@ -53,6 +57,7 @@ pub fn compile_with_vars(
     runtime_prompt: Option<&str>,
     override_vars: &[(String, String)],
     override_tiers: &[(String, String)],
+    override_params: &[(String, String)],
 ) -> Result<CompiledPlan, miette::Report> {
     use miette::NamedSource;
 
@@ -88,6 +93,7 @@ pub fn compile_with_vars(
         runtime_prompt,
         override_vars,
         override_tiers,
+        override_params,
     )
     .map_err(|e| miette::Report::new(e))
 }
@@ -109,6 +115,7 @@ pub fn compile_file(
     runtime_prompt: Option<&str>,
     override_vars: &[(String, String)],
     override_tiers: &[(String, String)],
+    override_params: &[(String, String)],
 ) -> Result<CompiledPlan, miette::Report> {
     let (script, sources) = resolver::resolve(entry_path).map_err(miette::Report::new)?;
     compiler::compile_ast_with_sources(
@@ -118,6 +125,7 @@ pub fn compile_file(
         runtime_prompt,
         override_vars,
         override_tiers,
+        override_params,
     )
     .map_err(miette::Report::new)
 }

@@ -211,14 +211,55 @@ pub struct AgentDecl {
     pub file_id: u32,
 }
 
-/// One reviewer in a `reviewers [ { id "…" client … } … ]` roster.
+/// One reviewer in a `reviewers [ { id "…" model "provider:model" effort <val> } … ]`
+/// roster. The roster carries the model spec directly — no `client {}`
+/// indirection — so reviewers can be supplied 100% externally via a workflow
+/// `param`. `effort` is optional and overrides whatever the backend default
+/// would be; backends that don't accept effort ignore it.
 #[derive(Debug, Clone)]
 pub struct ReviewerEntry {
     pub id: String,
     pub id_span: Span,
-    /// Name of a `client {}` declaration.
-    pub client: String,
-    pub client_span: Span,
+    /// Canonical `provider:model` spec (validated downstream by
+    /// `gaviero_core::swarm::backend::shared::validate_model_spec`).
+    pub model: String,
+    pub model_span: Span,
+    /// Optional effort override (`off | auto | low | medium | high | xhigh | max`).
+    /// When `None`, the backend's default kicks in.
+    pub effort: Option<(String, Span)>,
+    pub span: Span,
+}
+
+/// Where a `loop { reviewers ... }` field gets its roster.
+#[derive(Debug, Clone)]
+pub enum ReviewerSource {
+    /// No `reviewers` field present; the loop runs only its `agents` list.
+    None,
+    /// A literal list of reviewer entries in the script.
+    Literal(Vec<ReviewerEntry>),
+    /// A bare identifier reference to a workflow `param <name>` declaration.
+    /// Resolved at compile time against CLI `--param` overrides and the
+    /// workflow's default (if any). Missing required params → compile error.
+    ParamRef(String, Span),
+}
+
+impl ReviewerSource {
+    pub fn is_none(&self) -> bool {
+        matches!(self, ReviewerSource::None)
+    }
+}
+
+/// A workflow-level parameter declaration: `param <name> [= <reviewer_list>]`.
+/// Supplies the binding for a `reviewers <name>` reference inside a loop.
+/// When `default` is `None`, the param is required and the CLI must provide
+/// it via `--param <name>=<spec>`; otherwise compilation fails with a span
+/// pointing here.
+#[derive(Debug, Clone)]
+pub struct ParamDecl {
+    pub name: String,
+    pub name_span: Span,
+    /// Optional in-script default. Same shape as a literal `reviewer_list`.
+    pub default: Option<Vec<ReviewerEntry>>,
     pub span: Span,
 }
 
@@ -404,9 +445,11 @@ pub struct LoopBlock {
     /// [`BranchChainLit`] for the semantics. Defaults to `None` (the
     /// legacy reset-each-iteration behaviour).
     pub branch_chain: BranchChainLit,
-    /// Roster of reviewers; when non-empty the compiler expands
-    /// `template_init` / `template_refine` into per-id agents.
-    pub reviewers: Vec<ReviewerEntry>,
+    /// Roster of reviewers. When non-`None` the compiler expands
+    /// `template_init` / `template_refine` into per-id agents. A literal
+    /// list lives in the script; a `ParamRef` resolves at compile time
+    /// against the workflow's `param` declarations and CLI overrides.
+    pub reviewers: ReviewerSource,
     /// Template agent name for the independent first pass.
     pub template_init: Option<(String, Span)>,
     /// Template agent name for each refinement iteration.
@@ -446,6 +489,9 @@ pub struct WorkflowDecl {
     pub attempts: Option<(u32, Span)>,
     pub escalate_after: Option<(u32, Span)>,
     pub verify: Option<VerifyBlock>,
+    /// Workflow-level parameter declarations. Resolved at compile time via
+    /// CLI `--param NAME=VALUE` overrides; required when no default present.
+    pub params: Vec<ParamDecl>,
     pub span: Span,
     #[doc(hidden)]
     pub file_id: u32,

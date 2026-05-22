@@ -305,7 +305,7 @@ fn compile_example(filename: &str) -> Vec<gaviero_core::swarm::models::WorkUnit>
         env!("CARGO_MANIFEST_DIR"),
         filename
     ));
-    gaviero_dsl::compile_file(&path, None, None, &[], &[])
+    gaviero_dsl::compile_file(&path, None, None, &[], &[], &[])
         .unwrap_or_else(|e| panic!("compiling {}:\n{:?}", filename, e))
         .work_units_ordered()
         .expect("toposort")
@@ -444,7 +444,7 @@ fn compile_example_plan(filename: &str) -> gaviero_core::swarm::plan::CompiledPl
         env!("CARGO_MANIFEST_DIR"),
         filename
     ));
-    gaviero_dsl::compile_file(&path, None, None, &[], &[])
+    gaviero_dsl::compile_file(&path, None, None, &[], &[], &[])
         .unwrap_or_else(|e| panic!("compiling {}:\n{:?}", filename, e))
 }
 
@@ -483,7 +483,7 @@ fn update_docs_tiers_file_overrides_profile() {
     let codex_profile = examples.join("profiles/doc-codex.gaviero");
     let overrides = gaviero_dsl::load_tier_overrides(&codex_profile)
         .expect("load codex tiers profile");
-    let plan = gaviero_dsl::compile_file(&entry, None, None, &[], &overrides)
+    let plan = gaviero_dsl::compile_file(&entry, None, None, &[], &overrides, &[])
         .expect("compile with --tiers-file overrides");
     let inventory = plan
         .work_units_ordered()
@@ -727,6 +727,7 @@ fn compile_file_generic_consensus_with_reviewers() {
         Some("test topic"),
         &[],
         &[],
+        &[],
     )
     .expect("generic_consensus should compile");
     let ids: Vec<_> = plan
@@ -740,6 +741,167 @@ fn compile_file_generic_consensus_with_reviewers() {
     assert_eq!(
         plan.loop_configs[0].consensus_mode,
         gaviero_core::swarm::plan::ConsensusMode::PartialOk
+    );
+}
+
+#[test]
+fn generic_consensus_param_roster_override_swaps_to_three_reviewers() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/generic_consensus.gaviero");
+    let overrides = vec![(
+        "roster".to_string(),
+        "claude=claude:opus@max,codex=codex:gpt-5.5@high,cursor=cursor:composer-2.5"
+            .to_string(),
+    )];
+    let plan = gaviero_dsl::compile_file(
+        &path,
+        Some("generic-consensus"),
+        Some("test topic"),
+        &[],
+        &[],
+        &overrides,
+    )
+    .expect("--param override should compile");
+    let ids: Vec<String> = plan
+        .work_units_unordered()
+        .into_iter()
+        .map(|u| u.id.clone())
+        .collect();
+    // All three reviewer ids expanded into init + refine.
+    for prefix in &["claude", "codex", "cursor"] {
+        assert!(
+            ids.iter().any(|id| id == &format!("{prefix}-init")),
+            "missing {prefix}-init in {ids:?}"
+        );
+        assert!(
+            ids.iter().any(|id| id == &format!("{prefix}-refine")),
+            "missing {prefix}-refine in {ids:?}"
+        );
+    }
+    // Loop's refine agent list contains all three.
+    assert_eq!(plan.loop_configs[0].agent_ids.len(), 3);
+}
+
+#[test]
+fn compile_file_scientific_research_default_roster() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/scientific_research.gaviero");
+    let plan = gaviero_dsl::compile_file(
+        &path,
+        Some("scientific-research-consensus"),
+        Some("test topic"),
+        &[],
+        &[],
+        &[],
+    )
+    .expect("scientific_research default roster should compile");
+    let ids: Vec<String> = plan
+        .work_units_unordered()
+        .into_iter()
+        .map(|u| u.id.clone())
+        .collect();
+    for prefix in &["claude", "codex", "cursor"] {
+        assert!(
+            ids.iter().any(|id| id == &format!("{prefix}-init")),
+            "missing {prefix}-init in {ids:?}"
+        );
+        assert!(
+            ids.iter().any(|id| id == &format!("{prefix}-refine")),
+            "missing {prefix}-refine in {ids:?}"
+        );
+    }
+    assert_eq!(plan.loop_configs.len(), 1);
+    assert_eq!(plan.loop_configs[0].agent_ids.len(), 3);
+    assert_eq!(plan.loop_configs[0].max_iterations, 10);
+    assert_eq!(plan.loop_configs[0].iter_start, 2);
+}
+
+#[test]
+fn compile_file_scientific_research_param_roster_override_to_two() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/scientific_research.gaviero");
+    let overrides = vec![(
+        "roster".to_string(),
+        "claude=claude:opus@max,codex=codex:gpt-5.5@high".to_string(),
+    )];
+    let plan = gaviero_dsl::compile_file(
+        &path,
+        Some("scientific-research-consensus"),
+        Some("test topic"),
+        &[],
+        &[],
+        &overrides,
+    )
+    .expect("scientific_research roster override should compile");
+    let ids: Vec<String> = plan
+        .work_units_unordered()
+        .into_iter()
+        .map(|u| u.id.clone())
+        .collect();
+    for prefix in &["claude", "codex"] {
+        assert!(
+            ids.iter().any(|id| id == &format!("{prefix}-init")),
+            "missing {prefix}-init in {ids:?}"
+        );
+        assert!(
+            ids.iter().any(|id| id == &format!("{prefix}-refine")),
+            "missing {prefix}-refine in {ids:?}"
+        );
+    }
+    assert!(
+        !ids.iter().any(|id| id == "cursor-init"),
+        "cursor should be absent after override, got {ids:?}"
+    );
+    assert_eq!(plan.loop_configs[0].agent_ids.len(), 2);
+}
+
+#[test]
+fn generic_consensus_param_roster_missing_provider_is_rejected() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/generic_consensus.gaviero");
+    let overrides = vec![("roster".to_string(), "claude=opus,codex=gpt-5.5".to_string())];
+    let err = gaviero_dsl::compile_file(
+        &path,
+        Some("generic-consensus"),
+        Some("t"),
+        &[],
+        &[],
+        &overrides,
+    )
+    .expect_err("model without provider prefix must fail");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("provider:model"),
+        "expected provider:model diagnostic, got: {msg}"
+    );
+}
+
+#[test]
+fn param_without_default_or_cli_value_is_required_error() {
+    let src = concat!(
+        "prompt p #\"x\"#\n",
+        "prompt r #\"y\"#\n",
+        "client c { model \"claude:sonnet\" }\n",
+        "agent tinit { template true prompt p scope { owned [\"out/x-*\"] } }\n",
+        "agent tref  { template true prompt r scope { owned [\"out/y-*\"] } }\n",
+        "agent judge { client c prompt \"j\" }\n",
+        "workflow w {\n",
+        "  param roster\n",
+        "  steps [ loop {\n",
+        "    reviewers       roster\n",
+        "    template_init   tinit\n",
+        "    template_refine tref\n",
+        "    until agent     judge\n",
+        "    max_iterations  3\n",
+        "  } ]\n",
+        "}\n",
+    );
+    let err = gaviero_dsl::compile(src, "inline.gaviero", None, None)
+        .expect_err("required param without default must fail");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("`roster` has no default") || msg.contains("not supplied"),
+        "expected required-param diagnostic, got: {msg}"
     );
 }
 
@@ -777,7 +939,7 @@ fn compile_file_resolves_include_and_compiles_workflow() {
     )
     .unwrap();
 
-    let plan = gaviero_dsl::compile_file(&entry, None, None, &[], &[])
+    let plan = gaviero_dsl::compile_file(&entry, None, None, &[], &[], &[])
         .expect("compile_file should succeed across include boundary");
     let units = plan.work_units_ordered().unwrap();
     assert_eq!(units.len(), 1);
@@ -816,7 +978,7 @@ fn compile_file_reports_duplicate_decl_across_files() {
         )
         .unwrap();
 
-    let err = gaviero_dsl::compile_file(&entry, None, None, &[], &[]).unwrap_err();
+    let err = gaviero_dsl::compile_file(&entry, None, None, &[], &[], &[]).unwrap_err();
     let msg = format!("{:?}", err);
     assert!(
         msg.contains("duplicate client name `base`"),
