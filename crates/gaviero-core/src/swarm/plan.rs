@@ -96,6 +96,16 @@ pub enum BranchChainMode {
     Stacked,
 }
 
+/// How a consensus-style loop treats judge verdicts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsensusMode {
+    #[default]
+    Strict,
+    PartialOk,
+    Explore,
+}
+
 /// Configuration for an explicit `loop { ... }` block in a workflow.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopConfig {
@@ -126,6 +136,13 @@ pub struct LoopConfig {
     /// pre-existing reset-each-iteration behaviour.
     #[serde(default)]
     pub branch_chain: BranchChainMode,
+    /// Consensus loop behaviour for agent judges (default: strict).
+    #[serde(default)]
+    pub consensus_mode: ConsensusMode,
+    /// When set, path (relative to workspace root) for `consensus-verdict.json`
+    /// on partial exit. Populated by the DSL compiler from script `OUT_DIR`.
+    #[serde(default)]
+    pub verdict_output_dir: Option<String>,
 }
 
 fn default_iter_start() -> u32 {

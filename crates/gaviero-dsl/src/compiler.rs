@@ -5,11 +5,12 @@ use std::collections::{HashMap, HashSet};
 use miette::NamedSource;
 
 use gaviero_core::swarm::models::{AgentBackend, WorkUnit};
-use gaviero_core::swarm::plan::{CompiledPlan, LoopConfig, LoopUntilCondition};
+use gaviero_core::swarm::plan::{CompiledPlan, ConsensusMode, LoopConfig, LoopUntilCondition};
 use gaviero_core::types::{FileScope, ModelTier, PrivacyLevel};
 
 use crate::ast::*;
 use crate::error::{DslError, DslErrors};
+use crate::reviewers::expand_reviewers_in_script;
 
 // ── Public types ───────────────────────────────────────────────────────────
 
@@ -72,6 +73,9 @@ pub fn compile_ast_with_sources(
     override_vars: &[(String, String)],
     override_tiers: &[(String, String)],
 ) -> Result<CompiledPlan, DslErrors> {
+    let mut script = script.clone();
+    expand_reviewers_in_script(&mut script, workflow, override_vars)?;
+
     if sources.is_empty() {
         return Err(DslErrors::single(DslError::Compile {
             src: NamedSource::new("<input>", String::new()),
@@ -101,6 +105,7 @@ pub fn compile_ast_with_sources(
 
     for item in &script.items {
         match item {
+            Item::Agent(a) if a.template => continue,
             Item::Vars(pairs) => {
                 // Later declarations override earlier ones for the same key.
                 script_vars.extend(pairs.clone());
@@ -568,6 +573,18 @@ fn ordered_agents_from_workflow<'a>(
                 continue;
             }
             match agent_map.get(name) {
+                Some(a) if a.template => errors.push(DslError::Compile {
+                    src: src(),
+                    span: (
+                        name_span.start,
+                        name_span.end.saturating_sub(name_span.start),
+                    )
+                    .into(),
+                    reason: format!(
+                        "workflow step `{}` references a template agent — use `reviewers` expansion instead",
+                        name
+                    ),
+                }),
                 Some(a) => {
                     seen.insert(name);
                     agents.push(*a);
@@ -613,6 +630,9 @@ fn collect_loop_judge_agents<'a>(
 
     for step in steps {
         let StepItem::Loop(lb) = step else { continue };
+        if lb.consensus_mode == ConsensusModeLit::Explore {
+            continue;
+        }
         let UntilCondition::Agent(name, span) = &lb.until else {
             continue;
         };
@@ -1167,13 +1187,17 @@ fn extract_loop_configs(
         None => return Vec::new(),
     };
 
+    let out_dir = resolve_var("OUT_DIR", script_vars, override_vars)
+        .unwrap_or_else(|| "consensus_runs/latest".to_string());
+
     steps
         .iter()
         .filter_map(|step| {
             if let StepItem::Loop(lb) = step {
+                let until = map_until_condition(&lb.until, script_vars, override_vars);
                 Some(LoopConfig {
                     agent_ids: lb.agents.iter().map(|(n, _)| n.clone()).collect(),
-                    until: map_until_condition(&lb.until, script_vars, override_vars),
+                    until,
                     max_iterations: lb.max_iterations,
                     iter_start: lb.iter_start,
                     strict_judge: lb.strict_judge,
@@ -1187,12 +1211,37 @@ fn extract_loop_configs(
                             gaviero_core::swarm::plan::BranchChainMode::Stacked
                         }
                     },
+                    consensus_mode: match lb.consensus_mode {
+                        ConsensusModeLit::Strict => ConsensusMode::Strict,
+                        ConsensusModeLit::PartialOk => ConsensusMode::PartialOk,
+                        ConsensusModeLit::Explore => ConsensusMode::Explore,
+                    },
+                    verdict_output_dir: Some(out_dir.clone()),
                 })
             } else {
                 None
             }
         })
         .collect()
+}
+
+fn resolve_var(
+    key: &str,
+    script_vars: &[(String, String)],
+    override_vars: &[(String, String)],
+) -> Option<String> {
+    override_vars
+        .iter()
+        .rev()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.clone())
+        .or_else(|| {
+            script_vars
+                .iter()
+                .rev()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        })
 }
 
 fn map_until_condition(
@@ -1996,6 +2045,37 @@ mod tests {
         assert_eq!(lc.stability, 3);
         assert_eq!(lc.judge_timeout_secs, 45);
         assert!(!lc.strict_judge);
+    }
+
+    #[test]
+    fn reviewers_loop_expands_init_and_refine_agents() {
+        let src = concat!(
+            "prompt p #\"init {{REVIEWER_ID}}\"#\n",
+            "prompt r #\"refine {{REVIEWER_ID}}\"#\n",
+            "client c { model \"claude:sonnet\" }\n",
+            "agent tinit { template true client c prompt p scope { owned [\"out/x-*\"] } }\n",
+            "agent tref { template true client c prompt r scope { owned [\"out/y-*\"] } }\n",
+            "agent judge { client c prompt \"judge\" }\n",
+            "workflow w { steps [ loop {\n",
+            "  reviewers [ { id \"a\" client c } { id \"b\" client c } ]\n",
+            "  template_init tinit template_refine tref max_iterations 3 until agent judge\n",
+            "} ] }\n",
+        );
+        let plan = compile_plan(src).unwrap();
+        let ids: Vec<_> = plan
+            .work_units_unordered()
+            .into_iter()
+            .map(|u| u.id.as_str())
+            .collect();
+        assert!(ids.iter().any(|id| *id == "a-init"));
+        assert!(ids.iter().any(|id| *id == "b-init"));
+        assert!(ids.iter().any(|id| *id == "a-refine"));
+        assert!(ids.iter().any(|id| *id == "b-refine"));
+        assert_eq!(
+            plan.loop_configs[0].agent_ids,
+            ["a-refine".to_string(), "b-refine".to_string()]
+        );
+        assert_eq!(plan.loop_judge_units.len(), 1);
     }
 
     #[test]

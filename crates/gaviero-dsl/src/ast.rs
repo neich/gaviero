@@ -203,9 +203,35 @@ pub struct AgentDecl {
     /// write-gate's guarantees — use sparingly, only for agents that truly
     /// need to run `cargo check` / `cargo test` / etc.
     pub tools: Vec<String>,
+    /// When true, this agent is a roster expansion template only — not executed
+    /// unless cloned for each `reviewers` entry in a `loop {}` block.
+    pub template: bool,
     pub span: Span,
     #[doc(hidden)]
     pub file_id: u32,
+}
+
+/// One reviewer in a `reviewers [ { id "…" client … } … ]` roster.
+#[derive(Debug, Clone)]
+pub struct ReviewerEntry {
+    pub id: String,
+    pub id_span: Span,
+    /// Name of a `client {}` declaration.
+    pub client: String,
+    pub client_span: Span,
+    pub span: Span,
+}
+
+/// How a consensus loop treats judge verdicts and whether a judge runs at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConsensusModeLit {
+    /// Only `pass` ends the loop early (after `stability` consecutive passes).
+    #[default]
+    Strict,
+    /// `pass` or `partial` ends the loop early.
+    PartialOk,
+    /// No judge invocations; run through `max_iterations` only.
+    Explore,
 }
 
 /// The `context { ... }` block inside an agent declaration.
@@ -378,6 +404,14 @@ pub struct LoopBlock {
     /// [`BranchChainLit`] for the semantics. Defaults to `None` (the
     /// legacy reset-each-iteration behaviour).
     pub branch_chain: BranchChainLit,
+    /// Roster of reviewers; when non-empty the compiler expands
+    /// `template_init` / `template_refine` into per-id agents.
+    pub reviewers: Vec<ReviewerEntry>,
+    /// Template agent name for the independent first pass.
+    pub template_init: Option<(String, Span)>,
+    /// Template agent name for each refinement iteration.
+    pub template_refine: Option<(String, Span)>,
+    pub consensus_mode: ConsensusModeLit,
     pub span: Span,
 }
 

@@ -107,6 +107,16 @@ pub enum Token {
     KwStrictJudge,
     #[token("branch_chain")]
     KwBranchChain,
+    #[token("reviewers")]
+    KwReviewers,
+    #[token("template_init")]
+    KwTemplateInit,
+    #[token("template_refine")]
+    KwTemplateRefine,
+    #[token("consensus_mode")]
+    KwConsensusMode,
+    #[token("template")]
+    KwTemplate,
     #[token("command")]
     KwCommand,
 
@@ -238,6 +248,11 @@ impl fmt::Display for Token {
             Token::KwJudgeTimeout => write!(f, "judge_timeout"),
             Token::KwStrictJudge => write!(f, "strict_judge"),
             Token::KwBranchChain => write!(f, "branch_chain"),
+            Token::KwReviewers => write!(f, "reviewers"),
+            Token::KwTemplateInit => write!(f, "template_init"),
+            Token::KwTemplateRefine => write!(f, "template_refine"),
+            Token::KwConsensusMode => write!(f, "consensus_mode"),
+            Token::KwTemplate => write!(f, "template"),
             Token::KwCommand => write!(f, "command"),
             Token::KwImpactScope => write!(f, "impact_scope"),
             Token::KwImpactTests => write!(f, "impact_tests"),

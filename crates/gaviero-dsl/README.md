@@ -118,6 +118,7 @@ includes).
 |------|----------------|
 | `clients.gaviero` | Shared profiles: `claude:opus`, `claude:sonnet`, `codex:gpt-5.5`, `codex:gpt-5.4` |
 | `plan_refinement.gaviero` | Dual-model plan refinement; judge loop with `stability`, `judge_timeout`, `{{ITER_EVIDENCE}}` |
+| `generic_consensus.gaviero` | N-reviewer generic consensus via `reviewers [...]` roster expansion; `consensus_mode` strict/partial_ok/explore |
 | `phased_plan.gaviero` | Dynamic phase extraction; per-iteration executor, gate, and judge |
 | `codebase_review.gaviero` | Rolling replan/apply loop; `branch_chain stacked`; `until command` termination |
 | `update_docs.gaviero` | Parallel doc rewrite; semantic `tier` roles + `profiles/*.gaviero`; `--tiers-file` |

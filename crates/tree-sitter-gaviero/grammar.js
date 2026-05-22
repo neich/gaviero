@@ -96,6 +96,7 @@ module.exports = grammar({
         $.context_block,
         $.vars_block,
         seq("tools", $.string_list),
+        seq("template", $.boolean),
       ),
 
     // ── Scope block ──────────────────────────────────────────────
@@ -154,6 +155,10 @@ module.exports = grammar({
     loop_field: ($) =>
       choice(
         seq("agents", $.identifier_list),
+        seq("reviewers", $.reviewer_list),
+        seq("template_init", $.identifier),
+        seq("template_refine", $.identifier),
+        seq("consensus_mode", $.consensus_mode_value),
         $.until_clause,
         seq("max_iterations", $.integer),
         seq("iter_start", $.integer),
@@ -162,6 +167,17 @@ module.exports = grammar({
         seq("strict_judge", $.boolean),
         seq("branch_chain", $.branch_chain_value),
       ),
+
+    reviewer_list: ($) => seq("[", repeat($.reviewer_entry), "]"),
+
+    reviewer_entry: ($) =>
+      seq("{", repeat($.reviewer_field), "}"),
+
+    reviewer_field: ($) =>
+      choice(seq("id", $._string_value), seq("client", $.identifier)),
+
+    consensus_mode_value: (_) =>
+      choice("strict", "partial_ok", "explore"),
 
     branch_chain_value: (_) => choice("stacked", "none"),
 

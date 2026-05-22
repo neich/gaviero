@@ -31,6 +31,7 @@ enum AgentField {
     Context(ContextBlock),
     Vars(Vec<(String, String)>),
     Tools(Vec<String>),
+    Template(bool),
 }
 
 #[derive(Debug)]
@@ -78,6 +79,16 @@ enum LoopField {
     JudgeTimeout(u32),
     StrictJudge(bool),
     BranchChain(BranchChainLit),
+    Reviewers(Vec<ReviewerEntry>),
+    TemplateInit(String, Span),
+    TemplateRefine(String, Span),
+    ConsensusMode(ConsensusModeLit),
+}
+
+#[derive(Debug)]
+enum ReviewerField {
+    Id(String),
+    Client(String),
 }
 
 #[derive(Debug)]
@@ -585,6 +596,9 @@ where
         just(Token::KwTools)
             .ignore_then(str_list.clone())
             .map(AgentField::Tools),
+        just(Token::KwTemplate)
+            .ignore_then(bool_lit)
+            .map(AgentField::Template),
     ));
 
     let agent_decl = just(Token::KwAgent)
@@ -607,6 +621,7 @@ where
             let mut context = None;
             let mut vars: Vec<(String, String)> = Vec::new();
             let mut tools: Vec<String> = Vec::new();
+            let mut template = false;
             for f in fields {
                 match f {
                     AgentField::Description(v, s) => {
@@ -642,6 +657,9 @@ where
                     AgentField::Tools(ts) => {
                         tools.extend(ts);
                     }
+                    AgentField::Template(v) => {
+                        template = v;
+                    }
                 }
             }
             AgentDecl {
@@ -658,6 +676,7 @@ where
                 context,
                 vars,
                 tools,
+                template,
                 span: e.span(),
                 file_id: 0,
             }
@@ -720,7 +739,47 @@ where
         choice((until_verify, until_agent, until_command))
     };
 
+    let kw_id = select! { Token::Ident(s) if s == "id" => () };
+    let reviewer_field = choice((
+        kw_id
+            .ignore_then(string)
+            .map(ReviewerField::Id),
+        just(Token::KwClient)
+            .ignore_then(ident)
+            .map(ReviewerField::Client),
+    ));
+    let reviewer_entry = reviewer_field
+        .repeated()
+        .at_least(2)
+        .collect::<Vec<_>>()
+        .delimited_by(just(Token::LBrace), just(Token::RBrace))
+        .map_with(|fields, e| {
+            let mut id = None;
+            let mut client = None;
+            for f in fields {
+                match f {
+                    ReviewerField::Id(v) => id = Some(v),
+                    ReviewerField::Client(v) => client = Some(v),
+                }
+            }
+            ReviewerEntry {
+                id: id.unwrap_or_default(),
+                id_span: e.span(),
+                client: client.unwrap_or_default(),
+                client_span: e.span(),
+                span: e.span(),
+            }
+        });
+    let reviewers_list = reviewer_entry
+        .repeated()
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .delimited_by(just(Token::LBracket), just(Token::RBracket));
+
     let loop_field = choice((
+        just(Token::KwReviewers)
+            .ignore_then(reviewers_list)
+            .map(LoopField::Reviewers),
         just(Token::KwAgents)
             .ignore_then(ident_list.clone())
             .map(LoopField::Agents),
@@ -749,6 +808,19 @@ where
                 Token::Ident(s) if s == "none"    => BranchChainLit::None,
             })
             .map(LoopField::BranchChain),
+        just(Token::KwTemplateInit)
+            .ignore_then(ident.map_with(|s, e| (s, e.span())))
+            .map(|(n, s)| LoopField::TemplateInit(n, s)),
+        just(Token::KwTemplateRefine)
+            .ignore_then(ident.map_with(|s, e| (s, e.span())))
+            .map(|(n, s)| LoopField::TemplateRefine(n, s)),
+        just(Token::KwConsensusMode)
+            .ignore_then(select! {
+                Token::Ident(s) if s == "strict"      => ConsensusModeLit::Strict,
+                Token::Ident(s) if s == "partial_ok"  => ConsensusModeLit::PartialOk,
+                Token::Ident(s) if s == "explore"     => ConsensusModeLit::Explore,
+            })
+            .map(LoopField::ConsensusMode),
     ));
 
     let loop_block = just(Token::KwLoop)
@@ -767,8 +839,13 @@ where
             let mut judge_timeout_secs = None;
             let mut strict_judge = None;
             let mut branch_chain: Option<BranchChainLit> = None;
+            let mut reviewers: Vec<ReviewerEntry> = Vec::new();
+            let mut template_init = None;
+            let mut template_refine = None;
+            let mut consensus_mode = ConsensusModeLit::Strict;
             for f in fields {
                 match f {
+                    LoopField::Reviewers(v) => reviewers = v,
                     LoopField::Agents(v) => agents = v,
                     LoopField::Until(c) => {
                         until.get_or_insert(c);
@@ -791,6 +868,13 @@ where
                     LoopField::BranchChain(v) => {
                         branch_chain.get_or_insert(v);
                     }
+                    LoopField::TemplateInit(n, s) => {
+                        template_init.get_or_insert((n, s));
+                    }
+                    LoopField::TemplateRefine(n, s) => {
+                        template_refine.get_or_insert((n, s));
+                    }
+                    LoopField::ConsensusMode(m) => consensus_mode = m,
                 }
             }
             LoopBlock {
@@ -808,6 +892,10 @@ where
                 judge_timeout_secs: judge_timeout_secs.unwrap_or(120),
                 strict_judge: strict_judge.unwrap_or(true),
                 branch_chain: branch_chain.unwrap_or(BranchChainLit::None),
+                reviewers,
+                template_init,
+                template_refine,
+                consensus_mode,
                 span: e.span(),
             }
         });

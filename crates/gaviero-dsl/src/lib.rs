@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod compiler;
+pub mod reviewers;
 pub mod error;
 pub mod lexer;
 pub mod parser;

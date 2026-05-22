@@ -987,7 +987,7 @@ pub async fn execute(
 
         for iteration in 1..loop_config.max_iterations {
             let current_iter_abs = loop_config.iter_start + iteration - 1;
-            let condition_met = {
+            let outcome = {
                 let mut loop_ctx = LoopConditionContext {
                     config,
                     memory: &memory,
@@ -1009,39 +1009,53 @@ pub async fn execute(
                     strict_judge: loop_config.strict_judge,
                     judge_timeout_secs: loop_config.judge_timeout_secs,
                     loop_agent_ids: &loop_config.agent_ids,
+                    consensus_mode: loop_config.consensus_mode,
+                    verdict_output_dir: loop_config.verdict_output_dir.as_deref(),
                 };
                 evaluate_loop_condition(&loop_config.until, current_iter_abs, &mut loop_ctx).await
             };
 
-            if condition_met {
-                consecutive_pass = consecutive_pass.saturating_add(1);
-                observer.on_loop_verdict(true, consecutive_pass, stability_target);
-                if consecutive_pass >= stability_target {
+            match outcome {
+                LoopConditionOutcome::Partial => {
                     tracing::info!(
-                        "Loop converged after {} iteration(s) with {}/{} consecutive PASS for agents {:?}",
+                        "Loop exited with PARTIAL consensus at iteration {} for agents {:?}",
                         iteration,
-                        consecutive_pass,
-                        stability_target,
                         loop_config.agent_ids
                     );
                     loop_terminated = true;
                     break;
                 }
-                tracing::info!(
-                    "Loop got PASS {} / {} for agents {:?}; continuing for stability",
-                    consecutive_pass,
-                    stability_target,
-                    loop_config.agent_ids
-                );
-            } else {
-                if consecutive_pass > 0 {
-                    tracing::debug!(
-                        "Loop PASS streak broken by FAIL at iteration {}, resetting counter",
-                        iteration
+                LoopConditionOutcome::Pass => {
+                    consecutive_pass = consecutive_pass.saturating_add(1);
+                    observer.on_loop_verdict(true, consecutive_pass, stability_target);
+                    if consecutive_pass >= stability_target {
+                        tracing::info!(
+                            "Loop converged after {} iteration(s) with {}/{} consecutive PASS for agents {:?}",
+                            iteration,
+                            consecutive_pass,
+                            stability_target,
+                            loop_config.agent_ids
+                        );
+                        loop_terminated = true;
+                        break;
+                    }
+                    tracing::info!(
+                        "Loop got PASS {} / {} for agents {:?}; continuing for stability",
+                        consecutive_pass,
+                        stability_target,
+                        loop_config.agent_ids
                     );
                 }
-                consecutive_pass = 0;
-                observer.on_loop_verdict(false, 0, stability_target);
+                LoopConditionOutcome::Continue => {
+                    if consecutive_pass > 0 {
+                        tracing::debug!(
+                            "Loop PASS streak broken by FAIL at iteration {}, resetting counter",
+                            iteration
+                        );
+                    }
+                    consecutive_pass = 0;
+                    observer.on_loop_verdict(false, 0, stability_target);
+                }
             }
 
             tracing::info!(
@@ -1160,7 +1174,7 @@ pub async fn execute(
         if !loop_terminated {
             let final_iter_abs =
                 loop_config.iter_start + loop_config.max_iterations.saturating_sub(1);
-            let final_met = {
+            let final_outcome = {
                 let mut loop_ctx = LoopConditionContext {
                     config,
                     memory: &memory,
@@ -1182,26 +1196,38 @@ pub async fn execute(
                     strict_judge: loop_config.strict_judge,
                     judge_timeout_secs: loop_config.judge_timeout_secs,
                     loop_agent_ids: &loop_config.agent_ids,
+                    consensus_mode: loop_config.consensus_mode,
+                    verdict_output_dir: loop_config.verdict_output_dir.as_deref(),
                 };
                 evaluate_loop_condition(&loop_config.until, final_iter_abs, &mut loop_ctx).await
             };
-            if final_met {
-                consecutive_pass = consecutive_pass.saturating_add(1);
-                if consecutive_pass < stability_target {
-                    tracing::warn!(
-                        "Loop exhausted max_iterations ({}) with final PASS but only {}/{} consecutive — convergence not confirmed for agents {:?}",
+            match final_outcome {
+                LoopConditionOutcome::Pass => {
+                    consecutive_pass = consecutive_pass.saturating_add(1);
+                    if consecutive_pass < stability_target {
+                        tracing::warn!(
+                            "Loop exhausted max_iterations ({}) with final PASS but only {}/{} consecutive — convergence not confirmed for agents {:?}",
+                            loop_config.max_iterations,
+                            consecutive_pass,
+                            stability_target,
+                            loop_config.agent_ids
+                        );
+                    }
+                }
+                LoopConditionOutcome::Partial => {
+                    tracing::info!(
+                        "Loop exhausted max_iterations ({}) with final PARTIAL verdict for agents {:?}",
                         loop_config.max_iterations,
-                        consecutive_pass,
-                        stability_target,
                         loop_config.agent_ids
                     );
                 }
-            } else {
-                tracing::warn!(
-                    "Loop exhausted max_iterations ({}) without condition being met for agents {:?}",
-                    loop_config.max_iterations,
-                    loop_config.agent_ids
-                );
+                LoopConditionOutcome::Continue => {
+                    tracing::warn!(
+                        "Loop exhausted max_iterations ({}) without condition being met for agents {:?}",
+                        loop_config.max_iterations,
+                        loop_config.agent_ids
+                    );
+                }
             }
         }
     }
@@ -1652,12 +1678,24 @@ struct LoopConditionContext<'a> {
     judge_timeout_secs: u32,
     /// Loop worker agent ids, used to build `{{ITER_EVIDENCE}}` digests.
     loop_agent_ids: &'a [String],
+    consensus_mode: crate::swarm::plan::ConsensusMode,
+    verdict_output_dir: Option<&'a str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum JudgeVerdict {
     Pass,
     Fail,
+    Partial,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoopConditionOutcome {
+    /// Keep iterating (FAIL, unparseable, or not yet converged).
+    Continue,
+    Pass,
+    /// Substantive agreement not reached but the run should stop (partial_ok).
+    Partial,
 }
 
 /// Clone `unit` and substitute `{{ITER}}` / `{{PREV_ITER}}` with `iter_abs`
@@ -2565,6 +2603,10 @@ mod tests {
         assert_eq!(parse_judge_verdict("LGTM"), Some(JudgeVerdict::Pass));
         assert_eq!(parse_judge_verdict("CONVERGED"), Some(JudgeVerdict::Pass));
         assert_eq!(parse_judge_verdict("REJECTED"), Some(JudgeVerdict::Fail));
+        assert_eq!(
+            parse_judge_verdict(r#"{"verdict":"partial","reason":"gaps remain"}"#),
+            Some(JudgeVerdict::Partial)
+        );
     }
 
     #[test]
@@ -2778,29 +2820,37 @@ async fn invalidate_stale_sources(
 }
 
 /// Evaluate a loop's exit condition.
-///
-/// Returns `true` if the condition is met and the loop should stop.
 async fn evaluate_loop_condition(
     condition: &super::plan::LoopUntilCondition,
     current_iter_abs: u32,
     ctx: &mut LoopConditionContext<'_>,
-) -> bool {
+) -> LoopConditionOutcome {
+    if ctx.consensus_mode == crate::swarm::plan::ConsensusMode::Explore {
+        return LoopConditionOutcome::Continue;
+    }
     match condition {
-        super::plan::LoopUntilCondition::Verify(config) => run_verification_checks(
-            config,
-            &ctx.config.workspace_root,
-            &ctx.config.excludes,
-            None,
-        )
-        .await
-        .unwrap_or(false),
+        super::plan::LoopUntilCondition::Verify(config) => {
+            if run_verification_checks(
+                config,
+                &ctx.config.workspace_root,
+                &ctx.config.excludes,
+                None,
+            )
+            .await
+            .unwrap_or(false)
+            {
+                LoopConditionOutcome::Pass
+            } else {
+                LoopConditionOutcome::Continue
+            }
+        }
         super::plan::LoopUntilCondition::Agent(agent_id) => {
             let Some(unit_template) = ctx.loop_judge_map.get(agent_id.as_str()).copied() else {
                 tracing::warn!(
                     "loop judge agent '{}' not found in compiled plan (judges must be declared distinct from workflow agents)",
                     agent_id
                 );
-                return false;
+                return LoopConditionOutcome::Continue;
             };
 
             // Build a compact digest of the most recent worker manifests for
@@ -2890,6 +2940,7 @@ async fn evaluate_loop_condition(
             manifest.summary = Some(match (verdict, &manifest.status) {
                 (Some(JudgeVerdict::Pass), _) => "Judge verdict: PASS".into(),
                 (Some(JudgeVerdict::Fail), _) => "Judge verdict: FAIL".into(),
+                (Some(JudgeVerdict::Partial), _) => "Judge verdict: PARTIAL".into(),
                 (None, AgentStatus::Failed(msg)) => format!("Judge failed: {}", msg),
                 (None, _) => "Judge verdict: unparseable".into(),
             });
@@ -2944,10 +2995,29 @@ async fn evaluate_loop_condition(
                 .await;
             }
 
-            let condition_met = matches!(verdict, Some(JudgeVerdict::Pass));
+            let outcome = match verdict {
+                Some(JudgeVerdict::Pass) => LoopConditionOutcome::Pass,
+                Some(JudgeVerdict::Partial)
+                    if ctx.consensus_mode == crate::swarm::plan::ConsensusMode::PartialOk =>
+                {
+                    if let Some(dir) = ctx.verdict_output_dir {
+                        write_consensus_verdict_file(
+                            &ctx.config.workspace_root,
+                            dir,
+                            current_iter_abs,
+                            "partial",
+                            manifest.summary.as_deref().unwrap_or(""),
+                            &ctx.loop_agent_ids,
+                        );
+                    }
+                    LoopConditionOutcome::Partial
+                }
+                Some(JudgeVerdict::Partial) => LoopConditionOutcome::Continue,
+                _ => LoopConditionOutcome::Continue,
+            };
 
             ctx.all_manifests.push(manifest);
-            condition_met
+            outcome
         }
         super::plan::LoopUntilCondition::Command(cmd) => {
             // Substitute {{ITER}}/{{PREV_ITER}} so iteration-aware probes
@@ -2966,8 +3036,35 @@ async fn evaluate_loop_condition(
                 .stderr(std::process::Stdio::null())
                 .status()
                 .await;
-            result.map(|s| s.success()).unwrap_or(false)
+            if result.map(|s| s.success()).unwrap_or(false) {
+                LoopConditionOutcome::Pass
+            } else {
+                LoopConditionOutcome::Continue
+            }
         }
+    }
+}
+
+fn write_consensus_verdict_file(
+    workspace_root: &std::path::Path,
+    out_dir: &str,
+    iter_abs: u32,
+    verdict: &str,
+    reason: &str,
+    reviewer_ids: &[String],
+) {
+    let path = workspace_root.join(out_dir).join("consensus-verdict.json");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let body = serde_json::json!({
+        "verdict": verdict,
+        "iter": iter_abs,
+        "reason": reason,
+        "reviewers": reviewer_ids,
+    });
+    if let Ok(serialized) = serde_json::to_string_pretty(&body) {
+        let _ = std::fs::write(path, serialized);
     }
 }
 
@@ -3125,6 +3222,7 @@ fn parse_judge_token(token: &str) -> Option<JudgeVerdict> {
             Some(JudgeVerdict::Pass)
         }
         "FAIL" | "FAILED" | "REJECTED" | "REJECT" => Some(JudgeVerdict::Fail),
+        "PARTIAL" | "PARTIALLY" => Some(JudgeVerdict::Partial),
         _ => None,
     }
 }
