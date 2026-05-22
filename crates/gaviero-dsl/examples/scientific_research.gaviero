@@ -79,8 +79,6 @@
 //       --var PROBLEM_FILE=research_problem.md \
 //       --param roster=claude=claude:opus@max,codex=codex:gpt-5.5@high
 
-include "clients.gaviero"
-
 // ── Shared configuration ──────────────────────────────────────────────────────
 //
 // PROBLEM_FILE: external problem statement. {{PROMPT}} from the CLI is
@@ -542,7 +540,7 @@ agent reviewer-refine {
 
 agent convergence-judge {
     description "Judge consensus across reviewer panel: {{PROMPT}}"
-    client sonnet
+    client judge
     scope {
         read_only ["{{OUT_DIR}}/" "{{PROBLEM_FILE}}"]
     }
@@ -593,6 +591,10 @@ agent convergence-judge {
 // parallel; the default 3-reviewer panel uses three of those slots.
 
 workflow scientific-research-consensus {
+    param judge {
+        model "claude:sonnet"
+        effort medium
+    }
     param roster [
         { id "claude" model "claude:opus"         effort max  }
         { id "codex"  model "codex:gpt-5.5"       effort high }
