@@ -59,6 +59,7 @@ enum WorkflowField {
     Attempts(u32, Span),
     EscalateAfter(u32, Span),
     Verify(VerifyBlock),
+    Param(ParamDecl),
 }
 
 #[derive(Debug)]
@@ -79,7 +80,7 @@ enum LoopField {
     JudgeTimeout(u32),
     StrictJudge(bool),
     BranchChain(BranchChainLit),
-    Reviewers(Vec<ReviewerEntry>),
+    Reviewers(ReviewerSource),
     TemplateInit(String, Span),
     TemplateRefine(String, Span),
     ConsensusMode(ConsensusModeLit),
@@ -87,8 +88,9 @@ enum LoopField {
 
 #[derive(Debug)]
 enum ReviewerField {
-    Id(String),
-    Client(String),
+    Id(String, Span),
+    Model(String, Span),
+    Effort(String, Span),
 }
 
 #[derive(Debug)]
@@ -740,13 +742,22 @@ where
     };
 
     let kw_id = select! { Token::Ident(s) if s == "id" => () };
+    // `effort` accepts the same shape as `client { effort <value> }` — either
+    // an identifier (e.g. `high`) or a quoted string (e.g. `"max"`).
+    let effort_value = choice((
+        select! { Token::Ident(s) => s },
+        select! { Token::Str(s) => s },
+    ));
     let reviewer_field = choice((
         kw_id
-            .ignore_then(string)
-            .map(ReviewerField::Id),
-        just(Token::KwClient)
-            .ignore_then(ident)
-            .map(ReviewerField::Client),
+            .ignore_then(string.map_with(|v, e| (v, e.span())))
+            .map(|(v, s)| ReviewerField::Id(v, s)),
+        just(Token::KwModel)
+            .ignore_then(string.map_with(|v, e| (v, e.span())))
+            .map(|(v, s)| ReviewerField::Model(v, s)),
+        just(Token::KwEffort)
+            .ignore_then(effort_value.map_with(|v, e| (v, e.span())))
+            .map(|(v, s)| ReviewerField::Effort(v, s)),
     ));
     let reviewer_entry = reviewer_field
         .repeated()
@@ -754,31 +765,46 @@ where
         .collect::<Vec<_>>()
         .delimited_by(just(Token::LBrace), just(Token::RBrace))
         .map_with(|fields, e| {
-            let mut id = None;
-            let mut client = None;
+            let mut id: Option<(String, Span)> = None;
+            let mut model: Option<(String, Span)> = None;
+            let mut effort: Option<(String, Span)> = None;
             for f in fields {
                 match f {
-                    ReviewerField::Id(v) => id = Some(v),
-                    ReviewerField::Client(v) => client = Some(v),
-                }
+                    ReviewerField::Id(v, s) => id.get_or_insert((v, s)),
+                    ReviewerField::Model(v, s) => model.get_or_insert((v, s)),
+                    ReviewerField::Effort(v, s) => effort.get_or_insert((v, s)),
+                };
             }
+            let (id_value, id_span) = id.unwrap_or_else(|| (String::new(), e.span()));
+            let (model_value, model_span) =
+                model.unwrap_or_else(|| (String::new(), e.span()));
             ReviewerEntry {
-                id: id.unwrap_or_default(),
-                id_span: e.span(),
-                client: client.unwrap_or_default(),
-                client_span: e.span(),
+                id: id_value,
+                id_span,
+                model: model_value,
+                model_span,
+                effort,
                 span: e.span(),
             }
         });
-    let reviewers_list = reviewer_entry
+    let reviewer_literal_list = reviewer_entry
+        .clone()
         .repeated()
         .at_least(1)
         .collect::<Vec<_>>()
         .delimited_by(just(Token::LBracket), just(Token::RBracket));
+    // `reviewers` accepts either a literal list or a bare identifier that
+    // references a workflow `param` declaration.
+    let reviewers_source = choice((
+        reviewer_literal_list.clone().map(ReviewerSource::Literal),
+        ident
+            .clone()
+            .map_with(|name, e| ReviewerSource::ParamRef(name, e.span())),
+    ));
 
     let loop_field = choice((
         just(Token::KwReviewers)
-            .ignore_then(reviewers_list)
+            .ignore_then(reviewers_source)
             .map(LoopField::Reviewers),
         just(Token::KwAgents)
             .ignore_then(ident_list.clone())
@@ -839,7 +865,7 @@ where
             let mut judge_timeout_secs = None;
             let mut strict_judge = None;
             let mut branch_chain: Option<BranchChainLit> = None;
-            let mut reviewers: Vec<ReviewerEntry> = Vec::new();
+            let mut reviewers: ReviewerSource = ReviewerSource::None;
             let mut template_init = None;
             let mut template_refine = None;
             let mut consensus_mode = ConsensusModeLit::Strict;
@@ -914,7 +940,26 @@ where
 
     // ── workflow declaration ──────────────────────────────────────
 
+    // `param <name> [ <reviewer-list> ]` — workflow-level parameter
+    // declaration. The default literal-list is optional; when omitted, the
+    // param is required and the CLI must supply it via
+    // `--param <name>=<spec>`. Today the only param shape supported is
+    // rosters (so the default is a reviewer-literal list); the grammar
+    // leaves room for typed params later.
+    let param_decl = just(Token::KwParam)
+        .ignore_then(ident.map_with(|n, e| (n, e.span())))
+        .then(reviewer_literal_list.clone().or_not())
+        .map_with(|((name, name_span), default), e| {
+            WorkflowField::Param(ParamDecl {
+                name,
+                name_span,
+                default,
+                span: e.span(),
+            })
+        });
+
     let workflow_field = choice((
+        param_decl,
         just(Token::KwSteps)
             .ignore_then(step_list.map_with(|v, e| (v, e.span())))
             .map(|(v, s)| WorkflowField::Steps(v, s)),
@@ -958,6 +1003,7 @@ where
             let mut attempts = None;
             let mut escalate_after = None;
             let mut verify = None;
+            let mut params: Vec<ParamDecl> = Vec::new();
             for f in fields {
                 match f {
                     WorkflowField::Steps(v, s) => {
@@ -987,6 +1033,9 @@ where
                     WorkflowField::Verify(b) => {
                         verify.get_or_insert(b);
                     }
+                    WorkflowField::Param(p) => {
+                        params.push(p);
+                    }
                 }
             }
             WorkflowDecl {
@@ -1001,6 +1050,7 @@ where
                 attempts,
                 escalate_after,
                 verify,
+                params,
                 span: e.span(),
                 file_id: 0,
             }
