@@ -1,6 +1,6 @@
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -410,12 +410,15 @@ struct Cli {
 
 /// CLI observer that prints agent events to stderr.
 ///
+/// Every line is prefixed with `[{agent_id}]` so concurrent agents stay legible.
 /// When `verbose` is false (script mode), raw streamed text is suppressed;
 /// only tool calls, status updates, file writes, and validation results are shown.
-/// All lines are prefixed with `[{agent_id}]` for easy multi-agent tracing.
+/// In verbose mode, streamed chunks are line-buffered so each emitted line is
+/// prefixed with the agent id rather than spliced into other agents' output.
 struct CliAcpObserver {
     agent_id: String,
     verbose: bool,
+    stream_buffer: Mutex<String>,
 }
 
 impl CliAcpObserver {
@@ -423,28 +426,49 @@ impl CliAcpObserver {
         Self {
             agent_id: agent_id.into(),
             verbose,
+            stream_buffer: Mutex::new(String::new()),
+        }
+    }
+
+    fn flush_stream_lines(&self, force_final: bool) {
+        let Ok(mut buf) = self.stream_buffer.lock() else {
+            return;
+        };
+        while let Some(idx) = buf.find('\n') {
+            let line = buf[..idx].to_string();
+            buf.drain(..=idx);
+            eprintln!("  [{}] {}", self.agent_id, line);
+        }
+        if force_final && !buf.is_empty() {
+            let line = std::mem::take(&mut *buf);
+            eprintln!("  [{}] {}", self.agent_id, line);
         }
     }
 }
 
 impl AcpObserver for CliAcpObserver {
     fn on_stream_chunk(&self, text: &str) {
-        if self.verbose {
-            eprint!("{}", text);
-            let _ = std::io::stderr().flush();
+        if !self.verbose {
+            return;
         }
+        if let Ok(mut buf) = self.stream_buffer.lock() {
+            buf.push_str(text);
+        }
+        self.flush_stream_lines(false);
+        let _ = std::io::stderr().flush();
     }
 
-    fn on_tool_call_started(&self, tool_name: &str) {
-        eprintln!("  [{}] ⚙ {}", self.agent_id, tool_name);
+    fn on_tool_call_started(&self, tool_summary: &str) {
+        self.flush_stream_lines(true);
+        eprintln!("  [{}] ⚙ {}", self.agent_id, tool_summary);
     }
 
     fn on_message_complete(&self, role: &str, content: &str) {
         if role != "assistant" {
             return;
         }
+        self.flush_stream_lines(true);
         if self.verbose {
-            eprintln!(); // newline after streamed text
             return;
         }
         let trimmed = content.trim();
@@ -462,14 +486,17 @@ impl AcpObserver for CliAcpObserver {
         _old_content: Option<&str>,
         _new_content: &str,
     ) {
+        self.flush_stream_lines(true);
         eprintln!("  [{}] ✎ {}", self.agent_id, path.display());
     }
 
     fn on_streaming_status(&self, status: &str) {
+        self.flush_stream_lines(true);
         eprintln!("  [{}] … {}", self.agent_id, status);
     }
 
     fn on_validation_result(&self, gate: &str, passed: bool, message: Option<&str>) {
+        self.flush_stream_lines(true);
         if passed {
             eprintln!("  [{}] ✓ {}", self.agent_id, gate);
         } else {
@@ -483,6 +510,7 @@ impl AcpObserver for CliAcpObserver {
     }
 
     fn on_validation_retry(&self, attempt: u8, max_retries: u8) {
+        self.flush_stream_lines(true);
         eprintln!("  [{}] ↺ retry {}/{}", self.agent_id, attempt, max_retries);
     }
 }
