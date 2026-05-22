@@ -1,0 +1,171 @@
+// Generic N-reviewer consensus for any prompt-shaped task.
+//
+// Usage:
+//   gaviero-cli --script crates/gaviero-dsl/examples/generic_consensus.gaviero \
+//     --workflow generic-consensus \
+//     --prompt "Short title for logs" \
+//     --var PROBLEM_FILE=consensus/problem.md \
+//     --var OUT_DIR=consensus_runs/latest
+//
+// Override reviewers at compile time:
+//   --var REVIEWERS=claude:opus,codex:codex-5-5,cursor:composer
+//
+// Modes (loop consensus_mode):
+//   strict      — only PASS ends early (after stability)
+//   partial_ok  — PASS or PARTIAL ends early; writes consensus-verdict.json
+//   explore     — no judge; run max_iterations only
+//
+// Optional:
+//   --var CONTEXT_PATHS="docs/ research/"
+//   --var ENABLE_WEB=true
+//   --var CONCLUSION_SECTIONS="## Answer\n## Claims\n..."
+//   --var CONSENSUS_RUBRIC="..."
+
+include "clients.gaviero"
+
+client cursor-consensus {
+    model "cursor:composer-2.5"
+    privacy public
+    effort high
+}
+
+vars {
+    OUT_DIR              "consensus_runs/latest"
+    INIT_VER             "1"
+    PROBLEM_FILE         "consensus/problem.md"
+    CONTEXT_PATHS        ""
+    ENABLE_WEB           "false"
+    CONCLUSION_SECTIONS  "## Answer\n## Key claims\n## Uncertainties\n## Recommended actions"
+    CONSENSUS_RUBRIC     "Substantive agreement on the direct answer; no incompatible recommended actions; top claims align; remaining gaps only under Uncertainties."
+}
+
+prompt init-body #"
+    You are an independent expert reviewer.
+
+    Short title: {{PROMPT}}
+    Full task: read {{PROBLEM_FILE}} in full.
+
+    Do not read any files under {{OUT_DIR}}/.
+
+    Additional read-only context roots (may be empty):
+      {{CONTEXT_PATHS}}
+
+    Write one file:
+      {{OUT_DIR}}/{{REVIEWER_ID}}-conclusion-v{{INIT_VER}}.md
+
+    Use exactly these sections (in order):
+      {{CONCLUSION_SECTIONS}}
+
+    Rules:
+      - Be critical and honest.
+      - Standalone conclusion only: no process narrative, no peer names.
+      - If context is insufficient, say so under Uncertainties.
+"#
+
+prompt refine-body #"
+    You are refining your expert conclusion for:
+
+    Short title: {{PROMPT}}
+    Full task: {{PROBLEM_FILE}}
+
+    Read your previous conclusion:
+      {{OUT_DIR}}/{{REVIEWER_ID}}-conclusion-v{{PREV_ITER}}.md
+      (on first refine when {{PREV_ITER}}=1, read -init-v1 instead if you wrote init)
+
+    {{PEER_READ_BLOCK}}
+
+    Also read each peer's prior summary when {{PREV_ITER}} >= 2.
+
+    Write two files:
+
+    1) {{OUT_DIR}}/{{REVIEWER_ID}}-conclusion-v{{ITER}}.md
+       Same section list as init:
+         {{CONCLUSION_SECTIONS}}
+       Pure conclusion only — no peers, iterations, or provider names.
+
+    2) {{OUT_DIR}}/{{REVIEWER_ID}}-summary-v{{ITER}}.md
+       Sections:
+         - `## Consensus status` — first sentence MUST be exactly
+           `Consensus reached.` or `Consensus not reached.`
+         - `## Merits of each view`
+         - `## Substantive disagreements`
+         - `## Changes made in this iteration`
+         - `## How and why` — reasoning trace (≤600 words)
+"#
+
+prompt judge-body #"
+    Judge whether {{PEER_COUNT}} reviewers reached consensus on:
+      {{PROBLEM_FILE}}
+
+    Rubric:
+      {{CONSENSUS_RUBRIC}}
+
+    {{ITER_EVIDENCE}}
+
+    Read all summaries for iteration {{ITER}}:
+      (glob {{OUT_DIR}}/*-summary-v{{ITER}}.md)
+
+    Pass 1: if every summary starts with `Consensus reached.`, return pass.
+    Pass 2: if material disagreement remains under the rubric, return fail.
+    If they agree on the answer but not every detail, return partial.
+
+    Emit exactly one fenced JSON object:
+    ```json
+    {"verdict": "pass" | "fail" | "partial", "reason": "<one sentence>"}
+    ```
+"#
+
+agent reviewer-init {
+    template true
+    description "Initial conclusion ({{REVIEWER_ID}}): {{PROMPT}}"
+    client opus
+    scope {
+        owned ["{{OUT_DIR}}/{{REVIEWER_ID}}-conclusion-v*.md"]
+        read_only ["{{PROBLEM_FILE}}"]
+    }
+    prompt init-body
+}
+
+agent reviewer-refine {
+    template true
+    description "Refine conclusion ({{REVIEWER_ID}}): {{PROMPT}}"
+    client opus
+    scope {
+        owned [
+            "{{OUT_DIR}}/{{REVIEWER_ID}}-conclusion-v*.md"
+            "{{OUT_DIR}}/{{REVIEWER_ID}}-summary-v*.md"
+        ]
+        read_only ["{{PROBLEM_FILE}}" "{{OUT_DIR}}/"]
+    }
+    prompt refine-body
+}
+
+agent consensus-judge {
+    description "Judge consensus: {{PROMPT}}"
+    client sonnet
+    scope {
+        read_only ["{{OUT_DIR}}/"]
+    }
+    prompt judge-body
+}
+
+workflow generic-consensus {
+    steps [
+        loop {
+            reviewers [
+                { id "claude" client opus }
+                { id "codex"  client codex-5-5 }
+            ]
+            template_init   reviewer-init
+            template_refine reviewer-refine
+            max_iterations  8
+            iter_start      2
+            stability       2
+            judge_timeout   240
+            strict_judge    false
+            consensus_mode  partial_ok
+            until agent     consensus-judge
+        }
+    ]
+    max_parallel 2
+}
