@@ -342,7 +342,7 @@ pub(super) fn enter_batch_review(app: &mut App, proposals: Vec<WriteProposal>) {
         return;
     }
 
-    let mut review_proposals: Vec<ReviewProposal> = proposals
+    let incoming: Vec<ReviewProposal> = proposals
         .into_iter()
         .map(|p| {
             let old_lines = p.original_content.lines().count();
@@ -365,6 +365,11 @@ pub(super) fn enter_batch_review(app: &mut App, proposals: Vec<WriteProposal>) {
                 Some(p.original_content.clone())
             };
             ReviewProposal {
+                id: p.id,
+                source: p.source,
+                conv_id: p.conv_id,
+                conflicts_with: p.conflicts_with,
+                superseded: p.status == gaviero_core::types::ProposalStatus::Superseded,
                 path: p.file_path,
                 old_content,
                 new_content: p.proposed_content,
@@ -375,20 +380,25 @@ pub(super) fn enter_batch_review(app: &mut App, proposals: Vec<WriteProposal>) {
         })
         .collect();
 
-    // Sort by (folder root, path) so files belonging to the same workspace
-    // root cluster together. Render emits a folder header between groups
-    // when the workspace has more than one root.
-    review_proposals.sort_by(|a, b| {
-        let fa = app
-            .workspace
-            .folder_for_worktree_path(&a.path)
-            .map(|p| p.to_path_buf());
-        let fb = app
-            .workspace
-            .folder_for_worktree_path(&b.path)
-            .map(|p| p.to_path_buf());
-        fa.cmp(&fb).then_with(|| a.path.cmp(&b.path))
-    });
+    if let Some(state) = app.batch_review.as_mut() {
+        let selected_path = state
+            .proposals
+            .get(state.selected_index)
+            .map(|p| p.path.clone());
+        merge_into_batch(&mut state.proposals, incoming);
+        link_conflicts_by_path(&mut state.proposals);
+        sort_review_proposals(&mut state.proposals, &app.workspace);
+        state.selected_index =
+            remap_selected_index_after_sort(&state.proposals, selected_path.as_deref());
+        // Diff cache index referred to the pre-sort ordering, drop it.
+        state.cached_diff = Vec::new();
+        state.cached_diff_index = usize::MAX;
+        return;
+    }
+
+    let mut review_proposals = incoming;
+    link_conflicts_by_path(&mut review_proposals);
+    sort_review_proposals(&mut review_proposals, &app.workspace);
 
     let initial_diff = if let Some(p) = review_proposals.first() {
         let old_lines: Vec<&str> = p.old_content.as_deref().unwrap_or("").lines().collect();
@@ -405,10 +415,215 @@ pub(super) fn enter_batch_review(app: &mut App, proposals: Vec<WriteProposal>) {
         diff_scroll: 0,
         cached_diff: initial_diff,
         cached_diff_index: 0,
+        filter_source: None,
     });
     app.left_panel = LeftPanelMode::Review;
     app.panel_visible.file_tree = true;
     app.focus = Focus::FileTree;
+}
+
+/// Append new proposals into an open batch, deduping by `id` so that tasks
+/// for the same conversation re-sending the same proposal don't accumulate.
+/// Keeps the caller responsible for re-sorting afterwards.
+fn merge_into_batch(existing: &mut Vec<ReviewProposal>, incoming: Vec<ReviewProposal>) {
+    for proposal in incoming {
+        if existing.iter().any(|p| p.id == proposal.id) {
+            continue;
+        }
+        existing.push(proposal);
+    }
+}
+
+/// Mutual `conflicts_with` links for every row targeting the same path.
+/// Backstop when staggered task completion missed gate-side pairing.
+fn link_conflicts_by_path(proposals: &mut [ReviewProposal]) {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    let mut by_path: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+    for (idx, p) in proposals.iter().enumerate() {
+        by_path.entry(p.path.clone()).or_default().push(idx);
+    }
+    for indices in by_path.values() {
+        if indices.len() < 2 {
+            continue;
+        }
+        let ids: Vec<u64> = indices.iter().map(|&i| proposals[i].id).collect();
+        for &idx in indices {
+            let row = &mut proposals[idx];
+            for &peer_id in &ids {
+                if peer_id != row.id && !row.conflicts_with.contains(&peer_id) {
+                    row.conflicts_with.push(peer_id);
+                }
+            }
+        }
+    }
+}
+
+/// After re-sorting the file list, keep the same path selected when possible.
+fn remap_selected_index_after_sort(
+    proposals: &[ReviewProposal],
+    selected_path: Option<&std::path::Path>,
+) -> usize {
+    if proposals.is_empty() {
+        return 0;
+    }
+    if let Some(path) = selected_path {
+        if let Some(idx) = proposals.iter().position(|p| p.path == path) {
+            return idx;
+        }
+    }
+    0
+}
+
+fn release_review_hold_ids_async(app: &App, ids: Vec<u64>) {
+    if ids.is_empty() {
+        return;
+    }
+    let wg = app.write_gate.clone();
+    tokio::spawn(async move {
+        let mut gate = wg.lock().await;
+        gate.release_review_hold_ids(&ids);
+    });
+}
+
+/// Mirror gate-side conflict / supersede updates into an open batch inbox.
+pub(super) fn sync_batch_proposal_from_gate(app: &App, proposal_id: u64) {
+    if app.batch_review.is_none() {
+        return;
+    }
+    let wg = app.write_gate.clone();
+    let tx = app.event_tx.clone();
+    if let Ok(gate) = wg.try_lock() {
+        if let Some((conflicts_with, status)) = gate.review_proposal_fields(proposal_id) {
+            let superseded = status == gaviero_core::types::ProposalStatus::Superseded;
+            drop(gate);
+            let _ = tx.send(crate::event::Event::BatchProposalSynced {
+                id: proposal_id,
+                conflicts_with,
+                superseded,
+            });
+        }
+        return;
+    }
+    tokio::spawn(async move {
+        let gate = wg.lock().await;
+        if let Some((conflicts_with, status)) = gate.review_proposal_fields(proposal_id) {
+            let superseded = status == gaviero_core::types::ProposalStatus::Superseded;
+            let _ = tx.send(crate::event::Event::BatchProposalSynced {
+                id: proposal_id,
+                conflicts_with,
+                superseded,
+            });
+        }
+    });
+}
+
+pub(super) fn apply_batch_proposal_sync(
+    app: &mut App,
+    proposal_id: u64,
+    conflicts_with: Vec<u64>,
+    superseded: bool,
+) {
+    let Some(br) = app.batch_review.as_mut() else {
+        return;
+    };
+    let mut touched_selected = false;
+    if let Some(row) = br.proposals.iter_mut().find(|p| p.id == proposal_id) {
+        row.conflicts_with = conflicts_with.clone();
+        row.superseded = superseded;
+        touched_selected = br
+            .proposals
+            .get(br.selected_index)
+            .is_some_and(|p| p.id == proposal_id);
+    }
+    for row in br.proposals.iter_mut() {
+        if row.id == proposal_id {
+            continue;
+        }
+        if row.conflicts_with.contains(&proposal_id) {
+            for &peer in &conflicts_with {
+                if peer != row.id && !row.conflicts_with.contains(&peer) {
+                    row.conflicts_with.push(peer);
+                }
+            }
+        }
+    }
+    if touched_selected {
+        br.cached_diff = Vec::new();
+        br.cached_diff_index = usize::MAX;
+    }
+}
+
+/// Truncate a provider name to a short badge label. Drops a trailing
+/// ellipsis when the input exceeds `max` chars; preserves short names as-is.
+fn truncate_source(source: &str, max: usize) -> String {
+    if source.chars().count() <= max {
+        source.to_string()
+    } else {
+        let mut out: String = source.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// Collect the unique provider sources present in `proposals`, in
+/// first-seen order. Used to drive the per-source filter cycle.
+fn unique_filter_sources(proposals: &[ReviewProposal]) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for p in proposals {
+        if !seen.iter().any(|s| s == &p.source) {
+            seen.push(p.source.clone());
+        }
+    }
+    seen
+}
+
+/// Cycle the active filter through `[None, source_0, source_1, ...]`.
+/// `forward = true` follows Alt+o (next), `false` follows Alt+i (previous).
+fn cycle_filter_source(
+    current: Option<&str>,
+    sources: &[String],
+    forward: bool,
+) -> Option<String> {
+    if sources.is_empty() {
+        return None;
+    }
+    // The cycle has `sources.len() + 1` slots: index 0 = None, 1.. = sources.
+    let current_idx = match current {
+        None => 0,
+        Some(s) => sources
+            .iter()
+            .position(|x| x == s)
+            .map(|i| i + 1)
+            .unwrap_or(0),
+    };
+    let len = sources.len() + 1;
+    let next_idx = if forward {
+        (current_idx + 1) % len
+    } else {
+        (current_idx + len - 1) % len
+    };
+    if next_idx == 0 {
+        None
+    } else {
+        Some(sources[next_idx - 1].clone())
+    }
+}
+
+/// Sort proposals so files in the same workspace folder cluster together.
+fn sort_review_proposals(
+    proposals: &mut [ReviewProposal],
+    workspace: &gaviero_core::workspace::Workspace,
+) {
+    proposals.sort_by(|a, b| {
+        let fa = workspace
+            .folder_for_worktree_path(&a.path)
+            .map(|p| p.to_path_buf());
+        let fb = workspace
+            .folder_for_worktree_path(&b.path)
+            .map(|p| p.to_path_buf());
+        fa.cmp(&fb).then_with(|| a.path.cmp(&b.path))
+    });
 }
 
 pub(super) fn handle_batch_review_action(app: &mut App, action: &Action) -> bool {
@@ -417,6 +632,13 @@ pub(super) fn handle_batch_review_action(app: &mut App, action: &Action) -> bool
     }
 
     match action {
+        Action::CycleTabForward | Action::CycleTabBack => {
+            let forward = matches!(action, Action::CycleTabForward);
+            let br = app.batch_review.as_mut().unwrap();
+            let sources = unique_filter_sources(&br.proposals);
+            br.filter_source = cycle_filter_source(br.filter_source.as_deref(), &sources, forward);
+            true
+        }
         Action::InsertChar('f') => {
             app.finalize_batch_review();
             true
@@ -460,7 +682,7 @@ pub(super) fn handle_batch_review_action(app: &mut App, action: &Action) -> bool
             true
         }
         Action::InsertChar('a') => {
-            let (path, content, expected_old, is_deletion) = {
+            let (path, content, expected_old, is_deletion, peer_ids, superseded) = {
                 let br = app.batch_review.as_ref().unwrap();
                 match br.proposals.get(br.selected_index) {
                     Some(p) => (
@@ -468,10 +690,21 @@ pub(super) fn handle_batch_review_action(app: &mut App, action: &Action) -> bool
                         p.new_content.clone(),
                         p.old_content.clone(),
                         p.is_deletion,
+                        p.conflicts_with.clone(),
+                        p.superseded,
                     ),
                     None => return true,
                 }
             };
+            if superseded {
+                let msg = format!(
+                    "⊘ Cannot apply {} — superseded by a conflicting proposal that was already accepted",
+                    path.display()
+                );
+                app.chat_state.add_system_message(&msg);
+                app.status_message = Some((msg, std::time::Instant::now()));
+                return true;
+            }
             let outcome =
                 apply_proposal_to_disk(&path, expected_old.as_deref(), &content, is_deletion);
             match outcome {
@@ -503,15 +736,32 @@ pub(super) fn handle_batch_review_action(app: &mut App, action: &Action) -> bool
                 }
             }
             {
-                let br = app.batch_review.as_mut().unwrap();
-                br.proposals.remove(br.selected_index);
-                if br.selected_index >= br.proposals.len() && br.selected_index > 0 {
-                    br.selected_index -= 1;
+                let (removed_id, empty) = {
+                    let br = app.batch_review.as_mut().unwrap();
+                    // Mark any peer conflicts as superseded so the user sees the
+                    // pick-one resolution take effect without removing the rows.
+                    if !peer_ids.is_empty() {
+                        for peer in br.proposals.iter_mut() {
+                            if peer_ids.contains(&peer.id) {
+                                peer.superseded = true;
+                            }
+                        }
+                    }
+                    let removed_id = br.proposals.get(br.selected_index).map(|p| p.id);
+                    br.proposals.remove(br.selected_index);
+                    if br.selected_index >= br.proposals.len() && br.selected_index > 0 {
+                        br.selected_index -= 1;
+                    }
+                    br.diff_scroll = 0;
+                    br.cached_diff = Vec::new();
+                    br.cached_diff_index = usize::MAX;
+                    let empty = br.proposals.is_empty();
+                    (removed_id, empty)
+                };
+                if let Some(id) = removed_id {
+                    release_review_hold_ids_async(app, vec![id]);
                 }
-                br.diff_scroll = 0;
-                br.cached_diff = Vec::new();
-                br.cached_diff_index = usize::MAX;
-                if br.proposals.is_empty() {
+                if empty {
                     app.batch_review = None;
                     app.left_panel = LeftPanelMode::FileTree;
                     app.status_message =
@@ -521,23 +771,35 @@ pub(super) fn handle_batch_review_action(app: &mut App, action: &Action) -> bool
             true
         }
         Action::InsertChar('r') => {
-            let br = app.batch_review.as_mut().unwrap();
-            if !br.proposals.is_empty() {
-                br.proposals.remove(br.selected_index);
-                if br.selected_index >= br.proposals.len() && br.selected_index > 0 {
-                    br.selected_index -= 1;
+            let (removed_id, empty) = {
+                let br = app.batch_review.as_mut().unwrap();
+                let removed_id = if br.proposals.is_empty() {
+                    None
+                } else {
+                    Some(br.proposals[br.selected_index].id)
+                };
+                if !br.proposals.is_empty() {
+                    br.proposals.remove(br.selected_index);
+                    if br.selected_index >= br.proposals.len() && br.selected_index > 0 {
+                        br.selected_index -= 1;
+                    }
+                    br.diff_scroll = 0;
+                    br.cached_diff = Vec::new();
+                    br.cached_diff_index = usize::MAX;
                 }
-                br.diff_scroll = 0;
-                br.cached_diff = Vec::new();
-                br.cached_diff_index = usize::MAX;
-                if br.proposals.is_empty() {
-                    app.batch_review = None;
-                    app.left_panel = LeftPanelMode::FileTree;
-                    app.status_message = Some((
-                        "All files reviewed — no changes applied".to_string(),
-                        std::time::Instant::now(),
-                    ));
-                }
+                let empty = br.proposals.is_empty();
+                (removed_id, empty)
+            };
+            if let Some(id) = removed_id {
+                release_review_hold_ids_async(app, vec![id]);
+            }
+            if empty {
+                app.batch_review = None;
+                app.left_panel = LeftPanelMode::FileTree;
+                app.status_message = Some((
+                    "All files reviewed — no changes applied".to_string(),
+                    std::time::Instant::now(),
+                ));
             }
             true
         }
@@ -551,10 +813,49 @@ pub(super) fn finalize_batch_review(app: &mut App) {
         None => return,
     };
 
+    let hold_ids: Vec<u64> = br.proposals.iter().map(|p| p.id).collect();
+    release_review_hold_ids_async(app, hold_ids);
+
+    // Pick-one for conflict pairs: when both halves of a conflict survive into
+    // apply-all, the first one wins and the rest get marked superseded. We
+    // mutate a local Vec so the visible-superseded check stays simple.
+    let mut proposals = br.proposals.clone();
+    let mut superseded_ids: std::collections::HashSet<u64> = proposals
+        .iter()
+        .filter(|p| p.superseded)
+        .map(|p| p.id)
+        .collect();
+    for proposal in proposals.iter() {
+        if superseded_ids.contains(&proposal.id) {
+            continue;
+        }
+        for peer in &proposal.conflicts_with {
+            superseded_ids.insert(*peer);
+        }
+    }
+    for p in proposals.iter_mut() {
+        if superseded_ids.contains(&p.id) {
+            p.superseded = true;
+        }
+    }
+
     let mut written = Vec::new();
     let mut stale = Vec::new();
     let mut failed = Vec::new();
-    for proposal in &br.proposals {
+    let mut superseded_count = 0_usize;
+    for proposal in &proposals {
+        if proposal.superseded {
+            tracing::warn!(
+                "Skipping superseded proposal for {}",
+                proposal.path.display()
+            );
+            app.chat_state.add_system_message(&format!(
+                "⊘ Superseded: {} not applied (conflict resolved by peer)",
+                proposal.path.display()
+            ));
+            superseded_count += 1;
+            continue;
+        }
         match apply_proposal_to_disk(
             &proposal.path,
             proposal.old_content.as_deref(),
@@ -595,6 +896,9 @@ pub(super) fn finalize_batch_review(app: &mut App) {
 
     app.left_panel = LeftPanelMode::FileTree;
     let mut summary = format!("{} file(s) written", written.len());
+    if superseded_count > 0 {
+        summary.push_str(&format!(", {} superseded (skipped)", superseded_count));
+    }
     if !stale.is_empty() {
         summary.push_str(&format!(", {} stale (skipped)", stale.len()));
     }
@@ -605,11 +909,17 @@ pub(super) fn finalize_batch_review(app: &mut App) {
 }
 
 pub(super) fn cancel_batch_review(app: &mut App) {
-    let n = app
+    let (n, hold_ids) = app
         .batch_review
         .as_ref()
-        .map(|br| br.proposals.len())
-        .unwrap_or(0);
+        .map(|br| {
+            (
+                br.proposals.len(),
+                br.proposals.iter().map(|p| p.id).collect::<Vec<_>>(),
+            )
+        })
+        .unwrap_or((0, Vec::new()));
+    release_review_hold_ids_async(app, hold_ids);
     app.batch_review = None;
     app.left_panel = LeftPanelMode::FileTree;
     app.status_message = Some((
@@ -692,6 +1002,7 @@ pub(super) fn render_review_file_list(app: &mut App, frame: &mut Frame, area: Re
         Some(r) => r,
         None => return,
     };
+    let filter_source = br.filter_source.clone();
 
     let visible = inner.height as usize;
 
@@ -737,19 +1048,28 @@ pub(super) fn render_review_file_list(app: &mut App, frame: &mut Frame, area: Re
             ReviewRow::Entry(i) => {
                 let proposal = &br.proposals[*i];
                 let is_selected = *i == br.selected_index;
+                let filtered_out = filter_source
+                    .as_deref()
+                    .is_some_and(|f| f != proposal.source);
+                let in_conflict = !proposal.conflicts_with.is_empty();
                 let filename = proposal
                     .path
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("?");
 
+                let base_fg = if filtered_out {
+                    theme::TEXT_DIM
+                } else {
+                    theme::TEXT_FG
+                };
                 let name_style = if is_selected {
                     Style::default()
                         .fg(Color::White)
                         .add_modifier(Modifier::BOLD)
                         .bg(theme::SELECTION_BG)
                 } else {
-                    Style::default().fg(theme::TEXT_FG)
+                    Style::default().fg(base_fg)
                 };
 
                 let adds = format!(" +{}", proposal.additions);
@@ -762,14 +1082,38 @@ pub(super) fn render_review_file_list(app: &mut App, frame: &mut Frame, area: Re
                 } else {
                     ('M', theme::WARNING)
                 };
+                let status_fg = if filtered_out {
+                    theme::TEXT_DIM
+                } else {
+                    status_color
+                };
+
+                let badge_label = truncate_source(&proposal.source, 10);
+                let badge_color = if proposal.superseded {
+                    theme::TEXT_DIM
+                } else if in_conflict {
+                    theme::WARNING
+                } else if filtered_out {
+                    theme::TEXT_DIM
+                } else {
+                    theme::FOCUS_BORDER
+                };
+                let badge_text = if proposal.superseded {
+                    format!("⊘ {} ", badge_label)
+                } else if in_conflict {
+                    format!("⚠ {} ", badge_label)
+                } else {
+                    format!("{} ", badge_label)
+                };
 
                 let prefix = if multi_root { "  " } else { "" };
                 let spans = vec![
                     Span::raw(prefix),
                     Span::styled(
                         format!(" {} ", status_char),
-                        Style::default().fg(status_color),
+                        Style::default().fg(status_fg),
                     ),
+                    Span::styled(badge_text, Style::default().fg(badge_color)),
                     Span::styled(filename.to_string(), name_style),
                     Span::styled(adds, Style::default().fg(theme::SUCCESS)),
                     Span::styled(dels, Style::default().fg(theme::ERROR)),
@@ -1319,7 +1663,123 @@ pub(super) fn render_changes_diff(app: &mut App, frame: &mut Frame, area: Rect) 
 
 #[cfg(test)]
 mod tests {
-    use super::{ApplyOutcome, apply_proposal_to_disk, temp_sibling_path};
+    use super::{ApplyOutcome, apply_proposal_to_disk, merge_into_batch, temp_sibling_path};
+    use crate::app::state::ReviewProposal;
+
+    fn make_review_proposal(id: u64, path: &str) -> ReviewProposal {
+        ReviewProposal {
+            id,
+            source: "agent".into(),
+            conv_id: None,
+            conflicts_with: Vec::new(),
+            superseded: false,
+            path: path.into(),
+            old_content: None,
+            new_content: String::new(),
+            additions: 0,
+            deletions: 0,
+            is_deletion: false,
+        }
+    }
+
+    #[test]
+    fn merge_into_batch_appends_new_proposals() {
+        let mut existing = vec![make_review_proposal(1, "src/a.rs")];
+        let incoming = vec![
+            make_review_proposal(2, "src/b.rs"),
+            make_review_proposal(3, "src/c.rs"),
+        ];
+        merge_into_batch(&mut existing, incoming);
+        let ids: Vec<u64> = existing.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn cycle_filter_source_walks_none_sources_then_back() {
+        let sources = vec!["claude".to_string(), "codex".to_string()];
+
+        let s1 = super::cycle_filter_source(None, &sources, true);
+        assert_eq!(s1.as_deref(), Some("claude"));
+        let s2 = super::cycle_filter_source(s1.as_deref(), &sources, true);
+        assert_eq!(s2.as_deref(), Some("codex"));
+        let s3 = super::cycle_filter_source(s2.as_deref(), &sources, true);
+        assert_eq!(s3, None);
+        // Backward from None goes to the last source.
+        let back = super::cycle_filter_source(None, &sources, false);
+        assert_eq!(back.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn cycle_filter_source_is_inert_when_no_sources() {
+        let sources: Vec<String> = Vec::new();
+        assert_eq!(super::cycle_filter_source(None, &sources, true), None);
+        assert_eq!(super::cycle_filter_source(Some("x"), &sources, false), None);
+    }
+
+    #[test]
+    fn unique_filter_sources_preserves_first_seen_order() {
+        let proposals = vec![
+            ReviewProposal {
+                source: "codex".into(),
+                ..make_review_proposal(1, "a")
+            },
+            ReviewProposal {
+                source: "claude".into(),
+                ..make_review_proposal(2, "b")
+            },
+            ReviewProposal {
+                source: "codex".into(),
+                ..make_review_proposal(3, "c")
+            },
+        ];
+        let unique = super::unique_filter_sources(&proposals);
+        assert_eq!(unique, vec!["codex", "claude"]);
+    }
+
+    #[test]
+    fn truncate_source_keeps_short_and_truncates_long() {
+        assert_eq!(super::truncate_source("claude", 10), "claude");
+        assert_eq!(super::truncate_source("very-long-name", 6), "very-…");
+    }
+
+    #[test]
+    fn link_conflicts_by_path_links_same_path_rows() {
+        let mut rows = vec![
+            make_review_proposal(1, "src/shared.rs"),
+            make_review_proposal(2, "src/shared.rs"),
+            make_review_proposal(3, "src/other.rs"),
+        ];
+        super::link_conflicts_by_path(&mut rows);
+        assert_eq!(rows[0].conflicts_with, vec![2]);
+        assert_eq!(rows[1].conflicts_with, vec![1]);
+        assert!(rows[2].conflicts_with.is_empty());
+    }
+
+    #[test]
+    fn merge_into_batch_links_path_conflicts() {
+        let mut existing = vec![make_review_proposal(10, "src/x.rs")];
+        let incoming = vec![make_review_proposal(20, "src/x.rs")];
+        merge_into_batch(&mut existing, incoming);
+        super::link_conflicts_by_path(&mut existing);
+        assert_eq!(existing[0].conflicts_with, vec![20]);
+        assert_eq!(existing[1].conflicts_with, vec![10]);
+    }
+
+    #[test]
+    fn merge_into_batch_dedupes_by_id() {
+        let mut existing = vec![
+            make_review_proposal(1, "src/a.rs"),
+            make_review_proposal(2, "src/b.rs"),
+        ];
+        // id=2 already present — must be dropped from incoming.
+        let incoming = vec![
+            make_review_proposal(2, "src/b.rs"),
+            make_review_proposal(3, "src/c.rs"),
+        ];
+        merge_into_batch(&mut existing, incoming);
+        let ids: Vec<u64> = existing.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
 
     #[test]
     fn apply_writes_when_disk_matches_expected() {
