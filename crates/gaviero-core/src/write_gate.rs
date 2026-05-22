@@ -37,11 +37,23 @@ pub enum WriteMode {
 pub struct WriteGatePipeline {
     proposals: HashMap<u64, WriteProposal>,
     next_id: u64,
-    mode: WriteMode,
+    /// Fallback mode used when a proposal has no `conv_id` or no per-conv
+    /// override is registered. `set_mode` / `mode()` operate on this field
+    /// so legacy callers continue to work.
+    default_mode: WriteMode,
+    /// Per-conversation mode overrides. When a proposal carries a `conv_id`
+    /// listed here, the effective mode is `conv_modes[conv_id]` instead of
+    /// `default_mode`. This isolates concurrent providers: one chat task
+    /// finishing and flipping to `Interactive` no longer pops a single-proposal
+    /// modal for another conversation that is still streaming in `Deferred`.
+    conv_modes: HashMap<String, WriteMode>,
     observer: Box<dyn WriteGateObserver>,
     agent_scopes: HashMap<String, FileScope>,
     /// Proposals accumulated in `Deferred` mode, pending batch review.
     deferred_proposals: Vec<WriteProposal>,
+    /// Proposals handed to the TUI batch-review inbox but still tracked for
+    /// same-path conflict detection until the user resolves or dismisses them.
+    review_hold: Vec<WriteProposal>,
 }
 
 impl WriteGatePipeline {
@@ -49,11 +61,21 @@ impl WriteGatePipeline {
         Self {
             proposals: HashMap::new(),
             next_id: 1,
-            mode,
+            default_mode: mode,
+            conv_modes: HashMap::new(),
             observer,
             agent_scopes: HashMap::new(),
             deferred_proposals: Vec::new(),
+            review_hold: Vec::new(),
         }
+    }
+
+    /// Effective mode for a proposal: per-conv override if present, else
+    /// `default_mode`. `conv_id = None` always resolves to `default_mode`.
+    fn effective_mode(&self, conv_id: Option<&str>) -> &WriteMode {
+        conv_id
+            .and_then(|id| self.conv_modes.get(id))
+            .unwrap_or(&self.default_mode)
     }
 
     /// Register a file scope for an agent.
@@ -84,9 +106,15 @@ impl WriteGatePipeline {
     /// Build a WriteProposal from original + proposed content.
     /// Computes diff hunks and enriches with structural info.
     /// This does NOT hold self — call it before inserting.
+    ///
+    /// `conv_id` tags the proposal with the originating conversation so the
+    /// gate can drain / mode-switch per conversation. `None` means the
+    /// proposal came from a non-conversational path (CLI batch ops, internal
+    /// tooling) and the gate's `default_mode` applies.
     pub fn build_proposal(
         id: u64,
         source: &str,
+        conv_id: Option<&str>,
         file_path: &Path,
         original_content: &str,
         proposed_content: &str,
@@ -128,6 +156,8 @@ impl WriteGatePipeline {
             structural_hunks,
             status: ProposalStatus::Pending,
             is_deletion: false,
+            conv_id: conv_id.map(str::to_string),
+            conflicts_with: Vec::new(),
         }
     }
 
@@ -139,6 +169,7 @@ impl WriteGatePipeline {
     pub fn build_delete_proposal(
         id: u64,
         source: &str,
+        conv_id: Option<&str>,
         file_path: &Path,
         original_content: &str,
     ) -> WriteProposal {
@@ -170,14 +201,21 @@ impl WriteGatePipeline {
             structural_hunks: hunk.into_iter().collect(),
             status: ProposalStatus::Pending,
             is_deletion: true,
+            conv_id: conv_id.map(str::to_string),
+            conflicts_with: Vec::new(),
         }
     }
 
     /// Insert a proposal into the pipeline.
     /// Returns `Some(action)` if the mode auto-accepts (caller performs disk I/O).
     /// Returns `None` if the proposal is queued for interactive review, deferred, or rejected.
+    ///
+    /// The effective `WriteMode` is the per-conv override for `proposal.conv_id`
+    /// if registered, otherwise `default_mode`. This keeps concurrent providers
+    /// isolated.
     pub fn insert_proposal(&mut self, proposal: WriteProposal) -> Option<AutoAcceptAction> {
-        match self.mode {
+        let mode = self.effective_mode(proposal.conv_id.as_deref()).clone();
+        match mode {
             WriteMode::Interactive => {
                 self.observer.on_proposal_created(&proposal);
                 self.proposals.insert(proposal.id, proposal);
@@ -213,9 +251,16 @@ impl WriteGatePipeline {
         }
     }
 
-    /// Whether the pipeline is in deferred (batch review) mode.
+    /// Whether the pipeline default is `Deferred`. Per-conv overrides are
+    /// inspected via [`Self::is_deferred_for_conv`].
     pub fn is_deferred(&self) -> bool {
-        self.mode == WriteMode::Deferred
+        self.default_mode == WriteMode::Deferred
+    }
+
+    /// Whether the effective mode for `conv_id` is `Deferred`. `None`
+    /// resolves to `default_mode`.
+    pub fn is_deferred_for_conv(&self, conv_id: Option<&str>) -> bool {
+        *self.effective_mode(conv_id) == WriteMode::Deferred
     }
 
     /// Access the deferred proposals accumulated so far.
@@ -224,8 +269,89 @@ impl WriteGatePipeline {
     }
 
     /// Drain and return all deferred proposals.
+    ///
+    /// Prefer [`Self::take_pending_proposals_for_conv`] when multiple
+    /// conversations share a single gate — drain-all sweeps up another
+    /// conversation's still-pending proposals.
     pub fn take_pending_proposals(&mut self) -> Vec<WriteProposal> {
-        std::mem::take(&mut self.deferred_proposals)
+        let drained = std::mem::take(&mut self.deferred_proposals);
+        self.hold_for_review(&drained);
+        drained
+    }
+
+    /// Drain and return deferred proposals owned by `conv_id`. `None` drains
+    /// the global bucket (proposals with no `conv_id`); `Some(id)` drains only
+    /// proposals whose `conv_id` matches. Proposals owned by other
+    /// conversations stay queued so a finishing chat task does not sweep up
+    /// a concurrent conversation's pending work.
+    pub fn take_pending_proposals_for_conv(
+        &mut self,
+        conv_id: Option<&str>,
+    ) -> Vec<WriteProposal> {
+        let mut keep = Vec::new();
+        let mut drained = Vec::new();
+        for proposal in std::mem::take(&mut self.deferred_proposals) {
+            let matches = match (conv_id, proposal.conv_id.as_deref()) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            };
+            if matches {
+                drained.push(proposal);
+            } else {
+                keep.push(proposal);
+            }
+        }
+        self.deferred_proposals = keep;
+        self.hold_for_review(&drained);
+        drained
+    }
+
+    /// Track proposals currently in the TUI batch-review inbox so
+    /// `conflict_candidates_for_path` still sees them after deferred drain.
+    pub fn hold_for_review(&mut self, proposals: &[WriteProposal]) {
+        for proposal in proposals {
+            if self
+                .review_hold
+                .iter()
+                .any(|held| held.id == proposal.id)
+            {
+                continue;
+            }
+            self.review_hold.push(proposal.clone());
+        }
+    }
+
+    /// Stop tracking the given proposal IDs (user applied, rejected, or
+    /// dismissed the corresponding batch-review rows).
+    pub fn release_review_hold_ids(&mut self, ids: &[u64]) {
+        if ids.is_empty() {
+            return;
+        }
+        self.review_hold.retain(|p| !ids.contains(&p.id));
+    }
+
+    /// Drop every held proposal (batch review cancelled or fully finalized).
+    pub fn release_review_hold_all(&mut self) {
+        self.review_hold.clear();
+    }
+
+    /// Lookup a proposal across active, deferred, and review-hold buckets.
+    pub fn proposal_by_id(&self, proposal_id: u64) -> Option<&WriteProposal> {
+        self.proposals
+            .get(&proposal_id)
+            .or_else(|| {
+                self.deferred_proposals
+                    .iter()
+                    .find(|p| p.id == proposal_id)
+            })
+            .or_else(|| self.review_hold.iter().find(|p| p.id == proposal_id))
+    }
+
+    /// Fields the TUI batch inbox mirrors when `ProposalUpdated` fires.
+    pub fn review_proposal_fields(&self, proposal_id: u64) -> Option<(Vec<u64>, ProposalStatus)> {
+        self.proposal_by_id(proposal_id)
+            .map(|p| (p.conflicts_with.clone(), p.status.clone()))
     }
 
     /// Accept a specific hunk by index.
@@ -292,6 +418,35 @@ impl WriteGatePipeline {
     /// caller removes the file. Returns `None` if the proposal id is unknown.
     pub fn finalize(&mut self, proposal_id: u64) -> Option<AutoAcceptAction> {
         let proposal = self.proposals.remove(&proposal_id)?;
+        // Mark each conflicting peer as Superseded so the panel can render it
+        // as "⊘ superseded by N" and the accept path refuses to write it.
+        let peers = proposal.conflicts_with.clone();
+        for peer_id in &peers {
+            let mut updated = false;
+            if let Some(peer) = self.proposals.get_mut(peer_id) {
+                peer.status = ProposalStatus::Superseded;
+                updated = true;
+            }
+            if let Some(peer) = self
+                .deferred_proposals
+                .iter_mut()
+                .find(|p| p.id == *peer_id)
+            {
+                peer.status = ProposalStatus::Superseded;
+                updated = true;
+            }
+            if let Some(peer) = self
+                .review_hold
+                .iter_mut()
+                .find(|p| p.id == *peer_id)
+            {
+                peer.status = ProposalStatus::Superseded;
+                updated = true;
+            }
+            if updated {
+                self.observer.on_proposal_updated(*peer_id);
+            }
+        }
         let path = proposal.file_path.clone();
         self.observer.on_proposal_finalized(&path.to_string_lossy());
         if proposal.is_deletion {
@@ -319,13 +474,104 @@ impl WriteGatePipeline {
         self.proposals.keys().copied().collect()
     }
 
+    /// Returns the default mode (fallback for proposals with no `conv_id` or
+    /// no per-conv override). Use [`Self::effective_mode_for_conv`] to inspect
+    /// the resolved mode for a specific conversation.
     pub fn mode(&self) -> &WriteMode {
-        &self.mode
+        &self.default_mode
     }
 
-    /// Change the write mode at runtime (e.g., switch to Deferred before agent calls).
+    /// Returns the effective mode for `conv_id`: per-conv override if set,
+    /// otherwise `default_mode`.
+    pub fn effective_mode_for_conv(&self, conv_id: Option<&str>) -> &WriteMode {
+        self.effective_mode(conv_id)
+    }
+
+    /// Change the *default* write mode at runtime. Per-conv overrides
+    /// continue to take precedence.
     pub fn set_mode(&mut self, mode: WriteMode) {
-        self.mode = mode;
+        self.default_mode = mode;
+    }
+
+    /// Register a per-conversation `WriteMode` override. A proposal whose
+    /// `conv_id` matches will use this mode instead of `default_mode` until
+    /// [`Self::clear_conv_mode`] is called.
+    pub fn set_conv_mode(&mut self, conv_id: impl Into<String>, mode: WriteMode) {
+        self.conv_modes.insert(conv_id.into(), mode);
+    }
+
+    /// Remove a per-conversation `WriteMode` override. Future proposals from
+    /// that conversation fall back to `default_mode`.
+    pub fn clear_conv_mode(&mut self, conv_id: &str) {
+        self.conv_modes.remove(conv_id);
+    }
+
+    /// Collect the IDs of every pending or deferred proposal that targets
+    /// `abs_path`. Used by the propose-write seam to detect concurrent
+    /// providers proposing changes to the same file so the conflict can be
+    /// surfaced in the review UX instead of silently dropping the later
+    /// proposal.
+    pub fn conflict_candidates_for_path(&self, abs_path: &Path) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .proposals
+            .values()
+            .filter(|p| p.file_path == abs_path)
+            .map(|p| p.id)
+            .collect();
+        ids.extend(
+            self.deferred_proposals
+                .iter()
+                .filter(|p| p.file_path == abs_path)
+                .map(|p| p.id),
+        );
+        ids.extend(
+            self.review_hold
+                .iter()
+                .filter(|p| p.file_path == abs_path)
+                .map(|p| p.id),
+        );
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Link a freshly-inserted proposal `new_id` with `peers` as a conflict
+    /// set. Each peer gets `new_id` appended to its `conflicts_with`, and
+    /// observers see one `on_proposal_updated` per touched peer. Has no
+    /// effect on the new proposal itself — the caller is expected to seed
+    /// its `conflicts_with` field with `peers` before calling
+    /// `insert_proposal`.
+    pub fn mark_conflict_pair(&mut self, new_id: u64, peers: &[u64]) {
+        for peer_id in peers {
+            let mut updated = false;
+            if let Some(peer) = self.proposals.get_mut(peer_id)
+                && !peer.conflicts_with.contains(&new_id)
+            {
+                peer.conflicts_with.push(new_id);
+                updated = true;
+            }
+            if let Some(peer) = self
+                .deferred_proposals
+                .iter_mut()
+                .find(|p| p.id == *peer_id)
+                && !peer.conflicts_with.contains(&new_id)
+            {
+                peer.conflicts_with.push(new_id);
+                updated = true;
+            }
+            if let Some(peer) = self
+                .review_hold
+                .iter_mut()
+                .find(|p| p.id == *peer_id)
+                && !peer.conflicts_with.contains(&new_id)
+            {
+                peer.conflicts_with.push(new_id);
+                updated = true;
+            }
+            if updated {
+                self.observer.on_proposal_updated(*peer_id);
+            }
+        }
     }
 }
 
@@ -475,6 +721,7 @@ mod tests {
         let proposal = WriteGatePipeline::build_proposal(
             id,
             "test-agent",
+            None,
             Path::new("src/main.rs"),
             "fn old() {}\n",
             "fn new() {}\n",
@@ -495,6 +742,7 @@ mod tests {
         let proposal = WriteGatePipeline::build_proposal(
             id,
             "test-agent",
+            None,
             Path::new("src/main.rs"),
             "fn old() {}\n",
             "fn new() {}\n",
@@ -518,6 +766,7 @@ mod tests {
         let proposal = WriteGatePipeline::build_proposal(
             id,
             "test-agent",
+            None,
             Path::new("src/main.rs"),
             "fn old() {}\n",
             "fn new() {}\n",
@@ -535,6 +784,7 @@ mod tests {
         let proposal = WriteGatePipeline::build_proposal(
             id,
             "test-agent",
+            None,
             Path::new("src/main.rs"),
             "fn old() {}\n",
             "fn new() {}\n",
@@ -553,6 +803,7 @@ mod tests {
         let proposal2 = WriteGatePipeline::build_proposal(
             id2,
             "test-agent",
+            None,
             Path::new("src/lib.rs"),
             "fn lib_old() {}\n",
             "fn lib_new() {}\n",
@@ -567,12 +818,249 @@ mod tests {
     }
 
     #[test]
+    fn test_take_pending_proposals_for_conv_filters_by_owner() {
+        let (mut pipeline, _c, _u, _f) = make_pipeline(WriteMode::Deferred);
+
+        let id_a = pipeline.next_id();
+        let proposal_a = WriteGatePipeline::build_proposal(
+            id_a,
+            "agent-a",
+            Some("conv-A"),
+            Path::new("src/a.rs"),
+            "",
+            "fn a() {}\n",
+        );
+        pipeline.insert_proposal(proposal_a);
+
+        let id_b = pipeline.next_id();
+        let proposal_b = WriteGatePipeline::build_proposal(
+            id_b,
+            "agent-b",
+            Some("conv-B"),
+            Path::new("src/b.rs"),
+            "",
+            "fn b() {}\n",
+        );
+        pipeline.insert_proposal(proposal_b);
+
+        let id_none = pipeline.next_id();
+        let proposal_none = WriteGatePipeline::build_proposal(
+            id_none,
+            "external",
+            None,
+            Path::new("src/c.rs"),
+            "",
+            "fn c() {}\n",
+        );
+        pipeline.insert_proposal(proposal_none);
+
+        assert_eq!(pipeline.pending_proposals().len(), 3);
+
+        let drained_a = pipeline.take_pending_proposals_for_conv(Some("conv-A"));
+        assert_eq!(drained_a.len(), 1);
+        assert_eq!(drained_a[0].id, id_a);
+        assert_eq!(pipeline.pending_proposals().len(), 2);
+
+        // conv-B's proposal must still be there
+        assert!(
+            pipeline
+                .pending_proposals()
+                .iter()
+                .any(|p| p.conv_id.as_deref() == Some("conv-B"))
+        );
+
+        // None-keyed bucket is independent
+        let drained_none = pipeline.take_pending_proposals_for_conv(None);
+        assert_eq!(drained_none.len(), 1);
+        assert!(drained_none[0].conv_id.is_none());
+        assert_eq!(pipeline.pending_proposals().len(), 1);
+    }
+
+    #[test]
+    fn test_review_hold_keeps_path_visible_after_drain() {
+        let (mut pipeline, _c, _u, _f) = make_pipeline(WriteMode::Deferred);
+
+        let id_a = pipeline.next_id();
+        let proposal_a = WriteGatePipeline::build_proposal(
+            id_a,
+            "agent-a",
+            Some("conv-A"),
+            Path::new("src/shared.rs"),
+            "old\n",
+            "from-a\n",
+        );
+        pipeline.insert_proposal(proposal_a);
+
+        let drained = pipeline.take_pending_proposals_for_conv(Some("conv-A"));
+        assert_eq!(drained.len(), 1);
+        assert!(pipeline.pending_proposals().is_empty());
+
+        // A is in review_hold — a later provider must still see the collision.
+        let peers = pipeline.conflict_candidates_for_path(Path::new("src/shared.rs"));
+        assert_eq!(peers, vec![id_a]);
+
+        pipeline.release_review_hold_ids(&[id_a]);
+        assert!(pipeline.conflict_candidates_for_path(Path::new("src/shared.rs")).is_empty());
+    }
+
+    #[test]
+    fn test_finalize_marks_conflict_peers_superseded() {
+        let (mut pipeline, _c, updated, _f) = make_pipeline(WriteMode::Interactive);
+
+        let id_a = pipeline.next_id();
+        let mut proposal_a = WriteGatePipeline::build_proposal(
+            id_a,
+            "agent-a",
+            Some("conv-A"),
+            Path::new("src/shared.rs"),
+            "old\n",
+            "from-a\n",
+        );
+        // Pre-stage the conflict link as the runner would.
+        let id_b = pipeline.next_id() + 1; // Reserve next id below; pretend B's id.
+        proposal_a.conflicts_with = vec![id_b];
+        pipeline.insert_proposal(proposal_a);
+
+        let mut proposal_b = WriteGatePipeline::build_proposal(
+            id_b,
+            "agent-b",
+            Some("conv-B"),
+            Path::new("src/shared.rs"),
+            "old\n",
+            "from-b\n",
+        );
+        proposal_b.conflicts_with = vec![id_a];
+        pipeline.insert_proposal(proposal_b);
+
+        let before = updated.load(Ordering::SeqCst);
+        // Accept A.
+        pipeline.accept_all(id_a);
+        let _ = pipeline.finalize(id_a);
+
+        // B must now be Superseded with one extra observer update.
+        let b_after = pipeline.get_proposal(id_b).unwrap();
+        assert_eq!(b_after.status, ProposalStatus::Superseded);
+        // accept_all fired one update for A; finalize fired one update for B.
+        assert!(updated.load(Ordering::SeqCst) > before);
+    }
+
+    #[test]
+    fn test_mark_conflict_pair_links_proposals_and_fires_updated() {
+        let (mut pipeline, _c, updated, _f) = make_pipeline(WriteMode::Interactive);
+
+        // First proposal lands in Interactive mode → `proposals` HashMap.
+        let id_a = pipeline.next_id();
+        let proposal_a = WriteGatePipeline::build_proposal(
+            id_a,
+            "agent-a",
+            Some("conv-A"),
+            Path::new("src/shared.rs"),
+            "fn old() {}\n",
+            "fn from_a() {}\n",
+        );
+        pipeline.insert_proposal(proposal_a);
+        // Reset updated counter — `on_proposal_created` did not bump it.
+        let before = updated.load(Ordering::SeqCst);
+
+        // Second proposal targets the same file from a different conv.
+        let peers = pipeline.conflict_candidates_for_path(Path::new("src/shared.rs"));
+        assert_eq!(peers, vec![id_a]);
+
+        let id_b = pipeline.next_id();
+        let mut proposal_b = WriteGatePipeline::build_proposal(
+            id_b,
+            "agent-b",
+            Some("conv-B"),
+            Path::new("src/shared.rs"),
+            "fn old() {}\n",
+            "fn from_b() {}\n",
+        );
+        proposal_b.conflicts_with = peers.clone();
+        pipeline.insert_proposal(proposal_b);
+        pipeline.mark_conflict_pair(id_b, &peers);
+
+        // A learned about B (one `on_proposal_updated`).
+        assert_eq!(updated.load(Ordering::SeqCst), before + 1);
+        let a_after = pipeline.get_proposal(id_a).unwrap();
+        assert_eq!(a_after.conflicts_with, vec![id_b]);
+        // B carries A from construction.
+        let b_after = pipeline.get_proposal(id_b).unwrap();
+        assert_eq!(b_after.conflicts_with, vec![id_a]);
+    }
+
+    #[test]
+    fn test_per_conv_write_mode_overrides_default() {
+        let (mut pipeline, created, _u, finalized) = make_pipeline(WriteMode::Interactive);
+        // Conv A → Deferred (override). Conv B → no override (default
+        // Interactive). Conv C → AutoAccept (override).
+        pipeline.set_conv_mode("conv-A", WriteMode::Deferred);
+        pipeline.set_conv_mode("conv-C", WriteMode::AutoAccept);
+
+        // Default is still Interactive.
+        assert_eq!(*pipeline.mode(), WriteMode::Interactive);
+        assert!(pipeline.is_deferred_for_conv(Some("conv-A")));
+        assert!(!pipeline.is_deferred_for_conv(Some("conv-B")));
+
+        // Conv A insert lands in the deferred bucket without firing
+        // `on_proposal_created`.
+        let id_a = pipeline.next_id();
+        let proposal_a = WriteGatePipeline::build_proposal(
+            id_a,
+            "agent-a",
+            Some("conv-A"),
+            Path::new("src/a.rs"),
+            "",
+            "fn a() {}\n",
+        );
+        assert!(pipeline.insert_proposal(proposal_a).is_none());
+        assert_eq!(pipeline.pending_proposals().len(), 1);
+        assert_eq!(created.load(Ordering::SeqCst), 0);
+
+        // Conv B insert hits the default Interactive path: observer fires,
+        // proposal lands in `proposals`, no deferred bucket.
+        let id_b = pipeline.next_id();
+        let proposal_b = WriteGatePipeline::build_proposal(
+            id_b,
+            "agent-b",
+            Some("conv-B"),
+            Path::new("src/b.rs"),
+            "",
+            "fn b() {}\n",
+        );
+        assert!(pipeline.insert_proposal(proposal_b).is_none());
+        assert_eq!(created.load(Ordering::SeqCst), 1);
+        assert!(pipeline.get_proposal(id_b).is_some());
+        assert_eq!(pipeline.pending_proposals().len(), 1);
+
+        // Conv C insert hits AutoAccept and returns a Write action.
+        let id_c = pipeline.next_id();
+        let proposal_c = WriteGatePipeline::build_proposal(
+            id_c,
+            "agent-c",
+            Some("conv-C"),
+            Path::new("src/c.rs"),
+            "",
+            "fn c() {}\n",
+        );
+        match pipeline.insert_proposal(proposal_c) {
+            Some(AutoAcceptAction::Write { .. }) => {}
+            other => panic!("expected AutoAccept Write, got {:?}", other),
+        }
+        assert_eq!(finalized.load(Ordering::SeqCst), 1);
+
+        // Clearing the conv-A override drops it back to Interactive.
+        pipeline.clear_conv_mode("conv-A");
+        assert!(!pipeline.is_deferred_for_conv(Some("conv-A")));
+    }
+
+    #[test]
     fn test_accept_reject_hunks() {
         let (mut pipeline, _c, updated, _f) = make_pipeline(WriteMode::Interactive);
         let id = pipeline.next_id();
         let proposal = WriteGatePipeline::build_proposal(
             id,
             "test-agent",
+            None,
             Path::new("src/main.rs"),
             "aaa\nbbb\nccc\nddd\neee\nfff\n",
             "aaa\nBBB\nccc\nddd\nEEE\nfff\n",
@@ -599,6 +1087,7 @@ mod tests {
         let proposal = WriteGatePipeline::build_proposal(
             id,
             "test-agent",
+            None,
             Path::new("src/main.rs"),
             "aaa\nbbb\nccc\n",
             "aaa\nBBB\nccc\n",
@@ -625,6 +1114,7 @@ mod tests {
         let proposal = WriteGatePipeline::build_proposal(
             id,
             "test-agent",
+            None,
             Path::new("src/main.rs"),
             "aaa\nbbb\nccc\nddd\neee\nfff\n",
             "aaa\nBBB\nccc\nddd\nEEE\nfff\n",
@@ -652,6 +1142,7 @@ mod tests {
         let proposal = WriteGatePipeline::build_delete_proposal(
             id,
             "test-agent",
+            None,
             Path::new("src/stale.rs"),
             "fn doomed() {}\n",
         );
@@ -682,6 +1173,7 @@ mod tests {
         let proposal = WriteGatePipeline::build_delete_proposal(
             id,
             "test-agent",
+            None,
             Path::new("src/stale.rs"),
             "fn doomed() {}\n",
         );
@@ -720,6 +1212,7 @@ mod tests {
         let proposal = WriteGatePipeline::build_proposal(
             id,
             "test-agent",
+            None,
             Path::new("src/main.rs"),
             original,
             proposed,

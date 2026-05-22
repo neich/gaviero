@@ -39,6 +39,7 @@ pub struct AcpPipeline {
     /// mode.
     additional_roots: Vec<PathBuf>,
     agent_id: String,
+    conv_id: Option<String>,
     options: AgentOptions,
 }
 
@@ -51,6 +52,7 @@ impl AcpPipeline {
         workspace_root: impl Into<PathBuf>,
         additional_roots: Vec<PathBuf>,
         agent_id: impl Into<String>,
+        conv_id: Option<String>,
         options: AgentOptions,
     ) -> Self {
         Self {
@@ -61,6 +63,7 @@ impl AcpPipeline {
             workspace_root: workspace_root.into(),
             additional_roots,
             agent_id: agent_id.into(),
+            conv_id,
             options,
         }
     }
@@ -155,6 +158,7 @@ impl AcpPipeline {
                 self.observer.as_ref(),
                 self.write_gate.clone(),
                 &self.agent_id,
+                self.conv_id.as_deref(),
             )
             .await?;
             return Ok(());
@@ -194,41 +198,33 @@ pub(crate) async fn propose_write(
     observer: &dyn AcpObserver,
     workspace_root: &Path,
     agent_id: &str,
+    conv_id: Option<&str>,
     rel_path: &Path,
     proposed_content: &str,
 ) -> Result<()> {
     let abs_path = workspace_root.join(rel_path);
 
-    // 1. Scope check + duplicate check + allocate ID (single lock)
-    let (id, is_deferred) = {
+    // 1. Scope check + collect conflict peers + allocate ID. Same-path
+    // collisions now pair into a conflict set rather than dropping the
+    // later proposal silently.
+    let (id, is_deferred, conflict_peers) = {
         let mut gate = write_gate.lock().await;
         let path_str = rel_path.to_string_lossy();
         if !gate.is_scope_allowed(agent_id, &path_str) {
             tracing::warn!("Scope rejected for {}", rel_path.display());
             return Ok(());
         }
-        if gate.proposal_for_path(&abs_path).is_some() {
+        let peers = gate.conflict_candidates_for_path(&abs_path);
+        let id = gate.next_id();
+        let is_deferred = gate.is_deferred_for_conv(conv_id);
+        if !peers.is_empty() {
             tracing::warn!(
-                "Dropping later proposal for {} — an earlier proposal for this path is already pending review. \
-                 If the agent is correcting itself, the user is reviewing stale content.",
-                rel_path.display()
+                "Pairing proposal for {} as conflict with {} existing proposal(s)",
+                rel_path.display(),
+                peers.len()
             );
-            return Ok(());
         }
-        // Also check deferred proposals for duplicates
-        if gate
-            .pending_proposals()
-            .iter()
-            .any(|p| p.file_path == abs_path)
-        {
-            tracing::warn!(
-                "Dropping later deferred proposal for {} — an earlier proposal for this path is already queued. \
-                 If the agent is correcting itself, the user is reviewing stale content.",
-                rel_path.display()
-            );
-            return Ok(());
-        }
-        (gate.next_id(), gate.is_deferred())
+        (id, is_deferred, peers)
     };
 
     // 2. Read original content + build proposal (outside lock)
@@ -248,8 +244,14 @@ pub(crate) async fn propose_write(
         return Ok(());
     }
 
-    let proposal =
-        WriteGatePipeline::build_proposal(id, agent_id, &abs_path, &original, proposed_content);
+    let mut proposal = WriteGatePipeline::build_proposal(
+        id,
+        agent_id,
+        conv_id,
+        &abs_path,
+        &original,
+        proposed_content,
+    );
 
     if proposal.structural_hunks.is_empty() {
         tracing::info!(
@@ -259,6 +261,8 @@ pub(crate) async fn propose_write(
         return Ok(());
     }
 
+    proposal.conflicts_with = conflict_peers.clone();
+
     tracing::info!(
         "propose_write: {} — {} hunks, is_deferred={}, inserting",
         rel_path.display(),
@@ -266,10 +270,14 @@ pub(crate) async fn propose_write(
         is_deferred
     );
 
-    // 3. Insert proposal (single lock)
+    // 3. Insert proposal + back-fill peer `conflicts_with` (single lock)
     let auto_accept_result = {
         let mut gate = write_gate.lock().await;
-        gate.insert_proposal(proposal)
+        let action = gate.insert_proposal(proposal);
+        if !conflict_peers.is_empty() {
+            gate.mark_conflict_pair(id, &conflict_peers);
+        }
+        action
     };
 
     // 4. If deferred, notify observer for compact summary display
@@ -317,41 +325,40 @@ pub(crate) async fn propose_delete(
     observer: &dyn AcpObserver,
     workspace_root: &Path,
     agent_id: &str,
+    conv_id: Option<&str>,
     rel_path: &Path,
     original_content: &str,
 ) -> Result<()> {
     let abs_path = workspace_root.join(rel_path);
 
-    let (id, is_deferred) = {
+    let (id, is_deferred, conflict_peers) = {
         let mut gate = write_gate.lock().await;
         let path_str = rel_path.to_string_lossy();
         if !gate.is_scope_allowed(agent_id, &path_str) {
             tracing::warn!("Scope rejected for delete of {}", rel_path.display());
             return Ok(());
         }
-        if gate.proposal_for_path(&abs_path).is_some() {
+        let peers = gate.conflict_candidates_for_path(&abs_path);
+        let id = gate.next_id();
+        let is_deferred = gate.is_deferred_for_conv(conv_id);
+        if !peers.is_empty() {
             tracing::warn!(
-                "Dropping delete proposal for {} — earlier proposal already pending review",
-                rel_path.display()
+                "Pairing delete proposal for {} as conflict with {} existing proposal(s)",
+                rel_path.display(),
+                peers.len()
             );
-            return Ok(());
         }
-        if gate
-            .pending_proposals()
-            .iter()
-            .any(|p| p.file_path == abs_path)
-        {
-            tracing::warn!(
-                "Dropping delete proposal for {} — earlier proposal already queued",
-                rel_path.display()
-            );
-            return Ok(());
-        }
-        (gate.next_id(), gate.is_deferred())
+        (id, is_deferred, peers)
     };
 
-    let proposal =
-        WriteGatePipeline::build_delete_proposal(id, agent_id, &abs_path, original_content);
+    let mut proposal = WriteGatePipeline::build_delete_proposal(
+        id,
+        agent_id,
+        conv_id,
+        &abs_path,
+        original_content,
+    );
+    proposal.conflicts_with = conflict_peers.clone();
 
     tracing::info!(
         "propose_delete: {} — {} bytes, is_deferred={}, inserting",
@@ -362,7 +369,11 @@ pub(crate) async fn propose_delete(
 
     let auto_accept_result = {
         let mut gate = write_gate.lock().await;
-        gate.insert_proposal(proposal)
+        let action = gate.insert_proposal(proposal);
+        if !conflict_peers.is_empty() {
+            gate.mark_conflict_pair(id, &conflict_peers);
+        }
+        action
     };
 
     if is_deferred {

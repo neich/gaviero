@@ -1,0 +1,580 @@
+// Template: Iterative scientific-research consensus across 3 providers
+//
+// Shape:
+//
+//   Phase 1 (parallel x3): claude-init, codex-init, cursor-init each
+//     read the problem file ({{PROBLEM_FILE}}), do extensive independent
+//     literature research via web tools, and write an analysis covering
+//     state-of-the-field, best avenues for advance, and risks/problems.
+//     Critical and honest — no hedging.
+//
+//   Phase 2 (loop up to 10): claude-refine, codex-refine, cursor-refine
+//     each read all three previous conclusions + (from iter 2 onward)
+//     all three prior summaries, perform ADDITIONAL web research, and
+//     write:
+//       (a) a new conclusions document, and
+//       (b) a separate summary explaining the comparison findings.
+//     After each pass, convergence-judge (sonnet) checks whether the
+//     three providers have reached consensus; the loop exits on PASS
+//     (stability 2) or hits max_iterations 10.
+//
+// Files written per iteration N (N=1 for init, N=2..11 for refinement):
+//   {{OUT_DIR}}/<model>-init-v1.md                       (init only)
+//   {{OUT_DIR}}/<model>-refine-conclusions-v{N}.md       (refine)
+//   {{OUT_DIR}}/<model>-refine-summary-v{N}.md           (refine)
+//
+// Inputs (set via --var):
+//   PROBLEM_FILE — relative path to the markdown file describing the
+//                  problem to research (default: research/problem.md).
+//                  This file is read-only for every agent. Put the full
+//                  problem statement, available data references, prior
+//                  results, and success criteria in it. {{PROMPT}} on
+//                  the CLI is treated as a short title; the detailed
+//                  description lives in {{PROBLEM_FILE}}.
+//   OUT_DIR      — directory for all written outputs (default research).
+//
+// Cost note:
+//   Three frontier providers x up to 10 refinement passes plus init is
+//   expensive — easily 30+ deep-reasoning turns. Convergence via the
+//   judge is the only way to exit early; the prompts deliberately push
+//   agents to declare convergence honestly once the substantive
+//   disagreements close. `stability 2` guards against a flaky single
+//   PASS verdict.
+//
+// Usage:
+//   gaviero-cli --script crates/gaviero-dsl/examples/scientific_research.gaviero \
+//     --var PROBLEM_FILE=research/problem.md \
+//     --var OUT_DIR=research
+
+include "clients.gaviero"
+
+// Local override of the cursor client so all three providers run at
+// maximum research depth. clients.gaviero ships `composer` at
+// effort=medium for cheaper coding tasks; for an iterative literature
+// review we want the same depth as opus and codex-5-5.
+client cursor-deep {
+    model "cursor:composer-2.5"
+    privacy public
+    effort high
+}
+
+// ── Shared configuration ──────────────────────────────────────────────────────
+//
+// INIT_VER: the version written by the init phase; read by the first loop
+// pass as PREV_ITER (iter_start 2 → PREV_ITER=1 on loop iteration 1).
+//
+// PROBLEM_FILE: external problem statement. The {{PROMPT}} passed to
+// gaviero-cli is a short topic title; the substantive description lives
+// in this file so all three providers anchor to the same source of truth.
+
+vars {
+    OUT_DIR      "research"
+    INIT_VER     "1"
+    PROBLEM_FILE "research/problem.md"
+}
+
+// ── Prompts ───────────────────────────────────────────────────────────────────
+//
+// Three prompts: independent initial analysis with literature search,
+// cross-provider refinement with fresh research each pass, and a
+// summary-first convergence judgment.
+//
+//   Init agents:    MODEL_NAME set per-agent; writes v{{INIT_VER}}
+//   Refine agents:  MODEL_NAME + PEER1_NAME + PEER2_NAME set per-agent;
+//                   reads v{{PREV_ITER}}, writes v{{ITER}}
+//   Judge agent:    reads all three v{{ITER}} summaries (and conclusions
+//                   on borderline calls) and emits PASS / FAIL
+
+prompt init-body #"
+    You are producing an independent expert analysis of a scientific
+    research problem.
+
+    Topic (short title): {{PROMPT}}
+    Full problem statement: {{PROBLEM_FILE}}
+
+    1. Read {{PROBLEM_FILE}} in full. Treat it as the authoritative
+       description of the endeavour — the available data, the existing
+       results, the constraints, and what success looks like. Do NOT
+       paraphrase loosely; every downstream conclusion you draw must
+       trace back to something in that file.
+
+    2. Conduct EXTENSIVE web research. Use every web search and fetch
+       tool available to you. Specifically:
+         - Search for the latest peer-reviewed and preprint literature
+           relevant to the problem. Prioritise the last 24 months but
+           include seminal earlier work where it shapes the field.
+         - Identify the leading research groups, the dominant
+           techniques, the open questions, and the recent surprises.
+         - Look for negative results, reproducibility issues, and
+           contested or retracted findings tied to this problem.
+         - Search arXiv, Google Scholar, conference proceedings (NeurIPS,
+           ICML, Nature, Science, plus the relevant domain venues),
+           preprint servers, and credible institutional blogs. Follow
+           the citation graph two hops deep where something seems
+           load-bearing.
+       Do NOT skip this step. The workflow's whole point is that three
+       independent providers each bring a fresh, well-sourced literature
+       view; superficial research undermines the comparison phase.
+
+    3. Do NOT read any existing files in {{OUT_DIR}}/. You are forming
+       an independent baseline — peer analyses arrive in the refine
+       phase, not now.
+
+    4. Think from first principles AFTER the research, not before. The
+       literature constrains what's been tried and what failed;
+       first-principles thinking constrains what's plausible under the
+       {{PROBLEM_FILE}} constraints. Combine them.
+
+    5. Be critical and honest. The downstream loop will compare your
+       analysis to two peers' analyses; sandbagging or hedging reduces
+       signal. State your real best assessment, including where you
+       think the problem may be ill-posed or where the data is likely
+       insufficient.
+
+    Write your analysis to
+    {{OUT_DIR}}/{{MODEL_NAME}}-init-v{{INIT_VER}}.md using markdown
+    with these EXACT headings, in this order:
+
+      - `## Problem restatement`
+        Two or three paragraphs in your own words. Demonstrates you
+        understood the endeavour, the available data, and the
+        literature context. Cite the strongest 5–10 sources you found,
+        with full titles, authors, year, and venue/URL.
+      - `## State of the field`
+        What is currently known, what is contested, what is open. Be
+        specific — name techniques, datasets, benchmarks, results.
+        Include citations.
+      - `## Best avenues for advance`
+        The strongest concrete directions for progress. For each:
+          * One-paragraph description.
+          * Why it is promising given the literature and the
+            {{PROBLEM_FILE}} constraints.
+          * What evidence would distinguish success from failure.
+          * Cost/feasibility — compute, data, expertise, time.
+          * Citations to the prior work it builds on.
+        Rank them: which would you pursue first, and why.
+      - `## Risks and problems`
+        Honest, critical assessment. For each risk:
+          * What could go wrong (technical, methodological,
+            reproducibility, ethical).
+          * Likelihood and severity.
+          * Mitigation, if any exists.
+        Include risks the available data may be insufficient to settle,
+        risks of negative result, and risks that the problem as posed
+        may be ill-defined.
+      - `## Open questions for the consensus loop`
+        Two to five questions the next iteration of refinement should
+        resolve. These are not rhetorical — they are the disagreements
+        you expect to find with the peer providers and the questions
+        you'd most want their independent view on.
+      - `## Sources consulted`
+        A flat bibliography of every source you used, with full
+        bibliographic info and a URL where available. Mark which
+        sources you read in full versus which you sampled. This is
+        the audit trail for the comparison phase.
+
+    Aim for depth over breadth. A 3000-word analysis that engages
+    seriously with 15 sources beats a 1500-word analysis that
+    name-drops 50.
+"#
+
+prompt refine-body #"
+    You are iteratively refining a scientific analysis. Three providers
+    (you + two peers, {{PEER1_NAME}} and {{PEER2_NAME}}) are running
+    this loop in parallel; on each pass every provider reads the others'
+    most recent work, does additional web research, and updates its
+    conclusions.
+
+    Topic (short title): {{PROMPT}}
+    Full problem statement: {{PROBLEM_FILE}}
+
+    Inputs to read this pass:
+
+    1. Re-read {{PROBLEM_FILE}} in full. The problem statement is the
+       anchor — every conclusion must trace back to a constraint,
+       datum, or goal listed there.
+
+    2. Read your own previous analysis:
+         - {{OUT_DIR}}/{{MODEL_NAME}}-init-v{{PREV_ITER}}.md (when
+           {{PREV_ITER}} = 1) or
+           {{OUT_DIR}}/{{MODEL_NAME}}-refine-conclusions-v{{PREV_ITER}}.md
+           (when {{PREV_ITER}} >= 2).
+
+    3. Read BOTH peers' previous conclusions IN FULL:
+         - {{OUT_DIR}}/{{PEER1_NAME}}-init-v{{PREV_ITER}}.md (PREV_ITER=1)
+           or {{OUT_DIR}}/{{PEER1_NAME}}-refine-conclusions-v{{PREV_ITER}}.md
+           (PREV_ITER >= 2).
+         - The same file pattern for {{PEER2_NAME}}.
+
+    4. **If {{PREV_ITER}} >= 2**, also read all three prior summaries:
+         - {{OUT_DIR}}/{{MODEL_NAME}}-refine-summary-v{{PREV_ITER}}.md
+         - {{OUT_DIR}}/{{PEER1_NAME}}-refine-summary-v{{PREV_ITER}}.md
+         - {{OUT_DIR}}/{{PEER2_NAME}}-refine-summary-v{{PREV_ITER}}.md
+       Use them to focus your comparison: which disagreements persisted,
+       which were settled, what each side conceded last pass.
+
+    5. Conduct ADDITIONAL web research this iteration. Do NOT recycle
+       the searches from the previous pass. Specifically:
+         - Read primary sources the peers cited that you did not. If
+           {{PEER1_NAME}} or {{PEER2_NAME}} grounds a claim in a paper
+           outside your prior bibliography, fetch and read that paper
+           before evaluating their argument.
+         - Look for newer publications (preprints in the last six
+           months — the field moves fast).
+         - Search for counter-evidence to the consensus claims in your
+           previous analysis. Specifically try to falsify your own
+           strongest conclusion.
+         - Follow up on any "I'd want to check X" notes from the prior
+           summaries.
+       Each refinement pass MUST be backed by fresh searches, not just
+       re-reading the prior trio. The whole point of iterating is to
+       deepen the evidence base — a refinement that adds no new
+       sources adds no new signal.
+
+    Then synthesise:
+
+    6. Evaluate the merits of each peer analysis on its own terms.
+       For each peer ({{PEER1_NAME}} and {{PEER2_NAME}}) identify:
+         - Strongest claim — and whether the literature supports it.
+         - Weakest claim — and what evidence would change your mind.
+         - What this peer saw that you did not (techniques, risks,
+           sources, framings).
+         - What this peer overlooked or got wrong, citing sources.
+
+    7. Decide whether the trio has converged. Convergence means all
+       three independent analyses agree on:
+         - The framing of the problem.
+         - The top two or three avenues for advance (the same
+           directions, not necessarily the same priority ordering).
+         - The dominant risks and problems.
+         - The state-of-the-field assessment.
+       Editorial differences (wording, section ordering, prose length,
+       which extra sources are cited beyond a core shared set) DO NOT
+       block convergence.
+         - **If the trio has converged**: do NOT introduce new
+           directions, risks, or analytical frames just to make
+           progress visible. Copy your previous conclusions document
+           ({{OUT_DIR}}/{{MODEL_NAME}}-refine-conclusions-v{{PREV_ITER}}.md
+           or {{OUT_DIR}}/{{MODEL_NAME}}-init-v{{PREV_ITER}}.md on the
+           first refine pass) into v{{ITER}} verbatim — same sections,
+           same prose, same bibliography. Byte stability across
+           iterations is the desired outcome. Declare convergence in
+           the summary (step 9).
+         - **If the trio has NOT converged**: synthesise a new
+           conclusions document taking the strongest evidence-backed
+           elements from your prior analysis AND from the two peer
+           analyses, and resolve conflicts on their merits. Make the
+           minimum changes needed to close the actual gaps — do not
+           invent additional refinements beyond what the disagreements
+           demand.
+
+    Outputs to write this pass:
+
+    8. Write the refined conclusions to
+       {{OUT_DIR}}/{{MODEL_NAME}}-refine-conclusions-v{{ITER}}.md with
+       these sections, in this order, with these headings:
+         - `## Problem restatement`
+         - `## State of the field`
+         - `## Best avenues for advance`
+         - `## Risks and problems`
+         - `## Open questions for the consensus loop`
+         - `## Sources consulted`
+       Same shape as the init body — this is the document a human
+       reviewer would read at the end of the run. Hard rules — failing
+       any of these makes the conclusions unfit for hand-off:
+         - Say what is known, what is promising, what is risky, and
+           why. Nothing else.
+         - Do NOT write "I previously said X but now…", "the peer
+           proposed Y which I reject…", or any first-person iteration
+           narrative.
+         - Do NOT reference peer names, version numbers (v{{PREV_ITER}},
+           v{{ITER}}), or refinement passes anywhere in the conclusions
+           body.
+         - Do NOT include `## Synthesis Notes`, `## Comparison`, or
+           any other iteration-metadata section in the conclusions
+           file.
+       All iteration metadata, peer comparison, and version references
+       go in the **summary** file (step 9) — never the conclusions
+       file.
+
+    9. Write the comparison summary to
+       {{OUT_DIR}}/{{MODEL_NAME}}-refine-summary-v{{ITER}}.md. The
+       summary is the deliberate home for ALL iteration metadata; the
+       judge reads summaries before conclusions, so make this file
+       carry the truth about where the three providers stand. Keep it
+       under ~800 words. Use this structure:
+         - **Convergence status** (one sentence, leads the file). If
+           this version is a no-material-change convergence copy, say
+           so explicitly — e.g. "Converged with peers at v{{PREV_ITER}};
+           this version is a no-material-change copy." The judge keys
+           off that exact phrasing. Otherwise summarise the remaining
+           disagreements in one sentence.
+         - **Comparison findings**: one short subsection per peer
+           ({{PEER1_NAME}}, {{PEER2_NAME}}). For each: what you
+           adopted from them, what you rejected, what specific evidence
+           drove the adjudication. Cite sources.
+         - **New evidence this iteration**: what fresh literature or
+           arguments you brought in this pass, and what it settled or
+           destabilised. If you brought in no new evidence, say so —
+           it is a signal the field has been canvassed.
+         - **Alternatives considered and rejected**: framings,
+           techniques, or research directions you weighed and chose
+           not to carry forward, with one-line reasons.
+         - **Remaining open questions**: the disagreements you expect
+           the next iteration to address. Empty list if converged.
+       Write it for a human skimming the iteration evolution.
+"#
+
+prompt judge-body #"
+    You are deciding whether three independently refined scientific
+    analyses have converged for:
+
+    Topic: {{PROMPT}}
+    Problem statement: {{PROBLEM_FILE}}
+
+    {{ITER_EVIDENCE}}
+
+    The digest above lists what the refine agents actually changed
+    this iteration. Use it to focus your reading — if a file is not
+    listed there it did not change this pass.
+
+    Evaluate in two passes — start cheap, only escalate to the full
+    conclusions documents on borderline calls. Three full conclusions
+    documents per iteration is a lot of tokens; the summaries exist
+    precisely so this pass can usually settle on summaries alone.
+
+    Pass 1 (cheap, always do this):
+    1. Read all three current summaries in full:
+         - {{OUT_DIR}}/claude-refine-summary-v{{ITER}}.md
+         - {{OUT_DIR}}/codex-refine-summary-v{{ITER}}.md
+         - {{OUT_DIR}}/cursor-refine-summary-v{{ITER}}.md
+       Each is under ~800 words and carries the convergence status,
+       comparison findings, new evidence, rejected alternatives, and
+       remaining open questions for this pass.
+    2. From the summaries alone, classify the iteration:
+       - **Convergence shortcut — PASS**: ALL THREE leading
+         "Convergence status" sentences declare convergence. Look for
+         phrasing like "Converged with peers at v{{PREV_ITER}}", "no
+         material changes", or "this version is a no-material-change
+         copy". All three must agree — a single dissenting provider
+         blocks the PASS. If all three providers reported they are
+         done, stop here and return PASS.
+       - **Material divergence shortcut — FAIL**: any summary
+         describes a material change to the problem framing, the top
+         avenues for advance, the dominant risks, or the state-of-
+         the-field assessment. Stop here and return FAIL.
+       - **Borderline**: continue to Pass 2.
+
+    Pass 2 (deep, only on borderline):
+    3. Read all three current conclusions documents in full:
+         - {{OUT_DIR}}/claude-refine-conclusions-v{{ITER}}.md
+         - {{OUT_DIR}}/codex-refine-conclusions-v{{ITER}}.md
+         - {{OUT_DIR}}/cursor-refine-conclusions-v{{ITER}}.md
+    4. If you still need it, compare against v{{PREV_ITER}} to judge
+       whether a specific difference is material.
+    5. Return PASS if the three conclusions agree on the problem
+       framing, the top two or three avenues for advance, and the
+       dominant risks. Wording differences and extra citations beyond
+       a shared core DO NOT block convergence — they are expected
+       artefacts of three independent literature reviews.
+    6. Otherwise return FAIL.
+
+    Output format — emit exactly one fenced JSON object as your last
+    output. Keep the reason terse (one short sentence) so the response
+    fits inside the judge timeout:
+
+    ```json
+    {"verdict": "pass" | "fail", "reason": "<one short sentence>"}
+    ```
+
+    A plain `VERDICT: PASS` / `VERDICT: FAIL` line is also accepted as
+    a fallback, but the JSON form is preferred for machine-parseability.
+"#
+
+// ── Agents ────────────────────────────────────────────────────────────────────
+//
+// Ownership uses glob patterns so each phase/model trio owns a disjoint
+// filename namespace inside {{OUT_DIR}}/:
+//   {{OUT_DIR}}/<model>-init-v*.md
+//   {{OUT_DIR}}/<model>-refine-conclusions-v*.md
+//   {{OUT_DIR}}/<model>-refine-summary-v*.md
+// The scope validator checks for real overlap, so the three init globs
+// (claude-init-*, codex-init-*, cursor-init-*) are accepted, and the
+// three refine globs are accepted within the same loop group.
+//
+// Init agents deliberately do NOT have OUT_DIR in their read_only scope
+// — they form an independent baseline. Refine agents read OUT_DIR
+// (everything) plus the problem file.
+
+agent claude-init {
+    vars { MODEL_NAME "claude" }
+    description "Initial analysis (Claude): {{PROMPT}}"
+    client opus
+    scope {
+        owned     ["{{OUT_DIR}}/claude-init-*.md"]
+        read_only ["{{PROBLEM_FILE}}"]
+    }
+    prompt init-body
+}
+
+agent codex-init {
+    vars { MODEL_NAME "codex" }
+    description "Initial analysis (Codex): {{PROMPT}}"
+    client codex-5-5
+    scope {
+        owned     ["{{OUT_DIR}}/codex-init-*.md"]
+        read_only ["{{PROBLEM_FILE}}"]
+    }
+    prompt init-body
+}
+
+agent cursor-init {
+    vars { MODEL_NAME "cursor" }
+    description "Initial analysis (Cursor): {{PROMPT}}"
+    client cursor-deep
+    scope {
+        owned     ["{{OUT_DIR}}/cursor-init-*.md"]
+        read_only ["{{PROBLEM_FILE}}"]
+    }
+    prompt init-body
+}
+
+agent claude-refine {
+    vars { MODEL_NAME "claude" PEER1_NAME "codex" PEER2_NAME "cursor" }
+    description "Refine analysis (Claude): {{PROMPT}}"
+    client opus
+    scope {
+        owned     ["{{OUT_DIR}}/claude-refine-*.md"]
+        read_only ["{{OUT_DIR}}/" "{{PROBLEM_FILE}}"]
+    }
+    prompt refine-body
+    memory {
+        write_ns   "research-evolution"
+        importance 0.7
+        write_content #"
+            Claude refinement — research: {{PROMPT}}
+        "#
+    }
+}
+
+agent codex-refine {
+    vars { MODEL_NAME "codex" PEER1_NAME "claude" PEER2_NAME "cursor" }
+    description "Refine analysis (Codex): {{PROMPT}}"
+    client codex-5-5
+    scope {
+        owned     ["{{OUT_DIR}}/codex-refine-*.md"]
+        read_only ["{{OUT_DIR}}/" "{{PROBLEM_FILE}}"]
+    }
+    prompt refine-body
+    memory {
+        write_ns   "research-evolution"
+        importance 0.7
+        write_content #"
+            Codex refinement — research: {{PROMPT}}
+        "#
+    }
+}
+
+agent cursor-refine {
+    vars { MODEL_NAME "cursor" PEER1_NAME "claude" PEER2_NAME "codex" }
+    description "Refine analysis (Cursor): {{PROMPT}}"
+    client cursor-deep
+    scope {
+        owned     ["{{OUT_DIR}}/cursor-refine-*.md"]
+        read_only ["{{OUT_DIR}}/" "{{PROBLEM_FILE}}"]
+    }
+    prompt refine-body
+    memory {
+        write_ns   "research-evolution"
+        importance 0.7
+        write_content #"
+            Cursor refinement — research: {{PROMPT}}
+        "#
+    }
+}
+
+agent convergence-judge {
+    description "Judge consensus across 3 analyses: {{PROMPT}}"
+    client sonnet
+    scope {
+        read_only ["{{OUT_DIR}}/" "{{PROBLEM_FILE}}"]
+    }
+    prompt judge-body
+}
+
+// ── Workflow ──────────────────────────────────────────────────────────────────
+//
+// Phase 1 (parallel x3): claude-init, codex-init, cursor-init each write
+// an independent v1 analysis from the problem file + their own web
+// research, with no cross-reading.
+//
+// Phase 2 (loop up to 10): claude-refine, codex-refine, cursor-refine
+// repeatedly read the previous trio of conclusions + (on iter ≥ 2) all
+// three prior summaries, do fresh web research, and write a new
+// conclusions document plus a comparison summary.
+//
+// Conclusions/summary contract: the conclusions file is for a human
+// reviewer who will hand the work off, and contains ONLY deliverable
+// content (problem restatement, state of the field, avenues, risks,
+// open questions, sources). No peer comparisons, no version numbers,
+// no synthesis notes in the conclusions body. All iteration metadata —
+// convergence status, comparison findings, new evidence, rejected
+// alternatives, open questions — lives in the summary file. The refine
+// prompt allows agents to declare convergence in the summary ("no
+// material changes — copy v{{PREV_ITER}} verbatim"), which lets the
+// judge's cheap summary-only pass PASS without reading the full
+// conclusions trio.
+//
+// Post-convergence the workflow leaves three v{N} conclusions documents
+// on disk. None is designated canonical here — the human operator
+// picks one (or merges across all three) to hand off.
+//
+// Judge-control knobs (all optional; shown here with explicit values
+// for documentation):
+//
+//   stability 2       → require 2 consecutive PASS verdicts before
+//                       exiting. A single PASS is treated as
+//                       provisional: the refine agents run one more
+//                       pass and the judge re-evaluates. This guards
+//                       against a flaky "looks good" verdict on a
+//                       trio that is still materially evolving.
+//   judge_timeout 240 → hard cap each judge invocation at 240s (0
+//                       disables). Wide enough that even the deep-read
+//                       borderline path covering three full conclusions
+//                       documents can finish.
+//   strict_judge false → an unparseable judge response is treated as
+//                        FAIL rather than a hard error. A timeout on
+//                        the final loop check therefore can't bury the
+//                        run; the loop just exits with max_iterations
+//                        exhausted and the latest trio available for
+//                        human review.
+//
+// The judge prompt also uses {{ITER_EVIDENCE}}: the runtime substitutes
+// a bounded digest of the refine agents' most recent summaries and
+// modified files so the judge can focus on what actually changed.
+//
+// iter_start 2: loop iteration 1 → ITER=2, PREV_ITER=1 (reads v1 init)
+//               loop iteration 2 → ITER=3, PREV_ITER=2
+//               ...
+//               loop iteration 10 → ITER=11, PREV_ITER=10
+
+workflow scientific-research-consensus {
+    steps [
+        claude-init
+        codex-init
+        cursor-init
+        loop {
+            agents         [claude-refine codex-refine cursor-refine]
+            max_iterations 10
+            iter_start     2
+            stability      2
+            judge_timeout  240
+            strict_judge   false
+            until agent    convergence-judge
+        }
+    ]
+    max_parallel 3
+    memory {
+        write_ns "research-evolution"
+    }
+}

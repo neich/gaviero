@@ -45,7 +45,8 @@ use self::observers::{TuiAcpObserver, TuiSwarmObserver, TuiWriteGateObserver};
 use self::state::{
     BatchReviewState, BulkOpState, ChangesEntry, ChangesState, CodexTrustDialog, DiffKind,
     FirstRunDialog, FirstRunStep, Focus, LayoutAreas, LayoutPreset, LeftPanelMode, MoveState,
-    PanelVisibility, ReviewProposal, ScrollbarTarget, SidePanelMode, TreeDialog, TreeDialogKind,
+    MarkdownPreviewMode, PanelVisibility, ReviewProposal, ScrollbarTarget, SidePanelMode,
+    TreeDialog, TreeDialogKind,
     build_simple_diff,
 };
 
@@ -137,9 +138,12 @@ pub struct App {
     pub find_bar_active: bool,
     pub find_input: crate::widgets::text_input::TextInput,
 
-    // Markdown preview
-    pub preview_visible: bool,
+    // Markdown preview (Alt+P cycles Off → Split → PreviewOnly)
+    pub preview_mode: MarkdownPreviewMode,
     pub preview_scroll: usize,
+    /// Updated each preview render; used for PageUp/PageDown in preview-only mode.
+    pub preview_viewport_lines: usize,
+    pub preview_line_count: usize,
 
     // Write gate
     pub write_gate: Arc<Mutex<WriteGatePipeline>>,
@@ -365,8 +369,10 @@ impl App {
             bulk_op_state: None,
             find_bar_active: false,
             find_input: crate::widgets::text_input::TextInput::new(),
-            preview_visible: false,
+            preview_mode: MarkdownPreviewMode::Off,
             preview_scroll: 0,
+            preview_viewport_lines: 1,
+            preview_line_count: 0,
             write_gate,
             diff_review: None,
             batch_review: None,
@@ -909,7 +915,7 @@ impl App {
         render::render_terminal(self, frame, area);
     }
 
-    fn render_markdown_preview(&self, frame: &mut Frame, area: Rect) {
+    fn render_markdown_preview(&mut self, frame: &mut Frame, area: Rect) {
         render::render_markdown_preview(self, frame, area);
     }
 

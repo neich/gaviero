@@ -2058,10 +2058,11 @@ pub(super) fn send_chat_message(app: &mut App) {
         {
             let mut gate = wg.lock().await;
             tracing::info!(
-                "Write gate mode before: {:?}, switching to Deferred",
+                "Registering conv {} as Deferred (default mode stays {:?})",
+                conv_id_clone,
                 gate.mode()
             );
-            gate.set_mode(WriteMode::Deferred);
+            gate.set_conv_mode(conv_id_clone.clone(), WriteMode::Deferred);
         }
 
         // M2: Chat hands the planner the raw memory + repo_map references
@@ -2383,6 +2384,7 @@ pub(super) fn send_chat_message(app: &mut App) {
                 workspace_root: root,
                 additional_roots,
                 agent_id: "claude-chat".to_string(),
+                conv_id: Some(conv_id_clone.clone()),
                 options,
                 profile: provider_profile_clone,
                 cancel_token: session_cancel,
@@ -2422,12 +2424,16 @@ pub(super) fn send_chat_message(app: &mut App) {
 
         let proposals = {
             let mut gate = wg.lock().await;
-            let proposals = gate.take_pending_proposals();
+            let proposals =
+                gate.take_pending_proposals_for_conv(Some(&conv_id_clone));
             tracing::info!(
-                "Draining deferred proposals: count={}, switching back to Interactive",
+                "Draining deferred proposals for conv {}: count={}",
+                conv_id_clone,
                 proposals.len()
             );
-            gate.set_mode(WriteMode::Interactive);
+            // Conversation done — clear its per-conv override so any late
+            // straggler proposals fall back to the gate's default mode.
+            gate.clear_conv_mode(&conv_id_clone);
             proposals
         };
         if !proposals.is_empty() {

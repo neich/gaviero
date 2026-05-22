@@ -117,6 +117,15 @@ pub struct WriteProposal {
     /// rather than write `proposed_content`. Set by `propose_delete` for
     /// tool-driven deletions; finalize paths branch on this flag.
     pub is_deletion: bool,
+    /// Conversation that produced this proposal. `None` for proposals from
+    /// non-conversational paths (CLI bulk operations, internal tooling).
+    /// Enables per-conversation drain + per-conversation `WriteMode` so
+    /// concurrent providers don't cross-contaminate each other's queues.
+    pub conv_id: Option<String>,
+    /// IDs of other pending proposals that overlap on `file_path`. Populated
+    /// by the gate when a same-path collision is detected; mutually linked
+    /// across the conflict pair. Empty in the no-conflict case.
+    pub conflicts_with: Vec<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -125,6 +134,9 @@ pub enum ProposalStatus {
     PartiallyAccepted,
     Accepted,
     Rejected,
+    /// Marked superseded after a conflicting peer was finalized.
+    /// Apply paths refuse to write a superseded proposal.
+    Superseded,
 }
 
 // ── SymbolKind ───────────────────────────────────────────────────

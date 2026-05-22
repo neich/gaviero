@@ -1,11 +1,10 @@
-//! Regex-based markdown highlighting and terminal preview rendering.
+//! Regex-based markdown syntax highlighting for the source editor.
 //!
+//! Rendered preview uses `panels::chat_markdown::format_chat_markdown`.
 //! We can't use tree-sitter-md because it requires tree-sitter 0.24 while we
 //! use 0.25. Markdown syntax is regular enough that regex works well.
 
-use ratatui::buffer::Buffer as RataBuf;
-use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 
 use super::highlight::StyledSpan;
 use crate::theme::Theme;
@@ -256,151 +255,6 @@ pub(crate) fn find_double_closing(line: &str, start: usize, marker: u8) -> Optio
     None
 }
 
-// ── Markdown preview rendering ──────────────────────────────────
-
-/// Render a markdown preview into a ratatui buffer area.
-/// Interprets markdown inline formatting for terminal display.
-pub fn render_markdown_preview(
-    source: &str,
-    area: Rect,
-    buf: &mut RataBuf,
-    theme: &Theme,
-    scroll_top: usize,
-) {
-    if area.width < 2 || area.height == 0 {
-        return;
-    }
-
-    let default_style = theme.default_style();
-    let content_width = (area.width - 2) as usize; // 1 char margin each side
-
-    // Pre-process markdown into display lines
-    let display_lines = layout_markdown(source, content_width);
-
-    for row in 0..area.height as usize {
-        let line_idx = scroll_top + row;
-        let y = area.y + row as u16;
-
-        // Clear row
-        for col in 0..area.width {
-            let cx = area.x + col;
-            if cx < buf.area().right() {
-                buf[(cx, y)].set_char(' ').set_style(default_style);
-            }
-        }
-
-        if line_idx >= display_lines.len() {
-            continue;
-        }
-
-        let dline = &display_lines[line_idx];
-        let x_start = area.x + 1; // 1 char left margin
-
-        match dline {
-            DisplayLine::Heading(level, text) => {
-                let style = theme
-                    .highlight_style("markup.heading")
-                    .unwrap_or(default_style)
-                    .add_modifier(Modifier::BOLD);
-
-                // Prefix with level indicator
-                let prefix = match level {
-                    1 => "█ ",
-                    2 => "▌ ",
-                    3 => "▎ ",
-                    _ => "· ",
-                };
-                write_styled(buf, x_start, y, area.right(), prefix, style);
-                let offset = prefix.chars().count() as u16;
-                write_styled(buf, x_start + offset, y, area.right(), text, style);
-            }
-            DisplayLine::Text(segments) => {
-                let mut x = x_start;
-                for seg in segments {
-                    let style = segment_style(seg, theme, default_style);
-                    x = write_styled(buf, x, y, area.right(), &seg.text, style);
-                }
-            }
-            DisplayLine::CodeBlock(text) => {
-                let style = theme
-                    .highlight_style("markup.code")
-                    .unwrap_or(default_style);
-                // Draw a subtle background bar
-                let bg_style = style.bg(ratatui::style::Color::Rgb(40, 44, 52));
-                for col in 0..area.width {
-                    let cx = area.x + col;
-                    if cx < buf.area().right() {
-                        buf[(cx, y)].set_style(bg_style);
-                    }
-                }
-                write_styled(buf, x_start + 1, y, area.right(), text, bg_style);
-            }
-            DisplayLine::Quote(text) => {
-                let style = theme
-                    .highlight_style("markup.quote")
-                    .unwrap_or(default_style);
-                // Vertical bar
-                let bar_style = style.fg(ratatui::style::Color::Rgb(97, 175, 239));
-                if x_start < buf.area().right() {
-                    buf[(x_start, y)].set_char('│').set_style(bar_style);
-                }
-                write_styled(buf, x_start + 2, y, area.right(), text, style);
-            }
-            DisplayLine::ListItem(indent, marker, text) => {
-                let x_indent = x_start + (*indent as u16) * 2;
-                let marker_style = theme
-                    .highlight_style("markup.list")
-                    .unwrap_or(default_style);
-                let x_after = write_styled(buf, x_indent, y, area.right(), marker, marker_style);
-                write_styled(buf, x_after, y, area.right(), text, default_style);
-            }
-            DisplayLine::HorizontalRule => {
-                let rule_style = Style::default().fg(ratatui::style::Color::Rgb(75, 82, 99));
-                for col in 1..area.width.saturating_sub(1) {
-                    let cx = area.x + col;
-                    if cx < buf.area().right() {
-                        buf[(cx, y)].set_char('─').set_style(rule_style);
-                    }
-                }
-            }
-            DisplayLine::Empty => {}
-        }
-    }
-}
-
-/// Write a string at (x, y), return the x position after writing.
-fn write_styled(buf: &mut RataBuf, x: u16, y: u16, x_max: u16, text: &str, style: Style) -> u16 {
-    crate::widgets::render_utils::write_text(buf, x, y, x_max, text, style)
-}
-
-fn segment_style(seg: &TextSegment, theme: &Theme, default: Style) -> Style {
-    match seg.kind {
-        SegmentKind::Plain => default,
-        SegmentKind::Bold => theme
-            .highlight_style("markup.bold")
-            .unwrap_or(default)
-            .add_modifier(Modifier::BOLD),
-        SegmentKind::Italic => theme
-            .highlight_style("markup.italic")
-            .unwrap_or(default)
-            .add_modifier(Modifier::ITALIC),
-        SegmentKind::Code => theme.highlight_style("markup.code").unwrap_or(default),
-        SegmentKind::Link(ref _url) => theme.highlight_style("markup.link").unwrap_or(default),
-    }
-}
-
-// ── Layout model ────────────────────────────────────────────────
-
-enum DisplayLine {
-    Heading(usize, String), // level, text
-    Text(Vec<TextSegment>),
-    CodeBlock(String),
-    Quote(String),
-    ListItem(usize, String, String), // indent, marker, text
-    HorizontalRule,
-    Empty,
-}
-
 #[derive(Clone)]
 pub(crate) struct TextSegment {
     pub text: String,
@@ -414,89 +268,6 @@ pub(crate) enum SegmentKind {
     Italic,
     Code,
     Link(String),
-}
-
-fn layout_markdown(source: &str, _max_width: usize) -> Vec<DisplayLine> {
-    let mut lines = Vec::new();
-    let mut in_code_block = false;
-
-    for line in source.lines() {
-        let trimmed = line.trim();
-
-        // Code block fences
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_code_block = !in_code_block;
-            if in_code_block {
-                // Don't show the opening fence
-            } else {
-                // Don't show the closing fence
-            }
-            continue;
-        }
-
-        if in_code_block {
-            lines.push(DisplayLine::CodeBlock(line.to_string()));
-            continue;
-        }
-
-        // Empty lines
-        if trimmed.is_empty() {
-            lines.push(DisplayLine::Empty);
-            continue;
-        }
-
-        // Horizontal rules
-        if (trimmed.starts_with("---") || trimmed.starts_with("***") || trimmed.starts_with("___"))
-            && trimmed
-                .chars()
-                .all(|c| c == '-' || c == '*' || c == '_' || c == ' ')
-            && trimmed.chars().filter(|c| !c.is_whitespace()).count() >= 3
-        {
-            lines.push(DisplayLine::HorizontalRule);
-            continue;
-        }
-
-        // Headings
-        if trimmed.starts_with('#') {
-            let level = trimmed.chars().take_while(|c| *c == '#').count().min(6);
-            let text = trimmed[level..].trim_start().to_string();
-            lines.push(DisplayLine::Heading(level, text));
-            continue;
-        }
-
-        // Block quotes
-        if trimmed.starts_with('>') {
-            let text = trimmed[1..].trim_start().to_string();
-            lines.push(DisplayLine::Quote(text));
-            continue;
-        }
-
-        // Unordered lists
-        let leading_spaces = line.len() - line.trim_start().len();
-        let indent = leading_spaces / 2;
-        if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
-            let text = trimmed[2..].to_string();
-            lines.push(DisplayLine::ListItem(indent, "• ".to_string(), text));
-            continue;
-        }
-
-        // Ordered lists
-        if let Some(dot_pos) = trimmed.find(". ") {
-            let prefix = &trimmed[..dot_pos];
-            if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit()) {
-                let text = trimmed[dot_pos + 2..].to_string();
-                let marker = format!("{}. ", prefix);
-                lines.push(DisplayLine::ListItem(indent, marker, text));
-                continue;
-            }
-        }
-
-        // Regular text — parse inline formatting
-        let segments = parse_inline(trimmed);
-        lines.push(DisplayLine::Text(segments));
-    }
-
-    lines
 }
 
 pub(crate) fn parse_inline(text: &str) -> Vec<TextSegment> {
@@ -640,9 +411,11 @@ mod tests {
     }
 
     #[test]
-    fn test_layout_mixed() {
+    fn test_format_preview_mixed() {
+        use crate::panels::chat_markdown::format_chat_markdown;
+
         let source = "# Title\n\nSome text\n\n- item 1\n- item 2\n\n> quote\n\n```\ncode\n```\n";
-        let lines = layout_markdown(source, 80);
+        let lines = format_chat_markdown(source, 80, Style::default());
         assert!(lines.len() >= 6);
     }
 }

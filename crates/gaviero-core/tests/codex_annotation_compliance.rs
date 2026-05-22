@@ -140,6 +140,7 @@ async fn codex_emits_parseable_turn_annotations_sidecar() {
         workspace_root: workspace,
         additional_roots: vec![],
         agent_id: "codex-compliance".into(),
+        conv_id: None,
         options: AgentOptions::default(),
         profile,
         cancel_token: tokio_util::sync::CancellationToken::new(),

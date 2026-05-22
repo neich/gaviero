@@ -134,6 +134,7 @@ pub async fn complete_to_write_gate(
     observer: &dyn AcpObserver,
     write_gate: Arc<Mutex<WriteGatePipeline>>,
     agent_id: &str,
+    conv_id: Option<&str>,
 ) -> Result<CompletionOutcome> {
     validate_request(backend, &request)?;
     // M0 instrumentation: log prompt size at dispatch.
@@ -207,6 +208,7 @@ pub async fn complete_to_write_gate(
                 }
                 if propose_write(
                     agent_id,
+                    conv_id.or(Some(agent_id)),
                     &path,
                     &content,
                     &workspace_root,
@@ -396,7 +398,7 @@ mod tests {
             WriteMode::RejectAll,
             Box::new(NoopWriteGateObserver),
         )));
-        let _ = complete_to_write_gate(&backend, request, &NoopObserver, gate, "agent-x").await;
+        let _ = complete_to_write_gate(&backend, request, &NoopObserver, gate, "agent-x", None).await;
     }
 
     #[tokio::test]
@@ -443,7 +445,7 @@ mod tests {
             WriteMode::RejectAll,
             Box::new(NoopWriteGateObserver),
         )));
-        let outcome = complete_to_write_gate(&backend, request, &NoopObserver, gate, "agent-x")
+        let outcome = complete_to_write_gate(&backend, request, &NoopObserver, gate, "agent-x", None)
             .await
             .unwrap();
         assert_eq!(outcome.modified_files.len(), 1);
