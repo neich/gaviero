@@ -53,6 +53,7 @@ fn construction_for(model_spec: &str) -> SessionConstruction {
         workspace_root: std::env::temp_dir(),
         additional_roots: vec![],
         agent_id: "test-agent".to_string(),
+        conv_id: None,
         options: AgentOptions::default(),
         profile,
         cancel_token: tokio_util::sync::CancellationToken::new(),
