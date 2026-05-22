@@ -33,7 +33,16 @@ pub fn compile_ast(
     workflow: Option<&str>,
     runtime_prompt: Option<&str>,
 ) -> Result<CompiledPlan, DslErrors> {
-    compile_ast_with_vars(script, source, filename, workflow, runtime_prompt, &[], &[])
+    compile_ast_with_vars(
+        script,
+        source,
+        filename,
+        workflow,
+        runtime_prompt,
+        &[],
+        &[],
+        &[],
+    )
 }
 
 /// Like [`compile_ast`] but accepts additional variable overrides that take
@@ -46,6 +55,7 @@ pub fn compile_ast_with_vars(
     runtime_prompt: Option<&str>,
     override_vars: &[(String, String)],
     override_tiers: &[(String, String)],
+    override_params: &[(String, String)],
 ) -> Result<CompiledPlan, DslErrors> {
     let sources = vec![(filename.to_string(), source.to_string())];
     compile_ast_with_sources(
@@ -55,6 +65,7 @@ pub fn compile_ast_with_vars(
         runtime_prompt,
         override_vars,
         override_tiers,
+        override_params,
     )
 }
 
@@ -72,9 +83,10 @@ pub fn compile_ast_with_sources(
     runtime_prompt: Option<&str>,
     override_vars: &[(String, String)],
     override_tiers: &[(String, String)],
+    override_params: &[(String, String)],
 ) -> Result<CompiledPlan, DslErrors> {
     let mut script = script.clone();
-    expand_reviewers_in_script(&mut script, workflow, override_vars)?;
+    expand_reviewers_in_script(&mut script, workflow, override_params)?;
 
     if sources.is_empty() {
         return Err(DslErrors::single(DslError::Compile {
@@ -2053,11 +2065,11 @@ mod tests {
             "prompt p #\"init {{REVIEWER_ID}}\"#\n",
             "prompt r #\"refine {{REVIEWER_ID}}\"#\n",
             "client c { model \"claude:sonnet\" }\n",
-            "agent tinit { template true client c prompt p scope { owned [\"out/x-*\"] } }\n",
-            "agent tref { template true client c prompt r scope { owned [\"out/y-*\"] } }\n",
+            "agent tinit { template true prompt p scope { owned [\"out/x-*\"] } }\n",
+            "agent tref { template true prompt r scope { owned [\"out/y-*\"] } }\n",
             "agent judge { client c prompt \"judge\" }\n",
             "workflow w { steps [ loop {\n",
-            "  reviewers [ { id \"a\" client c } { id \"b\" client c } ]\n",
+            "  reviewers [ { id \"a\" model \"claude:sonnet\" } { id \"b\" model \"claude:sonnet\" } ]\n",
             "  template_init tinit template_refine tref max_iterations 3 until agent judge\n",
             "} ] }\n",
         );
