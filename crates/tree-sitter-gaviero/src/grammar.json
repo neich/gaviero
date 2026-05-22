@@ -477,6 +477,19 @@
               "name": "string_list"
             }
           ]
+        },
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "template"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "boolean"
+            }
+          ]
         }
       ]
     },
@@ -858,6 +871,58 @@
           ]
         },
         {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "reviewers"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "reviewer_list"
+            }
+          ]
+        },
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "template_init"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "identifier"
+            }
+          ]
+        },
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "template_refine"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "identifier"
+            }
+          ]
+        },
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "consensus_mode"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "consensus_mode_value"
+            }
+          ]
+        },
+        {
           "type": "SYMBOL",
           "name": "until_clause"
         },
@@ -938,6 +1003,94 @@
               "name": "branch_chain_value"
             }
           ]
+        }
+      ]
+    },
+    "reviewer_list": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "["
+        },
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "SYMBOL",
+            "name": "reviewer_entry"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": "]"
+        }
+      ]
+    },
+    "reviewer_entry": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "{"
+        },
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "SYMBOL",
+            "name": "reviewer_field"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": "}"
+        }
+      ]
+    },
+    "reviewer_field": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "id"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "_string_value"
+            }
+          ]
+        },
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "client"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "identifier"
+            }
+          ]
+        }
+      ]
+    },
+    "consensus_mode_value": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "strict"
+        },
+        {
+          "type": "STRING",
+          "value": "partial_ok"
+        },
+        {
+          "type": "STRING",
+          "value": "explore"
         }
       ]
     },
