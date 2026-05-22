@@ -294,11 +294,13 @@ pub async fn run_backend(
                     }
                     observer.on_stream_chunk(&text);
                 }
-                UnifiedStreamEvent::ToolCallStart { name, .. } => {
+                UnifiedStreamEvent::ToolCallStart { name, args, .. } => {
                     if name == "Read" {
                         read_count += 1;
                     }
-                    observer.on_tool_call_started(&name);
+                    let summary =
+                        crate::acp::client::format_tool_summary(&name, &args, workspace_root);
+                    observer.on_tool_call_started(&summary);
                     observer.on_streaming_status(&format!("Using {}...", name));
                 }
                 UnifiedStreamEvent::ToolCallDelta { .. } => {}
