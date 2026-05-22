@@ -303,10 +303,12 @@ fn cursor_event_to_unified(event: CursorEvent) -> Vec<UnifiedStreamEvent> {
         CursorEvent::AssistantSegment(_) => vec![],
         CursorEvent::ThinkingDelta(text) => vec![UnifiedStreamEvent::ThinkingDelta(text)],
         CursorEvent::ThinkingCompleted => vec![],
-        CursorEvent::ToolCallStarted { id, name, .. } => {
+        CursorEvent::ToolCallStarted { id, name, args_json } => {
+            let args = serde_json::from_str::<Value>(&args_json).unwrap_or(Value::Null);
             vec![UnifiedStreamEvent::ToolCallStart {
                 id,
                 name: tool_display_name(&name),
+                args,
             }]
         }
         CursorEvent::ToolCallCompleted { id, .. } => {
