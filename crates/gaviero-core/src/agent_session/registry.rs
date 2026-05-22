@@ -153,8 +153,13 @@ impl ObservedStreamSession {
                     }
                     self.observer.on_stream_chunk(&text);
                 }
-                UnifiedStreamEvent::ToolCallStart { name, .. } => {
-                    self.observer.on_tool_call_started(&name);
+                UnifiedStreamEvent::ToolCallStart { name, args, .. } => {
+                    let summary = crate::acp::client::format_tool_summary(
+                        &name,
+                        &args,
+                        &self.workspace_root,
+                    );
+                    self.observer.on_tool_call_started(&summary);
                     self.observer
                         .on_streaming_status(&format!("Using {}...", name));
                 }
@@ -460,6 +465,7 @@ mod tests {
             Ok(UnifiedStreamEvent::ToolCallStart {
                 id: "1".into(),
                 name: "Bash".into(),
+                args: serde_json::json!({ "command": "ls -la" }),
             }),
             Ok(UnifiedStreamEvent::TextDelta("done".into())),
             Ok(UnifiedStreamEvent::Usage(BackendTokenUsage {
@@ -497,9 +503,13 @@ mod tests {
         assert!(recorded.iter().any(|e| e == "chunk:hi "));
         assert!(recorded.iter().any(|e| e == "chunk:done"));
 
-        // ToolCallStart triggers tool name + Using... status (drives the
-        // streaming indicator in the chat panel header).
-        assert!(recorded.iter().any(|e| e == "tool:Bash"));
+        // ToolCallStart triggers a rich tool summary + Using... status (drives
+        // the streaming indicator in the chat panel header). The summary uses
+        // `format_tool_summary` so the Bash command shows the actual argv.
+        assert!(
+            recorded.iter().any(|e| e == "tool:Bash: ls -la"),
+            "expected rich tool summary, recorded={recorded:?}"
+        );
         assert!(recorded.iter().any(|e| e == "status:Using Bash..."));
 
         // Usage event drives the token counter in the status bar.
