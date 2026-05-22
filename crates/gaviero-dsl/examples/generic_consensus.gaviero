@@ -1,33 +1,30 @@
 // Generic N-reviewer consensus for any prompt-shaped task.
 //
-// Usage:
+// The reviewer roster is supplied via a workflow `param` so you can swap
+// 2 / 3 / N providers entirely from the CLI without editing this file.
+//
+// Usage (default 2-reviewer roster):
 //   gaviero-cli --script crates/gaviero-dsl/examples/generic_consensus.gaviero \
 //     --workflow generic-consensus \
 //     --prompt "Short title for logs" \
 //     --var PROBLEM_FILE=consensus/problem.md \
 //     --var OUT_DIR=consensus_runs/latest
 //
-// Override reviewers at compile time:
-//   --var REVIEWERS=claude:opus,codex:codex-5-5,cursor:composer
+// Override the roster from the CLI (each entry is `id=provider:model[@effort]`):
+//   --param roster=claude=claude:opus@max,codex=codex:gpt-5.5@high,cursor=cursor:composer-2.5
 //
 // Modes (loop consensus_mode):
 //   strict      — only PASS ends early (after stability)
 //   partial_ok  — PASS or PARTIAL ends early; writes consensus-verdict.json
 //   explore     — no judge; run max_iterations only
 //
-// Optional:
+// Optional vars:
 //   --var CONTEXT_PATHS="docs/ research/"
 //   --var ENABLE_WEB=true
 //   --var CONCLUSION_SECTIONS="## Answer\n## Claims\n..."
 //   --var CONSENSUS_RUBRIC="..."
 
 include "clients.gaviero"
-
-client cursor-consensus {
-    model "cursor:composer-2.5"
-    privacy public
-    effort high
-}
 
 vars {
     OUT_DIR              "consensus_runs/latest"
@@ -115,10 +112,12 @@ prompt judge-body #"
     ```
 "#
 
+// Reviewer agent templates. They have no `client` of their own — each
+// roster entry brings its model + effort, and the expansion pass binds the
+// cloned agent to an anonymous client built from that entry.
 agent reviewer-init {
     template true
     description "Initial conclusion ({{REVIEWER_ID}}): {{PROMPT}}"
-    client opus
     scope {
         owned ["{{OUT_DIR}}/{{REVIEWER_ID}}-conclusion-v*.md"]
         read_only ["{{PROBLEM_FILE}}"]
@@ -129,7 +128,6 @@ agent reviewer-init {
 agent reviewer-refine {
     template true
     description "Refine conclusion ({{REVIEWER_ID}}): {{PROMPT}}"
-    client opus
     scope {
         owned [
             "{{OUT_DIR}}/{{REVIEWER_ID}}-conclusion-v*.md"
@@ -150,12 +148,17 @@ agent consensus-judge {
 }
 
 workflow generic-consensus {
+    // Roster parameter — supplied externally. The default below runs a
+    // two-reviewer panel (Claude + Codex) so the example works with no
+    // CLI flag. Override via `--param roster=...` for a different panel.
+    param roster [
+        { id "claude" model "claude:opus" effort max }
+        { id "codex"  model "codex:gpt-5.5" effort high }
+    ]
+
     steps [
         loop {
-            reviewers [
-                { id "claude" client opus }
-                { id "codex"  client codex-5-5 }
-            ]
+            reviewers       roster
             template_init   reviewer-init
             template_refine reviewer-refine
             max_iterations  8
