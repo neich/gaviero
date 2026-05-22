@@ -62,6 +62,7 @@ pub struct ClaudeSession {
     /// single-folder mode and per-agent swarm worktrees.
     additional_roots: Vec<PathBuf>,
     agent_id: String,
+    conv_id: Option<String>,
     effort: String,
     max_tokens: u32,
     auto_approve: bool,
@@ -120,6 +121,7 @@ impl ClaudeSession {
             workspace_root: args.workspace_root,
             additional_roots: args.additional_roots,
             agent_id: args.agent_id,
+            conv_id: args.conv_id,
             effort,
             max_tokens,
             auto_approve,
@@ -711,6 +713,7 @@ impl ClaudeSession {
                             self.observer.as_ref(),
                             &self.workspace_root,
                             &self.agent_id,
+                            self.conv_id.as_deref(),
                             rel_path,
                             new_content,
                         )
@@ -722,6 +725,7 @@ impl ClaudeSession {
                             self.observer.as_ref(),
                             &self.workspace_root,
                             &self.agent_id,
+                            self.conv_id.as_deref(),
                             rel_path,
                             orig,
                         )
