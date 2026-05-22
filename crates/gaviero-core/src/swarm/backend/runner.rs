@@ -306,6 +306,7 @@ pub async fn run_backend(
                 UnifiedStreamEvent::FileBlock { path, content } => {
                     match propose_write(
                         &agent_id,
+                        Some(&agent_id),
                         &path,
                         &content,
                         workspace_root,
@@ -485,6 +486,7 @@ pub async fn run_backend(
 /// (scope rejected, duplicate, unchanged content, empty diff).
 pub(crate) async fn propose_write(
     agent_id: &str,
+    conv_id: Option<&str>,
     rel_path: &Path,
     proposed_content: &str,
     workspace_root: &Path,
@@ -493,33 +495,27 @@ pub(crate) async fn propose_write(
 ) -> Result<bool> {
     let abs_path = workspace_root.join(rel_path);
 
-    // 1. Scope check + duplicate check + allocate ID
-    let (id, is_deferred) = {
+    // 1. Scope check + collect conflict peers + allocate ID. Same-path
+    // collisions used to drop the later proposal; now we pair the two so
+    // the reviewer sees both and resolves with a pick-one decision.
+    let (id, is_deferred, conflict_peers) = {
         let mut gate = write_gate.lock().await;
         let path_str = rel_path.to_string_lossy();
         if !gate.is_scope_allowed(agent_id, &path_str) {
             tracing::warn!("Scope rejected for {}", rel_path.display());
             return Ok(false);
         }
-        if gate.proposal_for_path(&abs_path).is_some() {
+        let peers = gate.conflict_candidates_for_path(&abs_path);
+        let id = gate.next_id();
+        let is_deferred = gate.is_deferred_for_conv(conv_id);
+        if !peers.is_empty() {
             tracing::warn!(
-                "Dropping later proposal for {} — earlier proposal already pending review",
-                rel_path.display()
+                "Pairing proposal for {} as conflict with {} existing proposal(s)",
+                rel_path.display(),
+                peers.len()
             );
-            return Ok(false);
         }
-        if gate
-            .pending_proposals()
-            .iter()
-            .any(|p| p.file_path == abs_path)
-        {
-            tracing::warn!(
-                "Dropping later deferred proposal for {} — earlier proposal already queued",
-                rel_path.display()
-            );
-            return Ok(false);
-        }
-        (gate.next_id(), gate.is_deferred())
+        (id, is_deferred, peers)
     };
 
     // 2. Read original + build proposal (outside lock)
@@ -535,17 +531,31 @@ pub(crate) async fn propose_write(
         return Ok(false);
     }
 
-    let proposal =
-        WriteGatePipeline::build_proposal(id, agent_id, &abs_path, &original, proposed_content);
+    let mut proposal = WriteGatePipeline::build_proposal(
+        id,
+        agent_id,
+        conv_id,
+        &abs_path,
+        &original,
+        proposed_content,
+    );
 
     if proposal.structural_hunks.is_empty() {
         return Ok(false);
     }
 
-    // 3. Insert proposal
+    // Seed the conflict link before insertion so the new proposal carries
+    // its peers from the moment observers see it.
+    proposal.conflicts_with = conflict_peers.clone();
+
+    // 3. Insert proposal + back-fill peers' `conflicts_with`.
     let auto_accept_result = {
         let mut gate = write_gate.lock().await;
-        gate.insert_proposal(proposal)
+        let action = gate.insert_proposal(proposal);
+        if !conflict_peers.is_empty() {
+            gate.mark_conflict_pair(id, &conflict_peers);
+        }
+        action
     };
 
     // 4. Notify observer if deferred
