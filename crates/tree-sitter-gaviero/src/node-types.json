@@ -27,6 +27,10 @@
       "required": true,
       "types": [
         {
+          "type": "boolean",
+          "named": true
+        },
+        {
           "type": "context_block",
           "named": true
         },
@@ -136,6 +140,11 @@
         }
       ]
     }
+  },
+  {
+    "type": "consensus_mode_value",
+    "named": true,
+    "fields": {}
   },
   {
     "type": "context_block",
@@ -275,11 +284,23 @@
           "named": true
         },
         {
+          "type": "consensus_mode_value",
+          "named": true
+        },
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
           "type": "identifier_list",
           "named": true
         },
         {
           "type": "integer",
+          "named": true
+        },
+        {
+          "type": "reviewer_list",
           "named": true
         },
         {
@@ -358,6 +379,59 @@
         },
         {
           "type": "string",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "reviewer_entry",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "reviewer_field",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "reviewer_field",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "raw_string",
+          "named": true
+        },
+        {
+          "type": "string",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "reviewer_list",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "reviewer_entry",
           "named": true
         }
       ]
@@ -776,6 +850,10 @@
     "named": false
   },
   {
+    "type": "consensus_mode",
+    "named": false
+  },
+  {
     "type": "context",
     "named": false
   },
@@ -816,6 +894,10 @@
     "named": false
   },
   {
+    "type": "explore",
+    "named": false
+  },
+  {
     "type": "extra",
     "named": false
   },
@@ -826,6 +908,10 @@
   {
     "type": "float",
     "named": true
+  },
+  {
+    "type": "id",
+    "named": false
   },
   {
     "type": "identifier",
@@ -900,6 +986,10 @@
     "named": false
   },
   {
+    "type": "partial_ok",
+    "named": false
+  },
+  {
     "type": "privacy",
     "named": false
   },
@@ -940,6 +1030,10 @@
     "named": false
   },
   {
+    "type": "reviewers",
+    "named": false
+  },
+  {
     "type": "scope",
     "named": false
   },
@@ -968,12 +1062,28 @@
     "named": false
   },
   {
+    "type": "strict",
+    "named": false
+  },
+  {
     "type": "strict_judge",
     "named": false
   },
   {
     "type": "string",
     "named": true
+  },
+  {
+    "type": "template",
+    "named": false
+  },
+  {
+    "type": "template_init",
+    "named": false
+  },
+  {
+    "type": "template_refine",
+    "named": false
   },
   {
     "type": "test",
