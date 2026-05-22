@@ -413,7 +413,7 @@ pub(crate) fn is_auth_error(text: &str) -> bool {
 }
 
 /// Format a one-line summary for a tool call, extracting key info from the input JSON.
-pub(crate) fn format_tool_summary(
+pub fn format_tool_summary(
     tool_name: &str,
     input: &serde_json::Value,
     workspace_root: &Path,
