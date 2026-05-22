@@ -1313,15 +1313,23 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
 }
 
 pub(super) fn handle_action(app: &mut App, action: Action) {
-    // While a review is pending, the only honored inputs are the
-    // review-specific actions (accept/reject/navigate/dismiss). All other
-    // actions are swallowed so the terminal, editor, and side panels stay
-    // locked until the user finishes the review.
+    // While a review is pending, review-specific actions take priority; layout
+    // presets (Alt+5..9, Alt+0) still apply so the user can widen the diff pane.
+    // All other actions are swallowed so the terminal, editor, and side panels
+    // stay locked until the user finishes the review.
     if app.has_active_review() {
-        if app.diff_review.is_some() {
-            app.handle_review_action(&action);
+        let consumed = if app.diff_review.is_some() {
+            app.handle_review_action(&action)
         } else if app.batch_review.is_some() {
-            app.handle_batch_review_action(&action);
+            app.handle_batch_review_action(&action)
+        } else {
+            false
+        };
+        if consumed {
+            return;
+        }
+        if let Action::SwitchLayout(n) = action {
+            app.switch_layout(n);
         }
         return;
     }
