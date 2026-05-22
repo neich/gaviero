@@ -856,6 +856,65 @@ fn compile_file_scientific_research_param_roster_override_to_two() {
 }
 
 #[test]
+fn scientific_research_judge_uses_client_param_default() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/scientific_research.gaviero");
+    let plan = gaviero_dsl::compile_file(
+        &path,
+        Some("scientific-research-consensus"),
+        Some("topic"),
+        &[],
+        &[],
+        &[],
+    )
+    .expect("scientific_research should compile");
+    assert_eq!(plan.loop_judge_units.len(), 1);
+    assert_eq!(
+        plan.loop_judge_units[0].model.as_deref(),
+        Some("claude:sonnet")
+    );
+    assert_eq!(plan.loop_judge_units[0].effort.as_deref(), Some("medium"));
+}
+
+#[test]
+fn client_param_override_swaps_judge_model() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/generic_consensus.gaviero");
+    let overrides = vec![("judge".to_string(), "claude:haiku@low".to_string())];
+    let plan = gaviero_dsl::compile_file(
+        &path,
+        Some("generic-consensus"),
+        Some("topic"),
+        &[],
+        &[],
+        &overrides,
+    )
+    .expect("judge param override should compile");
+    assert_eq!(plan.loop_judge_units[0].model.as_deref(), Some("claude:haiku"));
+    assert_eq!(plan.loop_judge_units[0].effort.as_deref(), Some("low"));
+}
+
+#[test]
+fn client_param_without_default_requires_cli() {
+    let src = concat!(
+        "prompt p #\"x\"#\n",
+        "agent judge { client gate prompt \"j\" }\n",
+        "workflow w {\n",
+        "  param gate { }\n",
+        "  steps [ judge ]\n",
+        "}\n",
+    );
+    let err =
+        gaviero_dsl::compile_with_vars(src, "inline.gaviero", Some("w"), None, &[], &[], &[])
+            .expect_err("required client param must fail");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("gate") && (msg.contains("model") || msg.contains("CLI")),
+        "expected client-param required diagnostic, got: {msg}"
+    );
+}
+
+#[test]
 fn generic_consensus_param_roster_missing_provider_is_rejected() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("examples/generic_consensus.gaviero");

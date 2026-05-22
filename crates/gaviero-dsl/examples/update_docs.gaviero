@@ -15,6 +15,7 @@
 
 // Client pool + default tier bindings (override with --tiers-file).
 include "clients.gaviero"
+include "profiles/doc-claude.gaviero"
 
 // ── Shared configuration ──────────────────────────────────────────────────────
 //

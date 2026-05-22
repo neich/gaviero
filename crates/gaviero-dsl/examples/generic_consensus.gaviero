@@ -24,8 +24,6 @@
 //   --var CONCLUSION_SECTIONS="## Answer\n## Claims\n..."
 //   --var CONSENSUS_RUBRIC="..."
 
-include "clients.gaviero"
-
 vars {
     OUT_DIR              "consensus_runs/latest"
     INIT_VER             "1"
@@ -140,7 +138,7 @@ agent reviewer-refine {
 
 agent consensus-judge {
     description "Judge consensus: {{PROMPT}}"
-    client sonnet
+    client judge
     scope {
         read_only ["{{OUT_DIR}}/"]
     }
@@ -148,6 +146,10 @@ agent consensus-judge {
 }
 
 workflow generic-consensus {
+    param judge {
+        model "claude:sonnet"
+        effort medium
+    }
     // Roster parameter — supplied externally. The default below runs a
     // two-reviewer panel (Claude + Codex) so the example works with no
     // CLI flag. Override via `--param roster=...` for a different panel.

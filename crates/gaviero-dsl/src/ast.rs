@@ -249,17 +249,49 @@ impl ReviewerSource {
     }
 }
 
-/// A workflow-level parameter declaration: `param <name> [= <reviewer_list>]`.
-/// Supplies the binding for a `reviewers <name>` reference inside a loop.
-/// When `default` is `None`, the param is required and the CLI must provide
-/// it via `--param <name>=<spec>`; otherwise compilation fails with a span
-/// pointing here.
+/// Explicit shape of a workflow `param` when the author uses `[...]` or `{...}`.
+#[derive(Debug, Clone)]
+pub enum ParamShape {
+    /// `param <name> [ { id "a" model "claude:opus" ... } ]`
+    Roster(Vec<ReviewerEntry>),
+    /// `param <name> { model "provider:model" effort ... privacy ... extra { } }`
+    Client(ClientParamSpec),
+}
+
+/// In-script default for a client workflow param (before CLI `--param` override).
+#[derive(Debug, Clone, Default)]
+pub struct ClientParamSpec {
+    pub model: Option<(String, Span)>,
+    pub effort: Option<(String, Span)>,
+    pub privacy: Option<(PrivacyLit, Span)>,
+    pub extra: Vec<ExtraPair>,
+    pub span: Span,
+}
+
+/// Resolved kind after inferring bare `param <name>` declarations from usage.
+#[derive(Debug, Clone)]
+pub enum ParamKind {
+    Roster(Option<Vec<ReviewerEntry>>),
+    Client(ClientParamSpec),
+}
+
+/// A workflow-level parameter declaration.
+///
+/// ```text
+/// param roster [ { id "a" model "claude:opus" } ]   // roster param
+/// param judge { model "claude:sonnet" effort medium } // client param
+/// param roster                                        // required roster (CLI)
+/// param gate { }                                      // required client (CLI)
+/// ```
+///
+/// Bare `param <name>` (no `[...]` or `{...}`) infers kind from usage:
+/// `reviewers <name>` → roster; `client <name>` on an agent → client.
 #[derive(Debug, Clone)]
 pub struct ParamDecl {
     pub name: String,
     pub name_span: Span,
-    /// Optional in-script default. Same shape as a literal `reviewer_list`.
-    pub default: Option<Vec<ReviewerEntry>>,
+    /// When `None`, kind is inferred from `reviewers` / `client` references.
+    pub shape: Option<ParamShape>,
     pub span: Span,
 }
 

@@ -111,6 +111,9 @@ tokens
   ▼ parser::parse
 AST (Script { items: Vec<Item> })
   │
+  ▼ workflow_params::expand_workflow_params_in_script
+    (client params → `__param_*` clients; roster → per-reviewer clones)
+  │
   ▼ compiler::compile_ast_with_vars  /  compile_ast_with_sources
     1. index Items (clients, agents, workflows, prompts, vars, tiers)
     2. duplicate-name checks (carry spans)

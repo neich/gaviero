@@ -283,6 +283,7 @@ where
         .ignore_then(ident.map_with(|n, e| (n, e.span())))
         .then(
             client_field
+                .clone()
                 .repeated()
                 .collect::<Vec<_>>()
                 .delimited_by(just(Token::LBrace), just(Token::RBrace)),
@@ -940,20 +941,50 @@ where
 
     // ── workflow declaration ──────────────────────────────────────
 
-    // `param <name> [ <reviewer-list> ]` — workflow-level parameter
-    // declaration. The default literal-list is optional; when omitted, the
-    // param is required and the CLI must supply it via
-    // `--param <name>=<spec>`. Today the only param shape supported is
-    // rosters (so the default is a reviewer-literal list); the grammar
-    // leaves room for typed params later.
+    // `param <name> [ <reviewer-list> ]` | `param <name> { model ... }`
+    // Bare `param <name>` infers roster vs client from usage at compile time.
+    let param_client_block = client_field
+        .clone()
+        .repeated()
+        .collect::<Vec<_>>()
+        .delimited_by(just(Token::LBrace), just(Token::RBrace));
+    let param_body = choice((
+        reviewer_literal_list
+            .clone()
+            .map(ParamShape::Roster),
+        param_client_block.map_with(|fields, e| {
+            let mut spec = ClientParamSpec {
+                span: e.span(),
+                ..Default::default()
+            };
+            for f in fields {
+                match f {
+                    ClientField::Model(v, s) => {
+                        spec.model.get_or_insert((v, s));
+                    }
+                    ClientField::Effort(v, s) => {
+                        spec.effort.get_or_insert((v, s));
+                    }
+                    ClientField::Privacy(v, s) => {
+                        spec.privacy.get_or_insert((v, s));
+                    }
+                    ClientField::Extra(pairs) => {
+                        spec.extra.extend(pairs);
+                    }
+                    ClientField::Tier(_, _) | ClientField::Default => {}
+                }
+            }
+            ParamShape::Client(spec)
+        }),
+    ));
     let param_decl = just(Token::KwParam)
         .ignore_then(ident.map_with(|n, e| (n, e.span())))
-        .then(reviewer_literal_list.clone().or_not())
-        .map_with(|((name, name_span), default), e| {
+        .then(param_body.or_not())
+        .map_with(|((name, name_span), shape), e| {
             WorkflowField::Param(ParamDecl {
                 name,
                 name_span,
-                default,
+                shape,
                 span: e.span(),
             })
         });
