@@ -139,6 +139,7 @@ async fn cursor_emits_parseable_turn_annotations_sidecar() {
         workspace_root: workspace.path().to_path_buf(),
         additional_roots: vec![],
         agent_id: "cursor-compliance".into(),
+        conv_id: None,
         options: AgentOptions::default(),
         profile,
         cancel_token: tokio_util::sync::CancellationToken::new(),
