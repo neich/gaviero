@@ -2474,8 +2474,12 @@ impl AgentChatState {
             None
         };
 
-        // Build rendered lines from messages: (style, text, message_index)
-        let mut lines: Vec<(Style, String, Option<usize>)> = Vec::new();
+        // Build rendered lines from messages: (segments, message_index).
+        // Each rendered visual line is a sequence of styled segments so that
+        // inline markdown styling (bold, italic, code, links) can be preserved
+        // across the whole line — not just per-line.
+        let mut lines: Vec<(Vec<crate::panels::chat_markdown::StyledSegment>, Option<usize>)> =
+            Vec::new();
 
         for (msg_idx, msg) in self.messages().iter().enumerate() {
             let (prefix, base_style) = match msg.role {
@@ -2489,25 +2493,37 @@ impl AgentChatState {
 
             if msg.role == ChatRole::Assistant && !display_content.is_empty() {
                 // Render assistant messages with markdown formatting
-                lines.push((base_style, prefix.to_string(), Some(msg_idx)));
+                lines.push((
+                    vec![crate::panels::chat_markdown::StyledSegment {
+                        text: prefix.to_string(),
+                        style: base_style,
+                    }],
+                    Some(msg_idx),
+                ));
                 let md_lines = crate::panels::chat_markdown::format_chat_markdown(
                     &display_content,
                     width,
                     base_style,
                 );
                 for cl in md_lines {
-                    lines.push((cl.style, cl.text, Some(msg_idx)));
+                    lines.push((cl.segments, Some(msg_idx)));
                 }
             } else {
-                // User/System: simple word-wrap
+                // User/System: simple word-wrap (plain, no inline styling)
                 let full_text = format!("{}{}", prefix, display_content);
                 for line in crate::widgets::render_utils::word_wrap(&full_text, width) {
-                    lines.push((base_style, line, Some(msg_idx)));
+                    lines.push((
+                        vec![crate::panels::chat_markdown::StyledSegment {
+                            text: line,
+                            style: base_style,
+                        }],
+                        Some(msg_idx),
+                    ));
                 }
             }
 
             // Blank line between messages
-            lines.push((Style::default(), String::new(), None));
+            lines.push((Vec::new(), None));
         }
 
         // Streaming indicator with animated spinner
@@ -2535,8 +2551,10 @@ impl AgentChatState {
                 .unwrap_or_default();
             let stream_style = Style::default().fg(theme::ACCENT);
             lines.push((
-                stream_style,
-                format!("{} {}{}", frame, label, elapsed_str),
+                vec![crate::panels::chat_markdown::StyledSegment {
+                    text: format!("{} {}{}", frame, label, elapsed_str),
+                    style: stream_style,
+                }],
                 None,
             ));
         }
@@ -2544,7 +2562,10 @@ impl AgentChatState {
         // Cache rendered line texts + message index for mouse text selection
         self.rendered_lines_cache = lines
             .iter()
-            .map(|(_, text, mi)| (text.clone(), *mi))
+            .map(|(segments, mi)| {
+                let text: String = segments.iter().map(|s| s.text.as_str()).collect();
+                (text, *mi)
+            })
             .collect();
 
         // In browse mode, scroll to keep the browsed message visible
@@ -2552,12 +2573,10 @@ impl AgentChatState {
         let viewport = area.height as usize;
         if self.browse_mode {
             // Find first and last line belonging to the browsed message
-            let first_line = lines
-                .iter()
-                .position(|(_, _, mi)| *mi == Some(self.browsed_msg));
+            let first_line = lines.iter().position(|(_, mi)| *mi == Some(self.browsed_msg));
             let last_line = lines
                 .iter()
-                .rposition(|(_, _, mi)| *mi == Some(self.browsed_msg));
+                .rposition(|(_, mi)| *mi == Some(self.browsed_msg));
             if let (Some(first), Some(last)) = (first_line, last_line) {
                 if first < self.scroll_offset {
                     self.scroll_offset = first;
@@ -2590,7 +2609,7 @@ impl AgentChatState {
 
             let is_browsed = self.browse_mode
                 && line_idx < lines.len()
-                && lines[line_idx].2 == Some(self.browsed_msg);
+                && lines[line_idx].1 == Some(self.browsed_msg);
 
             let row_bg = if is_browsed {
                 browse_bg
@@ -2612,31 +2631,37 @@ impl AgentChatState {
             }
 
             if line_idx < lines.len() {
-                let (style, ref text, _) = lines[line_idx];
-                let line_style = if is_browsed { style.bg(row_bg) } else { style };
+                let (ref segments, _) = lines[line_idx];
                 let sel_style = Style::default().fg(theme::TAB_BG).bg(theme::ACCENT);
                 let mut cx = area.x;
                 let mut char_idx = 0usize;
-                for ch in text.chars() {
-                    if ch == '\r' {
-                        char_idx += 1;
-                        continue;
-                    }
-                    let display_ch = if ch == '\t' { ' ' } else { ch };
-                    let ch_width = UnicodeWidthChar::width(display_ch).unwrap_or(1) as u16;
-                    let final_style = if self.is_char_selected(line_idx, char_idx) {
-                        sel_style
+                for seg in segments {
+                    let seg_style = if is_browsed {
+                        seg.style.bg(row_bg)
                     } else {
-                        line_style
+                        seg.style
                     };
-                    if cx + ch_width <= area.x + area.width
-                        && cx < buf.area().right()
-                        && y < buf.area().bottom()
-                    {
-                        buf[(cx, y)].set_char(display_ch).set_style(final_style);
+                    for ch in seg.text.chars() {
+                        if ch == '\r' {
+                            char_idx += 1;
+                            continue;
+                        }
+                        let display_ch = if ch == '\t' { ' ' } else { ch };
+                        let ch_width = UnicodeWidthChar::width(display_ch).unwrap_or(1) as u16;
+                        let final_style = if self.is_char_selected(line_idx, char_idx) {
+                            sel_style
+                        } else {
+                            seg_style
+                        };
+                        if cx + ch_width <= area.x + area.width
+                            && cx < buf.area().right()
+                            && y < buf.area().bottom()
+                        {
+                            buf[(cx, y)].set_char(display_ch).set_style(final_style);
+                        }
+                        cx += ch_width;
+                        char_idx += 1;
                     }
-                    cx += ch_width;
-                    char_idx += 1;
                 }
             }
         }
