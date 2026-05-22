@@ -444,6 +444,8 @@ mod tests {
             structural_hunks,
             status: ProposalStatus::Pending,
             is_deletion: false,
+            conv_id: None,
+            conflicts_with: Vec::new(),
         }
     }
 
