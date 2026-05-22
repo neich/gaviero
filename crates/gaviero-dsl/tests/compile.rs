@@ -718,6 +718,32 @@ fn template_phased_plan() {
 // ── compile_file include integration tests ─────────────────────────────────
 
 #[test]
+fn compile_file_generic_consensus_with_reviewers() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/generic_consensus.gaviero");
+    let plan = gaviero_dsl::compile_file(
+        &path,
+        Some("generic-consensus"),
+        Some("test topic"),
+        &[],
+        &[],
+    )
+    .expect("generic_consensus should compile");
+    let ids: Vec<_> = plan
+        .work_units_unordered()
+        .into_iter()
+        .map(|u| u.id.as_str())
+        .collect();
+    assert!(ids.iter().any(|id| *id == "claude-init"));
+    assert!(ids.iter().any(|id| *id == "codex-refine"));
+    assert_eq!(plan.loop_configs.len(), 1);
+    assert_eq!(
+        plan.loop_configs[0].consensus_mode,
+        gaviero_core::swarm::plan::ConsensusMode::PartialOk
+    );
+}
+
+#[test]
 fn compile_file_resolves_include_and_compiles_workflow() {
     use std::fs;
     use std::io::Write;
