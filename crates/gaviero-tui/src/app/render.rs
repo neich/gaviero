@@ -115,21 +115,36 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
         editor_header_override,
     );
 
-    let (actual_editor_area, preview_area) =
-        if app.preview_visible && app.is_current_buffer_markdown() {
+    app.layout.preview_area = None;
+
+    let md_active =
+        app.is_current_buffer_markdown() && app.preview_mode.is_active();
+
+    let (actual_editor_area, preview_area) = match app.preview_mode {
+        MarkdownPreviewMode::Off => (editor_content, None),
+        MarkdownPreviewMode::Split if md_active => {
+            // Keep at least a few columns for the source pane (gutter + scrollbar).
             let split = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
                 .split(editor_content);
             (split[0], Some(split[1]))
-        } else {
-            (editor_content, None)
-        };
+        }
+        MarkdownPreviewMode::PreviewOnly if md_active => {
+            (Rect::default(), Some(editor_content))
+        }
+        _ => (editor_content, None),
+    };
 
-    app.layout.editor_area = actual_editor_area;
-    app.render_editor(frame, actual_editor_area);
+    if actual_editor_area.width > 0 && actual_editor_area.height > 0 {
+        app.layout.editor_area = actual_editor_area;
+        app.render_editor(frame, actual_editor_area);
+    } else {
+        app.layout.editor_area = Rect::default();
+    }
 
     if let Some(preview_area) = preview_area {
+        app.layout.preview_area = Some(preview_area);
         app.render_markdown_preview(frame, preview_area);
     }
     panel_idx += 1;
@@ -639,12 +654,19 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
                     }
                 },
                 LeftPanelMode::Review => {
-                    let n = app
+                    let (n, filter) = app
                         .batch_review
                         .as_ref()
-                        .map(|br| br.proposals.len())
-                        .unwrap_or(0);
-                    format!("REVIEW ({} files)  f: apply all  Esc: discard  ↑↓: navigate", n)
+                        .map(|br| (br.proposals.len(), br.filter_source.clone()))
+                        .unwrap_or((0, None));
+                    let filter_hint = match filter {
+                        Some(s) => format!("  filter: {}", s),
+                        None => String::new(),
+                    };
+                    format!(
+                        "REVIEW ({} files){}  f: apply all  Esc: discard  ↑↓: navigate  Alt+o/i: filter",
+                        n, filter_hint
+                    )
                 }
                 LeftPanelMode::Search => {
                     if app.search_panel.editing {
@@ -860,26 +882,61 @@ pub(super) fn render_terminal(app: &mut App, frame: &mut Frame, area: Rect) {
     }
 }
 
-pub(super) fn render_markdown_preview(app: &App, frame: &mut Frame, area: Rect) {
-    use crate::editor::markdown;
+pub(super) fn render_markdown_preview(app: &mut App, frame: &mut Frame, area: Rect) {
+    use crate::panels::chat_markdown;
     use ratatui::widgets::{Block, Borders};
 
+    let borders = if app.preview_mode == MarkdownPreviewMode::PreviewOnly {
+        Borders::TOP
+    } else {
+        Borders::LEFT
+    };
+
     let block = Block::default()
-        .borders(Borders::LEFT)
+        .borders(borders)
         .border_style(Style::default().fg(theme::BORDER_DIM))
-        .title(" Preview (Ctrl+M) ");
+        .title(format!(" {} ", app.preview_mode.title_label()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     if let Some(buf) = app.buffers.get(app.active_buffer) {
         let source = buf.text.to_string();
-        markdown::render_markdown_preview(
+        let content_width = inner.width.saturating_sub(2) as usize;
+        let lines = chat_markdown::format_chat_markdown(
             &source,
+            content_width.max(1),
+            app.theme.default_style(),
+        );
+        app.preview_viewport_lines = inner.height.max(1) as usize;
+        app.preview_line_count = lines.len();
+        clamp_preview_scroll(app, lines.len());
+
+        let scrollbar_col = inner.width.saturating_sub(1);
+        let text_area = Rect {
+            width: scrollbar_col.saturating_sub(1),
+            ..inner
+        };
+        chat_markdown::render_lines_to_buffer(
+            &lines,
+            text_area,
+            frame.buffer_mut(),
+            app.preview_scroll,
+            app.theme.default_style(),
+        );
+        crate::widgets::scrollbar::render_scrollbar(
             inner,
             frame.buffer_mut(),
-            &app.theme,
+            app.preview_line_count,
+            app.preview_viewport_lines,
             app.preview_scroll,
         );
+    }
+}
+
+pub(super) fn clamp_preview_scroll(app: &mut App, line_count: usize) {
+    let max = line_count.saturating_sub(app.preview_viewport_lines);
+    if app.preview_scroll > max {
+        app.preview_scroll = max;
     }
 }
 
