@@ -155,7 +155,9 @@ module.exports = grammar({
     loop_field: ($) =>
       choice(
         seq("agents", $.identifier_list),
-        seq("reviewers", $.reviewer_list),
+        // `reviewers` accepts either a literal list (anonymous roster) or
+        // a bare identifier that names a workflow `param` declaration.
+        seq("reviewers", choice($.reviewer_list, $.identifier)),
         seq("template_init", $.identifier),
         seq("template_refine", $.identifier),
         seq("consensus_mode", $.consensus_mode_value),
@@ -174,7 +176,11 @@ module.exports = grammar({
       seq("{", repeat($.reviewer_field), "}"),
 
     reviewer_field: ($) =>
-      choice(seq("id", $._string_value), seq("client", $.identifier)),
+      choice(
+        seq("id", $._string_value),
+        seq("model", $._string_value),
+        seq("effort", $._effort_value),
+      ),
 
     consensus_mode_value: (_) =>
       choice("strict", "partial_ok", "explore"),
@@ -207,8 +213,15 @@ module.exports = grammar({
         seq("max_retries", $.integer),
         seq("attempts", $.integer),
         seq("escalate_after", $.integer),
-        $.verify_block
+        $.verify_block,
+        $.param_declaration,
       ),
+
+    // `param <name> [<reviewer_list>]` — workflow-level parameter. The
+    // default reviewer-list is optional; when omitted, the CLI must
+    // supply `--param <name>=...`.
+    param_declaration: ($) =>
+      seq("param", $.identifier, optional($.reviewer_list)),
 
     // ── Step list (identifiers + loop blocks) ────────────────────
     step_list: ($) => seq("[", repeat(choice($.loop_block, $.identifier)), "]"),
