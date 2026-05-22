@@ -26,6 +26,13 @@ pub enum Event {
     // needs to lock the write gate to read it.
     ProposalCreated(Box<WriteProposal>),
     ProposalUpdated(u64),
+    /// Gate pushed new `conflicts_with` / supersede state for a proposal
+    /// already visible in batch review (deferred when the gate lock was busy).
+    BatchProposalSynced {
+        id: u64,
+        conflicts_with: Vec<u64>,
+        superseded: bool,
+    },
     ProposalFinalized(String), // file path
 
     // ACP agent events (conv_id identifies which conversation)
