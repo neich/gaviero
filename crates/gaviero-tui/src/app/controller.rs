@@ -181,7 +181,16 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
         Event::ProposalCreated(proposal) => {
             app.enter_review_mode(*proposal, DiffSource::Acp);
         }
-        Event::ProposalUpdated(_id) => {}
+        Event::ProposalUpdated(id) => {
+            review::sync_batch_proposal_from_gate(app, id);
+        }
+        Event::BatchProposalSynced {
+            id,
+            conflicts_with,
+            superseded,
+        } => {
+            review::apply_batch_proposal_sync(app, id, conflicts_with, superseded);
+        }
         Event::ProposalFinalized(path_str) => {
             let path = std::path::PathBuf::from(&path_str);
             if path.exists() {
@@ -1644,8 +1653,19 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
         }
         Action::Save => app.save_current_buffer(),
         Action::TogglePreview => {
-            app.preview_visible = !app.preview_visible;
-            app.preview_scroll = 0;
+            if app.is_current_buffer_markdown() {
+                app.preview_mode = app.preview_mode.cycle();
+                app.preview_scroll = 0;
+                app.status_message = Some((
+                    format!("Markdown preview: {}", app.preview_mode.title_label()),
+                    std::time::Instant::now(),
+                ));
+            } else {
+                app.status_message = Some((
+                    "Markdown preview: open a .md file first".to_string(),
+                    std::time::Instant::now(),
+                ));
+            }
         }
         Action::ToggleWordWrap => {
             if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
