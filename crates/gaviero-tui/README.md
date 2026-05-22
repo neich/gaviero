@@ -128,6 +128,7 @@ No background tasks mutate the `App` struct directly. All state changes flow thr
 | Editor | Ctrl+F | Find in file |
 | Editor | F3 | Next match (in-file) / workspace search (no find bar) |
 | Editor | Alt+Z | Toggle word wrap |
+| Editor (.md) | Alt+P | Cycle markdown view: source → split preview → preview only |
 | Editor | Ctrl+T / Ctrl+W | New tab / close tab |
 | Editor | Alt+[ / Alt+] | Cycle tabs |
 | Terminal | Ctrl+J / F4 | Toggle bottom terminal panel |
