@@ -20,8 +20,83 @@ pub enum LeftPanelMode {
     Changes,
 }
 
+/// Markdown buffer preview layout, cycled with Alt+P.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MarkdownPreviewMode {
+    /// Source only (no rendered pane).
+    #[default]
+    Off,
+    /// Source and rendered preview side by side.
+    Split,
+    /// Rendered preview only (source hidden).
+    PreviewOnly,
+}
+
+impl MarkdownPreviewMode {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Off => Self::Split,
+            Self::Split => Self::PreviewOnly,
+            Self::PreviewOnly => Self::Off,
+        }
+    }
+
+    pub fn is_active(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub fn title_label(self) -> &'static str {
+        match self {
+            Self::Off => "Markdown",
+            Self::Split => "Markdown · split (Alt+P)",
+            Self::PreviewOnly => "Markdown · preview (Alt+P)",
+        }
+    }
+}
+
+#[cfg(test)]
+mod preview_mode_tests {
+    use super::MarkdownPreviewMode;
+
+    #[test]
+    fn cycle_off_split_preview_only_off() {
+        assert_eq!(
+            MarkdownPreviewMode::Off.cycle(),
+            MarkdownPreviewMode::Split
+        );
+        assert_eq!(
+            MarkdownPreviewMode::Split.cycle(),
+            MarkdownPreviewMode::PreviewOnly
+        );
+        assert_eq!(
+            MarkdownPreviewMode::PreviewOnly.cycle(),
+            MarkdownPreviewMode::Off
+        );
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ReviewProposal {
+    /// Stable identifier copied from the source `WriteProposal` so the UI can
+    /// detect conflict peers across the open batch even after re-sorting.
+    pub id: u64,
+    /// Agent/source name carried over from `WriteProposal.source`. Rendered
+    /// as a short badge so the reviewer sees which provider produced the
+    /// proposal in a mixed-batch inbox.
+    pub source: String,
+    /// Conversation that produced this proposal. Kept for future per-conv
+    /// filtering and audit; the v1 filter cycles by `source` (agent name)
+    /// because providers like `claude-chat` use a constant agent_id across
+    /// conversations.
+    #[allow(dead_code)]
+    pub conv_id: Option<String>,
+    /// IDs of other proposals in the same batch that target the same path.
+    /// Non-empty means this proposal is half of a conflict pair.
+    pub conflicts_with: Vec<u64>,
+    /// Set to true after the conflicting peer was accepted. A superseded
+    /// proposal is rendered with `⊘` and cannot be applied — Unit 7 enforces
+    /// pick-one resolution.
+    pub superseded: bool,
     pub path: PathBuf,
     pub old_content: Option<String>,
     pub new_content: String,
@@ -39,6 +114,9 @@ pub struct BatchReviewState {
     pub diff_scroll: usize,
     pub(super) cached_diff: Vec<(DiffKind, String)>,
     pub(super) cached_diff_index: usize,
+    /// Active provider filter (matches `ReviewProposal.source`). `None` means
+    /// "show everything". Cycled with `Alt+o` / `Alt+i`.
+    pub filter_source: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -88,6 +166,8 @@ pub struct LayoutPreset {
 #[derive(Debug, Clone, Copy)]
 pub(super) enum ScrollbarTarget {
     Editor,
+    /// Markdown rendered preview pane (split or preview-only).
+    MarkdownPreview,
     Chat,
     LeftPanel,
 }
@@ -98,6 +178,7 @@ pub(super) struct LayoutAreas {
     pub file_tree_area: Option<Rect>,
     pub left_header_area: Option<Rect>,
     pub editor_area: Rect,
+    pub preview_area: Option<Rect>,
     pub side_panel_area: Option<Rect>,
     pub side_header_area: Option<Rect>,
     pub terminal_area: Option<Rect>,
