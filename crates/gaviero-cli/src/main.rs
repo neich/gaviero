@@ -165,6 +165,15 @@ struct Cli {
     #[arg(long = "var", requires = "script")]
     vars: Vec<String>,
 
+    /// Supply a workflow `param <name>` declared in a DSL script. Format:
+    /// `NAME=VALUE`. For roster params, the value is a comma-separated list
+    /// of `id=provider:model[@effort]` entries
+    /// (e.g. `--param roster=claude=claude:opus@max,codex=codex:gpt-5.5@high`).
+    /// Required params without a default fail compilation when absent.
+    /// Can be specified multiple times. Only valid with `--script`.
+    #[arg(long = "param", requires = "script")]
+    params: Vec<String>,
+
     /// Tier profile for a DSL script: a `.gaviero` file containing only
     /// `tier <role> <client>` bindings. Overrides tier lines from the script
     /// and its `include`s (e.g. `profiles/doc-default.gaviero`). Agents must
@@ -596,6 +605,17 @@ fn parse_var_overrides(raw: &[String]) -> Result<Vec<(String, String)>> {
             let (k, v) = s
                 .split_once('=')
                 .ok_or_else(|| anyhow::anyhow!("--var `{}`: expected KEY=VALUE format", s))?;
+            Ok((k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+fn parse_param_overrides(raw: &[String]) -> Result<Vec<(String, String)>> {
+    raw.iter()
+        .map(|s| {
+            let (k, v) = s
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("--param `{}`: expected NAME=VALUE format", s))?;
             Ok((k.to_string(), v.to_string()))
         })
         .collect()
@@ -2066,6 +2086,7 @@ async fn main() -> Result<()> {
             None
         };
         let override_vars = parse_var_overrides(&cli.vars)?;
+        let override_params = parse_param_overrides(&cli.params)?;
         let override_tiers = if let Some(ref tiers_path) = cli.tiers_file {
             let tiers_path = if tiers_path.is_absolute() {
                 tiers_path.clone()
@@ -2095,6 +2116,7 @@ async fn main() -> Result<()> {
             runtime_prompt.as_deref(),
             &override_vars,
             &override_tiers,
+            &override_params,
         )
         .map_err(|report| {
             eprintln!("{:?}", report);
