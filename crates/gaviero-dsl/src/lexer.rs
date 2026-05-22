@@ -53,6 +53,8 @@ pub enum Token {
     KwSteps,
     #[token("max_parallel")]
     KwMaxParallel,
+    #[token("param")]
+    KwParam,
     #[token("memory")]
     KwMemory,
     #[token("read_ns")]
@@ -224,6 +226,7 @@ impl fmt::Display for Token {
             Token::KwTools => write!(f, "tools"),
             Token::KwSteps => write!(f, "steps"),
             Token::KwMaxParallel => write!(f, "max_parallel"),
+            Token::KwParam => write!(f, "param"),
             Token::KwMemory => write!(f, "memory"),
             Token::KwReadNs => write!(f, "read_ns"),
             Token::KwWriteNs => write!(f, "write_ns"),
