@@ -212,6 +212,41 @@ The main script must still `include` the client pool (`clients.gaviero`). `--tie
 overrides `tier` lines from the script and its includes; precedence is CLI profile >
 included profile > script.
 
+### Workflow Params
+
+Typed parameters on a `workflow { ... }` block, overridable from the CLI with
+`--param NAME=VALUE`:
+
+```gaviero
+workflow my-flow {
+    // Client param — bind agents with `client judge`
+    param judge {
+        model "claude:sonnet"
+        effort medium
+        privacy public
+    }
+
+    // Roster param — use in `loop { reviewers roster ... }`
+    param roster [
+        { id "claude" model "claude:opus" effort max }
+        { id "codex"  model "codex:gpt-5.5" effort high }
+    ]
+
+    steps [ loop { reviewers roster template_init t0 template_refine t1 until agent judge } ]
+}
+```
+
+CLI overrides:
+
+```bash
+--param judge=claude:haiku@low
+--param roster=claude=claude:opus@max,codex=codex:gpt-5.5@high
+```
+
+Bare `param roster` (no `[...]` or `{...}`) infers roster vs client from whether the
+name appears in `reviewers` or `client` on an agent. Required params without an
+in-script default must be supplied on the CLI.
+
 ### Top-level Vars
 
 Script-level substitution applied to agent prompts, descriptions, and scope paths before compilation:
