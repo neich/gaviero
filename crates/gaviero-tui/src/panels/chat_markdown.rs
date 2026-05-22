@@ -1,27 +1,70 @@
-//! Markdown formatting for the chat panel.
+//! Markdown formatting for the chat panel and in-editor preview.
 //!
-//! Converts markdown text into styled lines suitable for the chat panel's
-//! single-style-per-line rendering pipeline. Handles tables, headings,
-//! code blocks, lists, horizontal rules, and strips inline markers.
+//! Converts markdown text into a sequence of styled lines (`ChatLine`), each
+//! composed of one or more `StyledSegment`s so a single visual line can carry
+//! mixed inline styling (bold, italic, inline code, links) on top of its base
+//! style. Handles tables, headings, code blocks, lists, and horizontal rules.
 
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use unicode_width::UnicodeWidthChar;
 use unicode_width::UnicodeWidthStr;
 
-use crate::editor::markdown::parse_inline;
+use crate::editor::markdown::{SegmentKind, parse_inline};
 use crate::theme;
 
-/// A single rendered line for the chat panel.
-pub struct ChatLine {
-    pub style: Style,
+/// A run of contiguous characters sharing a single style.
+#[derive(Clone)]
+pub struct StyledSegment {
     pub text: String,
+    pub style: Style,
+}
+
+/// A single rendered line for the chat panel.
+///
+/// Holds one or more styled segments so a single visual line can mix inline
+/// styles (bold, italic, inline code, links) on top of the line's base style.
+pub struct ChatLine {
+    pub segments: Vec<StyledSegment>,
+}
+
+impl ChatLine {
+    /// Build a line with a single style covering the whole text.
+    pub fn single(text: impl Into<String>, style: Style) -> Self {
+        let text = text.into();
+        if text.is_empty() {
+            Self {
+                segments: Vec::new(),
+            }
+        } else {
+            Self {
+                segments: vec![StyledSegment { text, style }],
+            }
+        }
+    }
+
+    /// Plain-text concatenation of all segments (no style information).
+    pub fn text(&self) -> String {
+        self.segments.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    /// Style of the first segment, used as a fallback for whole-line
+    /// effects like the browse-mode background highlight.
+    pub fn primary_style(&self) -> Style {
+        self.segments
+            .first()
+            .map(|s| s.style)
+            .unwrap_or_default()
+    }
 }
 
 /// Format markdown content into styled lines for the chat panel.
 ///
 /// Processes tables with box-drawing characters, renders headings with visual
-/// markers, indents code blocks, formats lists, and strips inline `**`/`*`/`` ` ``
-/// markers from regular text.
+/// markers, indents code blocks, formats lists, and converts inline
+/// `**bold**`, `*italic*`, `` `code` ``, and `[text](url)` markers into styled
+/// segments that render with the corresponding visual attributes.
 pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<ChatLine> {
     let mut output = Vec::new();
     // Expand tabs to 4 spaces to prevent terminal rendering artifacts.
@@ -57,14 +100,14 @@ pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<
             let after_tag = trimmed.strip_prefix("<think>").unwrap_or("");
             let after_tag = after_tag.strip_suffix("</think>").unwrap_or(after_tag);
             if !after_tag.is_empty() {
-                let cleaned = strip_inline_markers(after_tag.trim());
-                for wl in crate::widgets::render_utils::word_wrap(&format!("  {}", cleaned), width)
-                {
-                    output.push(ChatLine {
-                        style: reasoning_style,
-                        text: wl,
-                    });
-                }
+                push_inline_wrapped(
+                    &mut output,
+                    after_tag.trim(),
+                    "  ",
+                    "  ",
+                    width,
+                    reasoning_style,
+                );
             }
             if trimmed.ends_with("</think>") {
                 in_thinking_block = false;
@@ -76,14 +119,14 @@ pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<
             // Render any text before the closing tag
             let before_tag = trimmed.strip_suffix("</think>").unwrap_or("");
             if !before_tag.is_empty() {
-                let cleaned = strip_inline_markers(before_tag.trim());
-                for wl in crate::widgets::render_utils::word_wrap(&format!("  {}", cleaned), width)
-                {
-                    output.push(ChatLine {
-                        style: reasoning_style,
-                        text: wl,
-                    });
-                }
+                push_inline_wrapped(
+                    &mut output,
+                    before_tag.trim(),
+                    "  ",
+                    "  ",
+                    width,
+                    reasoning_style,
+                );
             }
             in_thinking_block = false;
             i += 1;
@@ -91,19 +134,16 @@ pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<
         }
         if in_thinking_block {
             if trimmed.is_empty() {
-                output.push(ChatLine {
-                    style: reasoning_style,
-                    text: String::new(),
-                });
+                output.push(ChatLine::single(String::new(), reasoning_style));
             } else {
-                let cleaned = strip_inline_markers(trimmed);
-                for wl in crate::widgets::render_utils::word_wrap(&format!("  {}", cleaned), width)
-                {
-                    output.push(ChatLine {
-                        style: reasoning_style,
-                        text: wl,
-                    });
-                }
+                push_inline_wrapped(
+                    &mut output,
+                    trimmed,
+                    "  ",
+                    "  ",
+                    width,
+                    reasoning_style,
+                );
             }
             i += 1;
             continue;
@@ -117,10 +157,7 @@ pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<
         }
 
         if in_code_block {
-            output.push(ChatLine {
-                style: code_style,
-                text: format!("  {}", line),
-            });
+            output.push(ChatLine::single(format!("  {}", line), code_style));
             i += 1;
             continue;
         }
@@ -150,10 +187,7 @@ pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<
 
         // Empty line
         if trimmed.is_empty() {
-            output.push(ChatLine {
-                style: base_style,
-                text: String::new(),
-            });
+            output.push(ChatLine::single(String::new(), base_style));
             i += 1;
             continue;
         }
@@ -166,10 +200,7 @@ pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<
                 .all(|c| c == '-' || c == '*' || c == '_' || c == ' ')
         {
             let rule: String = "─".repeat(width.min(60));
-            output.push(ChatLine {
-                style: rule_style,
-                text: rule,
-            });
+            output.push(ChatLine::single(rule, rule_style));
             i += 1;
             continue;
         }
@@ -191,10 +222,7 @@ pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<
                     &format!("{}{}", marker, content),
                     width,
                 ) {
-                    output.push(ChatLine {
-                        style: heading_style,
-                        text: wl,
-                    });
+                    output.push(ChatLine::single(wl, heading_style));
                 }
                 i += 1;
                 continue;
@@ -203,13 +231,14 @@ pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<
 
         // Block quotes
         if trimmed.starts_with('>') {
-            let content = strip_inline_markers(trimmed[1..].trim_start());
-            for wl in crate::widgets::render_utils::word_wrap(&format!("│ {}", content), width) {
-                output.push(ChatLine {
-                    style: quote_style,
-                    text: wl,
-                });
-            }
+            push_inline_wrapped(
+                &mut output,
+                trimmed[1..].trim_start(),
+                "│ ",
+                "│ ",
+                width,
+                quote_style,
+            );
             i += 1;
             continue;
         }
@@ -218,24 +247,14 @@ pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<
         if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
             let indent = (line.len() - line.trim_start().len()) / 2;
             let pad: String = "  ".repeat(indent);
-            let content = strip_inline_markers(&trimmed[2..]);
-            let first = format!("{}• {}", pad, content);
-            for (j, wl) in crate::widgets::render_utils::word_wrap(&first, width)
-                .into_iter()
-                .enumerate()
-            {
-                if j == 0 {
-                    output.push(ChatLine {
-                        style: base_style,
-                        text: wl,
-                    });
-                } else {
-                    output.push(ChatLine {
-                        style: base_style,
-                        text: format!("{}  {}", pad, wl.trim_start()),
-                    });
-                }
-            }
+            push_inline_wrapped(
+                &mut output,
+                &trimmed[2..],
+                &format!("{}• ", pad),
+                &format!("{}  ", pad),
+                width,
+                base_style,
+            );
             i += 1;
             continue;
         }
@@ -244,15 +263,16 @@ pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<
         if let Some(dot_pos) = trimmed.find(". ") {
             let prefix = &trimmed[..dot_pos];
             if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit()) {
-                let content = strip_inline_markers(&trimmed[dot_pos + 2..]);
                 let marker = format!("{}. ", prefix);
-                let first = format!("{}{}", marker, content);
-                for wl in crate::widgets::render_utils::word_wrap(&first, width) {
-                    output.push(ChatLine {
-                        style: base_style,
-                        text: wl,
-                    });
-                }
+                let cont_indent: String = " ".repeat(marker.chars().count());
+                push_inline_wrapped(
+                    &mut output,
+                    &trimmed[dot_pos + 2..],
+                    &marker,
+                    &cont_indent,
+                    width,
+                    base_style,
+                );
                 i += 1;
                 continue;
             }
@@ -262,26 +282,254 @@ pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<
         // Style with dim color to visually distinguish from regular text
         if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.contains("](") {
             let marker_style = Style::default().fg(theme::TOOL_DIM);
-            output.push(ChatLine {
-                style: marker_style,
-                text: format!("  {}", trimmed),
-            });
+            output.push(ChatLine::single(format!("  {}", trimmed), marker_style));
             i += 1;
             continue;
         }
 
-        // Regular text: strip inline markers and word-wrap
-        let cleaned = strip_inline_markers(trimmed);
-        for wl in crate::widgets::render_utils::word_wrap(&cleaned, width) {
-            output.push(ChatLine {
-                style: base_style,
-                text: wl,
-            });
-        }
+        // Regular text: preserve inline styling (bold/italic/code/links).
+        push_inline_wrapped(&mut output, trimmed, "", "", width, base_style);
         i += 1;
     }
 
     output
+}
+
+/// Word-wrap a markdown text fragment with inline styling preserved, prepending
+/// `first_prefix` to the first wrapped line and `cont_prefix` to subsequent
+/// lines. Prefixes inherit `base_style`.
+fn push_inline_wrapped(
+    output: &mut Vec<ChatLine>,
+    text: &str,
+    first_prefix: &str,
+    cont_prefix: &str,
+    width: usize,
+    base_style: Style,
+) {
+    let inline = parse_inline_styled(text, base_style);
+
+    // Width budget shrinks by the prefix display width on each wrapped line.
+    let first_prefix_w = UnicodeWidthStr::width(first_prefix);
+    let cont_prefix_w = UnicodeWidthStr::width(cont_prefix);
+    let first_budget = width.saturating_sub(first_prefix_w).max(1);
+    let cont_budget = width.saturating_sub(cont_prefix_w).max(1);
+
+    let wrapped = word_wrap_segments(&inline, first_budget, cont_budget);
+
+    if wrapped.is_empty() {
+        if !first_prefix.is_empty() {
+            output.push(ChatLine::single(first_prefix.to_string(), base_style));
+        } else {
+            output.push(ChatLine::single(String::new(), base_style));
+        }
+        return;
+    }
+
+    for (j, wrapped_segments) in wrapped.into_iter().enumerate() {
+        let prefix = if j == 0 { first_prefix } else { cont_prefix };
+        let mut segments: Vec<StyledSegment> = Vec::with_capacity(wrapped_segments.len() + 1);
+        if !prefix.is_empty() {
+            segments.push(StyledSegment {
+                text: prefix.to_string(),
+                style: base_style,
+            });
+        }
+        segments.extend(wrapped_segments);
+        if segments.is_empty() {
+            output.push(ChatLine::single(String::new(), base_style));
+        } else {
+            output.push(ChatLine { segments });
+        }
+    }
+}
+
+/// Convert markdown inline segments into styled segments, mapping each marker
+/// kind to a concrete `Style` on top of `base_style`.
+fn parse_inline_styled(text: &str, base_style: Style) -> Vec<StyledSegment> {
+    // Colors mirror the source-editor markdown highlights in `theme.rs`
+    // (`markup.bold`, `markup.italic`, `markup.code`, `markup.link`) so the
+    // preview reads the same as the source view. The BOLD/ITALIC text
+    // modifiers alone render too subtly on many terminals — the visible
+    // distinction comes from the colour change.
+    const BOLD_FG: ratatui::style::Color = ratatui::style::Color::Rgb(229, 192, 123);
+    const ITALIC_FG: ratatui::style::Color = ratatui::style::Color::Rgb(198, 120, 221);
+
+    parse_inline(text)
+        .into_iter()
+        .filter_map(|seg| {
+            if seg.text.is_empty() {
+                return None;
+            }
+            let style = match seg.kind {
+                SegmentKind::Plain => base_style,
+                SegmentKind::Bold => base_style.fg(BOLD_FG).add_modifier(Modifier::BOLD),
+                SegmentKind::Italic => base_style.fg(ITALIC_FG).add_modifier(Modifier::ITALIC),
+                SegmentKind::Code => Style::default().fg(theme::CODE_GREEN),
+                SegmentKind::Link(_) => base_style
+                    .fg(theme::ACCENT)
+                    .add_modifier(Modifier::UNDERLINED),
+            };
+            Some(StyledSegment {
+                text: seg.text,
+                style,
+            })
+        })
+        .collect()
+}
+
+/// Word-wrap styled segments into multiple lines, preserving styles.
+///
+/// Each output line is a sequence of segments (style runs) covering exactly the
+/// characters that fit within the line budget. `first_width` is the budget for
+/// the first wrapped line and `cont_width` for subsequent continuation lines,
+/// so the caller can reserve room for prefix indents.
+fn word_wrap_segments(
+    segments: &[StyledSegment],
+    first_width: usize,
+    cont_width: usize,
+) -> Vec<Vec<StyledSegment>> {
+    // Flatten to (char, style) pairs, expanding tabs to 4 spaces to match
+    // `render_utils::word_wrap`'s behaviour.
+    let mut chars: Vec<(char, Style)> = Vec::new();
+    for seg in segments {
+        for ch in seg.text.chars() {
+            if ch == '\t' {
+                for _ in 0..4 {
+                    chars.push((' ', seg.style));
+                }
+            } else {
+                chars.push((ch, seg.style));
+            }
+        }
+    }
+
+    if chars.is_empty() {
+        return Vec::new();
+    }
+
+    let mut result: Vec<Vec<StyledSegment>> = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        let budget = if result.is_empty() {
+            first_width
+        } else {
+            cont_width
+        }
+        .max(1);
+
+        let mut display_w = 0usize;
+        let mut end = start;
+        while end < chars.len() {
+            let cw = UnicodeWidthChar::width(chars[end].0).unwrap_or(1);
+            if display_w + cw > budget {
+                break;
+            }
+            display_w += cw;
+            end += 1;
+        }
+        if end == start {
+            end = start + 1;
+        }
+
+        let break_at = if end < chars.len() {
+            let mut bp = end;
+            while bp > start && chars[bp].0 != ' ' {
+                bp -= 1;
+            }
+            if bp == start { end } else { bp + 1 }
+        } else {
+            end
+        };
+
+        // Trim trailing spaces on non-final wrapped lines for visual cleanliness.
+        let mut line_end = break_at;
+        if break_at < chars.len() {
+            while line_end > start && chars[line_end - 1].0 == ' ' {
+                line_end -= 1;
+            }
+        }
+
+        result.push(coalesce_segments(&chars[start..line_end]));
+        start = break_at;
+    }
+
+    result
+}
+
+/// Group consecutive characters with the same style into segments.
+fn coalesce_segments(chars: &[(char, Style)]) -> Vec<StyledSegment> {
+    let mut segments: Vec<StyledSegment> = Vec::new();
+    let mut iter = chars.iter();
+    if let Some(&(ch, style)) = iter.next() {
+        let mut current_text = String::new();
+        let mut current_style = style;
+        current_text.push(ch);
+        for &(ch, style) in iter {
+            if style == current_style {
+                current_text.push(ch);
+            } else {
+                segments.push(StyledSegment {
+                    text: std::mem::take(&mut current_text),
+                    style: current_style,
+                });
+                current_text.push(ch);
+                current_style = style;
+            }
+        }
+        if !current_text.is_empty() {
+            segments.push(StyledSegment {
+                text: current_text,
+                style: current_style,
+            });
+        }
+    }
+    segments
+}
+
+/// Paint pre-formatted markdown lines into a ratatui buffer (editor preview pane).
+pub fn render_lines_to_buffer(
+    lines: &[ChatLine],
+    area: Rect,
+    buf: &mut Buffer,
+    scroll_top: usize,
+    clear_style: Style,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    for row in 0..area.height as usize {
+        let line_idx = scroll_top + row;
+        let y = area.y + row as u16;
+
+        for col in 0..area.width {
+            let cx = area.x + col;
+            if cx < buf.area().right() && y < buf.area().bottom() {
+                buf[(cx, y)].set_char(' ').set_style(clear_style);
+            }
+        }
+
+        if line_idx >= lines.len() {
+            continue;
+        }
+
+        let line = &lines[line_idx];
+        let x_start = area.x.saturating_add(1);
+        let mut cx = x_start;
+        for seg in &line.segments {
+            cx = crate::widgets::render_utils::write_text(
+                buf,
+                cx,
+                y,
+                area.right(),
+                &seg.text,
+                seg.style,
+            );
+            if cx >= area.right() {
+                break;
+            }
+        }
+    }
 }
 
 // ── Table formatting ─────────────────────────────────────────
@@ -352,10 +600,7 @@ fn render_table(
     let mid = build_table_border(&col_widths, '├', '┼', '┤', '─');
     let bot = build_table_border(&col_widths, '└', '┴', '┘', '─');
 
-    output.push(ChatLine {
-        style: border_style,
-        text: top,
-    });
+    output.push(ChatLine::single(top, border_style));
 
     for (row_idx, row) in rows.iter().enumerate() {
         let style = if row_idx == 0 {
@@ -398,20 +643,14 @@ fn render_table(
         }
         line.push('│');
 
-        output.push(ChatLine { style, text: line });
+        output.push(ChatLine::single(line, style));
 
         if row_idx == 0 && rows.len() > 1 {
-            output.push(ChatLine {
-                style: border_style,
-                text: mid.clone(),
-            });
+            output.push(ChatLine::single(mid.clone(), border_style));
         }
     }
 
-    output.push(ChatLine {
-        style: border_style,
-        text: bot,
-    });
+    output.push(ChatLine::single(bot, border_style));
 }
 
 fn build_table_border(
@@ -467,9 +706,9 @@ mod tests {
         let lines = format_chat_markdown(text, 40, style);
         // Should produce: top border, header, mid border, 2 data rows, bottom border
         assert!(lines.len() >= 6);
-        assert!(lines[0].text.contains('┌'));
-        assert!(lines[1].text.contains("Name"));
-        assert!(lines[2].text.contains('├'));
+        assert!(lines[0].text().contains('┌'));
+        assert!(lines[1].text().contains("Name"));
+        assert!(lines[2].text().contains('├'));
     }
 
     #[test]
@@ -478,7 +717,7 @@ mod tests {
         let style = Style::default();
         let lines = format_chat_markdown(text, 40, style);
         assert!(!lines.is_empty());
-        assert!(lines[0].text.contains("█ Hello World"));
+        assert!(lines[0].text().contains("█ Hello World"));
     }
 
     #[test]
@@ -487,16 +726,77 @@ mod tests {
         let style = Style::default();
         let lines = format_chat_markdown(text, 40, style);
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].text.contains("let x = 1;"));
+        assert!(lines[0].text().contains("let x = 1;"));
     }
 
     #[test]
-    fn test_strips_bold_in_text() {
+    fn test_bold_text_preserves_style() {
         let text = "This is **important** info";
         let style = Style::default();
         let lines = format_chat_markdown(text, 60, style);
         assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].text, "This is important info");
+        // Plain-text concatenation strips the ** markers …
+        assert_eq!(lines[0].text(), "This is important info");
+        // … but the bold run keeps its own segment with both the BOLD
+        // modifier and the bold foreground color so it is visually distinct
+        // (BOLD alone renders too subtly in many terminals).
+        let bold_seg = lines[0]
+            .segments
+            .iter()
+            .find(|s| s.text == "important")
+            .expect("expected a segment containing the bold text");
+        assert!(
+            bold_seg.style.add_modifier.contains(Modifier::BOLD),
+            "bold segment must carry the BOLD modifier"
+        );
+        assert!(
+            bold_seg.style.fg.is_some(),
+            "bold segment must set a foreground color so the change is visible"
+        );
+    }
+
+    #[test]
+    fn test_italic_text_preserves_style() {
+        let text = "An *italic* word";
+        let style = Style::default();
+        let lines = format_chat_markdown(text, 60, style);
+        assert_eq!(lines.len(), 1);
+        let italic_seg = lines[0]
+            .segments
+            .iter()
+            .find(|s| s.text == "italic")
+            .expect("expected italic segment");
+        assert!(italic_seg.style.add_modifier.contains(Modifier::ITALIC));
+        assert!(italic_seg.style.fg.is_some());
+    }
+
+    #[test]
+    fn test_inline_code_preserves_style() {
+        let text = "Run `cargo test` now";
+        let style = Style::default();
+        let lines = format_chat_markdown(text, 60, style);
+        assert_eq!(lines.len(), 1);
+        let code_seg = lines[0]
+            .segments
+            .iter()
+            .find(|s| s.text == "cargo test")
+            .expect("expected inline code segment");
+        assert_eq!(code_seg.style.fg, Some(theme::CODE_GREEN));
+    }
+
+    #[test]
+    fn test_bold_inside_list_item() {
+        let text = "- a **bold** item";
+        let style = Style::default();
+        let lines = format_chat_markdown(text, 60, style);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].text().starts_with("• "));
+        let bold_seg = lines[0]
+            .segments
+            .iter()
+            .find(|s| s.text == "bold")
+            .expect("expected bold segment inside list item");
+        assert!(bold_seg.style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -505,12 +805,12 @@ mod tests {
         let style = Style::default();
         let lines = format_chat_markdown(text, 60, style);
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].text.contains("    indented"));
-        assert!(lines[1].text.contains("        double"));
+        assert!(lines[0].text().contains("    indented"));
+        assert!(lines[1].text().contains("        double"));
         // Ensure no tab characters remain
         for line in &lines {
             assert!(
-                !line.text.contains('\t'),
+                !line.text().contains('\t'),
                 "tab character should be expanded"
             );
         }
@@ -524,8 +824,8 @@ mod tests {
         // Width 6 columns: fits 3 CJK chars (6 cols), then wraps
         let lines = format_chat_markdown(text, 6, style);
         assert_eq!(lines.len(), 2);
-        assert_eq!(UnicodeWidthStr::width(lines[0].text.as_str()), 6);
-        assert_eq!(UnicodeWidthStr::width(lines[1].text.as_str()), 6);
+        assert_eq!(UnicodeWidthStr::width(lines[0].text().as_str()), 6);
+        assert_eq!(UnicodeWidthStr::width(lines[1].text().as_str()), 6);
     }
 
     #[test]
@@ -534,7 +834,7 @@ mod tests {
         let style = Style::default();
         let lines = format_chat_markdown(text, 40, style);
         // The column for "日本" should be 4 display cols wide (not 2)
-        let data_row = &lines[3].text; // top, header, separator, first data row
+        let data_row = lines[3].text(); // top, header, separator, first data row
         // "日本" has display width 4, cell should be padded correctly
         assert!(
             data_row.contains("日本"),
