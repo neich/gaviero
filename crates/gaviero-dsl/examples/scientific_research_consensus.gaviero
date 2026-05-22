@@ -1,0 +1,426 @@
+// Template: three-provider scientific research consensus loop
+//
+// This workflow simulates a critical research process over a scientific
+// endeavour. Three high-end providers independently analyse the problem,
+// local data, local literature, and current web literature. They then
+// iteratively read each other's conclusions, perform more targeted web
+// research, and revise their own conclusions until a consensus judge passes
+// or the loop reaches 10 refinement iterations.
+//
+// Usage:
+//   gaviero-cli --script crates/gaviero-dsl/examples/scientific_research_consensus.gaviero \
+//     --var PROBLEM_FILE=path/to/problem.md \
+//     --var DATA_DIR=path/to/data \
+//     --var LOCAL_LIT_DIR=path/to/literature \
+//     --var OUT_DIR=research_runs/my-project
+//
+// Privacy note: the included clients are public-provider clients. Do not point
+// DATA_DIR or LOCAL_LIT_DIR at sensitive material unless that is acceptable for
+// the selected providers.
+
+include "clients.gaviero"
+
+// Optional third-provider high-effort profile. Replace this with another
+// expensive provider available in your environment if desired.
+client cursor-research {
+    model "cursor:composer-2.5"
+    privacy public
+    effort high
+}
+
+vars {
+    OUT_DIR       "research_runs/latest"
+    PROBLEM_FILE  "research_problem.md"
+    DATA_DIR      "data"
+    LOCAL_LIT_DIR "literature"
+    INIT_VER      "1"
+}
+
+// -----------------------------------------------------------------------------
+// Prompts
+// -----------------------------------------------------------------------------
+
+prompt initial-research-body #"
+    You are {{PROVIDER_LABEL}}, acting as an independent senior scientific
+    research strategist.
+
+    Your task is to analyse the scientific endeavour described in:
+      {{PROBLEM_FILE}}
+
+    Also inspect any relevant local material available under:
+      - Data: {{DATA_DIR}}/
+      - Local literature: {{LOCAL_LIT_DIR}}/
+
+    Do not read any existing files in {{OUT_DIR}}/. This is the independent
+    first pass.
+
+    Perform extensive current web research using web search/fetch tools when
+    available. Prioritise:
+      - peer-reviewed papers, preprints, datasets, benchmarks, standards, and
+        reputable technical reports;
+      - literature from the last 36 months when the field is active;
+      - foundational older work only when it materially changes the analysis;
+      - negative results, failed approaches, replication limits, and evidence
+        that weakens attractive hypotheses.
+
+    Hard rules:
+      - Be critical, honest, and specific.
+      - Do not invent citations, datasets, or results. If web tools are
+        unavailable, state that explicitly in the evidence log and rely only
+        on local material.
+      - Distinguish what is known from what is inferred.
+      - Treat the local data as evidence to be characterised, not as proof.
+      - Do not optimise for agreement. Optimise for truth and useful next
+        research actions.
+
+    Write two files.
+
+    File 1:
+      {{OUT_DIR}}/{{PROVIDER_ID}}-initial-conclusion-v{{INIT_VER}}.md
+
+    It must contain exactly these sections, in this order:
+      - `## Problem understanding`
+      - `## Current evidence base`
+      - `## Best avenues for advance`
+      - `## Critical risks and failure modes`
+      - `## Data and literature gaps`
+      - `## Proposed research programme`
+      - `## Decision points and stopping criteria`
+
+    Requirements for File 1:
+      - Rank the best avenues for advance.
+      - For each avenue, state the central hypothesis, required evidence,
+        expected upside, main risks, and first decisive experiment or analysis.
+      - Include explicit reasons why attractive avenues may fail.
+      - Include stopping criteria that would justify abandoning or deprioritising
+        an avenue.
+
+    File 2:
+      {{OUT_DIR}}/{{PROVIDER_ID}}-initial-evidence-v{{INIT_VER}}.md
+
+    It must contain:
+      - `## Search strategy`
+      - `## Sources reviewed`
+      - `## Evidence extracted`
+      - `## Claims needing verification`
+      - `## Research limitations`
+
+    Requirements for File 2:
+      - List search queries or discovery paths used.
+      - For each source, include title, authors if available, venue/source,
+        year/date, URL or DOI, and the specific claim it supports or weakens.
+      - Mark each source as local, web, peer-reviewed, preprint, dataset,
+        standard, or report when possible.
+"#
+
+prompt refinement-body #"
+    You are {{PROVIDER_LABEL}}, refining your scientific research conclusion
+    for the endeavour described in:
+      {{PROBLEM_FILE}}
+
+    Also inspect relevant local material under:
+      - Data: {{DATA_DIR}}/
+      - Local literature: {{LOCAL_LIT_DIR}}/
+
+    Inputs to read.
+
+    If {{PREV_ITER}} = 1, read the three independent first-pass conclusions
+    and evidence logs:
+      - {{OUT_DIR}}/claude-initial-conclusion-v{{PREV_ITER}}.md
+      - {{OUT_DIR}}/codex-initial-conclusion-v{{PREV_ITER}}.md
+      - {{OUT_DIR}}/cursor-initial-conclusion-v{{PREV_ITER}}.md
+      - {{OUT_DIR}}/claude-initial-evidence-v{{PREV_ITER}}.md
+      - {{OUT_DIR}}/codex-initial-evidence-v{{PREV_ITER}}.md
+      - {{OUT_DIR}}/cursor-initial-evidence-v{{PREV_ITER}}.md
+
+    If {{PREV_ITER}} >= 2, read the three previous refined conclusions,
+    comparison summaries, and evidence logs:
+      - {{OUT_DIR}}/claude-conclusion-v{{PREV_ITER}}.md
+      - {{OUT_DIR}}/codex-conclusion-v{{PREV_ITER}}.md
+      - {{OUT_DIR}}/cursor-conclusion-v{{PREV_ITER}}.md
+      - {{OUT_DIR}}/claude-comparison-v{{PREV_ITER}}.md
+      - {{OUT_DIR}}/codex-comparison-v{{PREV_ITER}}.md
+      - {{OUT_DIR}}/cursor-comparison-v{{PREV_ITER}}.md
+      - {{OUT_DIR}}/claude-evidence-v{{PREV_ITER}}.md
+      - {{OUT_DIR}}/codex-evidence-v{{PREV_ITER}}.md
+      - {{OUT_DIR}}/cursor-evidence-v{{PREV_ITER}}.md
+
+    Then perform additional web research targeted at unresolved disagreements,
+    weak citations, missing risks, and the most important proposed avenues.
+    Prefer new sources or sources that verify/refute claims made by peers.
+    Do not merely repeat the prior search.
+
+    Evaluate the other two providers' conclusions on their merits:
+      - What did each identify correctly?
+      - What did each overstate, understate, or miss?
+      - Which proposed avenues are best supported?
+      - Which risks are most likely to invalidate the programme?
+      - Which disagreements are substantive and which are wording or emphasis?
+
+    Hard rules:
+      - Be critical and honest, including about your own previous conclusion.
+      - Do not converge for social reasons. Consensus requires agreement on
+        the top avenues, the evidence needed, the main risks, and the stopping
+        criteria.
+      - Do not invent citations. If web tools are unavailable, state that
+        explicitly in the evidence file.
+      - Keep the conclusion file free of process narrative. Put comparison,
+        peer evaluation, and iteration history only in the comparison file.
+
+    Write three files.
+
+    File 1:
+      {{OUT_DIR}}/{{PROVIDER_ID}}-conclusion-v{{ITER}}.md
+
+    It must contain exactly these sections, in this order:
+      - `## Problem understanding`
+      - `## Current evidence base`
+      - `## Best avenues for advance`
+      - `## Critical risks and failure modes`
+      - `## Data and literature gaps`
+      - `## Proposed research programme`
+      - `## Decision points and stopping criteria`
+
+    Requirements for File 1:
+      - Present your current best conclusion as a standalone document.
+      - Rank the avenues for advance.
+      - For each avenue, state hypothesis, evidence needed, expected upside,
+        main risks, first decisive experiment or analysis, and stopping
+        criteria.
+      - Do not mention provider names, peer documents, iteration numbers, or
+        comparison history.
+
+    File 2:
+      {{OUT_DIR}}/{{PROVIDER_ID}}-comparison-v{{ITER}}.md
+
+    It must contain exactly these sections:
+      - `## Consensus status`
+      - `## Merits of each proposal`
+      - `## Substantive disagreements`
+      - `## Changes made in this iteration`
+      - `## Remaining research questions`
+
+    Requirements for File 2:
+      - The first sentence under `## Consensus status` must be one of:
+          `Consensus reached.`
+          `Consensus not reached.`
+      - Explain whether the three providers now agree on the top avenues,
+        major risks, required evidence, and stopping criteria.
+      - Keep this under roughly 900 words.
+
+    File 3:
+      {{OUT_DIR}}/{{PROVIDER_ID}}-evidence-v{{ITER}}.md
+
+    It must contain:
+      - `## New search strategy`
+      - `## New or revalidated sources`
+      - `## Evidence extracted`
+      - `## Claims strengthened`
+      - `## Claims weakened`
+      - `## Research limitations`
+
+    Requirements for File 3:
+      - Include the searches or discovery paths used this iteration.
+      - Include title, authors if available, venue/source, year/date, URL or
+        DOI, and the claim each source supports or weakens.
+      - Clearly mark sources that are newly discovered vs revalidated.
+"#
+
+prompt consensus-judge-body #"
+    You are judging whether three independently refined scientific research
+    conclusions have reached consensus for:
+      {{PROBLEM_FILE}}
+
+    {{ITER_EVIDENCE}}
+
+    Read these files for the current iteration:
+      - {{OUT_DIR}}/claude-comparison-v{{ITER}}.md
+      - {{OUT_DIR}}/codex-comparison-v{{ITER}}.md
+      - {{OUT_DIR}}/cursor-comparison-v{{ITER}}.md
+
+    If needed, also read:
+      - {{OUT_DIR}}/claude-conclusion-v{{ITER}}.md
+      - {{OUT_DIR}}/codex-conclusion-v{{ITER}}.md
+      - {{OUT_DIR}}/cursor-conclusion-v{{ITER}}.md
+
+    Consensus means all three providers substantially agree on:
+      - the ranked best avenues for advance;
+      - the evidence required to validate or falsify those avenues;
+      - the critical risks and failure modes;
+      - the data and literature gaps that matter most;
+      - the decision points and stopping criteria.
+
+    Do not require identical wording, identical section length, or identical
+    citations. Do require substantive alignment. If one provider still names a
+    different top avenue, discounts a major risk, or proposes incompatible
+    stopping criteria, return fail.
+
+    Output exactly one fenced JSON object as your final output:
+
+    ```json
+    {"verdict": "pass" | "fail", "reason": "<one short sentence>"}
+    ```
+"#
+
+// -----------------------------------------------------------------------------
+// Agents
+// -----------------------------------------------------------------------------
+
+agent claude-initial-research {
+    vars { PROVIDER_ID "claude" PROVIDER_LABEL "Claude Opus" }
+    description "Initial scientific research analysis (Claude): {{PROMPT}}"
+    client opus
+    tools ["WebSearch" "WebFetch"]
+    scope {
+        owned [
+            "{{OUT_DIR}}/claude-initial-conclusion-v*.md"
+            "{{OUT_DIR}}/claude-initial-evidence-v*.md"
+        ]
+        read_only ["{{PROBLEM_FILE}}" "{{DATA_DIR}}/" "{{LOCAL_LIT_DIR}}/"]
+    }
+    prompt initial-research-body
+    max_retries 1
+}
+
+agent codex-initial-research {
+    vars { PROVIDER_ID "codex" PROVIDER_LABEL "Codex GPT-5.5" }
+    description "Initial scientific research analysis (Codex): {{PROMPT}}"
+    client codex-5-5
+    tools ["WebSearch" "WebFetch"]
+    scope {
+        owned [
+            "{{OUT_DIR}}/codex-initial-conclusion-v*.md"
+            "{{OUT_DIR}}/codex-initial-evidence-v*.md"
+        ]
+        read_only ["{{PROBLEM_FILE}}" "{{DATA_DIR}}/" "{{LOCAL_LIT_DIR}}/"]
+    }
+    prompt initial-research-body
+    max_retries 1
+}
+
+agent cursor-initial-research {
+    vars { PROVIDER_ID "cursor" PROVIDER_LABEL "Cursor Composer" }
+    description "Initial scientific research analysis (Cursor): {{PROMPT}}"
+    client cursor-research
+    tools ["WebSearch" "WebFetch"]
+    scope {
+        owned [
+            "{{OUT_DIR}}/cursor-initial-conclusion-v*.md"
+            "{{OUT_DIR}}/cursor-initial-evidence-v*.md"
+        ]
+        read_only ["{{PROBLEM_FILE}}" "{{DATA_DIR}}/" "{{LOCAL_LIT_DIR}}/"]
+    }
+    prompt initial-research-body
+    max_retries 1
+}
+
+agent claude-refine-research {
+    vars { PROVIDER_ID "claude" PROVIDER_LABEL "Claude Opus" }
+    description "Refine scientific research conclusion (Claude): {{PROMPT}}"
+    client opus
+    tools ["WebSearch" "WebFetch"]
+    scope {
+        owned [
+            "{{OUT_DIR}}/claude-conclusion-v*.md"
+            "{{OUT_DIR}}/claude-comparison-v*.md"
+            "{{OUT_DIR}}/claude-evidence-v*.md"
+        ]
+        read_only ["{{PROBLEM_FILE}}" "{{DATA_DIR}}/" "{{LOCAL_LIT_DIR}}/" "{{OUT_DIR}}/"]
+    }
+    prompt refinement-body
+    max_retries 1
+    memory {
+        write_ns   "scientific-research-consensus"
+        importance 0.8
+        write_content #"
+            Claude research refinement for {{PROMPT}} using {{PROBLEM_FILE}}.
+        "#
+    }
+}
+
+agent codex-refine-research {
+    vars { PROVIDER_ID "codex" PROVIDER_LABEL "Codex GPT-5.5" }
+    description "Refine scientific research conclusion (Codex): {{PROMPT}}"
+    client codex-5-5
+    tools ["WebSearch" "WebFetch"]
+    scope {
+        owned [
+            "{{OUT_DIR}}/codex-conclusion-v*.md"
+            "{{OUT_DIR}}/codex-comparison-v*.md"
+            "{{OUT_DIR}}/codex-evidence-v*.md"
+        ]
+        read_only ["{{PROBLEM_FILE}}" "{{DATA_DIR}}/" "{{LOCAL_LIT_DIR}}/" "{{OUT_DIR}}/"]
+    }
+    prompt refinement-body
+    max_retries 1
+    memory {
+        write_ns   "scientific-research-consensus"
+        importance 0.8
+        write_content #"
+            Codex research refinement for {{PROMPT}} using {{PROBLEM_FILE}}.
+        "#
+    }
+}
+
+agent cursor-refine-research {
+    vars { PROVIDER_ID "cursor" PROVIDER_LABEL "Cursor Composer" }
+    description "Refine scientific research conclusion (Cursor): {{PROMPT}}"
+    client cursor-research
+    tools ["WebSearch" "WebFetch"]
+    scope {
+        owned [
+            "{{OUT_DIR}}/cursor-conclusion-v*.md"
+            "{{OUT_DIR}}/cursor-comparison-v*.md"
+            "{{OUT_DIR}}/cursor-evidence-v*.md"
+        ]
+        read_only ["{{PROBLEM_FILE}}" "{{DATA_DIR}}/" "{{LOCAL_LIT_DIR}}/" "{{OUT_DIR}}/"]
+    }
+    prompt refinement-body
+    max_retries 1
+    memory {
+        write_ns   "scientific-research-consensus"
+        importance 0.8
+        write_content #"
+            Cursor research refinement for {{PROMPT}} using {{PROBLEM_FILE}}.
+        "#
+    }
+}
+
+agent consensus-judge {
+    description "Judge scientific research consensus: {{PROMPT}}"
+    client sonnet
+    scope {
+        read_only ["{{OUT_DIR}}/"]
+    }
+    prompt consensus-judge-body
+    max_retries 1
+}
+
+// -----------------------------------------------------------------------------
+// Workflow
+// -----------------------------------------------------------------------------
+
+workflow scientific-research-consensus {
+    steps [
+        claude-initial-research
+        codex-initial-research
+        cursor-initial-research
+        loop {
+            agents [
+                claude-refine-research
+                codex-refine-research
+                cursor-refine-research
+            ]
+            max_iterations 10
+            iter_start     2
+            stability      1
+            judge_timeout  300
+            strict_judge   false
+            until agent    consensus-judge
+        }
+    ]
+    max_parallel 3
+    memory {
+        write_ns "scientific-research-consensus"
+    }
+}
