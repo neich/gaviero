@@ -534,10 +534,15 @@ fn parse_rpc_event(line: &str) -> (Vec<UnifiedStreamEvent>, bool) {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                let args = match item.get("command") {
+                    Some(cmd) => serde_json::json!({ "command": cmd }),
+                    None => serde_json::Value::Null,
+                };
                 (
                     vec![UnifiedStreamEvent::ToolCallStart {
                         id,
                         name: "Bash".to_string(),
+                        args,
                     }],
                     false,
                 )
@@ -759,7 +764,8 @@ mod tests {
             events,
             vec![UnifiedStreamEvent::ToolCallStart {
                 id: "cmd1".into(),
-                name: "Bash".into()
+                name: "Bash".into(),
+                args: serde_json::json!({ "command": "ls" }),
             }]
         );
         assert!(!done);
