@@ -49,6 +49,7 @@ The `Cli` struct is the **authoritative flag list** — read it before adding fl
 - `--max-retries N` / `--attempts N` / `--no-iterate` / `--test-first` — iteration controls.
 - `--namespace <name>` / `--read-ns <name>` (repeatable) — memory scope control.
 - `--var KEY=VALUE` (repeatable, `--script` only) — override script-level `vars {}`.
+- `--param NAME=VALUE` (repeatable, `--script` only) — supply a workflow-level `param <name>` declaration. For roster params, the value is `id=provider:model[@effort],...`. Required params (no in-script default) fail compilation when absent. See [`gaviero-dsl::reviewers`](../gaviero-dsl/src/reviewers.rs).
 - `--tiers-file <path>` (`--script` only) — tier profile with only `tier <alias> <client-ref>` lines; overrides bindings from the script and any `include`d files. See [`gaviero-dsl::tiers`](../gaviero-dsl/src/tiers.rs).
 - `--prompt-file <path>` (`--script` only) — file contents replace every `{{PROMPT}}` and become the default prompt for agents with no `prompt` field.
 - `--trace <path>` — structured JSON trace; enables DEBUG-level tracing.
