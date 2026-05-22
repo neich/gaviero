@@ -70,6 +70,7 @@ pub struct CursorSession {
     /// fallback `codex_app_server` uses.
     additional_roots: Vec<PathBuf>,
     agent_id: String,
+    conv_id: Option<String>,
     profile: ProviderProfile,
     /// Resume handle, seeded at construction from
     /// [`crate::acp::session::AgentOptions::resume_session_id`]. On each
@@ -112,6 +113,7 @@ impl CursorSession {
             workspace_root: args.workspace_root,
             additional_roots: args.additional_roots,
             agent_id: args.agent_id,
+            conv_id: args.conv_id,
             profile: args.profile,
             handle,
             cancel_token: args.cancel_token,
@@ -457,6 +459,7 @@ impl CursorSession {
                             self.observer.as_ref(),
                             &self.workspace_root,
                             &self.agent_id,
+                            self.conv_id.as_deref(),
                             rel_path,
                             new_content,
                         )
@@ -468,6 +471,7 @@ impl CursorSession {
                             self.observer.as_ref(),
                             &self.workspace_root,
                             &self.agent_id,
+                            self.conv_id.as_deref(),
                             rel_path,
                             orig,
                         )
