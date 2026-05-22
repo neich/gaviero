@@ -878,8 +878,17 @@
               "value": "reviewers"
             },
             {
-              "type": "SYMBOL",
-              "name": "reviewer_list"
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "SYMBOL",
+                  "name": "reviewer_list"
+                },
+                {
+                  "type": "SYMBOL",
+                  "name": "identifier"
+                }
+              ]
             }
           ]
         },
@@ -1067,11 +1076,24 @@
           "members": [
             {
               "type": "STRING",
-              "value": "client"
+              "value": "model"
             },
             {
               "type": "SYMBOL",
-              "name": "identifier"
+              "name": "_string_value"
+            }
+          ]
+        },
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "effort"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "_effort_value"
             }
           ]
         }
@@ -1312,6 +1334,35 @@
         {
           "type": "SYMBOL",
           "name": "verify_block"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "param_declaration"
+        }
+      ]
+    },
+    "param_declaration": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "param"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "identifier"
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SYMBOL",
+              "name": "reviewer_list"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
         }
       ]
     },
