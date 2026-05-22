@@ -87,12 +87,48 @@ pub(super) fn ensure_editor_cursor_visible(app: &mut App) {
     }
 }
 
+pub(super) fn scroll_preview_lines(app: &mut App, delta: i32) {
+    let step = delta.unsigned_abs() as usize;
+    if delta < 0 {
+        app.preview_scroll = app.preview_scroll.saturating_sub(step);
+    } else {
+        let max = app
+            .preview_line_count
+            .saturating_sub(app.preview_viewport_lines);
+        app.preview_scroll = (app.preview_scroll + step).min(max);
+    }
+}
+
 pub(super) fn handle_editor_action(app: &mut App, action: Action) {
     let read_only = app
         .buffers
         .get(app.active_buffer)
         .map(|b| b.read_only)
         .unwrap_or(false);
+
+    if app.preview_mode == MarkdownPreviewMode::PreviewOnly
+        && is_current_buffer_markdown(app)
+    {
+        match action {
+            Action::PageUp => {
+                scroll_preview_lines(app, -(app.preview_viewport_lines as i32));
+                return;
+            }
+            Action::PageDown => {
+                scroll_preview_lines(app, app.preview_viewport_lines as i32);
+                return;
+            }
+            Action::CursorUp => {
+                scroll_preview_lines(app, -1);
+                return;
+            }
+            Action::CursorDown => {
+                scroll_preview_lines(app, 1);
+                return;
+            }
+            _ => {}
+        }
+    }
 
     match action {
         Action::Copy => {
@@ -436,6 +472,18 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     return;
                 }
             }
+            if let Some(preview) = app.layout.preview_area {
+                if preview.contains((col, row).into()) {
+                    app.focus = Focus::Editor;
+                    let scrollbar_x = preview.x + preview.width.saturating_sub(1);
+                    if col == scrollbar_x {
+                        app.scrollbar_dragging = Some(ScrollbarTarget::MarkdownPreview);
+                        app.scroll_panel_to_row(ScrollbarTarget::MarkdownPreview, row);
+                        return;
+                    }
+                    return;
+                }
+            }
             if app.layout.editor_area.contains((col, row).into()) {
                 app.focus = Focus::Editor;
 
@@ -612,6 +660,11 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     }
                 }
             }
+            if let Some(preview) = app.layout.preview_area {
+                if preview.contains((col, row).into()) {
+                    scroll_preview_lines(app, -3);
+                }
+            }
             if app.layout.editor_area.contains((col, row).into()) {
                 if let Some(ref mut br) = app.batch_review {
                     br.diff_scroll = br.diff_scroll.saturating_sub(3);
@@ -686,6 +739,11 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                             }
                         }
                     }
+                }
+            }
+            if let Some(preview) = app.layout.preview_area {
+                if preview.contains((col, row).into()) {
+                    scroll_preview_lines(app, 3);
                 }
             }
             if app.layout.editor_area.contains((col, row).into()) {
@@ -979,6 +1037,27 @@ pub(super) fn scroll_panel_to_row(app: &mut App, target: ScrollbarTarget, row: u
                 .round()
                 .min(max_scroll as f64) as usize;
         }
+        ScrollbarTarget::MarkdownPreview => {
+            let Some(area) = app.layout.preview_area else {
+                return;
+            };
+            let track_height = area.height as usize;
+            if track_height == 0 {
+                return;
+            }
+            let total = app.preview_line_count;
+            if total <= app.preview_viewport_lines {
+                return;
+            }
+            let max_scroll = total.saturating_sub(app.preview_viewport_lines);
+            let row_in_track = row
+                .saturating_sub(area.y)
+                .min(area.height.saturating_sub(1)) as usize;
+            let fraction = row_in_track as f64 / track_height.saturating_sub(1).max(1) as f64;
+            app.preview_scroll = (fraction * max_scroll as f64)
+                .round()
+                .min(max_scroll as f64) as usize;
+        }
         ScrollbarTarget::Chat => {
             let Some(area) = app.chat_state.conv_area_cache else {
                 return;
@@ -1242,8 +1321,14 @@ pub(super) fn handle_file_changed(app: &mut App, path: &Path) {
         return;
     }
 
-    let proposal =
-        WriteGatePipeline::build_proposal(0, "external", path, &old_content, &new_content);
+    let proposal = WriteGatePipeline::build_proposal(
+        0,
+        "external",
+        None,
+        path,
+        &old_content,
+        &new_content,
+    );
 
     let _ = app.buffers[buf_idx].reload();
 
@@ -1304,10 +1389,18 @@ pub(super) fn open_diff_view(
     }
 }
 
+pub(super) fn sync_preview_mode_for_active_buffer(app: &mut App) {
+    if !is_current_buffer_markdown(app) && app.preview_mode != MarkdownPreviewMode::Off {
+        app.preview_mode = MarkdownPreviewMode::Off;
+        app.preview_scroll = 0;
+    }
+}
+
 pub(super) fn open_file(app: &mut App, path: &Path) {
     for (i, buf) in app.buffers.iter().enumerate() {
         if buf.path.as_deref() == Some(path) {
             app.active_buffer = i;
+            sync_preview_mode_for_active_buffer(app);
             app.needs_full_redraw = true;
             return;
         }
@@ -1355,6 +1448,7 @@ pub(super) fn open_file(app: &mut App, path: &Path) {
             }
             app.buffers.push(buf);
             app.active_buffer = app.buffers.len() - 1;
+            sync_preview_mode_for_active_buffer(app);
             app.needs_full_redraw = true;
         }
         Err(e) => {
@@ -1369,6 +1463,7 @@ pub(super) fn cycle_tab(app: &mut App, delta: i32) {
     }
     let len = app.buffers.len() as i32;
     app.active_buffer = ((app.active_buffer as i32 + delta).rem_euclid(len)) as usize;
+    sync_preview_mode_for_active_buffer(app);
     app.needs_full_redraw = true;
 }
 
