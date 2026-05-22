@@ -566,6 +566,25 @@ fn truncate_source(source: &str, max: usize) -> String {
     }
 }
 
+/// Width (in chars) of the agent-source label column in the batch review
+/// file list. Sizes to fit the longest source name, capped by the panel
+/// width minus a reservation for the status, symbol, filename and stats
+/// columns. Bounded below by 3 so a very narrow panel still shows a couple
+/// chars of identification, and so Alt+5..9 layout swaps grow the column
+/// instead of leaving it stuck at a hardcoded 10 chars.
+fn badge_label_width(inner_width: u16, longest_source: usize, multi_root: bool) -> usize {
+    const STATUS_W: usize = 3; // " X "
+    const SYMBOL_W: usize = 2; // "⊘ ", "⚠ ", or two-space pad
+    const TRAIL_W: usize = 1; // trailing space after the label
+    const FILENAME_MIN: usize = 10;
+    const STATS_W: usize = 10; // " +N -M" budget
+    const RESERVED: usize = STATUS_W + SYMBOL_W + TRAIL_W + FILENAME_MIN + STATS_W;
+
+    let multi_root_w = if multi_root { 2 } else { 0 };
+    let avail = (inner_width as usize).saturating_sub(multi_root_w + RESERVED);
+    longest_source.min(avail).max(3)
+}
+
 /// Collect the unique provider sources present in `proposals`, in
 /// first-seen order. Used to drive the per-source filter cycle.
 fn unique_filter_sources(proposals: &[ReviewProposal]) -> Vec<String> {
@@ -1004,6 +1023,14 @@ pub(super) fn render_review_file_list(app: &mut App, frame: &mut Frame, area: Re
     };
     let filter_source = br.filter_source.clone();
 
+    let longest_source = br
+        .proposals
+        .iter()
+        .map(|p| p.source.chars().count())
+        .max()
+        .unwrap_or(0);
+    let label_w = badge_label_width(inner.width, longest_source, multi_root);
+
     let visible = inner.height as usize;
 
     // Scroll is in render-row space (header rows count toward scrolling).
@@ -1088,7 +1115,7 @@ pub(super) fn render_review_file_list(app: &mut App, frame: &mut Frame, area: Re
                     status_color
                 };
 
-                let badge_label = truncate_source(&proposal.source, 10);
+                let badge_label = truncate_source(&proposal.source, label_w);
                 let badge_color = if proposal.superseded {
                     theme::TEXT_DIM
                 } else if in_conflict {
@@ -1099,11 +1126,11 @@ pub(super) fn render_review_file_list(app: &mut App, frame: &mut Frame, area: Re
                     theme::FOCUS_BORDER
                 };
                 let badge_text = if proposal.superseded {
-                    format!("⊘ {} ", badge_label)
+                    format!("⊘ {:<width$} ", badge_label, width = label_w)
                 } else if in_conflict {
-                    format!("⚠ {} ", badge_label)
+                    format!("⚠ {:<width$} ", badge_label, width = label_w)
                 } else {
-                    format!("{} ", badge_label)
+                    format!("  {:<width$} ", badge_label, width = label_w)
                 };
 
                 let prefix = if multi_root { "  " } else { "" };
@@ -1740,6 +1767,34 @@ mod tests {
     fn truncate_source_keeps_short_and_truncates_long() {
         assert_eq!(super::truncate_source("claude", 10), "claude");
         assert_eq!(super::truncate_source("very-long-name", 6), "very-…");
+    }
+
+    #[test]
+    fn badge_label_width_grows_with_panel_width() {
+        // Wide panel fits the full 20-char source name.
+        assert_eq!(super::badge_label_width(80, 20, false), 20);
+        // Same source on a narrower panel gets squeezed.
+        let narrow = super::badge_label_width(40, 20, false);
+        assert!(narrow < 20, "narrow={}, expected < 20", narrow);
+        // Multi-root reserves 2 extra chars for the folder-group indent.
+        let single = super::badge_label_width(40, 20, false);
+        let multi = super::badge_label_width(40, 20, true);
+        assert!(multi <= single, "multi={}, single={}", multi, single);
+    }
+
+    #[test]
+    fn badge_label_width_floors_at_three_on_tight_panels() {
+        // Even a near-zero panel keeps at least 3 chars so the user sees
+        // something identifying.
+        assert_eq!(super::badge_label_width(0, 20, false), 3);
+        assert_eq!(super::badge_label_width(10, 20, false), 3);
+    }
+
+    #[test]
+    fn badge_label_width_caps_at_longest_source() {
+        // A short longest_source must not balloon the column even on huge
+        // panels — wasted padding hurts readability.
+        assert_eq!(super::badge_label_width(200, 5, false), 5);
     }
 
     #[test]
