@@ -17,6 +17,7 @@ cargo clippy -p gaviero-dsl
 | [`parser.rs`](src/parser.rs) | Chumsky combinators → AST. |
 | [`ast.rs`](src/ast.rs) | AST types: `Script`, `Item`, `AgentDecl`, `WorkflowDecl`, `PromptDecl`, `TierAlias`, blocks. **Authoritative** for the DSL surface — read here before extending docs. |
 | [`compiler.rs`](src/compiler.rs) | Semantic analysis → `CompiledPlan` (scope-overlap checks, dependency cycles, tier resolution, var substitution). |
+| [`workflow_params.rs`](src/workflow_params.rs) | Workflow `param` materialization: client params (`__param_*` clients) + roster expansion. |
 | [`resolver.rs`](src/resolver.rs) | `include "..."` resolution: relative paths, cycle detection, idempotent dedup. Drives the `compile_file` entry point. |
 | [`tiers.rs`](src/tiers.rs) | `--tiers-file` loader: parses a `.gaviero` that contains only `tier <alias> <client-ref>` lines and returns `Vec<(alias, client)>`. |
 | [`error.rs`](src/error.rs) | `DslError` / `DslErrors` (miette diagnostics with source spans). |
@@ -35,12 +36,15 @@ load_tier_overrides(path) -> Result<Vec<(String, String)>>
 - `compile_with_vars` backs `gaviero-cli --var KEY=VALUE`. **Var precedence:** agent-level `vars {}` > CLI `--var` overrides > script-level `vars {}`.
 - `compile_file` is the file-path entry point — it runs the include resolver first, then lex/parse/compile. Use it whenever inputs come from disk. `compile` / `compile_with_vars` reject `include` statements with a diagnostic pointing here.
 - `load_tier_overrides` + `override_tiers` backs `gaviero-cli --tiers-file <profile.gaviero>`. **Tier precedence:** CLI `--tiers-file` > script/includes `tier` lines.
-- `override_params` backs `gaviero-cli --param NAME=VALUE`. Today the only supported param shape is a reviewer roster (`id=provider:model[@effort],...`). Required workflow params (`param <name>` with no default) fail compilation if not supplied here.
+- `override_params` backs `gaviero-cli --param NAME=VALUE`. **Roster** params: `id=provider:model[@effort],...`. **Client** params: `provider:model[@effort]`. Required params (no in-script default) fail compilation if not supplied here.
 
 ## DSL Surface (high-level)
 
 - Top-level items: `client`, `agent`, `workflow`, `prompt`, `vars`, `tier <alias> <client-ref>`, `include "path.gaviero"`.
-- Workflow-level: `param <name> [<reviewer-list-default>]` — external parameter referenced from a loop's `reviewers <name>` slot. Defaults are optional; missing required params fail compilation. Each reviewer entry inside the default list / CLI override is `id "..." model "provider:model" effort <value>?` (DSL) or `id=provider:model[@effort]` (CLI).
+- Workflow-level params:
+  - `param <name> [ { id "..." model "provider:model" effort ... } ]` — roster; referenced by `reviewers <name>`.
+  - `param <name> { model "provider:model" effort ... privacy ... extra { } }` — client; referenced by `client <name>` on an agent.
+  - Bare `param <name>` infers roster vs client from usage. CLI roster override: `id=provider:model[@effort],...`; client override: `provider:model[@effort]`.
 - `prompt <name> #" ... "#` — reusable named prompts; substitutes `{{AGENT}}`, `{{PROMPT}}`, and in-scope `vars`.
 - `vars {}` — compile-time substitution across prompts, descriptions, memory content, scope paths. Single-pass: `{{FOO}}` expands once; nested refs in values do not.
 - `tier <alias> <client-ref>` — re-pointable routing label so agents say `tier expensive` instead of binding to a specific client.
