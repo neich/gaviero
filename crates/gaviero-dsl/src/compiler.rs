@@ -10,7 +10,7 @@ use gaviero_core::types::{FileScope, ModelTier, PrivacyLevel};
 
 use crate::ast::*;
 use crate::error::{DslError, DslErrors};
-use crate::reviewers::expand_reviewers_in_script;
+use crate::workflow_params::expand_workflow_params_in_script;
 
 // ── Public types ───────────────────────────────────────────────────────────
 
@@ -86,7 +86,7 @@ pub fn compile_ast_with_sources(
     override_params: &[(String, String)],
 ) -> Result<CompiledPlan, DslErrors> {
     let mut script = script.clone();
-    expand_reviewers_in_script(&mut script, workflow, override_params)?;
+    expand_workflow_params_in_script(&mut script, workflow, override_params)?;
 
     if sources.is_empty() {
         return Err(DslErrors::single(DslError::Compile {
