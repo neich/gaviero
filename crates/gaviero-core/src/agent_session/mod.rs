@@ -244,6 +244,7 @@ impl LegacyAgentSession {
         workspace_root: PathBuf,
         additional_roots: Vec<PathBuf>,
         agent_id: String,
+        conv_id: Option<String>,
         options: AgentOptions,
         profile: ProviderProfile,
     ) -> Self {
@@ -260,6 +261,7 @@ impl LegacyAgentSession {
             workspace_root,
             additional_roots,
             agent_id,
+            conv_id,
             options,
         );
         Self {
