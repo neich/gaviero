@@ -19,6 +19,7 @@ use std::pin::Pin;
 use anyhow::Result;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 // ── Trait ────────────────────────────────────────────────────────────────────
 
@@ -53,8 +54,15 @@ pub enum UnifiedStreamEvent {
     TextDelta(String),
     /// Incremental thinking/reasoning text.
     ThinkingDelta(String),
-    /// Agent started a tool call.
-    ToolCallStart { id: String, name: String },
+    /// Agent started a tool call. `args` carries the parsed arguments when the
+    /// backend can supply them at start time (Cursor, Codex `commandExecution`);
+    /// Claude populates them once `AssistantMessage::tool_uses` lands. Stays
+    /// `Value::Null` when args were not available.
+    ToolCallStart {
+        id: String,
+        name: String,
+        args: Value,
+    },
     /// Incremental JSON arguments for a tool call.
     ToolCallDelta { id: String, args_chunk: String },
     /// Tool call arguments are complete.
