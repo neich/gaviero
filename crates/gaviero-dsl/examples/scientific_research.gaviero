@@ -65,16 +65,34 @@
 //   honestly once substantive disagreements close. `stability 2`
 //   guards against a flaky single PASS verdict.
 //
+// Consensus policy (strict only):
+//
+//   `consensus_mode strict` — the loop exits only on judge PASS (two
+//   consecutive passes via `stability 2`). There is no partial_ok exit.
+//   A single run already retries refinement up to `max_iterations 10`;
+//   you do not need to invoke the workflow twice in one session for that.
+//
+//   If the run ends without consensus, read each reviewer's latest
+//   `*-summary-v*.md` — when status is `Consensus not reached.` the
+//   summary must explain why (see refine prompt). Then either accept
+//   the best-effort conclusions for human merge, or start a **new** CLI
+//   run with a fresh `--var OUT_DIR=...` (or archive the old tree),
+//   an updated {{PROBLEM_FILE}}, a smaller roster, or higher
+//   `max_iterations` if you edit the script. Reusing the same OUT_DIR
+//   without archiving mixes independent-init baselines with stale peers.
+//
 // Usage:
 //
 //   Default 3-provider panel:
 //     gaviero-cli --script crates/gaviero-dsl/examples/scientific_research.gaviero \
+//       --workflow scientific-research-consensus \
 //       --prompt "Short topic title for logs" \
 //       --var PROBLEM_FILE=research_problem.md \
 //       --var OUT_DIR=research
 //
 //   Custom 2-provider panel:
 //     gaviero-cli --script crates/gaviero-dsl/examples/scientific_research.gaviero \
+//       --workflow scientific-research-consensus \
 //       --prompt "Short topic title for logs" \
 //       --var PROBLEM_FILE=research_problem.md \
 //       --param roster=claude=claude:opus@max,codex=codex:gpt-5.5@high
@@ -359,8 +377,18 @@ prompt refine-body #"
            second sentence stating which previous version you copied
            verbatim (e.g. "Copied conclusion-v{{PREV_ITER}} into
            v{{ITER}} unchanged."). Otherwise write `Consensus not
-           reached.` and one sentence describing the dominant
-           remaining disagreement.
+           reached.` and one sentence naming the dominant blocking
+           disagreement (avenue, risk, evidence bar, or stopping rule).
+         - `## Why consensus was not reached` — REQUIRED when the first
+           sentence is `Consensus not reached.`; omit this section only
+           when the first sentence is `Consensus reached.`. Explain in
+           plain language: (a) which convergence criterion from step 6
+           failed (framing, top avenues, risks, evidence required, or
+           stopping criteria); (b) which peer positions conflict and
+           why the literature does not yet adjudicate them; (c) what
+           evidence or problem clarification would unblock consensus.
+           This section is the human handoff when the workflow stops
+           without a judge PASS — be specific, not generic.
          - `## Merits of each proposal` — one short subsection per
            peer id in {{PEER_IDS}}. For each: what you adopted from
            them, what you rejected, what specific evidence drove the
@@ -424,21 +452,24 @@ prompt judge-body #"
        status, comparison findings, changes, and remaining open
        questions for this pass.
 
-    2. From the summaries alone, classify the iteration:
+    2. From the summaries alone, classify the iteration (strict
+       consensus — only `pass` or `fail`, never partial):
 
-       - **Convergence shortcut — PASS**: EVERY summary's first
-         sentence is exactly `Consensus reached.`. A single dissenting
-         summary blocks PASS. If every reviewer declared consensus,
-         stop here and return PASS.
+       - **PASS**: EVERY summary's first sentence is exactly
+         `Consensus reached.`. A single `Consensus not reached.`
+         blocks PASS. When all declare reached, return PASS even if
+         `## Changes made in this iteration` notes a verbatim copy or
+         minor editorial tweaks — those do not negate consensus.
 
-       - **Material divergence shortcut — FAIL**: any summary
-         describes a material change to the problem framing, the top
-         avenues for advance, the dominant risks, the evidence
-         required to validate or falsify those avenues, or the
-         decision points / stopping criteria. Stop here and return
-         FAIL.
+       - **FAIL**: ANY summary's first sentence is exactly
+         `Consensus not reached.`. Read that reviewer's
+         `## Why consensus was not reached` (and
+         `## Substantive disagreements`) for the reason; you do not
+         need Pass 2 unless summaries are contradictory or evasive.
 
-       - **Borderline**: continue to Pass 2.
+       - **Borderline**: first sentences disagree with body content,
+         or some summaries lack `## Why consensus was not reached`
+         when required — continue to Pass 2.
 
     Pass 2 (deep, only on borderline):
 
@@ -582,10 +613,17 @@ agent convergence-judge {
 // a bounded digest of the refine agents' most recent summaries and
 // modified files so the judge can focus on what actually changed.
 //
-// Post-convergence the workflow leaves one conclusion + summary +
-// evidence triple per reviewer on disk for the iteration that
-// converged. None is designated canonical here — the human operator
-// picks one (or merges across reviewers) to hand off.
+// Post-run artefacts:
+//
+//   On consensus: one conclusion + summary + evidence triple per
+//   reviewer for the iteration that converged. None is canonical —
+//   the operator picks one or merges.
+//
+//   Without consensus: the loop stops after `max_iterations` or a
+//   failed final judge check. Use the highest `*-summary-v{{ITER}}.md`
+//   per reviewer; `Consensus not reached.` entries must document why
+//   in `## Why consensus was not reached`. A new CLI run is optional
+//   (see header); this script does not auto-restart.
 //
 // max_parallel 5 supports rosters up to five reviewers running in
 // parallel; the default 3-reviewer panel uses three of those slots.
@@ -611,6 +649,7 @@ workflow scientific-research-consensus {
             stability       2
             judge_timeout   240
             strict_judge    false
+            consensus_mode  strict
             until agent     convergence-judge
         }
     ]
