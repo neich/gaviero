@@ -31,6 +31,7 @@
 "max_parallel" @keyword
 "param" @keyword
 "template" @keyword
+"id" @keyword
 
 ; ── Memory block keywords ─────────────────────────────────────
 "memory" @keyword
