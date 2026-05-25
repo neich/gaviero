@@ -393,6 +393,7 @@ pub(super) fn enter_batch_review(app: &mut App, proposals: Vec<WriteProposal>) {
         // Diff cache index referred to the pre-sort ordering, drop it.
         state.cached_diff = Vec::new();
         state.cached_diff_index = usize::MAX;
+        state.cached_highlights = None;
         return;
     }
 
@@ -400,21 +401,14 @@ pub(super) fn enter_batch_review(app: &mut App, proposals: Vec<WriteProposal>) {
     link_conflicts_by_path(&mut review_proposals);
     sort_review_proposals(&mut review_proposals, &app.workspace);
 
-    let initial_diff = if let Some(p) = review_proposals.first() {
-        let old_lines: Vec<&str> = p.old_content.as_deref().unwrap_or("").lines().collect();
-        let new_lines: Vec<&str> = p.new_content.lines().collect();
-        build_simple_diff(&old_lines, &new_lines)
-    } else {
-        Vec::new()
-    };
-
     app.batch_review = Some(BatchReviewState {
         proposals: review_proposals,
         selected_index: 0,
         scroll_offset: 0,
         diff_scroll: 0,
-        cached_diff: initial_diff,
-        cached_diff_index: 0,
+        cached_diff: Vec::new(),
+        cached_diff_index: usize::MAX,
+        cached_highlights: None,
         filter_source: None,
     });
     app.left_panel = LeftPanelMode::Review;
@@ -551,6 +545,7 @@ pub(super) fn apply_batch_proposal_sync(
     if touched_selected {
         br.cached_diff = Vec::new();
         br.cached_diff_index = usize::MAX;
+        br.cached_highlights = None;
     }
 }
 
@@ -774,6 +769,7 @@ pub(super) fn handle_batch_review_action(app: &mut App, action: &Action) -> bool
                     br.diff_scroll = 0;
                     br.cached_diff = Vec::new();
                     br.cached_diff_index = usize::MAX;
+                    br.cached_highlights = None;
                     let empty = br.proposals.is_empty();
                     (removed_id, empty)
                 };
@@ -805,6 +801,7 @@ pub(super) fn handle_batch_review_action(app: &mut App, action: &Action) -> bool
                     br.diff_scroll = 0;
                     br.cached_diff = Vec::new();
                     br.cached_diff_index = usize::MAX;
+                    br.cached_highlights = None;
                 }
                 let empty = br.proposals.is_empty();
                 (removed_id, empty)
@@ -1174,9 +1171,152 @@ pub(super) fn render_review_file_list(app: &mut App, frame: &mut Frame, area: Re
     );
 }
 
+/// Build a tree-sitter highlight cache for a diff view. Concatenates every
+/// diff line into a single synthetic source string, parses it with the
+/// language's tree-sitter grammar, and runs the editor's highlight query
+/// with `with_errors=false` (the diff text contains both old and new lines
+/// interleaved, so the tree will have ERROR nodes we don't want to render
+/// as parse-error underlines).
+fn compute_diff_highlights(
+    diff_lines: &[(DiffKind, String)],
+    language: &gaviero_core::Language,
+    config: &crate::editor::highlight::HighlightConfig,
+    theme: &Theme,
+) -> Option<DiffHighlightCache> {
+    let mut source = String::new();
+    let mut line_start_bytes = Vec::with_capacity(diff_lines.len());
+    for (_, text) in diff_lines {
+        line_start_bytes.push(source.len());
+        source.push_str(text);
+        source.push('\n');
+    }
+
+    let mut parser = gaviero_core::Parser::new();
+    parser.set_language(language).ok()?;
+    let tree = parser.parse(&source, None)?;
+    let rope = ropey::Rope::from_str(&source);
+    let spans = crate::editor::highlight::run_highlights(
+        &tree,
+        &rope,
+        config,
+        theme,
+        0..source.len(),
+        false,
+    );
+
+    Some(DiffHighlightCache {
+        line_start_bytes,
+        spans,
+    })
+}
+
+/// Apply syntax-highlight spans on top of a per-line diff style. Keeps the
+/// diff line's background, overrides foreground and bold/underline modifiers
+/// from whichever spans contain `byte_offset` (last span wins, matching the
+/// editor view's last-wins rendering).
+fn apply_span_style(
+    base: Style,
+    spans: &[crate::editor::highlight::StyledSpan],
+    byte_offset: usize,
+) -> Style {
+    use ratatui::style::Modifier;
+    let mut style = base;
+    for span in spans {
+        if span.start_byte > byte_offset {
+            break;
+        }
+        if span.start_byte <= byte_offset && byte_offset < span.end_byte {
+            if let Some(fg) = span.style.fg {
+                style = style.fg(fg);
+            }
+            if span.style.add_modifier.contains(Modifier::BOLD) {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            if span.style.add_modifier.contains(Modifier::UNDERLINED) {
+                style = style.add_modifier(Modifier::UNDERLINED);
+            }
+        }
+    }
+    style
+}
+
+/// Look up the language name + `Language` for a file path's extension.
+fn language_for_path(
+    path: &std::path::Path,
+) -> (Option<String>, Option<gaviero_core::Language>) {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    (
+        gaviero_core::tree_sitter::language_name_for_extension(ext).map(str::to_string),
+        gaviero_core::tree_sitter::language_for_extension(ext),
+    )
+}
+
+/// Owned inputs needed to rebuild a diff cache + highlights for either the
+/// batch-review or git-changes panel. Computed under an immutable borrow of
+/// `App` so the subsequent mutable write-back doesn't conflict with reads of
+/// `App.theme` and `App.highlight_configs`.
+type DiffRecomputeInputs = (
+    String,
+    String,
+    usize,
+    Option<String>,
+    Option<gaviero_core::Language>,
+);
+
 pub(super) fn render_batch_review_diff(app: &mut App, frame: &mut Frame, area: Rect) {
     use ratatui::style::Modifier;
 
+    // ── Phase 1: gather inputs for a possible recompute (immut borrow of app). ──
+    let recompute_inputs: Option<DiffRecomputeInputs> = {
+        let br = match app.batch_review.as_ref() {
+            Some(r) => r,
+            None => return,
+        };
+        let proposal = match br.proposals.get(br.selected_index) {
+            Some(p) => p,
+            None => return,
+        };
+        if br.cached_diff_index != br.selected_index {
+            let (lang_name, language) = language_for_path(&proposal.path);
+            Some((
+                proposal.old_content.clone().unwrap_or_default(),
+                proposal.new_content.clone(),
+                br.selected_index,
+                lang_name,
+                language,
+            ))
+        } else {
+            None
+        }
+    };
+
+    // ── Phase 2: lazily load HighlightConfig (mut borrow of app.highlight_configs). ──
+    if let Some((_, _, _, Some(name), Some(lang))) = &recompute_inputs
+        && !app.highlight_configs.contains_key(name)
+        && let Ok(cfg) = load_highlight_config(lang.clone(), name)
+    {
+        app.highlight_configs.insert(name.clone(), cfg);
+    }
+
+    // ── Phase 3: compute diff + highlights, write back into batch_review. ──
+    if let Some((old, new, idx, lang_name, language)) = recompute_inputs {
+        let old_lines: Vec<&str> = old.lines().collect();
+        let new_lines: Vec<&str> = new.lines().collect();
+        let cached_diff = build_simple_diff(&old_lines, &new_lines);
+        let highlights = match (
+            lang_name.as_deref().and_then(|n| app.highlight_configs.get(n)),
+            language.as_ref(),
+        ) {
+            (Some(cfg), Some(lang)) => compute_diff_highlights(&cached_diff, lang, cfg, &app.theme),
+            _ => None,
+        };
+        let br = app.batch_review.as_mut().unwrap();
+        br.cached_diff = cached_diff;
+        br.cached_diff_index = idx;
+        br.cached_highlights = highlights;
+    }
+
+    // ── Phase 4: render. ──
     let br = match &mut app.batch_review {
         Some(r) => r,
         None => return,
@@ -1187,19 +1327,8 @@ pub(super) fn render_batch_review_diff(app: &mut App, frame: &mut Frame, area: R
         None => return,
     };
 
-    if br.cached_diff_index != br.selected_index {
-        let old_lines: Vec<&str> = proposal
-            .old_content
-            .as_deref()
-            .unwrap_or("")
-            .lines()
-            .collect();
-        let new_lines: Vec<&str> = proposal.new_content.lines().collect();
-        br.cached_diff = build_simple_diff(&old_lines, &new_lines);
-        br.cached_diff_index = br.selected_index;
-    }
-
     let diff_lines = &br.cached_diff;
+    let highlights = br.cached_highlights.as_ref();
     let gutter_w = theme::DIFF_GUTTER_WIDTH;
     let max_scroll = diff_lines.len().saturating_sub(1);
     if br.diff_scroll > max_scroll {
@@ -1277,13 +1406,19 @@ pub(super) fn render_batch_review_diff(app: &mut App, frame: &mut Frame, area: R
             }
         }
 
-        for (i, ch) in text.chars().enumerate() {
-            let x = area.x + gutter_w + i as u16;
-            if x < area.right() {
-                frame.buffer_mut()[(x, y)]
-                    .set_char(ch)
-                    .set_style(line_style);
+        let line_start = highlights.map(|h| h.line_start_bytes[line_idx]);
+        for (col, (byte_in_line, ch)) in text.char_indices().enumerate() {
+            let x = area.x + gutter_w + col as u16;
+            if x >= area.right() {
+                break;
             }
+            let style = match (highlights, line_start) {
+                (Some(h), Some(start)) => {
+                    apply_span_style(line_style, &h.spans, start + byte_in_line)
+                }
+                _ => line_style,
+            };
+            frame.buffer_mut()[(x, y)].set_char(ch).set_style(style);
         }
     }
 
@@ -1378,6 +1513,7 @@ pub(super) fn refresh_git_changes(app: &mut App) {
         diff_scroll: 0,
         cached_diff: Vec::new(),
         cached_diff_index: usize::MAX,
+        cached_highlights: None,
     });
 }
 
@@ -1559,32 +1695,69 @@ pub(super) fn render_changes_file_list(
 pub(super) fn render_changes_diff(app: &mut App, frame: &mut Frame, area: Rect) {
     use ratatui::style::Modifier;
 
+    // ── Phase 1: gather inputs for a possible recompute. ──
+    let recompute_inputs: Option<DiffRecomputeInputs> = {
+        let cs = match app.changes_state.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        let entry = match cs.entries.get(cs.selected_index) {
+            Some(e) => e,
+            None => return,
+        };
+        if cs.cached_diff_index != cs.selected_index {
+            let root = app.workspace.roots().first().map(|r| r.to_path_buf());
+            let old_content = root
+                .as_ref()
+                .and_then(|r| gaviero_core::git::GitRepo::open(r).ok())
+                .and_then(|repo| repo.head_file_content(&entry.rel_path).ok())
+                .unwrap_or_default();
+            let new_content = std::fs::read_to_string(&entry.abs_path).unwrap_or_default();
+            let (lang_name, language) = language_for_path(&entry.abs_path);
+            Some((old_content, new_content, cs.selected_index, lang_name, language))
+        } else {
+            None
+        }
+    };
+
+    // ── Phase 2: lazily load HighlightConfig. ──
+    if let Some((_, _, _, Some(name), Some(lang))) = &recompute_inputs
+        && !app.highlight_configs.contains_key(name)
+        && let Ok(cfg) = load_highlight_config(lang.clone(), name)
+    {
+        app.highlight_configs.insert(name.clone(), cfg);
+    }
+
+    // ── Phase 3: compute diff + highlights, write back. ──
+    if let Some((old, new, idx, lang_name, language)) = recompute_inputs {
+        let old_lines: Vec<&str> = old.lines().collect();
+        let new_lines: Vec<&str> = new.lines().collect();
+        let cached_diff = build_simple_diff(&old_lines, &new_lines);
+        let highlights = match (
+            lang_name.as_deref().and_then(|n| app.highlight_configs.get(n)),
+            language.as_ref(),
+        ) {
+            (Some(cfg), Some(lang)) => compute_diff_highlights(&cached_diff, lang, cfg, &app.theme),
+            _ => None,
+        };
+        let cs = app.changes_state.as_mut().unwrap();
+        cs.cached_diff = cached_diff;
+        cs.cached_diff_index = idx;
+        cs.cached_highlights = highlights;
+    }
+
+    // ── Phase 4: render. ──
     let cs = match &mut app.changes_state {
         Some(s) => s,
         None => return,
     };
-
     let entry = match cs.entries.get(cs.selected_index) {
         Some(e) => e,
         None => return,
     };
 
-    if cs.cached_diff_index != cs.selected_index {
-        let root = app.workspace.roots().first().map(|r| r.to_path_buf());
-        let old_content = root
-            .as_ref()
-            .and_then(|r| gaviero_core::git::GitRepo::open(r).ok())
-            .and_then(|repo| repo.head_file_content(&entry.rel_path).ok())
-            .unwrap_or_default();
-        let new_content = std::fs::read_to_string(&entry.abs_path).unwrap_or_default();
-
-        let old_lines: Vec<&str> = old_content.lines().collect();
-        let new_lines: Vec<&str> = new_content.lines().collect();
-        cs.cached_diff = build_simple_diff(&old_lines, &new_lines);
-        cs.cached_diff_index = cs.selected_index;
-    }
-
     let diff_lines = &cs.cached_diff;
+    let highlights = cs.cached_highlights.as_ref();
     let gutter_w = theme::DIFF_GUTTER_WIDTH;
     let max_scroll = diff_lines.len().saturating_sub(1);
     if cs.diff_scroll > max_scroll {
@@ -1654,13 +1827,19 @@ pub(super) fn render_changes_diff(app: &mut App, frame: &mut Frame, area: Rect) 
             }
         }
 
-        for (i, ch) in text.chars().enumerate() {
-            let x = area.x + gutter_w + i as u16;
-            if x < area.right() {
-                frame.buffer_mut()[(x, y)]
-                    .set_char(ch)
-                    .set_style(line_style);
+        let line_start = highlights.map(|h| h.line_start_bytes[line_idx]);
+        for (col, (byte_in_line, ch)) in text.char_indices().enumerate() {
+            let x = area.x + gutter_w + col as u16;
+            if x >= area.right() {
+                break;
             }
+            let style = match (highlights, line_start) {
+                (Some(h), Some(start)) => {
+                    apply_span_style(line_style, &h.spans, start + byte_in_line)
+                }
+                _ => line_style,
+            };
+            frame.buffer_mut()[(x, y)].set_char(ch).set_style(style);
         }
     }
 

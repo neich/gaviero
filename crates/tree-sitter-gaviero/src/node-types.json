@@ -357,6 +357,21 @@
     }
   },
   {
+    "type": "param_client_block",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "client_field",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "param_declaration",
     "named": true,
     "fields": {},
@@ -366,6 +381,10 @@
       "types": [
         {
           "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "param_client_block",
           "named": true
         },
         {

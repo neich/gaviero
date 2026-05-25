@@ -43,10 +43,10 @@ mod state;
 
 use self::observers::{TuiAcpObserver, TuiSwarmObserver, TuiWriteGateObserver};
 use self::state::{
-    BatchReviewState, BulkOpState, ChangesEntry, ChangesState, CodexTrustDialog, DiffKind,
-    FirstRunDialog, FirstRunStep, Focus, LayoutAreas, LayoutPreset, LeftPanelMode, MoveState,
-    MarkdownPreviewMode, PanelVisibility, ReviewProposal, ScrollbarTarget, SidePanelMode,
-    TreeDialog, TreeDialogKind,
+    BatchReviewState, BulkOpState, ChangesEntry, ChangesState, CodexTrustDialog, DiffHighlightCache,
+    DiffKind, FirstRunDialog, FirstRunStep, Focus, LayoutAreas, LayoutPreset, LeftPanelMode,
+    MoveState, MarkdownPreviewMode, PanelVisibility, ReviewProposal, ScrollbarTarget,
+    SidePanelMode, TreeDialog, TreeDialogKind,
     build_simple_diff,
 };
 

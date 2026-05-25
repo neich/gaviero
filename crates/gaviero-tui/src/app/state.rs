@@ -3,6 +3,20 @@ use std::path::PathBuf;
 use ratatui::layout::Rect;
 
 pub(super) use crate::editor::diff::{DiffKind, build_simple_diff};
+use crate::editor::highlight::StyledSpan;
+
+/// Tree-sitter highlight spans precomputed for a diff view, indexed by the
+/// byte offset of each diff line in a synthetic concatenated source. Stored
+/// alongside `cached_diff` so it's recomputed only when the selected file
+/// changes, not on every render frame.
+pub(super) struct DiffHighlightCache {
+    /// `line_start_bytes[i]` is the byte offset where diff line `i` starts in
+    /// the synthetic source that tree-sitter parsed.
+    pub line_start_bytes: Vec<usize>,
+    /// Highlight spans sorted by start_byte; the rendering loop applies them
+    /// in order and the last matching span wins (matches `editor::view`).
+    pub spans: Vec<StyledSpan>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Focus {
@@ -114,6 +128,7 @@ pub struct BatchReviewState {
     pub diff_scroll: usize,
     pub(super) cached_diff: Vec<(DiffKind, String)>,
     pub(super) cached_diff_index: usize,
+    pub(super) cached_highlights: Option<DiffHighlightCache>,
     /// Active provider filter (matches `ReviewProposal.source`). `None` means
     /// "show everything". Cycled with `Alt+o` / `Alt+i`.
     pub filter_source: Option<String>,
@@ -135,6 +150,7 @@ pub struct ChangesState {
     pub diff_scroll: usize,
     pub(super) cached_diff: Vec<(DiffKind, String)>,
     pub(super) cached_diff_index: usize,
+    pub(super) cached_highlights: Option<DiffHighlightCache>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

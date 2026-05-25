@@ -217,11 +217,19 @@ module.exports = grammar({
         $.param_declaration,
       ),
 
-    // `param <name> [<reviewer_list>]` — workflow-level parameter. The
-    // default reviewer-list is optional; when omitted, the CLI must
-    // supply `--param <name>=...`.
+    // `param <name>`                                — bare; kind inferred from usage
+    // `param <name> [ <reviewer_entry>* ]`          — roster default
+    // `param <name> { <client_field>* }`            — client default (model / effort / privacy / extra)
+    // When the default is omitted, the CLI must supply `--param <name>=...`.
     param_declaration: ($) =>
-      seq("param", $.identifier, optional($.reviewer_list)),
+      seq(
+        "param",
+        $.identifier,
+        optional(choice($.reviewer_list, $.param_client_block)),
+      ),
+
+    param_client_block: ($) =>
+      seq("{", repeat($.client_field), "}"),
 
     // ── Step list (identifiers + loop blocks) ────────────────────
     step_list: ($) => seq("[", repeat(choice($.loop_block, $.identifier)), "]"),

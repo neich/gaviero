@@ -1356,13 +1356,42 @@
           "type": "CHOICE",
           "members": [
             {
-              "type": "SYMBOL",
-              "name": "reviewer_list"
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "SYMBOL",
+                  "name": "reviewer_list"
+                },
+                {
+                  "type": "SYMBOL",
+                  "name": "param_client_block"
+                }
+              ]
             },
             {
               "type": "BLANK"
             }
           ]
+        }
+      ]
+    },
+    "param_client_block": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "{"
+        },
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "SYMBOL",
+            "name": "client_field"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": "}"
         }
       ]
     },

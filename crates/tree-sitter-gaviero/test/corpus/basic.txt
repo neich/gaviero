@@ -387,3 +387,92 @@ client c { tier cheap }
     (identifier)
     (client_field
       (tier_value))))
+
+=====
+Workflow param — client shape
+=====
+
+workflow w {
+    param judge {
+        model "claude:sonnet"
+        effort medium
+    }
+    steps [a]
+}
+
+-----
+
+(source_file
+  (workflow_declaration
+    (identifier)
+    (workflow_field
+      (param_declaration
+        (identifier)
+        (param_client_block
+          (client_field
+            (string))
+          (client_field
+            (identifier)))))
+    (workflow_field
+      (step_list
+        (identifier)))))
+
+=====
+Workflow param — roster shape
+=====
+
+workflow w {
+    param roster [
+        { id "claude" model "claude:opus" effort max }
+        { id "codex"  model "codex:gpt-5.5" effort high }
+    ]
+    steps [a]
+}
+
+-----
+
+(source_file
+  (workflow_declaration
+    (identifier)
+    (workflow_field
+      (param_declaration
+        (identifier)
+        (reviewer_list
+          (reviewer_entry
+            (reviewer_field
+              (string))
+            (reviewer_field
+              (string))
+            (reviewer_field
+              (identifier)))
+          (reviewer_entry
+            (reviewer_field
+              (string))
+            (reviewer_field
+              (string))
+            (reviewer_field
+              (identifier))))))
+    (workflow_field
+      (step_list
+        (identifier)))))
+
+=====
+Workflow param — bare (CLI-required)
+=====
+
+workflow w {
+    param roster
+    steps [a]
+}
+
+-----
+
+(source_file
+  (workflow_declaration
+    (identifier)
+    (workflow_field
+      (param_declaration
+        (identifier)))
+    (workflow_field
+      (step_list
+        (identifier)))))
