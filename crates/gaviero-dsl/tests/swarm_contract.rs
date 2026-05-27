@@ -39,15 +39,45 @@ fn dsl_compiled_plan_passes_swarm_validate_scopes() {
     let units = plan.work_units_ordered().expect("toposort");
     assert_eq!(units.len(), 2);
 
-    let loop_groups: Vec<Vec<String>> = plan
-        .loop_configs
-        .iter()
-        .map(|lc| lc.agent_ids.clone())
-        .collect();
+    let loop_groups = validation::expand_loop_groups_with_roster_init(
+        plan.loop_configs
+            .iter()
+            .map(|lc| lc.agent_ids.clone())
+            .collect(),
+        &units.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(),
+    );
     let errors = validation::validate_scopes(&units, &loop_groups);
     assert!(
         errors.is_empty(),
         "DSL-accepted plan must also pass swarm scope validation; got: {errors:?}"
+    );
+}
+
+#[test]
+fn scientific_research_roster_passes_swarm_scope_validation() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/scientific_research.gaviero");
+    let plan = gaviero_dsl::compile_file(
+        &path,
+        Some("scientific-research-consensus"),
+        Some("test topic"),
+        &[],
+        &[],
+        &[],
+    )
+    .expect("scientific_research should compile");
+    let units = plan.work_units_ordered().expect("toposort");
+    let loop_groups = validation::expand_loop_groups_with_roster_init(
+        plan.loop_configs
+            .iter()
+            .map(|lc| lc.agent_ids.clone())
+            .collect(),
+        &units.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(),
+    );
+    let errors = validation::validate_scopes(&units, &loop_groups);
+    assert!(
+        errors.is_empty(),
+        "scientific_research init/refine scopes must validate; got: {errors:?}"
     );
 }
 
@@ -182,11 +212,13 @@ fn coordinator_dsl_template_compiles_and_passes_swarm_validation() {
     assert_eq!(plan.max_parallel, Some(2));
 
     // Scope validation matches what `pipeline::execute` runs.
-    let loop_groups: Vec<Vec<String>> = plan
-        .loop_configs
-        .iter()
-        .map(|lc| lc.agent_ids.clone())
-        .collect();
+    let loop_groups = validation::expand_loop_groups_with_roster_init(
+        plan.loop_configs
+            .iter()
+            .map(|lc| lc.agent_ids.clone())
+            .collect(),
+        &units.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(),
+    );
     let scope_errors = validation::validate_scopes(&units, &loop_groups);
     assert!(
         scope_errors.is_empty(),

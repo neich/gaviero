@@ -44,11 +44,26 @@ struct Cli {
     #[arg(long, conflicts_with_all = ["task", "work_units"])]
     script: Option<PathBuf>,
 
+    /// Inline value to substitute for every `{{PROMPT}}` placeholder in the
+    /// DSL script. Also becomes the full prompt for any agent without a
+    /// `prompt` field. Mutually exclusive with `--prompt-file` (use that
+    /// when the text is long enough to warrant its own file).
+    /// Only valid with `--script`.
+    #[arg(long, requires = "script", conflicts_with_all = ["task", "work_units", "prompt_file"])]
+    prompt: Option<String>,
+
     /// Path to a file whose contents replace every `{{PROMPT}}` placeholder in
     /// the DSL script. Also becomes the full prompt for any agent without a
     /// `prompt` field. Only valid with `--script`.
     #[arg(long, requires = "script", conflicts_with_all = ["task", "work_units"])]
     prompt_file: Option<PathBuf>,
+
+    /// Pick a workflow `<name>` declared in the DSL script. Required when
+    /// the script defines more than one workflow; for a single-workflow
+    /// script (or no workflows at all) the compiler auto-selects.
+    /// Only valid with `--script`.
+    #[arg(long, requires = "script", conflicts_with_all = ["task", "work_units"])]
+    workflow: Option<String>,
 
     /// Auto-accept all changes (no interactive review).
     #[arg(long)]
@@ -638,6 +653,16 @@ fn parse_var_overrides(raw: &[String]) -> Result<Vec<(String, String)>> {
         .collect()
 }
 
+fn ensure_parent_dir(path: &std::path::Path) -> Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating parent directory {}", parent.display()))?;
+    }
+    Ok(())
+}
+
 fn parse_param_overrides(raw: &[String]) -> Result<Vec<(String, String)>> {
     raw.iter()
         .map(|s| {
@@ -1097,6 +1122,7 @@ async fn bootstrap_eval_fixture(
     let body = cases_to_jsonl(&cases)?;
     match out {
         Some(p) => {
+            ensure_parent_dir(p)?;
             std::fs::write(p, &body)
                 .with_context(|| format!("writing fixture to {}", p.display()))?;
             eprintln!(
@@ -1149,7 +1175,9 @@ async fn run_eval_smoke_test(repo: &std::path::Path, fixture: &PathBuf, cli: &Cl
         .clone()
         .unwrap_or_else(|| fixture.with_extension("last.json"));
     if let Ok(json) = serde_json::to_string_pretty(&report) {
-        if let Err(e) = std::fs::write(&report_out, json) {
+        if let Err(e) = ensure_parent_dir(&report_out)
+            .and_then(|()| std::fs::write(&report_out, json).map_err(Into::into))
+        {
             tracing::warn!(
                 "failed to write eval report to {}: {}",
                 report_out.display(),
@@ -1761,6 +1789,7 @@ async fn main() -> Result<()> {
     // Initialize tracing: JSON to file when --trace is set, human-readable to stderr otherwise.
     // --verbose/-v = INFO, -vv = DEBUG.
     if let Some(ref trace_path) = cli.trace {
+        ensure_parent_dir(trace_path)?;
         let file = std::fs::File::create(trace_path)
             .with_context(|| format!("creating trace file: {}", trace_path.display()))?;
         tracing_subscriber::fmt()
@@ -2105,7 +2134,9 @@ async fn main() -> Result<()> {
 
     // Parse work units
     let mut plan = if let Some(ref script_path) = cli.script {
-        let runtime_prompt = if let Some(ref p) = cli.prompt_file {
+        let runtime_prompt = if let Some(ref text) = cli.prompt {
+            Some(text.clone())
+        } else if let Some(ref p) = cli.prompt_file {
             Some(
                 std::fs::read_to_string(p)
                     .with_context(|| format!("reading prompt file: {}", p.display()))?,
@@ -2140,7 +2171,7 @@ async fn main() -> Result<()> {
         // so multi-file scripts (shared clients/prompts/etc.) work here.
         gaviero_dsl::compile_file(
             script_path,
-            None,
+            cli.workflow.as_deref(),
             runtime_prompt.as_deref(),
             &override_vars,
             &override_tiers,
@@ -2574,6 +2605,96 @@ mod tests {
         ])
         .unwrap_err();
         assert!(err.to_string().contains("--prompt-file"));
+    }
+
+    #[test]
+    fn cli_accepts_prompt_with_script() {
+        let cli = Cli::try_parse_from([
+            "gaviero-cli",
+            "--script",
+            "workflow.gaviero",
+            "--prompt",
+            "Short topic title for logs",
+        ])
+        .unwrap();
+        assert_eq!(cli.prompt.as_deref(), Some("Short topic title for logs"));
+        assert!(cli.prompt_file.is_none());
+    }
+
+    #[test]
+    fn cli_rejects_prompt_without_script() {
+        let err = Cli::try_parse_from([
+            "gaviero-cli",
+            "--task",
+            "fix it",
+            "--prompt",
+            "Short topic",
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("--prompt"));
+    }
+
+    #[test]
+    fn cli_rejects_prompt_with_prompt_file() {
+        let err = Cli::try_parse_from([
+            "gaviero-cli",
+            "--script",
+            "workflow.gaviero",
+            "--prompt",
+            "inline",
+            "--prompt-file",
+            "prompt.txt",
+        ])
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--prompt") && msg.contains("--prompt-file"));
+    }
+
+    #[test]
+    fn cli_accepts_workflow_with_script() {
+        let cli = Cli::try_parse_from([
+            "gaviero-cli",
+            "--script",
+            "workflow.gaviero",
+            "--workflow",
+            "consensus_review",
+        ])
+        .unwrap();
+        assert_eq!(cli.workflow.as_deref(), Some("consensus_review"));
+    }
+
+    #[test]
+    fn cli_rejects_workflow_without_script() {
+        let err = Cli::try_parse_from([
+            "gaviero-cli",
+            "--task",
+            "fix it",
+            "--workflow",
+            "consensus_review",
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("--workflow"));
+    }
+
+    #[test]
+    fn ensure_parent_dir_creates_nested_path() {
+        let tmp = std::env::temp_dir().join(format!(
+            "gaviero-cli-ensure-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let nested = tmp.join("a/b/c/file.json");
+        assert!(!tmp.exists());
+        ensure_parent_dir(&nested).unwrap();
+        assert!(nested.parent().unwrap().is_dir());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn ensure_parent_dir_handles_bare_filename() {
+        ensure_parent_dir(std::path::Path::new("foo.json")).unwrap();
     }
 
     #[test]
