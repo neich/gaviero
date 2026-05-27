@@ -73,6 +73,42 @@ fn share_loop_group(a: &str, b: &str, groups: &[Vec<String>]) -> bool {
         .any(|g| g.iter().any(|id| id == a) && g.iter().any(|id| id == b))
 }
 
+/// Expand loop scope groups to include roster `{id}-init` agents that run
+/// immediately before a `reviewers` loop whose body is `{id}-refine`.
+///
+/// `LoopConfig::agent_ids` lists only refine participants (they iterate);
+/// init agents are separate pre-loop steps but intentionally share owned
+/// globs with their refine clone. Without this expansion, pairwise scope
+/// validation rejects those templates at runtime.
+pub fn expand_loop_groups_with_roster_init(
+    loop_groups: Vec<Vec<String>>,
+    unit_ids: &[&str],
+) -> Vec<Vec<String>> {
+    use std::collections::HashSet;
+
+    let id_set: HashSet<&str> = unit_ids.iter().copied().collect();
+    loop_groups
+        .into_iter()
+        .map(|mut group| {
+            let refiners: Vec<String> = group
+                .iter()
+                .filter(|id| id.ends_with("-refine"))
+                .cloned()
+                .collect();
+            for refine_id in refiners {
+                let Some(prefix) = refine_id.strip_suffix("-refine") else {
+                    continue;
+                };
+                let init_id = format!("{prefix}-init");
+                if id_set.contains(init_id.as_str()) && !group.contains(&init_id) {
+                    group.push(init_id);
+                }
+            }
+            group
+        })
+        .collect()
+}
+
 /// Check if two sets of owned paths overlap.
 fn find_overlapping_paths(paths_a: &[String], paths_b: &[String]) -> Vec<String> {
     let mut overlaps = Vec::new();
@@ -239,6 +275,25 @@ mod tests {
         ];
         let errors = validate_scopes(&units, &[]);
         assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn test_roster_init_refine_overlap_allowed_when_group_expanded() {
+        let units = vec![
+            unit("claude-init", &["out/claude-conclusion-v*.md"], &[]),
+            unit(
+                "claude-refine",
+                &["out/claude-conclusion-v*.md", "out/claude-summary-v*.md"],
+                &[],
+            ),
+        ];
+        let narrow = vec![vec!["claude-refine".to_string()]];
+        assert_eq!(validate_scopes(&units, &narrow).len(), 1);
+        let expanded = expand_loop_groups_with_roster_init(
+            narrow,
+            &["claude-init", "claude-refine"],
+        );
+        assert!(validate_scopes(&units, &expanded).is_empty());
     }
 
     #[test]
