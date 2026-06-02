@@ -19,6 +19,8 @@ pub enum FileStatus {
     Deleted,
     Untracked,
     Renamed,
+    /// Unmerged path during merge/rebase/cherry-pick (conflict).
+    Unmerged,
 }
 
 impl FileStatus {
@@ -30,6 +32,7 @@ impl FileStatus {
             Self::Deleted => 'D',
             Self::Untracked => '?',
             Self::Renamed => 'R',
+            Self::Unmerged => 'U',
         }
     }
 }
@@ -151,6 +154,15 @@ impl GitRepo {
         for entry in statuses.iter() {
             let path = entry.path().unwrap_or("").to_string();
             let s = entry.status();
+
+            if s.intersects(git2::Status::CONFLICTED) {
+                entries.push(FileStatusEntry {
+                    path: path.clone(),
+                    status: FileStatus::Unmerged,
+                    staged: false,
+                });
+                continue;
+            }
 
             // Index (staged) changes
             if s.intersects(git2::Status::INDEX_NEW) {
@@ -358,6 +370,50 @@ impl GitRepo {
             });
         }
         Ok(result)
+    }
+
+    /// Paths with unmerged index entries (`git diff --diff-filter=U`).
+    pub fn unmerged_paths(&self) -> Result<Vec<String>> {
+        let workdir = self
+            .repo
+            .workdir()
+            .ok_or_else(|| anyhow::anyhow!("bare repository"))?;
+        let output = Command::new("git")
+            .args(["diff", "--name-only", "--diff-filter=U"])
+            .current_dir(workdir)
+            .output()
+            .context("git diff --name-only --diff-filter=U")?;
+        if !output.status.success() {
+            bail!(
+                "git diff --diff-filter=U failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// True when `rel_path` is in an unmerged (conflicted) state.
+    pub fn is_path_unmerged(&self, rel_path: &str) -> Result<bool> {
+        Ok(self.unmerged_paths()?.iter().any(|p| p == rel_path))
+    }
+
+    /// Read a blob from the index at merge stage `stage` (1=base, 2=ours, 3=theirs).
+    pub fn index_stage_content(&self, rel_path: &str, stage: i32) -> Result<Option<String>> {
+        let index = self.repo.index().context("reading index")?;
+        let path = Path::new(rel_path);
+        let Some(entry) = index.get_path(path, stage) else {
+            return Ok(None);
+        };
+        let blob = self
+            .repo
+            .find_blob(entry.id)
+            .with_context(|| format!("finding blob for {} stage {}", rel_path, stage))?;
+        let content = std::str::from_utf8(blob.content()).context("stage blob is not UTF-8")?;
+        Ok(Some(content.to_string()))
     }
 
     /// Read a file's content from HEAD (for diffing against working tree).
@@ -1020,6 +1076,51 @@ mod tests {
         std::fs::write(dir.path().join("new.txt"), "new\n").unwrap();
         let status = repo.file_status().unwrap();
         assert_eq!(status.len(), 2);
+    }
+
+    #[test]
+    fn test_unmerged_after_merge_conflict() {
+        let (dir, repo) = init_test_repo();
+        let path = dir.path().join("README.md");
+        let main_branch = repo.current_branch().unwrap();
+
+        repo.create_branch("side").unwrap();
+        std::fs::write(&path, "main version\n").unwrap();
+        repo.stage_file("README.md").unwrap();
+        repo.commit("main change").unwrap();
+
+        repo.checkout("side").unwrap();
+        std::fs::write(&path, "side version\n").unwrap();
+        repo.stage_file("README.md").unwrap();
+        repo.commit("side change").unwrap();
+
+        repo.checkout(&main_branch).unwrap();
+        let merge = Command::new("git")
+            .args(["merge", "side", "--no-commit", "--no-ff"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            !merge.status.success(),
+            "merge should conflict: {}",
+            String::from_utf8_lossy(&merge.stderr)
+        );
+
+        let opened = GitRepo::open(dir.path()).unwrap();
+        let unmerged = opened.unmerged_paths().unwrap();
+        assert!(
+            unmerged.iter().any(|p| p == "README.md"),
+            "expected README.md unmerged, got {:?}",
+            unmerged
+        );
+        let status = opened.file_status().unwrap();
+        assert!(
+            status
+                .iter()
+                .any(|e| e.path == "README.md" && e.status == FileStatus::Unmerged),
+            "file_file should report unmerged: {:?}",
+            status
+        );
     }
 
     #[test]
