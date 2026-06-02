@@ -141,6 +141,8 @@ pub struct ChangesEntry {
     pub status_char: char,
     pub additions: usize,
     pub deletions: usize,
+    /// Git unmerged path and/or `<<<<<<<` markers in the working tree.
+    pub is_conflict: bool,
 }
 
 pub struct ChangesState {
