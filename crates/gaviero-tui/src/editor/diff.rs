@@ -6,6 +6,35 @@ pub enum DiffKind {
     Context,
     Added,
     Removed,
+    /// `<<<<<<<`, `=======`, or `>>>>>>>` marker line.
+    ConflictMarker,
+    /// Lines between `<<<<<<<` and `=======`.
+    ConflictOurs,
+    /// Lines between `=======` and `>>>>>>>`.
+    ConflictTheirs,
+}
+
+/// Map a git-conflict line classification to diff rendering kind.
+pub fn diff_kind_from_conflict(
+    kind: gaviero_core::git_conflict::ConflictLineKind,
+) -> DiffKind {
+    use gaviero_core::git_conflict::ConflictLineKind;
+    match kind {
+        ConflictLineKind::Start | ConflictLineKind::Sep | ConflictLineKind::End => {
+            DiffKind::ConflictMarker
+        }
+        ConflictLineKind::Ours => DiffKind::ConflictOurs,
+        ConflictLineKind::Theirs => DiffKind::ConflictTheirs,
+        ConflictLineKind::Normal => DiffKind::Context,
+    }
+}
+
+/// Per-line conflict annotation for the Changes panel (working-tree file).
+pub fn build_conflict_diff(content: &str) -> Vec<(DiffKind, String)> {
+    gaviero_core::git_conflict::build_conflict_annotated_lines(content)
+        .into_iter()
+        .map(|(k, line)| (diff_kind_from_conflict(k), line))
+        .collect()
 }
 
 /// LCS-based line diff. Each output line is one of `Context` / `Added` /

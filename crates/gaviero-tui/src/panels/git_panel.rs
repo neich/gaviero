@@ -707,5 +707,6 @@ fn status_color(status: &FileStatus) -> Color {
         FileStatus::Deleted => theme::PROPERTY_RED, // red
         FileStatus::Untracked => theme::TEXT_DIM,   // dim
         FileStatus::Renamed => theme::INFO_CYAN,    // cyan
+        FileStatus::Unmerged => theme::PROPERTY_RED,
     }
 }

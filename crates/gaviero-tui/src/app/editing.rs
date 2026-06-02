@@ -106,6 +106,35 @@ pub(super) fn handle_editor_action(app: &mut App, action: Action) {
         .map(|b| b.read_only)
         .unwrap_or(false);
 
+    if !read_only {
+        match action {
+            Action::NextConflict | Action::PrevConflict => {
+                let forward = matches!(action, Action::NextConflict);
+                if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
+                    if buf.jump_to_conflict(forward) {
+                        let n = buf.conflict_regions.len();
+                        app.status_message = Some((
+                            format!(
+                                "Conflict {}/{}  F8 next  F9 previous",
+                                buf.conflict_index + 1,
+                                n
+                            ),
+                            std::time::Instant::now(),
+                        ));
+                    } else {
+                        app.status_message = Some((
+                            "No merge conflicts in this file".to_string(),
+                            std::time::Instant::now(),
+                        ));
+                    }
+                }
+                ensure_editor_cursor_visible(app);
+                return;
+            }
+            _ => {}
+        }
+    }
+
     if app.preview_mode == MarkdownPreviewMode::PreviewOnly
         && is_current_buffer_markdown(app)
     {
@@ -1446,6 +1475,20 @@ pub(super) fn open_file(app: &mut App, path: &Path) {
                 }
                 buf.indent_query = app.indent_query_cache.get_or_load(lang_name, language);
             }
+            let git_unmerged = app
+                .workspace
+                .roots()
+                .first()
+                .and_then(|root| {
+                    path.strip_prefix(root).ok().and_then(|rel| {
+                        gaviero_core::git::GitRepo::open(root)
+                            .ok()
+                            .and_then(|repo| repo.is_path_unmerged(rel.to_str()?).ok())
+                    })
+                })
+                .unwrap_or(false);
+            buf.refresh_conflict_metadata(git_unmerged);
+
             app.buffers.push(buf);
             app.active_buffer = app.buffers.len() - 1;
             sync_preview_mode_for_active_buffer(app);
@@ -1506,9 +1549,51 @@ pub(super) fn spawn_active_terminal(app: &mut App) {
 }
 
 pub(super) fn save_current_buffer(app: &mut App) {
+    let saved = app
+        .buffers
+        .get(app.active_buffer)
+        .and_then(|b| b.path.clone());
     if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
         if let Err(e) = buf.save() {
             tracing::error!("Save failed: {}", e);
+            return;
+        }
+        buf.refresh_conflict_metadata(buf.git_unmerged);
+    }
+    if let Some(path) = saved {
+        stage_file_if_conflict_resolved(app, &path);
+    }
+    app.refresh_git_changes();
+}
+
+fn stage_file_if_conflict_resolved(app: &mut App, path: &std::path::Path) {
+    let root = match app.workspace.roots().first() {
+        Some(r) => r.clone(),
+        None => return,
+    };
+    let rel = match path.strip_prefix(&root).ok().and_then(|p| p.to_str()) {
+        Some(r) => r,
+        None => return,
+    };
+    let Ok(repo) = gaviero_core::git::GitRepo::open(&root) else {
+        return;
+    };
+    let Ok(true) = repo.is_path_unmerged(rel) else {
+        return;
+    };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
+    if gaviero_core::git_conflict::file_has_conflict_markers(&content) {
+        return;
+    }
+    if repo.stage_file(rel).is_ok() {
+        app.status_message = Some((
+            format!("Staged resolved {} — run git commit to finish merge", rel),
+            std::time::Instant::now(),
+        ));
+        if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
+            buf.git_unmerged = false;
         }
     }
 }

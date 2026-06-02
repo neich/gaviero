@@ -124,6 +124,12 @@ pub struct Buffer {
     /// When set, the buffer is rendered as a unified diff: each rope line is
     /// tinted by `diff_view.kinds[i]` (Added=green / Removed=red / Context=plain).
     pub diff_view: Option<DiffView>,
+    /// Git reports this path as unmerged (merge/rebase in progress).
+    pub git_unmerged: bool,
+    /// Parsed `<<<<<<<` / `=======` / `>>>>>>>` regions in the buffer text.
+    pub conflict_regions: Vec<gaviero_core::git_conflict::ConflictRegion>,
+    /// Index into `conflict_regions` for F8 / F9 navigation.
+    pub conflict_index: usize,
 }
 
 impl Buffer {
@@ -150,6 +156,9 @@ impl Buffer {
             search_matches: Vec::new(),
             read_only: false,
             diff_view: None,
+            git_unmerged: false,
+            conflict_regions: Vec::new(),
+            conflict_index: 0,
         }
     }
 
@@ -197,6 +206,9 @@ impl Buffer {
             search_matches: Vec::new(),
             read_only: false,
             diff_view: None,
+            git_unmerged: false,
+            conflict_regions: Vec::new(),
+            conflict_index: 0,
         })
     }
 
@@ -263,7 +275,45 @@ impl Buffer {
                 kinds,
                 original_text: original,
             }),
+            git_unmerged: false,
+            conflict_regions: Vec::new(),
+            conflict_index: 0,
         })
+    }
+
+    /// Re-scan buffer text for conflict markers; `git_unmerged` is OR'd in.
+    pub fn refresh_conflict_metadata(&mut self, git_unmerged: bool) {
+        let content = self.text.to_string();
+        self.conflict_regions = gaviero_core::git_conflict::find_conflict_regions(&content);
+        self.git_unmerged = git_unmerged
+            || gaviero_core::git_conflict::file_has_conflict_markers(&content);
+        if self.conflict_index >= self.conflict_regions.len() {
+            self.conflict_index = 0;
+        }
+    }
+
+    pub fn is_line_in_conflict(&self, line: usize) -> bool {
+        self.conflict_regions
+            .iter()
+            .any(|r| line >= r.start_line && line <= r.end_line)
+    }
+
+    /// Jump to the next (`forward`) or previous conflict region; moves cursor.
+    pub fn jump_to_conflict(&mut self, forward: bool) -> bool {
+        if self.conflict_regions.is_empty() {
+            return false;
+        }
+        let n = self.conflict_regions.len();
+        if forward {
+            self.conflict_index = (self.conflict_index + 1) % n;
+        } else {
+            self.conflict_index = (self.conflict_index + n - 1) % n;
+        }
+        let region = &self.conflict_regions[self.conflict_index];
+        self.cursor.line = region.start_line;
+        self.cursor.col = 0;
+        self.cursor.anchor = None;
+        true
     }
 
     /// Display name for the tab bar.
@@ -297,6 +347,11 @@ impl Buffer {
         self.undo_stack.push(transaction);
         self.search_highlight = None; // Clear search highlight on any edit
         self.reparse();
+        let content = self.text.to_string();
+        self.conflict_regions = gaviero_core::git_conflict::find_conflict_regions(&content);
+        if self.conflict_index >= self.conflict_regions.len() {
+            self.conflict_index = 0;
+        }
     }
 
     /// Undo the last transaction.

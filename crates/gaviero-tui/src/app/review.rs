@@ -1390,7 +1390,10 @@ pub(super) fn render_batch_review_diff(app: &mut App, frame: &mut Frame, area: R
                     .fg(theme::ERROR)
                     .bg(theme::DIFF_REM_LINE_BG),
             ),
-            DiffKind::Context => (
+            DiffKind::Context
+            | DiffKind::ConflictMarker
+            | DiffKind::ConflictOurs
+            | DiffKind::ConflictTheirs => (
                 "   │ ",
                 Style::default().fg(theme::TEXT_DIM),
                 Style::default().fg(theme::TEXT_FG),
@@ -1471,25 +1474,45 @@ pub(super) fn refresh_git_changes(app: &mut App) {
 
     let workdir = repo.workdir().unwrap_or(&root).to_path_buf();
 
+    let unmerged: std::collections::HashSet<String> = repo.unmerged_paths().unwrap_or_default().into_iter().collect();
+
     let git_entries: Vec<ChangesEntry> = entries
         .into_iter()
         .filter(|e| !e.staged)
         .map(|e| {
             let abs_path = workdir.join(&e.path);
-            let old_content = repo.head_file_content(&e.path).unwrap_or_default();
             let new_content = std::fs::read_to_string(&abs_path).unwrap_or_default();
+            let is_conflict = e.status == gaviero_core::git::FileStatus::Unmerged
+                || unmerged.contains(&e.path)
+                || gaviero_core::git_conflict::file_has_conflict_markers(&new_content);
 
-            let old_lines: Vec<&str> = old_content.lines().collect();
-            let new_lines: Vec<&str> = new_content.lines().collect();
-            let diff = build_simple_diff(&old_lines, &new_lines);
-            let additions = diff
-                .iter()
-                .filter(|(k, _)| matches!(k, DiffKind::Added))
-                .count();
-            let deletions = diff
-                .iter()
-                .filter(|(k, _)| matches!(k, DiffKind::Removed))
-                .count();
+            let (additions, deletions) = if is_conflict {
+                use gaviero_core::git_conflict::ConflictLineKind;
+                let annotated = gaviero_core::git_conflict::build_conflict_annotated_lines(&new_content);
+                let adds = annotated
+                    .iter()
+                    .filter(|(k, _)| matches!(k, ConflictLineKind::Theirs | ConflictLineKind::Ours))
+                    .count();
+                let dels = annotated
+                    .iter()
+                    .filter(|(k, _)| matches!(k, ConflictLineKind::Start | ConflictLineKind::End | ConflictLineKind::Sep))
+                    .count();
+                (adds, dels)
+            } else {
+                let old_content = repo.head_file_content(&e.path).unwrap_or_default();
+                let old_lines: Vec<&str> = old_content.lines().collect();
+                let new_lines: Vec<&str> = new_content.lines().collect();
+                let diff = build_simple_diff(&old_lines, &new_lines);
+                let additions = diff
+                    .iter()
+                    .filter(|(k, _)| matches!(k, DiffKind::Added))
+                    .count();
+                let deletions = diff
+                    .iter()
+                    .filter(|(k, _)| matches!(k, DiffKind::Removed))
+                    .count();
+                (additions, deletions)
+            };
 
             ChangesEntry {
                 rel_path: e.path,
@@ -1497,6 +1520,7 @@ pub(super) fn refresh_git_changes(app: &mut App) {
                 status_char: e.status.marker(),
                 additions,
                 deletions,
+                is_conflict,
             }
         })
         .collect();
@@ -1564,8 +1588,42 @@ pub(super) fn handle_changes_action(app: &mut App, action: &Action) -> bool {
             app.refresh_git_changes();
             true
         }
+        Action::NextConflict => {
+            cycle_changes_conflict_selection(cs, true);
+            true
+        }
+        Action::PrevConflict => {
+            cycle_changes_conflict_selection(cs, false);
+            true
+        }
         _ => false,
     }
+}
+
+/// Jump to the next/previous entry marked `is_conflict` in the Changes list.
+fn cycle_changes_conflict_selection(cs: &mut ChangesState, forward: bool) {
+    let conflict_indices: Vec<usize> = cs
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.is_conflict)
+        .map(|(i, _)| i)
+        .collect();
+    if conflict_indices.is_empty() {
+        return;
+    }
+    let pos = conflict_indices
+        .iter()
+        .position(|&i| i == cs.selected_index)
+        .unwrap_or(0);
+    let next_pos = if forward {
+        (pos + 1) % conflict_indices.len()
+    } else {
+        (pos + conflict_indices.len() - 1) % conflict_indices.len()
+    };
+    cs.selected_index = conflict_indices[next_pos];
+    cs.diff_scroll = 0;
+    cs.cached_diff_index = usize::MAX;
 }
 
 pub(super) fn render_changes_file_list(
@@ -1644,6 +1702,7 @@ pub(super) fn render_changes_file_list(
             'M' => Style::default().fg(theme::WARNING),
             'A' | '?' => Style::default().fg(theme::SUCCESS),
             'D' => Style::default().fg(theme::ERROR),
+            'U' => Style::default().fg(theme::PROPERTY_RED).add_modifier(Modifier::BOLD),
             _ => Style::default().fg(theme::TEXT_DIM),
         };
 
@@ -1706,13 +1765,31 @@ pub(super) fn render_changes_diff(app: &mut App, frame: &mut Frame, area: Rect) 
             None => return,
         };
         if cs.cached_diff_index != cs.selected_index {
+            let new_content = std::fs::read_to_string(&entry.abs_path).unwrap_or_default();
+            let (lang_name, language) = language_for_path(&entry.abs_path);
+            if entry.is_conflict {
+                let cached_diff = crate::editor::diff::build_conflict_diff(&new_content);
+                let highlights = match (
+                    lang_name.as_deref().and_then(|n| app.highlight_configs.get(n)),
+                    language.as_ref(),
+                ) {
+                    (Some(cfg), Some(lang)) => {
+                        compute_diff_highlights(&cached_diff, lang, cfg, &app.theme)
+                    }
+                    _ => None,
+                };
+                let cs = app.changes_state.as_mut().unwrap();
+                cs.cached_diff = cached_diff;
+                cs.cached_diff_index = cs.selected_index;
+                cs.cached_highlights = highlights;
+                return;
+            }
             let root = app.workspace.roots().first().map(|r| r.to_path_buf());
             let old_content = root
                 .as_ref()
                 .and_then(|r| gaviero_core::git::GitRepo::open(r).ok())
                 .and_then(|repo| repo.head_file_content(&entry.rel_path).ok())
                 .unwrap_or_default();
-            let new_content = std::fs::read_to_string(&entry.abs_path).unwrap_or_default();
             let (lang_name, language) = language_for_path(&entry.abs_path);
             Some((old_content, new_content, cs.selected_index, lang_name, language))
         } else {
@@ -1765,9 +1842,20 @@ pub(super) fn render_changes_diff(app: &mut App, frame: &mut Frame, area: Rect) 
     }
     let scroll = cs.diff_scroll;
 
-    let header = format!(" {} ", entry.rel_path);
+    let header = if entry.is_conflict {
+        format!(
+            " {}  (merge conflict — Enter: edit  F8/F9: jump) ",
+            entry.rel_path
+        )
+    } else {
+        format!(" {} ", entry.rel_path)
+    };
     let header_style = Style::default()
-        .fg(theme::FOCUS_BORDER)
+        .fg(if entry.is_conflict {
+            theme::PROPERTY_RED
+        } else {
+            theme::FOCUS_BORDER
+        })
         .add_modifier(Modifier::BOLD);
     for (i, ch) in header.chars().enumerate() {
         let x = area.x + i as u16;
@@ -1792,31 +1880,7 @@ pub(super) fn render_changes_diff(app: &mut App, frame: &mut Frame, area: Rect) 
 
         let (kind, text) = &diff_lines[line_idx];
 
-        let (gutter_str, gutter_style, line_style) = match kind {
-            DiffKind::Added => (
-                " + │ ",
-                Style::default()
-                    .fg(theme::SUCCESS)
-                    .add_modifier(Modifier::BOLD),
-                Style::default()
-                    .fg(theme::SUCCESS)
-                    .bg(theme::DIFF_ADD_LINE_BG),
-            ),
-            DiffKind::Removed => (
-                " - │ ",
-                Style::default()
-                    .fg(theme::ERROR)
-                    .add_modifier(Modifier::BOLD),
-                Style::default()
-                    .fg(theme::ERROR)
-                    .bg(theme::DIFF_REM_LINE_BG),
-            ),
-            DiffKind::Context => (
-                "   │ ",
-                Style::default().fg(theme::TEXT_DIM),
-                Style::default().fg(theme::TEXT_FG),
-            ),
-        };
+        let (gutter_str, gutter_style, line_style) = changes_diff_line_style(kind);
 
         for (i, ch) in gutter_str.chars().enumerate() {
             let x = area.x + i as u16;
@@ -1853,7 +1917,7 @@ pub(super) fn render_changes_diff(app: &mut App, frame: &mut Frame, area: Rect) 
         let diff_indices: Vec<usize> = diff_lines
             .iter()
             .enumerate()
-            .filter(|(_, (k, _))| !matches!(k, DiffKind::Context))
+            .filter(|(_, (k, _))| changes_diff_is_highlighted(k))
             .map(|(i, _)| i)
             .collect();
         crate::widgets::scrollbar::render_scrollbar_with_diff_markers(
@@ -1865,6 +1929,65 @@ pub(super) fn render_changes_diff(app: &mut App, frame: &mut Frame, area: Rect) 
             &diff_indices,
         );
     }
+}
+
+fn changes_diff_line_style(kind: &DiffKind) -> (&'static str, Style, Style) {
+    match kind {
+        DiffKind::Added => (
+            " + │ ",
+            Style::default()
+                .fg(theme::SUCCESS)
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::SUCCESS)
+                .bg(theme::DIFF_ADD_LINE_BG),
+        ),
+        DiffKind::Removed => (
+            " - │ ",
+            Style::default()
+                .fg(theme::ERROR)
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::ERROR)
+                .bg(theme::DIFF_REM_LINE_BG),
+        ),
+        DiffKind::ConflictMarker => (
+            " ! │ ",
+            Style::default()
+                .fg(theme::WARNING)
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::WARNING)
+                .bg(theme::CONFLICT_MARKER_BG),
+        ),
+        DiffKind::ConflictOurs => (
+            " O │ ",
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::TEXT_FG)
+                .bg(theme::CONFLICT_OURS_BG),
+        ),
+        DiffKind::ConflictTheirs => (
+            " T │ ",
+            Style::default()
+                .fg(theme::INFO_CYAN)
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::TEXT_FG)
+                .bg(theme::CONFLICT_THEIRS_BG),
+        ),
+        DiffKind::Context => (
+            "   │ ",
+            Style::default().fg(theme::TEXT_DIM),
+            Style::default().fg(theme::TEXT_FG),
+        ),
+    }
+}
+
+fn changes_diff_is_highlighted(kind: &DiffKind) -> bool {
+    !matches!(kind, DiffKind::Context)
 }
 
 #[cfg(test)]

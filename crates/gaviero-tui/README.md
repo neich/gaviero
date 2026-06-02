@@ -133,6 +133,7 @@ No background tasks mutate the `App` struct directly. All state changes flow thr
 | Editor | Alt+[ / Alt+] | Cycle tabs |
 | Terminal | Ctrl+J / F4 | Toggle bottom terminal panel |
 | Diff review | `]h` / `[h` | Next / previous hunk |
+| Merge conflict (editor / Changes) | F8 / F9 | Next / previous conflict region or file |
 | Diff review | `a` / `r` | Accept / reject current hunk |
 | Diff review | `A` / `R` | Accept / reject all |
 | Diff review | `f` | Finalize (write to disk) |

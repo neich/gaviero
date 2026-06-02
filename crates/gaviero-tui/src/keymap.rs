@@ -67,6 +67,10 @@ pub enum Action {
     ToggleWordWrap,
     FindInBuffer,
     SearchInWorkspace,
+    /// Next git merge-conflict region (editor) or file (Changes panel).
+    NextConflict,
+    /// Previous git merge-conflict region (editor) or file (Changes panel).
+    PrevConflict,
 
     // Chat
     AltEnter,
@@ -170,6 +174,8 @@ impl Keymap {
             KeyCode::F(4) => Action::ToggleTerminal,
             KeyCode::F(5) => Action::FormatBuffer,
             KeyCode::F(6) => Action::CycleFormatLevel,
+            KeyCode::F(8) => Action::NextConflict,
+            KeyCode::F(9) => Action::PrevConflict,
             KeyCode::F(11) => Action::ToggleFullscreen,
 
             // ── Tab character ────────────────────────────────────
@@ -317,6 +323,18 @@ mod tests {
         assert_eq!(
             Keymap::resolve(&key(KeyCode::Char('j'), KeyModifiers::CONTROL)),
             Action::ToggleTerminal
+        );
+    }
+
+    #[test]
+    fn test_f8_f9_conflict_navigation() {
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::F(8), KeyModifiers::NONE)),
+            Action::NextConflict
+        );
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::F(9), KeyModifiers::NONE)),
+            Action::PrevConflict
         );
     }
 
