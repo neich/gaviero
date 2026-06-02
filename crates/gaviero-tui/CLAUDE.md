@@ -40,6 +40,7 @@ Dispatched in [`app/commands.rs`](src/app/commands.rs) and [`panels/agent_chat.r
 - **Event-loop golden rule.** `draw → recv → handle → repeat`. Render is pure; mutation only happens in `handle`.
 - **No `Mutex` in the TUI.** State changes go through the event loop.
 - Diff overlay keys: `]h` / `[h` navigate; `a` / `r` accept/reject; `A` / `R` all; `f` finalize; `q` exit.
+- Merge conflicts: F8 / F9 next/previous region (editor) or conflict file (Changes panel); save stages when markers are gone.
 - Editing actions that depend on wrapped layout receive viewport width via [`app/editing.rs`](src/app/editing.rs); never compute visual position outside the editor module.
 
 ## Rules
