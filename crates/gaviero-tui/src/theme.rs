@@ -77,6 +77,12 @@ pub const CODE_BLOCK_BG: Color = Color::Rgb(40, 44, 52);
 pub const DIFF_ADD_LINE_BG: Color = Color::Rgb(30, 50, 30);
 /// Diff removed line foreground background (subtle red).
 pub const DIFF_REM_LINE_BG: Color = Color::Rgb(50, 30, 30);
+/// Merge conflict: ours (current branch) section background.
+pub const CONFLICT_OURS_BG: Color = Color::Rgb(45, 55, 75);
+/// Merge conflict: theirs (incoming) section background.
+pub const CONFLICT_THEIRS_BG: Color = Color::Rgb(55, 45, 65);
+/// Merge conflict: marker line background.
+pub const CONFLICT_MARKER_BG: Color = Color::Rgb(70, 55, 35);
 /// Numeric / constant orange.
 pub const NUMERIC_ORANGE: Color = Color::Rgb(209, 154, 102);
 /// Medium gray for secondary labels.
