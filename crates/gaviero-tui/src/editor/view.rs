@@ -290,11 +290,14 @@ impl<'a> EditorView<'a> {
 
             // Search highlight (orange background for matching chars)
             let in_search_match = self.is_in_search_match(line_idx, char_idx);
+            let in_conflict = self.buffer.is_line_in_conflict(line_idx);
 
             if self.is_selected(line_idx, char_idx) {
                 style = style.bg(SELECTION_BG);
             } else if in_search_match {
                 style = style.bg(SEARCH_HIGHLIGHT_BG);
+            } else if in_conflict {
+                style = style.bg(crate::theme::CONFLICT_MARKER_BG);
             } else {
                 style = style.bg(row_bg);
             }
