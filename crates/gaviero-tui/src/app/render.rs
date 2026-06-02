@@ -683,7 +683,7 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
                         .map(|cs| cs.entries.len())
                         .unwrap_or(0);
                     format!(
-                        "{} changed files  ↑↓: navigate  Enter: open  R: refresh  Esc: back  F7: cycle",
+                        "{} changed (U=unmerged)  ↑↓ navigate  Enter edit  F8/F9 conflict  R refresh  Esc back",
                         n
                     )
                 }
@@ -697,7 +697,23 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
                 )
             }
             Focus::Terminal => "Terminal (M4)".to_string(),
-            Focus::Editor => String::new(),
+            Focus::Editor => {
+                if let Some(buf) = current_buffer {
+                    if !buf.conflict_regions.is_empty() {
+                        format!(
+                            "CONFLICT {}/{}  F8/F9 jump  save when clean to stage",
+                            buf.conflict_index + 1,
+                            buf.conflict_regions.len()
+                        )
+                    } else if buf.git_unmerged {
+                        "Unmerged file — resolve markers and save to stage".to_string()
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                }
+            }
         }
     };
 
