@@ -3,6 +3,7 @@ pub mod agent_session;
 pub mod context_planner;
 pub mod diff_engine;
 pub mod git;
+pub mod git_conflict;
 pub mod indent;
 pub mod iteration;
 pub mod mcp;
