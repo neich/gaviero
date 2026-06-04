@@ -9,7 +9,8 @@ pub mod resolver;
 pub mod tiers;
 
 // Re-export `CompiledPlan` as the primary output type.
-pub use gaviero_core::swarm::plan::CompiledPlan;
+pub use gaviero_core::swarm::plan::{CompiledPlan, ExecutionMode};
+pub use compiler::peek_workflow_execution_mode;
 // Backward-compat alias — existing code using `CompiledScript` keeps compiling.
 #[allow(deprecated)]
 pub use compiler::CompiledScript;
@@ -130,4 +131,13 @@ pub fn compile_file(
         override_params,
     )
     .map_err(miette::Report::new)
+}
+
+/// Resolve `execution repo|document` for a script on disk (includes resolved).
+pub fn workflow_execution_mode(
+    entry_path: &std::path::Path,
+    workflow: Option<&str>,
+) -> Result<ExecutionMode, miette::Report> {
+    let (script, _) = resolver::resolve(entry_path).map_err(miette::Report::new)?;
+    Ok(compiler::peek_workflow_execution_mode(&script, workflow))
 }
