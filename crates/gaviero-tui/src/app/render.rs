@@ -517,6 +517,20 @@ pub(super) fn render_tree_dialog(
     }
 }
 
+/// Default status-bar hints when the editor is focused and idle.
+fn editor_status_key_hints(app: &App, buf: &crate::editor::buffer::Buffer) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if app.is_current_buffer_markdown() {
+        parts.push("Alt+P: preview");
+    }
+    parts.push("Alt+Z: wrap");
+    if !buf.read_only {
+        parts.push("F5: reformat");
+        parts.push("F6: format level");
+    }
+    parts.join("  ")
+}
+
 pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
     if let Some(ref review) = app.diff_review {
         let proposal = &review.proposal;
@@ -708,10 +722,10 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
                     } else if buf.git_unmerged {
                         "Unmerged file — resolve markers and save to stage".to_string()
                     } else {
-                        String::new()
+                        editor_status_key_hints(app, buf)
                     }
                 } else {
-                    String::new()
+                    "Alt+Z: wrap  F5: reformat  F6: format level".to_string()
                 }
             }
         }
