@@ -47,76 +47,19 @@ fn mcp_config_for_workspace(
     app: &App,
     root: &std::path::Path,
 ) -> gaviero_core::mcp::McpConfigSynth {
-    use gaviero_core::workspace::settings as S;
-
-    let enabled = app
-        .workspace
-        .resolve_setting(S::MCP_GAVIERO_ENABLED, Some(root))
-        .as_bool()
-        .unwrap_or(true);
-    let shim_binary = app
-        .workspace
-        .resolve_setting(S::MCP_GAVIERO_SHIM_BINARY, Some(root))
-        .as_str()
-        .unwrap_or("gaviero-mcp-shim")
-        .to_string();
-    let codex_trust = match app
-        .workspace
-        .resolve_setting(S::MCP_GAVIERO_CODEX_TRUST, Some(root))
-        .as_str()
-        .unwrap_or("unknown")
-    {
-        "granted" | "trusted" => gaviero_core::mcp::TrustConsent::Granted,
-        "denied" | "untrusted" => gaviero_core::mcp::TrustConsent::Denied,
-        _ => gaviero_core::mcp::TrustConsent::Unknown,
-    };
-
-    let context7 = resolve_context7_config(app, Some(root));
-
-    gaviero_core::mcp::McpConfigSynth {
-        worktree: root.to_path_buf(),
-        socket_path: root.join(".gaviero/mcp.sock"),
-        shim_binary,
-        codex_trust,
-        enabled,
-        context7,
-    }
+    gaviero_core::mcp::resolve_mcp_config_synth(
+        &app.workspace,
+        root,
+        root.join(".gaviero/mcp.sock"),
+        &gaviero_core::mcp::McpConfigOverrides::default(),
+    )
 }
 
 pub(crate) fn resolve_context7_config(
     app: &App,
     root: Option<&std::path::Path>,
 ) -> gaviero_core::mcp::Context7Config {
-    use gaviero_core::workspace::settings as S;
-
-    let defaults = gaviero_core::mcp::Context7Config::default();
-    let enabled = app
-        .workspace
-        .resolve_setting(S::MCP_CONTEXT7_ENABLED, root)
-        .as_bool()
-        .unwrap_or(defaults.enabled);
-    let command = app
-        .workspace
-        .resolve_setting(S::MCP_CONTEXT7_COMMAND, root)
-        .as_str()
-        .map(|s| s.to_string())
-        .unwrap_or(defaults.command);
-    let args = app
-        .workspace
-        .resolve_setting(S::MCP_CONTEXT7_ARGS, root)
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect::<Vec<_>>()
-        })
-        .filter(|v| !v.is_empty())
-        .unwrap_or(defaults.args);
-    gaviero_core::mcp::Context7Config {
-        enabled,
-        command,
-        args,
-    }
+    gaviero_core::mcp::resolve_context7_config(&app.workspace, root)
 }
 
 pub(crate) fn run_swarm(app: &mut App, task_desc: String) {
@@ -195,6 +138,7 @@ pub(crate) fn run_swarm(app: &mut App, task_desc: String) {
 
         let plan = gaviero_core::swarm::plan::CompiledPlan::from_work_units(work_units, None);
         let config = pipeline::SwarmConfig {
+            execution_mode: gaviero_core::swarm::plan::ExecutionMode::Repo,
             max_parallel: unit_count.min(4),
             workspace_root: root,
             model: model.clone(),
@@ -203,6 +147,7 @@ pub(crate) fn run_swarm(app: &mut App, task_desc: String) {
             read_namespaces: read_ns,
             write_namespace: write_ns,
             context_files: vec![],
+            worktree_context_paths: vec![],
             excludes: vec![],
             memory_writer,
             mcp_config: Some(mcp_config),
@@ -355,6 +300,7 @@ pub(super) fn handle_run_script_command(app: &mut App) {
         let effective_max_parallel = compiled.max_parallel.unwrap_or_else(|| unit_count.min(4));
 
         let config = pipeline::SwarmConfig {
+            execution_mode: gaviero_core::swarm::plan::ExecutionMode::Repo,
             max_parallel: effective_max_parallel,
             workspace_root: root,
             model,
@@ -363,6 +309,7 @@ pub(super) fn handle_run_script_command(app: &mut App) {
             read_namespaces: read_ns,
             write_namespace: write_ns,
             context_files: vec![],
+            worktree_context_paths: vec![],
             excludes: vec![],
             memory_writer,
             mcp_config: Some(mcp_config),
@@ -493,6 +440,7 @@ pub(super) fn handle_coordinated_swarm_command(app: &mut App) {
         use gaviero_core::swarm::{coordinator, pipeline};
 
         let config = pipeline::SwarmConfig {
+            execution_mode: gaviero_core::swarm::plan::ExecutionMode::Repo,
             max_parallel: 4,
             workspace_root: root.clone(),
             model: coordinator_model.clone(),
@@ -501,6 +449,7 @@ pub(super) fn handle_coordinated_swarm_command(app: &mut App) {
             read_namespaces: read_ns,
             write_namespace: write_ns,
             context_files,
+            worktree_context_paths: vec![],
             excludes: vec![],
             memory_writer,
             mcp_config: Some(mcp_config),
