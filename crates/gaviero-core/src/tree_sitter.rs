@@ -36,7 +36,12 @@ const LANGUAGE_REGISTRY: &[(&[&str], &str, Option<GrammarFn>)] = &[
         // in `gaviero-core::workspace`). Aliasing it to the JSON grammar
         // gives editors syntax highlighting, indentation, and structural
         // validation for free — same as opening `*.json` directly.
-        &["json", "gaviero-workspace"],
+        //
+        // `jsonl` (JSON Lines) is a sequence of standalone JSON values, one
+        // per line. The grammar's `document` rule is `repeat($._value)`, so
+        // multi-value files parse cleanly under the JSON grammar — no ERROR
+        // nodes — making the alias sound for highlighting and validation.
+        &["json", "jsonl", "gaviero-workspace"],
         "json",
         Some(|| tree_sitter_json::LANGUAGE.into()),
     ),
@@ -299,6 +304,16 @@ mod tests {
             language_name_for_extension("gaviero-workspace"),
             Some("json")
         );
+    }
+
+    #[test]
+    fn jsonl_extension_aliases_json() {
+        // JSON Lines files (`*.jsonl`) are aliased to the JSON grammar so
+        // highlighting, indentation, and structural validation work the same
+        // as `*.json`. The grammar accepts multiple top-level values, so
+        // line-delimited JSON parses without ERROR nodes.
+        assert!(language_for_extension("jsonl").is_some());
+        assert_eq!(language_name_for_extension("jsonl"), Some("json"));
     }
 
     #[test]
