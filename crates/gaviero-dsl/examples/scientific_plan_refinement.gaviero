@@ -1,0 +1,258 @@
+// Scientific refinement of a *research plan* (not an implementation plan).
+//
+// `execution_mode document` — no git worktrees, merge, or repo-map. Pass
+// `--var PLAN_FILE=/path/to/draft.md` (and optionally `--workspace <dir>`).
+// The CLI anchors the workspace to the plan's folder, sets OUT_DIR there, and
+// writes versioned panel artefacts alongside the plan.
+//
+// Artefacts are versioned (`-plan-v1.md`, `-plan-v2.md`, …): create each file
+// once, read later, never overwrite a prior version. They are scratch outputs,
+// not meant to be committed.
+//
+// Mixes plan_refinement + scientific_research patterns (roster, evidence logs,
+// Semantic Scholar MCP, convergence judge).
+//
+// Required:
+//   --var PLAN_FILE=/path/to/draft-research-plan.md
+//   --prompt "Short topic title"
+//
+// Optional:
+//   --var OUT_DIR=...          (default: directory containing PLAN_FILE)
+//   --mcp-url semantic-scholar=URL   OR  --var SEMANTIC_SCHOLAR_MCP_URL=URL
+//   OR put the server in <workspace>/.cursor/mcp.json (gaviero-cli imports it).
+//   (Wuilder URLs need a trailing slash; gaviero-cli adds it for mcp.wuilder.com)
+//   Cursor agents get `--approve-mcps` and `--sandbox disabled` plus `.cursor/cli.json`
+//   network/MCP allowlists when a remote Semantic Scholar URL is configured.
+//   Cursor `.cursor/mcp.json` omits context7 (npx) so the remote server can register;
+//   call tools by server id `{{SEMANTIC_SCHOLAR_SERVER}}` (default semantic-scholar).
+//   --var ENABLE_WEB_FALLBACK=true
+//
+// Usage (no separate --repo needed):
+//
+//   gaviero-cli --script scientific_plan_refinement.gaviero \
+//     --workflow scientific-plan-refinement \
+//     --prompt "Sparse attention mechanisms" \
+//     --var PLAN_FILE=/path/to/draft-research-plan.md \
+//     --var SEMANTIC_SCHOLAR_MCP_URL=https://YOUR-MCP-ENDPOINT/ \
+//     --mcp-codex-trust granted
+//
+include "clients.gaviero"
+
+vars {
+    OUT_DIR                   "."
+    INIT_VER                  "1"
+    PLAN_FILE                 "plan.md"
+    SEMANTIC_SCHOLAR_SERVER   "semantic-scholar"
+    SEMANTIC_SCHOLAR_MCP_URL  ""
+    ENABLE_WEB_FALLBACK       "false"
+}
+
+prompt init-body #"
+    You are an independent senior research-methodology reviewer.
+
+    Short topic title: {{PROMPT}}
+    Draft research plan to refine: {{PLAN_FILE}}
+
+    Operator-configured Semantic Scholar MCP server id: {{SEMANTIC_SCHOLAR_SERVER}}
+    (Remote URL for operator setup: {{SEMANTIC_SCHOLAR_MCP_URL}} — configure MCP
+    before running; agents invoke tools exposed by that server.)
+
+  Workspace isolation (mandatory):
+    - Read ONLY {{PLAN_FILE}}. Do not read any other files in {{OUT_DIR}}/ yet.
+    - Do not read or search any host checkout beyond {{PLAN_FILE}}.
+    - The scientific topic has no relationship to whatever repository hosts
+      this run unless the draft plan itself says so.
+    - Do NOT produce an implementation roadmap (no code modules, PR phases,
+      or software-project decomposition).
+
+  Write-once artefacts:
+    - Create each output file exactly once with the version suffix given below.
+    - Never edit or overwrite a file from a prior iteration or peer.
+
+    1. Read {{PLAN_FILE}} in full.
+
+    2. Do NOT read any peer outputs under {{OUT_DIR}}/.
+
+    3. Conduct EXTENSIVE literature research using Semantic Scholar MCP
+       ({{SEMANTIC_SCHOLAR_SERVER}}). WebSearch/WebFetch only when
+       ENABLE_WEB_FALLBACK=true (current: {{ENABLE_WEB_FALLBACK}}).
+
+    4. Produce a *research plan* — strengthen hypotheses, methodology,
+       evidence bars, milestones, and stopping rules.
+
+    Hard rules:
+      - Do NOT invent citations; log every source in the evidence file.
+      - Optimise for scientific rigour, not peer agreement.
+
+    Write TWO new files under {{OUT_DIR}}/:
+
+      {{OUT_DIR}}/{{REVIEWER_ID}}-plan-v{{INIT_VER}}.md
+      {{OUT_DIR}}/{{REVIEWER_ID}}-evidence-v{{INIT_VER}}.md
+
+    Plan sections (in order):
+      `## Research objectives and hypotheses`
+      `## State of the art`
+      `## Proposed methodology`
+      `## Data and evidence requirements`
+      `## Risks, limitations, and ethics`
+      `## Milestones and decision points`
+      `## Literature gaps and follow-up searches`
+
+    Evidence sections (in order):
+      `## Search strategy`
+      `## Semantic Scholar queries and tool calls`
+      `## Sources reviewed`
+      `## Evidence extracted`
+      `## Claims needing verification`
+      `## Research limitations`
+"#
+
+prompt refine-body #"
+    You are refining your independent research plan for:
+
+    Short topic title: {{PROMPT}}
+    Anchor draft: {{PLAN_FILE}}
+    Semantic Scholar MCP server id: {{SEMANTIC_SCHOLAR_SERVER}}
+
+    There are {{PEER_COUNT}} other reviewers: {{PEER_IDS}}.
+    Your reviewer id is {{REVIEWER_ID}}.
+
+  Workspace isolation:
+    - Read ONLY {{PLAN_FILE}}, your own prior `{{REVIEWER_ID}}-*` files, and
+      peer `*-v{{PREV_ITER}}.md` artefacts listed below under {{OUT_DIR}}/.
+
+  Write-once artefacts:
+    - Write NEW versioned paths for this iteration only (`-v{{ITER}}`).
+    - Never modify files from earlier iterations (including your own).
+
+    1. Re-read {{PLAN_FILE}} in full.
+
+    2. Read your previous work:
+         {{OUT_DIR}}/{{REVIEWER_ID}}-plan-v{{PREV_ITER}}.md
+         {{OUT_DIR}}/{{REVIEWER_ID}}-evidence-v{{PREV_ITER}}.md
+       When {{PREV_ITER}} >= 2, also:
+         {{OUT_DIR}}/{{REVIEWER_ID}}-summary-v{{PREV_ITER}}.md
+
+    3. Read every peer's previous work IN FULL.
+
+{{PEER_READ_BLOCK}}
+
+       For each peer in {{PEER_IDS}}, also read:
+         {{OUT_DIR}}/<peer>-evidence-v{{PREV_ITER}}.md
+
+    4. Additional Semantic Scholar MCP research (no repeated queries).
+
+    5. Evaluate peers on merits; decide convergence at programme level.
+
+    6. If converged: copy your previous plan into `-v{{ITER}}` verbatim;
+       say so in the summary. If not: minimum-change synthesis.
+
+    Write THREE new files:
+
+      {{OUT_DIR}}/{{REVIEWER_ID}}-plan-v{{ITER}}.md
+      {{OUT_DIR}}/{{REVIEWER_ID}}-summary-v{{ITER}}.md
+      {{OUT_DIR}}/{{REVIEWER_ID}}-evidence-v{{ITER}}.md
+
+    Summary: first sentence EXACTLY `Consensus reached.` or
+    `Consensus not reached.`; then sections per refine template in script.
+"#
+
+prompt judge-body #"
+    You are deciding whether a panel of independently refined *research plans*
+    has reached consensus for: {{PROMPT}}
+
+    {{ITER_EVIDENCE}}
+
+  Read ONLY reviewer artefacts under {{OUT_DIR}}/ for iteration {{ITER}}.
+
+    Pass 1: every `{{OUT_DIR}}/*-summary-v{{ITER}}.md` — all must start with
+    `Consensus reached.` or FAIL.
+
+    Pass 2: every `{{OUT_DIR}}/*-plan-v{{ITER}}.md` — substantive agreement on
+    hypotheses, methodology, risks, milestones, and literature gaps.
+
+    Emit exactly one fenced JSON object last:
+
+    ```json
+    {"verdict": "pass" | "fail", "reason": "<one short sentence>"}
+    ```
+"#
+
+agent reviewer-init {
+    template true
+    description "Initial research plan ({{REVIEWER_ID}}): {{PROMPT}}"
+    tools ["WebSearch" "WebFetch"]
+    scope {
+        owned [
+            "{{OUT_DIR}}/{{REVIEWER_ID}}-plan-v*.md"
+            "{{OUT_DIR}}/{{REVIEWER_ID}}-evidence-v*.md"
+        ]
+        read_only ["{{PLAN_FILE}}"]
+    }
+    prompt init-body
+    max_retries 1
+}
+
+agent reviewer-refine {
+    template true
+    description "Refine research plan ({{REVIEWER_ID}}): {{PROMPT}}"
+    tools ["WebSearch" "WebFetch"]
+    scope {
+        owned [
+            "{{OUT_DIR}}/{{REVIEWER_ID}}-plan-v*.md"
+            "{{OUT_DIR}}/{{REVIEWER_ID}}-summary-v*.md"
+            "{{OUT_DIR}}/{{REVIEWER_ID}}-evidence-v*.md"
+        ]
+        read_only ["{{PLAN_FILE}}" "{{OUT_DIR}}/"]
+    }
+    prompt refine-body
+    max_retries 1
+    memory {
+        write_ns   "scientific-plan-refinement"
+        importance 0.8
+        write_content #"
+            Scientific plan refinement panel for {{PROMPT}} (anchor {{PLAN_FILE}}).
+        "#
+    }
+}
+
+agent convergence-judge {
+    description "Judge research-plan consensus: {{PROMPT}}"
+    client judge
+    scope {
+        read_only ["{{OUT_DIR}}/"]
+    }
+    prompt judge-body
+    max_retries 1
+}
+
+workflow scientific-plan-refinement {
+    execution_mode document
+    param judge {
+        model "claude:sonnet"
+        effort medium
+    }
+    param roster [
+        { id "claude" model "claude:opus"         effort max  }
+        { id "codex"  model "codex:gpt-5.5"       effort high }
+    ]   
+
+    steps [
+        loop {
+            reviewers       roster
+            template_init   reviewer-init
+            template_refine reviewer-refine
+            max_iterations  8
+            iter_start      2
+            stability       2
+            judge_timeout   240
+            strict_judge    false
+            consensus_mode  strict
+            until agent     convergence-judge
+        }
+    ]
+    max_parallel 3
+    memory {
+        write_ns "scientific-plan-refinement"
+    }
+}
