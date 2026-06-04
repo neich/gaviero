@@ -183,6 +183,11 @@ pub mod settings {
     pub const MCP_CONTEXT7_COMMAND: &str = "mcp.context7.command";
     pub const MCP_CONTEXT7_ARGS: &str = "mcp.context7.args";
 
+    /// Extra MCP servers merged into every swarm worktree (Claude/Cursor
+    /// `.mcp.json`, Codex `config.toml`). JSON array of objects, each with
+    /// `name` plus either `url` or `command` + optional `args`.
+    pub const MCP_EXTRA_SERVERS: &str = "mcp.extraServers";
+
     // TUI memory panel (Tier A / A4)
     pub const UI_MEMORY_PANEL_RECENT_WINDOW_HOURS: &str = "ui.memoryPanel.recentWindowHours";
 }
@@ -984,6 +989,7 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::MCP_CONTEXT7_ENABLED => serde_json::json!(true),
         settings::MCP_CONTEXT7_COMMAND => serde_json::json!("npx"),
         settings::MCP_CONTEXT7_ARGS => serde_json::json!(["-y", "@upstash/context7-mcp"]),
+        settings::MCP_EXTRA_SERVERS => serde_json::json!([]),
 
         // Memory panel (A4)
         settings::UI_MEMORY_PANEL_RECENT_WINDOW_HOURS => serde_json::json!(24),
