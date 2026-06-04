@@ -54,6 +54,34 @@ fn dsl_compiled_plan_passes_swarm_validate_scopes() {
 }
 
 #[test]
+fn scientific_plan_refinement_roster_passes_swarm_scope_validation() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/scientific_plan_refinement.gaviero");
+    let plan = gaviero_dsl::compile_file(
+        &path,
+        Some("scientific-plan-refinement"),
+        Some("test topic"),
+        &[],
+        &[],
+        &[],
+    )
+    .expect("scientific_plan_refinement should compile");
+    let units = plan.work_units_ordered().expect("toposort");
+    let loop_groups = validation::expand_loop_groups_with_roster_init(
+        plan.loop_configs
+            .iter()
+            .map(|lc| lc.agent_ids.clone())
+            .collect(),
+        &units.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(),
+    );
+    let errors = validation::validate_scopes(&units, &loop_groups);
+    assert!(
+        errors.is_empty(),
+        "scientific_plan_refinement init/refine scopes must validate; got: {errors:?}"
+    );
+}
+
+#[test]
 fn scientific_research_roster_passes_swarm_scope_validation() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("examples/scientific_research.gaviero");
