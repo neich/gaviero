@@ -58,7 +58,7 @@ impl<'a> EditorView<'a> {
         let scroll_lines = layout.len();
 
         // Compute highlights for visible range
-        let spans = self.compute_highlights(code_area.height as usize);
+        let spans = self.compute_highlights(code_area.height as usize, content_width);
 
         // Render each visible line (logical or wrapped visual row)
         let top = self.buffer.scroll.top_line;
@@ -383,19 +383,12 @@ impl<'a> EditorView<'a> {
         }
     }
 
-    fn compute_highlights(&self, viewport_height: usize) -> Vec<StyledSpan> {
-        let top = self.buffer.scroll.top_line;
-        let bottom = (top + viewport_height).min(self.buffer.line_count());
-
-        if top >= self.buffer.line_count() {
+    fn compute_highlights(&self, viewport_height: usize, content_width: usize) -> Vec<StyledSpan> {
+        let Some((start_byte, end_byte)) =
+            self.buffer
+                .highlight_viewport_byte_range(viewport_height, content_width)
+        else {
             return Vec::new();
-        }
-
-        let start_byte = self.buffer.text.line_to_byte(top);
-        let end_byte = if bottom >= self.buffer.line_count() {
-            self.buffer.text.len_bytes()
-        } else {
-            self.buffer.text.line_to_byte(bottom)
         };
 
         // Use regex-based markdown highlighter when there's no tree-sitter config
