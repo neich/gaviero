@@ -113,6 +113,7 @@ impl TestGenerator {
             None, // no graph store for test generation
             None, // no pre-fetched memory for test generation
             &[],  // workspace tool extras: not applicable to test generator
+            false,
         )
         .await
         {
