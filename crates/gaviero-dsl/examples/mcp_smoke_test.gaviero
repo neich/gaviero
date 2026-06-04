@@ -1,0 +1,142 @@
+// MCP smoke test — verify an external MCP server works for every client.
+//
+// Runs one tiny probe per provider (Claude, Codex, Cursor). Each probe is told
+// to call ONE read-only tool on the operator-supplied MCP server and write a
+// verdict file `{{OUT_DIR}}/<agent>.probe` whose FIRST LINE is exactly:
+//     MCP_OK     — a tool call to the server returned a real response
+//     MCP_FAIL   — unreachable / errored / no tools / could not call it
+//
+// Why a verdict file instead of the run's exit code: gaviero-cli only exits
+// non-zero on backend/validation failures. Codex marks user `--mcp-url`/
+// `--mcp-stdio` servers `required = true`, so `codex exec` hard-fails by itself
+// when the server is unreachable — but Claude and Cursor just finish the turn
+// and report the problem in prose. The companion wrapper `mcp_smoke_test.sh`
+// turns these verdict files into a hard pass/fail and stops on the first FAIL.
+//
+// `execution_mode document` — no git worktrees, no merge, no repo-map. Point
+// `--workspace` at a scratch dir; the probes write their verdicts there.
+//
+// The `--mcp-url` NAME must equal `--var MCP_SERVER=...` so the prompt names the
+// right server. Use `--mcp-stdio NAME=cmd,arg1,...` instead for a local server.
+//
+// Usage (let the wrapper do it for you):
+//   gaviero-cli --script mcp_smoke_test.gaviero --workflow mcp-smoke-test \
+//     --workspace /tmp/mcp-smoke --var OUT_DIR=. --var MCP_SERVER=my-server \
+//     --mcp-url my-server=https://YOUR-ENDPOINT/ \
+//     --mcp-codex-trust granted
+//
+// Probe a single client (used by the wrapper for fail-fast):
+//   --workflow probe-claude | probe-codex | probe-cursor
+//
+// To change a model, edit the `client` blocks below (e.g. claude:haiku for an
+// even cheaper probe). Effort is kept low — this only checks connectivity.
+
+vars {
+    OUT_DIR    "."
+    MCP_SERVER "probe-mcp"
+    // What each probe should do. Override per server's tool surface, e.g.
+    //   --var PROBE_TASK="Call search_papers with query \"attention\", limit 1."
+    PROBE_TASK "List the tools this server exposes, then call exactly one safe, read-only tool with a minimal argument and capture its raw response."
+}
+
+// ── Clients ──────────────────────────────────────────────────────────────────
+// Top-level (not workflow params) so every workflow in this file — including
+// the single-client ones — resolves them regardless of which `--workflow` runs.
+
+client claude_probe {
+    model "claude:sonnet"
+    privacy public
+    effort low
+    default
+}
+
+client codex_probe {
+    model "codex:gpt-5.5"
+    privacy public
+    effort low
+}
+
+client cursor_probe {
+    model "cursor:composer-2.5"
+    privacy public
+    effort low
+}
+
+// ── Probe prompt (shared) ────────────────────────────────────────────────────
+
+prompt probe-body #"
+    You are a connectivity probe. Your ONLY job is to confirm that the MCP
+    server named `{{MCP_SERVER}}` is reachable and answers a tool call from
+    THIS client. Do not edit code, do not explore the workspace, do not call
+    any other server.
+
+    Steps:
+      1. Target the MCP server named `{{MCP_SERVER}}`.
+      2. {{PROBE_TASK}}
+      3. Write your verdict to `{{OUT_DIR}}/{{AGENT}}.probe` (create it once):
+           - The VERY FIRST LINE must be exactly `MCP_OK` if an actual tool
+             call to `{{MCP_SERVER}}` returned a real response, or exactly
+             `MCP_FAIL` if the server was unreachable, returned an error,
+             exposed no tools, or you could not call it for any reason.
+           - Below the first line, record: the tool you called, the arguments,
+             and the raw response or the exact error text.
+
+    Never write `MCP_OK` unless a real tool call to `{{MCP_SERVER}}` actually
+    succeeded. If you are unsure or had to guess, the verdict is `MCP_FAIL`.
+"#
+
+// ── Probe agents (one per client) ────────────────────────────────────────────
+
+agent probe_claude {
+    description "MCP probe via Claude: {{MCP_SERVER}}"
+    client claude_probe
+    scope { owned ["{{OUT_DIR}}/probe_claude.probe"] }
+    prompt probe-body
+    max_retries 0
+}
+
+agent probe_codex {
+    description "MCP probe via Codex: {{MCP_SERVER}}"
+    client codex_probe
+    scope { owned ["{{OUT_DIR}}/probe_codex.probe"] }
+    prompt probe-body
+    max_retries 0
+}
+
+agent probe_cursor {
+    description "MCP probe via Cursor: {{MCP_SERVER}}"
+    client cursor_probe
+    scope { owned ["{{OUT_DIR}}/probe_cursor.probe"] }
+    prompt probe-body
+    max_retries 0
+}
+
+// ── Workflows ────────────────────────────────────────────────────────────────
+
+// All three, in order. `max_parallel 1` keeps the output readable; the wrapper
+// reads the verdict files afterwards to decide pass/fail for every client.
+workflow mcp-smoke-test {
+    execution_mode document
+    steps [probe_claude probe_codex probe_cursor]
+    max_parallel 1
+}
+
+// Single-client workflows — let the wrapper run one provider at a time and
+// stop at the first failure (true fail-fast), and let you probe one ad hoc.
+workflow probe-claude {
+    execution_mode document
+    steps [probe_claude]
+    max_parallel 1
+}
+
+workflow probe-codex {
+    execution_mode document
+    steps [probe_codex]
+    max_parallel 1
+}
+
+workflow probe-cursor {
+    execution_mode document
+    steps [probe_cursor]
+    max_parallel 1
+}
