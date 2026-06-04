@@ -80,6 +80,7 @@
 "test_first" @keyword
 "attempts" @keyword
 "escalate_after" @keyword
+"execution_mode" @keyword
 
 ; ── Tier values ───────────────────────────────────────────────
 (tier_value) @constant.builtin
@@ -89,6 +90,9 @@
 
 ; ── Strategy values ───────────────────────────────────────────
 (strategy_value) @constant.builtin
+
+; ── Execution mode values ─────────────────────────────────────
+(execution_mode_value) @constant.builtin
 
 ; ── Boolean values ────────────────────────────────────────────
 (boolean) @constant.builtin
