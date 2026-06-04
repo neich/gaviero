@@ -1220,15 +1220,6 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                             "mcp server listening"
                         );
                         app.mcp_server = Some(handle);
-                        let shim_binary = app
-                            .workspace
-                            .resolve_setting(
-                                gaviero_core::workspace::settings::MCP_GAVIERO_SHIM_BINARY,
-                                Some(&workspace_root_for_mcp),
-                            )
-                            .as_str()
-                            .unwrap_or("gaviero-mcp-shim")
-                            .to_string();
                         let codex_trust = match app
                             .workspace
                             .resolve_setting(
@@ -1242,18 +1233,14 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                             "denied" | "untrusted" => gaviero_core::mcp::TrustConsent::Denied,
                             _ => gaviero_core::mcp::TrustConsent::Unknown,
                         };
-                        let context7 = super::commands::resolve_context7_config(
-                            app,
-                            Some(&workspace_root_for_mcp),
+                        let mut overrides = gaviero_core::mcp::McpConfigOverrides::default();
+                        overrides.codex_trust = Some(codex_trust);
+                        let synth = gaviero_core::mcp::resolve_mcp_config_synth(
+                            &app.workspace,
+                            &workspace_root_for_mcp,
+                            socket_path.clone(),
+                            &overrides,
                         );
-                        let synth = gaviero_core::mcp::McpConfigSynth {
-                            worktree: workspace_root_for_mcp.clone(),
-                            socket_path: socket_path.clone(),
-                            shim_binary,
-                            codex_trust,
-                            enabled: true,
-                            context7,
-                        };
                         if let Err(e) = gaviero_core::mcp::synthesize_for_worktree(&synth) {
                             tracing::warn!(
                                 target: "mcp_server",
