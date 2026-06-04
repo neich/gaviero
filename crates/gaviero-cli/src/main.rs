@@ -28,9 +28,14 @@ enum OutputFormat {
 #[derive(Parser, Debug)]
 #[command(name = "gaviero-cli", about = "Headless AI agent task runner")]
 struct Cli {
-    /// Path to the repository / workspace root.
-    #[arg(long, default_value = ".")]
+    /// Path to the git repository root (`execution repo` workflows).
+    #[arg(long, default_value = ".", conflicts_with = "workspace")]
     repo: PathBuf,
+
+    /// Data directory for `execution document` workflows (no git lifecycle).
+    /// Defaults to the plan file's directory when `--var PLAN_FILE=...` is set.
+    #[arg(long, conflicts_with = "repo")]
+    workspace: Option<PathBuf>,
 
     /// Single task description (creates one WorkUnit with full repo scope).
     #[arg(long, conflicts_with = "work_units")]
@@ -408,6 +413,31 @@ struct Cli {
     #[arg(long = "redact-reason")]
     redact_reason: Option<String>,
 
+    /// Disable MCP config synthesis and the in-process Gaviero MCP server
+    /// for this run. Extra servers from workspace settings are skipped too.
+    #[arg(long = "no-mcp")]
+    no_mcp: bool,
+
+    /// Extra remote MCP server for every agent worktree. Format: `name=url`
+    /// (repeatable). Merged into `.mcp.json` / `.cursor/mcp.json` and
+    /// Codex `config.toml` alongside Gaviero's built-in servers. CLI
+    /// entries override workspace `mcp.extraServers` with the same name.
+    #[arg(long = "mcp-url", value_name = "NAME=URL")]
+    mcp_url: Vec<String>,
+
+    /// Extra stdio MCP server. Format: `name=command,arg1,arg2` (repeatable).
+    #[arg(long = "mcp-stdio", value_name = "NAME=COMMAND[,ARGS...]")]
+    mcp_stdio: Vec<String>,
+
+    /// Codex project trust for synthesized `.codex/config.toml`.
+    /// Use `granted` in CI so Codex agents see MCP servers without a TUI prompt.
+    #[arg(long = "mcp-codex-trust", value_name = "granted|denied|unknown")]
+    mcp_codex_trust: Option<String>,
+
+    /// Skip MCP preflight (shim on PATH, URL shape, optional HTTP probe).
+    #[arg(long = "skip-mcp-preflight")]
+    skip_mcp_preflight: bool,
+
     /// Tier A / A2: write a `/remember`-style memory from headless
     /// mode and exit. Goes through the writer task (single-consumer
     /// invariant) — opens [`MemoryServices`] under the hood. Pair with
@@ -653,6 +683,160 @@ fn parse_var_overrides(raw: &[String]) -> Result<Vec<(String, String)>> {
         .collect()
 }
 
+fn cli_repo_is_default(cli: &Cli) -> bool {
+    cli.repo.as_os_str() == std::ffi::OsStr::new(".")
+}
+
+/// Resolve a path from `--var` before the workspace root is finalised.
+fn resolve_host_path_early(cwd: &std::path::Path, repo: &std::path::Path, value: &str) -> Option<std::path::PathBuf> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.ends_with('/') {
+        return None;
+    }
+    let host = if std::path::Path::new(trimmed).is_absolute() {
+        std::path::PathBuf::from(trimmed)
+    } else {
+        let under_repo = repo.join(trimmed);
+        if under_repo.is_file() {
+            under_repo
+        } else {
+            cwd.join(trimmed)
+        }
+    };
+    host.is_file().then_some(host)
+}
+
+fn set_var(vars: &mut Vec<(String, String)>, key: &str, value: String) {
+    if let Some((_, v)) = vars.iter_mut().find(|(k, _)| k == key) {
+        *v = value;
+    } else {
+        vars.push((key.to_string(), value));
+    }
+}
+
+fn apply_out_dir_default_from_plan(
+    vars: &mut Vec<(String, String)>,
+    repo: &std::path::Path,
+    plan_host: &std::path::Path,
+) {
+    if vars.iter().any(|(k, _)| k == "OUT_DIR") {
+        return;
+    }
+    let Some(plan_dir) = plan_host.parent() else {
+        return;
+    };
+    let out = path_spec_for_worktree(repo, plan_dir);
+    set_var(vars, "OUT_DIR", out);
+}
+
+/// When running a DSL script with `PLAN_FILE`, anchor the workspace to the plan's
+/// directory (if `--repo` is still the default `.`) and default `OUT_DIR` there.
+struct SwarmWorkspacePrep {
+    repo_path: PathBuf,
+    /// Set when `--script` is present (vars parsed, plan defaults applied).
+    override_vars: Option<Vec<(String, String)>>,
+}
+
+fn prepare_swarm_workspace(
+    cli: &Cli,
+    cwd: &std::path::Path,
+    execution_mode: gaviero_core::swarm::plan::ExecutionMode,
+) -> Result<SwarmWorkspacePrep> {
+    use gaviero_core::swarm::plan::ExecutionMode;
+
+    if cli.script.is_none() {
+        return Ok(SwarmWorkspacePrep {
+            repo_path: cli
+                .workspace
+                .clone()
+                .unwrap_or_else(|| cli.repo.clone()),
+            override_vars: None,
+        });
+    }
+
+    if execution_mode == ExecutionMode::Document && !cli_repo_is_default(cli) {
+        anyhow::bail!(
+            "workflow declares `execution_mode document`: use --workspace or --var PLAN_FILE=... \
+             (omit --repo)"
+        );
+    }
+    if execution_mode == ExecutionMode::Repo && cli.workspace.is_some() {
+        anyhow::bail!(
+            "workflow declares `execution_mode repo`: --workspace is not allowed (use --repo)"
+        );
+    }
+
+    let mut vars = parse_var_overrides(&cli.vars)?;
+    let mut repo_path = cli
+        .workspace
+        .clone()
+        .unwrap_or_else(|| cli.repo.clone());
+
+    if execution_mode == ExecutionMode::Document {
+        if let Some(ws) = &cli.workspace {
+            repo_path = ws.clone();
+            eprintln!(
+                "[execution] document workspace: {}",
+                repo_path.display()
+            );
+        } else if let Some(plan_value) = vars
+            .iter()
+            .find(|(k, _)| k == "PLAN_FILE")
+            .map(|(_, v)| v.as_str())
+        {
+            let Some(plan_host) = resolve_host_path_early(cwd, &repo_path, plan_value) else {
+                anyhow::bail!(
+                    "--var PLAN_FILE={plan_value}: file not found (pass an existing path)"
+                );
+            };
+            let plan_dir = plan_host
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("--var PLAN_FILE has no parent directory"))?;
+            let plan_dir = std::fs::canonicalize(plan_dir)
+                .with_context(|| format!("resolving plan directory {}", plan_dir.display()))?;
+            if cli_repo_is_default(cli) {
+                repo_path = plan_dir.clone();
+                let plan_rel = path_spec_for_worktree(&plan_dir, &plan_host);
+                set_var(&mut vars, "PLAN_FILE", plan_rel);
+                eprintln!(
+                    "[execution] document workspace: {} (PLAN_FILE={})",
+                    plan_dir.display(),
+                    vars.iter()
+                        .find(|(k, _)| k == "PLAN_FILE")
+                        .map(|(_, v)| v.as_str())
+                        .unwrap_or("?")
+                );
+            }
+            apply_out_dir_default_from_plan(&mut vars, &repo_path, &plan_host);
+        } else {
+            anyhow::bail!(
+                "execution document requires --workspace <dir> or --var PLAN_FILE=<path>"
+            );
+        }
+    } else if let Some(plan_value) = vars
+        .iter()
+        .find(|(k, _)| k == "PLAN_FILE")
+        .map(|(_, v)| v.as_str())
+    {
+        if let Some(plan_host) = resolve_host_path_early(cwd, &repo_path, plan_value) {
+            let repo_canon =
+                std::fs::canonicalize(&repo_path).unwrap_or_else(|_| repo_path.clone());
+            apply_out_dir_default_from_plan(&mut vars, &repo_canon, &plan_host);
+        }
+    }
+
+    if execution_mode == ExecutionMode::Document {
+        if let Some(out) = vars.iter().find(|(k, _)| k == "OUT_DIR").map(|(_, v)| v.as_str()) {
+            eprintln!("[execution] OUT_DIR={out} (versioned artefacts; not for commit)");
+        }
+    }
+
+    Ok(SwarmWorkspacePrep {
+        repo_path,
+        override_vars: Some(vars),
+    })
+}
+
 fn ensure_parent_dir(path: &std::path::Path) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -661,6 +845,300 @@ fn ensure_parent_dir(path: &std::path::Path) -> Result<()> {
             .with_context(|| format!("creating parent directory {}", parent.display()))?;
     }
     Ok(())
+}
+
+/// Resolve a `--var` value to an existing file under or outside `--repo`.
+fn resolve_var_file_path(repo: &std::path::Path, value: &str) -> Option<std::path::PathBuf> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.ends_with('/') {
+        return None;
+    }
+    let host = if std::path::Path::new(trimmed).is_absolute() {
+        std::path::PathBuf::from(trimmed)
+    } else {
+        repo.join(trimmed)
+    };
+    host.is_file().then_some(host)
+}
+
+fn path_spec_for_worktree(repo: &std::path::Path, host: &std::path::Path) -> String {
+    let normalize_rel = |rel: &std::path::Path| {
+        let s = rel.to_string_lossy().replace('\\', "/");
+        if s.is_empty() { ".".to_string() } else { s }
+    };
+    if let Ok(rel) = host.strip_prefix(repo) {
+        return normalize_rel(rel);
+    }
+    let ws = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    let host_canon = std::fs::canonicalize(host).unwrap_or_else(|_| host.to_path_buf());
+    if let Ok(rel) = host_canon.strip_prefix(&ws) {
+        normalize_rel(rel.as_ref())
+    } else {
+        host.to_string_lossy().to_string()
+    }
+}
+
+/// Paths from the CLI that may need worktree injection (`--var` files, `--prompt-file`).
+fn collect_cli_worktree_context_paths(
+    repo: &std::path::Path,
+    cwd: &std::path::Path,
+    override_vars: &[(String, String)],
+    prompt_file: Option<&std::path::Path>,
+) -> Vec<String> {
+    use std::collections::HashSet;
+
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(p) = prompt_file {
+        let host = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cwd.join(p)
+        };
+        if host.is_file() {
+            let spec = path_spec_for_worktree(repo, &host);
+            if seen.insert(spec.clone()) {
+                paths.push(spec);
+            }
+        }
+    }
+
+    for (_key, value) in override_vars {
+        if let Some(host) = resolve_var_file_path(repo, value) {
+            let spec = path_spec_for_worktree(repo, &host);
+            if seen.insert(spec.clone()) {
+                paths.push(spec);
+            }
+        }
+    }
+
+    paths
+}
+
+/// When a `--var` points at a file outside `--repo`, copy it under
+/// `.gaviero/injected/` and rewrite the var so agents and worktrees can read it.
+fn materialize_external_vars_for_repo(
+    repo: &std::path::Path,
+    vars: &mut Vec<(String, String)>,
+) -> Result<()> {
+    let injected_dir = repo.join(".gaviero/injected");
+    let ws = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+
+    for (key, value) in vars.iter_mut() {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some(host) = resolve_var_file_path(repo, trimmed) else {
+            continue;
+        };
+        let host_canon = std::fs::canonicalize(&host).unwrap_or(host.clone());
+        if host_canon.starts_with(&ws) {
+            continue;
+        }
+        std::fs::create_dir_all(&injected_dir)
+            .with_context(|| format!("creating {}", injected_dir.display()))?;
+        let dest = injected_dir.join(
+            host.file_name()
+                .ok_or_else(|| anyhow::anyhow!("path has no filename: {}", host.display()))?,
+        );
+        std::fs::copy(&host, &dest)
+            .with_context(|| format!("copying external file into {}", dest.display()))?;
+        let rel = dest
+            .strip_prefix(repo)
+            .with_context(|| "injected file must stay under --repo")?
+            .to_string_lossy()
+            .replace('\\', "/");
+        eprintln!(
+            "[vars] {}: file outside --repo copied to {} (was {})",
+            key,
+            rel,
+            host.display()
+        );
+        *value = rel;
+    }
+    Ok(())
+}
+
+/// Normalize remote MCP URLs (some hosts 308-redirect unless the path ends with `/`).
+fn normalize_remote_mcp_url(url: &str) -> String {
+    let url = url.trim();
+    if url.starts_with("https://mcp.wuilder.com/") && !url.ends_with('/') {
+        format!("{url}/")
+    } else {
+        url.to_string()
+    }
+}
+
+/// Register `SEMANTIC_SCHOLAR_MCP_URL` / `SEMANTIC_SCHOLAR_SERVER` script vars as MCP URLs.
+fn extra_mcp_urls_from_script_vars(vars: &[(String, String)]) -> Vec<(String, String)> {
+    let Some(url) = vars
+        .iter()
+        .find(|(k, _)| k == "SEMANTIC_SCHOLAR_MCP_URL")
+        .map(|(_, v)| v.as_str())
+        .filter(|v| !v.trim().is_empty())
+    else {
+        return Vec::new();
+    };
+    let name = vars
+        .iter()
+        .find(|(k, _)| k == "SEMANTIC_SCHOLAR_SERVER")
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "semantic-scholar".to_string());
+    vec![(name, normalize_remote_mcp_url(url))]
+}
+
+fn mcp_overrides_from_cli(
+    cli: &Cli,
+    script_vars: &[(String, String)],
+) -> Result<gaviero_core::mcp::McpConfigOverrides> {
+    use gaviero_core::mcp::{parse_mcp_codex_trust_flag, parse_mcp_stdio_flag, parse_mcp_url_flag};
+
+    let mut overrides = gaviero_core::mcp::McpConfigOverrides::default();
+    if cli.no_mcp {
+        overrides.enabled = Some(false);
+    }
+    for raw in &cli.mcp_url {
+        let (name, url) = parse_mcp_url_flag(raw)?;
+        overrides
+            .extra_urls
+            .push((name, normalize_remote_mcp_url(&url)));
+    }
+    for (name, url) in extra_mcp_urls_from_script_vars(script_vars) {
+        if overrides.extra_urls.iter().any(|(n, _)| n == &name) {
+            continue;
+        }
+        eprintln!("[mcp] {name}: remote server from SEMANTIC_SCHOLAR_MCP_URL");
+        overrides.extra_urls.push((name, url));
+    }
+    for raw in &cli.mcp_stdio {
+        let (name, command, args) = parse_mcp_stdio_flag(raw)?;
+        overrides.extra_stdio.push((name, command, args));
+    }
+    if let Some(ref trust) = cli.mcp_codex_trust {
+        overrides.codex_trust = Some(parse_mcp_codex_trust_flag(trust)?);
+    }
+    Ok(overrides)
+}
+
+/// Start the in-process MCP server (when memory is available), synthesize
+/// per-worktree provider configs at the repo root, and return the synth
+/// struct for the swarm pipeline (cloned per agent worktree).
+fn prepare_mcp_for_swarm(
+    repo: &std::path::Path,
+    workspace: &gaviero_core::workspace::Workspace,
+    cli: &Cli,
+    script_vars: &[(String, String)],
+    memory: &Option<Arc<gaviero_core::memory::MemoryStores>>,
+) -> Result<(Option<gaviero_core::mcp::McpConfigSynth>, Option<gaviero_core::mcp::McpServerHandle>)> {
+    use std::sync::Arc;
+
+    use gaviero_core::mcp::{
+        GavieroMcpServer, NoopMcpObserver, PreflightOpts, preflight_mcp, resolve_mcp_config_synth,
+        spawn_mcp_server, synthesize_for_worktree,
+    };
+
+    let mut overrides = mcp_overrides_from_cli(cli, script_vars)?;
+    for (name, url) in gaviero_core::mcp::extra_urls_from_project_mcp_json(repo) {
+        if overrides.extra_urls.iter().any(|(n, _)| n == &name) {
+            continue;
+        }
+        eprintln!("[mcp] {name}: remote server from project mcp.json");
+        overrides
+            .extra_urls
+            .push((name, normalize_remote_mcp_url(&url)));
+    }
+    if memory.is_none() {
+        overrides.gaviero_enabled = Some(false);
+    }
+    let socket_path = repo.join(".gaviero/mcp.sock");
+    let synth = resolve_mcp_config_synth(workspace, repo, socket_path, &overrides);
+    if !synth.enabled {
+        return Ok((None, None));
+    }
+
+    if !cli.skip_mcp_preflight {
+        preflight_mcp(&synth, PreflightOpts::default())?;
+    }
+
+    let mut handle = None;
+    if synth.gaviero_enabled {
+        if let Some(stores) = memory {
+            let retrieval_cfg = workspace.resolve_retrieval_config(Some(repo));
+            let rerank_cfg = workspace.resolve_rerank_config(Some(repo));
+            let specificity = workspace.resolve_specificity_config(Some(repo));
+            let edge_weights = workspace.resolve_all_edge_weights(Some(repo));
+            let server = GavieroMcpServer::new(
+                stores.clone(),
+                repo.to_path_buf(),
+                Arc::new(NoopMcpObserver),
+                retrieval_cfg,
+                rerank_cfg,
+                None,
+            )
+            .with_specificity(specificity)
+            .with_edge_weights(edge_weights);
+            let h = spawn_mcp_server(server, &synth.socket_path)
+                .with_context(|| format!("starting gaviero MCP server at {}", synth.socket_path.display()))?;
+            eprintln!(
+                "[mcp] gaviero server listening on {}",
+                h.socket_path.display()
+            );
+            handle = Some(h);
+        }
+    }
+
+    if !synth.extra_servers.is_empty() {
+        eprintln!(
+            "[mcp] {} extra server(s): {}",
+            synth.extra_servers.len(),
+            synth
+                .extra_servers
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        for extra in &synth.extra_servers {
+            if let gaviero_core::mcp::ExtraMcpTransport::Url { url } = &extra.transport {
+                eprintln!(
+                    "[mcp] cursor: invoke MCP tools as {:?} (not display names); url={url}",
+                    extra.name
+                );
+            }
+        }
+        eprintln!(
+            "[mcp] cursor: if MCP tools still fail, set in ~/.cursor/cli-config.json: \
+             {{\"approvalMode\":\"unrestricted\",\"sandbox\":{{\"mode\":\"disabled\",\"networkAccess\":\"allow_all\"}}}}",
+        );
+        if matches!(synth.codex_trust, gaviero_core::mcp::TrustConsent::Granted) {
+            eprintln!(
+                "[mcp] codex agents will run with --dangerously-bypass-approvals-and-sandbox \
+                 (required for MCP tool calls in `codex exec`; sandboxed by per-agent git \
+                 worktree + Write Gate). Extras carry `required = true` + \
+                 startup_timeout_sec=60 / tool_timeout_sec=60.",
+            );
+        }
+    }
+
+    let paths = synthesize_for_worktree(&synth)
+        .context("synthesizing MCP provider config under execution root")?;
+    gaviero_core::mcp::validate_synthesized_cursor_remote_mcp(&synth)
+        .context("validating Cursor MCP config for remote URL server(s)")?;
+    if !paths.is_empty() {
+        eprintln!(
+            "[mcp] synthesized config at {}",
+            paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    Ok((Some(synth), handle))
 }
 
 fn parse_param_overrides(raw: &[String]) -> Result<Vec<(String, String)>> {
@@ -1809,8 +2287,21 @@ async fn main() -> Result<()> {
             .init();
     }
 
-    let repo = std::fs::canonicalize(&cli.repo)
-        .with_context(|| format!("resolving repo path: {}", cli.repo.display()))?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let script_execution_mode = cli
+        .script
+        .as_ref()
+        .map(|p| {
+            gaviero_dsl::workflow_execution_mode(p, cli.workflow.as_deref()).map_err(|e| {
+                eprintln!("{:?}", e);
+                anyhow::anyhow!("failed to read workflow execution_mode from script")
+            })
+        })
+        .transpose()?
+        .unwrap_or(gaviero_core::swarm::plan::ExecutionMode::Repo);
+    let swarm_workspace = prepare_swarm_workspace(&cli, &cwd, script_execution_mode)?;
+    let repo = std::fs::canonicalize(&swarm_workspace.repo_path)
+        .with_context(|| format!("resolving repo path: {}", swarm_workspace.repo_path.display()))?;
 
     // ── Tier C / C1: enforce explicit consent for the typed-stores
     // migration. Headless invocation cannot prompt; require the
@@ -2133,6 +2624,7 @@ async fn main() -> Result<()> {
     };
 
     // Parse work units
+    let mut worktree_context_paths = Vec::new();
     let mut plan = if let Some(ref script_path) = cli.script {
         let runtime_prompt = if let Some(ref text) = cli.prompt {
             Some(text.clone())
@@ -2144,7 +2636,17 @@ async fn main() -> Result<()> {
         } else {
             None
         };
-        let override_vars = parse_var_overrides(&cli.vars)?;
+        let mut override_vars = swarm_workspace
+            .override_vars
+            .clone()
+            .expect("script mode always pre-parses --var overrides");
+        materialize_external_vars_for_repo(&repo, &mut override_vars)?;
+        worktree_context_paths = collect_cli_worktree_context_paths(
+            &repo,
+            &cwd,
+            &override_vars,
+            cli.prompt_file.as_deref(),
+        );
         let override_params = parse_param_overrides(&cli.params)?;
         let override_tiers = if let Some(ref tiers_path) = cli.tiers_file {
             let tiers_path = if tiers_path.is_absolute() {
@@ -2281,23 +2783,55 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Execute via swarm pipeline
+    // MCP: synthesize per-worktree provider configs + optional in-process server.
+    let mcp_script_vars = swarm_workspace
+        .override_vars
+        .as_deref()
+        .unwrap_or(&[]);
+    let (mcp_config, _mcp_server_guard) =
+        prepare_mcp_for_swarm(&repo, &workspace, &cli, mcp_script_vars, &memory)?;
+    if let Some(ref synth) = mcp_config {
+        gaviero_core::mcp::validate_codex_trust_for_extras(synth, &plan, &execution_model)?;
+    }
+
     // plan.max_parallel overrides the CLI flag when declared.
+    let effective_max_parallel = plan.max_parallel.unwrap_or(cli.max_parallel);
+    eprintln!("[execution] mode={:?}", plan.execution_mode);
+    if plan.execution_mode == gaviero_core::swarm::plan::ExecutionMode::Repo
+        && effective_max_parallel > 1
+        && cli.max_parallel <= 1
+    {
+        eprintln!(
+            "[parallel] workflow requests max_parallel={effective_max_parallel} \
+             (CLI default is 1) — using worktree isolation"
+        );
+    }
+    if !worktree_context_paths.is_empty() {
+        eprintln!(
+            "[worktree] injecting CLI context file(s): {}",
+            worktree_context_paths.join(", ")
+        );
+    }
+
+    // Execute via swarm pipeline
     let swarm_observer = CliSwarmObserver;
     let specificity = workspace.resolve_specificity_config(Some(&repo));
     let (swarm_extra_tools, _) = workspace.resolve_agent_tools(Some(&repo));
     let config = gaviero_core::swarm::pipeline::SwarmConfig {
-        max_parallel: cli.max_parallel,
-        workspace_root: repo,
+        execution_mode: plan.execution_mode,
+        max_parallel: effective_max_parallel,
+        workspace_root: repo.clone(),
         model: execution_model.clone(),
         ollama_base_url: ollama_base_url.clone(),
-        use_worktrees: cli.max_parallel > 1,
+        use_worktrees: plan.execution_mode == gaviero_core::swarm::plan::ExecutionMode::Repo
+            && effective_max_parallel > 1,
         read_namespaces: read_nss,
         write_namespace: write_ns,
         context_files: vec![],
+        worktree_context_paths,
         excludes: cli.exclude.clone(),
         memory_writer: None,
-        mcp_config: None,
+        mcp_config,
         specificity,
         swarm_extra_tools,
     };
@@ -2576,6 +3110,60 @@ mod tests {
     fn parse_var_overrides_rejects_missing_equals() {
         let raw = vec!["BADVAR".to_string()];
         assert!(parse_var_overrides(&raw).is_err());
+    }
+
+    #[test]
+    fn prepare_swarm_workspace_anchors_repo_and_out_dir_to_plan_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("draft.md");
+        std::fs::write(&plan, "# draft").unwrap();
+        let cli = Cli::try_parse_from([
+            "gaviero-cli",
+            "--script",
+            "workflow.gaviero",
+            "--var",
+            &format!("PLAN_FILE={}", plan.display()),
+        ])
+        .unwrap();
+        let prep = prepare_swarm_workspace(
+            &cli,
+            dir.path(),
+            gaviero_core::swarm::plan::ExecutionMode::Document,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::canonicalize(prep.repo_path).unwrap(),
+            std::fs::canonicalize(dir.path()).unwrap()
+        );
+        let vars = prep.override_vars.unwrap();
+        assert_eq!(
+            vars.iter().find(|(k, _)| k == "OUT_DIR").map(|(_, v)| v.as_str()),
+            Some(".")
+        );
+        assert_eq!(
+            vars.iter().find(|(k, _)| k == "PLAN_FILE").map(|(_, v)| v.as_str()),
+            Some("draft.md")
+        );
+    }
+
+    #[test]
+    fn cli_accepts_mcp_url_flags() {
+        let cli = Cli::try_parse_from([
+            "gaviero-cli",
+            "--task",
+            "x",
+            "--mcp-url",
+            "semantic-scholar=https://example/mcp",
+            "--mcp-codex-trust",
+            "granted",
+        ])
+        .unwrap();
+        let overrides = mcp_overrides_from_cli(&cli, &[]).unwrap();
+        assert_eq!(overrides.extra_urls.len(), 1);
+        assert_eq!(
+            overrides.codex_trust,
+            Some(gaviero_core::mcp::TrustConsent::Granted)
+        );
     }
 
     #[test]
