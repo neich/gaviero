@@ -86,6 +86,7 @@ impl AcpObserver for NoopAcpObserver {
 
 fn make_config(workspace: &std::path::Path) -> SwarmConfig {
     SwarmConfig {
+        execution_mode: gaviero_core::swarm::plan::ExecutionMode::Repo,
         max_parallel: 1,
         workspace_root: workspace.to_path_buf(),
         // Pipeline must abort at validation BEFORE this model spec is
@@ -97,6 +98,7 @@ fn make_config(workspace: &std::path::Path) -> SwarmConfig {
         read_namespaces: vec!["default".to_string()],
         write_namespace: "default".to_string(),
         context_files: vec![],
+        worktree_context_paths: vec![],
         excludes: vec![],
         memory_writer: None,
         mcp_config: None,
