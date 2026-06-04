@@ -181,6 +181,40 @@ The authoritative flag list is the `Cli` struct in `src/main.rs`. Flags are grou
 | `--remember` | `<text>` | Store a memory and exit |
 | `--remember-scope` | `<scope>` | Scope for `--remember` (default: repo) |
 
+### MCP (swarm / `--script` runs)
+
+| Flag | Argument | Purpose |
+|---|---|---|
+| `--no-mcp` | — | Skip MCP config synthesis and the in-process Gaviero MCP server |
+| `--mcp-url` | `name=url` | Extra remote MCP server merged into every agent worktree (repeatable) |
+| `--mcp-stdio` | `name=cmd,args…` | Extra stdio MCP server (repeatable) |
+| `--mcp-codex-trust` | `granted\|denied\|unknown` | Codex trust for synthesized `.codex/config.toml` (use `granted` in CI) |
+| `--skip-mcp-preflight` | — | Skip shim/URL validation before agents run |
+
+Workspace setting `mcp.extraServers` (JSON array) is merged the same way; CLI flags override entries with the same `name`. Example:
+
+```bash
+gaviero-cli --script examples/scientific_plan_refinement.gaviero \
+  --workflow scientific-plan-refinement \
+  --prompt "Sparse attention study" \
+  --var PLAN_FILE=/path/to/draft-research-plan.md \
+  --mcp-url semantic-scholar=https://YOUR-MCP-ENDPOINT \
+  --mcp-codex-trust granted
+```
+
+Document workflows declare `execution_mode document` in the DSL. With `PLAN_FILE`, the CLI anchors the workspace to the plan's directory and defaults `OUT_DIR` there. Repo workflows use `execution_mode repo` (default) and `--repo` for git worktrees + merge.
+
+Or in `<repo>/.gaviero/settings.json`:
+
+```json
+{
+  "mcp.extraServers": [
+    { "name": "semantic-scholar", "url": "https://YOUR-MCP-ENDPOINT" }
+  ],
+  "mcp.gavieroServer.codexTrust": "granted"
+}
+```
+
 ### Memory admin
 
 | Flag | Argument | Purpose |
