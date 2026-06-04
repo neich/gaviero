@@ -1263,6 +1263,19 @@
           ]
         },
         {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "execution_mode"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "execution_mode_value"
+            }
+          ]
+        },
+        {
           "type": "SYMBOL",
           "name": "memory_block"
         },
@@ -1520,6 +1533,19 @@
         {
           "type": "SYMBOL",
           "name": "identifier"
+        }
+      ]
+    },
+    "execution_mode_value": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "repo"
+        },
+        {
+          "type": "STRING",
+          "value": "document"
         }
       ]
     },
