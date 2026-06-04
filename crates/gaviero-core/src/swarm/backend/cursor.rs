@@ -101,6 +101,15 @@ impl AgentBackend for CursorBackend {
         }
 
         let mut cmd = Command::new("agent");
+        let mcp_json = request.workspace_root.join(".cursor/mcp.json");
+        if crate::mcp::config_synth::worktree_has_remote_mcp_urls(&request.workspace_root) {
+            tracing::info!(
+                target: "backend.cursor",
+                workspace = %request.workspace_root.display(),
+                mcp_config = %mcp_json.display(),
+                "cursor spawn: remote MCP configured — sandbox disabled, approve-mcps enabled",
+            );
+        }
         for arg in cursor_argv(&self.model, &request.workspace_root, None) {
             cmd.arg(arg);
         }
@@ -247,6 +256,19 @@ pub(crate) fn cursor_argv(
         // writable; we re-trust the cwd here because gaviero already gave
         // its own workspace consent at the host layer.
         "--trust".to_string(),
+        // Without `--approve-mcps`, remote MCP servers in `.cursor/mcp.json`
+        // (e.g. Semantic Scholar) stay unregistered in `-p` runs — agents
+        // report the server id as unavailable. See cursor.com/docs/cli/mcp.
+        "--approve-mcps".to_string(),
+        // Streamable HTTP MCP (Wuilder / Semantic Scholar) and WebFetch
+        // fallbacks need outbound network. Probed 2026-06: with sandbox
+        // enabled, agents report "network calls rejected" even when
+        // `.cursor/cli.json` allowlists the MCP host. Gaviero headless runs
+        // already bound scope via Write Gate + workspace isolation.
+        "--sandbox".to_string(),
+        "disabled".to_string(),
+    ];
+    args.extend([
         "--workspace".to_string(),
         workspace_root.to_string_lossy().into_owned(),
         "--model".to_string(),
@@ -255,7 +277,7 @@ pub(crate) fn cursor_argv(
         } else {
             model.to_string()
         },
-    ];
+    ]);
 
     if let Some(id) = resume_session_id
         && !id.is_empty()
@@ -695,9 +717,11 @@ mod tests {
         //     contract the parser depends on,
         //   * `--trust` so headless writes aren't blocked by the workspace
         //     trust prompt,
+        //   * `--approve-mcps` so project MCP servers load in `-p` mode,
         //   * `--workspace` so the agent's cwd survives shell-cwd-reset
         //     postscripts.
         assert!(args.iter().any(|a| a == "-p"));
+        assert!(args.iter().any(|a| a == "--approve-mcps"));
         assert!(
             args.windows(2)
                 .any(|w| w == ["--output-format", "stream-json"])
@@ -719,6 +743,12 @@ mod tests {
     fn argv_skips_resume_for_empty_session_id() {
         let args = cursor_argv("auto", Path::new("/tmp/wt"), Some(""));
         assert!(!args.iter().any(|a| a == "--resume"));
+    }
+
+    #[test]
+    fn argv_always_disables_sandbox_for_remote_mcp_and_webfetch() {
+        let args = cursor_argv("auto", Path::new("/tmp/wt"), None);
+        assert!(args.windows(2).any(|w| w == ["--sandbox", "disabled"]));
     }
 
     #[test]
