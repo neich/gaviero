@@ -297,9 +297,17 @@ mod tests {
 
         let mut parser = gaviero_core::Parser::new();
         parser.set_language(&lang).unwrap();
-        let source = "client opus { tier expensive model \"claude-opus-4-7\" }\n\nagent scan {\n    description \"Scan\"\n    client opus\n    memory {\n        read_ns [\"shared\"]\n        importance 0.9\n    }\n}\n";
+        // Includes `workflow { execution_mode document }` — a clean parse here
+        // guards against the grammar/parser drift that surfaced as spurious
+        // syntax-highlight errors on `execution_mode` workflows.
+        let source = "client opus { tier expensive model \"claude-opus-4-7\" }\n\nagent scan {\n    description \"Scan\"\n    client opus\n    memory {\n        read_ns [\"shared\"]\n        importance 0.9\n    }\n}\n\nworkflow run {\n    execution_mode document\n    steps [scan]\n}\n";
         let rope = ropey::Rope::from_str(source);
         let tree = parser.parse(source, None).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "gaviero source must parse without errors: {}",
+            tree.root_node().to_sexp()
+        );
 
         let theme = Theme::builtin_default();
         let spans = run_highlights(&tree, &rope, &config, &theme, 0..source.len(), true);
