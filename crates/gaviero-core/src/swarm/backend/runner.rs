@@ -93,6 +93,7 @@ pub async fn run_backend(
     // when present so the unit's checked-in declaration remains the
     // audit record of which tools it can use.
     workspace_extra_tools: &[String],
+    skip_repo_context: bool,
 ) -> Result<AgentManifest> {
     let agent_id = format!("agent-{}", work_unit.id);
 
@@ -133,7 +134,9 @@ pub async fn run_backend(
 
     // Agents with `context { depth 0 }` (and no callers_of/tests_for) opt out
     // of the pre-injected graph — they read specific files via tools instead.
-    let graph_budget_tokens = if work_unit.context_depth == 0
+    let graph_budget_tokens = if skip_repo_context {
+        0
+    } else if work_unit.context_depth == 0
         && work_unit.context_callers_of.is_empty()
         && work_unit.context_tests_for.is_empty()
     {
@@ -143,7 +146,14 @@ pub async fn run_backend(
     };
 
     // v1: swarm uses default topology settings (not workspace cascade).
-    let topology_config = TopologyConfig::default();
+    let topology_config = if skip_repo_context {
+        TopologyConfig {
+            enabled: false,
+            ..TopologyConfig::default()
+        }
+    } else {
+        TopologyConfig::default()
+    };
     let topology_body = if topology_config.enabled {
         build_folder_topology(workspace_root, &[], &topology_config)
             .ok()
@@ -715,6 +725,7 @@ mod tests {
             None,
             None,
             &[],
+            false,
         )
         .await
         .unwrap();
@@ -755,6 +766,7 @@ mod tests {
             None,
             None,
             &[],
+            false,
         )
         .await
         .unwrap();
@@ -804,6 +816,7 @@ mod tests {
             None,
             None,
             &[],
+            false,
         )
         .await
         .unwrap();
@@ -857,6 +870,7 @@ mod tests {
             None,
             None,
             &[],
+            false,
         )
         .await
         .unwrap();
@@ -892,6 +906,7 @@ mod tests {
             None,
             None,
             &[],
+            false,
         )
         .await
         .unwrap();

@@ -181,6 +181,11 @@
     }
   },
   {
+    "type": "execution_mode_value",
+    "named": true,
+    "fields": {}
+  },
+  {
     "type": "extra_block",
     "named": true,
     "fields": {},
@@ -817,6 +822,10 @@
           "named": true
         },
         {
+          "type": "execution_mode_value",
+          "named": true
+        },
+        {
           "type": "integer",
           "named": true
         },
@@ -924,6 +933,10 @@
     "named": false
   },
   {
+    "type": "document",
+    "named": false
+  },
+  {
     "type": "effort",
     "named": false
   },
@@ -933,6 +946,10 @@
   },
   {
     "type": "execution",
+    "named": false
+  },
+  {
+    "type": "execution_mode",
     "named": false
   },
   {
@@ -1077,6 +1094,10 @@
   },
   {
     "type": "refine",
+    "named": false
+  },
+  {
+    "type": "repo",
     "named": false
   },
   {

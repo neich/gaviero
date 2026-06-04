@@ -1,5 +1,7 @@
 use chumsky::span::SimpleSpan;
 
+pub use gaviero_core::swarm::plan::ExecutionMode;
+
 pub type Span = SimpleSpan;
 
 /// Top-level parsed script.
@@ -514,6 +516,8 @@ pub struct WorkflowDecl {
     pub name_span: Span,
     pub steps: Option<(Vec<StepItem>, Span)>,
     pub max_parallel: Option<(usize, Span)>,
+    /// `execution repo` (default) or `execution document`.
+    pub execution: Option<(ExecutionMode, Span)>,
     pub memory: Option<MemoryBlock>,
     pub strategy: Option<(StrategyLit, Span)>,
     pub test_first: Option<(bool, Span)>,

@@ -11,7 +11,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
 dirs = "6"
 clap = { version = "4", features = ["derive"] }
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
 logos = "0.14"
 chumsky = "0.12"
 miette = { version = "7", features = ["fancy"] }

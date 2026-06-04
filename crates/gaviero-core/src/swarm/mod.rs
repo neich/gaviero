@@ -17,3 +17,4 @@ pub mod replanner;
 pub mod router;
 pub mod validation;
 pub mod verify;
+pub mod worktree_context;

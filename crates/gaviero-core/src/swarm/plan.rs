@@ -161,6 +161,18 @@ fn default_judge_timeout_secs() -> u32 {
     120
 }
 
+// ── Execution mode ───────────────────────────────────────────
+
+/// How a workflow uses the filesystem and git.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ExecutionMode {
+    /// Git worktrees (when parallel), branch merge, repo-map and code graph.
+    #[default]
+    Repo,
+    /// Filesystem workspace only: versioned artefacts, no git lifecycle.
+    Document,
+}
+
 // ── CompiledPlan ─────────────────────────────────────────────
 
 /// Immutable execution plan produced by the DSL compiler.
@@ -186,6 +198,8 @@ pub struct CompiledPlan {
     /// These units are compiled for runtime lookup and on-demand execution,
     /// but they are not scheduled as normal workflow steps in the main DAG.
     pub loop_judge_units: Vec<WorkUnit>,
+    /// `execution repo` (default) or `execution document` on the workflow block.
+    pub execution_mode: ExecutionMode,
 }
 
 impl CompiledPlan {
@@ -285,6 +299,7 @@ impl CompiledPlan {
             verification_config: VerificationConfig::default(),
             loop_configs: Vec::new(),
             loop_judge_units: Vec::new(),
+            execution_mode: ExecutionMode::default(),
         }
     }
 

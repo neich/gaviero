@@ -322,6 +322,24 @@ impl AcpSession {
             cmd.arg("--tools").arg(available_tools.join(","));
         }
 
+        // Load the per-worktree MCP config synthesized for this agent
+        // (`<cwd>/.mcp.json`: the gaviero shim + context7 + any operator
+        // `--mcp-url` / `--mcp-stdio` servers). In headless `--print` mode
+        // Claude does NOT auto-load a project `.mcp.json` — that discovery
+        // path requires interactive trust approval — so without this flag
+        // swarm / worktree agents see ZERO MCP tools and report "no MCP
+        // client capability". `--tools` only governs the built-in set, so it
+        // does not bring MCP tools in; only `--mcp-config` does. MCP tools
+        // are auto-approved by `--dangerously-skip-permissions` above when
+        // `auto_approve` is set (otherwise they surface as permission
+        // prompts, matching built-in tool behaviour). Non-strict on purpose:
+        // the user's own global MCP servers still load alongside. Mirrors how
+        // the Codex backend replays its synthesized `.codex/config.toml`.
+        let mcp_config_path = cwd.join(".mcp.json");
+        if mcp_config_path.is_file() {
+            cmd.arg("--mcp-config").arg(&mcp_config_path);
+        }
+
         // NOTE: Claude CLI's `--file` flag is for downloading remote file
         // resources (format `file_id:relative_path`), not for attaching
         // local images or documents. Passing local paths there fails with

@@ -207,6 +207,7 @@ module.exports = grammar({
       choice(
         seq("steps", $.step_list),
         seq("max_parallel", $.integer),
+        seq("execution_mode", $.execution_mode_value),
         $.memory_block,
         seq("strategy", $.strategy_value),
         seq("test_first", $.boolean),
@@ -253,6 +254,8 @@ module.exports = grammar({
     privacy_value: (_) => choice("public", "local_only"),
 
     strategy_value: ($) => choice("single_pass", "refine", $.identifier),
+
+    execution_mode_value: (_) => choice("repo", "document"),
 
     boolean: (_) => choice("true", "false"),
 

@@ -93,6 +93,7 @@ impl AgentBackend for CodexBackend {
             request.effort.as_deref(),
             &request.extra,
             &request.additional_roots,
+            &request.workspace_root,
         ) {
             cmd.arg(arg);
         }
@@ -239,17 +240,51 @@ fn codex_exec_args(
     effort: Option<&str>,
     extra: &[(String, String)],
     additional_roots: &[std::path::PathBuf],
+    workspace_root: &std::path::Path,
 ) -> Vec<String> {
     let mut args = vec![
         "exec".to_string(),
         "--skip-git-repo-check".to_string(),
         "--model".to_string(),
         model.to_string(),
-        "--config".to_string(),
-        "approval_policy=never".to_string(),
-        "--sandbox".to_string(),
-        "read-only".to_string(),
     ];
+
+    // Approval / sandbox shape depends on whether any MCP server is
+    // configured for this worktree:
+    //
+    // * **No MCP**: keep the locked-down defaults — `--sandbox read-only`
+    //   plus `--config approval_policy=never` so shell tools and writes
+    //   never escape the worktree.
+    //
+    // * **Any MCP (stdio or remote)**: switch to
+    //   `--dangerously-bypass-approvals-and-sandbox`. Probed against
+    //   `codex-cli 0.131.0` (2026-06-03): every standard approval policy
+    //   (`never`, `on-request`, `on-failure`, `untrusted`) auto-cancels
+    //   MCP tool calls as `user cancelled MCP tool call` in `codex exec`,
+    //   because there's no user to satisfy the elicitation. The bypass
+    //   flag is codex's documented escape hatch for "externally
+    //   sandboxed" environments — gaviero swarm agents qualify: each
+    //   runs in its own per-agent git worktree (read-only branch of
+    //   user's repo, cleaned up afterwards) and every file change
+    //   merges back through the Write Gate. `--mcp-codex-trust granted`
+    //   is the user-facing opt-in to this trade.
+    let has_mcp = crate::mcp::codex_synth_has_any_mcp(workspace_root);
+    if has_mcp {
+        tracing::warn!(
+            target: "backend.codex",
+            workspace = %workspace_root.display(),
+            "MCP servers detected in synthesized .codex/config.toml — using \
+             --dangerously-bypass-approvals-and-sandbox so MCP tool calls can fire \
+             (codex exec auto-cancels MCP under every standard approval_policy). \
+             Per-agent git worktree + Write Gate at merge time bound the blast radius.",
+        );
+        args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+    } else {
+        args.push("--config".to_string());
+        args.push("approval_policy=never".to_string());
+        args.push("--sandbox".to_string());
+        args.push("read-only".to_string());
+    }
 
     // Workspace-mode multi-folder: each sibling folder is added as a writable
     // root. The primary cwd reaches codex via `Command::current_dir`; these
@@ -265,6 +300,18 @@ fn codex_exec_args(
     if let Some(codex_effort) = map_effort_to_codex(effort) {
         args.push("--config".to_string());
         args.push(format!("model_reasoning_effort={codex_effort}"));
+    }
+
+    // Replay the synthesized `<worktree>/.codex/config.toml` MCP servers
+    // as `--config mcp_servers.X.Y=Z` overrides. Codex's CLI only loads
+    // `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`), never
+    // the per-worktree file, so without this step the external MCP
+    // servers Gaviero synthesizes (e.g. Semantic Scholar, context7) are
+    // invisible to `codex exec`.
+    let codex_config = workspace_root.join(".codex/config.toml");
+    for pair in crate::mcp::codex_mcp_overrides_from_config_file(&codex_config) {
+        args.push("--config".to_string());
+        args.push(pair);
     }
 
     // Forward every `extra { k v }` pair as a `-c k=v` override to codex.
@@ -403,7 +450,7 @@ mod tests {
 
     #[test]
     fn test_codex_exec_args_force_read_only_review_channel() {
-        let args = codex_exec_args("gpt-5.5", Some("high"), &[], &[]);
+        let args = codex_exec_args("gpt-5.5", Some("high"), &[], &[], std::path::Path::new(""));
         assert!(
             args.windows(2)
                 .any(|w| w == ["--config", "approval_policy=never"])
@@ -418,7 +465,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/sibling-a"),
             std::path::PathBuf::from("/tmp/sibling-b"),
         ];
-        let args = codex_exec_args("gpt-5.5", None, &[], &extras);
+        let args = codex_exec_args("gpt-5.5", None, &[], &extras, std::path::Path::new(""));
         let count = args.windows(2).filter(|w| w[0] == "--add-dir").count();
         assert_eq!(count, 2, "one --add-dir per additional root");
         assert!(
@@ -434,8 +481,114 @@ mod tests {
     #[test]
     fn test_codex_exec_args_skips_empty_additional_root() {
         let extras = [std::path::PathBuf::new()];
-        let args = codex_exec_args("gpt-5.5", None, &[], &extras);
+        let args = codex_exec_args("gpt-5.5", None, &[], &extras, std::path::Path::new(""));
         assert!(!args.iter().any(|a| a == "--add-dir"));
+    }
+
+    #[test]
+    fn test_codex_exec_args_forwards_synthesized_mcp_servers_as_config_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        std::fs::write(
+            codex_dir.join("config.toml"),
+            r#"
+[mcp_servers.gaviero]
+command = "gaviero-mcp-shim"
+args = ["--socket", "/tmp/mcp.sock"]
+
+[mcp_servers.semantic-scholar]
+url = "https://example/mcp/"
+"#,
+        )
+        .unwrap();
+        let args = codex_exec_args("gpt-5.5", None, &[], &[], dir.path());
+        // Each server table is replayed as `--config mcp_servers.X.Y=value` pairs.
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--config" && w[1] == r#"mcp_servers.gaviero.command="gaviero-mcp-shim""#),
+            "missing gaviero.command override in {args:?}",
+        );
+        assert!(
+            args.windows(2).any(|w| w[0] == "--config"
+                && w[1] == r#"mcp_servers.gaviero.args=["--socket", "/tmp/mcp.sock"]"#),
+            "missing gaviero.args override in {args:?}",
+        );
+        assert!(
+            args.windows(2).any(|w| w[0] == "--config"
+                && w[1] == r#"mcp_servers.semantic-scholar.url="https://example/mcp/""#),
+            "missing semantic-scholar.url override in {args:?}",
+        );
+    }
+
+    #[test]
+    fn test_codex_exec_args_bypasses_approvals_when_remote_mcp_url_present() {
+        // codex 0.131.0 (verified live, 2026-06-03): every standard approval
+        // policy auto-cancels MCP tool calls with `user cancelled MCP tool
+        // call` in `codex exec`. Remote MCP requires the documented
+        // `--dangerously-bypass-approvals-and-sandbox` escape hatch, which
+        // also gives the worktree the network access HTTP MCP needs — so
+        // we drop the prior `--sandbox workspace-write` + `network_access`
+        // upgrade in favour of the single bypass flag.
+        let dir = tempfile::tempdir().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        std::fs::write(
+            codex_dir.join("config.toml"),
+            "[mcp_servers.semantic-scholar]\nurl = \"https://example/mcp/\"\n",
+        )
+        .unwrap();
+        let args = codex_exec_args("gpt-5.5", None, &[], &[], dir.path());
+        assert!(
+            args.iter()
+                .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"),
+            "expected bypass flag in {args:?}",
+        );
+        // The old per-MCP sandbox knobs are now redundant — the bypass flag
+        // covers both approvals and sandbox in one move.
+        assert!(
+            !args.windows(2).any(|w| w == ["--sandbox", "workspace-write"]),
+            "stale --sandbox workspace-write override leaked into {args:?}",
+        );
+        assert!(
+            !args.iter().any(|a| a == "approval_policy=never"),
+            "stale approval_policy=never leaked into {args:?}",
+        );
+    }
+
+    #[test]
+    fn test_codex_exec_args_bypasses_approvals_for_stdio_only_mcp() {
+        // The cancellation symptom also bites stdio MCP servers (gaviero
+        // shim, context7), not just remote URLs — `codex exec` doesn't
+        // distinguish. Any `[mcp_servers.X]` entry triggers the bypass.
+        let dir = tempfile::tempdir().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        std::fs::write(
+            codex_dir.join("config.toml"),
+            "[mcp_servers.gaviero]\ncommand = \"gaviero-mcp-shim\"\nargs = [\"--socket\", \"/tmp/mcp.sock\"]\n",
+        )
+        .unwrap();
+        let args = codex_exec_args("gpt-5.5", None, &[], &[], dir.path());
+        assert!(
+            args.iter()
+                .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"),
+            "expected bypass flag for stdio MCP in {args:?}",
+        );
+        assert!(
+            !args.windows(2).any(|w| w == ["--sandbox", "read-only"]),
+            "stale --sandbox read-only override leaked into {args:?}",
+        );
+    }
+
+    #[test]
+    fn test_codex_exec_args_skips_mcp_overrides_when_config_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = codex_exec_args("gpt-5.5", None, &[], &[], dir.path());
+        assert!(
+            !args.iter().any(|a| a.starts_with("mcp_servers.")),
+            "expected no mcp_servers overrides when synth file is absent, got {args:?}",
+        );
     }
 
     #[test]

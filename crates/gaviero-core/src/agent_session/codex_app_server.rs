@@ -132,12 +132,14 @@ fn thread_start_params(
     model: &str,
     cwd: &PathBuf,
     additional_roots: &[PathBuf],
+    allow_network: bool,
 ) -> serde_json::Value {
     serde_json::json!({
         "model": model,
         "cwd": cwd.to_string_lossy(),
         "approvalPolicy": "never",
         "sandbox": "read-only",
+        "sandboxPolicy": { "type": "readOnly", "networkAccess": allow_network },
         "developerInstructions": codex_file_block_developer_instructions(cwd, additional_roots),
     })
 }
@@ -146,22 +148,24 @@ fn thread_resume_params(
     thread_id: &str,
     cwd: &PathBuf,
     additional_roots: &[PathBuf],
+    allow_network: bool,
 ) -> serde_json::Value {
     serde_json::json!({
         "threadId": thread_id,
         "cwd": cwd.to_string_lossy(),
         "approvalPolicy": "never",
         "sandbox": "read-only",
+        "sandboxPolicy": { "type": "readOnly", "networkAccess": allow_network },
         "developerInstructions": codex_file_block_developer_instructions(cwd, additional_roots),
     })
 }
 
-fn turn_start_params(thread_id: &str, user_message: &str) -> serde_json::Value {
+fn turn_start_params(thread_id: &str, user_message: &str, allow_network: bool) -> serde_json::Value {
     serde_json::json!({
         "threadId": thread_id,
         "input": [{ "type": "text", "text": user_message }],
         "approvalPolicy": "never",
-        "sandboxPolicy": { "type": "readOnly", "networkAccess": false },
+        "sandboxPolicy": { "type": "readOnly", "networkAccess": allow_network },
     })
 }
 
@@ -207,6 +211,27 @@ pub struct CodexAppServerSession {
     handle: Option<ContinuityHandle>,
 }
 
+/// Build the argv (after the `codex` binary) for the `app-server` invocation.
+///
+/// Top-level `-c mcp_servers.X.Y=Z` overrides go **before** the `app-server`
+/// subcommand because codex CLI applies `--config` on the top-level command
+/// and dispatches to subcommands afterwards. The MCP entries themselves come
+/// from the synthesized `<workspace_root>/.codex/config.toml`, since codex's
+/// CLI only auto-loads `$CODEX_HOME/config.toml` — without these overrides
+/// the per-worktree MCP servers stay invisible to the chat session.
+fn codex_app_server_args(workspace_root: &std::path::Path) -> Vec<String> {
+    let mut args = Vec::new();
+    let codex_config = workspace_root.join(".codex/config.toml");
+    for pair in crate::mcp::codex_mcp_overrides_from_config_file(&codex_config) {
+        args.push("--config".to_string());
+        args.push(pair);
+    }
+    args.push("app-server".to_string());
+    args.push("--listen".to_string());
+    args.push("stdio://".to_string());
+    args
+}
+
 impl CodexAppServerSession {
     pub(super) fn new(args: SessionConstruction) -> Self {
         let model = args
@@ -244,10 +269,10 @@ impl CodexAppServerSession {
         }
 
         let mut cmd = Command::new("codex");
-        cmd.arg("app-server")
-            .arg("--listen")
-            .arg("stdio://")
-            .current_dir(&self.workspace_root)
+        for arg in codex_app_server_args(&self.workspace_root) {
+            cmd.arg(arg);
+        }
+        cmd.current_dir(&self.workspace_root)
             .env("NO_COLOR", "1")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -273,6 +298,12 @@ impl CodexAppServerSession {
         let mut stdin = BufWriter::new(stdin);
         let mut lines = BufReader::new(stdout).lines();
 
+        // Grant network access at thread start when the synthesized MCP
+        // config declares an HTTP server. Same logic as `send_turn` so
+        // the policy stays consistent between the initial handshake and
+        // every subsequent turn.
+        let allow_network = crate::mcp::codex_synth_has_remote_mcp(&self.workspace_root);
+
         // Run the startup handshake synchronously before handing stdout to the
         // background reader — avoids races between init messages and turn events.
         let thread_id = tokio::time::timeout(
@@ -284,6 +315,7 @@ impl CodexAppServerSession {
                 &self.workspace_root,
                 &self.additional_roots,
                 &self.handle,
+                allow_network,
             ),
         )
         .await
@@ -359,11 +391,16 @@ impl AgentSession for CodexAppServerSession {
         let (tx, rx) = mpsc::channel::<Result<UnifiedStreamEvent>>(64);
         *inner.active_tx.lock().await = Some(tx);
 
+        // Grant network access to read-only sandbox when the synthesized
+        // MCP config declares an HTTP server — otherwise Codex's network
+        // sandbox blocks MCP tool calls before they leave the process.
+        let allow_network = crate::mcp::codex_synth_has_remote_mcp(&self.workspace_root);
+
         // Send turn/start request.
         let req = rpc_request(
             "turn/start",
             next_id(),
-            turn_start_params(&thread_id, &turn.user_message),
+            turn_start_params(&thread_id, &turn.user_message, allow_network),
         );
         if let Err(e) = write_msg(&mut inner.stdin, &req).await {
             tracing::warn!("codex app-server: stdin write failed (crash?): {e}");
@@ -398,6 +435,7 @@ async fn handshake(
     cwd: &PathBuf,
     additional_roots: &[PathBuf],
     existing_handle: &Option<ContinuityHandle>,
+    allow_network: bool,
 ) -> Result<String> {
     // 1. initialize
     let init_id = next_id();
@@ -425,11 +463,11 @@ async fn handshake(
     let (method, params) = match existing_handle {
         Some(ContinuityHandle::CodexThreadId(id)) => (
             "thread/resume",
-            thread_resume_params(id, cwd, additional_roots),
+            thread_resume_params(id, cwd, additional_roots, allow_network),
         ),
         _ => (
             "thread/start",
-            thread_start_params(model, cwd, additional_roots),
+            thread_start_params(model, cwd, additional_roots, allow_network),
         ),
     };
 
@@ -675,10 +713,76 @@ mod tests {
     }
 
     #[test]
+    fn codex_app_server_args_place_config_overrides_before_subcommand() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        std::fs::write(
+            codex_dir.join("config.toml"),
+            r#"
+[mcp_servers.gaviero]
+command = "gaviero-mcp-shim"
+args = ["--socket", "/tmp/mcp.sock"]
+
+[mcp_servers.semantic-scholar]
+url = "https://example/mcp/"
+"#,
+        )
+        .unwrap();
+        let args = codex_app_server_args(dir.path());
+        // The `--config` pairs must come before `app-server` so codex parses
+        // them at the top-level command rather than passing them to the
+        // subcommand (where they would be rejected as unknown flags).
+        let app_server_idx = args.iter().position(|a| a == "app-server").expect("app-server arg");
+        let last_config_idx = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.as_str() == "--config")
+            .map(|(i, _)| i)
+            .last()
+            .expect("at least one --config pair");
+        assert!(
+            last_config_idx < app_server_idx,
+            "--config must precede app-server in {args:?}",
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--config" && w[1] == r#"mcp_servers.gaviero.command="gaviero-mcp-shim""#),
+            "missing gaviero.command override in {args:?}",
+        );
+        assert!(
+            args.windows(2).any(|w| w[0] == "--config"
+                && w[1] == r#"mcp_servers.semantic-scholar.url="https://example/mcp/""#),
+            "missing semantic-scholar.url override in {args:?}",
+        );
+        // The literal subcommand wiring stays intact.
+        assert_eq!(
+            args.iter().rev().take(3).cloned().collect::<Vec<_>>(),
+            vec!["stdio://".to_string(), "--listen".to_string(), "app-server".to_string()],
+        );
+    }
+
+    #[test]
+    fn codex_app_server_args_emit_no_config_when_synth_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = codex_app_server_args(dir.path());
+        assert!(
+            !args.iter().any(|a| a == "--config"),
+            "expected no --config overrides, got {args:?}",
+        );
+        assert_eq!(
+            args,
+            vec!["app-server".to_string(), "--listen".to_string(), "stdio://".to_string()],
+        );
+    }
+
+    #[test]
     fn thread_start_policy_forces_file_blocks_and_read_only() {
-        let params = thread_start_params("gpt-5.5", &PathBuf::from("/tmp/work"), &[]);
+        let params = thread_start_params("gpt-5.5", &PathBuf::from("/tmp/work"), &[], false);
         assert_eq!(params["approvalPolicy"], "never");
         assert_eq!(params["sandbox"], "read-only");
+        assert_eq!(params["sandboxPolicy"]["type"], "readOnly");
+        assert_eq!(params["sandboxPolicy"]["networkAccess"], false);
         let instructions = params["developerInstructions"].as_str().unwrap();
         assert!(instructions.contains("All code edits must be proposed"));
         assert!(instructions.contains("<file path=\"relative/path\">...</file>"));
@@ -687,13 +791,28 @@ mod tests {
     }
 
     #[test]
+    fn thread_start_grants_network_when_remote_mcp_present() {
+        let params = thread_start_params("gpt-5.5", &PathBuf::from("/tmp/work"), &[], true);
+        // Filesystem stays read-only — only the network layer opens up.
+        assert_eq!(params["sandboxPolicy"]["type"], "readOnly");
+        assert_eq!(params["sandboxPolicy"]["networkAccess"], true);
+    }
+
+    #[test]
     fn thread_resume_policy_reasserts_file_blocks_and_read_only() {
-        let params = thread_resume_params("thread-1", &PathBuf::from("/tmp/work"), &[]);
+        let params = thread_resume_params("thread-1", &PathBuf::from("/tmp/work"), &[], false);
         assert_eq!(params["threadId"], "thread-1");
         assert_eq!(params["approvalPolicy"], "never");
         assert_eq!(params["sandbox"], "read-only");
+        assert_eq!(params["sandboxPolicy"]["networkAccess"], false);
         let instructions = params["developerInstructions"].as_str().unwrap();
         assert!(instructions.contains("All code edits must be proposed"));
+    }
+
+    #[test]
+    fn thread_resume_grants_network_when_remote_mcp_present() {
+        let params = thread_resume_params("thread-1", &PathBuf::from("/tmp/work"), &[], true);
+        assert_eq!(params["sandboxPolicy"]["networkAccess"], true);
     }
 
     #[test]
@@ -702,7 +821,7 @@ mod tests {
             PathBuf::from("/tmp/sibling-a"),
             PathBuf::from("/tmp/sibling-b"),
         ];
-        let params = thread_start_params("gpt-5.5", &PathBuf::from("/tmp/work"), &extras);
+        let params = thread_start_params("gpt-5.5", &PathBuf::from("/tmp/work"), &extras, false);
         let instructions = params["developerInstructions"].as_str().unwrap();
         assert!(instructions.contains("Workspace folders"));
         assert!(instructions.contains("primary: /tmp/work"));
@@ -717,7 +836,7 @@ mod tests {
             PathBuf::from("/tmp/work"), // same as cwd; should be skipped
             PathBuf::from("/tmp/sibling"),
         ];
-        let params = thread_start_params("gpt-5.5", &PathBuf::from("/tmp/work"), &extras);
+        let params = thread_start_params("gpt-5.5", &PathBuf::from("/tmp/work"), &extras, false);
         let instructions = params["developerInstructions"].as_str().unwrap();
         // The cwd appears once as "primary"; not as a sibling line.
         let sibling_lines = instructions.matches("sibling:").count();
@@ -727,11 +846,19 @@ mod tests {
 
     #[test]
     fn turn_start_policy_reasserts_read_only_sandbox() {
-        let params = turn_start_params("thread-1", "hello");
+        let params = turn_start_params("thread-1", "hello", false);
         assert_eq!(params["threadId"], "thread-1");
         assert_eq!(params["approvalPolicy"], "never");
         assert_eq!(params["sandboxPolicy"]["type"], "readOnly");
         assert_eq!(params["sandboxPolicy"]["networkAccess"], false);
+    }
+
+    #[test]
+    fn turn_start_grants_network_when_remote_mcp_present() {
+        let params = turn_start_params("thread-1", "hello", true);
+        // Filesystem stays read-only — only the network bit flips.
+        assert_eq!(params["sandboxPolicy"]["type"], "readOnly");
+        assert_eq!(params["sandboxPolicy"]["networkAccess"], true);
     }
 
     #[test]

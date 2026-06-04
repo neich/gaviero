@@ -248,6 +248,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_workflow_execution_mode() {
+        let mut parser = tree_sitter::Parser::new();
+        let lang: tree_sitter::Language = LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        let src = r#"
+            agent a { description "a" }
+            workflow doc { execution_mode document steps [a] }
+            workflow rep { execution_mode repo steps [a] }
+        "#;
+        let tree = parser.parse(src, None).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "parse tree: {}",
+            tree.root_node().to_sexp()
+        );
+    }
+
+    #[test]
     fn parse_string_with_escaped_quote() {
         let mut parser = tree_sitter::Parser::new();
         let lang: tree_sitter::Language = LANGUAGE.into();

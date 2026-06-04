@@ -52,6 +52,7 @@ enum ScopeField {
 enum WorkflowField {
     Steps(Vec<StepItem>, Span),
     MaxParallel(usize, Span),
+    Execution(gaviero_core::swarm::plan::ExecutionMode, Span),
     Memory(MemoryBlock),
     Strategy(StrategyLit, Span),
     TestFirst(bool, Span),
@@ -997,6 +998,14 @@ where
         just(Token::KwMaxParallel)
             .ignore_then(integer.map_with(|n, e| (n, e.span())))
             .map(|(n, s)| WorkflowField::MaxParallel(n as usize, s)),
+        just(Token::KwExecutionMode)
+            .ignore_then(select! {
+                Token::Ident(s) if s == "repo" => gaviero_core::swarm::plan::ExecutionMode::Repo,
+                Token::Ident(s) if s == "document" => {
+                    gaviero_core::swarm::plan::ExecutionMode::Document
+                },
+            })
+            .map_with(|mode, e| WorkflowField::Execution(mode, e.span())),
         memory_block.map(WorkflowField::Memory),
         just(Token::KwStrategy)
             .ignore_then(strategy_lit.map_with(|v, e| (v, e.span())))
@@ -1027,6 +1036,7 @@ where
         .map_with(|((name, name_span), fields), e| {
             let mut steps = None;
             let mut max_parallel = None;
+            let mut execution = None;
             let mut memory = None;
             let mut strategy = None;
             let mut test_first = None;
@@ -1042,6 +1052,9 @@ where
                     }
                     WorkflowField::MaxParallel(n, s) => {
                         max_parallel.get_or_insert((n, s));
+                    }
+                    WorkflowField::Execution(m, s) => {
+                        execution.get_or_insert((m, s));
                     }
                     WorkflowField::Memory(b) => {
                         memory.get_or_insert(b);
@@ -1074,6 +1087,7 @@ where
                 name_span,
                 steps,
                 max_parallel,
+                execution,
                 memory,
                 strategy,
                 test_first,

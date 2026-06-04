@@ -219,7 +219,11 @@ impl CursorSession {
         };
 
         let mut cmd = Command::new("agent");
-        for arg in cursor_argv(&self.cursor_model, &self.workspace_root, resume_id.as_deref()) {
+        for arg in cursor_argv(
+            &self.cursor_model,
+            &self.workspace_root,
+            resume_id.as_deref(),
+        ) {
             cmd.arg(arg);
         }
         cmd.arg(&combined_prompt)

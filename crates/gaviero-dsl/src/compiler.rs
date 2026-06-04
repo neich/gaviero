@@ -477,12 +477,51 @@ pub fn compile_ast_with_sources(
 
     let loop_configs = extract_loop_configs(selected_workflow, &script_vars, override_vars);
 
+    let workflow_execution = if let Some(wf) = selected_workflow {
+        if let Some((mode, _span)) = &wf.execution {
+            *mode
+        } else {
+            gaviero_core::swarm::plan::ExecutionMode::Repo
+        }
+    } else {
+        gaviero_core::swarm::plan::ExecutionMode::Repo
+    };
+
     let mut plan = CompiledPlan::from_work_units(work_units, workflow_max_parallel);
     plan.iteration_config = iteration_config;
     plan.verification_config = verification_config;
     plan.loop_configs = loop_configs;
     plan.loop_judge_units = loop_judge_units;
+    plan.execution_mode = workflow_execution;
     Ok(plan)
+}
+
+/// Read `execution repo|document` from a workflow without full compilation.
+pub fn peek_workflow_execution_mode(
+    script: &crate::ast::Script,
+    workflow: Option<&str>,
+) -> gaviero_core::swarm::plan::ExecutionMode {
+    use crate::ast::Item;
+    use gaviero_core::swarm::plan::ExecutionMode;
+
+    let workflows: Vec<&crate::ast::WorkflowDecl> = script
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Workflow(w) => Some(w),
+            _ => None,
+        })
+        .collect();
+
+    let selected = match workflow {
+        Some(name) => workflows.iter().find(|w| w.name == name).copied(),
+        None if workflows.len() == 1 => workflows.first().copied(),
+        None => None,
+    };
+
+    selected
+        .and_then(|wf| wf.execution.as_ref().map(|(m, _)| *m))
+        .unwrap_or(ExecutionMode::Repo)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────

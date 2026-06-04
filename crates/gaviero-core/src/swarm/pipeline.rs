@@ -15,7 +15,7 @@ use super::coordinator::{Coordinator, CoordinatorConfig};
 use super::execution_state::{ExecutionState, NodeStatus};
 use super::merge;
 use super::models::{AgentManifest, AgentStatus, MergeResult, SwarmResult, WorkUnit};
-use super::plan::CompiledPlan;
+use super::plan::{CompiledPlan, ExecutionMode};
 use super::router::{TierConfig, TierRouter};
 use super::validation;
 use crate::git::{GitCoordinator, WorktreeManager};
@@ -29,6 +29,9 @@ use crate::write_gate::{WriteGatePipeline, WriteMode};
 
 /// Configuration for a swarm execution.
 pub struct SwarmConfig {
+    /// `Repo` (default): git worktrees, merge, repo-map / code graph.
+    /// `Document`: shared workspace, no git lifecycle or code context assembly.
+    pub execution_mode: ExecutionMode,
     pub max_parallel: usize,
     pub workspace_root: PathBuf,
     pub model: String,
@@ -40,6 +43,10 @@ pub struct SwarmConfig {
     /// Populated from `@file` references in the user prompt that are not git-tracked
     /// (e.g. `tmp/` plan documents). Each entry is `(rel_path, content)`.
     pub context_files: Vec<(String, String)>,
+    /// Repo-relative or absolute file paths to copy into worktrees when they are
+    /// missing from `HEAD` (CLI: `--var` file values and `--prompt-file`).
+    /// Agent `read_only` scopes are not scanned — only this list is injected.
+    pub worktree_context_paths: Vec<String>,
     /// Folder names or glob patterns to skip when scanning the workspace for
     /// repo-map / code-graph building. Bare names (no `/`) match any directory
     /// basename; entries with `/` are glob-matched against workspace-relative
@@ -89,6 +96,7 @@ pub async fn execute(
     tracing::info!(
         agents = plan.graph.node_count(),
         max_parallel = config.max_parallel,
+        execution_mode = ?config.execution_mode,
         "swarm.execute starting"
     );
 
@@ -117,7 +125,47 @@ pub async fn execute(
         .map_err(|e| anyhow::anyhow!("plan graph error: {}", e))?;
 
     // Override max_parallel from plan if declared
-    let effective_max_parallel = plan.max_parallel.unwrap_or(config.max_parallel);
+    let mut effective_max_parallel = plan.max_parallel.unwrap_or(config.max_parallel);
+    let repo_execution = config.execution_mode == ExecutionMode::Repo;
+    if !repo_execution
+        && let Some(ref mcp) = config.mcp_config
+        && crate::mcp::config_synth::synth_has_remote_url_servers(mcp)
+        && effective_max_parallel > 1
+    {
+        tracing::warn!(
+            "document mode with remote MCP: reducing max_parallel from {effective_max_parallel} \
+             to 1 (shared workspace — concurrent Cursor agents race on .cursor/mcp.json)",
+        );
+        effective_max_parallel = 1;
+    }
+
+    // CLI-referenced context files (outside --repo or uncommitted) are absent
+    // from git worktrees checked out at HEAD — inject copies and rewrite paths.
+    let read_only_prep = super::worktree_context::prepare_worktree_read_only_context(
+        &config.workspace_root,
+        &config.worktree_context_paths,
+    )?;
+    let mut context_files = config.context_files.clone();
+    context_files.extend(read_only_prep.injections);
+    let work_units = super::worktree_context::apply_worktree_path_rewrites(
+        work_units,
+        &read_only_prep.path_rewrites,
+    );
+    let want_worktrees = repo_execution && config.use_worktrees && effective_max_parallel > 1;
+    let use_worktrees = if want_worktrees {
+        let mgr = WorktreeManager::new(config.workspace_root.clone());
+        if !mgr.can_use_worktrees() {
+            tracing::warn!(
+                "git worktrees unavailable (not a git repo or no commits); \
+                 running agents in the shared workspace"
+            );
+            false
+        } else {
+            true
+        }
+    } else {
+        false
+    };
     let mut tier_config = TierConfig::default();
     let selected_local_model = config
         .model
@@ -179,7 +227,7 @@ pub async fn execute(
     );
 
     // Capture HEAD SHA before any merges (for revert support)
-    let pre_swarm_sha = if config.use_worktrees {
+    let pre_swarm_sha = if use_worktrees {
         crate::git::current_head_sha(&config.workspace_root).unwrap_or_default()
     } else {
         String::new()
@@ -255,6 +303,7 @@ pub async fn execute(
         // (coordinator + runner = 2 queries, already within M7 ≤2 gate).
         let agent_ctx = AgentRunContext::for_run(
             config,
+            &context_files,
             &effective_read_ns,
             observer,
             memory.clone(),
@@ -336,7 +385,9 @@ pub async fn execute(
 
     // Build validation pipeline based on workspace type (shared across all agents via Arc)
     let validation_pipeline: Option<Arc<crate::validation_gate::ValidationPipeline>> =
-        if config.workspace_root.join("Cargo.toml").exists() {
+        if config.execution_mode == ExecutionMode::Document {
+            None
+        } else if config.workspace_root.join("Cargo.toml").exists() {
             Some(Arc::new(
                 crate::validation_gate::ValidationPipeline::default_for_rust(),
             ))
@@ -346,17 +397,20 @@ pub async fn execute(
             ))
         };
 
-    // Build repo map + per-unit impact texts once for the whole swarm.
-    // Both phases run on blocking threads inside `WorkspaceAnalysis::build`
-    // (workspace scan + rusqlite GraphStore are !Send / CPU-heavy).
-    tracing::info!("repo_map: scanning workspace");
-    tracing::info!("code graph: indexing workspace");
+    // Build repo map + per-unit impact texts once for the whole swarm (repo mode only).
     let units_for_graph: Vec<WorkUnit> = work_units
         .iter()
         .chain(plan.loop_judge_units.iter())
         .cloned()
         .collect();
-    let analysis = WorkspaceAnalysis::build(config, &units_for_graph).await;
+    let analysis = if repo_execution {
+        tracing::info!("repo_map: scanning workspace");
+        tracing::info!("code graph: indexing workspace");
+        WorkspaceAnalysis::build(config, &units_for_graph).await
+    } else {
+        tracing::info!("execution document: skipping repo-map and code graph");
+        WorkspaceAnalysis::empty()
+    };
     let repo_map = analysis.repo_map.clone();
     let impact_texts = analysis.impact_texts.clone();
 
@@ -402,18 +456,16 @@ pub async fn execute(
     // Shared discovery board: agents post tagged findings for downstream agents
     let shared_board = Arc::new(SharedBoard::new());
 
-    // Optional worktree manager
-    let mut worktree_mgr = if config.use_worktrees {
-        let mgr = WorktreeManager::new(config.workspace_root.clone());
-        if mgr.can_use_worktrees() {
-            Some(mgr)
-        } else {
-            tracing::warn!(
-                "Worktrees unavailable (no git commits?), running agents in shared workspace"
-            );
-            None
-        }
+    // Optional worktree manager (see `use_worktrees` computed above).
+    let mut worktree_mgr = if use_worktrees {
+        Some(WorktreeManager::new(config.workspace_root.clone()))
     } else {
+        if want_worktrees {
+            tracing::warn!(
+                "parallel swarm requested worktree isolation but it is unavailable; \
+                 running agents in the shared workspace"
+            );
+        }
         None
     };
 
@@ -536,6 +588,7 @@ pub async fn execute(
 
                 let agent_ctx = AgentRunContext::for_run(
                     config,
+                    &context_files,
                     &effective_read_ns,
                     observer,
                     memory.clone(),
@@ -637,6 +690,7 @@ pub async fn execute(
                 let iteration_config = plan.iteration_config.clone();
                 let pfm = pre_fetched_memory.clone();
                 let swarm_extras = config.swarm_extra_tools.clone();
+                let skip_repo_context = config.execution_mode == ExecutionMode::Document;
                 if let Ok(backend) = resolve_backend_for_unit(&router, &unit) {
                     observer.on_tier_dispatch(unit_id, unit.tier, backend.name());
                 }
@@ -674,6 +728,7 @@ pub async fn execute(
                             agent_impact.as_deref(),
                             (*pfm).as_deref(),
                             &swarm_extras,
+                            skip_repo_context,
                             |candidate| resolve_backend_for_unit(&router, candidate),
                         )
                         .await
@@ -894,7 +949,7 @@ pub async fn execute(
                  usable git worktrees, but neither was available (worktrees enabled = {}). \
                  Ensure the workspace is a git repo with at least one commit and that \
                  worktrees are enabled in SwarmConfig.",
-                config.use_worktrees
+                use_worktrees
             );
         }
 
@@ -932,6 +987,7 @@ pub async fn execute(
                 let effective_read_ns = effective_read_namespaces(unit, config);
                 let agent_ctx = AgentRunContext::for_run(
                     config,
+                    &context_files,
                     &effective_read_ns,
                     observer,
                     memory.clone(),
@@ -992,6 +1048,7 @@ pub async fn execute(
             let outcome = {
                 let mut loop_ctx = LoopConditionContext {
                     config,
+                    context_files: &context_files,
                     memory: &memory,
                     memory_writer: &memory_writer,
                     observer,
@@ -1094,6 +1151,7 @@ pub async fn execute(
 
                 let agent_ctx = AgentRunContext::for_run(
                     config,
+                    &context_files,
                     &effective_read_ns,
                     observer,
                     memory.clone(),
@@ -1179,6 +1237,7 @@ pub async fn execute(
             let final_outcome = {
                 let mut loop_ctx = LoopConditionContext {
                     config,
+                    context_files: &context_files,
                     memory: &memory,
                     memory_writer: &memory_writer,
                     observer,
@@ -1262,6 +1321,7 @@ pub async fn execute(
                 let effective_read_ns = effective_read_namespaces(unit, config);
                 let agent_ctx = AgentRunContext::for_run(
                     config,
+                    &context_files,
                     &effective_read_ns,
                     observer,
                     memory.clone(),
@@ -1319,7 +1379,7 @@ pub async fn execute(
     }
 
     // 4. Merge phase (only if using worktrees)
-    if config.use_worktrees {
+    if use_worktrees {
         observer.on_phase_changed("merging");
 
         // Stacked-loop iterations produce branches like `gaviero/{id}-iter{N}`
@@ -1468,6 +1528,8 @@ struct AgentRunContext<'a> {
     /// `SwarmConfig::swarm_extra_tools`). Borrowed from `SwarmConfig`
     /// for the duration of the swarm run.
     swarm_extras: &'a [String],
+    /// When true, omit repo-map, topology, and code-graph context from prompts.
+    skip_repo_context: bool,
 }
 
 impl<'a> AgentRunContext<'a> {
@@ -1479,6 +1541,7 @@ impl<'a> AgentRunContext<'a> {
     #[allow(clippy::too_many_arguments)]
     fn for_run(
         config: &'a SwarmConfig,
+        context_files: &'a [(String, String)],
         read_namespaces: &'a [String],
         observer: &'a dyn SwarmObserver,
         memory: Option<Arc<MemoryStores>>,
@@ -1490,7 +1553,7 @@ impl<'a> AgentRunContext<'a> {
     ) -> Self {
         Self {
             workspace_root: &config.workspace_root,
-            context_files: &config.context_files,
+            context_files,
             memory,
             read_namespaces,
             swarm_observer: observer,
@@ -1502,6 +1565,7 @@ impl<'a> AgentRunContext<'a> {
             pre_fetched_memory,
             mcp_config: config.mcp_config.clone(),
             swarm_extras: &config.swarm_extra_tools,
+            skip_repo_context: config.execution_mode == ExecutionMode::Document,
         }
     }
 }
@@ -1515,6 +1579,13 @@ struct WorkspaceAnalysis {
 }
 
 impl WorkspaceAnalysis {
+    fn empty() -> Self {
+        Self {
+            repo_map: Arc::new(None),
+            impact_texts: Arc::new(std::collections::HashMap::new()),
+        }
+    }
+
     /// Build the repo map and per-unit impact texts. Both phases run on
     /// blocking threads to avoid starving the async executor; failures are
     /// logged at debug level and yield empty results so single-agent and
@@ -1656,6 +1727,7 @@ fn effective_read_namespaces(unit: &WorkUnit, config: &SwarmConfig) -> Vec<Strin
 
 struct LoopConditionContext<'a> {
     config: &'a SwarmConfig,
+    context_files: &'a [(String, String)],
     memory: &'a Option<Arc<MemoryStores>>,
     memory_writer: &'a Option<WriterHandle>,
     observer: &'a dyn SwarmObserver,
@@ -1942,7 +2014,14 @@ async fn run_agent_inner(
         (workspace_root.clone(), None)
     };
 
-    if let Some(base_mcp) = &ctx.mcp_config {
+    // Per-agent git worktrees need their own `.mcp.json` / `.cursor/mcp.json`.
+    // Document mode and single-threaded repo runs share `workspace_root` with
+    // the root synth done in `prepare_mcp_for_swarm` — re-writing here races
+    // when `max_parallel > 1` without worktrees.
+    if let Some(base_mcp) = &ctx.mcp_config
+        && in_worktree
+        && agent_root != base_mcp.worktree
+    {
         let mut synth = base_mcp.clone();
         synth.worktree = agent_root.clone();
         match crate::mcp::synthesize_for_worktree(&synth) {
@@ -1991,6 +2070,7 @@ async fn run_agent_inner(
             impact_text.as_deref(),
             pre_fetched_memory_text.as_deref(),
             ctx.swarm_extras,
+            ctx.skip_repo_context,
             |candidate| {
                 let backend = resolve_backend_for_unit(tier_router, candidate)?;
                 swarm_observer.on_tier_dispatch(&candidate.id, candidate.tier, backend.name());
@@ -2878,6 +2958,7 @@ async fn evaluate_loop_condition(
             };
             let agent_ctx = AgentRunContext::for_run(
                 ctx.config,
+                ctx.context_files,
                 &effective_read_ns,
                 ctx.observer,
                 ctx.memory.clone(),

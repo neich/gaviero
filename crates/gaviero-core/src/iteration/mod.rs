@@ -137,6 +137,7 @@ impl IterationEngine {
         impact_text: Option<&str>,
         pre_fetched_memory: Option<&str>,
         workspace_extra_tools: &[String],
+        skip_repo_context: bool,
     ) -> IterationResult {
         let n_attempts = match &self.config.strategy {
             Strategy::SinglePass => 1,
@@ -145,7 +146,10 @@ impl IterationEngine {
         };
 
         // Test-first: generate failing tests before the edit loop
-        if self.config.test_first && !matches!(self.config.strategy, Strategy::SinglePass) {
+        if self.config.test_first
+            && !skip_repo_context
+            && !matches!(self.config.strategy, Strategy::SinglePass)
+        {
             let generator = TestGenerator::new();
             let test_files = generator
                 .generate(
@@ -185,6 +189,7 @@ impl IterationEngine {
                 impact_text,
                 pre_fetched_memory,
                 workspace_extra_tools,
+                skip_repo_context,
             )
             .await
             {
@@ -260,6 +265,7 @@ impl IterationEngine {
         impact_text: Option<&str>,
         pre_fetched_memory: Option<&str>,
         workspace_extra_tools: &[String],
+        skip_repo_context: bool,
         resolve_backend: F,
     ) -> IterationResult
     where
@@ -271,7 +277,10 @@ impl IterationEngine {
             Strategy::BestOfN { n } => *n,
         };
 
-        if self.config.test_first && !matches!(self.config.strategy, Strategy::SinglePass) {
+        if self.config.test_first
+            && !skip_repo_context
+            && !matches!(self.config.strategy, Strategy::SinglePass)
+        {
             let generator = TestGenerator::new();
             let generator_unit = self.unit_for_attempt(&work_unit, 0);
             match resolve_backend(&generator_unit) {
@@ -326,6 +335,7 @@ impl IterationEngine {
                     impact_text,
                     pre_fetched_memory,
                     workspace_extra_tools,
+                    skip_repo_context,
                 )
                 .await
                 {
@@ -525,6 +535,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                false,
             )
             .await;
         assert_eq!(result.attempts_run, 1);
@@ -555,6 +566,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                false,
             )
             .await;
         assert_eq!(result.attempts_run, 1);
@@ -586,6 +598,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                false,
                 {
                     let seen_models = Arc::clone(&seen_models);
                     move |unit| {
@@ -647,6 +660,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                false,
                 {
                     let seen_models = Arc::clone(&seen_models);
                     move |unit| {
