@@ -567,6 +567,51 @@ impl Buffer {
         super::wrap::WrapLayout::build(self, content_width)
     }
 
+    /// Byte range covering logical source needed to highlight the visible viewport.
+    ///
+    /// `scroll.top_line` is a visual row index when [`word_wrap`](Self::word_wrap) is on,
+    /// otherwise a logical line index.
+    pub fn highlight_viewport_byte_range(
+        &self,
+        viewport_height: usize,
+        content_width: usize,
+    ) -> Option<(usize, usize)> {
+        let top = self.scroll.top_line;
+        let bottom = top + viewport_height;
+
+        if self.word_wrap && content_width > 0 {
+            let layout = self.wrap_layout(content_width);
+            if top >= layout.len() {
+                return None;
+            }
+            let end_visual = bottom.min(layout.len());
+            let first = &layout.segments[top];
+            let last = layout
+                .segments
+                .get(end_visual.saturating_sub(1))
+                .unwrap_or(first);
+            let start_byte = self.text.line_to_byte(first.logical_line);
+            let end_byte = if last.logical_line + 1 >= self.line_count() {
+                self.text.len_bytes()
+            } else {
+                self.text.line_to_byte(last.logical_line + 1)
+            };
+            return Some((start_byte, end_byte));
+        }
+
+        let bottom = bottom.min(self.line_count());
+        if top >= self.line_count() {
+            return None;
+        }
+        let start_byte = self.text.line_to_byte(top);
+        let end_byte = if bottom >= self.line_count() {
+            self.text.len_bytes()
+        } else {
+            self.text.line_to_byte(bottom)
+        };
+        Some((start_byte, end_byte))
+    }
+
     /// Lines used for vertical scroll (visual rows when wrap is on, else logical).
     pub fn scroll_line_count(&self, content_width: usize) -> usize {
         if self.word_wrap && content_width > 0 {
@@ -2663,6 +2708,28 @@ mod tests {
         let buf = Buffer::empty();
         assert_eq!(buf.line_count(), 1);
         assert!(!buf.modified);
+    }
+
+    #[test]
+    fn highlight_viewport_byte_range_maps_visual_scroll_when_wrapped() {
+        let mut buf = Buffer::empty();
+        buf.text = Rope::from_str("hello world foo");
+        buf.word_wrap = true;
+        let content_width = 11;
+        let layout = buf.wrap_layout(content_width);
+        assert!(
+            layout.len() >= 2,
+            "fixture should produce multiple visual rows"
+        );
+        // Visual row 1 is still logical line 0; old code treated top_line as logical
+        // and returned None once top_line >= line_count().
+        buf.scroll.top_line = 1;
+        let (start, end) = buf
+            .highlight_viewport_byte_range(10, content_width)
+            .expect("wrapped viewport must resolve");
+        assert_eq!(start, 0);
+        assert_eq!(end, buf.text.len_bytes());
+        assert!(buf.scroll.top_line >= buf.line_count());
     }
 
     #[test]
