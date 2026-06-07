@@ -242,18 +242,32 @@ pub fn expand_workflow_params_in_script(
                         }
                     };
 
-                    let (init_name, init_span) = match &lb.template_init {
-                        Some(t) => t.clone(),
-                        None => {
-                            errors.push(DslError::Compile {
-                                src: miette::NamedSource::new("script", String::new()),
-                                span: (lb.span.start, 1).into(),
-                                reason: "loop with `reviewers` requires `template_init <agent>`"
+                    let init_template = lb.template_init.as_ref().map(|(name, span)| {
+                        match agent_by_name.get(name) {
+                            Some(a) => Ok((a, name.clone(), *span)),
+                            None => {
+                                errors.push(DslError::Compile {
+                                    src: miette::NamedSource::new("script", String::new()),
+                                    span: (
+                                        span.start,
+                                        span.end.saturating_sub(span.start).max(1),
+                                    )
                                     .into(),
-                            });
-                            continue;
+                                    reason: format!(
+                                        "template_init `{name}` is not a defined agent"
+                                    ),
+                                });
+                                Err(())
+                            }
                         }
-                    };
+                    });
+                    if init_template.as_ref().is_some_and(|r| r.is_err()) {
+                        lb.reviewers = ReviewerSource::None;
+                        expanded_steps.push(StepItem::Loop(lb));
+                        continue;
+                    }
+                    let init_template = init_template.and_then(|r| r.ok());
+
                     let (refine_name, refine_span) = match &lb.template_refine {
                         Some(t) => t.clone(),
                         None => {
@@ -267,24 +281,6 @@ pub fn expand_workflow_params_in_script(
                         }
                     };
 
-                    let init_tpl = match agent_by_name.get(&init_name) {
-                        Some(a) => a,
-                        None => {
-                            errors.push(DslError::Compile {
-                                src: miette::NamedSource::new("script", String::new()),
-                                span: (
-                                    init_span.start,
-                                    init_span.end.saturating_sub(init_span.start).max(1),
-                                )
-                                .into(),
-                                reason: format!(
-                                    "template_init `{}` is not a defined agent",
-                                    init_name
-                                ),
-                            });
-                            continue;
-                        }
-                    };
                     let refine_tpl = match agent_by_name.get(&refine_name) {
                         Some(a) => a,
                         None => {
@@ -309,22 +305,28 @@ pub fn expand_workflow_params_in_script(
                         Vec::new();
 
                     for entry in &roster {
-                        let init_client_name = format!("__roster_{}_init", entry.id);
-                        let refine_client_name = format!("__roster_{}_refine", entry.id);
-                        new_clients.push(synth_client_from_entry(&init_client_name, entry));
+                        let refine_client_name = if init_template.is_some() {
+                            format!("__roster_{}_refine", entry.id)
+                        } else {
+                            format!("__roster_{}", entry.id)
+                        };
                         new_clients.push(synth_client_from_entry(&refine_client_name, entry));
 
-                        let init_agent = clone_reviewer_agent(
-                            init_tpl,
-                            &format!("{}-init", entry.id),
-                            entry,
-                            &init_client_name,
-                        );
-                        new_agents.push(init_agent.clone());
-                        expanded_steps.push(StepItem::Agent(
-                            init_agent.name.clone(),
-                            init_agent.name_span,
-                        ));
+                        if let Some((init_tpl, _, _)) = &init_template {
+                            let init_client_name = format!("__roster_{}_init", entry.id);
+                            new_clients.push(synth_client_from_entry(&init_client_name, entry));
+                            let init_agent = clone_reviewer_agent(
+                                init_tpl,
+                                &format!("{}-init", entry.id),
+                                entry,
+                                &init_client_name,
+                            );
+                            new_agents.push(init_agent.clone());
+                            expanded_steps.push(StepItem::Agent(
+                                init_agent.name.clone(),
+                                init_agent.name_span,
+                            ));
+                        }
 
                         let refine_agent = clone_reviewer_agent(
                             refine_tpl,
