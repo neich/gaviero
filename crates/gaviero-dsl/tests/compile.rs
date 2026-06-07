@@ -499,17 +499,9 @@ fn template_plan_refinement() {
     let plan = compile_example_plan("plan_refinement.gaviero");
     let units = plan.work_units_ordered().expect("toposort");
 
-    // 4 agents: 2 init + 2 refine (separate focused prompts per phase)
-    assert_eq!(units.len(), 4);
+    // Refine-only roster: 2 panel agents (no separate init step)
+    assert_eq!(units.len(), 2);
 
-    let cinit = units
-        .iter()
-        .find(|u| u.id == "claude-init")
-        .expect("claude-init");
-    let xinit = units
-        .iter()
-        .find(|u| u.id == "codex-init")
-        .expect("codex-init");
     let crefine = units
         .iter()
         .find(|u| u.id == "claude-refine")
@@ -519,36 +511,32 @@ fn template_plan_refinement() {
         .find(|u| u.id == "codex-refine")
         .expect("codex-refine");
 
-    // All four agents bind to a concrete client (not via a tier alias), so
-    // the resolved `tier` is whatever the client carries. The clients in
-    // plan_refinement.gaviero intentionally don't set `tier` — see the
-    // comment block at the top of that file — so every unit lands on the
-    // default tier. Models are what actually distinguish the agents.
     let expected_default = gaviero_core::types::ModelTier::default();
-    for u in &[cinit, xinit, crefine, xrefine] {
+    for u in &[crefine, xrefine] {
         assert_eq!(
             u.tier, expected_default,
-            "agent {} should resolve to the default tier (no tier on its client)",
+            "agent {} should resolve to the default tier (roster synth client)",
             u.id
         );
     }
-    assert_eq!(cinit.model.as_deref(), Some("claude:opus"));
-    assert_eq!(xinit.model.as_deref(), Some("codex:gpt-5.5"));
     assert_eq!(crefine.model.as_deref(), Some("claude:opus"));
     assert_eq!(xrefine.model.as_deref(), Some("codex:gpt-5.5"));
 
-    // Init agents: vars (MODEL_NAME, PLANS) substituted at compile time; no ITER
     assert!(
-        cinit.coordinator_instructions.contains("claude-init-v1.md"),
-        "claude-init prompt should reference claude-init-v1.md"
+        crefine.coordinator_instructions.contains("providers in this panel"),
+        "claude-refine should mention peer panel"
     );
     assert!(
-        xinit.coordinator_instructions.contains("codex-init-v1.md"),
-        "codex-init prompt should reference codex-init-v1.md"
+        crefine.coordinator_instructions.contains("codex"),
+        "claude-refine should list codex as a peer"
     );
     assert!(
-        !cinit.coordinator_instructions.contains("{{ITER}}"),
-        "init prompt should not contain {{ITER}}"
+        crefine.coordinator_instructions.contains("PREV_ITER}}` = 0"),
+        "claude-refine should document round-1 behaviour"
+    );
+    assert!(
+        crefine.scope.read_only_paths.iter().any(|p| p == "."),
+        "panel agents should have repo read-only scope"
     );
 
     // Refine agents: vars substituted; ITER/PREV_ITER survive for runtime
@@ -567,8 +555,8 @@ fn template_plan_refinement() {
     assert!(
         crefine
             .coordinator_instructions
-            .contains("claude-refine-plan-v{{PREV_ITER}}.md"),
-        "claude-refine should reference claude-refine-plan-v{{PREV_ITER}}.md"
+            .contains("refine-plan-v{{PREV_ITER}}.md"),
+        "claude-refine should reference refine-plan-v{{PREV_ITER}}.md"
     );
 
     // Summary file also uses ITER
@@ -583,13 +571,12 @@ fn template_plan_refinement() {
     assert_eq!(crefine.write_namespace.as_deref(), Some("plan-evolution"));
     assert_eq!(xrefine.write_namespace.as_deref(), Some("plan-evolution"));
 
-    // Loop config: 2 refine agents, 5 iterations, iter_start=2,
-    // plus the new judge-control knobs (stability, judge_timeout, strict_judge).
+    // Loop config: 2 refine agents, 5 iterations, iter_start=1 (round 1 PREV_ITER=0).
     assert_eq!(plan.loop_configs.len(), 1);
     let lc = &plan.loop_configs[0];
     assert_eq!(lc.agent_ids, vec!["claude-refine", "codex-refine"]);
     assert_eq!(lc.max_iterations, 5);
-    assert_eq!(lc.iter_start, 2);
+    assert_eq!(lc.iter_start, 1);
     assert_eq!(lc.stability, 2);
     assert_eq!(lc.judge_timeout_secs, 180);
     assert!(!lc.strict_judge);
@@ -597,16 +584,74 @@ fn template_plan_refinement() {
     // Judge agent is compiled into the aux list, not the main DAG.
     assert_eq!(plan.loop_judge_units.len(), 1);
     assert_eq!(plan.loop_judge_units[0].id, "convergence-judge");
-    // Judge prompt uses the new iteration-evidence placeholder.
+    // Judge prompt uses iteration evidence and panel-wide globs (N providers).
     assert!(
         plan.loop_judge_units[0]
             .coordinator_instructions
             .contains("{{ITER_EVIDENCE}}"),
         "judge prompt should reference {{{{ITER_EVIDENCE}}}}"
     );
+    assert!(
+        plan.loop_judge_units[0]
+            .coordinator_instructions
+            .contains("*-refine-summary-v{{ITER}}.md"),
+        "judge should glob all provider summaries"
+    );
+    assert_eq!(
+        plan.loop_judge_units[0].model.as_deref(),
+        Some("claude:sonnet")
+    );
 
-    // max_parallel 2
-    assert_eq!(plan.max_parallel, Some(2));
+    // max_parallel sized for 3+ provider panels
+    assert_eq!(plan.max_parallel, Some(4));
+}
+
+#[test]
+fn plan_refinement_three_provider_roster() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/plan_refinement.gaviero");
+    let plan = gaviero_dsl::compile_file(
+        &path,
+        Some("feature-plan-refinement"),
+        Some("multi-provider plan test"),
+        &[],
+        &[],
+        &[(
+            "roster".into(),
+            "claude=claude:opus@max,codex=codex:gpt-5.5@high,cursor=cursor:composer-2.5@medium"
+                .into(),
+        )],
+    )
+    .expect("three-provider roster should compile");
+    let ids: Vec<String> = plan
+        .work_units_unordered()
+        .into_iter()
+        .map(|u| u.id.clone())
+        .collect();
+    for prefix in &["claude", "codex", "cursor"] {
+        assert!(
+            ids.iter().any(|id| id == &format!("{prefix}-refine")),
+            "missing {prefix}-refine in {ids:?}"
+        );
+    }
+    assert_eq!(ids.len(), 3);
+    assert_eq!(plan.loop_configs.len(), 1);
+    assert_eq!(plan.loop_configs[0].agent_ids.len(), 3);
+    assert_eq!(plan.loop_configs[0].iter_start, 1);
+
+    let claude_refine = plan
+        .work_units_unordered()
+        .into_iter()
+        .find(|u| u.id == "claude-refine")
+        .expect("claude-refine");
+    assert!(
+        claude_refine.coordinator_instructions.contains("codex"),
+        "claude-refine should list codex peer"
+    );
+    assert!(
+        claude_refine.coordinator_instructions.contains("cursor"),
+        "claude-refine should list cursor peer"
+    );
 }
 
 #[test]
