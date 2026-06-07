@@ -25,8 +25,14 @@
 "\\let" @keyword
 "\\fi" @keyword
 
-; All other commands (generic — covers \date, \maketitle, \textbf, etc.)
+; All other commands (generic — covers \date, \maketitle, etc.)
 (command_name) @function
+
+; \textbf{...} — editor shows the argument in bold (markup.bold theme group)
+(generic_command
+  (command_name) @_bf (#match? @_bf "^\\\\textbf\\*?$")
+  (curly_group
+    (text) @markup.bold))
 
 ; Environment names
 (generic_environment
