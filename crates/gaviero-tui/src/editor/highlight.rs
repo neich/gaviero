@@ -338,6 +338,39 @@ mod tests {
     }
 
     #[test]
+    fn test_latex_textbf_argument_is_bold() {
+        use crate::theme::Theme;
+        use ratatui::style::Modifier;
+
+        let lang = gaviero_core::tree_sitter::language_for_extension("tex")
+            .expect("should have latex language");
+        let config =
+            load_highlight_config(lang.clone(), "latex").expect("should load latex highlights");
+
+        let mut parser = gaviero_core::Parser::new();
+        parser.set_language(&lang).unwrap();
+        let source = r"plain \textbf{bold words} tail";
+        let rope = ropey::Rope::from_str(source);
+        let tree = parser.parse(source, None).unwrap();
+
+        let theme = Theme::builtin_default();
+        let spans = run_highlights(&tree, &rope, &config, &theme, 0..source.len(), true);
+
+        let bold_start = source.find("bold words").expect("fixture text");
+        let bold_end = bold_start + "bold words".len();
+        let covers_bold = spans.iter().any(|s| {
+            s.start_byte <= bold_start
+                && s.end_byte >= bold_end
+                && s.style.add_modifier.contains(Modifier::BOLD)
+        });
+        assert!(
+            covers_bold,
+            "textbf argument should have a BOLD span; got {} spans",
+            spans.len()
+        );
+    }
+
+    #[test]
     fn test_json_highlight_pipeline() {
         use crate::theme::Theme;
 
