@@ -1130,102 +1130,304 @@ pub async fn execute(
             );
             observer.on_phase_changed(&format!("loop iteration {}", iteration + 1));
 
-            // Re-run each agent in the loop sequentially
-            for agent_id in &loop_config.agent_ids {
-                let unit_template = match unit_map.get(agent_id.as_str()) {
-                    Some(u) => u,
-                    None => continue,
-                };
+            // Substitute {{ITER}} / {{PREV_ITER}} for this loop pass.
+            // iteration is 1-indexed here (1..max_iterations); iter_abs = iter_start + iteration.
+            let iter_abs = loop_config.iter_start + iteration as u32;
+            let run_loop_parallel =
+                effective_max_parallel > 1 && loop_config.agent_ids.len() > 1;
 
-                // Substitute {{ITER}} / {{PREV_ITER}} for this specific iteration.
-                // iteration is 1-indexed here (1..max_iterations); iter_abs = iter_start + iteration.
-                let iter_abs = loop_config.iter_start + iteration as u32;
-                let iter_unit = apply_iter_vars(unit_template, iter_abs);
-                let unit = &iter_unit;
+            if run_loop_parallel {
+                // Barrier: fan out all loop-body agents concurrently (up to
+                // max_parallel), then wait for every agent before judge / next iter.
+                for agent_id in &loop_config.agent_ids {
+                    observer.on_agent_state_changed(agent_id, &AgentStatus::Pending, "queued");
+                }
 
-                observer.on_agent_state_changed(agent_id, &AgentStatus::Running, &unit.description);
+                let mut prepared: Vec<(String, WorkUnit, PathBuf, Option<BranchOverride>)> =
+                    Vec::new();
+                for agent_id in &loop_config.agent_ids {
+                    let unit_template = match unit_map.get(agent_id.as_str()) {
+                        Some(u) => u,
+                        None => continue,
+                    };
+                    let unit = apply_iter_vars(unit_template, iter_abs);
+                    invalidate_stale_sources(&memory, &unit, &config.workspace_root).await;
 
-                invalidate_stale_sources(&memory, unit, &config.workspace_root).await;
+                    let branch_override = if stacked && chain_anchor.is_some() {
+                        Some(BranchOverride {
+                            branch: format!("gaviero/{}-iter{}", agent_id, iter_abs),
+                            base_sha: chain_anchor.clone().unwrap(),
+                        })
+                    } else {
+                        None
+                    };
 
-                let effective_read_ns = effective_read_namespaces(unit, config);
+                    let agent_root = if let Some(ref mut mgr) = worktree_mgr {
+                        let handle = if let Some(ref ov) = branch_override {
+                            mgr.provision_with_base(&unit.id, &ov.branch, &ov.base_sha)?
+                        } else {
+                            mgr.provision(&unit.id)?
+                        };
+                        if !context_files.is_empty() {
+                            if let Err(e) = mgr.inject_context_files(&unit.id, &context_files) {
+                                tracing::warn!(
+                                    "Failed to inject context files for {}: {}",
+                                    unit.id,
+                                    e
+                                );
+                            }
+                        }
+                        handle.path.clone()
+                    } else {
+                        config.workspace_root.clone()
+                    };
+                    prepared.push((agent_id.clone(), unit, agent_root, branch_override));
+                }
 
-                let agent_ctx = AgentRunContext::for_run(
-                    config,
-                    &context_files,
-                    &effective_read_ns,
-                    observer,
-                    memory.clone(),
-                    git_coordinator.clone(),
-                    validation_pipeline.clone(),
-                    Some(shared_board.clone()),
-                    &analysis,
-                    pre_fetched_memory.clone(),
-                );
-                // Stacked mode: each agent in this iteration runs on its
-                // own per-iteration branch, based on the previous agent's
-                // tip (or the previous iteration's tip if this is the
-                // first agent of a new iteration).
-                let manifest = if stacked && chain_anchor.is_some() {
-                    let branch = format!("gaviero/{}-iter{}", agent_id, iter_abs);
-                    let base_sha = chain_anchor.clone().unwrap();
-                    run_single_agent_with_branch(
-                        unit,
-                        worktree_mgr.as_mut(),
-                        &agent_ctx,
-                        &tier_router,
-                        &plan.iteration_config,
-                        make_observer(agent_id),
-                        BranchOverride { branch, base_sha },
-                    )
-                    .await?
-                } else {
-                    run_single_agent(
-                        unit,
-                        worktree_mgr.as_mut(),
-                        &agent_ctx,
-                        &tier_router,
-                        &plan.iteration_config,
-                        make_observer(agent_id),
-                    )
-                    .await?
-                };
-
-                if matches!(manifest.status, AgentStatus::Completed) {
-                    let b = bus.lock().await;
-                    b.broadcast(
-                        &manifest.work_unit_id,
-                        &format!("completed: {}", manifest.summary.as_deref().unwrap_or("")),
-                    );
-                    let effective_write_ns = unit
-                        .write_namespace
+                let mut handles: Vec<(String, WorkUnit, tokio::task::JoinHandle<anyhow::Result<AgentManifest>>)> =
+                    Vec::new();
+                for (agent_id, unit, agent_root, branch_override) in prepared {
+                    let sem = semaphore.clone();
+                    let mem = memory.clone();
+                    let ns: Vec<String> = unit
+                        .read_namespaces
                         .as_deref()
-                        .unwrap_or(&config.write_namespace);
-                    store_agent_result(
-                        &memory,
-                        &memory_writer,
-                        effective_write_ns,
-                        &manifest,
-                        unit,
-                        &run_id,
-                        &config.workspace_root,
-                    )
-                    .await;
+                        .unwrap_or(config.read_namespaces.as_slice())
+                        .to_vec();
+                    let obs = make_observer(&agent_id);
+                    let git_coord = git_coordinator.clone();
+                    let val_pipeline = validation_pipeline.clone();
+                    let board_ref = Some(shared_board.clone());
+                    let rm = repo_map.clone();
+                    let agent_impact = impact_texts.get(&agent_id).cloned();
+                    let router = tier_router.clone();
+                    let iteration_config = plan.iteration_config.clone();
+                    let pfm = pre_fetched_memory.clone();
+                    let swarm_extras = config.swarm_extra_tools.clone();
+                    let skip_repo_context = config.execution_mode == ExecutionMode::Document;
+                    let in_worktree = worktree_mgr.is_some();
+                    let override_branch_name =
+                        branch_override.as_ref().map(|ov| ov.branch.clone());
 
-                    // Advance the stacked chain anchor: the next agent
-                    // (this iteration's next agent OR the next iteration's
-                    // first agent) chains off this commit.
-                    if stacked {
-                        if let Some(ref branch_name) = manifest.branch {
-                            if let Some(ref mgr) = worktree_mgr {
-                                if let Some(tip) = mgr.branch_tip(branch_name) {
-                                    chain_anchor = Some(tip);
+                    handles.push((
+                        agent_id.clone(),
+                        unit.clone(),
+                        tokio::spawn(async move {
+                            let _permit = sem.acquire().await.unwrap();
+                            let write_gate = Arc::new(Mutex::new(WriteGatePipeline::new(
+                                WriteMode::AutoAccept,
+                                Box::new(NoopWriteGateObserver),
+                            )));
+                            let engine =
+                                crate::iteration::IterationEngine::new(iteration_config.clone());
+                            let mut manifest = engine
+                                .run_with_backend_factory(
+                                    unit.clone(),
+                                    write_gate,
+                                    &agent_root,
+                                    mem.as_ref(),
+                                    &ns,
+                                    obs.as_ref(),
+                                    val_pipeline.as_deref(),
+                                    board_ref.as_deref(),
+                                    (*rm).as_ref(),
+                                    agent_impact.as_deref(),
+                                    (*pfm).as_deref(),
+                                    &swarm_extras,
+                                    skip_repo_context,
+                                    |candidate| {
+                                        resolve_backend_for_unit(&router, candidate)
+                                    },
+                                )
+                                .await
+                                .manifest;
+
+                            if in_worktree && matches!(manifest.status, AgentStatus::Completed) {
+                                let summary = manifest
+                                    .summary
+                                    .as_deref()
+                                    .unwrap_or("task complete")
+                                    .to_string();
+                                let agent_root_c = agent_root.clone();
+                                let unit_id_c = unit.id.clone();
+                                let changed = git_coord
+                                    .lock_git(move || {
+                                        commit_agent_changes(&agent_root_c, &unit_id_c, &summary)
+                                    })
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        tracing::warn!(
+                                            "Failed to commit worktree changes for {}: {}",
+                                            unit.id,
+                                            e
+                                        );
+                                        vec![]
+                                    });
+                                manifest.modified_files = changed;
+                                manifest.branch = Some(
+                                    override_branch_name
+                                        .unwrap_or_else(|| format!("gaviero/{}", unit.id)),
+                                );
+                            }
+
+                            Ok(manifest)
+                        }),
+                    ));
+                }
+
+                for (agent_id, unit, handle) in handles {
+                    let manifest = match handle.await {
+                        Ok(Ok(m)) => m,
+                        Ok(Err(e)) => {
+                            tracing::error!("Loop agent {} error: {:#}", agent_id, e);
+                            AgentManifest {
+                                work_unit_id: agent_id.clone(),
+                                status: AgentStatus::Failed(format!("{e:#}")),
+                                modified_files: vec![],
+                                branch: None,
+                                summary: Some("Agent task error".into()),
+                                output: None,
+                                cost_usd: 0.0,
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Loop agent {} panicked: {}", agent_id, e);
+                            AgentManifest {
+                                work_unit_id: agent_id.clone(),
+                                status: AgentStatus::Failed(format!("task panicked: {e}")),
+                                modified_files: vec![],
+                                branch: None,
+                                summary: Some("Agent task panicked".into()),
+                                output: None,
+                                cost_usd: 0.0,
+                            }
+                        }
+                    };
+                    observer.on_agent_state_changed(
+                        &manifest.work_unit_id,
+                        &manifest.status,
+                        manifest.summary.as_deref().unwrap_or(""),
+                    );
+                    if matches!(manifest.status, AgentStatus::Completed) {
+                        let b = bus.lock().await;
+                        b.broadcast(
+                            &manifest.work_unit_id,
+                            &format!(
+                                "completed: {}",
+                                manifest.summary.as_deref().unwrap_or("")
+                            ),
+                        );
+                        drop(b);
+                        let effective_write_ns = unit
+                            .write_namespace
+                            .as_deref()
+                            .unwrap_or(&config.write_namespace);
+                        store_agent_result(
+                            &memory,
+                            &memory_writer,
+                            effective_write_ns,
+                            &manifest,
+                            &unit,
+                            &run_id,
+                            &config.workspace_root,
+                        )
+                        .await;
+                    }
+                    exec_state.record_result(&agent_id, manifest.clone());
+                    all_manifests.push(manifest);
+                }
+            } else {
+                // Sequential fallback (max_parallel == 1 or a single loop agent).
+                for agent_id in &loop_config.agent_ids {
+                    let unit_template = match unit_map.get(agent_id.as_str()) {
+                        Some(u) => u,
+                        None => continue,
+                    };
+
+                    let iter_unit = apply_iter_vars(unit_template, iter_abs);
+                    let unit = &iter_unit;
+
+                    observer.on_agent_state_changed(
+                        agent_id,
+                        &AgentStatus::Running,
+                        &unit.description,
+                    );
+
+                    invalidate_stale_sources(&memory, unit, &config.workspace_root).await;
+
+                    let effective_read_ns = effective_read_namespaces(unit, config);
+
+                    let agent_ctx = AgentRunContext::for_run(
+                        config,
+                        &context_files,
+                        &effective_read_ns,
+                        observer,
+                        memory.clone(),
+                        git_coordinator.clone(),
+                        validation_pipeline.clone(),
+                        Some(shared_board.clone()),
+                        &analysis,
+                        pre_fetched_memory.clone(),
+                    );
+                    let manifest = if stacked && chain_anchor.is_some() {
+                        let branch = format!("gaviero/{}-iter{}", agent_id, iter_abs);
+                        let base_sha = chain_anchor.clone().unwrap();
+                        run_single_agent_with_branch(
+                            unit,
+                            worktree_mgr.as_mut(),
+                            &agent_ctx,
+                            &tier_router,
+                            &plan.iteration_config,
+                            make_observer(agent_id),
+                            BranchOverride { branch, base_sha },
+                        )
+                        .await?
+                    } else {
+                        run_single_agent(
+                            unit,
+                            worktree_mgr.as_mut(),
+                            &agent_ctx,
+                            &tier_router,
+                            &plan.iteration_config,
+                            make_observer(agent_id),
+                        )
+                        .await?
+                    };
+
+                    if matches!(manifest.status, AgentStatus::Completed) {
+                        let b = bus.lock().await;
+                        b.broadcast(
+                            &manifest.work_unit_id,
+                            &format!("completed: {}", manifest.summary.as_deref().unwrap_or("")),
+                        );
+                        let effective_write_ns = unit
+                            .write_namespace
+                            .as_deref()
+                            .unwrap_or(&config.write_namespace);
+                        store_agent_result(
+                            &memory,
+                            &memory_writer,
+                            effective_write_ns,
+                            &manifest,
+                            unit,
+                            &run_id,
+                            &config.workspace_root,
+                        )
+                        .await;
+
+                        if stacked {
+                            if let Some(ref branch_name) = manifest.branch {
+                                if let Some(ref mgr) = worktree_mgr {
+                                    if let Some(tip) = mgr.branch_tip(branch_name) {
+                                        chain_anchor = Some(tip);
+                                    }
                                 }
                             }
                         }
                     }
+                    exec_state.record_result(agent_id, manifest.clone());
+                    all_manifests.push(manifest);
                 }
-                exec_state.record_result(agent_id, manifest.clone());
-                all_manifests.push(manifest);
             }
         }
 
