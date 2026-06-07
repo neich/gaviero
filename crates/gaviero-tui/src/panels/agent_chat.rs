@@ -1264,72 +1264,97 @@ impl AgentChatState {
         self.update_autocomplete();
     }
 
-    // ── Multi-line cursor movement (chat-specific) ──────────────
+    // ── Input layout + vertical cursor movement ─────────────────
 
-    /// Move cursor up one logical line in multi-line input. Returns false if already on first line.
-    #[allow(dead_code)]
-    pub fn move_up(&mut self) -> bool {
-        let byte_off = self.text_input.cursor_byte_offset();
-        let before = &self.text_input.text[..byte_off];
-        let cur_line_start = before.rfind('\n').map(|p| p + 1).unwrap_or(0);
-        if cur_line_start == 0 {
-            return false;
+    /// Prompt label shown to the left of the input text (must match `render_input`).
+    pub fn input_prompt_label(&self) -> &'static str {
+        if self.renaming {
+            "Rename: "
+        } else if self.active_conv_streaming() {
+            "Ctrl+C to cancel"
+        } else if self.effective_auto_approve() {
+            "[auto-approve] > "
+        } else {
+            "> "
         }
-        let col = byte_off - cur_line_start;
-        let prev_line_start = self.text_input.text[..cur_line_start - 1]
-            .rfind('\n')
-            .map(|p| p + 1)
-            .unwrap_or(0);
-        let prev_line_len = cur_line_start - 1 - prev_line_start;
-        // Convert byte position back to char index
-        let target_byte = prev_line_start + col.min(prev_line_len);
-        self.text_input.cursor = self.text_input.text[..target_byte].chars().count();
-        true
     }
 
-    /// Move cursor down one logical line in multi-line input. Returns false if already on last line.
-    #[allow(dead_code)]
-    pub fn move_down(&mut self) -> bool {
-        let byte_off = self.text_input.cursor_byte_offset();
-        let before = &self.text_input.text[..byte_off];
-        let cur_line_start = before.rfind('\n').map(|p| p + 1).unwrap_or(0);
-        let col = byte_off - cur_line_start;
-        let next_nl = self.text_input.text[byte_off..].find('\n');
-        let Some(offset) = next_nl else {
-            return false;
-        };
-        let next_line_start = byte_off + offset + 1;
-        let next_line_end = self.text_input.text[next_line_start..]
-            .find('\n')
-            .map(|p| next_line_start + p)
-            .unwrap_or(self.text_input.text.len());
-        let next_line_len = next_line_end - next_line_start;
-        let target_byte = next_line_start + col.min(next_line_len);
-        self.text_input.cursor = self.text_input.text[..target_byte].chars().count();
-        true
+    /// Side-panel content width → `(first_line_text_width, full_line_width)`.
+    ///
+    /// `panel_content_width` is the rect passed to `AgentChatState::render`
+    /// (the side-panel content area). The chat block draws a left border, so
+    /// the usable inner width is one column narrower.
+    pub fn input_layout_widths(&self, panel_content_width: u16) -> (usize, usize) {
+        self.input_layout_widths_for_inner(panel_content_width.saturating_sub(1))
     }
 
-    /// Whether the input contains multiple lines (has newline characters).
-    pub fn input_is_multiline(&self) -> bool {
-        self.text_input.text.contains('\n')
+    fn input_layout_widths_for_inner(&self, inner_width: u16) -> (usize, usize) {
+        let full_w = inner_width as usize;
+        let prompt_len = self.input_prompt_label().chars().count();
+        (full_w.saturating_sub(prompt_len), full_w)
     }
 
-    /// Whether the input would visually wrap given the available width.
-    pub fn input_wraps_visually(&self, first_line_width: usize, full_width: usize) -> bool {
-        if self.text_input.text.is_empty() || full_width == 0 {
+    /// Whether Up/Down should move within the input before history / chat scroll.
+    pub fn input_has_multiple_visual_lines(&self, panel_content_width: u16) -> bool {
+        if self.text_input.text.is_empty() {
             return false;
         }
-        for (i, line) in self.text_input.text.split('\n').enumerate() {
-            let avail = if i == 0 { first_line_width } else { full_width };
-            if line.chars().count() > avail {
-                return true;
-            }
+        let (first_w, full_w) = self.input_layout_widths(panel_content_width);
+        self.build_visual_lines(first_w, full_w).len() > 1
+    }
+
+    /// Move the cursor up within the input. Returns `true` when the cursor moved.
+    pub fn cursor_up_in_input(&mut self, panel_content_width: u16) -> bool {
+        if !self.input_has_multiple_visual_lines(panel_content_width) {
+            return false;
         }
-        false
+        let (first_w, full_w) = self.input_layout_widths(panel_content_width);
+        self.text_input.sel_anchor = None;
+        self.move_up_visual(first_w, full_w)
+    }
+
+    /// Move the cursor down within the input. Returns `true` when the cursor moved.
+    pub fn cursor_down_in_input(&mut self, panel_content_width: u16) -> bool {
+        if !self.input_has_multiple_visual_lines(panel_content_width) {
+            return false;
+        }
+        let (first_w, full_w) = self.input_layout_widths(panel_content_width);
+        self.text_input.sel_anchor = None;
+        self.move_down_visual(first_w, full_w)
+    }
+
+    /// Extend the input selection upward by one visual line.
+    pub fn select_up_in_input(&mut self, panel_content_width: u16) -> bool {
+        if !self.input_has_multiple_visual_lines(panel_content_width) {
+            return false;
+        }
+        let (first_w, full_w) = self.input_layout_widths(panel_content_width);
+        self.text_input.ensure_anchor();
+        self.move_up_visual(first_w, full_w)
+    }
+
+    /// Extend the input selection downward by one visual line.
+    pub fn select_down_in_input(&mut self, panel_content_width: u16) -> bool {
+        if !self.input_has_multiple_visual_lines(panel_content_width) {
+            return false;
+        }
+        let (first_w, full_w) = self.input_layout_widths(panel_content_width);
+        self.text_input.ensure_anchor();
+        self.move_down_visual(first_w, full_w)
+    }
+
+    /// Scroll the conversation pane up by one rendered line.
+    pub fn scroll_chat_up(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+    }
+
+    /// Scroll the conversation pane down by one rendered line.
+    pub fn scroll_chat_down(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_add(1);
     }
 
     /// Move cursor up one visual line given the rendering widths.
-    pub fn move_up_visual(&mut self, first_line_width: usize, full_width: usize) -> bool {
+    fn move_up_visual(&mut self, first_line_width: usize, full_width: usize) -> bool {
         let lines = self.build_visual_lines(first_line_width, full_width);
         let cursor_char_pos = self.text_input.cursor;
         let (cur_vline, cur_col) = Self::find_cursor_in_visual_lines(&lines, cursor_char_pos);
@@ -1342,7 +1367,7 @@ impl AgentChatState {
     }
 
     /// Move cursor down one visual line given the rendering widths.
-    pub fn move_down_visual(&mut self, first_line_width: usize, full_width: usize) -> bool {
+    fn move_down_visual(&mut self, first_line_width: usize, full_width: usize) -> bool {
         let lines = self.build_visual_lines(first_line_width, full_width);
         let cursor_char_pos = self.text_input.cursor;
         let (cur_vline, cur_col) = Self::find_cursor_in_visual_lines(&lines, cursor_char_pos);
@@ -1355,7 +1380,7 @@ impl AgentChatState {
     }
 
     /// Build visual lines as (start_char_idx, char_count) for the current input.
-    fn build_visual_lines(
+    pub(crate) fn build_visual_lines(
         &self,
         first_line_width: usize,
         full_width: usize,
@@ -2799,16 +2824,7 @@ impl AgentChatState {
             return;
         }
 
-        // Minimal prompt: only show context for special modes
-        let prompt: &str = if self.renaming {
-            "Rename: "
-        } else if self.active_conv_streaming() {
-            "Ctrl+C to cancel"
-        } else if self.effective_auto_approve() {
-            "[auto-approve] > "
-        } else {
-            "> "
-        };
+        let prompt = self.input_prompt_label();
         let prompt_style = Style::default().fg(theme::ACCENT).bg(bg);
 
         let mut x = area.x;
@@ -2843,85 +2859,10 @@ impl AgentChatState {
                 }
             }
         } else if text_width > 0 {
-            // Build visual lines from input, respecting actual newlines (\n)
-            // and wrapping long lines within the available width.
-            // Each visual line: (start_char_idx, len_chars, is_first_visual_line)
             let input_chars: Vec<char> = self.text_input.text.chars().collect();
-            let cursor_char_pos = self.text_input.cursor;
-            let full_width = area.width as usize;
-
-            let mut lines: Vec<(usize, usize)> = Vec::new();
-            let mut pos = 0;
-
-            // Split by actual newlines first, then wrap each logical line
-            for (logical_idx, logical_line) in self.text_input.text.split('\n').enumerate() {
-                let line_char_count = logical_line.chars().count();
-                let avail = if lines.is_empty() {
-                    text_width
-                } else {
-                    full_width
-                };
-
-                if line_char_count == 0 {
-                    // Empty line (just a newline)
-                    lines.push((pos, 0));
-                } else {
-                    // Wrap this logical line into visual lines
-                    let mut col = 0;
-                    let first_visual = lines.len();
-                    while col < line_char_count {
-                        let w = if lines.len() == 0 {
-                            text_width
-                        } else if lines.len() == first_visual {
-                            avail
-                        } else {
-                            full_width
-                        };
-                        let take = w.min(line_char_count - col);
-                        lines.push((pos + col, take));
-                        col += take;
-                    }
-                }
-                // +1 for the '\n' character between logical lines
-                pos += line_char_count;
-                if logical_idx < self.text_input.text.split('\n').count() - 1 {
-                    pos += 1; // skip the \n char
-                }
-            }
-
-            // Ensure at least one line
-            if lines.is_empty() {
-                lines.push((0, 0));
-            }
-
-            // Find which visual line the cursor is on
-            let mut cursor_line = 0;
-            let mut cursor_col = 0;
-            for (i, &(start, len)) in lines.iter().enumerate() {
-                if cursor_char_pos >= start && cursor_char_pos <= start + len {
-                    // Check if this is the right line (cursor could be at the boundary)
-                    if cursor_char_pos < start + len || i == lines.len() - 1 {
-                        cursor_line = i;
-                        cursor_col = cursor_char_pos - start;
-                        break;
-                    }
-                }
-                // If cursor is exactly at the start of the next line
-                if i + 1 < lines.len() && cursor_char_pos == lines[i + 1].0 {
-                    cursor_line = i + 1;
-                    cursor_col = 0;
-                    break;
-                }
-            }
-            // Fallback: if cursor is past all lines (e.g., at very end)
-            if cursor_char_pos > 0 && cursor_line == 0 && cursor_col == 0 {
-                if let Some(&(start, _)) = lines.last() {
-                    if cursor_char_pos >= start {
-                        cursor_line = lines.len() - 1;
-                        cursor_col = cursor_char_pos - start;
-                    }
-                }
-            }
+            let lines = self.build_visual_lines(text_width, area.width as usize);
+            let (cursor_line, cursor_col) =
+                Self::find_cursor_in_visual_lines(&lines, self.text_input.cursor);
 
             // Scroll so cursor line is visible
             let scroll = if cursor_line >= total_rows {
@@ -3729,5 +3670,73 @@ mod tests {
         assert_eq!(input, 3);
         // Content only: "done it" + "[Write src/main.rs]" → 4 words (not 6).
         assert_eq!(output, 4);
+    }
+
+    #[test]
+    fn input_layout_widths_account_for_prompt_and_border() {
+        let mut state = AgentChatState::new();
+        // panel content 41 → inner 40 after left border; prompt "> " is 2 chars.
+        let (first, full) = state.input_layout_widths(41);
+        assert_eq!(full, 40);
+        assert_eq!(first, 38);
+
+        state.conversations[state.active_conv].auto_approve = true;
+        let (first_auto, full_auto) = state.input_layout_widths(41);
+        assert_eq!(full_auto, 40);
+        assert_eq!(first_auto, 23); // "[auto-approve] > " is 17 chars
+    }
+
+    #[test]
+    fn build_visual_lines_wraps_long_single_line() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "abcdefghijklmnopqrstuvwxyz".to_string();
+        let lines = state.build_visual_lines(10, 20);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], (0, 10));
+        assert_eq!(lines[1], (10, 16));
+    }
+
+    #[test]
+    fn cursor_up_in_input_moves_within_wrapped_text_before_history() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "abcdefghijklmnopqrstuvwxyz".to_string();
+        state.text_input.cursor = state.text_input.char_count();
+        state.add_user_message("prior");
+        let panel_w = 15; // inner 14, first line 12 → two visual lines (12 + 14)
+
+        assert!(state.input_has_multiple_visual_lines(panel_w));
+        assert!(state.cursor_up_in_input(panel_w));
+        assert_eq!(state.text_input.cursor, 12);
+        assert!(state.history_index.is_none());
+    }
+
+    #[test]
+    fn cursor_up_at_first_visual_line_does_not_move() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "abcdefghijklmnopqrstuvwxyz".to_string();
+        state.text_input.cursor = 5;
+
+        assert!(!state.cursor_up_in_input(15));
+    }
+
+    #[test]
+    fn cursor_down_in_input_moves_within_multiline_text() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "line one\nline two".to_string();
+        state.text_input.cursor = 0;
+
+        assert!(state.cursor_down_in_input(41));
+        assert_eq!(state.text_input.cursor, 9);
+    }
+
+    #[test]
+    fn select_up_in_input_extends_selection_across_visual_lines() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "abcdefghijklmnopqrstuvwxyz".to_string();
+        state.text_input.cursor = 15;
+
+        assert!(state.select_up_in_input(15));
+        assert_eq!(state.text_input.cursor, 3);
+        assert_eq!(state.text_input.sel_anchor, Some(15));
     }
 }

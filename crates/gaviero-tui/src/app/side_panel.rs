@@ -42,6 +42,53 @@ fn unique_root_labels(roots: &[(String, std::path::PathBuf)]) -> Vec<String> {
     labels
 }
 
+fn chat_panel_content_width(app: &App) -> u16 {
+    app.layout
+        .side_panel_area
+        .map(|a| a.width)
+        .unwrap_or(40)
+}
+
+/// Up in chat: move within wrapped/multiline input, else message history, else scroll output.
+fn handle_chat_cursor_up(app: &mut App) {
+    if app.chat_state.active_conv_streaming() {
+        app.chat_state.scroll_chat_up();
+        app.chat_state.user_scrolled_during_stream = true;
+        return;
+    }
+
+    let panel_w = chat_panel_content_width(app);
+    if app.chat_state.cursor_up_in_input(panel_w) {
+        return;
+    }
+
+    let before = app.chat_state.history_index;
+    app.chat_state.history_up();
+    if before.is_none() && app.chat_state.history_index.is_none() {
+        app.chat_state.scroll_chat_up();
+    }
+}
+
+/// Down in chat: move within wrapped/multiline input, else message history, else scroll output.
+fn handle_chat_cursor_down(app: &mut App) {
+    if app.chat_state.active_conv_streaming() {
+        app.chat_state.scroll_chat_down();
+        app.chat_state.user_scrolled_during_stream = true;
+        return;
+    }
+
+    let panel_w = chat_panel_content_width(app);
+    if app.chat_state.cursor_down_in_input(panel_w) {
+        return;
+    }
+
+    if app.chat_state.history_index.is_some() {
+        app.chat_state.history_down();
+    } else {
+        app.chat_state.scroll_chat_down();
+    }
+}
+
 pub(super) fn handle_chat_action(app: &mut App, action: Action) {
     // Only clear the output text selection on non-selection keypresses.
     // SelectUp/SelectDown extend it; Copy reads it.
@@ -259,66 +306,8 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
         Action::SelectWordRight => app.chat_state.text_input.select_word_right(),
         Action::Home => app.chat_state.text_input.move_home(),
         Action::End => app.chat_state.text_input.move_end(),
-        Action::CursorUp => {
-            let streaming = app.chat_state.active_conv_streaming();
-            if streaming {
-                app.chat_state.scroll_offset = app.chat_state.scroll_offset.saturating_sub(1);
-                app.chat_state.user_scrolled_during_stream = true;
-            } else {
-                let prompt_len = 2;
-                let panel_w = app
-                    .layout
-                    .side_panel_area
-                    .map(|a| a.width)
-                    .unwrap_or(40)
-                    .saturating_sub(2) as usize;
-                let first_w = panel_w.saturating_sub(prompt_len);
-                let has_visual_lines = !app.chat_state.text_input.text.is_empty()
-                    && (app.chat_state.input_is_multiline()
-                        || app.chat_state.input_wraps_visually(first_w, panel_w));
-
-                if has_visual_lines {
-                    if !app.chat_state.move_up_visual(first_w, panel_w) {
-                        app.chat_state.history_up();
-                    }
-                } else {
-                    app.chat_state.history_up();
-                }
-            }
-        }
-        Action::CursorDown => {
-            let streaming = app.chat_state.active_conv_streaming();
-            if streaming {
-                app.chat_state.scroll_offset += 1;
-                app.chat_state.user_scrolled_during_stream = true;
-            } else {
-                let prompt_len = 2;
-                let panel_w = app
-                    .layout
-                    .side_panel_area
-                    .map(|a| a.width)
-                    .unwrap_or(40)
-                    .saturating_sub(2) as usize;
-                let first_w = panel_w.saturating_sub(prompt_len);
-                let has_visual_lines = !app.chat_state.text_input.text.is_empty()
-                    && (app.chat_state.input_is_multiline()
-                        || app.chat_state.input_wraps_visually(first_w, panel_w));
-
-                if has_visual_lines {
-                    if !app.chat_state.move_down_visual(first_w, panel_w) {
-                        if app.chat_state.history_index.is_some() {
-                            app.chat_state.history_down();
-                        } else {
-                            app.chat_state.scroll_offset += 1;
-                        }
-                    }
-                } else if app.chat_state.history_index.is_some() {
-                    app.chat_state.history_down();
-                } else {
-                    app.chat_state.scroll_offset += 1;
-                }
-            }
-        }
+        Action::CursorUp => handle_chat_cursor_up(app),
+        Action::CursorDown => handle_chat_cursor_down(app),
         Action::PageUp => {
             app.chat_state.scroll_offset = app.chat_state.scroll_offset.saturating_sub(20);
             if app.chat_state.active_conv_streaming() {
@@ -365,12 +354,18 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
         }
         Action::SelectUp => {
             if !app.chat_state.active_conv_streaming() {
-                app.chat_state.select_up_in_output();
+                let panel_w = chat_panel_content_width(app);
+                if !app.chat_state.select_up_in_input(panel_w) {
+                    app.chat_state.select_up_in_output();
+                }
             }
         }
         Action::SelectDown => {
             if !app.chat_state.active_conv_streaming() {
-                app.chat_state.select_down_in_output();
+                let panel_w = chat_panel_content_width(app);
+                if !app.chat_state.select_down_in_input(panel_w) {
+                    app.chat_state.select_down_in_output();
+                }
             }
         }
         _ => {}
