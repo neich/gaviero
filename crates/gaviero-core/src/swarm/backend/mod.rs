@@ -158,6 +158,9 @@ pub struct CompletionRequest {
     pub max_tokens: Option<u32>,
     /// Whether the backend should auto-approve provider permission prompts.
     pub auto_approve: bool,
+    /// When true, sets `CLAUDE_QUIET=1` on Claude subprocess spawns so
+    /// global Stop hooks skip machine-consumed turns.
+    pub suppress_hooks: bool,
 }
 
 // ── Backend Config ──────────────────────────────────────────────────────────
@@ -247,6 +250,7 @@ mod tests {
             extra: Vec::new(),
             max_tokens: None,
             auto_approve: true,
+            suppress_hooks: true,
         };
 
         let mut stream = backend.stream_completion(req).await.unwrap();
@@ -289,6 +293,7 @@ mod tests {
             extra: Vec::new(),
             max_tokens: None,
             auto_approve: true,
+            suppress_hooks: true,
         };
 
         let mut stream = backend.stream_completion(req).await.unwrap();

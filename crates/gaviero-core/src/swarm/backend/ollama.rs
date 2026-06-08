@@ -375,6 +375,7 @@ mod tests {
             extra: Vec::new(),
             max_tokens: None,
             auto_approve: true,
+            suppress_hooks: true,
         };
 
         let mut stream = backend.stream_completion(req).await.unwrap();
@@ -415,6 +416,7 @@ mod tests {
             extra: Vec::new(),
             max_tokens: None,
             auto_approve: true,
+            suppress_hooks: true,
         };
 
         let result = backend.stream_completion(req).await;
@@ -482,6 +484,7 @@ mod tests {
             extra: Vec::new(),
             max_tokens: None,
             auto_approve: true,
+            suppress_hooks: true,
         };
 
         let mut stream = backend.stream_completion(req).await.unwrap();

@@ -151,6 +151,7 @@ impl AcpPipeline {
                 extra: Vec::new(),
                 max_tokens: Some(self.options.max_tokens),
                 auto_approve: self.options.auto_approve,
+                suppress_hooks: false,
             };
             executor::complete_to_write_gate(
                 &*backend,

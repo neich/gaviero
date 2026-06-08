@@ -473,6 +473,7 @@ async fn run_coordinator_request(
             extra: Vec::new(),
             max_tokens: None,
             auto_approve: true,
+            suppress_hooks: true,
         },
         observer,
     )

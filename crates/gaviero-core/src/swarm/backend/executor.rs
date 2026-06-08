@@ -352,6 +352,7 @@ mod tests {
             extra: Vec::new(),
             max_tokens: None,
             auto_approve: true,
+            suppress_hooks: true,
         };
 
         let outcome = complete_to_text(&backend, request, Some(&NoopObserver))
@@ -397,6 +398,7 @@ mod tests {
             extra: Vec::new(),
             max_tokens: None,
             auto_approve: true,
+            suppress_hooks: true,
         };
 
         let gate = Arc::new(Mutex::new(WriteGatePipeline::new(
@@ -439,6 +441,7 @@ mod tests {
             extra: Vec::new(),
             max_tokens: None,
             auto_approve: true,
+            suppress_hooks: true,
         };
 
         // RejectAll mode: gate discards the proposal (no disk write), but
@@ -478,6 +481,7 @@ mod tests {
             extra: Vec::new(),
             max_tokens: None,
             auto_approve: true,
+            suppress_hooks: true,
         };
 
         let err = complete_to_text(&backend, request, Some(&NoopObserver))

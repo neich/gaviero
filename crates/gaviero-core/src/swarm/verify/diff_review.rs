@@ -249,6 +249,7 @@ async fn call_reviewer(
             extra: Vec::new(),
             max_tokens: None,
             auto_approve: true,
+            suppress_hooks: true,
         },
         None,
     )

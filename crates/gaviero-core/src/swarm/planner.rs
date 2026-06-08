@@ -88,6 +88,7 @@ async fn try_plan(
             extra: Vec::new(),
             max_tokens: None,
             auto_approve: true,
+            suppress_hooks: true,
         },
         None,
     )

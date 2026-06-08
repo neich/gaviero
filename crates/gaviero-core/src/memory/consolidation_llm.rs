@@ -58,6 +58,7 @@ impl ConsolidationLlm for BackendConsolidationLlm {
             extra: Vec::new(),
             max_tokens: None,
             auto_approve: true,
+            suppress_hooks: true,
         };
         let outcome = executor::complete_to_text(self.backend.as_ref(), request, None).await?;
         Ok(outcome.text)
