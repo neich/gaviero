@@ -250,6 +250,22 @@ In coordinated mode, model selection is automatic — Opus plans the task, then 
 
 See [crates/gaviero-cli/README.md](crates/gaviero-cli/README.md) for the full flag reference including eval, utilization, and redaction flags.
 
+## Skills
+
+Turn-scoped instruction templates live as markdown files under `.gaviero/skills/` (per-repo folder, workspace root, or `~/.gaviero/skills/` globally). Invoke them in chat with `$skill-name` — inline `$name(arg1, arg2)` or line-start `$name arg1 arg2`. The rendered body is injected as a `<skill name="…">` block into the agent prompt for that turn only.
+
+Author skills with Claude Code–compatible frontmatter:
+
+```markdown
+---
+description: Migrate a UI component between frameworks
+arguments: [component, from, to]
+---
+Migrate the $component component from $from to $to.
+```
+
+Use `/skills` to list loaded skills and `/skills search <query>` for semantic discovery. Literal `$` in chat text is written as `\$`. Skills are read-only — they do not write files or memory rows.
+
 ## Workflow Scripts (DSL)
 
 Define reusable multi-agent workflows in `.gaviero` files. The Gaviero DSL compiles declarative workflows into execution plans run by the swarm engine. Learn more in [crates/gaviero-dsl/README.md](crates/gaviero-dsl/README.md).
