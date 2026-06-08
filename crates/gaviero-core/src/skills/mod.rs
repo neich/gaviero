@@ -44,7 +44,7 @@ impl Skill {
     }
 }
 
-/// Valid skill name / file stem charset.
+/// Valid skill name charset (folder name under `*/.gaviero/skills/`).
 pub fn valid_stem(stem: &str) -> bool {
     !stem.is_empty()
         && stem
@@ -52,16 +52,27 @@ pub fn valid_stem(stem: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-/// Parse a skill from disk contents. `path` supplies the expected file stem.
-pub fn parse_skill(path: &Path, contents: &str) -> Result<Skill, SkillWarning> {
-    let stem = path
-        .file_stem()
+/// Skill name from a `…/<name>/SKILL.md` path.
+pub fn skill_name_from_path(path: &Path) -> Option<&str> {
+    if path.file_name().and_then(|f| f.to_str()) != Some("SKILL.md") {
+        return None;
+    }
+    path.parent()
+        .and_then(|p| p.file_name())
         .and_then(|s| s.to_str())
-        .unwrap_or("");
+}
+
+/// Parse a skill from disk contents. `path` must be `…/<name>/SKILL.md`.
+pub fn parse_skill(path: &Path, contents: &str) -> Result<Skill, SkillWarning> {
+    let stem = skill_name_from_path(path).unwrap_or("?");
     let warn = |message: &str| SkillWarning {
         name: stem.to_string(),
         message: message.to_string(),
     };
+
+    if skill_name_from_path(path).is_none() {
+        return Err(warn("skill definition must be SKILL.md inside a named folder"));
+    }
 
     if !valid_stem(stem) {
         return Err(warn("invalid skill name charset"));
@@ -80,7 +91,7 @@ pub fn parse_skill(path: &Path, contents: &str) -> Result<Skill, SkillWarning> {
 
     if let Some(declared) = fm_map.get("name") {
         if declared != stem {
-            return Err(warn("frontmatter name does not match file stem"));
+            return Err(warn("frontmatter name does not match folder name"));
         }
     }
 
@@ -124,7 +135,7 @@ mod tests {
 
     #[test]
     fn parse_skill_loads_frontmatter_and_body() {
-        let path = Path::new("migrate-component.md");
+        let path = Path::new("migrate-component/SKILL.md");
         let skill = parse_skill(path, sample_skill_md()).unwrap();
         assert_eq!(skill.name, "migrate-component");
         assert_eq!(skill.arguments, vec!["from", "to"]);
@@ -133,7 +144,7 @@ mod tests {
 
     #[test]
     fn parse_skill_rejects_missing_description() {
-        let path = Path::new("bad.md");
+        let path = Path::new("bad/SKILL.md");
         let src = "---\nname: bad\n---\nbody\n";
         let err = parse_skill(path, src).unwrap_err();
         assert!(err.message.contains("description"));
@@ -141,7 +152,7 @@ mod tests {
 
     #[test]
     fn render_delegates_to_substitute() {
-        let path = Path::new("migrate-component.md");
+        let path = Path::new("migrate-component/SKILL.md");
         let skill = parse_skill(path, sample_skill_md()).unwrap();
         let args = vec!["React".into(), "Vue".into()];
         let rendered = skill.render(&args, "React Vue");
