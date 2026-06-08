@@ -245,13 +245,17 @@ pub struct Conversation {
     /// active-buffer heuristic would narrow incorrectly.
     pub workspace_wide_next: bool,
     /// One-shot flag toggled by `/lite`. When `true`, the next dispatched
-    /// turn skips all bootstrap context injection — graph (`<repo_outline>`),
-    /// memory (`<project_memory>`), and impact analysis — even on the first
-    /// turn. The user message + visible transcript still go through.
-    /// Primarily for providers with hard argv limits (cursor: 96 KB) where
-    /// the default ~12 K-token graph block still pushes the prompt over.
+    /// turn skips outline, memory, and impact; keeps `<repo_topology>`.
     /// Self-clears after `send_chat_message` consumes it.
     pub lite_next: bool,
+    /// One-shot flag toggled by `/no-inject`. Suppresses every bootstrap
+    /// layer on the next dispatch (including topology).
+    pub no_inject_next: bool,
+    /// Accumulated per-layer arms from `/inject <layer>` before the next
+    /// send. Merged across multiple `/inject` calls; consumed on dispatch.
+    pub inject_arms_next: gaviero_core::context_planner::BootstrapArms,
+    /// Per-conversation override of `agent.context.bootstrap` from settings.
+    pub context_mode_override: Option<gaviero_core::context_planner::BootstrapMode>,
     /// Claude's session id, captured from the first turn's `SystemInit` event.
     /// Subsequent turns pass this back via `--resume <id>` so Claude keeps
     /// conversation memory server-side and we don't re-send history.
@@ -280,8 +284,12 @@ pub struct Conversation {
     pub last_token_usage: Option<gaviero_core::acp::protocol::TokenUsage>,
     /// Gaviero bootstrap measured on the last send (`TurnBootstrapMeasured`):
     /// topology, graph outline, memory block, `@file` refs. Zero on follow-up
-    /// turns that skip bootstrap. Used by the status-bar composite estimate.
+    /// turns that skip bootstrap.
     pub last_bootstrap_tokens: usize,
+    /// Bootstrap arms that produced [`last_bootstrap_tokens`].
+    pub last_bootstrap_arms: gaviero_core::context_planner::BootstrapArms,
+    /// Memory injection size from the last `ChatMemoryInjected` event.
+    pub last_memory_injection_tokens: usize,
 }
 
 /// Context-window pressure shown in the status bar and `/context`.
@@ -322,6 +330,8 @@ pub struct AgentSettings {
     pub read_namespaces: Vec<String>,
     /// Token budget for graph-based source-code context injection. 0 disables graph context.
     pub graph_budget_tokens: usize,
+    /// Default chat bootstrap mode (`agent.context.bootstrap`).
+    pub bootstrap_mode: gaviero_core::context_planner::BootstrapMode,
 }
 
 impl Default for AgentSettings {
@@ -334,6 +344,7 @@ impl Default for AgentSettings {
             write_namespace: "default".to_string(),
             read_namespaces: vec!["default".to_string()],
             graph_budget_tokens: 12_000,
+            bootstrap_mode: gaviero_core::context_planner::BootstrapMode::Auto,
         }
     }
 }
@@ -412,12 +423,17 @@ impl AgentChatState {
             pending_focused_folder: None,
             workspace_wide_next: false,
             lite_next: false,
+            no_inject_next: false,
+            inject_arms_next: gaviero_core::context_planner::BootstrapArms::none(),
+            context_mode_override: None,
             claude_session_id: None,
             session_ledger: None,
             pending_persisted_ledger: None,
             transcript_inline_mode: TranscriptInlineMode::Auto,
             last_token_usage: None,
             last_bootstrap_tokens: 0,
+            last_bootstrap_arms: gaviero_core::context_planner::BootstrapArms::none(),
+            last_memory_injection_tokens: 0,
         };
         Self {
             conversations: vec![conv],
@@ -557,6 +573,138 @@ impl AgentChatState {
         nss
     }
 
+    pub fn effective_bootstrap_mode(&self) -> gaviero_core::context_planner::BootstrapMode {
+        self.active_conversation()
+            .context_mode_override
+            .unwrap_or(self.agent_settings.bootstrap_mode)
+    }
+
+    /// Budget-only bootstrap estimate for slash commands that lack workspace cache access.
+    pub fn fallback_bootstrap_estimate_context(
+        &self,
+    ) -> gaviero_core::context_planner::BootstrapEstimateContext {
+        let conv = self.active_conversation();
+        gaviero_core::context_planner::BootstrapEstimateContext {
+            budgets: gaviero_core::context_planner::BootstrapBudgets {
+                topology: 600,
+                outline: self.agent_settings.graph_budget_tokens,
+                memory: 1_000,
+                impact: self.agent_settings.graph_budget_tokens.min(4_000),
+            },
+            hints: gaviero_core::context_planner::BootstrapEstimateHints {
+                memory_tokens: if conv.last_memory_injection_tokens > 0 {
+                    Some(conv.last_memory_injection_tokens)
+                } else {
+                    None
+                },
+                ..Default::default()
+            },
+        }
+    }
+
+    fn format_bootstrap_layers(
+        arms: gaviero_core::context_planner::BootstrapArms,
+    ) -> String {
+        let mut parts = Vec::new();
+        if arms.topology {
+            parts.push("topology");
+        }
+        if arms.outline {
+            parts.push("outline");
+        }
+        if arms.memory {
+            parts.push("memory");
+        }
+        if arms.impact {
+            parts.push("impact");
+        }
+        if parts.is_empty() {
+            "none".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
+
+    fn conversation_is_first_turn(conv: &Conversation) -> bool {
+        conv.session_ledger
+            .as_ref()
+            .map(|l| l.is_first_turn())
+            .unwrap_or(true)
+    }
+
+    fn has_pending_bootstrap_override(conv: &Conversation) -> bool {
+        conv.lite_next
+            || conv.no_inject_next
+            || (conv.inject_arms_next.explicit && conv.inject_arms_next.any_layer())
+    }
+
+    /// Bootstrap arms that will apply on the next dispatched prompt.
+    pub fn resolve_next_bootstrap_arms(&self) -> gaviero_core::context_planner::BootstrapArms {
+        let conv = self.active_conversation();
+        let one_shot = if conv.lite_next {
+            Some(gaviero_core::context_planner::BootstrapOneShot::Lite)
+        } else if conv.no_inject_next {
+            Some(gaviero_core::context_planner::BootstrapOneShot::NoInject)
+        } else {
+            None
+        };
+        gaviero_core::context_planner::resolve_chat_bootstrap_arms(
+            self.effective_bootstrap_mode(),
+            Self::conversation_is_first_turn(conv),
+            one_shot,
+            conv.inject_arms_next,
+        )
+    }
+
+    fn projected_bootstrap_tokens(
+        &self,
+        ctx: &gaviero_core::context_planner::BootstrapEstimateContext,
+    ) -> usize {
+        let conv = self.active_conversation();
+        let next_arms = self.resolve_next_bootstrap_arms();
+        if next_arms == conv.last_bootstrap_arms && conv.last_bootstrap_tokens > 0 {
+            return conv.last_bootstrap_tokens;
+        }
+        let projected = gaviero_core::context_planner::estimate_bootstrap_tokens(
+            next_arms,
+            &ctx.budgets,
+            &ctx.hints,
+        );
+        // Between dispatch and provider `TurnTokenUsage`, `is_first_turn` may
+        // already be false while prefix is still unknown — don't drop the
+        // measured bootstrap from the composite bar in that window.
+        if projected == 0
+            && conv.last_bootstrap_tokens > 0
+            && conv.last_bootstrap_arms.any_layer()
+            && (conv.is_streaming || conv.last_token_usage.is_none())
+        {
+            return conv.last_bootstrap_tokens;
+        }
+        projected
+    }
+
+    fn pending_bootstrap_summary(&self) -> String {
+        let conv = self.active_conversation();
+        let mut lines = Vec::new();
+        if conv.lite_next {
+            lines.push("armed: /lite (topology only)".to_string());
+        }
+        if conv.no_inject_next {
+            lines.push("armed: /no-inject (suppress all)".to_string());
+        }
+        if conv.inject_arms_next.explicit && conv.inject_arms_next.any_layer() {
+            lines.push(format!(
+                "armed: /inject ({})",
+                Self::format_bootstrap_layers(conv.inject_arms_next)
+            ));
+        }
+        if lines.is_empty() {
+            "armed: none".to_string()
+        } else {
+            lines.join("; ")
+        }
+    }
+
     /// Process slash commands in input. Returns true if a command was handled.
     ///
     /// A leading `//` (double slash) is the explicit "send raw to agent"
@@ -684,7 +832,8 @@ impl AgentChatState {
                     });
                     conv.messages.extend(kept);
 
-                    let (_tokens, pct) = self.estimate_context();
+                    let (_tokens, pct) =
+                        self.estimate_context(&self.fallback_bootstrap_estimate_context());
                     self.add_system_message(&format!(
                         "Compacted: removed {} messages, kept {}. Context: ~{}% of limit",
                         removed, keep, pct
@@ -695,19 +844,58 @@ impl AgentChatState {
                 true
             }
             "/context" => {
+                if let Some(mode_arg) = arg.strip_prefix("mode") {
+                    let mode_str = mode_arg.trim();
+                    let conv = &mut self.conversations[self.active_conv];
+                    if mode_str.is_empty() {
+                        self.add_system_message(&format!(
+                            "Bootstrap mode: {} (workspace default: {})\n\
+                             Usage: /context mode auto|minimal|manual|none\n\
+                             /context mode reset — clear per-conversation override",
+                            self.effective_bootstrap_mode().as_str(),
+                            self.agent_settings.bootstrap_mode.as_str(),
+                        ));
+                    } else if mode_str == "reset" {
+                        conv.context_mode_override = None;
+                        self.add_system_message(&format!(
+                            "Bootstrap mode reset to workspace default: {}",
+                            self.agent_settings.bootstrap_mode.as_str()
+                        ));
+                    } else if let Some(mode) =
+                        gaviero_core::context_planner::BootstrapMode::parse(mode_str)
+                    {
+                        conv.context_mode_override = Some(mode);
+                        self.add_system_message(&format!(
+                            "Bootstrap mode set to: {} (this conversation)",
+                            mode.as_str()
+                        ));
+                    } else {
+                        self.add_system_message(
+                            "Invalid mode. Use: auto, minimal, manual, none, or reset",
+                        );
+                    }
+                    self.text_input.text.clear();
+                    self.text_input.cursor = 0;
+                    return true;
+                }
+
                 let limit = self.context_limit_tokens();
-                let pressure = self.context_pressure();
+                let estimate_ctx = self.fallback_bootstrap_estimate_context();
+                let pressure = self.context_pressure(&estimate_ctx);
                 let (input_words, output_words) = self.count_transcript_words();
                 let source_label = match pressure.source {
                     ContextBarSource::ProviderPrefix => "provider prefix (authoritative)",
                     ContextBarSource::CompositeEstimate => "composite estimate",
                 };
+                let mode = self.effective_bootstrap_mode();
+                let pending = self.pending_bootstrap_summary();
                 let mut msg = format!(
                     "Status bar: {} tokens — {} (~{}% of {} limit)\n\
                      Composite parts:\n  transcript: {} tok (visible chat × 1.3)\n  \
-                     bootstrap: {} tok (last measured gaviero injection)\n  \
+                     bootstrap: {} tok (projected next injection)\n  \
                      hidden overhead: {} tok (provider system/tools allowance)\n\
-                     Transcript words: {} input | {} output",
+                     Transcript words: {} input | {} output\n\n\
+                     Bootstrap policy:\n  mode: {} (workspace default: {})\n  {}",
                     pressure.tokens,
                     source_label,
                     pressure.pct,
@@ -717,7 +905,16 @@ impl AgentChatState {
                     pressure.hidden_overhead_tokens,
                     input_words,
                     output_words,
+                    mode.as_str(),
+                    self.agent_settings.bootstrap_mode.as_str(),
+                    pending,
                 );
+                if self.effective_model().starts_with("codex:") {
+                    msg.push_str(
+                        "\n  codex exec replays history client-side; use /inject memory \
+                         or /inject all on later turns when mode is manual.",
+                    );
+                }
                 if let Some(u) = self
                     .conversations
                     .get(self.active_conv)
@@ -744,6 +941,80 @@ impl AgentChatState {
                     ));
                 }
                 self.add_system_message(&msg);
+                self.text_input.text.clear();
+                self.text_input.cursor = 0;
+                true
+            }
+            "/inject" => {
+                let conv = &mut self.conversations[self.active_conv];
+                let layer = arg.to_ascii_lowercase();
+                if layer.is_empty() {
+                    self.add_system_message(
+                        "Inject bootstrap layers on the next prompt:\n\
+                         /inject memory    — <project_memory>\n\
+                         /inject outline   — <repo_outline> (alias: graph)\n\
+                         /inject topology  — <repo_topology>\n\
+                         /inject impact    — buffer-seeded impact slice\n\
+                         /inject all       — all layers (works on follow-up turns)\n\
+                         Layers merge if you run multiple /inject commands before sending.\n\
+                         /no-inject        — suppress all bootstrap on next prompt",
+                    );
+                } else if layer == "all" {
+                    conv.inject_arms_next = gaviero_core::context_planner::BootstrapArms {
+                        explicit: true,
+                        ..gaviero_core::context_planner::BootstrapArms::all()
+                    };
+                    self.add_system_message(
+                        "Inject all: ARMED for next prompt (topology, outline, memory, impact).",
+                    );
+                } else {
+                    let known = match layer.as_str() {
+                        "memory" => {
+                            conv.inject_arms_next.memory = true;
+                            true
+                        }
+                        "outline" | "graph" => {
+                            conv.inject_arms_next.outline = true;
+                            true
+                        }
+                        "topology" => {
+                            conv.inject_arms_next.topology = true;
+                            true
+                        }
+                        "impact" => {
+                            conv.inject_arms_next.impact = true;
+                            true
+                        }
+                        _ => false,
+                    };
+                    if known {
+                        let layers = {
+                            conv.inject_arms_next.explicit = true;
+                            Self::format_bootstrap_layers(conv.inject_arms_next)
+                        };
+                        self.add_system_message(&format!(
+                            "Inject armed for next prompt: {layers}"
+                        ));
+                    } else {
+                        self.add_system_message(
+                            "Unknown layer. Use: memory, outline, topology, impact, or all",
+                        );
+                    }
+                }
+                self.text_input.text.clear();
+                self.text_input.cursor = 0;
+                true
+            }
+            "/no-inject" => {
+                let conv = &mut self.conversations[self.active_conv];
+                conv.no_inject_next = !conv.no_inject_next;
+                let msg = if conv.no_inject_next {
+                    "No-inject: ARMED for next prompt — suppresses all bootstrap layers \
+                     (including topology). Run /no-inject again to cancel."
+                } else {
+                    "No-inject: cleared."
+                };
+                self.add_system_message(msg);
                 self.text_input.text.clear();
                 self.text_input.cursor = 0;
                 true
@@ -864,11 +1135,14 @@ impl AgentChatState {
                      /namespace <name>        — Set memory namespace (or show current). Alias: /ns\n\
                      /autoapprove             — Toggle auto-approve for this conversation. Alias: /yolo\n\
                      /workspace               — Arm workspace-wide planner scope for the next prompt only (multi-folder workspaces). Default scope follows the active buffer's folder; use this when the prompt genuinely spans folders. Alias: /ws\n\
-                     /lite                    — Arm minimal-context for the next prompt: skips <repo_outline>, <project_memory>, and impact on the first turn; keeps <repo_topology>. Use when argv is tight (cursor: 96 KB). Alias: /minimal\n\
+                     /lite                    — Arm minimal-context for the next prompt: skips <repo_outline>, <project_memory>, and impact; keeps <repo_topology>. Alias: /minimal\n\
+                     /inject <layer|all>      — Arm bootstrap layers for the next prompt (memory, outline, topology, impact, all)\n\
+                     /no-inject               — Arm zero bootstrap on the next prompt\n\
+                     /context                 — Show context usage + bootstrap policy\n\
+                     /context mode <mode>     — Set bootstrap mode for this conversation (auto|minimal|manual|none)\n\
                      /rename [new title]      — Rename the active conversation tab (bare form starts interactive rename, same as F2)\n\
                      /reset                   — Clear agent context (keeps visible chat history). Alias: /clear\n\
-                     /compact [N]             — Keep last N messages (default 6), discard older\n\
-                     /context                 — Show estimated context usage\n\n\
+                     /compact [N]             — Keep last N messages (default 6), discard older\n\n\
                      Files & scripts:\n\
                      /attach <path>           — Attach a file (text or image)\n\
                      /attach                  — List current attachments\n\
@@ -933,15 +1207,31 @@ impl AgentChatState {
 
     /// Context-window pressure for the status bar and `/context`.
     ///
-    /// When the provider reports usage, uses `prefix_tokens()` (last
-    /// iteration's conditioned prefix — authoritative for Claude). Otherwise
-    /// composites visible transcript + measured bootstrap + a provider-specific
-    /// hidden-overhead allowance (built-in system/tools/CLAUDE.md).
-    pub fn context_pressure(&self) -> ContextPressure {
+    /// ## Provider paths
+    ///
+    /// | Provider | Authoritative source | Notes |
+    /// |----------|---------------------|-------|
+    /// | `claude:` | `TokenUsage::prefix_tokens()` after each turn | Last API iteration's `input + cache_creation + cache_read` (not the billing sum). |
+    /// | `cursor:` | `input_tokens` from `result` event | No prompt-cache breakdown today; `prefix_tokens()` == `input_tokens`. |
+    /// | `codex:` | Composite only | `codex exec` emits no token counts; estimate replays transcript client-side. |
+    /// | `ollama:` / `local:` | Composite only | Chat path does not surface `prompt_eval_count` yet. |
+    ///
+    /// ## Composite estimate (no authoritative prefix yet)
+    ///
+    /// `transcript` (visible chat × 1.3, plus draft input) + `projected bootstrap`
+    /// (from `/lite` / `/inject` arms + cache hints) + `hidden overhead`
+    /// (flat provider allowance for system prompt, tool schemas, auto-loaded docs).
+    ///
+    /// When a resumed session has `/inject` or `/lite` armed, projected bootstrap
+    /// is added on top of the provider prefix (delta for the upcoming send).
+    pub fn context_pressure(
+        &self,
+        estimate_ctx: &gaviero_core::context_planner::BootstrapEstimateContext,
+    ) -> ContextPressure {
         let conv = &self.conversations[self.active_conv];
         let limit = self.context_limit_tokens();
         let transcript_tokens = self.transcript_token_estimate();
-        let bootstrap_tokens = conv.last_bootstrap_tokens;
+        let bootstrap_tokens = self.projected_bootstrap_tokens(estimate_ctx);
         let hidden_overhead_tokens = hidden_provider_overhead_tokens(self.effective_model());
 
         let composite = transcript_tokens
@@ -951,7 +1241,16 @@ impl AgentChatState {
         let (tokens, source) = if let Some(u) = &conv.last_token_usage {
             let prefix = u.prefix_tokens() as usize;
             if prefix > 0 {
-                (prefix, ContextBarSource::ProviderPrefix)
+                if Self::has_pending_bootstrap_override(conv) && bootstrap_tokens > 0 {
+                    // Resumed sessions omit armed bootstrap until the next send
+                    // (e.g. codex `/inject memory` on a follow-up turn).
+                    (
+                        prefix.saturating_add(bootstrap_tokens),
+                        ContextBarSource::CompositeEstimate,
+                    )
+                } else {
+                    (prefix, ContextBarSource::ProviderPrefix)
+                }
             } else {
                 (composite, ContextBarSource::CompositeEstimate)
             }
@@ -976,14 +1275,26 @@ impl AgentChatState {
     }
 
     /// Back-compat tuple for call sites that only need tokens + percent.
-    pub fn estimate_context(&self) -> (usize, usize) {
-        let p = self.context_pressure();
+    pub fn estimate_context(
+        &self,
+        estimate_ctx: &gaviero_core::context_planner::BootstrapEstimateContext,
+    ) -> (usize, usize) {
+        let p = self.context_pressure(estimate_ctx);
         (p.tokens, p.pct)
     }
 
     fn transcript_token_estimate(&self) -> usize {
         let (input_words, output_words) = self.count_transcript_words();
-        words_to_tokens(input_words.saturating_add(output_words))
+        let draft_words = if self.renaming {
+            0
+        } else {
+            count_words(self.text_input.text.trim())
+        };
+        words_to_tokens(
+            input_words
+                .saturating_add(output_words)
+                .saturating_add(draft_words),
+        )
     }
 
     /// Word counts for the active conversation's visible transcript,
@@ -1098,12 +1409,17 @@ impl AgentChatState {
             pending_focused_folder: None,
             workspace_wide_next: false,
             lite_next: false,
+            no_inject_next: false,
+            inject_arms_next: gaviero_core::context_planner::BootstrapArms::none(),
+            context_mode_override: None,
             claude_session_id: None,
             session_ledger: None,
             pending_persisted_ledger: None,
             transcript_inline_mode: TranscriptInlineMode::Auto,
             last_token_usage: None,
             last_bootstrap_tokens: 0,
+            last_bootstrap_arms: gaviero_core::context_planner::BootstrapArms::none(),
+            last_memory_injection_tokens: 0,
         };
         self.conversations.push(conv);
         self.active_conv = self.conversations.len() - 1;
@@ -1129,6 +1445,11 @@ impl AgentChatState {
         // post-reset turn reports fresh numbers.
         conv.last_token_usage = None;
         conv.last_bootstrap_tokens = 0;
+        conv.last_bootstrap_arms = gaviero_core::context_planner::BootstrapArms::none();
+        conv.last_memory_injection_tokens = 0;
+        conv.inject_arms_next = gaviero_core::context_planner::BootstrapArms::none();
+        conv.no_inject_next = false;
+        conv.lite_next = false;
         // Suppress the visible transcript on the next first-turn dispatch.
         // Bootstrap context (graph + memory) still flows; only the
         // re-inlining of prior user/assistant turns is skipped, matching
@@ -2268,6 +2589,9 @@ impl AgentChatState {
                     pending_focused_folder: None,
                     workspace_wide_next: false,
                     lite_next: false,
+                    no_inject_next: false,
+                    inject_arms_next: gaviero_core::context_planner::BootstrapArms::none(),
+                    context_mode_override: None,
                     claude_session_id,
                     // M4: in-memory ledger is rehydrated at send time from
                     // `pending_persisted_ledger` once the ProviderProfile
@@ -2281,6 +2605,8 @@ impl AgentChatState {
                     transcript_inline_mode: TranscriptInlineMode::Auto,
                     last_token_usage: pending_usage,
                     last_bootstrap_tokens: 0,
+                    last_bootstrap_arms: gaviero_core::context_planner::BootstrapArms::none(),
+                    last_memory_injection_tokens: 0,
                 });
             }
         }
@@ -4042,8 +4368,11 @@ mod tests {
         state.add_user_message("one two three");
         push_assistant(&mut state, "four five", Vec::new());
         state.conversations[state.active_conv].last_bootstrap_tokens = 12_000;
+        state.conversations[state.active_conv].last_bootstrap_arms =
+            gaviero_core::context_planner::BootstrapArms::all();
 
-        let p = state.context_pressure();
+        let ctx = state.fallback_bootstrap_estimate_context();
+        let p = state.context_pressure(&ctx);
         assert_eq!(p.source, ContextBarSource::CompositeEstimate);
         let expected = words_to_tokens(5)
             .saturating_add(12_000)
@@ -4063,10 +4392,74 @@ mod tests {
                 output_tokens: 42,
             });
 
-        let p = state.context_pressure();
+        let ctx = state.fallback_bootstrap_estimate_context();
+        let p = state.context_pressure(&ctx);
         assert_eq!(p.source, ContextBarSource::ProviderPrefix);
         assert_eq!(p.tokens, 88_000);
         assert!(!p.is_approximate());
+    }
+
+    #[test]
+    fn context_pressure_drops_when_lite_armed() {
+        let mut state = AgentChatState::new();
+        let ctx = state.fallback_bootstrap_estimate_context();
+        let full = state.context_pressure(&ctx).bootstrap_tokens;
+
+        state.conversations[state.active_conv].lite_next = true;
+        let lite = state.context_pressure(&ctx).bootstrap_tokens;
+
+        assert!(full > lite);
+        assert_eq!(lite, 600);
+    }
+
+    #[test]
+    fn context_pressure_holds_measured_bootstrap_while_streaming() {
+        let mut state = AgentChatState::new();
+        let ctx = state.fallback_bootstrap_estimate_context();
+        state.conversations[state.active_conv].last_bootstrap_tokens = 9_500;
+        state.conversations[state.active_conv].last_bootstrap_arms =
+            gaviero_core::context_planner::BootstrapArms::all();
+        state.conversations[state.active_conv].is_streaming = true;
+
+        assert_eq!(state.context_pressure(&ctx).bootstrap_tokens, 9_500);
+    }
+
+    #[test]
+    fn transcript_estimate_includes_draft_input() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "hello draft message".to_string();
+        let with_draft = state.transcript_token_estimate();
+        state.text_input.text.clear();
+        let without = state.transcript_token_estimate();
+        assert!(with_draft > without);
+    }
+
+    #[test]
+    fn context_pressure_rises_when_inject_memory_armed_on_follow_up() {
+        use gaviero_core::context_planner::{
+            ModelSpec, PlannerFingerprint, RuntimeConfig, SessionLedger, build_provider_profile,
+        };
+
+        let mut state = AgentChatState::new();
+        let profile = build_provider_profile(
+            &ModelSpec::parse("claude:sonnet"),
+            &RuntimeConfig::default(),
+        );
+        let fp = PlannerFingerprint::from_profile(&profile);
+        let mut ledger = SessionLedger::new(&profile, fp);
+        ledger.record_turn_dispatched();
+        state.conversations[state.active_conv].session_ledger = Some(ledger);
+
+        let ctx = state.fallback_bootstrap_estimate_context();
+        assert_eq!(state.context_pressure(&ctx).bootstrap_tokens, 0);
+
+        state.conversations[state.active_conv].inject_arms_next =
+            gaviero_core::context_planner::BootstrapArms {
+                memory: true,
+                explicit: true,
+                ..gaviero_core::context_planner::BootstrapArms::none()
+            };
+        assert_eq!(state.context_pressure(&ctx).bootstrap_tokens, 1_000);
     }
 
     #[test]
