@@ -240,6 +240,7 @@ pub async fn run_backend(
             extra: work_unit.extra.clone(),
             max_tokens: None,
             auto_approve: true,
+            suppress_hooks: true,
         };
 
         // M0 instrumentation: per-attempt dispatch metrics for swarm baselines.
