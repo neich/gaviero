@@ -64,6 +64,7 @@ impl AgentBackend for ClaudeCodeBackend {
             effort: request.effort.unwrap_or_else(|| "off".to_string()),
             max_tokens: request.max_tokens.unwrap_or(16384),
             auto_approve: request.auto_approve,
+            suppress_hooks: request.suppress_hooks,
             available_tools: None,
             approved_tools: None,
             resume_session_id: None,
