@@ -72,6 +72,10 @@ pub struct AgentOptions {
     /// string, in which case the `RecordingPromptObserver` fallback
     /// (T1.2) substitutes a "current turn id" mutex.
     pub turn_id: Option<String>,
+    /// When true, sets `CLAUDE_QUIET=1` on the subprocess so global
+    /// Claude Code Stop/Notification hooks skip machine turns (memory
+    /// extractor, swarm agents, etc.). Interactive chat leaves this false.
+    pub suppress_hooks: bool,
 }
 
 impl std::fmt::Debug for AgentOptions {
@@ -91,6 +95,7 @@ impl std::fmt::Debug for AgentOptions {
                 &self.prompt_observer.as_ref().map(|_| "<set>"),
             )
             .field("turn_id", &self.turn_id)
+            .field("suppress_hooks", &self.suppress_hooks)
             .finish()
     }
 }
@@ -109,6 +114,7 @@ impl Default for AgentOptions {
             resume_session_id: None,
             prompt_observer: None,
             turn_id: None,
+            suppress_hooks: false,
         }
     }
 }
@@ -376,6 +382,10 @@ impl AcpSession {
             // keeps issuing tool calls and editing files. Cancellation must be
             // transactional: kill the child, then revert tool snapshots.
             .kill_on_drop(true);
+
+        if options.suppress_hooks {
+            cmd.env("CLAUDE_QUIET", "1");
+        }
 
         tracing::info!(
             "Spawning claude: model={}, cwd={}, prompt_len={}, via_tempfile={}",
