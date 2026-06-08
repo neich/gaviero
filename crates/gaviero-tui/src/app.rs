@@ -291,6 +291,7 @@ impl App {
 
         let write_namespace = workspace.resolve_namespace(None);
         let read_namespaces = workspace.resolve_read_namespaces(None);
+        let bootstrap_mode = workspace.resolve_bootstrap_mode(None);
 
         let (skill_catalog, skill_load_warnings) = gaviero_core::skills::SkillCatalog::scan(
             &workspace,
@@ -399,6 +400,7 @@ impl App {
                     write_namespace,
                     read_namespaces,
                     graph_budget_tokens: agent_graph_budget_tokens,
+                    bootstrap_mode,
                 };
                 cs
             },
@@ -450,6 +452,51 @@ impl App {
 
     pub fn active_agent_chat_stream_visible(&self) -> bool {
         self.agent_chat_visible() && self.chat_state.active_conv_streaming()
+    }
+
+    /// Workspace-aware bootstrap projection inputs for the context indicator.
+    pub fn bootstrap_estimate_context(
+        &self,
+    ) -> gaviero_core::context_planner::BootstrapEstimateContext {
+        let graph_root = self
+            .graph_workspace_root
+            .clone()
+            .or_else(|| self.workspace.roots().first().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        let topology_cfg = self
+            .workspace
+            .resolve_topology_config(Some(&graph_root));
+        let memory_cfg = self
+            .workspace
+            .resolve_chat_injection_config(Some(&graph_root));
+        let budgets = gaviero_core::context_planner::BootstrapBudgets::from_workspace(
+            &topology_cfg,
+            self.chat_state.agent_settings.graph_budget_tokens,
+            &memory_cfg,
+        );
+
+        let mut hints = gaviero_core::context_planner::BootstrapEstimateHints::default();
+        if let Ok(guard) = self.topology_cache.try_read() {
+            if let Some(body) = guard.get(&graph_root) {
+                hints.topology_chars = Some(body.len());
+            }
+        }
+        if let Ok(guard) = self.repo_map.try_read() {
+            if let Some(map) = guard.get(&graph_root) {
+                let budget = self.chat_state.agent_settings.graph_budget_tokens;
+                if budget > 0 {
+                    let plan = map.rank_for_agent(&[], budget);
+                    hints.outline_tokens = Some(plan.token_estimate);
+                }
+            }
+        }
+        let conv = self.chat_state.active_conversation();
+        if conv.last_memory_injection_tokens > 0 {
+            hints.memory_tokens = Some(conv.last_memory_injection_tokens);
+        }
+
+        gaviero_core::context_planner::BootstrapEstimateContext { budgets, hints }
     }
 
     fn handle_action(&mut self, action: Action) {
