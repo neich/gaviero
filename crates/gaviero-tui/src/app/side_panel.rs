@@ -1734,14 +1734,17 @@ pub(super) fn send_chat_message(app: &mut App) {
         conv.workspace_wide_next = false;
         armed
     };
-    // `/lite` arms a one-shot bootstrap suppression: when set, skip graph,
-    // memory, and impact injection even on the first turn. Self-clears on
-    // dispatch. Used to fit under argv-limited providers (cursor: 96 KB).
-    let lite_turn = {
+    // One-shot bootstrap overrides consumed on dispatch.
+    let (lite_turn, no_inject_turn, inject_arms_next, context_mode_override) = {
         let conv = app.chat_state.active_conversation_mut();
-        let armed = conv.lite_next;
+        let lite = conv.lite_next;
+        let no_inject = conv.no_inject_next;
+        let inject_arms = conv.inject_arms_next;
+        let mode_override = conv.context_mode_override;
         conv.lite_next = false;
-        armed
+        conv.no_inject_next = false;
+        conv.inject_arms_next = gaviero_core::context_planner::BootstrapArms::none();
+        (lite, no_inject, inject_arms, mode_override)
     };
     let focused_folder: Option<std::path::PathBuf> = if workspace_wide {
         None
@@ -2155,6 +2158,26 @@ pub(super) fn send_chat_message(app: &mut App) {
     let topology_cache = app.topology_cache.clone();
     let planner_task_text = task_text.clone();
     let planner_resolved_skills = resolved_skills_buf.clone();
+    let bootstrap_mode = context_mode_override
+        .unwrap_or(app.chat_state.agent_settings.bootstrap_mode);
+    let bootstrap_one_shot = if lite_turn {
+        Some(gaviero_core::context_planner::BootstrapOneShot::Lite)
+    } else if no_inject_turn {
+        Some(gaviero_core::context_planner::BootstrapOneShot::NoInject)
+    } else {
+        None
+    };
+    let bootstrap_arms = gaviero_core::context_planner::resolve_chat_bootstrap_arms(
+        bootstrap_mode,
+        is_first_turn,
+        bootstrap_one_shot,
+        inject_arms_next,
+    );
+    let bootstrap_outline = bootstrap_arms.outline;
+    let bootstrap_memory = bootstrap_arms.memory;
+    let bootstrap_impact = bootstrap_arms.impact;
+    let bootstrap_topology =
+        bootstrap_arms.topology && topology_config.enabled;
     let task = tokio::spawn(async move {
         {
             let mut gate = wg.lock().await;
@@ -2180,13 +2203,8 @@ pub(super) fn send_chat_message(app: &mut App) {
         // user message (V9 §11 M2 acceptance: "turn 2+ transmits only
         // new user message").
         //
-        // `/lite` skips ranked graph, memory, and impact; shallow topology
-        // still runs on first turn when `agent.topology.enabled` is true.
-        let bootstrap_graph = is_first_turn && !lite_turn;
-        let bootstrap_topology = is_first_turn && topology_config.enabled;
-
         let repo_map_fut = async {
-            if bootstrap_graph {
+            if bootstrap_outline {
                 crate::app::session::get_or_build_repo_map_cached(
                     repo_map_cache.clone(),
                     graph_root.clone(),
@@ -2217,7 +2235,7 @@ pub(super) fn send_chat_message(app: &mut App) {
         // on follow-ups) AND when `/workspace` was armed (otherwise the
         // list is empty). Each lookup is a HashMap hit on warm cache.
         let extra_repo_map_arcs: Vec<std::sync::Arc<gaviero_core::repo_map::RepoMap>> =
-            if bootstrap_graph && !extra_workspace_folders.is_empty() {
+            if bootstrap_outline && !extra_workspace_folders.is_empty() {
                 let mut out = Vec::with_capacity(extra_workspace_folders.len());
                 for (i, folder) in extra_workspace_folders.iter().enumerate() {
                     if let Some(rm) = crate::app::session::get_or_build_repo_map_cached(
@@ -2266,7 +2284,7 @@ pub(super) fn send_chat_message(app: &mut App) {
             .map(|(label, body)| (label.as_str(), body.as_str()))
             .collect();
 
-        let impact_text = if bootstrap_graph {
+        let impact_text = if bootstrap_impact {
             crate::app::session::compute_impact_text(
                 graph_root.clone(),
                 graph_seeds.clone(),
@@ -2277,13 +2295,14 @@ pub(super) fn send_chat_message(app: &mut App) {
             None
         };
 
-        let seed_paths_buf: Vec<std::path::PathBuf> = if bootstrap_graph {
+        let seed_paths_buf: Vec<std::path::PathBuf> = if bootstrap_outline || bootstrap_impact {
             graph_seeds.iter().map(std::path::PathBuf::from).collect()
         } else {
             Vec::new()
         };
-        let read_ns_for_planner: &[String] = if bootstrap_graph { &read_ns } else { &[] };
-        let budget_for_planner: usize = if bootstrap_graph {
+        let read_ns_for_planner: &[String] =
+            if bootstrap_outline || bootstrap_memory { &read_ns } else { &[] };
+        let budget_for_planner: usize = if bootstrap_outline {
             graph_budget_tokens
         } else {
             0
@@ -2317,6 +2336,7 @@ pub(super) fn send_chat_message(app: &mut App) {
             pre_fetched_topology: primary_topology.as_deref(),
             extra_topology_blocks: &extra_topology_refs,
             resolved_skills: &planner_resolved_skills,
+            bootstrap_arms,
         };
 
         let selections = {
@@ -2353,7 +2373,7 @@ pub(super) fn send_chat_message(app: &mut App) {
         // `ChatMemoryInjected` event for the panel and supplying
         // workspace-resolved configs.
         let (chat_injection, memory_tok) =
-            if bootstrap_graph && memory.is_some() {
+            if bootstrap_memory && memory.is_some() {
                 let mem = memory.as_ref().expect("checked above");
                 let reranker_ref: Option<&dyn gaviero_core::memory::Reranker> =
                     memory_reranker.as_deref();
@@ -2448,7 +2468,7 @@ pub(super) fn send_chat_message(app: &mut App) {
             .filter_map(|f| f.content.as_ref())
             .map(|c| c.len().div_ceil(4))
             .sum();
-        let bootstrap_measured = if bootstrap_graph || bootstrap_topology {
+        let bootstrap_measured = if bootstrap_arms.any_layer() {
             selections
                 .metadata
                 .graph_token_estimate
@@ -2460,6 +2480,7 @@ pub(super) fn send_chat_message(app: &mut App) {
         let _ = tx.send(crate::event::Event::TurnBootstrapMeasured {
             conv_id: conv_id_clone.clone(),
             tokens: bootstrap_measured,
+            arms: bootstrap_arms,
         });
 
         let transport_ctx = gaviero_core::agent_session::TransportContext {
