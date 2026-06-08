@@ -413,6 +413,7 @@ mod tests {
             memory_selections: vec![],
             graph_selections: vec![],
             file_refs: vec![],
+            skill_selections: vec![],
             replay_history: None,
             effort: None,
             auto_approve: false,

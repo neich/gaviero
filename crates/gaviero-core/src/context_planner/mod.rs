@@ -26,8 +26,8 @@ pub use ledger::{
 pub use types::{
     ContinuityHandle, ContinuityMode, FileAttachment, GraphConfidence, GraphSelection,
     GraphSelectionKind, MemorySelection, ModelSpec, PlannerInput, PlannerMetadata,
-    PlannerSelections, Provider, ProviderProfile, ReplayPayload, RuntimeConfig, Symbol,
-    build_provider_profile,
+    PlannerSelections, Provider, ProviderProfile, ReplayPayload, RuntimeConfig, SkillSelection,
+    Symbol, build_provider_profile,
 };
 
 use std::path::Path;
@@ -73,6 +73,7 @@ impl<'a> ContextPlanner<'a> {
             memory_selections: Vec::new(),
             graph_selections: Vec::new(),
             file_refs: Vec::new(),
+            skill_selections: Vec::new(),
             replay_history: None,
             metadata: PlannerMetadata {
                 memory_count: 0,
@@ -101,6 +102,14 @@ impl<'a> ContextPlanner<'a> {
             selections.file_refs.push(FileAttachment {
                 path: std::path::PathBuf::from(path),
                 content: Some(content.clone()),
+            });
+        }
+
+        for skill in input.resolved_skills {
+            selections.skill_selections.push(SkillSelection {
+                name: skill.name.clone(),
+                scope_level: skill.scope_level,
+                rendered_body: skill.rendered_body.clone(),
             });
         }
 
@@ -498,6 +507,7 @@ mod tests {
             },
             pre_fetched_topology: None,
             extra_topology_blocks: &[],
+            resolved_skills: &[],
         };
         let sel = planner.plan(&input).await.unwrap();
         assert!(sel.memory_selections.is_empty());
@@ -541,6 +551,7 @@ mod tests {
             topology_config: crate::repo_map::TopologyConfig::default(),
             pre_fetched_topology: None,
             extra_topology_blocks: &[],
+            resolved_skills: &[],
         };
         let sel = planner.plan(&input).await.unwrap();
         // StatelessReplay emits Some(_) on first turn even when empty —
@@ -580,6 +591,7 @@ mod tests {
             topology_config: crate::repo_map::TopologyConfig::default(),
             pre_fetched_topology: None,
             extra_topology_blocks: &[],
+            resolved_skills: &[],
         };
         let sel = planner.plan(&input).await.unwrap();
         assert!(sel.memory_selections.is_empty());
@@ -649,6 +661,7 @@ mod tests {
             topology_config: crate::repo_map::TopologyConfig::default(),
             pre_fetched_topology: None,
             extra_topology_blocks: &[],
+            resolved_skills: &[],
         };
         let sel = planner.plan(&input).await.unwrap();
         // Exact rank counts are an implementation detail of
@@ -704,6 +717,7 @@ mod tests {
             },
             pre_fetched_topology: None,
             extra_topology_blocks: &[],
+            resolved_skills: &[],
         };
         let sel = planner.plan(&input).await.unwrap();
         assert_eq!(sel.graph_selections.len(), 1);
@@ -741,6 +755,7 @@ mod tests {
             topology_config: crate::repo_map::TopologyConfig::default(),
             pre_fetched_topology: Some(topo),
             extra_topology_blocks: &[],
+            resolved_skills: &[],
         };
         let sel = planner.plan(&input).await.unwrap();
         assert_eq!(sel.graph_selections.len(), 1);
@@ -772,8 +787,54 @@ mod tests {
             topology_config: crate::repo_map::TopologyConfig::default(),
             pre_fetched_topology: Some(topo),
             extra_topology_blocks: &[],
+            resolved_skills: &[],
         };
         let sel2 = planner2.plan(&input2).await.unwrap();
         assert!(sel2.graph_selections.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolved_skills_pass_through_on_follow_up_turn() {
+        let profile = fixture_profile();
+        let fp = PlannerFingerprint::from_profile(&profile);
+        let mut ledger = SessionLedger::new(&profile, fp);
+        ledger.record_turn_dispatched();
+        let workspace = std::path::PathBuf::from("/tmp");
+        let mut planner = ContextPlanner {
+            memory: None,
+            repo_map: None,
+            ledger: &mut ledger,
+            workspace_root: &workspace,
+        };
+        let resolved = vec![crate::skills::ResolvedSkill {
+            name: "lint".to_string(),
+            scope_level: crate::memory::scope::SCOPE_REPO,
+            rendered_body: "run clippy".to_string(),
+        }];
+        let input = PlannerInput {
+            user_message: "follow up",
+            explicit_refs: &[],
+            seed_paths: &[],
+            provider_profile: &profile,
+            read_namespaces: &[],
+            graph_budget_tokens: 0,
+            memory_query_override: None,
+            memory_limit: 5,
+            file_ref_blobs: &[],
+            pre_fetched_impact_text: None,
+            pre_fetched_graph_context: None,
+            pre_fetched_memory_context: None,
+            extra_folder_paths: &[],
+            extra_repo_maps: &[],
+            topology_config: crate::repo_map::TopologyConfig::default(),
+            pre_fetched_topology: None,
+            extra_topology_blocks: &[],
+            resolved_skills: &resolved,
+        };
+        let sel = planner.plan(&input).await.unwrap();
+        assert!(sel.memory_selections.is_empty());
+        assert!(sel.graph_selections.is_empty());
+        assert_eq!(sel.skill_selections.len(), 1);
+        assert_eq!(sel.skill_selections[0].name, "lint");
     }
 }

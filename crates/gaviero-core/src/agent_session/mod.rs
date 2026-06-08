@@ -140,6 +140,7 @@ pub struct Turn {
     pub memory_selections: Vec<MemorySelection>,
     pub graph_selections: Vec<GraphSelection>,
     pub file_refs: Vec<FileAttachment>,
+    pub skill_selections: Vec<crate::context_planner::SkillSelection>,
     pub replay_history: Option<ReplayPayload>,
     pub effort: Option<String>,
     pub auto_approve: bool,
@@ -161,6 +162,7 @@ pub fn build_turn(sel: PlannerSelections, ctx: TransportContext) -> Turn {
         memory_selections: sel.memory_selections,
         graph_selections: sel.graph_selections,
         file_refs: sel.file_refs,
+        skill_selections: sel.skill_selections,
         replay_history: sel.replay_history,
         effort: ctx.effort,
         auto_approve: ctx.auto_approve,
@@ -296,6 +298,11 @@ impl AgentSession for LegacyAgentSession {
         {
             parts.push(block);
         }
+        if let Some(block) =
+            crate::swarm::backend::shared::render_skill_block(&turn.skill_selections)
+        {
+            parts.push(block);
+        }
         let enriched_prompt = parts.join("\n\n");
 
         // Lift `replay_history` back into the legacy `Vec<(String, String)>`
@@ -390,6 +397,11 @@ mod tests {
                 path: PathBuf::from("Cargo.toml"),
                 content: Some("[package]\nname = \"x\"\n".to_string()),
             }],
+            skill_selections: vec![crate::context_planner::SkillSelection {
+                name: "lint".to_string(),
+                scope_level: 2,
+                rendered_body: "run clippy".to_string(),
+            }],
             replay_history: Some(ReplayPayload {
                 entries: vec![(Role::User, "hi".to_string())],
             }),
@@ -435,6 +447,7 @@ mod tests {
             assert_eq!(a.content_digest, b.content_digest);
         }
         assert_eq!(turn.file_refs, snapshot.file_refs);
+        assert_eq!(turn.skill_selections, snapshot.skill_selections);
         assert_eq!(turn.replay_history, snapshot.replay_history);
         assert_eq!(turn.metadata, snapshot.metadata);
 

@@ -185,6 +185,7 @@ pub async fn run_backend(
         topology_config,
         pre_fetched_topology: topology_body.as_deref(),
         extra_topology_blocks: &[],
+        resolved_skills: &[],
     };
 
     let selections = {

@@ -501,6 +501,7 @@ pub fn empty_selections() -> PlannerSelections {
     PlannerSelections {
         memory_selections: vec![],
         graph_selections: vec![],
+        skill_selections: vec![],
         file_refs: vec![],
         replay_history: None,
         metadata: PlannerMetadata {

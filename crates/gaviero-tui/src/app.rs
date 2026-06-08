@@ -210,6 +210,9 @@ pub struct App {
     /// cleaned up.
     pub mcp_server: Option<gaviero_core::mcp::McpServerHandle>,
 
+    /// Turn-scoped skill catalog scanned from `.gaviero/skills/` roots.
+    pub skill_catalog: Arc<gaviero_core::skills::SkillCatalog>,
+
     // Terminal (M4) — managed by TerminalManager in gaviero-core
     pub terminal_manager: gaviero_core::terminal::TerminalManager,
     /// Terminal panel text selection state.
@@ -288,6 +291,15 @@ impl App {
 
         let write_namespace = workspace.resolve_namespace(None);
         let read_namespaces = workspace.resolve_read_namespaces(None);
+
+        let (skill_catalog, skill_load_warnings) = gaviero_core::skills::SkillCatalog::scan(
+            &workspace,
+            &gaviero_core::skills::SkillCatalog::global_skills_dir(),
+        );
+        for w in &skill_load_warnings {
+            tracing::warn!("skill catalog: {} — {}", w.name, w.message);
+        }
+        let skill_catalog = Arc::new(skill_catalog);
 
         // Open git repos for git panel (M4): one per workspace folder root that
         // is a git repository. In single-folder mode this collapses to one entry.
@@ -402,6 +414,7 @@ impl App {
             git_panel: crate::panels::git_panel::GitPanelState::new(),
             memory_panel: crate::panels::memory_panel::MemoryPanelState::new(),
             mcp_server: None,
+            skill_catalog,
             git_repos,
             terminal_manager: gaviero_core::terminal::TerminalManager::new(
                 gaviero_core::terminal::TerminalConfig::default(),
@@ -413,6 +426,17 @@ impl App {
     /// Handle an incoming event.
     pub fn handle_event(&mut self, event: Event) {
         controller::handle_event(self, event);
+    }
+
+    /// Rescan skill roots after a `.gaviero/skills/` file change.
+    pub fn rebuild_skill_catalog(&mut self) {
+        let global = gaviero_core::skills::SkillCatalog::global_skills_dir();
+        let (fresh, warnings) =
+            gaviero_core::skills::SkillCatalog::scan(&self.workspace, &global);
+        for w in &warnings {
+            tracing::warn!("skill catalog rebuild: {} — {}", w.name, w.message);
+        }
+        self.skill_catalog = Arc::new(fresh);
     }
 
     pub fn agent_chat_visible(&self) -> bool {

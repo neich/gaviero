@@ -268,6 +268,9 @@ pub fn render_swarm_prompt(
     if let Some(block) = render_memory_block(&selections.memory_selections) {
         parts.push(block);
     }
+    if let Some(block) = render_skill_block(&selections.skill_selections) {
+        parts.push(block);
+    }
 
     let scope_clause = scope.to_prompt_clause();
     if !scope_clause.is_empty() {
@@ -375,6 +378,25 @@ pub fn render_memory_block(
     }
 }
 
+/// Format skill selections into `<skill name="…">` blocks.
+pub fn render_skill_block(
+    skill_selections: &[crate::context_planner::SkillSelection],
+) -> Option<String> {
+    if skill_selections.is_empty() {
+        return None;
+    }
+    let blocks: Vec<String> = skill_selections
+        .iter()
+        .map(|s| {
+            format!(
+                "<skill name=\"{}\">\n{}\n</skill>",
+                s.name, s.rendered_body
+            )
+        })
+        .collect();
+    Some(blocks.join("\n\n"))
+}
+
 pub fn request_prompt(request: &CompletionRequest) -> String {
     build_enriched_prompt(
         &request.prompt,
@@ -386,6 +408,55 @@ pub fn request_prompt(request: &CompletionRequest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_skill_block_formats_xml() {
+        use crate::context_planner::SkillSelection;
+        let block = render_skill_block(&[SkillSelection {
+            name: "lint".to_string(),
+            scope_level: 2,
+            rendered_body: "run clippy".to_string(),
+        }])
+        .expect("block");
+        assert!(block.contains("<skill name=\"lint\">"));
+        assert!(block.contains("run clippy"));
+    }
+
+    #[test]
+    fn render_skill_block_empty_returns_none() {
+        assert!(render_skill_block(&[]).is_none());
+    }
+
+    #[test]
+    fn render_skill_block_byte_identical_across_swarm_and_chat_edges() {
+        use crate::context_planner::{PlannerSelections, SkillSelection};
+        use crate::types::FileScope;
+
+        let selections = PlannerSelections {
+            skill_selections: vec![SkillSelection {
+                name: "migrate-component".to_string(),
+                scope_level: 2,
+                rendered_body: "Migrate the SearchBar component from React to Vue."
+                    .to_string(),
+            }],
+            ..PlannerSelections::default()
+        };
+
+        let skill_xml = render_skill_block(&selections.skill_selections)
+            .expect("skill block");
+        let swarm = render_swarm_prompt(&selections, &FileScope::default(), "do it");
+        let chat = format!(
+            "do it\n\n{}",
+            skill_xml
+        );
+
+        assert!(swarm.contains(&skill_xml));
+        assert!(chat.contains(&skill_xml));
+        assert_eq!(
+            swarm.find(&skill_xml).map(|p| &swarm[p..p + skill_xml.len()]),
+            chat.find(&skill_xml).map(|p| &chat[p..p + skill_xml.len()])
+        );
+    }
 
     #[test]
     fn test_build_enriched_prompt_includes_history_and_refs() {

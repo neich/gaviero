@@ -32,7 +32,9 @@ The TUI implements `WriteGateObserver`, `AcpObserver`, `SwarmObserver` from [`ga
 
 Dispatched in [`app/commands.rs`](src/app/commands.rs) and [`panels/agent_chat.rs`](src/panels/agent_chat.rs). The active set:
 
-`/swarm`, `/cswarm`, `/undo-swarm`, `/run`, `/model` (set runtime model), `/compact` (compact chat context), `/clear` (alias `/reset`), `/lite` (alias `/minimal` — minimal-context turn: keeps `<repo_topology>`, drops `<repo_outline>` + memory + impact), `/remember`, `/remember-here`, `/remember-module`, `/remember-workspace`, `/remember-global`, `/forget`, `/forget-scope`, `/forget-type`, `/forget-source`, `/forget-history`, `/restore`, `/attach`, `/detach`, `/help`.
+`/swarm`, `/cswarm`, `/undo-swarm`, `/run`, `/model` (set runtime model), `/compact` (compact chat context), `/clear` (alias `/reset`), `/lite` (alias `/minimal` — minimal-context turn: keeps `<repo_topology>`, drops `<repo_outline>` + memory + impact), `/skills` (list skills; `/skills search <q>` for semantic discovery), `/remember`, `/remember-here`, `/remember-module`, `/remember-workspace`, `/remember-global`, `/forget`, `/forget-scope`, `/forget-type`, `/forget-source`, `/forget-history`, `/restore`, `/attach`, `/detach`, `/help`.
+
+Chat input also supports `$skill` invocation (see README § Skills) with `$`-prefix autocomplete at ≥2 name characters.
 
 ## Conventions
 

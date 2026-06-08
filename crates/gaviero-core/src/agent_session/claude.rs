@@ -179,6 +179,9 @@ impl ClaudeSession {
         if let Some(block) = shared::render_memory_block(&turn.memory_selections) {
             parts.push(block);
         }
+        if let Some(block) = shared::render_skill_block(&turn.skill_selections) {
+            parts.push(block);
+        }
         let enriched_prompt = parts.join("\n\n");
 
         // Conversation history from replay payload (StatelessReplay only;
