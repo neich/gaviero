@@ -16,7 +16,9 @@ Thumbs.db
 
 # Environment
 .env
-.gaviero
+.gaviero/**
+!.gaviero/skills/
+!.gaviero/skills/**
 tmp/
 *.so
 .claude/
