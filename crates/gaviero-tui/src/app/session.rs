@@ -268,6 +268,11 @@ pub(crate) fn render_chat_selections(
     {
         parts.push(memory);
     }
+    if let Some(skills) =
+        gaviero_core::swarm::backend::shared::render_skill_block(&selections.skill_selections)
+    {
+        parts.push(skills);
+    }
 
     parts.join("\n\n")
 }
@@ -329,6 +334,7 @@ mod tests {
             topology_config: gaviero_core::repo_map::TopologyConfig::default(),
             pre_fetched_topology: None,
             extra_topology_blocks: &[],
+            resolved_skills: &[],
         };
         let selections = planner.plan(&input).await.unwrap();
         assert!(
