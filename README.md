@@ -252,9 +252,9 @@ See [crates/gaviero-cli/README.md](crates/gaviero-cli/README.md) for the full fl
 
 ## Skills
 
-Turn-scoped instruction templates live as markdown files under `.gaviero/skills/` (per-repo folder, workspace root, or `~/.gaviero/skills/` globally). Invoke them in chat with `$skill-name` — inline `$name(arg1, arg2)` or line-start `$name arg1 arg2`. The rendered body is injected as a `<skill name="…">` block into the agent prompt for that turn only.
+Turn-scoped instruction templates follow the Claude Code layout: each skill is a folder under `.gaviero/skills/` (per-repo folder, workspace root, or `~/.gaviero/skills/` globally) containing a `SKILL.md` file; the skill name is the folder name. Invoke them in chat with `$skill-name` — inline `$name(arg1, arg2)` or line-start `$name arg1 arg2`. The rendered body is injected as a `<skill name="…">` block into the agent prompt for that turn only.
 
-Author skills with Claude Code–compatible frontmatter:
+Author `SKILL.md` with Claude Code–compatible frontmatter:
 
 ```markdown
 ---

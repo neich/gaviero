@@ -9,7 +9,7 @@ use crate::memory::reranker::Reranker;
 use crate::memory::scope::{SCOPE_GLOBAL, SCOPE_REPO, SCOPE_WORKSPACE, hash_path};
 use crate::workspace::Workspace;
 
-use super::{Skill, SkillWarning, parse_skill};
+use super::{Skill, SkillWarning, parse_skill, skill_name_from_path};
 
 /// Registry of skills discovered under workspace and global roots.
 #[derive(Debug, Clone)]
@@ -80,26 +80,41 @@ impl SkillCatalog {
             Err(_) => return,
         };
         for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            let folder = entry.path();
+            if !folder.is_dir() {
                 continue;
             }
-            let contents = match std::fs::read_to_string(&path) {
+            let skill_md = folder.join("SKILL.md");
+            let folder_name = folder
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?");
+            if !skill_md.is_file() {
+                warnings.push(SkillWarning {
+                    name: folder_name.to_string(),
+                    message: format!(
+                        "skill folder {} is missing SKILL.md",
+                        folder.display()
+                    ),
+                });
+                continue;
+            }
+            let contents = match std::fs::read_to_string(&skill_md) {
                 Ok(c) => c,
                 Err(e) => {
                     warnings.push(SkillWarning {
-                        name: path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("?")
-                            .to_string(),
-                        message: format!("failed to read {}: {e}", path.display()),
+                        name: folder_name.to_string(),
+                        message: format!("failed to read {}: {e}", skill_md.display()),
                     });
                     continue;
                 }
             };
-            match parse_skill(&path, &contents) {
+            match parse_skill(&skill_md, &contents) {
                 Ok(mut skill) => {
+                    debug_assert_eq!(
+                        skill_name_from_path(&skill_md),
+                        Some(skill.name.as_str())
+                    );
                     skill.scope_level = scope_level;
                     self.by_name
                         .entry(skill.name.clone())
@@ -117,13 +132,7 @@ impl SkillCatalog {
             SCOPE_GLOBAL => "global".to_string(),
             SCOPE_WORKSPACE => "workspace".to_string(),
             SCOPE_REPO => {
-                let skill_canon = skill
-                    .source_path
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .and_then(|p| p.parent())
-                    .map(canonicalize_path);
-                if let Some(root) = skill_canon {
+                if let Some(root) = repo_root_for_skill(skill) {
                     if let Some(label) = self.folder_index.get(&root) {
                         return label.clone();
                     }
@@ -179,12 +188,7 @@ impl SkillCatalog {
         if skill.scope_level != SCOPE_REPO {
             return None;
         }
-        let root = skill
-            .source_path
-            .parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())?;
-        Some(hash_path(root))
+        repo_root_for_skill(skill).map(|root| hash_path(&root))
     }
 
     /// Prefix completion candidates, scope-ordered nearest-first.
@@ -307,6 +311,24 @@ fn canonicalize_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Repo folder root for a skill under `<repo>/.gaviero/skills/<name>/SKILL.md`.
+fn repo_root_for_skill(skill: &Skill) -> Option<PathBuf> {
+    for ancestor in skill.source_path.ancestors() {
+        if ancestor.file_name().is_some_and(|n| n == "skills")
+            && ancestor
+                .parent()
+                .and_then(|p| p.file_name())
+                .is_some_and(|n| n == ".gaviero")
+        {
+            return ancestor
+                .parent()
+                .and_then(|p| p.parent())
+                .map(canonicalize_path);
+        }
+    }
+    None
+}
+
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -349,11 +371,12 @@ mod tests {
     }
 
     fn write_skill(dir: &Path, name: &str, description: &str) {
-        fs::create_dir_all(dir).unwrap();
+        let skill_dir = dir.join(name);
+        fs::create_dir_all(&skill_dir).unwrap();
         let body = format!(
             "---\ndescription: {description}\n---\nBody for {name}\n"
         );
-        fs::write(dir.join(format!("{name}.md")), body).unwrap();
+        fs::write(skill_dir.join("SKILL.md"), body).unwrap();
     }
 
     #[test]
@@ -399,7 +422,7 @@ mod tests {
 
     #[test]
     fn needs_rebuild_detects_skills_path() {
-        let p = Path::new("/tmp/proj/.gaviero/skills/foo.md");
+        let p = Path::new("/tmp/proj/.gaviero/skills/foo/SKILL.md");
         assert!(SkillCatalog::needs_rebuild(p));
         let p2 = Path::new("/tmp/proj/.gaviero/memory.db");
         assert!(!SkillCatalog::needs_rebuild(p2));
