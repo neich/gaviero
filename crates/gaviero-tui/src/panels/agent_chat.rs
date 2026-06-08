@@ -95,6 +95,8 @@ pub enum AutocompleteMode {
     /// `/attach <path>` argument — workspace files plus filesystem listing
     /// when the partial starts with `/` or `~`, inserts the bare path.
     AttachPath,
+    /// `$skill` invocation — catalog-backed name completion.
+    SkillRef,
 }
 
 /// Autocomplete state for @file references or /attach path arguments.
@@ -1775,6 +1777,37 @@ impl AgentChatState {
             }
         }
 
+        // ── $skill invocation completion ────────────────────────────────
+        let dollar_pos = before_cursor.rfind('$');
+        if let Some(pos) = dollar_pos {
+            if pos > 0 {
+                let prev_byte = text.as_bytes()[pos - 1];
+                if prev_byte == b'\\' {
+                    // escaped — fall through to @ completion
+                } else if prev_byte == b' ' || prev_byte == b'\n' || prev_byte == b'\t' {
+                    let query = &before_cursor[pos + 1..];
+                    if !query.contains(' ') && query.len() >= 2 {
+                        self.autocomplete.active = true;
+                        self.autocomplete.mode = AutocompleteMode::SkillRef;
+                        self.autocomplete.at_pos = pos;
+                        self.autocomplete.query = query.to_string();
+                        self.autocomplete.selected = 0;
+                        return;
+                    }
+                }
+            } else {
+                let query = &before_cursor[pos + 1..];
+                if !query.contains(' ') && query.len() >= 2 {
+                    self.autocomplete.active = true;
+                    self.autocomplete.mode = AutocompleteMode::SkillRef;
+                    self.autocomplete.at_pos = pos;
+                    self.autocomplete.query = query.to_string();
+                    self.autocomplete.selected = 0;
+                    return;
+                }
+            }
+        }
+
         // ── @path reference completion ──────────────────────────────────
         let at_pos = before_cursor.rfind('@');
         match at_pos {
@@ -1803,9 +1836,38 @@ impl AgentChatState {
         }
     }
 
+    /// Update `$skill` autocomplete matches from the catalog.
+    pub fn update_skill_autocomplete_matches(
+        &mut self,
+        catalog: &gaviero_core::skills::SkillCatalog,
+        active_repo_id: Option<&str>,
+    ) {
+        if !self.autocomplete.active || self.autocomplete.mode != AutocompleteMode::SkillRef {
+            return;
+        }
+        let prefix = &self.autocomplete.query;
+        let hits = catalog.complete(prefix, active_repo_id);
+        let mut by_name: std::collections::HashMap<&str, Vec<&gaviero_core::skills::Skill>> =
+            std::collections::HashMap::new();
+        for skill in &hits {
+            by_name.entry(&skill.name).or_default().push(*skill);
+        }
+        self.autocomplete.matches = hits
+            .iter()
+            .map(|skill| {
+                let siblings = by_name.get(skill.name.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
+                skill_autocomplete_insert(catalog, skill, siblings)
+            })
+            .take(10)
+            .collect();
+        if self.autocomplete.selected >= self.autocomplete.matches.len() {
+            self.autocomplete.selected = 0;
+        }
+    }
+
     /// Update autocomplete matches from a list of workspace file paths.
     pub fn update_autocomplete_matches(&mut self, all_files: &[String]) {
-        if !self.autocomplete.active {
+        if !self.autocomplete.active || self.autocomplete.mode == AutocompleteMode::SkillRef {
             return;
         }
         let query_lower = self.autocomplete.query.to_lowercase();
@@ -1856,6 +1918,10 @@ impl AgentChatState {
                 // Replace just the path argument; no trailing space because
                 // `/attach <path>` has no further tokens.
                 self.text_input.text.push_str(&path);
+            }
+            AutocompleteMode::SkillRef => {
+                self.text_input.text.push_str(&path);
+                self.text_input.text.push(' ');
             }
         }
         self.text_input.cursor = self.text_input.char_count();
@@ -2961,6 +3027,7 @@ impl AgentChatState {
             let display = match self.autocomplete.mode {
                 AutocompleteMode::FileRef => format!(" @{}", path),
                 AutocompleteMode::AttachPath => format!(" {}", path),
+                AutocompleteMode::SkillRef => path.clone(),
             };
             for (ci, ch) in display.chars().enumerate() {
                 let cx = area.x + ci as u16;
@@ -3085,6 +3152,233 @@ fn normalize_model_spec(arg: &str) -> String {
     format!("claude:{}", canonical)
 }
 
+/// Parse `$skill` invocations from chat text.
+///
+/// Returns `(cleaned_text, resolved_skills, warnings)`. Unknown invocations
+/// stay verbatim in the cleaned text with a non-fatal warning.
+pub fn parse_skill_invocations(
+    text: &str,
+    catalog: &gaviero_core::skills::SkillCatalog,
+    active_repo_id: Option<&str>,
+) -> (
+    String,
+    Vec<gaviero_core::skills::ResolvedSkill>,
+    Vec<gaviero_core::skills::SkillWarning>,
+) {
+    let mut out = String::new();
+    let mut resolved = Vec::new();
+    let mut warnings = Vec::new();
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        if bytes[i] != b'$' {
+            out.push(text[i..].chars().next().unwrap());
+            i += text[i..].chars().next().unwrap().len_utf8();
+            continue;
+        }
+
+        let (bs_count, _) = count_backslashes(bytes, i);
+        if bs_count % 2 == 1 {
+            out.push('$');
+            i += 1;
+            continue;
+        }
+        for _ in 0..bs_count / 2 {
+            out.push('\\');
+        }
+
+        let rest = &text[i + 1..];
+        if rest.starts_with('{') || rest.starts_with('(') {
+            out.push('$');
+            i += 1;
+            continue;
+        }
+
+        if let Some(parsed) = try_parse_invocation(text, i) {
+            let ParsedInvocation {
+                qualifier,
+                name,
+                args,
+                raw_args,
+                consumed,
+            } = parsed;
+            if let Some(skill) = catalog.resolve(qualifier.as_deref(), name, active_repo_id) {
+                let rendered = skill.render(&args, &raw_args);
+                resolved.push(gaviero_core::skills::ResolvedSkill {
+                    name: skill.name.clone(),
+                    scope_level: skill.scope_level,
+                    rendered_body: rendered,
+                });
+                i += consumed;
+                continue;
+            }
+            warnings.push(gaviero_core::skills::SkillWarning {
+                name: name.to_string(),
+                message: "unknown skill".to_string(),
+            });
+            out.push_str(&text[i..i + consumed]);
+            i += consumed;
+            continue;
+        }
+
+        out.push('$');
+        i += 1;
+    }
+
+    (out, resolved, warnings)
+}
+
+fn count_backslashes(bytes: &[u8], dollar_pos: usize) -> (usize, usize) {
+    let mut count = 0usize;
+    let mut pos = dollar_pos;
+    while pos > 0 && bytes[pos - 1] == b'\\' {
+        count += 1;
+        pos -= 1;
+    }
+    (count, pos)
+}
+
+fn is_name_char(c: char, first: bool) -> bool {
+    if first {
+        c.is_ascii_alphabetic() || c == '_'
+    } else {
+        c.is_ascii_alphanumeric() || c == '_' || c == '-'
+    }
+}
+
+fn parse_identifier(s: &str) -> Option<(&str, usize)> {
+    let mut chars = s.char_indices();
+    let (start, first) = chars.next()?;
+    if !is_name_char(first, true) {
+        return None;
+    }
+    let mut end = start + first.len_utf8();
+    for (_, ch) in chars {
+        if is_name_char(ch, false) {
+            end += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    Some((&s[start..end], end))
+}
+
+fn parse_paren_args(s: &str) -> Option<(Vec<String>, String, usize)> {
+    if !s.starts_with('(') {
+        return None;
+    }
+    let close = s.find(')')?;
+    let inner = s[1..close].trim();
+    let args: Vec<String> = if inner.is_empty() {
+        Vec::new()
+    } else {
+        inner
+            .split(',')
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+            .collect()
+    };
+    let raw = inner.to_string();
+    Some((args, raw, close + 1))
+}
+
+fn line_start_space_args(
+    text: &str,
+    dollar: usize,
+    after_name_byte: usize,
+) -> Option<(Vec<String>, String, usize)> {
+    let line_start = text[..dollar].rfind('\n').map(|p| p + 1).unwrap_or(0);
+    if !text[line_start..dollar].trim().is_empty() {
+        return None;
+    }
+    let rest = &text[after_name_byte..];
+    if rest.starts_with('(') {
+        return None;
+    }
+    let line_end = rest.find('\n').unwrap_or(rest.len());
+    let tail = rest[..line_end].trim();
+    if tail.is_empty() {
+        return Some((Vec::new(), String::new(), 0));
+    }
+    let args: Vec<String> = tail.split_whitespace().map(|s| s.to_string()).collect();
+    let raw = tail.to_string();
+    let leading_ws = rest.len() - rest.trim_start().len();
+    Some((args, raw, leading_ws + line_end))
+}
+
+struct ParsedInvocation<'a> {
+    qualifier: Option<String>,
+    name: &'a str,
+    args: Vec<String>,
+    raw_args: String,
+    consumed: usize,
+}
+
+fn try_parse_invocation(text: &str, dollar: usize) -> Option<ParsedInvocation<'_>> {
+    let after = &text[dollar + 1..];
+    let (first, first_len) = parse_identifier(after)?;
+
+    let (qualifier, name, rest_offset) = if let Some(tail) = after.get(first_len..) {
+        if let Some(stripped) = tail.strip_prefix('/') {
+            let (skill_name, name_len) = parse_identifier(stripped)?;
+            (
+                Some(first.to_string()),
+                skill_name,
+                first_len + 1 + name_len,
+            )
+        } else {
+            (None, first, first_len)
+        }
+    } else {
+        (None, first, first_len)
+    };
+
+    let rest = &after[rest_offset..];
+    let after_name_byte = dollar + 1 + rest_offset;
+    let (args, raw_args, arg_len) = if let Some((a, r, l)) = parse_paren_args(rest) {
+        (a, r, l)
+    } else if rest.starts_with('(') {
+        return None;
+    } else if let Some((a, r, l)) = line_start_space_args(text, dollar, after_name_byte) {
+        (a, r, l)
+    } else {
+        (Vec::new(), String::new(), 0)
+    };
+
+    let consumed = 1 + rest_offset + arg_len;
+    Some(ParsedInvocation {
+        qualifier,
+        name,
+        args,
+        raw_args,
+        consumed,
+    })
+}
+
+/// Build the insertion text for a skill autocomplete selection.
+pub fn skill_autocomplete_insert(
+    catalog: &gaviero_core::skills::SkillCatalog,
+    skill: &gaviero_core::skills::Skill,
+    all_with_name: &[&gaviero_core::skills::Skill],
+) -> String {
+    let bare = format!("${}", skill.name);
+    if all_with_name.len() <= 1 {
+        if skill.arguments.is_empty() {
+            return bare;
+        }
+        return format!("{}()", bare);
+    }
+    let label = catalog.source_label(skill);
+    let qualified = format!("${}/{}", label, skill.name);
+    if skill.arguments.is_empty() {
+        qualified
+    } else {
+        format!("{}()", qualified)
+    }
+}
+
 /// Parse `@path/to/file` references from input text.
 /// Returns a list of relative file paths referenced.
 pub fn parse_file_references(text: &str) -> Vec<String> {
@@ -3150,6 +3444,121 @@ fn filter_file_blocks_for_display(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_skill_catalog(
+        name: &str,
+        body: &str,
+        description: &str,
+    ) -> (gaviero_core::skills::SkillCatalog, tempfile::TempDir) {
+        test_skill_catalog_with_args(name, body, description, &[])
+    }
+
+    fn test_skill_catalog_with_args(
+        name: &str,
+        body: &str,
+        description: &str,
+        arguments: &[&str],
+    ) -> (gaviero_core::skills::SkillCatalog, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path().join(".gaviero").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        let args_line = if arguments.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "arguments: [{}]\n",
+                arguments
+                    .iter()
+                    .map(|a| format!("{a}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        std::fs::write(
+            skills_dir.join(format!("{name}.md")),
+            format!("---\ndescription: {description}\n{args_line}---\n{body}\n"),
+        )
+        .unwrap();
+        let ws = gaviero_core::workspace::Workspace::single_folder(tmp.path().to_path_buf());
+        let (catalog, _) =
+            gaviero_core::skills::SkillCatalog::scan(&ws, std::path::Path::new("/nonexistent"));
+        (catalog, tmp)
+    }
+
+    #[test]
+    fn parse_skill_invocations_strips_known_skill() {
+        let (catalog, _tmp) =
+            test_skill_catalog("lint", "Lint the code.", "Run the linter on changed files");
+        let (cleaned, resolved, warnings) =
+            parse_skill_invocations("please $lint", &catalog, None);
+        assert!(warnings.is_empty());
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "lint");
+        assert_eq!(cleaned, "please ");
+    }
+
+    #[test]
+    fn parse_skill_invocations_parens_inline_mid_sentence() {
+        let (catalog, _tmp) = test_skill_catalog(
+            "migrate",
+            "Migrate $0 from $1 to $2.",
+            "Migrate a UI component between frameworks",
+        );
+        let (cleaned, resolved, _) = parse_skill_invocations(
+            "fix it with $migrate(SearchBar, React, Vue) then ship",
+            &catalog,
+            None,
+        );
+        assert_eq!(cleaned, "fix it with  then ship");
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].rendered_body.contains("SearchBar"));
+    }
+
+    #[test]
+    fn parse_skill_invocations_unknown_stays_verbatim_with_warning() {
+        let (catalog, _tmp) =
+            test_skill_catalog("known", "body", "known skill for verbatim unknown test");
+        let (cleaned, resolved, warnings) =
+            parse_skill_invocations("use $PATH here", &catalog, None);
+        assert!(resolved.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(cleaned, "use $PATH here");
+    }
+
+    #[test]
+    fn parse_skill_invocations_dollar_amount_not_invocation() {
+        let (catalog, _tmp) =
+            test_skill_catalog("x", "body", "unused skill for dollar amount test");
+        let (cleaned, resolved, warnings) =
+            parse_skill_invocations("cost is $5.00 today", &catalog, None);
+        assert!(resolved.is_empty());
+        assert!(warnings.is_empty());
+        assert_eq!(cleaned, "cost is $5.00 today");
+    }
+
+    #[test]
+    fn parse_skill_invocations_escape_is_literal() {
+        let (catalog, _tmp) =
+            test_skill_catalog("lint", "body", "lint skill for escape literal test");
+        let (cleaned, resolved, warnings) =
+            parse_skill_invocations(r"run \$lint(x)", &catalog, None);
+        assert!(resolved.is_empty());
+        assert!(warnings.is_empty());
+        assert_eq!(cleaned, r"run \$lint(x)");
+    }
+
+    #[test]
+    fn skill_autocomplete_insert_unique_with_args_adds_parens() {
+        let (catalog, _tmp) = test_skill_catalog_with_args(
+            "review",
+            "Review $path",
+            "review code at a path",
+            &["path"],
+        );
+        let skill = catalog.resolve(None, "review", None).unwrap();
+        let insert = skill_autocomplete_insert(&catalog, skill, &[skill]);
+        assert_eq!(insert, "$review()");
+    }
 
     #[test]
     fn parse_file_references_extracts_multiple_paths() {
