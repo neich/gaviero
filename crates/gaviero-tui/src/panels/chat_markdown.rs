@@ -157,7 +157,10 @@ pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<
         }
 
         if in_code_block {
-            output.push(ChatLine::single(format!("  {}", line), code_style));
+            let budget = width.saturating_sub(2).max(1);
+            for wl in crate::widgets::render_utils::word_wrap(line, budget) {
+                output.push(ChatLine::single(format!("  {}", wl), code_style));
+            }
             i += 1;
             continue;
         }
@@ -282,7 +285,9 @@ pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<
         // Style with dim color to visually distinguish from regular text
         if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.contains("](") {
             let marker_style = Style::default().fg(theme::TOOL_DIM);
-            output.push(ChatLine::single(format!("  {}", trimmed), marker_style));
+            for wl in crate::widgets::render_utils::word_wrap(&format!("  {}", trimmed), width) {
+                output.push(ChatLine::single(wl, marker_style));
+            }
             i += 1;
             continue;
         }
@@ -292,7 +297,41 @@ pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<
         i += 1;
     }
 
-    output
+    reflow_overwide_lines(output, width)
+}
+
+/// Re-wrap any rendered line that still exceeds `width` display columns.
+///
+/// Catches formatted output that can exceed the panel budget after layout; uses
+/// the line's primary style for the wrapped parts. Table rows are left intact —
+/// they use multiline cells instead of post-hoc line breaking.
+fn reflow_overwide_lines(lines: Vec<ChatLine>, width: usize) -> Vec<ChatLine> {
+    if width == 0 {
+        return lines;
+    }
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let text = line.text();
+        if UnicodeWidthStr::width(text.as_str()) <= width || is_table_rendered_line(&text) {
+            out.push(line);
+            continue;
+        }
+        let style = line.primary_style();
+        for wl in crate::widgets::render_utils::word_wrap(&text, width) {
+            out.push(ChatLine::single(wl, style));
+        }
+    }
+    out
+}
+
+/// True for box-drawn table borders and data rows (already width-constrained).
+fn is_table_rendered_line(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let first = t.chars().next().unwrap_or(' ');
+    matches!(first, '│' | '┌' | '├' | '└')
 }
 
 /// Word-wrap a markdown text fragment with inline styling preserved, prepending
@@ -588,10 +627,17 @@ fn render_table(
     let overhead = num_cols + 1 + num_cols * 2;
     let content_budget = max_width.saturating_sub(overhead);
     let total_content: usize = col_widths.iter().sum();
-    if total_content > content_budget && content_budget > 0 {
-        // Proportionally shrink columns
-        for w in &mut col_widths {
-            *w = (*w * content_budget / total_content).max(1);
+    if total_content > content_budget {
+        if content_budget > 0 {
+            // Proportionally shrink columns
+            for w in &mut col_widths {
+                *w = (*w * content_budget / total_content).max(1);
+            }
+        } else {
+            // Panel too narrow for the table overhead — force minimal columns.
+            for w in &mut col_widths {
+                *w = 1;
+            }
         }
     }
 
@@ -609,41 +655,24 @@ fn render_table(
             base_style
         };
 
-        let mut line = String::new();
-        for (j, w) in col_widths.iter().enumerate() {
-            line.push('│');
-            line.push(' ');
-            let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
-            let cell_display_w = UnicodeWidthStr::width(cell);
-            if cell_display_w <= *w {
-                line.push_str(cell);
-                for _ in 0..(*w - cell_display_w) {
-                    line.push(' ');
-                }
-            } else {
-                // Truncate by display width
-                let mut tw = 0;
-                let mut truncated = String::new();
-                for ch in cell.chars() {
-                    let cw = UnicodeWidthChar::width(ch).unwrap_or(1);
-                    if tw + cw >= *w {
-                        break;
-                    }
-                    truncated.push(ch);
-                    tw += cw;
-                }
-                line.push_str(&truncated);
-                line.push('…');
-                // Pad remaining space if truncation left a gap
-                for _ in 0..(*w - tw - 1) {
-                    line.push(' ');
-                }
-            }
-            line.push(' ');
-        }
-        line.push('│');
+        let wrapped_cells: Vec<Vec<String>> = col_widths
+            .iter()
+            .enumerate()
+            .map(|(j, w)| {
+                let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
+                wrap_cell_content(cell, *w)
+            })
+            .collect();
+        let row_height = wrapped_cells
+            .iter()
+            .map(|c| c.len())
+            .max()
+            .unwrap_or(1);
 
-        output.push(ChatLine::single(line, style));
+        for line_idx in 0..row_height {
+            let line = build_table_row_line(&wrapped_cells, &col_widths, line_idx);
+            output.push(ChatLine::single(line, style));
+        }
 
         if row_idx == 0 && rows.len() > 1 {
             output.push(ChatLine::single(mid.clone(), border_style));
@@ -651,6 +680,50 @@ fn render_table(
     }
 
     output.push(ChatLine::single(bot, border_style));
+}
+
+/// Word-wrap cell text to `col_width` display columns; empty cells yield one blank line.
+fn wrap_cell_content(cell: &str, col_width: usize) -> Vec<String> {
+    let budget = col_width.max(1);
+    if cell.is_empty() {
+        return vec![String::new()];
+    }
+    crate::widgets::render_utils::word_wrap(cell, budget)
+}
+
+/// Pad a single cell line to exactly `col_width` display columns.
+fn pad_cell_line(line: &str, col_width: usize) -> String {
+    let display_w = UnicodeWidthStr::width(line);
+    if display_w >= col_width {
+        return line.to_string();
+    }
+    let mut padded = line.to_string();
+    for _ in 0..(col_width - display_w) {
+        padded.push(' ');
+    }
+    padded
+}
+
+/// Build one visual row of a table at `line_idx` across wrapped cell lines.
+fn build_table_row_line(
+    wrapped_cells: &[Vec<String>],
+    col_widths: &[usize],
+    line_idx: usize,
+) -> String {
+    let mut line = String::new();
+    for (j, w) in col_widths.iter().enumerate() {
+        line.push('│');
+        line.push(' ');
+        let cell_line = wrapped_cells
+            .get(j)
+            .and_then(|lines| lines.get(line_idx))
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        line.push_str(&pad_cell_line(cell_line, *w));
+        line.push(' ');
+    }
+    line.push('│');
+    line
 }
 
 fn build_table_border(
@@ -727,6 +800,55 @@ mod tests {
         let lines = format_chat_markdown(text, 40, style);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].text().contains("let x = 1;"));
+    }
+
+    #[test]
+    fn test_format_code_block_wraps_long_lines() {
+        let long = "x".repeat(50);
+        let text = format!("```\n{long}\n```");
+        let style = Style::default();
+        let width = 20;
+        let lines = format_chat_markdown(&text, width, style);
+        assert!(lines.len() > 1, "long code lines should wrap");
+        for line in &lines {
+            assert!(
+                UnicodeWidthStr::width(line.text().as_str()) <= width,
+                "wrapped code line {:?} exceeds width {}",
+                line.text(),
+                width
+            );
+            assert!(
+                line.text().starts_with("  "),
+                "code lines keep the 2-space indent"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tool_marker_wraps_long_line() {
+        let style = Style::default();
+        let width = 30;
+        let lines = format_chat_markdown(&format!("[Read {}]", "a".repeat(60)), width, style);
+        assert!(lines.len() > 1);
+        for line in &lines {
+            assert!(UnicodeWidthStr::width(line.text().as_str()) <= width);
+        }
+    }
+
+    #[test]
+    fn test_all_output_lines_fit_width() {
+        let text = "plain paragraph with enough words to require wrapping across the panel\n\n| Col A | Col B |\n|-------|-------|\n| alpha | beta |\n\n```\nfn main() { println!(\"hello\"); }\n```";
+        let style = Style::default();
+        let width = 24;
+        let lines = format_chat_markdown(text, width, style);
+        for line in &lines {
+            assert!(
+                UnicodeWidthStr::width(line.text().as_str()) <= width,
+                "line {:?} exceeds width {}",
+                line.text(),
+                width
+            );
+        }
     }
 
     #[test]
@@ -840,5 +962,59 @@ mod tests {
             data_row.contains("日本"),
             "data row should contain wide chars"
         );
+    }
+
+    #[test]
+    fn test_table_multiline_cells_show_full_content() {
+        let text = "| Feature | Description |\n|---------|-------------|\n| Auth | Supports JWT tokens and refresh rotation |\n| API | REST and GraphQL endpoints |";
+        let style = Style::default();
+        let width = 30;
+        let lines = format_chat_markdown(text, width, style);
+
+        let joined = lines.iter().map(|l| l.text()).collect::<Vec<_>>().join("\n");
+        assert!(
+            joined.contains("JWT tokens"),
+            "full cell text must appear, got:\n{joined}"
+        );
+        assert!(
+            joined.contains("rotation"),
+            "wrapped continuation must appear, got:\n{joined}"
+        );
+        assert!(
+            !joined.contains('…'),
+            "tables must not truncate cells with ellipsis"
+        );
+
+        for line in &lines {
+            if is_table_rendered_line(&line.text()) {
+                assert!(
+                    UnicodeWidthStr::width(line.text().as_str()) <= width,
+                    "table line {:?} exceeds width {}",
+                    line.text(),
+                    width
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_table_row_height_matches_tallest_wrapped_cell() {
+        let text = "| Col | Text |\n|-----|------|\n| a | word1 word2 word3 word4 |";
+        let style = Style::default();
+        let width = 18;
+        let lines = format_chat_markdown(text, width, style);
+
+        let body_rows: Vec<String> = lines
+            .iter()
+            .map(|l| l.text())
+            .skip_while(|t| !t.starts_with('├'))
+            .skip(1)
+            .take_while(|t| !t.starts_with('└'))
+            .collect();
+        assert!(
+            body_rows.len() >= 2,
+            "tall cell should span multiple │ rows, got {body_rows:?}"
+        );
+        assert!(body_rows.iter().all(|t| t.starts_with('│')));
     }
 }
