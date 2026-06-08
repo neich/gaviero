@@ -258,6 +258,8 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
                         || (t.starts_with("/forget") && !t.starts_with("/forget-history"))
                 } {
                     app.handle_forget_command();
+                } else if app.chat_state.text_input.text.trim().starts_with("/skills") {
+                    handle_skills_command(app);
                 } else if !app.chat_state.process_slash_command() {
                     app.send_chat_message();
                 }
@@ -1489,8 +1491,95 @@ pub(super) fn refresh_manifest_selected_items(app: &mut App) {
     });
 }
 
+pub(super) fn handle_skills_command(app: &mut App) {
+    let input = app.chat_state.text_input.text.trim().to_string();
+    app.chat_state.add_user_message(&input);
+
+    let rest = input.strip_prefix("/skills").unwrap_or("").trim();
+    if let Some(query) = rest.strip_prefix("search") {
+        let q = query.trim();
+        if q.is_empty() {
+            app.chat_state
+                .add_system_message("Usage: /skills search <query>");
+        } else if let Some(memory) = app.memory.as_ref() {
+            let catalog = app.skill_catalog.clone();
+            let embedder = std::sync::Arc::clone(memory.embedder());
+            let reranker = app.memory_reranker.clone();
+            let tx = app.event_tx.clone();
+            let q_owned = q.to_string();
+            tokio::spawn(async move {
+                use gaviero_core::memory::reranker::NullReranker;
+                let hits = if let Some(ref r) = reranker {
+                    catalog.search(&q_owned, &embedder, r.as_ref()).await
+                } else {
+                    catalog
+                        .search(&q_owned, &embedder, &NullReranker)
+                        .await
+                };
+                let body = if hits.is_empty() {
+                    format!("No skills matched \"{q_owned}\".")
+                } else {
+                    hits.iter()
+                        .map(|s| format!("- {} — {}", s.name, s.description))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                let _ = tx.send(crate::event::Event::MessageComplete {
+                    conv_id: String::new(),
+                    role: "system".to_string(),
+                    content: body,
+                });
+            });
+            app.chat_state
+                .add_system_message("Searching skills…");
+        } else {
+            app.chat_state.add_system_message(
+                "Semantic skill search requires memory (embedder) to be ready.",
+            );
+        }
+    } else {
+        let skills = app.skill_catalog.all_skills();
+        let body = if skills.is_empty() {
+            "No skills found. Add `*.md` files under `.gaviero/skills/`.".to_string()
+        } else {
+            skills
+                .iter()
+                .map(|s| {
+                    format!(
+                        "- {} [{}] — {}",
+                        s.name,
+                        app.skill_catalog.source_label(s),
+                        s.description
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        app.chat_state.add_system_message(&body);
+    }
+
+    app.chat_state.text_input.text.clear();
+    app.chat_state.text_input.cursor = 0;
+}
+
 pub(super) fn refresh_chat_autocomplete(app: &mut App) {
     if !app.chat_state.autocomplete.active {
+        return;
+    }
+
+    if app.chat_state.autocomplete.mode
+        == crate::panels::agent_chat::AutocompleteMode::SkillRef
+    {
+        let active_repo_id = app
+            .buffers
+            .get(app.active_buffer)
+            .and_then(|b| b.path.as_deref())
+            .and_then(|p| app.workspace.folder_for_path(p))
+            .map(|p| gaviero_core::memory::scope::hash_path(p));
+        app.chat_state.update_skill_autocomplete_matches(
+            &app.skill_catalog,
+            active_repo_id.as_deref(),
+        );
         return;
     }
 
@@ -1708,7 +1797,22 @@ pub(super) fn send_chat_message(app: &mut App) {
     };
     let multi_root = named_roots.len() > 1;
     let labels = unique_root_labels(&named_roots);
-    let refs = crate::panels::agent_chat::parse_file_references(&prompt);
+    let active_repo_id = focused_folder
+        .as_ref()
+        .map(|p| gaviero_core::memory::scope::hash_path(p));
+    let (task_text, resolved_skills_buf, skill_warnings) =
+        crate::panels::agent_chat::parse_skill_invocations(
+            &prompt,
+            &app.skill_catalog,
+            active_repo_id.as_deref(),
+        );
+    for w in skill_warnings {
+        app.chat_state.add_system_message(&format!(
+            "Skill warning ({}): {}",
+            w.name, w.message
+        ));
+    }
+    let refs = crate::panels::agent_chat::parse_file_references(&task_text);
     let mut file_refs: Vec<(String, String)> = Vec::new();
     for rel_path in &refs {
         // If multi-root and the ref starts with "<label>/", resolve it to that root only.
@@ -2049,6 +2153,8 @@ pub(super) fn send_chat_message(app: &mut App) {
     let session_cancel = cancel_token.clone();
     let topology_config = app.workspace.resolve_topology_config(Some(&graph_root));
     let topology_cache = app.topology_cache.clone();
+    let planner_task_text = task_text.clone();
+    let planner_resolved_skills = resolved_skills_buf.clone();
     let task = tokio::spawn(async move {
         {
             let mut gate = wg.lock().await;
@@ -2193,7 +2299,7 @@ pub(super) fn send_chat_message(app: &mut App) {
             .map(|a| a.as_ref())
             .collect();
         let planner_input = gaviero_core::context_planner::PlannerInput {
-            user_message: &prompt,
+            user_message: &planner_task_text,
             explicit_refs: &[],
             seed_paths: &seed_paths_buf,
             provider_profile: &provider_profile_clone,
@@ -2210,6 +2316,7 @@ pub(super) fn send_chat_message(app: &mut App) {
             topology_config: topology_config.clone(),
             pre_fetched_topology: primary_topology.as_deref(),
             extra_topology_blocks: &extra_topology_refs,
+            resolved_skills: &planner_resolved_skills,
         };
 
         let selections = {
@@ -2356,7 +2463,7 @@ pub(super) fn send_chat_message(app: &mut App) {
         });
 
         let transport_ctx = gaviero_core::agent_session::TransportContext {
-            user_message: prompt.clone(),
+            user_message: task_text.clone(),
             effort: if options.effort.is_empty() || options.effort == "off" {
                 None
             } else {
