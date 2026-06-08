@@ -12,11 +12,12 @@ cargo test -p gaviero-core --features api-embedders   # placeholder factory only
 
 Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presence) are `#[ignore]`.
 
-## Public Modules (22, from [src/lib.rs](src/lib.rs))
+## Public Modules (23, from [src/lib.rs](src/lib.rs))
 
 | Module | Purpose |
 |---|---|
 | `swarm` | Multi-agent orchestration: tier routing, parallel fan-out, verification, merge, replan, calibration, context bundling. |
+| `skills` | Turn-scoped instruction templates: frontmatter parse, CC substitution, multi-root catalog, planner `ResolvedSkill` seam. |
 | `memory` | Multi-DB ONNX-embedding store + three-cadence consolidation. |
 | `mcp` | In-process MCP server (read-only tools for subprocess agents). |
 | `acp` | Legacy direct Claude subprocess transport (one-shot / persistent). |
