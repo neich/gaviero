@@ -3460,8 +3460,12 @@ mod tests {
         arguments: &[&str],
     ) -> (gaviero_core::skills::SkillCatalog, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
-        let skills_dir = tmp.path().join(".gaviero").join("skills");
-        std::fs::create_dir_all(&skills_dir).unwrap();
+        let skill_dir = tmp
+            .path()
+            .join(".gaviero")
+            .join("skills")
+            .join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
         let args_line = if arguments.is_empty() {
             String::new()
         } else {
@@ -3475,7 +3479,7 @@ mod tests {
             )
         };
         std::fs::write(
-            skills_dir.join(format!("{name}.md")),
+            skill_dir.join("SKILL.md"),
             format!("---\ndescription: {description}\n{args_line}---\n{body}\n"),
         )
         .unwrap();
