@@ -186,6 +186,7 @@ pub async fn run_backend(
         pre_fetched_topology: topology_body.as_deref(),
         extra_topology_blocks: &[],
         resolved_skills: &[],
+        bootstrap_arms: crate::context_planner::BootstrapArms::swarm_first_turn(),
     };
 
     let selections = {

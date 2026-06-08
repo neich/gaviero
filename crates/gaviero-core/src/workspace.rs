@@ -28,6 +28,8 @@ pub mod settings {
     pub const AGENT_TOPOLOGY_MAX_DEPTH: &str = "agent.topology.maxDepth";
     pub const AGENT_TOPOLOGY_MAX_DIRS: &str = "agent.topology.maxDirs";
     pub const AGENT_TOPOLOGY_TOKEN_BUDGET: &str = "agent.topology.tokenBudget";
+    /// Default chat bootstrap policy: `auto` | `minimal` | `manual` | `none`.
+    pub const AGENT_CONTEXT_BOOTSTRAP: &str = "agent.context.bootstrap";
     /// Tool surface offered to the Claude subprocess via `--tools`.
     /// Anything outside this list is unavailable to the agent regardless
     /// of `--allowedTools`. Default omits `Bash` so agent writes flow
@@ -612,6 +614,14 @@ impl Workspace {
     /// folder → workspace → user → defaults resolution. Callers at the chat
     /// entry point hand this to `memory::retrieve_for_chat`.
     /// Resolve shallow `<repo_topology>` settings for the workspace root.
+    /// Resolve the default chat bootstrap mode from the settings cascade.
+    pub fn resolve_bootstrap_mode(&self, root: Option<&Path>) -> crate::context_planner::BootstrapMode {
+        self.resolve_setting(settings::AGENT_CONTEXT_BOOTSTRAP, root)
+            .as_str()
+            .and_then(crate::context_planner::BootstrapMode::parse)
+            .unwrap_or(crate::context_planner::BootstrapMode::Auto)
+    }
+
     pub fn resolve_topology_config(&self, root: Option<&Path>) -> crate::repo_map::TopologyConfig {
         let enabled = self
             .resolve_setting(settings::AGENT_TOPOLOGY_ENABLED, root)
@@ -899,6 +909,7 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::AGENT_EFFORT => serde_json::json!("off"),
         settings::AGENT_MAX_TOKENS => serde_json::json!(16384),
         settings::AGENT_GRAPH_BUDGET_TOKENS => serde_json::json!(12000),
+        settings::AGENT_CONTEXT_BOOTSTRAP => serde_json::json!("auto"),
         settings::AGENT_AVAILABLE_TOOLS => {
             serde_json::json!(["Read", "Glob", "Grep", "Write", "Edit", "MultiEdit"])
         }

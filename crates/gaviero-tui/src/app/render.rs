@@ -618,7 +618,8 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
 
     let model = app.chat_state.effective_model().to_string();
     let effort = app.chat_state.effective_effort();
-    let pressure = app.chat_state.context_pressure();
+    let estimate_ctx = app.bootstrap_estimate_context();
+    let pressure = app.chat_state.context_pressure(&estimate_ctx);
     let approx = if pressure.is_approximate() { "~" } else { "" };
     let ctx_size = if pressure.tokens >= 1000 {
         format!("{}{}K", approx, pressure.tokens / 1000)

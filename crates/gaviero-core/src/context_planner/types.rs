@@ -318,8 +318,13 @@ pub struct PlannerInput<'a> {
     pub extra_topology_blocks: &'a [(&'a str, &'a str)],
 
     /// Turn-scoped skills resolved from `$skill` invocations in chat.
-    /// Passed every turn (outside the `is_first_turn` bootstrap gate).
+    /// Passed every turn (outside the bootstrap gate).
     pub resolved_skills: &'a [crate::skills::ResolvedSkill],
+
+    /// Resolved per-layer bootstrap switches for this planner pass.
+    /// Chat callers use [`resolve_chat_bootstrap_arms`]; swarm passes
+    /// [`BootstrapArms::swarm_first_turn`].
+    pub bootstrap_arms: super::bootstrap::BootstrapArms,
 }
 
 /// Memory selection record.

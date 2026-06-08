@@ -117,6 +117,7 @@ pub enum Event {
     TurnBootstrapMeasured {
         conv_id: String,
         tokens: usize,
+        arms: gaviero_core::context_planner::BootstrapArms,
     },
 
     /// Fired once per chat turn with the provider's authoritative token
