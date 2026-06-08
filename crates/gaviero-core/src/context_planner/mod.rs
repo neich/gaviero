@@ -10,11 +10,16 @@
 //! and wraps the legacy concatenated strings in single-entry `MemorySelection`
 //! / `GraphSelection` records. M3 will widen to one entry per ranked item.
 
+pub mod bootstrap;
 pub mod chat_memory;
 pub mod compaction;
 pub mod ledger;
 pub mod types;
 
+pub use bootstrap::{
+    BootstrapArms, BootstrapBudgets, BootstrapEstimateContext, BootstrapEstimateHints,
+    BootstrapMode, BootstrapOneShot, estimate_bootstrap_tokens, resolve_chat_bootstrap_arms,
+};
 pub use chat_memory::{
     ChatMemoryOutcome, ChatMemoryRequest, PostTurnRequest, enqueue_post_turn, perform_injection,
     splice_into_selections,
@@ -84,15 +89,21 @@ impl<'a> ContextPlanner<'a> {
             },
         };
 
-        // Bootstrap-only injection. Today's chat path skips memory + graph
-        // on follow-up turns (Claude --resume holds context server-side);
-        // today's swarm path always treats every attempt as a fresh first
-        // turn (no persistence). One-shot ledger semantics for swarm match
-        // because each attempt builds a fresh ledger.
-        if is_first_turn {
+        // Bootstrap injection is gated by `bootstrap_arms` resolved by the
+        // caller (chat: mode + slash commands; swarm: always all layers on
+        // the work unit's fresh first turn). Follow-up turns skip unless
+        // `explicit` (e.g. `/inject memory` for codex exec).
+        let arms = input.bootstrap_arms;
+        if arms.memory {
             self.collect_memory(input, &mut selections).await;
+        }
+        if arms.topology {
             self.collect_topology(input, &mut selections);
+        }
+        if arms.outline {
             self.collect_graph(input, &mut selections);
+        }
+        if arms.impact {
             self.collect_pre_fetched_impact(input, &mut selections);
         }
 
@@ -508,6 +519,7 @@ mod tests {
             pre_fetched_topology: None,
             extra_topology_blocks: &[],
             resolved_skills: &[],
+            bootstrap_arms: BootstrapArms::all(),
         };
         let sel = planner.plan(&input).await.unwrap();
         assert!(sel.memory_selections.is_empty());
@@ -552,6 +564,7 @@ mod tests {
             pre_fetched_topology: None,
             extra_topology_blocks: &[],
             resolved_skills: &[],
+            bootstrap_arms: BootstrapArms::all(),
         };
         let sel = planner.plan(&input).await.unwrap();
         // StatelessReplay emits Some(_) on first turn even when empty —
@@ -592,6 +605,7 @@ mod tests {
             pre_fetched_topology: None,
             extra_topology_blocks: &[],
             resolved_skills: &[],
+            bootstrap_arms: BootstrapArms::none(),
         };
         let sel = planner.plan(&input).await.unwrap();
         assert!(sel.memory_selections.is_empty());
@@ -662,6 +676,7 @@ mod tests {
             pre_fetched_topology: None,
             extra_topology_blocks: &[],
             resolved_skills: &[],
+            bootstrap_arms: BootstrapArms::all(),
         };
         let sel = planner.plan(&input).await.unwrap();
         // Exact rank counts are an implementation detail of
@@ -718,6 +733,10 @@ mod tests {
             pre_fetched_topology: None,
             extra_topology_blocks: &[],
             resolved_skills: &[],
+            bootstrap_arms: BootstrapArms {
+                impact: true,
+                ..BootstrapArms::none()
+            },
         };
         let sel = planner.plan(&input).await.unwrap();
         assert_eq!(sel.graph_selections.len(), 1);
@@ -756,6 +775,7 @@ mod tests {
             pre_fetched_topology: Some(topo),
             extra_topology_blocks: &[],
             resolved_skills: &[],
+            bootstrap_arms: BootstrapArms::topology_only(),
         };
         let sel = planner.plan(&input).await.unwrap();
         assert_eq!(sel.graph_selections.len(), 1);
@@ -788,6 +808,7 @@ mod tests {
             pre_fetched_topology: Some(topo),
             extra_topology_blocks: &[],
             resolved_skills: &[],
+            bootstrap_arms: BootstrapArms::none(),
         };
         let sel2 = planner2.plan(&input2).await.unwrap();
         assert!(sel2.graph_selections.is_empty());
@@ -830,6 +851,7 @@ mod tests {
             pre_fetched_topology: None,
             extra_topology_blocks: &[],
             resolved_skills: &resolved,
+            bootstrap_arms: BootstrapArms::none(),
         };
         let sel = planner.plan(&input).await.unwrap();
         assert!(sel.memory_selections.is_empty());
