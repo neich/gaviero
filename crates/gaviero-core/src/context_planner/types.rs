@@ -316,6 +316,10 @@ pub struct PlannerInput<'a> {
     /// Additional topology blocks for multi-root `/workspace` mode.
     /// Each entry is `(folder_label, body)` without XML tags.
     pub extra_topology_blocks: &'a [(&'a str, &'a str)],
+
+    /// Turn-scoped skills resolved from `$skill` invocations in chat.
+    /// Passed every turn (outside the `is_first_turn` bootstrap gate).
+    pub resolved_skills: &'a [crate::skills::ResolvedSkill],
 }
 
 /// Memory selection record.
@@ -400,6 +404,14 @@ pub struct FileAttachment {
     pub content: Option<String>,
 }
 
+/// Turn-scoped skill injection record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillSelection {
+    pub name: String,
+    pub scope_level: i32,
+    pub rendered_body: String,
+}
+
 /// Replay payload for `StatelessReplay` providers.
 ///
 /// Mirrors `SessionLedger::replay_history` so the rendering adapter can
@@ -420,6 +432,7 @@ pub struct PlannerSelections {
     pub memory_selections: Vec<MemorySelection>,
     pub graph_selections: Vec<GraphSelection>,
     pub file_refs: Vec<FileAttachment>,
+    pub skill_selections: Vec<SkillSelection>,
     /// `Some(_)` only for `StatelessReplay` providers. `None` for
     /// `NativeResume` / `ProcessBound` — they hold history server-side.
     pub replay_history: Option<ReplayPayload>,
