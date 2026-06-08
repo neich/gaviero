@@ -335,6 +335,7 @@ mod tests {
             pre_fetched_topology: None,
             extra_topology_blocks: &[],
             resolved_skills: &[],
+            bootstrap_arms: gaviero_core::context_planner::BootstrapArms::none(),
         };
         let selections = planner.plan(&input).await.unwrap();
         assert!(
