@@ -679,6 +679,9 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 token_budget,
                 "chat memory injected"
             );
+            if let Some(idx) = app.chat_state.find_conv_idx(&conv_id) {
+                app.chat_state.conversations[idx].last_memory_injection_tokens = tokens_used;
+            }
             if items_injected > 0 {
                 app.status_message = Some((
                     format!(
@@ -688,9 +691,14 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 ));
             }
         }
-        Event::TurnBootstrapMeasured { conv_id, tokens } => {
+        Event::TurnBootstrapMeasured {
+            conv_id,
+            tokens,
+            arms,
+        } => {
             if let Some(idx) = app.chat_state.find_conv_idx(&conv_id) {
                 app.chat_state.conversations[idx].last_bootstrap_tokens = tokens;
+                app.chat_state.conversations[idx].last_bootstrap_arms = arms;
             }
         }
         Event::TurnTokenUsage { conv_id, usage } => {
