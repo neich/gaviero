@@ -238,6 +238,16 @@ async fn commit_write(ctx: &ToolCtx, file_path: &str, contents: &str) -> Result<
         .await
         .map_err(|e| format!("writing '{}': {e}", file_path))?;
 
+    if let (Some(obs), Some(snap)) = (&ctx.observer, &ctx.snapshot) {
+        let pre = snap.lock().await.pre_turn_content(&path);
+        if let Some(pre_turn) = pre {
+            obs.on_tool_agent_edit_captured(
+                &path,
+                pre_turn.as_deref(),
+            );
+        }
+    }
+
     Ok(format!("Wrote {}", display_rel(&path, &ctx.workspace_root)))
 }
 

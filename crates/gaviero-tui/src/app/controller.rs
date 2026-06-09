@@ -717,6 +717,13 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 app.chat_state.conversations[idx].last_turn_cost_usd = cost_usd;
             }
         }
+        Event::ToolAgentEditCaptured {
+            path,
+            pre_turn_content,
+        } => {
+            app.pending_tool_agent_edits
+                .insert(path, pre_turn_content);
+        }
         Event::ToolAgentEditsPending { conv_id: _, edits } => {
             for edit in &edits {
                 app.pending_tool_agent_edits

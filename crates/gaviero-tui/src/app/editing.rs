@@ -1327,30 +1327,51 @@ pub(super) fn goto_next_search_result(app: &mut App) {
     ));
 }
 
+/// Look up a pre-turn snapshot for an Option-B tool-agent edit.
+fn pending_pre_turn_content(
+    pending: &std::collections::HashMap<std::path::PathBuf, Option<String>>,
+    path: &Path,
+) -> Option<Option<String>> {
+    if let Some(content) = pending.get(path) {
+        return Some(content.clone());
+    }
+    pending.iter().find_map(|(p, content)| {
+        Buffer::paths_refer_to_same_file(p, path)
+            .then(|| content.clone())
+    })
+}
+
+/// Resolve the "before" side of an external-change diff for a tool-agent edit.
+/// The per-turn snapshot wins over the open buffer so a file-watcher reload
+/// cannot erase the diff.
+fn tool_agent_old_content(app: &App, path: &Path) -> String {
+    if let Some(pre_turn) = pending_pre_turn_content(&app.pending_tool_agent_edits, path) {
+        return pre_turn.unwrap_or_default();
+    }
+    app.buffers
+        .iter()
+        .find(|b| {
+            b.path
+                .as_deref()
+                .is_some_and(|p| Buffer::paths_refer_to_same_file(p, path))
+        })
+        .map(|b| b.text.to_string())
+        .unwrap_or_default()
+}
+
 /// Open external-change review for an in-process tool-agent edit (Option B).
 pub(super) fn open_tool_agent_edit_review(app: &mut App, path: &Path) {
     if app.diff_review.is_some() {
         return;
     }
 
-    let read_path = path.to_path_buf();
+    let read_path = Buffer::resolve_editor_path(path);
     let new_content = match std::fs::read_to_string(&read_path) {
         Ok(c) => c,
         Err(_) => return,
     };
 
-    let old_content = if let Some(buf_idx) = app.buffers.iter().position(|b| {
-        b.path
-            .as_deref()
-            .is_some_and(|p| crate::editor::buffer::Buffer::paths_refer_to_same_file(p, path))
-    }) {
-        app.buffers[buf_idx].text.to_string()
-    } else {
-        app.pending_tool_agent_edits
-            .get(path)
-            .and_then(|c| c.clone())
-            .unwrap_or_default()
-    };
+    let old_content = tool_agent_old_content(app, path);
 
     if old_content == new_content {
         return;
@@ -1415,15 +1436,22 @@ pub(super) fn handle_file_changed(app: &mut App, path: &Path) {
         return;
     }
 
-    let old_content = buf.text.to_string();
+    let old_content = pending_pre_turn_content(&app.pending_tool_agent_edits, path)
+        .map(|pre| pre.unwrap_or_default())
+        .unwrap_or_else(|| buf.text.to_string());
     if old_content == new_content {
         buf.note_disk_sync(&new_content);
         return;
     }
 
+    let source = if pending_pre_turn_content(&app.pending_tool_agent_edits, path).is_some() {
+        "tool-agent"
+    } else {
+        "external"
+    };
     let proposal = WriteGatePipeline::build_proposal(
         0,
-        "external",
+        source,
         None,
         &read_path,
         &old_content,
