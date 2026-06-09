@@ -1332,21 +1332,40 @@ pub(super) fn handle_file_changed(app: &mut App, path: &Path) {
         return;
     }
 
-    let buf_idx = app
-        .buffers
-        .iter()
-        .position(|b| b.path.as_deref() == Some(path) && !b.modified);
+    let buf_idx = app.buffers.iter().position(|b| {
+        b.path.as_deref().is_some_and(|buf_path| {
+            Buffer::paths_refer_to_same_file(buf_path, path) && !b.modified
+        })
+    });
     let Some(buf_idx) = buf_idx else {
         return;
     };
 
-    let new_content = match std::fs::read_to_string(path) {
+    let read_path = match app.buffers[buf_idx].path.as_deref() {
+        Some(p) => p.to_path_buf(),
+        None => return,
+    };
+
+    let new_content = match std::fs::read_to_string(&read_path) {
         Ok(c) => c,
         Err(_) => return,
     };
 
-    let old_content = app.buffers[buf_idx].text.to_string();
+    let buf = &mut app.buffers[buf_idx];
+    if buf.should_suppress_post_open_watch() {
+        // Watcher often replays stale metadata right after reopen; trust the
+        // content we just loaded until the user edits or the grace window ends.
+        buf.note_disk_sync(buf.text.to_string());
+        return;
+    }
+    if buf.should_ignore_external_change(&new_content) {
+        buf.note_disk_sync(&new_content);
+        return;
+    }
+
+    let old_content = buf.text.to_string();
     if old_content == new_content {
+        buf.note_disk_sync(&new_content);
         return;
     }
 
@@ -1354,12 +1373,10 @@ pub(super) fn handle_file_changed(app: &mut App, path: &Path) {
         0,
         "external",
         None,
-        path,
+        &read_path,
         &old_content,
         &new_content,
     );
-
-    let _ = app.buffers[buf_idx].reload();
 
     app.active_buffer = buf_idx;
     app.focus = Focus::Editor;
@@ -1426,8 +1443,13 @@ pub(super) fn sync_preview_mode_for_active_buffer(app: &mut App) {
 }
 
 pub(super) fn open_file(app: &mut App, path: &Path) {
+    let path = Buffer::resolve_editor_path(path);
     for (i, buf) in app.buffers.iter().enumerate() {
-        if buf.path.as_deref() == Some(path) {
+        if buf
+            .path
+            .as_deref()
+            .is_some_and(|existing| Buffer::paths_refer_to_same_file(existing, &path))
+        {
             app.active_buffer = i;
             sync_preview_mode_for_active_buffer(app);
             app.needs_full_redraw = true;
@@ -1435,7 +1457,7 @@ pub(super) fn open_file(app: &mut App, path: &Path) {
         }
     }
 
-    match Buffer::open(path) {
+    match Buffer::open(&path) {
         Ok(mut buf) => {
             use gaviero_core::workspace::settings;
             let lang = buf.lang_name.as_deref();
@@ -1556,12 +1578,20 @@ pub(super) fn save_current_buffer(app: &mut App) {
     if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
         if let Err(e) = buf.save() {
             tracing::error!("Save failed: {}", e);
+            app.status_message = Some((
+                format!("Save failed: {e}"),
+                std::time::Instant::now(),
+            ));
             return;
         }
         buf.refresh_conflict_metadata(buf.git_unmerged);
     }
     if let Some(path) = saved {
         stage_file_if_conflict_resolved(app, &path);
+        app.status_message = Some((
+            format!("Saved {}", path.display()),
+            std::time::Instant::now(),
+        ));
     }
     app.refresh_git_changes();
 }

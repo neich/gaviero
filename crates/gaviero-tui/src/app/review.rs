@@ -179,12 +179,70 @@ fn temp_sibling_path(target: &std::path::Path) -> std::path::PathBuf {
     parent.join(name)
 }
 
+/// Apply the on-disk version for an external-change review.
+pub(super) fn accept_external_review(app: &mut App) {
+    let review = match app.diff_review.take() {
+        Some(r) if r.is_external() => r,
+        Some(r) => {
+            app.diff_review = Some(r);
+            return;
+        }
+        None => return,
+    };
+    let path = review.proposal.file_path;
+    for buf in &mut app.buffers {
+        if buf
+            .path
+            .as_deref()
+            .is_some_and(|p| crate::editor::buffer::Buffer::paths_refer_to_same_file(p, &path))
+        {
+            let _ = buf.reload();
+            break;
+        }
+    }
+}
+
+/// Keep the in-editor version and dismiss an external-change review.
+pub(super) fn reject_external_review(app: &mut App) {
+    let review = match app.diff_review.take() {
+        Some(r) if r.is_external() => r,
+        Some(r) => {
+            app.diff_review = Some(r);
+            return;
+        }
+        None => return,
+    };
+    let path = review.proposal.file_path;
+    let disk_content = review.proposal.proposed_content;
+    for buf in &mut app.buffers {
+        if buf
+            .path
+            .as_deref()
+            .is_some_and(|p| crate::editor::buffer::Buffer::paths_refer_to_same_file(p, &path))
+        {
+            // Editor copy is authoritative; disk is stale until the user saves.
+            buf.modified = buf.text.to_string() != disk_content;
+            if buf.modified {
+                app.status_message = Some((
+                    format!(
+                        "Kept editor version of {} — press Ctrl+S to write it to disk",
+                        path.display()
+                    ),
+                    std::time::Instant::now(),
+                ));
+            }
+            break;
+        }
+    }
+}
+
 pub(super) fn handle_review_action(app: &mut App, action: &Action) -> bool {
     let review = match &mut app.diff_review {
         Some(r) => r,
         None => return false,
     };
     let is_interactive = review.is_interactive();
+    let is_external = review.is_external();
 
     match action {
         Action::InsertChar(']') => {
@@ -206,32 +264,56 @@ pub(super) fn handle_review_action(app: &mut App, action: &Action) -> bool {
         }
         Action::InsertChar('a') if is_interactive => {
             review.pending_bracket = None;
-            let idx = review.current_hunk;
-            review.accept_hunk(idx);
+            if is_external {
+                accept_external_review(app);
+            } else {
+                let idx = review.current_hunk;
+                review.accept_hunk(idx);
+            }
             true
         }
         Action::InsertChar('r') if is_interactive => {
             review.pending_bracket = None;
-            let idx = review.current_hunk;
-            review.reject_hunk(idx);
+            if is_external {
+                reject_external_review(app);
+            } else {
+                let idx = review.current_hunk;
+                review.reject_hunk(idx);
+            }
             true
         }
         Action::InsertChar('A') if is_interactive => {
             review.pending_bracket = None;
-            review.accept_all();
+            if is_external {
+                accept_external_review(app);
+            } else {
+                review.accept_all();
+            }
             true
         }
         Action::InsertChar('R') if is_interactive => {
             review.pending_bracket = None;
-            review.reject_all();
+            if is_external {
+                reject_external_review(app);
+            } else {
+                review.reject_all();
+            }
             true
         }
         Action::InsertChar('f') if is_interactive => {
-            finalize_current_review(app);
+            if is_external {
+                accept_external_review(app);
+            } else {
+                finalize_current_review(app);
+            }
             true
         }
         Action::InsertChar('q') => {
-            app.diff_review = None;
+            if is_external {
+                reject_external_review(app);
+            } else {
+                app.diff_review = None;
+            }
             true
         }
         Action::Quit => {

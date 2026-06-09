@@ -546,7 +546,7 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
                 let current = review.current_hunk + 1;
                 (
                     format!(
-                        " CHANGED  {} modified externally [{}/{}]  |  ]h/[h: navigate  q: dismiss",
+                        " CHANGED  {} modified externally [{}/{}]  |  a/A: accept disk  r/R: keep editor  ]h/[h: nav  q: keep editor",
                         filename, current, total,
                     ),
                     Style::default().fg(Color::Black).bg(theme::FOCUS_BORDER),
