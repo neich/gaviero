@@ -130,6 +130,14 @@ pub struct Buffer {
     pub conflict_regions: Vec<gaviero_core::git_conflict::ConflictRegion>,
     /// Index into `conflict_regions` for F8 / F9 navigation.
     pub conflict_index: usize,
+    /// Last known on-disk content for this buffer (after open, save, or reload).
+    /// Used to ignore file-watcher noise from the editor's own writes.
+    disk_snapshot: Option<String>,
+    /// Set after a successful save; suppresses spurious watcher events while
+    /// the kernel / sync layer finishes flushing the write.
+    last_self_write: Option<std::time::Instant>,
+    /// When this buffer last loaded content from disk (open or reload).
+    opened_at: std::time::Instant,
 }
 
 impl Buffer {
@@ -159,13 +167,70 @@ impl Buffer {
             git_unmerged: false,
             conflict_regions: Vec::new(),
             conflict_index: 0,
+            disk_snapshot: None,
+            last_self_write: None,
+            opened_at: std::time::Instant::now(),
         }
+    }
+
+    /// Whether two paths refer to the same on-disk file.
+    pub fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
+        if a == b {
+            return true;
+        }
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        }
+    }
+
+    /// Resolve a buffer path to a stable absolute form when possible.
+    pub fn resolve_editor_path(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    /// Record that the buffer now matches what is on disk.
+    pub fn note_disk_sync(&mut self, content: impl Into<String>) {
+        self.disk_snapshot = Some(content.into());
+        self.last_self_write = None;
+    }
+
+    /// Record a successful save so we can ignore the watcher echo.
+    pub fn note_self_save(&mut self, content: impl Into<String>) {
+        self.disk_snapshot = Some(content.into());
+        self.last_self_write = Some(std::time::Instant::now());
+    }
+
+    /// Whether a file-watcher event should be ignored for this buffer.
+    pub fn should_ignore_external_change(&self, disk_content: &str) -> bool {
+        if self
+            .disk_snapshot
+            .as_deref()
+            .is_some_and(|snap| snap == disk_content)
+        {
+            return true;
+        }
+        if self.text.to_string() == disk_content {
+            return true;
+        }
+        if let Some(wrote_at) = self.last_self_write {
+            if wrote_at.elapsed() < std::time::Duration::from_secs(2) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Ignore watcher noise immediately after a buffer was opened/reloaded.
+    pub fn should_suppress_post_open_watch(&self) -> bool {
+        self.opened_at.elapsed() < std::time::Duration::from_secs(3)
     }
 
     /// Open a file from disk.
     pub fn open(path: &Path) -> Result<Self> {
+        let path = Self::resolve_editor_path(path);
         let content =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+            std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
         let text = Rope::from_str(&content);
 
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -209,6 +274,9 @@ impl Buffer {
             git_unmerged: false,
             conflict_regions: Vec::new(),
             conflict_index: 0,
+            disk_snapshot: Some(content.clone()),
+            last_self_write: None,
+            opened_at: std::time::Instant::now(),
         })
     }
 
@@ -278,6 +346,9 @@ impl Buffer {
             git_unmerged: false,
             conflict_regions: Vec::new(),
             conflict_index: 0,
+            disk_snapshot: None,
+            last_self_write: None,
+            opened_at: std::time::Instant::now(),
         })
     }
 
@@ -1026,6 +1097,8 @@ impl Buffer {
         let content = std::fs::read_to_string(path)?;
         self.text = Rope::from_str(&content);
         self.modified = false;
+        self.note_disk_sync(&content);
+        self.opened_at = std::time::Instant::now();
         self.undo_stack.clear();
         self.redo_stack.clear();
         // Full reparse from scratch (not incremental) since the content was replaced entirely
@@ -1039,13 +1112,26 @@ impl Buffer {
 
     /// Save buffer to its file path.
     pub fn save(&mut self) -> Result<()> {
+        if self.read_only {
+            anyhow::bail!("cannot save read-only buffer");
+        }
         let path = self
             .path
             .as_ref()
             .context("cannot save buffer without path")?;
         let content = self.text.to_string();
-        std::fs::write(path, &content)?;
+        atomic_write_to_path(path, content.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
+        let on_disk = std::fs::read_to_string(path)
+            .with_context(|| format!("verifying save of {}", path.display()))?;
+        if on_disk != content {
+            anyhow::bail!(
+                "save verification failed for {}: bytes on disk do not match buffer",
+                path.display()
+            );
+        }
         self.modified = false;
+        self.note_self_save(&on_disk);
         Ok(())
     }
 
@@ -2682,6 +2768,49 @@ fn format_toml(content: &str) -> Option<String> {
     Some(formatted)
 }
 
+fn atomic_write_to_path(path: &Path, content: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    let tmp = save_temp_sibling_path(path);
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn save_temp_sibling_path(target: &Path) -> PathBuf {
+    use std::ffi::OsString;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stem = target
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_else(|| OsString::from("file"));
+    let mut name = OsString::from(".gaviero-save-");
+    name.push(&stem);
+    name.push(format!("-{}-{}", pid, nanos));
+    parent.join(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2975,5 +3104,64 @@ mod tests {
         let mut numbers = Vec::new();
         collect_numbers(root, source_bytes, &mut numbers);
         assert_eq!(numbers, vec!["5", "100", "200"]);
+    }
+
+    #[test]
+    fn should_ignore_external_change_when_disk_matches_snapshot() {
+        let mut buf = Buffer::empty();
+        buf.text = Rope::from_str("hello\n");
+        buf.note_disk_sync("hello\n");
+        assert!(buf.should_ignore_external_change("hello\n"));
+    }
+
+    #[test]
+    fn should_ignore_external_change_when_buffer_matches_disk() {
+        let mut buf = Buffer::empty();
+        buf.text = Rope::from_str("hello\n");
+        assert!(buf.should_ignore_external_change("hello\n"));
+    }
+
+    #[test]
+    fn should_ignore_external_change_immediately_after_self_save() {
+        let mut buf = Buffer::empty();
+        buf.text = Rope::from_str("hello\n");
+        buf.note_self_save("hello\n");
+        assert!(buf.should_ignore_external_change("other\n"));
+    }
+
+    #[test]
+    fn should_not_ignore_external_change_when_disk_differs() {
+        let mut buf = Buffer::empty();
+        buf.text = Rope::from_str("hello\n");
+        buf.note_disk_sync("hello\n");
+        assert!(!buf.should_ignore_external_change("world\n"));
+    }
+
+    #[test]
+    fn save_persists_and_reopen_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.txt");
+        std::fs::write(&path, "old\n").unwrap();
+
+        let mut buf = Buffer::open(&path).unwrap();
+        buf.text = Rope::from_str("new\n");
+        buf.modified = true;
+        buf.save().unwrap();
+
+        let disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(disk, "new\n");
+
+        let reopened = Buffer::open(&path).unwrap();
+        assert_eq!(reopened.text.to_string(), "new\n");
+        assert!(!reopened.modified);
+    }
+
+    #[test]
+    fn should_suppress_post_open_watch_immediately_after_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh.txt");
+        std::fs::write(&path, "hi\n").unwrap();
+        let buf = Buffer::open(&path).unwrap();
+        assert!(buf.should_suppress_post_open_watch());
     }
 }
