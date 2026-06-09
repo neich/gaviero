@@ -478,9 +478,11 @@ pub(super) fn restore_session(app: &mut App) {
     }
 
     for tab in &state.tabs {
-        let path = std::path::Path::new(&tab.path);
+        let path = crate::editor::buffer::Buffer::resolve_editor_path(std::path::Path::new(
+            &tab.path,
+        ));
         if path.exists() {
-            app.open_file(path);
+            app.open_file(&path);
             if let Some(buf) = app.buffers.last_mut() {
                 let max_line = buf.text.len_lines().saturating_sub(1);
                 buf.cursor.line = tab.cursor_line.min(max_line);
@@ -523,7 +525,9 @@ pub(super) fn save_session(app: &App) {
         .iter()
         .filter_map(|buf| {
             buf.path.as_ref().map(|p| TabState {
-                path: p.to_string_lossy().to_string(),
+                path: crate::editor::buffer::Buffer::resolve_editor_path(p)
+                    .to_string_lossy()
+                    .to_string(),
                 cursor_line: buf.cursor.line,
                 cursor_col: buf.cursor.col,
                 scroll_top: buf.scroll.top_line,
