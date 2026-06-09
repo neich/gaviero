@@ -37,6 +37,7 @@ use super::codex_app_server::CodexAppServerSession;
 use super::codex_exec::CodexExecSession;
 use super::cursor::CursorSession;
 use super::ollama::OllamaSession;
+use super::tool_agent::ToolAgentSession;
 use super::{AgentSession, Turn};
 
 /// Inputs the shim needs. Named struct (not positional args) so adding a
@@ -165,6 +166,7 @@ impl ObservedStreamSession {
                 }
                 UnifiedStreamEvent::ToolCallDelta { .. } | UnifiedStreamEvent::ToolCallEnd { .. } => {
                 }
+                UnifiedStreamEvent::PathsModified(_) => {}
                 UnifiedStreamEvent::FileBlock { path, content } => {
                     crate::acp::client::propose_write(
                         &self.write_gate,
@@ -311,6 +313,12 @@ pub fn create_session(args: SessionConstruction) -> Box<dyn AgentSession> {
                 // registry can route them independently and M10 has separate
                 // deletion targets.
                 Box::new(CodexExecSession::new(args))
+            } else if args.profile.provider == "deepseek" {
+                // DeepSeek V4 Pro: in-process API tool-agent harness. Replays
+                // history each turn (no server-side thread) and drives the loop
+                // over the raw DeepSeek HTTP API.
+                // See docs/plans/deepseek_v4_pro_provider.md.
+                Box::new(ToolAgentSession::new(args))
             } else {
                 // M9: Ollama (and future StatelessReplay providers) get a
                 // bounded session that applies compaction before forwarding

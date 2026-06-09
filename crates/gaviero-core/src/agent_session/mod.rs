@@ -51,6 +51,19 @@
 //! `ObservedStreamSession`, which drains the stream and calls the same
 //! observer callbacks Pattern A uses. Used today by `codex-app-server:`.
 //!
+//! ### Pattern C — in-process API tool-agent
+//!
+//! Implement `AgentSession` directly in `agent_session/tool_agent/` over the
+//! [`tool_agent::ApiClient`] trait. The host owns the call→tool→result loop;
+//! tools execute in-process (reads, writes, Bash) and file edits land on the
+//! real tree with post-turn external-change review. Register the model-spec
+//! prefix (`deepseek:` today) in `registry::create_session` for
+//! `ContinuityMode::StatelessReplay`. Drive the observer directly from the
+//! loop (like `ClaudeSession`) — do **not** wrap in `ObservedStreamSession`.
+//! `supports_file_blocks=false`; edits flow only through Write/Edit/MultiEdit
+//! tool calls. Replay history is rebuilt from `Turn.replay_history` each turn
+//! with compaction at the session boundary. Used today by `deepseek:`.
+//!
 //! ### Provider checklist
 //!
 //! 1. Emit `UnifiedStreamEvent::TextDelta` for visible reply text and
@@ -89,6 +102,7 @@ pub mod codex_exec;
 pub mod cursor;
 pub mod ollama;
 pub mod registry;
+pub mod tool_agent;
 
 use std::path::PathBuf;
 use std::pin::Pin;

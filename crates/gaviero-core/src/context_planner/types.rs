@@ -96,6 +96,7 @@ impl ModelSpec {
             "codex-app-server",
             "codex",
             "cursor",
+            "deepseek",
             "claude",
         ] {
             let with_colon = format!("{}:", prefix);
@@ -122,6 +123,7 @@ impl ModelSpec {
             "codex-app-server" => Provider::CodexAppServer,
             "codex" => Provider::Codex,
             "cursor" => Provider::Cursor,
+            "deepseek" => Provider::Deepseek,
             // Bare or claude-prefixed → Claude.
             _ => Provider::Claude,
         }
@@ -140,6 +142,9 @@ pub enum Provider {
     /// promotes it to `NativeResume` via `--resume <chat-id>`).
     Cursor,
     Ollama,
+    /// DeepSeek V4 Pro — in-process API tool-agent (`StatelessReplay`, native
+    /// function-calling). See docs/plans/deepseek_v4_pro_provider.md.
+    Deepseek,
 }
 
 /// Runtime config the factory needs.
@@ -224,6 +229,17 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             // this value to bound replay history size. A future milestone may
             // query the Ollama `/api/show` endpoint for per-model context size.
             max_context_tokens: Some(8_192),
+        },
+        Provider::Deepseek => ProviderProfile {
+            provider: "deepseek".to_string(),
+            model: spec.model.clone(),
+            // Raw DeepSeek HTTP API: the harness replays history each turn
+            // (no server-side thread), and DeepSeek V4 Pro exposes native
+            // function-calling, so the in-process loop drives tool use.
+            continuity_mode: ContinuityMode::StatelessReplay,
+            supports_tool_use: true,
+            supports_native_resume: false,
+            max_context_tokens: Some(128_000),
         },
     }
 }
@@ -536,6 +552,14 @@ mod tests {
         let ollama = build_provider_profile(&ModelSpec::parse("ollama:llama3.1"), &runtime);
         assert_eq!(ollama.continuity_mode, ContinuityMode::StatelessReplay);
         assert!(!ollama.supports_native_resume);
+
+        let deepseek =
+            build_provider_profile(&ModelSpec::parse("deepseek:deepseek-v4-pro"), &runtime);
+        assert_eq!(deepseek.provider, "deepseek");
+        assert_eq!(deepseek.continuity_mode, ContinuityMode::StatelessReplay);
+        assert!(deepseek.supports_tool_use);
+        assert!(!deepseek.supports_native_resume);
+        assert_eq!(deepseek.max_context_tokens, Some(128_000));
 
         let bare = build_provider_profile(&ModelSpec::parse("haiku"), &runtime);
         assert_eq!(bare.continuity_mode, ContinuityMode::NativeResume);

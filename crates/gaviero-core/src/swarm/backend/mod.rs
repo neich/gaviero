@@ -7,11 +7,14 @@
 pub mod claude_code;
 pub mod codex;
 pub mod cursor;
+pub mod deepseek;
 pub mod executor;
 pub mod mock;
 pub mod ollama;
 pub mod runner;
 pub mod shared;
+
+use crate::types::FileScope;
 
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -69,6 +72,9 @@ pub enum UnifiedStreamEvent {
     ToolCallEnd { id: String },
     /// A complete `<file path="...">content</file>` block was detected.
     FileBlock { path: PathBuf, content: String },
+    /// Paths written directly on disk by an in-process tool-agent (Option-B).
+    /// The runner records these for validation without re-writing through the gate.
+    PathsModified(Vec<PathBuf>),
     /// Token usage / cost information.
     Usage(TokenUsage),
     /// Non-fatal error during streaming.
@@ -161,6 +167,8 @@ pub struct CompletionRequest {
     /// When true, sets `CLAUDE_QUIET=1` on Claude subprocess spawns so
     /// global Stop hooks skip machine-consumed turns.
     pub suppress_hooks: bool,
+    /// Owned-path scope for in-process tool-agent backends (swarm work units).
+    pub file_scope: FileScope,
 }
 
 // ── Backend Config ──────────────────────────────────────────────────────────
@@ -182,6 +190,10 @@ pub enum BackendConfig {
     Ollama {
         model: String,
         base_url: Option<String>,
+    },
+    /// In-process API tool-agent harness (`deepseek:` today).
+    Deepseek {
+        model: String,
     },
     Custom {
         command: String,
@@ -207,6 +219,9 @@ pub fn create_backend(config: &BackendConfig) -> Result<Box<dyn AgentBackend>> {
         BackendConfig::Ollama { model, base_url } => {
             let url = base_url.as_deref().unwrap_or("http://localhost:11434");
             Ok(Box::new(ollama::OllamaStreamBackend::new(url, model)))
+        }
+        BackendConfig::Deepseek { model } => {
+            Ok(Box::new(deepseek::DeepseekBackend::new(model)))
         }
         BackendConfig::Custom { command, args } => {
             anyhow::bail!(
@@ -251,6 +266,7 @@ mod tests {
             max_tokens: None,
             auto_approve: true,
             suppress_hooks: true,
+            file_scope: FileScope::default(),
         };
 
         let mut stream = backend.stream_completion(req).await.unwrap();
@@ -294,6 +310,7 @@ mod tests {
             max_tokens: None,
             auto_approve: true,
             suppress_hooks: true,
+            file_scope: FileScope::default(),
         };
 
         let mut stream = backend.stream_completion(req).await.unwrap();
@@ -376,6 +393,12 @@ mod tests {
         };
         let ol_backend = create_backend(&ol).unwrap();
         assert!(ol_backend.name().contains("ollama"));
+
+        let ds = BackendConfig::Deepseek {
+            model: "deepseek-v4-pro".into(),
+        };
+        let ds_backend = create_backend(&ds).unwrap();
+        assert!(ds_backend.name().contains("deepseek"));
 
         // Custom not yet implemented — returns error
         let custom = BackendConfig::Custom {
