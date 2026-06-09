@@ -109,7 +109,7 @@ Useful commands you can type in the chat:
 
 | Command | What it does |
 |---|---|
-| `/model <spec>` | Switch active model (e.g., `claude:sonnet`, `cursor:claude-4-sonnet`) |
+| `/model <spec>` | Switch active model (e.g., `claude:sonnet`, `deepseek:deepseek-v4-pro`, `cursor:claude-4-sonnet`) |
 | `/lite` | Send a minimal-context turn (topology kept; outline, memory, impact dropped) |
 | `/compact` | Trim conversation history while preserving key context |
 | `/clear` | Clear conversation history |
@@ -222,7 +222,7 @@ In coordinated mode, model selection is automatic — Opus plans the task, then 
 | `--output PATH` | Output path for generated plan file (`--coordinated` only) |
 | `--auto-accept` | Skip interactive review |
 | `--max-parallel N` | Parallel agent limit (default: 1) |
-| `--model NAME` | Model spec: `claude:<m>`, `codex:<m>`, `cursor:<m>`, `ollama:<m>`, `local:<m>` (default: `claude:sonnet`) |
+| `--model NAME` | Model spec: `claude:<m>`, `codex:<m>`, `cursor:<m>`, `deepseek:<m>`, `ollama:<m>`, `local:<m>` (default: `claude:sonnet`) |
 | `--namespace NS` | Memory write namespace |
 | `--read-ns NS` | Additional read namespaces (repeatable) |
 | `--no-memory` | Disable memory subsystem for this run |
