@@ -190,6 +190,7 @@ pub(super) fn accept_external_review(app: &mut App) {
         None => return,
     };
     let path = review.proposal.file_path;
+    app.pending_tool_agent_edits.remove(&path);
     for buf in &mut app.buffers {
         if buf
             .path
@@ -213,6 +214,41 @@ pub(super) fn reject_external_review(app: &mut App) {
         None => return,
     };
     let path = review.proposal.file_path;
+
+    // In-process tool-agent edits: revert disk to the pre-turn snapshot.
+    if let Some(pre_turn) = app.pending_tool_agent_edits.remove(&path) {
+        let revert_result = match pre_turn.as_deref() {
+            Some(content) => std::fs::write(&path, content),
+            None => std::fs::remove_file(&path).or_else(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }),
+        };
+        if let Err(e) = revert_result {
+            app.status_message = Some((
+                format!("Failed to revert {}: {e}", path.display()),
+                std::time::Instant::now(),
+            ));
+            return;
+        }
+        for buf in &mut app.buffers {
+            if buf.path.as_deref().is_some_and(|p| {
+                crate::editor::buffer::Buffer::paths_refer_to_same_file(p, &path)
+            }) {
+                let _ = buf.reload();
+                break;
+            }
+        }
+        app.status_message = Some((
+            format!("Reverted agent edit to {}", path.display()),
+            std::time::Instant::now(),
+        ));
+        return;
+    }
+
     let disk_content = review.proposal.proposed_content;
     for buf in &mut app.buffers {
         if buf

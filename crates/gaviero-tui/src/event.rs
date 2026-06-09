@@ -129,6 +129,20 @@ pub enum Event {
         usage: gaviero_core::acp::protocol::TokenUsage,
     },
 
+    /// Accumulated USD cost for an in-process tool-agent turn (DeepSeek).
+    TurnCostUpdate {
+        conv_id: String,
+        cost_usd: f64,
+    },
+
+    /// In-process tool-agent (DeepSeek) finished a turn with on-disk edits.
+    /// The controller opens external-change review for the first touched file
+    /// and stores pre-turn snapshots for revert-on-reject.
+    ToolAgentEditsPending {
+        conv_id: String,
+        edits: Vec<gaviero_core::observer::ToolAgentEdit>,
+    },
+
     /// A4: writer task enqueued a write. Panel counts events for the
     /// "activity" pulse indicator but does not re-query yet.
     MemoryWriteEnqueued {

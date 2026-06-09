@@ -282,6 +282,8 @@ pub struct Conversation {
     /// `Event::TurnTokenUsage`. `None` before the first turn completes,
     /// or for providers that don't surface usage.
     pub last_token_usage: Option<gaviero_core::acp::protocol::TokenUsage>,
+    /// Accumulated API cost for the last turn (`Event::TurnCostUpdate`).
+    pub last_turn_cost_usd: f64,
     /// Gaviero bootstrap measured on the last send (`TurnBootstrapMeasured`):
     /// topology, graph outline, memory block, `@file` refs. Zero on follow-up
     /// turns that skip bootstrap.
@@ -431,6 +433,7 @@ impl AgentChatState {
             pending_persisted_ledger: None,
             transcript_inline_mode: TranscriptInlineMode::Auto,
             last_token_usage: None,
+            last_turn_cost_usd: 0.0,
             last_bootstrap_tokens: 0,
             last_bootstrap_arms: gaviero_core::context_planner::BootstrapArms::none(),
             last_memory_injection_tokens: 0,
@@ -1417,6 +1420,7 @@ impl AgentChatState {
             pending_persisted_ledger: None,
             transcript_inline_mode: TranscriptInlineMode::Auto,
             last_token_usage: None,
+            last_turn_cost_usd: 0.0,
             last_bootstrap_tokens: 0,
             last_bootstrap_arms: gaviero_core::context_planner::BootstrapArms::none(),
             last_memory_injection_tokens: 0,
@@ -2604,6 +2608,7 @@ impl AgentChatState {
                     // refuse the stale id. Default `Auto` preserves that.
                     transcript_inline_mode: TranscriptInlineMode::Auto,
                     last_token_usage: pending_usage,
+                    last_turn_cost_usd: 0.0,
                     last_bootstrap_tokens: 0,
                     last_bootstrap_arms: gaviero_core::context_planner::BootstrapArms::none(),
                     last_memory_injection_tokens: 0,

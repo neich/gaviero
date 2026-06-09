@@ -149,6 +149,12 @@ pub struct App {
     pub write_gate: Arc<Mutex<WriteGatePipeline>>,
     /// Unified diff review state — owns the proposal locally (no lock needed).
     pub diff_review: Option<DiffReviewState>,
+    /// Pre-turn on-disk snapshots for in-process tool-agent edits awaiting
+    /// external-change review. Cleared when the user accepts or reverts.
+    pub pending_tool_agent_edits: std::collections::HashMap<
+        std::path::PathBuf,
+        Option<String>,
+    >,
     /// Batch review state — entered after agent response with deferred writes.
     pub batch_review: Option<BatchReviewState>,
     /// Git changes panel state — populated when cycling to Changes mode via F7.
@@ -388,6 +394,7 @@ impl App {
             preview_line_count: 0,
             write_gate,
             diff_review: None,
+            pending_tool_agent_edits: std::collections::HashMap::new(),
             batch_review: None,
             changes_state: None,
             chat_state: {
