@@ -82,6 +82,14 @@ Example `.gaviero/settings.json`:
     "model": "claude:sonnet",
     "maxTokens": 16384,
     "ollamaBaseUrl": "http://localhost:11434",
+    "availableTools": ["Read", "Glob", "Grep", "Write", "Edit", "MultiEdit", "Bash"],
+    "approvedTools": ["Read", "Glob", "Grep", "Write", "Edit", "MultiEdit"],
+    "permissions": {
+      "bash": {
+        "denylist": ["terraform destroy", "npm publish", "git push --force"],
+        "allowlist": ["cargo check", "cargo test", "git status", "rg "]
+      }
+    },
     "coordinator": {
       "model": "claude:opus"
     }

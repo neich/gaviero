@@ -36,9 +36,13 @@ pub mod settings {
     /// through the Write Gate; opt in per-workspace to enable shell.
     pub const AGENT_AVAILABLE_TOOLS: &str = "agent.availableTools";
     /// Subset of `agent.availableTools` auto-approved without a permission
-    /// prompt (passed via `--allowedTools`). Anything available but not
-    /// approved triggers a `PermissionRequest` that the host must answer.
+    /// prompt (passed via `--allowedTools` for Claude; in-process tool-agent
+    /// backends honor the same list). Anything available but not approved
+    /// triggers a `PermissionRequest` that the host must answer.
     pub const AGENT_APPROVED_TOOLS: &str = "agent.approvedTools";
+    /// Bash permission policy for in-process tool-agent backends (DeepSeek).
+    /// Sub-keys: `denylist`, `allowlist`, `timeoutSecs`, `outputCapBytes`.
+    pub const AGENT_PERMISSIONS_BASH: &str = "agent.permissions.bash";
 
     // Memory settings
     /// The namespace to write memories to.
