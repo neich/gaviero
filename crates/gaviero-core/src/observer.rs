@@ -95,6 +95,10 @@ pub trait AcpObserver: Send + Sync {
     /// Default no-op so observers without a usage display pay nothing.
     fn on_turn_token_usage(&self, _usage: &crate::acp::protocol::TokenUsage) {}
 
+    /// Fired when an Option-B write tool snapshots a path mid-turn so the host
+    /// can stash pre-turn content before the file watcher fires.
+    fn on_tool_agent_edit_captured(&self, _path: &Path, _pre_turn_content: Option<&str>) {}
+
     /// Fired after a successful in-process tool-agent turn that wrote files
     /// to disk (Option B). Carries each touched path and its pre-turn content
     /// (`None` = file did not exist) so the host can open external-change

@@ -135,6 +135,12 @@ pub enum Event {
         cost_usd: f64,
     },
 
+    /// Option-B write tool snapshotted a path mid-turn (before the watcher fires).
+    ToolAgentEditCaptured {
+        path: std::path::PathBuf,
+        pre_turn_content: Option<String>,
+    },
+
     /// In-process tool-agent (DeepSeek) finished a turn with on-disk edits.
     /// The controller opens external-change review for the first touched file
     /// and stores pre-turn snapshots for revert-on-reject.

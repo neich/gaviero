@@ -135,9 +135,14 @@ impl ToolAgentSession {
             additional_roots,
             profile,
             cancel_token,
+            options,
             ..
         } = args;
         let config = resolve_api_config(&workspace_root);
+        let tools = match &options.available_tools {
+            Some(names) if !names.is_empty() => ToolRegistry::from_names(names),
+            _ => ToolRegistry::full_chat(),
+        };
         Self {
             client: Box::new(DeepseekClient::new(config)),
             observer: Arc::from(observer),
@@ -149,7 +154,7 @@ impl ToolAgentSession {
             // Chat has no scope restriction; the swarm passes the work unit's
             // owned_paths in Phase 6.
             scope: FileScope::default(),
-            tools: ToolRegistry::full_chat(),
+            tools,
             limits: agent_loop::LoopLimits::default(),
             profile,
             compaction: CompactionPolicy::default(),

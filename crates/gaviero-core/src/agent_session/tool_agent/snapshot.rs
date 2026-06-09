@@ -35,6 +35,12 @@ impl TurnSnapshot {
         self.originals.iter().map(|(p, c)| (p.clone(), c.clone())).collect()
     }
 
+    /// Pre-turn on-disk content for `path` after the first snapshot capture.
+    /// `None` means the file did not exist; missing paths were never snapshotted.
+    pub fn pre_turn_content(&self, path: &Path) -> Option<Option<String>> {
+        self.originals.get(path).map(|c| c.clone())
+    }
+
     /// Record the pre-write state for `path` if not already captured.
     pub async fn capture_before_write(&mut self, path: &Path) -> Result<()> {
         let key = path.to_path_buf();

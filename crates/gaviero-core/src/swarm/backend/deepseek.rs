@@ -54,16 +54,32 @@ struct StreamBridge {
     tx: mpsc::Sender<Result<UnifiedStreamEvent>>,
 }
 
+impl StreamBridge {
+    /// Observer callbacks run on the tokio runtime thread inside `run_turn`;
+    /// `blocking_send` would panic there, so schedule an async send instead.
+    fn emit(&self, event: Result<UnifiedStreamEvent>) {
+        let tx = self.tx.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let _ = tx.send(event).await;
+                });
+            }
+            Err(_) => {
+                let _ = tx.try_send(event);
+            }
+        }
+    }
+}
+
 impl AcpObserver for StreamBridge {
     fn on_stream_chunk(&self, text: &str) {
-        let _ = self
-            .tx
-            .blocking_send(Ok(UnifiedStreamEvent::TextDelta(text.to_string())));
+        self.emit(Ok(UnifiedStreamEvent::TextDelta(text.to_string())));
     }
 
     fn on_tool_call_started(&self, summary: &str) {
         let name = summary.split_whitespace().next().unwrap_or("tool").to_string();
-        let _ = self.tx.blocking_send(Ok(UnifiedStreamEvent::ToolCallStart {
+        self.emit(Ok(UnifiedStreamEvent::ToolCallStart {
             id: String::new(),
             name,
             args: Value::Null,
@@ -77,7 +93,7 @@ impl AcpObserver for StreamBridge {
     fn on_proposal_deferred(&self, _path: &Path, _old_content: Option<&str>, _new_content: &str) {}
 
     fn on_turn_token_usage(&self, usage: &crate::acp::protocol::TokenUsage) {
-        let _ = self.tx.blocking_send(Ok(UnifiedStreamEvent::Usage(TokenUsage {
+        self.emit(Ok(UnifiedStreamEvent::Usage(TokenUsage {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
             cost_usd: None,
