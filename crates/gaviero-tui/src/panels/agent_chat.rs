@@ -97,6 +97,8 @@ pub enum AutocompleteMode {
     AttachPath,
     /// `$skill` invocation — catalog-backed name completion.
     SkillRef,
+    /// `/model <provider:model>` argument — provider prefix and model names.
+    ModelSpec,
 }
 
 /// Autocomplete state for @file references or /attach path arguments.
@@ -467,12 +469,18 @@ impl AgentChatState {
     }
 
     /// Get model options from provider tooling (cached after first call).
-    fn model_options(&mut self) -> &[String] {
+    pub(crate) fn model_options(&mut self) -> &[String] {
         if self.cli_model_options.is_none() {
             let mut options = gaviero_core::acp::session::discover_model_options();
             for cursor_model in gaviero_core::acp::session::discover_cursor_model_options() {
                 if !options.iter().any(|opt| opt == &cursor_model) {
                     options.push(cursor_model);
+                }
+            }
+            for deepseek_model in gaviero_core::swarm::backend::shared::DEEPSEEK_API_MODELS {
+                let spec = format!("deepseek:{deepseek_model}");
+                if !options.iter().any(|opt| opt == &spec) {
+                    options.push(spec);
                 }
             }
             let ollama_example = "ollama:qwen2.5-coder:7b".to_string();
@@ -764,8 +772,14 @@ impl AgentChatState {
                     ));
                 } else {
                     let model = normalize_model_spec(arg);
-                    self.conversations[self.active_conv].model_override = Some(model.clone());
-                    self.add_system_message(&format!("Model set to: {}", model));
+                    if let Err(err) =
+                        gaviero_core::swarm::backend::shared::validate_model_spec(&model)
+                    {
+                        self.add_system_message(&format!("Invalid model spec: {err:#}"));
+                    } else {
+                        self.conversations[self.active_conv].model_override = Some(model.clone());
+                        self.add_system_message(&format!("Model set to: {}", model));
+                    }
                 }
                 self.text_input.text.clear();
                 self.text_input.cursor = 0;
@@ -2083,6 +2097,18 @@ impl AgentChatState {
         let text = &self.text_input.text;
         let before_cursor = &text[..byte_pos];
 
+        // ── /model <provider:model> completion ───────────────────────────
+        if let Some(rest) = before_cursor.strip_prefix("/model ") {
+            if !rest.contains('\n') {
+                self.autocomplete.active = true;
+                self.autocomplete.mode = AutocompleteMode::ModelSpec;
+                self.autocomplete.at_pos = "/model ".len();
+                self.autocomplete.query = rest.to_string();
+                self.autocomplete.selected = 0;
+                return;
+            }
+        }
+
         // ── /attach <path> completion ────────────────────────────────────
         //
         // Only kicks in on a single-line input starting with `/attach `
@@ -2190,9 +2216,27 @@ impl AgentChatState {
         }
     }
 
+    /// Update `/model` autocomplete matches from discovered provider specs.
+    pub fn update_model_autocomplete_matches(&mut self, discovered: &[String]) {
+        if !self.autocomplete.active || self.autocomplete.mode != AutocompleteMode::ModelSpec {
+            return;
+        }
+        self.autocomplete.matches =
+            gaviero_core::swarm::backend::shared::model_spec_completions(
+                &self.autocomplete.query,
+                discovered,
+            );
+        if self.autocomplete.selected >= self.autocomplete.matches.len() {
+            self.autocomplete.selected = 0;
+        }
+    }
+
     /// Update autocomplete matches from a list of workspace file paths.
     pub fn update_autocomplete_matches(&mut self, all_files: &[String]) {
-        if !self.autocomplete.active || self.autocomplete.mode == AutocompleteMode::SkillRef {
+        if !self.autocomplete.active
+            || self.autocomplete.mode == AutocompleteMode::SkillRef
+            || self.autocomplete.mode == AutocompleteMode::ModelSpec
+        {
             return;
         }
         let query_lower = self.autocomplete.query.to_lowercase();
@@ -2247,6 +2291,9 @@ impl AgentChatState {
             AutocompleteMode::SkillRef => {
                 self.text_input.text.push_str(&path);
                 self.text_input.text.push(' ');
+            }
+            AutocompleteMode::ModelSpec => {
+                self.text_input.text.push_str(&path);
             }
         }
         self.text_input.cursor = self.text_input.char_count();
@@ -3357,7 +3404,9 @@ impl AgentChatState {
             // bare paths so they line up with what gets inserted on accept.
             let display = match self.autocomplete.mode {
                 AutocompleteMode::FileRef => format!(" @{}", path),
-                AutocompleteMode::AttachPath => format!(" {}", path),
+                AutocompleteMode::AttachPath | AutocompleteMode::ModelSpec => {
+                    format!(" {}", path)
+                }
                 AutocompleteMode::SkillRef => path.clone(),
             };
             for (ci, ch) in display.chars().enumerate() {
@@ -3468,6 +3517,16 @@ fn normalize_model_spec(arg: &str) -> String {
     }
     if gaviero_core::swarm::backend::shared::validate_model_spec(trimmed).is_ok() {
         return trimmed.to_string();
+    }
+    // Already provider-prefixed but invalid (e.g. `deepseek:deepseek-v4`) —
+    // return verbatim so validation surfaces the real error instead of
+    // rewriting to `claude:deepseek:…`.
+    if let Some((prefix, _)) = trimmed.split_once(':') {
+        if gaviero_core::swarm::backend::shared::SUPPORTED_PROVIDER_PREFIXES
+            .contains(&prefix)
+        {
+            return trimmed.to_string();
+        }
     }
     // Back-compat aliases for the legacy bare/dashed shorthand.
     let canonical = match trimmed {
@@ -3926,7 +3985,7 @@ mod tests {
             "ollama:qwen2.5-coder:7b",
             "local:qwen2.5-coder:14b",
             "deepseek:deepseek-v4-pro",
-            "deepseek:deepseek-v4",
+            "deepseek:deepseek-v4-flash",
         ] {
             assert_eq!(normalize_model_spec(spec), spec);
         }
@@ -3963,9 +4022,26 @@ mod tests {
     }
 
     #[test]
-    fn process_slash_command_model_preserves_deepseek_prefix_verbatim() {
+    fn process_slash_command_model_rejects_unknown_deepseek_model() {
         let mut state = AgentChatState::new();
         state.text_input.text = "/model deepseek:deepseek-v4".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+
+        let handled = state.process_slash_command();
+
+        assert!(handled);
+        assert!(state.conversations[state.active_conv].model_override.is_none());
+        let last = state.conversations[state.active_conv]
+            .messages
+            .last()
+            .expect("system error message");
+        assert!(last.content.contains("Invalid model spec"));
+    }
+
+    #[test]
+    fn process_slash_command_model_accepts_deepseek_v4_pro() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "/model deepseek:deepseek-v4-pro".to_string();
         state.text_input.cursor = state.text_input.text.len();
 
         let handled = state.process_slash_command();
@@ -3975,7 +4051,7 @@ mod tests {
             state.conversations[state.active_conv]
                 .model_override
                 .as_deref(),
-            Some("deepseek:deepseek-v4")
+            Some("deepseek:deepseek-v4-pro")
         );
     }
 
@@ -4248,6 +4324,33 @@ mod tests {
                 .session_ledger
                 .is_none()
         );
+    }
+
+    #[test]
+    fn update_autocomplete_recognises_model_argument() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "/model deepseek:deep".to_string();
+        state.text_input.cursor = state.text_input.text.chars().count();
+        state.update_autocomplete();
+
+        assert!(state.autocomplete.active);
+        assert_eq!(state.autocomplete.mode, AutocompleteMode::ModelSpec);
+        assert_eq!(state.autocomplete.query, "deepseek:deep");
+        assert_eq!(state.autocomplete.at_pos, "/model ".len());
+    }
+
+    #[test]
+    fn update_autocomplete_model_accept_replaces_argument_only() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "/model deepseek:deep".to_string();
+        state.text_input.cursor = state.text_input.text.chars().count();
+        state.update_autocomplete();
+        state.autocomplete.matches = vec!["deepseek:deepseek-v4-pro".to_string()];
+        state.autocomplete.selected = 0;
+        state.accept_autocomplete();
+
+        assert_eq!(state.text_input.text, "/model deepseek:deepseek-v4-pro");
+        assert!(!state.autocomplete.active);
     }
 
     #[test]
