@@ -131,7 +131,6 @@ impl ToolAgentSession {
         let SessionConstruction {
             write_gate,
             observer,
-            model,
             workspace_root,
             additional_roots,
             profile,
@@ -142,7 +141,9 @@ impl ToolAgentSession {
         Self {
             client: Box::new(DeepseekClient::new(config)),
             observer: Arc::from(observer),
-            model,
+            // API model id is unprefixed (`deepseek-v4-pro`); `args.model` is
+            // the user-facing `deepseek:…` spec.
+            model: profile.model.clone(),
             workspace_root: workspace_root.clone(),
             additional_roots,
             // Chat has no scope restriction; the swarm passes the work unit's

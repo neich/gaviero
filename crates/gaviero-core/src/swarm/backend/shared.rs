@@ -7,8 +7,11 @@ use super::{AgentBackend, BackendConfig, Capabilities, CompletionRequest, create
 
 const HISTORY_TRUNCATION_CHARS: usize = 2000;
 const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
-const SUPPORTED_PROVIDER_PREFIXES: &[&str] =
+pub const SUPPORTED_PROVIDER_PREFIXES: &[&str] =
     &["claude", "codex", "cursor", "ollama", "local", "deepseek"];
+
+/// DeepSeek HTTP API model ids (without the `deepseek:` provider prefix).
+pub const DEEPSEEK_API_MODELS: &[&str] = &["deepseek-v4-pro", "deepseek-v4-flash"];
 
 pub fn build_enriched_prompt(
     prompt: &str,
@@ -205,9 +208,22 @@ pub fn validate_model_spec(model_spec: &str) -> Result<()> {
     };
 
     match prefix {
-        "ollama" | "local" | "claude" | "codex" | "cursor" | "deepseek" => {
+        "ollama" | "local" | "claude" | "codex" | "cursor" => {
             if remainder.trim().is_empty() {
                 anyhow::bail!("model spec '{}' is missing a model name", trimmed);
+            }
+        }
+        "deepseek" => {
+            let model = remainder.trim();
+            if model.is_empty() {
+                anyhow::bail!("model spec '{}' is missing a model name", trimmed);
+            }
+            if !DEEPSEEK_API_MODELS.contains(&model) {
+                anyhow::bail!(
+                    "unsupported DeepSeek model '{}'; supported models: {}",
+                    model,
+                    DEEPSEEK_API_MODELS.join(", ")
+                );
             }
         }
         _ => {
@@ -220,6 +236,63 @@ pub fn validate_model_spec(model_spec: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Tab-completion candidates for `/model <spec>`.
+///
+/// When `partial` contains `:`, completes model names for the typed provider
+/// (static list for DeepSeek; `discovered` for Claude/Cursor/etc.). Otherwise
+/// completes provider prefixes and any matching entries from `discovered`.
+pub fn model_spec_completions(partial: &str, discovered: &[String]) -> Vec<String> {
+    let partial = partial.trim();
+    let partial_lower = partial.to_lowercase();
+
+    if let Some((provider, model_part)) = partial.split_once(':') {
+        let provider_lower = provider.to_lowercase();
+        let model_part_lower = model_part.to_lowercase();
+        let mut candidates = Vec::new();
+
+        if provider_lower == "deepseek" {
+            for model in DEEPSEEK_API_MODELS {
+                if model_part.is_empty() || model.to_lowercase().starts_with(&model_part_lower) {
+                    candidates.push(format!("deepseek:{model}"));
+                }
+            }
+        } else {
+            let prefix = format!("{provider}:");
+            for spec in discovered {
+                if !spec.to_lowercase().starts_with(&prefix.to_lowercase()) {
+                    continue;
+                }
+                let model = spec.strip_prefix(&prefix).unwrap_or("");
+                if model_part.is_empty() || model.to_lowercase().starts_with(&model_part_lower) {
+                    candidates.push(spec.clone());
+                }
+            }
+        }
+
+        candidates.sort();
+        candidates.dedup();
+        candidates.truncate(10);
+        return candidates;
+    }
+
+    let mut out: Vec<String> = SUPPORTED_PROVIDER_PREFIXES
+        .iter()
+        .filter(|p| partial.is_empty() || p.starts_with(&partial_lower))
+        .map(|p| format!("{p}:"))
+        .collect();
+
+    for spec in discovered {
+        if partial.is_empty() || spec.to_lowercase().starts_with(&partial_lower) {
+            out.push(spec.clone());
+        }
+    }
+
+    out.sort();
+    out.dedup();
+    out.truncate(10);
+    out
 }
 
 pub fn create_backend_for_model(
@@ -523,6 +596,7 @@ mod tests {
             "cursor:gpt-5.2",
             "cursor:claude-4.6-opus-high-thinking",
             "deepseek:deepseek-v4-pro",
+            "deepseek:deepseek-v4-flash",
         ] {
             validate_model_spec(spec).unwrap();
         }
@@ -595,6 +669,26 @@ mod tests {
                 "expected `provider prefix` complaint for `{spec}`, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn test_validate_model_spec_rejects_unknown_deepseek_models() {
+        let err = validate_model_spec("deepseek:deepseek-v4").unwrap_err();
+        assert!(err.to_string().contains("unsupported DeepSeek model"));
+        validate_model_spec("deepseek:deepseek-v4-flash").unwrap();
+    }
+
+    #[test]
+    fn test_model_spec_completions_provider_prefix() {
+        let hits = model_spec_completions("dee", &[]);
+        assert!(hits.iter().any(|h| h == "deepseek:"));
+    }
+
+    #[test]
+    fn test_model_spec_completions_deepseek_models() {
+        let hits = model_spec_completions("deepseek:deep", &[]);
+        assert!(hits.contains(&"deepseek:deepseek-v4-pro".to_string()));
+        assert!(hits.contains(&"deepseek:deepseek-v4-flash".to_string()));
     }
 
     // ── Tagged-prompt format tests ────────────────────────────────

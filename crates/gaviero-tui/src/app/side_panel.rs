@@ -1583,6 +1583,15 @@ pub(super) fn refresh_chat_autocomplete(app: &mut App) {
         return;
     }
 
+    if app.chat_state.autocomplete.mode
+        == crate::panels::agent_chat::AutocompleteMode::ModelSpec
+    {
+        let discovered = app.chat_state.model_options().to_vec();
+        app.chat_state
+            .update_model_autocomplete_matches(&discovered);
+        return;
+    }
+
     // `/attach` mode supports absolute and `~/`-rooted filesystem listings
     // so the user can attach screenshots / tempfiles outside the workspace
     // without typing the full path. Plain (relative) partials fall through
