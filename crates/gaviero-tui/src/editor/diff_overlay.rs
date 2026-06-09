@@ -13,7 +13,7 @@ use crate::theme::Theme;
 pub enum DiffSource {
     /// From the AI agent (ACP pipeline) — user can accept/reject/finalize.
     Acp,
-    /// From an external tool or editor — read-only display, dismiss only.
+    /// From an external tool or editor — accept disk version or keep editor copy.
     External,
 }
 
@@ -121,7 +121,11 @@ impl DiffReviewState {
 
     /// Whether this diff allows interactive accept/reject.
     pub fn is_interactive(&self) -> bool {
-        self.source == DiffSource::Acp
+        matches!(self.source, DiffSource::Acp | DiffSource::External)
+    }
+
+    pub fn is_external(&self) -> bool {
+        self.source == DiffSource::External
     }
 }
 
