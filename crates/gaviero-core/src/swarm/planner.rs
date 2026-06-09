@@ -89,6 +89,7 @@ async fn try_plan(
             max_tokens: None,
             auto_approve: true,
             suppress_hooks: true,
+            file_scope: crate::types::FileScope::default(),
         },
         None,
     )

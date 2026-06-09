@@ -59,6 +59,7 @@ impl ConsolidationLlm for BackendConsolidationLlm {
             max_tokens: None,
             auto_approve: true,
             suppress_hooks: true,
+            file_scope: crate::types::FileScope::default(),
         };
         let outcome = executor::complete_to_text(self.backend.as_ref(), request, None).await?;
         Ok(outcome.text)

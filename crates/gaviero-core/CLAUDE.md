@@ -21,7 +21,7 @@ Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presenc
 | `memory` | Multi-DB ONNX-embedding store + three-cadence consolidation. |
 | `mcp` | In-process MCP server (read-only tools for subprocess agents). |
 | `acp` | Legacy direct Claude subprocess transport (one-shot / persistent). |
-| `agent_session` | Backend-neutral session transport: `claude`, `codex_exec`, `codex_app_server`, `cursor`, `ollama`, `registry`. |
+| `agent_session` | Backend-neutral session transport: `claude`, `codex_exec`, `codex_app_server`, `cursor`, `ollama`, `tool_agent` (DeepSeek + future API providers), `registry`. |
 | `context_planner` | Pre-prompt context assembly (graph + memory + chat history + ledger + compaction). |
 | `write_gate` | File-modification boundary; diff review; observer callbacks. |
 | `validation_gate` | Post-write structural + semantic validation (`cargo_gate`, `tree_sitter_gate`). |
@@ -50,7 +50,7 @@ Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presenc
 
 **MCP** ([`mcp/`](src/mcp)) — in-process server exposing three read-only tools to subprocess coding agents: `memory_search`, `blast_radius`, `node_doc` ([`tools.rs`](src/mcp/tools.rs)). Listens on `<workspace>/.gaviero/mcp.sock`; subprocess agents reach it through the `gaviero-mcp-shim` binary. [`config_synth.rs`](src/mcp/config_synth.rs) writes `.mcp.json` (Claude Code), `.codex/config.toml` (Codex), and `cursor.json` per-worktree configs that point at the shim. [`external_memory.rs`](src/mcp/external_memory.rs) detects and disables competing memory MCP servers in agent config with consent. [`observer.rs`](src/mcp/observer.rs) surfaces tool-call events to the host for the TUI audit panel. **Read-only by construction.**
 
-**Agent session** ([`agent_session/`](src/agent_session)) — backend-neutral transport. Codex is dual-mode: [`codex_exec.rs`](src/agent_session/codex_exec.rs) for one-shot exec mode, [`codex_app_server.rs`](src/agent_session/codex_app_server.rs) for persistent app-server mode. [`cursor.rs`](src/agent_session/cursor.rs) wraps the Cursor CLI (native resume mode). [`registry.rs`](src/agent_session/registry.rs) routes by model-spec prefix.
+**Agent session** ([`agent_session/`](src/agent_session)) — backend-neutral transport. Codex is dual-mode: [`codex_exec.rs`](src/agent_session/codex_exec.rs) for one-shot exec mode, [`codex_app_server.rs`](src/agent_session/codex_app_server.rs) for persistent app-server mode. [`cursor.rs`](src/agent_session/cursor.rs) wraps the Cursor CLI (native resume mode). [`tool_agent/`](src/agent_session/tool_agent) is the in-process API harness (`deepseek:` v1): SSE client, multi-round tool loop, Option-B writes, Bash + permission policy, cross-turn replay. [`registry.rs`](src/agent_session/registry.rs) routes by model-spec prefix.
 
 **ACP** ([`acp/`](src/acp)) — legacy direct Claude subprocess path: session factory, argv/tempfile prompt spill (`ARGV_THRESHOLD` in [`session.rs`](src/acp/session.rs)), streaming file-block extraction ([`protocol.rs`](src/acp/protocol.rs)). New code paths use `agent_session::claude` instead; the legacy path remains until parity is reached.
 

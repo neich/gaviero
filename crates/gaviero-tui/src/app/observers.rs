@@ -187,6 +187,20 @@ impl AcpObserver for TuiAcpObserver {
             usage: usage.clone(),
         });
     }
+
+    fn on_turn_cost_usd(&self, cost: f64) {
+        let _ = self.tx.send(Event::TurnCostUpdate {
+            conv_id: self.conv_id.clone(),
+            cost_usd: cost,
+        });
+    }
+
+    fn on_tool_agent_edits(&self, edits: &[gaviero_core::observer::ToolAgentEdit]) {
+        let _ = self.tx.send(Event::ToolAgentEditsPending {
+            conv_id: self.conv_id.clone(),
+            edits: edits.to_vec(),
+        });
+    }
 }
 
 /// A4: forwards `MemoryObserver` callbacks from the writer task to the

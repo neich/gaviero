@@ -68,6 +68,8 @@ rmcp = { version = "1.5", default-features = false, features = ["server", "macro
 schemars = "1.2"
 toml = "0.8"
 chrono = "0.4.44"
+regex = "1"
+walkdir = "2"
 
 [dev-dependencies]
 wiremock = "0.6"

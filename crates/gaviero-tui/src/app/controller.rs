@@ -712,6 +712,20 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 );
             }
         }
+        Event::TurnCostUpdate { conv_id, cost_usd } => {
+            if let Some(idx) = app.chat_state.find_conv_idx(&conv_id) {
+                app.chat_state.conversations[idx].last_turn_cost_usd = cost_usd;
+            }
+        }
+        Event::ToolAgentEditsPending { conv_id: _, edits } => {
+            for edit in &edits {
+                app.pending_tool_agent_edits
+                    .insert(edit.path.clone(), edit.pre_turn_content.clone());
+            }
+            if let Some(first) = edits.first() {
+                super::editing::open_tool_agent_edit_review(app, &first.path);
+            }
+        }
         Event::AcpTaskCompleted { conv_id, proposals } => {
             tracing::info!(
                 "ACP task completed for conv {} with {} proposals",

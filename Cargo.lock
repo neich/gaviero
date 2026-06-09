@@ -1197,6 +1197,7 @@ dependencies = [
  "ort",
  "petgraph",
  "portable-pty",
+ "regex",
  "reqwest",
  "rmcp",
  "ropey",
@@ -1232,6 +1233,7 @@ dependencies = [
  "tree-sitter-typescript",
  "tree-sitter-yaml",
  "vt100",
+ "walkdir",
  "wiremock",
  "zstd",
 ]

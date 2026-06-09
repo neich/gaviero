@@ -626,7 +626,13 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
     } else {
         format!("{}{}", approx, pressure.tokens)
     };
-    let model_info = format!("{}|{} ctx:{}", model, effort, ctx_size);
+    let turn_cost = app.chat_state.active_conversation().last_turn_cost_usd;
+    let cost_suffix = if turn_cost > 0.0 {
+        format!(" ${turn_cost:.4}")
+    } else {
+        String::new()
+    };
+    let model_info = format!("{}|{} ctx:{}{}", model, effort, ctx_size, cost_suffix);
 
     let current_buffer = if app.focus == Focus::Editor {
         app.buffers.get(app.active_buffer)

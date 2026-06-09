@@ -1327,6 +1327,58 @@ pub(super) fn goto_next_search_result(app: &mut App) {
     ));
 }
 
+/// Open external-change review for an in-process tool-agent edit (Option B).
+pub(super) fn open_tool_agent_edit_review(app: &mut App, path: &Path) {
+    if app.diff_review.is_some() {
+        return;
+    }
+
+    let read_path = path.to_path_buf();
+    let new_content = match std::fs::read_to_string(&read_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let old_content = if let Some(buf_idx) = app.buffers.iter().position(|b| {
+        b.path
+            .as_deref()
+            .is_some_and(|p| crate::editor::buffer::Buffer::paths_refer_to_same_file(p, path))
+    }) {
+        app.buffers[buf_idx].text.to_string()
+    } else {
+        app.pending_tool_agent_edits
+            .get(path)
+            .and_then(|c| c.clone())
+            .unwrap_or_default()
+    };
+
+    if old_content == new_content {
+        return;
+    }
+
+    let proposal = gaviero_core::write_gate::WriteGatePipeline::build_proposal(
+        0,
+        "tool-agent",
+        None,
+        &read_path,
+        &old_content,
+        &new_content,
+    );
+
+    if let Some(buf_idx) = app.buffers.iter().position(|b| {
+        b.path
+            .as_deref()
+            .is_some_and(|p| crate::editor::buffer::Buffer::paths_refer_to_same_file(p, path))
+    }) {
+        app.active_buffer = buf_idx;
+    }
+    app.focus = crate::app::Focus::Editor;
+    app.diff_review = Some(crate::editor::diff_overlay::DiffReviewState::new(
+        proposal,
+        crate::editor::diff_overlay::DiffSource::External,
+    ));
+}
+
 pub(super) fn handle_file_changed(app: &mut App, path: &Path) {
     if app.diff_review.is_some() {
         return;
