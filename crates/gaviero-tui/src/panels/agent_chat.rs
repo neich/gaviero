@@ -758,8 +758,8 @@ impl AgentChatState {
                     };
                     self.add_system_message(&format!(
                         "Current model: {}\nAvailable: {}\nUsage: /model <provider:model>\n\
-                         Specs require a provider prefix: `claude:`, `codex:`, `ollama:`, \
-                         or `local:`.",
+                         Specs require a provider prefix: `claude:`, `codex:`, `cursor:`, \
+                         `deepseek:`, `ollama:`, or `local:`.",
                         current, list
                     ));
                 } else {
@@ -3457,8 +3457,8 @@ fn words_to_tokens(words: usize) -> usize {
 
 /// Normalize a user-typed model spec to canonical `provider:model` form.
 ///
-/// Already-prefixed specs (`claude:`, `codex:`, `ollama:`, `local:`) pass
-/// through unchanged. Bare names are auto-prefixed with `claude:` so old
+/// Specs that pass [`gaviero_core::swarm::backend::shared::validate_model_spec`]
+/// are stored verbatim. Bare names are auto-prefixed with `claude:` so old
 /// muscle memory (`/model opus`) keeps working, but the stored value is
 /// always the canonical form.
 fn normalize_model_spec(arg: &str) -> String {
@@ -3466,12 +3466,8 @@ fn normalize_model_spec(arg: &str) -> String {
     if trimmed.is_empty() {
         return trimmed.to_string();
     }
-    if let Some((prefix, _)) = trimmed.split_once(':') {
-        // Only treat known providers as "already prefixed"; otherwise the
-        // colon is part of the model name (e.g. ollama-style tags).
-        if matches!(prefix, "claude" | "codex" | "cursor" | "ollama" | "local") {
-            return trimmed.to_string();
-        }
+    if gaviero_core::swarm::backend::shared::validate_model_spec(trimmed).is_ok() {
+        return trimmed.to_string();
     }
     // Back-compat aliases for the legacy bare/dashed shorthand.
     let canonical = match trimmed {
@@ -3929,6 +3925,8 @@ mod tests {
             "cursor:claude-4.6-opus-high-thinking",
             "ollama:qwen2.5-coder:7b",
             "local:qwen2.5-coder:14b",
+            "deepseek:deepseek-v4-pro",
+            "deepseek:deepseek-v4",
         ] {
             assert_eq!(normalize_model_spec(spec), spec);
         }
@@ -3965,12 +3963,28 @@ mod tests {
     }
 
     #[test]
+    fn process_slash_command_model_preserves_deepseek_prefix_verbatim() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "/model deepseek:deepseek-v4".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+
+        let handled = state.process_slash_command();
+
+        assert!(handled);
+        assert_eq!(
+            state.conversations[state.active_conv]
+                .model_override
+                .as_deref(),
+            Some("deepseek:deepseek-v4")
+        );
+    }
+
+    #[test]
     fn process_slash_command_model_preserves_cursor_prefix_verbatim() {
         // Regression: `/model cursor:composer-2.5` previously fell through
         // `normalize_model_spec`'s unknown-prefix branch and was stored
-        // as `claude:cursor:composer-2.5`. Pin the canonical-prefix
-        // pass-through so any future provider added to the chat input
-        // path must also extend the `matches!` guard above.
+        // as `claude:cursor:composer-2.5`. Pass-through now delegates to
+        // core's `validate_model_spec` so new providers need no TUI guard.
         let mut state = AgentChatState::new();
         state.text_input.text = "/model cursor:composer-2.5".to_string();
         state.text_input.cursor = state.text_input.text.len();
