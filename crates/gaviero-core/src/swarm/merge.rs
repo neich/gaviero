@@ -212,6 +212,7 @@ async fn resolve_single_file(
             max_tokens: None,
             auto_approve: true,
             suppress_hooks: true,
+            file_scope: crate::types::FileScope::default(),
         },
         None,
     )

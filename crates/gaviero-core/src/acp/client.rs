@@ -152,6 +152,7 @@ impl AcpPipeline {
                 max_tokens: Some(self.options.max_tokens),
                 auto_approve: self.options.auto_approve,
                 suppress_hooks: false,
+                file_scope: crate::types::FileScope::default(),
             };
             executor::complete_to_write_gate(
                 &*backend,

@@ -376,6 +376,7 @@ mod tests {
             max_tokens: None,
             auto_approve: true,
             suppress_hooks: true,
+            file_scope: crate::types::FileScope::default(),
         };
 
         let mut stream = backend.stream_completion(req).await.unwrap();
@@ -417,6 +418,7 @@ mod tests {
             max_tokens: None,
             auto_approve: true,
             suppress_hooks: true,
+            file_scope: crate::types::FileScope::default(),
         };
 
         let result = backend.stream_completion(req).await;
@@ -485,6 +487,7 @@ mod tests {
             max_tokens: None,
             auto_approve: true,
             suppress_hooks: true,
+            file_scope: crate::types::FileScope::default(),
         };
 
         let mut stream = backend.stream_completion(req).await.unwrap();

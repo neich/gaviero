@@ -243,6 +243,7 @@ pub async fn run_backend(
             max_tokens: None,
             auto_approve: true,
             suppress_hooks: true,
+            file_scope: work_unit.scope.clone(),
         };
 
         // M0 instrumentation: per-attempt dispatch metrics for swarm baselines.
@@ -280,6 +281,7 @@ pub async fn run_backend(
         let mut error_msg = String::new();
         let mut in_thinking = false;
         let mut read_count: usize = 0;
+        let mut turn_cost_usd = 0.0_f64;
 
         while let Some(event_result) = stream.next().await {
             let event = match event_result {
@@ -318,6 +320,9 @@ pub async fn run_backend(
                 }
                 UnifiedStreamEvent::ToolCallDelta { .. } => {}
                 UnifiedStreamEvent::ToolCallEnd { .. } => {}
+                UnifiedStreamEvent::PathsModified(paths) => {
+                    attempt_modified.extend(paths);
+                }
                 UnifiedStreamEvent::FileBlock { path, content } => {
                     match propose_write(
                         &agent_id,
@@ -344,6 +349,9 @@ pub async fn run_backend(
                     }
                 }
                 UnifiedStreamEvent::Usage(usage) => {
+                    if let Some(c) = usage.cost_usd {
+                        turn_cost_usd += c;
+                    }
                     // M0 instrumentation: log provider-reported token usage.
                     tracing::info!(
                         target: "turn_metrics",
@@ -393,7 +401,7 @@ pub async fn run_backend(
                 } else {
                     Some(full_text.clone())
                 },
-                cost_usd: 0.0,
+                cost_usd: turn_cost_usd,
             });
         }
 
@@ -461,7 +469,7 @@ pub async fn run_backend(
                         } else {
                             Some(full_text.clone())
                         },
-                        cost_usd: 0.0,
+                        cost_usd: turn_cost_usd,
                     });
                 }
             }
@@ -479,7 +487,7 @@ pub async fn run_backend(
             } else {
                 Some(full_text)
             },
-            cost_usd: 0.0,
+            cost_usd: turn_cost_usd,
         });
     }
 

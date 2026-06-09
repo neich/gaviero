@@ -57,6 +57,8 @@ pub enum ResolvedBackend {
     Cursor { model: String },
     /// Route to Ollama local model.
     Ollama { model: String, base_url: String },
+    /// Route to the in-process DeepSeek tool-agent harness.
+    Deepseek { model: String },
     /// Blocked — cannot dispatch (privacy constraint, unavailable backend).
     Blocked { reason: String },
 }
@@ -114,6 +116,10 @@ impl TierRouter {
                 let model_spec = format!("ollama:{}", model);
                 shared::create_backend_for_model(&model_spec, Some(&base_url))
                     .map_err(|e| e.to_string())
+            }
+            ResolvedBackend::Deepseek { model } => {
+                let model_spec = format!("deepseek:{}", model);
+                shared::create_backend_for_model(&model_spec, None).map_err(|e| e.to_string())
             }
             ResolvedBackend::Blocked { reason } => Err(reason),
         }
@@ -181,6 +187,13 @@ impl TierRouter {
         if shared::is_cursor_model(model) {
             let resolved_model = model.strip_prefix("cursor:").unwrap_or(model).to_string();
             return ResolvedBackend::Cursor {
+                model: resolved_model,
+            };
+        }
+
+        if shared::is_deepseek_model(model) {
+            let resolved_model = model.strip_prefix("deepseek:").unwrap_or(model).to_string();
+            return ResolvedBackend::Deepseek {
                 model: resolved_model,
             };
         }
@@ -256,6 +269,12 @@ fn api_backend_for_spec(model_spec: &str) -> ResolvedBackend {
             .unwrap_or(model_spec)
             .to_string();
         ResolvedBackend::Cursor { model: stripped }
+    } else if shared::is_deepseek_model(model_spec) {
+        let stripped = model_spec
+            .strip_prefix("deepseek:")
+            .unwrap_or(model_spec)
+            .to_string();
+        ResolvedBackend::Deepseek { model: stripped }
     } else {
         ResolvedBackend::Claude {
             model: model_spec.to_string(),
@@ -280,6 +299,12 @@ pub fn validate_privacy(unit: &WorkUnit) -> Result<(), String> {
             if shared::is_cursor_model(model) {
                 return Err(format!(
                     "unit '{}': LocalOnly privacy with Cursor API model override '{}'",
+                    unit.id, model
+                ));
+            }
+            if shared::is_deepseek_model(model) {
+                return Err(format!(
+                    "unit '{}': LocalOnly privacy with DeepSeek API model override '{}'",
                     unit.id, model
                 ));
             }
@@ -446,6 +471,50 @@ mod tests {
     }
 
     #[test]
+    fn test_deepseek_model_override_routes_to_deepseek_backend() {
+        let router = TierRouter::new(TierConfig::default(), false);
+        let unit = test_unit(
+            ModelTier::Cheap,
+            PrivacyLevel::Public,
+            Some("deepseek:deepseek-v4-pro"),
+        );
+        assert_eq!(
+            router.resolve(&unit),
+            ResolvedBackend::Deepseek {
+                model: "deepseek-v4-pro".into()
+            }
+        );
+    }
+
+    #[test]
+    fn test_deepseek_blocked_under_local_only() {
+        let router = TierRouter::new(TierConfig::default(), true);
+        let unit = test_unit(
+            ModelTier::Cheap,
+            PrivacyLevel::LocalOnly,
+            Some("deepseek:deepseek-v4-pro"),
+        );
+        assert!(matches!(
+            router.resolve(&unit),
+            ResolvedBackend::Blocked { .. }
+        ));
+    }
+
+    #[test]
+    fn test_cheap_tier_routes_to_deepseek_when_configured() {
+        let mut config = TierConfig::default();
+        config.cheap_model = "deepseek:deepseek-v4-pro".into();
+        let router = TierRouter::new(config, false);
+        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
+        assert_eq!(
+            router.resolve(&unit),
+            ResolvedBackend::Deepseek {
+                model: "deepseek-v4-pro".into()
+            }
+        );
+    }
+
+    #[test]
     fn test_cursor_model_override_routes_to_cursor_backend() {
         let router = TierRouter::new(TierConfig::default(), false);
         let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, Some("cursor:auto"));
@@ -542,6 +611,16 @@ mod tests {
         let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
         let backend = router.resolve_backend(&unit).unwrap();
         assert!(backend.name().contains("ollama"));
+
+        // Deepseek override → deepseek backend
+        let router = TierRouter::new(TierConfig::default(), false);
+        let unit = test_unit(
+            ModelTier::Cheap,
+            PrivacyLevel::Public,
+            Some("deepseek:deepseek-v4-pro"),
+        );
+        let backend = router.resolve_backend(&unit).unwrap();
+        assert!(backend.name().contains("deepseek"));
 
         // Blocked → returns Err
         let router = TierRouter::new(TierConfig::default(), false);

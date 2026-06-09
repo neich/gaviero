@@ -83,6 +83,7 @@ pub async fn complete_to_text(
             }
             UnifiedStreamEvent::ToolCallDelta { .. } => {}
             UnifiedStreamEvent::ToolCallEnd { .. } => {}
+            UnifiedStreamEvent::PathsModified(_) => {}
             UnifiedStreamEvent::FileBlock { .. } => {}
             UnifiedStreamEvent::Usage(usage) => {
                 // M0 instrumentation: log provider-reported token usage.
@@ -190,6 +191,9 @@ pub async fn complete_to_write_gate(
             }
             UnifiedStreamEvent::ToolCallDelta { .. } => {}
             UnifiedStreamEvent::ToolCallEnd { .. } => {}
+            UnifiedStreamEvent::PathsModified(paths) => {
+                modified_files.extend(paths);
+            }
             UnifiedStreamEvent::FileBlock { path, content } => {
                 // Capability invariant: backends that advertise
                 // `supports_file_blocks=false` must not emit FileBlock events.
@@ -353,6 +357,7 @@ mod tests {
             max_tokens: None,
             auto_approve: true,
             suppress_hooks: true,
+            file_scope: crate::types::FileScope::default(),
         };
 
         let outcome = complete_to_text(&backend, request, Some(&NoopObserver))
@@ -399,6 +404,7 @@ mod tests {
             max_tokens: None,
             auto_approve: true,
             suppress_hooks: true,
+            file_scope: crate::types::FileScope::default(),
         };
 
         let gate = Arc::new(Mutex::new(WriteGatePipeline::new(
@@ -442,6 +448,7 @@ mod tests {
             max_tokens: None,
             auto_approve: true,
             suppress_hooks: true,
+            file_scope: crate::types::FileScope::default(),
         };
 
         // RejectAll mode: gate discards the proposal (no disk write), but
@@ -482,6 +489,7 @@ mod tests {
             max_tokens: None,
             auto_approve: true,
             suppress_hooks: true,
+            file_scope: crate::types::FileScope::default(),
         };
 
         let err = complete_to_text(&backend, request, Some(&NoopObserver))
