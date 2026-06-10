@@ -94,7 +94,7 @@ The CLI supports provider-aware model specifications.
 
 All specs require a provider prefix: `provider:model`.
 
-- **Claude** — `claude:sonnet`, `claude:opus`, `claude:haiku`, `claude:opusplan`, `claude:sonnet[1m]`
+- **Claude** — `claude:fable`, `claude:sonnet`, `claude:opus`, `claude:haiku`, `claude:opusplan`, `claude:sonnet[1m]`
 - **Codex** — `codex:gpt-5.5`
 - **Cursor** — `cursor:<model>` (e.g., `cursor:claude-4-sonnet`)
 - **Ollama / local** — `ollama:qwen2.5-coder:7b`, `local:qwen2.5-coder:14b`

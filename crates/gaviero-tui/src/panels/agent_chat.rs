@@ -757,9 +757,9 @@ impl AgentChatState {
                     let current = self.effective_model().to_string();
                     let options = self.model_options().to_vec();
                     let list = if options.is_empty() {
-                        "claude:sonnet, claude:opus, claude:haiku, claude:opusplan, \
-                         claude:sonnet[1m], claude:opus[1m], codex:<model>, \
-                         ollama:qwen2.5-coder:7b"
+                        "claude:fable, claude:sonnet, claude:opus, claude:haiku, \
+                         claude:opusplan, claude:sonnet[1m], claude:opus[1m], \
+                         codex:<model>, ollama:qwen2.5-coder:7b"
                             .to_string()
                     } else {
                         options.join(", ")
@@ -1147,7 +1147,7 @@ impl AgentChatState {
                 self.add_system_message(
                     "Available commands:\n\n\
                      Conversation:\n\
-                     /model <provider:model>  — Set model. Examples: claude:sonnet, claude:opus, claude:haiku, claude:opusplan, claude:sonnet[1m], claude:opus[1m], codex:<model>, ollama:<model>\n\
+                     /model <provider:model>  — Set model. Examples: claude:fable, claude:sonnet, claude:opus, claude:haiku, claude:opusplan, claude:sonnet[1m], claude:opus[1m], codex:<model>, ollama:<model>\n\
                      /effort <level>          — Set effort/reasoning level for Claude + Codex (off, auto, low, medium, high, xhigh, max). Alias: /thinking\n\
                      /namespace <name>        — Set memory namespace (or show current). Alias: /ns\n\
                      /autoapprove             — Toggle auto-approve for this conversation. Alias: /yolo\n\
@@ -3533,6 +3533,7 @@ fn normalize_model_spec(arg: &str) -> String {
         "claude-sonnet" => "sonnet",
         "claude-opus" => "opus",
         "claude-haiku" => "haiku",
+        "claude-fable" => "fable",
         other => other,
     };
     format!("claude:{}", canonical)
@@ -3997,10 +3998,12 @@ mod tests {
         assert_eq!(normalize_model_spec("sonnet"), "claude:sonnet");
         assert_eq!(normalize_model_spec("haiku"), "claude:haiku");
         assert_eq!(normalize_model_spec("opusplan"), "claude:opusplan");
+        assert_eq!(normalize_model_spec("fable"), "claude:fable");
         // Dashed legacy aliases collapse to canonical Claude alias.
         assert_eq!(normalize_model_spec("claude-opus"), "claude:opus");
         assert_eq!(normalize_model_spec("claude-sonnet"), "claude:sonnet");
         assert_eq!(normalize_model_spec("claude-haiku"), "claude:haiku");
+        assert_eq!(normalize_model_spec("claude-fable"), "claude:fable");
     }
 
     #[test]
