@@ -280,9 +280,9 @@ agent reviewer {
 Canonical form is `provider:model`. Bare names (no `:`) are rejected at
 compile-dispatch time by `gaviero-core`.
 
-- **Claude** — `claude:sonnet`, `claude:opus`, `claude:haiku`,
+- **Claude** — `claude:fable`, `claude:sonnet`, `claude:opus`, `claude:haiku`,
   `claude:opusplan`, `claude:sonnet[1m]`, or any versioned form like
-  `claude:claude-opus-4-7`
+  `claude:claude-fable-5`, `claude:claude-opus-4-7`
 - **Codex** — `codex:<model>` (e.g., `codex:gpt-5.5`, `codex:gpt-5.4`)
 - **Cursor** — `cursor:<model>` (e.g., `cursor:claude-4-sonnet`)
 - **Ollama/local** — `ollama:qwen2.5-coder:7b` or `local:model-name`

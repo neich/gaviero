@@ -33,7 +33,7 @@ Most tests run offline. Some (marked `#[ignore]`) require network for Ollama hea
 
 Model selection uses a unified convention across chat and swarm execution. All specs require a `provider:model` prefix — bare names are rejected by `validate_model_spec`.
 
-- **Claude** — `claude:sonnet`, `claude:opus`, `claude:haiku` (shorthand) or versioned forms like `claude:claude-opus-4-7`
+- **Claude** — `claude:fable`, `claude:sonnet`, `claude:opus`, `claude:haiku` (shorthand) or versioned forms like `claude:claude-fable-5`, `claude:claude-opus-4-7`
 - **Codex** — `codex:<model>` (e.g., `codex:gpt-5.4`) — routed to the Codex backend
 - **Cursor** — `cursor:<model>` — routed to the Cursor backend
 - **Ollama/local** — `ollama:qwen2.5-coder:7b` or `local:model-name`

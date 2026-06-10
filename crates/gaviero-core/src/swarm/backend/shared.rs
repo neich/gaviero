@@ -587,6 +587,8 @@ mod tests {
         for spec in [
             "claude:sonnet",
             "claude:opus",
+            "claude:fable",
+            "claude:claude-fable-5",
             "claude:opusplan",
             "claude:sonnet[1m]",
             "ollama:qwen2.5-coder:7b",
