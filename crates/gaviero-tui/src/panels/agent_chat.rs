@@ -1465,9 +1465,17 @@ impl AgentChatState {
         conv.last_bootstrap_tokens = 0;
         conv.last_bootstrap_arms = gaviero_core::context_planner::BootstrapArms::none();
         conv.last_memory_injection_tokens = 0;
-        conv.inject_arms_next = gaviero_core::context_planner::BootstrapArms::none();
-        conv.no_inject_next = false;
-        conv.lite_next = false;
+        // NOTE: `lite_next` / `no_inject_next` / `inject_arms_next` are
+        // deliberately NOT cleared here. They are forward-looking one-shot
+        // arms for the *next* dispatch, orthogonal to dropping past session
+        // state — exactly like `workspace_wide_next`, which reset already
+        // leaves alone. Clearing them was a footgun for providers with a
+        // hard prompt ceiling: `/reset` re-arms a fresh first turn whose
+        // full bootstrap (`<repo_outline>` ~48 KB + impact + memory) can blow
+        // Cursor's 96 KB argv limit, and `/lite` is the documented escape
+        // hatch (see the `/lite` handler). Wiping `lite_next` on `/reset`
+        // meant arming `/lite` then `/reset` silently disarmed that hatch,
+        // so the post-reset prompt failed with "input prompt too big".
         // Suppress the visible transcript on the next first-turn dispatch.
         // Bootstrap context (graph + memory) still flows; only the
         // re-inlining of prior user/assistant turns is skipped, matching
@@ -4326,6 +4334,70 @@ mod tests {
             state.conversations[state.active_conv]
                 .session_ledger
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn reset_preserves_armed_lite_one_shot() {
+        // Regression: `/lite` is the documented escape hatch for providers
+        // with a hard prompt ceiling (Cursor's 96 KB argv limit). Arming
+        // `/lite` then `/reset` must NOT disarm it — otherwise the post-reset
+        // first turn re-injects the full bootstrap and Cursor bails with
+        // "input prompt too big".
+        let mut state = AgentChatState::new();
+
+        state.text_input.text = "/lite".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+        assert!(state.process_slash_command());
+        assert!(state.conversations[state.active_conv].lite_next);
+
+        state.text_input.text = "/reset".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+        assert!(state.process_slash_command());
+
+        assert!(
+            state.conversations[state.active_conv].lite_next,
+            "an armed /lite must survive /reset so the post-reset bootstrap stays minimal"
+        );
+        // /reset still drops session state regardless.
+        assert!(
+            state.conversations[state.active_conv]
+                .session_ledger
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reset_preserves_armed_no_inject_and_inject_arms() {
+        // Same orthogonality contract as `/lite`: `/no-inject` and
+        // `/inject <layer>` are forward-looking one-shot arms for the next
+        // dispatch, not past session state, so `/reset` leaves them alone.
+        let mut state = AgentChatState::new();
+
+        state.text_input.text = "/no-inject".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+        assert!(state.process_slash_command());
+        assert!(state.conversations[state.active_conv].no_inject_next);
+
+        state.text_input.text = "/reset".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+        assert!(state.process_slash_command());
+        assert!(
+            state.conversations[state.active_conv].no_inject_next,
+            "an armed /no-inject must survive /reset"
+        );
+
+        state.text_input.text = "/inject memory".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+        assert!(state.process_slash_command());
+        assert!(state.conversations[state.active_conv].inject_arms_next.memory);
+
+        state.text_input.text = "/reset".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+        assert!(state.process_slash_command());
+        assert!(
+            state.conversations[state.active_conv].inject_arms_next.memory,
+            "an armed /inject layer must survive /reset"
         );
     }
 

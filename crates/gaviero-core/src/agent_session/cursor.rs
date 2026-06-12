@@ -185,9 +185,12 @@ impl CursorSession {
         if combined_prompt.len() >= CURSOR_ARGV_LIMIT {
             anyhow::bail!(
                 "cursor prompt is {} bytes which exceeds the {}-byte argv limit. \
-                 The `agent` CLI has no stdin or `--prompt-file` fallback, so \
-                 trim the user message, the context bundle, or switch to a provider \
-                 with stdin support (claude, codex, ollama).",
+                 The `agent` CLI has no stdin or `--prompt-file` fallback. \
+                 Most of a first-turn prompt is bootstrap context: run `/lite` \
+                 to drop <repo_outline> + memory + impact (keeps topology) for \
+                 the next turn, then send. You can also trim the user message / \
+                 attachments, or switch to a provider with stdin support \
+                 (claude, codex, ollama).",
                 combined_prompt.len(),
                 CURSOR_ARGV_LIMIT,
             );
