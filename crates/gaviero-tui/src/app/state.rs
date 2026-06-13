@@ -188,6 +188,10 @@ pub(super) enum ScrollbarTarget {
     MarkdownPreview,
     Chat,
     LeftPanel,
+    /// Diff pane while a review is active — single proposal (`diff_review`,
+    /// scrolls `scroll_top`) or batch file-set (`batch_review`, scrolls
+    /// `diff_scroll`). The active one is resolved at scroll time.
+    ReviewDiff,
 }
 
 #[derive(Default, Clone)]
