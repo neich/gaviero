@@ -970,6 +970,19 @@ fn handle_mouse_review(app: &mut App, mouse: crossterm::event::MouseEvent) {
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            // Scrollbar on the right edge of the diff pane: start a drag and
+            // jump to the clicked row. The track sits below the 1-row header
+            // for batch review; the single-proposal overlay has no header.
+            let editor = app.layout.editor_area;
+            if editor.width > 0 && editor.height > 0 && col == editor.x + editor.width - 1 {
+                let header_offset = if app.batch_review.is_some() { 1 } else { 0 };
+                if row >= editor.y + header_offset && row < editor.bottom() {
+                    app.scrollbar_dragging = Some(ScrollbarTarget::ReviewDiff);
+                    app.scroll_panel_to_row(ScrollbarTarget::ReviewDiff, row);
+                    return;
+                }
+            }
+
             if let Some(ref mut review) = app.diff_review {
                 if review.is_interactive()
                     && app.layout.editor_area.contains((col, row).into())
@@ -1038,6 +1051,14 @@ fn handle_mouse_review(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     review.scroll_top += 3;
                 }
             }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if matches!(app.scrollbar_dragging, Some(ScrollbarTarget::ReviewDiff)) {
+                app.scroll_panel_to_row(ScrollbarTarget::ReviewDiff, row);
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            app.scrollbar_dragging = None;
         }
         _ => {}
     }
@@ -1175,6 +1196,48 @@ pub(super) fn scroll_panel_to_row(app: &mut App, target: ScrollbarTarget, row: u
                             as usize;
                     }
                 }
+            }
+        }
+        ScrollbarTarget::ReviewDiff => {
+            let area = app.layout.editor_area;
+            if area.height == 0 {
+                return;
+            }
+            if let Some(ref mut br) = app.batch_review {
+                // Diff content starts one row below the file-path header, so the
+                // track is `area.height - 1` rows tall.
+                let track_height = area.height.saturating_sub(1) as usize;
+                let total = br.cached_diff.len();
+                if track_height == 0 || total <= track_height {
+                    return;
+                }
+                let max_scroll = total - track_height;
+                let row_in_track = row
+                    .saturating_sub(area.y + 1)
+                    .min(area.height.saturating_sub(2)) as usize;
+                let fraction =
+                    row_in_track as f64 / track_height.saturating_sub(1).max(1) as f64;
+                br.diff_scroll = (fraction * max_scroll as f64)
+                    .round()
+                    .min(max_scroll as f64)
+                    as usize;
+            } else if let Some(ref mut review) = app.diff_review {
+                // The single-proposal overlay fills the whole pane (no header).
+                let track_height = area.height as usize;
+                let total = review.diff_lines().len();
+                if total <= track_height {
+                    return;
+                }
+                let max_scroll = total - track_height;
+                let row_in_track = row
+                    .saturating_sub(area.y)
+                    .min(area.height.saturating_sub(1)) as usize;
+                let fraction =
+                    row_in_track as f64 / track_height.saturating_sub(1).max(1) as f64;
+                review.scroll_top = (fraction * max_scroll as f64)
+                    .round()
+                    .min(max_scroll as f64)
+                    as usize;
             }
         }
     }
