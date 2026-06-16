@@ -472,6 +472,16 @@ impl AgentChatState {
     pub(crate) fn model_options(&mut self) -> &[String] {
         if self.cli_model_options.is_none() {
             let mut options = gaviero_core::acp::session::discover_model_options();
+            // Always offer the canonical Claude aliases, even when the CLI is
+            // absent or its `--help` text drifts and discovery comes back
+            // empty. Merged (not replacing) so discovered full model names
+            // still surface.
+            for alias in gaviero_core::swarm::backend::shared::CLAUDE_MODEL_ALIASES {
+                let spec = format!("claude:{alias}");
+                if !options.iter().any(|opt| opt == &spec) {
+                    options.push(spec);
+                }
+            }
             for cursor_model in gaviero_core::acp::session::discover_cursor_model_options() {
                 if !options.iter().any(|opt| opt == &cursor_model) {
                     options.push(cursor_model);
@@ -2280,7 +2290,21 @@ impl AgentChatState {
         let anchor = self.autocomplete.at_pos;
 
         let cursor_byte = self.text_input.cursor_byte_offset();
-        let after_cursor = self.text_input.text[cursor_byte..].to_string();
+        let after_cursor = if self.autocomplete.mode == AutocompleteMode::ModelSpec {
+            // A model spec is a single whitespace-free token spanning to the
+            // end of the line. Accepting with the cursor mid-token must
+            // replace the *whole* token, so drop the remainder of it that
+            // sits right of the cursor — otherwise an existing tail like
+            // `cursor:composer-2.5` gets concatenated after the accepted
+            // `claude:`, yielding the doubly-prefixed `claude:cursor:...`.
+            let raw = &self.text_input.text[cursor_byte..];
+            match raw.find(char::is_whitespace) {
+                Some(ws) => raw[ws..].to_string(),
+                None => String::new(),
+            }
+        } else {
+            self.text_input.text[cursor_byte..].to_string()
+        };
         self.text_input.text.truncate(anchor);
 
         match self.autocomplete.mode {
@@ -4425,6 +4449,28 @@ mod tests {
         state.accept_autocomplete();
 
         assert_eq!(state.text_input.text, "/model deepseek:deepseek-v4-pro");
+        assert!(!state.autocomplete.active);
+    }
+
+    #[test]
+    fn update_autocomplete_model_accept_midspec_replaces_whole_token() {
+        // Regression: cursor sits right after `/model ` while an old spec
+        // (`cursor:composer-2.5`) still trails to the right. Accepting a new
+        // provider must replace the whole spec token, not concatenate after
+        // it — the old behaviour produced `claude:cursor:composer-2.5`.
+        let mut state = AgentChatState::new();
+        state.text_input.text = "/model cursor:composer-2.5".to_string();
+        // Place the cursor immediately after "/model " (char index 7).
+        state.text_input.cursor = "/model ".chars().count();
+        state.update_autocomplete();
+
+        assert_eq!(state.autocomplete.mode, AutocompleteMode::ModelSpec);
+        assert_eq!(state.autocomplete.query, "");
+        state.autocomplete.matches = vec!["claude:".to_string()];
+        state.autocomplete.selected = 0;
+        state.accept_autocomplete();
+
+        assert_eq!(state.text_input.text, "/model claude:");
         assert!(!state.autocomplete.active);
     }
 

@@ -674,11 +674,11 @@ mod tests {
 
 /// Query `claude --help` for the model options documented by the CLI.
 ///
-/// Parses the `--model` flag description and extracts all single-quoted
-/// strings (aliases and full model names), then prefixes them with
-/// `claude:` so callers receive the canonical `provider:model` form.
-/// Returns an empty Vec if the CLI is unavailable or the help text
-/// format changes.
+/// Parses the `--model` flag description and extracts all single-quoted model
+/// ids (aliases and full names), then prefixes them with `claude:` so callers
+/// receive the canonical `provider:model` form. Returns an empty Vec if the
+/// CLI is unavailable or the help text format changes — the picker still
+/// offers [`crate::swarm::backend::shared::CLAUDE_MODEL_ALIASES`] in that case.
 pub fn discover_model_options() -> Vec<String> {
     let output = std::process::Command::new("claude")
         .arg("--help")
@@ -691,31 +691,81 @@ pub fn discover_model_options() -> Vec<String> {
     };
 
     let text = String::from_utf8_lossy(&output.stdout);
+    parse_claude_help_models(&text)
+}
 
-    // Find the --model line in the help output
-    for line in text.lines() {
+/// Parse the `--model` option block out of `claude --help` into `claude:<id>`
+/// specs. Extracted from [`discover_model_options`] so it can be unit-tested
+/// without a `claude` binary on PATH.
+///
+/// The quoted aliases/full-names live in the option's description, which wraps
+/// across several indented continuation lines, so we accumulate the `--model`
+/// line plus its continuations (up to the next flag or a blank line) before
+/// extracting ids.
+fn parse_claude_help_models(help_text: &str) -> Vec<String> {
+    let mut block = String::new();
+    let mut in_model = false;
+    for line in help_text.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("--model") {
-            // Extract all single-quoted strings from the description
-            let mut models = Vec::new();
-            let mut rest = trimmed.as_bytes();
-            while let Some(pos) = rest.iter().position(|&b| b == b'\'') {
-                rest = &rest[pos + 1..];
-                if let Some(end) = rest.iter().position(|&b| b == b'\'') {
-                    let name = std::str::from_utf8(&rest[..end]).unwrap_or("");
-                    if !name.is_empty() {
-                        models.push(format!("claude:{}", name));
-                    }
-                    rest = &rest[end + 1..];
-                } else {
-                    break;
-                }
+        if in_model {
+            // A new option (`-x` / `--flag`) or a blank line ends the block.
+            if trimmed.is_empty() || trimmed.starts_with('-') {
+                break;
             }
-            return models;
+            block.push(' ');
+            block.push_str(trimmed);
+        } else if trimmed.starts_with("--model") {
+            in_model = true;
+            block.push_str(trimmed);
         }
     }
 
-    Vec::new()
+    if block.is_empty() {
+        return Vec::new();
+    }
+
+    extract_quoted_model_ids(&block)
+        .into_iter()
+        .map(|id| format!("claude:{id}"))
+        .collect()
+}
+
+/// Extract single-quoted, model-id-shaped tokens from help prose.
+///
+/// Robust against stray apostrophes (e.g. "a model's full name"): a `'…'` pair
+/// whose contents don't look like a model id is not consumed — scanning
+/// resumes one byte past the opening quote, so a genuine id later on the line
+/// (e.g. `'claude-fable-5'`) is still recovered instead of being swallowed by
+/// the mispaired apostrophe.
+fn extract_quoted_model_ids(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\'' {
+            i += 1;
+            continue;
+        }
+        if let Some(rel) = bytes[i + 1..].iter().position(|&b| b == b'\'') {
+            let content = &text[i + 1..i + 1 + rel];
+            if is_model_id_shaped(content) {
+                out.push(content.to_string());
+                i = i + 1 + rel + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Model ids are ASCII alphanumerics plus `_ . -` (matches the Cursor parser's
+/// defensive shape check). Rejects empty strings and any token with spaces or
+/// punctuation, which is what keeps apostrophe-induced garbage out.
+fn is_model_id_shaped(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
 }
 
 /// Query the Cursor CLI (`agent --list-models`) for the model ids the
@@ -889,5 +939,73 @@ mod discover_cursor_tests {
         assert_eq!(out[0], "cursor:composer-2.5");
         assert_eq!(out[1], "cursor:auto");
         assert_eq!(out[2], "cursor:gpt-5.2");
+    }
+}
+
+#[cfg(test)]
+mod discover_claude_tests {
+    use super::{extract_quoted_model_ids, parse_claude_help_models};
+
+    /// Real `claude --help` shape: the quoted aliases/full-name wrap onto
+    /// indented continuation lines below the `--model` line, and the prose
+    /// contains a stray apostrophe in "model's". The old parser only scanned
+    /// the `--model` line itself and returned nothing — the regression this
+    /// fixes (typing `claude:` surfaced no models).
+    const WRAPPED_HELP: &str = "\
+  --mcp-debug                           [DEPRECATED] Enable MCP debug mode
+  --model <model>                       Model for the current session. Provide
+                                        an alias for the latest model (e.g.
+                                        'fable', 'opus', or 'sonnet') or a
+                                        model's full name (e.g.
+                                        'claude-fable-5').
+  -n, --name <name>                     Set a display name for this session
+";
+
+    #[test]
+    fn parses_aliases_across_wrapped_continuation_lines() {
+        let out = parse_claude_help_models(WRAPPED_HELP);
+        assert!(out.contains(&"claude:fable".to_string()), "got {out:?}");
+        assert!(out.contains(&"claude:opus".to_string()), "got {out:?}");
+        assert!(out.contains(&"claude:sonnet".to_string()), "got {out:?}");
+    }
+
+    #[test]
+    fn recovers_full_model_name_after_stray_apostrophe() {
+        // The apostrophe in "model's" must not swallow the later
+        // 'claude-fable-5' id, and must not leak a garbage entry.
+        let out = parse_claude_help_models(WRAPPED_HELP);
+        assert!(out.contains(&"claude:claude-fable-5".to_string()), "got {out:?}");
+        assert!(
+            out.iter().all(|m| !m.contains(' ')),
+            "no model id should contain spaces: {out:?}"
+        );
+    }
+
+    #[test]
+    fn returns_empty_when_no_model_flag_present() {
+        let out = parse_claude_help_models("  --verbose   Be loud\n  -h, --help   Help\n");
+        assert!(out.is_empty(), "got {out:?}");
+    }
+
+    #[test]
+    fn parses_inline_aliases_on_a_single_wide_line() {
+        // Wide terminals keep everything on the `--model` line; that case
+        // must still parse.
+        let inline = "  --model <model>   alias 'opus' or 'sonnet' or full 'claude-fable-5'\n";
+        let out = parse_claude_help_models(inline);
+        assert_eq!(
+            out,
+            vec![
+                "claude:opus".to_string(),
+                "claude:sonnet".to_string(),
+                "claude:claude-fable-5".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_skips_non_id_shaped_quoted_text() {
+        let ids = extract_quoted_model_ids("'good-id' and 'not an id' and 'also.good'");
+        assert_eq!(ids, vec!["good-id".to_string(), "also.good".to_string()]);
     }
 }

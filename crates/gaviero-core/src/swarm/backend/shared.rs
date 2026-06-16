@@ -13,6 +13,16 @@ pub const SUPPORTED_PROVIDER_PREFIXES: &[&str] =
 /// DeepSeek HTTP API model ids (without the `deepseek:` provider prefix).
 pub const DEEPSEEK_API_MODELS: &[&str] = &["deepseek-v4-pro", "deepseek-v4-flash"];
 
+/// Canonical Claude model aliases the `/model` picker always offers, without
+/// the `claude:` prefix. Independent of `claude --help` parsing so the picker
+/// stays populated even when the CLI is absent or its help text drifts; CLI
+/// discovery ([`crate::acp::session::discover_model_options`]) is merged on
+/// top to surface full model names. Mirrors the documented `/model` aliases;
+/// the `[1m]` long-context variants are valid specs (context-window sizing
+/// strips the suffix before matching).
+pub const CLAUDE_MODEL_ALIASES: &[&str] =
+    &["fable", "sonnet", "opus", "haiku", "opusplan", "sonnet[1m]", "opus[1m]"];
+
 pub fn build_enriched_prompt(
     prompt: &str,
     conversation_history: &[(String, String)],
@@ -207,6 +217,19 @@ pub fn validate_model_spec(model_spec: &str) -> Result<()> {
         );
     };
 
+    // Reject doubly-prefixed specs like `claude:cursor:composer-2.5`: the model
+    // name must not itself begin with a known provider prefix. (Ollama specs
+    // such as `ollama:qwen2.5-coder:7b` are fine — `qwen2.5-coder` is not a
+    // provider.)
+    if model_id_has_nested_provider(remainder.trim()) {
+        anyhow::bail!(
+            "model spec '{}' has a nested provider prefix; \
+             use a single `provider:model` pair \
+             (e.g. `claude:opus`, not `claude:cursor:composer-2.5`)",
+            trimmed
+        );
+    }
+
     match prefix {
         "ollama" | "local" | "claude" | "codex" | "cursor" => {
             if remainder.trim().is_empty() {
@@ -238,38 +261,64 @@ pub fn validate_model_spec(model_spec: &str) -> Result<()> {
     Ok(())
 }
 
+/// True when a model id (the part after `provider:`) itself begins with a
+/// known `provider:` prefix — e.g. `cursor:composer-2.5`. Used to keep
+/// doubly-prefixed specs such as `claude:cursor:composer-2.5` out of the
+/// completion candidates and out of `validate_model_spec`.
+fn model_id_has_nested_provider(model: &str) -> bool {
+    model
+        .split_once(':')
+        .is_some_and(|(head, _)| SUPPORTED_PROVIDER_PREFIXES.contains(&head.trim()))
+}
+
 /// Tab-completion candidates for `/model <spec>`.
 ///
-/// When `partial` contains `:`, completes model names for the typed provider
-/// (static list for DeepSeek; `discovered` for Claude/Cursor/etc.). Otherwise
-/// completes provider prefixes and any matching entries from `discovered`.
+/// Two shapes, matching the canonical `provider:model` schema:
+/// * `partial` contains `:` → complete model names for the typed provider.
+///   Candidates are the provider's static ids (Claude / DeepSeek) merged with
+///   any matching entries from `discovered` (CLI-discovered Claude / Cursor /
+///   Ollama specs), filtered by the typed model fragment.
+/// * `partial` has no `:` yet → offer provider prefixes only. Selecting one
+///   re-triggers completion in the model-name branch. Listing prefixes (not
+///   full discovered specs) keeps the picker aligned with the schema and
+///   avoids burying providers below the truncation limit.
+///
+/// Candidates whose model id is itself a `provider:` prefix are dropped, so a
+/// doubly-prefixed spec can never be suggested.
 pub fn model_spec_completions(partial: &str, discovered: &[String]) -> Vec<String> {
     let partial = partial.trim();
     let partial_lower = partial.to_lowercase();
 
+    // ── `provider:model` — complete model names for the typed provider ──
     if let Some((provider, model_part)) = partial.split_once(':') {
         let provider_lower = provider.to_lowercase();
         let model_part_lower = model_part.to_lowercase();
-        let mut candidates = Vec::new();
 
-        if provider_lower == "deepseek" {
-            for model in DEEPSEEK_API_MODELS {
-                if model_part.is_empty() || model.to_lowercase().starts_with(&model_part_lower) {
-                    candidates.push(format!("deepseek:{model}"));
-                }
-            }
-        } else {
-            let prefix = format!("{provider}:");
-            for spec in discovered {
-                if !spec.to_lowercase().starts_with(&prefix.to_lowercase()) {
-                    continue;
-                }
-                let model = spec.strip_prefix(&prefix).unwrap_or("");
-                if model_part.is_empty() || model.to_lowercase().starts_with(&model_part_lower) {
-                    candidates.push(spec.clone());
+        // Static ids always offered for this provider, regardless of CLI
+        // discovery (which can be empty or drift across CLI versions).
+        let mut model_ids: Vec<String> = match provider_lower.as_str() {
+            "claude" => CLAUDE_MODEL_ALIASES.iter().map(|s| s.to_string()).collect(),
+            "deepseek" => DEEPSEEK_API_MODELS.iter().map(|s| s.to_string()).collect(),
+            _ => Vec::new(),
+        };
+
+        // Merge model ids surfaced by CLI discovery for the same provider.
+        let disc_prefix = format!("{provider_lower}:");
+        for spec in discovered {
+            if spec.to_lowercase().starts_with(&disc_prefix) {
+                let model = &spec[disc_prefix.len()..];
+                if !model.is_empty() {
+                    model_ids.push(model.to_string());
                 }
             }
         }
+
+        let mut candidates: Vec<String> = model_ids
+            .into_iter()
+            .filter(|m| !model_id_has_nested_provider(m))
+            .filter(|m| model_part.is_empty() || m.to_lowercase().starts_with(&model_part_lower))
+            .map(|m| format!("{provider_lower}:{m}"))
+            .collect();
 
         candidates.sort();
         candidates.dedup();
@@ -277,17 +326,12 @@ pub fn model_spec_completions(partial: &str, discovered: &[String]) -> Vec<Strin
         return candidates;
     }
 
+    // ── No `:` yet — offer provider prefixes only ──
     let mut out: Vec<String> = SUPPORTED_PROVIDER_PREFIXES
         .iter()
         .filter(|p| partial.is_empty() || p.starts_with(&partial_lower))
         .map(|p| format!("{p}:"))
         .collect();
-
-    for spec in discovered {
-        if partial.is_empty() || spec.to_lowercase().starts_with(&partial_lower) {
-            out.push(spec.clone());
-        }
-    }
 
     out.sort();
     out.dedup();
@@ -691,6 +735,78 @@ mod tests {
         let hits = model_spec_completions("deepseek:deep", &[]);
         assert!(hits.contains(&"deepseek:deepseek-v4-pro".to_string()));
         assert!(hits.contains(&"deepseek:deepseek-v4-flash".to_string()));
+    }
+
+    #[test]
+    fn test_model_spec_completions_claude_models_from_static_aliases() {
+        // Regression: typing `claude:` must surface Claude models even with no
+        // CLI discovery (empty `discovered`). The static alias list backs this.
+        let hits = model_spec_completions("claude:", &[]);
+        assert!(hits.contains(&"claude:fable".to_string()), "got {hits:?}");
+        assert!(hits.contains(&"claude:sonnet".to_string()), "got {hits:?}");
+        assert!(hits.contains(&"claude:opus".to_string()), "got {hits:?}");
+    }
+
+    #[test]
+    fn test_model_spec_completions_claude_filters_by_fragment() {
+        let hits = model_spec_completions("claude:op", &[]);
+        assert!(hits.iter().all(|h| h.starts_with("claude:op")), "got {hits:?}");
+        assert!(hits.contains(&"claude:opus".to_string()), "got {hits:?}");
+        assert!(hits.contains(&"claude:opusplan".to_string()), "got {hits:?}");
+    }
+
+    #[test]
+    fn test_model_spec_completions_merges_discovered_with_statics() {
+        let discovered = vec!["claude:claude-fable-5".to_string()];
+        let hits = model_spec_completions("claude:claude", &discovered);
+        assert_eq!(hits, vec!["claude:claude-fable-5".to_string()]);
+    }
+
+    #[test]
+    fn test_model_spec_completions_cursor_from_discovered() {
+        // Cursor has no static list — its models come only from discovery.
+        let discovered = vec!["cursor:composer-2.5".to_string(), "cursor:auto".to_string()];
+        let hits = model_spec_completions("cursor:comp", &discovered);
+        assert_eq!(hits, vec!["cursor:composer-2.5".to_string()]);
+    }
+
+    #[test]
+    fn test_model_spec_completions_no_colon_lists_prefixes_only() {
+        // Before a `:` is typed the picker offers provider prefixes, not full
+        // discovered specs — keeps it aligned with `provider:model` and avoids
+        // burying providers below the truncation limit.
+        let discovered = vec!["cursor:composer-2.5".to_string()];
+        let hits = model_spec_completions("", &discovered);
+        assert!(hits.contains(&"cursor:".to_string()), "got {hits:?}");
+        assert!(hits.contains(&"claude:".to_string()), "got {hits:?}");
+        assert!(
+            !hits.iter().any(|h| h == "cursor:composer-2.5"),
+            "no-colon view must not list full discovered specs: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn test_model_spec_completions_never_emits_nested_provider_prefix() {
+        // Even if a malformed doubly-prefixed spec leaks into `discovered`, it
+        // must never be offered as a completion.
+        let discovered = vec!["claude:cursor:composer-2.5".to_string()];
+        let hits = model_spec_completions("claude:", &discovered);
+        assert!(
+            hits.iter().all(|h| !h.contains("cursor:")),
+            "nested provider prefix leaked into completions: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_model_spec_rejects_nested_provider_prefix() {
+        let err = validate_model_spec("claude:cursor:composer-2.5").unwrap_err();
+        assert!(
+            err.to_string().contains("nested provider prefix"),
+            "got: {err}"
+        );
+        // The colon-bearing Ollama form is NOT a nested prefix and stays valid.
+        validate_model_spec("ollama:qwen2.5-coder:7b").unwrap();
+        validate_model_spec("local:qwen2.5-coder:14b").unwrap();
     }
 
     // ── Tagged-prompt format tests ────────────────────────────────
