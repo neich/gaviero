@@ -26,6 +26,44 @@ use super::model_manager::{ModelInfo, ModelManager};
 /// comfortably without OOM risk.
 const MAX_PAIR_TOKENS: usize = 512;
 
+/// Sub-batch size for reranker ONNX inference. The candidate pool (up to
+/// `RerankConfig::pool_size`, default 50) is scored in chunks of this many
+/// `(query, candidate)` pairs, capping the worst-case resident activation
+/// set at ~`RERANK_SUB_BATCH` sequences instead of the whole pool.
+///
+/// This is a **secondary** bound. The primary OOM cause was the ModernBERT
+/// tokenizer's fixed 8000-token padding — disabled in
+/// [`ModernBertReranker::load`]; once real sequence length is capped at
+/// `MAX_PAIR_TOKENS`, a full `50 × 512` batch fits comfortably. Chunking
+/// just keeps the peak small on memory-constrained workstations. Cross-encoder
+/// logits are per-pair independent, so chunking changes neither the scores
+/// nor their order.
+const RERANK_SUB_BATCH: usize = 8;
+
+/// Apply the bounded-length tokenizer config the reranker relies on for
+/// memory safety: truncate every `(query, candidate)` pair to
+/// `MAX_PAIR_TOKENS`, and **disable the tokenizer's own padding**.
+///
+/// The shipped gte-reranker-modernbert `tokenizer.json` pins padding to a
+/// *fixed* 8000 tokens (`padding.strategy = Fixed(8000)`). Left in place,
+/// `encode_batch` re-pads every pair back up to 8000 even after truncation
+/// caps the real tokens at `MAX_PAIR_TOKENS`; ModernBERT then runs attention
+/// at seq=8000 (O(seq²)), spiking ONNX activation memory hard enough to OOM
+/// the process. `run_inference` builds the rectangular input tensor and
+/// zero-pads to the batch max itself, so the tokenizer must not pad.
+fn configure_reranker_tokenizer(tokenizer: &mut Tokenizer) -> Result<()> {
+    tokenizer
+        .with_truncation(Some(TruncationParams {
+            max_length: MAX_PAIR_TOKENS,
+            strategy: TruncationStrategy::LongestFirst,
+            stride: 0,
+            direction: TruncationDirection::Right,
+        }))
+        .map_err(|e| anyhow::anyhow!("configuring reranker tokenizer truncation: {e}"))?;
+    tokenizer.with_padding(None);
+    Ok(())
+}
+
 /// Trait for query/candidate cross-encoder rerankers.
 ///
 /// Implementations must be `Send + Sync`. Reranking runs **outside**
@@ -104,15 +142,26 @@ pub struct RerankConfig {
     /// `enabled` flip against measured p95 latency, since there is no
     /// runtime fallback once rerank is on.
     pub max_latency_ms: u64,
+    /// Intra-op thread count for the reranker's ONNX session. `0` = auto
+    /// (the machine's available parallelism, clamped to
+    /// `RERANK_MAX_AUTO_THREADS`). The cross-encoder is the
+    /// latency-dominant retrieval stage; on a multi-core CPU the historical
+    /// single-thread session left most of the speedup on the table. This
+    /// knob is reranker-only — embedder inference stays single-threaded.
+    pub threads: usize,
 }
 
 impl Default for RerankConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            pool_size: 50,
+            // Int8 + multi-thread make a wider pool affordable, but a
+            // smaller pool is still the cheapest latency lever; 20 keeps
+            // enough candidates for the top-k blend to reorder.
+            pool_size: 20,
             blend_weight: 0.6,
             max_latency_ms: 200,
+            threads: 0,
         }
     }
 }
@@ -164,6 +213,55 @@ pub const GTE_RERANKER_MODERNBERT_BASE: ModelInfo = ModelInfo {
     dimensions: 1, // single-logit output, not an embedding
 };
 
+/// Int8-quantized gte-reranker-modernbert (`onnx/model_int8.onnx`). Same
+/// tokenizer and single-logit output as the fp32 variant, ~4× smaller on
+/// disk and markedly faster on CPU at a small accuracy cost. A distinct
+/// `id` gives it a separate cache dir, so it downloads alongside — not
+/// over — the fp32 model. The quality-ceiling option; ~4 s/query on CPU
+/// (thread-capped ~8 intra-op), so prefer [`MS_MARCO_MINILM_L6_V2_INT8`]
+/// (the default) for always-on use, and this one at chat frequency / GPU.
+pub const GTE_RERANKER_MODERNBERT_BASE_INT8: ModelInfo = ModelInfo {
+    id: "gte-reranker-modernbert-base-int8",
+    onnx_url: "https://huggingface.co/Alibaba-NLP/gte-reranker-modernbert-base/resolve/main/onnx/model_int8.onnx",
+    tokenizer_url: "https://huggingface.co/Alibaba-NLP/gte-reranker-modernbert-base/resolve/main/tokenizer.json",
+    dimensions: 1,
+};
+
+/// Int8 ms-marco-MiniLM-L6-v2 cross-encoder (Xenova ONNX export). ~22M
+/// params — an order of magnitude smaller than ModernBERT-150M — with a
+/// BERT WordPiece tokenizer and the same single-logit relevance output.
+/// **The shipped reranker default**: on the B2f code gold set it matched
+/// the int8 ModernBERT on ndcg@5 to within noise (+0.261 vs +0.270) at
+/// ~8× lower latency (~540 ms vs ~4 s/query, pool 20, 8 threads), making
+/// it the CPU-viable always-on choice. Caveat: ms-marco is web-passage
+/// trained — validate transfer on non-code corpora before relying on it.
+pub const MS_MARCO_MINILM_L6_V2_INT8: ModelInfo = ModelInfo {
+    id: "ms-marco-minilm-l6-v2-int8",
+    onnx_url: "https://huggingface.co/Xenova/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model_int8.onnx",
+    tokenizer_url: "https://huggingface.co/Xenova/ms-marco-MiniLM-L-6-v2/resolve/main/tokenizer.json",
+    dimensions: 1,
+};
+
+/// Cap on the auto-resolved intra-op thread count (`threads = 0`). Beyond
+/// roughly the physical P-core count, ModernBERT reranking sees
+/// diminishing — sometimes negative — returns as it spills onto SMT
+/// siblings / E-cores, so auto stops here. Explicit settings may exceed it.
+const RERANK_MAX_AUTO_THREADS: usize = 8;
+
+/// Resolve a configured reranker thread count to a concrete intra-op
+/// value. `0` means "auto": the machine's available parallelism, clamped
+/// to `[1, RERANK_MAX_AUTO_THREADS]`. Any explicit `>= 1` is honoured
+/// verbatim so an operator can push past the auto cap on a big box.
+fn resolve_intra_threads(configured: usize) -> usize {
+    if configured >= 1 {
+        return configured;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, RERANK_MAX_AUTO_THREADS)
+}
+
 /// Resolve a settings string to a reranker model. `"none"` (or unknown)
 /// returns `None`, which the factory treats as "rerank disabled".
 pub fn resolve_reranker_model(name: &str) -> Option<&'static ModelInfo> {
@@ -171,6 +269,12 @@ pub fn resolve_reranker_model(name: &str) -> Option<&'static ModelInfo> {
         "" | "none" => None,
         "gte-reranker-modernbert" | "gte-reranker-modernbert-base" => {
             Some(&GTE_RERANKER_MODERNBERT_BASE)
+        }
+        "gte-reranker-modernbert-int8" | "gte-reranker-modernbert-base-int8" => {
+            Some(&GTE_RERANKER_MODERNBERT_BASE_INT8)
+        }
+        "minilm" | "ms-marco-minilm" | "ms-marco-minilm-l6" | "ms-marco-minilm-l6-v2-int8" => {
+            Some(&MS_MARCO_MINILM_L6_V2_INT8)
         }
         _ => None,
     }
@@ -180,12 +284,14 @@ pub fn resolve_reranker_model(name: &str) -> Option<&'static ModelInfo> {
 /// rerank is disabled / unknown so callers cleanly degrade to
 /// composite-only ranking. Errors are reserved for "model resolved but
 /// could not be loaded".
-pub fn build_reranker(name: &str) -> Result<Option<Arc<dyn Reranker>>> {
+/// `threads` is the intra-op thread count for the ONNX session (`0` =
+/// auto; see [`RerankConfig::threads`] / [`resolve_intra_threads`]).
+pub fn build_reranker(name: &str, threads: usize) -> Result<Option<Arc<dyn Reranker>>> {
     match name.trim().to_ascii_lowercase().as_str() {
         "null" => Ok(Some(Arc::new(NullReranker) as Arc<dyn Reranker>)),
         _ => match resolve_reranker_model(name) {
             Some(info) => Ok(Some(
-                Arc::new(ModernBertReranker::from_model(info)?) as Arc<dyn Reranker>
+                Arc::new(ModernBertReranker::from_model(info, threads)?) as Arc<dyn Reranker>
             )),
             None => Ok(None),
         },
@@ -212,13 +318,14 @@ struct RerankerInner {
 }
 
 impl ModernBertReranker {
-    pub fn from_model(model: &ModelInfo) -> Result<Self> {
+    pub fn from_model(model: &ModelInfo, threads: usize) -> Result<Self> {
         let manager = ModelManager::new();
         manager.ensure_downloaded(model)?;
         Self::load(
             &manager.onnx_path(model),
             &manager.tokenizer_path(model),
             model.id,
+            threads,
         )
     }
 
@@ -226,10 +333,12 @@ impl ModernBertReranker {
         onnx_path: &std::path::Path,
         tokenizer_path: &std::path::Path,
         model_id: &str,
+        threads: usize,
     ) -> Result<Self> {
+        let intra_threads = resolve_intra_threads(threads);
         let session = Session::builder()
             .map_err(|e| anyhow::anyhow!("creating ONNX session builder: {e}"))?
-            .with_intra_threads(1)
+            .with_intra_threads(intra_threads)
             .map_err(|e| anyhow::anyhow!("setting thread count: {e}"))?
             .commit_from_file(onnx_path)
             .map_err(|e| {
@@ -238,14 +347,7 @@ impl ModernBertReranker {
 
         let mut tokenizer = Tokenizer::from_file(tokenizer_path)
             .map_err(|e| anyhow::anyhow!("loading reranker tokenizer: {e}"))?;
-        tokenizer
-            .with_truncation(Some(TruncationParams {
-                max_length: MAX_PAIR_TOKENS,
-                strategy: TruncationStrategy::LongestFirst,
-                stride: 0,
-                direction: TruncationDirection::Right,
-            }))
-            .map_err(|e| anyhow::anyhow!("configuring reranker tokenizer truncation: {e}"))?;
+        configure_reranker_tokenizer(&mut tokenizer)?;
 
         Ok(Self {
             inner: Arc::new(RerankerInner {
@@ -279,36 +381,11 @@ impl RerankerInner {
             .encode_batch(pairs, true)
             .map_err(|e| anyhow::anyhow!("reranker tokenization failed: {e}"))?;
 
-        let batch = encodings.len();
-        let max_len = encodings
-            .iter()
-            .map(|e| e.get_ids().len())
-            .max()
-            .unwrap_or(0);
-        let mut input_ids = Array2::<i64>::zeros((batch, max_len));
-        let mut attention_mask = Array2::<i64>::zeros((batch, max_len));
-        let mut token_type_ids = Array2::<i64>::zeros((batch, max_len));
-        for (i, enc) in encodings.iter().enumerate() {
-            for (j, ((&id, &m), &ty)) in enc
-                .get_ids()
-                .iter()
-                .zip(enc.get_attention_mask().iter())
-                .zip(enc.get_type_ids().iter())
-                .enumerate()
-            {
-                input_ids[[i, j]] = id as i64;
-                attention_mask[[i, j]] = m as i64;
-                token_type_ids[[i, j]] = ty as i64;
-            }
-        }
-
-        let ids_t = TensorRef::from_array_view(&input_ids)
-            .map_err(|e| anyhow::anyhow!("creating input_ids tensor: {e}"))?;
-        let mask_t = TensorRef::from_array_view(&attention_mask)
-            .map_err(|e| anyhow::anyhow!("creating attention_mask tensor: {e}"))?;
-        let ty_t = TensorRef::from_array_view(&token_type_ids)
-            .map_err(|e| anyhow::anyhow!("creating token_type_ids tensor: {e}"))?;
-
+        // Score in fixed-size sub-batches, reusing one session arena across
+        // chunks. This caps the worst-case resident set (see RERANK_SUB_BATCH);
+        // the actual OOM fix is disabling the tokenizer's fixed 8000-token
+        // padding in `load`. Cross-encoder logits are per-pair independent, so
+        // chunking yields the same scores and order as one big batch.
         let mut session = self
             .session
             .lock()
@@ -317,42 +394,77 @@ impl RerankerInner {
             .inputs()
             .iter()
             .any(|i| i.name() == "token_type_ids");
-        let outputs = if needs_token_type_ids {
-            session.run(ort::inputs![
-                "input_ids" => ids_t,
-                "attention_mask" => mask_t,
-                "token_type_ids" => ty_t,
-            ])
-        } else {
-            session.run(ort::inputs![
-                "input_ids" => ids_t,
-                "attention_mask" => mask_t,
-            ])
-        }
-        .map_err(|e| anyhow::anyhow!("reranker inference failed: {e}"))?;
 
-        // Output shape: [batch, 1] (single logit) or [batch, 2]
-        // (binary classifier — relevance is logit[1] - logit[0]).
-        let arr = outputs[0]
-            .try_extract_array::<f32>()
-            .map_err(|e| anyhow::anyhow!("extracting reranker output: {e}"))?;
-        let shape = arr.shape();
-        let mut scores = Vec::with_capacity(batch);
-        match shape.len() {
-            2 if shape[1] == 1 => {
-                for i in 0..batch {
-                    scores.push(arr[[i, 0]]);
+        let mut scores = Vec::with_capacity(encodings.len());
+        for chunk in encodings.chunks(RERANK_SUB_BATCH) {
+            let batch = chunk.len();
+            // Pad only to the longest sequence in *this* chunk, not the
+            // whole pool — a chunk of short docs stays cheap.
+            let max_len = chunk
+                .iter()
+                .map(|e| e.get_ids().len())
+                .max()
+                .unwrap_or(0);
+            let mut input_ids = Array2::<i64>::zeros((batch, max_len));
+            let mut attention_mask = Array2::<i64>::zeros((batch, max_len));
+            let mut token_type_ids = Array2::<i64>::zeros((batch, max_len));
+            for (i, enc) in chunk.iter().enumerate() {
+                for (j, ((&id, &m), &ty)) in enc
+                    .get_ids()
+                    .iter()
+                    .zip(enc.get_attention_mask().iter())
+                    .zip(enc.get_type_ids().iter())
+                    .enumerate()
+                {
+                    input_ids[[i, j]] = id as i64;
+                    attention_mask[[i, j]] = m as i64;
+                    token_type_ids[[i, j]] = ty as i64;
                 }
             }
-            2 if shape[1] >= 2 => {
-                for i in 0..batch {
-                    scores.push(arr[[i, 1]] - arr[[i, 0]]);
-                }
+
+            let ids_t = TensorRef::from_array_view(&input_ids)
+                .map_err(|e| anyhow::anyhow!("creating input_ids tensor: {e}"))?;
+            let mask_t = TensorRef::from_array_view(&attention_mask)
+                .map_err(|e| anyhow::anyhow!("creating attention_mask tensor: {e}"))?;
+            let ty_t = TensorRef::from_array_view(&token_type_ids)
+                .map_err(|e| anyhow::anyhow!("creating token_type_ids tensor: {e}"))?;
+
+            let outputs = if needs_token_type_ids {
+                session.run(ort::inputs![
+                    "input_ids" => ids_t,
+                    "attention_mask" => mask_t,
+                    "token_type_ids" => ty_t,
+                ])
+            } else {
+                session.run(ort::inputs![
+                    "input_ids" => ids_t,
+                    "attention_mask" => mask_t,
+                ])
             }
-            _ => anyhow::bail!(
-                "unexpected reranker output shape: {:?} (expected [batch, 1] or [batch, 2])",
-                shape
-            ),
+            .map_err(|e| anyhow::anyhow!("reranker inference failed: {e}"))?;
+
+            // Output shape: [batch, 1] (single logit) or [batch, 2]
+            // (binary classifier — relevance is logit[1] - logit[0]).
+            let arr = outputs[0]
+                .try_extract_array::<f32>()
+                .map_err(|e| anyhow::anyhow!("extracting reranker output: {e}"))?;
+            let shape = arr.shape();
+            match shape.len() {
+                2 if shape[1] == 1 => {
+                    for i in 0..batch {
+                        scores.push(arr[[i, 0]]);
+                    }
+                }
+                2 if shape[1] >= 2 => {
+                    for i in 0..batch {
+                        scores.push(arr[[i, 1]] - arr[[i, 0]]);
+                    }
+                }
+                _ => anyhow::bail!(
+                    "unexpected reranker output shape: {:?} (expected [batch, 1] or [batch, 2])",
+                    shape
+                ),
+            }
         }
         Ok(scores)
     }
@@ -480,6 +592,32 @@ mod tests {
         assert!(resolve_reranker_model("gte-reranker-modernbert-base").is_some());
     }
 
+    #[test]
+    fn resolve_reranker_model_handles_int8_and_minilm_aliases() {
+        assert_eq!(
+            resolve_reranker_model("gte-reranker-modernbert-int8").unwrap().id,
+            "gte-reranker-modernbert-base-int8"
+        );
+        assert_eq!(
+            resolve_reranker_model("minilm").unwrap().id,
+            "ms-marco-minilm-l6-v2-int8"
+        );
+        assert_eq!(
+            resolve_reranker_model("ms-marco-minilm-l6").unwrap().id,
+            "ms-marco-minilm-l6-v2-int8"
+        );
+    }
+
+    #[test]
+    fn resolve_intra_threads_honours_explicit_and_caps_auto() {
+        // Explicit values pass through untouched (even past the auto cap).
+        assert_eq!(resolve_intra_threads(1), 1);
+        assert_eq!(resolve_intra_threads(16), 16);
+        // Auto (0) is clamped to [1, RERANK_MAX_AUTO_THREADS].
+        let auto = resolve_intra_threads(0);
+        assert!((1..=RERANK_MAX_AUTO_THREADS).contains(&auto), "auto={auto}");
+    }
+
     #[tokio::test]
     async fn null_reranker_preserves_candidate_count() {
         let reranker = NullReranker;
@@ -490,8 +628,37 @@ mod tests {
 
     #[test]
     fn build_reranker_accepts_null_and_none() {
-        assert!(build_reranker("none").unwrap().is_none());
-        let rr = build_reranker("null").unwrap().expect("null reranker");
+        assert!(build_reranker("none", 0).unwrap().is_none());
+        let rr = build_reranker("null", 0).unwrap().expect("null reranker");
         assert_eq!(rr.model_id(), "null");
+    }
+
+    /// Regression guard for the fixed-padding OOM: the gte-reranker-modernbert
+    /// tokenizer ships `padding.strategy = Fixed(8000)`, which would re-pad
+    /// every pair to 8000 tokens after truncation and OOM the ONNX forward.
+    /// [`configure_reranker_tokenizer`] must disable padding so a huge
+    /// candidate still encodes to `<= MAX_PAIR_TOKENS`. Requires the model to
+    /// be downloaded (skips cleanly otherwise).
+    #[test]
+    #[ignore = "requires downloaded gte-reranker-modernbert tokenizer"]
+    fn reranker_tokenizer_caps_pair_length() {
+        let manager = ModelManager::new();
+        let path = manager.tokenizer_path(&GTE_RERANKER_MODERNBERT_BASE);
+        if !path.exists() {
+            eprintln!("skip: tokenizer not downloaded at {}", path.display());
+            return;
+        }
+        let mut tokenizer = Tokenizer::from_file(&path).expect("load tokenizer");
+        configure_reranker_tokenizer(&mut tokenizer).expect("configure");
+
+        let huge = "lorem ipsum dolor sit amet ".repeat(5000);
+        let enc = tokenizer
+            .encode(("what is the write gate", huge.as_str()), true)
+            .expect("encode pair");
+        assert!(
+            enc.get_ids().len() <= MAX_PAIR_TOKENS,
+            "pair encoded to {} tokens; padding not disabled (expected <= {MAX_PAIR_TOKENS})",
+            enc.get_ids().len(),
+        );
     }
 }
