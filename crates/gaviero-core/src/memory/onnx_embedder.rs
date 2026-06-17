@@ -95,6 +95,14 @@ impl OnnxEmbedder {
             }))
             .map_err(|e| anyhow::anyhow!("configuring tokenizer truncation: {}", e))?;
 
+        // Defensive: some tokenizers (notably the Alibaba gte-modernbert family)
+        // ship a *fixed* padding strategy in tokenizer.json that re-pads every
+        // input back up to thousands of tokens *after* the truncation above,
+        // reintroducing the O(seq²) ONNX blow-up that truncation is meant to
+        // prevent. `run_inference` zero-pads to the batch max itself, so disable
+        // tokenizer-side padding. (No-op for nomic/e5, whose padding is null.)
+        tokenizer.with_padding(None);
+
         Ok(Self {
             session: Mutex::new(session),
             tokenizer,
