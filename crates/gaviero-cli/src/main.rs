@@ -2194,10 +2194,22 @@ async fn run_eval_rerank_ablation(repo: &std::path::Path, fixture: &PathBuf) -> 
     row("recall@5", off.recall_at_5, on.recall_at_5);
     row("recall@10", off.recall_at_10, on.recall_at_10);
     row("MRR", off.mrr, on.mrr);
+    // Gold-set (T1.3) metrics: these are the ones that move on a
+    // gold-set fixture like `code_prompts.jsonl`, where every case
+    // expresses ground truth via `gold_must`/`gold_neutral` and carries
+    // no `expected_memory_id` (so Recall@K / MRR above stay ~0).
+    row("precision@5", off.precision_at_5, on.precision_at_5);
+    row("precision@10", off.precision_at_10, on.precision_at_10);
+    row("ndcg@5", off.ndcg_at_5, on.ndcg_at_5);
+    row("ndcg@10", off.ndcg_at_10, on.ndcg_at_10);
+    row("blast_leak", off.blast_leakage, on.blast_leakage);
     let r5_delta = on.recall_at_5 - off.recall_at_5;
+    let ndcg5_delta = on.ndcg_at_5 - off.ndcg_at_5;
     println!(
-        "\nverdict     : recall@5 Δ = {:+.3} (B2 plan target ≥ +0.030)",
-        r5_delta
+        "\nverdict     : recall@5 Δ = {:+.3}  |  ndcg@5 Δ = {:+.3}\n\
+         (legacy fixtures gate on recall@5; gold-set fixtures gate on \
+         ndcg@5 — B2 plan target ≥ +0.030)",
+        r5_delta, ndcg5_delta
     );
     Ok(())
 }

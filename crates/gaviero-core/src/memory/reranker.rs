@@ -97,8 +97,12 @@ pub struct RerankConfig {
     /// (`final = w * rerank + (1 - w) * composite`). 0.0 = pure
     /// composite, 1.0 = pure rerank.
     pub blend_weight: f32,
-    /// Soft latency budget in ms. Exceeding this once disables rerank
-    /// for the rest of the session and falls back to composite.
+    /// Advisory soft latency budget in ms. This is **not** a kill-switch:
+    /// exceeding it logs a `memory_rerank` warning ("applied this turn")
+    /// and the rerank blend is applied anyway for that query, with no
+    /// effect on subsequent queries (see `retrieval.rs`). Tune the
+    /// `enabled` flip against measured p95 latency, since there is no
+    /// runtime fallback once rerank is on.
     pub max_latency_ms: u64,
 }
 

@@ -661,7 +661,13 @@ pub async fn run_live(
 ) -> Result<EvalReport> {
     let default_cfg = RetrievalConfig::default();
     let cfg = retrieval_cfg.unwrap_or(&default_cfg);
-    let mut outcomes = Vec::with_capacity(cases.len());
+    // Retain each case's retrieved pool so the report carries the T1.3
+    // gold-set metrics (precision/ndcg/leakage) — not just the legacy
+    // `expected_memory_id` Recall@K. Code fixtures (`code_prompts.jsonl`)
+    // express ground truth via `gold_must`/`gold_neutral` only, so a
+    // reranker ablation that scored Recall@K alone would report Δ0; the
+    // gold-set metrics are where a rerank change actually shows up.
+    let mut pools = Vec::with_capacity(cases.len());
     for case in cases {
         // The eval scope hint biases the scope chain but doesn't gate
         // retrieval — the merged engine considers every level. We fold
@@ -672,9 +678,9 @@ pub async fn run_live(
         let out = retrieve_ranked(&stores, &scope, &case.query, 50, cfg, reranker, rerank_cfg)
             .await
             .with_context(|| format!("retrieving for case {}", case.id))?;
-        outcomes.push(outcome_from_pool(case, &out.items));
+        pools.push(out.items);
     }
-    Ok(build_report(outcomes))
+    Ok(build_report_with_pools(cases, &pools))
 }
 
 /// Construct a `MemoryScope` for an eval case. The case's `scope`
