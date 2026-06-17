@@ -1232,18 +1232,37 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 let mcp_edge_weights = app
                     .workspace
                     .resolve_all_edge_weights(Some(&workspace_root_for_mcp));
+                // Phase 1: fan the tool-call stream out to both the TUI
+                // audit panel and the host-side NDJSON telemetry sink
+                // (`<workspace>/.gaviero/mcp_calls.ndjson`, size-rotated,
+                // never via the memory writer).
+                let mcp_observer: std::sync::Arc<dyn gaviero_core::mcp::McpToolCallObserver> =
+                    std::sync::Arc::new(gaviero_core::mcp::FanOutMcpObserver::new(vec![
+                        std::sync::Arc::new(super::observers::TuiMcpObserver {
+                            tx: app.event_tx.clone(),
+                        }),
+                        std::sync::Arc::new(
+                            gaviero_core::mcp::NdjsonTelemetrySink::for_workspace(
+                                &workspace_root_for_mcp,
+                            ),
+                        ),
+                    ]));
                 let server = gaviero_core::mcp::GavieroMcpServer::new(
                     stores.clone(),
                     workspace_root_for_mcp.clone(),
-                    std::sync::Arc::new(super::observers::TuiMcpObserver {
-                        tx: app.event_tx.clone(),
-                    }),
+                    mcp_observer,
                     mcp_retrieval_cfg,
                     mcp_rerank_cfg,
                     app.memory_reranker.clone(),
                 )
                 .with_specificity(mcp_specificity)
                 .with_edge_weights(mcp_edge_weights);
+                // Phase 1: warm the graph cache + reranker in the
+                // background so the first user query never pays the cold
+                // start. The cache is shared via Arc with every spawned
+                // connection clone.
+                let warm = server.clone();
+                tokio::spawn(async move { warm.warmup().await });
                 match gaviero_core::mcp::spawn_mcp_server(server, &socket_path) {
                     Ok(handle) => {
                         tracing::info!(
