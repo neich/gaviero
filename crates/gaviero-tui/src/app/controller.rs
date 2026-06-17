@@ -1003,40 +1003,16 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                     .as_str()
                     .unwrap_or("none")
                     .to_string();
-                let pool_size = app
+                // Resolve the full rerank config (pool / blend / latency /
+                // threads) from settings; `enabled` is already true on this
+                // branch. Threads drive the ONNX session's intra-op width.
+                let cfg = app
                     .workspace
-                    .resolve_setting(
-                        gaviero_core::workspace::settings::MEMORY_RERANKER_POOL_SIZE,
-                        Some(&workspace_root),
-                    )
-                    .as_u64()
-                    .unwrap_or(50) as usize;
-                let blend_weight = app
-                    .workspace
-                    .resolve_setting(
-                        gaviero_core::workspace::settings::MEMORY_RERANKER_BLEND_WEIGHT,
-                        Some(&workspace_root),
-                    )
-                    .as_f64()
-                    .unwrap_or(0.6) as f32;
-                let max_latency_ms = app
-                    .workspace
-                    .resolve_setting(
-                        gaviero_core::workspace::settings::MEMORY_RERANKER_MAX_LATENCY_MS,
-                        Some(&workspace_root),
-                    )
-                    .as_u64()
-                    .unwrap_or(200);
-
-                let cfg = gaviero_core::memory::RerankConfig {
-                    enabled: true,
-                    pool_size,
-                    blend_weight,
-                    max_latency_ms,
-                };
+                    .resolve_rerank_config(Some(&workspace_root));
+                let threads = cfg.threads;
                 let model_for_load = model_name.clone();
                 match tokio::task::block_in_place(|| {
-                    gaviero_core::memory::build_reranker(&model_for_load)
+                    gaviero_core::memory::build_reranker(&model_for_load, threads)
                 }) {
                     Ok(Some(rr)) => {
                         let arc: std::sync::Arc<dyn gaviero_core::memory::Reranker> = rr;

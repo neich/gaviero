@@ -113,6 +113,7 @@ pub mod settings {
     pub const MEMORY_RERANKER_POOL_SIZE: &str = "memory.reranker.candidatePoolSize";
     pub const MEMORY_RERANKER_BLEND_WEIGHT: &str = "memory.reranker.blendWeight";
     pub const MEMORY_RERANKER_MAX_LATENCY_MS: &str = "memory.reranker.maxLatencyMs";
+    pub const MEMORY_RERANKER_THREADS: &str = "memory.reranker.threads";
 
     // Tier C / C3-C4 — repo-map specificity and typed edge settings
     pub const REPO_MAP_SPECIFICITY_ENABLED: &str = "repoMap.specificity.enabled";
@@ -822,7 +823,7 @@ impl Workspace {
         let pool_size = self
             .resolve_setting(settings::MEMORY_RERANKER_POOL_SIZE, root)
             .as_u64()
-            .unwrap_or(50) as usize;
+            .unwrap_or(20) as usize;
         let blend_weight = self
             .resolve_setting(settings::MEMORY_RERANKER_BLEND_WEIGHT, root)
             .as_f64()
@@ -831,11 +832,18 @@ impl Workspace {
             .resolve_setting(settings::MEMORY_RERANKER_MAX_LATENCY_MS, root)
             .as_u64()
             .unwrap_or(200);
+        // `0` = auto (resolved to available parallelism, capped, in the
+        // reranker loader). Reranker-only; the embedder stays single-threaded.
+        let threads = self
+            .resolve_setting(settings::MEMORY_RERANKER_THREADS, root)
+            .as_u64()
+            .unwrap_or(0) as usize;
         crate::memory::RerankConfig {
             enabled,
             pool_size,
             blend_weight,
             max_latency_ms,
+            threads,
         }
     }
 
@@ -958,12 +966,20 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::MEMORY_EMBEDDER_REEMBED_BATCH_SIZE => serde_json::json!(32),
 
         // Cross-encoder reranker (B2).
-        // Disabled by default until the B2f ablation gate is green.
-        settings::MEMORY_RERANKER_ENABLED => serde_json::json!(false),
-        settings::MEMORY_RERANKER_MODEL => serde_json::json!("gte-reranker-modernbert"),
-        settings::MEMORY_RERANKER_POOL_SIZE => serde_json::json!(50),
+        // Enabled by default as of the B2f viability ablation (2026-06-17):
+        // runs in its fast, CPU-viable configuration. The default model is
+        // the int8 ms-marco-MiniLM-L6 cross-encoder (~22M): on the B2f code
+        // gold set it matched the int8 gte-reranker-modernbert (~150M) on
+        // ndcg@5 to within noise (+0.261 vs +0.270) at ~8× lower latency
+        // (~540 ms vs ~4 s/query). `gte-reranker-modernbert-int8` remains
+        // selectable for the quality ceiling (tolerable only at chat
+        // frequency, or on GPU). Threads = auto, pool = 20; see reranker.rs.
+        settings::MEMORY_RERANKER_ENABLED => serde_json::json!(true),
+        settings::MEMORY_RERANKER_MODEL => serde_json::json!("minilm"),
+        settings::MEMORY_RERANKER_POOL_SIZE => serde_json::json!(20),
         settings::MEMORY_RERANKER_BLEND_WEIGHT => serde_json::json!(0.6),
         settings::MEMORY_RERANKER_MAX_LATENCY_MS => serde_json::json!(200),
+        settings::MEMORY_RERANKER_THREADS => serde_json::json!(0),
 
         // Repo-map graph precision (C3/C4).
         settings::REPO_MAP_SPECIFICITY_ENABLED => serde_json::json!(true),

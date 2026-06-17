@@ -2112,9 +2112,7 @@ async fn run_eval_from_manifests(
 /// just `--eval-fixture` without this flag, so we don't double-run.
 async fn run_eval_rerank_ablation(repo: &std::path::Path, fixture: &PathBuf) -> Result<()> {
     use gaviero_core::memory::eval::{load_fixture, run_live};
-    use gaviero_core::memory::{
-        MemoryScope, RerankConfig, Reranker, RetrievalConfig, build_reranker, hash_path,
-    };
+    use gaviero_core::memory::{MemoryScope, Reranker, RetrievalConfig, build_reranker, hash_path};
 
     let cases = load_fixture(fixture).context("loading eval fixture")?;
     if cases.is_empty() {
@@ -2126,6 +2124,11 @@ async fn run_eval_rerank_ablation(repo: &std::path::Path, fixture: &PathBuf) -> 
     let mut workspace = gaviero_core::workspace::Workspace::single_folder(repo.to_path_buf());
     workspace.ensure_settings();
     let workspace_root = repo.to_path_buf();
+    // Drive the ON-mode config from settings (model / pool_size / threads /
+    // blend) so the temp-repo settings.json can sweep configurations; only
+    // `enabled` is forced on.
+    let mut rerank_cfg = workspace.resolve_rerank_config(Some(&workspace_root));
+    rerank_cfg.enabled = true;
     let model_name = workspace
         .resolve_setting(
             gaviero_core::workspace::settings::MEMORY_RERANKER_MODEL,
@@ -2134,12 +2137,16 @@ async fn run_eval_rerank_ablation(repo: &std::path::Path, fixture: &PathBuf) -> 
         .as_str()
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "gte-reranker-modernbert-base".to_string());
+        .unwrap_or_else(|| "gte-reranker-modernbert-base-int8".to_string());
 
-    eprintln!("[gaviero-eval] loading reranker model `{model_name}`…");
+    eprintln!(
+        "[gaviero-eval] loading reranker `{model_name}` (pool={}, threads={})…",
+        rerank_cfg.pool_size, rerank_cfg.threads
+    );
+    let threads = rerank_cfg.threads;
     let reranker = tokio::task::spawn_blocking({
         let model = model_name.clone();
-        move || build_reranker(&model)
+        move || build_reranker(&model, threads)
     })
     .await
     .context("loading reranker (ablation)")??;
@@ -2147,7 +2154,7 @@ async fn run_eval_rerank_ablation(repo: &std::path::Path, fixture: &PathBuf) -> 
         anyhow::bail!(
             "rerank model `{model_name}` resolved to none — set \
              `memory.reranker.model` to a known reranker (e.g. \
-             gte-reranker-modernbert-base) or download the model file first."
+             gte-reranker-modernbert-int8) or download the model file first."
         );
     };
     let rr_arc: std::sync::Arc<dyn Reranker> = rr;
@@ -2165,10 +2172,6 @@ async fn run_eval_rerank_ablation(repo: &std::path::Path, fixture: &PathBuf) -> 
         run_id: None,
     };
     let retrieval_cfg = RetrievalConfig::default();
-    let rerank_cfg = RerankConfig {
-        enabled: true,
-        ..RerankConfig::default()
-    };
 
     eprintln!("[gaviero-eval] running OFF-mode (composite-only)…");
     let off = run_live(&store, &scope_ctx, &cases, Some(&retrieval_cfg), None, None).await?;
@@ -2185,6 +2188,10 @@ async fn run_eval_rerank_ablation(repo: &std::path::Path, fixture: &PathBuf) -> 
 
     println!("─── Rerank ablation (B2f) ────────────────────────────");
     println!("model       : {model_name}");
+    println!(
+        "pool/threads: {} / {} (0=auto)",
+        rerank_cfg.pool_size, rerank_cfg.threads
+    );
     println!("cases       : {}", cases.len());
     println!("             {:>10}  {:>10}  {:>10}", "off", "on", "Δ");
     let row = |label: &str, a: f32, b: f32| {
