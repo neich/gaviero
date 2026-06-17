@@ -7,6 +7,7 @@
 //! tool-output memories" is avoided here — nothing touches the writer
 //! task.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 /// One observable MCP tool invocation. Input/output are raw JSON so
@@ -33,4 +34,27 @@ pub struct NoopMcpObserver;
 
 impl McpToolCallObserver for NoopMcpObserver {
     fn on_tool_call(&self, _entry: &McpCallLogEntry) {}
+}
+
+/// Fan-out observer: forwards each tool-call event to every wrapped
+/// observer in registration order. `GavieroMcpServer::new` accepts a
+/// single observer, so the host composes (e.g.) the TUI audit-panel
+/// observer with the NDJSON telemetry sink behind one slot. Each sink
+/// must stay cheap — they run on the tool-response path in sequence.
+pub struct FanOutMcpObserver {
+    sinks: Vec<Arc<dyn McpToolCallObserver>>,
+}
+
+impl FanOutMcpObserver {
+    pub fn new(sinks: Vec<Arc<dyn McpToolCallObserver>>) -> Self {
+        Self { sinks }
+    }
+}
+
+impl McpToolCallObserver for FanOutMcpObserver {
+    fn on_tool_call(&self, entry: &McpCallLogEntry) {
+        for sink in &self.sinks {
+            sink.on_tool_call(entry);
+        }
+    }
 }

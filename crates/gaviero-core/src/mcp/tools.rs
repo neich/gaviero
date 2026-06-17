@@ -20,8 +20,9 @@ pub struct MemorySearchInput {
     /// retrieval query.
     pub query: String,
     /// Optional scope filter (`"global"`, `"workspace"`, `"repo"`,
-    /// `"module"`, `"run"`). When omitted, the cascading default
-    /// (`Workspace ∪ Repo ∪ Module`, Global off) applies.
+    /// `"module"`, `"run"`). When omitted, retrieval merges the
+    /// workspace and global scopes via multi-scope hybrid search (RRF),
+    /// not a narrow→wide cascade.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope_hint: Option<String>,
     /// Maximum results. Server clamps to [1, 20] to protect token
@@ -51,8 +52,6 @@ pub struct MemorySearchResult {
     pub text: String,
     pub importance: f32,
     pub trust: f32,
-    #[serde(default)]
-    pub refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]

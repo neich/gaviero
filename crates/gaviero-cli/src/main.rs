@@ -438,6 +438,18 @@ struct Cli {
     #[arg(long = "skip-mcp-preflight")]
     skip_mcp_preflight: bool,
 
+    /// KB-efficiency Phase 1: read the MCP tool-call telemetry sink and
+    /// print per-tool intrinsic metrics (call count, p50/p95 latency,
+    /// error rate, empty-result rate), then exit. Reads
+    /// `<repo>/.gaviero/mcp_calls.ndjson` unless `--mcp-stats-path`
+    /// overrides it.
+    #[arg(long = "mcp-stats")]
+    mcp_stats: bool,
+
+    /// Override the NDJSON path read by `--mcp-stats`.
+    #[arg(long = "mcp-stats-path", value_name = "PATH", requires = "mcp_stats")]
+    mcp_stats_path: Option<PathBuf>,
+
     /// Tier A / A2: write a `/remember`-style memory from headless
     /// mode and exit. Goes through the writer task (single-consumer
     /// invariant) — opens [`MemoryServices`] under the hood. Pair with
@@ -1036,8 +1048,8 @@ fn prepare_mcp_for_swarm(
     use std::sync::Arc;
 
     use gaviero_core::mcp::{
-        GavieroMcpServer, NoopMcpObserver, PreflightOpts, preflight_mcp, resolve_mcp_config_synth,
-        spawn_mcp_server, synthesize_for_worktree,
+        GavieroMcpServer, NdjsonTelemetrySink, PreflightOpts, preflight_mcp,
+        resolve_mcp_config_synth, spawn_mcp_server, synthesize_for_worktree,
     };
 
     let mut overrides = mcp_overrides_from_cli(cli, script_vars)?;
@@ -1073,13 +1085,21 @@ fn prepare_mcp_for_swarm(
             let server = GavieroMcpServer::new(
                 stores.clone(),
                 repo.to_path_buf(),
-                Arc::new(NoopMcpObserver),
+                // Phase 1: persist tool-call telemetry to
+                // `<repo>/.gaviero/mcp_calls.ndjson` (read back by
+                // `--mcp-stats`). Size-rotated, never via the writer.
+                Arc::new(NdjsonTelemetrySink::for_workspace(repo)),
                 retrieval_cfg,
                 rerank_cfg,
                 None,
             )
             .with_specificity(specificity)
             .with_edge_weights(edge_weights);
+            // Phase 1: warm the blast_radius graph cache in the
+            // background so the first agent tool call doesn't pay the
+            // cold build. (No reranker in the CLI path → graph only.)
+            let warm = server.clone();
+            tokio::spawn(async move { warm.warmup().await });
             let h = spawn_mcp_server(server, &synth.socket_path)
                 .with_context(|| format!("starting gaviero MCP server at {}", synth.socket_path.display()))?;
             eprintln!(
@@ -2260,6 +2280,39 @@ fn resolve_coordinator_model(
     resolve_model_spec(&candidate, "coordinator")
 }
 
+/// KB-efficiency Phase 1: read the MCP tool-call telemetry sink and
+/// print per-tool intrinsic metrics to stdout. Intrinsic only — no
+/// task-success correlation. A missing/empty sink is not an error.
+fn run_mcp_stats(repo: &std::path::Path, path_override: Option<&std::path::Path>) -> Result<()> {
+    let path = path_override
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| gaviero_core::mcp::default_telemetry_path(repo));
+    let stats = gaviero_core::mcp::compute_stats(&path)
+        .with_context(|| format!("reading MCP telemetry from {}", path.display()))?;
+    if stats.is_empty() {
+        println!("No MCP tool-call telemetry at {}", path.display());
+        return Ok(());
+    }
+    let total: usize = stats.iter().map(|s| s.calls).sum();
+    println!("MCP tool-call stats — {} call(s) at {}", total, path.display());
+    println!(
+        "{:<16} {:>6} {:>10} {:>10} {:>8} {:>8}",
+        "tool", "calls", "p50(ms)", "p95(ms)", "err%", "empty%"
+    );
+    for s in &stats {
+        println!(
+            "{:<16} {:>6} {:>10.2} {:>10.2} {:>7.1}% {:>7.1}%",
+            s.tool_name,
+            s.calls,
+            s.p50_ms,
+            s.p95_ms,
+            s.error_rate * 100.0,
+            s.empty_result_rate * 100.0,
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -2302,6 +2355,13 @@ async fn main() -> Result<()> {
     let swarm_workspace = prepare_swarm_workspace(&cli, &cwd, script_execution_mode)?;
     let repo = std::fs::canonicalize(&swarm_workspace.repo_path)
         .with_context(|| format!("resolving repo path: {}", swarm_workspace.repo_path.display()))?;
+
+    // ── KB-efficiency Phase 1: MCP telemetry report ──────────────
+    // A pure read of the NDJSON sink. Placed before the C1 migration
+    // probe so `--mcp-stats` never forces a migration prompt.
+    if cli.mcp_stats {
+        return run_mcp_stats(&repo, cli.mcp_stats_path.as_deref());
+    }
 
     // ── Tier C / C1: enforce explicit consent for the typed-stores
     // migration. Headless invocation cannot prompt; require the

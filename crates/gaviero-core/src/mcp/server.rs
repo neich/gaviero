@@ -144,6 +144,45 @@ impl GavieroMcpServer {
         *guard = None;
     }
 
+    /// Phase 1 warmup: pay the `blast_radius` graph-build cost and (when
+    /// a reranker is configured) the cold-ONNX session/tokenizer load at
+    /// workspace-open time, in the background, so the first real user
+    /// query never lands on a cold start. Best-effort: build/warm errors
+    /// are logged and swallowed — a warmup failure must never block
+    /// workspace open. The graph cache is shared via `Arc` with every
+    /// per-connection server clone, so warming here warms all of them.
+    pub async fn warmup(&self) {
+        let cache = Arc::clone(&self.graph_cache);
+        let workspace_root = self.workspace_root.clone();
+        // build_graph is blocking + potentially heavy on a large repo;
+        // run it off the async runtime and hold the cache lock only for
+        // this build (matching the `blast_radius` pattern).
+        let _ = tokio::task::spawn_blocking(move || {
+            let mut guard = cache.blocking_lock();
+            if guard.is_none() {
+                match crate::repo_map::graph_builder::build_graph(&workspace_root, &[]) {
+                    Ok((store, _)) => *guard = Some(store),
+                    Err(e) => tracing::warn!(
+                        target: "mcp_server",
+                        error = %e,
+                        "graph cache warmup build failed"
+                    ),
+                }
+            }
+        })
+        .await;
+
+        if let Some(reranker) = self.reranker.as_ref()
+            && let Err(e) = reranker.warmup().await
+        {
+            tracing::warn!(
+                target: "mcp_server",
+                error = %e,
+                "reranker warmup failed"
+            );
+        }
+    }
+
     pub fn with_defaults(stores: Arc<MemoryStores>, workspace_root: PathBuf) -> Self {
         Self::new(
             stores,
@@ -158,9 +197,14 @@ impl GavieroMcpServer {
     // ── memory_search ───────────────────────────────────────────────
     #[tool(
         name = "memory_search",
-        description = "Scoped cascading search over Gaviero's workspace memory store. \
-                       Returns top-K scored memories (id, scope, type, text, \
-                       importance, trust, refs). Read-only."
+        description = "Call this when you need a fact a prior session or the user already \
+                       established — conventions, decisions, past bugs, project context — \
+                       before reading code to rediscover it. Merged multi-scope hybrid \
+                       search (workspace + global, RRF) over Gaviero's memory store; \
+                       returns up to `limit` scored memories (id, scope, type, text, \
+                       importance, trust). Read-only. Token cost: roughly 50-150 tokens \
+                       per result.",
+        annotations(read_only_hint = true, idempotent_hint = true)
     )]
     async fn memory_search(
         &self,
@@ -229,7 +273,6 @@ impl GavieroMcpServer {
                 text: m.content.clone(),
                 importance: m.importance,
                 trust: m.trust_score,
-                refs: Vec::new(),
             });
         }
         let out = MemorySearchOutput { results };
@@ -247,9 +290,12 @@ impl GavieroMcpServer {
     // ── blast_radius ────────────────────────────────────────────────
     #[tool(
         name = "blast_radius",
-        description = "Graph-based impact / callers / tests affected by one or more \
-                       source paths. Wraps the repo-map; returns {nodes: [{path, \
-                       relation, distance, purpose?}]}. Read-only."
+        description = "Call this before editing a file to see what else may break: the \
+                       impacted files, callers, and missing tests for one or more source \
+                       paths, ranked by the requested `mode`. Graph-based (repo-map); \
+                       returns {nodes: [{path, relation, distance, score?}]}. Read-only. \
+                       Token cost: roughly 20-40 tokens per returned relation.",
+        annotations(read_only_hint = true, idempotent_hint = true)
     )]
     async fn blast_radius(
         &self,
@@ -294,8 +340,7 @@ impl GavieroMcpServer {
             let impact = store.impact_radius_with_mode(&seed_refs, depth as usize, mode)?;
             // Rank only the files we'll actually emit so the DiGraph
             // build stays bounded by graph size, not affected-set size.
-            let mut to_rank: Vec<String> =
-                impact.changed_files.iter().cloned().collect();
+            let mut to_rank: Vec<String> = impact.changed_files.to_vec();
             for f in &impact.affected_files {
                 if !to_rank.contains(f) {
                     to_rank.push(f.clone());
@@ -377,8 +422,11 @@ impl GavieroMcpServer {
     // ── node_doc ────────────────────────────────────────────────────
     #[tool(
         name = "node_doc",
-        description = "Tier D1 stub: returns {path, signatures, purpose, summary} \
-                       for a file. `purpose` and `summary` are empty until D1 lands."
+        description = "Call this when you need one file's symbol signatures. Returns \
+                       {path, signatures, purpose, summary}; `purpose`/`summary` fill in \
+                       once symbol enrichment runs (empty until then). Read-only. Low \
+                       token cost.",
+        annotations(read_only_hint = true, idempotent_hint = true)
     )]
     async fn node_doc(
         &self,
