@@ -920,7 +920,10 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::AGENT_MODEL => serde_json::json!("claude:sonnet"),
         settings::AGENT_EFFORT => serde_json::json!("off"),
         settings::AGENT_MAX_TOKENS => serde_json::json!(16384),
-        settings::AGENT_GRAPH_BUDGET_TOKENS => serde_json::json!(12000),
+        // 8000 (was 12000): the per-file outline downgrade (repo_map/mod.rs)
+        // makes files lose detail rather than drop, so a smaller outline
+        // budget cuts first-turn tokens while keeping breadth.
+        settings::AGENT_GRAPH_BUDGET_TOKENS => serde_json::json!(8000),
         settings::AGENT_CONTEXT_BOOTSTRAP => serde_json::json!("auto"),
         settings::AGENT_AVAILABLE_TOOLS => {
             serde_json::json!(["Read", "Glob", "Grep", "Write", "Edit", "MultiEdit"])

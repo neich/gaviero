@@ -186,6 +186,25 @@ pub struct GraphCandidate {
     pub content_digest: Option<String>,
 }
 
+/// Hard cap on `<repo_outline>` entries, independent of the token budget.
+/// An anti-explosion guard: with the line-cost budgeting below, outline
+/// entries are cheap, so a very large graph could otherwise dump thousands
+/// of path-only lines. The token budget is the primary bound; this only
+/// binds on pathologically large repos.
+const OUTLINE_MAX_FILES: usize = 300;
+
+/// Token cost of a single `<repo_outline>` line — what the outline actually
+/// injects for a file. The outline budget is charged against *this*, never
+/// the file's full content: a `FullAttach` file only emits its `OWN <path>`
+/// line on the first turn (the full content is attached later by the M7
+/// outline→full upgrade, keyed off the content digest). Charging
+/// full-content tokens up front over-reserves the budget and starves
+/// signature breadth, and inflates `graph_token_estimate` (the bottom-bar
+/// `ctx:` readout) above what is actually sent.
+fn outline_line_cost(line: &str) -> usize {
+    (line.len() / 4).max(1)
+}
+
 /// C3 + C4: rank a set of files using mode-weighted PageRank +
 /// specificity, sourced from the persisted [`store::GraphStore`].
 ///
@@ -454,7 +473,8 @@ impl RepoMap {
         let mut out: Vec<GraphCandidate> = Vec::new();
 
         for (rank_idx, idx) in sorted.iter().enumerate() {
-            if tokens_used >= budget_tokens {
+            // Anti-explosion guard; the token budget below is the primary bound.
+            if out.len() >= OUTLINE_MAX_FILES {
                 break;
             }
             let node = &self.graph[*idx];
@@ -469,61 +489,65 @@ impl RepoMap {
                 GraphConfidence::Low
             };
 
-            if owned_set.contains(idx) {
-                if tokens_used + node.token_estimate <= budget_tokens {
-                    let line = format!("  OWN {} (s{:.2})", path_str, specificity);
-                    out.push(GraphCandidate {
-                        path: node.path.clone(),
-                        rank_score,
-                        specificity,
-                        confidence,
-                        decision: GraphDecision::FullAttach,
-                        token_estimate: node.token_estimate,
-                        symbols: node.symbols.clone(),
-                        rendered_line: line,
-                        content_digest: None,
-                    });
-                    tokens_used += node.token_estimate;
+            let remaining = budget_tokens.saturating_sub(tokens_used);
+
+            // PathOnly is the cheapest tier and the budget floor: when even a
+            // path line won't fit, the outline budget is spent — stop.
+            let path_line = format!("  {} (s{:.2})", path_str, specificity);
+            let path_cost = outline_line_cost(&path_line);
+            if path_cost > remaining {
+                break;
+            }
+
+            // Pick the richest tier whose *outline-line* cost fits the
+            // remaining budget, downgrading FullAttach → SignatureOnly →
+            // PathOnly. Trading per-file depth keeps a file in the map rather
+            // than dropping it once the budget tightens (breadth-preserving).
+            let (decision, line, cost) = if owned_set.contains(idx) {
+                let own_line = format!("  OWN {} (s{:.2})", path_str, specificity);
+                let own_cost = outline_line_cost(&own_line);
+                if own_cost <= remaining {
+                    (GraphDecision::FullAttach, own_line, own_cost)
+                } else {
+                    (GraphDecision::PathOnly, path_line, path_cost)
                 }
             } else if !node.symbols.is_empty() {
-                let sig_tokens = node.symbols.len() * 10;
-                if tokens_used + sig_tokens <= budget_tokens {
-                    let syms = node.symbols.clone();
-                    let sym_names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
-                    let line = format!(
-                        "  {} (s{:.2}) ({})",
-                        path_str,
-                        specificity,
-                        sym_names.join(", ")
-                    );
-                    out.push(GraphCandidate {
-                        path: node.path.clone(),
-                        rank_score,
-                        specificity,
-                        confidence,
-                        decision: GraphDecision::SignatureOnly,
-                        token_estimate: sig_tokens,
-                        symbols: syms,
-                        rendered_line: line,
-                        content_digest: None,
-                    });
-                    tokens_used += sig_tokens;
+                let sym_names: Vec<&str> = node.symbols.iter().map(|s| s.name.as_str()).collect();
+                let sig_line = format!(
+                    "  {} (s{:.2}) ({})",
+                    path_str,
+                    specificity,
+                    sym_names.join(", ")
+                );
+                let sig_cost = outline_line_cost(&sig_line);
+                if sig_cost <= remaining {
+                    (GraphDecision::SignatureOnly, sig_line, sig_cost)
+                } else {
+                    (GraphDecision::PathOnly, path_line, path_cost)
                 }
             } else {
-                let line = format!("  {} (s{:.2})", path_str, specificity);
-                out.push(GraphCandidate {
-                    path: node.path.clone(),
-                    rank_score,
-                    specificity,
-                    confidence,
-                    decision: GraphDecision::PathOnly,
-                    token_estimate: 5,
-                    symbols: Vec::new(),
-                    rendered_line: line,
-                    content_digest: None,
-                });
-                tokens_used += 5;
-            }
+                (GraphDecision::PathOnly, path_line, path_cost)
+            };
+
+            // Symbols ride along on Full/Signature candidates (ledger + M7
+            // upgrade); a PathOnly downgrade drops them from the rendered line.
+            let symbols = match decision {
+                GraphDecision::FullAttach | GraphDecision::SignatureOnly => node.symbols.clone(),
+                GraphDecision::OutlineOnly | GraphDecision::PathOnly => Vec::new(),
+            };
+
+            tokens_used += cost;
+            out.push(GraphCandidate {
+                path: node.path.clone(),
+                rank_score,
+                specificity,
+                confidence,
+                decision,
+                token_estimate: cost,
+                symbols,
+                rendered_line: line,
+                content_digest: None,
+            });
         }
 
         // M3 per-selection tracing (V9 §11 M3 acceptance: "planner logs show
@@ -844,6 +868,92 @@ mod tests {
         assert!(
             score(&tests, "by_test.rs") > score(&tests, "by_call.rs"),
             "mode=Tests must rank TestOf-reached higher: tests={tests:?}"
+        );
+    }
+
+    #[test]
+    fn fullattach_charges_outline_line_cost_not_full_content() {
+        // D1: an owned file with a huge full-content estimate must still fit
+        // a tiny outline budget — the outline injects only its `OWN <path>`
+        // line, so it is charged the line cost, not `node.token_estimate`.
+        // (Old behaviour reserved 10_000 > budget and dropped the file.)
+        let mut g: DiGraph<FileNode, ReferenceEdge> = DiGraph::new();
+        g.add_node(FileNode {
+            path: PathBuf::from("a.rs"),
+            token_estimate: 10_000,
+            symbols: Vec::new(),
+        });
+        let specificity_map = compute_specificity_map(&g, 0.5);
+        let map = RepoMap {
+            graph: g,
+            specificity_map,
+        };
+
+        let cands = map.rank_for_agent_structured(&["a.rs".to_string()], 50);
+        let a = cands
+            .iter()
+            .find(|c| c.path.to_string_lossy() == "a.rs")
+            .expect("owned file must appear, not be dropped for over-budget full content");
+        assert_eq!(a.decision, GraphDecision::FullAttach);
+        assert!(
+            a.token_estimate < 50,
+            "FullAttach must be charged the outline line cost, got {}",
+            a.token_estimate
+        );
+    }
+
+    #[test]
+    fn downgrades_to_pathonly_instead_of_dropping() {
+        // D2: a non-owned, symbol-heavy file whose full signature line won't
+        // fit the budget must still appear — downgraded to PathOnly — rather
+        // than vanishing from the map.
+        let mut g: DiGraph<FileNode, ReferenceEdge> = DiGraph::new();
+        let a = g.add_node(FileNode {
+            path: PathBuf::from("owned.rs"),
+            token_estimate: 9_000,
+            symbols: Vec::new(),
+        });
+        let symbols: Vec<Symbol> = (0..40)
+            .map(|i| Symbol {
+                name: format!("a_long_symbol_name_number_{i}"),
+                kind: "function_item".into(),
+                line: 0,
+            })
+            .collect();
+        let b = g.add_node(FileNode {
+            path: PathBuf::from("heavy.rs"),
+            token_estimate: 10,
+            symbols,
+        });
+        g.add_edge(
+            a,
+            b,
+            ReferenceEdge::new(crate::repo_map::store::EdgeKind::Calls),
+        );
+        let specificity_map = compute_specificity_map(&g, 0.5);
+        let map = RepoMap {
+            graph: g,
+            specificity_map,
+        };
+
+        // Budget fits short lines but never heavy.rs's 40-symbol signature.
+        let cands = map.rank_for_agent_structured(&["owned.rs".to_string()], 40);
+        let heavy = cands
+            .iter()
+            .find(|c| c.path.to_string_lossy() == "heavy.rs")
+            .expect("symbol-heavy file must be downgraded, not dropped");
+        assert_eq!(
+            heavy.decision,
+            GraphDecision::PathOnly,
+            "heavy.rs should downgrade to PathOnly under budget pressure"
+        );
+        assert!(
+            heavy.symbols.is_empty(),
+            "a PathOnly downgrade drops symbols from the rendered line"
+        );
+        assert!(
+            cands.iter().any(|c| c.path.to_string_lossy() == "owned.rs"),
+            "the owned file is still present alongside the downgraded one"
         );
     }
 
