@@ -79,6 +79,16 @@ pub enum Event {
         proposals: Vec<WriteProposal>,
     },
 
+    /// Chat agent turn fully finished (success, error, or user cancel).
+    /// Fired once per `send_chat_message` spawn after the session closes and
+    /// deferred proposals are drained — model-agnostic completion hook.
+    AgentTurnFinished {
+        conv_id: String,
+        cancelled: bool,
+        error: Option<String>,
+        proposal_count: usize,
+    },
+
     /// Claude emitted its session id (first `SystemInit` event of a turn).
     /// The controller stores this on the matching `Conversation` so the
     /// next turn can pass `--resume <session_id>` and avoid re-sending

@@ -2528,10 +2528,13 @@ pub(super) fn send_chat_message(app: &mut App) {
         // their child processes. Claude observes the token directly inside
         // `run_claude_turn` and finishes its revert path before returning,
         // so this branch never wins for Claude.
+        let mut cancelled = false;
+        let mut send_error: Option<String> = None;
         let send_result = tokio::select! {
             biased;
             _ = task_cancel.cancelled() => {
                 tracing::info!("Chat turn cancelled by user — dropping session");
+                cancelled = true;
                 drop(session);
                 let _ = tx.send(Event::MessageComplete {
                     conv_id: conv_id.clone(),
@@ -2545,6 +2548,7 @@ pub(super) fn send_chat_message(app: &mut App) {
         if let Some((session, result)) = send_result {
             if let Err(e) = result {
                 tracing::error!("send_turn error: {}", e);
+                send_error = Some(e.to_string());
                 let _ = tx.send(Event::MessageComplete {
                     conv_id: conv_id.clone(),
                     role: "system".to_string(),
@@ -2568,18 +2572,26 @@ pub(super) fn send_chat_message(app: &mut App) {
             gate.clear_conv_mode(&conv_id_clone);
             proposals
         };
+        let proposal_count = proposals.len();
         if !proposals.is_empty() {
             tracing::info!(
                 "Sending AcpTaskCompleted with {} proposals",
-                proposals.len()
+                proposal_count
             );
             let _ = tx.send(Event::AcpTaskCompleted {
-                conv_id: conv_id_clone,
+                conv_id: conv_id_clone.clone(),
                 proposals,
             });
         } else {
             tracing::info!("No deferred proposals — skipping AcpTaskCompleted");
         }
+
+        let _ = tx.send(Event::AgentTurnFinished {
+            conv_id: conv_id_clone,
+            cancelled,
+            error: send_error,
+            proposal_count,
+        });
     });
     app.acp_tasks.insert(
         app.chat_state.active_conversation_id().to_string(),

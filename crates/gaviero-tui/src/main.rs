@@ -2,6 +2,7 @@ mod app;
 mod editor;
 mod event;
 mod keymap;
+mod notify;
 mod panels;
 mod theme;
 mod widgets;

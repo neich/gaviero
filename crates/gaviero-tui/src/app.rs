@@ -127,6 +127,9 @@ pub struct App {
     // Transient status message (shown for a few seconds, then cleared)
     status_message: Option<(String, std::time::Instant)>,
 
+    /// Highlighted status-bar banner after an agent turn completes (8s TTL).
+    agent_finish_banner: Option<(String, std::time::Instant)>,
+
     // File tree dialog (new file/folder, rename, delete)
     tree_dialog: Option<TreeDialog>,
     // File move state (multi-step: select source → select dest → confirm)
@@ -384,6 +387,7 @@ impl App {
             scrollbar_dragging: None,
             last_click: None,
             status_message: None,
+            agent_finish_banner: None,
             tree_dialog: None,
             move_state: None,
             bulk_op_state: None,

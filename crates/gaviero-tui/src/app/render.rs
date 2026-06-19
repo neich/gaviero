@@ -611,6 +611,25 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
         return;
     }
 
+    if let Some((msg, when)) = &app.agent_finish_banner {
+        if when.elapsed().as_secs() < 8 {
+            let status_text = format!(" ✓ {msg}");
+            let style = Style::default().fg(Color::Black).bg(theme::SUCCESS);
+            for (i, ch) in status_text.chars().enumerate() {
+                let x = area.x + i as u16;
+                if x < area.right() {
+                    frame.buffer_mut()[(x, area.y)]
+                        .set_char(ch)
+                        .set_style(style);
+                }
+            }
+            for x in (area.x + status_text.len() as u16)..area.right() {
+                frame.buffer_mut()[(x, area.y)].set_style(style);
+            }
+            return;
+        }
+    }
+
     let focus_label = match app.focus {
         Focus::Editor => "EDIT",
         Focus::FileTree => match app.left_panel {

@@ -748,6 +748,57 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 app.enter_batch_review(proposals);
             }
         }
+        Event::AgentTurnFinished {
+            conv_id,
+            cancelled,
+            error,
+            proposal_count,
+        } => {
+            app.acp_tasks.remove(&conv_id);
+
+            if cancelled {
+                return;
+            }
+
+            let roots = app.workspace.roots();
+            let scope_root = roots.first().copied();
+            let config = crate::notify::resolve_config(&app.workspace, scope_root);
+
+            let model = app
+                .chat_state
+                .conversations
+                .iter()
+                .find(|c| c.id == conv_id)
+                .map(|c| {
+                    c.model_override
+                        .as_deref()
+                        .unwrap_or(&app.chat_state.agent_settings.model)
+                        .to_string()
+                })
+                .unwrap_or_else(|| app.chat_state.effective_model().to_string());
+
+            let body = if let Some(err) = error {
+                format!("Agent error ({model}): {err}")
+            } else if proposal_count == 0 {
+                format!("Agent finished ({model}) — no file changes")
+            } else {
+                format!(
+                    "Agent finished ({model}) — {proposal_count} file(s) to review"
+                )
+            };
+
+            if config.enabled {
+                if config.status_bar {
+                    app.agent_finish_banner =
+                        Some((body.clone(), std::time::Instant::now()));
+                }
+                crate::notify::notify_agent_finished(
+                    &config,
+                    "Gaviero — agent finished",
+                    &body,
+                );
+            }
+        }
         Event::PermissionRequest {
             conv_id,
             tool_name,
