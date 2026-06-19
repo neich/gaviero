@@ -28,7 +28,18 @@ pub(super) fn switch_layout(app: &mut App, n: u8) {
     app.active_preset = Some(idx);
 
     app.panel_visible.file_tree = preset.file_tree_pct > 0;
+    app.panel_visible.editor = preset.editor_pct > 0;
     app.panel_visible.side_panel = preset.side_panel_pct > 0;
+
+    if !app.panel_visible.editor && app.focus == Focus::Editor {
+        app.focus = if app.panel_visible.side_panel {
+            Focus::SidePanel
+        } else if app.panel_visible.file_tree {
+            Focus::FileTree
+        } else {
+            Focus::Editor
+        };
+    }
 
     let label = format!(
         "Layout {} (tree {}%  editor {}%  side {}%)",
@@ -110,4 +121,32 @@ pub(super) fn parse_layout_presets(workspace: &Workspace) -> Vec<LayoutPreset> {
     }
 
     presets
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gaviero_core::workspace::Workspace;
+
+    #[test]
+    fn layout_preset_zero_editor_pct_hides_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join(".gaviero");
+        std::fs::create_dir_all(&settings).unwrap();
+        std::fs::write(
+            settings.join("settings.json"),
+            r#"{"panels":{"layouts":{"3":[20,0,80]}}}"#,
+        )
+        .unwrap();
+
+        let ws = Workspace::single_folder(dir.path().to_path_buf());
+        let presets = parse_layout_presets(&ws);
+        let preset = &presets[2];
+        assert_eq!(preset.file_tree_pct, 20);
+        assert_eq!(preset.editor_pct, 0);
+        assert_eq!(preset.side_panel_pct, 80);
+        assert!(preset.file_tree_pct > 0);
+        assert_eq!(preset.editor_pct > 0, false);
+        assert!(preset.side_panel_pct > 0);
+    }
 }

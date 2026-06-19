@@ -169,6 +169,7 @@ pub enum SidePanelMode {
 #[derive(Debug, Clone)]
 pub struct PanelVisibility {
     pub file_tree: bool,
+    pub editor: bool,
     pub side_panel: bool,
     pub terminal: bool,
 }

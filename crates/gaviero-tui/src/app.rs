@@ -344,6 +344,7 @@ impl App {
             focus: Focus::FileTree,
             panel_visible: PanelVisibility {
                 file_tree: true,
+                editor: true,
                 side_panel: false,
                 terminal: false,
             },

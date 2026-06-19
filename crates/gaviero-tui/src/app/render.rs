@@ -67,7 +67,9 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
     if app.panel_visible.file_tree {
         constraints.push(Constraint::Length(eff_ft_w));
     }
-    constraints.push(Constraint::Min(20));
+    if app.panel_visible.editor {
+        constraints.push(Constraint::Min(20));
+    }
     if app.panel_visible.side_panel {
         constraints.push(Constraint::Length(eff_sp_w));
     }
@@ -94,60 +96,65 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
         panel_idx += 1;
     }
 
-    let editor_full_area = h_layout[panel_idx];
-    let editor_focused = app.focus == Focus::Editor;
-    let editor_title = app
-        .buffers
-        .get(app.active_buffer)
-        .map(|b| b.display_name().to_string())
-        .unwrap_or_else(|| "EDITOR".to_string());
-    let editor_header_override = app
-        .buffers
-        .get(app.active_buffer)
-        .filter(|b| b.diff_view.is_some())
-        .map(|_| (theme::DIFF_VIEW_HEADER_BG, theme::DIFF_VIEW_HEADER_FG));
-    let (_editor_header, editor_content) = render_panel_header_styled(
-        frame,
-        editor_full_area,
-        &editor_title,
-        editor_focused,
-        false,
-        editor_header_override,
-    );
+    if app.panel_visible.editor {
+        let editor_full_area = h_layout[panel_idx];
+        let editor_focused = app.focus == Focus::Editor;
+        let editor_title = app
+            .buffers
+            .get(app.active_buffer)
+            .map(|b| b.display_name().to_string())
+            .unwrap_or_else(|| "EDITOR".to_string());
+        let editor_header_override = app
+            .buffers
+            .get(app.active_buffer)
+            .filter(|b| b.diff_view.is_some())
+            .map(|_| (theme::DIFF_VIEW_HEADER_BG, theme::DIFF_VIEW_HEADER_FG));
+        let (_editor_header, editor_content) = render_panel_header_styled(
+            frame,
+            editor_full_area,
+            &editor_title,
+            editor_focused,
+            false,
+            editor_header_override,
+        );
 
-    app.layout.preview_area = None;
+        app.layout.preview_area = None;
 
-    let md_active =
-        app.is_current_buffer_markdown() && app.preview_mode.is_active();
+        let md_active =
+            app.is_current_buffer_markdown() && app.preview_mode.is_active();
 
-    let (actual_editor_area, preview_area) = match app.preview_mode {
-        MarkdownPreviewMode::Off => (editor_content, None),
-        MarkdownPreviewMode::Split if md_active => {
-            // Keep at least a few columns for the source pane (gutter + scrollbar).
-            let split = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
-                .split(editor_content);
-            (split[0], Some(split[1]))
+        let (actual_editor_area, preview_area) = match app.preview_mode {
+            MarkdownPreviewMode::Off => (editor_content, None),
+            MarkdownPreviewMode::Split if md_active => {
+                // Keep at least a few columns for the source pane (gutter + scrollbar).
+                let split = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+                    .split(editor_content);
+                (split[0], Some(split[1]))
+            }
+            MarkdownPreviewMode::PreviewOnly if md_active => {
+                (Rect::default(), Some(editor_content))
+            }
+            _ => (editor_content, None),
+        };
+
+        if actual_editor_area.width > 0 && actual_editor_area.height > 0 {
+            app.layout.editor_area = actual_editor_area;
+            app.render_editor(frame, actual_editor_area);
+        } else {
+            app.layout.editor_area = Rect::default();
         }
-        MarkdownPreviewMode::PreviewOnly if md_active => {
-            (Rect::default(), Some(editor_content))
-        }
-        _ => (editor_content, None),
-    };
 
-    if actual_editor_area.width > 0 && actual_editor_area.height > 0 {
-        app.layout.editor_area = actual_editor_area;
-        app.render_editor(frame, actual_editor_area);
+        if let Some(preview_area) = preview_area {
+            app.layout.preview_area = Some(preview_area);
+            app.render_markdown_preview(frame, preview_area);
+        }
+        panel_idx += 1;
     } else {
         app.layout.editor_area = Rect::default();
+        app.layout.preview_area = None;
     }
-
-    if let Some(preview_area) = preview_area {
-        app.layout.preview_area = Some(preview_area);
-        app.render_markdown_preview(frame, preview_area);
-    }
-    panel_idx += 1;
 
     app.layout.side_panel_area = None;
     app.layout.side_header_area = None;
