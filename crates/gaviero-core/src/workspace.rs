@@ -197,6 +197,13 @@ pub mod settings {
 
     // TUI memory panel (Tier A / A4)
     pub const UI_MEMORY_PANEL_RECENT_WINDOW_HOURS: &str = "ui.memoryPanel.recentWindowHours";
+
+    // Agent-finish notifications (TUI)
+    pub const NOTIFICATIONS_AGENT_FINISHED_ENABLED: &str = "notifications.agentFinished.enabled";
+    pub const NOTIFICATIONS_AGENT_FINISHED_SOUND: &str = "notifications.agentFinished.sound";
+    pub const NOTIFICATIONS_AGENT_FINISHED_DESKTOP: &str = "notifications.agentFinished.desktop";
+    pub const NOTIFICATIONS_AGENT_FINISHED_STATUS_BAR: &str =
+        "notifications.agentFinished.statusBar";
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1027,6 +1034,12 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
 
         // Memory panel (A4)
         settings::UI_MEMORY_PANEL_RECENT_WINDOW_HOURS => serde_json::json!(24),
+
+        // Agent-finish notifications (TUI)
+        settings::NOTIFICATIONS_AGENT_FINISHED_ENABLED => serde_json::json!(true),
+        settings::NOTIFICATIONS_AGENT_FINISHED_SOUND => serde_json::json!(true),
+        settings::NOTIFICATIONS_AGENT_FINISHED_DESKTOP => serde_json::json!(true),
+        settings::NOTIFICATIONS_AGENT_FINISHED_STATUS_BAR => serde_json::json!(true),
 
         // Tier B / B5 — session consolidator + sleeptime
         settings::MEMORY_SESSION_CONSOLIDATE_ON_CLOSE => serde_json::json!(true),
