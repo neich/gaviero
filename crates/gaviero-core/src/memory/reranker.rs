@@ -5,7 +5,9 @@
 //! returns a per-candidate relevance score; the caller blends it with
 //! the existing composite score (default `0.6 * rerank + 0.4 * composite`).
 //!
-//! Disabled by default until the B2f ablation gate confirms gain. When
+//! Optional cross-encoder reranker stage for retrieval. Enabled by default
+//! (`memory.reranker.enabled = true`, model `minilm`) after the B2f ablation
+//! gate cleared on the code gold set. When the model file is missing or the
 //! the model file is missing or the configured tier is `"none"`,
 //! [`build_reranker`] returns `None` and retrieval falls back silently
 //! to composite-only ranking.
