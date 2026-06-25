@@ -14,6 +14,8 @@ pub enum Event {
     Mouse(crossterm::event::MouseEvent),
     Paste(String),
     Resize(u16, u16),
+    /// Host terminal gained or lost OS window focus (crossterm focus-change).
+    TerminalFocus(bool),
 
     // Filesystem
     FileChanged(PathBuf),
@@ -379,6 +381,16 @@ impl EventLoop {
                     }
                     Ok(Some(crossterm::event::Event::Paste(text))) => {
                         if tx.send(Event::Paste(text)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Some(crossterm::event::Event::FocusGained)) => {
+                        if tx.send(Event::TerminalFocus(true)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Some(crossterm::event::Event::FocusLost)) => {
+                        if tx.send(Event::TerminalFocus(false)).is_err() {
                             break;
                         }
                     }

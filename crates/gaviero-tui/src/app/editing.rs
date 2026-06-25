@@ -958,12 +958,37 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
     }
 }
 
-/// Mouse handling while a review is pending. Only review-relevant
-/// interactions are honored: clicking a hunk gutter to toggle accept/reject,
-/// clicking a row in the batch-review file list, and scrolling the diff or
-/// the file list. Every other branch (focus changes, editor cursor, terminal
-/// selection, side-panel clicks, etc.) is intentionally dropped so the rest
-/// of the UI stays locked until the user finishes the review.
+/// Scroll the agent-chat output by `delta` rendered lines (negative = up).
+fn scroll_chat_output(app: &mut App, delta: i32) {
+    if delta == 0 {
+        return;
+    }
+    if delta < 0 {
+        app.chat_state.scroll_offset = app
+            .chat_state
+            .scroll_offset
+            .saturating_sub((-delta) as usize);
+    } else {
+        app.chat_state.scroll_offset = app.chat_state.scroll_offset.saturating_add(delta as usize);
+    }
+    if app.chat_state.active_conv_streaming() {
+        app.chat_state.user_scrolled_during_stream = true;
+    }
+}
+
+fn side_panel_chat_scroll_at(app: &App, col: u16, row: u16) -> bool {
+    app.panel_visible.side_panel
+        && matches!(app.side_panel, SidePanelMode::AgentChat)
+        && app
+            .layout
+            .side_panel_area
+            .is_some_and(|area| area.contains((col, row).into()))
+}
+
+/// Mouse handling while a review is pending. Review interactions (hunk
+/// gutter, batch file list, diff scroll) plus read-only agent-chat browsing
+/// (wheel scroll, scrollbar drag, text selection). Everything else stays
+/// locked until the user finishes the review.
 fn handle_mouse_review(app: &mut App, mouse: crossterm::event::MouseEvent) {
     let col = mouse.column;
     let row = mouse.row;
@@ -1008,6 +1033,33 @@ fn handle_mouse_review(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 return;
             }
 
+            if let Some(hdr) = app.layout.side_header_area {
+                if hdr.contains((col, row).into()) {
+                    app.focus = Focus::SidePanel;
+                    return;
+                }
+            }
+
+            if let Some(area) = app.layout.side_panel_area {
+                if area.contains((col, row).into())
+                    && matches!(app.side_panel, SidePanelMode::AgentChat)
+                {
+                    app.focus = Focus::SidePanel;
+                    let scrollbar_x = area.x + area.width.saturating_sub(1);
+                    if col == scrollbar_x {
+                        app.scrollbar_dragging = Some(ScrollbarTarget::Chat);
+                        app.scroll_panel_to_row(ScrollbarTarget::Chat, row);
+                        return;
+                    }
+                    if let Some((line, ci)) = app.chat_state.screen_to_text_pos(col, row) {
+                        app.chat_state.start_text_selection(line, ci);
+                    } else {
+                        app.chat_state.clear_text_selection();
+                    }
+                    return;
+                }
+            }
+
             if let (Some(area), Some(ref mut br)) =
                 (app.layout.file_tree_area, app.batch_review.as_mut())
             {
@@ -1035,6 +1087,9 @@ fn handle_mouse_review(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     review.scroll_top = review.scroll_top.saturating_sub(3);
                 }
             }
+            if side_panel_chat_scroll_at(app, col, row) {
+                scroll_chat_output(app, -3);
+            }
         }
         MouseEventKind::ScrollDown => {
             if let Some(ref mut br) = app.batch_review {
@@ -1051,10 +1106,19 @@ fn handle_mouse_review(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     review.scroll_top += 3;
                 }
             }
+            if side_panel_chat_scroll_at(app, col, row) {
+                scroll_chat_output(app, 3);
+            }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if matches!(app.scrollbar_dragging, Some(ScrollbarTarget::ReviewDiff)) {
-                app.scroll_panel_to_row(ScrollbarTarget::ReviewDiff, row);
+            match app.scrollbar_dragging {
+                Some(ScrollbarTarget::ReviewDiff) => {
+                    app.scroll_panel_to_row(ScrollbarTarget::ReviewDiff, row);
+                }
+                Some(ScrollbarTarget::Chat) => {
+                    app.scroll_panel_to_row(ScrollbarTarget::Chat, row);
+                }
+                _ => {}
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {

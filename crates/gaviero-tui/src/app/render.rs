@@ -24,6 +24,7 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
     if let Some(fs_panel) = app.fullscreen_panel {
         app.render_fullscreen(frame, main_area, fs_panel);
         app.render_status_bar(frame, status_area);
+        render_agent_finish_toast(app, frame, main_area);
         if fs_panel == Focus::Editor {
             app.update_cursor_position(frame, app.layout.editor_area);
         }
@@ -538,6 +539,80 @@ fn editor_status_key_hints(app: &App, buf: &crate::editor::buffer::Buffer) -> St
     parts.join("  ")
 }
 
+/// How long the agent-finish banner stays visible (status bar + fullscreen toast).
+const AGENT_FINISH_BANNER_SECS: u64 = 8;
+
+fn active_agent_finish_message(app: &App) -> Option<&str> {
+    let (msg, when) = app.agent_finish_banner.as_ref()?;
+    if when.elapsed().as_secs() >= AGENT_FINISH_BANNER_SECS {
+        return None;
+    }
+    Some(msg.as_str())
+}
+
+/// Floating toast over the main panel when an agent finishes during fullscreen
+/// (e.g. mpv in the terminal) — the status bar alone is easy to miss.
+pub(super) fn render_agent_finish_toast(app: &App, frame: &mut Frame, area: Rect) {
+    if app.fullscreen_panel.is_none() || !app.terminal_has_focus {
+        return;
+    }
+    let Some(msg) = active_agent_finish_message(app) else {
+        return;
+    };
+    if area.width < 12 || area.height < 3 {
+        return;
+    }
+
+    let label = format!(" ✓ {msg}");
+    let max_w = area.width.saturating_sub(4) as usize;
+    let display: String = label.chars().take(max_w).collect();
+    let text_w = display.chars().count() as u16;
+    let box_w = text_w.saturating_add(4).min(area.width);
+    let box_h: u16 = 3;
+    let x = area.x + (area.width.saturating_sub(box_w)) / 2;
+    let y = area.y + area.height.saturating_sub(box_h + 1);
+
+    let border_style = Style::default().fg(theme::SUCCESS);
+    let fill_style = Style::default().fg(Color::Black).bg(theme::SUCCESS);
+    let buf = frame.buffer_mut();
+
+    for row in 0..box_h {
+        for col in 0..box_w {
+            let cx = x + col;
+            let cy = y + row;
+            if cx >= buf.area().right() || cy >= buf.area().bottom() {
+                continue;
+            }
+            let (ch, style) = if row == 0 {
+                let ch = if col == 0 {
+                    '┌'
+                } else if col == box_w - 1 {
+                    '┐'
+                } else {
+                    '─'
+                };
+                (ch, border_style)
+            } else if row == box_h - 1 {
+                let ch = if col == 0 {
+                    '└'
+                } else if col == box_w - 1 {
+                    '┘'
+                } else {
+                    '─'
+                };
+                (ch, border_style)
+            } else if col == 0 || col == box_w - 1 {
+                ('│', border_style)
+            } else {
+                let text_col = col.saturating_sub(1) as usize;
+                let ch = display.chars().nth(text_col).unwrap_or(' ');
+                (ch, fill_style)
+            };
+            buf[(cx, cy)].set_char(ch).set_style(style);
+        }
+    }
+}
+
 pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
     if let Some(ref review) = app.diff_review {
         let proposal = &review.proposal;
@@ -611,23 +686,21 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
         return;
     }
 
-    if let Some((msg, when)) = &app.agent_finish_banner {
-        if when.elapsed().as_secs() < 8 {
-            let status_text = format!(" ✓ {msg}");
-            let style = Style::default().fg(Color::Black).bg(theme::SUCCESS);
-            for (i, ch) in status_text.chars().enumerate() {
-                let x = area.x + i as u16;
-                if x < area.right() {
-                    frame.buffer_mut()[(x, area.y)]
-                        .set_char(ch)
-                        .set_style(style);
-                }
+    if let Some(msg) = active_agent_finish_message(app) {
+        let status_text = format!(" ✓ {msg}");
+        let style = Style::default().fg(Color::Black).bg(theme::SUCCESS);
+        for (i, ch) in status_text.chars().enumerate() {
+            let x = area.x + i as u16;
+            if x < area.right() {
+                frame.buffer_mut()[(x, area.y)]
+                    .set_char(ch)
+                    .set_style(style);
             }
-            for x in (area.x + status_text.len() as u16)..area.right() {
-                frame.buffer_mut()[(x, area.y)].set_style(style);
-            }
-            return;
         }
+        for x in (area.x + status_text.len() as u16)..area.right() {
+            frame.buffer_mut()[(x, area.y)].set_style(style);
+        }
+        return;
     }
 
     let focus_label = match app.focus {
