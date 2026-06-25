@@ -944,7 +944,7 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::MEMORY_CHAT_INJECTION_SCOPES => {
             serde_json::json!(["workspace", "repo", "module"])
         }
-        settings::MEMORY_CHAT_INJECTION_MAX_ITEMS => serde_json::json!(8),
+        settings::MEMORY_CHAT_INJECTION_MAX_ITEMS => serde_json::json!(5),
         settings::MEMORY_CHAT_INJECTION_TOKEN_BUDGET => serde_json::json!(1000),
         settings::MEMORY_CHAT_INJECTION_MIN_SIM => serde_json::json!(0.3),
 
