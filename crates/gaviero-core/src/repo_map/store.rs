@@ -51,6 +51,20 @@ CREATE INDEX IF NOT EXISTS idx_edges_src  ON edges(source_qn);
 CREATE INDEX IF NOT EXISTS idx_edges_tgt  ON edges(target_qn);
 CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind);
 CREATE INDEX IF NOT EXISTS idx_edges_file ON edges(file_path);
+
+CREATE TABLE IF NOT EXISTS symbol_docs (
+    qualified_name TEXT PRIMARY KEY,
+    file_path      TEXT NOT NULL,
+    file_hash      TEXT,
+    signature      TEXT NOT NULL DEFAULT '',
+    bounds           TEXT NOT NULL DEFAULT '',
+    doc              TEXT NOT NULL DEFAULT '',
+    role_summary     TEXT NOT NULL DEFAULT '',
+    embedding        BLOB,
+    updated_at       REAL NOT NULL DEFAULT (julianday('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_symbol_docs_file ON symbol_docs(file_path);
 ";
 
 /// C4: one-shot migration applied at every `open*` call.
@@ -373,6 +387,19 @@ impl EdgeWeights {
     }
 }
 
+/// A row in the `symbol_docs` enrichment sidecar (S2.1 / S2.2).
+#[derive(Debug, Clone, Default)]
+pub struct SymbolDoc {
+    pub qualified_name: String,
+    pub file_path: String,
+    pub file_hash: Option<String>,
+    pub signature: String,
+    pub bounds: String,
+    pub doc: String,
+    pub role_summary: String,
+    pub embedding: Option<Vec<f32>>,
+}
+
 /// A node stored in the graph.
 #[derive(Debug, Clone)]
 pub struct GraphNode {
@@ -403,6 +430,22 @@ pub struct ImpactSummary {
     pub test_gaps: Vec<String>,
     /// Whether the result was truncated due to max_nodes limit.
     pub truncated: bool,
+}
+
+fn embedding_to_blob(values: &[f32]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+fn blob_to_embedding(blob: &[u8]) -> Result<Vec<f32>> {
+    if !blob.len().is_multiple_of(4) {
+        anyhow::bail!("invalid embedding blob length {}", blob.len());
+    }
+    blob.chunks_exact(4)
+        .map(|chunk| {
+            let bytes: [u8; 4] = chunk.try_into().expect("chunk length checked");
+            Ok(f32::from_le_bytes(bytes))
+        })
+        .collect()
 }
 
 // ── GraphStore ───────────────────────────────────────────────────
@@ -483,8 +526,91 @@ impl GraphStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Whether a node with this `qualified_name` exists.
+    pub fn has_node(&self, qualified_name: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(1) FROM nodes WHERE qualified_name = ?1",
+            params![qualified_name],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    // ── Symbol enrichment sidecar (S2.1 / S2.2) ─────────────────
+
+    /// Insert or update one `symbol_docs` row.
+    pub fn upsert_symbol_doc(&self, doc: &SymbolDoc) -> Result<()> {
+        let embedding_blob = doc
+            .embedding
+            .as_ref()
+            .map(|v| embedding_to_blob(v));
+        self.conn.execute(
+            "INSERT INTO symbol_docs (
+                qualified_name, file_path, file_hash, signature, bounds,
+                doc, role_summary, embedding, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, julianday('now'))
+             ON CONFLICT(qualified_name) DO UPDATE SET
+                file_path = excluded.file_path,
+                file_hash = excluded.file_hash,
+                signature = excluded.signature,
+                bounds = excluded.bounds,
+                doc = excluded.doc,
+                role_summary = excluded.role_summary,
+                embedding = excluded.embedding,
+                updated_at = julianday('now')",
+            params![
+                doc.qualified_name,
+                doc.file_path,
+                doc.file_hash,
+                doc.signature,
+                doc.bounds,
+                doc.doc,
+                doc.role_summary,
+                embedding_blob,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Fetch enrichment for one symbol, if present.
+    pub fn symbol_doc(&self, qualified_name: &str) -> Result<Option<SymbolDoc>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT qualified_name, file_path, file_hash, signature, bounds,
+                    doc, role_summary, embedding
+             FROM symbol_docs WHERE qualified_name = ?1",
+        )?;
+        let mut rows = stmt.query(params![qualified_name])?;
+        if let Some(row) = rows.next()? {
+            let blob: Option<Vec<u8>> = row.get(7)?;
+            Ok(Some(SymbolDoc {
+                qualified_name: row.get(0)?,
+                file_path: row.get(1)?,
+                file_hash: row.get(2)?,
+                signature: row.get(3)?,
+                bounds: row.get(4)?,
+                doc: row.get(5)?,
+                role_summary: row.get(6)?,
+                embedding: blob.map(|b| blob_to_embedding(&b)).transpose()?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Count rows in `symbol_docs`.
+    pub fn symbol_doc_count(&self) -> Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(1) FROM symbol_docs", [], |row| row.get(0))?;
+        Ok(count as usize)
+    }
+
     /// Delete all nodes and edges for a given file path.
     pub fn delete_file(&self, file_path: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM symbol_docs WHERE file_path = ?1",
+            params![file_path],
+        )?;
         self.conn
             .execute("DELETE FROM edges WHERE file_path = ?1", params![file_path])?;
         self.conn
@@ -853,6 +979,39 @@ impl GraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn symbol_docs_round_trip() {
+        let store = GraphStore::open_memory().unwrap();
+        store
+            .upsert_node(
+                NodeKind::Function,
+                "foo",
+                "src/lib.rs::foo",
+                "src/lib.rs",
+                Some(1),
+                None,
+                Some("rust"),
+                None,
+            )
+            .unwrap();
+        let doc = SymbolDoc {
+            qualified_name: "src/lib.rs::foo".into(),
+            file_path: "src/lib.rs".into(),
+            file_hash: Some("abc".into()),
+            signature: "fn foo()".into(),
+            bounds: String::new(),
+            doc: "Does foo things".into(),
+            role_summary: "function".into(),
+            embedding: Some(vec![1.0, 0.0, 0.5]),
+        };
+        store.upsert_symbol_doc(&doc).unwrap();
+        let loaded = store.symbol_doc("src/lib.rs::foo").unwrap().unwrap();
+        assert_eq!(loaded.signature, "fn foo()");
+        assert_eq!(loaded.embedding, doc.embedding);
+        store.delete_file("src/lib.rs").unwrap();
+        assert!(store.symbol_doc("src/lib.rs::foo").unwrap().is_none());
+    }
 
     #[test]
     fn create_and_query_nodes() {
