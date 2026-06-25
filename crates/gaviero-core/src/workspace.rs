@@ -120,6 +120,13 @@ pub mod settings {
     pub const REPO_MAP_SPECIFICITY_STOP_SYMBOL_THRESHOLD: &str =
         "repoMap.specificity.stopSymbolThreshold";
     pub const REPO_MAP_TYPED_EDGES_ENABLED: &str = "repoMap.edges.typed";
+    /// S2.1 — rustdoc symbol enrichment sidecar (`symbol_docs`). Default
+    /// `false`; MCP symbol tools (PR-3) read the sidecar only when enabled.
+    /// Manual refresh: `gaviero-cli --graph --enrich` (never workspace-open).
+    pub const REPO_MAP_SYMBOL_ENRICHMENT_ENABLED: &str = "repoMap.symbolEnrichment.enabled";
+    /// S2.2 — embedder for symbol vectors. `"inherit"` uses the active memory
+    /// embedder; otherwise a `memory.embedder.model` alias (`nomic`, etc.).
+    pub const REPO_MAP_EMBEDDER_MODEL: &str = "repoMap.embedder.model";
     /// C4: per-intent edge weight overrides. Keyed by intent name
     /// (`"impact"`, `"callers"`, `"tests"`, `"implementations"`,
     /// `"all"`); each value is a JSON object whose keys are
@@ -995,6 +1002,8 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::REPO_MAP_SPECIFICITY_ENABLED => serde_json::json!(true),
         settings::REPO_MAP_SPECIFICITY_STOP_SYMBOL_THRESHOLD => serde_json::json!(0.5),
         settings::REPO_MAP_TYPED_EDGES_ENABLED => serde_json::json!(true),
+        settings::REPO_MAP_SYMBOL_ENRICHMENT_ENABLED => serde_json::json!(false),
+        settings::REPO_MAP_EMBEDDER_MODEL => serde_json::json!("inherit"),
 
         // Merged multi-scope retrieval (B3).
         // "merged" → no 0.70 early-exit, every scope flows into one

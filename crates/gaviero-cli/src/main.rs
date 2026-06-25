@@ -147,14 +147,20 @@ struct Cli {
     output: Option<PathBuf>,
 
     /// Build or update the code knowledge graph, print stats, and exit.
-    /// Does not run any agents. Useful after major codebase changes,
-    /// and required once after upgrading to a build that adds typed
-    /// edges (Tier C / C4): the open-time migration defaults legacy
-    /// untyped rows to `'Imports'`, but per-intent precision (mode=
-    /// callers / tests / implementations) only fully recovers after
-    /// a `--graph` re-scan repopulates each edge with its real kind.
+    /// Pass `--enrich` to run rustdoc symbol enrichment (S2.1) after the
+    /// graph scan. Requires a successful `cargo build` and the pinned
+    /// nightly toolchain (`rust-toolchain.toml`).
     #[arg(long)]
     graph: bool,
+
+    /// With `--graph`, run rustdoc JSON enrichment into `symbol_docs`
+    /// (S2.1 / S2.2). Never runs at workspace-open — explicit only.
+    #[arg(long, requires = "graph")]
+    enrich: bool,
+
+    /// With `--graph --enrich`, skip embedding vectors (signatures/docs only).
+    #[arg(long, requires = "enrich")]
+    enrich_no_embed: bool,
 
     /// Delete local branches matching `gaviero/*` (left over from prior
     /// swarm runs — agent worktrees and stacked-loop iteration branches).
@@ -2998,6 +3004,41 @@ async fn main() -> Result<()> {
         eprintln!("  files removed:   {}", result.files_removed);
         eprintln!("  total nodes:     {}", nodes);
         eprintln!("  total edges:     {}", edges);
+
+        if cli.enrich {
+            use gaviero_core::repo_map::symbol_enrichment::{SymbolEnrichOpts, enrich_graph};
+            use gaviero_core::workspace::settings;
+
+            let mut workspace = gaviero_core::workspace::Workspace::single_folder(repo.clone());
+            workspace.ensure_settings();
+            let embedder_setting = workspace
+                .resolve_setting(settings::REPO_MAP_EMBEDDER_MODEL, Some(&repo))
+                .as_str()
+                .map(str::to_string)
+                .filter(|s| !s.is_empty() && s != "inherit");
+            let embed = !cli.enrich_no_embed;
+            let opts = SymbolEnrichOpts {
+                embed,
+                embedder_name: embedder_setting,
+            };
+            eprintln!("[graph] enriching symbols (rustdoc JSON)…");
+            let enrich_result = enrich_graph(&store, &repo, &opts).await?;
+            eprintln!("[graph] enrich done");
+            eprintln!("  crates processed: {}", enrich_result.crates_processed);
+            eprintln!("  symbols written:  {}", enrich_result.symbols_written);
+            eprintln!("  unmatched:        {}", enrich_result.symbols_unmatched);
+            eprintln!("  skipped (hash):   {}", enrich_result.symbols_skipped_hash);
+            eprintln!(
+                "  symbol_docs rows: {}",
+                store.symbol_doc_count()?
+            );
+            if !enrich_result.rustdoc_failures.is_empty() {
+                eprintln!("  rustdoc failures:");
+                for f in &enrich_result.rustdoc_failures {
+                    eprintln!("    - {f}");
+                }
+            }
+        }
         return Ok(());
     }
 

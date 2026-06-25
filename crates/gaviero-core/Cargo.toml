@@ -70,6 +70,8 @@ toml = "0.8"
 chrono = "0.4.44"
 regex = "1"
 walkdir = "2"
+rustdoc-types = "0.57"
+syn = { version = "2", features = ["full", "parsing"] }
 
 [dev-dependencies]
 wiremock = "0.6"
