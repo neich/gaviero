@@ -884,6 +884,204 @@ pub fn worst_recall5_drop(baseline: &EvalReport, current: &EvalReport) -> f32 {
     worst.max(global_drop)
 }
 
+// ── S1.3 budget sweep (kb-efficiency) ───────────────────────────────
+
+/// One row of the `max_items` chat-injection sweep.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaxItemsSweepRow {
+    pub max_items: usize,
+    pub mean_memory_tokens: f32,
+    pub precision_at_5: f32,
+    pub ndcg_at_5: f32,
+    pub under_retrieval: f32,
+    pub blast_leakage: f32,
+}
+
+/// One row of the `agent.graphBudgetTokens` outline sweep.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphBudgetSweepRow {
+    pub graph_budget_tokens: usize,
+    pub outline_tokens: usize,
+    pub file_count: usize,
+    pub path_only: usize,
+    pub signature_only: usize,
+    pub full_attach: usize,
+}
+
+/// Aggregate S1.3 sweep output (memory + graph knobs).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct S13BudgetSweepReport {
+    pub fixture: String,
+    pub workspace: String,
+    pub max_items_sweep: Vec<MaxItemsSweepRow>,
+    pub graph_budget_sweep: Vec<GraphBudgetSweepRow>,
+    /// Heuristic knee pick: smallest knobs within 1 pt ndcg@5 of max_items=5
+    /// and within 5% under_retrieval of the 5-item baseline.
+    pub recommended_max_items: usize,
+    /// Heuristic: smallest graph budget within 5% file_count of 12k ceiling.
+    pub recommended_graph_budget_tokens: usize,
+}
+
+/// Sweep `memory.chatInjection.maxItems` ∈ {3, 5, 8} using the chat injection
+/// path (scope filter + token budget), scoring gold-set metrics on the
+/// injected item list.
+pub async fn run_s13_max_items_sweep(
+    store: &Arc<MemoryStore>,
+    scope_ctx: &MemoryScope,
+    cases: &[EvalCase],
+    base_chat_cfg: &super::ChatInjectionConfig,
+    retrieval_cfg: &RetrievalConfig,
+    reranker: Option<&dyn Reranker>,
+    rerank_cfg: Option<&RerankConfig>,
+) -> Result<Vec<MaxItemsSweepRow>> {
+    use super::retrieval::retrieve_for_chat_with_reranker;
+
+    let stores = super::stores::MemoryStores::from_single_store(store.clone());
+    let mut rows = Vec::new();
+
+    for &max_items in &[3usize, 5, 8] {
+        let mut cfg = base_chat_cfg.clone();
+        cfg.max_items = max_items;
+        let mut pools: Vec<Vec<ScoredMemory>> = Vec::with_capacity(cases.len());
+        let mut token_sum = 0usize;
+
+        for case in cases {
+            let scope = scope_for_eval(&case.scope, scope_ctx);
+            let inj = retrieve_for_chat_with_reranker(
+                &stores,
+                &scope,
+                &case.query,
+                &cfg,
+                retrieval_cfg,
+                reranker,
+                rerank_cfg,
+            )
+            .await
+            .with_context(|| format!("chat injection for case {}", case.id))?;
+            let (items, tokens) = match inj {
+                Some(c) => (c.items, c.tokens_used),
+                None => (Vec::new(), 0),
+            };
+            token_sum += tokens;
+            pools.push(items);
+        }
+
+        let report = build_report_with_pools(cases, &pools);
+        rows.push(MaxItemsSweepRow {
+            max_items,
+            mean_memory_tokens: token_sum as f32 / cases.len().max(1) as f32,
+            precision_at_5: report.precision_at_5,
+            ndcg_at_5: report.ndcg_at_5,
+            under_retrieval: report.under_retrieval,
+            blast_leakage: report.blast_leakage,
+        });
+    }
+    Ok(rows)
+}
+
+/// Sweep `agent.graphBudgetTokens` ∈ budgets against a built [`RepoMap`].
+pub fn run_s13_graph_budget_sweep(
+    repo_map: &crate::repo_map::RepoMap,
+    budgets: &[usize],
+) -> Vec<GraphBudgetSweepRow> {
+    use crate::repo_map::GraphDecision;
+
+    budgets
+        .iter()
+        .map(|&budget| {
+            let candidates = repo_map.rank_for_agent_structured(&[], budget);
+            let outline_tokens: usize = candidates.iter().map(|c| c.token_estimate).sum();
+            let mut path_only = 0usize;
+            let mut signature_only = 0usize;
+            let mut full_attach = 0usize;
+            for c in &candidates {
+                match c.decision {
+                    GraphDecision::PathOnly => path_only += 1,
+                    GraphDecision::SignatureOnly => signature_only += 1,
+                    GraphDecision::FullAttach => full_attach += 1,
+                    GraphDecision::OutlineOnly => {}
+                }
+            }
+            GraphBudgetSweepRow {
+                graph_budget_tokens: budget,
+                outline_tokens,
+                file_count: candidates.len(),
+                path_only,
+                signature_only,
+                full_attach,
+            }
+        })
+        .collect()
+}
+
+fn pick_recommended_max_items(rows: &[MaxItemsSweepRow]) -> usize {
+    let baseline = rows
+        .iter()
+        .find(|r| r.max_items == 5)
+        .or_else(|| rows.last());
+    let Some(base) = baseline else {
+        return 5;
+    };
+    let ndcg_floor = base.ndcg_at_5 - 0.01;
+    let under_ceiling = base.under_retrieval * 1.05 + 0.001;
+    rows.iter()
+        .filter(|r| r.ndcg_at_5 >= ndcg_floor && r.under_retrieval <= under_ceiling)
+        .map(|r| r.max_items)
+        .min()
+        .unwrap_or(5)
+}
+
+fn pick_recommended_graph_budget(rows: &[GraphBudgetSweepRow]) -> usize {
+    let baseline = rows
+        .iter()
+        .find(|r| r.graph_budget_tokens == 8_000)
+        .or_else(|| rows.last());
+    let Some(base) = baseline else {
+        return 8_000;
+    };
+    let file_floor = (base.file_count as f32 * 0.95) as usize;
+    rows.iter()
+        .filter(|r| r.file_count >= file_floor)
+        .map(|r| r.graph_budget_tokens)
+        .min()
+        .unwrap_or(8_000)
+}
+
+/// Run the full S1.3 sweep and assemble recommendations.
+pub async fn run_s13_budget_sweep(
+    store: &Arc<MemoryStore>,
+    scope_ctx: &MemoryScope,
+    cases: &[EvalCase],
+    base_chat_cfg: &super::ChatInjectionConfig,
+    retrieval_cfg: &RetrievalConfig,
+    reranker: Option<&dyn Reranker>,
+    rerank_cfg: Option<&RerankConfig>,
+    repo_map: &crate::repo_map::RepoMap,
+    graph_budgets: &[usize],
+    fixture_label: &str,
+    workspace_label: &str,
+) -> Result<S13BudgetSweepReport> {
+    let max_items_sweep = run_s13_max_items_sweep(
+        store,
+        scope_ctx,
+        cases,
+        base_chat_cfg,
+        retrieval_cfg,
+        reranker,
+        rerank_cfg,
+    )
+    .await?;
+    let graph_budget_sweep = run_s13_graph_budget_sweep(repo_map, graph_budgets);
+    Ok(S13BudgetSweepReport {
+        fixture: fixture_label.to_string(),
+        workspace: workspace_label.to_string(),
+        recommended_max_items: pick_recommended_max_items(&max_items_sweep),
+        recommended_graph_budget_tokens: pick_recommended_graph_budget(&graph_budget_sweep),
+        max_items_sweep,
+        graph_budget_sweep,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

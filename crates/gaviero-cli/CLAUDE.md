@@ -35,7 +35,7 @@ The `Cli` struct is the **authoritative flag list** — read it before adding fl
 | `--deletions-last <N>` / `--restore-id <id>` / `--restore-since <when>` | Soft-delete audit (C2.2). |
 | `--forget-query` / `--forget-scope` / `--forget-type` / `--forget-source` (+ `--forget-dry-run`, `--forget-yes`, `--forget-reason`) | Bulk soft-delete (C2.3). |
 | `--forget-history-id <id>` (+ `--redact-confirm <literal>`, `--redact-reason <text>`) | History row redaction (C2.4). |
-| `--eval-fixture <path>` (+ `--eval-tolerance`, `--eval-update-baseline`, `--eval-report-out`, `--eval-allow-missing-baseline`, `--eval-rerank-ablation`, `--eval-from-manifests <N>`, `--eval-bootstrap-from-manifests <N>`, `--eval-scope-matrix`, `--eval-scope-matrix-scopes <list>`) | Memory recall@K / MRR regression harness. |
+| `--eval-fixture <path>` (+ `--eval-tolerance`, `--eval-update-baseline`, `--eval-report-out`, `--eval-allow-missing-baseline`, `--eval-rerank-ablation`, `--eval-embedder-ablation`, `--eval-budget-sweep`, `--eval-from-manifests <N>`, `--eval-bootstrap-from-manifests <N>`, `--eval-scope-matrix`, `--eval-scope-matrix-scopes <list>`, `--seed-corpus-from-paths`) | Memory recall@K / MRR regression harness. |
 | `--seed-corpus-from-paths` (+ `--seed-corpus-doc-chars`) | T2 corpus seeding from `gold_must` File entries. |
 | `--accept-c1-migration` | Accept the typed-stores schema migration on first launch (C1). |
 

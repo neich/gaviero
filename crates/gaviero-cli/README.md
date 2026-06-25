@@ -266,7 +266,9 @@ Or in `<repo>/.gaviero/settings.json`:
 | `--eval-tolerance` | `<f>` | Recall@5 regression tolerance for `--eval-fixture` (default 0.02) |
 | `--eval-report-out` | `<path>` | Write eval report to file (defaults to `<fixture>.last.json`) |
 | `--eval-update-baseline` | — | Update the baseline file from this run's results |
-| `--eval-rerank-ablation` | — | Run fixture twice with/without reranker and print recall/MRR deltas |
+| `--eval-rerank-ablation` | — | Run fixture twice with/without reranker; print recall/MRR + gold-set ndcg deltas |
+| `--eval-embedder-ablation` | — | S1.1: `nomic` vs `gte-modernbert` on seeded corpus (backs up + restores `memory.db`) |
+| `--eval-budget-sweep` | — | S1.3: sweep `maxItems` {3,5,8} and `graphBudgetTokens` {4k,8k,12k} |
 | `--eval-from-manifests` | `<n>` | Rescore fixture against N persisted manifests (no embedder/LLM) |
 | `--eval-allow-missing-baseline` | — | Do not fail when the baseline file does not exist |
 | `--eval-bootstrap-from-manifests` | — | Bootstrap the baseline file from persisted manifests |
