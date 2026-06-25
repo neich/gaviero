@@ -169,6 +169,9 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
         Event::Resize(_w, _h) => {
             app.needs_full_redraw = true;
         }
+        Event::TerminalFocus(focused) => {
+            app.terminal_has_focus = focused;
+        }
         Event::FileChanged(path) => {
             invalidate_repo_map(app);
             if gaviero_core::skills::SkillCatalog::needs_rebuild(&path) {
@@ -794,6 +797,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 }
                 crate::notify::notify_agent_finished(
                     &config,
+                    app.terminal_has_focus,
                     "Gaviero — agent finished",
                     &body,
                 );
@@ -1395,6 +1399,56 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
         }
         if let Action::SwitchLayout(n) = action {
             app.switch_layout(n);
+            return;
+        }
+        // Read-only agent-chat browsing: scroll (and copy selection) while
+        // review is pending so the user can read what the agent said.
+        if app.panel_visible.side_panel
+            && app.focus == Focus::SidePanel
+            && matches!(app.side_panel, SidePanelMode::AgentChat)
+        {
+            match action {
+                Action::PageUp => {
+                    app.chat_state.scroll_offset =
+                        app.chat_state.scroll_offset.saturating_sub(20);
+                    if app.chat_state.active_conv_streaming() {
+                        app.chat_state.user_scrolled_during_stream = true;
+                    }
+                    return;
+                }
+                Action::PageDown => {
+                    app.chat_state.scroll_offset =
+                        app.chat_state.scroll_offset.saturating_add(20);
+                    if app.chat_state.active_conv_streaming() {
+                        app.chat_state.user_scrolled_during_stream = true;
+                    }
+                    return;
+                }
+                Action::CursorUp => {
+                    super::side_panel::handle_chat_cursor_up(app);
+                    return;
+                }
+                Action::CursorDown => {
+                    super::side_panel::handle_chat_cursor_down(app);
+                    return;
+                }
+                Action::Copy => {
+                    if let Some(text) = app.chat_state.selected_chat_text() {
+                        app.set_clipboard(&text);
+                    }
+                    app.chat_state.clear_text_selection();
+                    return;
+                }
+                Action::Quit => {
+                    app.focus = if app.batch_review.is_some() {
+                        Focus::FileTree
+                    } else {
+                        Focus::Editor
+                    };
+                    return;
+                }
+                _ => {}
+            }
         }
         return;
     }

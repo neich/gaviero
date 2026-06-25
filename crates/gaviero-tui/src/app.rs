@@ -130,6 +130,9 @@ pub struct App {
     /// Highlighted status-bar banner after an agent turn completes (8s TTL).
     agent_finish_banner: Option<(String, std::time::Instant)>,
 
+    /// Whether the host terminal window currently has OS focus.
+    terminal_has_focus: bool,
+
     // File tree dialog (new file/folder, rename, delete)
     tree_dialog: Option<TreeDialog>,
     // File move state (multi-step: select source → select dest → confirm)
@@ -388,6 +391,7 @@ impl App {
             last_click: None,
             status_message: None,
             agent_finish_banner: None,
+            terminal_has_focus: true,
             tree_dialog: None,
             move_state: None,
             bulk_op_state: None,
@@ -684,9 +688,9 @@ impl App {
     }
 
     /// True while a single-file diff overlay or a multi-file batch review is
-    /// pending the user's accept/dismiss decision. While active the rest of
-    /// the UI (terminal, editor, side panels) is locked: the only inputs
-    /// honored are the review-specific keys and clicks.
+    /// pending the user's accept/dismiss decision. While active most of the
+    /// UI is locked; review keys/clicks and read-only agent-chat scrolling
+    /// remain available.
     pub(crate) fn has_active_review(&self) -> bool {
         self.diff_review.is_some() || self.batch_review.is_some()
     }

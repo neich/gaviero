@@ -50,7 +50,7 @@ fn chat_panel_content_width(app: &App) -> u16 {
 }
 
 /// Up in chat: move within wrapped/multiline input, else message history, else scroll output.
-fn handle_chat_cursor_up(app: &mut App) {
+pub(super) fn handle_chat_cursor_up(app: &mut App) {
     if app.chat_state.active_conv_streaming() {
         app.chat_state.scroll_chat_up();
         app.chat_state.user_scrolled_during_stream = true;
@@ -70,7 +70,7 @@ fn handle_chat_cursor_up(app: &mut App) {
 }
 
 /// Down in chat: move within wrapped/multiline input, else message history, else scroll output.
-fn handle_chat_cursor_down(app: &mut App) {
+pub(super) fn handle_chat_cursor_down(app: &mut App) {
     if app.chat_state.active_conv_streaming() {
         app.chat_state.scroll_chat_down();
         app.chat_state.user_scrolled_during_stream = true;

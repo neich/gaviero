@@ -1,7 +1,9 @@
 //! Agent-finish notifications: terminal bell, desktop toast, status-bar banner.
 //!
-//! Desktop toasts use low urgency and no focus-stealing hints so other apps
-//! keep keyboard focus while the user is notified.
+//! Bell and desktop toast fire only while the host terminal has keyboard focus
+//! (crossterm `FocusGained` / `FocusLost`). When gaviero is backgrounded,
+//! minimized, or covered by another fullscreen app, those audible/desktop
+//! notifications are suppressed so they do not interrupt the user.
 
 use gaviero_core::workspace::{Workspace, settings};
 use std::path::Path;
@@ -51,9 +53,15 @@ pub fn resolve_config(workspace: &Workspace, root: Option<&Path>) -> AgentFinish
     }
 }
 
-/// Play the terminal bell and/or spawn a desktop toast. Never raises the window.
-pub fn notify_agent_finished(config: &AgentFinishNotifyConfig, title: &str, body: &str) {
-    if !config.enabled {
+/// Play the terminal bell and/or spawn a desktop toast when the terminal is in
+/// the foreground. Never raises the window.
+pub fn notify_agent_finished(
+    config: &AgentFinishNotifyConfig,
+    terminal_focused: bool,
+    title: &str,
+    body: &str,
+) {
+    if !config.enabled || !terminal_focused {
         return;
     }
     if config.sound {
@@ -117,6 +125,12 @@ mod tests {
     fn default_config_all_on() {
         let c = AgentFinishNotifyConfig::default();
         assert!(c.enabled && c.sound && c.desktop && c.status_bar);
+    }
+
+    #[test]
+    fn notify_skipped_when_terminal_unfocused() {
+        let c = AgentFinishNotifyConfig::default();
+        notify_agent_finished(&c, false, "title", "body");
     }
 
     #[cfg(target_os = "macos")]

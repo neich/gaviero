@@ -298,7 +298,7 @@ Soft-delete via `/forget` writes to a `deletions` audit table; History rows are 
 Every first turn injects two layers of repo context:
 
 - `<repo_topology>` — cheap filesystem-only folder map ([`repo_map/topology.rs`](crates/gaviero-core/src/repo_map/topology.rs)). `agent.topology.*` budget, default 600 tokens. Built async per-folder; cached on the TUI side ([`app/session.rs`](crates/gaviero-tui/src/app/session.rs)).
-- `<repo_outline>` — ranked PageRank file list (`agent.graphBudgetTokens`, default 12k).
+- `<repo_outline>` — ranked PageRank file list (`agent.graphBudgetTokens`, default 8k).
 
 The TUI `/lite` slash command (alias `/minimal`) arms a one-shot minimal-context turn: keeps `<repo_topology>` and drops `<repo_outline>`, memory, and impact. Mid-turn relational context stays on the MCP `blast_radius` tool.
 

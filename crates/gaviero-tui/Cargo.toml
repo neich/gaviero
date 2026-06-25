@@ -20,7 +20,7 @@ tracing-subscriber = { workspace = true }
 dirs = { workspace = true }
 clap = { workspace = true }
 ratatui = "0.30"
-crossterm = { version = "0.29", features = ["bracketed-paste"] }
+crossterm = { version = "0.29", features = ["bracketed-paste", "events"] }
 ropey = "1.6"
 arboard = { version = "3", features = ["wayland-data-control"] }
 base64 = "0.22"

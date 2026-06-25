@@ -253,6 +253,14 @@ struct Cli {
     #[arg(long = "eval-rerank-ablation", conflicts_with = "eval_update_baseline")]
     eval_rerank_ablation: bool,
 
+    /// KB-efficiency S1.1 / B1g: embedder ablation. Backs up
+    /// `.gaviero/memory.db`, then for each of `nomic` and
+    /// `gte-modernbert` wipes the workspace DB, seeds the fixture's
+    /// `gold_must` File paths, and scores at `run` scope. Restores the
+    /// backup afterward. Report-only — does not flip defaults.
+    #[arg(long = "eval-embedder-ablation", conflicts_with = "eval_update_baseline")]
+    eval_embedder_ablation: bool,
+
     /// Tier B / T0 rescore mode: replay the fixture against the most
     /// recent N persisted `injection_manifests`. No embedder, no
     /// reranker, no LLM — cheap regression replay for scoring-formula
@@ -284,6 +292,13 @@ struct Cli {
     /// Comma-separated; defaults to `repo,module,run`.
     #[arg(long = "eval-scope-matrix-scopes", default_value = "repo,module,run")]
     eval_scope_matrix_scopes: String,
+
+    /// KB-efficiency S1.3: sweep `memory.chatInjection.maxItems` {3,5,8}
+    /// and `agent.graphBudgetTokens` {4k,8k,12k}; print token/quality
+    /// tables and write JSON to `--eval-report-out` (default:
+    /// `<fixture>.s13-sweep.json`).
+    #[arg(long = "eval-budget-sweep", requires = "eval_fixture")]
+    eval_budget_sweep: bool,
 
     /// Tier T1 / T2 corpus seeding: walk every `gold_must` File entry
     /// in the supplied `--eval-fixture` and write one Record memory
@@ -1786,6 +1801,7 @@ async fn run_seed_corpus_from_paths(
     repo: &std::path::Path,
     fixture: &PathBuf,
     doc_chars: usize,
+    embedder_name: Option<&str>,
 ) -> Result<()> {
     use gaviero_core::memory::eval::{GoldRef, load_fixture};
     use gaviero_core::memory::scope::WriteScope;
@@ -1858,13 +1874,14 @@ async fn run_seed_corpus_from_paths(
     let counters = std::sync::Arc::new(SeedCounters::default());
 
     let repo_buf = repo.to_path_buf();
+    let embedder_for_seed = embedder_name.map(str::to_string);
     let observer: std::sync::Arc<dyn gaviero_core::memory::MemoryObserver> = counters.clone();
     let services = tokio::task::spawn_blocking({
         let repo_buf = repo_buf.clone();
         move || -> anyhow::Result<std::sync::Arc<gaviero_core::memory::MemoryServices>> {
             let workspace = gaviero_core::workspace::Workspace::single_folder(repo_buf.clone());
             let opts = gaviero_core::memory::ServicesOpts {
-                embedder_name: None,
+                embedder_name: embedder_for_seed,
                 llm: None,
                 observer: Some(observer),
                 manifest_observer: None,
@@ -2102,6 +2119,194 @@ async fn run_eval_from_manifests(
     Ok(())
 }
 
+/// Backup `.gaviero/memory.db` (+ WAL/SHM sidecars) before a destructive
+/// eval arm. Restored by [`restore_memory_db`].
+struct MemoryDbBackup {
+    db: Option<Vec<u8>>,
+    wal: Option<Vec<u8>>,
+    shm: Option<Vec<u8>>,
+}
+
+fn backup_memory_db(repo: &std::path::Path) -> Result<MemoryDbBackup> {
+    let dir = repo.join(".gaviero");
+    let read = |name: &str| -> Result<Option<Vec<u8>>> {
+        let p = dir.join(name);
+        if p.exists() {
+            Ok(Some(std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?))
+        } else {
+            Ok(None)
+        }
+    };
+    Ok(MemoryDbBackup {
+        db: read("memory.db")?,
+        wal: read("memory.db-wal")?,
+        shm: read("memory.db-shm")?,
+    })
+}
+
+fn remove_memory_db(repo: &std::path::Path) -> Result<()> {
+    let dir = repo.join(".gaviero");
+    for name in ["memory.db", "memory.db-wal", "memory.db-shm"] {
+        let p = dir.join(name);
+        if p.exists() {
+            std::fs::remove_file(&p)
+                .with_context(|| format!("removing {}", p.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn restore_memory_db(repo: &std::path::Path, backup: &MemoryDbBackup) -> Result<()> {
+    remove_memory_db(repo)?;
+    let dir = repo.join(".gaviero");
+    std::fs::create_dir_all(&dir)?;
+    let write = |name: &str, bytes: &Option<Vec<u8>>| -> Result<()> {
+        if let Some(b) = bytes {
+            std::fs::write(dir.join(name), b)
+                .with_context(|| format!("restoring {name}"))?;
+        }
+        Ok(())
+    };
+    write("memory.db", &backup.db)?;
+    write("memory.db-wal", &backup.wal)?;
+    write("memory.db-shm", &backup.shm)?;
+    Ok(())
+}
+
+/// KB-efficiency S1.1 / B1g: compare `nomic` vs `gte-modernbert` on the
+/// gold-set fixture with a seeded corpus per arm (fair vector space).
+async fn run_eval_embedder_ablation(repo: &std::path::Path, fixture: &PathBuf) -> Result<()> {
+    use gaviero_core::memory::eval::{load_fixture, run_scope_matrix};
+    use gaviero_core::memory::{
+        MemoryScope, Reranker, RetrievalConfig, build_reranker, hash_path,
+        init_workspace_with_embedder_name,
+    };
+
+    const MODELS: &[&str] = &["nomic", "gte-modernbert"];
+
+    let cases = load_fixture(fixture).context("loading eval fixture")?;
+    if cases.is_empty() {
+        anyhow::bail!("eval fixture {} contained no cases", fixture.display());
+    }
+
+    eprintln!(
+        "[gaviero-eval] backing up {} before embedder ablation…",
+        repo.join(".gaviero/memory.db").display()
+    );
+    let backup = backup_memory_db(repo)?;
+
+    let mut workspace = gaviero_core::workspace::Workspace::single_folder(repo.to_path_buf());
+    workspace.ensure_settings();
+    let workspace_root = repo.to_path_buf();
+    let retrieval_cfg = workspace.resolve_retrieval_config(Some(&workspace_root));
+    let mut rerank_cfg = workspace.resolve_rerank_config(Some(&workspace_root));
+    rerank_cfg.enabled = true;
+
+    let reranker_arc: Option<std::sync::Arc<dyn Reranker>> = {
+        let model_name = workspace
+            .resolve_setting(
+                gaviero_core::workspace::settings::MEMORY_RERANKER_MODEL,
+                Some(&workspace_root),
+            )
+            .as_str()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "minilm".to_string());
+        let threads = rerank_cfg.threads;
+        eprintln!("[gaviero-eval] loading reranker `{model_name}` for embedder ablation…");
+        let built = tokio::task::spawn_blocking(move || build_reranker(&model_name, threads))
+            .await
+            .context("loading reranker (embedder ablation)")??;
+        built.map(std::sync::Arc::from)
+    };
+    if let Some(ref rr) = reranker_arc {
+        if let Err(e) = rr.warmup().await {
+            tracing::warn!(target: "memory_rerank", error = %e, "rerank warmup failed");
+        }
+    }
+
+    let scope_ctx = MemoryScope {
+        global_db: PathBuf::new(),
+        workspace_db: PathBuf::new(),
+        repo_db: None,
+        workspace_id: hash_path(repo),
+        repo_id: Some(hash_path(repo)),
+        module_path: None,
+        run_id: None,
+    };
+
+    let mut arms: Vec<(String, gaviero_core::memory::eval::EvalReport)> = Vec::new();
+    for model in MODELS {
+        eprintln!("[gaviero-eval] embedder arm `{model}`: fresh db + seed…");
+        remove_memory_db(repo)?;
+        run_seed_corpus_from_paths(repo, fixture, 480, Some(model)).await?;
+
+        let store = tokio::task::spawn_blocking({
+            let repo = repo.to_path_buf();
+            let model = model.to_string();
+            move || init_workspace_with_embedder_name(&repo, &model)
+        })
+        .await
+        .with_context(|| format!("init memory (embedder ablation, {model})"))??;
+
+        let matrix = run_scope_matrix(
+            &store,
+            &scope_ctx,
+            &cases,
+            &["run".to_string()],
+            Some(&retrieval_cfg),
+            reranker_arc.as_deref(),
+            Some(&rerank_cfg),
+        )
+        .await?;
+        let report = matrix
+            .into_iter()
+            .next()
+            .map(|(_, r)| r)
+            .context("scope matrix returned no rows")?;
+        arms.push((model.to_string(), report));
+    }
+
+    eprintln!("[gaviero-eval] restoring workspace memory.db…");
+    restore_memory_db(repo, &backup)?;
+
+    println!("─── Embedder ablation (B1g / S1.1) ─────────────────────");
+    println!("fixture     : {}", fixture.display());
+    println!("scope       : run (seeded gold_must File corpus per arm)");
+    println!("cases       : {}", cases.len());
+    println!(
+        "reranker    : {} ({})",
+        if reranker_arc.is_some() { "on" } else { "off" },
+        workspace
+            .resolve_setting(
+                gaviero_core::workspace::settings::MEMORY_RERANKER_MODEL,
+                Some(&workspace_root),
+            )
+            .as_str()
+            .unwrap_or("minilm")
+    );
+    println!("             {:>10}  {:>10}  {:>10}", "nomic", "gte-mbert", "Δ");
+    let row = |label: &str, a: f32, b: f32| {
+        println!("{:11}  {:>10.3}  {:>10.3}  {:>+10.3}", label, a, b, b - a);
+    };
+    let nomic = &arms[0].1;
+    let gte = &arms[1].1;
+    row("precision@5", nomic.precision_at_5, gte.precision_at_5);
+    row("precision@10", nomic.precision_at_10, gte.precision_at_10);
+    row("ndcg@5", nomic.ndcg_at_5, gte.ndcg_at_5);
+    row("ndcg@10", nomic.ndcg_at_10, gte.ndcg_at_10);
+    row("blast_leak", nomic.blast_leakage, gte.blast_leakage);
+    row("over_ret", nomic.over_retrieval, gte.over_retrieval);
+    let ndcg5_delta = gte.ndcg_at_5 - nomic.ndcg_at_5;
+    println!(
+        "\nverdict     : ndcg@5 Δ (gte − nomic) = {:+.3}\n\
+         PR-1 gate   : report-only — embedder default stays `nomic` \
+         (flip authority → PR-4; guardrail band ≥ +5 pt recall@5)",
+        ndcg5_delta
+    );
+    Ok(())
+}
+
 /// Tier B / B2f: rerank ablation. Runs the fixture twice — once with
 /// the reranker enabled, once without — and prints recall@K / MRR
 /// deltas so the dev can decide whether to flip
@@ -2254,6 +2459,174 @@ fn print_eval_report(r: &gaviero_core::memory::eval::EvalReport) {
             println!("  {} expected={} {}", o.id, expected, rank);
         }
     }
+}
+
+fn parse_workspace_exclude_patterns(
+    workspace: &gaviero_core::workspace::Workspace,
+    root: Option<&std::path::Path>,
+) -> Vec<String> {
+    use gaviero_core::workspace::settings;
+    let val = workspace.resolve_setting(settings::FILES_EXCLUDE, root);
+    let mut patterns = Vec::new();
+    if let Some(obj) = val.as_object() {
+        for (pattern, enabled) in obj {
+            if enabled.as_bool().unwrap_or(false) {
+                patterns.push(pattern.clone());
+            }
+        }
+    }
+    patterns
+}
+
+/// KB-efficiency S1.3: sweep chat `max_items` and graph budget knobs.
+async fn run_eval_budget_sweep(repo: &std::path::Path, fixture: &PathBuf, cli: &Cli) -> Result<()> {
+    use gaviero_core::memory::eval::{load_fixture, run_s13_budget_sweep};
+    use gaviero_core::memory::{MemoryScope, Reranker, build_reranker, hash_path};
+    use gaviero_core::repo_map::RepoMap;
+
+    let cases = load_fixture(fixture).context("loading eval fixture")?;
+    if cases.is_empty() {
+        anyhow::bail!("eval fixture {} contained no cases", fixture.display());
+    }
+
+    let store = open_eval_store(repo, "S1.3 budget sweep").await?;
+
+    let mut workspace = gaviero_core::workspace::Workspace::single_folder(repo.to_path_buf());
+    workspace.ensure_settings();
+    let workspace_root = repo.to_path_buf();
+    let excludes = parse_workspace_exclude_patterns(&workspace, Some(&workspace_root));
+    let chat_cfg = workspace.resolve_chat_injection_config(Some(&workspace_root));
+    let retrieval_cfg = workspace.resolve_retrieval_config(Some(&workspace_root));
+    let rerank_cfg = workspace.resolve_rerank_config(Some(&workspace_root));
+
+    let reranker_arc: Option<std::sync::Arc<dyn Reranker>> = if rerank_cfg.enabled {
+        let model_name = workspace
+            .resolve_setting(
+                gaviero_core::workspace::settings::MEMORY_RERANKER_MODEL,
+                Some(&workspace_root),
+            )
+            .as_str()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "minilm".to_string());
+        let threads = rerank_cfg.threads;
+        eprintln!(
+            "[gaviero-eval] loading reranker `{model_name}` for chat-path sweep…"
+        );
+        let built = tokio::task::spawn_blocking(move || build_reranker(&model_name, threads))
+            .await
+            .context("loading reranker (budget sweep)")??;
+        built.map(std::sync::Arc::from)
+    } else {
+        None
+    };
+    if let Some(ref rr) = reranker_arc {
+        if let Err(e) = rr.warmup().await {
+            tracing::warn!(target: "memory_rerank", error = %e, "rerank warmup failed");
+        }
+    }
+
+    eprintln!(
+        "[gaviero-eval] building RepoMap for graph budget sweep (may take a minute)…"
+    );
+    let repo_map = tokio::task::spawn_blocking({
+        let repo = repo.to_path_buf();
+        let excludes = excludes.clone();
+        move || RepoMap::build(&repo, &excludes)
+    })
+    .await
+    .context("RepoMap build (budget sweep)")??;
+
+    let scope_ctx = MemoryScope {
+        global_db: PathBuf::new(),
+        workspace_db: PathBuf::new(),
+        repo_db: None,
+        workspace_id: hash_path(repo),
+        repo_id: Some(hash_path(repo)),
+        module_path: None,
+        run_id: None,
+    };
+
+    let report = run_s13_budget_sweep(
+        &store,
+        &scope_ctx,
+        &cases,
+        &chat_cfg,
+        &retrieval_cfg,
+        reranker_arc.as_deref(),
+        if reranker_arc.is_some() {
+            Some(&rerank_cfg)
+        } else {
+            None
+        },
+        &repo_map,
+        &[4_000, 8_000, 12_000],
+        &fixture.to_string_lossy(),
+        &repo.to_string_lossy(),
+    )
+    .await?;
+
+    print_s13_budget_sweep_report(&report);
+
+    let report_out = cli
+        .eval_report_out
+        .clone()
+        .unwrap_or_else(|| fixture.with_extension("s13-sweep.json"));
+    if let Ok(json) = serde_json::to_string_pretty(&report) {
+        ensure_parent_dir(&report_out)
+            .and_then(|()| std::fs::write(&report_out, json).map_err(Into::into))
+            .with_context(|| format!("writing S1.3 sweep report to {}", report_out.display()))?;
+        eprintln!(
+            "[gaviero-eval] S1.3 sweep report written to {}",
+            report_out.display()
+        );
+    }
+    Ok(())
+}
+
+fn print_s13_budget_sweep_report(r: &gaviero_core::memory::eval::S13BudgetSweepReport) {
+    println!("─── S1.3 budget sweep ────────────────────────────────");
+    println!("fixture   : {}", r.fixture);
+    println!("workspace : {}", r.workspace);
+    println!();
+    println!("max_items sweep (chat injection path):");
+    println!(
+        "  {:>9}  {:>10}  {:>8}  {:>8}  {:>8}  {:>8}",
+        "max_items", "mem_tok", "p@5", "ndcg@5", "under", "leak"
+    );
+    for row in &r.max_items_sweep {
+        println!(
+            "  {:>9}  {:>10.1}  {:>8.3}  {:>8.3}  {:>8.3}  {:>8.3}",
+            row.max_items,
+            row.mean_memory_tokens,
+            row.precision_at_5,
+            row.ndcg_at_5,
+            row.under_retrieval,
+            row.blast_leakage,
+        );
+    }
+    println!();
+    println!("graphBudgetTokens sweep (repo outline):");
+    println!(
+        "  {:>9}  {:>10}  {:>6}  {:>6}  {:>6}  {:>6}",
+        "budget", "outline", "files", "path", "sig", "full"
+    );
+    for row in &r.graph_budget_sweep {
+        println!(
+            "  {:>9}  {:>10}  {:>6}  {:>6}  {:>6}  {:>6}",
+            row.graph_budget_tokens,
+            row.outline_tokens,
+            row.file_count,
+            row.path_only,
+            row.signature_only,
+            row.full_attach,
+        );
+    }
+    println!();
+    println!(
+        "recommended: max_items={} graphBudgetTokens={}",
+        r.recommended_max_items, r.recommended_graph_budget_tokens
+    );
 }
 
 fn workspace_setting_string(
@@ -2452,6 +2825,9 @@ async fn main() -> Result<()> {
         if let Some(n) = cli.eval_from_manifests {
             return run_eval_from_manifests(&repo, &fixture_path, n).await;
         }
+        if cli.eval_embedder_ablation {
+            return run_eval_embedder_ablation(&repo, &fixture_path).await;
+        }
         if cli.eval_rerank_ablation {
             return run_eval_rerank_ablation(&repo, &fixture_path).await;
         }
@@ -2460,12 +2836,16 @@ async fn main() -> Result<()> {
                 &repo,
                 &fixture_path,
                 cli.seed_corpus_doc_chars,
+                None,
             )
             .await;
         }
         if cli.eval_scope_matrix {
             return run_eval_scope_matrix(&repo, &fixture_path, &cli.eval_scope_matrix_scopes)
                 .await;
+        }
+        if cli.eval_budget_sweep {
+            return run_eval_budget_sweep(&repo, &fixture_path, &cli).await;
         }
         return run_eval_smoke_test(&repo, &fixture_path, &cli).await;
     }

@@ -56,7 +56,7 @@ impl Default for ChatInjectionConfig {
         Self {
             enabled: true,
             scopes: ScopeMix::default(),
-            max_items: 8,
+            max_items: 5,
             token_budget: 1000,
             min_similarity: 0.3,
         }

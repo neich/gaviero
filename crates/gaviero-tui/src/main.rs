@@ -10,7 +10,7 @@ mod widgets;
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
-    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
+    event::{DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange, EnableMouseCapture},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -97,7 +97,8 @@ fn restore_terminal() {
         std::io::stdout(),
         LeaveAlternateScreen,
         DisableMouseCapture,
-        DisableBracketedPaste
+        DisableBracketedPaste,
+        DisableFocusChange
     );
     let _ = crossterm::cursor::Show;
     // Print a newline so the shell prompt starts on a clean line
@@ -251,7 +252,8 @@ async fn main() -> Result<()> {
         stdout,
         EnterAlternateScreen,
         EnableMouseCapture,
-        EnableBracketedPaste
+        EnableBracketedPaste,
+        EnableFocusChange
     )
     .context("entering alternate screen")?;
 

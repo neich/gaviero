@@ -726,6 +726,98 @@ impl AgentChatState {
         }
     }
 
+    /// Per-layer projected bootstrap token ceilings for the next send.
+    fn format_bootstrap_layer_breakdown(
+        arms: gaviero_core::context_planner::BootstrapArms,
+        budgets: &gaviero_core::context_planner::BootstrapBudgets,
+        hints: &gaviero_core::context_planner::BootstrapEstimateHints,
+    ) -> String {
+        if !arms.any_layer() {
+            return "  (none)".to_string();
+        }
+
+        let mut lines = Vec::new();
+        if arms.topology {
+            let projected = hints
+                .topology_chars
+                .map(|c| c.div_ceil(4).min(budgets.topology))
+                .unwrap_or(budgets.topology);
+            lines.push(format!(
+                "  topology: ~{} tok (ceiling {})",
+                projected, budgets.topology
+            ));
+        }
+        if arms.outline {
+            let projected = hints.outline_tokens.unwrap_or(budgets.outline);
+            lines.push(format!(
+                "  outline: ~{} tok (ceiling {})",
+                projected, budgets.outline
+            ));
+        }
+        if arms.memory {
+            let projected = hints.memory_tokens.unwrap_or(budgets.memory);
+            lines.push(format!(
+                "  memory: ~{} tok (ceiling {})",
+                projected, budgets.memory
+            ));
+        }
+        if arms.impact {
+            let projected = hints
+                .impact_chars
+                .map(|c| c.div_ceil(4).min(budgets.impact))
+                .unwrap_or(budgets.impact);
+            lines.push(format!(
+                "  impact: ~{} tok (ceiling {})",
+                projected, budgets.impact
+            ));
+        }
+        let total =
+            gaviero_core::context_planner::estimate_bootstrap_tokens(arms, budgets, hints);
+        lines.push(format!("  total bootstrap: ~{} tok", total));
+        lines.join("\n")
+    }
+
+    /// User-facing summary after `/reset`: what the next first turn will inject.
+    fn reset_post_bootstrap_message(
+        &self,
+        estimate_ctx: &gaviero_core::context_planner::BootstrapEstimateContext,
+    ) -> String {
+        let arms = self.resolve_next_bootstrap_arms();
+        let breakdown = Self::format_bootstrap_layer_breakdown(
+            arms,
+            &estimate_ctx.budgets,
+            &estimate_ctx.hints,
+        );
+        let bootstrap_total = gaviero_core::context_planner::estimate_bootstrap_tokens(
+            arms,
+            &estimate_ctx.budgets,
+            &estimate_ctx.hints,
+        );
+        let model = self.effective_model();
+        let hidden = hidden_provider_overhead_tokens(&model);
+        let composite = bootstrap_total.saturating_add(hidden);
+
+        let mut msg = format!(
+            "Context cleared. Chat history stays in the panel but won't be re-sent.\n\
+             Next send is a first turn — server session starts fresh.\n\n\
+             Projected bootstrap injection:\n{breakdown}"
+        );
+
+        if arms.any_layer() && (arms.outline || arms.memory || arms.impact) {
+            msg.push_str(
+                "\n\nTip: /lite drops outline + memory + impact (keeps topology only) \
+                 for the next send. /lite survives /reset if armed first.",
+            );
+        }
+        if model.starts_with("cursor:") {
+            msg.push_str(&format!(
+                "\n\nCursor composite estimate: ~{composite} tok \
+                 (~{bootstrap_total} bootstrap + ~{hidden} system/tools allowance)."
+            ));
+        }
+        msg
+    }
+
     /// Process slash commands in input. Returns true if a command was handled.
     ///
     /// A leading `//` (double slash) is the explicit "send raw to agent"
@@ -916,13 +1008,21 @@ impl AgentChatState {
                 };
                 let mode = self.effective_bootstrap_mode();
                 let pending = self.pending_bootstrap_summary();
+                let next_arms = self.resolve_next_bootstrap_arms();
+                let layer_breakdown = Self::format_bootstrap_layer_breakdown(
+                    next_arms,
+                    &estimate_ctx.budgets,
+                    &estimate_ctx.hints,
+                );
+                let conv = self.active_conversation();
                 let mut msg = format!(
                     "Status bar: {} tokens — {} (~{}% of {} limit)\n\
                      Composite parts:\n  transcript: {} tok (visible chat × 1.3)\n  \
                      bootstrap: {} tok (projected next injection)\n  \
                      hidden overhead: {} tok (provider system/tools allowance)\n\
                      Transcript words: {} input | {} output\n\n\
-                     Bootstrap policy:\n  mode: {} (workspace default: {})\n  {}",
+                     Bootstrap policy:\n  mode: {} (workspace default: {})\n  {}\n\n\
+                     Next-send bootstrap breakdown:\n{layer_breakdown}",
                     pressure.tokens,
                     source_label,
                     pressure.pct,
@@ -936,6 +1036,13 @@ impl AgentChatState {
                     self.agent_settings.bootstrap_mode.as_str(),
                     pending,
                 );
+                if conv.last_bootstrap_tokens > 0 {
+                    msg.push_str(&format!(
+                        "\n\nLast measured bootstrap (prior send): {} tok ({})",
+                        conv.last_bootstrap_tokens,
+                        Self::format_bootstrap_layers(conv.last_bootstrap_arms),
+                    ));
+                }
                 if self.effective_model().starts_with("codex:") {
                     msg.push_str(
                         "\n  codex exec replays history client-side; use /inject memory \
@@ -1495,9 +1602,9 @@ impl AgentChatState {
         conv.transcript_inline_mode = TranscriptInlineMode::Suppress;
         self.text_input.text.clear();
         self.text_input.cursor = 0;
-        self.add_system_message(
-            "Context cleared. Next turn will bootstrap fresh (chat history preserved in panel; not re-sent to the agent).",
-        );
+        let estimate_ctx = self.fallback_bootstrap_estimate_context();
+        let msg = self.reset_post_bootstrap_message(&estimate_ctx);
+        self.add_system_message(&msg);
     }
 
     /// Close the active conversation. If it's the last one, replace it with a fresh one.
@@ -4358,6 +4465,69 @@ mod tests {
             state.conversations[state.active_conv]
                 .session_ledger
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn reset_message_includes_bootstrap_projection() {
+        let mut state = AgentChatState::new();
+        state.agent_settings.graph_budget_tokens = 8_000;
+        state.agent_settings.model = "cursor:composer".to_string();
+
+        state.text_input.text = "/reset".to_string();
+        assert!(state.process_slash_command());
+
+        let last = state
+            .conversations[state.active_conv]
+            .messages
+            .last()
+            .expect("reset emits a system message");
+        assert_eq!(last.role, ChatRole::System);
+        assert!(
+            last.content.contains("Projected bootstrap injection"),
+            "reset should explain upcoming bootstrap: {:?}",
+            last.content
+        );
+        assert!(
+            last.content.contains("outline: ~8000 tok"),
+            "should show outline ceiling from graph budget: {:?}",
+            last.content
+        );
+        assert!(
+            last.content.contains("/lite"),
+            "should mention /lite escape hatch: {:?}",
+            last.content
+        );
+        assert!(
+            last.content.contains("Cursor composite estimate"),
+            "cursor model should show composite breakdown: {:?}",
+            last.content
+        );
+    }
+
+    #[test]
+    fn reset_message_with_lite_shows_topology_only_projection() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "/lite".to_string();
+        assert!(state.process_slash_command());
+
+        state.text_input.text = "/reset".to_string();
+        assert!(state.process_slash_command());
+
+        let last = state
+            .conversations[state.active_conv]
+            .messages
+            .last()
+            .expect("reset emits a system message");
+        assert!(
+            last.content.contains("topology: ~600 tok"),
+            "armed /lite should project topology-only bootstrap: {:?}",
+            last.content
+        );
+        assert!(
+            !last.content.contains("outline:"),
+            "armed /lite should not project outline layer: {:?}",
+            last.content
         );
     }
 
