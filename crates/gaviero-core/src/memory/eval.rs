@@ -906,6 +906,26 @@ pub struct GraphBudgetSweepRow {
     pub path_only: usize,
     pub signature_only: usize,
     pub full_attach: usize,
+    /// PUSH→PULL Phase 0: estimated first-turn injected tokens at this graph
+    /// budget — the measured memory-injection baseline (held constant across
+    /// the graph axis) plus this budget's outline tokens. The topology and
+    /// impact layers are not measured by this harness, so this is a lower
+    /// bound on the true turn-one total, useful for the per-budget token/recall
+    /// trade-off curve.
+    #[serde(default)]
+    pub mean_turn_one_tokens: f32,
+    /// PUSH→PULL Phase 0: fraction of File-gold fixture cases whose gold file
+    /// appears among the top-5 ranked outline candidates at this budget. Cases
+    /// without a `GoldRef::File` in `gold_must` are excluded from the
+    /// denominator. Separates "the budget-limited outline still surfaced the
+    /// gold file" from "the model never called a pull tool".
+    #[serde(default)]
+    pub recall_at_5: f32,
+    /// PUSH→PULL Phase 0: end-to-end task pass@1. `None` until a
+    /// test-execution harness over the fixture exists — see the CLI sweep call
+    /// site (`run_eval_budget_sweep`) for the wiring point.
+    #[serde(default)]
+    pub pass_at_1: Option<f32>,
 }
 
 /// Aggregate S1.3 sweep output (memory + graph knobs).
@@ -980,9 +1000,17 @@ pub async fn run_s13_max_items_sweep(
 }
 
 /// Sweep `agent.graphBudgetTokens` ∈ budgets against a built [`RepoMap`].
+///
+/// `cases` supply the gold sets for per-budget graph recall (see
+/// [`graph_file_recall_at_k`]); pass `&[]` to skip recall (it reports 0.0).
+/// `memory_token_base` is the measured memory-injection token baseline, added
+/// to each budget's outline tokens to estimate `mean_turn_one_tokens`; pass
+/// `0.0` to report outline tokens alone.
 pub fn run_s13_graph_budget_sweep(
     repo_map: &crate::repo_map::RepoMap,
     budgets: &[usize],
+    cases: &[EvalCase],
+    memory_token_base: f32,
 ) -> Vec<GraphBudgetSweepRow> {
     use crate::repo_map::GraphDecision;
 
@@ -1009,9 +1037,118 @@ pub fn run_s13_graph_budget_sweep(
                 path_only,
                 signature_only,
                 full_attach,
+                mean_turn_one_tokens: memory_token_base + outline_tokens as f32,
+                recall_at_5: graph_file_recall_at_k(cases, &candidates, 5),
+                // TODO pass@k: no test-execution harness drives the code-prompt
+                // fixture end to end yet, so task pass@1 is unmeasured here. The
+                // CLI sweep call site documents where to wire one.
+                pass_at_1: None,
             }
         })
         .collect()
+}
+
+/// Graph recall@k for the budget sweep: the fraction of File-gold fixture
+/// cases whose gold file appears among the top-`k` ranked outline candidates.
+///
+/// A case is "file-relevant" iff its `gold_must` carries at least one
+/// [`GoldRef::File`]; only those count toward the denominator (the file-level
+/// outline metric does not apply to memory-only cases). Path matching is
+/// separator-normalised and tolerant of repo-relative vs absolute candidate
+/// paths (`ends_with`), plus directory-prefix gold refs (trailing `/`).
+/// Returns 0.0 when no case is file-relevant.
+fn graph_file_recall_at_k(
+    cases: &[EvalCase],
+    candidates: &[crate::repo_map::GraphCandidate],
+    k: usize,
+) -> f32 {
+    let top: Vec<String> = candidates
+        .iter()
+        .take(k)
+        .map(|c| c.path.to_string_lossy().replace('\\', "/"))
+        .collect();
+
+    let mut relevant = 0usize;
+    let mut hits = 0usize;
+    for case in cases {
+        let golds: Vec<&str> = case
+            .gold_must
+            .iter()
+            .filter_map(|g| match g {
+                GoldRef::File(p) => Some(p.as_str()),
+                _ => None,
+            })
+            .collect();
+        if golds.is_empty() {
+            continue;
+        }
+        relevant += 1;
+        let hit = golds.iter().any(|gold| {
+            let gold = gold.trim_start_matches("./");
+            top.iter().any(|cand| {
+                cand == gold
+                    || cand.ends_with(gold)
+                    || (gold.ends_with('/') && cand.starts_with(gold))
+            })
+        });
+        if hit {
+            hits += 1;
+        }
+    }
+
+    if relevant == 0 {
+        0.0
+    } else {
+        hits as f32 / relevant as f32
+    }
+}
+
+/// Recall@k computed from a persisted `injection_manifests` payload.
+///
+/// Separates "retrieval surfaced the gold memory" from "the model never acted
+/// on it": it reads the ranked `candidate_pool` (the full retrieval surface)
+/// when present, otherwise falls back to `selected_ids` (the post-budget
+/// injection list, already in selection order), takes the top `k` by score,
+/// and returns the fraction of `gold_ids` found there. Returns 0.0 for empty
+/// `gold_ids` or an unparseable payload.
+pub fn compute_recall_at_k_from_manifest(payload: &str, gold_ids: &[i64], k: usize) -> f64 {
+    if gold_ids.is_empty() {
+        return 0.0;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return 0.0;
+    };
+
+    // Prefer the candidate pool (full retrieval surface, score-ranked); fall
+    // back to selected_ids (post-budget injection list) when the pool was not
+    // captured for this turn.
+    let ranked: Vec<i64> = if let Some(pool) = value.get("candidate_pool").and_then(|v| v.as_array())
+    {
+        let mut entries: Vec<(i64, f64)> = pool
+            .iter()
+            .filter_map(|c| {
+                let id = c.get("memory_id").and_then(|v| v.as_i64())?;
+                let score = c
+                    .get("blended_score")
+                    .and_then(|v| v.as_f64())
+                    .or_else(|| c.get("composite_score").and_then(|v| v.as_f64()))
+                    .unwrap_or(0.0);
+                Some((id, score))
+            })
+            .collect();
+        entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        entries.into_iter().map(|(id, _)| id).collect()
+    } else {
+        value
+            .get("selected_ids")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(serde_json::Value::as_i64).collect())
+            .unwrap_or_default()
+    };
+
+    let top: std::collections::HashSet<i64> = ranked.into_iter().take(k).collect();
+    let found = gold_ids.iter().filter(|id| top.contains(id)).count();
+    found as f64 / gold_ids.len() as f64
 }
 
 fn pick_recommended_max_items(rows: &[MaxItemsSweepRow]) -> usize {
@@ -1071,7 +1208,18 @@ pub async fn run_s13_budget_sweep(
         rerank_cfg,
     )
     .await?;
-    let graph_budget_sweep = run_s13_graph_budget_sweep(repo_map, graph_budgets);
+    // The memory-injection token cost is independent of the graph budget, so
+    // take it once from the max_items baseline (the active config's max_items,
+    // else the conventional 5) and hold it constant across the graph axis when
+    // estimating mean_turn_one_tokens.
+    let memory_token_base = max_items_sweep
+        .iter()
+        .find(|r| r.max_items == base_chat_cfg.max_items)
+        .or_else(|| max_items_sweep.iter().find(|r| r.max_items == 5))
+        .map(|r| r.mean_memory_tokens)
+        .unwrap_or(0.0);
+    let graph_budget_sweep =
+        run_s13_graph_budget_sweep(repo_map, graph_budgets, cases, memory_token_base);
     Ok(S13BudgetSweepReport {
         fixture: fixture_label.to_string(),
         workspace: workspace_label.to_string(),
@@ -1536,5 +1684,104 @@ mod tests {
 
         let drop = worst_recall5_drop(&base, &cur);
         assert!((drop - 0.05).abs() < 1e-6);
+    }
+
+    // ── PUSH→PULL Phase 0 harness ───────────────────────────────────
+
+    fn mk_candidate(path: &str) -> crate::repo_map::GraphCandidate {
+        crate::repo_map::GraphCandidate {
+            path: std::path::PathBuf::from(path),
+            rank_score: 1.0,
+            specificity: 1.0,
+            confidence: crate::repo_map::GraphConfidence::Medium,
+            decision: crate::repo_map::GraphDecision::PathOnly,
+            token_estimate: 10,
+            symbols: Vec::new(),
+            rendered_line: String::new(),
+            content_digest: None,
+        }
+    }
+
+    fn mk_file_case(id: &str, files: &[&str]) -> EvalCase {
+        EvalCase {
+            id: id.into(),
+            query: String::new(),
+            expected_memory_id: None,
+            scope: String::new(),
+            tags: Vec::new(),
+            kind: None,
+            gold_must: files.iter().map(|f| GoldRef::File((*f).into())).collect(),
+            gold_neutral: Vec::new(),
+            gold_forbid: Vec::new(),
+            graded: std::collections::BTreeMap::new(),
+            expected_scope_path: None,
+        }
+    }
+
+    #[test]
+    fn graph_file_recall_counts_only_file_relevant_cases() {
+        let candidates = [
+            mk_candidate("crates/gaviero-core/src/lib.rs"),
+            mk_candidate("crates/gaviero-core/src/memory/eval.rs"),
+            mk_candidate("crates/gaviero-cli/src/main.rs"),
+        ];
+        let mut mem_only = mk_file_case("mem-only", &[]);
+        mem_only.gold_must = vec![GoldRef::Memory(7)];
+        let cases = [
+            mk_file_case("hit", &["crates/gaviero-core/src/memory/eval.rs"]),
+            mk_file_case("miss", &["crates/does/not/exist.rs"]),
+            mem_only, // memory-only → excluded from the denominator
+        ];
+        // 2 file-relevant cases, 1 hit → 0.5.
+        let r = graph_file_recall_at_k(&cases, &candidates, 5);
+        assert!((r - 0.5).abs() < 1e-6, "got {r}");
+    }
+
+    #[test]
+    fn graph_file_recall_respects_top_k_cutoff() {
+        let candidates = [
+            mk_candidate("a.rs"),
+            mk_candidate("b.rs"),
+            mk_candidate("crates/target.rs"),
+        ];
+        let cases = [mk_file_case("c", &["crates/target.rs"])];
+        // target.rs is the 3rd candidate: inside top-5, outside top-2.
+        assert_eq!(graph_file_recall_at_k(&cases, &candidates, 5), 1.0);
+        assert_eq!(graph_file_recall_at_k(&cases, &candidates, 2), 0.0);
+    }
+
+    #[test]
+    fn graph_file_recall_zero_when_no_file_cases() {
+        let candidates = [mk_candidate("a.rs")];
+        let cases: [EvalCase; 0] = [];
+        assert_eq!(graph_file_recall_at_k(&cases, &candidates, 5), 0.0);
+    }
+
+    #[test]
+    fn manifest_recall_prefers_candidate_pool_then_selected_ids() {
+        let payload = serde_json::json!({
+            "selected_ids": [1, 2],
+            "candidate_pool": [
+                {"memory_id": 9, "composite_score": 0.1},
+                {"memory_id": 42, "blended_score": 0.9},
+                {"memory_id": 7, "composite_score": 0.5},
+            ],
+        })
+        .to_string();
+        // Pool ranked by score desc → [42, 7, 9].
+        assert!((compute_recall_at_k_from_manifest(&payload, &[42], 1) - 1.0).abs() < 1e-9);
+        assert!(compute_recall_at_k_from_manifest(&payload, &[7], 1).abs() < 1e-9);
+        assert!((compute_recall_at_k_from_manifest(&payload, &[7], 2) - 1.0).abs() < 1e-9);
+        // Two golds, one found in top-2 → 0.5.
+        assert!((compute_recall_at_k_from_manifest(&payload, &[7, 100], 2) - 0.5).abs() < 1e-9);
+
+        // No candidate_pool → fall back to selected_ids order.
+        let payload2 = serde_json::json!({ "selected_ids": [5, 6, 8] }).to_string();
+        assert!((compute_recall_at_k_from_manifest(&payload2, &[6], 2) - 1.0).abs() < 1e-9);
+        assert!(compute_recall_at_k_from_manifest(&payload2, &[8], 2).abs() < 1e-9);
+
+        // Empty gold or junk payload → 0.0, never panics.
+        assert_eq!(compute_recall_at_k_from_manifest(&payload, &[], 5), 0.0);
+        assert_eq!(compute_recall_at_k_from_manifest("not json", &[1], 5), 0.0);
     }
 }
