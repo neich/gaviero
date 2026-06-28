@@ -54,6 +54,19 @@ pub struct McpCallRecord {
     /// True when the tool returned no result rows. Precomputed at capture
     /// so the reporter need not re-derive output shape per tool.
     pub empty_result: bool,
+    /// PUSH→PULL Phase 0: first tool call on the MCP connection (session)
+    /// that produced it. Lets the offline reader count sessions that issued
+    /// at least one read-only tool call, per tier.
+    #[serde(default)]
+    pub first_tool_call_initiated: bool,
+    /// Session id / turn for per-tier analysis. Currently absent (not yet
+    /// wired); persisted only when present so a later phase can populate them
+    /// without breaking the append-only format (old records read back as
+    /// `null` via `#[serde(default)]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<u64>,
     /// Raw tool input JSON.
     pub input: serde_json::Value,
     /// Raw tool output JSON.
@@ -68,6 +81,9 @@ impl McpCallRecord {
             duration_us: entry.duration.as_micros() as u64,
             error: entry.error.clone(),
             empty_result: output_is_empty(&entry.output),
+            first_tool_call_initiated: entry.first_tool_call_initiated,
+            session_id: entry.session_id.clone(),
+            turn: entry.turn,
             input: entry.input.clone(),
             output: entry.output.clone(),
         }
@@ -293,6 +309,9 @@ mod tests {
             output,
             duration: dur,
             error: error.map(str::to_string),
+            first_tool_call_initiated: false,
+            session_id: None,
+            turn: None,
         }
     }
 

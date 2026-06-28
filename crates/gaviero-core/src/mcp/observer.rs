@@ -19,6 +19,18 @@ pub struct McpCallLogEntry {
     pub output: serde_json::Value,
     pub duration: Duration,
     pub error: Option<String>,
+    /// PUSH→PULL Phase 0: true only for the first tool call observed on this
+    /// MCP connection (one connection = one shim = one agent session). Lets
+    /// later phases measure per-tier tool-use reliability — "did the agent
+    /// call any read-only tool at all this session?".
+    pub first_tool_call_initiated: bool,
+    /// Session id / turn for per-tier offline analysis. Currently `None`: the
+    /// in-process server has no per-connection session identity or turn
+    /// counter wired yet (the shim passes none). Carried on the entry so a
+    /// later phase can populate them without an observer-trait or telemetry
+    /// format break.
+    pub session_id: Option<String>,
+    pub turn: Option<u64>,
 }
 
 /// Fired after every `tools/call`. Implementations MUST be cheap —

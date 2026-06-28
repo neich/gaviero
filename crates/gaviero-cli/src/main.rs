@@ -2681,11 +2681,19 @@ async fn run_eval_budget_sweep(repo: &std::path::Path, fixture: &PathBuf, cli: &
             None
         },
         &repo_map,
-        &[4_000, 8_000, 12_000],
+        // PUSH→PULL Phase 0: sweep down to thin-anchor budgets so Phase 1 can
+        // read the token/recall trade-off at 600–1200 tokens, not just the
+        // legacy 4k–12k push range.
+        &[600, 1_200, 2_400, 4_000, 8_000, 12_000],
         &fixture.to_string_lossy(),
         &repo.to_string_lossy(),
     )
     .await?;
+    // TODO pass@k: GraphBudgetSweepRow::pass_at_1 stays `None` until a
+    // test-execution harness drives the code-prompt fixture end to end (run the
+    // prompt through an agent at each budget, execute the repo's tests, score
+    // pass/fail). Until then the sweep reports tokens + retrieval recall only;
+    // never let such a hook block or fail the sweep.
 
     print_s13_budget_sweep_report(&report);
 
@@ -2729,18 +2737,25 @@ fn print_s13_budget_sweep_report(r: &gaviero_core::memory::eval::S13BudgetSweepR
     println!();
     println!("graphBudgetTokens sweep (repo outline):");
     println!(
-        "  {:>9}  {:>10}  {:>6}  {:>6}  {:>6}  {:>6}",
-        "budget", "outline", "files", "path", "sig", "full"
+        "  {:>9}  {:>10}  {:>6}  {:>6}  {:>6}  {:>6}  {:>10}  {:>7}  {:>7}",
+        "budget", "outline", "files", "path", "sig", "full", "turn1_tok", "rec@5", "pass@1"
     );
     for row in &r.graph_budget_sweep {
+        let pass_at_1 = row
+            .pass_at_1
+            .map(|p| format!("{p:.3}"))
+            .unwrap_or_else(|| "-".to_string());
         println!(
-            "  {:>9}  {:>10}  {:>6}  {:>6}  {:>6}  {:>6}",
+            "  {:>9}  {:>10}  {:>6}  {:>6}  {:>6}  {:>6}  {:>10.1}  {:>7.3}  {:>7}",
             row.graph_budget_tokens,
             row.outline_tokens,
             row.file_count,
             row.path_only,
             row.signature_only,
             row.full_attach,
+            row.mean_turn_one_tokens,
+            row.recall_at_5,
+            pass_at_1,
         );
     }
     println!();
