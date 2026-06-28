@@ -49,6 +49,43 @@ pub enum ContinuityHandle {
     // Future providers: add a variant here.
 }
 
+/// Bootstrap strategy tier for a provider (PUSH→PULL plan, Phase 0).
+///
+/// Selects how much repository context the pre-prompt assembler pushes on the
+/// first turn:
+/// * `Strong` — tool-capable, large-context providers. Later phases inject a
+///   thin orientation anchor and let the model *pull* specifics through the
+///   read-only MCP tools.
+/// * `SmallLocal` — providers without reliable tool use or with a small
+///   context window. They keep the full push until per-tier evidence proves a
+///   thinner bootstrap is non-inferior.
+///
+/// The per-arm value in [`build_provider_profile`] is written as an explicit
+/// literal so adding a provider forces a conscious choice, but the literal
+/// must equal [`BootstrapTier::derive`] for that provider's capabilities —
+/// `build_provider_profile_sets_tier` pins every arm to the rule so a literal
+/// cannot silently diverge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapTier {
+    Strong,
+    SmallLocal,
+}
+
+impl BootstrapTier {
+    /// Canonical derivation rule (PUSH→PULL plan, Phase 0): a provider is
+    /// `SmallLocal` iff it lacks tool use or its context window is under 32k
+    /// tokens; otherwise `Strong`. This is the single source of truth the
+    /// per-arm literals in [`build_provider_profile`] are checked against, and
+    /// the seam a later phase's `resolve_bootstrap_tier` builds on.
+    pub fn derive(supports_tool_use: bool, max_context_tokens: Option<usize>) -> Self {
+        if !supports_tool_use || max_context_tokens.is_some_and(|c| c < 32_000) {
+            BootstrapTier::SmallLocal
+        } else {
+            BootstrapTier::Strong
+        }
+    }
+}
+
 /// Provider capability profile.
 ///
 /// **Construct only via [`build_provider_profile`].** Inline construction is
@@ -64,6 +101,9 @@ pub struct ProviderProfile {
     pub supports_tool_use: bool,
     pub supports_native_resume: bool,
     pub max_context_tokens: Option<usize>,
+    /// PUSH→PULL bootstrap tier. Filled explicitly in every
+    /// [`build_provider_profile`] arm; must match [`BootstrapTier::derive`].
+    pub bootstrap_tier: BootstrapTier,
 }
 
 /// Parsed `<prefix>:<model>` model spec.
@@ -173,6 +213,8 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             // refine per model; M0 Finding C means we don't yet read this
             // value back from any backend.
             max_context_tokens: Some(200_000),
+            // tool_use + 200k context ⇒ Strong (matches BootstrapTier::derive).
+            bootstrap_tier: BootstrapTier::Strong,
         },
         Provider::CodexAppServer => ProviderProfile {
             provider: "codex".to_string(),
@@ -184,6 +226,9 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             supports_tool_use: true,
             supports_native_resume: true,
             max_context_tokens: None,
+            // tool_use + unknown (None) context ⇒ Strong (derive treats an
+            // unknown window as not-small).
+            bootstrap_tier: BootstrapTier::Strong,
         },
         Provider::Codex => ProviderProfile {
             provider: "codex".to_string(),
@@ -197,6 +242,8 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             // M0 Finding I: Codex backend doesn't surface usage today;
             // value is informational until M8/M9 wire budgeting.
             max_context_tokens: None,
+            // tool_use + unknown (None) context ⇒ Strong.
+            bootstrap_tier: BootstrapTier::Strong,
         },
         Provider::Cursor => ProviderProfile {
             provider: "cursor".to_string(),
@@ -213,6 +260,8 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             // Cursor's hosted models vary by account; 200k is a safe upper
             // bound that matches Claude / Codex.
             max_context_tokens: Some(200_000),
+            // tool_use + 200k context ⇒ Strong.
+            bootstrap_tier: BootstrapTier::Strong,
         },
         Provider::Ollama => ProviderProfile {
             provider: "ollama".to_string(),
@@ -229,6 +278,9 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             // this value to bound replay history size. A future milestone may
             // query the Ollama `/api/show` endpoint for per-model context size.
             max_context_tokens: Some(8_192),
+            // No reliable tool use (and an 8k window) ⇒ SmallLocal: keep the
+            // full push until per-tier evidence proves a thin bootstrap holds.
+            bootstrap_tier: BootstrapTier::SmallLocal,
         },
         Provider::Deepseek => ProviderProfile {
             provider: "deepseek".to_string(),
@@ -240,6 +292,8 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             supports_tool_use: true,
             supports_native_resume: false,
             max_context_tokens: Some(128_000),
+            // tool_use + 128k context ⇒ Strong.
+            bootstrap_tier: BootstrapTier::Strong,
         },
     }
 }
@@ -564,6 +618,57 @@ mod tests {
         let bare = build_provider_profile(&ModelSpec::parse("haiku"), &runtime);
         assert_eq!(bare.continuity_mode, ContinuityMode::NativeResume);
         assert_eq!(bare.provider, "claude");
+    }
+
+    #[test]
+    fn build_provider_profile_sets_tier() {
+        // PUSH→PULL Phase 0 gate: Ollama is the only SmallLocal provider
+        // (no reliable tool use); every other arm is Strong.
+        let runtime = RuntimeConfig::default();
+
+        let ollama = build_provider_profile(&ModelSpec::parse("ollama:llama3.1"), &runtime);
+        assert_eq!(ollama.bootstrap_tier, BootstrapTier::SmallLocal);
+        let local = build_provider_profile(&ModelSpec::parse("local:llama3.1"), &runtime);
+        assert_eq!(local.bootstrap_tier, BootstrapTier::SmallLocal);
+
+        for spec in [
+            "claude:sonnet",
+            "codex-app-server:gpt-5.5",
+            "codex:gpt-5.5",
+            "cursor:auto",
+            "deepseek:deepseek-v4-pro",
+            "haiku", // bare → claude
+        ] {
+            let p = build_provider_profile(&ModelSpec::parse(spec), &runtime);
+            assert_eq!(
+                p.bootstrap_tier,
+                BootstrapTier::Strong,
+                "spec {spec} should resolve to Strong"
+            );
+        }
+    }
+
+    #[test]
+    fn build_provider_profile_tier_matches_derivation_rule() {
+        // Pin every arm's explicit literal to BootstrapTier::derive so the two
+        // can never silently diverge as providers are added or capabilities
+        // change.
+        let runtime = RuntimeConfig::default();
+        for spec in [
+            "claude:sonnet",
+            "codex-app-server:gpt-5.5",
+            "codex:gpt-5.5",
+            "cursor:auto",
+            "ollama:llama3.1",
+            "deepseek:deepseek-v4-pro",
+        ] {
+            let p = build_provider_profile(&ModelSpec::parse(spec), &runtime);
+            assert_eq!(
+                p.bootstrap_tier,
+                BootstrapTier::derive(p.supports_tool_use, p.max_context_tokens),
+                "arm literal for {spec} diverged from BootstrapTier::derive"
+            );
+        }
     }
 
     #[test]
