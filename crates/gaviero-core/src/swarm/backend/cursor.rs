@@ -260,6 +260,18 @@ pub(crate) fn cursor_argv(
         // (e.g. Semantic Scholar) stay unregistered in `-p` runs — agents
         // report the server id as unavailable. See cursor.com/docs/cli/mcp.
         "--approve-mcps".to_string(),
+        // `--force` ("Run Everything": allow unless explicitly denied) makes
+        // gaviero the single MCP/permission gate — the same posture gaviero
+        // uses for codex (`--dangerously-bypass-approvals-and-sandbox`).
+        // Cursor's global `approvalMode: "allowlist"` otherwise prompts per
+        // MCP tool *call* (`--approve-mcps` only registers the server, it does
+        // not auto-approve calls), and headless `-p` cannot answer that
+        // elicitation, so the call auto-rejects ("User rejected MCP: …").
+        // Safety is preserved elsewhere: the synthesized `.cursor/cli.json`
+        // `deny` rules still apply under `--force`, file writes route through
+        // the Write Gate, and gaviero's in-process MCP server enforces
+        // `mcp.permissions` server-side on every tool call.
+        "--force".to_string(),
         // Streamable HTTP MCP (Wuilder / Semantic Scholar) and WebFetch
         // fallbacks need outbound network. Probed 2026-06: with sandbox
         // enabled, agents report "network calls rejected" even when
@@ -722,6 +734,10 @@ mod tests {
         //     postscripts.
         assert!(args.iter().any(|a| a == "-p"));
         assert!(args.iter().any(|a| a == "--approve-mcps"));
+        // `--force` makes gaviero the sole MCP/permission gate; without it
+        // Cursor's global approvalMode=allowlist auto-rejects gaviero MCP
+        // tool calls in headless `-p` mode.
+        assert!(args.iter().any(|a| a == "--force"));
         assert!(
             args.windows(2)
                 .any(|w| w == ["--output-format", "stream-json"])
