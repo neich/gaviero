@@ -1288,6 +1288,10 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 )
                 .with_specificity(mcp_specificity)
                 .with_edge_weights(mcp_edge_weights)
+                .with_permissions(gaviero_core::mcp::resolve_mcp_permissions(
+                    &app.workspace,
+                    Some(&workspace_root_for_mcp),
+                ))
                 .with_symbol_enrichment(
                     app.workspace
                         .resolve_setting(

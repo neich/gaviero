@@ -93,6 +93,171 @@ pub struct ExtraMcpServer {
     pub transport: ExtraMcpTransport,
 }
 
+/// Gaviero-level MCP permission policy (Tier A / A5, Option A).
+///
+/// A single allow/deny list defined once at the gaviero layer
+/// (`mcp.permissions` in workspace settings) and applied uniformly to
+/// every provider, so MCP permissions are no longer configured separately
+/// per provider. Patterns are `server:tool` globs where each side accepts
+/// `*` wildcards: `gaviero:*`, `context7:*`, `semantic-scholar:get_*`,
+/// `*:delete_*`, `*:*`. A bare pattern with no `:` is treated as a server
+/// name with an implicit `:*` tool part.
+///
+/// Semantics (deny wins): a tool is **denied** if any `deny` pattern
+/// matches; otherwise it is **allowed** when `allow` is empty (allow-all)
+/// or when some `allow` pattern matches. The empty policy (no allow, no
+/// deny) preserves the historical allow-everything behaviour.
+///
+/// How each provider honours this differs (see [`synthesize_for_worktree`]):
+/// * **Server registration is the hard gate** — a server is written into a
+///   provider's config only when [`McpPermissions::server_allowed`] is true.
+///   A disallowed server is simply never registered, which enforces the
+///   policy provider-independently (even under Claude
+///   `--dangerously-skip-permissions`).
+/// * **Per-tool** allow/deny is additionally translated into Claude
+///   `permissions` (`.claude/settings.json`) and Cursor `permissions`
+///   (`.cursor/cli.json`) on a best-effort basis (allow → auto-approve,
+///   deny → block); this layer is bypassed when a provider runs with
+///   blanket approval.
+/// * **Codex** has no per-tool permission surface, so only the
+///   server-registration gate applies.
+///
+/// The gaviero in-process server additionally enforces its own exposed-tool
+/// set server-side (`mcp.gavieroServer.exposedTools`), which is the
+/// authoritative gate for gaviero's own tools regardless of provider.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct McpPermissions {
+    /// `server:tool` glob patterns that grant access. Empty = allow all
+    /// (subject to `deny`).
+    pub allow: Vec<String>,
+    /// `server:tool` glob patterns that block access. Deny wins over allow.
+    pub deny: Vec<String>,
+}
+
+impl McpPermissions {
+    /// Whether `tool` on `server` is permitted. Deny wins; an empty
+    /// `allow` list means "everything not denied".
+    pub fn tool_allowed(&self, server: &str, tool: &str) -> bool {
+        if self
+            .deny
+            .iter()
+            .any(|p| permission_pattern_matches(p, server, tool))
+        {
+            return false;
+        }
+        if self.allow.is_empty() {
+            return true;
+        }
+        self.allow
+            .iter()
+            .any(|p| permission_pattern_matches(p, server, tool))
+    }
+
+    /// Whether some `deny` pattern blocks the whole `server` (`server:*`).
+    /// Such servers are dropped from every synthesized provider config.
+    pub fn server_denied_entirely(&self, server: &str) -> bool {
+        self.deny.iter().any(|p| {
+            let (ps, pt) = split_permission_pattern(p);
+            wildcard_matches(ps, server) && pt == "*"
+        })
+    }
+
+    /// Whether `server` may expose at least one allowed tool — the
+    /// registration gate. False when the server is fully denied or when a
+    /// non-empty `allow` list never names it; true when `allow` is empty
+    /// (allow-all) and the server is not fully denied.
+    pub fn server_allowed(&self, server: &str) -> bool {
+        if self.server_denied_entirely(server) {
+            return false;
+        }
+        if self.allow.is_empty() {
+            return true;
+        }
+        self.allow.iter().any(|p| {
+            let (ps, _) = split_permission_pattern(p);
+            wildcard_matches(ps, server)
+        })
+    }
+
+    /// True when no allow and no deny patterns are configured (historical
+    /// allow-everything default) — used to skip writing empty permission
+    /// blocks.
+    pub fn is_empty(&self) -> bool {
+        self.allow.is_empty() && self.deny.is_empty()
+    }
+}
+
+/// Split a `server:tool` pattern into `(server, tool)`, defaulting the tool
+/// part to `*` when no colon is present.
+fn split_permission_pattern(pattern: &str) -> (&str, &str) {
+    match pattern.split_once(':') {
+        Some((s, t)) => (s.trim(), t.trim()),
+        None => (pattern.trim(), "*"),
+    }
+}
+
+fn permission_pattern_matches(pattern: &str, server: &str, tool: &str) -> bool {
+    let (ps, pt) = split_permission_pattern(pattern);
+    let pt = if pt.is_empty() { "*" } else { pt };
+    wildcard_matches(ps, server) && wildcard_matches(pt, tool)
+}
+
+/// Minimal `*`-wildcard match (case-sensitive). `*` matches any run of
+/// characters including empty; no `?` or character classes — MCP server and
+/// tool names don't need them.
+fn wildcard_matches(pattern: &str, text: &str) -> bool {
+    if pattern == "*" || pattern == text {
+        return true;
+    }
+    if !pattern.contains('*') {
+        return false;
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star, mut mark) = (None::<usize>, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Concrete MCP server names this synth will register, after dropping any
+/// the permission policy disallows. Used to expand `*` server-globs into
+/// the real `mcp__<server>__…` / `Mcp(<server>:…)` permission entries each
+/// provider understands, and as the registration gate for managed entries.
+fn synth_server_names(synth: &McpConfigSynth) -> Vec<String> {
+    let mut names = Vec::new();
+    if synth.gaviero_enabled && synth.permissions.server_allowed("gaviero") {
+        names.push("gaviero".to_string());
+    }
+    if synth.context7.enabled && synth.permissions.server_allowed("context7") {
+        names.push("context7".to_string());
+    }
+    for extra in &synth.extra_servers {
+        if synth.permissions.server_allowed(&extra.name) {
+            names.push(extra.name.clone());
+        }
+    }
+    names
+}
+
 /// Configuration for a per-worktree MCP config synth.
 #[derive(Debug, Clone)]
 pub struct McpConfigSynth {
@@ -121,6 +286,9 @@ pub struct McpConfigSynth {
     pub context7: Context7Config,
     /// Extra servers from `mcp.extraServers` settings and/or CLI flags.
     pub extra_servers: Vec<ExtraMcpServer>,
+    /// Gaviero-level MCP permission policy (`mcp.permissions`), translated
+    /// into each provider's native config. Default (empty) allows all.
+    pub permissions: McpPermissions,
 }
 
 impl Default for McpConfigSynth {
@@ -134,6 +302,7 @@ impl Default for McpConfigSynth {
             gaviero_enabled: true,
             context7: Context7Config::default(),
             extra_servers: Vec::new(),
+            permissions: McpPermissions::default(),
         }
     }
 }
@@ -152,14 +321,19 @@ pub fn claude_mcp_config_json(synth: &McpConfigSynth) -> Result<String> {
 
 fn managed_mcp_json_servers(synth: &McpConfigSynth) -> Result<serde_json::Map<String, serde_json::Value>> {
     let mut servers = serde_json::Map::new();
-    if synth.gaviero_enabled {
+    // A server is registered only when the gaviero permission policy allows
+    // it — a disallowed server is never written, which enforces the policy
+    // even for providers that run with blanket tool approval.
+    if synth.gaviero_enabled && synth.permissions.server_allowed("gaviero") {
         servers.insert("gaviero".to_string(), gaviero_server_entry(synth));
     }
-    if synth.context7.enabled {
+    if synth.context7.enabled && synth.permissions.server_allowed("context7") {
         servers.insert("context7".to_string(), context7_server_entry(&synth.context7));
     }
     for extra in &synth.extra_servers {
-        servers.insert(extra.name.clone(), extra_server_json_entry(extra));
+        if synth.permissions.server_allowed(&extra.name) {
+            servers.insert(extra.name.clone(), extra_server_json_entry(extra));
+        }
     }
     Ok(servers)
 }
@@ -264,18 +438,22 @@ fn managed_cursor_mcp_json_servers(synth: &McpConfigSynth) -> Result<serde_json:
     let mut servers = serde_json::Map::new();
     // When a remote URL extra (e.g. semantic-scholar) is configured, keep
     // Cursor's registry lean — the stdio gaviero shim competes for startup
-    // with streamable HTTP and often leaves ListMcpResources empty.
+    // with streamable HTTP and often leaves ListMcpResources empty. The
+    // permission policy is the outer gate: a disallowed server is dropped.
     if synth.gaviero_enabled
         && !has_remote_extra
+        && synth.permissions.server_allowed("gaviero")
         && shim_binary_resolvable(&synth.shim_binary)
     {
         servers.insert("gaviero".to_string(), gaviero_server_entry(synth));
     }
     for extra in &synth.extra_servers {
-        servers.insert(
-            extra.name.clone(),
-            extra_server_json_entry_for_cursor(extra),
-        );
+        if synth.permissions.server_allowed(&extra.name) {
+            servers.insert(
+                extra.name.clone(),
+                extra_server_json_entry_for_cursor(extra),
+            );
+        }
     }
     Ok(servers)
 }
@@ -303,6 +481,100 @@ fn context7_server_entry(ctx7: &Context7Config) -> serde_json::Value {
         "command": ctx7.command,
         "args": ctx7.args,
     })
+}
+
+/// Build the `permissions` object for `.claude/settings.json` from the
+/// gaviero MCP permission policy, or `None` when the policy is empty.
+///
+/// Allow rules become Claude `permissions.allow` (auto-approve without a
+/// prompt); deny rules become `permissions.deny` (hard block). Claude
+/// forbids globs in the server segment, so a `*` server-part is expanded
+/// across the registered server list; the tool segment keeps its glob
+/// (Claude supports e.g. `mcp__github__get_*`).
+///
+/// Note: a non-empty `allow` does not by itself *restrict* Claude to those
+/// tools — Claude treats `allow` as "skip the prompt", not "deny the rest".
+/// Hard server-level restriction comes from omitting the server from
+/// `.mcp.json` (the registration gate in [`managed_mcp_json_servers`]);
+/// per-tool hard restriction of a registered third-party server needs an
+/// explicit `deny` pattern.
+pub fn claude_settings_permissions(synth: &McpConfigSynth) -> Option<serde_json::Value> {
+    if synth.permissions.is_empty() {
+        return None;
+    }
+    let servers = synth_server_names(synth);
+    let allow = sorted_unique(
+        synth
+            .permissions
+            .allow
+            .iter()
+            .flat_map(|p| expand_claude_patterns(p, &servers))
+            .collect(),
+    );
+    let deny = sorted_unique(
+        synth
+            .permissions
+            .deny
+            .iter()
+            .flat_map(|p| expand_claude_patterns(p, &servers))
+            .collect(),
+    );
+    if allow.is_empty() && deny.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({ "allow": allow, "deny": deny }))
+}
+
+/// Expand one `server:tool` pattern into concrete Claude `mcp__server__tool`
+/// rule strings.
+fn expand_claude_patterns(pattern: &str, servers: &[String]) -> Vec<String> {
+    let (ps, pt) = split_permission_pattern(pattern);
+    let tool = if pt.is_empty() { "*" } else { pt };
+    if ps == "*" {
+        servers
+            .iter()
+            .map(|s| format!("mcp__{s}__{tool}"))
+            .collect()
+    } else if ps.contains('*') {
+        servers
+            .iter()
+            .filter(|s| wildcard_matches(ps, s))
+            .map(|s| format!("mcp__{s}__{tool}"))
+            .collect()
+    } else {
+        vec![format!("mcp__{ps}__{tool}")]
+    }
+}
+
+/// `(allow, deny)` Cursor permission rule strings (`Mcp(server:tool)`) from
+/// the gaviero MCP permission policy. Cursor supports a `*` server segment
+/// natively (`Mcp(*:*)`), so patterns translate without expansion.
+fn cursor_permission_rules(synth: &McpConfigSynth) -> (Vec<String>, Vec<String>) {
+    let allow = synth
+        .permissions
+        .allow
+        .iter()
+        .map(|p| cursor_rule(p))
+        .collect();
+    let deny = synth
+        .permissions
+        .deny
+        .iter()
+        .map(|p| cursor_rule(p))
+        .collect();
+    (allow, deny)
+}
+
+fn cursor_rule(pattern: &str) -> String {
+    let (ps, pt) = split_permission_pattern(pattern);
+    let tool = if pt.is_empty() { "*" } else { pt };
+    format!("Mcp({ps}:{tool})")
+}
+
+fn sorted_unique(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v.dedup();
+    v
 }
 
 /// Match a comma-form Cursor MCP permission entry like `Mcp(name, *)`
@@ -496,7 +768,10 @@ pub fn codex_mcp_config_toml(synth: &McpConfigSynth) -> Result<String> {
     let mut body = String::from(
         "# Generated by gaviero (Tier A / A5). Do not edit — regenerated per swarm worktree.\n\n",
     );
-    if synth.gaviero_enabled {
+    // Codex has no per-tool permission surface, so the server-registration
+    // gate is the only place the permission policy applies: a disallowed
+    // server is omitted from the config entirely.
+    if synth.gaviero_enabled && synth.permissions.server_allowed("gaviero") {
         body.push_str(&format!(
             "[mcp_servers.gaviero]\n\
              command = {command:?}\n\
@@ -509,7 +784,7 @@ pub fn codex_mcp_config_toml(synth: &McpConfigSynth) -> Result<String> {
             tool = CODEX_MCP_TOOL_TIMEOUT_SECS,
         ));
     }
-    if synth.context7.enabled {
+    if synth.context7.enabled && synth.permissions.server_allowed("context7") {
         body.push_str(&format!(
             "\n[mcp_servers.context7]\n\
              command = {command:?}\n\
@@ -523,7 +798,9 @@ pub fn codex_mcp_config_toml(synth: &McpConfigSynth) -> Result<String> {
         ));
     }
     for extra in &synth.extra_servers {
-        body.push_str(&extra_server_codex_toml(extra));
+        if synth.permissions.server_allowed(&extra.name) {
+            body.push_str(&extra_server_codex_toml(extra));
+        }
     }
     body.push_str(&format!(
         "\n[projects.{worktree:?}]\n\
@@ -600,6 +877,17 @@ pub fn synthesize_for_worktree(synth: &McpConfigSynth) -> Result<Vec<PathBuf>> {
     write_if_changed(&claude_path, &claude_body)?;
     written.push(claude_path);
 
+    // Claude permissions: <worktree>/.claude/settings.json — Claude reads
+    // project settings (including `permissions.allow/deny` with `mcp__…`
+    // rules) from this path. Only written when the gaviero permission policy
+    // has something to say; merged so user-authored settings are preserved.
+    if let Some(perms) = claude_settings_permissions(synth) {
+        let claude_settings_path = synth.worktree.join(".claude/settings.json");
+        let settings_body = merge_claude_settings_permissions(&claude_settings_path, perms)?;
+        write_if_changed(&claude_settings_path, &settings_body)?;
+        written.push(claude_settings_path);
+    }
+
     // Cursor: <worktree>/.cursor/mcp.json — same schema as Claude's
     // `.mcp.json`, so the merge helper handles preserving any user
     // entries the same way.
@@ -609,7 +897,7 @@ pub fn synthesize_for_worktree(synth: &McpConfigSynth) -> Result<Vec<PathBuf>> {
     let cursor_path = cursor_dir.join("mcp.json");
     let cursor_body = cursor_mcp_json_servers_merged(synth, &cursor_path)?;
     write_if_changed(&cursor_path, &cursor_body)?;
-    if let Some(cli_path) = synthesize_cursor_cli_for_remote_mcp(&cursor_dir, &cursor_path)? {
+    if let Some(cli_path) = synthesize_cursor_cli(&cursor_dir, &cursor_path, synth)? {
         written.push(cli_path);
     }
     written.push(cursor_path);
@@ -646,12 +934,18 @@ pub fn synthesize_for_worktree(synth: &McpConfigSynth) -> Result<Vec<PathBuf>> {
 /// [`crate::swarm::backend::cursor::cursor_argv`] instead. This function
 /// emits **only** the `permissions` object and preserves any user-authored
 /// entries already in the file.
-fn synthesize_cursor_cli_for_remote_mcp(
+fn synthesize_cursor_cli(
     cursor_dir: &Path,
     mcp_json_path: &Path,
+    synth: &McpConfigSynth,
 ) -> Result<Option<PathBuf>> {
     let remote = remote_mcp_servers_from_mcp_json_path(mcp_json_path);
-    if remote.is_empty() {
+    let (perm_allow, perm_deny) = cursor_permission_rules(synth);
+    // Write cli.json when there's a remote server to allow-list *or* an
+    // explicit gaviero permission policy to translate. Stdio-only worktrees
+    // with the default (empty) policy still skip it, preserving the prior
+    // behaviour where project cli.json was reserved for remote MCP.
+    if remote.is_empty() && perm_allow.is_empty() && perm_deny.is_empty() {
         return Ok(None);
     }
 
@@ -725,17 +1019,47 @@ fn synthesize_cursor_cli_for_remote_mcp(
                 None => true,
             });
             existing.retain(|s| !is_legacy_comma_mcp_pattern(s));
-            let mut patterns = vec!["Mcp(*:*)".to_string()];
-            patterns.extend(remote.iter().map(|(s, _)| format!("Mcp({s}:*)")));
-            patterns.extend(webfetch_patterns);
+            let mut patterns: Vec<String> = Vec::new();
+            if !remote.is_empty() {
+                // Baseline needed for streamable-HTTP MCP to register and for
+                // WebFetch fallbacks in headless `-p` runs. Only registered
+                // (permission-allowed) servers appear in `remote`, so the
+                // blanket `Mcp(*:*)` only affects servers the policy permits.
+                patterns.push("Mcp(*:*)".to_string());
+                patterns.extend(remote.iter().map(|(s, _)| format!("Mcp({s}:*)")));
+                patterns.extend(webfetch_patterns);
+            }
+            // Gaviero permission policy → explicit allow rules (auto-approve).
+            patterns.extend(perm_allow.iter().cloned());
             for pat in patterns {
                 if existing.insert(pat.clone()) {
                     arr.push(serde_json::Value::String(pat));
                 }
             }
         }
-        obj.entry("deny".to_string())
+        // Deny array: preserve user entries, scrub legacy comma forms, then
+        // append the gaviero permission policy's deny rules.
+        let deny = obj
+            .entry("deny".to_string())
             .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        if !deny.is_array() {
+            *deny = serde_json::Value::Array(Vec::new());
+        }
+        if let Some(arr) = deny.as_array_mut() {
+            arr.retain(|v| match v.as_str() {
+                Some(s) => !is_legacy_comma_mcp_pattern(s),
+                None => true,
+            });
+            let mut existing: std::collections::HashSet<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            for pat in &perm_deny {
+                if existing.insert(pat.clone()) {
+                    arr.push(serde_json::Value::String(pat.clone()));
+                }
+            }
+        }
     }
 
     let body = serde_json::to_string_pretty(&serde_json::Value::Object(root))
@@ -807,6 +1131,67 @@ fn merge_mcp_json_servers_at_path(
         .context("serialising merged mcp servers JSON")
 }
 
+/// Merge gaviero's MCP permission rules into an existing
+/// `.claude/settings.json` (or a fresh document), preserving user-authored
+/// keys and non-MCP permission rules.
+///
+/// Gaviero is the single source of MCP permissions, so every existing
+/// `mcp__…` rule under `permissions.allow` / `.deny` is dropped and replaced
+/// with the freshly generated set — this keeps re-synthesis idempotent when
+/// the policy changes. Non-MCP rules (e.g. `Bash`, `WebFetch`, `Read`) and
+/// all other settings keys are left untouched.
+fn merge_claude_settings_permissions(path: &Path, perms: serde_json::Value) -> Result<String> {
+    let mut root = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+
+    let permissions = root
+        .entry("permissions".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !permissions.is_object() {
+        *permissions = serde_json::json!({});
+    }
+    if let Some(obj) = permissions.as_object_mut() {
+        for key in ["allow", "deny"] {
+            let incoming: Vec<String> = perms
+                .get(key)
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let slot = obj
+                .entry(key.to_string())
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+            if !slot.is_array() {
+                *slot = serde_json::Value::Array(Vec::new());
+            }
+            if let Some(arr) = slot.as_array_mut() {
+                // Drop gaviero-owned MCP rules, then re-add the current set.
+                arr.retain(|v| {
+                    !v.as_str().map(|s| s.starts_with("mcp__")).unwrap_or(false)
+                });
+                let mut existing: std::collections::HashSet<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect();
+                for pat in incoming {
+                    if existing.insert(pat.clone()) {
+                        arr.push(serde_json::Value::String(pat));
+                    }
+                }
+            }
+        }
+    }
+
+    serde_json::to_string_pretty(&serde_json::Value::Object(root))
+        .context("serialising merged .claude/settings.json")
+}
+
 /// Write `body` to `path` only when the contents differ — avoids
 /// churning mtimes on Codex's trust cache. Creates parent dirs.
 fn write_if_changed(path: &Path, body: &str) -> Result<()> {
@@ -838,6 +1223,7 @@ mod tests {
             gaviero_enabled: true,
             context7: Context7Config::default(),
             extra_servers: Vec::new(),
+            permissions: McpPermissions::default(),
         }
     }
 
@@ -1284,6 +1670,200 @@ mod tests {
             host_from_mcp_url("https://mcp.wuilder.com/semantic-scholar/token/"),
             Some("mcp.wuilder.com".to_string())
         );
+    }
+
+    // ── MCP permission policy (Option A) ─────────────────────────────────
+
+    #[test]
+    fn wildcard_matches_basics() {
+        assert!(wildcard_matches("*", "anything"));
+        assert!(wildcard_matches("gaviero", "gaviero"));
+        assert!(!wildcard_matches("gaviero", "context7"));
+        assert!(wildcard_matches("get_*", "get_paper"));
+        assert!(!wildcard_matches("get_*", "set_paper"));
+        assert!(wildcard_matches("*_paper", "get_paper"));
+        assert!(wildcard_matches("a*c", "abc"));
+        assert!(wildcard_matches("a*c", "ac"));
+        assert!(!wildcard_matches("a*c", "ab"));
+    }
+
+    #[test]
+    fn permissions_tool_allowed_semantics() {
+        // Empty policy allows everything (historical default).
+        assert!(McpPermissions::default().tool_allowed("gaviero", "memory_search"));
+
+        // Deny wins over the implicit allow-all.
+        let p = McpPermissions {
+            allow: vec![],
+            deny: vec!["*:delete_*".into()],
+        };
+        assert!(p.tool_allowed("gaviero", "memory_search"));
+        assert!(!p.tool_allowed("fs", "delete_file"));
+
+        // A non-empty allow list is an allowlist.
+        let p = McpPermissions {
+            allow: vec!["gaviero:*".into()],
+            deny: vec![],
+        };
+        assert!(p.tool_allowed("gaviero", "memory_search"));
+        assert!(!p.tool_allowed("context7", "resolve-library-id"));
+    }
+
+    #[test]
+    fn server_allowed_and_denied_entirely() {
+        let p = McpPermissions {
+            allow: vec![],
+            deny: vec!["context7:*".into()],
+        };
+        assert!(p.server_denied_entirely("context7"));
+        assert!(!p.server_allowed("context7"));
+        assert!(p.server_allowed("gaviero"));
+
+        // A per-tool deny does not deny the whole server.
+        let p = McpPermissions {
+            allow: vec![],
+            deny: vec!["context7:resolve-library-id".into()],
+        };
+        assert!(!p.server_denied_entirely("context7"));
+        assert!(p.server_allowed("context7"));
+
+        // A non-empty allow gates servers at the server level.
+        let p = McpPermissions {
+            allow: vec!["gaviero:*".into()],
+            deny: vec![],
+        };
+        assert!(p.server_allowed("gaviero"));
+        assert!(!p.server_allowed("context7"));
+    }
+
+    #[test]
+    fn denied_server_omitted_from_claude_and_codex_configs() {
+        let mut synth = fixture(PathBuf::from("/tmp/wt"));
+        synth.permissions = McpPermissions {
+            allow: vec![],
+            deny: vec!["context7:*".into()],
+        };
+        let claude = claude_mcp_config_json(&synth).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&claude).unwrap();
+        assert!(v["mcpServers"]["gaviero"].is_object());
+        assert!(
+            v["mcpServers"].get("context7").is_none(),
+            "fully-denied context7 must not be registered in .mcp.json"
+        );
+
+        let codex = codex_mcp_config_toml(&synth).unwrap();
+        assert!(codex.contains("[mcp_servers.gaviero]"));
+        assert!(!codex.contains("[mcp_servers.context7]"));
+    }
+
+    #[test]
+    fn claude_settings_permissions_translates_policy() {
+        let mut synth = fixture(PathBuf::from("/tmp/wt"));
+        synth.extra_servers.push(ExtraMcpServer {
+            name: "semantic-scholar".into(),
+            transport: ExtraMcpTransport::Url {
+                url: "https://scholar.example/mcp".into(),
+            },
+        });
+        synth.permissions = McpPermissions {
+            allow: vec!["gaviero:*".into(), "semantic-scholar:get_*".into()],
+            deny: vec!["semantic-scholar:delete_*".into()],
+        };
+        let perms = claude_settings_permissions(&synth).expect("policy present");
+        let allow: Vec<String> = perms["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        let deny: Vec<String> = perms["deny"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        assert!(allow.contains(&"mcp__gaviero__*".to_string()));
+        assert!(allow.contains(&"mcp__semantic-scholar__get_*".to_string()));
+        assert!(deny.contains(&"mcp__semantic-scholar__delete_*".to_string()));
+        // context7 is not in the allowlist, so it is omitted and earns no rule.
+        assert!(!allow.iter().any(|s| s.contains("context7")));
+    }
+
+    #[test]
+    fn claude_settings_permissions_none_for_empty_policy() {
+        let synth = fixture(PathBuf::from("/tmp/wt"));
+        assert!(claude_settings_permissions(&synth).is_none());
+    }
+
+    #[test]
+    fn synthesize_writes_claude_settings_and_preserves_user_keys() {
+        let dir = tempdir().unwrap();
+        let settings_path = dir.path().join(".claude/settings.json");
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings_path,
+            r#"{"model":"x","permissions":{"allow":["Bash(ls)"],"deny":[]}}"#,
+        )
+        .unwrap();
+
+        let mut synth = fixture(dir.path().to_path_buf());
+        synth.permissions = McpPermissions {
+            allow: vec![],
+            deny: vec!["context7:*".into()],
+        };
+        synthesize_for_worktree(&synth).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        // Unrelated user keys + non-MCP permission rules survive.
+        assert_eq!(v["model"], "x");
+        let allow: Vec<&str> = v["permissions"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect();
+        assert!(allow.contains(&"Bash(ls)"));
+        let deny: Vec<&str> = v["permissions"]["deny"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect();
+        assert!(deny.contains(&"mcp__context7__*"));
+    }
+
+    #[test]
+    fn cursor_cli_json_emits_permission_policy_without_remote() {
+        let dir = tempdir().unwrap();
+        let mut synth = fixture_resolvable_shim(dir.path().to_path_buf());
+        synth.permissions = McpPermissions {
+            allow: vec!["gaviero:*".into()],
+            deny: vec!["gaviero:write_*".into()],
+        };
+        synthesize_for_worktree(&synth).unwrap();
+
+        let cli_path = dir.path().join(".cursor/cli.json");
+        assert!(
+            cli_path.exists(),
+            "cli.json should be written when a permission policy is set, even without remote MCP"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cli_path).unwrap()).unwrap();
+        let allow: Vec<&str> = v["permissions"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect();
+        let deny: Vec<&str> = v["permissions"]["deny"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect();
+        assert!(allow.contains(&"Mcp(gaviero:*)"));
+        assert!(deny.contains(&"Mcp(gaviero:write_*)"));
     }
 
     fn codex_config_includes_extra_url_server() {

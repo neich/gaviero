@@ -1116,6 +1116,7 @@ fn prepare_mcp_for_swarm(
             )
             .with_specificity(specificity)
             .with_edge_weights(edge_weights)
+            .with_permissions(synth.permissions.clone())
             .with_symbol_enrichment(
                 workspace
                     .resolve_setting(
