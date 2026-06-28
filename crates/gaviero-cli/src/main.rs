@@ -3432,6 +3432,29 @@ async fn main() -> Result<()> {
     let swarm_observer = CliSwarmObserver;
     let specificity = workspace.resolve_specificity_config(Some(&repo));
     let (swarm_extra_tools, _) = workspace.resolve_agent_tools(Some(&repo));
+    // PR-6-replacement (scope-B follow-up): give the headless swarm an
+    // extraction-LLM-equipped writer so completed agents' findings flow
+    // through the per-turn extractor, mirroring the TUI. Falls back to no
+    // extraction (writer = None → swarm's own raw-only writer) when the
+    // extractor is disabled or the backend can't be built.
+    let extractor_enabled = workspace
+        .resolve_setting(
+            gaviero_core::workspace::settings::MEMORY_EXTRACTOR_ENABLED,
+            Some(&repo),
+        )
+        .as_bool()
+        .unwrap_or(true);
+    let swarm_memory_writer = build_swarm_extractor_writer(
+        &workspace,
+        &repo,
+        &memory,
+        extractor_enabled,
+        &execution_model,
+        ollama_base_url.as_deref(),
+    );
+    let extract_agent_findings = swarm_memory_writer.is_some();
+    // Keep a handle to drain in-flight extractions before the process exits.
+    let swarm_writer_drain = swarm_memory_writer.clone();
     let config = gaviero_core::swarm::pipeline::SwarmConfig {
         execution_mode: plan.execution_mode,
         max_parallel: effective_max_parallel,
@@ -3445,10 +3468,11 @@ async fn main() -> Result<()> {
         context_files: vec![],
         worktree_context_paths,
         excludes: cli.exclude.clone(),
-        memory_writer: None,
+        memory_writer: swarm_memory_writer,
         mcp_config,
         specificity,
         swarm_extra_tools,
+        extract_agent_findings,
     };
 
     // --coordinated: produce a DSL plan file for review, then exit.
@@ -3576,6 +3600,16 @@ async fn main() -> Result<()> {
     )
     .await?;
 
+    // Drain the extractor writer before the runtime shuts down, so in-flight
+    // swarm-finding extraction (slow LLM calls enqueued right up to the end
+    // of `execute`) is not cancelled mid-flight. FIFO `flush` resolves once
+    // every enqueued extraction has been processed.
+    if let Some(w) = &swarm_writer_drain
+        && let Err(e) = w.flush().await
+    {
+        eprintln!("[memory] swarm extractor flush failed: {e}");
+    }
+
     // Output results
     match cli.format {
         OutputFormat::Json => {
@@ -3607,6 +3641,60 @@ async fn main() -> Result<()> {
     } else {
         anyhow::bail!("swarm execution reported failure")
     }
+}
+
+/// Build an extraction-LLM-equipped memory writer for the headless swarm
+/// (PR-6-replacement, scope-B follow-up). Mirrors the TUI: resolve
+/// `memory.extractor.model` (falling back to the agent model), build the
+/// backend, and spawn a writer task carrying a `BackendConsolidationLlm`.
+/// Returns `None` — meaning "no swarm-finding extraction"; the swarm then
+/// falls back to its own raw-only writer — when the extractor is disabled,
+/// there is no memory store, or the backend cannot be built.
+fn build_swarm_extractor_writer(
+    workspace: &gaviero_core::workspace::Workspace,
+    repo: &std::path::Path,
+    memory: &Option<std::sync::Arc<gaviero_core::memory::MemoryStores>>,
+    extractor_enabled: bool,
+    agent_model: &str,
+    ollama_base_url: Option<&str>,
+) -> Option<gaviero_core::memory::WriterHandle> {
+    use gaviero_core::memory::{
+        BackendConsolidationLlm, ConsolidationLlm, WriterConfig, spawn_writer_task,
+    };
+    if !extractor_enabled {
+        return None;
+    }
+    let stores = memory.as_ref()?.clone();
+    let extractor_model = workspace
+        .resolve_setting(
+            gaviero_core::workspace::settings::MEMORY_EXTRACTOR_MODEL,
+            Some(repo),
+        )
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| agent_model.to_string());
+    let backend = match gaviero_core::swarm::backend::shared::create_backend_for_model(
+        &extractor_model,
+        ollama_base_url,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[memory] swarm-finding extractor disabled (backend `{extractor_model}`: {e})");
+            return None;
+        }
+    };
+    let backend: std::sync::Arc<dyn gaviero_core::swarm::backend::AgentBackend> = backend.into();
+    let llm: std::sync::Arc<dyn ConsolidationLlm> =
+        std::sync::Arc::new(BackendConsolidationLlm::new(backend, repo.to_path_buf()));
+    eprintln!("[memory] swarm-finding extractor on (model `{extractor_model}`)");
+    Some(spawn_writer_task(WriterConfig {
+        stores,
+        llm: Some(llm),
+        observer: None,
+        manifest_observer: None,
+    }))
 }
 
 #[cfg(test)]

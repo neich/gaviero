@@ -73,6 +73,16 @@ pub struct SwarmConfig {
     /// ignored entirely for that unit so the DSL remains the audit
     /// record. Empty = no fallback (legacy behaviour).
     pub swarm_extra_tools: Vec<String>,
+    /// When true, each completed agent's findings (task + full text
+    /// output) are run through the per-turn memory extractor — the same
+    /// `enqueue_post_turn` path as a TUI chat turn — so durable facts are
+    /// captured with `source=agent`, low trust, and subject to
+    /// dedup/consolidation/decay. This is the curated route; it does
+    /// **not** add an MCP write tool. Requires the supplied
+    /// `memory_writer` to carry an extraction LLM (the TUI's does; the
+    /// headless CLI's fallback writer does not, so leave this `false`
+    /// there until a CLI extractor LLM is wired). Default `false`.
+    pub extract_agent_findings: bool,
 }
 
 /// Execute a swarm of work units from a compiled plan.
@@ -345,6 +355,7 @@ pub async fn execute(
                 &unit,
                 &run_id,
                 &config.workspace_root,
+                config.extract_agent_findings,
             )
             .await;
         }
@@ -629,6 +640,7 @@ pub async fn execute(
                         unit,
                         &run_id,
                         &config.workspace_root,
+                        config.extract_agent_findings,
                     )
                     .await;
                 }
@@ -795,6 +807,7 @@ pub async fn execute(
                                     unit,
                                     &run_id,
                                     &config.workspace_root,
+                                    config.extract_agent_findings,
                                 )
                                 .await;
                             }
@@ -1028,6 +1041,7 @@ pub async fn execute(
                         unit,
                         &run_id,
                         &config.workspace_root,
+                        config.extract_agent_findings,
                     )
                     .await;
                     if let Some(ref branch_name) = manifest.branch {
@@ -1330,6 +1344,7 @@ pub async fn execute(
                             &unit,
                             &run_id,
                             &config.workspace_root,
+                            config.extract_agent_findings,
                         )
                         .await;
                     }
@@ -1412,6 +1427,7 @@ pub async fn execute(
                             unit,
                             &run_id,
                             &config.workspace_root,
+                            config.extract_agent_findings,
                         )
                         .await;
 
@@ -1562,6 +1578,7 @@ pub async fn execute(
                         unit,
                         &run_id,
                         &config.workspace_root,
+                        config.extract_agent_findings,
                     )
                     .await;
                 }
@@ -2549,6 +2566,7 @@ async fn store_agent_result(
     unit: &WorkUnit,
     run_id: &str,
     workspace_root: &std::path::Path,
+    extract_findings: bool,
 ) {
     if memory.is_none() {
         return;
@@ -2633,6 +2651,51 @@ async fn store_agent_result(
             tracing::warn!("Failed to store source snapshot for {}: {}", source_path, e);
         }
     }
+
+    // 3. PR-6 replacement: route the agent's findings through the per-turn
+    // memory extractor — the same `enqueue_post_turn` path a TUI chat turn
+    // uses — so durable facts are curated with `source=agent`, low trust,
+    // and subject to dedup/consolidation/decay. This is additive to the raw
+    // aggregate above (which serves run bookkeeping + staleness). No-op
+    // unless enabled; degrades to a History row when `writer` carries no
+    // extraction LLM (e.g. the headless CLI fallback writer).
+    if extract_findings
+        && let Some(transcript) = agent_findings_transcript(unit, manifest)
+    {
+        let turn_id = format!("swarm:{run_id}:{}", manifest.work_unit_id);
+        let repo_id = crate::memory::hash_path(workspace_root);
+        crate::context_planner::enqueue_post_turn(crate::context_planner::PostTurnRequest {
+            writer,
+            session_id: run_id,
+            turn_id: &turn_id,
+            repo_id: &repo_id,
+            module_path: None,
+            run_id,
+            transcript,
+            annotations: None,
+            // Telemetry is off for swarm findings, so `response_text` is unused.
+            response_text: String::new(),
+            extractor_enabled: true,
+            telemetry_enabled: false,
+        });
+    }
+}
+
+/// Build the per-turn-extractor transcript for a completed swarm agent's
+/// findings: the unit's task plus the agent's full text output (falling
+/// back to its short summary). Returns `None` when there is no usable
+/// output, so the caller skips the extractor enqueue entirely.
+fn agent_findings_transcript(unit: &WorkUnit, manifest: &AgentManifest) -> Option<String> {
+    let body = manifest
+        .output
+        .as_deref()
+        .or(manifest.summary.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    Some(format!(
+        "TASK: {}\n\nAGENT {} OUTPUT:\n{}",
+        unit.description, manifest.work_unit_id, body
+    ))
 }
 
 /// Plan a coordinated swarm: Opus produces a `.gaviero` DSL file for user review.
@@ -2818,6 +2881,46 @@ mod tests {
             context_depth: 2,
             extra_allowed_tools: vec![],
         }
+    }
+
+    fn manifest_with(output: Option<&str>, summary: Option<&str>) -> AgentManifest {
+        AgentManifest {
+            work_unit_id: "unit-a".into(),
+            status: AgentStatus::Completed,
+            modified_files: vec![],
+            branch: None,
+            summary: summary.map(String::from),
+            output: output.map(String::from),
+            cost_usd: 0.0,
+        }
+    }
+
+    #[test]
+    fn agent_findings_transcript_prefers_output_and_tags_task() {
+        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
+        let manifest = manifest_with(Some("Refactored the parser; added 3 tests."), Some("done"));
+        let t = agent_findings_transcript(&unit, &manifest).expect("output present");
+        assert!(t.contains("TASK: test task"));
+        assert!(t.contains("AGENT unit-a OUTPUT:"));
+        assert!(t.contains("Refactored the parser"));
+        // The full output wins over the short summary.
+        assert!(!t.contains("done"));
+    }
+
+    #[test]
+    fn agent_findings_transcript_falls_back_to_summary() {
+        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
+        let manifest = manifest_with(None, Some("Summary only."));
+        let t = agent_findings_transcript(&unit, &manifest).expect("summary present");
+        assert!(t.contains("Summary only."));
+    }
+
+    #[test]
+    fn agent_findings_transcript_none_when_empty() {
+        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
+        assert!(agent_findings_transcript(&unit, &manifest_with(None, None)).is_none());
+        // Whitespace-only output is treated as empty → skipped.
+        assert!(agent_findings_transcript(&unit, &manifest_with(Some("  \n "), None)).is_none());
     }
 
     #[test]
@@ -3276,6 +3379,7 @@ async fn evaluate_loop_condition(
                     &unit,
                     ctx.run_id,
                     &ctx.config.workspace_root,
+                    ctx.config.extract_agent_findings,
                 )
                 .await;
             }

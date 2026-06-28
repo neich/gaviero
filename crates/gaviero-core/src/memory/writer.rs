@@ -199,6 +199,12 @@ pub enum WriterMessage {
         reason: String,
         ack: Option<oneshot::Sender<Result<i64, String>>>,
     },
+    /// No-op drain barrier. Because the writer processes messages strictly
+    /// FIFO, acking this guarantees every message enqueued before it has
+    /// been fully processed. Used by headless callers ([`WriterHandle::flush`])
+    /// to drain fire-and-forget work (e.g. swarm-finding extraction) before
+    /// the process exits.
+    Flush { ack: oneshot::Sender<()> },
 }
 
 /// Discrete operation for `WriterMessage::PanelEdit` (Tier A / A4).
@@ -239,6 +245,7 @@ impl WriterMessage {
             WriterMessage::RestoreSince { .. } => "RestoreSince",
             WriterMessage::BulkForget { .. } => "BulkForget",
             WriterMessage::RedactHistory { .. } => "RedactHistory",
+            WriterMessage::Flush { .. } => "Flush",
         }
     }
 }
@@ -291,6 +298,24 @@ impl WriterHandle {
             .tx
             .send(msg)
             .map_err(|_| anyhow!("writer task terminated"))
+    }
+
+    /// Enqueue a [`WriterMessage::Flush`] barrier and await it. Because the
+    /// writer drains strictly FIFO, this resolves only once every message
+    /// enqueued *before* this call has been fully processed — including
+    /// slow fire-and-forget work like swarm-finding extraction. Headless
+    /// callers (the CLI swarm) await this before exit so the runtime does
+    /// not cancel in-flight extractor LLM calls. Resolves immediately if
+    /// the writer task is already gone (nothing left to drain).
+    pub async fn flush(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        if self.enqueue(WriterMessage::Flush { ack: tx }).is_err() {
+            return Ok(());
+        }
+        // A receive error means the task dropped its sender (terminated);
+        // treat that as "drained" rather than propagating.
+        let _ = rx.await;
+        Ok(())
     }
 
     /// Enqueue a legacy-namespace `UserRemember` and await the ack with a
@@ -623,6 +648,13 @@ async fn writer_task(
     } = cfg;
 
     while let Some(msg) = rx.recv().await {
+        // Drain barrier: ack and move on. Reaching it in FIFO order means
+        // every prior message has already been processed to completion.
+        if let WriterMessage::Flush { ack } = msg {
+            state.drained.fetch_add(1, Ordering::Relaxed);
+            let _ = ack.send(());
+            continue;
+        }
         let kind = msg.kind();
         let drained = state.drained.fetch_add(1, Ordering::Relaxed) + 1;
         tracing::debug!(
@@ -928,6 +960,13 @@ async fn process_message(
             let res = store.redact_history_row(memory_id, &reason).await;
             send_ack_typed(ack, &res);
             res.map(|audit_id| WriteResult::Inserted(audit_id))
+        }
+        WriterMessage::Flush { ack } => {
+            // The receive loop intercepts `Flush` as a drain barrier before
+            // reaching here; this arm only satisfies match exhaustiveness.
+            // Ack defensively in case that ever changes.
+            let _ = ack.send(());
+            Ok(WriteResult::Skipped)
         }
         WriterMessage::BulkForget {
             filter,
@@ -1680,6 +1719,39 @@ mod tests {
             annotations: None,
         };
         assert_eq!(m.kind(), "TurnComplete");
+    }
+
+    #[tokio::test]
+    async fn flush_barrier_drains_prior_messages() {
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let store = Arc::new(MemoryStore::in_memory(embedder).unwrap());
+        let handle = spawn_writer_task(WriterConfig {
+            stores: MemoryStores::from_single_store(store.clone()),
+            llm: None,
+            observer: None,
+            manifest_observer: None,
+        });
+
+        handle
+            .enqueue(WriterMessage::InjectionManifest {
+                turn_id: "t-flush".into(),
+                session_id: "conv-flush".into(),
+                payload: serde_json::json!({
+                    "schema_version": 1,
+                    "query_text": "x",
+                    "selected_ids": [],
+                }),
+            })
+            .unwrap();
+
+        // No polling: `flush` must not resolve until the FIFO-prior write
+        // has been fully processed.
+        handle.flush().await.unwrap();
+
+        let rows = store.recent_manifests(10).await.unwrap();
+        assert_eq!(rows.len(), 1, "flush must guarantee the prior write landed");
+        assert_eq!(rows[0].turn_id, "t-flush");
+        assert_eq!(handle.queue_depth(), 0);
     }
 
     #[tokio::test]
