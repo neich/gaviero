@@ -134,6 +134,17 @@ pub(crate) fn run_swarm(app: &mut App, task_desc: String) {
     let excludes = parse_exclude_patterns(&app.workspace, Some(&root));
     let specificity = app.workspace.resolve_specificity_config(Some(&root));
     let (swarm_extra_tools, _) = app.workspace.resolve_agent_tools(Some(&root));
+    // Route each completed swarm agent's findings through the per-turn
+    // memory extractor (same path as a chat turn). The TUI's writer carries
+    // the extraction LLM, so this is live whenever `memory.extractor.enabled`.
+    let extract_agent_findings = app
+        .workspace
+        .resolve_setting(
+            gaviero_core::workspace::settings::MEMORY_EXTRACTOR_ENABLED,
+            Some(&root),
+        )
+        .as_bool()
+        .unwrap_or(true);
 
     tokio::spawn(async move {
         use gaviero_core::swarm::{pipeline, planner};
@@ -192,6 +203,7 @@ pub(crate) fn run_swarm(app: &mut App, task_desc: String) {
             mcp_config: Some(mcp_config),
             specificity,
             swarm_extra_tools,
+            extract_agent_findings,
         };
 
         let observer = TuiSwarmObserver { tx: tx.clone() };
@@ -332,6 +344,17 @@ pub(super) fn handle_run_script_command(app: &mut App) {
     let mcp_config = mcp_config_for_workspace(app, &root);
     let specificity = app.workspace.resolve_specificity_config(Some(&root));
     let (swarm_extra_tools, _) = app.workspace.resolve_agent_tools(Some(&root));
+    // Route each completed swarm agent's findings through the per-turn
+    // memory extractor (same path as a chat turn). The TUI's writer carries
+    // the extraction LLM, so this is live whenever `memory.extractor.enabled`.
+    let extract_agent_findings = app
+        .workspace
+        .resolve_setting(
+            gaviero_core::workspace::settings::MEMORY_EXTRACTOR_ENABLED,
+            Some(&root),
+        )
+        .as_bool()
+        .unwrap_or(true);
 
     tokio::spawn(async move {
         use gaviero_core::swarm::pipeline;
@@ -354,6 +377,7 @@ pub(super) fn handle_run_script_command(app: &mut App) {
             mcp_config: Some(mcp_config),
             specificity,
             swarm_extra_tools,
+            extract_agent_findings,
         };
 
         let observer = TuiSwarmObserver { tx: tx.clone() };
@@ -474,6 +498,17 @@ pub(super) fn handle_coordinated_swarm_command(app: &mut App) {
     let mcp_config = mcp_config_for_workspace(app, &root);
     let specificity = app.workspace.resolve_specificity_config(Some(&root));
     let (swarm_extra_tools, _) = app.workspace.resolve_agent_tools(Some(&root));
+    // Route each completed swarm agent's findings through the per-turn
+    // memory extractor (same path as a chat turn). The TUI's writer carries
+    // the extraction LLM, so this is live whenever `memory.extractor.enabled`.
+    let extract_agent_findings = app
+        .workspace
+        .resolve_setting(
+            gaviero_core::workspace::settings::MEMORY_EXTRACTOR_ENABLED,
+            Some(&root),
+        )
+        .as_bool()
+        .unwrap_or(true);
 
     tokio::spawn(async move {
         use gaviero_core::swarm::{coordinator, pipeline};
@@ -494,6 +529,7 @@ pub(super) fn handle_coordinated_swarm_command(app: &mut App) {
             mcp_config: Some(mcp_config),
             specificity,
             swarm_extra_tools,
+            extract_agent_findings,
         };
 
         let coord_config = coordinator::CoordinatorConfig {
