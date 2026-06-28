@@ -993,8 +993,10 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         ]),
 
         // Embedder selection (B1).
-        // Default = "nomic" until B1g flips after the eval ablation.
-        // Accepted: "nomic" | "gte-modernbert".
+        // Default = "nomic" until B1g/S3.1 flips after the eval ablation.
+        // Accepted: "nomic" | "gte-modernbert" | "jina-code"
+        // (jinaai/jina-embeddings-v2-base-code, the code-specialized PR-4
+        // candidate; all three are 768-dim so no vector migration).
         settings::MEMORY_EMBEDDER_MODEL => serde_json::json!("nomic"),
         settings::MEMORY_EMBEDDER_REEMBED_BATCH_SIZE => serde_json::json!(32),
 

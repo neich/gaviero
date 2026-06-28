@@ -2189,21 +2189,40 @@ fn restore_memory_db(repo: &std::path::Path, backup: &MemoryDbBackup) -> Result<
     Ok(())
 }
 
-/// KB-efficiency S1.1 / B1g: compare `nomic` vs `gte-modernbert` on the
-/// gold-set fixture with a seeded corpus per arm (fair vector space).
+/// One arm of the embedder ablation (S3.1): `(resolve-name, display
+/// label, recall/ranking report, (p50, p95, mean) embed latency ms)`.
+type EmbedderArm = (
+    String,
+    String,
+    gaviero_core::memory::eval::EvalReport,
+    (f64, f64, f64),
+);
+
+/// KB-efficiency S1.1 / B1g + S3.1 / PR-4: compare `nomic` (incumbent),
+/// `gte-modernbert`, and `jina-code` on the gold-set fixture with a
+/// seeded corpus per arm (fair vector space). Reports per-arm recall /
+/// ranking metrics (Δ vs the `nomic` incumbent) **and** per-arm CPU
+/// embed latency (p50/p95/mean ms/query), since PR-4's flip gate is
+/// "code-recall + CPU-latency vs incumbent".
 async fn run_eval_embedder_ablation(repo: &std::path::Path, fixture: &PathBuf) -> Result<()> {
-    use gaviero_core::memory::eval::{load_fixture, run_scope_matrix};
+    use gaviero_core::memory::eval::{EvalReport, load_fixture, run_scope_matrix};
     use gaviero_core::memory::{
-        MemoryScope, Reranker, RetrievalConfig, build_reranker, hash_path,
-        init_workspace_with_embedder_name,
+        MemoryScope, Reranker, build_reranker, hash_path, init_workspace_with_embedder_name,
     };
 
-    const MODELS: &[&str] = &["nomic", "gte-modernbert"];
+    // Incumbent first; Δ columns are computed against `arms[0]` (`nomic`).
+    // Each entry is (resolve-name, short display label).
+    const ARMS: &[(&str, &str)] = &[
+        ("nomic", "nomic"),
+        ("gte-modernbert", "gte-mbert"),
+        ("jina-code", "jina-code"),
+    ];
 
     let cases = load_fixture(fixture).context("loading eval fixture")?;
     if cases.is_empty() {
         anyhow::bail!("eval fixture {} contained no cases", fixture.display());
     }
+    let query_texts: Vec<String> = cases.iter().map(|c| c.query.clone()).collect();
 
     eprintln!(
         "[gaviero-eval] backing up {} before embedder ablation…",
@@ -2251,19 +2270,20 @@ async fn run_eval_embedder_ablation(repo: &std::path::Path, fixture: &PathBuf) -
         run_id: None,
     };
 
-    let mut arms: Vec<(String, gaviero_core::memory::eval::EvalReport)> = Vec::new();
-    for model in MODELS {
-        eprintln!("[gaviero-eval] embedder arm `{model}`: fresh db + seed…");
+    // (resolve-name, label, recall/ranking report, (p50, p95, mean) ms)
+    let mut arms: Vec<EmbedderArm> = Vec::new();
+    for &(resolve_name, label) in ARMS {
+        eprintln!("[gaviero-eval] embedder arm `{label}` ({resolve_name}): fresh db + seed…");
         remove_memory_db(repo)?;
-        run_seed_corpus_from_paths(repo, fixture, 480, Some(model)).await?;
+        run_seed_corpus_from_paths(repo, fixture, 480, Some(resolve_name)).await?;
 
         let store = tokio::task::spawn_blocking({
             let repo = repo.to_path_buf();
-            let model = model.to_string();
+            let model = resolve_name.to_string();
             move || init_workspace_with_embedder_name(&repo, &model)
         })
         .await
-        .with_context(|| format!("init memory (embedder ablation, {model})"))??;
+        .with_context(|| format!("init memory (embedder ablation, {resolve_name})"))??;
 
         let matrix = run_scope_matrix(
             &store,
@@ -2280,13 +2300,18 @@ async fn run_eval_embedder_ablation(repo: &std::path::Path, fixture: &PathBuf) -
             .next()
             .map(|(_, r)| r)
             .context("scope matrix returned no rows")?;
-        arms.push((model.to_string(), report));
+
+        // CPU embed-latency probe: a separate, bare embedder load so the
+        // timing is pure embed cost (no retrieval / rerank noise).
+        let latency = measure_embed_latency(resolve_name, &query_texts).await?;
+
+        arms.push((resolve_name.to_string(), label.to_string(), report, latency));
     }
 
     eprintln!("[gaviero-eval] restoring workspace memory.db…");
     restore_memory_db(repo, &backup)?;
 
-    println!("─── Embedder ablation (B1g / S1.1) ─────────────────────");
+    println!("─── Embedder ablation (B1g / S1.1 + S3.1 / PR-4) ───────");
     println!("fixture     : {}", fixture.display());
     println!("scope       : run (seeded gold_must File corpus per arm)");
     println!("cases       : {}", cases.len());
@@ -2301,26 +2326,106 @@ async fn run_eval_embedder_ablation(repo: &std::path::Path, fixture: &PathBuf) -
             .as_str()
             .unwrap_or("minilm")
     );
-    println!("             {:>10}  {:>10}  {:>10}", "nomic", "gte-mbert", "Δ");
-    let row = |label: &str, a: f32, b: f32| {
-        println!("{:11}  {:>10.3}  {:>10.3}  {:>+10.3}", label, a, b, b - a);
+
+    // ── recall / ranking (Δ vs the incumbent `arms[0]`) ──
+    println!("\nrecall / ranking (Δ vs incumbent `{}`):", arms[0].0);
+    print!("{:13}", "metric");
+    for (_, label, _, _) in &arms {
+        print!("  {label:>18}");
+    }
+    println!();
+    let row = |name: &str, get: fn(&EvalReport) -> f32| {
+        print!("{name:13}");
+        let base = get(&arms[0].2);
+        for (i, (_, _, r, _)) in arms.iter().enumerate() {
+            let v = get(r);
+            if i == 0 {
+                print!("  {v:>18.3}");
+            } else {
+                print!("  {:>9.3} ({:+.3})", v, v - base);
+            }
+        }
+        println!();
     };
-    let nomic = &arms[0].1;
-    let gte = &arms[1].1;
-    row("precision@5", nomic.precision_at_5, gte.precision_at_5);
-    row("precision@10", nomic.precision_at_10, gte.precision_at_10);
-    row("ndcg@5", nomic.ndcg_at_5, gte.ndcg_at_5);
-    row("ndcg@10", nomic.ndcg_at_10, gte.ndcg_at_10);
-    row("blast_leak", nomic.blast_leakage, gte.blast_leakage);
-    row("over_ret", nomic.over_retrieval, gte.over_retrieval);
-    let ndcg5_delta = gte.ndcg_at_5 - nomic.ndcg_at_5;
+    row("precision@5", |r| r.precision_at_5);
+    row("precision@10", |r| r.precision_at_10);
+    row("ndcg@5", |r| r.ndcg_at_5);
+    row("ndcg@10", |r| r.ndcg_at_10);
+    row("blast_leak", |r| r.blast_leakage);
+    row("over_ret", |r| r.over_retrieval);
+    // under_ret = fraction of gold_must MISSED — disambiguates a low
+    // over_ret (tight-and-complete vs tight-but-dropping-gold).
+    row("under_ret", |r| r.under_retrieval);
+
+    // ── CPU embed latency ──
     println!(
-        "\nverdict     : ndcg@5 Δ (gte − nomic) = {:+.3}\n\
-         PR-1 gate   : report-only — embedder default stays `nomic` \
-         (flip authority → PR-4; guardrail band ≥ +5 pt recall@5)",
-        ndcg5_delta
+        "\nCPU embed latency (ms/query over {} fixture queries, intra_threads=1):",
+        query_texts.len()
     );
+    println!("{:13}  {:>8}  {:>8}  {:>8}", "arm", "p50", "p95", "mean");
+    for (_, label, _, (p50, p95, mean)) in &arms {
+        println!("{label:13}  {p50:>8.1}  {p95:>8.1}  {mean:>8.1}");
+    }
+
+    // ── verdict: jina-code vs the `nomic` incumbent ──
+    let incumbent = &arms[0].2;
+    if let Some((_, _, jina, jlat)) = arms.iter().find(|(n, _, _, _)| n == "jina-code") {
+        let ndcg5_d = jina.ndcg_at_5 - incumbent.ndcg_at_5;
+        let p5_d = jina.precision_at_5 - incumbent.precision_at_5;
+        println!(
+            "\nverdict     : jina-code vs nomic — ndcg@5 Δ = {:+.3}, precision@5 Δ = {:+.3}, \
+             p50 latency = {:.1} ms/query",
+            ndcg5_d, p5_d, jlat.0
+        );
+        println!(
+            "PR-4 gate   : embedder-flip authority. Band (per-kind recall@5): ≥ +5 pt across \
+             all 4 kinds → flip; ≤ +1 pt or any-kind regression → no flip; between → widen \
+             the corpus. Latency tiebreak: if recall ≈, prefer the faster arm for symbol \
+             vectors (`repoMap.embedder.model`); memory may keep `nomic`."
+        );
+    } else {
+        println!("\nverdict     : jina-code arm absent — check the ARMS table.");
+    }
     Ok(())
+}
+
+/// CPU embed-latency probe for the embedder ablation (S3.1). Builds the
+/// named embedder fresh and times `embed_query` over the fixture queries
+/// on CPU (`OnnxEmbedder` builds its session with `intra_threads = 1`).
+/// Returns `(p50, p95, mean)` in milliseconds.
+async fn measure_embed_latency(model: &str, queries: &[String]) -> Result<(f64, f64, f64)> {
+    let embedder = tokio::task::spawn_blocking({
+        let model = model.to_string();
+        move || gaviero_core::memory::build_embedder_by_name(&model)
+    })
+    .await
+    .with_context(|| format!("building embedder for latency probe ({model})"))??;
+
+    let mut samples_ms = Vec::with_capacity(queries.len());
+    for q in queries {
+        let started = std::time::Instant::now();
+        embedder
+            .embed_query(q)
+            .await
+            .with_context(|| format!("embed_query during latency probe ({model})"))?;
+        samples_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    Ok(percentiles_ms(samples_ms))
+}
+
+/// `(p50, p95, mean)` of a millisecond sample set; zeros on empty input.
+fn percentiles_ms(mut samples: Vec<f64>) -> (f64, f64, f64) {
+    if samples.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = samples.len();
+    let pct = |q: f64| -> f64 {
+        let idx = ((q * n as f64).ceil() as usize).saturating_sub(1).min(n - 1);
+        samples[idx]
+    };
+    let mean = samples.iter().sum::<f64>() / n as f64;
+    (pct(0.5), pct(0.95), mean)
 }
 
 /// Tier B / B2f: rerank ablation. Runs the fixture twice — once with

@@ -34,12 +34,33 @@ pub const GTE_MODERNBERT_BASE: ModelInfo = ModelInfo {
     dimensions: 768,
 };
 
-/// Resolve a settings string (`"nomic" | "gte-modernbert" | ""`) to a
-/// `ModelInfo`. Empty / unknown values fall back to the configured
-/// default (currently `"nomic"`; B1g flips this to `"gte-modernbert"`).
+/// Tier B / S3.1: jinaai/jina-embeddings-v2-base-code — Apache-2.0,
+/// ~161M parameters, **768-dim (same as nomic/gte so no vector
+/// migration)**, 8192-token context, mean-pool + L2 (an exact match for
+/// [`OnnxEmbedder`]'s pooling). Code-specialized (CoIR) and the third B1
+/// candidate; uses **no** task prefix — adding one regresses code
+/// retrieval. CPU-only inference here (`ort` has no GPU EP wired). The
+/// ONNX export is self-contained (JinaBERT / ALiBi) and loads under the
+/// generic `ort` session; it omits `token_type_ids`, which
+/// `run_inference` already handles conditionally.
+pub const JINA_EMBEDDINGS_V2_BASE_CODE: ModelInfo = ModelInfo {
+    id: "jina-embeddings-v2-base-code",
+    onnx_url: "https://huggingface.co/jinaai/jina-embeddings-v2-base-code/resolve/main/onnx/model.onnx",
+    tokenizer_url: "https://huggingface.co/jinaai/jina-embeddings-v2-base-code/resolve/main/tokenizer.json",
+    dimensions: 768,
+};
+
+/// Resolve a settings string (`"nomic" | "gte-modernbert" | "jina-code"
+/// | ""`) to a `ModelInfo`. Empty / unknown values fall back to the
+/// configured default (currently `"nomic"`). The embedder-flip authority
+/// for `jina-code` lives in PR-4 (S3.1), gated on the code-recall +
+/// CPU-latency ablation.
 pub fn resolve_embedder_model(name: &str) -> &'static ModelInfo {
     match name.trim().to_ascii_lowercase().as_str() {
         "gte-modernbert" | "gte-modernbert-base" => &GTE_MODERNBERT_BASE,
+        "jina-code" | "jina" | "jina-v2-code" | "jina-embeddings-v2-base-code" => {
+            &JINA_EMBEDDINGS_V2_BASE_CODE
+        }
         "nomic" | "nomic-v15" | "nomic-v1.5" | "nomic-embed-text-v1.5" => &NOMIC_EMBED_TEXT_V1_5,
         "e5" | "e5-small-v2" => &E5_SMALL_V2,
         _ => &NOMIC_EMBED_TEXT_V1_5,
@@ -121,5 +142,57 @@ impl ModelManager {
             anyhow::bail!("curl failed with status {}", status);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_embedder_model_maps_known_aliases() {
+        assert_eq!(resolve_embedder_model("nomic").id, NOMIC_EMBED_TEXT_V1_5.id);
+        assert_eq!(
+            resolve_embedder_model("gte-modernbert").id,
+            GTE_MODERNBERT_BASE.id
+        );
+        assert_eq!(resolve_embedder_model("e5").id, E5_SMALL_V2.id);
+    }
+
+    #[test]
+    fn resolve_embedder_model_maps_jina_code_aliases() {
+        for alias in [
+            "jina-code",
+            "jina",
+            "jina-v2-code",
+            "jina-embeddings-v2-base-code",
+            "  JINA-CODE  ",
+        ] {
+            assert_eq!(
+                resolve_embedder_model(alias).id,
+                JINA_EMBEDDINGS_V2_BASE_CODE.id,
+                "alias `{alias}` should resolve to jina"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_embedder_model_unknown_falls_back_to_nomic() {
+        assert_eq!(
+            resolve_embedder_model("does-not-exist").id,
+            NOMIC_EMBED_TEXT_V1_5.id
+        );
+        assert_eq!(resolve_embedder_model("").id, NOMIC_EMBED_TEXT_V1_5.id);
+    }
+
+    #[test]
+    fn jina_is_768d_no_vector_migration() {
+        // 768-dim keeps the same sqlite-vec column as nomic/gte → no
+        // schema migration when symbol/memory vectors adopt jina.
+        assert_eq!(JINA_EMBEDDINGS_V2_BASE_CODE.dimensions, 768);
+        assert_eq!(
+            JINA_EMBEDDINGS_V2_BASE_CODE.dimensions,
+            NOMIC_EMBED_TEXT_V1_5.dimensions
+        );
     }
 }
