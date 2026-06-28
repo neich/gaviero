@@ -421,7 +421,7 @@ fn run_rustdoc_json(workspace: &Path, package: &str) -> Result<PathBuf> {
     let status = Command::new("cargo")
         .current_dir(workspace)
         .args([
-            "+nightly-2026-06-15",
+            "+nightly",
             "rustdoc",
             "-p",
             package,
@@ -438,34 +438,72 @@ fn run_rustdoc_json(workspace: &Path, package: &str) -> Result<PathBuf> {
         bail!("cargo rustdoc failed for {package} (exit {status})");
     }
 
-    let json_path = workspace.join("target/doc").join(format!("{package}.json"));
-    if json_path.exists() {
-        return Ok(json_path);
-    }
+    locate_rustdoc_json(workspace, package)
+}
+
+/// Rustdoc names JSON files with underscores (`gaviero_core.json`) while Cargo
+/// package names use hyphens (`gaviero-core`).
+fn locate_rustdoc_json(workspace: &Path, package: &str) -> Result<PathBuf> {
     let doc_dir = workspace.join("target/doc");
+    let stems = rustdoc_json_stems(package);
+
+    for stem in &stems {
+        let path = doc_dir.join(format!("{stem}.json"));
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
     let mut matches = Vec::new();
     if doc_dir.is_dir() {
         for entry in std::fs::read_dir(&doc_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().is_some_and(|e| e == "json")
-                && path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .is_some_and(|s| !s.starts_with('.'))
-            {
+            if !path.extension().is_some_and(|e| e == "json") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if stem.starts_with('.') {
+                continue;
+            }
+            if stems.iter().any(|s| s == stem) {
                 matches.push(path);
             }
         }
     }
-    if matches.len() == 1 {
-        return Ok(matches.pop().expect("checked len"));
+
+    match matches.len() {
+        0 => bail!(
+            "rustdoc JSON not found for package `{package}` in {} (expected one of: {})",
+            doc_dir.display(),
+            stems
+                .iter()
+                .map(|s| format!("{s}.json"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        1 => Ok(matches.pop().expect("checked len")),
+        _ => bail!(
+            "ambiguous rustdoc JSON for package `{package}` in {}: {}",
+            doc_dir.display(),
+            matches
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
-    bail!(
-        "rustdoc JSON not found at {} (found {} json files in target/doc)",
-        json_path.display(),
-        matches.len()
-    );
+}
+
+fn rustdoc_json_stems(package: &str) -> Vec<String> {
+    let underscored = package.replace('-', "_");
+    if underscored == package {
+        vec![package.to_string()]
+    } else {
+        vec![package.to_string(), underscored]
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -522,5 +560,27 @@ mod tests {
         let (qn, path) = graph_qn_from_span(&ws, "foo", Some(&span)).unwrap();
         assert_eq!(path, rel);
         assert_eq!(qn, format!("{rel}::foo"));
+    }
+
+    #[test]
+    fn locate_rustdoc_json_finds_underscore_stem() {
+        let tmp = tempfile::tempdir().unwrap();
+        let doc = tmp.path().join("target/doc");
+        std::fs::create_dir_all(&doc).unwrap();
+        let json = doc.join("gaviero_core.json");
+        std::fs::write(&json, "{}").unwrap();
+        std::fs::write(doc.join("other_crate.json"), "{}").unwrap();
+
+        let found = locate_rustdoc_json(tmp.path(), "gaviero-core").unwrap();
+        assert_eq!(found, json);
+    }
+
+    #[test]
+    fn rustdoc_json_stems_includes_hyphen_and_underscore() {
+        assert_eq!(
+            rustdoc_json_stems("gaviero-core"),
+            vec!["gaviero-core".to_string(), "gaviero_core".to_string()]
+        );
+        assert_eq!(rustdoc_json_stems("serde"), vec!["serde".to_string()]);
     }
 }
