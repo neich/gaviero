@@ -14,6 +14,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context as _, Result};
@@ -91,6 +92,13 @@ pub struct GavieroMcpServer {
     /// launched (authoritative even under Claude
     /// `--dangerously-skip-permissions`). Default (empty) allows all.
     permissions: super::McpPermissions,
+    /// PUSH→PULL Phase 0: per-connection "first tool call seen" latch. Each
+    /// accepted connection is one MCP session, so [`Self::clone_for_connection`]
+    /// gives every connection a fresh latch; the first tool call on it stamps
+    /// `first_tool_call_initiated = true` in the telemetry entry. Shared by
+    /// `Arc` so any per-request clone rmcp makes still sees one latch per
+    /// connection.
+    first_tool_call_done: Arc<AtomicBool>,
     #[allow(dead_code)] // populated and dispatched via the `#[tool_router]` macro
     tool_router: ToolRouter<Self>,
 }
@@ -117,8 +125,43 @@ impl GavieroMcpServer {
             graph_cache: Arc::new(tokio::sync::Mutex::new(None)),
             symbol_enrichment_enabled: false,
             permissions: super::McpPermissions::default(),
+            first_tool_call_done: Arc::new(AtomicBool::new(false)),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Clone the server for a freshly accepted connection, giving it its own
+    /// first-tool-call latch while sharing the warm caches (`graph_cache`,
+    /// reranker) via `Arc`. Each shim connection is one MCP session, so the
+    /// latch is per-session rather than process-global.
+    fn clone_for_connection(&self) -> Self {
+        let mut s = self.clone();
+        s.first_tool_call_done = Arc::new(AtomicBool::new(false));
+        s
+    }
+
+    /// Build and dispatch one tool-call telemetry entry, stamping the
+    /// per-connection first-call latch. `session_id` / `turn` are not yet
+    /// wired (the shim passes no session identity), so they ride as `None`.
+    fn emit_tool_call(
+        &self,
+        tool_name: &str,
+        input: serde_json::Value,
+        output: serde_json::Value,
+        started: Instant,
+        error: Option<String>,
+    ) {
+        let first = !self.first_tool_call_done.swap(true, Ordering::Relaxed);
+        self.observer.on_tool_call(&McpCallLogEntry {
+            tool_name: tool_name.to_string(),
+            input,
+            output,
+            duration: started.elapsed(),
+            error,
+            first_tool_call_initiated: first,
+            session_id: None,
+            turn: None,
+        });
     }
 
     /// Install the gaviero-level MCP permission policy. Tools this policy
@@ -322,13 +365,13 @@ impl GavieroMcpServer {
         }
         let out = MemorySearchOutput { results };
 
-        self.observer.on_tool_call(&McpCallLogEntry {
-            tool_name: super::tools::TOOL_MEMORY_SEARCH.to_string(),
-            input: serde_json::to_value(&input).unwrap_or_default(),
-            output: serde_json::to_value(&out).unwrap_or_default(),
-            duration: started.elapsed(),
-            error: None,
-        });
+        self.emit_tool_call(
+            super::tools::TOOL_MEMORY_SEARCH,
+            serde_json::to_value(&input).unwrap_or_default(),
+            serde_json::to_value(&out).unwrap_or_default(),
+            started,
+            None,
+        );
         Ok(Json(out))
     }
 
@@ -458,13 +501,13 @@ impl GavieroMcpServer {
         }
 
         let out = BlastRadiusOutput { nodes };
-        self.observer.on_tool_call(&McpCallLogEntry {
-            tool_name: super::tools::TOOL_BLAST_RADIUS.to_string(),
-            input: serde_json::to_value(&input).unwrap_or_default(),
-            output: serde_json::to_value(&out).unwrap_or_default(),
-            duration: started.elapsed(),
-            error: None,
-        });
+        self.emit_tool_call(
+            super::tools::TOOL_BLAST_RADIUS,
+            serde_json::to_value(&input).unwrap_or_default(),
+            serde_json::to_value(&out).unwrap_or_default(),
+            started,
+            None,
+        );
         Ok(Json(out))
     }
 
@@ -542,13 +585,13 @@ impl GavieroMcpServer {
             purpose: String::new(),
             summary: String::new(),
         };
-        self.observer.on_tool_call(&McpCallLogEntry {
-            tool_name: super::tools::TOOL_NODE_DOC.to_string(),
-            input: log_input,
-            output: serde_json::to_value(&out).unwrap_or_default(),
-            duration: started.elapsed(),
-            error: None,
-        });
+        self.emit_tool_call(
+            super::tools::TOOL_NODE_DOC,
+            log_input,
+            serde_json::to_value(&out).unwrap_or_default(),
+            started,
+            None,
+        );
         Ok(Json(out))
     }
 
@@ -622,13 +665,13 @@ impl GavieroMcpServer {
             })
             .collect();
         let out = SymbolSearchOutput { results };
-        self.observer.on_tool_call(&McpCallLogEntry {
-            tool_name: super::tools::TOOL_SYMBOL_SEARCH.to_string(),
-            input: serde_json::to_value(&input).unwrap_or_default(),
-            output: serde_json::to_value(&out).unwrap_or_default(),
-            duration: started.elapsed(),
-            error: None,
-        });
+        self.emit_tool_call(
+            super::tools::TOOL_SYMBOL_SEARCH,
+            serde_json::to_value(&input).unwrap_or_default(),
+            serde_json::to_value(&out).unwrap_or_default(),
+            started,
+            None,
+        );
         Ok(Json(out))
     }
 
@@ -703,13 +746,13 @@ impl GavieroMcpServer {
         .map_err(|e| ErrorData::internal_error(format!("symbol_doc join: {e}"), None))?
         .map_err(|e| ErrorData::internal_error(format!("symbol_doc: {e}"), None))?;
 
-        self.observer.on_tool_call(&McpCallLogEntry {
-            tool_name: super::tools::TOOL_SYMBOL_DOC.to_string(),
-            input: serde_json::to_value(&input).unwrap_or_default(),
-            output: serde_json::to_value(&out).unwrap_or_default(),
-            duration: started.elapsed(),
-            error: None,
-        });
+        self.emit_tool_call(
+            super::tools::TOOL_SYMBOL_DOC,
+            serde_json::to_value(&input).unwrap_or_default(),
+            serde_json::to_value(&out).unwrap_or_default(),
+            started,
+            None,
+        );
         Ok(Json(out))
     }
 }
@@ -794,7 +837,9 @@ pub fn spawn_mcp_server(server: GavieroMcpServer, socket_path: &Path) -> Result<
                             continue;
                         }
                     };
-                    let server_clone = server.clone();
+                    // Per-connection clone: fresh first-tool-call latch,
+                    // shared warm caches.
+                    let server_clone = server.clone_for_connection();
                     tokio::spawn(async move {
                         // rmcp speaks JSON-RPC 2.0 over any AsyncRead +
                         // AsyncWrite — `UnixStream` satisfies both via
