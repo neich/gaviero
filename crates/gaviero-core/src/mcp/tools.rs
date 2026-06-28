@@ -1,6 +1,6 @@
 //! Tool input/output schemas (Tier A / A5).
 //!
-//! Exactly three tools — no writes. Each input/output struct derives
+//! Read-only MCP tools. Each input/output struct derives
 //! `schemars::JsonSchema` so rmcp's tool macro can emit the JSON-RPC
 //! schema at server-handshake time.
 
@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub const TOOL_MEMORY_SEARCH: &str = "memory_search";
 pub const TOOL_BLAST_RADIUS: &str = "blast_radius";
 pub const TOOL_NODE_DOC: &str = "node_doc";
+pub const TOOL_SYMBOL_SEARCH: &str = "symbol_search";
+pub const TOOL_SYMBOL_DOC: &str = "symbol_doc";
 
 // ── memory_search ─────────────────────────────────────────────────
 
@@ -79,6 +81,9 @@ pub struct BlastRadiusInput {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct BlastRadiusRelation {
     pub path: String,
+    /// Stable graph key for chaining to `symbol_doc` / `symbol_search`.
+    /// For file-level nodes this equals `path`.
+    pub qualified_name: String,
     pub relation: String,
     pub distance: u32,
     /// Populated when the Tier D1 NodeDoc schema lands; empty today.
@@ -108,21 +113,103 @@ pub struct NodeDocInput {
     pub path: String,
 }
 
-/// NodeDoc schema stub (Tier D1 finalizes). MVP returns the
-/// signatures we already extract via tree-sitter; `purpose` and
-/// `summary` remain empty until Tier D fills them in.
+/// One symbol entry returned by `node_doc`.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct NodeDocSymbol {
+    pub qualified_name: String,
+    pub signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_snippet: Option<String>,
+}
+
+/// Node documentation for one file. `symbols` carries stable
+/// `qualified_name` values for chaining to `symbol_doc`.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct NodeDoc {
     pub path: String,
+    /// File-level graph key (same as `path` for File nodes).
+    pub qualified_name: String,
+    /// Legacy flat list — mirrors `symbols[].signature`.
     #[serde(default)]
     pub signatures: Vec<String>,
-    /// Tier D1 fills this in. Empty string today so the schema is
-    /// stable for subprocess agents.
+    #[serde(default)]
+    pub symbols: Vec<NodeDocSymbol>,
     #[serde(default)]
     pub purpose: String,
-    /// Tier D1 fills this in.
     #[serde(default)]
     pub summary: String,
+}
+
+// ── symbol_search / symbol_doc (S2.3 / PR-3) ─────────────────────
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
+pub struct SymbolSearchInput {
+    /// Natural-language query over symbol signatures + docs.
+    pub query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct SymbolSearchHit {
+    pub qualified_name: String,
+    pub file_path: String,
+    pub signature: String,
+    pub score: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_snippet: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct SymbolSearchOutput {
+    pub results: Vec<SymbolSearchHit>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
+pub struct SymbolDocInput {
+    /// Graph `qualified_name` (`{path}::{symbol}`), e.g. from `symbol_search`.
+    pub qualified_name: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct SymbolDocImpl {
+    pub qualified_name: String,
+    pub signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_snippet: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct SymbolDocOutput {
+    pub qualified_name: String,
+    pub file_path: String,
+    pub signature: String,
+    pub bounds: String,
+    pub doc: String,
+    pub role_summary: String,
+    /// Trait impls linked via `Implements` edges (when `qualified_name` is a trait).
+    #[serde(default)]
+    pub implementations: Vec<SymbolDocImpl>,
+}
+
+pub const SYMBOL_SEARCH_MIN_LIMIT: usize = 1;
+pub const SYMBOL_SEARCH_MAX_LIMIT: usize = 20;
+pub const SYMBOL_SEARCH_DEFAULT_LIMIT: usize = 5;
+pub const SYMBOL_DOC_SNIPPET_MAX_CHARS: usize = 480;
+
+/// Clamp `symbol_search.limit` to [1, 20].
+pub fn clamp_symbol_search_limit(limit: Option<u32>) -> usize {
+    let n = limit.unwrap_or(SYMBOL_SEARCH_DEFAULT_LIMIT as u32) as usize;
+    n.clamp(SYMBOL_SEARCH_MIN_LIMIT, SYMBOL_SEARCH_MAX_LIMIT)
+}
+
+pub fn truncate_symbol_snippet(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max_chars).collect();
+    out.push('…');
+    out
 }
 
 /// Clamp `memory_search.limit` to the server-enforced range. Plan
@@ -257,7 +344,22 @@ mod tests {
         assert_eq!(TOOL_MEMORY_SEARCH, "memory_search");
         assert_eq!(TOOL_BLAST_RADIUS, "blast_radius");
         assert_eq!(TOOL_NODE_DOC, "node_doc");
+        assert_eq!(TOOL_SYMBOL_SEARCH, "symbol_search");
+        assert_eq!(TOOL_SYMBOL_DOC, "symbol_doc");
         // C1.6: documented default kind is record.
         assert_eq!(MEMORY_SEARCH_DEFAULT_KIND, "record");
+    }
+
+    #[test]
+    fn symbol_search_limit_clamps() {
+        assert_eq!(
+            clamp_symbol_search_limit(None),
+            SYMBOL_SEARCH_DEFAULT_LIMIT
+        );
+        assert_eq!(clamp_symbol_search_limit(Some(0)), SYMBOL_SEARCH_MIN_LIMIT);
+        assert_eq!(
+            clamp_symbol_search_limit(Some(99)),
+            SYMBOL_SEARCH_MAX_LIMIT
+        );
     }
 }

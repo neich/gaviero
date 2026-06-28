@@ -30,8 +30,10 @@ use crate::repo_map::store::BlastRadiusMode;
 use super::observer::{McpCallLogEntry, McpToolCallObserver, NoopMcpObserver};
 use super::tools::{
     BlastRadiusInput, BlastRadiusOutput, BlastRadiusRelation, MemorySearchInput,
-    MemorySearchOutput, MemorySearchResult, NodeDoc, NodeDocInput, clamp_blast_depth,
-    clamp_memory_search_limit,
+    MemorySearchOutput, MemorySearchResult, NodeDoc, NodeDocInput, NodeDocSymbol,
+    SymbolDocInput, SymbolDocImpl, SymbolDocOutput, SymbolSearchHit, SymbolSearchInput,
+    SymbolSearchOutput, clamp_blast_depth, clamp_memory_search_limit, clamp_symbol_search_limit,
+    truncate_symbol_snippet, SYMBOL_DOC_SNIPPET_MAX_CHARS,
 };
 
 /// Gaviero's MCP server. One instance lives per workspace; it
@@ -80,6 +82,9 @@ pub struct GavieroMcpServer {
     /// split into a snapshotted projection (edges + file list + DF) to
     /// allow concurrent reads.
     graph_cache: Arc<tokio::sync::Mutex<Option<crate::repo_map::store::GraphStore>>>,
+    /// S2.3: when false, `symbol_search` / `symbol_doc` return a clear
+    /// error directing the agent to run `--graph --enrich` first.
+    symbol_enrichment_enabled: bool,
     #[allow(dead_code)] // populated and dispatched via the `#[tool_router]` macro
     tool_router: ToolRouter<Self>,
 }
@@ -104,8 +109,16 @@ impl GavieroMcpServer {
             specificity: crate::repo_map::SpecificityConfig::default(),
             edge_weights: std::collections::HashMap::new(),
             graph_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            symbol_enrichment_enabled: false,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Enable symbol MCP tools (`symbol_search`, `symbol_doc`). Requires a
+    /// populated `symbol_docs` sidecar from `gaviero-cli --graph --enrich`.
+    pub fn with_symbol_enrichment(mut self, enabled: bool) -> Self {
+        self.symbol_enrichment_enabled = enabled;
+        self
     }
 
     /// Override the specificity config used by `blast_radius`. Returns
@@ -366,6 +379,7 @@ impl GavieroMcpServer {
             let (score, sp) = lookup(path);
             nodes.push(BlastRadiusRelation {
                 path: path.clone(),
+                qualified_name: path.clone(),
                 relation: "changed".to_string(),
                 distance: 0,
                 purpose: None,
@@ -388,7 +402,8 @@ impl GavieroMcpServer {
             .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         for (path, score, sp) in affected_with_score {
             nodes.push(BlastRadiusRelation {
-                path,
+                path: path.clone(),
+                qualified_name: path,
                 relation: mode.as_str().to_string(),
                 distance: 1,
                 purpose: None,
@@ -400,6 +415,7 @@ impl GavieroMcpServer {
             let (score, sp) = lookup(path);
             nodes.push(BlastRadiusRelation {
                 path: path.clone(),
+                qualified_name: path.clone(),
                 relation: "test_gap".to_string(),
                 distance: 1,
                 purpose: None,
@@ -423,9 +439,8 @@ impl GavieroMcpServer {
     #[tool(
         name = "node_doc",
         description = "Call this when you need one file's symbol signatures. Returns \
-                       {path, signatures, purpose, summary}; `purpose`/`summary` fill in \
-                       once symbol enrichment runs (empty until then). Read-only. Low \
-                       token cost.",
+                       {path, qualified_name, symbols[{qualified_name, signature, doc_snippet?}], \
+                       signatures}. Use `qualified_name` to chain into `symbol_doc`. Read-only.",
         annotations(read_only_hint = true, idempotent_hint = true)
     )]
     async fn node_doc(
@@ -433,14 +448,227 @@ impl GavieroMcpServer {
         Parameters(input): Parameters<NodeDocInput>,
     ) -> Result<Json<NodeDoc>, ErrorData> {
         let started = Instant::now();
+        let path = input.path.clone();
+        let qualified_name = path.clone();
+        let log_input = serde_json::to_value(&input).unwrap_or_default();
+        let cache = Arc::clone(&self.graph_cache);
+        let workspace_root = self.workspace_root.clone();
+        let path_for_graph = path.clone();
+
+        let (symbols, signatures) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let mut guard = cache.blocking_lock();
+            if guard.is_none() {
+                let (store, _) =
+                    crate::repo_map::graph_builder::build_graph(&workspace_root, &[])?;
+                *guard = Some(store);
+            }
+            let store = guard.as_ref().expect("graph cache populated");
+            let nodes = store.nodes_for_file(&path_for_graph)?;
+            let mut symbols = Vec::new();
+            let mut signatures = Vec::new();
+            for node in nodes {
+                if node.kind == "File" {
+                    continue;
+                }
+                if let Some(doc) = store.symbol_doc(&node.qualified_name)? {
+                    let snippet = if doc.doc.is_empty() {
+                        None
+                    } else {
+                        Some(truncate_symbol_snippet(
+                            &doc.doc,
+                            SYMBOL_DOC_SNIPPET_MAX_CHARS,
+                        ))
+                    };
+                    signatures.push(doc.signature.clone());
+                    symbols.push(NodeDocSymbol {
+                        qualified_name: node.qualified_name.clone(),
+                        signature: doc.signature,
+                        doc_snippet: snippet,
+                    });
+                } else {
+                    signatures.push(node.name.clone());
+                    symbols.push(NodeDocSymbol {
+                        qualified_name: node.qualified_name.clone(),
+                        signature: node.name.clone(),
+                        doc_snippet: None,
+                    });
+                }
+            }
+            Ok((symbols, signatures))
+        })
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("node_doc join: {e}"), None))?
+        .map_err(|e| ErrorData::internal_error(format!("node_doc: {e}"), None))?;
+
         let out = NodeDoc {
-            path: input.path.clone(),
-            signatures: Vec::new(),
+            qualified_name,
+            path,
+            signatures,
+            symbols,
             purpose: String::new(),
             summary: String::new(),
         };
         self.observer.on_tool_call(&McpCallLogEntry {
             tool_name: super::tools::TOOL_NODE_DOC.to_string(),
+            input: log_input,
+            output: serde_json::to_value(&out).unwrap_or_default(),
+            duration: started.elapsed(),
+            error: None,
+        });
+        Ok(Json(out))
+    }
+
+    // ── symbol_search ───────────────────────────────────────────────
+    #[tool(
+        name = "symbol_search",
+        description = "Semantic search over enriched Rust symbols (signatures + docs). \
+                       Returns {results: [{qualified_name, file_path, signature, score, \
+                       doc_snippet?}]} — chain `qualified_name` into `symbol_doc`. Requires \
+                       `repoMap.symbolEnrichment.enabled` and `gaviero-cli --graph --enrich`. \
+                       Read-only.",
+        annotations(read_only_hint = true, idempotent_hint = true)
+    )]
+    async fn symbol_search(
+        &self,
+        Parameters(input): Parameters<SymbolSearchInput>,
+    ) -> Result<Json<SymbolSearchOutput>, ErrorData> {
+        let started = Instant::now();
+        if !self.symbol_enrichment_enabled {
+            return Err(symbol_tools_disabled_error());
+        }
+        if input.query.trim().is_empty() {
+            return Err(ErrorData::invalid_params(
+                "symbol_search requires a non-empty query",
+                None,
+            ));
+        }
+        let limit = clamp_symbol_search_limit(input.limit);
+        let query_emb = self
+            .stores
+            .embedder()
+            .embed_query(&input.query)
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("symbol_search embed: {e}"), None))?;
+
+        let cache = Arc::clone(&self.graph_cache);
+        let workspace_root = self.workspace_root.clone();
+        let hits = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let mut guard = cache.blocking_lock();
+            if guard.is_none() {
+                let (store, _) =
+                    crate::repo_map::graph_builder::build_graph(&workspace_root, &[])?;
+                *guard = Some(store);
+            }
+            let store = guard.as_ref().expect("graph cache populated");
+            crate::repo_map::symbol_search::search_symbol_docs(store, &query_emb, limit)
+        })
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("symbol_search join: {e}"), None))?
+        .map_err(|e| ErrorData::internal_error(format!("symbol_search: {e}"), None))?;
+
+        let results: Vec<SymbolSearchHit> = hits
+            .into_iter()
+            .map(|hit| {
+                let snippet = if hit.doc.doc.is_empty() {
+                    None
+                } else {
+                    Some(truncate_symbol_snippet(
+                        &hit.doc.doc,
+                        SYMBOL_DOC_SNIPPET_MAX_CHARS,
+                    ))
+                };
+                SymbolSearchHit {
+                    qualified_name: hit.doc.qualified_name,
+                    file_path: hit.doc.file_path,
+                    signature: hit.doc.signature,
+                    score: hit.score,
+                    doc_snippet: snippet,
+                }
+            })
+            .collect();
+        let out = SymbolSearchOutput { results };
+        self.observer.on_tool_call(&McpCallLogEntry {
+            tool_name: super::tools::TOOL_SYMBOL_SEARCH.to_string(),
+            input: serde_json::to_value(&input).unwrap_or_default(),
+            output: serde_json::to_value(&out).unwrap_or_default(),
+            duration: started.elapsed(),
+            error: None,
+        });
+        Ok(Json(out))
+    }
+
+    // ── symbol_doc ──────────────────────────────────────────────────
+    #[tool(
+        name = "symbol_doc",
+        description = "Full symbol enrichment for one `qualified_name` from `symbol_search` \
+                       or `node_doc`. Returns signature, bounds, doc, role_summary, and trait \
+                       `implementations` when applicable. Read-only.",
+        annotations(read_only_hint = true, idempotent_hint = true)
+    )]
+    async fn symbol_doc(
+        &self,
+        Parameters(input): Parameters<SymbolDocInput>,
+    ) -> Result<Json<SymbolDocOutput>, ErrorData> {
+        let started = Instant::now();
+        if !self.symbol_enrichment_enabled {
+            return Err(symbol_tools_disabled_error());
+        }
+        if input.qualified_name.trim().is_empty() {
+            return Err(ErrorData::invalid_params(
+                "symbol_doc requires qualified_name",
+                None,
+            ));
+        }
+
+        let qn = input.qualified_name.clone();
+        let cache = Arc::clone(&self.graph_cache);
+        let workspace_root = self.workspace_root.clone();
+        let out = tokio::task::spawn_blocking(move || -> anyhow::Result<SymbolDocOutput> {
+            let mut guard = cache.blocking_lock();
+            if guard.is_none() {
+                let (store, _) =
+                    crate::repo_map::graph_builder::build_graph(&workspace_root, &[])?;
+                *guard = Some(store);
+            }
+            let store = guard.as_ref().expect("graph cache populated");
+            let Some(doc) = store.symbol_doc(&qn)? else {
+                anyhow::bail!("no symbol_docs row for qualified_name `{qn}`");
+            };
+            let impl_qns = store.implementation_qns_for_trait(&qn)?;
+            let mut implementations = Vec::new();
+            for impl_qn in impl_qns {
+                if let Some(impl_doc) = store.symbol_doc(&impl_qn)? {
+                    let snippet = if impl_doc.doc.is_empty() {
+                        None
+                    } else {
+                        Some(truncate_symbol_snippet(
+                            &impl_doc.doc,
+                            SYMBOL_DOC_SNIPPET_MAX_CHARS,
+                        ))
+                    };
+                    implementations.push(SymbolDocImpl {
+                        qualified_name: impl_qn,
+                        signature: impl_doc.signature,
+                        doc_snippet: snippet,
+                    });
+                }
+            }
+            Ok(SymbolDocOutput {
+                qualified_name: doc.qualified_name,
+                file_path: doc.file_path,
+                signature: doc.signature,
+                bounds: doc.bounds,
+                doc: doc.doc,
+                role_summary: doc.role_summary,
+                implementations,
+            })
+        })
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("symbol_doc join: {e}"), None))?
+        .map_err(|e| ErrorData::internal_error(format!("symbol_doc: {e}"), None))?;
+
+        self.observer.on_tool_call(&McpCallLogEntry {
+            tool_name: super::tools::TOOL_SYMBOL_DOC.to_string(),
             input: serde_json::to_value(&input).unwrap_or_default(),
             output: serde_json::to_value(&out).unwrap_or_default(),
             duration: started.elapsed(),
@@ -450,12 +678,13 @@ impl GavieroMcpServer {
     }
 }
 
-// `#[tool_router(server_handler)]` above already emits the
-// `impl ServerHandler for GavieroMcpServer` that wires `tools/list`
-// and `tools/call`. `get_info` defaults to the `Default::default()`
-// on `ServerInfo`; we override via a trait-extension approach if
-// needed. Plan §A5 lists `instructions` as nice-to-have — deferring
-// until rmcp exposes a non-conflicting override hook.
+fn symbol_tools_disabled_error() -> ErrorData {
+    ErrorData::invalid_params(
+        "symbol_search/symbol_doc require repoMap.symbolEnrichment.enabled=true \
+         and a populated symbol_docs sidecar — run `gaviero-cli --graph --enrich` first",
+        None,
+    )
+}
 
 fn format_scope(level: i32) -> String {
     match level {
@@ -769,7 +998,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn node_doc_returns_stub() {
+    async fn node_doc_includes_qualified_name() {
         let s = fixture();
         let out = s
             .node_doc(Parameters(NodeDocInput {
@@ -778,6 +1007,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.0.path, "src/lib.rs");
-        assert!(out.0.purpose.is_empty());
+        assert_eq!(out.0.qualified_name, "src/lib.rs");
+    }
+
+    #[tokio::test]
+    async fn symbol_search_disabled_without_enrichment_flag() {
+        let s = fixture();
+        match s
+            .symbol_search(Parameters(SymbolSearchInput {
+                query: "handler".into(),
+                limit: None,
+            }))
+            .await
+        {
+            Err(err) => assert!(err.message.contains("symbolEnrichment")),
+            Ok(_) => panic!("expected symbol_search to fail without enrichment"),
+        }
     }
 }

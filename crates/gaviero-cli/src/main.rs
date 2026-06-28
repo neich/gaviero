@@ -148,8 +148,8 @@ struct Cli {
 
     /// Build or update the code knowledge graph, print stats, and exit.
     /// Pass `--enrich` to run rustdoc symbol enrichment (S2.1) after the
-    /// graph scan. Requires a successful `cargo build` and the pinned
-    /// nightly toolchain (`rust-toolchain.toml`).
+    /// graph scan. Requires a successful `cargo build` and a nightly
+    /// toolchain for `cargo rustdoc --output-format json` (`rustup toolchain install nightly`).
     #[arg(long)]
     graph: bool,
 
@@ -1115,7 +1115,16 @@ fn prepare_mcp_for_swarm(
                 None,
             )
             .with_specificity(specificity)
-            .with_edge_weights(edge_weights);
+            .with_edge_weights(edge_weights)
+            .with_symbol_enrichment(
+                workspace
+                    .resolve_setting(
+                        gaviero_core::workspace::settings::REPO_MAP_SYMBOL_ENRICHMENT_ENABLED,
+                        Some(repo),
+                    )
+                    .as_bool()
+                    .unwrap_or(false),
+            );
             // Phase 1: warm the blast_radius graph cache in the
             // background so the first agent tool call doesn't pay the
             // cold build. (No reranker in the CLI path → graph only.)

@@ -605,6 +605,41 @@ impl GraphStore {
         Ok(count as usize)
     }
 
+    /// Load every enriched symbol row (for brute-force vector search).
+    pub fn all_symbol_docs(&self) -> Result<Vec<SymbolDoc>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT qualified_name, file_path, file_hash, signature, bounds,
+                    doc, role_summary, embedding
+             FROM symbol_docs",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let blob: Option<Vec<u8>> = row.get(7)?;
+            out.push(SymbolDoc {
+                qualified_name: row.get(0)?,
+                file_path: row.get(1)?,
+                file_hash: row.get(2)?,
+                signature: row.get(3)?,
+                bounds: row.get(4)?,
+                doc: row.get(5)?,
+                role_summary: row.get(6)?,
+                embedding: blob.map(|b| blob_to_embedding(&b)).transpose()?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// `Implements` edges whose target is `trait_qn` (impl sources).
+    pub fn implementation_qns_for_trait(&self, trait_qn: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT source_qn FROM edges
+             WHERE kind = 'Implements' AND target_qn = ?1",
+        )?;
+        let rows = stmt.query_map(params![trait_qn], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Delete all nodes and edges for a given file path.
     pub fn delete_file(&self, file_path: &str) -> Result<()> {
         self.conn.execute(
