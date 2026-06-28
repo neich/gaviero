@@ -1714,6 +1714,22 @@ fn display_dir_prefix(query: &str) -> String {
 }
 
 pub(super) fn send_chat_message(app: &mut App) {
+    // Codex needs MCP trust consent the same way `/swarm` does, but that
+    // dialog only ever fired on the first `/swarm` run — so a codex chat turn
+    // would otherwise dispatch *silently* without gaviero MCP tools
+    // (`.codex/config.toml` is gated on `codexTrust == granted`). When the
+    // active model is codex and trust is still "unknown", open the consent
+    // dialog instead. The typed prompt stays in the input buffer (the dialog
+    // captures all keys), and `handle_codex_trust_key` re-synthesizes the
+    // codex config and replays this send on grant.
+    if app.chat_state.effective_model().starts_with("codex:")
+        && super::commands::should_prompt_codex_trust(app)
+    {
+        app.codex_trust_dialog = Some(super::state::CodexTrustDialog {
+            pending: super::state::PendingAfterTrust::ChatSend,
+        });
+        return;
+    }
     let conv_id = app.chat_state.active_conversation_id().to_string();
     let prompt = app.chat_state.take_input();
     let root = app
