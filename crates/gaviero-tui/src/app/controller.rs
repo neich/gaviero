@@ -1287,7 +1287,16 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                     app.memory_reranker.clone(),
                 )
                 .with_specificity(mcp_specificity)
-                .with_edge_weights(mcp_edge_weights);
+                .with_edge_weights(mcp_edge_weights)
+                .with_symbol_enrichment(
+                    app.workspace
+                        .resolve_setting(
+                            gaviero_core::workspace::settings::REPO_MAP_SYMBOL_ENRICHMENT_ENABLED,
+                            Some(&workspace_root_for_mcp),
+                        )
+                        .as_bool()
+                        .unwrap_or(false),
+                );
                 // Phase 1: warm the graph cache + reranker in the
                 // background so the first user query never pays the cold
                 // start. The cache is shared via Arc with every spawned
