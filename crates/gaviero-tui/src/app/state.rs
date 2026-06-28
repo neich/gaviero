@@ -233,9 +233,20 @@ pub(super) struct FirstRunDialog {
 /// swarm command that was pending.
 #[derive(Debug, Clone)]
 pub(crate) struct CodexTrustDialog {
-    /// The `/swarm <task>` description the user submitted, replayed
-    /// after the prompt resolves (regardless of grant/deny).
-    pub pending_task: String,
+    /// What to replay after the consent prompt resolves (grant or deny).
+    pub pending: PendingAfterTrust,
+}
+
+/// The action the Codex trust dialog was opened on behalf of, replayed
+/// once the user answers.
+#[derive(Debug, Clone)]
+pub(crate) enum PendingAfterTrust {
+    /// `/swarm <task>` description to re-dispatch after consent.
+    Swarm(String),
+    /// A pending codex chat turn — the typed prompt is still in the chat
+    /// input buffer (the dialog captures all keys); on grant we
+    /// re-synthesize the codex MCP config and replay `send_chat_message`.
+    ChatSend,
 }
 
 #[derive(Debug, Clone)]

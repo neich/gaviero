@@ -75,9 +75,27 @@ pub(super) fn handle_codex_trust_key(app: &mut App, key: &crossterm::event::KeyE
         }
     }
 
-    app.chat_state
-        .add_system_message(&format!("Codex MCP trust: {decision}. Resuming /swarm…"));
-    super::commands::run_swarm(app, dialog.pending_task);
+    match dialog.pending {
+        super::state::PendingAfterTrust::Swarm(task) => {
+            app.chat_state
+                .add_system_message(&format!("Codex MCP trust: {decision}. Resuming /swarm…"));
+            super::commands::run_swarm(app, task);
+        }
+        super::state::PendingAfterTrust::ChatSend => {
+            // On grant, re-synthesize so the next codex-exec turn picks up the
+            // gaviero MCP server (fresh subprocess reads .codex/config.toml at
+            // spawn — no restart needed). On deny, codex runs without it. The
+            // typed prompt is still in the chat input buffer, so replaying
+            // `send_chat_message` dispatches it; trust is now persisted, so the
+            // codex gate no longer fires (no dialog loop).
+            if decision == "granted" {
+                super::commands::resynthesize_mcp_configs(app);
+            }
+            app.chat_state
+                .add_system_message(&format!("Codex MCP trust: {decision}. Sending…"));
+            super::side_panel::send_chat_message(app);
+        }
+    }
 }
 
 pub(super) fn apply_first_run(app: &mut App, init_memory: bool) {

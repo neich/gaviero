@@ -23,7 +23,7 @@ pub(super) fn handle_swarm_command(app: &mut App) {
     // replays `run_swarm` after the answer persists.
     if should_prompt_codex_trust(app) {
         app.codex_trust_dialog = Some(super::state::CodexTrustDialog {
-            pending_task: task_desc,
+            pending: super::state::PendingAfterTrust::Swarm(task_desc),
         });
         return;
     }
@@ -33,14 +33,53 @@ pub(super) fn handle_swarm_command(app: &mut App) {
 
 /// Returns `true` when the Codex trust consent has not yet been given
 /// or denied for this workspace — i.e. the value resolves to
-/// `"unknown"` (the hardcoded default).
-fn should_prompt_codex_trust(app: &App) -> bool {
+/// `"unknown"` (the hardcoded default). Shared by `/swarm` and the codex
+/// chat dispatch gate.
+pub(super) fn should_prompt_codex_trust(app: &App) -> bool {
     use gaviero_core::workspace::settings as S;
     let root = app.workspace.roots().first().map(|p| p.to_path_buf());
     let value = app
         .workspace
         .resolve_setting(S::MCP_GAVIERO_CODEX_TRUST, root.as_deref());
     matches!(value.as_str(), Some("unknown"))
+}
+
+/// Re-synthesize the per-workspace MCP config files (`.mcp.json`,
+/// `.cursor/*`, `.codex/config.toml`) from current settings, including
+/// the freshly-resolved codex trust. Called after the user grants codex
+/// trust from the chat path so the next codex-exec turn (a fresh
+/// subprocess that reads `.codex/config.toml` at spawn) picks up
+/// `[mcp_servers.gaviero]` without a gaviero restart. Mirrors the startup
+/// synth in `controller::handle_event`.
+pub(super) fn resynthesize_mcp_configs(app: &App) {
+    let Some(root) = app.workspace.roots().first().map(|p| p.to_path_buf()) else {
+        return;
+    };
+    let socket_path = root.join(".gaviero/mcp.sock");
+    let codex_trust = match app
+        .workspace
+        .resolve_setting(
+            gaviero_core::workspace::settings::MCP_GAVIERO_CODEX_TRUST,
+            Some(&root),
+        )
+        .as_str()
+        .unwrap_or("unknown")
+    {
+        "granted" | "trusted" => gaviero_core::mcp::TrustConsent::Granted,
+        "denied" | "untrusted" => gaviero_core::mcp::TrustConsent::Denied,
+        _ => gaviero_core::mcp::TrustConsent::Unknown,
+    };
+    let mut overrides = gaviero_core::mcp::McpConfigOverrides::default();
+    overrides.codex_trust = Some(codex_trust);
+    let synth = gaviero_core::mcp::resolve_mcp_config_synth(
+        &app.workspace,
+        &root,
+        socket_path,
+        &overrides,
+    );
+    if let Err(e) = gaviero_core::mcp::synthesize_for_worktree(&synth) {
+        tracing::warn!(target: "mcp_server", error = %e, "codex-trust resynthesis failed");
+    }
 }
 
 fn mcp_config_for_workspace(
