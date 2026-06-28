@@ -215,6 +215,36 @@ Or in `<repo>/.gaviero/settings.json`:
 }
 ```
 
+#### `mcp.permissions` — one permission policy for every provider
+
+Define MCP permissions once at the Gaviero level instead of per provider.
+`mcp.permissions` is a single allow/deny list of `server:tool` glob patterns,
+applied uniformly to Claude, Cursor, and Codex (swarm *and* interactive chat):
+
+```json
+{
+  "mcp.permissions": {
+    "allow": ["gaviero:*", "context7:*", "semantic-scholar:get_*"],
+    "deny":  ["*:delete_*"]
+  }
+}
+```
+
+Semantics (deny wins): an empty policy (the default) allows everything; a
+non-empty `allow` is an allowlist. How it is enforced:
+
+- **Server registration is the hard gate.** A server the policy disallows is
+  never written into any provider's config (`.mcp.json`, `.cursor/mcp.json`,
+  `.codex/config.toml`), so no provider can reach it — even Claude under
+  `--dangerously-skip-permissions`.
+- **Gaviero's own tools are enforced server-side** by the in-process MCP
+  server, so a per-tool deny (e.g. `gaviero:blast_radius`) is authoritative
+  regardless of provider.
+- **Per-tool allow/deny for third-party servers** is translated into Claude
+  (`.claude/settings.json`) and Cursor (`.cursor/cli.json`) permission rules
+  (allow → auto-approve, deny → block) on a best-effort basis; Codex has no
+  per-tool surface, so only the server-registration gate applies there.
+
 ### Memory admin
 
 | Flag | Argument | Purpose |

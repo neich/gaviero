@@ -202,6 +202,13 @@ pub mod settings {
     /// `name` plus either `url` or `command` + optional `args`.
     pub const MCP_EXTRA_SERVERS: &str = "mcp.extraServers";
 
+    /// Gaviero-level MCP permission policy applied uniformly to every
+    /// provider. JSON object `{ "allow": ["server:tool", …], "deny": [...] }`
+    /// of `server:tool` glob patterns (`gaviero:*`, `*:delete_*`). Empty
+    /// (default) allows everything; deny wins. Translated per provider by
+    /// [`crate::mcp::synthesize_for_worktree`].
+    pub const MCP_PERMISSIONS: &str = "mcp.permissions";
+
     // TUI memory panel (Tier A / A4)
     pub const UI_MEMORY_PANEL_RECENT_WINDOW_HOURS: &str = "ui.memoryPanel.recentWindowHours";
 
@@ -896,14 +903,23 @@ impl Workspace {
     }
 }
 
-/// Resolve a dot-notation key like `"editor.tabSize"` into a nested JSON value.
+/// Resolve a dot-notation key like `"editor.tabSize"` into a JSON value.
+///
+/// Accepts both shapes, since setting keys are dotted strings and users
+/// reasonably write them either way:
+///   - flat:   `{ "repoMap.symbolEnrichment.enabled": true }`
+///   - nested: `{ "repoMap": { "symbolEnrichment": { "enabled": true } } }`
+///
+/// An exact flat-key match wins; otherwise descend one segment and recurse.
 fn dot_get<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
-    let parts: Vec<&str> = key.splitn(2, '.').collect();
-    match value.get(parts[0]) {
-        Some(inner) if parts.len() == 2 => dot_get(inner, parts[1]),
-        Some(inner) if parts.len() == 1 => Some(inner),
-        _ => None,
+    if let Some(v) = value.get(key) {
+        return Some(v);
     }
+    let parts: Vec<&str> = key.splitn(2, '.').collect();
+    if parts.len() == 2 {
+        return dot_get(value.get(parts[0])?, parts[1]);
+    }
+    None
 }
 
 fn dot_set(target: &mut serde_json::Value, key: &str, value: serde_json::Value) {
@@ -1040,6 +1056,9 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::MCP_CONTEXT7_COMMAND => serde_json::json!("npx"),
         settings::MCP_CONTEXT7_ARGS => serde_json::json!(["-y", "@upstash/context7-mcp"]),
         settings::MCP_EXTRA_SERVERS => serde_json::json!([]),
+        // MCP permission policy: empty allow/deny = allow everything (the
+        // historical default before the gaviero-level policy existed).
+        settings::MCP_PERMISSIONS => serde_json::json!({ "allow": [], "deny": [] }),
 
         // Memory panel (A4)
         settings::UI_MEMORY_PANEL_RECENT_WINDOW_HOURS => serde_json::json!(24),
@@ -1316,6 +1335,18 @@ mod tests {
         assert_eq!(dot_get(&val, "a.b.c"), Some(&serde_json::json!(42)));
         assert_eq!(dot_get(&val, "a.b"), Some(&serde_json::json!({"c": 42})));
         assert_eq!(dot_get(&val, "x.y"), None);
+
+        // Flat dotted keys written as a single top-level key also resolve.
+        let flat = serde_json::json!({"repoMap.symbolEnrichment.enabled": true});
+        assert_eq!(
+            dot_get(&flat, "repoMap.symbolEnrichment.enabled"),
+            Some(&serde_json::json!(true))
+        );
+        // Exact flat-key match wins over a partial nested object…
+        let mixed = serde_json::json!({"a": {"z": 1}, "a.b": 2});
+        assert_eq!(dot_get(&mixed, "a.b"), Some(&serde_json::json!(2)));
+        // …and nested traversal still works when no flat key exists.
+        assert_eq!(dot_get(&mixed, "a.z"), Some(&serde_json::json!(1)));
     }
 
     #[test]

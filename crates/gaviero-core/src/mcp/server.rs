@@ -85,6 +85,12 @@ pub struct GavieroMcpServer {
     /// S2.3: when false, `symbol_search` / `symbol_doc` return a clear
     /// error directing the agent to run `--graph --enrich` first.
     symbol_enrichment_enabled: bool,
+    /// Option A: gaviero-level MCP permission policy (`mcp.permissions`),
+    /// enforced server-side for this server's own tools. A tool the policy
+    /// denies is rejected here regardless of how the calling provider was
+    /// launched (authoritative even under Claude
+    /// `--dangerously-skip-permissions`). Default (empty) allows all.
+    permissions: super::McpPermissions,
     #[allow(dead_code)] // populated and dispatched via the `#[tool_router]` macro
     tool_router: ToolRouter<Self>,
 }
@@ -110,7 +116,32 @@ impl GavieroMcpServer {
             edge_weights: std::collections::HashMap::new(),
             graph_cache: Arc::new(tokio::sync::Mutex::new(None)),
             symbol_enrichment_enabled: false,
+            permissions: super::McpPermissions::default(),
             tool_router: Self::tool_router(),
+        }
+    }
+
+    /// Install the gaviero-level MCP permission policy. Tools this policy
+    /// denies are rejected server-side, the authoritative enforcement point
+    /// for gaviero's own tools (the client-config translation in
+    /// [`super::synthesize_for_worktree`] is best-effort by comparison).
+    pub fn with_permissions(mut self, permissions: super::McpPermissions) -> Self {
+        self.permissions = permissions;
+        self
+    }
+
+    /// Reject a call to one of this server's tools when the permission
+    /// policy denies it (server name is always `gaviero`). Mirrors the
+    /// `symbol_enrichment_enabled` gate: the tool stays listed but a denied
+    /// call returns a clear error instead of running.
+    fn ensure_tool_allowed(&self, tool: &str) -> Result<(), ErrorData> {
+        if self.permissions.tool_allowed("gaviero", tool) {
+            Ok(())
+        } else {
+            Err(ErrorData::invalid_request(
+                format!("gaviero MCP tool {tool:?} is disabled by mcp.permissions"),
+                None,
+            ))
         }
     }
 
@@ -224,6 +255,7 @@ impl GavieroMcpServer {
         Parameters(input): Parameters<MemorySearchInput>,
     ) -> Result<Json<MemorySearchOutput>, ErrorData> {
         let started = Instant::now();
+        self.ensure_tool_allowed("memory_search")?;
         let limit = clamp_memory_search_limit(input.limit);
         // C1.6: resolve the kind filter. Default is `record`; `any`
         // disables filtering; explicit kinds filter to that one
@@ -315,6 +347,7 @@ impl GavieroMcpServer {
         Parameters(input): Parameters<BlastRadiusInput>,
     ) -> Result<Json<BlastRadiusOutput>, ErrorData> {
         let started = Instant::now();
+        self.ensure_tool_allowed("blast_radius")?;
         if input.paths.is_empty() {
             return Err(ErrorData::invalid_params(
                 "blast_radius requires at least one path",
@@ -448,6 +481,7 @@ impl GavieroMcpServer {
         Parameters(input): Parameters<NodeDocInput>,
     ) -> Result<Json<NodeDoc>, ErrorData> {
         let started = Instant::now();
+        self.ensure_tool_allowed("node_doc")?;
         let path = input.path.clone();
         let qualified_name = path.clone();
         let log_input = serde_json::to_value(&input).unwrap_or_default();
@@ -533,6 +567,7 @@ impl GavieroMcpServer {
         Parameters(input): Parameters<SymbolSearchInput>,
     ) -> Result<Json<SymbolSearchOutput>, ErrorData> {
         let started = Instant::now();
+        self.ensure_tool_allowed("symbol_search")?;
         if !self.symbol_enrichment_enabled {
             return Err(symbol_tools_disabled_error());
         }
@@ -610,6 +645,7 @@ impl GavieroMcpServer {
         Parameters(input): Parameters<SymbolDocInput>,
     ) -> Result<Json<SymbolDocOutput>, ErrorData> {
         let started = Instant::now();
+        self.ensure_tool_allowed("symbol_doc")?;
         if !self.symbol_enrichment_enabled {
             return Err(symbol_tools_disabled_error());
         }
@@ -680,8 +716,10 @@ impl GavieroMcpServer {
 
 fn symbol_tools_disabled_error() -> ErrorData {
     ErrorData::invalid_params(
-        "symbol_search/symbol_doc require repoMap.symbolEnrichment.enabled=true \
-         and a populated symbol_docs sidecar — run `gaviero-cli --graph --enrich` first",
+        "symbol_search/symbol_doc are disabled: repoMap.symbolEnrichment.enabled was \
+         false when this MCP server started (the flag is read once at startup). Set it \
+         to true in .gaviero/settings.json and restart gaviero, then run \
+         `gaviero-cli --graph --enrich` once to populate the symbol_docs sidecar.",
         None,
     )
 }
@@ -1023,5 +1061,45 @@ mod tests {
             Err(err) => assert!(err.message.contains("symbolEnrichment")),
             Ok(_) => panic!("expected symbol_search to fail without enrichment"),
         }
+    }
+
+    #[tokio::test]
+    async fn permission_policy_rejects_denied_tool_server_side() {
+        // A per-tool deny is enforced here regardless of how the calling
+        // provider was launched — the authoritative gate for gaviero tools.
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let stores = MemoryStores::for_tests_in_memory(embedder).unwrap();
+        let s = GavieroMcpServer::with_defaults(stores, std::path::PathBuf::from("/tmp"))
+            .with_permissions(super::super::McpPermissions {
+                allow: vec![],
+                deny: vec!["gaviero:blast_radius".into()],
+            });
+
+        // Denied tool is rejected with a clear message.
+        match s
+            .blast_radius(Parameters(BlastRadiusInput {
+                paths: vec!["src/lib.rs".into()],
+                mode: None,
+                depth: None,
+            }))
+            .await
+        {
+            Err(err) => assert!(
+                err.message.contains("mcp.permissions"),
+                "unexpected error: {}",
+                err.message
+            ),
+            Ok(_) => panic!("expected blast_radius to be denied by policy"),
+        }
+
+        // A sibling tool not named in the deny list still runs.
+        s.memory_search(Parameters(MemorySearchInput {
+            query: "anything".into(),
+            scope_hint: None,
+            limit: None,
+            kind: None,
+        }))
+        .await
+        .expect("memory_search must remain allowed");
     }
 }

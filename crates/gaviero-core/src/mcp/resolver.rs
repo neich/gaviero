@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::workspace::{Workspace, settings as S};
-use crate::mcp::{Context7Config, ExtraMcpServer, ExtraMcpTransport, McpConfigSynth, TrustConsent};
+use crate::mcp::{
+    Context7Config, ExtraMcpServer, ExtraMcpTransport, McpConfigSynth, McpPermissions, TrustConsent,
+};
 
 /// CLI / caller overrides layered on workspace defaults.
 #[derive(Debug, Clone, Default)]
@@ -217,6 +219,34 @@ fn overrides_to_extra_servers(overrides: &McpConfigOverrides) -> Vec<ExtraMcpSer
     out
 }
 
+/// Load the gaviero-level MCP permission policy from `mcp.permissions`.
+///
+/// The setting is a JSON object `{ "allow": ["server:tool", …], "deny":
+/// [...] }`. Missing / malformed fields resolve to empty lists (the
+/// historical allow-everything default).
+pub fn resolve_mcp_permissions(workspace: &Workspace, root: Option<&Path>) -> McpPermissions {
+    let val = workspace.resolve_setting(S::MCP_PERMISSIONS, root);
+    parse_mcp_permissions_json(&val)
+}
+
+fn parse_mcp_permissions_json(val: &serde_json::Value) -> McpPermissions {
+    let field = |key: &str| -> Vec<String> {
+        val.get(key)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()))
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    McpPermissions {
+        allow: field("allow"),
+        deny: field("deny"),
+    }
+}
+
 pub fn resolve_context7_config(workspace: &Workspace, root: Option<&Path>) -> Context7Config {
     let defaults = Context7Config::default();
     let enabled = workspace
@@ -294,6 +324,7 @@ pub fn resolve_mcp_config_synth(
         gaviero_enabled,
         context7: resolve_context7_config(workspace, Some(root)),
         extra_servers,
+        permissions: resolve_mcp_permissions(workspace, Some(root)),
     }
 }
 

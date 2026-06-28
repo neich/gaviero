@@ -25,11 +25,11 @@ pub mod telemetry_sink;
 pub mod tools;
 
 pub use config_synth::{
-    Context7Config, ExtraMcpServer, ExtraMcpTransport, McpConfigSynth, TrustConsent,
-    claude_mcp_config_json, codex_mcp_config_toml, codex_mcp_overrides_from_config_file,
-    codex_synth_has_any_mcp, codex_synth_has_remote_mcp, host_from_mcp_url,
-    mcp_json_has_remote_urls, synth_has_remote_url_servers, synthesize_for_worktree,
-    worktree_has_remote_mcp_urls,
+    Context7Config, ExtraMcpServer, ExtraMcpTransport, McpConfigSynth, McpPermissions,
+    TrustConsent, claude_mcp_config_json, claude_settings_permissions, codex_mcp_config_toml,
+    codex_mcp_overrides_from_config_file, codex_synth_has_any_mcp, codex_synth_has_remote_mcp,
+    host_from_mcp_url, mcp_json_has_remote_urls, synth_has_remote_url_servers,
+    synthesize_for_worktree, worktree_has_remote_mcp_urls,
 };
 pub use preflight::{
     PreflightOpts, plan_uses_codex, preflight_mcp, shim_binary_resolvable,
@@ -38,7 +38,7 @@ pub use preflight::{
 pub use resolver::{
     McpConfigOverrides, extra_servers_from_workspace, extra_urls_from_project_mcp_json,
     parse_mcp_codex_trust_flag, parse_mcp_stdio_flag, parse_mcp_url_flag, resolve_context7_config,
-    resolve_mcp_config_synth,
+    resolve_mcp_config_synth, resolve_mcp_permissions,
 };
 pub use external_memory::{
     ExternalMemoryServer, detect_external_memory_servers, disable_external_memory_servers,
