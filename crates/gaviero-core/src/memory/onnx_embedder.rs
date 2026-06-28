@@ -63,6 +63,11 @@ impl OnnxEmbedder {
                 embedder.prefix_query = Some("search_query: ".to_string());
                 embedder.prefix_document = Some("search_document: ".to_string());
             }
+            "jina-embeddings-v2-base-code" => {
+                // jina-v2-code is trained WITHOUT task prefixes; adding a
+                // query/document prefix regresses code retrieval. Leave
+                // both `None` (explicit so nobody "helpfully" adds one).
+            }
             _ => {}
         }
 
@@ -313,5 +318,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(doc_emb.len(), 768);
+    }
+
+    /// S3.1 pre-flight: confirm the self-contained JinaBERT / ALiBi ONNX
+    /// export loads under the generic `ort` session (no token_type_ids),
+    /// that mean-pool + L2 yields a unit 768-vector, and that jina uses
+    /// no task prefix (query and document embeddings of the same text are
+    /// identical).
+    #[tokio::test]
+    #[ignore] // Requires ONNX model to be downloaded
+    async fn test_jina_code_embedder() {
+        let embedder = OnnxEmbedder::from_model(
+            &super::super::model_manager::JINA_EMBEDDINGS_V2_BASE_CODE,
+        )
+        .expect("Failed to load jina-embeddings-v2-base-code model");
+
+        assert!(embedder.prefix_query.is_none(), "jina uses no query prefix");
+        assert!(
+            embedder.prefix_document.is_none(),
+            "jina uses no document prefix"
+        );
+
+        let snippet = "fn main() { println!(\"hello\"); }";
+        let query_emb = embedder.embed_query(snippet).await.unwrap();
+        assert_eq!(query_emb.len(), 768);
+        let norm: f32 = query_emb.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 0.01, "embedding must be L2-normalized");
+
+        // No prefix → query and document encodings coincide.
+        let doc_emb = embedder.embed_document(snippet).await.unwrap();
+        let cos: f32 = query_emb.iter().zip(&doc_emb).map(|(a, b)| a * b).sum();
+        assert!((cos - 1.0).abs() < 1e-4, "no-prefix query/doc must match");
     }
 }

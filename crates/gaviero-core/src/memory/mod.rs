@@ -124,6 +124,7 @@ pub fn build_embedder_by_name(embedder_name: &str) -> anyhow::Result<Arc<dyn Emb
 /// Supported static names today:
 /// - `nomic`, `nomic-v15`, `nomic-embed-text-v1.5`
 /// - `gte-modernbert`, `gte-modernbert-base`
+/// - `jina-code`, `jina`, `jina-v2-code`, `jina-embeddings-v2-base-code`
 /// - `e5`, `e5-small-v2`
 /// - `null`
 ///
