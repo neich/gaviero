@@ -56,6 +56,54 @@ pub(super) fn resolve_swarm_tools(
     tools
 }
 
+/// PUSH→PULL Phase 3: per-agent `<repo_outline>` token budget for a swarm work
+/// unit.
+///
+/// The swarm analogue of the chat thin anchor (Phase 1): for strong,
+/// tool-capable agents the per-agent outline is a thin ~1200-token anchor over
+/// the agent's own scope — `collect_graph` ranks `work_unit.scope.owned_paths`
+/// from the warm shared `Arc<RepoMap>` at this budget — and the agent pulls
+/// specifics on demand via the read-only MCP tools (the retrieval stanza is
+/// already emitted for these backends). This is a *budget value*, not a new
+/// renderer, and is token-equivalent to one shared coordinator brief injected
+/// per agent (N×1200 either way) while staying scoped to each agent's files.
+/// Agents that can't pull, or that explicitly requested per-agent graph
+/// context, keep the full push.
+///
+///   - `skip_repo_context` (Document mode)        → 0
+///   - explicit `context { depth 0 }` opt-out      → 0 (pull only)
+///   - explicit `callers_of` / `tests_for` request → 8000 full push
+///   - small-local / non-tool-using backend        → 8000 full push
+///   - strong, tool-capable (the default)          → 1200 thin anchor
+pub(super) fn swarm_graph_budget(
+    work_unit: &WorkUnit,
+    profile: &crate::context_planner::ProviderProfile,
+    skip_repo_context: bool,
+) -> usize {
+    // Matches the chat `agent.anchorBudgetTokens` default. The swarm uses a
+    // const rather than the workspace cascade, consistent with its "default
+    // topology settings (not workspace cascade)" convention below.
+    const SWARM_ANCHOR_BUDGET_TOKENS: usize = 1_200;
+    // Full per-agent push budget (the pre-PUSH→PULL swarm default).
+    const SWARM_PUSH_BUDGET_TOKENS: usize = 8_000;
+
+    let explicit_context =
+        !work_unit.context_callers_of.is_empty() || !work_unit.context_tests_for.is_empty();
+    if skip_repo_context {
+        0
+    } else if work_unit.context_depth == 0 && !explicit_context {
+        // Explicit DSL opt-out of pushed graph context → pull only.
+        0
+    } else if explicit_context
+        || profile.bootstrap_tier == crate::context_planner::BootstrapTier::SmallLocal
+        || !profile.supports_tool_use
+    {
+        SWARM_PUSH_BUDGET_TOKENS
+    } else {
+        SWARM_ANCHOR_BUDGET_TOKENS
+    }
+}
+
 /// Run a work unit through any `AgentBackend`, producing an `AgentManifest`.
 ///
 /// When `validation` is provided, runs the validation pipeline after each agent
@@ -132,18 +180,11 @@ pub async fn run_backend(
     let memory_query_override = work_unit.memory_read_query.as_deref();
     let memory_limit = work_unit.memory_read_limit.unwrap_or(5);
 
-    // Agents with `context { depth 0 }` (and no callers_of/tests_for) opt out
-    // of the pre-injected graph — they read specific files via tools instead.
-    let graph_budget_tokens = if skip_repo_context {
-        0
-    } else if work_unit.context_depth == 0
-        && work_unit.context_callers_of.is_empty()
-        && work_unit.context_tests_for.is_empty()
-    {
-        0
-    } else {
-        8_000
-    };
+    // PUSH→PULL Phase 3: strong, tool-capable agents get a thin per-agent
+    // anchor over their own scope (built from the warm shared RepoMap) and pull
+    // specifics on demand; agents that can't pull keep the full push. See
+    // `swarm_graph_budget`.
+    let graph_budget_tokens = swarm_graph_budget(work_unit, &provider_profile, skip_repo_context);
 
     // v1: swarm uses default topology settings (not workspace cascade).
     let topology_config = if skip_repo_context {
@@ -704,6 +745,51 @@ mod tests {
         fn on_proposal_created(&self, _proposal: &crate::types::WriteProposal) {}
         fn on_proposal_updated(&self, _proposal_id: u64) {}
         fn on_proposal_finalized(&self, _path: &str) {}
+    }
+
+    // ── PUSH→PULL Phase 3: swarm per-agent outline budget ───────────────
+
+    #[test]
+    fn swarm_graph_budget_thin_anchor_for_strong_tool_capable() {
+        let unit = test_work_unit(); // default context_depth 2, no callers/tests
+        let strong =
+            build_provider_profile(&ModelSpec::parse("claude:sonnet"), &RuntimeConfig::default());
+        // Strong, tool-capable, default depth → thin 1200 anchor (pull on demand).
+        assert_eq!(swarm_graph_budget(&unit, &strong, false), 1_200);
+        // Document mode (skip_repo_context) → nothing injected.
+        assert_eq!(swarm_graph_budget(&unit, &strong, true), 0);
+    }
+
+    #[test]
+    fn swarm_graph_budget_full_push_for_small_local() {
+        let unit = test_work_unit();
+        let small =
+            build_provider_profile(&ModelSpec::parse("ollama:llama3"), &RuntimeConfig::default());
+        // Small-local / non-tool agents keep the full 8000 push (can't pull).
+        assert_eq!(swarm_graph_budget(&unit, &small, false), 8_000);
+    }
+
+    #[test]
+    fn swarm_graph_budget_explicit_context_forces_push() {
+        let strong =
+            build_provider_profile(&ModelSpec::parse("claude:sonnet"), &RuntimeConfig::default());
+        // Explicit callers_of → full push even for a strong agent.
+        let mut callers = test_work_unit();
+        callers.context_callers_of = vec!["src/lib.rs".to_string()];
+        assert_eq!(swarm_graph_budget(&callers, &strong, false), 8_000);
+        // Explicit tests_for → full push.
+        let mut tests = test_work_unit();
+        tests.context_tests_for = vec!["src/lib.rs".to_string()];
+        assert_eq!(swarm_graph_budget(&tests, &strong, false), 8_000);
+    }
+
+    #[test]
+    fn swarm_graph_budget_depth_zero_optout_is_pull_only() {
+        let strong =
+            build_provider_profile(&ModelSpec::parse("claude:sonnet"), &RuntimeConfig::default());
+        let mut unit = test_work_unit();
+        unit.context_depth = 0; // explicit `context { depth 0 }`, no callers/tests
+        assert_eq!(swarm_graph_budget(&unit, &strong, false), 0);
     }
 
     // Test 17: Trait runner success path

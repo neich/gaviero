@@ -23,6 +23,18 @@ pub mod settings {
     pub const AGENT_OLLAMA_BASE_URL: &str = "agent.ollamaBaseUrl";
     /// Token budget for graph-based source-code context injection in simple chat. 0 disables.
     pub const AGENT_GRAPH_BUDGET_TOKENS: &str = "agent.graphBudgetTokens";
+    /// Thin-anchor outline budget for strong, tool-capable providers (PUSH→PULL
+    /// Phase 1). The first turn injects a small `<repo_outline>` at this budget
+    /// and the model pulls bodies on demand via the read-only MCP tools. The
+    /// full-push `agent.graphBudgetTokens` still applies to small-local
+    /// providers and to any explicit `/inject outline` / `/inject all`.
+    pub const AGENT_ANCHOR_BUDGET_TOKENS: &str = "agent.anchorBudgetTokens";
+    /// PUSH→PULL Phase 4 tier override. When set to `"strong"` or
+    /// `"smalllocal"`, forces the bootstrap tier regardless of the
+    /// capability-derived value (`resolve_bootstrap_tier`), so a known-good
+    /// local tool-calling model can opt into the thin-anchor path (or a flaky
+    /// one be pinned to the full push). Empty = use the derived tier.
+    pub const AGENT_BOOTSTRAP_TIER: &str = "agent.bootstrapTier";
 
     pub const AGENT_TOPOLOGY_ENABLED: &str = "agent.topology.enabled";
     pub const AGENT_TOPOLOGY_MAX_DEPTH: &str = "agent.topology.maxDepth";
@@ -954,6 +966,10 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         // makes files lose detail rather than drop, so a smaller outline
         // budget cuts first-turn tokens while keeping breadth.
         settings::AGENT_GRAPH_BUDGET_TOKENS => serde_json::json!(8000),
+        // PUSH→PULL Phase 1: thin first-turn outline for strong providers.
+        settings::AGENT_ANCHOR_BUDGET_TOKENS => serde_json::json!(1200),
+        // PUSH→PULL Phase 4: empty = derive the tier from provider capabilities.
+        settings::AGENT_BOOTSTRAP_TIER => serde_json::json!(""),
         settings::AGENT_CONTEXT_BOOTSTRAP => serde_json::json!("auto"),
         settings::AGENT_AVAILABLE_TOOLS => {
             serde_json::json!(["Read", "Glob", "Grep", "Write", "Edit", "MultiEdit"])
