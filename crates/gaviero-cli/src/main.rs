@@ -306,6 +306,15 @@ struct Cli {
     #[arg(long = "eval-budget-sweep", requires = "eval_fixture")]
     eval_budget_sweep: bool,
 
+    /// PUSH→PULL Phase 1 A/B: seed the ranker with each case's primary gold
+    /// file (the realistic "open file") and compare gold coverage at the thin
+    /// anchor budget (`agent.anchorBudgetTokens`) vs the full push
+    /// (`agent.graphBudgetTokens`). Offline — no model/reranker. Prints a
+    /// verdict and writes JSON to `--eval-report-out`
+    /// (default `<fixture>.anchor-ab.json`).
+    #[arg(long = "eval-anchor-ab", requires = "eval_fixture")]
+    eval_anchor_ab: bool,
+
     /// Tier T1 / T2 corpus seeding: walk every `gold_must` File entry
     /// in the supplied `--eval-fixture` and write one Record memory
     /// per file to the workspace store. Each memory's content is the
@@ -2737,8 +2746,8 @@ fn print_s13_budget_sweep_report(r: &gaviero_core::memory::eval::S13BudgetSweepR
     println!();
     println!("graphBudgetTokens sweep (repo outline):");
     println!(
-        "  {:>9}  {:>10}  {:>6}  {:>6}  {:>6}  {:>6}  {:>10}  {:>7}  {:>7}",
-        "budget", "outline", "files", "path", "sig", "full", "turn1_tok", "rec@5", "pass@1"
+        "  {:>9}  {:>10}  {:>6}  {:>6}  {:>6}  {:>6}  {:>10}  {:>7}  {:>9}  {:>7}",
+        "budget", "outline", "files", "path", "sig", "full", "turn1_tok", "rec@5", "cover", "pass@1"
     );
     for row in &r.graph_budget_sweep {
         let pass_at_1 = row
@@ -2746,7 +2755,7 @@ fn print_s13_budget_sweep_report(r: &gaviero_core::memory::eval::S13BudgetSweepR
             .map(|p| format!("{p:.3}"))
             .unwrap_or_else(|| "-".to_string());
         println!(
-            "  {:>9}  {:>10}  {:>6}  {:>6}  {:>6}  {:>6}  {:>10.1}  {:>7.3}  {:>7}",
+            "  {:>9}  {:>10}  {:>6}  {:>6}  {:>6}  {:>6}  {:>10.1}  {:>7.3}  {:>9.3}  {:>7}",
             row.graph_budget_tokens,
             row.outline_tokens,
             row.file_count,
@@ -2755,6 +2764,7 @@ fn print_s13_budget_sweep_report(r: &gaviero_core::memory::eval::S13BudgetSweepR
             row.full_attach,
             row.mean_turn_one_tokens,
             row.recall_at_5,
+            row.outline_recall,
             pass_at_1,
         );
     }
@@ -2762,6 +2772,109 @@ fn print_s13_budget_sweep_report(r: &gaviero_core::memory::eval::S13BudgetSweepR
     println!(
         "recommended: max_items={} graphBudgetTokens={}",
         r.recommended_max_items, r.recommended_graph_budget_tokens
+    );
+}
+
+/// PUSH→PULL Phase 1: seeded thin-anchor vs full-push A/B. Offline — builds
+/// only the RepoMap (no store / reranker / embedder).
+async fn run_eval_anchor_ab(repo: &std::path::Path, fixture: &std::path::Path, cli: &Cli) -> Result<()> {
+    use gaviero_core::memory::eval::{load_fixture, run_anchor_ab};
+    use gaviero_core::repo_map::RepoMap;
+    use gaviero_core::workspace::settings;
+
+    let cases = load_fixture(fixture).context("loading eval fixture")?;
+    if cases.is_empty() {
+        anyhow::bail!("eval fixture {} contained no cases", fixture.display());
+    }
+
+    let mut workspace = gaviero_core::workspace::Workspace::single_folder(repo.to_path_buf());
+    workspace.ensure_settings();
+    let workspace_root = repo.to_path_buf();
+    let excludes = parse_workspace_exclude_patterns(&workspace, Some(&workspace_root));
+
+    let anchor_budget = workspace
+        .resolve_setting(settings::AGENT_ANCHOR_BUDGET_TOKENS, Some(&workspace_root))
+        .as_u64()
+        .unwrap_or(1_200) as usize;
+    let push_budget = workspace
+        .resolve_setting(settings::AGENT_GRAPH_BUDGET_TOKENS, Some(&workspace_root))
+        .as_u64()
+        .unwrap_or(8_000) as usize;
+
+    eprintln!("[gaviero-eval] building RepoMap for anchor A/B (may take a minute)…");
+    let repo_map = tokio::task::spawn_blocking({
+        let repo = repo.to_path_buf();
+        let excludes = excludes.clone();
+        move || RepoMap::build(&repo, &excludes)
+    })
+    .await
+    .context("RepoMap build (anchor A/B)")??;
+
+    // Margin = 0.02 (the plan's pre-registered recall non-inferiority margin).
+    let report = run_anchor_ab(
+        &repo_map,
+        &cases,
+        anchor_budget,
+        push_budget,
+        0.02,
+        &fixture.to_string_lossy(),
+    );
+    print_anchor_ab_report(&report);
+
+    let report_out = cli
+        .eval_report_out
+        .clone()
+        .unwrap_or_else(|| fixture.with_extension("anchor-ab.json"));
+    if let Ok(json) = serde_json::to_string_pretty(&report) {
+        ensure_parent_dir(&report_out)
+            .and_then(|()| std::fs::write(&report_out, json).map_err(Into::into))
+            .with_context(|| format!("writing anchor A/B report to {}", report_out.display()))?;
+        eprintln!(
+            "[gaviero-eval] anchor A/B report written to {}",
+            report_out.display()
+        );
+    }
+    Ok(())
+}
+
+fn print_anchor_ab_report(r: &gaviero_core::memory::eval::AnchorAbReport) {
+    let verdict = |ni: bool| if ni { "NON-INFERIOR" } else { "REGRESSION" };
+    println!("─── seeded thin-anchor A/B (thin vs full push) ────────");
+    println!("fixture : {}", r.fixture);
+    println!(
+        "A = anchor {} tok   B = push {} tok   margin {:.3}",
+        r.budget_a, r.budget_b, r.margin
+    );
+    println!("cases   : {} ({} seeds resolved)", r.n_cases, r.n_seeds_resolved);
+    println!();
+    println!("headline coverage (files + symbols, all cases):");
+    println!(
+        "  A={:.3}  B={:.3}  B-A={:+.3}  → {}",
+        r.mean_coverage_a,
+        r.mean_coverage_b,
+        r.mean_coverage_b - r.mean_coverage_a,
+        verdict(r.headline_non_inferior),
+    );
+    println!();
+    println!(
+        "cross-file coverage (non-seed gold files, {} multi-file cases):",
+        r.n_cross_file_cases
+    );
+    println!(
+        "  A={:.3}  B={:.3}  B-A={:+.3}  → {}",
+        r.mean_cross_coverage_a,
+        r.mean_cross_coverage_b,
+        r.mean_cross_coverage_b - r.mean_cross_coverage_a,
+        verdict(r.cross_non_inferior),
+    );
+    println!();
+    println!(
+        "VERDICT: {}",
+        if r.pass {
+            "PASS — thin anchor non-inferior within margin on both cuts"
+        } else {
+            "FAIL — thin anchor regresses beyond margin"
+        }
     );
 }
 
@@ -2982,6 +3095,9 @@ async fn main() -> Result<()> {
         }
         if cli.eval_budget_sweep {
             return run_eval_budget_sweep(&repo, &fixture_path, &cli).await;
+        }
+        if cli.eval_anchor_ab {
+            return run_eval_anchor_ab(&repo, &fixture_path, &cli).await;
         }
         return run_eval_smoke_test(&repo, &fixture_path, &cli).await;
     }
