@@ -921,6 +921,14 @@ pub struct GraphBudgetSweepRow {
     /// gold file" from "the model never called a pull tool".
     #[serde(default)]
     pub recall_at_5: f32,
+    /// PUSH→PULL Phase 1: fraction of File-gold cases whose gold file appears
+    /// *anywhere* in the budgeted outline (not just the top 5). This is the
+    /// metric that matters for a flat index the model reads in full and pulls
+    /// from — it shows how much gold the outline still covers as the budget
+    /// shrinks. (With empty ranker seeds it is a query-independent lower bound;
+    /// real chat seeds the ranker with the active buffer, which lifts it.)
+    #[serde(default)]
+    pub outline_recall: f32,
     /// PUSH→PULL Phase 0: end-to-end task pass@1. `None` until a
     /// test-execution harness over the fixture exists — see the CLI sweep call
     /// site (`run_eval_budget_sweep`) for the wiring point.
@@ -1039,6 +1047,9 @@ pub fn run_s13_graph_budget_sweep(
                 full_attach,
                 mean_turn_one_tokens: memory_token_base + outline_tokens as f32,
                 recall_at_5: graph_file_recall_at_k(cases, &candidates, 5),
+                // Coverage over the whole budgeted outline (every shown file is
+                // visible to the model), not just the top 5.
+                outline_recall: graph_file_recall_at_k(cases, &candidates, candidates.len().max(1)),
                 // TODO pass@k: no test-execution harness drives the code-prompt
                 // fixture end to end yet, so task pass@1 is unmeasured here. The
                 // CLI sweep call site documents where to wire one.
@@ -1149,6 +1160,219 @@ pub fn compute_recall_at_k_from_manifest(payload: &str, gold_ids: &[i64], k: usi
     let top: std::collections::HashSet<i64> = ranked.into_iter().take(k).collect();
     let found = gold_ids.iter().filter(|id| top.contains(id)).count();
     found as f64 / gold_ids.len() as f64
+}
+
+// ── PUSH→PULL Phase 1: seeded thin-anchor vs full-push A/B ───────────────
+
+/// Per-case coverage under the seeded A/B.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnchorAbCaseRow {
+    pub id: String,
+    /// Primary gold file used as the ranker seed (the realistic "open file").
+    pub seed: String,
+    /// True if the seed matched a graph node (so ranking was actually seeded;
+    /// false means it fell back to the global outline and the row is suspect).
+    pub seed_resolved: bool,
+    /// gold_must items (files + symbols) scored for this case.
+    pub gold_total: usize,
+    pub coverage_a: f32,
+    pub coverage_b: f32,
+    /// Non-seed gold files (cross-file reach). 0 → single-file case.
+    pub cross_file_total: usize,
+    pub cross_coverage_a: f32,
+    pub cross_coverage_b: f32,
+}
+
+/// Result of the seeded thin-anchor (A) vs full-push (B) A/B.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnchorAbReport {
+    pub fixture: String,
+    pub budget_a: usize,
+    pub budget_b: usize,
+    pub margin: f32,
+    pub n_cases: usize,
+    pub n_seeds_resolved: usize,
+    /// Headline: mean gold coverage (files + symbols) across all cases.
+    pub mean_coverage_a: f32,
+    pub mean_coverage_b: f32,
+    pub headline_non_inferior: bool,
+    /// Focused cut: cross-file gold coverage over the multi-file cases only.
+    pub n_cross_file_cases: usize,
+    pub mean_cross_coverage_a: f32,
+    pub mean_cross_coverage_b: f32,
+    pub cross_non_inferior: bool,
+    /// Both cuts non-inferior within `margin`.
+    pub pass: bool,
+    pub rows: Vec<AnchorAbCaseRow>,
+}
+
+/// Run the seeded thin-anchor (A) vs full-push (B) A/B over `cases`.
+///
+/// Each case is seeded with its primary gold file — the realistic "open file"
+/// chat hands the ranker — then the outline is built at each budget. Coverage
+/// credits the pull design: a gold item counts as covered when its file is
+/// listed in the budgeted outline (files) or its name appears in an outline
+/// file's signature list (symbols). The seed file is covered in both arms, so
+/// the headline isolates reach *beyond* the open file; the cross-file cut drops
+/// seed-file items entirely and is the signal that actually moves with budget.
+/// Non-inferior ⇔ `coverage(A) ≥ coverage(B) − margin` on both cuts.
+pub fn run_anchor_ab(
+    repo_map: &crate::repo_map::RepoMap,
+    cases: &[EvalCase],
+    budget_a: usize,
+    budget_b: usize,
+    margin: f32,
+    fixture_label: &str,
+) -> AnchorAbReport {
+    let mut rows = Vec::new();
+    let (mut sum_a, mut sum_b) = (0.0f32, 0.0f32);
+    let (mut cross_sum_a, mut cross_sum_b) = (0.0f32, 0.0f32);
+    let mut n_cross = 0usize;
+    let mut n_seeds_resolved = 0usize;
+
+    for case in cases {
+        let Some(seed) = primary_gold_file(case) else {
+            continue;
+        };
+        let cand_a = repo_map.rank_for_agent_structured(std::slice::from_ref(&seed), budget_a);
+        let cand_b = repo_map.rank_for_agent_structured(std::slice::from_ref(&seed), budget_b);
+
+        // The seed, when it matches a node, is FullAttach and ranks first, so
+        // its presence in the full-push outline confirms the seed resolved.
+        let seed_resolved = cand_b
+            .iter()
+            .any(|c| c.path.to_string_lossy().replace('\\', "/") == seed);
+        if seed_resolved {
+            n_seeds_resolved += 1;
+        }
+
+        let (cov_a_n, total) = case_gold_coverage(case, &cand_a, &seed, false);
+        let (cov_b_n, _) = case_gold_coverage(case, &cand_b, &seed, false);
+        let cov_a = ratio(cov_a_n, total);
+        let cov_b = ratio(cov_b_n, total);
+        sum_a += cov_a;
+        sum_b += cov_b;
+
+        let (xa_n, xtotal) = case_gold_coverage(case, &cand_a, &seed, true);
+        let (xb_n, _) = case_gold_coverage(case, &cand_b, &seed, true);
+        let (cross_a, cross_b) = if xtotal > 0 {
+            n_cross += 1;
+            let ca = ratio(xa_n, xtotal);
+            let cb = ratio(xb_n, xtotal);
+            cross_sum_a += ca;
+            cross_sum_b += cb;
+            (ca, cb)
+        } else {
+            (0.0, 0.0)
+        };
+
+        rows.push(AnchorAbCaseRow {
+            id: case.id.clone(),
+            seed,
+            seed_resolved,
+            gold_total: total,
+            coverage_a: cov_a,
+            coverage_b: cov_b,
+            cross_file_total: xtotal,
+            cross_coverage_a: cross_a,
+            cross_coverage_b: cross_b,
+        });
+    }
+
+    let n = rows.len().max(1) as f32;
+    let mean_a = sum_a / n;
+    let mean_b = sum_b / n;
+    let xn = n_cross.max(1) as f32;
+    let mean_xa = cross_sum_a / xn;
+    let mean_xb = cross_sum_b / xn;
+    let headline_ni = mean_a >= mean_b - margin;
+    let cross_ni = mean_xa >= mean_xb - margin;
+
+    AnchorAbReport {
+        fixture: fixture_label.to_string(),
+        budget_a,
+        budget_b,
+        margin,
+        n_cases: rows.len(),
+        n_seeds_resolved,
+        mean_coverage_a: mean_a,
+        mean_coverage_b: mean_b,
+        headline_non_inferior: headline_ni,
+        n_cross_file_cases: n_cross,
+        mean_cross_coverage_a: mean_xa,
+        mean_cross_coverage_b: mean_xb,
+        cross_non_inferior: cross_ni,
+        pass: headline_ni && cross_ni,
+        rows,
+    }
+}
+
+fn ratio(covered: usize, total: usize) -> f32 {
+    if total == 0 {
+        0.0
+    } else {
+        covered as f32 / total as f32
+    }
+}
+
+/// First `GoldRef::File` in `gold_must`, separator-normalised — the seed.
+fn primary_gold_file(case: &EvalCase) -> Option<String> {
+    case.gold_must.iter().find_map(|g| match g {
+        GoldRef::File(p) => Some(p.trim_start_matches("./").replace('\\', "/")),
+        _ => None,
+    })
+}
+
+/// Covered vs total gold_must items for one case against one budgeted outline.
+/// `cross_file_only` restricts to gold *files* other than the seed (the
+/// cross-file reach signal); otherwise it scores all files + symbols.
+fn case_gold_coverage(
+    case: &EvalCase,
+    candidates: &[crate::repo_map::GraphCandidate],
+    seed: &str,
+    cross_file_only: bool,
+) -> (usize, usize) {
+    let paths: Vec<String> = candidates
+        .iter()
+        .map(|c| c.path.to_string_lossy().replace('\\', "/"))
+        .collect();
+    let symbols: std::collections::HashSet<&str> = candidates
+        .iter()
+        .flat_map(|c| c.symbols.iter().map(|s| s.name.as_str()))
+        .collect();
+
+    let path_listed = |gold: &str| {
+        let gold = gold.trim_start_matches("./");
+        paths.iter().any(|cand| {
+            cand == gold || cand.ends_with(gold) || (gold.ends_with('/') && cand.starts_with(gold))
+        })
+    };
+
+    let mut covered = 0usize;
+    let mut total = 0usize;
+    for g in &case.gold_must {
+        match g {
+            GoldRef::File(p) => {
+                let p = p.trim_start_matches("./").replace('\\', "/");
+                if cross_file_only && p == seed {
+                    continue; // the seed is the open file, not a reach test
+                }
+                total += 1;
+                if path_listed(&p) {
+                    covered += 1;
+                }
+            }
+            GoldRef::Symbol(s) if !cross_file_only => {
+                total += 1;
+                let last = s.rsplit("::").next().unwrap_or(s);
+                if symbols.contains(last) {
+                    covered += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    (covered, total)
 }
 
 fn pick_recommended_max_items(rows: &[MaxItemsSweepRow]) -> usize {
@@ -1783,5 +2007,38 @@ mod tests {
         // Empty gold or junk payload → 0.0, never panics.
         assert_eq!(compute_recall_at_k_from_manifest(&payload, &[], 5), 0.0);
         assert_eq!(compute_recall_at_k_from_manifest("not json", &[1], 5), 0.0);
+    }
+
+    #[test]
+    fn anchor_ab_coverage_scores_files_and_symbols() {
+        use crate::repo_map::Symbol;
+        let sym = |n: &str| Symbol {
+            name: n.into(),
+            kind: "fn".into(),
+            line: 0,
+        };
+        let mut a = mk_candidate("crates/x/src/a.rs");
+        a.symbols = vec![sym("Foo")];
+        let mut b = mk_candidate("crates/x/src/b.rs");
+        b.symbols = vec![sym("bar")];
+        let candidates = [a, b];
+
+        let mut case = mk_file_case("t", &["crates/x/src/a.rs", "crates/x/src/b.rs"]);
+        case.gold_must.push(GoldRef::Symbol("bar".into()));
+        case.gold_must.push(GoldRef::Symbol("Foo".into()));
+        case.gold_must.push(GoldRef::Symbol("missing".into()));
+
+        assert_eq!(primary_gold_file(&case).as_deref(), Some("crates/x/src/a.rs"));
+
+        // All items: 2 files + 3 symbols = 5; covered = a.rs, b.rs, bar, Foo = 4.
+        assert_eq!(
+            case_gold_coverage(&case, &candidates, "crates/x/src/a.rs", false),
+            (4, 5)
+        );
+        // Cross-file cut: only non-seed gold files → b.rs (1 of 1).
+        assert_eq!(
+            case_gold_coverage(&case, &candidates, "crates/x/src/a.rs", true),
+            (1, 1)
+        );
     }
 }

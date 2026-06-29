@@ -910,6 +910,58 @@ impl GraphStore {
         lines.join("\n")
     }
 
+    /// PUSH→PULL Phase 2: a tiny (~150-token) count summary of an impact
+    /// radius, for the strong-tier chat first turn. Replaces the full ranked
+    /// render: it states the shape of the blast radius (changed / dependent /
+    /// missing-tests counts), names `blast_radius(path)` so the model knows how
+    /// to pull the ranked detail, and keeps the missing-tests filenames
+    /// verbatim (the cheapest, highest-value signal) up to the char budget.
+    ///
+    /// Returns an empty string when there is nothing to report (no changed and
+    /// no affected files), so the caller injects nothing for an empty buffer.
+    pub fn format_impact_summary(result: &ImpactSummary) -> String {
+        let changed = result.changed_files.len();
+        let dependents = result
+            .affected_files
+            .iter()
+            .filter(|f| !result.changed_files.contains(f))
+            .count();
+        if changed == 0 && dependents == 0 {
+            return String::new();
+        }
+        let gaps = result.test_gaps.len();
+        // ~150-token cap (project convention: ~4 chars/token).
+        const MAX_CHARS: usize = 600;
+        let mut s = format!(
+            "Imp: {changed} changed, {dependents} dependent file(s) affected, \
+             {gaps} missing tests — call blast_radius(path) for the ranked detail."
+        );
+        // Keep the missing-tests filenames verbatim; truncate the *list* (never
+        // the count) to stay under budget.
+        if !result.test_gaps.is_empty() {
+            let mut listed: Vec<&str> = Vec::new();
+            let mut used = s.len() + "\nno tests: ".len();
+            let mut overflow = 0usize;
+            for f in &result.test_gaps {
+                // +2 for the ", " separator.
+                if used + f.len() + 2 <= MAX_CHARS {
+                    used += f.len() + 2;
+                    listed.push(f.as_str());
+                } else {
+                    overflow += 1;
+                }
+            }
+            if !listed.is_empty() {
+                s.push_str("\nno tests: ");
+                s.push_str(&listed.join(", "));
+                if overflow > 0 {
+                    s.push_str(&format!(" (+{overflow} more)"));
+                }
+            }
+        }
+        s
+    }
+
     /// Begin a transaction for batch operations.
     pub fn begin_transaction(&self) -> Result<()> {
         self.conn.execute_batch("BEGIN TRANSACTION")?;
@@ -1595,5 +1647,60 @@ mod tests {
         assert!(text.contains("chg: src/auth.rs"));
         assert!(text.contains("dep: src/api.rs"));
         assert!(text.contains("tst: tests/auth_test.rs"));
+    }
+
+    // PUSH→PULL Phase 2: the thin impact summary names blast_radius, keeps the
+    // missing-tests slice verbatim, and stays inside the ~150-token cap.
+    #[test]
+    fn format_impact_summary_is_thin_and_names_blast_radius() {
+        let result = ImpactSummary {
+            changed_files: vec!["src/auth.rs".into(), "src/api.rs".into()],
+            affected_files: vec![
+                "src/auth.rs".into(),
+                "src/api.rs".into(),
+                "src/router.rs".into(),
+                "src/server.rs".into(),
+            ],
+            affected_tests: vec![],
+            test_gaps: vec!["src/auth.rs".into()],
+            truncated: false,
+        };
+        let text = GraphStore::format_impact_summary(&result);
+        // Counts: 2 changed, 2 dependents (router/server, not the changed set).
+        assert!(text.contains("2 changed"), "{text}");
+        assert!(text.contains("2 dependent"), "{text}");
+        assert!(text.contains("1 missing tests"), "{text}");
+        // Names the pull tool and keeps the missing-tests filename verbatim.
+        assert!(text.contains("blast_radius(path)"), "{text}");
+        assert!(text.contains("no tests: src/auth.rs"), "{text}");
+        // ≤150 tokens (project convention ~4 chars/token → ≤600 chars).
+        assert!(text.len() / 4 <= 150, "summary too large: {} chars", text.len());
+    }
+
+    #[test]
+    fn format_impact_summary_empty_when_nothing_to_report() {
+        // Empty buffer / no impact → empty string → caller injects nothing.
+        let empty = ImpactSummary::default();
+        assert!(GraphStore::format_impact_summary(&empty).is_empty());
+    }
+
+    #[test]
+    fn format_impact_summary_caps_long_test_gap_list() {
+        // A large missing-tests list is truncated (never the count) to stay
+        // under the char budget, with a "+N more" marker.
+        let gaps: Vec<String> = (0..200)
+            .map(|i| format!("crates/some/long/path/to/module_number_{i:04}.rs"))
+            .collect();
+        let result = ImpactSummary {
+            changed_files: gaps.clone(),
+            affected_files: gaps.clone(),
+            affected_tests: vec![],
+            test_gaps: gaps,
+            truncated: false,
+        };
+        let text = GraphStore::format_impact_summary(&result);
+        assert!(text.len() / 4 <= 150, "summary too large: {} chars", text.len());
+        assert!(text.contains("more)"), "{text}");
+        assert!(text.contains("200 missing tests"), "{text}");
     }
 }

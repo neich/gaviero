@@ -334,8 +334,15 @@ pub struct AgentSettings {
     pub read_namespaces: Vec<String>,
     /// Token budget for graph-based source-code context injection. 0 disables graph context.
     pub graph_budget_tokens: usize,
+    /// PUSH→PULL Phase 1 thin-anchor outline budget for strong providers
+    /// (`agent.anchorBudgetTokens`). The default first turn injects an outline
+    /// at this budget and lets the model pull bodies via the MCP tools.
+    pub anchor_budget_tokens: usize,
     /// Default chat bootstrap mode (`agent.context.bootstrap`).
     pub bootstrap_mode: gaviero_core::context_planner::BootstrapMode,
+    /// PUSH→PULL Phase 4 tier override (`agent.bootstrapTier`). Empty = derive
+    /// the tier from provider capabilities; `"strong"` / `"smalllocal"` force it.
+    pub bootstrap_tier_override: String,
 }
 
 impl Default for AgentSettings {
@@ -348,7 +355,9 @@ impl Default for AgentSettings {
             write_namespace: "default".to_string(),
             read_namespaces: vec!["default".to_string()],
             graph_budget_tokens: 12_000,
+            anchor_budget_tokens: 1_200,
             bootstrap_mode: gaviero_core::context_planner::BootstrapMode::Auto,
+            bootstrap_tier_override: String::new(),
         }
     }
 }
@@ -609,8 +618,10 @@ impl AgentChatState {
             budgets: gaviero_core::context_planner::BootstrapBudgets {
                 topology: 600,
                 outline: self.agent_settings.graph_budget_tokens,
+                anchor: self.agent_settings.anchor_budget_tokens,
                 memory: 1_000,
                 impact: self.agent_settings.graph_budget_tokens.min(4_000),
+                impact_summary: 150,
             },
             hints: gaviero_core::context_planner::BootstrapEstimateHints {
                 memory_tokens: if conv.last_memory_injection_tokens > 0 {
@@ -748,11 +759,15 @@ impl AgentChatState {
             ));
         }
         if arms.outline {
-            let projected = hints.outline_tokens.unwrap_or(budgets.outline);
-            lines.push(format!(
-                "  outline: ~{} tok (ceiling {})",
-                projected, budgets.outline
-            ));
+            // PUSH→PULL Phase 1: the default first turn uses the thin anchor;
+            // an explicit /inject outline|all uses the full push. Mirror
+            // estimate_bootstrap_tokens so the breakdown total stays consistent.
+            let (projected, ceiling) = if arms.explicit {
+                (hints.outline_tokens.unwrap_or(budgets.outline), budgets.outline)
+            } else {
+                (budgets.anchor, budgets.anchor)
+            };
+            lines.push(format!("  outline: ~{} tok (ceiling {})", projected, ceiling));
         }
         if arms.memory {
             let projected = hints.memory_tokens.unwrap_or(budgets.memory);
@@ -4474,6 +4489,12 @@ mod tests {
         state.agent_settings.graph_budget_tokens = 8_000;
         state.agent_settings.model = "cursor:composer".to_string();
 
+        // PUSH→PULL Phase 1: the default first turn projects the thin anchor
+        // (default 1200), not the full graph budget. cursor:composer is a
+        // strong, tool-capable provider, so the auto first turn pulls bodies
+        // on demand rather than pushing the full outline.
+        assert_eq!(state.agent_settings.anchor_budget_tokens, 1_200);
+
         state.text_input.text = "/reset".to_string();
         assert!(state.process_slash_command());
 
@@ -4489,8 +4510,8 @@ mod tests {
             last.content
         );
         assert!(
-            last.content.contains("outline: ~8000 tok"),
-            "should show outline ceiling from graph budget: {:?}",
+            last.content.contains("outline: ~1200 tok"),
+            "default first turn should project the thin anchor, not the full push: {:?}",
             last.content
         );
         assert!(

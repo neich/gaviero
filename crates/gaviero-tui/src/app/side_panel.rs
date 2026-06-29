@@ -1540,7 +1540,7 @@ pub(super) fn handle_skills_command(app: &mut App) {
     } else {
         let skills = app.skill_catalog.all_skills();
         let body = if skills.is_empty() {
-            "No skills found. Add `*.md` files under `.gaviero/skills/`.".to_string()
+            "No skills found. Add skill folders under `.gaviero/skills/<name>/SKILL.md` (repo, workspace, or `~/.gaviero/skills/`).".to_string()
         } else {
             skills
                 .iter()
@@ -2096,6 +2096,8 @@ pub(super) fn send_chat_message(app: &mut App) {
     let read_ns = app.chat_state.agent_settings.read_namespaces.clone();
     let ollama_base_url = app.chat_state.agent_settings.ollama_base_url.clone();
     let graph_budget_tokens = app.chat_state.agent_settings.graph_budget_tokens;
+    let anchor_budget_tokens = app.chat_state.agent_settings.anchor_budget_tokens;
+    let bootstrap_tier_override = app.chat_state.agent_settings.bootstrap_tier_override.clone();
     let repo_map_cache = app.repo_map.clone();
     // In workspace mode (multi-folder), every sibling folder is forwarded to
     // the agent CLI as a `--add-dir`. The primary cwd is `root`; siblings are
@@ -2170,6 +2172,13 @@ pub(super) fn send_chat_message(app: &mut App) {
         .clone()
         .expect("session_ledger initialized above");
     let provider_profile_clone = provider_profile.clone();
+    // PUSH→PULL Phase 4: an explicit `agent.bootstrapTier` setting overrides the
+    // capability-derived tier (e.g. force a known-good local tool-caller onto
+    // the thin-anchor path). Empty → derived tier.
+    let resolved_tier = gaviero_core::context_planner::resolve_bootstrap_tier(
+        &provider_profile_clone,
+        Some(bootstrap_tier_override.as_str()),
+    );
 
     let conv_id_clone = conv_id.clone();
     let turn_id_clone = turn_id.clone();
@@ -2309,7 +2318,17 @@ pub(super) fn send_chat_message(app: &mut App) {
             .map(|(label, body)| (label.as_str(), body.as_str()))
             .collect();
 
-        let impact_text = if bootstrap_impact {
+        // PUSH→PULL Phase 2: pick the impact render by provider tier.
+        //   - no impact arm            → nothing
+        //   - explicit /inject impact|all → full ranked push (any tier)
+        //   - strong, tool-capable     → thin count summary (pull via blast_radius)
+        //   - small-local              → full push (kept until proven non-inferior)
+        // An empty change buffer yields no seeds, so both paths return None.
+        let impact_text = if !bootstrap_impact {
+            None
+        } else if bootstrap_arms.explicit
+            || resolved_tier != gaviero_core::context_planner::BootstrapTier::Strong
+        {
             crate::app::session::compute_impact_text(
                 graph_root.clone(),
                 graph_seeds.clone(),
@@ -2317,7 +2336,12 @@ pub(super) fn send_chat_message(app: &mut App) {
             )
             .await
         } else {
-            None
+            crate::app::session::compute_impact_summary(
+                graph_root.clone(),
+                graph_seeds.clone(),
+                graph_excludes.clone(),
+            )
+            .await
         };
 
         let seed_paths_buf: Vec<std::path::PathBuf> = if bootstrap_outline || bootstrap_impact {
@@ -2327,10 +2351,19 @@ pub(super) fn send_chat_message(app: &mut App) {
         };
         let read_ns_for_planner: &[String] =
             if bootstrap_outline || bootstrap_memory { &read_ns } else { &[] };
-        let budget_for_planner: usize = if bootstrap_outline {
-            graph_budget_tokens
-        } else {
+        // PUSH→PULL Phase 1: pick the outline budget by provider tier.
+        //   - no outline arm           → 0 (nothing injected)
+        //   - explicit /inject all|outline → full push (any tier)
+        //   - strong, tool-capable     → thin anchor (pull bodies via MCP tools)
+        //   - small-local              → full push (kept until proven non-inferior)
+        let budget_for_planner: usize = if !bootstrap_outline {
             0
+        } else if bootstrap_arms.explicit {
+            graph_budget_tokens
+        } else if resolved_tier == gaviero_core::context_planner::BootstrapTier::Strong {
+            anchor_budget_tokens
+        } else {
+            graph_budget_tokens
         };
 
         let mut local_ledger = ledger_snapshot;

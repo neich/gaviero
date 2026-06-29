@@ -84,11 +84,14 @@ impl SkillCatalog {
             if !folder.is_dir() {
                 continue;
             }
-            let skill_md = folder.join("SKILL.md");
             let folder_name = folder
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("?");
+            if folder_name.starts_with('.') {
+                continue;
+            }
+            let skill_md = folder.join("SKILL.md");
             if !skill_md.is_file() {
                 warnings.push(SkillWarning {
                     name: folder_name.to_string(),
@@ -426,6 +429,21 @@ mod tests {
         assert!(SkillCatalog::needs_rebuild(p));
         let p2 = Path::new("/tmp/proj/.gaviero/memory.db");
         assert!(!SkillCatalog::needs_rebuild(p2));
+    }
+
+    #[test]
+    fn scan_skips_hidden_skill_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path().join(".gaviero").join("skills");
+        write_skill(&skills_dir, "visible", "Visible skill description here");
+        let hidden = skills_dir.join(".claude");
+        std::fs::create_dir_all(&hidden).unwrap();
+
+        let ws = Workspace::single_folder(tmp.path().to_path_buf());
+        let (catalog, warnings) = SkillCatalog::scan(&ws, Path::new("/nonexistent"));
+        assert_eq!(catalog.all_skills().len(), 1);
+        assert_eq!(catalog.all_skills()[0].name, "visible");
+        assert!(warnings.is_empty());
     }
 
     #[tokio::test]

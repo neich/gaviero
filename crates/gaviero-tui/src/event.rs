@@ -438,6 +438,11 @@ impl EventLoop {
                     notify::EventKind::Create(_)
                     | notify::EventKind::Remove(_)
                     | notify::EventKind::Modify(ModifyKind::Name(_)) => {
+                        for path in &event.paths {
+                            if gaviero_core::skills::SkillCatalog::needs_rebuild(path) {
+                                let _ = tx.send(Event::FileChanged(path.clone()));
+                            }
+                        }
                         // FileTreeChanged carries no path, so coalesce: drop the
                         // event entirely if every reported path is excluded.
                         let any_visible = event

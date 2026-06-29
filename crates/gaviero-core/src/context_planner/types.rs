@@ -298,6 +298,28 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
     }
 }
 
+/// PUSH→PULL Phase 4: resolve the effective bootstrap tier, letting an explicit
+/// `agent.bootstrapTier` workspace setting override the capability-derived tier
+/// (`profile.bootstrap_tier`).
+///
+/// The explicit setting wins, so a known-good local tool-calling model can be
+/// forced onto the thin-anchor (`strong`) path, or a flaky one pinned to the
+/// full push (`smalllocal`). An empty or unrecognized setting falls back to the
+/// derived tier — keeping [`BootstrapTier::derive`] the default source of truth.
+pub fn resolve_bootstrap_tier(profile: &ProviderProfile, setting: Option<&str>) -> BootstrapTier {
+    match setting
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("strong") => BootstrapTier::Strong,
+        Some("smalllocal" | "small_local" | "small-local" | "local" | "weak") => {
+            BootstrapTier::SmallLocal
+        }
+        // None, "", or anything unrecognized → the capability-derived tier.
+        _ => profile.bootstrap_tier,
+    }
+}
+
 /// Planner input. Replaces the ad-hoc tuple-of-strings each call site assembled.
 ///
 /// **Note (V9 §0 rule 4, §10 stop 11):** there is intentionally no
@@ -669,6 +691,31 @@ mod tests {
                 "arm literal for {spec} diverged from BootstrapTier::derive"
             );
         }
+    }
+
+    #[test]
+    fn resolve_bootstrap_tier_override_wins_over_derived() {
+        let runtime = RuntimeConfig::default();
+        let ollama = build_provider_profile(&ModelSpec::parse("ollama:llama3.1"), &runtime);
+        let claude = build_provider_profile(&ModelSpec::parse("claude:sonnet"), &runtime);
+
+        // No / empty / unrecognized setting → the derived tier.
+        assert_eq!(resolve_bootstrap_tier(&ollama, None), BootstrapTier::SmallLocal);
+        assert_eq!(resolve_bootstrap_tier(&ollama, Some("")), BootstrapTier::SmallLocal);
+        assert_eq!(resolve_bootstrap_tier(&ollama, Some("nonsense")), BootstrapTier::SmallLocal);
+        assert_eq!(resolve_bootstrap_tier(&claude, None), BootstrapTier::Strong);
+
+        // Explicit override wins, case/whitespace-insensitive.
+        assert_eq!(resolve_bootstrap_tier(&ollama, Some("strong")), BootstrapTier::Strong);
+        assert_eq!(resolve_bootstrap_tier(&ollama, Some("  Strong ")), BootstrapTier::Strong);
+        assert_eq!(
+            resolve_bootstrap_tier(&claude, Some("small-local")),
+            BootstrapTier::SmallLocal
+        );
+        assert_eq!(
+            resolve_bootstrap_tier(&claude, Some("SmallLocal")),
+            BootstrapTier::SmallLocal
+        );
     }
 
     #[test]

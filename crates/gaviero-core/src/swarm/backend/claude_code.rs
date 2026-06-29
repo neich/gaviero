@@ -15,7 +15,8 @@ use crate::acp::session::{AcpSession, AgentOptions};
 
 use super::shared::request_prompt;
 use super::{
-    AgentBackend, Capabilities, CompletionRequest, StopReason, TokenUsage, UnifiedStreamEvent,
+    AgentBackend, Capabilities, CompletionRequest, RetrievalToolset, StopReason, TokenUsage,
+    UnifiedStreamEvent,
 };
 
 /// Backend that spawns Claude Code as a subprocess.
@@ -127,6 +128,13 @@ impl AgentBackend for ClaudeCodeBackend {
             // false suppresses the file-block instruction in the system
             // prompt (see swarm::backend::shared::default_editor_system_prompt).
             supports_file_blocks: false,
+            // PUSH→PULL Phase 1: the host wires the gaviero MCP server for
+            // Claude (.mcp.json via config_synth), so the always-on retrieval
+            // tools are live. Symbols stay off (enrichment sidecar off by default).
+            retrieval: RetrievalToolset {
+                graph_and_memory: true,
+                symbols: false,
+            },
         }
     }
 

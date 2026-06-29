@@ -268,6 +268,37 @@ pub(crate) async fn compute_impact_text(
     .flatten()
 }
 
+/// PUSH→PULL Phase 2: compute the thin impact *summary* for the strong-tier
+/// chat first turn. Mirrors [`compute_impact_text`] but returns the ~150-token
+/// count summary (naming `blast_radius(path)`) instead of the full ranked
+/// render, so the model pulls the detail on demand. Returns `None` when seeds
+/// are empty (empty buffer → inject nothing), the GraphStore can't be built,
+/// or there is nothing to report.
+pub(crate) async fn compute_impact_summary(
+    workspace_root: std::path::PathBuf,
+    seeds: Vec<String>,
+    excludes: Vec<String>,
+) -> Option<String> {
+    if seeds.is_empty() {
+        return None;
+    }
+    tokio::task::spawn_blocking(move || {
+        let (store, _) =
+            gaviero_core::repo_map::graph_builder::build_graph(&workspace_root, &excludes).ok()?;
+        let seed_refs: Vec<&str> = seeds.iter().map(|s| s.as_str()).collect();
+        let impact = store.impact_radius(&seed_refs, 2).ok()?;
+        let summary = gaviero_core::repo_map::store::GraphStore::format_impact_summary(&impact);
+        if summary.is_empty() {
+            None
+        } else {
+            Some(summary)
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Render chat prompt text from planner selections using the chat ordering:
 /// user message first, then graph, then memory.
 pub(crate) fn render_chat_selections(

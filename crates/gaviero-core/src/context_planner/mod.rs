@@ -29,10 +29,10 @@ pub use ledger::{
     CompactionRecord, ContentDigest, GraphDecision, PlannerFingerprint, Role, SessionLedger,
 };
 pub use types::{
-    ContinuityHandle, ContinuityMode, FileAttachment, GraphConfidence, GraphSelection,
-    GraphSelectionKind, MemorySelection, ModelSpec, PlannerInput, PlannerMetadata,
+    BootstrapTier, ContinuityHandle, ContinuityMode, FileAttachment, GraphConfidence,
+    GraphSelection, GraphSelectionKind, MemorySelection, ModelSpec, PlannerInput, PlannerMetadata,
     PlannerSelections, Provider, ProviderProfile, ReplayPayload, RuntimeConfig, SkillSelection,
-    Symbol, build_provider_profile,
+    Symbol, build_provider_profile, resolve_bootstrap_tier,
 };
 
 use std::path::Path;

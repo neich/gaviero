@@ -169,15 +169,28 @@ pub fn resolve_chat_bootstrap_arms(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BootstrapBudgets {
     pub topology: usize,
+    /// Full-push outline budget. Used for the explicit `/inject outline` /
+    /// `/inject all` path and for small-local providers.
     pub outline: usize,
+    /// PUSH→PULL Phase 1 thin-anchor outline budget. Used to project the
+    /// first-turn outline size on the default (non-explicit) strong-tier path.
+    pub anchor: usize,
     pub memory: usize,
+    /// Full-push impact budget. Used for the explicit `/inject impact` /
+    /// `/inject all` path and for small-local providers.
     pub impact: usize,
+    /// PUSH→PULL Phase 2 thin impact-summary budget (~150 tokens). Used to
+    /// project the first-turn impact size on the default (non-explicit)
+    /// strong-tier path, where only a count summary is injected and the model
+    /// pulls the ranked detail via `blast_radius`.
+    pub impact_summary: usize,
 }
 
 impl BootstrapBudgets {
     pub fn from_workspace(
         topology_cfg: &crate::repo_map::TopologyConfig,
         graph_budget_tokens: usize,
+        anchor_budget_tokens: usize,
         memory_cfg: &crate::memory::ChatInjectionConfig,
     ) -> Self {
         Self {
@@ -187,6 +200,7 @@ impl BootstrapBudgets {
                 0
             },
             outline: graph_budget_tokens,
+            anchor: anchor_budget_tokens,
             memory: if memory_cfg.enabled {
                 memory_cfg.token_budget
             } else {
@@ -194,6 +208,9 @@ impl BootstrapBudgets {
             },
             // Impact is buffer-seeded and variable; cap at a fraction of graph budget.
             impact: graph_budget_tokens.min(4_000),
+            // PUSH→PULL Phase 2: the strong-tier first turn injects only a
+            // ~150-token count summary in place of the full ranked render.
+            impact_summary: 150,
         }
     }
 }
@@ -236,18 +253,40 @@ pub fn estimate_bootstrap_tokens(
         );
     }
     if arms.outline {
-        total = total.saturating_add(hints.outline_tokens.unwrap_or(budgets.outline));
+        // PUSH→PULL Phase 1: the default (non-explicit) first turn projects the
+        // thin-anchor budget; an explicit `/inject outline|all` projects the
+        // full push. A measured `outline_tokens` hint was taken at the full
+        // budget, so it is only trusted on the explicit (full) path. (This
+        // projection assumes the strong tier — the small-local full-push case
+        // under-counts here, but the indicator self-corrects from measured
+        // tokens after the first turn.)
+        let outline_projection = if arms.explicit {
+            hints.outline_tokens.unwrap_or(budgets.outline)
+        } else {
+            budgets.anchor
+        };
+        total = total.saturating_add(outline_projection);
     }
     if arms.memory {
         total = total.saturating_add(hints.memory_tokens.unwrap_or(budgets.memory));
     }
     if arms.impact {
-        total = total.saturating_add(
+        // PUSH→PULL Phase 2: the default (non-explicit) first turn projects the
+        // ~150-token count summary; an explicit `/inject impact|all` projects
+        // the full ranked push. The measured `impact_chars` hint was taken at
+        // the full render, so it is only trusted on the explicit path. (As with
+        // the outline anchor, this assumes the strong tier — the small-local
+        // full-push case under-counts until the first turn's measured tokens
+        // correct it.)
+        let impact_projection = if arms.explicit {
             hints
                 .impact_chars
                 .map(|chars| chars.div_ceil(4).min(budgets.impact))
-                .unwrap_or(budgets.impact),
-        );
+                .unwrap_or(budgets.impact)
+        } else {
+            budgets.impact_summary
+        };
+        total = total.saturating_add(impact_projection);
     }
     total
 }
@@ -303,8 +342,10 @@ mod tests {
         let budgets = BootstrapBudgets {
             topology: 600,
             outline: 12_000,
+            anchor: 1_200,
             memory: 1_000,
             impact: 2_000,
+            impact_summary: 150,
         };
         let arms = resolve_chat_bootstrap_arms(
             BootstrapMode::Auto,
@@ -321,8 +362,10 @@ mod tests {
         let budgets = BootstrapBudgets {
             topology: 600,
             outline: 12_000,
+            anchor: 1_200,
             memory: 1_000,
             impact: 2_000,
+            impact_summary: 150,
         };
         let arms = resolve_chat_bootstrap_arms(
             BootstrapMode::Auto,
@@ -343,8 +386,10 @@ mod tests {
         let budgets = BootstrapBudgets {
             topology: 600,
             outline: 0,
+            anchor: 0,
             memory: 0,
             impact: 0,
+            impact_summary: 0,
         };
         let hints = BootstrapEstimateHints {
             topology_chars: Some(800),
@@ -352,5 +397,90 @@ mod tests {
         };
         let tok = estimate_bootstrap_tokens(BootstrapArms::topology_only(), &budgets, &hints);
         assert_eq!(tok, 200);
+    }
+
+    #[test]
+    fn estimate_outline_uses_anchor_unless_explicit() {
+        // PUSH→PULL Phase 1: the auto first turn projects the thin anchor; an
+        // explicit /inject all (or /inject outline) projects the full outline.
+        let budgets = BootstrapBudgets {
+            topology: 0,
+            outline: 8_000,
+            anchor: 1_200,
+            memory: 0,
+            impact: 0,
+            impact_summary: 0,
+        };
+        let hints = BootstrapEstimateHints::default();
+
+        let auto = resolve_chat_bootstrap_arms(
+            BootstrapMode::Auto,
+            true,
+            None,
+            BootstrapArms::none(),
+        );
+        assert_eq!(
+            estimate_bootstrap_tokens(auto, &budgets, &hints),
+            1_200,
+            "default first turn projects the thin anchor"
+        );
+
+        let explicit = resolve_chat_bootstrap_arms(
+            BootstrapMode::Auto,
+            true,
+            Some(BootstrapOneShot::All),
+            BootstrapArms::none(),
+        );
+        // /inject all turns on every layer, so subtract the others to isolate
+        // the outline contribution.
+        assert_eq!(
+            estimate_bootstrap_tokens(explicit, &budgets, &hints),
+            8_000,
+            "explicit /inject all projects the full outline"
+        );
+    }
+
+    #[test]
+    fn estimate_impact_uses_summary_unless_explicit() {
+        // PUSH→PULL Phase 2: the auto first turn projects the thin impact
+        // summary; an explicit /inject impact (or /inject all) projects the
+        // full ranked impact. Outline/memory/topology are zeroed to isolate
+        // the impact contribution.
+        let budgets = BootstrapBudgets {
+            topology: 0,
+            outline: 0,
+            anchor: 0,
+            memory: 0,
+            impact: 4_000,
+            impact_summary: 150,
+        };
+        let hints = BootstrapEstimateHints::default();
+
+        // Auto first turn arms every layer, but only impact has a non-zero
+        // budget here → the summary, not the full push.
+        let auto = resolve_chat_bootstrap_arms(BootstrapMode::Auto, true, None, BootstrapArms::none());
+        assert!(auto.impact);
+        assert_eq!(
+            estimate_bootstrap_tokens(auto, &budgets, &hints),
+            150,
+            "default first turn projects the thin impact summary"
+        );
+
+        // Explicit per-layer /inject impact → full ranked push.
+        let explicit = resolve_chat_bootstrap_arms(
+            BootstrapMode::Auto,
+            false,
+            None,
+            BootstrapArms {
+                impact: true,
+                explicit: true,
+                ..BootstrapArms::none()
+            },
+        );
+        assert_eq!(
+            estimate_bootstrap_tokens(explicit, &budgets, &hints),
+            4_000,
+            "explicit /inject impact projects the full ranked impact"
+        );
     }
 }

@@ -300,6 +300,15 @@ impl App {
             .resolve_setting(settings::AGENT_GRAPH_BUDGET_TOKENS, None)
             .as_u64()
             .unwrap_or(8_000) as usize;
+        let agent_anchor_budget_tokens = workspace
+            .resolve_setting(settings::AGENT_ANCHOR_BUDGET_TOKENS, None)
+            .as_u64()
+            .unwrap_or(1_200) as usize;
+        let agent_bootstrap_tier_override = workspace
+            .resolve_setting(settings::AGENT_BOOTSTRAP_TIER, None)
+            .as_str()
+            .unwrap_or("")
+            .to_string();
 
         let write_namespace = workspace.resolve_namespace(None);
         let read_namespaces = workspace.resolve_read_namespaces(None);
@@ -416,7 +425,9 @@ impl App {
                     write_namespace,
                     read_namespaces,
                     graph_budget_tokens: agent_graph_budget_tokens,
+                    anchor_budget_tokens: agent_anchor_budget_tokens,
                     bootstrap_mode,
+                    bootstrap_tier_override: agent_bootstrap_tier_override,
                 };
                 cs
             },
@@ -489,6 +500,7 @@ impl App {
         let budgets = gaviero_core::context_planner::BootstrapBudgets::from_workspace(
             &topology_cfg,
             self.chat_state.agent_settings.graph_budget_tokens,
+            self.chat_state.agent_settings.anchor_budget_tokens,
             &memory_cfg,
         );
 

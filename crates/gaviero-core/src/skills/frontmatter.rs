@@ -40,7 +40,7 @@ pub fn parse_lines(fm: &str) -> HashMap<String, String> {
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
-        let key = key.trim().to_string();
+        let key = key.trim().to_ascii_lowercase();
         let value = strip_scalar_quotes(value.trim());
         map.insert(key, value);
     }
@@ -108,6 +108,13 @@ mod tests {
     #[test]
     fn parse_space_separated_arguments() {
         assert_eq!(parse_arguments("one two three"), vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn parse_lines_normalizes_keys_to_lowercase() {
+        let map = parse_lines("Name: Foo\nDescription: Bar skill\n");
+        assert_eq!(map.get("name"), Some(&"Foo".to_string()));
+        assert_eq!(map.get("description"), Some(&"Bar skill".to_string()));
     }
 
     #[test]

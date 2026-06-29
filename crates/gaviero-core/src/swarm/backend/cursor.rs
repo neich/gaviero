@@ -33,7 +33,8 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use super::shared::{build_enriched_prompt, default_editor_system_prompt};
 use super::{
-    AgentBackend, Capabilities, CompletionRequest, StopReason, TokenUsage, UnifiedStreamEvent,
+    AgentBackend, Capabilities, CompletionRequest, RetrievalToolset, StopReason, TokenUsage,
+    UnifiedStreamEvent,
 };
 
 /// Default Cursor model when no model is supplied with the `cursor:`
@@ -217,6 +218,12 @@ impl AgentBackend for CursorBackend {
             // channel. The chat path (CursorSession) handles edits via
             // snapshot+revert; the swarm path relies on worktree isolation.
             supports_file_blocks: false,
+            // PUSH→PULL Phase 1: the gaviero MCP server is wired for Cursor
+            // (cursor config via config_synth), so retrieval tools are live.
+            retrieval: RetrievalToolset {
+                graph_and_memory: true,
+                symbols: false,
+            },
         }
     }
 
