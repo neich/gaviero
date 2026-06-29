@@ -143,6 +143,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_skill_accepts_capitalized_frontmatter_keys() {
+        let path = Path::new("full-plan/SKILL.md");
+        let src = "---\nName: full-plan\nDescription: Execute all phases of a plan\n---\nBody\n";
+        let skill = parse_skill(path, src).unwrap();
+        assert_eq!(skill.name, "full-plan");
+        assert_eq!(skill.description, "Execute all phases of a plan");
+    }
+
+    #[test]
     fn parse_skill_rejects_missing_description() {
         let path = Path::new("bad/SKILL.md");
         let src = "---\nname: bad\n---\nbody\n";
