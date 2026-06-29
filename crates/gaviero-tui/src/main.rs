@@ -279,8 +279,14 @@ async fn main() -> Result<()> {
     // floods notify with thousands of events and the main loop wedges
     // inside synchronous file-tree + git-status refresh.
     let watcher_excludes = app::parse_exclude_patterns(&workspace, None);
+    let mut watch_paths: Vec<PathBuf> = roots.iter().map(|p| p.to_path_buf()).collect();
+    let global_skills = gaviero_core::skills::SkillCatalog::global_skills_dir();
+    if global_skills.is_dir() {
+        watch_paths.push(global_skills);
+    }
+    let watch_refs: Vec<&std::path::Path> = watch_paths.iter().map(|p| p.as_path()).collect();
     let _file_watcher = event_loop
-        .spawn_file_watcher(&roots, watcher_excludes)
+        .spawn_file_watcher(&watch_refs, watcher_excludes)
         .ok();
 
     let memory_root = workspace.roots().first().map(|p| p.to_path_buf());
