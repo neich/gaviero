@@ -42,7 +42,7 @@ use crate::swarm::backend::cursor::{
     tool_display_name, write_tool_args,
 };
 use crate::swarm::backend::shared;
-use crate::swarm::backend::{Capabilities, UnifiedStreamEvent};
+use crate::swarm::backend::{Capabilities, RetrievalToolset, UnifiedStreamEvent};
 use crate::write_gate::WriteGatePipeline;
 
 use super::registry::SessionConstruction;
@@ -176,6 +176,12 @@ impl CursorSession {
             max_context_tokens: 200_000,
             supports_system_prompt: true,
             supports_file_blocks: false,
+            // PUSH→PULL Phase 1: the gaviero MCP server is wired for Cursor, so
+            // the always-on retrieval tools are live.
+            retrieval: RetrievalToolset {
+                graph_and_memory: true,
+                symbols: false,
+            },
         };
         let system_prompt = shared::default_editor_system_prompt(&backend_caps);
         let user_prompt =

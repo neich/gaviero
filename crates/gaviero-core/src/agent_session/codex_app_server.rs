@@ -73,7 +73,9 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::context_planner::{ContinuityHandle, ContinuityMode};
 use crate::swarm::backend::shared::default_editor_system_prompt;
-use crate::swarm::backend::{Capabilities, StopReason, TokenUsage, UnifiedStreamEvent};
+use crate::swarm::backend::{
+    Capabilities, RetrievalToolset, StopReason, TokenUsage, UnifiedStreamEvent,
+};
 
 use super::registry::SessionConstruction;
 use super::{AgentSession, Turn};
@@ -96,6 +98,12 @@ fn codex_file_block_capabilities() -> Capabilities {
         max_context_tokens: 200_000,
         supports_system_prompt: true,
         supports_file_blocks: true,
+        // PUSH→PULL Phase 1: the gaviero MCP server is wired for Codex, so the
+        // always-on retrieval tools are live.
+        retrieval: RetrievalToolset {
+            graph_and_memory: true,
+            symbols: false,
+        },
     }
 }
 

@@ -103,6 +103,25 @@ pub enum StopReason {
 
 // ── Capabilities ────────────────────────────────────────────────────────────
 
+/// Which read-only gaviero MCP retrieval tools are live for a session
+/// (PUSH→PULL Phase 1).
+///
+/// Drives the retrieval-protocol ("pull") stanza in
+/// [`shared::default_editor_system_prompt`], which must name only tools that
+/// are actually wired. The default is all-false → no stanza, so behavior is
+/// unchanged until a backend opts in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetrievalToolset {
+    /// `memory_search` / `blast_radius` / `node_doc` are wired. These are the
+    /// always-on gaviero MCP tools (present for every subprocess provider the
+    /// host wires the gaviero MCP server for: Claude, Codex, Cursor).
+    pub graph_and_memory: bool,
+    /// `symbol_search` / `symbol_doc` are wired. These require the enrichment
+    /// sidecar (`repoMap.symbolEnrichment.enabled`, off by default), so this
+    /// stays false unless enrichment is on.
+    pub symbols: bool,
+}
+
 /// Runtime capability flags for a backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capabilities {
@@ -114,6 +133,8 @@ pub struct Capabilities {
     pub supports_system_prompt: bool,
     /// Whether the backend can produce `<file>` blocks in its output.
     pub supports_file_blocks: bool,
+    /// Which read-only retrieval tools are live (drives the pull stanza).
+    pub retrieval: RetrievalToolset,
 }
 
 impl Default for Capabilities {
@@ -126,6 +147,7 @@ impl Default for Capabilities {
             max_context_tokens: 0,
             supports_system_prompt: false,
             supports_file_blocks: false,
+            retrieval: RetrievalToolset::default(),
         }
     }
 }
@@ -329,6 +351,8 @@ mod tests {
         assert_eq!(default.max_context_tokens, 0);
         assert!(!default.supports_system_prompt);
         assert!(!default.supports_file_blocks);
+        assert_eq!(default.retrieval, RetrievalToolset::default());
+        assert!(!default.retrieval.graph_and_memory);
 
         let full = Capabilities {
             tool_use: true,
@@ -338,9 +362,14 @@ mod tests {
             max_context_tokens: 200_000,
             supports_system_prompt: true,
             supports_file_blocks: true,
+            retrieval: RetrievalToolset {
+                graph_and_memory: true,
+                symbols: true,
+            },
         };
         assert!(full.tool_use);
         assert_eq!(full.max_context_tokens, 200_000);
+        assert!(full.retrieval.graph_and_memory);
     }
 
     // Test 4: BackendConfig serde round-trip

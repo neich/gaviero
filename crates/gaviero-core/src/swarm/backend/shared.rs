@@ -3,7 +3,9 @@ use anyhow::Result;
 use crate::context_planner::PlannerSelections;
 use crate::types::FileScope;
 
-use super::{AgentBackend, BackendConfig, Capabilities, CompletionRequest, create_backend};
+use super::{
+    AgentBackend, BackendConfig, Capabilities, CompletionRequest, RetrievalToolset, create_backend,
+};
 
 const HISTORY_TRUNCATION_CHARS: usize = 2000;
 const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
@@ -104,12 +106,45 @@ pub fn default_editor_system_prompt(capabilities: &Capabilities) -> String {
         ""
     };
 
+    // PUSH→PULL Phase 1 retrieval ("pull") stanza. Emitted only when the
+    // read-only graph/memory tools are actually wired, so it never names a
+    // tool the session cannot call. Session-stable (no per-turn data) so it
+    // stays inside the prompt cache boundary alongside the annotations block.
+    let retrieval_clause = retrieval_protocol_clause(&capabilities.retrieval);
+
     format!(
-        "You are a coding assistant working inside the gaviero editor.\n\n{}\n{}{ann}",
+        "You are a coding assistant working inside the gaviero editor.\n\n{}\n{}{retrieval_clause}{ann}",
         tool_clause,
         file_clause,
         ann = TURN_ANNOTATIONS_CONVENTION,
     )
+}
+
+/// The retrieval-protocol ("pull") stanza for the system prompt.
+///
+/// Returns `""` when no retrieval tools are live (so the prompt is byte-for-byte
+/// unchanged for backends that haven't opted in). The symbol-tool sentence is
+/// appended only when `symbols` is live, so the stanza never points the model at
+/// `symbol_search`/`symbol_doc` when the enrichment sidecar is absent.
+fn retrieval_protocol_clause(retrieval: &RetrievalToolset) -> String {
+    if !retrieval.graph_and_memory {
+        return String::new();
+    }
+    let mut s = String::from(
+        "You have read-only repository tools. The <repo_outline> you were given is a thin \
+         index — file paths with top symbol names, not full code. Before answering questions \
+         that need a definition or body, read it with node_doc(path); use blast_radius(path) \
+         for callers, affected files, and missing tests; use memory_search for prior decisions. \
+         Do not ask the user to paste code you can retrieve.",
+    );
+    if retrieval.symbols {
+        s.push_str(
+            " For a symbol whose file you don't know yet, search by name with \
+             symbol_search(query) and expand it with symbol_doc(qualified_name).",
+        );
+    }
+    s.push_str("\n\n");
+    s
 }
 
 /// Teaches the LLM the `<turn_annotations>` sidecar convention.
@@ -536,6 +571,40 @@ pub fn request_prompt(request: &CompletionRequest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retrieval_stanza_gated_on_live_tools() {
+        // No retrieval tools → no stanza, prompt unchanged.
+        let mut caps = Capabilities {
+            tool_use: true,
+            supports_system_prompt: true,
+            ..Capabilities::default()
+        };
+        let none = default_editor_system_prompt(&caps);
+        assert!(!none.contains("read-only repository tools"));
+        assert!(!none.contains("node_doc"));
+
+        // graph_and_memory live → stanza names node_doc/blast_radius/memory_search
+        // but NOT the symbol tools (enrichment off).
+        caps.retrieval = RetrievalToolset {
+            graph_and_memory: true,
+            symbols: false,
+        };
+        let graph = default_editor_system_prompt(&caps);
+        assert!(graph.contains("node_doc(path)"));
+        assert!(graph.contains("blast_radius(path)"));
+        assert!(graph.contains("memory_search"));
+        assert!(!graph.contains("symbol_search"));
+
+        // symbols live → the symbol-tool sentence is appended.
+        caps.retrieval.symbols = true;
+        let sym = default_editor_system_prompt(&caps);
+        assert!(sym.contains("symbol_search(query)"));
+        assert!(sym.contains("symbol_doc(qualified_name)"));
+
+        // The annotations convention still terminates the prompt (cache tail).
+        assert!(sym.trim_end().ends_with("no trailing commentary."));
+    }
 
     #[test]
     fn render_skill_block_formats_xml() {

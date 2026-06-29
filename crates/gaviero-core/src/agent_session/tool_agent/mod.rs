@@ -37,7 +37,9 @@ use crate::observer::{AcpObserver, ToolAgentEdit};
 use crate::swarm::backend::shared::{
     default_editor_system_prompt, render_graph_block, render_memory_block, render_skill_block,
 };
-use crate::swarm::backend::{Capabilities, StopReason, TokenUsage, UnifiedStreamEvent};
+use crate::swarm::backend::{
+    Capabilities, RetrievalToolset, StopReason, TokenUsage, UnifiedStreamEvent,
+};
 use crate::types::FileScope;
 use crate::write_gate::WriteGatePipeline;
 
@@ -176,6 +178,9 @@ impl ToolAgentSession {
             max_context_tokens: self.profile.max_context_tokens.unwrap_or(0),
             supports_system_prompt: true,
             supports_file_blocks: false,
+            // The in-process tool agent exposes Read/Grep/Glob/Bash/Write, not
+            // the gaviero MCP retrieval tools → no pull stanza.
+            retrieval: RetrievalToolset::default(),
         }
     }
 

@@ -13,7 +13,8 @@ use crate::acp::protocol::parse_file_blocks;
 
 use super::shared::request_prompt;
 use super::{
-    AgentBackend, Capabilities, CompletionRequest, StopReason, TokenUsage, UnifiedStreamEvent,
+    AgentBackend, Capabilities, CompletionRequest, RetrievalToolset, StopReason, TokenUsage,
+    UnifiedStreamEvent,
 };
 
 /// Streaming Ollama backend using `/api/chat`.
@@ -126,6 +127,8 @@ impl AgentBackend for OllamaStreamBackend {
             max_context_tokens: 8192,
             supports_system_prompt: true,
             supports_file_blocks: true,
+            // Ollama has no gaviero MCP tools wired (stream-only) → no pull stanza.
+            retrieval: RetrievalToolset::default(),
         }
     }
 

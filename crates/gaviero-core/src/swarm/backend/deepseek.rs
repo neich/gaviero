@@ -19,7 +19,8 @@ use crate::agent_session::tool_agent::swarm::{SwarmTurnRequest, run_turn};
 use crate::observer::AcpObserver;
 
 use super::{
-    AgentBackend, Capabilities, CompletionRequest, StopReason, TokenUsage, UnifiedStreamEvent,
+    AgentBackend, Capabilities, CompletionRequest, RetrievalToolset, StopReason, TokenUsage,
+    UnifiedStreamEvent,
 };
 
 /// Swarm backend that delegates to the in-process tool-agent harness.
@@ -45,6 +46,9 @@ impl DeepseekBackend {
             max_context_tokens: 128_000,
             supports_system_prompt: true,
             supports_file_blocks: false,
+            // DeepSeek's in-process tool agent exposes Read/Grep/Glob/Bash/Write,
+            // not the gaviero MCP retrieval tools → no pull stanza.
+            retrieval: RetrievalToolset::default(),
         }
     }
 }

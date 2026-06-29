@@ -29,7 +29,8 @@ use crate::acp::protocol::{find_next_file_block, parse_file_blocks};
 
 use super::shared::{build_enriched_prompt, default_editor_system_prompt};
 use super::{
-    AgentBackend, Capabilities, CompletionRequest, StopReason, TokenUsage, UnifiedStreamEvent,
+    AgentBackend, Capabilities, CompletionRequest, RetrievalToolset, StopReason, TokenUsage,
+    UnifiedStreamEvent,
 };
 
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
@@ -214,6 +215,12 @@ impl AgentBackend for CodexBackend {
             max_context_tokens: 200_000,
             supports_system_prompt: true,
             supports_file_blocks: true,
+            // PUSH→PULL Phase 1: the gaviero MCP server is wired for Codex
+            // (.codex/config.toml via config_synth), so retrieval tools are live.
+            retrieval: RetrievalToolset {
+                graph_and_memory: true,
+                symbols: false,
+            },
         }
     }
 
