@@ -94,6 +94,9 @@ fn mcp_config_for_workspace(
     )
 }
 
+// Wrapper resolving the per-folder context7 MCP config; no caller yet (kept
+// for the in-progress context7 config-synth wiring).
+#[allow(dead_code)]
 pub(crate) fn resolve_context7_config(
     app: &App,
     root: Option<&std::path::Path>,

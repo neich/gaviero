@@ -4,8 +4,6 @@
 //! We can't use tree-sitter-md because it requires tree-sitter 0.24 while we
 //! use 0.25. Markdown syntax is regular enough that regex works well.
 
-use ratatui::style::Style;
-
 use super::highlight::StyledSpan;
 use crate::theme::Theme;
 
@@ -267,7 +265,7 @@ pub(crate) enum SegmentKind {
     Bold,
     Italic,
     Code,
-    Link(String),
+    Link(#[allow(dead_code)] String), // URL retained for future link rendering
 }
 
 pub(crate) fn parse_inline(text: &str) -> Vec<TextSegment> {
@@ -413,6 +411,7 @@ mod tests {
     #[test]
     fn test_format_preview_mixed() {
         use crate::panels::chat_markdown::format_chat_markdown;
+        use ratatui::style::Style;
 
         let source = "# Title\n\nSome text\n\n- item 1\n- item 2\n\n> quote\n\n```\ncode\n```\n";
         let lines = format_chat_markdown(source, 80, Style::default());
