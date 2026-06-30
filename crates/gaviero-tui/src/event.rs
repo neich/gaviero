@@ -394,8 +394,7 @@ impl EventLoop {
                             break;
                         }
                     }
-                    Ok(Some(_)) => {} // Ignore other event types
-                    Ok(None) => {}    // No event in poll window
+                    Ok(None) => {} // No event in poll window
                     Err(_) => break,  // spawn_blocking failed
                 }
             }

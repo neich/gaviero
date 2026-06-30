@@ -1805,7 +1805,7 @@ pub(super) fn save_current_buffer(app: &mut App) {
 
 fn stage_file_if_conflict_resolved(app: &mut App, path: &std::path::Path) {
     let root = match app.workspace.roots().first() {
-        Some(r) => r.clone(),
+        Some(r) => r.to_path_buf(),
         None => return,
     };
     let rel = match path.strip_prefix(&root).ok().and_then(|p| p.to_str()) {

@@ -65,6 +65,7 @@ impl ScrollState {
     }
 
     /// Move selection down by one viewport page. Adjusts scroll to keep selection visible.
+    #[allow(dead_code)] // exercised by tests; reserved for list-panel paging
     pub fn page_down(&mut self, item_count: usize) {
         if item_count == 0 {
             self.selected = 0;
@@ -109,6 +110,7 @@ impl ScrollState {
     }
 
     /// Clamp `selected` and `offset` to a list of `item_count` items.
+    #[allow(dead_code)] // exercised by tests; reserved for list-panel paging
     pub fn clamp(&mut self, item_count: usize) {
         if item_count == 0 {
             self.selected = 0;

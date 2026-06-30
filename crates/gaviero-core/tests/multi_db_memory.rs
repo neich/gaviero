@@ -15,7 +15,7 @@ use gaviero_core::memory::{
     Embedder, MemorySource, MemoryStores, ScopeFilter, StoreKind, StoreResult, WriteMeta,
     WriteScope, hash_path,
 };
-use gaviero_core::workspace::{Workspace, WorkspaceFolder};
+use gaviero_core::workspace::Workspace;
 
 // ── Test helpers ────────────────────────────────────────────────────
 

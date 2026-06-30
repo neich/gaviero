@@ -301,6 +301,7 @@ pub(crate) async fn compute_impact_summary(
 
 /// Render chat prompt text from planner selections using the chat ordering:
 /// user message first, then graph, then memory.
+#[allow(dead_code)] // test-covered; chat-ordering renderer not yet wired into live dispatch
 pub(crate) fn render_chat_selections(
     selections: &gaviero_core::context_planner::PlannerSelections,
     user_message: &str,
