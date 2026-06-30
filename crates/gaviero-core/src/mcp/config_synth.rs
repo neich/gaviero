@@ -1866,6 +1866,7 @@ mod tests {
         assert!(deny.contains(&"Mcp(gaviero:write_*)"));
     }
 
+    #[test]
     fn codex_config_includes_extra_url_server() {
         let mut synth = fixture(PathBuf::from("/tmp/wt"));
         synth.extra_servers.push(ExtraMcpServer {
@@ -1879,6 +1880,7 @@ mod tests {
         assert!(body.contains("url = \"https://scholar.example/mcp\""));
     }
 
+    #[test]
     fn merged_claude_config_preserves_user_servers_and_adds_context7() {
         let dir = tempdir().unwrap();
         let claude_path = dir.path().join(".mcp.json");
