@@ -25,6 +25,42 @@ pub const DEEPSEEK_API_MODELS: &[&str] = &["deepseek-v4-pro", "deepseek-v4-flash
 pub const CLAUDE_MODEL_ALIASES: &[&str] =
     &["fable", "sonnet", "opus", "haiku", "opusplan", "sonnet[1m]", "opus[1m]"];
 
+/// Concrete Claude CLI `--model` id that the bare `sonnet` alias resolves to.
+///
+/// The picker, settings, and `backend.name()` display keep storing the
+/// `sonnet` alias (so the provider profiler still recognises the sonnet
+/// family for context sizing); this is only the value handed to the CLI so
+/// "sonnet" pins to Sonnet 5 instead of whatever the installed `claude`
+/// treats as the current "latest sonnet". Follows the CLI's documented
+/// full-name convention (`claude --help` example: `claude-fable-5`).
+///
+/// If Anthropic ships a different Sonnet 5 id, this one line is the only
+/// change needed.
+pub const SONNET_ALIAS_CLI_MODEL: &str = "claude-sonnet-5";
+
+/// Resolve a prefix-stripped Claude model alias/name into the concrete CLI
+/// `--model` argument. Only the `sonnet` alias is remapped (to
+/// [`SONNET_ALIAS_CLI_MODEL`]); the optional `[1m]` long-context suffix is
+/// preserved. Every other alias (`opus`, `haiku`, `fable`, `opusplan`, …) and
+/// every explicit full model id (e.g. `claude-sonnet-4-6`) passes through
+/// unchanged so a deliberate pin is always honoured.
+///
+/// Expects the `claude:` provider prefix to have already been stripped — the
+/// single call site is [`crate::acp::session::AcpSession::spawn`], which is the
+/// one place every Claude backend builds its `--model` argv.
+pub fn resolve_claude_cli_model(model: &str) -> String {
+    let trimmed = model.trim();
+    let (base, suffix) = match trimmed.strip_suffix("[1m]") {
+        Some(base) => (base, "[1m]"),
+        None => (trimmed, ""),
+    };
+    if base == "sonnet" {
+        format!("{SONNET_ALIAS_CLI_MODEL}{suffix}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
 pub fn build_enriched_prompt(
     prompt: &str,
     conversation_history: &[(String, String)],
@@ -680,6 +716,37 @@ mod tests {
             BackendConfig::ClaudeCode {
                 model: Some("sonnet".into())
             }
+        );
+    }
+
+    #[test]
+    fn resolve_claude_cli_model_pins_sonnet_alias_to_sonnet_5() {
+        assert_eq!(resolve_claude_cli_model("sonnet"), SONNET_ALIAS_CLI_MODEL);
+        // The `[1m]` long-context suffix is preserved on the resolved id.
+        assert_eq!(
+            resolve_claude_cli_model("sonnet[1m]"),
+            format!("{SONNET_ALIAS_CLI_MODEL}[1m]")
+        );
+        // Surrounding whitespace is trimmed before matching.
+        assert_eq!(resolve_claude_cli_model("  sonnet  "), SONNET_ALIAS_CLI_MODEL);
+    }
+
+    #[test]
+    fn resolve_claude_cli_model_passes_through_other_specs() {
+        // Other aliases are untouched — only `sonnet` is remapped.
+        for alias in ["opus", "haiku", "fable", "opusplan", "opus[1m]"] {
+            assert_eq!(resolve_claude_cli_model(alias), alias);
+        }
+        // An explicit full model id is a deliberate pin — never rewritten,
+        // including an explicit older Sonnet.
+        assert_eq!(
+            resolve_claude_cli_model("claude-sonnet-4-6"),
+            "claude-sonnet-4-6"
+        );
+        // Idempotent: the resolved id resolves to itself.
+        assert_eq!(
+            resolve_claude_cli_model(SONNET_ALIAS_CLI_MODEL),
+            SONNET_ALIAS_CLI_MODEL
         );
     }
 

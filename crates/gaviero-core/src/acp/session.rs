@@ -281,7 +281,10 @@ impl AcpSession {
             .arg("--verbose")
             .arg("--include-partial-messages")
             .arg("--model")
-            .arg(model);
+            // Resolve alias→concrete id (e.g. `sonnet` → Sonnet 5) so the
+            // `sonnet` alias pins to a specific model rather than the CLI's
+            // drifting "latest sonnet". Every Claude spawn funnels through here.
+            .arg(crate::swarm::backend::shared::resolve_claude_cli_model(model));
 
         // Session reuse: when a prior session_id is known (captured from the
         // first turn's SystemInit event), resume it so Claude's model keeps
