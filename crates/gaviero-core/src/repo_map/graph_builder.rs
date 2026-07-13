@@ -221,7 +221,10 @@ fn collect_source_files(
             // Only index files with known extensions
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             if language_for_extension(ext).is_some() {
-                out.push((path.clone(), rel.to_path_buf()));
+                // Store keys and LLM-facing outputs (blast_radius,
+                // impact texts) use `/`-separated rel paths on all
+                // hosts; abs_path stays native for I/O.
+                out.push((path.clone(), super::normalize_rel_path(rel)));
             }
         }
     }

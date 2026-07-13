@@ -30,6 +30,17 @@ pub mod topology;
 
 pub use topology::{TopologyConfig, build_folder_topology};
 
+/// Normalize a workspace-relative path to `/` separators (Tier W1 /
+/// PR-6). Rel paths are store keys and LLM-facing text — one spelling
+/// on every host; absolute paths stay native for I/O.
+pub(crate) fn normalize_rel_path(rel: &Path) -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(rel.to_string_lossy().replace('\\', "/"))
+    } else {
+        rel.to_path_buf()
+    }
+}
+
 // ── Graph types ──────────────────────────────────────────────
 
 /// A source file node in the repo reference graph.

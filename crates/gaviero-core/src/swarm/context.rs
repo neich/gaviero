@@ -145,7 +145,8 @@ fn collect_recursive(root: &Path, dir: &Path, files: &mut Vec<String>, depth: us
         if path.is_dir() {
             collect_recursive(root, &path, files, depth + 1, max);
         } else if let Ok(rel) = path.strip_prefix(root) {
-            files.push(rel.to_string_lossy().to_string());
+            // Forward slashes on all hosts — this list lands in prompts.
+            files.push(rel.to_string_lossy().replace('\\', "/"));
         }
     }
 }

@@ -3417,9 +3417,10 @@ async fn evaluate_loop_condition(
             let expanded = cmd
                 .replace("{{ITER}}", &iter_str)
                 .replace("{{PREV_ITER}}", &prev_str);
-            // Run the shell command; exit code 0 = condition met
-            let result = tokio::process::Command::new("sh")
-                .args(["-c", expanded.as_str()])
+            // Run the shell command; exit code 0 = condition met.
+            // User-authored probe — POSIX shell when available, pwsh
+            // otherwise (Tier W1 / PR-4, W-D5).
+            let result = crate::util::spawn::shell_command_lenient(expanded.as_str())
                 .current_dir(&ctx.config.workspace_root)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
