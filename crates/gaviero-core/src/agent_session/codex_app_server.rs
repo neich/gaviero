@@ -67,7 +67,7 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use futures::Stream;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter, Lines};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -276,7 +276,7 @@ impl CodexAppServerSession {
             return Ok(());
         }
 
-        let mut cmd = Command::new("codex");
+        let mut cmd = crate::util::spawn::agent_command("codex");
         for arg in codex_app_server_args(&self.workspace_root) {
             cmd.arg(arg);
         }

@@ -143,7 +143,7 @@ impl AgentBackend for ClaudeCodeBackend {
     }
 
     async fn health_check(&self) -> Result<()> {
-        let output = tokio::process::Command::new("claude")
+        let output = crate::util::spawn::agent_command("claude")
             .arg("--version")
             .output()
             .await

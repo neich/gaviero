@@ -132,54 +132,35 @@ pub fn shim_binary_resolvable(shim_binary: &str) -> bool {
 }
 
 fn ensure_shim_resolvable(shim_binary: &str) -> Result<()> {
+    // Pure-Rust PATHEXT-aware resolution on every platform (Tier W1 /
+    // PR-2) — no `sh` dependency, and npm-style `.cmd` shims resolve
+    // on Windows. Path-qualified names are checked directly inside
+    // `resolve_program` too.
+    if crate::util::spawn::resolve_program(shim_binary).is_some() {
+        return Ok(());
+    }
     let path = Path::new(shim_binary);
     if path.is_absolute() || shim_binary.contains('/') || shim_binary.contains('\\') {
-        if path.is_file() {
-            return Ok(());
-        }
         bail!(
             "gaviero MCP shim not found at {} (set mcp.gavieroServer.shimBinary or install gaviero-mcp-shim)",
             path.display()
         );
     }
-    let ok = std::process::Command::new("sh")
-        .args(["-c", &format!("command -v {shim_binary} >/dev/null 2>&1")])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if ok {
-        Ok(())
-    } else {
-        bail!(
-            "gaviero MCP shim {shim_binary:?} is not on PATH — \
-             run `cargo install --path crates/gaviero-mcp-shim` or set an absolute shimBinary"
-        );
-    }
+    bail!(
+        "gaviero MCP shim {shim_binary:?} is not on PATH — \
+         run `cargo install --path crates/gaviero-mcp-shim` or set an absolute shimBinary"
+    );
 }
 
-fn ensure_stdio_command_resolvable(command: &str, args: &[String]) -> Result<()> {
+fn ensure_stdio_command_resolvable(command: &str, _args: &[String]) -> Result<()> {
+    if crate::util::spawn::resolve_program(command).is_some() {
+        return Ok(());
+    }
     let path = Path::new(command);
     if path.is_absolute() || command.contains('/') || command.contains('\\') {
-        if path.is_file() {
-            return Ok(());
-        }
         bail!("stdio MCP command not found: {}", path.display());
     }
-    let probe = if args.is_empty() {
-        format!("command -v {command} >/dev/null 2>&1")
-    } else {
-        format!("command -v {command} >/dev/null 2>&1")
-    };
-    let ok = std::process::Command::new("sh")
-        .args(["-c", &probe])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if ok {
-        Ok(())
-    } else {
-        bail!("stdio MCP command {command:?} is not on PATH");
-    }
+    bail!("stdio MCP command {command:?} is not on PATH");
 }
 
 fn probe_remote_url(name: &str, url: &str) -> Result<()> {

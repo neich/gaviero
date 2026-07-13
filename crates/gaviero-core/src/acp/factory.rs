@@ -265,7 +265,7 @@ fn spawn_persistent(
 
     let tools_str = tools.join(",");
 
-    let mut cmd = tokio::process::Command::new("claude");
+    let mut cmd = crate::util::spawn::agent_command("claude");
     // No --print — persistent conversation mode
     cmd.arg("--output-format")
         .arg("stream-json")
