@@ -76,7 +76,10 @@ impl Tool for GrepTool {
                 }
                 let path = entry.path();
                 let rel = path.strip_prefix(&workspace_root).unwrap_or(path);
-                let rel_str = rel.to_string_lossy();
+                // Forward slashes everywhere: glob patterns are written
+                // POSIX-style, and the LLM-facing output contract is
+                // workspace-relative `/`-separated paths on all hosts.
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
                 if let Some(gre) = &glob_re
                     && !gre.is_match(&rel_str)
                 {

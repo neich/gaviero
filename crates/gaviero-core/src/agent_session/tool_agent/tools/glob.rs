@@ -66,7 +66,10 @@ impl Tool for GlobTool {
                 }
                 let path = entry.path();
                 let rel = path.strip_prefix(&workspace_root).unwrap_or(path);
-                let rel_str = rel.to_string_lossy().to_string();
+                // Forward slashes everywhere: glob patterns are written
+                // POSIX-style, and the LLM-facing output contract is
+                // workspace-relative `/`-separated paths on all hosts.
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
                 if glob_re.is_match(&rel_str) {
                     out.push(rel_str);
                     if out.len() >= MAX_RESULTS {
