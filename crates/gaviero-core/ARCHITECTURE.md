@@ -369,7 +369,7 @@ The planner is the single owner of memory queries, graph selection, replay, and 
 
 ## 7. MCP (in-process server)
 
-Listens on `<workspace>/.gaviero/mcp.sock`. Subprocess agents reach it through the [`gaviero-mcp-shim`](../gaviero-mcp-shim) binary (stdio↔socket bridge), declared as their MCP server in synthesized per-worktree configs.
+Listens on the workspace `McpEndpoint` (Unix socket / Windows named pipe). Subprocess agents reach it through the [`gaviero-mcp-shim`](../gaviero-mcp-shim) binary (stdio↔socket bridge), declared as their MCP server in synthesized per-worktree configs.
 
 **Three read-only tools:**
 

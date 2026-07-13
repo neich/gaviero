@@ -20,16 +20,16 @@ Six crates — read the per-crate `CLAUDE.md` before touching its source.
 - [`gaviero-tui/`](crates/gaviero-tui/CLAUDE.md) — terminal UI (ratatui + crossterm).
 - [`gaviero-cli/`](crates/gaviero-cli/CLAUDE.md) — headless runner (clap).
 - [`gaviero-dsl/`](crates/gaviero-dsl/CLAUDE.md) — `.gaviero` workflow compiler (logos + chumsky).
-- [`gaviero-mcp-shim/`](crates/gaviero-mcp-shim/CLAUDE.md) — stdio↔Unix-socket bridge. Zero workspace deps.
+- [`gaviero-mcp-shim/`](crates/gaviero-mcp-shim/CLAUDE.md) — stdio↔socket bridge (Unix socket / Windows named pipe). Zero workspace deps.
 - [`tree-sitter-gaviero/`](crates/tree-sitter-gaviero/CLAUDE.md) — `.gaviero` grammar.
 
-Dependency rules: core has no UI/DSL deps. `tui` and `cli` depend on `core` + `dsl`. `dsl` depends on `core`. `gaviero-mcp-shim` is self-contained and reaches core only over `<workspace>/.gaviero/mcp.sock`. See [ARCHITECTURE.md](ARCHITECTURE.md) for the full topology.
+Dependency rules: core has no UI/DSL deps. `tui` and `cli` depend on `core` + `dsl`. `dsl` depends on `core`. `gaviero-mcp-shim` is self-contained and reaches core only over the workspace MCP endpoint (`McpEndpoint`: `<workspace>/.gaviero/mcp.sock` on Unix, `\\.\pipe\gaviero-<hash>` on Windows). See [ARCHITECTURE.md](ARCHITECTURE.md) for the full topology.
 
 ## Architecture (orientation)
 
 Pipeline logic lives in `gaviero-core`. The TUI and CLI are thin wrappers that wire observers (`WriteGateObserver`, `AcpObserver`, `SwarmObserver` — [crates/gaviero-core/src/observer.rs](crates/gaviero-core/src/observer.rs)) to surface agent activity.
 
-Subprocess coding agents (Claude Code, Codex, Cursor) reach core's in-process MCP server (read-only memory + graph tools) by spawning `gaviero-mcp-shim`, which pipes stdio to `<workspace>/.gaviero/mcp.sock`.
+Subprocess coding agents (Claude Code, Codex, Cursor) reach core's in-process MCP server (read-only memory + graph tools) by spawning `gaviero-mcp-shim`, which pipes stdio to the workspace MCP endpoint (Unix socket / Windows named pipe — [crates/gaviero-core/src/mcp/transport.rs](crates/gaviero-core/src/mcp/transport.rs)).
 
 `.gaviero-workspace` files (any basename, fixed extension) describe multi-folder workspaces; bare directories are treated as single-folder workspaces. Dispatched at TUI startup in [crates/gaviero-tui/src/main.rs](crates/gaviero-tui/src/main.rs).
 
