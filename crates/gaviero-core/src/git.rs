@@ -579,6 +579,68 @@ pub struct WorktreeManager {
     worktree_base: PathBuf,
     /// Active worktrees that will be cleaned up on drop.
     active: Vec<WorktreeHandle>,
+    /// Cached Windows long-path probe (Tier W1 / PR-6); computed on
+    /// first provision, `None` until then.
+    #[cfg(windows)]
+    long_path_probe: Option<LongPathProbe>,
+}
+
+/// Windows long-path environment probe: the repo's deepest tracked
+/// relative path plus whether long paths are enabled end to end
+/// (`git config core.longpaths` AND the `LongPathsEnabled` registry
+/// policy — git and Win32 APIs gate on them independently).
+#[cfg(windows)]
+#[derive(Clone)]
+struct LongPathProbe {
+    max_rel_path: usize,
+    long_paths_enabled: bool,
+}
+
+#[cfg(windows)]
+impl LongPathProbe {
+    fn run(repo_dir: &Path) -> Self {
+        let max_rel_path = Command::new("git")
+            .args(["ls-files", "-z"])
+            .current_dir(repo_dir)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                o.stdout
+                    .split(|b| *b == 0)
+                    .map(|p| p.len())
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        let git_longpaths = Command::new("git")
+            .args(["config", "--get", "core.longpaths"])
+            .current_dir(repo_dir)
+            .output()
+            .ok()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .eq_ignore_ascii_case("true")
+            })
+            .unwrap_or(false);
+        let registry_longpaths = Command::new("reg")
+            .args([
+                "query",
+                r"HKLM\SYSTEM\CurrentControlSet\Control\FileSystem",
+                "/v",
+                "LongPathsEnabled",
+            ])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("0x1"))
+            .unwrap_or(false);
+        Self {
+            max_rel_path,
+            long_paths_enabled: git_longpaths && registry_longpaths,
+        }
+    }
 }
 
 /// A handle to a provisioned worktree.
@@ -604,6 +666,11 @@ impl WorktreeManager {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("repo");
+        // On Windows the base must also stay short: MAX_PATH pressure
+        // (Tier W1 / PR-6) means every extra base char eats into the
+        // repo's deepest relative path. `dirs::cache_dir()` is
+        // `%LOCALAPPDATA%` there (and honors XDG on Unix via the
+        // explicit env branch above it).
         let base_root = std::env::var("GAVIERO_WORKTREE_BASE")
             .ok()
             .map(PathBuf::from)
@@ -613,7 +680,14 @@ impl WorktreeManager {
                 })
             })
             .or_else(|| {
-                dirs::home_dir().map(|h| h.join(".cache").join("gaviero-worktrees"))
+                #[cfg(windows)]
+                {
+                    dirs::cache_dir().map(|c| c.join("gaviero-worktrees"))
+                }
+                #[cfg(not(windows))]
+                {
+                    dirs::home_dir().map(|h| h.join(".cache").join("gaviero-worktrees"))
+                }
             })
             .unwrap_or_else(|| std::env::temp_dir().join("gaviero-worktrees"));
         let worktree_base = base_root.join(repo_name);
@@ -621,7 +695,41 @@ impl WorktreeManager {
             repo_dir,
             worktree_base,
             active: Vec::new(),
+            #[cfg(windows)]
+            long_path_probe: None,
         }
+    }
+
+    /// Windows long-path preflight (Tier W1 / PR-6): estimate the
+    /// deepest path this worktree would contain; if it exceeds the
+    /// MAX_PATH comfort margin and long paths aren't enabled end to
+    /// end, fail with every actionable fix listed. 240 (not 260)
+    /// leaves headroom for build artifacts deeper than any tracked
+    /// file. `GAVIERO_WORKTREE_BASE` remains the escape hatch.
+    #[cfg(windows)]
+    fn ensure_long_paths_ok(&mut self, wt_path: &Path) -> std::result::Result<(), String> {
+        const MAX_PATH_HEADROOM: usize = 240;
+        let probe = match &self.long_path_probe {
+            Some(p) => p.clone(),
+            None => {
+                let p = LongPathProbe::run(&self.repo_dir);
+                self.long_path_probe = Some(p.clone());
+                p
+            }
+        };
+        let estimate = wt_path.as_os_str().len() + 1 + probe.max_rel_path;
+        if estimate <= MAX_PATH_HEADROOM || probe.long_paths_enabled {
+            return Ok(());
+        }
+        Err(format!(
+            "worktree at {} would contain paths up to ~{estimate} chars, past Windows' \
+             260-char default limit. Fix one: set GAVIERO_WORKTREE_BASE to a short \
+             directory (e.g. C:\\gv); or enable long paths in BOTH git \
+             (`git config --global core.longpaths true`) and Windows (admin: \
+             `reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\FileSystem\" \
+             /v LongPathsEnabled /t REG_DWORD /d 1`)",
+            wt_path.display()
+        ))
     }
 
     /// Check if this repo supports worktrees (is a git repo with at least one commit).
@@ -713,6 +821,14 @@ impl WorktreeManager {
         let wt_path = self.worktree_base.join(&name);
         let _ = agent_id; // currently unused after refactor; preserved for caller ergonomics
 
+        // Windows: fail provisioning up front, with an actionable error,
+        // when the deepest worktree path would exceed MAX_PATH and long
+        // paths aren't enabled — instead of a mid-run `Filename too
+        // long` from git (Tier W1 / PR-6, W-D7).
+        #[cfg(windows)]
+        self.ensure_long_paths_ok(&wt_path)
+            .map_err(|e| anyhow::anyhow!(e))?;
+
         // Ensure base directory exists
         std::fs::create_dir_all(&self.worktree_base).with_context(|| {
             format!(
@@ -725,7 +841,7 @@ impl WorktreeManager {
         if wt_path.exists() {
             let _ = self.remove_worktree(&name);
             if wt_path.exists() {
-                let _ = std::fs::remove_dir_all(&wt_path);
+                let _ = crate::util::fs::remove_dir_all_retry(&wt_path);
             }
         }
 
@@ -891,6 +1007,21 @@ impl WorktreeManager {
 
         if !status.success() {
             tracing::warn!("failed to remove worktree '{}'", name);
+            // Windows: `git worktree remove` fails on a lingering handle
+            // (live SQLite in `.gaviero/`, a slow-dying child's cwd).
+            // Retry the directory removal ourselves, then prune the
+            // now-dangling worktree metadata.
+            let wt_path = self.worktree_base.join(name);
+            if wt_path.exists()
+                && crate::util::fs::remove_dir_all_retry(&wt_path).is_ok()
+            {
+                let _ = Command::new("git")
+                    .args(["worktree", "prune"])
+                    .current_dir(&self.repo_dir)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
         }
         Ok(())
     }
@@ -1197,7 +1328,12 @@ mod tests {
 
         repo.discard_changes("README.md").unwrap();
         assert!(repo.is_clean().unwrap());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# Test\n");
+        // Checkout may apply core.autocrlf (Git for Windows defaults it
+        // to true) — compare content, not line endings.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().replace("\r\n", "\n"),
+            "# Test\n"
+        );
     }
 
     #[test]
