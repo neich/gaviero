@@ -22,7 +22,6 @@ use std::process::Stdio;
 use anyhow::{Context, Result};
 use futures::Stream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::acp::protocol::{find_next_file_block, parse_file_blocks};
@@ -35,18 +34,14 @@ use super::{
 
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
 
-/// Prompts at or above this size are piped to `codex exec` via stdin
-/// instead of appended as a positional argv. Linux's `MAX_ARG_STRLEN`
-/// is 128 KB per argument; 32 KB keeps comfortable headroom for the
-/// rest of the argv (flags, `--config` keys, `--add-dir` roots) and
-/// matches the threshold the ACP/Claude path uses for symmetry.
-const ARGV_THRESHOLD: usize = 32_768;
-
 /// Whether a prompt of `len` bytes should be piped via stdin rather
-/// than passed as a positional argv. Extracted so tests can exercise
-/// the decision without spawning a subprocess.
+/// than passed as a positional argv. The threshold
+/// ([`crate::util::spawn::argv_threshold`]) leaves comfortable headroom
+/// for the rest of the argv (flags, `--config` keys, `--add-dir` roots)
+/// and matches the ACP/Claude path for symmetry. Extracted so tests can
+/// exercise the decision without spawning a subprocess.
 fn would_use_stdin(len: usize) -> bool {
-    len >= ARGV_THRESHOLD
+    len >= crate::util::spawn::argv_threshold()
 }
 
 /// Backend that spawns the Codex CLI as a subprocess.
@@ -88,7 +83,7 @@ impl AgentBackend for CodexBackend {
 
         let combined_prompt = format!("{system_prompt}\n\n{user_prompt}");
 
-        let mut cmd = Command::new("codex");
+        let mut cmd = crate::util::spawn::agent_command("codex");
         for arg in codex_exec_args(
             &self.model,
             request.effort.as_deref(),
@@ -229,7 +224,7 @@ impl AgentBackend for CodexBackend {
     }
 
     async fn health_check(&self) -> Result<()> {
-        let output = Command::new("codex")
+        let output = crate::util::spawn::agent_command("codex")
             .arg("--version")
             .output()
             .await
@@ -643,12 +638,12 @@ url = "https://example/mcp/"
     fn small_prompt_passes_via_argv() {
         assert!(!would_use_stdin(0));
         assert!(!would_use_stdin(1_000));
-        assert!(!would_use_stdin(ARGV_THRESHOLD - 1));
+        assert!(!would_use_stdin(crate::util::spawn::argv_threshold() - 1));
     }
 
     #[test]
     fn large_prompt_passes_via_stdin() {
-        assert!(would_use_stdin(ARGV_THRESHOLD));
+        assert!(would_use_stdin(crate::util::spawn::argv_threshold()));
         assert!(would_use_stdin(100_000));
         assert!(would_use_stdin(1_000_000));
     }

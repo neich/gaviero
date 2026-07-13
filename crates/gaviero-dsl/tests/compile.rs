@@ -918,7 +918,8 @@ fn compile_file_scientific_plan_refinement_default_roster() {
         .into_iter()
         .map(|u| u.id.clone())
         .collect();
-    for prefix in &["claude", "codex", "cursor"] {
+    // Default roster in the example ships claude + codex (no cursor).
+    for prefix in &["claude", "codex"] {
         assert!(
             ids.iter().any(|id| id == &format!("{prefix}-init")),
             "missing {prefix}-init in {ids:?}"
@@ -929,7 +930,7 @@ fn compile_file_scientific_plan_refinement_default_roster() {
         );
     }
     assert_eq!(plan.loop_configs.len(), 1);
-    assert_eq!(plan.loop_configs[0].agent_ids.len(), 3);
+    assert_eq!(plan.loop_configs[0].agent_ids.len(), 2);
     assert_eq!(plan.loop_configs[0].max_iterations, 8);
     assert_eq!(
         plan.execution_mode,

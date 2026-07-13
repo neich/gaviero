@@ -1109,7 +1109,11 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
 }
 
 fn canonicalize_path(p: &Path) -> PathBuf {
-    p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+    // Simplify away Windows' `\\?\` verbatim prefix — workspace folder
+    // paths flow into shell cwds, prompts, and synthesized configs.
+    p.canonicalize()
+        .map(|c| crate::util::fs::simplify_path(&c))
+        .unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// If `path` lives inside a `.gaviero/worktrees/{id}/...` subtree,

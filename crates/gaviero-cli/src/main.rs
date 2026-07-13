@@ -1095,8 +1095,8 @@ fn prepare_mcp_for_swarm(
     if memory.is_none() {
         overrides.gaviero_enabled = Some(false);
     }
-    let socket_path = repo.join(".gaviero/mcp.sock");
-    let synth = resolve_mcp_config_synth(workspace, repo, socket_path, &overrides);
+    let endpoint = gaviero_core::mcp::McpEndpoint::for_workspace(repo);
+    let synth = resolve_mcp_config_synth(workspace, repo, endpoint, &overrides);
     if !synth.enabled {
         return Ok((None, None));
     }
@@ -1140,12 +1140,9 @@ fn prepare_mcp_for_swarm(
             // cold build. (No reranker in the CLI path → graph only.)
             let warm = server.clone();
             tokio::spawn(async move { warm.warmup().await });
-            let h = spawn_mcp_server(server, &synth.socket_path)
-                .with_context(|| format!("starting gaviero MCP server at {}", synth.socket_path.display()))?;
-            eprintln!(
-                "[mcp] gaviero server listening on {}",
-                h.socket_path.display()
-            );
+            let h = spawn_mcp_server(server, &synth.endpoint)
+                .with_context(|| format!("starting gaviero MCP server at {}", synth.endpoint))?;
+            eprintln!("[mcp] gaviero server listening on {}", h.endpoint);
             handle = Some(h);
         }
     }

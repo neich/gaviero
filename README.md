@@ -394,7 +394,7 @@ For complete architectural details including data flow, module maps, and inter-c
 ## Requirements
 
 - **Rust 2024 edition** — for building from source
-- **Linux or POSIX terminal** — terminal environment for the TUI
+- **Linux, macOS, or Windows 11+** — terminal environment for the TUI. On Windows: Windows Terminal is the supported host, and **PowerShell 7.2+** (`winget install Microsoft.PowerShell`) plus **Git for Windows** are hard runtime requirements (Windows PowerShell 5.1 and cmd are unsupported)
 - **Claude API key** (optional) — required only for AI agent features; the editor works standalone
 
 ## Getting Help

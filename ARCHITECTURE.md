@@ -101,7 +101,7 @@ See [`crates/gaviero-core/ARCHITECTURE.md`](crates/gaviero-core/ARCHITECTURE.md)
 - [`gaviero-dsl/src/`](crates/gaviero-dsl/src/): `lib.rs` / `lexer.rs` / `ast.rs` / `parser.rs` / `compiler.rs` / `resolver.rs` / `tiers.rs` / `error.rs`. See [`crates/gaviero-dsl/ARCHITECTURE.md`](crates/gaviero-dsl/ARCHITECTURE.md).
 - [`gaviero-tui/src/`](crates/gaviero-tui/src/): `app/`, `editor/` (incl. `wrap.rs`, `diff.rs`), `panels/` (incl. `memory_panel.rs`), `widgets/`. See [`crates/gaviero-tui/ARCHITECTURE.md`](crates/gaviero-tui/ARCHITECTURE.md).
 - [`gaviero-cli/src/main.rs`](crates/gaviero-cli/src/main.rs): single file, 2586 lines. See [`crates/gaviero-cli/ARCHITECTURE.md`](crates/gaviero-cli/ARCHITECTURE.md).
-- [`gaviero-mcp-shim/src/main.rs`](crates/gaviero-mcp-shim/src/main.rs): ~110 lines; bidirectional `tokio::io::copy` between stdio and `<workspace>/.gaviero/mcp.sock`, with reconnect/backoff up to `--connect-timeout-secs`. See [`crates/gaviero-mcp-shim/ARCHITECTURE.md`](crates/gaviero-mcp-shim/ARCHITECTURE.md).
+- [`gaviero-mcp-shim/src/main.rs`](crates/gaviero-mcp-shim/src/main.rs): ~110 lines; bidirectional `tokio::io::copy` between stdio and the workspace `McpEndpoint` (Unix socket / Windows named pipe), with reconnect/backoff up to `--connect-timeout-secs`. See [`crates/gaviero-mcp-shim/ARCHITECTURE.md`](crates/gaviero-mcp-shim/ARCHITECTURE.md).
 - [`tree-sitter-gaviero/`](crates/tree-sitter-gaviero/): `grammar.js` + generated `parser.c` / `grammar.json` / `node-types.json`, `src/lib.rs` (LANGUAGE export). See [`crates/tree-sitter-gaviero/ARCHITECTURE.md`](crates/tree-sitter-gaviero/ARCHITECTURE.md).
 
 ---
@@ -178,7 +178,7 @@ Single owner of bootstrap / delta / replay policy. Emits `MemorySelection`, `Gra
 
 ### `GavieroMcpServer` ([`mcp/server.rs`](crates/gaviero-core/src/mcp/server.rs))
 
-In-process MCP server task. Three read-only tools — `memory_search`, `blast_radius`, `node_doc`. Listens on `<workspace>/.gaviero/mcp.sock`; subprocess agents reach it via `gaviero-mcp-shim`. **Read-only by construction:** there is no `WriterHandle` on the server type, so `memory_store` / `_update` / `_delete` are unimplementable. Per-worktree configs are synthesized by [`mcp::config_synth`](crates/gaviero-core/src/mcp/config_synth.rs):
+In-process MCP server task. Three read-only tools — `memory_search`, `blast_radius`, `node_doc`. Listens on the workspace `McpEndpoint` (`.gaviero/mcp.sock` on Unix, a named pipe on Windows); subprocess agents reach it via `gaviero-mcp-shim`. **Read-only by construction:** there is no `WriterHandle` on the server type, so `memory_store` / `_update` / `_delete` are unimplementable. Per-worktree configs are synthesized by [`mcp::config_synth`](crates/gaviero-core/src/mcp/config_synth.rs):
 
 - Claude Code → `<worktree>/.mcp.json`.
 - Codex → `<worktree>/.codex/config.toml` (gated on `TrustConsent::Granted`).

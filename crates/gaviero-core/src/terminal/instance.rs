@@ -84,6 +84,13 @@ impl TerminalInstance {
             return Ok(());
         }
 
+        // pwsh 7.2+ is a hard requirement on Windows — verified once per
+        // process, before the first PowerShell spawn (Tier W1 / PR-3).
+        #[cfg(windows)]
+        if self.shell_config.shell_type == super::config::ShellType::PowerShell {
+            super::config::ensure_pwsh_version(&self.shell_config.shell_path)?;
+        }
+
         let handle = super::pty::spawn_pty(&self.shell_config, &self.cwd, self.rows, self.cols)?;
 
         self.pty_writer = Some(handle.writer);
@@ -108,8 +115,31 @@ impl TerminalInstance {
         if !clean.is_empty() {
             self.parser.process(&clean);
         }
+        self.respond_to_terminal_queries(data);
         self.is_dirty = true;
         results
+    }
+
+    /// Answer terminal status queries the application sends us — we ARE
+    /// the terminal here. PSReadLine (pwsh) sends DSR-CPR (`ESC[6n`) at
+    /// startup and blocks rendering its prompt until the cursor
+    /// position report arrives; a real terminal answers, so must the
+    /// embedded panel (Tier W1: blank pwsh pane otherwise). Bash-family
+    /// shells never ask, which is why Unix never hit this.
+    fn respond_to_terminal_queries(&mut self, data: &[u8]) {
+        let dsr_queries = count_occurrences(data, b"\x1b[6n");
+        if dsr_queries > 0 {
+            let (row, col) = self.parser.screen().cursor_position();
+            let report = format!("\x1b[{};{}R", row + 1, col + 1);
+            for _ in 0..dsr_queries {
+                self.write_input(report.as_bytes());
+            }
+        }
+        // DA1 (`ESC[c` / `ESC[0c`): identify as a VT101-class terminal.
+        let da1_queries = count_occurrences(data, b"\x1b[c") + count_occurrences(data, b"\x1b[0c");
+        for _ in 0..da1_queries {
+            self.write_input(b"\x1b[?1;2c");
+        }
     }
 
     /// Send raw bytes to the PTY (user keystrokes).
@@ -227,5 +257,76 @@ impl TerminalInstance {
 impl Drop for TerminalInstance {
     fn drop(&mut self) {
         self.kill();
+    }
+}
+
+/// Count non-overlapping occurrences of `needle` in `haystack`.
+fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut i = 0;
+    while i + needle.len() <= haystack.len() {
+        if &haystack[i..i + needle.len()] == needle {
+            count += 1;
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// Writer that captures everything written to the PTY.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn instance_with_capture() -> (TerminalInstance, CaptureWriter) {
+        let config = ShellConfig::with_shell("bash");
+        let mut inst = TerminalInstance::new(TerminalId::next(), config, PathBuf::from("."), 24, 80, 100);
+        let writer = CaptureWriter::default();
+        inst.pty_writer = Some(Box::new(writer.clone()));
+        (inst, writer)
+    }
+
+    #[test]
+    fn dsr_cursor_query_gets_position_report() {
+        let (mut inst, writer) = instance_with_capture();
+        // Print some text so the cursor moves, then query position.
+        inst.process_output(b"hello\x1b[6n");
+        let written = writer.0.lock().unwrap().clone();
+        // Cursor after "hello" on the first row: row 1, col 6 (1-based).
+        assert_eq!(String::from_utf8_lossy(&written), "\x1b[1;6R");
+    }
+
+    #[test]
+    fn da1_query_gets_terminal_id() {
+        let (mut inst, writer) = instance_with_capture();
+        inst.process_output(b"\x1b[c");
+        let written = writer.0.lock().unwrap().clone();
+        assert_eq!(String::from_utf8_lossy(&written), "\x1b[?1;2c");
+    }
+
+    #[test]
+    fn plain_output_writes_nothing_back() {
+        let (mut inst, writer) = instance_with_capture();
+        inst.process_output(b"just text\x1b[31mred\x1b[0m");
+        assert!(writer.0.lock().unwrap().is_empty());
     }
 }

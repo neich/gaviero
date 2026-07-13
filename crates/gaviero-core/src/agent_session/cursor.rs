@@ -30,7 +30,6 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use futures::Stream;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -230,7 +229,7 @@ impl CursorSession {
             _ => None,
         };
 
-        let mut cmd = Command::new("agent");
+        let mut cmd = crate::util::spawn::agent_command("agent");
         for arg in cursor_argv(
             &self.cursor_model,
             &self.workspace_root,

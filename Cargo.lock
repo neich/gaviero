@@ -868,6 +868,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
+name = "embed-manifest"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94cdc65b1cf9e871453ce2f86f5aaec24ff2eaa36a1fa3e02e441dddc3613b99"
+
+[[package]]
 name = "encode_unicode"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -909,9 +915,6 @@ name = "esaxx-rs"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
-dependencies = [
- "cc",
-]
 
 [[package]]
 name = "euclid"
@@ -1181,6 +1184,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dirs",
+ "embed-manifest",
  "gaviero-core",
  "gaviero-dsl",
  "miette",
@@ -1286,6 +1290,7 @@ dependencies = [
  "clap",
  "crossterm",
  "dirs",
+ "embed-manifest",
  "gaviero-core",
  "gaviero-dsl",
  "notify",

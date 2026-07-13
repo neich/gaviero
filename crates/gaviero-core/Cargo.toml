@@ -24,7 +24,12 @@ git2 = "0.19"
 tree-sitter = "0.25"
 rusqlite = { version = "0.32", features = ["bundled"] }
 ort = "2.0.0-rc.12"
-tokenizers = "0.21"
+# Default features minus `esaxx_fast`: esaxx-rs's build script hardcodes
+# the static CRT (/MT), which cannot link alongside ort's /MD prebuilt
+# onnxruntime on windows-msvc (LNK2038 mismatch). esaxx only accelerates
+# Unigram *training*, which gaviero never runs — the pure-Rust fallback
+# (`suffix_rs`) covers the API.
+tokenizers = { version = "0.21", default-features = false, features = ["progressbar", "onig"] }
 ndarray = "0.17"
 ropey = "1.6"
 portable-pty = "0.9"

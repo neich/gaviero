@@ -263,9 +263,9 @@ fn synth_server_names(synth: &McpConfigSynth) -> Vec<String> {
 pub struct McpConfigSynth {
     /// Absolute path to the worktree where the subprocess will run.
     pub worktree: PathBuf,
-    /// Absolute path to the Unix domain socket the MCP server is
-    /// listening on. The shim proxies stdio to this socket.
-    pub socket_path: PathBuf,
+    /// Endpoint the MCP server is listening on (Unix socket path or
+    /// Windows named pipe). The shim proxies stdio to this endpoint.
+    pub endpoint: super::McpEndpoint,
     /// Path (or bare name) written verbatim as the config's `command`.
     /// The default `"gaviero-mcp-shim"` expects the binary to be on
     /// `PATH` — `cargo install --path crates/gaviero-mcp-shim` or a
@@ -295,7 +295,7 @@ impl Default for McpConfigSynth {
     fn default() -> Self {
         Self {
             worktree: PathBuf::new(),
-            socket_path: PathBuf::new(),
+            endpoint: super::McpEndpoint::Unix(PathBuf::new()),
             shim_binary: "gaviero-mcp-shim".to_string(),
             codex_trust: TrustConsent::Unknown,
             enabled: true,
@@ -472,7 +472,7 @@ pub fn cursor_mcp_config_json(synth: &McpConfigSynth) -> Result<String> {
 fn gaviero_server_entry(synth: &McpConfigSynth) -> serde_json::Value {
     serde_json::json!({
         "command": synth.shim_binary,
-        "args": ["--socket", synth.socket_path.to_string_lossy()],
+        "args": synth.endpoint.shim_args(),
     })
 }
 
@@ -759,7 +759,7 @@ fn toml_quote_key(k: &str) -> String {
 pub fn codex_mcp_config_toml(synth: &McpConfigSynth) -> Result<String> {
     // Manually construct the TOML — toml's serializer doesn't like
     // the dotted-header shape Codex expects.
-    let socket = synth.socket_path.to_string_lossy();
+    let shim_args = synth.endpoint.shim_args();
     let worktree = synth.worktree.to_string_lossy();
     let trust_value = match synth.codex_trust {
         TrustConsent::Granted => "trusted",
@@ -775,11 +775,12 @@ pub fn codex_mcp_config_toml(synth: &McpConfigSynth) -> Result<String> {
         body.push_str(&format!(
             "[mcp_servers.gaviero]\n\
              command = {command:?}\n\
-             args = [\"--socket\", {socket:?}]\n\
+             args = [{flag:?}, {value:?}]\n\
              startup_timeout_sec = {start}\n\
              tool_timeout_sec = {tool}\n",
             command = synth.shim_binary,
-            socket = socket,
+            flag = shim_args[0],
+            value = shim_args[1],
             start = CODEX_MCP_STARTUP_TIMEOUT_SECS,
             tool = CODEX_MCP_TOOL_TIMEOUT_SECS,
         ));
@@ -1216,7 +1217,9 @@ mod tests {
     fn fixture(worktree: PathBuf) -> McpConfigSynth {
         McpConfigSynth {
             worktree: worktree.clone(),
-            socket_path: worktree.join(".gaviero/mcp.sock"),
+            // Explicit Unix variant so config-shape assertions
+            // (`--socket`) hold on every host platform.
+            endpoint: super::super::McpEndpoint::Unix(worktree.join(".gaviero/mcp.sock")),
             shim_binary: "gaviero-mcp-shim".into(),
             codex_trust: TrustConsent::Granted,
             enabled: true,
@@ -1230,7 +1233,11 @@ mod tests {
     /// Fixture with a shim path that always resolves in unit tests.
     fn fixture_resolvable_shim(worktree: PathBuf) -> McpConfigSynth {
         let mut synth = fixture(worktree);
-        synth.shim_binary = "/bin/sh".into();
+        synth.shim_binary = if cfg!(windows) {
+            std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".into())
+        } else {
+            "/bin/sh".into()
+        };
         synth
     }
 

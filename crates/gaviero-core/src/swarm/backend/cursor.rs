@@ -28,7 +28,6 @@ use anyhow::{Context, Result};
 use futures::Stream;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::process::Command;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::shared::{build_enriched_prompt, default_editor_system_prompt};
@@ -101,7 +100,7 @@ impl AgentBackend for CursorBackend {
             );
         }
 
-        let mut cmd = Command::new("agent");
+        let mut cmd = crate::util::spawn::agent_command("agent");
         let mcp_json = request.workspace_root.join(".cursor/mcp.json");
         if crate::mcp::config_synth::worktree_has_remote_mcp_urls(&request.workspace_root) {
             tracing::info!(
@@ -232,7 +231,7 @@ impl AgentBackend for CursorBackend {
     }
 
     async fn health_check(&self) -> Result<()> {
-        let output = Command::new("agent")
+        let output = crate::util::spawn::agent_command("agent")
             .arg("--version")
             .output()
             .await

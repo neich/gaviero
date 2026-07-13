@@ -1,10 +1,10 @@
 # gaviero-mcp-shim
 
-A tiny stdio↔Unix-socket bridge that connects subprocess coding agents (Claude Code, Codex, Cursor) to Gaviero's in-process MCP server.
+A tiny stdio↔socket bridge that connects subprocess coding agents (Claude Code, Codex, Cursor) to Gaviero's in-process MCP server.
 
 ## Overview
 
-When Gaviero spawns a subprocess agent, the agent expects to talk to an MCP server over stdio. `gaviero-mcp-shim` is the binary it spawns: it opens a Unix socket connection to `<workspace>/.gaviero/mcp.sock` and copies bytes in both directions. Gaviero's in-process `rmcp` server on the other end handles the actual MCP protocol.
+When Gaviero spawns a subprocess agent, the agent expects to talk to an MCP server over stdio. `gaviero-mcp-shim` is the binary it spawns: it opens a connection to Gaviero's workspace endpoint — the Unix socket `<workspace>/.gaviero/mcp.sock` on Unix, a `\\.\pipe\gaviero-<hash>` named pipe on Windows — and copies bytes in both directions. Gaviero's in-process `rmcp` server on the other end handles the actual MCP protocol.
 
 **No workspace dependencies.** This crate uses only `tokio`, `clap`, `anyhow`, and `tracing`. It builds and installs independently of the rest of the workspace.
 
@@ -27,7 +27,8 @@ For subprocess agents to find the shim, either:
 ## Usage
 
 ```bash
-gaviero-mcp-shim --socket /path/to/.gaviero/mcp.sock
+gaviero-mcp-shim --socket /path/to/.gaviero/mcp.sock            # Unix
+gaviero-mcp-shim --pipe '\\.\pipe\gaviero-<hash>'               # Windows
 gaviero-mcp-shim --socket /path/to/.gaviero/mcp.sock --connect-timeout-secs 10
 ```
 
@@ -37,8 +38,9 @@ Gaviero writes the per-workspace MCP config automatically (via `mcp::config_synt
 
 | Flag | Default | Description |
 |---|---|---|
-| `--socket <path>` | — | Absolute path to the workspace MCP socket (`<workspace>/.gaviero/mcp.sock`) |
-| `--connect-timeout-secs <n>` | `5` | Retry window for the initial socket connect. Useful when the agent spawns before Gaviero finishes `Workspace::open`. |
+| `--socket <path>` | — | Absolute path to the workspace MCP Unix socket (`<workspace>/.gaviero/mcp.sock`). Unix only. |
+| `--pipe <name>` | — | Windows named-pipe name (`\\.\pipe\gaviero-…`). Windows only. |
+| `--connect-timeout-secs <n>` | `5` | Retry window for the initial connect. Useful when the agent spawns before Gaviero finishes `Workspace::open`. |
 
 ## Protocol
 

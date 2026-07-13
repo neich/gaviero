@@ -70,15 +70,18 @@ impl Tool for BashTool {
 }
 
 /// Execute `command` via `bash -c` with `cwd` confined to `workspace_root`.
+///
+/// The tool's LLM-facing contract is POSIX semantics — on Windows this
+/// means Git Bash, and its absence is a hard error rather than a
+/// silent cmd/PowerShell fallback (Tier W1 / PR-4, W-D5).
 pub(crate) async fn run_command(
     command: &str,
     workspace_root: &Path,
     timeout: Duration,
     output_cap: usize,
 ) -> Result<String, String> {
-    let child = Command::new("bash")
-        .arg("-c")
-        .arg(command)
+    let mut cmd = build_bash_command(command)?;
+    let child = cmd
         .current_dir(workspace_root)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -107,6 +110,30 @@ pub(crate) async fn run_command(
     let code = output.status.code().unwrap_or(-1);
     let body = truncate_output(&combined, output_cap);
     Ok(format!("exit code: {code}\n{body}"))
+}
+
+/// Build the `bash -c <command>` invocation. Unix: system `bash`.
+/// Windows: Git Bash (`GAVIERO_GIT_BASH_PATH` → PATH → Program Files),
+/// hard error when absent — the tool is *named* Bash and promises
+/// POSIX semantics to the model.
+fn build_bash_command(command: &str) -> Result<Command, String> {
+    #[cfg(not(windows))]
+    {
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg(command);
+        Ok(cmd)
+    }
+    #[cfg(windows)]
+    {
+        let bash = crate::util::spawn::find_git_bash().ok_or_else(|| {
+            "Bash tool requires Git Bash on Windows; install Git for Windows \
+             or set GAVIERO_GIT_BASH_PATH"
+                .to_string()
+        })?;
+        let mut cmd = Command::new(bash);
+        cmd.arg("-c").arg(command);
+        Ok(cmd)
+    }
 }
 
 /// Keep head + tail when `text` exceeds `cap` bytes (UTF-8 safe on char boundaries).

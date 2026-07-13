@@ -1,6 +1,6 @@
 # gaviero-mcp-shim
 
-A small stdio↔Unix-socket bridge (~110 lines). Subprocess coding agents (Claude Code, Codex, Cursor) spawn this binary as their MCP "server"; it opens a connection to Gaviero's workspace socket and pipes bytes in both directions. The actual MCP protocol terminates at the in-process rmcp server inside [`gaviero-core`](../gaviero-core/CLAUDE.md).
+A small stdio↔socket bridge (~200 lines). Subprocess coding agents (Claude Code, Codex, Cursor) spawn this binary as their MCP "server"; it opens a connection to Gaviero's workspace endpoint — a Unix domain socket on Unix, a named pipe on Windows — and pipes bytes in both directions. The actual MCP protocol terminates at the in-process rmcp server inside [`gaviero-core`](../gaviero-core/CLAUDE.md).
 
 Binary: `gaviero-mcp-shim` ([src/main.rs](src/main.rs)).
 
@@ -15,15 +15,16 @@ Subprocess MCP configs (`<worktree>/.mcp.json` for Claude Code, `<worktree>/.cod
 
 ## Architecture
 
-- `connect_with_backoff` — retries the Unix socket connect with exponential backoff (50 ms → 400 ms) until the deadline, so the shim survives Gaviero restarting `Workspace::open` after the subprocess is already spawned.
-- `bridge` — bidirectional `tokio::select!` between stdin→socket and socket→stdout using `tokio::io::copy`-style byte-faithful loops. Exits when either side closes.
+- `connect_with_backoff` (per-platform `unix`/`windows` modules) — retries the endpoint connect with exponential backoff (50 ms → 400 ms) until the deadline, so the shim survives Gaviero restarting `Workspace::open` after the subprocess is already spawned. The Windows arm folds `ERROR_PIPE_BUSY` into the same retry loop.
+- `bridge` — generic over `AsyncRead + AsyncWrite` halves: bidirectional `tokio::select!` between stdin→endpoint and endpoint→stdout using byte-faithful copy loops. Exits when either side closes.
 - MCP over stdio is line-delimited JSON-RPC 2.0; the shim does **not** parse or reframe — `rmcp` on the server side expects byte-faithful delivery.
 
 ## Flags
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--socket <path>` | (required) | Absolute path to the workspace MCP socket (`<workspace>/.gaviero/mcp.sock`). |
+| `--socket <path>` | (required on Unix) | Absolute path to the workspace MCP socket (`<workspace>/.gaviero/mcp.sock`). Unix only. |
+| `--pipe <name>` | (required on Windows) | Named-pipe name (`\\.\pipe\gaviero-…`). Windows only. |
 | `--connect-timeout-secs <N>` | `5` | Total seconds the initial connect will retry before failing. |
 
 `tracing-subscriber` is initialised at WARN level on stderr.

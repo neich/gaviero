@@ -198,7 +198,10 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Simplify away Windows' `\\?\` verbatim prefix — this path becomes
+    // the workspace root and flows into shell cwds, prompts, and configs.
     let path = std::fs::canonicalize(&cli.path)
+        .map(|p| gaviero_core::util::fs::simplify_path(&p))
         .with_context(|| format!("resolving path: {}", cli.path.display()))?;
 
     let workspace = if path

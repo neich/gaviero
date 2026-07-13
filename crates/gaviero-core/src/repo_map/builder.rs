@@ -61,7 +61,7 @@ fn walk_dir(
         if path.is_dir() {
             walk_dir(&path, workspace, graph, excludes)?;
         } else if path.is_file() {
-            if let Some(node) = build_node(&path, rel.to_path_buf()) {
+            if let Some(node) = build_node(&path, super::normalize_rel_path(rel)) {
                 graph.add_node(node);
             }
         }

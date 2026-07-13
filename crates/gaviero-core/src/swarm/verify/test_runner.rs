@@ -300,17 +300,30 @@ fn build_targeted_command(
 }
 
 /// Run a shell command and capture output.
+///
+/// User-authored test commands run under a POSIX shell (`sh` / Git
+/// Bash) when available, `pwsh` otherwise — the user owns the syntax
+/// (Tier W1 / PR-4, W-D5).
 async fn run_command(
     command: &str,
     cwd: &Path,
     env: &HashMap<String, String>,
 ) -> Result<(i32, String, String)> {
-    let output = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .current_dir(cwd)
-        .env_clear()
-        .envs(env)
+    let mut cmd = crate::util::spawn::shell_command_lenient(command);
+    cmd.current_dir(cwd).env_clear().envs(env);
+    // `env_clear()` on Windows strips system variables that child
+    // processes need to function at all; re-inherit a minimal
+    // allowlist unless the caller overrode them explicitly.
+    if cfg!(windows) {
+        for key in ["SYSTEMROOT", "PATH", "TEMP", "TMP", "PATHEXT", "COMSPEC"] {
+            if !env.keys().any(|k| k.eq_ignore_ascii_case(key))
+                && let Ok(value) = std::env::var(key)
+            {
+                cmd.env(key, value);
+            }
+        }
+    }
+    let output = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()

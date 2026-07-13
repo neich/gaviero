@@ -391,7 +391,7 @@ mod tests {
                 id: Some(42),
                 namespace: Some("ws".to_string()),
                 scope_label: Some("workspace".to_string()),
-                score: Some(3.14),
+                score: Some(3.25),
                 trust: None,
                 content: "remember this".to_string(),
                 source_hash: None,

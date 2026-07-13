@@ -9,17 +9,20 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 
 use super::protocol::{StreamEvent, parse_stream_line};
 use crate::observer::{PromptEvent, PromptObserver};
 
-/// If the enriched prompt + system prompt combined exceed this size, pass the
-/// prompt to Claude through a workspace-local tempfile via `@`-reference
-/// instead of argv. Linux `ARG_MAX` is ~128 KB; 32 KB leaves ample headroom
-/// for the other flag args, environment, and OS overhead. The tempfile path
+/// If the enriched prompt + system prompt combined exceed
+/// [`crate::util::spawn::argv_threshold`], pass the prompt to Claude through
+/// a workspace-local tempfile via `@`-reference instead of argv. Linux
+/// `ARG_MAX` is ~128 KB; Windows caps the whole command line at ~32,767
+/// UTF-16 chars, hence the much lower Windows threshold. The tempfile path
 /// itself has no practical size ceiling.
-const ARGV_THRESHOLD: usize = 32_768;
+fn argv_threshold() -> usize {
+    crate::util::spawn::argv_threshold()
+}
 
 /// Subdirectory under the workspace root where oversized prompt tempfiles live.
 /// `--add-dir <cwd>` already lets Claude read files under the workspace; the
@@ -177,7 +180,7 @@ pub struct AcpSession {
 /// be passed via argv or a tempfile. Extracted so tests can exercise the
 /// decision without spawning a subprocess.
 pub fn would_use_tempfile(prompt_len: usize, system_prompt_len: usize) -> bool {
-    prompt_len + system_prompt_len >= ARGV_THRESHOLD
+    prompt_len + system_prompt_len >= argv_threshold()
 }
 
 /// Write `prompt` to a workspace-local tempfile and return (NamedTempFile,
@@ -256,7 +259,7 @@ impl AcpSession {
                 prompt: prompt.to_string(),
                 system_prompt: system_prompt.to_string(),
                 used_tempfile: use_tempfile,
-                argv_threshold: ARGV_THRESHOLD,
+                argv_threshold: argv_threshold(),
                 captured_at: std::time::Instant::now(),
             });
         }
@@ -274,7 +277,7 @@ impl AcpSession {
                 (None, prompt.to_string())
             };
 
-        let mut cmd = Command::new("claude");
+        let mut cmd = crate::util::spawn::agent_command("claude");
         cmd.arg("--print")
             .arg("--output-format")
             .arg("stream-json")
@@ -413,8 +416,9 @@ impl AcpSession {
                 // error with a pointer at the system prompt as the suspect.
                 anyhow::anyhow!(
                     "spawning claude subprocess: argument list too long.\n\
-                     This shouldn't happen — user prompts spill to a tempfile above {ARGV_THRESHOLD} B.\n\
-                     The system prompt or flag arguments must be pathologically large; report this as a bug."
+                     This shouldn't happen — user prompts spill to a tempfile above {} B.\n\
+                     The system prompt or flag arguments must be pathologically large; report this as a bug.",
+                    argv_threshold()
                 )
             } else {
                 anyhow::anyhow!("spawning claude subprocess: {e}")
@@ -547,7 +551,7 @@ impl AcpSession {
 
 /// Check if the `claude` CLI binary is available on PATH.
 pub fn is_claude_available() -> bool {
-    std::process::Command::new("claude")
+    crate::util::spawn::agent_command_std("claude")
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -564,16 +568,16 @@ mod tests {
     fn small_prompt_uses_argv() {
         assert!(!would_use_tempfile(0, 0));
         assert!(!would_use_tempfile(1_000, 500));
-        // Right at the boundary — well below ARGV_THRESHOLD.
-        assert!(!would_use_tempfile(ARGV_THRESHOLD - 1, 0));
+        // Right at the boundary — just below the threshold.
+        assert!(!would_use_tempfile(argv_threshold() - 1, 0));
     }
 
     #[test]
     fn large_prompt_spills_to_tempfile() {
-        assert!(would_use_tempfile(ARGV_THRESHOLD, 0));
+        assert!(would_use_tempfile(argv_threshold(), 0));
         assert!(would_use_tempfile(100_000, 0));
         // Combined prompt + system prompt crossing threshold.
-        assert!(would_use_tempfile(ARGV_THRESHOLD - 100, 200));
+        assert!(would_use_tempfile(argv_threshold() - 100, 200));
     }
 
     #[test]
@@ -683,7 +687,7 @@ mod tests {
 /// CLI is unavailable or the help text format changes — the picker still
 /// offers [`crate::swarm::backend::shared::CLAUDE_MODEL_ALIASES`] in that case.
 pub fn discover_model_options() -> Vec<String> {
-    let output = std::process::Command::new("claude")
+    let output = crate::util::spawn::agent_command_std("claude")
         .arg("--help")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -782,7 +786,7 @@ fn is_model_id_shaped(s: &str) -> bool {
 /// present in the CLI's list, follows immediately after for free-tier
 /// users.
 pub fn discover_cursor_model_options() -> Vec<String> {
-    let output = std::process::Command::new("agent")
+    let output = crate::util::spawn::agent_command_std("agent")
         .arg("--list-models")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

@@ -1354,7 +1354,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_embedding_roundtrip() {
-        let original = vec![1.0, -2.5, 3.14, 0.0];
+        let original = vec![1.0, -2.5, 3.5, 0.0];
         let blob = embedding_to_blob(&original);
         // Verify blob is correct length
         assert_eq!(blob.len(), 16);

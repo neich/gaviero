@@ -55,7 +55,7 @@ pub(super) fn resynthesize_mcp_configs(app: &App) {
     let Some(root) = app.workspace.roots().first().map(|p| p.to_path_buf()) else {
         return;
     };
-    let socket_path = root.join(".gaviero/mcp.sock");
+    let endpoint = gaviero_core::mcp::McpEndpoint::for_workspace(&root);
     let codex_trust = match app
         .workspace
         .resolve_setting(
@@ -74,7 +74,7 @@ pub(super) fn resynthesize_mcp_configs(app: &App) {
     let synth = gaviero_core::mcp::resolve_mcp_config_synth(
         &app.workspace,
         &root,
-        socket_path,
+        endpoint,
         &overrides,
     );
     if let Err(e) = gaviero_core::mcp::synthesize_for_worktree(&synth) {
@@ -89,7 +89,7 @@ fn mcp_config_for_workspace(
     gaviero_core::mcp::resolve_mcp_config_synth(
         &app.workspace,
         root,
-        root.join(".gaviero/mcp.sock"),
+        gaviero_core::mcp::McpEndpoint::for_workspace(root),
         &gaviero_core::mcp::McpConfigOverrides::default(),
     )
 }

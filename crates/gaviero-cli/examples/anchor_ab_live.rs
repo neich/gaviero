@@ -126,7 +126,11 @@ async fn main() -> Result<()> {
     );
     eprintln!("[ab-live] warming MCP graph (build_graph)…");
     server.warmup().await;
-    let _handle = spawn_mcp_server(server, &socket).context("spawn mcp server")?;
+    let _handle = spawn_mcp_server(
+        server,
+        &gaviero_core::mcp::McpEndpoint::Unix(socket.clone()),
+    )
+    .context("spawn mcp server")?;
 
     let shim = repo.join("target/debug/gaviero-mcp-shim");
     anyhow::ensure!(

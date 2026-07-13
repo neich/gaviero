@@ -1,7 +1,8 @@
 //! In-process MCP server task (Tier A / A5).
 //!
-//! Listens on a Unix domain socket under the workspace's
-//! `.gaviero/mcp.sock`. Each shim connection is a single MCP session
+//! Listens on the workspace's [`McpEndpoint`] — a Unix domain socket
+//! at `.gaviero/mcp.sock` on Unix, a `\\.\pipe\gaviero-…` named pipe
+//! on Windows. Each shim connection is a single MCP session
 //! speaking JSON-RPC 2.0 over `AsyncRead + AsyncWrite` — rmcp handles
 //! framing, initialize, and tools/list. Gaviero owns only the three
 //! tool handlers.
@@ -12,7 +13,7 @@
 //! `store_scoped`. Plan-rejected `memory_store` / `memory_update` /
 //! `memory_delete` tools remain unimplementable by construction.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -779,14 +780,14 @@ fn format_scope(level: i32) -> String {
     .to_string()
 }
 
-// ── Socket accept loop ────────────────────────────────────────────
+// ── Accept loop (Unix socket / Windows named pipe) ────────────────
 
 /// Handle returned by `spawn_mcp_server` — lets the caller signal
 /// shutdown when the workspace closes.
 pub struct McpServerHandle {
     shutdown: tokio::sync::broadcast::Sender<()>,
     join: tokio::task::JoinHandle<()>,
-    pub socket_path: PathBuf,
+    pub endpoint: super::McpEndpoint,
 }
 
 impl McpServerHandle {
@@ -794,16 +795,53 @@ impl McpServerHandle {
     pub async fn shutdown(self) {
         let _ = self.shutdown.send(());
         let _ = self.join.await;
-        // Best-effort socket cleanup.
-        let _ = std::fs::remove_file(&self.socket_path);
+        // Best-effort socket-file cleanup. Named pipes vanish with the
+        // last open handle — nothing to remove on the pipe arm.
+        if let super::McpEndpoint::Unix(path) = &self.endpoint {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
-/// Spawn the MCP server on a Unix socket. Windows support is stubbed
-/// — plan §A5 flags named-pipe support as a second path; today this
-/// compiles only on Unix.
+/// Serve one accepted connection on its own task: per-connection
+/// clone (fresh first-tool-call latch, shared warm caches), rmcp over
+/// split `AsyncRead + AsyncWrite` halves.
+fn spawn_connection<S>(server: &GavieroMcpServer, stream: S)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+{
+    let server_clone = server.clone_for_connection();
+    tokio::spawn(async move {
+        let (rx, tx) = tokio::io::split(stream);
+        match server_clone.serve((rx, tx)).await {
+            Ok(svc) => {
+                let _ = svc.waiting().await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "mcp_server",
+                    error = %e,
+                    "rmcp serve failed"
+                );
+            }
+        }
+    });
+}
+
+/// Spawn the MCP server accept loop on the workspace endpoint —
+/// Unix domain socket on Unix, named pipe on Windows.
+pub fn spawn_mcp_server(
+    server: GavieroMcpServer,
+    endpoint: &super::McpEndpoint,
+) -> Result<McpServerHandle> {
+    match endpoint {
+        super::McpEndpoint::Unix(path) => spawn_unix(server, path.clone()),
+        super::McpEndpoint::Pipe(name) => spawn_pipe(server, name.clone()),
+    }
+}
+
 #[cfg(unix)]
-pub fn spawn_mcp_server(server: GavieroMcpServer, socket_path: &Path) -> Result<McpServerHandle> {
+fn spawn_unix(server: GavieroMcpServer, socket_path: PathBuf) -> Result<McpServerHandle> {
     use tokio::net::UnixListener;
 
     if let Some(parent) = socket_path.parent() {
@@ -811,12 +849,11 @@ pub fn spawn_mcp_server(server: GavieroMcpServer, socket_path: &Path) -> Result<
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     // Remove any stale socket from a previous run.
-    let _ = std::fs::remove_file(socket_path);
-    let listener = UnixListener::bind(socket_path)
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("binding MCP socket at {}", socket_path.display()))?;
     let (shutdown, mut shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-    let socket_path_buf = socket_path.to_path_buf();
-    let socket_path_accept = socket_path_buf.clone();
+    let socket_path_accept = socket_path.clone();
 
     let join = tokio::spawn(async move {
         loop {
@@ -837,27 +874,7 @@ pub fn spawn_mcp_server(server: GavieroMcpServer, socket_path: &Path) -> Result<
                             continue;
                         }
                     };
-                    // Per-connection clone: fresh first-tool-call latch,
-                    // shared warm caches.
-                    let server_clone = server.clone_for_connection();
-                    tokio::spawn(async move {
-                        // rmcp speaks JSON-RPC 2.0 over any AsyncRead +
-                        // AsyncWrite — `UnixStream` satisfies both via
-                        // `tokio::io::split`.
-                        let (rx, tx) = tokio::io::split(stream);
-                        match server_clone.serve((rx, tx)).await {
-                            Ok(svc) => {
-                                let _ = svc.waiting().await;
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    target: "mcp_server",
-                                    error = %e,
-                                    "rmcp serve failed"
-                                );
-                            }
-                        }
-                    });
+                    spawn_connection(&server, stream);
                 }
             }
         }
@@ -866,15 +883,82 @@ pub fn spawn_mcp_server(server: GavieroMcpServer, socket_path: &Path) -> Result<
     Ok(McpServerHandle {
         shutdown,
         join,
-        socket_path: socket_path_buf,
+        endpoint: super::McpEndpoint::Unix(socket_path),
     })
 }
 
 #[cfg(not(unix))]
-pub fn spawn_mcp_server(_server: GavieroMcpServer, _socket_path: &Path) -> Result<McpServerHandle> {
+fn spawn_unix(_server: GavieroMcpServer, socket_path: PathBuf) -> Result<McpServerHandle> {
     anyhow::bail!(
-        "MCP server: Unix-socket transport only on Unix platforms (plan §A5 open question)"
+        "MCP server: Unix-socket endpoint {} is not supported on this platform \
+         (use a named-pipe endpoint)",
+        socket_path.display()
     )
+}
+
+/// Windows: multi-instance named-pipe accept loop. A fresh pipe
+/// instance must exist *before* the connected one is handed off, or a
+/// fast second client hits `ERROR_FILE_NOT_FOUND` between accepts —
+/// mirrors tokio's documented server pattern. The first instance sets
+/// `first_pipe_instance(true)` so another process can't squat the
+/// name; the default DACL (current user) is the ACL policy.
+#[cfg(windows)]
+fn spawn_pipe(server: GavieroMcpServer, pipe_name: String) -> Result<McpServerHandle> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    let mut instance = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&pipe_name)
+        .with_context(|| format!("creating MCP named pipe {pipe_name}"))?;
+    let (shutdown, mut shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+    let pipe_name_accept = pipe_name.clone();
+
+    let join = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.recv() => {
+                    tracing::info!(
+                        target: "mcp_server",
+                        pipe = %pipe_name_accept,
+                        "shutdown signal received"
+                    );
+                    break;
+                }
+                connected = instance.connect() => {
+                    if let Err(e) = connected {
+                        tracing::warn!(target: "mcp_server", error = %e, "pipe connect failed");
+                        continue;
+                    }
+                    // Next instance first, then hand off the connected one.
+                    let next = match ServerOptions::new().create(&pipe_name_accept) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "mcp_server",
+                                error = %e,
+                                "creating next pipe instance failed — accept loop stopping"
+                            );
+                            spawn_connection(&server, instance);
+                            break;
+                        }
+                    };
+                    let stream = std::mem::replace(&mut instance, next);
+                    spawn_connection(&server, stream);
+                }
+            }
+        }
+    });
+
+    Ok(McpServerHandle {
+        shutdown,
+        join,
+        endpoint: super::McpEndpoint::Pipe(pipe_name),
+    })
+}
+
+#[cfg(not(windows))]
+fn spawn_pipe(_server: GavieroMcpServer, pipe_name: String) -> Result<McpServerHandle> {
+    anyhow::bail!("MCP server: named-pipe endpoint {pipe_name} is only supported on Windows")
 }
 
 #[cfg(test)]
@@ -1058,7 +1142,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("mcp.sock");
         let server = fixture();
-        let handle = spawn_mcp_server(server, &sock).unwrap();
+        let handle =
+            spawn_mcp_server(server, &super::super::McpEndpoint::Unix(sock.clone())).unwrap();
 
         // Retry connect briefly so accept loop is listening.
         let mut attempts = 0;
@@ -1078,6 +1163,42 @@ mod tests {
             !sock.exists(),
             "socket file should be cleaned up on shutdown"
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn server_accepts_named_pipe_connections() {
+        // Windows mirror of the unix accept smoke test, plus a second
+        // concurrent client to exercise the multi-instance re-create
+        // step in the accept loop.
+        use tokio::net::windows::named_pipe::ClientOptions;
+        let pipe_name = format!(r"\\.\pipe\gaviero-test-{}", std::process::id());
+        let server = fixture();
+        let handle =
+            spawn_mcp_server(server, &super::super::McpEndpoint::Pipe(pipe_name.clone()))
+                .unwrap();
+
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let mut attempts = 0;
+            loop {
+                match ClientOptions::new().open(&pipe_name) {
+                    Ok(c) => {
+                        clients.push(c);
+                        break;
+                    }
+                    Err(_) => {
+                        attempts += 1;
+                        if attempts > 10 {
+                            panic!("pipe connect never succeeded");
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                }
+            }
+        }
+
+        handle.shutdown().await;
     }
 
     #[tokio::test]

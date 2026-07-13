@@ -8,8 +8,9 @@
 //!
 //! The server runs as an in-process tokio task launched at
 //! `Workspace::open` time. A small `gaviero-mcp-shim` binary connects
-//! subprocess agents' stdio to the server's Unix domain socket at
-//! `<workspace>/.gaviero/mcp.sock`.
+//! subprocess agents' stdio to the server's workspace endpoint
+//! ([`McpEndpoint`]): the Unix domain socket `<workspace>/.gaviero/mcp.sock`
+//! on Unix, a `\\.\pipe\gaviero-…` named pipe on Windows.
 //!
 //! **Read-only by construction** (Phase 1 invariant): there are no
 //! `memory_store` / `memory_update` / `memory_delete` tools. Writes
@@ -23,6 +24,7 @@ pub mod observer;
 pub mod server;
 pub mod telemetry_sink;
 pub mod tools;
+pub mod transport;
 
 pub use config_synth::{
     Context7Config, ExtraMcpServer, ExtraMcpTransport, McpConfigSynth, McpPermissions,
@@ -48,6 +50,7 @@ pub use observer::{
     FanOutMcpObserver, McpCallLogEntry, McpToolCallObserver, NoopMcpObserver,
 };
 pub use server::{GavieroMcpServer, McpServerHandle, spawn_mcp_server};
+pub use transport::McpEndpoint;
 pub use telemetry_sink::{
     McpCallRecord, NdjsonTelemetrySink, ToolStats, compute_stats, default_telemetry_path,
 };
