@@ -4,7 +4,7 @@
 //! merged into every swarm worktree alongside `gaviero` and `context7`.
 //! CLI flags `--mcp-url` / `--mcp-stdio` append or override by name.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
@@ -279,7 +279,7 @@ pub fn resolve_context7_config(workspace: &Workspace, root: Option<&Path>) -> Co
 pub fn resolve_mcp_config_synth(
     workspace: &Workspace,
     root: &Path,
-    socket_path: PathBuf,
+    endpoint: super::McpEndpoint,
     overrides: &McpConfigOverrides,
 ) -> McpConfigSynth {
     let enabled = overrides.enabled.unwrap_or_else(|| {
@@ -317,7 +317,7 @@ pub fn resolve_mcp_config_synth(
 
     McpConfigSynth {
         worktree: root.to_path_buf(),
-        socket_path,
+        endpoint,
         shim_binary,
         codex_trust,
         enabled,
@@ -331,6 +331,7 @@ pub fn resolve_mcp_config_synth(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn parse_mcp_url_flag_splits_on_first_equals() {

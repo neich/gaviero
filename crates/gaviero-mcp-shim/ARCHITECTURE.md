@@ -1,8 +1,8 @@
 # gaviero-mcp-shim — Architecture
 
-A standalone stdio↔Unix-socket bridge. Subprocess coding agents (Claude Code, Codex, Cursor) spawn this binary as their MCP "server"; it opens a connection to `<workspace>/.gaviero/mcp.sock` and pipes bytes in both directions. The actual MCP protocol is handled by [`GavieroMcpServer`](../gaviero-core/src/mcp/server.rs) inside the host process.
+A standalone stdio↔socket bridge. Subprocess coding agents (Claude Code, Codex, Cursor) spawn this binary as their MCP "server"; it opens a connection to Gaviero's workspace endpoint — the Unix socket `<workspace>/.gaviero/mcp.sock` on Unix, a `\\.\pipe\gaviero-<hash>` named pipe on Windows — and pipes bytes in both directions. The actual MCP protocol is handled by [`GavieroMcpServer`](../gaviero-core/src/mcp/server.rs) inside the host process.
 
-Binary: `gaviero-mcp-shim` (~110 lines of Rust, single source file)
+Binary: `gaviero-mcp-shim` (~200 lines of Rust, single source file)
 
 ---
 
@@ -30,7 +30,7 @@ Binary: `gaviero-mcp-shim` (~110 lines of Rust, single source file)
 └─────────────┼──────────────┘
               │
               ▼   <workspace>/.gaviero/mcp.sock (Unix socket)
-              │
+              │   \\.\pipe\gaviero-<hash>       (Windows named pipe)
 ┌─────────────┴──────────────┐
 │ gaviero-core::mcp::server  │
 │ (in-process rmcp server)   │
@@ -61,23 +61,25 @@ The crate is a single source file:
 
 ```rust
 struct Cli {
-    /// Absolute path to <workspace>/.gaviero/mcp.sock
-    socket: PathBuf,
+    /// Absolute path to <workspace>/.gaviero/mcp.sock (Unix only)
+    socket: Option<PathBuf>,
+    /// Windows named-pipe name (\\.\pipe\gaviero-…, Windows only)
+    pipe: Option<String>,
     /// Retry window for the initial connect (default 5s)
     connect_timeout_secs: u64,
 }
 ```
 
-### `connect_with_backoff` ([`src/main.rs`](src/main.rs))
+### `connect_with_backoff` (per-platform modules, [`src/main.rs`](src/main.rs))
 
-Retries `UnixStream::connect` with exponential backoff (50 ms → 400 ms ceiling) until either the connection succeeds or the deadline (`Instant::now + connect_timeout_secs`) passes. Used so the subprocess can spawn before the host finishes `Workspace::open`.
+Retries `UnixStream::connect` (Unix) / `ClientOptions::open` (Windows, folding `ERROR_PIPE_BUSY` into the loop) with exponential backoff (50 ms → 400 ms ceiling) until either the connection succeeds or the deadline (`Instant::now + connect_timeout_secs`) passes. Used so the subprocess can spawn before the host finishes `Workspace::open`.
 
 ### `bridge` ([`src/main.rs`](src/main.rs))
 
-Splits the connected `UnixStream` into `(sock_rx, sock_tx)`, then runs two async tasks under `tokio::select!`:
+Generic over split `AsyncRead + AsyncWrite` halves; runs two async tasks under `tokio::select!`:
 
-- `to_sock`: `stdin → sock_tx` with explicit `flush()` after every chunk.
-- `from_sock`: `sock_rx → stdout` with explicit `flush()`.
+- `to_endpoint`: `stdin → endpoint` with explicit `flush()` after every chunk.
+- `from_endpoint`: `endpoint → stdout` with explicit `flush()`.
 
 Both tasks use a fixed 8192-byte buffer. The first task to return EOF or an error terminates the bridge.
 
@@ -137,7 +139,7 @@ None — this is a binary crate. Subprocess agents launch it via their MCP confi
 - Codex: `<worktree>/.codex/config.toml`'s `[mcp_servers.gaviero]` block (see [`codex_mcp_config_toml`](../gaviero-core/src/mcp/config_synth.rs)).
 - Cursor: `<worktree>/.cursor/mcp.json` (same schema as Claude, see [`cursor_mcp_config_json`](../gaviero-core/src/mcp/config_synth.rs)).
 
-Each config sets `command` to `gaviero-mcp-shim` and passes `--socket <abs-path>`. The shim must therefore be on `PATH` or referenced by absolute path; otherwise the agent's MCP startup fails.
+Each config sets `command` to `gaviero-mcp-shim` and passes `--socket <abs-path>` (Unix) or `--pipe <name>` (Windows), emitted per-platform by [`McpEndpoint::shim_args`](../gaviero-core/src/mcp/transport.rs). The shim must therefore be on `PATH` or referenced by absolute path; otherwise the agent's MCP startup fails.
 
 ---
 
