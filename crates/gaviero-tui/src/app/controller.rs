@@ -1214,7 +1214,8 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                     .first()
                     .map(|p| p.to_path_buf())
                     .unwrap_or_else(|| std::path::PathBuf::from("."));
-                let socket_path = workspace_root_for_mcp.join(".gaviero/mcp.sock");
+                let endpoint =
+                    gaviero_core::mcp::McpEndpoint::for_workspace(&workspace_root_for_mcp);
                 let disabled_external_summary = {
                     let disable_external = app
                         .workspace
@@ -1307,11 +1308,11 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 // connection clone.
                 let warm = server.clone();
                 tokio::spawn(async move { warm.warmup().await });
-                match gaviero_core::mcp::spawn_mcp_server(server, &socket_path) {
+                match gaviero_core::mcp::spawn_mcp_server(server, &endpoint) {
                     Ok(handle) => {
                         tracing::info!(
                             target: "mcp_server",
-                            socket = %handle.socket_path.display(),
+                            endpoint = %handle.endpoint,
                             "mcp server listening"
                         );
                         app.mcp_server = Some(handle);
@@ -1333,7 +1334,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                         let synth = gaviero_core::mcp::resolve_mcp_config_synth(
                             &app.workspace,
                             &workspace_root_for_mcp,
-                            socket_path.clone(),
+                            endpoint.clone(),
                             &overrides,
                         );
                         if let Err(e) = gaviero_core::mcp::synthesize_for_worktree(&synth) {

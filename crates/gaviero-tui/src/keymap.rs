@@ -216,6 +216,11 @@ impl Keymap {
             KeyCode::Enter if shift => Action::AltEnter,
             KeyCode::Enter => Action::Enter,
             KeyCode::Char(c) if !ctrl && !alt => Action::InsertChar(c),
+            // AltGr on Windows reports as CONTROL|ALT with the
+            // layout-resolved char (Spanish AltGr+2 = '@'); insert it
+            // as text. Reached only after every specific Ctrl/Alt
+            // shortcut above has had its chance.
+            KeyCode::Char(c) if cfg!(windows) && ctrl && alt => Action::InsertChar(c),
 
             _ => Action::None,
         }
@@ -243,6 +248,20 @@ mod tests {
         assert_eq!(
             Keymap::resolve(&key(KeyCode::Char('a'), KeyModifiers::NONE)),
             Action::InsertChar('a')
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_altgr_char_inserts() {
+        // AltGr = CONTROL|ALT on Windows; the layout already resolved
+        // the char (Spanish AltGr+2 = '@').
+        assert_eq!(
+            Keymap::resolve(&key(
+                KeyCode::Char('@'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            )),
+            Action::InsertChar('@')
         );
     }
 

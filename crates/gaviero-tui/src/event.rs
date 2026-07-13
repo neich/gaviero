@@ -365,6 +365,14 @@ impl EventLoop {
 
                 match event {
                     Ok(Some(crossterm::event::Event::Key(key))) => {
+                        // Windows crossterm emits Press AND Release for
+                        // every keystroke — forwarding both double-fires
+                        // all input (Tier W1 / PR-5). Keep Repeat: held
+                        // keys must still repeat in editor/terminal
+                        // panes. Unix emits Press only; unaffected.
+                        if key.kind == crossterm::event::KeyEventKind::Release {
+                            continue;
+                        }
                         if tx.send(Event::Key(key)).is_err() {
                             break;
                         }

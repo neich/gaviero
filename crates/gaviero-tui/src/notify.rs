@@ -79,7 +79,16 @@ pub fn play_terminal_bell() {
 
 /// Fire-and-forget desktop notification. Best-effort: missing `notify-send`
 /// / `osascript` is silently ignored.
+///
+/// Windows: intentionally a no-op in v1 (Tier W1 / PR-5, W-D6) — the
+/// terminal bell and status-bar banner still fire. A WinRT toast needs
+/// either a PowerShell `Windows.UI.Notifications` script (slow, flashes
+/// a console) or a new dependency (`tauri-winrt-notification`); revisit
+/// post-W1 if users ask.
 pub fn spawn_desktop_notification(title: &str, body: &str) {
+    #[cfg(windows)]
+    let _ = (title, body);
+
     #[cfg(target_os = "linux")]
     {
         let _ = std::process::Command::new("notify-send")
