@@ -358,6 +358,14 @@ pub fn key_event_to_bytes(key: &KeyEvent) -> Vec<u8> {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     match key.code {
+        // AltGr on Windows reports as CONTROL|ALT with the
+        // layout-resolved char (Spanish AltGr+2 = '@') — send the char
+        // verbatim, before the Ctrl arm can mangle it into a control
+        // byte. Must precede both modifier arms.
+        KeyCode::Char(c) if cfg!(windows) && ctrl && alt => {
+            let mut char_buf = [0u8; 4];
+            c.encode_utf8(&mut char_buf).as_bytes().to_vec()
+        }
         KeyCode::Char(c) if ctrl => {
             let byte = (c.to_ascii_lowercase() as u8)
                 .wrapping_sub(b'a')
@@ -488,4 +496,27 @@ fn vt100_style_to_ratatui(cell: &vt100::Cell) -> ratatui::style::Style {
     }
 
     Style::default().fg(fg).bg(bg).add_modifier(modifier)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn altgr_char_passes_through_verbatim() {
+        // AltGr = CONTROL|ALT on Windows; Spanish AltGr+2 = '@' must
+        // reach the PTY as the character, not a control byte.
+        let key = KeyEvent::new(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        assert_eq!(key_event_to_bytes(&key), b"@".to_vec());
+    }
+
+    #[test]
+    fn ctrl_char_maps_to_control_byte() {
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(key_event_to_bytes(&key), vec![0x03]);
+    }
 }

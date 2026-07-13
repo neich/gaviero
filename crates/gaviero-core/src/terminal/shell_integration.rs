@@ -4,6 +4,7 @@
 //! - Bash: `--init-file`
 //! - Zsh: `ZDOTDIR` wrapping
 //! - Fish: `--init-command`
+//! - PowerShell (pwsh 7.2+): `-NoExit -Command ". '<init.ps1>'"` (dot-source)
 
 use std::path::{Path, PathBuf};
 
@@ -33,10 +34,16 @@ pub fn create_init_file(
         ShellType::Bash => generate_bash_init(histfile),
         ShellType::Zsh => generate_zsh_init(histfile),
         ShellType::Fish => generate_fish_init(histfile),
+        ShellType::PowerShell => generate_pwsh_init(histfile),
         ShellType::Unknown(_) => return Err(anyhow::anyhow!("unsupported shell for integration")),
     };
 
-    let filename = format!("gaviero-init-{}.sh", tab_id);
+    // pwsh only dot-sources scripts with a `.ps1` extension.
+    let extension = match shell_type {
+        ShellType::PowerShell => "ps1",
+        _ => "sh",
+    };
+    let filename = format!("gaviero-init-{}.{}", tab_id, extension);
     let path = dir.join(filename);
     std::fs::write(&path, content).context("writing shell init script")?;
     Ok(path)
@@ -64,6 +71,20 @@ pub fn build_shell_args(config: &mut ShellConfig, init_path: &Path) {
             config.shell_args = vec![
                 "--init-command".into(),
                 format!("source {}", init_path.to_string_lossy()),
+            ];
+        }
+        ShellType::PowerShell => {
+            // Dot-source so the init runs in the interactive session's
+            // scope; `-File` + `-NoExit` doesn't leave an interactive
+            // prompt. `-ExecutionPolicy Bypass` is process-scoped.
+            config.shell_args = vec![
+                "-NoExit".into(),
+                "-NoLogo".into(),
+                "-ExecutionPolicy".into(),
+                "Bypass".into(),
+                "-Command".into(),
+                // Single-quoted PowerShell string: `'` escapes by doubling.
+                format!(". '{}'", init_path.to_string_lossy().replace('\'', "''")),
             ];
         }
         ShellType::Unknown(_) => {}
@@ -249,5 +270,58 @@ end
 printf '\e]133;A\a'
 "#,
         histfile = histfile.to_string_lossy()
+    )
+}
+
+/// Generate PowerShell (pwsh 7.2+) init script content.
+///
+/// One dialect only (Tier W1 / PR-3): `` `e `` escapes, PSReadLine
+/// assumed present, no 5.1 compatibility. The user's `prompt` function
+/// is wrapped, not replaced; OSC 133;C (command execution start) comes
+/// from wrapping `PSConsoleHostReadLine`, which PSReadLine invokes
+/// after the user submits a line.
+fn generate_pwsh_init(histfile: &Path) -> String {
+    // Single-quoted PowerShell strings escape `'` by doubling it.
+    let histfile_ps = histfile.to_string_lossy().replace('\'', "''");
+    format!(
+        r#"# Gaviero shell integration for PowerShell 7.2+
+# Dot-sourced at spawn via: pwsh -NoExit -NoLogo -ExecutionPolicy Bypass -Command ". '<this file>'"
+
+# Per-tab command history
+Set-PSReadLineOption -HistorySavePath '{histfile_ps}' -ErrorAction SilentlyContinue
+
+# --- OSC 133 / OSC 7 shell integration ---
+
+# Wrap (not replace) the user's prompt function.
+$global:__gavieroOriginalPrompt = $function:prompt
+
+function global:prompt {{
+    # Capture command outcome before anything here can clobber it.
+    $gavieroExit = if ($null -ne $global:LASTEXITCODE) {{ $global:LASTEXITCODE }} elseif ($?) {{ 0 }} else {{ 1 }}
+    # OSC 133;D — command finished (with exit code)
+    [Console]::Write("`e]133;D;$gavieroExit`a")
+    # OSC 133;A — prompt start
+    [Console]::Write("`e]133;A`a")
+    # OSC 7 — report CWD (forward slashes, file://<host>/<path>)
+    $gavieroCwd = $PWD.ProviderPath -replace '\\', '/'
+    [Console]::Write("`e]7;file://$([System.Environment]::MachineName)/$gavieroCwd`a")
+    # Original prompt text, then OSC 133;B — prompt end / input start
+    $gavieroPrompt = & $global:__gavieroOriginalPrompt
+    "$gavieroPrompt`e]133;B`a"
+}}
+
+# OSC 133;C — command execution start. PSReadLine calls
+# PSConsoleHostReadLine to obtain the submitted line; emit C after it
+# returns, immediately before the host executes the command.
+$global:__gavieroOriginalReadLine = $function:PSConsoleHostReadLine
+function global:PSConsoleHostReadLine {{
+    $gavieroLine = & $global:__gavieroOriginalReadLine
+    [Console]::Write("`e]133;C`a")
+    $gavieroLine
+}}
+
+# Emit initial prompt marker
+[Console]::Write("`e]133;A`a")
+"#
     )
 }

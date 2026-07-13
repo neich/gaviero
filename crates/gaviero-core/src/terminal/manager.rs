@@ -381,6 +381,18 @@ fn parse_osc7_path(url: &str) -> Option<PathBuf> {
     let path_str = &rest[path_start..];
     // URL-decode percent-encoded characters
     let decoded = percent_decode(path_str);
+    // Windows drive-letter URIs are `file://host/C:/path` — drop the
+    // URI's leading slash so `C:/path` round-trips as a real path.
+    let bytes = decoded.as_bytes();
+    let decoded = if bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+    {
+        decoded[1..].to_string()
+    } else {
+        decoded
+    };
     Some(PathBuf::from(decoded))
 }
 
@@ -431,5 +443,12 @@ mod tests {
     #[test]
     fn parse_osc7_invalid() {
         assert!(parse_osc7_path("not-a-url").is_none());
+    }
+
+    #[test]
+    fn parse_osc7_windows_drive() {
+        // pwsh integration emits forward-slash drive paths.
+        let path = parse_osc7_path("file://HOST/C:/Users/dev/project");
+        assert_eq!(path, Some(PathBuf::from("C:/Users/dev/project")));
     }
 }
