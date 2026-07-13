@@ -19,6 +19,7 @@ pub mod swarm;
 pub mod terminal;
 pub mod tree_sitter;
 pub mod types;
+pub mod util;
 pub mod validation_gate;
 pub mod workspace;
 pub mod write_gate;
