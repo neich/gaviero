@@ -389,6 +389,13 @@ pub fn key_event_to_bytes(key: &KeyEvent) -> Vec<u8> {
         KeyCode::Esc => vec![0x1b],
         KeyCode::Up => vec![0x1b, b'[', b'A'],
         KeyCode::Down => vec![0x1b, b'[', b'B'],
+        // Ctrl+Left / Ctrl+Right → xterm modifier-5 arrow sequences so the
+        // shell's line editor (readline / PSReadLine) performs backward-word /
+        // forward-word instead of single-char motion. Must precede the plain
+        // arrow arms. (Ctrl+Up/Down never reach here — is_terminal_escape_key
+        // routes them to panel resize.)
+        KeyCode::Right if ctrl => vec![0x1b, b'[', b'1', b';', b'5', b'C'],
+        KeyCode::Left if ctrl => vec![0x1b, b'[', b'1', b';', b'5', b'D'],
         KeyCode::Right => vec![0x1b, b'[', b'C'],
         KeyCode::Left => vec![0x1b, b'[', b'D'],
         KeyCode::Home => vec![0x1b, b'[', b'H'],
@@ -450,6 +457,10 @@ pub fn is_terminal_escape_key(key: &KeyEvent) -> bool {
         // Alt+Up/Down — terminal resize
         | (KeyCode::Up, false, true, false)           // Alt+Up — grow terminal
         | (KeyCode::Down, false, true, false)         // Alt+Down — shrink terminal
+        // Ctrl+Up/Down — terminal resize fallback (Windows Terminal steals
+        // Alt+arrows for pane navigation when the window has >1 pane)
+        | (KeyCode::Up, true, false, false)           // Ctrl+Up — grow terminal
+        | (KeyCode::Down, true, false, false)         // Ctrl+Down — shrink terminal
         // Alt+O/I — cycle terminal tabs (forward/back)
         | (KeyCode::Char('o'), false, true, false)
         | (KeyCode::Char('i'), false, true, false)
@@ -518,5 +529,16 @@ mod tests {
     fn ctrl_char_maps_to_control_byte() {
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(key_event_to_bytes(&key), vec![0x03]);
+    }
+
+    #[test]
+    fn ctrl_arrow_maps_to_word_motion() {
+        // Ctrl+Left / Ctrl+Right must reach the shell as xterm modifier-5
+        // arrow sequences so readline / PSReadLine do backward/forward-word,
+        // not a bare arrow (single-char motion).
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL);
+        assert_eq!(key_event_to_bytes(&left), b"\x1b[1;5D".to_vec());
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL);
+        assert_eq!(key_event_to_bytes(&right), b"\x1b[1;5C".to_vec());
     }
 }
