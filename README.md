@@ -58,6 +58,8 @@ Gaviero works as a standalone editor even without AI features. Use it for everyd
 | F7 (also Alt+z / Alt+Shift+z) | Toggle word wrap — F7 works on every host; plain Alt+z is often stolen (NVIDIA's overlay registers it as a global hotkey) |
 | Alt+p or Alt+Shift+p | Toggle markdown preview |
 
+Mouse drag selects text panel-by-panel (editor, agent chat, embedded terminal) and copies to the clipboard on release. If the highlight instead spans the full terminal window and ignores panel borders, your terminal or multiplexer is doing its own selection on top of gaviero's: under psmux, add `set -g mouse-selection off` to `~/.psmux.conf` so drags are forwarded to the pane.
+
 ### Finding text
 
 **In the current file** — press **Ctrl+F**. A find bar appears at the top of the editor. Type your query and the editor highlights all matches and jumps to the first one. Press **Enter** or **F3** to cycle through matches, **Up** to go backward. Press **Esc** to close.

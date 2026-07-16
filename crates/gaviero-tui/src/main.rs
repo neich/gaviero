@@ -96,6 +96,13 @@ fn prompt_c1_consent(
 /// its own native drag-selection — a full-window-width highlight that ignores
 /// panel boundaries — instead of forwarding mouse events to the app. Writing
 /// the sequences explicitly makes ConPTY pass the request through.
+///
+/// Under a multiplexer these sequences reach the mux, not the host terminal.
+/// psmux forwards drags to alt-screen panes only when its own client-side
+/// drag-selection is disabled: `set -g mouse-selection off` (default is on).
+/// With it on, the psmux client swallows every left-drag after the initial
+/// press and paints its own unclamped highlight — the same full-window
+/// symptom — and no gaviero-side sequence can override that.
 #[cfg(windows)]
 const ENABLE_VT_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 #[cfg(windows)]
