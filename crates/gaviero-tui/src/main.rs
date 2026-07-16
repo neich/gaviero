@@ -89,10 +89,24 @@ fn prompt_c1_consent(
     Ok(matches!(answer.as_str(), "y" | "yes"))
 }
 
+/// VT mouse-mode sequences (normal + button-drag tracking, SGR encoding).
+/// crossterm's `EnableMouseCapture` on Windows only sets the WinAPI console
+/// mode (`is_ansi_code_supported` is hardwired to `false`); under Windows
+/// Terminal/ConPTY that never reaches the hosting terminal, which then keeps
+/// its own native drag-selection — a full-window-width highlight that ignores
+/// panel boundaries — instead of forwarding mouse events to the app. Writing
+/// the sequences explicitly makes ConPTY pass the request through.
+#[cfg(windows)]
+const ENABLE_VT_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+#[cfg(windows)]
+const DISABLE_VT_MOUSE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+
 /// Restore the host terminal to a sane state. Called on every exit path:
 /// normal exit, `?` early returns, and panics.
 fn restore_terminal() {
     let _ = disable_raw_mode();
+    #[cfg(windows)]
+    let _ = execute!(std::io::stdout(), crossterm::style::Print(DISABLE_VT_MOUSE));
     let _ = execute!(
         std::io::stdout(),
         LeaveAlternateScreen,
@@ -259,6 +273,12 @@ async fn main() -> Result<()> {
         EnableFocusChange
     )
     .context("entering alternate screen")?;
+    // See `ENABLE_VT_MOUSE`: on Windows the crossterm command above is
+    // WinAPI-only and Windows Terminal never learns the app captured the
+    // mouse, so its native drag-selection keeps hijacking the mouse.
+    #[cfg(windows)]
+    execute!(stdout, crossterm::style::Print(ENABLE_VT_MOUSE))
+        .context("enabling VT mouse passthrough")?;
 
     // RAII guard: if anything below returns Err via `?`, the terminal
     // is still restored when `_guard` is dropped.
