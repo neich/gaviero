@@ -158,6 +158,12 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             if app.focus == Focus::Terminal {
                 if let Some(inst) = app.terminal_manager.active_instance_mut() {
                     if inst.spawned {
+                        // Non-bracketed paste: newlines must go to the PTY as
+                        // CR, matching the Enter key path (terminal.rs maps
+                        // Enter → `\r`). A raw `\n` is ^J, which PSReadLine
+                        // inserts as a soft line break (">>" continuation)
+                        // instead of executing the command.
+                        let text = text.replace("\r\n", "\r").replace('\n', "\r");
                         inst.write_input(text.as_bytes());
                         return;
                     }
@@ -1469,13 +1475,13 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
 
     if app.panel_visible.terminal {
         match action {
-            Action::MoveLineUp if app.focus == Focus::Terminal => {
+            Action::MoveLineUp | Action::ResizePanelUp if app.focus == Focus::Terminal => {
                 app.terminal_split_percent = (app.terminal_split_percent
                     + theme::TERMINAL_RESIZE_STEP)
                     .min(theme::TERMINAL_MAX_PERCENT);
                 return;
             }
-            Action::MoveLineDown if app.focus == Focus::Terminal => {
+            Action::MoveLineDown | Action::ResizePanelDown if app.focus == Focus::Terminal => {
                 app.terminal_split_percent = app
                     .terminal_split_percent
                     .saturating_sub(theme::TERMINAL_RESIZE_STEP)
@@ -1556,12 +1562,12 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
 
     if app.focus == Focus::SidePanel {
         match action {
-            Action::MoveLineUp => {
+            Action::MoveLineUp | Action::ResizePanelUp => {
                 let current = app.chat_state.input_area_rows.max(3);
                 app.chat_state.input_area_rows = (current + 1).min(30);
                 return;
             }
-            Action::MoveLineDown => {
+            Action::MoveLineDown | Action::ResizePanelDown => {
                 let current = app.chat_state.input_area_rows;
                 if current <= 3 {
                     app.chat_state.input_area_rows = 0;

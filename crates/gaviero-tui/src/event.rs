@@ -323,6 +323,107 @@ fn path_is_excluded(path: &Path, roots: &[PathBuf], exclude_patterns: &[String])
     false
 }
 
+/// Max gap between key events still treated as one pasted burst on Windows.
+/// Console paste injects events back-to-back (sub-millisecond); this stays far
+/// below human keystroke and key-repeat cadence (>= ~30 ms), so real typing is
+/// never merged into a paste.
+#[cfg(windows)]
+const WINDOWS_PASTE_BURST_MS: u64 = 5;
+
+/// Read the crossterm events available after `poll` has reported one ready.
+///
+/// On Unix a paste already arrives as a single `Event::Paste`, so this is one
+/// `read()`. On Windows the console backend has no bracketed-paste support:
+/// `EnableBracketedPaste` is a no-op and a paste is delivered as a burst of
+/// individual key events, whose newlines fire as `Enter` — which submits the
+/// chat on the first line. The Windows variant coalesces such a burst into a
+/// synthetic `Event::Paste` so both platforms behave identically.
+#[cfg(not(windows))]
+fn read_crossterm_batch() -> Vec<crossterm::event::Event> {
+    crossterm::event::read().into_iter().collect()
+}
+
+#[cfg(windows)]
+fn read_crossterm_batch() -> Vec<crossterm::event::Event> {
+    use crossterm::event::{self, Event, KeyEventKind};
+
+    let Ok(first) = event::read() else {
+        return Vec::new();
+    };
+
+    // Only an unmodified text key can begin a paste burst.
+    let Some(first_ch) = paste_char(&first) else {
+        return vec![first];
+    };
+
+    // A console paste is injected as a batch, so the *next* event is already
+    // queued and a zero-wait poll succeeds. A physical keystroke leaves the
+    // queue empty here (its release lands ~tens of ms later), so it passes
+    // through untouched — a lone Enter still submits, a lone char still types,
+    // Tab still drives autocomplete.
+    if !event::poll(Duration::ZERO).unwrap_or(false) {
+        return vec![first];
+    }
+
+    // Drain the burst into one string. Windows emits a press + release per
+    // key; the releases are skipped. The first genuine non-text event ends the
+    // paste and is re-emitted after it.
+    let mut text = String::from(first_ch);
+    let mut trailing: Option<Event> = None;
+    while event::poll(Duration::from_millis(WINDOWS_PASTE_BURST_MS)).unwrap_or(false) {
+        let Ok(next) = event::read() else {
+            break;
+        };
+        if let Some(ch) = paste_char(&next) {
+            text.push(ch);
+        } else if matches!(&next, Event::Key(k) if k.kind == KeyEventKind::Release) {
+            continue;
+        } else {
+            trailing = Some(next);
+            break;
+        }
+    }
+
+    // A single drained character is a keystroke, not a paste: the zero-wait
+    // poll above also succeeds on unrelated queued events (mouse moves, focus
+    // changes, key releases), and rewriting a lone Enter/Tab/char into a
+    // `Paste` breaks chat submit and sends a raw `\n` to the embedded PTY.
+    let mut out = if text.chars().count() >= 2 {
+        vec![Event::Paste(text)]
+    } else {
+        vec![first]
+    };
+    out.extend(trailing);
+    out
+}
+
+/// Character a key event contributes to a pasted burst, or `None` if it cannot
+/// be part of a paste. Enter → `\n`, Tab → `\t`, plain chars → themselves;
+/// releases, control/alt/super chords, and navigation keys map to `None`.
+/// Shift is allowed so pasted capitals survive.
+#[cfg(windows)]
+fn paste_char(event: &crossterm::event::Event) -> Option<char> {
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+
+    let Event::Key(key) = event else {
+        return None;
+    };
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    if key.modifiers.intersects(
+        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER | KeyModifiers::META,
+    ) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(c) => Some(c),
+        KeyCode::Enter => Some('\n'),
+        KeyCode::Tab => Some('\t'),
+        _ => None,
+    }
+}
+
 pub struct EventLoop {
     tx: mpsc::UnboundedSender<Event>,
     rx: Option<mpsc::UnboundedReceiver<Event>>,
@@ -348,62 +449,70 @@ impl EventLoop {
     pub fn spawn_crossterm_reader(&self) {
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            loop {
-                // Poll crossterm events in a blocking thread
-                let event = tokio::task::spawn_blocking(|| {
+            'outer: loop {
+                // Poll + read in a blocking thread. On Windows the read step
+                // coalesces paste bursts into a synthetic `Event::Paste`
+                // (see `read_crossterm_batch`), so one poll can yield several
+                // logical events; on Unix the batch holds a single event.
+                let batch = tokio::task::spawn_blocking(|| {
                     if crossterm::event::poll(Duration::from_millis(
                         crate::theme::CROSSTERM_POLL_MS,
                     ))
                     .unwrap_or(false)
                     {
-                        crossterm::event::read().ok()
+                        read_crossterm_batch()
                     } else {
-                        None
+                        Vec::new()
                     }
                 })
                 .await;
 
-                match event {
-                    Ok(Some(crossterm::event::Event::Key(key))) => {
-                        // Windows crossterm emits Press AND Release for
-                        // every keystroke — forwarding both double-fires
-                        // all input (Tier W1 / PR-5). Keep Repeat: held
-                        // keys must still repeat in editor/terminal
-                        // panes. Unix emits Press only; unaffected.
-                        if key.kind == crossterm::event::KeyEventKind::Release {
-                            continue;
+                let batch = match batch {
+                    Ok(batch) => batch,
+                    Err(_) => break, // spawn_blocking failed
+                };
+
+                for event in batch {
+                    match event {
+                        crossterm::event::Event::Key(key) => {
+                            // Windows crossterm emits Press AND Release for
+                            // every keystroke — forwarding both double-fires
+                            // all input (Tier W1 / PR-5). Keep Repeat: held
+                            // keys must still repeat in editor/terminal
+                            // panes. Unix emits Press only; unaffected.
+                            if key.kind == crossterm::event::KeyEventKind::Release {
+                                continue;
+                            }
+                            if tx.send(Event::Key(key)).is_err() {
+                                break 'outer;
+                            }
                         }
-                        if tx.send(Event::Key(key)).is_err() {
-                            break;
+                        crossterm::event::Event::Mouse(mouse) => {
+                            if tx.send(Event::Mouse(mouse)).is_err() {
+                                break 'outer;
+                            }
+                        }
+                        crossterm::event::Event::Resize(w, h) => {
+                            if tx.send(Event::Resize(w, h)).is_err() {
+                                break 'outer;
+                            }
+                        }
+                        crossterm::event::Event::Paste(text) => {
+                            if tx.send(Event::Paste(text)).is_err() {
+                                break 'outer;
+                            }
+                        }
+                        crossterm::event::Event::FocusGained => {
+                            if tx.send(Event::TerminalFocus(true)).is_err() {
+                                break 'outer;
+                            }
+                        }
+                        crossterm::event::Event::FocusLost => {
+                            if tx.send(Event::TerminalFocus(false)).is_err() {
+                                break 'outer;
+                            }
                         }
                     }
-                    Ok(Some(crossterm::event::Event::Mouse(mouse))) => {
-                        if tx.send(Event::Mouse(mouse)).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(Some(crossterm::event::Event::Resize(w, h))) => {
-                        if tx.send(Event::Resize(w, h)).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(Some(crossterm::event::Event::Paste(text))) => {
-                        if tx.send(Event::Paste(text)).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(Some(crossterm::event::Event::FocusGained)) => {
-                        if tx.send(Event::TerminalFocus(true)).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(Some(crossterm::event::Event::FocusLost)) => {
-                        if tx.send(Event::TerminalFocus(false)).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => {} // No event in poll window
-                    Err(_) => break,  // spawn_blocking failed
                 }
             }
         });
@@ -584,6 +693,41 @@ mod tests {
             &roots,
             &[],
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn paste_char_maps_text_keys_and_rejects_chords() {
+        use crossterm::event::{
+            Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
+        };
+
+        let key = |code, mods, kind| {
+            Event::Key(KeyEvent {
+                code,
+                modifiers: mods,
+                kind,
+                state: KeyEventState::NONE,
+            })
+        };
+        let press = |code, mods| key(code, mods, KeyEventKind::Press);
+
+        // Text-bearing keys contribute their character; Enter/Tab normalize.
+        assert_eq!(paste_char(&press(KeyCode::Char('a'), KeyModifiers::NONE)), Some('a'));
+        assert_eq!(paste_char(&press(KeyCode::Enter, KeyModifiers::NONE)), Some('\n'));
+        assert_eq!(paste_char(&press(KeyCode::Tab, KeyModifiers::NONE)), Some('\t'));
+        // Shift is part of pasted capitals, not a chord.
+        assert_eq!(paste_char(&press(KeyCode::Char('A'), KeyModifiers::SHIFT)), Some('A'));
+
+        // Ctrl/Alt chords and navigation keys are never pasted text.
+        assert_eq!(paste_char(&press(KeyCode::Char('v'), KeyModifiers::CONTROL)), None);
+        assert_eq!(paste_char(&press(KeyCode::Enter, KeyModifiers::ALT)), None);
+        assert_eq!(paste_char(&press(KeyCode::Left, KeyModifiers::NONE)), None);
+        // Release halves of pasted keys must not contribute a character.
+        assert_eq!(
+            paste_char(&key(KeyCode::Char('a'), KeyModifiers::NONE, KeyEventKind::Release)),
+            None
+        );
     }
 
     #[test]
