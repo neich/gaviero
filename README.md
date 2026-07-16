@@ -36,6 +36,7 @@ Gaviero works as a standalone editor even without AI features. Use it for everyd
 | Alt+[ / Alt+] | Cycle tabs |
 | F11 | Toggle fullscreen for current panel |
 | Alt+Shift+1..6 | Switch layout preset |
+| Alt+Up / Alt+Down or Ctrl+Up / Ctrl+Down | Resize focused panel (terminal split, chat input) — use Ctrl if your host terminal grabs Alt+arrows (Windows Terminal pane navigation) |
 
 ### Editing
 
@@ -54,13 +55,14 @@ Gaviero works as a standalone editor even without AI features. Use it for everyd
 | Ctrl+h or Ctrl+Backspace | Delete word backward |
 | Ctrl+Delete | Delete to end of line |
 | F5 | Format buffer |
-| Alt+z | Toggle word wrap |
+| F7 (also Alt+z / Alt+Shift+z) | Toggle word wrap — F7 works on every host; plain Alt+z is often stolen (NVIDIA's overlay registers it as a global hotkey) |
+| Alt+p or Alt+Shift+p | Toggle markdown preview |
 
 ### Finding text
 
 **In the current file** — press **Ctrl+F**. A find bar appears at the top of the editor. Type your query and the editor highlights all matches and jumps to the first one. Press **Enter** or **F3** to cycle through matches, **Up** to go backward. Press **Esc** to close.
 
-**Across the workspace** — press **F3** (without the find bar open) to search the word under the cursor across all project files. Or switch to the **Search** panel (Shift+Right from the file tree, or F7) and type directly into the search input. Results update as you type. Press Enter on a result to open the file at that line.
+**Across the workspace** — press **F3** (without the find bar open) to search the word under the cursor across all project files. Or switch to the **Search** panel (Shift+Right from the file tree, or Alt+f) and type directly into the search input. Results update as you type. Press Enter on a result to open the file at that line.
 
 ### Side panels
 

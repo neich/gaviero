@@ -22,6 +22,17 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
     app.render_tab_bar(frame, tab_area);
 
     if let Some(fs_panel) = app.fullscreen_panel {
+        // Exactly one panel is on screen: drop every panel rect from the
+        // previous layout pass so stale rects can't route mouse events to
+        // panels that are no longer visible. `render_fullscreen` re-sets
+        // the rect of the panel it draws.
+        app.layout.file_tree_area = None;
+        app.layout.left_header_area = None;
+        app.layout.editor_area = Rect::default();
+        app.layout.preview_area = None;
+        app.layout.side_panel_area = None;
+        app.layout.side_header_area = None;
+        app.layout.terminal_area = None;
         app.render_fullscreen(frame, main_area, fs_panel);
         app.render_status_bar(frame, status_area);
         render_agent_finish_toast(app, frame, main_area);

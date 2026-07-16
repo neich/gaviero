@@ -85,6 +85,12 @@ pub enum Action {
     ToggleFullscreen,
     SwitchLayout(u8), // 0-5 via Alt+5..9 and Alt+0
     Rename,
+    /// Grow the focused resizable panel (terminal split / chat input).
+    /// Ctrl+Up — fallback for Alt+Up, which Windows Terminal consumes for
+    /// pane navigation whenever the window has more than one pane.
+    ResizePanelUp,
+    /// Shrink the focused resizable panel. Ctrl+Down — see `ResizePanelUp`.
+    ResizePanelDown,
 
     // Clipboard
     Copy,
@@ -118,7 +124,11 @@ impl Keymap {
             KeyCode::Char('w') if ctrl => Action::CloseTab,
             KeyCode::Char('s') if ctrl => Action::Save,
             KeyCode::Char('f') if ctrl => Action::FindInBuffer,
-            KeyCode::Char('z') if alt => Action::ToggleWordWrap,
+            // Alt+Shift+Z fallback: NVIDIA's overlay registers plain Alt+Z
+            // as a global hotkey (RegisterHotKey), so on machines where it
+            // runs the terminal never receives the chord. Same pattern as
+            // the Ctrl+Up/Down resize fallback below.
+            KeyCode::Char('z') | KeyCode::Char('Z') if alt => Action::ToggleWordWrap,
 
             KeyCode::Char('z') if ctrl => Action::Undo,
             KeyCode::Char('y') if ctrl => Action::Redo,
@@ -166,7 +176,9 @@ impl Keymap {
             KeyCode::Char('i') if alt => Action::CycleTabBack,
 
             // ── Preview toggle ───────────────────────────────────
-            KeyCode::Char('p') if alt => Action::TogglePreview,
+            // Uppercase variant for parity with Alt+Z: Alt+Shift+P stands
+            // in wherever a host app claims the plain chord.
+            KeyCode::Char('p') | KeyCode::Char('P') if alt => Action::TogglePreview,
 
             // ── F-keys ───────────────────────────────────────────
             KeyCode::F(2) => Action::Rename,
@@ -174,6 +186,11 @@ impl Keymap {
             KeyCode::F(4) => Action::ToggleTerminal,
             KeyCode::F(5) => Action::FormatBuffer,
             KeyCode::F(6) => Action::CycleFormatLevel,
+            // Primary word-wrap chord: F-keys have dedicated CSI encodings
+            // that survive every host layer on Windows and Linux, unlike
+            // Alt+Z (globally registered by NVIDIA's overlay) and unlike
+            // Alt/Shift chords that muxes and ConPTY re-encode.
+            KeyCode::F(7) => Action::ToggleWordWrap,
             KeyCode::F(8) => Action::NextConflict,
             KeyCode::F(9) => Action::PrevConflict,
             KeyCode::F(11) => Action::ToggleFullscreen,
@@ -190,6 +207,13 @@ impl Keymap {
             // ── Line movement: Alt+Up/Down ───────────────────────
             KeyCode::Up if alt => Action::MoveLineUp,
             KeyCode::Down if alt => Action::MoveLineDown,
+
+            // ── Panel resize fallback: Ctrl+Up/Down ──────────────
+            // Alt+Up/Down also resize the terminal/chat panels, but host
+            // terminals often steal Alt+arrows (Windows Terminal binds them
+            // to pane navigation); Ctrl+arrows pass through everywhere.
+            KeyCode::Up if ctrl && !shift => Action::ResizePanelUp,
+            KeyCode::Down if ctrl && !shift => Action::ResizePanelDown,
 
             // ── Selection: Shift+Arrow ───────────────────────────
             KeyCode::Left if shift => Action::SelectLeft,
@@ -338,10 +362,56 @@ mod tests {
     }
 
     #[test]
+    fn test_alt_shift_fallbacks_wrap_and_preview() {
+        // Plain chords.
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::Char('z'), KeyModifiers::ALT)),
+            Action::ToggleWordWrap
+        );
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::Char('p'), KeyModifiers::ALT)),
+            Action::TogglePreview
+        );
+        // Shifted fallbacks: Windows reports Char('Z') + ALT|SHIFT, the
+        // Unix ESC-prefix path reports Char('Z') + ALT only.
+        assert_eq!(
+            Keymap::resolve(&key(
+                KeyCode::Char('Z'),
+                KeyModifiers::ALT | KeyModifiers::SHIFT
+            )),
+            Action::ToggleWordWrap
+        );
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::Char('Z'), KeyModifiers::ALT)),
+            Action::ToggleWordWrap
+        );
+        assert_eq!(
+            Keymap::resolve(&key(
+                KeyCode::Char('P'),
+                KeyModifiers::ALT | KeyModifiers::SHIFT
+            )),
+            Action::TogglePreview
+        );
+        // Ctrl+Z must stay Undo — the uppercase arms are alt-only.
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::Char('z'), KeyModifiers::CONTROL)),
+            Action::Undo
+        );
+    }
+
+    #[test]
     fn test_ctrl_j_toggle_terminal() {
         assert_eq!(
             Keymap::resolve(&key(KeyCode::Char('j'), KeyModifiers::CONTROL)),
             Action::ToggleTerminal
+        );
+    }
+
+    #[test]
+    fn test_f7_toggles_word_wrap() {
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::F(7), KeyModifiers::NONE)),
+            Action::ToggleWordWrap
         );
     }
 
