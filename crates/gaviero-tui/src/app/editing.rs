@@ -648,6 +648,18 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             }
         }
         MouseEventKind::ScrollUp => {
+            match wheel_target(app.focus, app.panel_visible.side_panel, app.panel_visible.terminal)
+            {
+                WheelTarget::SidePanel => {
+                    scroll_side_panel(app, true, col, row);
+                    return;
+                }
+                WheelTarget::Terminal => {
+                    scroll_terminal_scrollback(app, true);
+                    return;
+                }
+                WheelTarget::Hover => {}
+            }
             if let Some(area) = app.layout.file_tree_area {
                 if area.contains((col, row).into()) {
                     match app.left_panel {
@@ -668,25 +680,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             }
             if let Some(area) = app.layout.side_panel_area {
                 if area.contains((col, row).into()) {
-                    match app.side_panel {
-                        SidePanelMode::SwarmDashboard => {
-                            let dash = &mut app.swarm_dashboard;
-                            let pos = ratatui::layout::Position::new(col, row);
-                            if dash.table_rect.contains(pos) {
-                                dash.scroll.scroll_up(1);
-                            } else if dash.detail_rect.contains(pos) {
-                                dash.detail_auto_scroll = false;
-                                dash.detail_scroll = dash.detail_scroll.saturating_sub(3);
-                            }
-                        }
-                        _ => {
-                            app.chat_state.scroll_offset =
-                                app.chat_state.scroll_offset.saturating_sub(3);
-                            if app.chat_state.active_conv_streaming() {
-                                app.chat_state.user_scrolled_during_stream = true;
-                            }
-                        }
-                    }
+                    scroll_side_panel(app, true, col, row);
                 }
             }
             if let Some(preview) = app.layout.preview_area {
@@ -709,14 +703,23 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             }
             if let Some(area) = app.layout.terminal_area {
                 if area.contains((col, row).into()) {
-                    if let Some(inst) = app.terminal_manager.active_instance_mut() {
-                        let current = inst.screen().scrollback();
-                        inst.screen_mut().set_scrollback(current + 3);
-                    }
+                    scroll_terminal_scrollback(app, true);
                 }
             }
         }
         MouseEventKind::ScrollDown => {
+            match wheel_target(app.focus, app.panel_visible.side_panel, app.panel_visible.terminal)
+            {
+                WheelTarget::SidePanel => {
+                    scroll_side_panel(app, false, col, row);
+                    return;
+                }
+                WheelTarget::Terminal => {
+                    scroll_terminal_scrollback(app, false);
+                    return;
+                }
+                WheelTarget::Hover => {}
+            }
             if let Some(area) = app.layout.file_tree_area {
                 if area.contains((col, row).into()) {
                     match app.left_panel {
@@ -742,32 +745,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             }
             if let Some(area) = app.layout.side_panel_area {
                 if area.contains((col, row).into()) {
-                    match app.side_panel {
-                        SidePanelMode::SwarmDashboard => {
-                            let dash = &mut app.swarm_dashboard;
-                            let pos = ratatui::layout::Position::new(col, row);
-                            if dash.table_rect.contains(pos) {
-                                dash.scroll.scroll_down(1, dash.agents.len());
-                            } else if dash.detail_rect.contains(pos) {
-                                if let Some(agent) = dash.agents.get(dash.scroll.selected) {
-                                    let w = dash.detail_rect.width.saturating_sub(1) as usize;
-                                    let total = crate::panels::swarm_dashboard::count_display_lines(
-                                        &agent.activity,
-                                        w,
-                                    );
-                                    dash.detail_scroll =
-                                        (dash.detail_scroll + 3).min(total.saturating_sub(1));
-                                }
-                            }
-                        }
-                        _ => {
-                            app.chat_state.scroll_offset =
-                                app.chat_state.scroll_offset.saturating_add(3);
-                            if app.chat_state.active_conv_streaming() {
-                                app.chat_state.user_scrolled_during_stream = true;
-                            }
-                        }
-                    }
+                    scroll_side_panel(app, false, col, row);
                 }
             }
             if let Some(preview) = app.layout.preview_area {
@@ -793,10 +771,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             }
             if let Some(area) = app.layout.terminal_area {
                 if area.contains((col, row).into()) {
-                    if let Some(inst) = app.terminal_manager.active_instance_mut() {
-                        let current = inst.screen().scrollback();
-                        inst.screen_mut().set_scrollback(current.saturating_sub(3));
-                    }
+                    scroll_terminal_scrollback(app, false);
                 }
             }
         }
@@ -989,6 +964,83 @@ fn side_panel_chat_scroll_at(app: &App, col: u16, row: u16) -> bool {
 /// gutter, batch file list, diff scroll) plus read-only agent-chat browsing
 /// (wheel scroll, scrollbar drag, text selection). Everything else stays
 /// locked until the user finishes the review.
+/// Where a mouse-wheel event should act.
+#[derive(Debug, PartialEq)]
+enum WheelTarget {
+    /// Focused side panel takes the wheel regardless of pointer position.
+    SidePanel,
+    /// Focused embedded terminal takes the wheel regardless of pointer position.
+    Terminal,
+    /// Route by pointer position (hover).
+    Hover,
+}
+
+/// Wheel events follow *focus* for the side panel and the embedded terminal,
+/// and *hover* everywhere else. Focus on those two panels is keyboard-driven
+/// (Alt+3 / Alt+4, or mux pane chords that never move the mouse), while the
+/// captured pointer typically rests over the editor — pure hover routing then
+/// scrolls a panel the user isn't looking at (W1: reported on Windows under
+/// psmux). Hidden panels never take the wheel even if focus is stale.
+fn wheel_target(focus: Focus, side_panel_visible: bool, terminal_visible: bool) -> WheelTarget {
+    match focus {
+        Focus::SidePanel if side_panel_visible => WheelTarget::SidePanel,
+        Focus::Terminal if terminal_visible => WheelTarget::Terminal,
+        _ => WheelTarget::Hover,
+    }
+}
+
+/// One wheel step (3 lines) on the side panel. The swarm dashboard sub-routes
+/// by pointer position — the detail pane scrolls only when the pointer is
+/// inside it, anything else scrolls the agent table — so a focus-routed wheel
+/// (pointer outside the panel) still acts on the primary list. All other side
+/// modes scroll the chat transcript.
+fn scroll_side_panel(app: &mut App, up: bool, col: u16, row: u16) {
+    match app.side_panel {
+        SidePanelMode::SwarmDashboard => {
+            let dash = &mut app.swarm_dashboard;
+            let pos = ratatui::layout::Position::new(col, row);
+            if dash.detail_rect.contains(pos) {
+                if up {
+                    dash.detail_auto_scroll = false;
+                    dash.detail_scroll = dash.detail_scroll.saturating_sub(3);
+                } else if let Some(agent) = dash.agents.get(dash.scroll.selected) {
+                    let w = dash.detail_rect.width.saturating_sub(1) as usize;
+                    let total =
+                        crate::panels::swarm_dashboard::count_display_lines(&agent.activity, w);
+                    dash.detail_scroll = (dash.detail_scroll + 3).min(total.saturating_sub(1));
+                }
+            } else if up {
+                dash.scroll.scroll_up(1);
+            } else {
+                dash.scroll.scroll_down(1, dash.agents.len());
+            }
+        }
+        _ => {
+            app.chat_state.scroll_offset = if up {
+                app.chat_state.scroll_offset.saturating_sub(3)
+            } else {
+                app.chat_state.scroll_offset.saturating_add(3)
+            };
+            if app.chat_state.active_conv_streaming() {
+                app.chat_state.user_scrolled_during_stream = true;
+            }
+        }
+    }
+}
+
+/// One wheel step (3 lines) of embedded-terminal scrollback.
+fn scroll_terminal_scrollback(app: &mut App, up: bool) {
+    if let Some(inst) = app.terminal_manager.active_instance_mut() {
+        let current = inst.screen().scrollback();
+        let next = if up {
+            current + 3
+        } else {
+            current.saturating_sub(3)
+        };
+        inst.screen_mut().set_scrollback(next);
+    }
+}
+
 fn handle_mouse_review(app: &mut App, mouse: crossterm::event::MouseEvent) {
     let col = mouse.column;
     let row = mouse.row;
@@ -1840,4 +1892,52 @@ pub(super) fn is_current_buffer_markdown(app: &App) -> bool {
         .get(app.active_buffer)
         .and_then(|b| b.lang_name.as_deref())
         == Some("markdown")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wheel_follows_focus_for_side_panel_and_terminal() {
+        assert_eq!(
+            wheel_target(Focus::SidePanel, true, true),
+            WheelTarget::SidePanel
+        );
+        assert_eq!(
+            wheel_target(Focus::SidePanel, true, false),
+            WheelTarget::SidePanel
+        );
+        assert_eq!(
+            wheel_target(Focus::Terminal, true, true),
+            WheelTarget::Terminal
+        );
+        assert_eq!(
+            wheel_target(Focus::Terminal, false, true),
+            WheelTarget::Terminal
+        );
+    }
+
+    #[test]
+    fn wheel_falls_back_to_hover_for_editor_and_tree_focus() {
+        assert_eq!(wheel_target(Focus::Editor, true, true), WheelTarget::Hover);
+        assert_eq!(
+            wheel_target(Focus::FileTree, true, true),
+            WheelTarget::Hover
+        );
+    }
+
+    #[test]
+    fn wheel_ignores_focus_on_hidden_panels() {
+        // Focus can be stale after a panel toggle; a hidden panel must not
+        // swallow the wheel — fall back to hover routing.
+        assert_eq!(
+            wheel_target(Focus::SidePanel, false, true),
+            WheelTarget::Hover
+        );
+        assert_eq!(
+            wheel_target(Focus::Terminal, true, false),
+            WheelTarget::Hover
+        );
+    }
 }
