@@ -42,7 +42,7 @@ Terminal editor + headless CLI for AI agent orchestration. Rust 2024.
 | Crate | Type | Role | Key deps |
 |---|---|---|---|
 | `gaviero-core` | lib (22 pub mods) | Swarm, memory, ACP, MCP server, write gate, validation, git, terminal, repo-map (+ topology), context planner, agent-session transport | tokio, tree-sitter 0.25, git2 0.19, rusqlite + sqlite-vec, ort 2.0 + tokenizers, petgraph 0.8, ropey, portable-pty, rmcp |
-| `gaviero-tui` | bin (`gaviero`) | Editor, panels, observer wiring, slash-commands, word-wrap, per-folder topology cache | ratatui 0.30, crossterm 0.29, notify, tui-term, unicode-width, core, dsl |
+| `gaviero-tui` | bin (`gaviero`) | Editor, panels, observer wiring, slash-commands, word-wrap, per-folder topology cache | ratatui 0.30, crossterm 0.29, notify, unicode-width, core, dsl |
 | `gaviero-cli` | bin (`gaviero-cli`) | Argument parsing, observer wiring, eval / sleeptime / forget / cleanup-branches tooling | clap 4, tokio, core, dsl |
 | `gaviero-dsl` | lib (7 pub mods) | `.gaviero` compiler (resolver → lexer → parser → AST → `CompiledPlan`) | logos, chumsky, miette, core |
 | `gaviero-mcp-shim` | bin (`gaviero-mcp-shim`) | stdio↔Unix-socket bridge for subprocess agents (Claude Code, Codex, Cursor) → core MCP server | tokio, clap |
