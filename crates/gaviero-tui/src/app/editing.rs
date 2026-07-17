@@ -663,16 +663,16 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             if let Some(area) = app.layout.file_tree_area {
                 if area.contains((col, row).into()) {
                     match app.left_panel {
-                        LeftPanelMode::FileTree => app.file_tree.scroll_up(3),
-                        LeftPanelMode::Search => app.search_panel.scroll.scroll_up(3),
+                        LeftPanelMode::FileTree => app.file_tree.scroll_up(theme::MOUSE_SCROLL_DELTA),
+                        LeftPanelMode::Search => app.search_panel.scroll.scroll_up(theme::MOUSE_SCROLL_DELTA),
                         LeftPanelMode::Review => {
                             if let Some(ref mut br) = app.batch_review {
-                                br.scroll_offset = br.scroll_offset.saturating_sub(3);
+                                br.scroll_offset = br.scroll_offset.saturating_sub(theme::MOUSE_SCROLL_DELTA);
                             }
                         }
                         LeftPanelMode::Changes => {
                             if let Some(ref mut cs) = app.changes_state {
-                                cs.scroll_offset = cs.scroll_offset.saturating_sub(3);
+                                cs.scroll_offset = cs.scroll_offset.saturating_sub(theme::MOUSE_SCROLL_DELTA);
                             }
                         }
                     }
@@ -685,20 +685,20 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             }
             if let Some(preview) = app.layout.preview_area {
                 if preview.contains((col, row).into()) {
-                    scroll_preview_lines(app, -3);
+                    scroll_preview_lines(app, -(theme::MOUSE_SCROLL_DELTA as i32));
                 }
             }
             if app.layout.editor_area.contains((col, row).into()) {
                 if let Some(ref mut br) = app.batch_review {
-                    br.diff_scroll = br.diff_scroll.saturating_sub(3);
+                    br.diff_scroll = br.diff_scroll.saturating_sub(theme::MOUSE_SCROLL_DELTA);
                 } else if let Some(ref mut cs) = app.changes_state {
                     if app.left_panel == LeftPanelMode::Changes {
-                        cs.diff_scroll = cs.diff_scroll.saturating_sub(3);
+                        cs.diff_scroll = cs.diff_scroll.saturating_sub(theme::MOUSE_SCROLL_DELTA);
                     }
                 } else if let Some(ref mut review) = app.diff_review {
-                    review.scroll_top = review.scroll_top.saturating_sub(3);
+                    review.scroll_top = review.scroll_top.saturating_sub(theme::MOUSE_SCROLL_DELTA);
                 } else if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
-                    buf.scroll.top_line = buf.scroll.top_line.saturating_sub(3);
+                    buf.scroll.top_line = buf.scroll.top_line.saturating_sub(theme::MOUSE_SCROLL_DELTA);
                 }
             }
             if let Some(area) = app.layout.terminal_area {
@@ -723,21 +723,21 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             if let Some(area) = app.layout.file_tree_area {
                 if area.contains((col, row).into()) {
                     match app.left_panel {
-                        LeftPanelMode::FileTree => app.file_tree.scroll_down(3),
+                        LeftPanelMode::FileTree => app.file_tree.scroll_down(theme::MOUSE_SCROLL_DELTA),
                         LeftPanelMode::Search => {
                             let count = app.search_panel.results.len();
-                            app.search_panel.scroll.scroll_down(3, count);
+                            app.search_panel.scroll.scroll_down(theme::MOUSE_SCROLL_DELTA, count);
                         }
                         LeftPanelMode::Review => {
                             if let Some(ref mut br) = app.batch_review {
                                 let max = br.proposals.len().saturating_sub(1);
-                                br.scroll_offset = (br.scroll_offset + 3).min(max);
+                                br.scroll_offset = (br.scroll_offset + theme::MOUSE_SCROLL_DELTA).min(max);
                             }
                         }
                         LeftPanelMode::Changes => {
                             if let Some(ref mut cs) = app.changes_state {
                                 let max = cs.entries.len().saturating_sub(1);
-                                cs.scroll_offset = (cs.scroll_offset + 3).min(max);
+                                cs.scroll_offset = (cs.scroll_offset + theme::MOUSE_SCROLL_DELTA).min(max);
                             }
                         }
                     }
@@ -750,23 +750,23 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             }
             if let Some(preview) = app.layout.preview_area {
                 if preview.contains((col, row).into()) {
-                    scroll_preview_lines(app, 3);
+                    scroll_preview_lines(app, theme::MOUSE_SCROLL_DELTA as i32);
                 }
             }
             if app.layout.editor_area.contains((col, row).into()) {
                 if let Some(ref mut br) = app.batch_review {
-                    br.diff_scroll += 3;
+                    br.diff_scroll += theme::MOUSE_SCROLL_DELTA;
                 } else if app.left_panel == LeftPanelMode::Changes {
                     if let Some(ref mut cs) = app.changes_state {
-                        cs.diff_scroll += 3;
+                        cs.diff_scroll += theme::MOUSE_SCROLL_DELTA;
                     }
                 } else if let Some(ref mut review) = app.diff_review {
-                    review.scroll_top += 3;
+                    review.scroll_top += theme::MOUSE_SCROLL_DELTA;
                 } else if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
                     let (_, content_w) =
                         editor_viewport(buf.line_count(), app.layout.editor_area);
                     let max = buf.scroll_line_count(content_w).saturating_sub(1);
-                    buf.scroll.top_line = (buf.scroll.top_line + 3).min(max);
+                    buf.scroll.top_line = (buf.scroll.top_line + theme::MOUSE_SCROLL_DELTA).min(max);
                 }
             }
             if let Some(area) = app.layout.terminal_area {
@@ -1002,12 +1002,12 @@ fn scroll_side_panel(app: &mut App, up: bool, col: u16, row: u16) {
             if dash.detail_rect.contains(pos) {
                 if up {
                     dash.detail_auto_scroll = false;
-                    dash.detail_scroll = dash.detail_scroll.saturating_sub(3);
+                    dash.detail_scroll = dash.detail_scroll.saturating_sub(theme::MOUSE_SCROLL_DELTA);
                 } else if let Some(agent) = dash.agents.get(dash.scroll.selected) {
                     let w = dash.detail_rect.width.saturating_sub(1) as usize;
                     let total =
                         crate::panels::swarm_dashboard::count_display_lines(&agent.activity, w);
-                    dash.detail_scroll = (dash.detail_scroll + 3).min(total.saturating_sub(1));
+                    dash.detail_scroll = (dash.detail_scroll + theme::MOUSE_SCROLL_DELTA).min(total.saturating_sub(1));
                 }
             } else if up {
                 dash.scroll.scroll_up(1);
@@ -1017,9 +1017,9 @@ fn scroll_side_panel(app: &mut App, up: bool, col: u16, row: u16) {
         }
         _ => {
             app.chat_state.scroll_offset = if up {
-                app.chat_state.scroll_offset.saturating_sub(3)
+                app.chat_state.scroll_offset.saturating_sub(theme::MOUSE_SCROLL_DELTA)
             } else {
-                app.chat_state.scroll_offset.saturating_add(3)
+                app.chat_state.scroll_offset.saturating_add(theme::MOUSE_SCROLL_DELTA)
             };
             if app.chat_state.active_conv_streaming() {
                 app.chat_state.user_scrolled_during_stream = true;
@@ -1128,38 +1128,38 @@ fn handle_mouse_review(app: &mut App, mouse: crossterm::event::MouseEvent) {
         MouseEventKind::ScrollUp => {
             if let Some(ref mut br) = app.batch_review {
                 if app.layout.editor_area.contains((col, row).into()) {
-                    br.diff_scroll = br.diff_scroll.saturating_sub(3);
+                    br.diff_scroll = br.diff_scroll.saturating_sub(theme::MOUSE_SCROLL_DELTA);
                 } else if let Some(area) = app.layout.file_tree_area {
                     if area.contains((col, row).into()) {
-                        br.scroll_offset = br.scroll_offset.saturating_sub(3);
+                        br.scroll_offset = br.scroll_offset.saturating_sub(theme::MOUSE_SCROLL_DELTA);
                     }
                 }
             } else if let Some(ref mut review) = app.diff_review {
                 if app.layout.editor_area.contains((col, row).into()) {
-                    review.scroll_top = review.scroll_top.saturating_sub(3);
+                    review.scroll_top = review.scroll_top.saturating_sub(theme::MOUSE_SCROLL_DELTA);
                 }
             }
             if side_panel_chat_scroll_at(app, col, row) {
-                scroll_chat_output(app, -3);
+                scroll_chat_output(app, -(theme::MOUSE_SCROLL_DELTA as i32));
             }
         }
         MouseEventKind::ScrollDown => {
             if let Some(ref mut br) = app.batch_review {
                 if app.layout.editor_area.contains((col, row).into()) {
-                    br.diff_scroll += 3;
+                    br.diff_scroll += theme::MOUSE_SCROLL_DELTA;
                 } else if let Some(area) = app.layout.file_tree_area {
                     if area.contains((col, row).into()) {
                         let max = br.proposals.len().saturating_sub(1);
-                        br.scroll_offset = (br.scroll_offset + 3).min(max);
+                        br.scroll_offset = (br.scroll_offset + theme::MOUSE_SCROLL_DELTA).min(max);
                     }
                 }
             } else if let Some(ref mut review) = app.diff_review {
                 if app.layout.editor_area.contains((col, row).into()) {
-                    review.scroll_top += 3;
+                    review.scroll_top += theme::MOUSE_SCROLL_DELTA;
                 }
             }
             if side_panel_chat_scroll_at(app, col, row) {
-                scroll_chat_output(app, 3);
+                scroll_chat_output(app, theme::MOUSE_SCROLL_DELTA as i32);
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
