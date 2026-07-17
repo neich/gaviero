@@ -40,6 +40,9 @@ gaviero-tui/src/
 ├─ event.rs                Event enum (45+ variants), source plumbing
 ├─ keymap.rs               Action enum, keybindings, chord system
 │                          (Alt+Z = ToggleWordWrap)
+├─ platform.rs             Platform-specific terminal workarounds:
+│                          VT mouse passthrough (Windows/ConPTY),
+│                          bracketed-paste gating, AltGr detection
 ├─ theme.rs                One Dark palette, timing constants
 ├─ editor/
 │  ├─ buffer.rs            Ropey-backed buffer, cursor, selection, undo/redo
@@ -61,7 +64,7 @@ gaviero-tui/src/
 │  ├─ chat_markdown.rs     ChatLine rendering
 │  ├─ swarm_dashboard.rs   Agent table, tier/phase indicators, cost
 │  ├─ git_panel.rs         Staging, commit, branch picker
-│  ├─ terminal.rs          Embedded PTY render (tui-term)
+│  ├─ terminal.rs          Embedded PTY render (vt100 → ratatui cells)
 │  ├─ status_bar.rs        Mode / file / branch / agent status +
 │  │                       word-wrap "│ Wrap" indicator
 │  ├─ search.rs            SearchPanelState, live results
@@ -272,7 +275,7 @@ Single-threaded UI + async producers. **No `Mutex` in TUI state.** Observer `Arc
 - `ratatui 0.30` + `crossterm 0.29` — rendering, input.
 - `ropey 1.6` — rope buffer.
 - `notify 7` — filesystem watch.
-- `portable-pty 0.9` + `vt100 0.16` + `tui-term 0.3` — embedded terminal.
+- `portable-pty 0.9` + `vt100 0.16` — embedded terminal.
 - `arboard 3` + `base64` + `png` — clipboard, image paste.
 - `unicode-width 0.2` — visual width for wrap layout.
 - `streaming-iterator`, `toml`, `tokio-util` — misc.

@@ -186,7 +186,12 @@ impl Buffer {
 
     /// Resolve a buffer path to a stable absolute form when possible.
     pub fn resolve_editor_path(path: &Path) -> PathBuf {
-        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        // Simplified form so the buffer path shares the workspace root's
+        // prefix components — a bare canonicalize returns verbatim `\\?\`
+        // paths on Windows, which fail every strip_prefix-relativization
+        // against the simplified root (git status, path labels).
+        gaviero_core::util::fs::canonicalize_simplified(path)
+            .unwrap_or_else(|_| path.to_path_buf())
     }
 
     /// Record that the buffer now matches what is on disk.
@@ -1535,8 +1540,8 @@ impl Buffer {
             return;
         }
 
-        // Normalize line endings
-        let text = &text.replace('\r', "");
+        // Normalize line endings (\r → \n, not stripped — see helper doc).
+        let text = &crate::editor::normalize_paste_newlines(text);
         if text.is_empty() {
             return;
         }
@@ -1573,10 +1578,7 @@ impl Buffer {
             return;
         }
 
-        // Normalize line endings: \r\n → \n, standalone \r → \n
-        // Terminals often convert \n to \r in bracketed paste events,
-        // so standalone \r must become \n rather than being stripped.
-        let text = &text.replace("\r\n", "\n").replace('\r', "\n");
+        let text = &crate::editor::normalize_paste_newlines(text);
 
         self.delete_selection();
 

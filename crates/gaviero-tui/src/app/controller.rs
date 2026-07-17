@@ -43,7 +43,8 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                             let action = Keymap::resolve(&key);
                             app.handle_action(action);
                         } else {
-                            let bytes = key_event_to_bytes(&key);
+                            let bytes =
+                                key_event_to_bytes(&key, inst.screen().application_cursor());
                             if !bytes.is_empty() {
                                 app.terminal_selection.clear();
                                 let inst = app.terminal_manager.active_instance_mut().unwrap();
@@ -158,13 +159,11 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             if app.focus == Focus::Terminal {
                 if let Some(inst) = app.terminal_manager.active_instance_mut() {
                     if inst.spawned {
-                        // Non-bracketed paste: newlines must go to the PTY as
-                        // CR, matching the Enter key path (terminal.rs maps
-                        // Enter → `\r`). A raw `\n` is ^J, which PSReadLine
-                        // inserts as a soft line break (">>" continuation)
-                        // instead of executing the command.
-                        let text = text.replace("\r\n", "\r").replace('\n', "\r");
-                        inst.write_input(text.as_bytes());
+                        let bytes = crate::panels::terminal::paste_bytes(
+                            inst.screen().bracketed_paste(),
+                            &text,
+                        );
+                        inst.write_input(&bytes);
                         return;
                     }
                 }
@@ -1549,10 +1548,11 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
             if !text.is_empty() {
                 if let Some(inst) = app.terminal_manager.active_instance_mut() {
                     if inst.spawned {
-                        let mut payload = b"\x1b[200~".to_vec();
-                        payload.extend_from_slice(text.as_bytes());
-                        payload.extend_from_slice(b"\x1b[201~");
-                        inst.write_input(&payload);
+                        let bytes = crate::panels::terminal::paste_bytes(
+                            inst.screen().bracketed_paste(),
+                            &text,
+                        );
+                        inst.write_input(&bytes);
                     }
                 }
             }

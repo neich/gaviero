@@ -751,7 +751,7 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
     };
 
     let transient_msg = app.status_message.as_ref().and_then(|(msg, when)| {
-        if when.elapsed().as_secs() < 3 {
+        if when.elapsed().as_secs() < theme::STATUS_MESSAGE_DURATION_SECS {
             Some(msg.as_str())
         } else {
             None

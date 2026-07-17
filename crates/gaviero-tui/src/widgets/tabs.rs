@@ -17,6 +17,17 @@ pub struct TabBar<'a> {
 /// Orange used for read-only diff-view tabs (e.g. git panel diff preview).
 const DIFF_VIEW_FG: Color = Color::Rgb(214, 134, 50);
 
+/// The rendered label for a tab and its display width in terminal cells.
+/// Width must be unicode-aware (`'●'` is 3 bytes / 1 cell, CJK chars are
+/// 2 cells) or rendering and mouse hit-testing desync.
+fn tab_label(title: &str, modified: bool) -> (String, u16) {
+    use unicode_width::UnicodeWidthStr;
+    let prefix = if modified { "● " } else { "" };
+    let label = format!(" {}{} ", prefix, title);
+    let width = label.as_str().width() as u16;
+    (label, width)
+}
+
 impl<'a> TabBar<'a> {
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
         if area.width == 0 || area.height == 0 {
@@ -32,9 +43,7 @@ impl<'a> TabBar<'a> {
         let mut x = area.x;
         for (i, (title, modified, is_diff_view)) in self.titles.iter().enumerate() {
             let is_active = i == self.active;
-            let prefix = if *modified { "● " } else { "" };
-            let label = format!(" {}{} ", prefix, title);
-            let label_len = label.len() as u16;
+            let (label, label_len) = tab_label(title, *modified);
 
             if x + label_len > area.right() {
                 // Show "..." if there are more tabs
@@ -100,13 +109,27 @@ impl<'a> TabBar<'a> {
     pub fn tab_at_x(&self, click_x: u16, area_x: u16) -> Option<usize> {
         let mut x = area_x;
         for (i, (title, modified, _)) in self.titles.iter().enumerate() {
-            let prefix = if *modified { "● " } else { "" };
-            let label_len = (format!(" {}{} ", prefix, title).len() as u16) + 1; // +1 for separator
+            let label_len = tab_label(title, *modified).1 + 1; // +1 for separator
             if click_x >= x && click_x < x + label_len {
                 return Some(i);
             }
             x += label_len;
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tab_label_width_is_cells_not_bytes() {
+        // '●' is 3 bytes but 1 cell; " ● a " = 5 cells.
+        assert_eq!(tab_label("a", true).1, 5);
+        // Plain ASCII: " a " = 3 cells.
+        assert_eq!(tab_label("a", false).1, 3);
+        // CJK chars occupy 2 cells each: " 日本 " = 2 + 4 = 6.
+        assert_eq!(tab_label("日本", false).1, 6);
     }
 }

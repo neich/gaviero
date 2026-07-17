@@ -442,7 +442,9 @@ pub(super) fn handle_dialog_key(app: &mut App, key: &crossterm::event::KeyEvent)
                 d.cursor = 0;
             }
         }
-        KeyCode::Char(c) if !ctrl => {
+        // `!ctrl` alone would drop AltGr chars on Windows, which arrive with
+        // CONTROL|ALT set (see `platform::altgr_char`).
+        KeyCode::Char(c) if !ctrl || crate::platform::altgr_char(key).is_some() => {
             if let Some(ref mut d) = app.tree_dialog {
                 d.insert_char(c);
             }

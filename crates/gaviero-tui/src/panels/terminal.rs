@@ -7,6 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer as RataBuf;
 use ratatui::layout::Rect;
 
+use crate::keymap::{Action, Keymap};
 use crate::theme;
 
 /// State for mouse-based text selection in the terminal panel.
@@ -257,7 +258,7 @@ pub fn render_terminal_screen(
     }
 
     if focused {
-        render_cursor(screen, area, buf, 0);
+        render_cursor(screen, area, buf);
     }
 }
 
@@ -301,49 +302,20 @@ pub fn render_terminal_with_border(
         }
     }
 
-    // Terminal content starts below border
-    let content_y = area.y + 1;
-    let content_height = area.height.saturating_sub(1);
-
-    let sel_style = ratatui::style::Style::default()
-        .fg(theme::TAB_BG)
-        .bg(theme::FOCUS_BORDER);
-
-    for row in 0..content_height {
-        for col in 0..area.width {
-            let cx = area.x + col;
-            let cy = content_y + row;
-            if cx >= buf.area().right() || cy >= buf.area().bottom() {
-                continue;
-            }
-
-            let cell = screen.cell(row, col);
-            let ch = if let Some(cell) = cell {
-                cell.contents().chars().next().unwrap_or(' ')
-            } else {
-                ' '
-            };
-            let style = if selection.is_selected(row, col, screen) {
-                sel_style
-            } else if let Some(cell) = cell {
-                vt100_style_to_ratatui(cell)
-            } else {
-                ratatui::style::Style::default()
-            };
-            buf[(cx, cy)].set_char(ch).set_style(style);
-        }
-    }
-
-    if focused {
-        render_cursor(screen, area, buf, 1);
-    }
+    // Terminal content starts below the border row.
+    let content = Rect {
+        y: area.y + 1,
+        height: area.height.saturating_sub(1),
+        ..area
+    };
+    render_terminal_screen(screen, content, buf, focused, selection);
 }
 
 /// Render the cursor block at the correct position.
-fn render_cursor(screen: &vt100::Screen, area: Rect, buf: &mut RataBuf, y_offset: u16) {
+fn render_cursor(screen: &vt100::Screen, area: Rect, buf: &mut RataBuf) {
     let (cursor_row, cursor_col) = screen.cursor_position();
     let cx = area.x + cursor_col;
-    let cy = area.y + y_offset + cursor_row;
+    let cy = area.y + cursor_row;
     if cx < buf.area().right() && cy < buf.area().bottom() {
         let cursor_style = ratatui::style::Style::default()
             .fg(theme::CURSOR_INVERT_FG)
@@ -353,19 +325,25 @@ fn render_cursor(screen: &vt100::Screen, area: Rect, buf: &mut RataBuf, y_offset
 }
 
 /// Convert a crossterm KeyEvent to the byte sequence expected by the terminal.
-pub fn key_event_to_bytes(key: &KeyEvent) -> Vec<u8> {
+///
+/// `application_cursor` is the DECCKM mode the foreground app negotiated
+/// (`screen().application_cursor()`): full-screen apps like vim/less expect
+/// SS3 (`ESC O _`) cursor sequences in that mode, CSI (`ESC [ _`) otherwise.
+pub fn key_event_to_bytes(key: &KeyEvent, application_cursor: bool) -> Vec<u8> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    // CSI vs SS3 introducer for unmodified cursor keys (DECCKM).
+    let cursor_intro = if application_cursor { b'O' } else { b'[' };
+
+    // AltGr chords carry text, not a control chord (see
+    // `platform::altgr_char`) — send the char verbatim, before the Ctrl arm
+    // can mangle it into a control byte.
+    if let Some(c) = crate::platform::altgr_char(key) {
+        let mut char_buf = [0u8; 4];
+        return c.encode_utf8(&mut char_buf).as_bytes().to_vec();
+    }
 
     match key.code {
-        // AltGr on Windows reports as CONTROL|ALT with the
-        // layout-resolved char (Spanish AltGr+2 = '@') — send the char
-        // verbatim, before the Ctrl arm can mangle it into a control
-        // byte. Must precede both modifier arms.
-        KeyCode::Char(c) if cfg!(windows) && ctrl && alt => {
-            let mut char_buf = [0u8; 4];
-            c.encode_utf8(&mut char_buf).as_bytes().to_vec()
-        }
         KeyCode::Char(c) if ctrl => {
             let byte = (c.to_ascii_lowercase() as u8)
                 .wrapping_sub(b'a')
@@ -387,19 +365,20 @@ pub fn key_event_to_bytes(key: &KeyEvent) -> Vec<u8> {
         KeyCode::Tab => vec![b'\t'],
         KeyCode::BackTab => vec![0x1b, b'[', b'Z'],
         KeyCode::Esc => vec![0x1b],
-        KeyCode::Up => vec![0x1b, b'[', b'A'],
-        KeyCode::Down => vec![0x1b, b'[', b'B'],
+        KeyCode::Up => vec![0x1b, cursor_intro, b'A'],
+        KeyCode::Down => vec![0x1b, cursor_intro, b'B'],
         // Ctrl+Left / Ctrl+Right → xterm modifier-5 arrow sequences so the
         // shell's line editor (readline / PSReadLine) performs backward-word /
         // forward-word instead of single-char motion. Must precede the plain
-        // arrow arms. (Ctrl+Up/Down never reach here — is_terminal_escape_key
-        // routes them to panel resize.)
+        // arrow arms; always CSI-form regardless of DECCKM (xterm behavior
+        // for modified cursor keys). (Ctrl+Up/Down never reach here —
+        // is_terminal_escape_key routes them to panel resize.)
         KeyCode::Right if ctrl => vec![0x1b, b'[', b'1', b';', b'5', b'C'],
         KeyCode::Left if ctrl => vec![0x1b, b'[', b'1', b';', b'5', b'D'],
-        KeyCode::Right => vec![0x1b, b'[', b'C'],
-        KeyCode::Left => vec![0x1b, b'[', b'D'],
-        KeyCode::Home => vec![0x1b, b'[', b'H'],
-        KeyCode::End => vec![0x1b, b'[', b'F'],
+        KeyCode::Right => vec![0x1b, cursor_intro, b'C'],
+        KeyCode::Left => vec![0x1b, cursor_intro, b'D'],
+        KeyCode::Home => vec![0x1b, cursor_intro, b'H'],
+        KeyCode::End => vec![0x1b, cursor_intro, b'F'],
         KeyCode::PageUp => vec![0x1b, b'[', b'5', b'~'],
         KeyCode::PageDown => vec![0x1b, b'[', b'6', b'~'],
         KeyCode::Insert => vec![0x1b, b'[', b'2', b'~'],
@@ -427,54 +406,83 @@ fn f_key_bytes(n: u8) -> Vec<u8> {
     }
 }
 
-/// Returns true if this key should escape the terminal and go to the app keymap.
-pub fn is_terminal_escape_key(key: &KeyEvent) -> bool {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+/// Encode pasted text for the PTY the way the foreground application expects.
+///
+/// If the application enabled bracketed-paste mode (vt100 tracks DECSET 2004
+/// via `screen().bracketed_paste()`), wrap the raw text in the paste markers
+/// so vim/fzf/readline treat it as one unit. Otherwise convert newlines to CR,
+/// matching the Enter key path (`key_event_to_bytes` maps Enter → `\r`): a raw
+/// `\n` is ^J, which PSReadLine inserts as a soft line break (">>"
+/// continuation) instead of executing the command.
+pub fn paste_bytes(bracketed: bool, text: &str) -> Vec<u8> {
+    if bracketed {
+        let mut payload = b"\x1b[200~".to_vec();
+        payload.extend_from_slice(text.as_bytes());
+        payload.extend_from_slice(b"\x1b[201~");
+        payload
+    } else {
+        text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
+    }
+}
+
+/// Whether an [`Action`] operates on the app frame rather than the focused
+/// pane — these escape the embedded terminal instead of reaching the PTY.
+///
+/// Everything else deliberately stays with the PTY: Ctrl+C (SIGINT), Ctrl+Z
+/// (SIGTSTP), Ctrl+D (EOF), Ctrl+A/E/K (readline), Ctrl+Left/Right
+/// (shell word-nav — user-confirmed), Tab completion, F-keys, plain text.
+fn action_escapes_terminal(action: &Action) -> bool {
+    use Action::*;
     matches!(
-        (key.code, ctrl, alt, shift),
-        // Panel visibility toggles
-        (KeyCode::F(4), false, false, false)         // F4 — toggle terminal
-        | (KeyCode::Char('j'), true, false, false)   // Ctrl+J — toggle terminal
-        | (KeyCode::Char('q'), true, false, false)    // Ctrl+Q — quit
-        | (KeyCode::Char('t'), true, false, false)    // Ctrl+T — new terminal tab
-        | (KeyCode::Char('w'), true, false, false)    // Ctrl+W — close terminal tab
-        | (KeyCode::Char('b'), true, false, false)    // Ctrl+B — toggle file tree
-        | (KeyCode::Char('p'), true, false, false)    // Ctrl+P — toggle side panel
-        // Alt+Number — panel focus (always escapes terminal)
-        | (KeyCode::Char('1'), false, true, false)    // Alt+1 — focus left panel
-        | (KeyCode::Char('2'), false, true, false)    // Alt+2 — focus editor
-        | (KeyCode::Char('3'), false, true, false)    // Alt+3 — focus side panel
-        | (KeyCode::Char('4'), false, true, false)    // Alt+4 — focus terminal
-        // Alt+Letter — panel mode switching (escapes terminal)
-        | (KeyCode::Char('e'), false, true, false)    // Alt+E — explorer
-        | (KeyCode::Char('f'), false, true, false)    // Alt+F — find
-        | (KeyCode::Char('c'), false, true, false)    // Alt+C — changes
-        | (KeyCode::Char('a'), false, true, false)    // Alt+A — agent chat
-        | (KeyCode::Char('w'), false, true, false)    // Alt+W — swarm dashboard
-        | (KeyCode::Char('g'), false, true, false)    // Alt+G — git panel
-        // Alt+Up/Down — terminal resize
-        | (KeyCode::Up, false, true, false)           // Alt+Up — grow terminal
-        | (KeyCode::Down, false, true, false)         // Alt+Down — shrink terminal
-        // Ctrl+Up/Down — terminal resize fallback (Windows Terminal steals
-        // Alt+arrows for pane navigation when the window has >1 pane)
-        | (KeyCode::Up, true, false, false)           // Ctrl+Up — grow terminal
-        | (KeyCode::Down, true, false, false)         // Ctrl+Down — shrink terminal
-        // Alt+O/I — cycle terminal tabs (forward/back)
-        | (KeyCode::Char('o'), false, true, false)
-        | (KeyCode::Char('i'), false, true, false)
-        // Shift+PageUp/PageDown — page scroll in terminal
-        | (KeyCode::PageUp, false, false, true)       // Shift+PageUp — page scroll back
-        | (KeyCode::PageDown, false, false, true)     // Shift+PageDown — page scroll forward
-        // Keyboard text selection in terminal (escape to TUI, not PTY)
-        | (KeyCode::Up, false, false, true)           // Shift+Up — select up
-        | (KeyCode::Down, false, false, true)         // Shift+Down — select down
-        | (KeyCode::Left, false, false, true)         // Shift+Left — select left
-        | (KeyCode::Right, false, false, true)        // Shift+Right — select right
-        // Ctrl+V — paste from clipboard (handled by app, not forwarded raw to PTY)
-        | (KeyCode::Char('v'), true, false, false)
+        action,
+        Quit | ToggleFileTree
+            | ToggleSidePanel
+            | ToggleTerminal
+            | NewTab
+            | CloseTab
+            | FocusLeftPanel
+            | FocusEditor
+            | FocusSidePanel
+            | FocusTerminal
+            | SetLeftModeExplorer
+            | SetLeftModeFind
+            | SetLeftModeChanges
+            | SetSideModeChat
+            | SetSideModeSwarm
+            | SetSideModeGit
+            | SetSideModeMemory
+            | ToggleAutoApprove
+            | SwitchLayout(_)
+            | CycleTabForward
+            | CycleTabBack
+            // Alt+Up/Down and the Ctrl+Up/Down fallback (Windows Terminal
+            // steals Alt+arrows for pane navigation) both resize the split.
+            | MoveLineUp
+            | MoveLineDown
+            | ResizePanelUp
+            | ResizePanelDown
+            // Keyboard text selection in the terminal (TUI-side, not PTY).
+            | SelectUp
+            | SelectDown
+            | SelectLeft
+            | SelectRight
+            // Ctrl+V — paste is handled by the app, not forwarded raw.
+            | Paste
     )
+}
+
+/// Returns true if this key should escape the terminal and go to the app
+/// keymap. Derived from `Keymap::resolve` so new global bindings escape
+/// automatically instead of desyncing from a second hand-written chord table.
+pub fn is_terminal_escape_key(key: &KeyEvent) -> bool {
+    // Shift+PageUp/PageDown page-scroll the terminal viewport. Explicit check:
+    // Keymap::resolve maps PageUp/PageDown to the same action with or without
+    // SHIFT, but the plain keys must reach the PTY.
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    if shift && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+        return true;
+    }
+    action_escapes_terminal(&Keymap::resolve(key))
 }
 
 /// Convert vt100 cell attributes to ratatui style.
@@ -495,6 +503,9 @@ fn vt100_style_to_ratatui(cell: &vt100::Cell) -> ratatui::style::Style {
     let mut modifier = Modifier::empty();
     if cell.bold() {
         modifier |= Modifier::BOLD;
+    }
+    if cell.dim() {
+        modifier |= Modifier::DIM;
     }
     if cell.italic() {
         modifier |= Modifier::ITALIC;
@@ -522,23 +533,72 @@ mod tests {
             KeyCode::Char('@'),
             KeyModifiers::CONTROL | KeyModifiers::ALT,
         );
-        assert_eq!(key_event_to_bytes(&key), b"@".to_vec());
+        assert_eq!(key_event_to_bytes(&key, false), b"@".to_vec());
     }
 
     #[test]
     fn ctrl_char_maps_to_control_byte() {
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(key_event_to_bytes(&key), vec![0x03]);
+        assert_eq!(key_event_to_bytes(&key, false), vec![0x03]);
     }
 
     #[test]
     fn ctrl_arrow_maps_to_word_motion() {
         // Ctrl+Left / Ctrl+Right must reach the shell as xterm modifier-5
         // arrow sequences so readline / PSReadLine do backward/forward-word,
-        // not a bare arrow (single-char motion).
-        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL);
-        assert_eq!(key_event_to_bytes(&left), b"\x1b[1;5D".to_vec());
-        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL);
-        assert_eq!(key_event_to_bytes(&right), b"\x1b[1;5C".to_vec());
+        // not a bare arrow (single-char motion) — in both DECCKM modes.
+        for app_cursor in [false, true] {
+            let left = KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL);
+            assert_eq!(key_event_to_bytes(&left, app_cursor), b"\x1b[1;5D".to_vec());
+            let right = KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL);
+            assert_eq!(key_event_to_bytes(&right, app_cursor), b"\x1b[1;5C".to_vec());
+        }
+    }
+
+    #[test]
+    fn cursor_keys_honor_application_mode() {
+        // Normal mode: CSI; DECCKM application mode (vim/less): SS3.
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(key_event_to_bytes(&up, false), b"\x1b[A".to_vec());
+        assert_eq!(key_event_to_bytes(&up, true), b"\x1bOA".to_vec());
+        let end = KeyEvent::new(KeyCode::End, KeyModifiers::NONE);
+        assert_eq!(key_event_to_bytes(&end, false), b"\x1b[F".to_vec());
+        assert_eq!(key_event_to_bytes(&end, true), b"\x1bOF".to_vec());
+    }
+
+    #[test]
+    fn paste_bytes_brackets_only_when_mode_enabled() {
+        // App enabled DECSET 2004: raw text between markers, no CR munge.
+        assert_eq!(
+            paste_bytes(true, "a\nb"),
+            b"\x1b[200~a\nb\x1b[201~".to_vec()
+        );
+        // Mode off: newlines become CR so the shell executes lines.
+        assert_eq!(paste_bytes(false, "a\r\nb\nc"), b"a\rb\rc".to_vec());
+    }
+
+    #[test]
+    fn escape_keys_track_the_keymap() {
+        let escapes = |code, mods| is_terminal_escape_key(&KeyEvent::new(code, mods));
+
+        // Global chords escape — including the ones the old hand-written
+        // table had desynced from the keymap (Alt+M, Alt+Y, Alt+digits).
+        assert!(escapes(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(escapes(KeyCode::Char('m'), KeyModifiers::ALT));
+        assert!(escapes(KeyCode::Char('y'), KeyModifiers::ALT));
+        assert!(escapes(KeyCode::Char('5'), KeyModifiers::ALT));
+        assert!(escapes(KeyCode::Up, KeyModifiers::CONTROL));
+        assert!(escapes(KeyCode::PageUp, KeyModifiers::SHIFT));
+        assert!(escapes(KeyCode::Char('v'), KeyModifiers::CONTROL));
+
+        // PTY-bound keys stay with the shell.
+        assert!(!escapes(KeyCode::Char('c'), KeyModifiers::CONTROL)); // SIGINT
+        assert!(!escapes(KeyCode::Char('d'), KeyModifiers::CONTROL)); // EOF
+        assert!(!escapes(KeyCode::Char('s'), KeyModifiers::CONTROL)); // XOFF
+        assert!(!escapes(KeyCode::Left, KeyModifiers::CONTROL)); // word-nav
+        assert!(!escapes(KeyCode::Char('a'), KeyModifiers::NONE)); // text
+        assert!(!escapes(KeyCode::PageUp, KeyModifiers::NONE));
+        assert!(!escapes(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(!escapes(KeyCode::Enter, KeyModifiers::NONE));
     }
 }

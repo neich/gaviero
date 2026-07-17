@@ -112,55 +112,31 @@ pub const DIFF_VIEW_HEADER_FG: Color = Color::Black;
 
 // ── Magic Number Constants ──────────────────────────────────────
 
-/// Default tab display width.
-#[allow(unused)]
-pub const DEFAULT_TAB_WIDTH: u8 = 4;
 /// Crossterm event poll timeout in milliseconds.
-#[allow(unused)]
 pub const CROSSTERM_POLL_MS: u64 = 50;
 /// UI tick interval in milliseconds (~30fps).
-#[allow(unused)]
 pub const TICK_INTERVAL_MS: u64 = 33;
+/// Max gap between key events still treated as one pasted burst on Windows.
+/// Console paste injects events back-to-back (sub-millisecond); this stays far
+/// below human keystroke and key-repeat cadence (>= ~30 ms), so real typing is
+/// never merged into a paste.
+pub const PASTE_BURST_MS: u64 = 5;
 /// Default number of messages to keep on /compact.
-#[allow(unused)]
 pub const DEFAULT_COMPACT_KEEP: usize = 6;
-/// Maximum lines to search upward for indent baseline.
-#[allow(unused)]
-pub const MAX_BASELINE_SEARCH_LINES: usize = 5;
-/// Broadcast bus channel capacity.
-#[allow(unused)]
-pub const BUS_CHANNEL_CAPACITY: usize = 256;
 /// Terminal resize step (percentage per key press).
 pub const TERMINAL_RESIZE_STEP: u16 = 5;
 /// Terminal maximum split percentage.
 pub const TERMINAL_MAX_PERCENT: u16 = 80;
 /// Terminal minimum split percentage.
 pub const TERMINAL_MIN_PERCENT: u16 = 10;
-/// Chat panel page-scroll lines.
-#[allow(unused)]
-pub const CHAT_PAGE_SCROLL: usize = 20;
 /// Diff viewer page-scroll lines.
 pub const DIFF_PAGE_SCROLL: usize = 10;
 /// Mouse scroll delta (lines per wheel event).
-#[allow(unused)]
 pub const MOUSE_SCROLL_DELTA: usize = 3;
 /// Diff gutter width (columns).
 pub const DIFF_GUTTER_WIDTH: u16 = 5;
-/// Chat input area height (rows).
-#[allow(unused)]
-pub const INPUT_AREA_HEIGHT: u16 = 3;
-/// Maximum autocomplete popup height (rows).
-#[allow(unused)]
-pub const AUTOCOMPLETE_MAX_HEIGHT: u16 = 8;
 /// Status message display duration (seconds).
-#[allow(unused)]
-pub const STATUS_MESSAGE_DURATION_SECS: u64 = 5;
-/// Diff context lines for unified diff.
-#[allow(unused)]
-pub const DIFF_CONTEXT_LINES: usize = 3;
-/// Maximum task planning retry attempts.
-#[allow(unused)]
-pub const MAX_PLAN_ATTEMPTS: usize = 2;
+pub const STATUS_MESSAGE_DURATION_SECS: u64 = 3;
 
 #[derive(Debug, Deserialize)]
 struct ThemeFile {

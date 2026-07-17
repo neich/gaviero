@@ -942,9 +942,9 @@ impl AgentChatState {
             }
             "/compact" => {
                 let keep = if arg.is_empty() {
-                    6 // default: keep last 6 messages (3 turns)
+                    theme::DEFAULT_COMPACT_KEEP
                 } else {
-                    arg.parse::<usize>().unwrap_or(6)
+                    arg.parse::<usize>().unwrap_or(theme::DEFAULT_COMPACT_KEEP)
                 };
                 let conv = &mut self.conversations[self.active_conv];
                 let total = conv.messages.len();
@@ -1727,7 +1727,7 @@ impl AgentChatState {
         // literal carriage-return to the terminal, which jumps the cursor to
         // column 0 and overwrites other TUI panels (Explorer, Editor).
         if text.contains('\r') {
-            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+            let normalized = crate::editor::normalize_paste_newlines(text);
             self.text_input.insert_str(&normalized);
         } else {
             self.text_input.insert_str(text);

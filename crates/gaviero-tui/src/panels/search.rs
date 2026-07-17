@@ -74,23 +74,30 @@ impl SearchPanelState {
         for entry in entries.flatten() {
             let path = entry.path();
             let rel = path.strip_prefix(root).unwrap_or(&path);
-            let rel_str = rel.to_string_lossy();
-
-            // Skip excluded patterns
-            if excludes.iter().any(|ex| {
-                if ex.ends_with('/') {
-                    rel_str.starts_with(ex) || rel_str.starts_with(ex.trim_end_matches('/'))
-                } else {
-                    rel_str == *ex
-                }
-            }) {
+            // '/'-joined for the exclude matcher: native separators (Windows
+            // `\`) never match the '/'-literal pattern grammar. Uses the same
+            // gitignore-style matcher as the file watcher and file list —
+            // search previously had its own weaker equality/prefix variant.
+            let rel_str: String = rel
+                .components()
+                .filter_map(|c| match c {
+                    std::path::Component::Normal(name) => name.to_str(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            if crate::app::matches_exclude(&rel_str, excludes) {
                 continue;
             }
 
-            // Skip hidden dirs and common build dirs
+            // Skip the components the file watcher always drops, plus every
+            // dotfile — search policy is to never descend hidden dirs (the
+            // watcher, by contrast, still reports non-`.git` dot-dirs).
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.starts_with('.') || name_str == "target" || name_str == "node_modules" {
+            if name_str.starts_with('.')
+                || crate::event::ALWAYS_SKIP_COMPONENTS.contains(&name_str.as_ref())
+            {
                 continue;
             }
 

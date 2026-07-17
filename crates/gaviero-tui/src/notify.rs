@@ -89,36 +89,63 @@ pub fn spawn_desktop_notification(title: &str, body: &str) {
     #[cfg(windows)]
     let _ = (title, body);
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        let _ = std::process::Command::new("notify-send")
-            .args([
+        // Enforced by the API rather than each caller: the body can carry
+        // arbitrary backend error text, and a raw newline would break the
+        // AppleScript string literal (silent osascript failure).
+        let title = sanitize_control_chars(title);
+        let body = sanitize_control_chars(body);
+
+        #[cfg(target_os = "linux")]
+        spawn_silent(
+            "notify-send",
+            &[
                 "--urgency=low",
                 "--hint=int:transient:1",
                 "--app-name=Gaviero",
-                title,
-                body,
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let script = format!(
-            "display notification \"{}\" with title \"{}\"",
-            escape_applescript(body),
-            escape_applescript(title),
+                &title,
+                &body,
+            ],
         );
-        let _ = std::process::Command::new("osascript")
-            .args(["-e", &script])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+
+        #[cfg(target_os = "macos")]
+        {
+            let script = format!(
+                "display notification \"{}\" with title \"{}\"",
+                escape_applescript(&body),
+                escape_applescript(&title),
+            );
+            spawn_silent("osascript", &["-e", &script]);
+        }
     }
+}
+
+/// Spawn a fire-and-forget helper with all stdio nulled. The child is handed
+/// to a detached reaper thread: `std::process::Child` does not wait on drop,
+/// so without the reaper every exited notifier would linger as a zombie for
+/// the lifetime of the TUI process.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn spawn_silent(bin: &str, args: &[&str]) {
+    use std::process::{Command, Stdio};
+    let child = Command::new(bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    if let Ok(mut child) = child {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+}
+
+/// Map control characters (newlines included) to spaces — toasts are
+/// single-line surfaces on every backend.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn sanitize_control_chars(s: &str) -> String {
+    s.replace(|c: char| c.is_control(), " ")
 }
 
 #[cfg(target_os = "macos")]
@@ -146,5 +173,11 @@ mod tests {
     #[test]
     fn applescript_escape_quotes() {
         assert_eq!(escape_applescript(r#"say "hi""#), r#"say \"hi\""#);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn control_chars_flattened_to_spaces() {
+        assert_eq!(sanitize_control_chars("a\nb\r\tc"), "a b  c");
     }
 }

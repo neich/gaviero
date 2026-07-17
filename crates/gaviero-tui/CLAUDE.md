@@ -17,8 +17,9 @@ cargo run -p gaviero-tui -- name.gaviero-workspace
 ## Architecture
 
 - [`app.rs`](src/app.rs) + [`app/`](src/app) — `App` struct, layout, focus, event dispatch, observer wiring, chat-memory bridge ([`app/chat_memory.rs`](src/app/chat_memory.rs)), per-folder topology cache built asynchronously ([`app/session.rs`](src/app/session.rs)), slash-command dispatch ([`app/commands.rs`](src/app/commands.rs)), context-pressure + bootstrap-tokens render ([`app/render.rs`](src/app/render.rs)).
-- [`event.rs`](src/event.rs) — event variants from crossterm / notify / tick / core observer callbacks.
+- [`event.rs`](src/event.rs) — event variants from crossterm / notify / tick / core observer callbacks; Windows paste-burst coalescer (runtime-gated, compiled on all platforms).
 - [`keymap.rs`](src/keymap.rs) — keybindings: Ctrl = editor, Alt = workspace layering. `Alt+Z` toggles word wrap.
+- [`platform.rs`](src/platform.rs) — every platform-specific terminal workaround: VT mouse passthrough (Windows/ConPTY), bracketed-paste gating, AltGr chord detection. New platform quirks go here, not inline.
 - [`editor/`](src/editor) — Ropey buffer ([`buffer.rs`](src/editor/buffer.rs)), viewport + gutter ([`view.rs`](src/editor/view.rs)), tree-sitter highlight ([`highlight.rs`](src/editor/highlight.rs)), markdown rendering ([`markdown.rs`](src/editor/markdown.rs)), diff-overlay state ([`diff_overlay.rs`](src/editor/diff_overlay.rs)), LCS line diff for diff-view buffers ([`diff.rs`](src/editor/diff.rs)), visual-line layout for word wrap ([`wrap.rs`](src/editor/wrap.rs)).
 - [`panels/`](src/panels) — `file_tree`, `agent_chat` (slash commands + context-pressure + bootstrap-tokens indicators), `swarm_dashboard`, `git_panel`, `terminal`, `search`, `memory_panel`, `status_bar` (mode / file / branch / agent / word-wrap indicator), `chat_markdown`.
 - [`widgets/`](src/widgets) — tabs, scrollbar, scroll state, text input, render utils.
@@ -57,7 +58,7 @@ Chat input also supports `$skill` invocation (see README § Skills) with `$`-pre
 - `ratatui 0.30` + `crossterm 0.29` — rendering, input.
 - `ropey 1.6` — rope buffer.
 - `notify 7` — filesystem watcher.
-- `portable-pty 0.9` + `vt100 0.16` + `tui-term 0.3` — embedded terminal.
+- `portable-pty 0.9` + `vt100 0.16` — embedded terminal.
 - `arboard 3` + `base64` + `png` — clipboard, image paste.
 - `unicode-width 0.2` — visual width for wrap.
 - `streaming-iterator`, `toml`, `tokio-util` — misc.
