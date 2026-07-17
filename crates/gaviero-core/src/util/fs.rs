@@ -48,6 +48,14 @@ pub fn remove_dir_all_retry(path: &Path) -> std::io::Result<()> {
 /// provider-qualified prompt — and some tools reject them outright.
 /// Paths at/over the classic MAX_PATH limit keep the prefix (they need
 /// it). Identity on non-Windows.
+/// `std::fs::canonicalize` followed by [`simplify_path`] — the only way the
+/// workspace should canonicalize a path. A bare `canonicalize` yields a
+/// verbatim `\\?\` path on Windows whose prefix components never
+/// `strip_prefix`-match against a simplified workspace root.
+pub fn canonicalize_simplified(p: &Path) -> std::io::Result<std::path::PathBuf> {
+    std::fs::canonicalize(p).map(|p| simplify_path(&p))
+}
+
 pub fn simplify_path(p: &Path) -> std::path::PathBuf {
     if !cfg!(windows) {
         return p.to_path_buf();
