@@ -240,11 +240,12 @@ impl Keymap {
             KeyCode::Enter if shift => Action::AltEnter,
             KeyCode::Enter => Action::Enter,
             KeyCode::Char(c) if !ctrl && !alt => Action::InsertChar(c),
-            // AltGr on Windows reports as CONTROL|ALT with the
-            // layout-resolved char (Spanish AltGr+2 = '@'); insert it
-            // as text. Reached only after every specific Ctrl/Alt
-            // shortcut above has had its chance.
-            KeyCode::Char(c) if cfg!(windows) && ctrl && alt => Action::InsertChar(c),
+            // AltGr chords insert text (see `platform::altgr_char`). Reached
+            // only after every specific Ctrl/Alt shortcut above has had its
+            // chance.
+            KeyCode::Char(c) if crate::platform::altgr_char(key).is_some() => {
+                Action::InsertChar(c)
+            }
 
             _ => Action::None,
         }

@@ -4,13 +4,14 @@ mod event;
 mod keymap;
 mod notify;
 mod panels;
+mod platform;
 mod theme;
 mod widgets;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
-    event::{DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange, EnableMouseCapture},
+    event::{DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -89,41 +90,23 @@ fn prompt_c1_consent(
     Ok(matches!(answer.as_str(), "y" | "yes"))
 }
 
-/// VT mouse-mode sequences (normal + button-drag tracking, SGR encoding).
-/// crossterm's `EnableMouseCapture` on Windows only sets the WinAPI console
-/// mode (`is_ansi_code_supported` is hardwired to `false`); under Windows
-/// Terminal/ConPTY that never reaches the hosting terminal, which then keeps
-/// its own native drag-selection — a full-window-width highlight that ignores
-/// panel boundaries — instead of forwarding mouse events to the app. Writing
-/// the sequences explicitly makes ConPTY pass the request through.
-///
-/// Under a multiplexer these sequences reach the mux, not the host terminal.
-/// psmux forwards drags to alt-screen panes only when its own client-side
-/// drag-selection is disabled: `set -g mouse-selection off` (default is on).
-/// With it on, the psmux client swallows every left-drag after the initial
-/// press and paints its own unclamped highlight — the same full-window
-/// symptom — and no gaviero-side sequence can override that.
-#[cfg(windows)]
-const ENABLE_VT_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
-#[cfg(windows)]
-const DISABLE_VT_MOUSE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
-
 /// Restore the host terminal to a sane state. Called on every exit path:
-/// normal exit, `?` early returns, and panics.
-fn restore_terminal() {
-    let _ = disable_raw_mode();
-    #[cfg(windows)]
-    let _ = execute!(std::io::stdout(), crossterm::style::Print(DISABLE_VT_MOUSE));
-    let _ = execute!(
-        std::io::stdout(),
+/// normal exit (where the error is reported), `?` early returns, and panics
+/// (where it is ignored). Every step is attempted even if an earlier one
+/// fails; the first error is returned.
+fn restore_terminal() -> std::io::Result<()> {
+    let mut stdout = std::io::stdout();
+    let raw = disable_raw_mode();
+    let vt_mouse = platform::disable_vt_mouse_passthrough(&mut stdout);
+    let modes = execute!(
+        stdout,
         LeaveAlternateScreen,
         DisableMouseCapture,
-        DisableBracketedPaste,
-        DisableFocusChange
+        DisableFocusChange,
+        crossterm::cursor::Show
     );
-    let _ = crossterm::cursor::Show;
-    // Print a newline so the shell prompt starts on a clean line
-    let _ = execute!(std::io::stdout(), crossterm::cursor::Show);
+    let paste = platform::set_bracketed_paste(&mut stdout, false);
+    raw.and(vt_mouse).and(modes).and(paste)
 }
 
 /// Coalesces expensive Agent Chat streaming redraws while leaving state
@@ -199,7 +182,7 @@ struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        restore_terminal();
+        let _ = restore_terminal();
     }
 }
 
@@ -214,15 +197,18 @@ async fn main() -> Result<()> {
         std::fs::File::create(log_dir.join("gaviero.log")).context("creating log file")?;
     tracing_subscriber::fmt()
         .with_writer(std::sync::Mutex::new(log_file))
-        .with_max_level(tracing::Level::DEBUG)
+        // Default stays DEBUG; GAVIERO_LOG (EnvFilter syntax) overrides it.
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_env("GAVIERO_LOG")
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug")),
+        )
         .init();
 
     let cli = Cli::parse();
 
     // Simplify away Windows' `\\?\` verbatim prefix — this path becomes
     // the workspace root and flows into shell cwds, prompts, and configs.
-    let path = std::fs::canonicalize(&cli.path)
-        .map(|p| gaviero_core::util::fs::simplify_path(&p))
+    let path = gaviero_core::util::fs::canonicalize_simplified(&cli.path)
         .with_context(|| format!("resolving path: {}", cli.path.display()))?;
 
     let workspace = if path
@@ -265,7 +251,7 @@ async fn main() -> Result<()> {
     // the terminal before printing the panic message.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        restore_terminal();
+        let _ = restore_terminal();
         default_hook(info);
     }));
 
@@ -276,15 +262,13 @@ async fn main() -> Result<()> {
         stdout,
         EnterAlternateScreen,
         EnableMouseCapture,
-        EnableBracketedPaste,
         EnableFocusChange
     )
     .context("entering alternate screen")?;
-    // See `ENABLE_VT_MOUSE`: on Windows the crossterm command above is
-    // WinAPI-only and Windows Terminal never learns the app captured the
-    // mouse, so its native drag-selection keeps hijacking the mouse.
-    #[cfg(windows)]
-    execute!(stdout, crossterm::style::Print(ENABLE_VT_MOUSE))
+    // Bracketed paste and VT mouse passthrough are platform-dependent —
+    // see `platform` for why each is gated the way it is.
+    platform::set_bracketed_paste(&mut stdout, true).context("enabling bracketed paste")?;
+    platform::enable_vt_mouse_passthrough(&mut stdout)
         .context("enabling VT mouse passthrough")?;
 
     // RAII guard: if anything below returns Err via `?`, the terminal
@@ -439,16 +423,9 @@ async fn main() -> Result<()> {
     // Save session state before exit
     app.save_session();
 
-    // Explicit cleanup (guard will also run, but that's harmless — the calls are idempotent)
-    // We keep the explicit block so errors are reported on the happy path.
-    disable_raw_mode().context("disabling raw mode")?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture,
-        DisableBracketedPaste
-    )
-    .context("leaving alternate screen")?;
+    // Explicit call so errors are reported on the happy path (the guard will
+    // run it again, but that's harmless — the calls are idempotent).
+    restore_terminal().context("restoring terminal")?;
     terminal.show_cursor().context("showing cursor")?;
 
     Ok(())
