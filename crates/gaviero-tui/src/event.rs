@@ -269,7 +269,7 @@ pub enum Event {
 /// virtually never useful as editor signals (build artefacts, VCS internals,
 /// gaviero's own swarm worktrees) and would otherwise flood the unbounded
 /// event channel during a build.
-const ALWAYS_SKIP_COMPONENTS: &[&str] = &["target", "node_modules", ".git"];
+pub(crate) const ALWAYS_SKIP_COMPONENTS: &[&str] = &["target", "node_modules", ".git"];
 
 /// Decide whether a notify event path should be dropped before it reaches
 /// the main loop. Skips paths under one of `ALWAYS_SKIP_COMPONENTS`,
@@ -304,52 +304,51 @@ fn path_is_excluded(path: &Path, roots: &[PathBuf], exclude_patterns: &[String])
 
     if !exclude_patterns.is_empty() {
         // `matches_exclude` is a leaf matcher: a pattern like `build/` only
-        // matches the literal `build` path, not `build/output.txt`. Walk the
-        // relative path up so a watcher event under an excluded directory
-        // still gets dropped. Cheap because rel paths inside a workspace are
-        // shallow (a handful of components at most).
-        let mut current: Option<&Path> = Some(rel);
-        while let Some(p) = current {
-            if !p.as_os_str().is_empty() {
-                let s = p.to_string_lossy();
-                if crate::app::matches_exclude(&s, exclude_patterns) {
-                    return true;
-                }
+        // matches the literal `build` path, not `build/output.txt`. Walk
+        // every ancestor prefix of the relative path so a watcher event under
+        // an excluded directory still gets dropped. Cheap because rel paths
+        // inside a workspace are shallow (a handful of components at most).
+        //
+        // Candidates are built from components joined with '/': on Windows,
+        // notify delivers native `\` separators, which the '/'-literal
+        // pattern grammar would never match.
+        let comps: Vec<&str> = rel
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(name) => name.to_str(),
+                _ => None,
+            })
+            .collect();
+        for end in (1..=comps.len()).rev() {
+            if crate::app::matches_exclude(&comps[..end].join("/"), exclude_patterns) {
+                return true;
             }
-            current = p.parent();
         }
     }
 
     false
 }
 
-/// Max gap between key events still treated as one pasted burst on Windows.
-/// Console paste injects events back-to-back (sub-millisecond); this stays far
-/// below human keystroke and key-repeat cadence (>= ~30 ms), so real typing is
-/// never merged into a paste.
-#[cfg(windows)]
-const WINDOWS_PASTE_BURST_MS: u64 = 5;
-
 /// Read the crossterm events available after `poll` has reported one ready.
 ///
 /// On Unix a paste already arrives as a single `Event::Paste`, so this is one
-/// `read()`. On Windows the console backend has no bracketed-paste support:
-/// `EnableBracketedPaste` is a no-op and a paste is delivered as a burst of
-/// individual key events, whose newlines fire as `Enter` — which submits the
-/// chat on the first line. The Windows variant coalesces such a burst into a
-/// synthetic `Event::Paste` so both platforms behave identically.
-#[cfg(not(windows))]
-fn read_crossterm_batch() -> Vec<crossterm::event::Event> {
-    crossterm::event::read().into_iter().collect()
-}
-
-#[cfg(windows)]
+/// `read()`. On Windows, crossterm's console event source can never surface
+/// `Event::Paste` (it builds only Key/Mouse/Resize/Focus events from console
+/// input records — see `platform::set_bracketed_paste`): a paste is delivered
+/// as a burst of individual key events, whose newlines fire as `Enter` —
+/// which submits the chat on the first line. The Windows path coalesces such
+/// a burst into a synthetic `Event::Paste` so both platforms behave
+/// identically. Runtime-gated (`cfg!`) rather than compile-time-gated so the
+/// coalescer builds and its tests run on every platform.
 fn read_crossterm_batch() -> Vec<crossterm::event::Event> {
     use crossterm::event::{self, Event, KeyEventKind};
 
     let Ok(first) = event::read() else {
         return Vec::new();
     };
+    if !cfg!(windows) {
+        return vec![first];
+    }
 
     // Only an unmodified text key can begin a paste burst.
     let Some(first_ch) = paste_char(&first) else {
@@ -370,7 +369,7 @@ fn read_crossterm_batch() -> Vec<crossterm::event::Event> {
     // paste and is re-emitted after it.
     let mut text = String::from(first_ch);
     let mut trailing: Option<Event> = None;
-    while event::poll(Duration::from_millis(WINDOWS_PASTE_BURST_MS)).unwrap_or(false) {
+    while event::poll(Duration::from_millis(crate::theme::PASTE_BURST_MS)).unwrap_or(false) {
         let Ok(next) = event::read() else {
             break;
         };
@@ -401,7 +400,6 @@ fn read_crossterm_batch() -> Vec<crossterm::event::Event> {
 /// be part of a paste. Enter → `\n`, Tab → `\t`, plain chars → themselves;
 /// releases, control/alt/super chords, and navigation keys map to `None`.
 /// Shift is allowed so pasted capitals survive.
-#[cfg(windows)]
 fn paste_char(event: &crossterm::event::Event) -> Option<char> {
     use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
@@ -605,6 +603,10 @@ impl EventLoop {
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(Duration::from_millis(crate::theme::TICK_INTERVAL_MS));
+            // After a UI stall, resume with at most one pending tick instead
+            // of tokio's default burst of catch-up ticks — missed heartbeats
+            // carry no information and only flood the unbounded channel.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
                 if tx.send(Event::Tick).is_err() {
@@ -683,6 +685,32 @@ mod tests {
         ));
     }
 
+    /// Real notify events on Windows carry native `\` separators (paths are
+    /// rebuilt from FILE_NOTIFY_INFORMATION); exclude patterns must still
+    /// match them.
+    #[cfg(windows)]
+    #[test]
+    fn path_is_excluded_matches_windows_native_separators() {
+        let root = PathBuf::from(r"C:\ws");
+        let roots = vec![root.clone()];
+        let patterns = vec!["**/*.log".to_string(), "build/".to_string()];
+        assert!(path_is_excluded(
+            &PathBuf::from(r"C:\ws\a\b\c.log"),
+            &roots,
+            &patterns,
+        ));
+        assert!(path_is_excluded(
+            &PathBuf::from(r"C:\ws\build\output.txt"),
+            &roots,
+            &patterns,
+        ));
+        assert!(!path_is_excluded(
+            &PathBuf::from(r"C:\ws\src\main.rs"),
+            &roots,
+            &patterns,
+        ));
+    }
+
     #[test]
     fn path_is_excluded_passes_through_paths_outside_roots() {
         let roots = vec![PathBuf::from("/ws")];
@@ -695,7 +723,6 @@ mod tests {
         ));
     }
 
-    #[cfg(windows)]
     #[test]
     fn paste_char_maps_text_keys_and_rejects_chords() {
         use crossterm::event::{
