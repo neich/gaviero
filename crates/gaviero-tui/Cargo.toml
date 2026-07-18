@@ -34,6 +34,14 @@ portable-pty = "0.9"
 vt100 = "0.16"
 unicode-width = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+# SetConsoleCtrlHandler for the Ctrl+C/Ctrl+Break → key-event forwarder
+# (platform::install_console_ctrl_forwarder). 0.59 is already in-tree.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
+
 [dev-dependencies]
 tempfile = "3"
 

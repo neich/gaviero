@@ -70,6 +70,106 @@ pub fn disable_vt_mouse_passthrough(_w: &mut impl Write) -> std::io::Result<()> 
     Ok(())
 }
 
+/// Install a Windows console-control handler that turns Ctrl+C / Ctrl+Break
+/// *signals* back into key events instead of letting them terminate the TUI.
+///
+/// With crossterm raw mode active (`ENABLE_PROCESSED_INPUT` cleared), Ctrl+C
+/// arrives as an ordinary key event and the keymap gives it its in-app
+/// meaning (cancel a streaming chat turn / copy). But that mode lives on the
+/// *console*, which is shared with every attached process; if something
+/// flips it back to processed mode behind our back, conhost instead
+/// broadcasts a `CTRL_C_EVENT` — and a handler-less process is terminated on
+/// the spot ("Ctrl+C killed gaviero mid-prompt", W1). Ctrl+Break is
+/// delivered as a control event *regardless* of raw mode, so it was always
+/// fatal. Agent subprocess trees are detached from the console at the spawn
+/// layer (`CREATE_NO_WINDOW`, `gaviero_core::util::spawn`); this handler is
+/// the safety net for anything that still stomps the mode (direct `git`
+/// spawns, credential prompts).
+///
+/// The handler swallows both events and re-injects a synthetic Ctrl+C key
+/// press into the unified event channel, so the gesture keeps its exact
+/// keymap semantics on whichever path Windows chose. No dedup is needed:
+/// with processed input off no control event is generated, and with it on
+/// the keystroke never enters the input buffer — exactly one path fires.
+/// Close / logoff / shutdown fall through to the default handler so closing
+/// the window still exits.
+///
+/// Registration failure is logged and ignored — running without the net is
+/// the status quo, not a startup-abort condition.
+#[cfg(windows)]
+pub fn install_console_ctrl_forwarder(tx: tokio::sync::mpsc::UnboundedSender<crate::event::Event>) {
+    use windows_sys::Win32::Foundation::TRUE;
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+
+    let _ = console_ctrl::TX.set(tx);
+    let ok = unsafe { SetConsoleCtrlHandler(Some(console_ctrl::forward_ctrl_events), TRUE) };
+    if ok == 0 {
+        tracing::warn!(
+            "SetConsoleCtrlHandler failed ({}) — Ctrl+C on a cooked console will kill the TUI",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+#[cfg(not(windows))]
+pub fn install_console_ctrl_forwarder(
+    _tx: tokio::sync::mpsc::UnboundedSender<crate::event::Event>,
+) {
+}
+
+#[cfg(windows)]
+mod console_ctrl {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Foundation::{BOOL, FALSE, TRUE};
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+
+    pub(super) static TX: OnceLock<tokio::sync::mpsc::UnboundedSender<crate::event::Event>> =
+        OnceLock::new();
+
+    /// Runs on a console-spawned thread — must stay signal-handler-simple:
+    /// one lock-free channel send, no I/O, no allocation-heavy work.
+    pub(super) unsafe extern "system" fn forward_ctrl_events(ctrl_type: u32) -> BOOL {
+        if ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT {
+            if let Some(tx) = TX.get() {
+                let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+                let _ = tx.send(crate::event::Event::Key(key));
+            }
+            TRUE
+        } else {
+            FALSE
+        }
+    }
+}
+
+/// Re-assert the WinAPI console *input* modes the TUI depends on: raw mode
+/// (Ctrl+C as key event, no line buffering/echo) and mouse reporting. Same
+/// insurance pattern as the VT keep-alive above, one layer down — the input
+/// mode is shared with every process attached to the console, and a child
+/// that flips it (cooked `ReadConsole`, git terminal prompts) reverts it for
+/// gaviero too, with no signal. Agent trees are already console-detached at
+/// spawn; this heals stomps from the remaining attached helpers so Ctrl+C
+/// returns to the key-event path within one reassert interval (the ctrl
+/// handler covers the gap).
+///
+/// Both crossterm 0.29 calls are verified idempotent on Windows:
+/// `enable_raw_mode` is a stateless read-modify-write, and
+/// `EnableMouseCapture`'s WinAPI path snapshots the pre-TUI mode only once
+/// (CAS-guarded), so repeated calls cannot corrupt the exit restore. No-op
+/// off Windows, where the pty is not shared this way.
+#[cfg(windows)]
+pub fn reassert_console_input_modes(w: &mut impl Write) -> std::io::Result<()> {
+    crossterm::terminal::enable_raw_mode()?;
+    // WinAPI-only under the hood (`is_ansi_code_supported` hardwired false
+    // for input modes): writes nothing to `w`, so no mux interference.
+    crossterm::execute!(w, crossterm::event::EnableMouseCapture)
+}
+
+#[cfg(not(windows))]
+pub fn reassert_console_input_modes(_w: &mut impl Write) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Enable/disable host-terminal bracketed paste where crossterm can actually
 /// deliver `Event::Paste` — Unix only.
 ///
@@ -131,6 +231,33 @@ mod tests {
         enable_vt_mouse_passthrough(&mut out).unwrap();
         assert_eq!(out, b"\x1b[?1000h\x1b[?1002h\x1b[?1006h".to_vec());
         assert!(!out.contains(&b'l'), "no DECRST (mode-off) bytes");
+    }
+
+    /// The handler must swallow Ctrl+C/Ctrl+Break (return TRUE — anything
+    /// else lets the OS default handler terminate the process) and re-inject
+    /// them as a synthetic Ctrl+C key event; close/logoff/shutdown must fall
+    /// through (FALSE) so closing the window still exits.
+    #[cfg(windows)]
+    #[test]
+    fn ctrl_forwarder_swallows_ctrl_c_and_reinjects_key_event() {
+        use windows_sys::Win32::System::Console::{CTRL_C_EVENT, CTRL_CLOSE_EVENT};
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = super::console_ctrl::TX.set(tx);
+
+        let handled = unsafe { super::console_ctrl::forward_ctrl_events(CTRL_C_EVENT) };
+        assert_eq!(handled, 1, "Ctrl+C must be swallowed, not left fatal");
+        match rx.try_recv() {
+            Ok(crate::event::Event::Key(k)) => {
+                assert_eq!(k.code, KeyCode::Char('c'));
+                assert!(k.modifiers.contains(KeyModifiers::CONTROL));
+            }
+            other => panic!("expected synthetic Ctrl+C key event, got {other:?}"),
+        }
+
+        let close = unsafe { super::console_ctrl::forward_ctrl_events(CTRL_CLOSE_EVENT) };
+        assert_eq!(close, 0, "window close must reach the default handler");
+        assert!(rx.try_recv().is_err(), "close must not synthesize a key");
     }
 
     #[cfg(windows)]

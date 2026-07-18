@@ -95,6 +95,10 @@ pub struct App {
     pub(crate) codex_trust_dialog: Option<CodexTrustDialog>,
     /// When true, the main loop should call `terminal.clear()` before the next draw
     /// to force a full redraw and fix any terminal state corruption.
+    /// Reserved for cases where the real terminal diverged from ratatui's model
+    /// (resize, mux reattach, external writes to the screen). Never set it for
+    /// in-app state changes like buffer/tab switches — the diffed draw handles
+    /// those, and `terminal.clear()` causes a visible blank-then-repaint flash.
     pub needs_full_redraw: bool,
     #[allow(dead_code)]
     pub event_tx: mpsc::UnboundedSender<Event>,
@@ -461,8 +465,9 @@ impl App {
         controller::handle_event(self, event);
     }
 
-    /// Re-assert the host-terminal VT mouse-passthrough request, throttled
-    /// to `theme::VT_MOUSE_REASSERT_MS`. `force` skips the throttle — used
+    /// Re-assert the host-terminal VT mouse-passthrough request and (on
+    /// Windows) the shared console *input* modes, throttled to
+    /// `theme::VT_MOUSE_REASSERT_MS`. `force` skips the throttle — used
     /// on host focus-gain, when a mux switch/reattach is the likeliest
     /// moment for the outer layer to have dropped the pane's mouse modes.
     pub(crate) fn maybe_reassert_vt_mouse(&mut self, force: bool) {
@@ -471,7 +476,13 @@ impl App {
             return;
         }
         self.last_vt_mouse_reassert = std::time::Instant::now();
-        let _ = crate::platform::enable_vt_mouse_passthrough(&mut std::io::stdout());
+        let mut stdout = std::io::stdout();
+        // A console-attached child can revert raw mode / mouse reporting on
+        // the shared console with no signal to us; heal within one interval
+        // so Ctrl+C keeps arriving as a key event (the console ctrl handler
+        // covers the gap in between). See platform.rs for both halves.
+        let _ = crate::platform::reassert_console_input_modes(&mut stdout);
+        let _ = crate::platform::enable_vt_mouse_passthrough(&mut stdout);
     }
 
     /// Rescan skill roots after a `.gaviero/skills/` file change.
