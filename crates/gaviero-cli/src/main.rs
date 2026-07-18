@@ -2978,6 +2978,29 @@ async fn main() -> Result<()> {
             .init();
     }
 
+    // The agent process tree must die with the CLI. On Windows the kernel
+    // enforces it: a kill-on-close Job Object adopted here is inherited by
+    // every descendant, and any CLI death closes the handle and terminates
+    // the whole tree (agent children run on private consoles — see
+    // util::spawn::isolate_console — so the old shared-console Ctrl+C
+    // broadcast no longer reaches them). No-op on Unix, where the terminal
+    // already signals the foreground process group.
+    if let Err(e) = gaviero_core::util::spawn::kill_tree_on_exit() {
+        tracing::warn!(
+            "could not arm kill-on-exit job object: {e} — \
+             agent subprocesses may outlive a Ctrl+C"
+        );
+    }
+    // Ctrl+C → deterministic hard exit. tokio's handler swallows the
+    // console event / SIGINT, so exiting is on us; process death then
+    // triggers the job-object tree kill above. 130 = 128 + SIGINT.
+    tokio::spawn(async {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("Interrupted — terminating agent process tree.");
+            std::process::exit(130);
+        }
+    });
+
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let script_execution_mode = cli
         .script

@@ -78,6 +78,19 @@ walkdir = "2"
 rustdoc-types = "0.57"
 syn = { version = "2", features = ["full", "parsing"] }
 
+[target.'cfg(windows)'.dependencies]
+# Kill-on-close Job Object (util::spawn::kill_tree_on_exit): ties every
+# agent descendant to the host process lifetime now that agent trees run
+# on private consoles (CREATE_NO_WINDOW) and no longer die with the
+# console broadcast. 0.59 is already in-tree. Win32_Security is required
+# by CreateJobObjectW's SECURITY_ATTRIBUTES parameter type.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 wiremock = "0.6"
 # Tier T1 / T1.6: snapshot regression baseline for prompt structure.

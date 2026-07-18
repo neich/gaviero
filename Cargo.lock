@@ -1252,6 +1252,7 @@ dependencies = [
  "tree-sitter-yaml",
  "vt100",
  "walkdir",
+ "windows-sys 0.59.0",
  "wiremock",
  "zstd",
 ]
@@ -1309,6 +1310,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-width 0.2.2",
  "vt100",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
