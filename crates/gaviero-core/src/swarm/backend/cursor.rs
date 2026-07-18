@@ -43,12 +43,19 @@ use super::{
 /// unavailable Free plans can only use Auto" on free accounts.
 pub(crate) const DEFAULT_CURSOR_MODEL: &str = "composer-2.5";
 
-/// The Cursor CLI takes its prompt as a positional argv (no `--prompt-file`
-/// or stdin fallback documented). Linux's `MAX_ARG_STRLEN` is 128 KB per
+/// Per-prompt argv budget. The Cursor CLI takes its prompt as a positional
+/// argv (no `--prompt-file` or stdin fallback — re-probed against
+/// `agent --help` 2026.07.16). Unix: Linux's `MAX_ARG_STRLEN` is 128 KB per
 /// argument; 96 KB leaves headroom for the rest of the argv (flags,
-/// `--workspace`, model spec, etc.). Prompts above this size are rejected
-/// with an explicit error rather than truncated.
-pub(crate) const CURSOR_ARGV_LIMIT: usize = 96 * 1024;
+/// `--workspace`, model spec, etc.). Windows: `CreateProcess` caps the
+/// *whole* command line — program path plus every argument — at 32,767
+/// UTF-16 units, so the prompt budget is 30 KB (byte length over-counts
+/// non-ASCII text relative to UTF-16, keeping the check conservative).
+/// Prompts above the budget are rejected with an explicit error rather
+/// than truncated.
+pub(crate) fn cursor_argv_limit() -> usize {
+    if cfg!(windows) { 30 * 1024 } else { 96 * 1024 }
+}
 
 /// Backend that spawns the Cursor CLI as a subprocess.
 pub struct CursorBackend {
@@ -89,14 +96,14 @@ impl AgentBackend for CursorBackend {
 
         let combined_prompt = format!("{system_prompt}\n\n{user_prompt}");
 
-        if combined_prompt.len() >= CURSOR_ARGV_LIMIT {
+        if combined_prompt.len() >= cursor_argv_limit() {
             anyhow::bail!(
                 "cursor prompt is {} bytes which exceeds the {}-byte argv limit. \
                  The `agent` CLI has no stdin or `--prompt-file` fallback, so \
                  trim the user message, the context bundle, or switch to a provider \
                  with stdin support (claude, codex, ollama).",
                 combined_prompt.len(),
-                CURSOR_ARGV_LIMIT,
+                cursor_argv_limit(),
             );
         }
 
@@ -130,6 +137,15 @@ impl AgentBackend for CursorBackend {
                      The `agent` CLI binary was not found on PATH. \
                      Install it from https://cursor.com/cli (curl https://cursor.com/install -fsS | bash), \
                      or switch provider by setting agent.model to a `claude:...` / `codex:...` / `ollama:...` spec."
+                )
+            } else if crate::util::spawn::is_batch_arg_error(&e) {
+                anyhow::anyhow!(
+                    "spawning cursor `agent` subprocess: {e}\n\
+                     `agent` resolved to a batch-file shim, which cannot receive \
+                     multi-line prompt arguments on Windows. gaviero bypasses the \
+                     standard cursor-agent install layout automatically but did not \
+                     recognize this one — update the Cursor CLI (`agent update`) or \
+                     reinstall it from https://cursor.com/cli."
                 )
             } else {
                 anyhow::anyhow!(
@@ -771,6 +787,22 @@ mod tests {
     fn argv_always_disables_sandbox_for_remote_mcp_and_webfetch() {
         let args = cursor_argv("auto", Path::new("/tmp/wt"), None);
         assert!(args.windows(2).any(|w| w == ["--sandbox", "disabled"]));
+    }
+
+    #[test]
+    fn argv_limit_fits_the_windows_command_line_cap() {
+        if cfg!(windows) {
+            // The whole CreateProcess command line is capped at 32,767
+            // UTF-16 units; the prompt budget must leave room for the
+            // node.exe path, index.js, and every flag in cursor_argv.
+            let flags: usize = cursor_argv("composer-2.5", Path::new("C:/some/workspace"), None)
+                .iter()
+                .map(|a| a.len() + 3) // quotes + separator
+                .sum();
+            assert!(cursor_argv_limit() + flags + 512 < 32_767);
+        } else {
+            assert_eq!(cursor_argv_limit(), 96 * 1024);
+        }
     }
 
     #[test]

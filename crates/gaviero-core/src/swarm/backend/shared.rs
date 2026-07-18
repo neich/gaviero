@@ -342,17 +342,56 @@ fn model_id_has_nested_provider(model: &str) -> bool {
         .is_some_and(|(head, _)| SUPPORTED_PROVIDER_PREFIXES.contains(&head.trim()))
 }
 
+/// Static (discovery-independent) model ids for a provider, without the
+/// provider prefix. Providers whose model lists come only from CLI discovery
+/// (cursor, codex, ollama, local) have no static entries.
+fn static_model_ids(provider: &str) -> Vec<String> {
+    match provider {
+        "claude" => CLAUDE_MODEL_ALIASES.iter().map(|s| s.to_string()).collect(),
+        "deepseek" => DEEPSEEK_API_MODELS.iter().map(|s| s.to_string()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Cursor's own models — every `composer-*` variant plus the bundled
+/// `grok-*` family. `cursor:` completions surface these ahead of the many
+/// third-party models Cursor proxies (gpt-*, claude-*, gemini-*, …) so the
+/// 10-candidate truncation can never bury them.
+fn is_preferred_cursor_model(model: &str) -> bool {
+    let m = model.to_lowercase();
+    m.starts_with("composer") || m.starts_with("grok")
+}
+
+/// Completion ordering: providers alphabetical, models alphabetical within a
+/// provider — except `cursor:`, whose own models
+/// ([`is_preferred_cursor_model`]) form a band ahead of the proxied rest.
+fn spec_sort_key(spec: &str) -> (String, u8, String) {
+    match spec.split_once(':') {
+        Some((provider, model)) => {
+            let provider = provider.to_lowercase();
+            let demoted = provider == "cursor" && !is_preferred_cursor_model(model);
+            (provider, u8::from(demoted), model.to_lowercase())
+        }
+        None => (spec.to_lowercase(), 0, String::new()),
+    }
+}
+
 /// Tab-completion candidates for `/model <spec>`.
 ///
-/// Two shapes, matching the canonical `provider:model` schema:
-/// * `partial` contains `:` → complete model names for the typed provider.
-///   Candidates are the provider's static ids (Claude / DeepSeek) merged with
-///   any matching entries from `discovered` (CLI-discovered Claude / Cursor /
-///   Ollama specs), filtered by the typed model fragment.
-/// * `partial` has no `:` yet → offer provider prefixes only. Selecting one
-///   re-triggers completion in the model-name branch. Listing prefixes (not
-///   full discovered specs) keeps the picker aligned with the schema and
-///   avoids burying providers below the truncation limit.
+/// Matches both halves of the canonical `provider:model` schema:
+/// * `partial` starts with a known `provider:` → complete model names for
+///   that provider only. Candidates are the provider's static ids (Claude /
+///   DeepSeek) merged with matching entries from `discovered`
+///   (CLI-discovered Claude / Cursor / Ollama specs), filtered by the typed
+///   model fragment. `cursor:` candidates rank Cursor's own models
+///   (composer / grok variants) ahead of the proxied third-party ones.
+/// * otherwise the fragment may be the start of a model name rather than a
+///   provider: offer matching provider prefixes first, then model ids from
+///   every provider that start with the fragment, as full `provider:model`
+///   specs (the provider prefix is filled in). An empty fragment lists
+///   prefixes only, so providers are never buried below the truncation
+///   limit. A fragment whose own colon head is not a provider (e.g. the
+///   Ollama id `qwen2.5-coder:7b`) is matched as a model id too.
 ///
 /// Candidates whose model id is itself a `provider:` prefix are dropped, so a
 /// doubly-prefixed spec can never be suggested.
@@ -360,52 +399,85 @@ pub fn model_spec_completions(partial: &str, discovered: &[String]) -> Vec<Strin
     let partial = partial.trim();
     let partial_lower = partial.to_lowercase();
 
-    // ── `provider:model` — complete model names for the typed provider ──
+    // ── `<known-provider>:model` — complete models for that provider ──
     if let Some((provider, model_part)) = partial.split_once(':') {
         let provider_lower = provider.to_lowercase();
-        let model_part_lower = model_part.to_lowercase();
+        if SUPPORTED_PROVIDER_PREFIXES.contains(&provider_lower.as_str()) {
+            let model_part_lower = model_part.to_lowercase();
 
-        // Static ids always offered for this provider, regardless of CLI
-        // discovery (which can be empty or drift across CLI versions).
-        let mut model_ids: Vec<String> = match provider_lower.as_str() {
-            "claude" => CLAUDE_MODEL_ALIASES.iter().map(|s| s.to_string()).collect(),
-            "deepseek" => DEEPSEEK_API_MODELS.iter().map(|s| s.to_string()).collect(),
-            _ => Vec::new(),
-        };
+            // Static ids always offered for this provider, regardless of CLI
+            // discovery (which can be empty or drift across CLI versions).
+            let mut model_ids: Vec<String> = static_model_ids(&provider_lower);
 
-        // Merge model ids surfaced by CLI discovery for the same provider.
-        let disc_prefix = format!("{provider_lower}:");
-        for spec in discovered {
-            if spec.to_lowercase().starts_with(&disc_prefix) {
-                let model = &spec[disc_prefix.len()..];
-                if !model.is_empty() {
-                    model_ids.push(model.to_string());
+            // Merge model ids surfaced by CLI discovery for the same provider.
+            let disc_prefix = format!("{provider_lower}:");
+            for spec in discovered {
+                if spec.to_lowercase().starts_with(&disc_prefix) {
+                    let model = &spec[disc_prefix.len()..];
+                    if !model.is_empty() {
+                        model_ids.push(model.to_string());
+                    }
                 }
             }
+
+            let mut candidates: Vec<String> = model_ids
+                .into_iter()
+                .filter(|m| !model_id_has_nested_provider(m))
+                .filter(|m| {
+                    model_part.is_empty() || m.to_lowercase().starts_with(&model_part_lower)
+                })
+                .map(|m| format!("{provider_lower}:{m}"))
+                .collect();
+
+            candidates.sort_by_key(|s| spec_sort_key(s));
+            candidates.dedup();
+            candidates.truncate(10);
+            return candidates;
         }
-
-        let mut candidates: Vec<String> = model_ids
-            .into_iter()
-            .filter(|m| !model_id_has_nested_provider(m))
-            .filter(|m| model_part.is_empty() || m.to_lowercase().starts_with(&model_part_lower))
-            .map(|m| format!("{provider_lower}:{m}"))
-            .collect();
-
-        candidates.sort();
-        candidates.dedup();
-        candidates.truncate(10);
-        return candidates;
+        // Colon head is not a provider — the fragment may be a bare model id
+        // with an internal colon (e.g. `qwen2.5-coder:7b`). Fall through to
+        // whole-fragment model matching below.
     }
 
-    // ── No `:` yet — offer provider prefixes only ──
+    // ── No provider yet — provider prefixes first… ──
     let mut out: Vec<String> = SUPPORTED_PROVIDER_PREFIXES
         .iter()
         .filter(|p| partial.is_empty() || p.starts_with(&partial_lower))
         .map(|p| format!("{p}:"))
         .collect();
-
     out.sort();
-    out.dedup();
+
+    // ── …then model names matched across every provider ──
+    // A non-empty fragment may be the start of a model name; offer the full
+    // spec with the provider prefix filled in. The empty fragment keeps
+    // listing prefixes only.
+    if !partial.is_empty() {
+        let mut model_matches: Vec<String> = Vec::new();
+        for provider in SUPPORTED_PROVIDER_PREFIXES {
+            for model in static_model_ids(provider) {
+                if model.to_lowercase().starts_with(&partial_lower) {
+                    model_matches.push(format!("{provider}:{model}"));
+                }
+            }
+        }
+        for spec in discovered {
+            let Some((provider, model)) = spec.split_once(':') else {
+                continue;
+            };
+            let provider = provider.to_lowercase();
+            if SUPPORTED_PROVIDER_PREFIXES.contains(&provider.as_str())
+                && !model.is_empty()
+                && !model_id_has_nested_provider(model)
+                && model.to_lowercase().starts_with(&partial_lower)
+            {
+                model_matches.push(format!("{provider}:{model}"));
+            }
+        }
+        model_matches.sort_by_key(|s| spec_sort_key(s));
+        model_matches.dedup();
+        out.extend(model_matches);
+    }
+
     out.truncate(10);
     out
 }
@@ -907,18 +979,108 @@ mod tests {
     }
 
     #[test]
-    fn test_model_spec_completions_no_colon_lists_prefixes_only() {
-        // Before a `:` is typed the picker offers provider prefixes, not full
+    fn test_model_spec_completions_empty_partial_lists_prefixes_only() {
+        // With nothing typed the picker offers provider prefixes, not full
         // discovered specs — keeps it aligned with `provider:model` and avoids
-        // burying providers below the truncation limit.
+        // burying providers below the truncation limit. Model-name matching
+        // only kicks in once a fragment is typed.
         let discovered = vec!["cursor:composer-2.5".to_string()];
         let hits = model_spec_completions("", &discovered);
         assert!(hits.contains(&"cursor:".to_string()), "got {hits:?}");
         assert!(hits.contains(&"claude:".to_string()), "got {hits:?}");
         assert!(
             !hits.iter().any(|h| h == "cursor:composer-2.5"),
-            "no-colon view must not list full discovered specs: {hits:?}"
+            "empty view must not list full discovered specs: {hits:?}"
         );
+    }
+
+    #[test]
+    fn test_model_spec_completions_bare_model_fragment_gets_provider_prefix() {
+        // Typing a model name without a provider must offer the full spec
+        // with the provider prefix filled in.
+        let hits = model_spec_completions("opu", &[]);
+        assert!(hits.contains(&"claude:opus".to_string()), "got {hits:?}");
+        assert!(hits.contains(&"claude:opusplan".to_string()), "got {hits:?}");
+
+        let discovered = vec!["cursor:composer-2.5".to_string()];
+        let hits = model_spec_completions("comp", &discovered);
+        assert_eq!(hits, vec!["cursor:composer-2.5".to_string()]);
+    }
+
+    #[test]
+    fn test_model_spec_completions_bare_fragment_lists_providers_before_models() {
+        // `c` is both a provider fragment (claude/codex/cursor) and a model
+        // fragment — providers stay on top, model specs follow.
+        let discovered = vec!["cursor:claude-4.6-sonnet".to_string()];
+        let hits = model_spec_completions("c", &discovered);
+        assert_eq!(
+            hits,
+            vec![
+                "claude:".to_string(),
+                "codex:".to_string(),
+                "cursor:".to_string(),
+                "cursor:claude-4.6-sonnet".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_model_spec_completions_bare_ollama_id_with_internal_colon() {
+        // `qwen2.5-coder:7b` contains a colon but `qwen2.5-coder` is not a
+        // provider — the whole fragment must be matched as a model id and
+        // offered with the `ollama:` prefix.
+        let discovered = vec!["ollama:qwen2.5-coder:7b".to_string()];
+        let hits = model_spec_completions("qwen2.5-coder:7", &discovered);
+        assert_eq!(hits, vec!["ollama:qwen2.5-coder:7b".to_string()]);
+    }
+
+    #[test]
+    fn test_model_spec_completions_cursor_prefers_composer_and_grok() {
+        // Cursor proxies many third-party models; its own composer/grok
+        // variants must rank ahead of them regardless of alphabet.
+        let discovered: Vec<String> = [
+            "cursor:auto",
+            "cursor:claude-4.6-sonnet",
+            "cursor:composer-2.5",
+            "cursor:composer-2-fast",
+            "cursor:gemini-3-pro",
+            "cursor:gpt-5.2",
+            "cursor:grok-4-fast",
+            "cursor:grok-code",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let hits = model_spec_completions("cursor:", &discovered);
+        assert_eq!(
+            hits,
+            vec![
+                "cursor:composer-2-fast".to_string(),
+                "cursor:composer-2.5".to_string(),
+                "cursor:grok-4-fast".to_string(),
+                "cursor:grok-code".to_string(),
+                "cursor:auto".to_string(),
+                "cursor:claude-4.6-sonnet".to_string(),
+                "cursor:gemini-3-pro".to_string(),
+                "cursor:gpt-5.2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_model_spec_completions_cursor_preference_survives_truncation() {
+        // Enough alphabetically-early proxied models to fill the whole
+        // 10-candidate window on their own — composer/grok must still
+        // surface at the top instead of being truncated away.
+        let mut discovered: Vec<String> = (0..12)
+            .map(|i| format!("cursor:aaa-proxied-{i:02}"))
+            .collect();
+        discovered.push("cursor:grok-4".to_string());
+        discovered.push("cursor:composer-2.5".to_string());
+        let hits = model_spec_completions("cursor:", &discovered);
+        assert_eq!(hits.len(), 10);
+        assert_eq!(hits[0], "cursor:composer-2.5");
+        assert_eq!(hits[1], "cursor:grok-4");
     }
 
     #[test]
