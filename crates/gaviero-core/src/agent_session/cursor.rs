@@ -37,7 +37,7 @@ use crate::acp::client::{propose_delete, propose_write};
 use crate::context_planner::{ContinuityHandle, ContinuityMode, ProviderProfile};
 use crate::observer::AcpObserver;
 use crate::swarm::backend::cursor::{
-    CURSOR_ARGV_LIMIT, CursorEvent, cursor_argv, is_auth_error, parse_cursor_event,
+    CursorEvent, cursor_argv, cursor_argv_limit, is_auth_error, parse_cursor_event,
     tool_display_name, write_tool_args,
 };
 use crate::swarm::backend::shared;
@@ -187,7 +187,7 @@ impl CursorSession {
             shared::build_enriched_prompt(&enriched_prompt, &conversation_history, &file_refs);
         let combined_prompt = format!("{system_prompt}\n\n{user_prompt}");
 
-        if combined_prompt.len() >= CURSOR_ARGV_LIMIT {
+        if combined_prompt.len() >= cursor_argv_limit() {
             anyhow::bail!(
                 "cursor prompt is {} bytes which exceeds the {}-byte argv limit. \
                  The `agent` CLI has no stdin or `--prompt-file` fallback. \
@@ -197,7 +197,7 @@ impl CursorSession {
                  attachments, or switch to a provider with stdin support \
                  (claude, codex, ollama).",
                 combined_prompt.len(),
-                CURSOR_ARGV_LIMIT,
+                cursor_argv_limit(),
             );
         }
 
@@ -251,6 +251,15 @@ impl CursorSession {
                     "spawning cursor `agent` subprocess: {e}\n\
                      The `agent` CLI binary was not found on PATH. \
                      Install it from https://cursor.com/cli (curl https://cursor.com/install -fsS | bash)."
+                )
+            } else if crate::util::spawn::is_batch_arg_error(&e) {
+                anyhow::anyhow!(
+                    "spawning cursor `agent` subprocess: {e}\n\
+                     `agent` resolved to a batch-file shim, which cannot receive \
+                     multi-line prompt arguments on Windows. gaviero bypasses the \
+                     standard cursor-agent install layout automatically but did not \
+                     recognize this one — update the Cursor CLI (`agent update`) or \
+                     reinstall it from https://cursor.com/cli."
                 )
             } else {
                 anyhow::anyhow!("spawning cursor `agent` subprocess: {e}")

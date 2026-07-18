@@ -7,7 +7,13 @@
 //! here do the PATHEXT-aware PATH walk in pure Rust — no `sh`, no
 //! `where.exe` — and hand `Command` the resolved absolute path.
 //! `std` itself safely wraps `.cmd`/`.bat` programs in `cmd.exe /C`
-//! (with BatBadBut-hardened quoting) once it can see the extension.
+//! once it can see the extension — but its BatBadBut hardening
+//! (CVE-2024-24576) *rejects* any argument containing `"`, `\r`, or
+//! `\n` with "batch file arguments are invalid", and agent prompts are
+//! multi-line by construction. A CLI that ships only a `.cmd` shim can
+//! therefore never receive a prompt through it, so
+//! [`resolve_agent_invocation`] hops over known batch launcher shims
+//! (Cursor's `agent.cmd`) to the real executable they delegate to.
 //!
 //! On Unix the walk checks the executable bit, which also lets MCP
 //! preflight drop its `sh -c "command -v …"` dependency.
@@ -212,17 +218,177 @@ pub fn kill_tree_on_exit() -> std::io::Result<()> {
     Ok(())
 }
 
+/// A resolved agent-CLI invocation: the program to execute plus any
+/// arguments and environment its launcher shim would have injected.
+pub struct AgentInvocation {
+    pub program: PathBuf,
+    /// Launcher arguments placed before caller-supplied args (e.g. the
+    /// `index.js` entry point of a Node-based CLI).
+    pub prepend_args: Vec<PathBuf>,
+    /// Environment variables the launcher shim would have exported.
+    pub envs: Vec<(&'static str, std::ffi::OsString)>,
+}
+
+/// Resolve `name` like [`resolve_program`], then — Windows only — hop
+/// over known batch-file launcher shims to the executable they delegate
+/// to.
+///
+/// `std` refuses to pass arguments containing `"`, `\r`, or `\n` to a
+/// `.bat`/`.cmd` program (BatBadBut hardening — the error reads "batch
+/// file arguments are invalid"), and prompts always contain newlines,
+/// so spawning through such a shim can never work for prompt-on-argv
+/// CLIs. Spawning the shim's own target is both safe (no `cmd.exe`
+/// parsing anywhere in the chain) and faithful (it is exactly what the
+/// launcher would have executed).
+pub fn resolve_agent_invocation(name: &str) -> AgentInvocation {
+    let program = resolve_program(name);
+    #[cfg(windows)]
+    if let Some(shim) = program.as_deref().filter(|p| is_batch_file(p))
+        && let Some(bypass) = cursor_shim_bypass(shim)
+    {
+        return bypass;
+    }
+    AgentInvocation {
+        program: program.unwrap_or_else(|| PathBuf::from(name)),
+        prepend_args: Vec::new(),
+        envs: Vec::new(),
+    }
+}
+
+#[cfg(windows)]
+fn is_batch_file(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
+}
+
+/// True when `e` is `std`'s batch-argument rejection: spawning a
+/// `.bat`/`.cmd` whose argument list contains `"`, `\r`, or `\n`.
+/// Spawn sites use it to replace the bare "batch file arguments are
+/// invalid" with an actionable explanation.
+pub fn is_batch_arg_error(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::InvalidInput
+        && e.to_string().contains("batch file arguments")
+}
+
+/// Recognize the Cursor CLI's Windows install layout and return the
+/// direct `node.exe index.js` invocation its launcher chain performs.
+///
+/// Layout (`%LOCALAPPDATA%\cursor-agent\`):
+/// `agent.cmd` / `cursor-agent.cmd` → `powershell -File cursor-agent.ps1`
+/// → `versions\<latest>\node.exe index.js`. The `.ps1` prefers a
+/// `node.exe` + `index.js` pair next to itself, otherwise the newest
+/// `versions\YYYY.MM.DD[-HH-MM-SS]-<hex>` directory. Mirrored here,
+/// additionally requiring the pair to exist so a half-written update
+/// falls back to the next-newest complete version. Unrecognized layouts
+/// return `None` and keep the shim (a future `agent.exe` install never
+/// reaches this — PATHEXT ranks `.exe` above `.cmd`).
+#[cfg(windows)]
+fn cursor_shim_bypass(shim: &Path) -> Option<AgentInvocation> {
+    let dir = shim.parent()?;
+    // The .ps1 is the layout discriminator: its presence identifies a
+    // cursor-agent install dir regardless of which shim name resolved.
+    if !dir.join("cursor-agent.ps1").is_file() {
+        return None;
+    }
+
+    let node_pair = |d: &Path| {
+        let node = d.join("node.exe");
+        let index = d.join("index.js");
+        (node.is_file() && index.is_file()).then_some((node, index))
+    };
+
+    let (node, index) = node_pair(dir).or_else(|| {
+        let versions = dir.join("versions");
+        let mut dirs: Vec<(u32, String, PathBuf)> = std::fs::read_dir(&versions)
+            .ok()?
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let key = cursor_version_key(&name)?;
+                Some((key, name, e.path()))
+            })
+            .collect();
+        // Newest date first; the name tie-break only makes same-day
+        // picks deterministic (the launcher can't order those either).
+        dirs.sort_by(|a, b| (b.0, &b.1).cmp(&(a.0, &a.1)));
+        dirs.iter().find_map(|(_, _, p)| node_pair(p))
+    })?;
+
+    let mut envs: Vec<(&'static str, std::ffi::OsString)> = Vec::new();
+    // agent.cmd exports its own file name before chaining to the .ps1;
+    // the CLI reads it to know its invoked-as spelling.
+    if let Some(invoked_as) = shim.file_name() {
+        envs.push(("CURSOR_INVOKED_AS", invoked_as.to_os_string()));
+    }
+    // The .ps1 arms node's compile cache when the caller hasn't.
+    if std::env::var_os("NODE_COMPILE_CACHE").is_none()
+        && let Some(local) = std::env::var_os("LOCALAPPDATA")
+    {
+        envs.push((
+            "NODE_COMPILE_CACHE",
+            Path::new(&local).join("cursor-compile-cache").into_os_string(),
+        ));
+    }
+
+    Some(AgentInvocation {
+        program: node,
+        prepend_args: vec![index],
+        envs,
+    })
+}
+
+/// Sort key for a cursor-agent version directory: `YYYY.M.D-<hex>` or
+/// `YYYY.M.D-HH-MM-SS-<hex>` → `YYYYMMDD`. Mirrors the validation
+/// pattern in `cursor-agent.ps1` (lowercase hex only, exactly as the
+/// launcher accepts).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn cursor_version_key(name: &str) -> Option<u32> {
+    fn num(s: &str) -> Option<u32> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        s.parse().ok()
+    }
+
+    let segments: Vec<&str> = name.split('-').collect();
+    let (date, hash) = match segments.as_slice() {
+        [date, hash] => (*date, *hash),
+        [date, h, m, s, hash]
+            if [h, m, s]
+                .iter()
+                .all(|t| t.len() == 2 && t.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            (*date, *hash)
+        }
+        _ => return None,
+    };
+    if hash.is_empty() || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    let mut parts = date.split('.');
+    let (year, month, day) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some()
+        || year.len() != 4
+        || !matches!(month.len(), 1..=2)
+        || !matches!(day.len(), 1..=2)
+    {
+        return None;
+    }
+    Some(num(year)? * 10_000 + num(month)? * 100 + num(day)?)
+}
+
 /// A `tokio::process::Command` for an agent CLI (`claude`, `codex`,
-/// `agent`, …), resolved PATHEXT-aware. Unresolvable names pass
+/// `agent`, …), resolved PATHEXT-aware with batch launcher shims
+/// bypassed ([`resolve_agent_invocation`]). Unresolvable names pass
 /// through verbatim so the eventual spawn error still names the
 /// missing binary (the NotFound match arms in the backends stay
 /// accurate). Detached from the host console on Windows
 /// ([`isolate_console`]).
 pub fn agent_command(name: &str) -> tokio::process::Command {
-    let mut cmd = match resolve_program(name) {
-        Some(path) => tokio::process::Command::new(path),
-        None => tokio::process::Command::new(name),
-    };
+    let inv = resolve_agent_invocation(name);
+    let mut cmd = tokio::process::Command::new(&inv.program);
+    cmd.args(&inv.prepend_args);
+    cmd.envs(inv.envs);
     isolate_console(&mut cmd);
     cmd
 }
@@ -230,10 +396,10 @@ pub fn agent_command(name: &str) -> tokio::process::Command {
 /// `std::process::Command` twin of [`agent_command`] for the blocking
 /// call sites.
 pub fn agent_command_std(name: &str) -> std::process::Command {
-    let mut cmd = match resolve_program(name) {
-        Some(path) => std::process::Command::new(path),
-        None => std::process::Command::new(name),
-    };
+    let inv = resolve_agent_invocation(name);
+    let mut cmd = std::process::Command::new(&inv.program);
+    cmd.args(&inv.prepend_args);
+    cmd.envs(inv.envs);
     isolate_console_std(&mut cmd);
     cmd
 }
@@ -401,5 +567,102 @@ mod tests {
         } else {
             assert_eq!(argv_threshold(), 32_768);
         }
+    }
+
+    #[test]
+    fn cursor_version_key_parses_both_launcher_forms() {
+        assert_eq!(cursor_version_key("2026.07.09-a3815c0"), Some(20_260_709));
+        assert_eq!(cursor_version_key("2026.7.9-abc"), Some(20_260_709));
+        assert_eq!(
+            cursor_version_key("2026.07.16-10-30-00-899851b"),
+            Some(20_260_716)
+        );
+    }
+
+    #[test]
+    fn cursor_version_key_rejects_non_version_names() {
+        assert_eq!(cursor_version_key("latest"), None);
+        assert_eq!(cursor_version_key("2026.07-a3815c0"), None); // missing day
+        assert_eq!(cursor_version_key("2026.07.16-ABC"), None); // uppercase hex
+        assert_eq!(cursor_version_key("2026.07.16"), None); // no hash
+        assert_eq!(cursor_version_key("26.07.16-abc"), None); // 2-digit year
+        assert_eq!(cursor_version_key("2026.07.16-1-2-3-abc"), None); // bad timestamp
+    }
+
+    /// Build a fake cursor-agent install: shim + .ps1 + the given
+    /// version dirs (each optionally missing `index.js`).
+    #[cfg(windows)]
+    fn fake_cursor_install(root: &Path, versions: &[(&str, bool)]) {
+        std::fs::write(root.join("agent.cmd"), "@echo off\r\n").unwrap();
+        std::fs::write(root.join("cursor-agent.ps1"), "# launcher\r\n").unwrap();
+        for (name, complete) in versions {
+            let vdir = root.join("versions").join(name);
+            std::fs::create_dir_all(&vdir).unwrap();
+            std::fs::write(vdir.join("node.exe"), "MZ").unwrap();
+            if *complete {
+                std::fs::write(vdir.join("index.js"), "// entry\n").unwrap();
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cursor_shim_bypass_picks_newest_complete_version() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_cursor_install(
+            dir.path(),
+            &[("2026.07.09-aaa", true), ("2026.07.16-bbb", true)],
+        );
+        let inv =
+            resolve_agent_invocation(&dir.path().join("agent.cmd").to_string_lossy());
+        let expected = dir.path().join("versions").join("2026.07.16-bbb");
+        assert_eq!(inv.program, expected.join("node.exe"));
+        assert_eq!(inv.prepend_args, vec![expected.join("index.js")]);
+        assert!(
+            inv.envs
+                .iter()
+                .any(|(k, v)| *k == "CURSOR_INVOKED_AS" && v == "agent.cmd")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cursor_shim_bypass_skips_incomplete_newest_version() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_cursor_install(
+            dir.path(),
+            &[("2026.07.09-aaa", true), ("2026.07.16-bbb", false)],
+        );
+        let inv =
+            resolve_agent_invocation(&dir.path().join("agent.cmd").to_string_lossy());
+        let expected = dir.path().join("versions").join("2026.07.09-aaa");
+        assert_eq!(inv.program, expected.join("node.exe"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cursor_shim_bypass_prefers_side_by_side_node() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_cursor_install(dir.path(), &[("2026.07.09-aaa", true)]);
+        std::fs::write(dir.path().join("node.exe"), "MZ").unwrap();
+        std::fs::write(dir.path().join("index.js"), "// entry\n").unwrap();
+        let inv =
+            resolve_agent_invocation(&dir.path().join("agent.cmd").to_string_lossy());
+        assert_eq!(inv.program, dir.path().join("node.exe"));
+        assert_eq!(inv.prepend_args, vec![dir.path().join("index.js")]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn foreign_cmd_shim_is_not_bypassed() {
+        // No cursor-agent.ps1 → not the cursor layout → keep the shim
+        // (npm shims etc. must not be second-guessed).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("agent.cmd"), "@echo off\r\n").unwrap();
+        let shim = dir.path().join("agent.cmd");
+        let inv = resolve_agent_invocation(&shim.to_string_lossy());
+        assert_eq!(inv.program, shim);
+        assert!(inv.prepend_args.is_empty());
+        assert!(inv.envs.is_empty());
     }
 }
