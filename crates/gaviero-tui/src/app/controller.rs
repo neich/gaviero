@@ -1739,7 +1739,6 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
                 }
             } else if app.focus == Focus::Terminal {
                 app.terminal_manager.cycle_tab(1);
-                app.needs_full_redraw = true;
             } else {
                 app.cycle_tab(1);
             }
@@ -1760,7 +1759,6 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
                 }
             } else if app.focus == Focus::Terminal {
                 app.terminal_manager.cycle_tab(-1);
-                app.needs_full_redraw = true;
             } else {
                 app.cycle_tab(-1);
             }

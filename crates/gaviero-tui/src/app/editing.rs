@@ -579,7 +579,6 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                             } else if idx != app.chat_state.active_conv {
                                 app.chat_state.switch_conversation(idx);
                             }
-                            app.needs_full_redraw = true;
                             return;
                         }
                     }
@@ -591,7 +590,6 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                         {
                             app.git_panel.select_file(region, idx);
                             super::side_panel::open_selected_git_file(app);
-                            app.needs_full_redraw = true;
                             return;
                         }
                     }
@@ -642,7 +640,6 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     if idx < app.buffers.len() && idx != app.active_buffer {
                         app.active_buffer = idx;
                         app.focus = Focus::Editor;
-                        app.needs_full_redraw = true;
                     }
                 }
             }
@@ -1695,7 +1692,6 @@ pub(super) fn open_diff_view(
     for (i, b) in app.buffers.iter().enumerate() {
         if b.diff_view.is_some() && b.path.as_deref() == Some(path) {
             app.active_buffer = i;
-            app.needs_full_redraw = true;
             return;
         }
     }
@@ -1723,7 +1719,6 @@ pub(super) fn open_diff_view(
             }
             app.buffers.push(buf);
             app.active_buffer = app.buffers.len() - 1;
-            app.needs_full_redraw = true;
         }
         Err(e) => {
             tracing::error!("Failed to open diff view for {}: {}", path.display(), e);
@@ -1748,7 +1743,6 @@ pub(super) fn open_file(app: &mut App, path: &Path) {
         {
             app.active_buffer = i;
             sync_preview_mode_for_active_buffer(app);
-            app.needs_full_redraw = true;
             return;
         }
     }
@@ -1810,7 +1804,6 @@ pub(super) fn open_file(app: &mut App, path: &Path) {
             app.buffers.push(buf);
             app.active_buffer = app.buffers.len() - 1;
             sync_preview_mode_for_active_buffer(app);
-            app.needs_full_redraw = true;
         }
         Err(e) => {
             tracing::error!("Failed to open file {}: {}", path.display(), e);
@@ -1825,7 +1818,6 @@ pub(super) fn cycle_tab(app: &mut App, delta: i32) {
     let len = app.buffers.len() as i32;
     app.active_buffer = ((app.active_buffer as i32 + delta).rem_euclid(len)) as usize;
     sync_preview_mode_for_active_buffer(app);
-    app.needs_full_redraw = true;
 }
 
 pub(super) fn close_tab(app: &mut App) {
