@@ -85,25 +85,157 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
+/// `CREATE_NO_WINDOW` process-creation flag: the child gets its own
+/// console (with no window) instead of attaching to gaviero's.
+///
+/// Everything spawned through this module is pure pipe-driven, but by
+/// default `CreateProcess` attaches each child — and every descendant
+/// (node, git, bash, cmd, rg, …) — to the parent's console. The console
+/// *input mode* is a property of that shared console, not of a process:
+/// one descendant flipping `ENABLE_PROCESSED_INPUT` back on (git
+/// terminal prompts, MSYS init, any cooked `ReadConsole`) silently
+/// reverts the TUI's crossterm raw mode, and the next Ctrl+C is then
+/// broadcast as a `CTRL_C_EVENT` to every attached process — terminating
+/// the handler-less TUI — instead of arriving as the key event the
+/// keymap turns into cancel-stream (W1: "Ctrl+C killed gaviero
+/// mid-prompt"). A private console removes both hazards: descendants
+/// cannot stomp the host console's modes, and ctrl events raised inside
+/// the agent tree cannot propagate out of it. `DETACHED_PROCESS` (no
+/// console at all) is deliberately not used — MSYS/cmd descendants
+/// expect console APIs to work.
+///
+/// Headless `gaviero-cli` trade-off: a terminal Ctrl+C now reaches only
+/// the CLI itself; agent children exit on their broken stdio pipes
+/// instead of the shared-console broadcast (all spawn sites already set
+/// `kill_on_drop(true)` for the graceful paths).
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Apply [`CREATE_NO_WINDOW`] to a child about to be spawned. No-op off
+/// Windows. Public so spawn sites that build their own `Command` (the
+/// tool-agent Bash tool) share the policy.
+#[cfg(windows)]
+pub fn isolate_console(cmd: &mut tokio::process::Command) {
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+pub fn isolate_console(_cmd: &mut tokio::process::Command) {}
+
+/// `std::process::Command` twin of [`isolate_console`].
+#[cfg(windows)]
+pub fn isolate_console_std(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+pub fn isolate_console_std(_cmd: &mut std::process::Command) {}
+
+/// Terminate every descendant process when this process exits — however
+/// it exits (Windows).
+///
+/// Assigns the *current* process to a Job Object with
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Job membership is inherited on
+/// process creation, so every future descendant — including grandchildren
+/// spawned by agent CLIs (node → bash → cargo) — lands in the job with no
+/// per-spawn bookkeeping and no assign-after-spawn race. The job handle is
+/// deliberately leaked: it must stay open for the process lifetime,
+/// because the kernel terminates all members when the last handle closes.
+/// That close happens on any death — clean exit, Ctrl+C's default
+/// `ExitProcess`, panic, `std::process::exit`, or Task Manager — so this
+/// is strictly stronger than a signal handler.
+///
+/// Exists for `gaviero-cli`: agent children run on private consoles
+/// ([`isolate_console`]), so a terminal Ctrl+C no longer reaches them via
+/// the shared-console broadcast; the job restores "the tree dies with the
+/// CLI" as a kernel guarantee. The TUI deliberately does not call it —
+/// its sessions die through cancel paths + `kill_on_drop`, and a job
+/// would also hard-kill embedded terminal panes on exit.
+///
+/// No-op on Unix, where the terminal already delivers SIGINT to the whole
+/// foreground process group (children inherit the pgid — nothing in this
+/// module calls `setsid`/`process_group`), which is the platform's native
+/// tree-teardown contract.
+///
+/// Idempotent. Nested jobs are fine on Windows 8+ — the process may
+/// already sit in a terminal- or CI-managed job.
+#[cfg(windows)]
+pub fn kill_tree_on_exit() -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    // First caller arms; the rest return. A failed arm stays "armed" —
+    // callers treat failure as log-and-degrade, not retry.
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    if ARMED.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            std::ptr::from_ref(&info).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) == 0
+        {
+            // Not yet a member — closing an unarmed, empty job is safe.
+            let e = std::io::Error::last_os_error();
+            CloseHandle(job);
+            return Err(e);
+        }
+        if AssignProcessToJobObject(job, GetCurrentProcess()) == 0 {
+            let e = std::io::Error::last_os_error();
+            CloseHandle(job);
+            return Err(e);
+        }
+        // Member now — never CloseHandle from here on: closing IS the kill.
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn kill_tree_on_exit() -> std::io::Result<()> {
+    Ok(())
+}
+
 /// A `tokio::process::Command` for an agent CLI (`claude`, `codex`,
 /// `agent`, …), resolved PATHEXT-aware. Unresolvable names pass
 /// through verbatim so the eventual spawn error still names the
 /// missing binary (the NotFound match arms in the backends stay
-/// accurate).
+/// accurate). Detached from the host console on Windows
+/// ([`isolate_console`]).
 pub fn agent_command(name: &str) -> tokio::process::Command {
-    match resolve_program(name) {
+    let mut cmd = match resolve_program(name) {
         Some(path) => tokio::process::Command::new(path),
         None => tokio::process::Command::new(name),
-    }
+    };
+    isolate_console(&mut cmd);
+    cmd
 }
 
 /// `std::process::Command` twin of [`agent_command`] for the blocking
 /// call sites.
 pub fn agent_command_std(name: &str) -> std::process::Command {
-    match resolve_program(name) {
+    let mut cmd = match resolve_program(name) {
         Some(path) => std::process::Command::new(path),
         None => std::process::Command::new(name),
-    }
+    };
+    isolate_console_std(&mut cmd);
+    cmd
 }
 
 /// Bytes of prompt allowed on argv before spilling to a tempfile /
@@ -161,6 +293,7 @@ pub fn posix_shell_command(script: &str) -> anyhow::Result<tokio::process::Comma
         })?;
         let mut cmd = tokio::process::Command::new(bash);
         cmd.arg("-c").arg(script);
+        isolate_console(&mut cmd);
         Ok(cmd)
     }
 }
@@ -182,6 +315,7 @@ pub fn shell_command_lenient(script: &str) -> tokio::process::Command {
             let pwsh = resolve_program("pwsh").unwrap_or_else(|| PathBuf::from("pwsh"));
             let mut cmd = tokio::process::Command::new(pwsh);
             cmd.arg("-NoProfile").arg("-Command").arg(script);
+            isolate_console(&mut cmd);
             cmd
         }
     }
@@ -248,6 +382,16 @@ mod tests {
     #[test]
     fn unresolvable_name_is_none() {
         assert_eq!(resolve_program("definitely-not-a-real-binary-xyz"), None);
+    }
+
+    /// Arming must succeed and be idempotent. On Windows the first call
+    /// really adopts the test process into a kill-on-close job — safe:
+    /// membership restricts nothing while running, and at exit the job
+    /// only reaps members that are already dying with the harness.
+    #[test]
+    fn kill_tree_on_exit_arms_and_is_idempotent() {
+        kill_tree_on_exit().expect("first arm");
+        kill_tree_on_exit().expect("second arm (no-op)");
     }
 
     #[test]

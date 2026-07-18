@@ -132,6 +132,7 @@ fn build_bash_command(command: &str) -> Result<Command, String> {
         })?;
         let mut cmd = Command::new(bash);
         cmd.arg("-c").arg(command);
+        crate::util::spawn::isolate_console(&mut cmd);
         Ok(cmd)
     }
 }

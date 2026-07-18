@@ -283,6 +283,11 @@ async fn main() -> Result<()> {
     let event_tx = event_loop.tx();
     let mut event_rx = event_loop.take_rx();
 
+    // Windows: console CTRL_C/CTRL_BREAK events must never terminate the
+    // TUI — swallow them and re-route into the normal key path (see
+    // `platform::install_console_ctrl_forwarder`). No-op elsewhere.
+    platform::install_console_ctrl_forwarder(event_loop.tx());
+
     // Spawn background event producers
     event_loop.spawn_crossterm_reader();
     event_loop.spawn_tick_timer();
