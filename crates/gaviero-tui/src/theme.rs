@@ -121,6 +121,13 @@ pub const TICK_INTERVAL_MS: u64 = 33;
 /// below human keystroke and key-repeat cadence (>= ~30 ms), so real typing is
 /// never merged into a paste.
 pub const PASTE_BURST_MS: u64 = 5;
+/// Interval for re-asserting VT mouse passthrough to the host terminal.
+/// A multiplexer between gaviero and the terminal keeps its own per-pane
+/// record of the requested mouse modes and can lose it without gaviero
+/// noticing (pane respawn / vt100 reset; psmux gates click forwarding on
+/// it). Re-writing the enable sequences is idempotent, so a short interval
+/// is safe; 24 bytes every 2 s is negligible next to frame output.
+pub const VT_MOUSE_REASSERT_MS: u64 = 2000;
 /// Default number of messages to keep on /compact.
 pub const DEFAULT_COMPACT_KEEP: usize = 6;
 /// Terminal resize step (percentage per key press).

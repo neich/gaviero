@@ -647,131 +647,54 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 }
             }
         }
-        MouseEventKind::ScrollUp => {
-            match wheel_target(app.focus, app.panel_visible.side_panel, app.panel_visible.terminal)
-            {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+            match wheel_target(app.focus, &app.panel_visible, app.fullscreen_panel) {
+                WheelTarget::FileTree => {
+                    scroll_left_panel(app, up);
+                    return;
+                }
+                WheelTarget::Editor => {
+                    scroll_editor_group(app, up, col, row);
+                    return;
+                }
                 WheelTarget::SidePanel => {
-                    scroll_side_panel(app, true, col, row);
+                    scroll_side_panel(app, up, col, row);
                     return;
                 }
                 WheelTarget::Terminal => {
-                    scroll_terminal_scrollback(app, true);
+                    scroll_terminal_scrollback(app, up);
                     return;
                 }
                 WheelTarget::Hover => {}
             }
+            // Stale focus (the focused panel is hidden): route by pointer.
             if let Some(area) = app.layout.file_tree_area {
                 if area.contains((col, row).into()) {
-                    match app.left_panel {
-                        LeftPanelMode::FileTree => app.file_tree.scroll_up(theme::MOUSE_SCROLL_DELTA),
-                        LeftPanelMode::Search => app.search_panel.scroll.scroll_up(theme::MOUSE_SCROLL_DELTA),
-                        LeftPanelMode::Review => {
-                            if let Some(ref mut br) = app.batch_review {
-                                br.scroll_offset = br.scroll_offset.saturating_sub(theme::MOUSE_SCROLL_DELTA);
-                            }
-                        }
-                        LeftPanelMode::Changes => {
-                            if let Some(ref mut cs) = app.changes_state {
-                                cs.scroll_offset = cs.scroll_offset.saturating_sub(theme::MOUSE_SCROLL_DELTA);
-                            }
-                        }
-                    }
+                    scroll_left_panel(app, up);
+                    return;
                 }
             }
             if let Some(area) = app.layout.side_panel_area {
                 if area.contains((col, row).into()) {
-                    scroll_side_panel(app, true, col, row);
+                    scroll_side_panel(app, up, col, row);
+                    return;
                 }
             }
             if let Some(preview) = app.layout.preview_area {
                 if preview.contains((col, row).into()) {
-                    scroll_preview_lines(app, -(theme::MOUSE_SCROLL_DELTA as i32));
+                    let delta = theme::MOUSE_SCROLL_DELTA as i32;
+                    scroll_preview_lines(app, if up { -delta } else { delta });
+                    return;
                 }
             }
             if app.layout.editor_area.contains((col, row).into()) {
-                if let Some(ref mut br) = app.batch_review {
-                    br.diff_scroll = br.diff_scroll.saturating_sub(theme::MOUSE_SCROLL_DELTA);
-                } else if let Some(ref mut cs) = app.changes_state {
-                    if app.left_panel == LeftPanelMode::Changes {
-                        cs.diff_scroll = cs.diff_scroll.saturating_sub(theme::MOUSE_SCROLL_DELTA);
-                    }
-                } else if let Some(ref mut review) = app.diff_review {
-                    review.scroll_top = review.scroll_top.saturating_sub(theme::MOUSE_SCROLL_DELTA);
-                } else if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
-                    buf.scroll.top_line = buf.scroll.top_line.saturating_sub(theme::MOUSE_SCROLL_DELTA);
-                }
+                scroll_editor_content(app, up);
+                return;
             }
             if let Some(area) = app.layout.terminal_area {
                 if area.contains((col, row).into()) {
-                    scroll_terminal_scrollback(app, true);
-                }
-            }
-        }
-        MouseEventKind::ScrollDown => {
-            match wheel_target(app.focus, app.panel_visible.side_panel, app.panel_visible.terminal)
-            {
-                WheelTarget::SidePanel => {
-                    scroll_side_panel(app, false, col, row);
-                    return;
-                }
-                WheelTarget::Terminal => {
-                    scroll_terminal_scrollback(app, false);
-                    return;
-                }
-                WheelTarget::Hover => {}
-            }
-            if let Some(area) = app.layout.file_tree_area {
-                if area.contains((col, row).into()) {
-                    match app.left_panel {
-                        LeftPanelMode::FileTree => app.file_tree.scroll_down(theme::MOUSE_SCROLL_DELTA),
-                        LeftPanelMode::Search => {
-                            let count = app.search_panel.results.len();
-                            app.search_panel.scroll.scroll_down(theme::MOUSE_SCROLL_DELTA, count);
-                        }
-                        LeftPanelMode::Review => {
-                            if let Some(ref mut br) = app.batch_review {
-                                let max = br.proposals.len().saturating_sub(1);
-                                br.scroll_offset = (br.scroll_offset + theme::MOUSE_SCROLL_DELTA).min(max);
-                            }
-                        }
-                        LeftPanelMode::Changes => {
-                            if let Some(ref mut cs) = app.changes_state {
-                                let max = cs.entries.len().saturating_sub(1);
-                                cs.scroll_offset = (cs.scroll_offset + theme::MOUSE_SCROLL_DELTA).min(max);
-                            }
-                        }
-                    }
-                }
-            }
-            if let Some(area) = app.layout.side_panel_area {
-                if area.contains((col, row).into()) {
-                    scroll_side_panel(app, false, col, row);
-                }
-            }
-            if let Some(preview) = app.layout.preview_area {
-                if preview.contains((col, row).into()) {
-                    scroll_preview_lines(app, theme::MOUSE_SCROLL_DELTA as i32);
-                }
-            }
-            if app.layout.editor_area.contains((col, row).into()) {
-                if let Some(ref mut br) = app.batch_review {
-                    br.diff_scroll += theme::MOUSE_SCROLL_DELTA;
-                } else if app.left_panel == LeftPanelMode::Changes {
-                    if let Some(ref mut cs) = app.changes_state {
-                        cs.diff_scroll += theme::MOUSE_SCROLL_DELTA;
-                    }
-                } else if let Some(ref mut review) = app.diff_review {
-                    review.scroll_top += theme::MOUSE_SCROLL_DELTA;
-                } else if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
-                    let (_, content_w) =
-                        editor_viewport(buf.line_count(), app.layout.editor_area);
-                    let max = buf.scroll_line_count(content_w).saturating_sub(1);
-                    buf.scroll.top_line = (buf.scroll.top_line + theme::MOUSE_SCROLL_DELTA).min(max);
-                }
-            }
-            if let Some(area) = app.layout.terminal_area {
-                if area.contains((col, row).into()) {
-                    scroll_terminal_scrollback(app, false);
+                    scroll_terminal_scrollback(app, up);
                 }
             }
         }
@@ -960,33 +883,141 @@ fn side_panel_chat_scroll_at(app: &App, col: u16, row: u16) -> bool {
             .is_some_and(|area| area.contains((col, row).into()))
 }
 
-/// Mouse handling while a review is pending. Review interactions (hunk
-/// gutter, batch file list, diff scroll) plus read-only agent-chat browsing
-/// (wheel scroll, scrollbar drag, text selection). Everything else stays
-/// locked until the user finishes the review.
 /// Where a mouse-wheel event should act.
 #[derive(Debug, PartialEq)]
 enum WheelTarget {
-    /// Focused side panel takes the wheel regardless of pointer position.
+    /// Left panel (file tree / search / review list / changes list).
+    FileTree,
+    /// Editor group: source buffer, diff states, markdown preview.
+    Editor,
+    /// Side panel (chat / dashboard / git / memory).
     SidePanel,
-    /// Focused embedded terminal takes the wheel regardless of pointer position.
+    /// Embedded terminal scrollback.
     Terminal,
-    /// Route by pointer position (hover).
+    /// Route by pointer position (only when the focused panel is hidden).
     Hover,
 }
 
-/// Wheel events follow *focus* for the side panel and the embedded terminal,
-/// and *hover* everywhere else. Focus on those two panels is keyboard-driven
-/// (Alt+3 / Alt+4, or mux pane chords that never move the mouse), while the
-/// captured pointer typically rests over the editor — pure hover routing then
-/// scrolls a panel the user isn't looking at (W1: reported on Windows under
-/// psmux). Hidden panels never take the wheel even if focus is stale.
-fn wheel_target(focus: Focus, side_panel_visible: bool, terminal_visible: bool) -> WheelTarget {
+/// Wheel events follow *focus*: the focused panel takes the wheel regardless
+/// of pointer position. Focus changes are keyboard-driven (Alt+1..4, or mux
+/// pane chords that never move the mouse) while the captured pointer
+/// typically rests over the editor — hover routing then scrolls a panel the
+/// user isn't looking at (W1: side panel + terminal, reported on Windows
+/// under psmux; later reproduced with the file tree focused, so routing is
+/// now focus-first for every panel). Hover remains only as the fallback when
+/// the focused panel is hidden (stale focus after a panel toggle). While a
+/// panel is fullscreen it is the only thing on screen, so the wheel pins to
+/// it even if focus drifted (Alt+1..4 don't clear fullscreen).
+fn wheel_target(focus: Focus, visible: &PanelVisibility, fullscreen: Option<Focus>) -> WheelTarget {
+    if let Some(fs) = fullscreen {
+        return match fs {
+            Focus::FileTree => WheelTarget::FileTree,
+            Focus::Editor => WheelTarget::Editor,
+            Focus::SidePanel => WheelTarget::SidePanel,
+            Focus::Terminal => WheelTarget::Terminal,
+        };
+    }
     match focus {
-        Focus::SidePanel if side_panel_visible => WheelTarget::SidePanel,
-        Focus::Terminal if terminal_visible => WheelTarget::Terminal,
+        Focus::FileTree if visible.file_tree => WheelTarget::FileTree,
+        Focus::Editor if visible.editor => WheelTarget::Editor,
+        Focus::SidePanel if visible.side_panel => WheelTarget::SidePanel,
+        Focus::Terminal if visible.terminal => WheelTarget::Terminal,
         _ => WheelTarget::Hover,
     }
+}
+
+/// One wheel step on the left panel, respecting the active mode's list.
+fn scroll_left_panel(app: &mut App, up: bool) {
+    let delta = theme::MOUSE_SCROLL_DELTA;
+    match app.left_panel {
+        LeftPanelMode::FileTree => {
+            if up {
+                app.file_tree.scroll_up(delta);
+            } else {
+                app.file_tree.scroll_down(delta);
+            }
+        }
+        LeftPanelMode::Search => {
+            if up {
+                app.search_panel.scroll.scroll_up(delta);
+            } else {
+                let count = app.search_panel.results.len();
+                app.search_panel.scroll.scroll_down(delta, count);
+            }
+        }
+        LeftPanelMode::Review => {
+            if let Some(ref mut br) = app.batch_review {
+                if up {
+                    br.scroll_offset = br.scroll_offset.saturating_sub(delta);
+                } else {
+                    let max = br.proposals.len().saturating_sub(1);
+                    br.scroll_offset = (br.scroll_offset + delta).min(max);
+                }
+            }
+        }
+        LeftPanelMode::Changes => {
+            if let Some(ref mut cs) = app.changes_state {
+                if up {
+                    cs.scroll_offset = cs.scroll_offset.saturating_sub(delta);
+                } else {
+                    let max = cs.entries.len().saturating_sub(1);
+                    cs.scroll_offset = (cs.scroll_offset + delta).min(max);
+                }
+            }
+        }
+    }
+}
+
+/// One wheel step on whatever the editor pane currently shows: batch-review
+/// diff, Changes diff, single-proposal diff, or the source buffer. A lingering
+/// `changes_state` outside Changes mode never swallows the wheel — the buffer
+/// scrolls (the old ScrollUp arm got this wrong and went dead instead).
+fn scroll_editor_content(app: &mut App, up: bool) {
+    let delta = theme::MOUSE_SCROLL_DELTA;
+    if let Some(ref mut br) = app.batch_review {
+        br.diff_scroll = if up {
+            br.diff_scroll.saturating_sub(delta)
+        } else {
+            br.diff_scroll + delta
+        };
+    } else if app.left_panel == LeftPanelMode::Changes {
+        if let Some(ref mut cs) = app.changes_state {
+            cs.diff_scroll = if up {
+                cs.diff_scroll.saturating_sub(delta)
+            } else {
+                cs.diff_scroll + delta
+            };
+        }
+    } else if let Some(ref mut review) = app.diff_review {
+        review.scroll_top = if up {
+            review.scroll_top.saturating_sub(delta)
+        } else {
+            review.scroll_top + delta
+        };
+    } else if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
+        if up {
+            buf.scroll.top_line = buf.scroll.top_line.saturating_sub(delta);
+        } else {
+            let (_, content_w) = editor_viewport(buf.line_count(), app.layout.editor_area);
+            let max = buf.scroll_line_count(content_w).saturating_sub(1);
+            buf.scroll.top_line = (buf.scroll.top_line + delta).min(max);
+        }
+    }
+}
+
+/// One wheel step on the editor group. The markdown preview sub-routes by
+/// pointer position (like the swarm dashboard's detail pane): pointer inside
+/// the preview scrolls it, anywhere else scrolls the source. In PreviewOnly
+/// mode the preview is the whole group, so it always takes the wheel.
+fn scroll_editor_group(app: &mut App, up: bool, col: u16, row: u16) {
+    if let Some(preview) = app.layout.preview_area {
+        if app.layout.editor_area.is_empty() || preview.contains((col, row).into()) {
+            let delta = theme::MOUSE_SCROLL_DELTA as i32;
+            scroll_preview_lines(app, if up { -delta } else { delta });
+            return;
+        }
+    }
+    scroll_editor_content(app, up);
 }
 
 /// One wheel step (3 lines) on the side panel. The swarm dashboard sub-routes
@@ -1041,6 +1072,12 @@ fn scroll_terminal_scrollback(app: &mut App, up: bool) {
     }
 }
 
+/// Mouse handling while a review is pending. Review interactions (hunk
+/// gutter, batch file list, diff scroll) plus read-only agent-chat browsing
+/// (wheel scroll, scrollbar drag, text selection). Everything else stays
+/// locked until the user finishes the review. Wheel routing here stays
+/// pointer-based: review is modal and focus is locked to the review surfaces,
+/// so the focus-first rule of `wheel_target` does not apply.
 fn handle_mouse_review(app: &mut App, mouse: crossterm::event::MouseEvent) {
     let col = mouse.column;
     let row = mouse.row;
@@ -1898,32 +1935,30 @@ pub(super) fn is_current_buffer_markdown(app: &App) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn wheel_follows_focus_for_side_panel_and_terminal() {
-        assert_eq!(
-            wheel_target(Focus::SidePanel, true, true),
-            WheelTarget::SidePanel
-        );
-        assert_eq!(
-            wheel_target(Focus::SidePanel, true, false),
-            WheelTarget::SidePanel
-        );
-        assert_eq!(
-            wheel_target(Focus::Terminal, true, true),
-            WheelTarget::Terminal
-        );
-        assert_eq!(
-            wheel_target(Focus::Terminal, false, true),
-            WheelTarget::Terminal
-        );
+    fn all_visible() -> PanelVisibility {
+        PanelVisibility {
+            file_tree: true,
+            editor: true,
+            side_panel: true,
+            terminal: true,
+        }
     }
 
     #[test]
-    fn wheel_falls_back_to_hover_for_editor_and_tree_focus() {
-        assert_eq!(wheel_target(Focus::Editor, true, true), WheelTarget::Hover);
+    fn wheel_follows_focus_for_every_visible_panel() {
+        let v = all_visible();
         assert_eq!(
-            wheel_target(Focus::FileTree, true, true),
-            WheelTarget::Hover
+            wheel_target(Focus::FileTree, &v, None),
+            WheelTarget::FileTree
+        );
+        assert_eq!(wheel_target(Focus::Editor, &v, None), WheelTarget::Editor);
+        assert_eq!(
+            wheel_target(Focus::SidePanel, &v, None),
+            WheelTarget::SidePanel
+        );
+        assert_eq!(
+            wheel_target(Focus::Terminal, &v, None),
+            WheelTarget::Terminal
         );
     }
 
@@ -1931,13 +1966,56 @@ mod tests {
     fn wheel_ignores_focus_on_hidden_panels() {
         // Focus can be stale after a panel toggle; a hidden panel must not
         // swallow the wheel — fall back to hover routing.
+        let hidden_tree = PanelVisibility {
+            file_tree: false,
+            ..all_visible()
+        };
         assert_eq!(
-            wheel_target(Focus::SidePanel, false, true),
+            wheel_target(Focus::FileTree, &hidden_tree, None),
             WheelTarget::Hover
         );
+        let hidden_editor = PanelVisibility {
+            editor: false,
+            ..all_visible()
+        };
         assert_eq!(
-            wheel_target(Focus::Terminal, true, false),
+            wheel_target(Focus::Editor, &hidden_editor, None),
             WheelTarget::Hover
+        );
+        let hidden_side = PanelVisibility {
+            side_panel: false,
+            ..all_visible()
+        };
+        assert_eq!(
+            wheel_target(Focus::SidePanel, &hidden_side, None),
+            WheelTarget::Hover
+        );
+        let hidden_term = PanelVisibility {
+            terminal: false,
+            ..all_visible()
+        };
+        assert_eq!(
+            wheel_target(Focus::Terminal, &hidden_term, None),
+            WheelTarget::Hover
+        );
+    }
+
+    #[test]
+    fn wheel_pins_to_fullscreen_panel_even_when_focus_drifted() {
+        // Alt+1..4 change focus without clearing fullscreen; only the
+        // fullscreen panel is on screen, so the wheel must act on it.
+        let v = all_visible();
+        assert_eq!(
+            wheel_target(Focus::FileTree, &v, Some(Focus::Editor)),
+            WheelTarget::Editor
+        );
+        assert_eq!(
+            wheel_target(Focus::Editor, &v, Some(Focus::Terminal)),
+            WheelTarget::Terminal
+        );
+        assert_eq!(
+            wheel_target(Focus::SidePanel, &v, Some(Focus::FileTree)),
+            WheelTarget::FileTree
         );
     }
 }

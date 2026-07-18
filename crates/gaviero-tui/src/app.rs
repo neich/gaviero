@@ -229,6 +229,9 @@ pub struct App {
     pub terminal_manager: gaviero_core::terminal::TerminalManager,
     /// Terminal panel text selection state.
     pub terminal_selection: crate::panels::terminal::TerminalSelectionState,
+    /// Last time the VT mouse-passthrough request was re-asserted to the
+    /// host terminal (see `platform::enable_vt_mouse_passthrough`).
+    pub last_vt_mouse_reassert: std::time::Instant,
 }
 
 impl App {
@@ -449,12 +452,26 @@ impl App {
                 gaviero_core::terminal::TerminalConfig::default(),
             ),
             terminal_selection: crate::panels::terminal::TerminalSelectionState::default(),
+            last_vt_mouse_reassert: std::time::Instant::now(),
         }
     }
 
     /// Handle an incoming event.
     pub fn handle_event(&mut self, event: Event) {
         controller::handle_event(self, event);
+    }
+
+    /// Re-assert the host-terminal VT mouse-passthrough request, throttled
+    /// to `theme::VT_MOUSE_REASSERT_MS`. `force` skips the throttle — used
+    /// on host focus-gain, when a mux switch/reattach is the likeliest
+    /// moment for the outer layer to have dropped the pane's mouse modes.
+    pub(crate) fn maybe_reassert_vt_mouse(&mut self, force: bool) {
+        let interval = std::time::Duration::from_millis(crate::theme::VT_MOUSE_REASSERT_MS);
+        if !force && self.last_vt_mouse_reassert.elapsed() < interval {
+            return;
+        }
+        self.last_vt_mouse_reassert = std::time::Instant::now();
+        let _ = crate::platform::enable_vt_mouse_passthrough(&mut std::io::stdout());
     }
 
     /// Rescan skill roots after a `.gaviero/skills/` file change.

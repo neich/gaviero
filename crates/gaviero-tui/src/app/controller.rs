@@ -176,6 +176,12 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
         }
         Event::TerminalFocus(focused) => {
             app.terminal_has_focus = focused;
+            // A focus-gain often follows a mux window switch or reattach —
+            // the moment an outer multiplexer is most likely to have lost
+            // this pane's mouse-mode registration. Re-assert immediately.
+            if focused {
+                app.maybe_reassert_vt_mouse(true);
+            }
         }
         Event::FileChanged(path) => {
             invalidate_repo_map(app);
@@ -1393,6 +1399,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
         }
         Event::Tick => {
             app.terminal_manager.tick();
+            app.maybe_reassert_vt_mouse(false);
             if app.chat_state.active_conv_streaming() {
                 app.chat_state.tick_count = app.chat_state.tick_count.wrapping_add(1);
             }
