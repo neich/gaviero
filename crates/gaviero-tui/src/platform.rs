@@ -35,6 +35,17 @@ const DISABLE_VT_MOUSE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 /// Ask the hosting terminal to forward mouse events (Windows-only VT write;
 /// no-op elsewhere, where crossterm's `EnableMouseCapture` already emits the
 /// sequences). Must run after `EnterAlternateScreen`/`EnableMouseCapture`.
+///
+/// Called once at startup AND re-asserted while running (throttled Tick +
+/// host focus-gain — `App::maybe_reassert_vt_mouse`): a multiplexer keeps
+/// its own per-pane record of these modes (psmux gates click forwarding on
+/// it) and can lose it without any signal to gaviero, e.g. on a pane
+/// respawn or vt100 state reset. Note the Jul 2026 "selection dead
+/// app-wide" incident turned out to be one layer up — Windows Terminal
+/// dropped the *psmux client's* mouse registration, which psmux only
+/// re-arms in SSH mode — so this keep-alive could not have fixed it; it
+/// remains as cheap insurance for the pane-level loss it does cover. The
+/// sequences are idempotent, so re-writing is safe on every host.
 #[cfg(windows)]
 pub fn enable_vt_mouse_passthrough(w: &mut impl Write) -> std::io::Result<()> {
     w.write_all(ENABLE_VT_MOUSE.as_bytes())?;
@@ -109,6 +120,18 @@ pub fn altgr_char(key: &KeyEvent) -> Option<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The re-assert path (`App::maybe_reassert_vt_mouse`) depends on this
+    /// write being the full enable set and nothing else — a disable byte
+    /// here would turn the keep-alive into a mouse kill switch.
+    #[cfg(windows)]
+    #[test]
+    fn vt_mouse_passthrough_writes_only_enable_sequences() {
+        let mut out: Vec<u8> = Vec::new();
+        enable_vt_mouse_passthrough(&mut out).unwrap();
+        assert_eq!(out, b"\x1b[?1000h\x1b[?1002h\x1b[?1006h".to_vec());
+        assert!(!out.contains(&b'l'), "no DECRST (mode-off) bytes");
+    }
 
     #[cfg(windows)]
     #[test]
