@@ -42,6 +42,7 @@ pub use reranker::{
 pub use retrieval::{
     CandidatePoolEntry, ChatInjection, ChatInjectionConfig, RetrievalConfig, RetrievalMode,
     RetrievalOutput, ScopeMix, retrieve_for_chat, retrieve_for_chat_with_reranker, retrieve_ranked,
+    retrieve_ranked_with_levels,
 };
 pub use scope::{
     MemoryScope, MemoryType, ScopeFilter, StoreKind, StoreResult, Trust, WriteMeta, WriteScope,

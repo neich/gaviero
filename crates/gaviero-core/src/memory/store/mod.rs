@@ -17,6 +17,7 @@ pub mod write;
 
 pub use deletions_ops::{BulkForgetReport, ForgetFilter, RestoreOutcome};
 pub use manifest::InjectionManifestRow;
+pub use panel_ops::MemoryRow;
 pub use telemetry_ops::MemoryUtilization;
 
 use std::path::{Path, PathBuf};
@@ -389,8 +390,7 @@ impl MemoryStore {
         db_path: Option<PathBuf>,
         c1_backup_path: Option<PathBuf>,
     ) -> Result<Self> {
-        schema::run_migrations(&conn, embedder.dimension())
-            .context("running schema migrations")?;
+        schema::run_migrations(&conn, embedder.dimension()).context("running schema migrations")?;
 
         // B1: stamp `_gaviero_meta.embedder_model` so mismatch detection
         // works on existing DBs. Without this, a pre-B1 database has no
@@ -519,7 +519,6 @@ impl MemoryStore {
     pub fn embedder(&self) -> &Arc<dyn Embedder> {
         &self.embedder
     }
-
 
     // ── Session ledger (Tier A / A1) ────────────────────────────
 
@@ -995,7 +994,12 @@ impl MemoryStore {
 /// - Importance: [0,1] normalized
 /// - Relevance: cosine similarity from sqlite-vec
 /// - Reinforcement: (1.0 + access_count × 0.1), capped at 3×
-pub(crate) fn retrieval_score(recency_hours: f64, importance: f32, relevance: f32, access_count: i32) -> f32 {
+pub(crate) fn retrieval_score(
+    recency_hours: f64,
+    importance: f32,
+    relevance: f32,
+    access_count: i32,
+) -> f32 {
     let recency = 0.995_f64.powf(recency_hours) as f32;
     let reinforcement = (1.0 + access_count as f32 * 0.1).min(3.0);
     // α = β = γ = 1.0
@@ -1080,7 +1084,6 @@ pub fn file_hash(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hash))
 }
 
-
 /// B1d: public re-export of [`embedding_to_blob`] for the re-embed
 /// migration crate-internal module. Same little-endian f32 encoding.
 pub(crate) fn embedding_to_blob_pub(embedding: &[f32]) -> Vec<u8> {
@@ -1158,10 +1161,10 @@ pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::scope::{MemoryScope, StoreResult, WriteMeta};
     use super::super::scoring::SearchConfig;
     use super::super::trust_defaults::MemorySource;
+    use super::*;
 
     /// Mock embedder that produces deterministic vectors from content hash.
     struct MockEmbedder;
@@ -2352,8 +2355,7 @@ mod tests {
         assert!(audit.is_restorable());
 
         // The JSON dump round-trips and contains the original content.
-        let v: serde_json::Value =
-            serde_json::from_str(&audit.original_row_json).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&audit.original_row_json).unwrap();
         assert_eq!(v["content"], "use git2 not shell git");
         assert_eq!(v["memory_kind"], "record");
         assert!(v["embedding_b64"].is_string());
@@ -2422,11 +2424,7 @@ mod tests {
         let meta = WriteMeta::for_source(MemorySource::UserRemember)
             .with_type(MemoryType::Decision)
             .with_tag("c21-tag");
-        let id = match store
-            .store_scoped(&scope, "anything", &meta)
-            .await
-            .unwrap()
-        {
+        let id = match store.store_scoped(&scope, "anything", &meta).await.unwrap() {
             crate::memory::scope::StoreResult::Inserted(id) => id,
             _ => panic!(),
         };
@@ -2829,8 +2827,7 @@ mod tests {
         assert_eq!(audit.deleted_by, DeletedBy::UserRedaction.as_str());
         assert!(!audit.is_restorable());
         // original_row_json carries the tombstone, not the original.
-        let v: serde_json::Value =
-            serde_json::from_str(&audit.original_row_json).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&audit.original_row_json).unwrap();
         assert_eq!(v["memory_kind"], "history");
         assert!(v["tombstone"].as_str().unwrap().starts_with("[REDACTED:"));
         assert!(!audit.original_row_json.contains("secret transcript body"));
@@ -2943,8 +2940,7 @@ mod tests {
             .iter()
             .find(|d| d.deleted_by == DeletedBy::SleeptimeMerge.as_str())
             .expect("sleeptime_merge audit row missing");
-        let v: serde_json::Value =
-            serde_json::from_str(&audit.original_row_json).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&audit.original_row_json).unwrap();
         assert!(v.get("merged_into").is_some(), "merged_into field absent");
     }
 
@@ -2984,17 +2980,25 @@ mod tests {
         }
 
         // Dry-run: count returned but no soft-delete happens.
-        let n = store.sleeptime_prune_old_summaries(365, true).await.unwrap();
+        let n = store
+            .sleeptime_prune_old_summaries(365, true)
+            .await
+            .unwrap();
         assert_eq!(n, 1);
         assert_eq!(store.deletions_count().await.unwrap(), 0);
         assert!(store.get_content(id).await.unwrap().is_some());
 
         // Live: row goes through audit with sleeptime_prune tag.
-        let n = store.sleeptime_prune_old_summaries(365, false).await.unwrap();
+        let n = store
+            .sleeptime_prune_old_summaries(365, false)
+            .await
+            .unwrap();
         assert_eq!(n, 1);
         let recent = store.recent_deletions(5).await.unwrap();
         assert!(
-            recent.iter().any(|d| d.deleted_by == DeletedBy::SleeptimePrune.as_str()),
+            recent
+                .iter()
+                .any(|d| d.deleted_by == DeletedBy::SleeptimePrune.as_str()),
             "no sleeptime_prune audit row: {recent:?}"
         );
     }
@@ -3063,7 +3067,11 @@ mod tests {
             .with_kind(MemoryKind::History)
             .with_type(MemoryType::Factual)
             .with_tag("history:s:t");
-        let id = match store.store_scoped(&scope, &original_text, &meta).await.unwrap() {
+        let id = match store
+            .store_scoped(&scope, &original_text, &meta)
+            .await
+            .unwrap()
+        {
             crate::memory::scope::StoreResult::Inserted(id) => id,
             other => panic!("history insert produced {other:?}"),
         };
@@ -3161,7 +3169,10 @@ mod tests {
                 |r| r.get(0),
             )
             .expect("c1_backup_path stamped");
-        assert!(std::path::Path::new(&backup).exists(), "backup file present");
+        assert!(
+            std::path::Path::new(&backup).exists(),
+            "backup file present"
+        );
         assert!(backup.ends_with(".db") == false);
         assert!(backup.contains(".bak."));
     }

@@ -48,11 +48,13 @@ impl Default for TrustConsent {
 
 /// Context7 MCP server defaults (Upstash hosted docs lookup).
 ///
-/// Gaviero injects this server entry alongside the `gaviero` shim
-/// entry so swarm subprocess agents (Claude Code, Codex) can call
-/// `resolve-library-id` / `get-library-docs` against current docs
-/// instead of relying on stale training data. Disabled per workspace
-/// via `mcp.context7.enabled = false` (e.g. offline / privacy work).
+/// When enabled, gaviero injects this server entry alongside the
+/// `gaviero` shim entry so swarm subprocess agents (Claude Code,
+/// Codex) can call `resolve-library-id` / `get-library-docs` against
+/// current docs instead of relying on stale training data. **Opt-in
+/// via `mcp.context7.enabled = true`** (OD-6): the default is off
+/// because it is a network dependency (`npx` fetch on first agent
+/// spawn) that a local-first default must not carry silently.
 #[derive(Debug, Clone)]
 pub struct Context7Config {
     /// When `false`, no context7 entry is written into either the
@@ -70,7 +72,7 @@ pub struct Context7Config {
 impl Default for Context7Config {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             command: "npx".to_string(),
             args: vec!["-y".into(), "@upstash/context7-mcp".into()],
         }
@@ -319,7 +321,9 @@ pub fn claude_mcp_config_json(synth: &McpConfigSynth) -> Result<String> {
     Ok(serde_json::to_string_pretty(&body).context("serialising .mcp.json")?)
 }
 
-fn managed_mcp_json_servers(synth: &McpConfigSynth) -> Result<serde_json::Map<String, serde_json::Value>> {
+fn managed_mcp_json_servers(
+    synth: &McpConfigSynth,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
     let mut servers = serde_json::Map::new();
     // A server is registered only when the gaviero permission policy allows
     // it — a disallowed server is never written, which enforces the policy
@@ -328,7 +332,10 @@ fn managed_mcp_json_servers(synth: &McpConfigSynth) -> Result<serde_json::Map<St
         servers.insert("gaviero".to_string(), gaviero_server_entry(synth));
     }
     if synth.context7.enabled && synth.permissions.server_allowed("context7") {
-        servers.insert("context7".to_string(), context7_server_entry(&synth.context7));
+        servers.insert(
+            "context7".to_string(),
+            context7_server_entry(&synth.context7),
+        );
     }
     for extra in &synth.extra_servers {
         if synth.permissions.server_allowed(&extra.name) {
@@ -431,7 +438,9 @@ fn extra_server_json_entry_for_cursor(extra: &ExtraMcpServer) -> serde_json::Val
 /// startup — a broken `npx` (context7) or missing shim can prevent URL
 /// servers from registering in `ListMcpResources`. Keep Cursor lean:
 /// remote extras + gaviero (only when the shim resolves), no context7.
-fn managed_cursor_mcp_json_servers(synth: &McpConfigSynth) -> Result<serde_json::Map<String, serde_json::Value>> {
+fn managed_cursor_mcp_json_servers(
+    synth: &McpConfigSynth,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
     use super::preflight::shim_binary_resolvable;
 
     let has_remote_extra = synth_has_remote_url_servers(synth);
@@ -709,7 +718,9 @@ fn toml_value_inline(value: &toml::Value) -> Option<String> {
         toml::Value::Table(table) => {
             let parts: Option<Vec<String>> = table
                 .iter()
-                .map(|(k, v)| toml_value_inline(v).map(|s| format!("{} = {}", toml_quote_key(k), s)))
+                .map(|(k, v)| {
+                    toml_value_inline(v).map(|s| format!("{} = {}", toml_quote_key(k), s))
+                })
                 .collect();
             parts.map(|p| format!("{{ {} }}", p.join(", ")))
         }
@@ -1173,9 +1184,7 @@ fn merge_claude_settings_permissions(path: &Path, perms: serde_json::Value) -> R
             }
             if let Some(arr) = slot.as_array_mut() {
                 // Drop gaviero-owned MCP rules, then re-add the current set.
-                arr.retain(|v| {
-                    !v.as_str().map(|s| s.starts_with("mcp__")).unwrap_or(false)
-                });
+                arr.retain(|v| !v.as_str().map(|s| s.starts_with("mcp__")).unwrap_or(false));
                 let mut existing: std::collections::HashSet<String> = arr
                     .iter()
                     .filter_map(|v| v.as_str().map(str::to_string))
@@ -1224,7 +1233,12 @@ mod tests {
             codex_trust: TrustConsent::Granted,
             enabled: true,
             gaviero_enabled: true,
-            context7: Context7Config::default(),
+            context7: Context7Config {
+                // Tests exercising context7 entries opt in explicitly;
+                // the shipped default is opt-out (OD-6).
+                enabled: true,
+                ..Context7Config::default()
+            },
             extra_servers: Vec::new(),
             permissions: McpPermissions::default(),
         }
@@ -1370,7 +1384,11 @@ mod tests {
                 "user-cursor-server": { "command": "user-bin", "args": [] }
             }
         });
-        std::fs::write(&cursor_path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+        std::fs::write(
+            &cursor_path,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
 
         let synth = fixture_resolvable_shim(dir.path().to_path_buf());
         synthesize_for_worktree(&synth).unwrap();
@@ -1411,6 +1429,26 @@ mod tests {
     }
 
     #[test]
+    fn context7_default_is_opt_in() {
+        // OD-6: context7 is a network dependency (`npx` fetch on first
+        // agent spawn); local-first defaults must not carry it silently.
+        assert!(!Context7Config::default().enabled);
+    }
+
+    #[test]
+    fn claude_and_codex_configs_omit_context7_by_default() {
+        let mut synth = fixture(PathBuf::from("/tmp/wt"));
+        synth.context7 = Context7Config::default();
+        let claude = claude_mcp_config_json(&synth).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&claude).unwrap();
+        assert!(v["mcpServers"]["gaviero"].is_object());
+        assert!(v["mcpServers"].get("context7").is_none());
+        let codex = codex_mcp_config_toml(&synth).unwrap();
+        assert!(codex.contains("[mcp_servers.gaviero]"));
+        assert!(!codex.contains("[mcp_servers.context7]"));
+    }
+
+    #[test]
     fn claude_config_omits_context7_when_disabled() {
         let mut synth = fixture(PathBuf::from("/tmp/wt"));
         synth.context7.enabled = false;
@@ -1429,7 +1467,9 @@ mod tests {
         assert!(body.contains("\"@upstash/context7-mcp\""));
         assert!(body.contains("trust_level = \"trusted\""));
         let parsed: toml::Value = toml::from_str(&body).expect("codex config is valid TOML");
-        let args = parsed["mcp_servers"]["context7"]["args"].as_array().unwrap();
+        let args = parsed["mcp_servers"]["context7"]["args"]
+            .as_array()
+            .unwrap();
         assert_eq!(args.len(), 2);
         assert_eq!(args[1].as_str().unwrap(), "@upstash/context7-mcp");
     }
@@ -1545,7 +1585,10 @@ mod tests {
         // implies. That validation runs on every `agent` invocation, so
         // any stray key kills the turn before our allowlist matters.
         let cli_path = dir.path().join(".cursor/cli.json");
-        assert!(cli_path.exists(), "expected .cursor/cli.json for remote MCP");
+        assert!(
+            cli_path.exists(),
+            "expected .cursor/cli.json for remote MCP"
+        );
         let cli: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&cli_path).unwrap()).unwrap();
         let obj = cli.as_object().expect("cli.json is a JSON object");
@@ -1896,7 +1939,11 @@ mod tests {
                 "user-server": { "command": "user-bin", "args": [] }
             }
         });
-        std::fs::write(&claude_path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+        std::fs::write(
+            &claude_path,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
 
         let synth = fixture(dir.path().to_path_buf());
         synthesize_for_worktree(&synth).unwrap();
@@ -1929,13 +1976,17 @@ mod tests {
             "missing gaviero.command in {pairs:?}",
         );
         assert!(
-            pairs.iter().any(|p| p.starts_with("mcp_servers.gaviero.args=[")
-                && p.contains("\"--socket\"")
-                && p.contains(".gaviero/mcp.sock")),
+            pairs
+                .iter()
+                .any(|p| p.starts_with("mcp_servers.gaviero.args=[")
+                    && p.contains("\"--socket\"")
+                    && p.contains(".gaviero/mcp.sock")),
             "missing or malformed gaviero.args in {pairs:?}",
         );
         assert!(
-            pairs.iter().any(|p| p == r#"mcp_servers.context7.command="npx""#),
+            pairs
+                .iter()
+                .any(|p| p == r#"mcp_servers.context7.command="npx""#),
             "missing context7.command in {pairs:?}",
         );
         assert!(

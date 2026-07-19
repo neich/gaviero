@@ -257,6 +257,34 @@ pub async fn retrieve_ranked(
     reranker: Option<&dyn crate::memory::Reranker>,
     rerank_cfg: Option<&crate::memory::RerankConfig>,
 ) -> Result<RetrievalOutput> {
+    retrieve_ranked_with_levels(
+        stores,
+        memory_scope,
+        query,
+        limit,
+        retrieval_cfg,
+        reranker,
+        rerank_cfg,
+        None,
+    )
+    .await
+}
+
+/// [`retrieve_ranked`] with an optional single-level scope restriction
+/// (a `SCOPE_*` constant threaded into [`SearchConfig::level_restriction`]).
+/// Backs the MCP `memory_search.scope_hint` parameter; every other
+/// surface passes `None` via [`retrieve_ranked`].
+#[allow(clippy::too_many_arguments)]
+pub async fn retrieve_ranked_with_levels(
+    stores: &Arc<MemoryStores>,
+    memory_scope: &MemoryScope,
+    query: &str,
+    limit: usize,
+    retrieval_cfg: &RetrievalConfig,
+    reranker: Option<&dyn crate::memory::Reranker>,
+    rerank_cfg: Option<&crate::memory::RerankConfig>,
+    level_restriction: Option<i32>,
+) -> Result<RetrievalOutput> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return Ok(RetrievalOutput::default());
@@ -277,7 +305,8 @@ pub async fn retrieve_ranked(
 
     let search_cfg = SearchConfig::new(trimmed, memory_scope.clone())
         .with_max_results(oversample)
-        .with_per_level_limit(retrieval_cfg.per_scope_top_k);
+        .with_per_level_limit(retrieval_cfg.per_scope_top_k)
+        .with_level_restriction(level_restriction);
     let raw = match retrieval_cfg.mode {
         RetrievalMode::Merged => stores.multi_scope_retrieve(&search_cfg).await?,
         #[allow(deprecated)]

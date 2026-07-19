@@ -25,6 +25,25 @@ use crate::memory::scope::{MemoryType, StoreResult, Trust, WriteMeta, WriteScope
 use crate::memory::scoring::ScoredMemory;
 use crate::memory::trust_defaults::MemorySource;
 
+/// One full `memories` row as fetched by [`MemoryStore::get_memory_row`]
+/// (PR-4 `memory_get`). Unlike [`ScoredMemory`] it carries the
+/// lifecycle `kind` and no retrieval scoring fields.
+#[derive(Debug, Clone)]
+pub struct MemoryRow {
+    pub id: i64,
+    pub scope_level: i32,
+    pub kind: crate::memory::kind::MemoryKind,
+    pub memory_type: MemoryType,
+    pub content: String,
+    pub importance: f32,
+    pub trust_score: f32,
+    pub created_at: String,
+    pub updated_at: String,
+    pub tag: Option<String>,
+    pub access_count: i32,
+    pub accessed_at: Option<String>,
+}
+
 impl MemoryStore {
     // ── Panel reads (Tier A / A4 + C1.5) ─────────────────────────
 
@@ -292,6 +311,86 @@ impl MemoryStore {
         }
     }
 
+    /// PR-4 (`memory_get`): fetch one full row by id. Returns `None`
+    /// when the id does not exist in *this* store — the caller picks
+    /// the owning store first (ids are only unique per physical DB).
+    pub async fn get_memory_row(&self, memory_id: i64) -> Result<Option<MemoryRow>> {
+        use std::str::FromStr;
+        let conn = self.conn.lock().await;
+        type RawRow = (
+            i64,
+            i32,
+            String,
+            String,
+            String,
+            f32,
+            f32,
+            String,
+            String,
+            Option<String>,
+            i32,
+            Option<String>,
+        );
+        let row: Result<RawRow, rusqlite::Error> = conn.query_row(
+            "SELECT id, scope_level, memory_kind, memory_type, content,
+                    importance, trust_score, created_at, updated_at, tag,
+                    access_count, last_accessed_at
+             FROM memories WHERE id = ?1",
+            rusqlite::params![memory_id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                    r.get(10)?,
+                    r.get(11)?,
+                ))
+            },
+        );
+        match row {
+            Ok((
+                id,
+                scope_level,
+                kind_str,
+                type_str,
+                content,
+                importance,
+                trust_score,
+                created_at,
+                updated_at,
+                tag,
+                access_count,
+                accessed_at,
+            )) => {
+                let kind = super::super::kind::MemoryKind::from_str(&kind_str)
+                    .map_err(|e| anyhow!("invalid memory_kind '{kind_str}' on row {id}: {e}"))?;
+                Ok(Some(MemoryRow {
+                    id,
+                    scope_level,
+                    kind,
+                    memory_type: MemoryType::parse_str(&type_str),
+                    content,
+                    importance,
+                    trust_score,
+                    created_at,
+                    updated_at,
+                    tag,
+                    access_count,
+                    accessed_at,
+                }))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(anyhow!("reading memory row: {e}")),
+        }
+    }
+
     /// C1: locate a single row by its `tag` column and return the
     /// triple `(id, memory_kind, content)`. Used by the C1.5 panel to
     /// find history rows by their `history:<session>:<turn>` tag, and
@@ -309,10 +408,12 @@ impl MemoryStore {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         );
         match row {
-            Ok((id, kind_str, content)) => match super::super::kind::MemoryKind::from_str(&kind_str) {
-                Ok(kind) => Ok(Some((id, kind, content))),
-                Err(e) => Err(anyhow!("invalid memory_kind '{kind_str}': {e}")),
-            },
+            Ok((id, kind_str, content)) => {
+                match super::super::kind::MemoryKind::from_str(&kind_str) {
+                    Ok(kind) => Ok(Some((id, kind, content))),
+                    Err(e) => Err(anyhow!("invalid memory_kind '{kind_str}': {e}")),
+                }
+            }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(anyhow!("finding memory by tag: {e}")),
         }
@@ -420,11 +521,7 @@ impl MemoryStore {
     /// `scope_level`, so the simplest correct path is: read the row,
     /// delete it, re-insert at the new scope via `store_scoped`. Caller
     /// gets the new row id back.
-    pub async fn change_memory_scope(
-        &self,
-        memory_id: i64,
-        new_scope: &WriteScope,
-    ) -> Result<i64> {
+    pub async fn change_memory_scope(&self, memory_id: i64, new_scope: &WriteScope) -> Result<i64> {
         // Read the existing row (content + meta) — outside the write
         // lock because `store_scoped` acquires its own.
         let (content, memory_type, importance, trust_score, source_str, tag): (

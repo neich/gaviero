@@ -12,6 +12,8 @@ pub const TOOL_BLAST_RADIUS: &str = "blast_radius";
 pub const TOOL_NODE_DOC: &str = "node_doc";
 pub const TOOL_SYMBOL_SEARCH: &str = "symbol_search";
 pub const TOOL_SYMBOL_DOC: &str = "symbol_doc";
+pub const TOOL_REPO_OUTLINE: &str = "repo_outline";
+pub const TOOL_MEMORY_GET: &str = "memory_get";
 
 // ── memory_search ─────────────────────────────────────────────────
 
@@ -21,10 +23,12 @@ pub struct MemorySearchInput {
     /// Free-form natural-language query. Same shape as a chat prompt's
     /// retrieval query.
     pub query: String,
-    /// Optional scope filter (`"global"`, `"workspace"`, `"repo"`,
-    /// `"module"`, `"run"`). When omitted, retrieval merges the
-    /// workspace and global scopes via multi-scope hybrid search (RRF),
-    /// not a narrow→wide cascade.
+    /// Optional scope *restriction*. `"workspace"` searches only the
+    /// workspace store; `"global"` only the global store. When
+    /// omitted, retrieval merges both via multi-scope hybrid search
+    /// (RRF), not a narrow→wide cascade. `"repo"`, `"module"`, and
+    /// `"run"` need folder/run context the MCP surface does not carry
+    /// and produce an invalid_params error, as do unknown values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope_hint: Option<String>,
     /// Maximum results. Server clamps to [1, 20] to protect token
@@ -138,6 +142,99 @@ pub struct NodeDoc {
     pub purpose: String,
     #[serde(default)]
     pub summary: String,
+}
+
+// ── repo_outline ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
+pub struct RepoOutlineInput {
+    /// Seed paths for personalized PageRank (repo-relative, glob-aware
+    /// — same matching as agent `owned_paths`). Omitted or empty →
+    /// `["."]`, i.e. match-all: rank the whole workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_paths: Option<Vec<String>>,
+    /// Token budget for the outline. Server clamps to [100, 8000];
+    /// default 2000 to protect the calling subprocess's token budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_cap: Option<u32>,
+    /// Edge-weight intent: `"all"` (default), `"impact"`, `"callers"`,
+    /// `"tests"`, or `"implementations"` — mirrors `blast_radius.mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
+/// One ranked outline entry. `rendered` is byte-compatible with the
+/// corresponding line of the turn-1 `<repo_outline>` injection.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct RepoOutlineEntry {
+    pub path: String,
+    pub rank_score: f64,
+    pub specificity: f64,
+    pub rendered: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct RepoOutlineOutput {
+    pub entries: Vec<RepoOutlineEntry>,
+    /// Total estimated tokens across `entries` (outline-line cost, the
+    /// same budgeting the injector charges). Always ≤ the token cap.
+    pub token_estimate: u32,
+}
+
+pub const REPO_OUTLINE_MIN_TOKEN_CAP: u32 = 100;
+pub const REPO_OUTLINE_MAX_TOKEN_CAP: u32 = 8000;
+pub const REPO_OUTLINE_DEFAULT_TOKEN_CAP: u32 = 2000;
+
+/// Clamp `repo_outline.token_cap` to [100, 8000] (default 2000).
+pub fn clamp_repo_outline_token_cap(cap: Option<u32>) -> u32 {
+    cap.unwrap_or(REPO_OUTLINE_DEFAULT_TOKEN_CAP)
+        .clamp(REPO_OUTLINE_MIN_TOKEN_CAP, REPO_OUTLINE_MAX_TOKEN_CAP)
+}
+
+// ── memory_get ────────────────────────────────────────────────────
+
+/// Input schema for `memory_get`. `scope` is required because a bare
+/// id is ambiguous across the physical DBs (independent rowid spaces —
+/// the BUG-1 root cause); pass the `scope` string a `memory_search`
+/// result carries.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
+pub struct MemoryGetInput {
+    /// Row id from a `memory_search` result.
+    pub id: i64,
+    /// Owning scope, as returned by `memory_search`: `"global"` |
+    /// `"workspace"` | `"run"` (run rows live in the workspace store).
+    /// `"repo"` / `"module"` need folder context the MCP surface does
+    /// not carry and produce an invalid_params error.
+    pub scope: String,
+}
+
+/// Full memory row for one `memory_search` hit.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct MemoryGetRow {
+    pub id: i64,
+    pub scope: String,
+    /// Lifecycle class: `record` | `history` | `summary`.
+    pub kind: String,
+    #[serde(rename = "type")]
+    pub memory_type: String,
+    pub text: String,
+    pub importance: f32,
+    pub trust: f32,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    pub access_count: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accessed_at: Option<String>,
+}
+
+/// `memory` is `None` on an id/scope miss — a miss is an empty result,
+/// not an error.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct MemoryGetOutput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryGetRow>,
 }
 
 // ── symbol_search / symbol_doc (S2.3 / PR-3) ─────────────────────
@@ -346,20 +443,32 @@ mod tests {
         assert_eq!(TOOL_NODE_DOC, "node_doc");
         assert_eq!(TOOL_SYMBOL_SEARCH, "symbol_search");
         assert_eq!(TOOL_SYMBOL_DOC, "symbol_doc");
+        assert_eq!(TOOL_REPO_OUTLINE, "repo_outline");
+        assert_eq!(TOOL_MEMORY_GET, "memory_get");
         // C1.6: documented default kind is record.
         assert_eq!(MEMORY_SEARCH_DEFAULT_KIND, "record");
     }
 
     #[test]
+    fn repo_outline_token_cap_clamps() {
+        assert_eq!(
+            clamp_repo_outline_token_cap(None),
+            REPO_OUTLINE_DEFAULT_TOKEN_CAP
+        );
+        assert_eq!(
+            clamp_repo_outline_token_cap(Some(1)),
+            REPO_OUTLINE_MIN_TOKEN_CAP
+        );
+        assert_eq!(
+            clamp_repo_outline_token_cap(Some(999_999)),
+            REPO_OUTLINE_MAX_TOKEN_CAP
+        );
+    }
+
+    #[test]
     fn symbol_search_limit_clamps() {
-        assert_eq!(
-            clamp_symbol_search_limit(None),
-            SYMBOL_SEARCH_DEFAULT_LIMIT
-        );
+        assert_eq!(clamp_symbol_search_limit(None), SYMBOL_SEARCH_DEFAULT_LIMIT);
         assert_eq!(clamp_symbol_search_limit(Some(0)), SYMBOL_SEARCH_MIN_LIMIT);
-        assert_eq!(
-            clamp_symbol_search_limit(Some(99)),
-            SYMBOL_SEARCH_MAX_LIMIT
-        );
+        assert_eq!(clamp_symbol_search_limit(Some(99)), SYMBOL_SEARCH_MAX_LIMIT);
     }
 }

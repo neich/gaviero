@@ -72,6 +72,7 @@ async fn user_remember_round_trip_through_writer_task() {
         // Single-folder workspace: folder == workspace_root, so the
         // Repo-scope cascade resolves to the same physical store.
         scope: MemoryScope::from_context(&repo, Some(&repo), None, None),
+        level_restriction: None,
     };
     let hits = target_store
         .search_scoped(&cfg)

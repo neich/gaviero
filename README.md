@@ -169,7 +169,7 @@ You can also define work units manually:
 
 ### Semantic memory
 
-Agents can store and retrieve knowledge across sessions. Memory is backed by ONNX embeddings (`gte-modernbert-base`, 768-dim) and SQLite, organized in a five-level scope hierarchy:
+Agents can store and retrieve knowledge across sessions. Memory is backed by ONNX embeddings (`nomic-embed-text-v1.5` by default, 768-dim; `gte-modernbert-base`, `jina-embeddings-v2-base-code`, and `e5-small-v2` selectable via `memory.embedder.model`, plus a `dual:<a>,<b>` A/B mode) and SQLite, organized in a five-level scope hierarchy:
 
 ```
 global        personal cross-workspace knowledge

@@ -264,7 +264,10 @@ struct Cli {
     /// `gte-modernbert` wipes the workspace DB, seeds the fixture's
     /// `gold_must` File paths, and scores at `run` scope. Restores the
     /// backup afterward. Report-only — does not flip defaults.
-    #[arg(long = "eval-embedder-ablation", conflicts_with = "eval_update_baseline")]
+    #[arg(
+        long = "eval-embedder-ablation",
+        conflicts_with = "eval_update_baseline"
+    )]
     eval_embedder_ablation: bool,
 
     /// Tier B / T0 rescore mode: replay the fixture against the most
@@ -730,7 +733,11 @@ fn cli_repo_is_default(cli: &Cli) -> bool {
 }
 
 /// Resolve a path from `--var` before the workspace root is finalised.
-fn resolve_host_path_early(cwd: &std::path::Path, repo: &std::path::Path, value: &str) -> Option<std::path::PathBuf> {
+fn resolve_host_path_early(
+    cwd: &std::path::Path,
+    repo: &std::path::Path,
+    value: &str,
+) -> Option<std::path::PathBuf> {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.ends_with('/') {
         return None;
@@ -788,10 +795,7 @@ fn prepare_swarm_workspace(
 
     if cli.script.is_none() {
         return Ok(SwarmWorkspacePrep {
-            repo_path: cli
-                .workspace
-                .clone()
-                .unwrap_or_else(|| cli.repo.clone()),
+            repo_path: cli.workspace.clone().unwrap_or_else(|| cli.repo.clone()),
             override_vars: None,
         });
     }
@@ -809,18 +813,12 @@ fn prepare_swarm_workspace(
     }
 
     let mut vars = parse_var_overrides(&cli.vars)?;
-    let mut repo_path = cli
-        .workspace
-        .clone()
-        .unwrap_or_else(|| cli.repo.clone());
+    let mut repo_path = cli.workspace.clone().unwrap_or_else(|| cli.repo.clone());
 
     if execution_mode == ExecutionMode::Document {
         if let Some(ws) = &cli.workspace {
             repo_path = ws.clone();
-            eprintln!(
-                "[execution] document workspace: {}",
-                repo_path.display()
-            );
+            eprintln!("[execution] document workspace: {}", repo_path.display());
         } else if let Some(plan_value) = vars
             .iter()
             .find(|(k, _)| k == "PLAN_FILE")
@@ -868,7 +866,11 @@ fn prepare_swarm_workspace(
     }
 
     if execution_mode == ExecutionMode::Document {
-        if let Some(out) = vars.iter().find(|(k, _)| k == "OUT_DIR").map(|(_, v)| v.as_str()) {
+        if let Some(out) = vars
+            .iter()
+            .find(|(k, _)| k == "OUT_DIR")
+            .map(|(_, v)| v.as_str())
+        {
             eprintln!("[execution] OUT_DIR={out} (versioned artefacts; not for commit)");
         }
     }
@@ -1074,7 +1076,10 @@ fn prepare_mcp_for_swarm(
     cli: &Cli,
     script_vars: &[(String, String)],
     memory: &Option<Arc<gaviero_core::memory::MemoryStores>>,
-) -> Result<(Option<gaviero_core::mcp::McpConfigSynth>, Option<gaviero_core::mcp::McpServerHandle>)> {
+) -> Result<(
+    Option<gaviero_core::mcp::McpConfigSynth>,
+    Option<gaviero_core::mcp::McpServerHandle>,
+)> {
     use std::sync::Arc;
 
     use gaviero_core::mcp::{
@@ -1092,13 +1097,19 @@ fn prepare_mcp_for_swarm(
             .extra_urls
             .push((name, normalize_remote_mcp_url(&url)));
     }
-    if memory.is_none() {
-        overrides.gaviero_enabled = Some(false);
-    }
     let endpoint = gaviero_core::mcp::McpEndpoint::for_workspace(repo);
     let synth = resolve_mcp_config_synth(workspace, repo, endpoint, &overrides);
     if !synth.enabled {
         return Ok((None, None));
+    }
+    // F3: memory being unavailable used to silently disable the gaviero
+    // MCP server, downgrading every headless agent below the runtime
+    // parity contract. Loud error instead; --no-mcp is the opt-out.
+    if synth.gaviero_enabled && memory.is_none() {
+        anyhow::bail!(
+            "gaviero MCP is enabled but memory stores are unavailable — fix memory \
+             initialization (see earlier [memory] errors) or pass --no-mcp"
+        );
     }
 
     if !cli.skip_mcp_preflight {
@@ -1112,6 +1123,45 @@ fn prepare_mcp_for_swarm(
             let rerank_cfg = workspace.resolve_rerank_config(Some(repo));
             let specificity = workspace.resolve_specificity_config(Some(repo));
             let edge_weights = workspace.resolve_all_edge_weights(Some(repo));
+            // OD-9 (F4 parity): build the cross-encoder reranker exactly as
+            // the TUI does so headless memory_search ranks identically
+            // (memory.reranker.enabled defaults to true). Model load is
+            // blocking ONNX (+ first-run download) → block_in_place.
+            // A missing/broken model degrades to composite-only, but
+            // loudly — silence was the OD-9 violation.
+            let reranker = if rerank_cfg.enabled {
+                let model_name = workspace
+                    .resolve_setting(
+                        gaviero_core::workspace::settings::MEMORY_RERANKER_MODEL,
+                        Some(repo),
+                    )
+                    .as_str()
+                    .unwrap_or("none")
+                    .to_string();
+                let threads = rerank_cfg.threads;
+                let model_for_load = model_name.clone();
+                match tokio::task::block_in_place(|| {
+                    gaviero_core::memory::build_reranker(&model_for_load, threads)
+                }) {
+                    Ok(Some(rr)) => Some(rr),
+                    Ok(None) => {
+                        eprintln!(
+                            "[mcp] reranker model {model_name:?} resolved to none — \
+                             memory_search runs composite-only this session"
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[mcp] reranker model {model_name:?} failed to load ({e}) — \
+                             memory_search runs composite-only this session"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let server = GavieroMcpServer::new(
                 stores.clone(),
                 repo.to_path_buf(),
@@ -1121,7 +1171,7 @@ fn prepare_mcp_for_swarm(
                 Arc::new(NdjsonTelemetrySink::for_workspace(repo)),
                 retrieval_cfg,
                 rerank_cfg,
-                None,
+                reranker,
             )
             .with_specificity(specificity)
             .with_edge_weights(edge_weights)
@@ -1135,9 +1185,9 @@ fn prepare_mcp_for_swarm(
                     .as_bool()
                     .unwrap_or(false),
             );
-            // Phase 1: warm the blast_radius graph cache in the
-            // background so the first agent tool call doesn't pay the
-            // cold build. (No reranker in the CLI path → graph only.)
+            // Phase 1: warm the graph cache, repo-map cache, and (when
+            // configured) the reranker in the background so the first
+            // agent tool call doesn't pay a cold start.
             let warm = server.clone();
             tokio::spawn(async move { warm.warmup().await });
             let h = spawn_mcp_server(server, &synth.endpoint)
@@ -1252,11 +1302,7 @@ fn print_manifests(rows: &[gaviero_core::memory::store::InjectionManifestRow]) {
 /// `scope` is one of `run | module | repo | workspace | global`. The
 /// CLI defaults to `repo` (the plan's recommended default — Run-scoped
 /// writes die with the session, which is wrong for `/remember`).
-async fn run_remember_cli(
-    repo: &std::path::Path,
-    text: &str,
-    scope: &str,
-) -> Result<()> {
+async fn run_remember_cli(repo: &std::path::Path, text: &str, scope: &str) -> Result<()> {
     use gaviero_core::memory::scope::WriteScope;
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -1276,9 +1322,7 @@ async fn run_remember_cli(
             "--remember-scope {other} requires session/file context only the TUI supplies; \
              use the `/remember-here` or `/remember-module` chat commands instead",
         ),
-        other => anyhow::bail!(
-            "--remember-scope: expected repo|workspace|global, got {other}"
-        ),
+        other => anyhow::bail!("--remember-scope: expected repo|workspace|global, got {other}"),
     };
 
     let repo_buf = repo.to_path_buf();
@@ -1475,9 +1519,7 @@ fn parse_restore_since_window(spec: &str) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("missing count"))?
         .parse()
         .map_err(|_| anyhow::anyhow!("count must be a positive integer"))?;
-    let unit_raw = it
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("missing unit"))?;
+    let unit_raw = it.next().ok_or_else(|| anyhow::anyhow!("missing unit"))?;
     let unit = match unit_raw.trim_end_matches('s') {
         "minute" | "min" => "minutes",
         "hour" | "hr" => "hours",
@@ -1844,8 +1886,7 @@ async fn run_seed_corpus_from_paths(
 
     // Collect the set of file paths from every case's gold_must File
     // entries. Dedupe so a path referenced by N cases yields one row.
-    let mut paths: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
+    let mut paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for case in &cases {
         for r in &case.gold_must {
             if let GoldRef::File(p) = r {
@@ -1880,11 +1921,7 @@ async fn run_seed_corpus_from_paths(
         fn on_write_enqueued(&self, _kind: &str) {
             self.enqueued.fetch_add(1, Ordering::Relaxed);
         }
-        fn on_write_committed(
-            &self,
-            _kind: &str,
-            _result: &gaviero_core::memory::WriteResult,
-        ) {
+        fn on_write_committed(&self, _kind: &str, _result: &gaviero_core::memory::WriteResult) {
             self.committed.fetch_add(1, Ordering::Relaxed);
         }
         fn on_write_failed(&self, kind: &str, error: &str) {
@@ -1937,10 +1974,7 @@ async fn run_seed_corpus_from_paths(
                 continue;
             }
         };
-        let ext = abs
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = abs.extension().and_then(|e| e.to_str()).unwrap_or("");
         if ext.is_empty() {
             skipped_unsupported += 1;
             continue;
@@ -1983,9 +2017,7 @@ async fn run_seed_corpus_from_paths(
         enqueued_local += 1;
     }
 
-    eprintln!(
-        "[gaviero-seed] enqueued {enqueued_local} writes; draining writer task…"
-    );
+    eprintln!("[gaviero-seed] enqueued {enqueued_local} writes; draining writer task…");
 
     // Drain: loop until queue_depth == 0 AND committed+failed >= enqueued.
     let drain_timeout = Duration::from_secs(120);
@@ -2062,8 +2094,8 @@ async fn run_eval_scope_matrix(
     fixture: &PathBuf,
     scopes_csv: &str,
 ) -> Result<()> {
-    use gaviero_core::memory::eval::{load_fixture, run_scope_matrix};
     use gaviero_core::memory::MemoryScope;
+    use gaviero_core::memory::eval::{load_fixture, run_scope_matrix};
     use gaviero_core::memory::hash_path;
 
     let cases = load_fixture(fixture).context("loading eval fixture")?;
@@ -2154,7 +2186,9 @@ fn backup_memory_db(repo: &std::path::Path) -> Result<MemoryDbBackup> {
     let read = |name: &str| -> Result<Option<Vec<u8>>> {
         let p = dir.join(name);
         if p.exists() {
-            Ok(Some(std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?))
+            Ok(Some(
+                std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?,
+            ))
         } else {
             Ok(None)
         }
@@ -2171,8 +2205,7 @@ fn remove_memory_db(repo: &std::path::Path) -> Result<()> {
     for name in ["memory.db", "memory.db-wal", "memory.db-shm"] {
         let p = dir.join(name);
         if p.exists() {
-            std::fs::remove_file(&p)
-                .with_context(|| format!("removing {}", p.display()))?;
+            std::fs::remove_file(&p).with_context(|| format!("removing {}", p.display()))?;
         }
     }
     Ok(())
@@ -2184,8 +2217,7 @@ fn restore_memory_db(repo: &std::path::Path, backup: &MemoryDbBackup) -> Result<
     std::fs::create_dir_all(&dir)?;
     let write = |name: &str, bytes: &Option<Vec<u8>>| -> Result<()> {
         if let Some(b) = bytes {
-            std::fs::write(dir.join(name), b)
-                .with_context(|| format!("restoring {name}"))?;
+            std::fs::write(dir.join(name), b).with_context(|| format!("restoring {name}"))?;
         }
         Ok(())
     };
@@ -2427,7 +2459,9 @@ fn percentiles_ms(mut samples: Vec<f64>) -> (f64, f64, f64) {
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = samples.len();
     let pct = |q: f64| -> f64 {
-        let idx = ((q * n as f64).ceil() as usize).saturating_sub(1).min(n - 1);
+        let idx = ((q * n as f64).ceil() as usize)
+            .saturating_sub(1)
+            .min(n - 1);
         samples[idx]
     };
     let mean = samples.iter().sum::<f64>() / n as f64;
@@ -2637,9 +2671,7 @@ async fn run_eval_budget_sweep(repo: &std::path::Path, fixture: &PathBuf, cli: &
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "minilm".to_string());
         let threads = rerank_cfg.threads;
-        eprintln!(
-            "[gaviero-eval] loading reranker `{model_name}` for chat-path sweep…"
-        );
+        eprintln!("[gaviero-eval] loading reranker `{model_name}` for chat-path sweep…");
         let built = tokio::task::spawn_blocking(move || build_reranker(&model_name, threads))
             .await
             .context("loading reranker (budget sweep)")??;
@@ -2653,9 +2685,7 @@ async fn run_eval_budget_sweep(repo: &std::path::Path, fixture: &PathBuf, cli: &
         }
     }
 
-    eprintln!(
-        "[gaviero-eval] building RepoMap for graph budget sweep (may take a minute)…"
-    );
+    eprintln!("[gaviero-eval] building RepoMap for graph budget sweep (may take a minute)…");
     let repo_map = tokio::task::spawn_blocking({
         let repo = repo.to_path_buf();
         let excludes = excludes.clone();
@@ -2744,7 +2774,16 @@ fn print_s13_budget_sweep_report(r: &gaviero_core::memory::eval::S13BudgetSweepR
     println!("graphBudgetTokens sweep (repo outline):");
     println!(
         "  {:>9}  {:>10}  {:>6}  {:>6}  {:>6}  {:>6}  {:>10}  {:>7}  {:>9}  {:>7}",
-        "budget", "outline", "files", "path", "sig", "full", "turn1_tok", "rec@5", "cover", "pass@1"
+        "budget",
+        "outline",
+        "files",
+        "path",
+        "sig",
+        "full",
+        "turn1_tok",
+        "rec@5",
+        "cover",
+        "pass@1"
     );
     for row in &r.graph_budget_sweep {
         let pass_at_1 = row
@@ -2774,7 +2813,11 @@ fn print_s13_budget_sweep_report(r: &gaviero_core::memory::eval::S13BudgetSweepR
 
 /// PUSH→PULL Phase 1: seeded thin-anchor vs full-push A/B. Offline — builds
 /// only the RepoMap (no store / reranker / embedder).
-async fn run_eval_anchor_ab(repo: &std::path::Path, fixture: &std::path::Path, cli: &Cli) -> Result<()> {
+async fn run_eval_anchor_ab(
+    repo: &std::path::Path,
+    fixture: &std::path::Path,
+    cli: &Cli,
+) -> Result<()> {
     use gaviero_core::memory::eval::{load_fixture, run_anchor_ab};
     use gaviero_core::repo_map::RepoMap;
     use gaviero_core::workspace::settings;
@@ -2842,7 +2885,10 @@ fn print_anchor_ab_report(r: &gaviero_core::memory::eval::AnchorAbReport) {
         "A = anchor {} tok   B = push {} tok   margin {:.3}",
         r.budget_a, r.budget_b, r.margin
     );
-    println!("cases   : {} ({} seeds resolved)", r.n_cases, r.n_seeds_resolved);
+    println!(
+        "cases   : {} ({} seeds resolved)",
+        r.n_cases, r.n_seeds_resolved
+    );
     println!();
     println!("headline coverage (files + symbols, all cases):");
     println!(
@@ -2932,7 +2978,11 @@ fn run_mcp_stats(repo: &std::path::Path, path_override: Option<&std::path::Path>
         return Ok(());
     }
     let total: usize = stats.iter().map(|s| s.calls).sum();
-    println!("MCP tool-call stats — {} call(s) at {}", total, path.display());
+    println!(
+        "MCP tool-call stats — {} call(s) at {}",
+        total,
+        path.display()
+    );
     println!(
         "{:<16} {:>6} {:>10} {:>10} {:>8} {:>8}",
         "tool", "calls", "p50(ms)", "p95(ms)", "err%", "empty%"
@@ -3014,8 +3064,12 @@ async fn main() -> Result<()> {
         .transpose()?
         .unwrap_or(gaviero_core::swarm::plan::ExecutionMode::Repo);
     let swarm_workspace = prepare_swarm_workspace(&cli, &cwd, script_execution_mode)?;
-    let repo = std::fs::canonicalize(&swarm_workspace.repo_path)
-        .with_context(|| format!("resolving repo path: {}", swarm_workspace.repo_path.display()))?;
+    let repo = std::fs::canonicalize(&swarm_workspace.repo_path).with_context(|| {
+        format!(
+            "resolving repo path: {}",
+            swarm_workspace.repo_path.display()
+        )
+    })?;
 
     // ── KB-efficiency Phase 1: MCP telemetry report ──────────────
     // A pure read of the NDJSON sink. Placed before the C1 migration
@@ -3031,14 +3085,11 @@ async fn main() -> Result<()> {
     // migration on first run.
     {
         let workspace = gaviero_core::workspace::Workspace::single_folder(repo.clone());
-        let pending = gaviero_core::memory::MemoryStores::probe_pending_c1_migrations(
-            &repo, &workspace,
-        )
-        .context("probing for pending C1 typed-stores migration")?;
+        let pending =
+            gaviero_core::memory::MemoryStores::probe_pending_c1_migrations(&repo, &workspace)
+                .context("probing for pending C1 typed-stores migration")?;
         if !pending.is_empty() && !cli.accept_c1_migration {
-            eprintln!(
-                "Gaviero's memory schema requires a one-time typed-stores upgrade (C1)."
-            );
+            eprintln!("Gaviero's memory schema requires a one-time typed-stores upgrade (C1).");
             eprintln!("Affected databases:");
             for p in &pending {
                 eprintln!(
@@ -3225,7 +3276,10 @@ async fn main() -> Result<()> {
             .context("cleaning up gaviero/* branches")?;
 
         if report.matched.is_empty() {
-            eprintln!("[cleanup] no gaviero/* branches found in {}", repo.display());
+            eprintln!(
+                "[cleanup] no gaviero/* branches found in {}",
+                repo.display()
+            );
             return Ok(());
         }
 
@@ -3294,10 +3348,7 @@ async fn main() -> Result<()> {
             eprintln!("  symbols written:  {}", enrich_result.symbols_written);
             eprintln!("  unmatched:        {}", enrich_result.symbols_unmatched);
             eprintln!("  skipped (hash):   {}", enrich_result.symbols_skipped_hash);
-            eprintln!(
-                "  symbol_docs rows: {}",
-                store.symbol_doc_count()?
-            );
+            eprintln!("  symbol_docs rows: {}", store.symbol_doc_count()?);
             if !enrich_result.rustdoc_failures.is_empty() {
                 eprintln!("  rustdoc failures:");
                 for f in &enrich_result.rustdoc_failures {
@@ -3550,10 +3601,7 @@ async fn main() -> Result<()> {
     }
 
     // MCP: synthesize per-worktree provider configs + optional in-process server.
-    let mcp_script_vars = swarm_workspace
-        .override_vars
-        .as_deref()
-        .unwrap_or(&[]);
+    let mcp_script_vars = swarm_workspace.override_vars.as_deref().unwrap_or(&[]);
     let (mcp_config, _mcp_server_guard) =
         prepare_mcp_for_swarm(&repo, &workspace, &cli, mcp_script_vars, &memory)?;
     if let Some(ref synth) = mcp_config {
@@ -3832,7 +3880,9 @@ fn build_swarm_extractor_writer(
     ) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("[memory] swarm-finding extractor disabled (backend `{extractor_model}`: {e})");
+            eprintln!(
+                "[memory] swarm-finding extractor disabled (backend `{extractor_model}`: {e})"
+            );
             return None;
         }
     };
@@ -3991,11 +4041,15 @@ mod tests {
         );
         let vars = prep.override_vars.unwrap();
         assert_eq!(
-            vars.iter().find(|(k, _)| k == "OUT_DIR").map(|(_, v)| v.as_str()),
+            vars.iter()
+                .find(|(k, _)| k == "OUT_DIR")
+                .map(|(_, v)| v.as_str()),
             Some(".")
         );
         assert_eq!(
-            vars.iter().find(|(k, _)| k == "PLAN_FILE").map(|(_, v)| v.as_str()),
+            vars.iter()
+                .find(|(k, _)| k == "PLAN_FILE")
+                .map(|(_, v)| v.as_str()),
             Some("draft.md")
         );
     }
@@ -4065,14 +4119,9 @@ mod tests {
 
     #[test]
     fn cli_rejects_prompt_without_script() {
-        let err = Cli::try_parse_from([
-            "gaviero-cli",
-            "--task",
-            "fix it",
-            "--prompt",
-            "Short topic",
-        ])
-        .unwrap_err();
+        let err =
+            Cli::try_parse_from(["gaviero-cli", "--task", "fix it", "--prompt", "Short topic"])
+                .unwrap_err();
         assert!(err.to_string().contains("--prompt"));
     }
 

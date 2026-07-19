@@ -106,7 +106,7 @@ gaviero-core/src/
 │  │  └─ manifest.rs     injection_manifests row writer (S4)
 │  ├─ embedder.rs        Embedder trait, NullEmbedder, DualEmbedder
 │  ├─ onnx_embedder.rs   OnnxEmbedder (ort 2.0 + tokenizers, mean pool + L2)
-│  ├─ model_manager.rs   resolve_embedder_model + cache (gte-modernbert default)
+│  ├─ model_manager.rs   resolve_embedder_model + cache (nomic default)
 │  ├─ reranker.rs        Optional cross-encoder; sigmoid_calibrate, blend_rerank
 │  ├─ retrieval.rs       retrieve_ranked / retrieve_for_chat — single funnel
 │  ├─ writer.rs          spawn_writer_task, WriterHandle, WriterMessage,
@@ -247,7 +247,7 @@ A directly-opened single directory collapses workspace and folder to one file. F
 
 ### 4.2 Embedder
 
-`Embedder` trait + [`model_manager::resolve_embedder_model`](src/memory/model_manager.rs). Default `gte-modernbert-base` (768 dim, mean-pool + L2 norm); legacy `nomic-embed-text-v1.5` selectable via `GAVIERO_EMBEDDER_MODEL` or `memory.embedder.model`. `e5-small-v2` and `null` available; `dual:<a>,<b>` runs an A/B comparison logged to `memory_embedder_ab`. The `api-embedders` Cargo feature reserves a hosted-API embedder surface but currently exposes a `NotImplemented` placeholder.
+`Embedder` trait + [`model_manager::resolve_embedder_model`](src/memory/model_manager.rs). Default `nomic-embed-text-v1.5` (768 dim, mean-pool + L2 norm); `gte-modernbert-base` and `jina-embeddings-v2-base-code` selectable via `GAVIERO_EMBEDDER_MODEL` or `memory.embedder.model`. `e5-small-v2` and `null` available; `dual:<a>,<b>` runs an A/B comparison logged to `memory_embedder_ab`. The `api-embedders` Cargo feature reserves a hosted-API embedder surface but currently exposes a `NotImplemented` placeholder.
 
 ### 4.3 Writes (single-consumer)
 
@@ -371,13 +371,17 @@ The planner is the single owner of memory queries, graph selection, replay, and 
 
 Listens on the workspace `McpEndpoint` (Unix socket / Windows named pipe). Subprocess agents reach it through the [`gaviero-mcp-shim`](../gaviero-mcp-shim) binary (stdio↔socket bridge), declared as their MCP server in synthesized per-worktree configs.
 
-**Three read-only tools:**
+**Seven read-only tools** (`symbol_search` / `symbol_doc` gated by `repoMap.symbolEnrichment.enabled`, default false):
 
 | Tool | Backed by | Output |
 |---|---|---|
-| `memory_search(query, scope_hint?, limit?)` | `retrieve_ranked` (same path as chat injection) | `Vec<MemorySearchResult>` |
+| `memory_search(query, scope_hint?, limit?, kind?)` | `retrieve_ranked` (same path as chat injection); `scope_hint` restricts to `workspace` \| `global` | `Vec<MemorySearchResult>` |
+| `memory_get(id, scope)` | `get_memory_row` on the owning store (scope names the store — ids are per-DB) | `MemoryGetOutput` (full row; miss = empty) |
 | `blast_radius(paths, depth?, mode?)` | `RepoMap` typed graph + mode-weighted PageRank + C3 specificity + C4 edge-weight overrides | `Vec<BlastRadiusRelation>` |
 | `node_doc(path)` | Tier D1 schema stub | `NodeDoc` (signatures today; `purpose` empty pending D1) |
+| `repo_outline(seed_paths?, token_cap?, mode?)` | cached `RepoMap` + `rank_for_agent_structured_with_mode` (same renderer as the turn-1 `<repo_outline>` injection; cap clamped to [100, 8000], default 2000) | `RepoOutlineOutput` |
+| `symbol_search(query, limit?)` | enriched `symbol_docs` sidecar (`gaviero-cli --graph --enrich`) | `Vec<SymbolSearchHit>` |
+| `symbol_doc(qualified_name)` | enriched `symbol_docs` sidecar + `Implements` edges | `SymbolDocOutput` |
 
 **Read-only invariant.** [`GavieroMcpServer`](src/mcp/server.rs) carries `Arc<MemoryStores>` + a graph cache, but **no `WriterHandle`** — `memory_store` / `_update` / `_delete` cannot exist. Writes flow through the S2 writer task (transcripts + annotations) only.
 

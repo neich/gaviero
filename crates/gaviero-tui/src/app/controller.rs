@@ -334,9 +334,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                         // used at dispatch time, else the workspace primary.
                         // Reads (planner) and writes (here) must hash the
                         // same path so they land in the same per-folder DB.
-                        let scope_root = focused_folder
-                            .as_ref()
-                            .unwrap_or(&workspace_root);
+                        let scope_root = focused_folder.as_ref().unwrap_or(&workspace_root);
                         let repo_id = gaviero_core::memory::hash_path(scope_root);
                         let extractor_enabled = app
                             .workspace
@@ -532,9 +530,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 }
                 if let Some(ref mut ledger) = conv.session_ledger {
                     ledger.record_continuity_handle(
-                        gaviero_core::context_planner::ContinuityHandle::CursorThreadId(
-                            session_id,
-                        ),
+                        gaviero_core::context_planner::ContinuityHandle::CursorThreadId(session_id),
                     );
                     if !resume_failed {
                         ledger.record_resume_success();
@@ -735,8 +731,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             path,
             pre_turn_content,
         } => {
-            app.pending_tool_agent_edits
-                .insert(path, pre_turn_content);
+            app.pending_tool_agent_edits.insert(path, pre_turn_content);
         }
         Event::ToolAgentEditsPending { conv_id: _, edits } => {
             for edit in &edits {
@@ -796,15 +791,12 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             } else if proposal_count == 0 {
                 format!("Agent finished ({model}) — no file changes")
             } else {
-                format!(
-                    "Agent finished ({model}) — {proposal_count} file(s) to review"
-                )
+                format!("Agent finished ({model}) — {proposal_count} file(s) to review")
             };
 
             if config.enabled {
                 if config.status_bar {
-                    app.agent_finish_banner =
-                        Some((body.clone(), std::time::Instant::now()));
+                    app.agent_finish_banner = Some((body.clone(), std::time::Instant::now()));
                 }
                 crate::notify::notify_agent_finished(
                     &config,
@@ -1072,9 +1064,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 // Resolve the full rerank config (pool / blend / latency /
                 // threads) from settings; `enabled` is already true on this
                 // branch. Threads drive the ONNX session's intra-op width.
-                let cfg = app
-                    .workspace
-                    .resolve_rerank_config(Some(&workspace_root));
+                let cfg = app.workspace.resolve_rerank_config(Some(&workspace_root));
                 let threads = cfg.threads;
                 let model_for_load = model_name.clone();
                 match tokio::task::block_in_place(|| {
@@ -1284,11 +1274,9 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                         std::sync::Arc::new(super::observers::TuiMcpObserver {
                             tx: app.event_tx.clone(),
                         }),
-                        std::sync::Arc::new(
-                            gaviero_core::mcp::NdjsonTelemetrySink::for_workspace(
-                                &workspace_root_for_mcp,
-                            ),
-                        ),
+                        std::sync::Arc::new(gaviero_core::mcp::NdjsonTelemetrySink::for_workspace(
+                            &workspace_root_for_mcp,
+                        )),
                     ]));
                 let server = gaviero_core::mcp::GavieroMcpServer::new(
                     stores.clone(),
@@ -1357,11 +1345,20 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                         }
                     }
                     Err(e) => {
+                        // C9: keep the session alive (prompt-time injection
+                        // still works) but surface the degradation in chat —
+                        // the violation was the silence, not the survival.
                         tracing::warn!(
                             target: "mcp_server",
                             error = %e,
                             "mcp server failed to start — falling back to prompt-time injection only"
                         );
+                        app.chat_state.add_system_message(&format!(
+                            "MCP server failed to start ({e}). Subprocess agents lose the \
+                             gaviero MCP tools (memory_search, blast_radius, …) this session; \
+                             prompt-time context injection still applies. Check the endpoint \
+                             (socket/pipe) and restart gaviero to retry."
+                        ));
                     }
                 }
                 if let Some(summary) = disabled_external_summary {
@@ -1435,16 +1432,14 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
         {
             match action {
                 Action::PageUp => {
-                    app.chat_state.scroll_offset =
-                        app.chat_state.scroll_offset.saturating_sub(20);
+                    app.chat_state.scroll_offset = app.chat_state.scroll_offset.saturating_sub(20);
                     if app.chat_state.active_conv_streaming() {
                         app.chat_state.user_scrolled_during_stream = true;
                     }
                     return;
                 }
                 Action::PageDown => {
-                    app.chat_state.scroll_offset =
-                        app.chat_state.scroll_offset.saturating_add(20);
+                    app.chat_state.scroll_offset = app.chat_state.scroll_offset.saturating_add(20);
                     if app.chat_state.active_conv_streaming() {
                         app.chat_state.user_scrolled_during_stream = true;
                     }
