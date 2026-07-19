@@ -137,7 +137,11 @@ pub mod settings {
     /// Manual refresh: `gaviero-cli --graph --enrich` (never workspace-open).
     pub const REPO_MAP_SYMBOL_ENRICHMENT_ENABLED: &str = "repoMap.symbolEnrichment.enabled";
     /// S2.2 — embedder for symbol vectors. `"inherit"` uses the active memory
-    /// embedder; otherwise a `memory.embedder.model` alias (`nomic`, etc.).
+    /// embedder; otherwise a `memory.embedder.model` alias. Default
+    /// `"jina-code"` per the G2 / OD-2 bench (best top-5 ranking + fastest
+    /// CPU embeds on the code corpus); memory keeps `nomic`. Sidecars are
+    /// stamped with their embedder — after changing this, re-run
+    /// `gaviero-cli --graph --enrich` or `symbol_search` errors loudly.
     pub const REPO_MAP_EMBEDDER_MODEL: &str = "repoMap.embedder.model";
     /// C4: per-intent edge weight overrides. Keyed by intent name
     /// (`"impact"`, `"callers"`, `"tests"`, `"implementations"`,
@@ -965,10 +969,14 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::AGENT_MODEL => serde_json::json!("claude:sonnet"),
         settings::AGENT_EFFORT => serde_json::json!("off"),
         settings::AGENT_MAX_TOKENS => serde_json::json!(16384),
-        // 8000 (was 12000): the per-file outline downgrade (repo_map/mod.rs)
-        // makes files lose detail rather than drop, so a smaller outline
-        // budget cuts first-turn tokens while keeping breadth.
-        settings::AGENT_GRAPH_BUDGET_TOKENS => serde_json::json!(8000),
+        // 4000 (was 8000, was 12000): PR-8 / G3 of v2 §8, backed by the
+        // T1 task-success A/B (2026-07-19, claude:sonnet, 5 tasks × 3
+        // runs): success 66.7%±11.5 @4000 vs 46.7%±11.5 @8000 with no
+        // per-task regression and no MCP-call inflation — the leaner
+        // outline outperformed, not just held. Per-workspace override:
+        // `agent.graphBudgetTokens`. Do not lower further without a new
+        // A/B (G3 revert rule: any success drop beyond variance → 8000).
+        settings::AGENT_GRAPH_BUDGET_TOKENS => serde_json::json!(4000),
         // PUSH→PULL Phase 1: thin first-turn outline for strong providers.
         settings::AGENT_ANCHOR_BUDGET_TOKENS => serde_json::json!(1200),
         // PUSH→PULL Phase 4: empty = derive the tier from provider capabilities.
@@ -1040,7 +1048,10 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::REPO_MAP_SPECIFICITY_STOP_SYMBOL_THRESHOLD => serde_json::json!(0.5),
         settings::REPO_MAP_TYPED_EDGES_ENABLED => serde_json::json!(true),
         settings::REPO_MAP_SYMBOL_ENRICHMENT_ENABLED => serde_json::json!(false),
-        settings::REPO_MAP_EMBEDDER_MODEL => serde_json::json!("inherit"),
+        // G2 / OD-2 (2026-07-19): symbol vectors default to the
+        // code-specialized embedder (ndcg@5 +0.093 vs nomic, ~25%
+        // faster CPU embeds on the PR-6 corpus); memory stays `nomic`.
+        settings::REPO_MAP_EMBEDDER_MODEL => serde_json::json!("jina-code"),
 
         // Merged multi-scope retrieval (B3).
         // "merged" → no 0.70 early-exit, every scope flows into one

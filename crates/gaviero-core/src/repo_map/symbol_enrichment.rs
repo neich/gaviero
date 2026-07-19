@@ -57,6 +57,10 @@ pub async fn enrich_graph(
         let built = tokio::task::spawn_blocking(move || build_embedder_by_name(&name))
             .await
             .context("spawn embedder for symbol enrichment")??;
+        // G2 / OD-2: stamp the sidecar with the model that produced its
+        // vectors so the `symbol_search` query path can refuse a
+        // cross-model cosine (garbage results) with a re-enrich remedy.
+        store.set_graph_meta("symbol_embedder", built.name())?;
         Some(built)
     } else {
         None
@@ -67,9 +71,7 @@ pub async fn enrich_graph(
         match enrich_crate(store, &workspace, &package, &embedder, &mut result).await {
             Ok(()) => result.crates_processed += 1,
             Err(e) => {
-                result
-                    .rustdoc_failures
-                    .push(format!("{package}: {e:#}"));
+                result.rustdoc_failures.push(format!("{package}: {e:#}"));
             }
         }
     }
