@@ -2531,6 +2531,26 @@ impl AgentChatState {
             _ => ChatRole::System,
         };
 
+        if chat_role == ChatRole::Assistant {
+            if let Some(last) = self
+                .messages_mut()
+                .iter_mut()
+                .rev()
+                .find(|m| m.role == ChatRole::Assistant)
+            {
+                last.content = content.to_string();
+                return;
+            }
+            if !content.is_empty() {
+                self.messages_mut().push(ChatMessage {
+                    role: chat_role,
+                    content: content.to_string(),
+                    tool_calls: Vec::new(),
+                });
+            }
+            return;
+        }
+
         // If the last message matches, just update its content
         if let Some(last) = self.messages_mut().last_mut() {
             if last.role == chat_role {
@@ -2674,6 +2694,32 @@ impl AgentChatState {
 
         let clean = crate::widgets::render_utils::strip_ansi(content);
         let msgs = &mut self.conversations[idx].messages;
+
+        // Assistant finalize must rewrite the last Assistant bubble even when
+        // a System message was appended after streaming (disk-drift warnings,
+        // etc.). Otherwise the streamed text — including a visible
+        // `<turn_annotations>` sidecar — stays on screen above a new bubble.
+        // Always apply `clean` (even when empty) so an annotations-only reply
+        // cannot leave the streamed sidecar behind.
+        if chat_role == ChatRole::Assistant {
+            if let Some(msg) = msgs.iter_mut().rev().find(|m| m.role == ChatRole::Assistant) {
+                msg.content = clean;
+            } else if !clean.is_empty() {
+                msgs.push(ChatMessage {
+                    role: chat_role,
+                    content: clean,
+                    tool_calls: Vec::new(),
+                });
+            }
+            self.conversations[idx].is_streaming = false;
+            self.conversations[idx].streaming_status.clear();
+            self.conversations[idx].streaming_started_at = None;
+            if idx == self.active_conv {
+                self.scroll_to_bottom();
+            }
+            return;
+        }
+
         if let Some(last) = msgs.last_mut() {
             if last.role == chat_role {
                 if !clean.is_empty() {
@@ -3117,8 +3163,13 @@ impl AgentChatState {
                 ChatRole::System => ("System: ", Style::default().fg(theme::WARNING)),
             };
 
-            // Filter <file> blocks from display (both complete and in-progress)
-            let display_content = filter_file_blocks_for_display(&msg.content);
+            // Filter <file> blocks and strip `<turn_annotations>` from display
+            // (defense in depth — finalize also strips for storage/memory).
+            let display_content = if msg.role == ChatRole::Assistant {
+                filter_assistant_for_display(&msg.content)
+            } else {
+                filter_file_blocks_for_display(&msg.content)
+            };
 
             if msg.role == ChatRole::Assistant && !display_content.is_empty() {
                 // Render assistant messages with markdown formatting
@@ -3982,6 +4033,14 @@ fn filter_file_blocks_for_display(text: &str) -> String {
     collapsed
 }
 
+/// Assistant display filter: collapse `<file>` blocks and strip a trailing
+/// `<turn_annotations>` sidecar so the memory JSON never reaches the user,
+/// even if finalize missed the bubble (interleaved system messages).
+fn filter_assistant_for_display(text: &str) -> String {
+    let collapsed = filter_file_blocks_for_display(text);
+    gaviero_core::memory::parse_and_strip(&collapsed).stripped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4715,6 +4774,54 @@ mod tests {
         state.accept_autocomplete();
 
         assert_eq!(state.text_input.text, "@src/lib.rs ");
+    }
+
+    #[test]
+    fn finalize_message_to_rewrites_assistant_even_with_trailing_system() {
+        let mut state = AgentChatState::new();
+        let conv_id = state.active_conversation_id().to_string();
+        state.append_stream_chunk_to(
+            &conv_id,
+            "Visible reply.\n\n<turn_annotations>\n{\"v\":1,\"flags\":[]}\n</turn_annotations>",
+        );
+        state.add_system_message("⚠ Disk drifted on foo.rs — skipping revert.");
+
+        let stripped = gaviero_core::memory::parse_and_strip(
+            "Visible reply.\n\n<turn_annotations>\n{\"v\":1,\"flags\":[]}\n</turn_annotations>",
+        )
+        .stripped;
+        state.finalize_message_to(&conv_id, "assistant", &stripped);
+
+        let msgs = &state.conversations[state.active_conv].messages;
+        let assistant = msgs
+            .iter()
+            .rev()
+            .find(|m| m.role == ChatRole::Assistant)
+            .expect("assistant message");
+        assert_eq!(assistant.content.trim_end(), "Visible reply.");
+        assert!(
+            !assistant.content.contains("<turn_annotations>"),
+            "sidecar must be stripped from stored assistant content"
+        );
+        assert!(
+            msgs.iter().any(|m| m.role == ChatRole::System),
+            "interleaved system message must remain"
+        );
+        // Must not push a second assistant bubble.
+        assert_eq!(
+            msgs.iter()
+                .filter(|m| m.role == ChatRole::Assistant)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn filter_assistant_for_display_strips_turn_annotations() {
+        let raw = "Answer text.\n\n<turn_annotations>\n{\"v\":1,\"flags\":[]}\n</turn_annotations>";
+        let shown = filter_assistant_for_display(raw);
+        assert_eq!(shown.trim_end(), "Answer text.");
+        assert!(!shown.contains("<turn_annotations>"));
     }
 
     #[test]
