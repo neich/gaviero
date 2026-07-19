@@ -20,9 +20,7 @@ use super::router::{TierConfig, TierRouter};
 use super::validation;
 use crate::git::{GitCoordinator, WorktreeManager};
 use crate::memory::store::file_hash;
-use crate::memory::{
-    MemoryStores, StoreOptions, WriterConfig, WriterHandle, spawn_writer_task,
-};
+use crate::memory::{MemoryStores, StoreOptions, WriterConfig, WriterHandle, spawn_writer_task};
 use crate::observer::{AcpObserver, SwarmObserver};
 use crate::types::{EntryMetadata, PrivacyLevel};
 use crate::write_gate::{WriteGatePipeline, WriteMode};
@@ -305,8 +303,7 @@ pub async fn execute(
                     crate::validation_gate::ValidationPipeline::fast_only(),
                 ))
             };
-        let analysis =
-            WorkspaceAnalysis::build(config, std::slice::from_ref(&unit)).await;
+        let analysis = WorkspaceAnalysis::build(config, std::slice::from_ref(&unit)).await;
 
         let effective_read_ns = effective_read_namespaces(&unit, config);
         // Single-agent fast path: no shared board, no bundle pre-fetch
@@ -895,8 +892,7 @@ pub async fn execute(
             // Walk depends_on transitively from each body agent, collecting
             // dep ids that are NOT themselves loop body agents.
             let mut visited: std::collections::HashSet<String> = Default::default();
-            let mut queue: Vec<String> =
-                loop_config.agent_ids.iter().cloned().collect();
+            let mut queue: Vec<String> = loop_config.agent_ids.iter().cloned().collect();
             while let Some(id) = queue.pop() {
                 if let Some(unit) = unit_map.get(id.as_str()) {
                     for d in &unit.depends_on {
@@ -1147,8 +1143,7 @@ pub async fn execute(
             // Substitute {{ITER}} / {{PREV_ITER}} for this loop pass.
             // iteration is 1-indexed here (1..max_iterations); iter_abs = iter_start + iteration.
             let iter_abs = loop_config.iter_start + iteration as u32;
-            let run_loop_parallel =
-                effective_max_parallel > 1 && loop_config.agent_ids.len() > 1;
+            let run_loop_parallel = effective_max_parallel > 1 && loop_config.agent_ids.len() > 1;
 
             if run_loop_parallel {
                 // Barrier: fan out all loop-body agents concurrently (up to
@@ -1198,8 +1193,11 @@ pub async fn execute(
                     prepared.push((agent_id.clone(), unit, agent_root, branch_override));
                 }
 
-                let mut handles: Vec<(String, WorkUnit, tokio::task::JoinHandle<anyhow::Result<AgentManifest>>)> =
-                    Vec::new();
+                let mut handles: Vec<(
+                    String,
+                    WorkUnit,
+                    tokio::task::JoinHandle<anyhow::Result<AgentManifest>>,
+                )> = Vec::new();
                 for (agent_id, unit, agent_root, branch_override) in prepared {
                     let sem = semaphore.clone();
                     let mem = memory.clone();
@@ -1220,8 +1218,7 @@ pub async fn execute(
                     let swarm_extras = config.swarm_extra_tools.clone();
                     let skip_repo_context = config.execution_mode == ExecutionMode::Document;
                     let in_worktree = worktree_mgr.is_some();
-                    let override_branch_name =
-                        branch_override.as_ref().map(|ov| ov.branch.clone());
+                    let override_branch_name = branch_override.as_ref().map(|ov| ov.branch.clone());
 
                     handles.push((
                         agent_id.clone(),
@@ -1249,9 +1246,7 @@ pub async fn execute(
                                     (*pfm).as_deref(),
                                     &swarm_extras,
                                     skip_repo_context,
-                                    |candidate| {
-                                        resolve_backend_for_unit(&router, candidate)
-                                    },
+                                    |candidate| resolve_backend_for_unit(&router, candidate),
                                 )
                                 .await
                                 .manifest;
@@ -1326,10 +1321,7 @@ pub async fn execute(
                         let b = bus.lock().await;
                         b.broadcast(
                             &manifest.work_unit_id,
-                            &format!(
-                                "completed: {}",
-                                manifest.summary.as_deref().unwrap_or("")
-                            ),
+                            &format!("completed: {}", manifest.summary.as_deref().unwrap_or("")),
                         );
                         drop(b);
                         let effective_write_ns = unit
@@ -1618,10 +1610,7 @@ pub async fn execute(
             if let Some(ref branch) = manifest.branch {
                 if matches!(manifest.status, AgentStatus::Completed) {
                     if is_stacked_iter_branch(branch) {
-                        tracing::debug!(
-                            "skipping merge of stacked iteration branch '{}'",
-                            branch
-                        );
+                        tracing::debug!("skipping merge of stacked iteration branch '{}'", branch);
                         continue;
                     }
                     let mut result = merge::merge_branch(&config.workspace_root, branch)?;
@@ -2225,10 +2214,7 @@ async fn run_agent_inner(
                 tracing::warn!("Failed to inject context files for {}: {}", unit.id, e);
             }
         }
-        (
-            path,
-            branch_override.as_ref().map(|ov| ov.branch.clone()),
-        )
+        (path, branch_override.as_ref().map(|ov| ov.branch.clone()))
     } else {
         (workspace_root.clone(), None)
     };
@@ -2251,13 +2237,30 @@ async fn run_agent_inner(
                     "synthesized MCP config for agent worktree"
                 );
             }
-            Ok(_) => {}
-            Err(e) => {
+            Ok(_) => {
+                // Zero files is legitimate intent (synthesis suppressed —
+                // e.g. Codex trust not granted with nothing else to
+                // write), but it must be visible: this agent runs without
+                // per-worktree gaviero MCP wiring.
                 tracing::warn!(
                     agent_id = %unit.id,
-                    error = %e,
-                    "failed to synthesize MCP config for agent worktree"
+                    worktree = %agent_root.display(),
+                    "MCP config synthesis wrote no files for this worktree \
+                     (e.g. Codex trust not granted); agent runs without \
+                     per-worktree MCP configs"
                 );
+            }
+            Err(e) => {
+                // F2: an agent silently launched without its MCP configs
+                // violates the runtime-parity contract (no degraded
+                // modes). Fail this work unit with the remedy instead.
+                return Err(anyhow::anyhow!(
+                    "failed to synthesize MCP config for agent `{}` in worktree {}: {e} — \
+                     fix the worktree (permissions / conflicting configs) or disable MCP \
+                     for this run",
+                    unit.id,
+                    agent_root.display(),
+                ));
             }
         }
     }
@@ -2326,9 +2329,8 @@ async fn run_agent_inner(
         // When the caller provided a per-iteration branch override (stacked
         // mode), record THAT branch name on the manifest so the merge phase
         // can treat it correctly and downstream iterations can chain off it.
-        manifest.branch = Some(
-            override_branch_name.unwrap_or_else(|| format!("gaviero/{}", unit.id)),
-        );
+        manifest.branch =
+            Some(override_branch_name.unwrap_or_else(|| format!("gaviero/{}", unit.id)));
     }
 
     Ok(manifest)
@@ -2659,9 +2661,7 @@ async fn store_agent_result(
     // aggregate above (which serves run bookkeeping + staleness). No-op
     // unless enabled; degrades to a History row when `writer` carries no
     // extraction LLM (e.g. the headless CLI fallback writer).
-    if extract_findings
-        && let Some(transcript) = agent_findings_transcript(unit, manifest)
-    {
+    if extract_findings && let Some(transcript) = agent_findings_transcript(unit, manifest) {
         let turn_id = format!("swarm:{run_id}:{}", manifest.work_unit_id);
         let repo_id = crate::memory::hash_path(workspace_root);
         crate::context_planner::enqueue_post_turn(crate::context_planner::PostTurnRequest {

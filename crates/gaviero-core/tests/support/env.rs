@@ -73,10 +73,7 @@ impl TestReport {
     }
 
     pub fn print(&self) {
-        let elapsed = self
-            .started_at
-            .map(|s| s.elapsed())
-            .unwrap_or_default();
+        let elapsed = self.started_at.map(|s| s.elapsed()).unwrap_or_default();
         let mut out = String::new();
         out.push_str(
             "\n┌──────────────────────────────────────────────────────────────────────────\n",
@@ -189,6 +186,7 @@ impl E2eEnv {
             confidence_threshold: 0.0,
             use_fts: true,
             scope: MemoryScope::from_context(&self.repo, Some(&self.repo), None, None),
+            level_restriction: None,
         };
         store.search_scoped(&cfg).await
     }
@@ -322,18 +320,8 @@ pub async fn run_one_claude_turn(
         ..Default::default()
     };
 
-    let mut session = AcpSession::spawn(
-        model,
-        cwd,
-        prompt,
-        "",
-        &[],
-        &[],
-        &options,
-        &[],
-        &[],
-    )
-    .context("spawning AcpSession")?;
+    let mut session = AcpSession::spawn(model, cwd, prompt, "", &[], &[], &options, &[], &[])
+        .context("spawning AcpSession")?;
 
     let deadline = Instant::now() + PER_TURN_TIMEOUT;
     loop {

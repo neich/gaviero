@@ -192,8 +192,7 @@ pub mod settings {
     pub const MEMORY_FORGET_SLEEP_RETENTION_DAYS: &str =
         "memory.forget.sleeptimePruneRetentionDays";
     pub const MEMORY_FORGET_REQUIRE_CONFIRM_BULK: &str = "memory.forget.requireConfirmForBulk";
-    pub const MEMORY_FORGET_ALLOW_HISTORY_REDACTION: &str =
-        "memory.forget.allowHistoryRedaction";
+    pub const MEMORY_FORGET_ALLOW_HISTORY_REDACTION: &str = "memory.forget.allowHistoryRedaction";
 
     // MCP server + external-memory migration (Tier A / A5)
     pub const MCP_GAVIERO_ENABLED: &str = "mcp.gavieroServer.enabled";
@@ -202,9 +201,10 @@ pub mod settings {
     pub const MCP_GAVIERO_SHIM_BINARY: &str = "mcp.gavieroServer.shimBinary";
     pub const MCP_GAVIERO_CODEX_TRUST: &str = "mcp.gavieroServer.codexTrust";
 
-    // context7 docs-lookup MCP server (default-on; injected into every
-    // swarm worktree's .mcp.json + .codex/config.toml alongside the
-    // gaviero shim). Disable for offline or privacy-sensitive work.
+    // context7 docs-lookup MCP server (opt-in, OD-6; when enabled it is
+    // injected into every swarm worktree's .mcp.json +
+    // .codex/config.toml alongside the gaviero shim). Enable with
+    // `mcp.context7.enabled = true`; it needs Node (`npx`) + network.
     pub const MCP_CONTEXT7_ENABLED: &str = "mcp.context7.enabled";
     pub const MCP_CONTEXT7_COMMAND: &str = "mcp.context7.command";
     pub const MCP_CONTEXT7_ARGS: &str = "mcp.context7.args";
@@ -653,7 +653,10 @@ impl Workspace {
     /// entry point hand this to `memory::retrieve_for_chat`.
     /// Resolve shallow `<repo_topology>` settings for the workspace root.
     /// Resolve the default chat bootstrap mode from the settings cascade.
-    pub fn resolve_bootstrap_mode(&self, root: Option<&Path>) -> crate::context_planner::BootstrapMode {
+    pub fn resolve_bootstrap_mode(
+        &self,
+        root: Option<&Path>,
+    ) -> crate::context_planner::BootstrapMode {
         self.resolve_setting(settings::AGENT_CONTEXT_BOOTSTRAP, root)
             .as_str()
             .and_then(crate::context_planner::BootstrapMode::parse)
@@ -1067,10 +1070,11 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::MCP_GAVIERO_SHIM_BINARY => serde_json::json!("gaviero-mcp-shim"),
         settings::MCP_GAVIERO_CODEX_TRUST => serde_json::json!("unknown"),
 
-        // context7 docs-lookup MCP server: default-on; uses `npx` so it
-        // works out of the box on any Node-equipped host. Users without
-        // Node, or running offline, set enabled=false to suppress.
-        settings::MCP_CONTEXT7_ENABLED => serde_json::json!(true),
+        // context7 docs-lookup MCP server: opt-in (OD-6). It is a
+        // network dependency (`npx` fetch on first agent spawn), so a
+        // local-first default must not carry it silently — set
+        // `mcp.context7.enabled = true` per workspace to inject it.
+        settings::MCP_CONTEXT7_ENABLED => serde_json::json!(false),
         settings::MCP_CONTEXT7_COMMAND => serde_json::json!("npx"),
         settings::MCP_CONTEXT7_ARGS => serde_json::json!(["-y", "@upstash/context7-mcp"]),
         settings::MCP_EXTRA_SERVERS => serde_json::json!([]),
@@ -1316,7 +1320,9 @@ mod tests {
         let inner = outer.path().join("nested");
         fs::create_dir_all(&inner).unwrap();
         let ws_path = inner.join("project.gaviero-workspace");
-        let folder = canonicalize_path(outer.path()).to_string_lossy().to_string();
+        let folder = canonicalize_path(outer.path())
+            .to_string_lossy()
+            .to_string();
         let body = format!(
             r#"{{"folders":[{{"path":"{}"}}],"settings":{{}}}}"#,
             folder.replace('\\', "\\\\")
