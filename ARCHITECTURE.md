@@ -79,8 +79,9 @@ agent_session/          V9 transport layer: AgentSession trait + per-provider
                         AcpPipeline
 context_planner/        Bootstrap / delta / replay policy. Owns memory, graph,
                         replay, continuity; emits PlannerSelections
-mcp/                    In-process MCP server. Three read-only tools
-                        (memory_search, blast_radius, node_doc) over a Unix
+mcp/                    In-process MCP server. Seven read-only tools
+                        (memory_search, memory_get, blast_radius, node_doc,
+                        repo_outline, symbol_search, symbol_doc) over a Unix
                         socket; per-worktree .mcp.json / .codex/config.toml /
                         .cursor/mcp.json synthesis; external-server detection
 memory/                 Multi-DB scoped memory: pluggable Embedder, single
@@ -178,7 +179,7 @@ Single owner of bootstrap / delta / replay policy. Emits `MemorySelection`, `Gra
 
 ### `GavieroMcpServer` ([`mcp/server.rs`](crates/gaviero-core/src/mcp/server.rs))
 
-In-process MCP server task. Three read-only tools — `memory_search`, `blast_radius`, `node_doc`. Listens on the workspace `McpEndpoint` (`.gaviero/mcp.sock` on Unix, a named pipe on Windows); subprocess agents reach it via `gaviero-mcp-shim`. **Read-only by construction:** there is no `WriterHandle` on the server type, so `memory_store` / `_update` / `_delete` are unimplementable. Per-worktree configs are synthesized by [`mcp::config_synth`](crates/gaviero-core/src/mcp/config_synth.rs):
+In-process MCP server task. Seven read-only tools — `memory_search`, `memory_get`, `blast_radius`, `node_doc`, `repo_outline`, plus `symbol_search` / `symbol_doc` (gated by `repoMap.symbolEnrichment.enabled`, default false). Listens on the workspace `McpEndpoint` (`.gaviero/mcp.sock` on Unix, a named pipe on Windows); subprocess agents reach it via `gaviero-mcp-shim`. **Read-only by construction:** there is no `WriterHandle` on the server type, so `memory_store` / `_update` / `_delete` are unimplementable. Per-worktree configs are synthesized by [`mcp::config_synth`](crates/gaviero-core/src/mcp/config_synth.rs):
 
 - Claude Code → `<worktree>/.mcp.json`.
 - Codex → `<worktree>/.codex/config.toml` (gated on `TrustConsent::Granted`).
@@ -300,7 +301,7 @@ Every first turn injects two layers of repo context:
 - `<repo_topology>` — cheap filesystem-only folder map ([`repo_map/topology.rs`](crates/gaviero-core/src/repo_map/topology.rs)). `agent.topology.*` budget, default 600 tokens. Built async per-folder; cached on the TUI side ([`app/session.rs`](crates/gaviero-tui/src/app/session.rs)).
 - `<repo_outline>` — ranked PageRank file list (`agent.graphBudgetTokens`, default 8k).
 
-The TUI `/lite` slash command (alias `/minimal`) arms a one-shot minimal-context turn: keeps `<repo_topology>` and drops `<repo_outline>`, memory, and impact. Mid-turn relational context stays on the MCP `blast_radius` tool.
+The TUI `/lite` slash command (alias `/minimal`) arms a one-shot minimal-context turn: keeps `<repo_topology>` and drops `<repo_outline>`, memory, and impact. Mid-turn relational context stays on the MCP tools.
 
 ---
 
@@ -335,7 +336,7 @@ Golden rule: **no Mutex held across `await`, tree-sitter parse, or `fs` I/O**. O
 | merge conflict | swarm::merge | Claude resolution or user choice |
 | memory init failure | memory | `Option<Arc<MemoryStores>>`, continue without memory |
 | C1 schema migration | memory | refuse open without explicit consent (`--accept-c1-migration` / TUI prompt) |
-| MCP server bind failure | mcp | log; subprocess agents fall back to prompt-time injection |
+| MCP server bind failure | mcp | log + chat-visible system message; subprocess agents fall back to prompt-time injection |
 | Cursor argv-limit overflow | core | reject prompt with explicit error (96 KB ceiling) |
 | consolidation / worktree cleanup | memory, git | best-effort, log only |
 

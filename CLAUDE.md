@@ -43,7 +43,7 @@ All interactive coding providers — Claude Code, Codex, Cursor, Ollama — must
 - **File edits never bypass review.** Native edit-capable providers (Claude Code, Codex, Cursor) route writes through their own tool-call channel; the host turns each tool call into a `WriteProposal` and runs it through the Write Gate. Stream-only providers (Ollama) emit complete `<file path="relative/path">…</file>` blocks inline; the swarm executor extracts them via [crates/gaviero-core/src/acp/protocol.rs](crates/gaviero-core/src/acp/protocol.rs) and routes them through the same Write Gate.
 - **Single Write Gate.** Every file change — proposed, modified, or deleted — passes through `write_gate::WriteGatePipeline` ([crates/gaviero-core/src/write_gate.rs](crates/gaviero-core/src/write_gate.rs)). No backend writes to disk directly.
 - **Scope enforcement.** Proposals are checked against the active `FileScope` ([crates/gaviero-core/src/scope_enforcer.rs](crates/gaviero-core/src/scope_enforcer.rs)) before they leave the gate.
-- **MCP is read-only.** The in-process MCP server exposes `memory_search`, `blast_radius`, `node_doc` only ([crates/gaviero-core/src/mcp/tools.rs](crates/gaviero-core/src/mcp/tools.rs)). Never add a write tool there; route writes through the Write Gate or the memory writer task.
+- **MCP is read-only.** The in-process MCP server exposes read-only tools only — `memory_search`, `memory_get`, `blast_radius`, `node_doc`, `repo_outline`, plus `symbol_search` / `symbol_doc` behind `repoMap.symbolEnrichment.enabled` ([crates/gaviero-core/src/mcp/tools.rs](crates/gaviero-core/src/mcp/tools.rs)). Never add a write tool there; route writes through the Write Gate or the memory writer task.
 
 ## Conventions
 
