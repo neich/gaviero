@@ -95,6 +95,13 @@ pub struct GavieroMcpServer {
     /// S2.3: when false, `symbol_search` / `symbol_doc` return a clear
     /// error directing the agent to run `--graph --enrich` first.
     symbol_enrichment_enabled: bool,
+    /// G2 / OD-2: embedder for symbol-vector queries — the resolved
+    /// `repoMap.embedder.model` (default `jina-code`). `None` =
+    /// "inherit" (use the memory embedder). Built lazily on the first
+    /// symbol call (model load is blocking and may download) and cached
+    /// in `symbol_embedder`, shared across per-connection clones.
+    symbol_embedder_name: Option<String>,
+    symbol_embedder: Arc<tokio::sync::Mutex<Option<Arc<dyn crate::memory::Embedder>>>>,
     /// Option A: gaviero-level MCP permission policy (`mcp.permissions`),
     /// enforced server-side for this server's own tools. A tool the policy
     /// denies is rejected here regardless of how the calling provider was
@@ -134,6 +141,8 @@ impl GavieroMcpServer {
             graph_cache: Arc::new(tokio::sync::Mutex::new(None)),
             repo_map_cache: Arc::new(tokio::sync::Mutex::new(None)),
             symbol_enrichment_enabled: false,
+            symbol_embedder_name: None,
+            symbol_embedder: Arc::new(tokio::sync::Mutex::new(None)),
             permissions: super::McpPermissions::default(),
             first_tool_call_done: Arc::new(AtomicBool::new(false)),
             tool_router: Self::tool_router(),
@@ -203,6 +212,45 @@ impl GavieroMcpServer {
     pub fn with_symbol_enrichment(mut self, enabled: bool) -> Self {
         self.symbol_enrichment_enabled = enabled;
         self
+    }
+
+    /// G2 / OD-2: set the symbol-vector query embedder — the resolved
+    /// `repoMap.embedder.model` setting. Pass `None` for `"inherit"`
+    /// (memory embedder). The sidecar's `symbol_embedder` stamp is
+    /// checked per call, so a mismatched sidecar errors with a
+    /// re-enrich remedy instead of returning cross-model cosine noise.
+    pub fn with_symbol_embedder_name(mut self, name: Option<String>) -> Self {
+        self.symbol_embedder_name = name;
+        self
+    }
+
+    /// Resolve the embedder used for symbol-vector queries: the
+    /// configured name when set (built lazily, cached, shared across
+    /// connection clones), else the memory embedder.
+    async fn resolve_symbol_embedder(&self) -> Result<Arc<dyn crate::memory::Embedder>, ErrorData> {
+        let Some(name) = &self.symbol_embedder_name else {
+            return Ok(self.stores.embedder().clone());
+        };
+        // Async mutex held across the one-time blocking build on
+        // purpose: concurrent first calls must not race two model
+        // loads (each can be a download).
+        let mut guard = self.symbol_embedder.lock().await;
+        if let Some(e) = guard.as_ref() {
+            return Ok(e.clone());
+        }
+        let name_owned = name.clone();
+        let built =
+            tokio::task::spawn_blocking(move || crate::memory::build_embedder_by_name(&name_owned))
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("symbol embedder join: {e}"), None))?
+                .map_err(|e| {
+                    ErrorData::internal_error(
+                        format!("loading symbol embedder `{name}` (repoMap.embedder.model): {e}"),
+                        None,
+                    )
+                })?;
+        *guard = Some(built.clone());
+        Ok(built)
     }
 
     /// Override the specificity config used by `blast_radius`. Returns
@@ -840,12 +888,13 @@ impl GavieroMcpServer {
             ));
         }
         let limit = clamp_symbol_search_limit(input.limit);
-        let query_emb = self
-            .stores
-            .embedder()
+        let query_embedder = self.resolve_symbol_embedder().await?;
+        let query_emb = query_embedder
             .embed_query(&input.query)
             .await
             .map_err(|e| ErrorData::internal_error(format!("symbol_search embed: {e}"), None))?;
+        let query_name = query_embedder.name().to_string();
+        let memory_name = self.stores.embedder().name().to_string();
 
         let cache = Arc::clone(&self.graph_cache);
         let workspace_root = self.workspace_root.clone();
@@ -856,6 +905,14 @@ impl GavieroMcpServer {
                 *guard = Some(store);
             }
             let store = guard.as_ref().expect("graph cache populated");
+            // G2 / OD-2: cross-model cosine is noise — verify the
+            // sidecar's vectors were built by the query embedder.
+            let stamp = store.graph_meta("symbol_embedder")?;
+            crate::repo_map::symbol_search::check_symbol_embedder_stamp(
+                stamp.as_deref(),
+                &query_name,
+                &memory_name,
+            )?;
             crate::repo_map::symbol_search::search_symbol_docs(store, &query_emb, limit)
         })
         .await

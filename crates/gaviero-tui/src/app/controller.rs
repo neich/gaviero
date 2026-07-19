@@ -1300,6 +1300,19 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                         )
                         .as_bool()
                         .unwrap_or(false),
+                )
+                // G2 / OD-2: symbol-vector queries embed with
+                // repoMap.embedder.model; "inherit" → memory embedder.
+                .with_symbol_embedder_name(
+                    app.workspace
+                        .resolve_setting(
+                            gaviero_core::workspace::settings::REPO_MAP_EMBEDDER_MODEL,
+                            Some(&workspace_root_for_mcp),
+                        )
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty() && *s != "inherit")
+                        .map(str::to_string),
                 );
                 // Phase 1: warm the graph cache + reranker in the
                 // background so the first user query never pays the cold

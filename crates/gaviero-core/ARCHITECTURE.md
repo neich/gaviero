@@ -247,7 +247,7 @@ A directly-opened single directory collapses workspace and folder to one file. F
 
 ### 4.2 Embedder
 
-`Embedder` trait + [`model_manager::resolve_embedder_model`](src/memory/model_manager.rs). Default `nomic-embed-text-v1.5` (768 dim, mean-pool + L2 norm); `gte-modernbert-base` and `jina-embeddings-v2-base-code` selectable via `GAVIERO_EMBEDDER_MODEL` or `memory.embedder.model`. `e5-small-v2` and `null` available; `dual:<a>,<b>` runs an A/B comparison logged to `memory_embedder_ab`. The `api-embedders` Cargo feature reserves a hosted-API embedder surface but currently exposes a `NotImplemented` placeholder.
+`Embedder` trait + [`model_manager::resolve_embedder_model`](src/memory/model_manager.rs). Default `nomic-embed-text-v1.5` (768 dim, mean-pool + L2 norm; kept per the PR-6/G2 bench); `gte-modernbert-base` and `jina-embeddings-v2-base-code` selectable via `GAVIERO_EMBEDDER_MODEL` or `memory.embedder.model`. Symbol vectors default to `jina-code` via `repoMap.embedder.model` (`"inherit"` = memory embedder); the `symbol_docs` sidecar carries a `graph_meta` embedder stamp and `symbol_search` errors on mismatch (re-run `--graph --enrich`). `e5-small-v2` and `null` available; `dual:<a>,<b>` runs an A/B comparison logged to `memory_embedder_ab`. The `api-embedders` Cargo feature reserves a hosted-API embedder surface but currently exposes a `NotImplemented` placeholder.
 
 ### 4.3 Writes (single-consumer)
 
@@ -361,7 +361,7 @@ The planner is the single owner of memory queries, graph selection, replay, and 
 
 [`LegacyAgentSession`](src/agent_session/mod.rs) wraps [`AcpPipeline`](src/acp/client.rs) for byte-identical migration; per-provider impls replace it progressively.
 
-**Two-layer graph context (first turn):** `<repo_topology>` is a cheap filesystem-only folder map ([`repo_map/topology.rs`](src/repo_map/topology.rs), `agent.topology.*` budget, default 600 tokens). `<repo_outline>` is the ranked PageRank file list (`agent.graphBudgetTokens`, default 12k). `/lite` keeps topology and drops outline, memory, and impact. Mid-turn relational context stays on MCP `blast_radius`.
+**Two-layer graph context (first turn):** `<repo_topology>` is a cheap filesystem-only folder map ([`repo_map/topology.rs`](src/repo_map/topology.rs), `agent.topology.*` budget, default 600 tokens). `<repo_outline>` is the ranked PageRank file list (`agent.graphBudgetTokens`, default 4k per the PR-8 task-success A/B; this line previously lagged two default changes behind). `/lite` keeps topology and drops outline, memory, and impact. Mid-turn relational context stays on MCP `blast_radius`.
 
 [`chat_memory::perform_injection`](src/context_planner/chat_memory.rs) runs the per-turn retrieval inline; `chat_memory::enqueue_post_turn` schedules the S3 extractor + transcript writer through `WriterHandle`.
 

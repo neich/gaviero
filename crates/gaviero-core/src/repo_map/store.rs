@@ -65,6 +65,11 @@ CREATE TABLE IF NOT EXISTS symbol_docs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_symbol_docs_file ON symbol_docs(file_path);
+
+CREATE TABLE IF NOT EXISTS graph_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 ";
 
 /// C4: one-shot migration applied at every `open*` call.
@@ -540,10 +545,7 @@ impl GraphStore {
 
     /// Insert or update one `symbol_docs` row.
     pub fn upsert_symbol_doc(&self, doc: &SymbolDoc) -> Result<()> {
-        let embedding_blob = doc
-            .embedding
-            .as_ref()
-            .map(|v| embedding_to_blob(v));
+        let embedding_blob = doc.embedding.as_ref().map(|v| embedding_to_blob(v));
         self.conn.execute(
             "INSERT INTO symbol_docs (
                 qualified_name, file_path, file_hash, signature, bounds,
@@ -628,6 +630,29 @@ impl GraphStore {
             });
         }
         Ok(out)
+    }
+
+    /// Read one `graph_meta` value — sidecar-level metadata such as the
+    /// `symbol_embedder` stamp written by enrichment (G2 / OD-2).
+    pub fn graph_meta(&self, key: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM graph_meta WHERE key = ?1")?;
+        let mut rows = stmt.query(params![key])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Upsert one `graph_meta` value.
+    pub fn set_graph_meta(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO graph_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
     }
 
     /// `Implements` edges whose target is `trait_qn` (impl sources).
@@ -1025,9 +1050,9 @@ impl GraphStore {
     /// file-level specificity map without rebuilding the in-memory
     /// `RepoMap` graph from disk.
     pub fn symbol_document_frequency(&self) -> Result<std::collections::HashMap<String, usize>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT n.name, COUNT(DISTINCT n.file_path) FROM nodes n GROUP BY n.name",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT n.name, COUNT(DISTINCT n.file_path) FROM nodes n GROUP BY n.name")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
         })?;
@@ -1674,7 +1699,11 @@ mod tests {
         assert!(text.contains("blast_radius(path)"), "{text}");
         assert!(text.contains("no tests: src/auth.rs"), "{text}");
         // ≤150 tokens (project convention ~4 chars/token → ≤600 chars).
-        assert!(text.len() / 4 <= 150, "summary too large: {} chars", text.len());
+        assert!(
+            text.len() / 4 <= 150,
+            "summary too large: {} chars",
+            text.len()
+        );
     }
 
     #[test]
@@ -1699,7 +1728,11 @@ mod tests {
             truncated: false,
         };
         let text = GraphStore::format_impact_summary(&result);
-        assert!(text.len() / 4 <= 150, "summary too large: {} chars", text.len());
+        assert!(
+            text.len() / 4 <= 150,
+            "summary too large: {} chars",
+            text.len()
+        );
         assert!(text.contains("more)"), "{text}");
         assert!(text.contains("200 missing tests"), "{text}");
     }

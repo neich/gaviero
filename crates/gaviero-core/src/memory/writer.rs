@@ -14,8 +14,8 @@
 
 #![deny(clippy::await_holding_lock)]
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -440,10 +440,7 @@ impl WriterHandle {
     /// to hold the store mutex; ack timeout is bumped to 30s because
     /// re-embedding restored content can dwarf the default 500ms used
     /// for hash-only writes.
-    pub async fn restore_deletion(
-        &self,
-        deletion_id: i64,
-    ) -> Result<super::store::RestoreOutcome> {
+    pub async fn restore_deletion(&self, deletion_id: i64) -> Result<super::store::RestoreOutcome> {
         let (tx, rx) = oneshot::channel();
         self.enqueue(WriterMessage::Restore {
             deletion_id,
@@ -491,11 +488,7 @@ impl WriterHandle {
     /// check on `drop_history_immutable_triggers` enforces that the
     /// store-side handler stays the only trigger-disable callsite
     /// besides compression.
-    pub async fn redact_history(
-        &self,
-        memory_id: i64,
-        reason: impl Into<String>,
-    ) -> Result<i64> {
+    pub async fn redact_history(&self, memory_id: i64, reason: impl Into<String>) -> Result<i64> {
         let (tx, rx) = oneshot::channel();
         self.enqueue(WriterMessage::RedactHistory {
             memory_id,
@@ -628,7 +621,13 @@ pub fn spawn_writer_task(cfg: WriterConfig) -> WriterHandle {
     let handle = WriterHandle {
         inner: inner.clone(),
     };
-    tokio::spawn(writer_task(rx, cfg, inner));
+    // The task gets only a Weak reference to the handle state: `inner`
+    // owns the channel's sole sender, so an Arc here would keep the
+    // channel open from inside the task and make it immortal — the
+    // task (and its `stores` SQLite handles) must instead exit once
+    // every external `WriterHandle` has dropped and the queue drained.
+    // (On Windows a leaked task pins `memory.db` against deletion.)
+    tokio::spawn(writer_task(rx, cfg, Arc::downgrade(&inner)));
     handle
 }
 
@@ -638,7 +637,7 @@ pub fn spawn_writer_task(cfg: WriterConfig) -> WriterHandle {
 async fn writer_task(
     mut rx: mpsc::UnboundedReceiver<WriterMessage>,
     cfg: WriterConfig,
-    state: Arc<WriterHandleInner>,
+    state: Weak<WriterHandleInner>,
 ) {
     let WriterConfig {
         stores,
@@ -651,12 +650,19 @@ async fn writer_task(
         // Drain barrier: ack and move on. Reaching it in FIFO order means
         // every prior message has already been processed to completion.
         if let WriterMessage::Flush { ack } = msg {
-            state.drained.fetch_add(1, Ordering::Relaxed);
+            if let Some(s) = state.upgrade() {
+                s.drained.fetch_add(1, Ordering::Relaxed);
+            }
             let _ = ack.send(());
             continue;
         }
         let kind = msg.kind();
-        let drained = state.drained.fetch_add(1, Ordering::Relaxed) + 1;
+        // `None` upgrade = every handle already dropped; we're just
+        // draining the tail of the queue before exiting.
+        let drained = state
+            .upgrade()
+            .map(|s| s.drained.fetch_add(1, Ordering::Relaxed) + 1)
+            .unwrap_or(0);
         tracing::debug!(
             target: "memory_writer",
             kind = kind,
@@ -870,10 +876,7 @@ async fn process_message(
                     // suppress real passes.
                     if !report.dry_run
                         && let Err(e) = store
-                            .set_meta_value(
-                                "last_sleeptime_at",
-                                &chrono::Utc::now().to_rfc3339(),
-                            )
+                            .set_meta_value("last_sleeptime_at", &chrono::Utc::now().to_rfc3339())
                             .await
                     {
                         tracing::warn!(
@@ -936,9 +939,7 @@ async fn process_message(
                     surviving_memory_id,
                     ..
                 } => WriteResult::Deduplicated(surviving_memory_id),
-                super::store::RestoreOutcome::AlreadyCovered { .. } => {
-                    WriteResult::AlreadyCovered
-                }
+                super::store::RestoreOutcome::AlreadyCovered { .. } => WriteResult::AlreadyCovered,
                 super::store::RestoreOutcome::Refused { .. } => WriteResult::Skipped,
             })
         }
@@ -1001,10 +1002,7 @@ async fn process_message(
 /// non-`WriteResult` payload (e.g. [`super::store::RestoreOutcome`]).
 /// Mirrors [`send_ack`] but is generic over the payload so each
 /// variant can have its own oneshot type without duplicated code.
-fn send_ack_typed<T: Clone>(
-    ack: Option<oneshot::Sender<Result<T, String>>>,
-    res: &Result<T>,
-) {
+fn send_ack_typed<T: Clone>(ack: Option<oneshot::Sender<Result<T, String>>>, res: &Result<T>) {
     if let Some(tx) = ack {
         let payload = match res {
             Ok(v) => Ok(v.clone()),
@@ -1300,17 +1298,18 @@ async fn process_turn_complete(
     // does not lose records and vice versa." We capture errors but
     // never propagate — the extractor path below still runs even if
     // this write fails.
-    let history_id = write_history_row(store, &session_id, &turn_id, &repo_id, &run_id, &transcript)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(
-                target: "memory_history",
-                turn_id = %turn_id,
-                error = %e,
-                "history-row write failed; proceeding to extractor path"
-            );
-            None
-        });
+    let history_id =
+        write_history_row(store, &session_id, &turn_id, &repo_id, &run_id, &transcript)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    target: "memory_history",
+                    turn_id = %turn_id,
+                    error = %e,
+                    "history-row write failed; proceeding to extractor path"
+                );
+                None
+            });
     if let Some(id) = history_id {
         tracing::debug!(
             target: "memory_history",
@@ -1921,13 +1920,7 @@ mod tests {
         let transcript = "USER: c1 history check\nASSISTANT: ack";
         handle
             .turn_complete(
-                "conv-c1",
-                "t-c1",
-                "repo-c1",
-                None,
-                "conv-c1",
-                transcript,
-                None,
+                "conv-c1", "t-c1", "repo-c1", None, "conv-c1", transcript, None,
             )
             .unwrap();
 
@@ -2041,6 +2034,9 @@ mod tests {
             .await
             .expect("ack within timeout")
             .unwrap();
-        assert!(result.is_ok(), "delete of record row must succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "delete of record row must succeed: {result:?}"
+        );
     }
 }

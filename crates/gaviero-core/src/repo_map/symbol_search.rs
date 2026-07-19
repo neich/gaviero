@@ -36,6 +36,33 @@ pub fn search_symbol_docs(
     Ok(scored)
 }
 
+/// G2 / OD-2: refuse cross-model cosine. `stamp` is the sidecar's
+/// `graph_meta("symbol_embedder")`; `query_name` / `memory_name` are
+/// built-embedder ids (`Embedder::name()`), never settings aliases. A
+/// missing stamp is tolerated only when the query embedder *is* the
+/// memory embedder — pre-stamp sidecars were built exactly that way
+/// (the old `"inherit"` default); anything else needs a re-enrich.
+pub fn check_symbol_embedder_stamp(
+    stamp: Option<&str>,
+    query_name: &str,
+    memory_name: &str,
+) -> anyhow::Result<()> {
+    match stamp {
+        Some(s) if s == query_name => Ok(()),
+        Some(s) => anyhow::bail!(
+            "symbol_docs sidecar was embedded with `{s}` but this query embeds with \
+             `{query_name}` — cross-model cosine is meaningless; re-run \
+             `gaviero-cli --graph --enrich` to rebuild symbol vectors"
+        ),
+        None if query_name == memory_name => Ok(()),
+        None => anyhow::bail!(
+            "symbol_docs sidecar carries no embedder stamp (predates \
+             `repoMap.embedder.model`) while queries embed with `{query_name}` — \
+             re-run `gaviero-cli --graph --enrich` to rebuild and stamp symbol vectors"
+        ),
+    }
+}
+
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -90,5 +117,40 @@ mod tests {
         let hits = search_symbol_docs(&store, &[0.9, 0.1, 0.0], 5).unwrap();
         assert_eq!(hits.len(), 2);
         assert!(hits[0].doc.qualified_name.contains("foo"));
+    }
+
+    /// G2 / OD-2 stamp semantics: match passes; mismatch and
+    /// missing-stamp-with-divergent-embedder fail with the re-enrich
+    /// remedy; missing stamp under the legacy inherit setup passes.
+    #[test]
+    fn embedder_stamp_check_semantics() {
+        use super::check_symbol_embedder_stamp as check;
+        assert!(
+            check(
+                Some("jina-embeddings-v2-base-code"),
+                "jina-embeddings-v2-base-code",
+                "nomic-embed-text-v1.5"
+            )
+            .is_ok()
+        );
+        assert!(check(None, "nomic-embed-text-v1.5", "nomic-embed-text-v1.5").is_ok());
+
+        let err = check(
+            Some("nomic-embed-text-v1.5"),
+            "jina-embeddings-v2-base-code",
+            "nomic-embed-text-v1.5",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--graph --enrich"), "{err}");
+
+        let err = check(
+            None,
+            "jina-embeddings-v2-base-code",
+            "nomic-embed-text-v1.5",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no embedder stamp"), "{err}");
     }
 }

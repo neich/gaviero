@@ -1184,6 +1184,19 @@ fn prepare_mcp_for_swarm(
                     )
                     .as_bool()
                     .unwrap_or(false),
+            )
+            // G2 / OD-2: symbol-vector queries embed with
+            // repoMap.embedder.model; "inherit" → memory embedder.
+            .with_symbol_embedder_name(
+                workspace
+                    .resolve_setting(
+                        gaviero_core::workspace::settings::REPO_MAP_EMBEDDER_MODEL,
+                        Some(repo),
+                    )
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && *s != "inherit")
+                    .map(str::to_string),
             );
             // Phase 1: warm the graph cache, repo-map cache, and (when
             // configured) the reranker in the background so the first
@@ -2204,8 +2217,26 @@ fn remove_memory_db(repo: &std::path::Path) -> Result<()> {
     let dir = repo.join(".gaviero");
     for name in ["memory.db", "memory.db-wal", "memory.db-shm"] {
         let p = dir.join(name);
-        if p.exists() {
-            std::fs::remove_file(&p).with_context(|| format!("removing {}", p.display()))?;
+        if !p.exists() {
+            continue;
+        }
+        // Windows: the previous ablation arm's writer task / store
+        // connection tears down asynchronously after its owning Arc
+        // drops, and unlinking a still-open file is a sharing violation
+        // here (unlike Unix). Retry briefly so the per-arm fresh-DB
+        // reset doesn't race a teardown that completes within ms.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match std::fs::remove_file(&p) {
+                Ok(()) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| format!("removing {}", p.display()));
+                }
+            }
         }
     }
     Ok(())
@@ -2312,42 +2343,59 @@ async fn run_eval_embedder_ablation(repo: &std::path::Path, fixture: &PathBuf) -
     let mut arms: Vec<EmbedderArm> = Vec::new();
     for &(resolve_name, label) in ARMS {
         eprintln!("[gaviero-eval] embedder arm `{label}` ({resolve_name}): fresh db + seed…");
-        remove_memory_db(repo)?;
-        run_seed_corpus_from_paths(repo, fixture, 480, Some(resolve_name)).await?;
+        // A failed arm (typically: its model can't be downloaded right
+        // now) skips loudly instead of aborting the whole ablation —
+        // partial cross-arm data beats none, and the verdict block
+        // below already reports an absent arm explicitly.
+        let arm_result: Result<EmbedderArm> = async {
+            remove_memory_db(repo)?;
+            run_seed_corpus_from_paths(repo, fixture, 480, Some(resolve_name)).await?;
 
-        let store = tokio::task::spawn_blocking({
-            let repo = repo.to_path_buf();
-            let model = resolve_name.to_string();
-            move || init_workspace_with_embedder_name(&repo, &model)
-        })
-        .await
-        .with_context(|| format!("init memory (embedder ablation, {resolve_name})"))??;
+            let store = tokio::task::spawn_blocking({
+                let repo = repo.to_path_buf();
+                let model = resolve_name.to_string();
+                move || init_workspace_with_embedder_name(&repo, &model)
+            })
+            .await
+            .with_context(|| format!("init memory (embedder ablation, {resolve_name})"))??;
 
-        let matrix = run_scope_matrix(
-            &store,
-            &scope_ctx,
-            &cases,
-            &["run".to_string()],
-            Some(&retrieval_cfg),
-            reranker_arc.as_deref(),
-            Some(&rerank_cfg),
-        )
-        .await?;
-        let report = matrix
-            .into_iter()
-            .next()
-            .map(|(_, r)| r)
-            .context("scope matrix returned no rows")?;
+            let matrix = run_scope_matrix(
+                &store,
+                &scope_ctx,
+                &cases,
+                &["run".to_string()],
+                Some(&retrieval_cfg),
+                reranker_arc.as_deref(),
+                Some(&rerank_cfg),
+            )
+            .await?;
+            let report = matrix
+                .into_iter()
+                .next()
+                .map(|(_, r)| r)
+                .context("scope matrix returned no rows")?;
 
-        // CPU embed-latency probe: a separate, bare embedder load so the
-        // timing is pure embed cost (no retrieval / rerank noise).
-        let latency = measure_embed_latency(resolve_name, &query_texts).await?;
+            // CPU embed-latency probe: a separate, bare embedder load so the
+            // timing is pure embed cost (no retrieval / rerank noise).
+            let latency = measure_embed_latency(resolve_name, &query_texts).await?;
 
-        arms.push((resolve_name.to_string(), label.to_string(), report, latency));
+            Ok((resolve_name.to_string(), label.to_string(), report, latency))
+        }
+        .await;
+        match arm_result {
+            Ok(arm) => arms.push(arm),
+            Err(e) => eprintln!(
+                "[gaviero-eval] arm `{label}` ({resolve_name}) FAILED and is skipped: {e:#} \
+                 — rerun the ablation once its model is downloadable."
+            ),
+        }
     }
 
     eprintln!("[gaviero-eval] restoring workspace memory.db…");
     restore_memory_db(repo, &backup)?;
+    if arms.is_empty() {
+        anyhow::bail!("embedder ablation: every arm failed — nothing to report");
+    }
 
     println!("─── Embedder ablation (B1g / S1.1 + S3.1 / PR-4) ───────");
     println!("fixture     : {}", fixture.display());
