@@ -25,17 +25,18 @@ use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{ErrorData, tool, tool_router};
 
 use crate::memory::{
-    MemoryScope, MemoryStores, RerankConfig, Reranker, RetrievalConfig, retrieve_ranked,
+    MemoryScope, MemoryStores, RerankConfig, Reranker, RetrievalConfig, retrieve_ranked_with_levels,
 };
 use crate::repo_map::store::BlastRadiusMode;
 
 use super::observer::{McpCallLogEntry, McpToolCallObserver, NoopMcpObserver};
 use super::tools::{
-    BlastRadiusInput, BlastRadiusOutput, BlastRadiusRelation, MemorySearchInput,
-    MemorySearchOutput, MemorySearchResult, NodeDoc, NodeDocInput, NodeDocSymbol,
-    SymbolDocInput, SymbolDocImpl, SymbolDocOutput, SymbolSearchHit, SymbolSearchInput,
-    SymbolSearchOutput, clamp_blast_depth, clamp_memory_search_limit, clamp_symbol_search_limit,
-    truncate_symbol_snippet, SYMBOL_DOC_SNIPPET_MAX_CHARS,
+    BlastRadiusInput, BlastRadiusOutput, BlastRadiusRelation, MemoryGetInput, MemoryGetOutput,
+    MemoryGetRow, MemorySearchInput, MemorySearchOutput, MemorySearchResult, NodeDoc, NodeDocInput,
+    NodeDocSymbol, RepoOutlineEntry, RepoOutlineInput, RepoOutlineOutput,
+    SYMBOL_DOC_SNIPPET_MAX_CHARS, SymbolDocImpl, SymbolDocInput, SymbolDocOutput, SymbolSearchHit,
+    SymbolSearchInput, SymbolSearchOutput, clamp_blast_depth, clamp_memory_search_limit,
+    clamp_repo_outline_token_cap, clamp_symbol_search_limit, truncate_symbol_snippet,
 };
 
 /// Gaviero's MCP server. One instance lives per workspace; it
@@ -84,6 +85,13 @@ pub struct GavieroMcpServer {
     /// split into a snapshotted projection (edges + file list + DF) to
     /// allow concurrent reads.
     graph_cache: Arc<tokio::sync::Mutex<Option<crate::repo_map::store::GraphStore>>>,
+    /// Cached in-memory `RepoMap` backing the `repo_outline` tool,
+    /// mirroring `graph_cache`'s lifecycle: lazily built on first use,
+    /// shared across per-connection clones via `Arc`, and cleared by
+    /// [`Self::invalidate_graph_cache`]. Kept separate from
+    /// `graph_cache` because the outline renderer / budget admit live
+    /// on `RepoMap`, not on the persisted `GraphStore`.
+    repo_map_cache: Arc<tokio::sync::Mutex<Option<crate::repo_map::RepoMap>>>,
     /// S2.3: when false, `symbol_search` / `symbol_doc` return a clear
     /// error directing the agent to run `--graph --enrich` first.
     symbol_enrichment_enabled: bool,
@@ -124,6 +132,7 @@ impl GavieroMcpServer {
             specificity: crate::repo_map::SpecificityConfig::default(),
             edge_weights: std::collections::HashMap::new(),
             graph_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            repo_map_cache: Arc::new(tokio::sync::Mutex::new(None)),
             symbol_enrichment_enabled: false,
             permissions: super::McpPermissions::default(),
             first_tool_call_done: Arc::new(AtomicBool::new(false)),
@@ -222,14 +231,18 @@ impl GavieroMcpServer {
         self
     }
 
-    /// Drop the cached `GraphStore` so the next `blast_radius` call
-    /// rebuilds it from the current workspace state. Embedding apps
-    /// (TUI / CLI) should call this after a bulk workspace change
-    /// (large checkout, large file deletion) — small per-file edits
-    /// don't require it because the next builder run is incremental.
+    /// Drop the cached `GraphStore` and `RepoMap` so the next
+    /// `blast_radius` / `repo_outline` call rebuilds them from the
+    /// current workspace state. Embedding apps (TUI / CLI) should call
+    /// this after a bulk workspace change (large checkout, large file
+    /// deletion) — small per-file edits don't require it because the
+    /// next builder run is incremental.
     pub async fn invalidate_graph_cache(&self) {
         let mut guard = self.graph_cache.lock().await;
         *guard = None;
+        drop(guard);
+        let mut rm = self.repo_map_cache.lock().await;
+        *rm = None;
     }
 
     /// Phase 1 warmup: pay the `blast_radius` graph-build cost and (when
@@ -241,6 +254,7 @@ impl GavieroMcpServer {
     /// per-connection server clone, so warming here warms all of them.
     pub async fn warmup(&self) {
         let cache = Arc::clone(&self.graph_cache);
+        let repo_map_cache = Arc::clone(&self.repo_map_cache);
         let workspace_root = self.workspace_root.clone();
         // build_graph is blocking + potentially heavy on a large repo;
         // run it off the async runtime and hold the cache lock only for
@@ -254,6 +268,20 @@ impl GavieroMcpServer {
                         target: "mcp_server",
                         error = %e,
                         "graph cache warmup build failed"
+                    ),
+                }
+            }
+            drop(guard);
+            // Also pre-build the `repo_outline` RepoMap so a mid-run
+            // outline pull never pays the cold workspace scan.
+            let mut rm = repo_map_cache.blocking_lock();
+            if rm.is_none() {
+                match crate::repo_map::RepoMap::build(&workspace_root, &[]) {
+                    Ok(map) => *rm = Some(map),
+                    Err(e) => tracing::warn!(
+                        target: "mcp_server",
+                        error = %e,
+                        "repo map warmup build failed"
                     ),
                 }
             }
@@ -307,6 +335,34 @@ impl GavieroMcpServer {
         // see the contract violation instead of silently falling back.
         let kind_filter = super::tools::resolve_memory_search_kind(input.kind.as_deref())
             .map_err(|e| ErrorData::invalid_params(e, None))?;
+        // DRIFT-2: `scope_hint` is a *restriction* over the levels the
+        // MCP context can reach ([Workspace, Global] — no folder/run
+        // identity crosses the shim). Folder/run hints are a loud
+        // error rather than a silent widen; unknown values likewise.
+        let level_restriction = match input.scope_hint.as_deref() {
+            None => None,
+            Some("workspace") => Some(crate::memory::scope::SCOPE_WORKSPACE),
+            Some("global") => Some(crate::memory::scope::SCOPE_GLOBAL),
+            Some(other @ ("repo" | "module" | "run")) => {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "memory_search.scope_hint: {other:?} needs folder/run context that the \
+                         MCP surface does not carry; reachable scopes are 'workspace' and \
+                         'global' (omit the hint to merge both)"
+                    ),
+                    None,
+                ));
+            }
+            Some(other) => {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "memory_search.scope_hint: unknown value {other:?}; expected \
+                         'workspace' | 'global', or omit to merge both"
+                    ),
+                    None,
+                ));
+            }
+        };
         // MCP has no active-file context → folder = None. The
         // registry's scope.levels() emits [Workspace, Global], which
         // is the correct default for an unscoped tool query.
@@ -321,7 +377,7 @@ impl GavieroMcpServer {
             None | Some(crate::memory::MemoryKind::Record) => limit,
             _ => (limit * 4).clamp(limit, 80),
         };
-        let out = retrieve_ranked(
+        let out = retrieve_ranked_with_levels(
             &self.stores,
             &scope,
             &input.query,
@@ -329,28 +385,49 @@ impl GavieroMcpServer {
             &self.retrieval_cfg,
             reranker_ref,
             Some(&self.rerank_cfg),
+            level_restriction,
         )
         .await
         .map_err(|e| ErrorData::internal_error(format!("retrieve_ranked: {e}"), None))?;
 
-        // C1.6: post-filter the candidate list by memory_kind. Lookup
-        // happens via the workspace store — MCP's retrieval mix is
-        // workspace+global, and the unfiltered case skips the lookup
-        // entirely. Rows whose kind cannot be resolved are dropped
-        // when a filter is active (forgive only on `any`).
+        // C1.6 + BUG-1: post-filter the candidate list by memory_kind.
+        // The candidate mix spans physical DBs with independent rowid
+        // spaces (workspace + global today), so each row's kind lookup
+        // must be routed to the store that owns it via its persisted
+        // (scope_level, repo_id) — a fixed-store lookup would miss
+        // global ids or, worse, read a colliding workspace row's kind.
+        // Rows whose kind cannot be resolved are dropped when a filter
+        // is active (forgive only on `any`); a bad row degrades that
+        // row, never the whole call.
         let mut results: Vec<MemorySearchResult> = Vec::with_capacity(limit);
+        let mut warned_unresolvable = false;
         for m in out.items.iter() {
             if results.len() >= limit {
                 break;
             }
             if let Some(want) = kind_filter {
-                let got = self
-                    .stores
-                    .workspace()
-                    .get_memory_kind(m.id)
-                    .await
-                    .ok()
-                    .flatten();
+                let owning_store = match crate::memory::scope::store_kind_for_scope(
+                    m.scope_level,
+                    m.repo_id.as_deref(),
+                ) {
+                    Some(kind) => self.stores.get(&kind).await.ok(),
+                    None => None,
+                };
+                let got = match owning_store {
+                    Some(store) => store.get_memory_kind(m.id).await.ok().flatten(),
+                    None => {
+                        if !warned_unresolvable {
+                            warned_unresolvable = true;
+                            tracing::warn!(
+                                target: "mcp_server",
+                                memory_id = m.id,
+                                scope_level = m.scope_level,
+                                "memory_search kind filter: owning store unresolvable; dropping row(s)"
+                            );
+                        }
+                        None
+                    }
+                };
                 if got != Some(want) {
                     continue;
                 }
@@ -421,8 +498,7 @@ impl GavieroMcpServer {
             // hold the cache for the duration of this call only.
             let mut guard = cache.blocking_lock();
             if guard.is_none() {
-                let (store, _) =
-                    crate::repo_map::graph_builder::build_graph(&workspace_root, &[])?;
+                let (store, _) = crate::repo_map::graph_builder::build_graph(&workspace_root, &[])?;
                 *guard = Some(store);
             }
             let store = guard.as_ref().expect("graph cache populated above");
@@ -536,8 +612,7 @@ impl GavieroMcpServer {
         let (symbols, signatures) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let mut guard = cache.blocking_lock();
             if guard.is_none() {
-                let (store, _) =
-                    crate::repo_map::graph_builder::build_graph(&workspace_root, &[])?;
+                let (store, _) = crate::repo_map::graph_builder::build_graph(&workspace_root, &[])?;
                 *guard = Some(store);
             }
             let store = guard.as_ref().expect("graph cache populated");
@@ -596,6 +671,149 @@ impl GavieroMcpServer {
         Ok(Json(out))
     }
 
+    // ── memory_get ──────────────────────────────────────────────────
+    #[tool(
+        name = "memory_get",
+        description = "Fetch the full stored row behind one memory_search hit — pass the \
+                       hit's `id` and `scope`. Returns text, kind, type, importance, trust, \
+                       timestamps, tag, and access stats; a miss is an empty result, not an \
+                       error. Read-only.",
+        annotations(read_only_hint = true, idempotent_hint = true)
+    )]
+    async fn memory_get(
+        &self,
+        Parameters(input): Parameters<MemoryGetInput>,
+    ) -> Result<Json<MemoryGetOutput>, ErrorData> {
+        let started = Instant::now();
+        self.ensure_tool_allowed("memory_get")?;
+        // `scope` names the owning *store* (ids are only unique per
+        // physical DB — the BUG-1 lesson). Run rows live in the
+        // workspace store; folder scopes need a repo_id the MCP
+        // surface does not carry, so they error loudly (PR-2
+        // precedent).
+        let store = match input.scope.trim() {
+            "global" => self.stores.global(),
+            "workspace" | "run" => self.stores.workspace(),
+            other @ ("repo" | "module") => {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "memory_get.scope: {other:?} rows live in per-folder DBs keyed by a \
+                         repo_id the MCP surface does not carry; reachable scopes are \
+                         'global', 'workspace', and 'run'"
+                    ),
+                    None,
+                ));
+            }
+            other => {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "memory_get.scope: unknown value {other:?}; expected 'global' | \
+                         'workspace' | 'run' (as returned by memory_search)"
+                    ),
+                    None,
+                ));
+            }
+        };
+        let row = store
+            .get_memory_row(input.id)
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("memory_get: {e}"), None))?;
+        let out = MemoryGetOutput {
+            memory: row.map(|r| MemoryGetRow {
+                id: r.id,
+                scope: format_scope(r.scope_level),
+                kind: r.kind.as_str().to_string(),
+                memory_type: r.memory_type.as_str().to_string(),
+                text: r.content,
+                importance: r.importance,
+                trust: r.trust_score,
+                created_at: r.created_at,
+                updated_at: r.updated_at,
+                tag: r.tag,
+                access_count: r.access_count,
+                accessed_at: r.accessed_at,
+            }),
+        };
+        self.emit_tool_call(
+            super::tools::TOOL_MEMORY_GET,
+            serde_json::to_value(&input).unwrap_or_default(),
+            serde_json::to_value(&out).unwrap_or_default(),
+            started,
+            None,
+        );
+        Ok(Json(out))
+    }
+
+    // ── repo_outline ────────────────────────────────────────────────
+    #[tool(
+        name = "repo_outline",
+        description = "Call this to pull the PageRank-ranked code outline mid-run — the same \
+                       ranked view injected as <repo_outline> on turn 1 — when you need repo \
+                       orientation without reading files. Optional seed_paths focus the \
+                       ranking on an area; token_cap bounds the output (default 2000, max \
+                       8000); mode weights edges like blast_radius. Read-only.",
+        annotations(read_only_hint = true, idempotent_hint = true)
+    )]
+    async fn repo_outline(
+        &self,
+        Parameters(input): Parameters<RepoOutlineInput>,
+    ) -> Result<Json<RepoOutlineOutput>, ErrorData> {
+        let started = Instant::now();
+        self.ensure_tool_allowed("repo_outline")?;
+        let budget = clamp_repo_outline_token_cap(input.token_cap) as usize;
+        let mode = BlastRadiusMode::from_str(input.mode.as_deref().unwrap_or("all"));
+        // Empty / omitted seeds → "." which the ranker treats as
+        // match-all (every file is owned; whole-workspace outline).
+        let seeds: Vec<String> = match &input.seed_paths {
+            Some(v) if !v.is_empty() => v.clone(),
+            _ => vec![".".to_string()],
+        };
+        let cache = Arc::clone(&self.repo_map_cache);
+        let workspace_root = self.workspace_root.clone();
+
+        let candidates = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let mut guard = cache.blocking_lock();
+            if guard.is_none() {
+                // No exclude source exists server-side (excludes are a
+                // host/TUI/CLI concern); mirror the graph_cache build's
+                // empty exclude set so both caches see the same tree.
+                *guard = Some(crate::repo_map::RepoMap::build(&workspace_root, &[])?);
+            }
+            let map = guard.as_ref().expect("repo map cache populated above");
+            Ok(map.rank_for_agent_structured_with_mode(&seeds, budget, mode))
+        })
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("repo_outline join: {e}"), None))?
+        .map_err(|e| ErrorData::internal_error(format!("repo_outline: {e}"), None))?;
+
+        let mut token_estimate: u32 = 0;
+        let entries: Vec<RepoOutlineEntry> = candidates
+            .iter()
+            .map(|c| {
+                token_estimate = token_estimate.saturating_add(c.token_estimate as u32);
+                RepoOutlineEntry {
+                    path: c.path.to_string_lossy().to_string(),
+                    rank_score: c.rank_score,
+                    specificity: c.specificity,
+                    rendered: c.rendered_line.clone(),
+                }
+            })
+            .collect();
+
+        let out = RepoOutlineOutput {
+            entries,
+            token_estimate,
+        };
+        self.emit_tool_call(
+            super::tools::TOOL_REPO_OUTLINE,
+            serde_json::to_value(&input).unwrap_or_default(),
+            serde_json::to_value(&out).unwrap_or_default(),
+            started,
+            None,
+        );
+        Ok(Json(out))
+    }
+
     // ── symbol_search ───────────────────────────────────────────────
     #[tool(
         name = "symbol_search",
@@ -634,8 +852,7 @@ impl GavieroMcpServer {
         let hits = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let mut guard = cache.blocking_lock();
             if guard.is_none() {
-                let (store, _) =
-                    crate::repo_map::graph_builder::build_graph(&workspace_root, &[])?;
+                let (store, _) = crate::repo_map::graph_builder::build_graph(&workspace_root, &[])?;
                 *guard = Some(store);
             }
             let store = guard.as_ref().expect("graph cache populated");
@@ -706,8 +923,7 @@ impl GavieroMcpServer {
         let out = tokio::task::spawn_blocking(move || -> anyhow::Result<SymbolDocOutput> {
             let mut guard = cache.blocking_lock();
             if guard.is_none() {
-                let (store, _) =
-                    crate::repo_map::graph_builder::build_graph(&workspace_root, &[])?;
+                let (store, _) = crate::repo_map::graph_builder::build_graph(&workspace_root, &[])?;
                 *guard = Some(store);
             }
             let store = guard.as_ref().expect("graph cache populated");
@@ -1043,7 +1259,11 @@ mod tests {
             .await
             .unwrap();
         store
-            .store_scoped(&scope, "purple elephant convention seen in transcript", &history_meta)
+            .store_scoped(
+                &scope,
+                "purple elephant convention seen in transcript",
+                &history_meta,
+            )
             .await
             .unwrap();
 
@@ -1099,6 +1319,214 @@ mod tests {
         let any_history = out.0.results.iter().any(|r| r.text.contains("transcript"));
         assert!(any_record, "any-filter must include records");
         assert!(any_history, "any-filter must include history");
+    }
+
+    /// BUG-1 fixture: distinct global and workspace in-memory DBs with
+    /// independent rowid spaces (no single-store aliasing).
+    fn split_fixture() -> GavieroMcpServer {
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let stores = MemoryStores::for_tests_split_in_memory(embedder).unwrap();
+        GavieroMcpServer::with_defaults(stores, std::path::PathBuf::from("/tmp"))
+    }
+
+    /// BUG-1: a Record living only in the global DB must survive the
+    /// default kind filter. Pre-fix, the kind lookup was hard-coded to
+    /// the workspace DB, missed the global id, and dropped the row.
+    #[tokio::test]
+    async fn memory_search_default_filter_sees_global_records_across_stores() {
+        use crate::memory::scope::{MemoryType, WriteMeta, WriteScope};
+        use crate::memory::trust_defaults::MemorySource;
+
+        let s = split_fixture();
+        let meta = WriteMeta::for_source(MemorySource::UserRemember)
+            .with_type(MemoryType::Decision)
+            .with_tag("bug1-global-record");
+        s.stores
+            .global()
+            .store_scoped(&WriteScope::Global, "orange giraffe convention", &meta)
+            .await
+            .unwrap();
+
+        let out = s
+            .memory_search(Parameters(MemorySearchInput {
+                query: "orange giraffe convention".into(),
+                scope_hint: None,
+                limit: Some(10),
+                kind: None,
+            }))
+            .await
+            .unwrap();
+        assert!(
+            out.0
+                .results
+                .iter()
+                .any(|r| r.text.contains("orange giraffe") && r.scope == "global"),
+            "global record must survive the default kind filter: {:?}",
+            out.0.results
+        );
+    }
+
+    /// BUG-1: id collision across DBs. Global id N is a Record while
+    /// workspace id N is a History row; the default filter must route
+    /// each row's kind lookup to its own store. Pre-fix, the global
+    /// record's kind resolved via the colliding workspace row
+    /// (History) and the record was wrongly dropped.
+    #[tokio::test]
+    async fn memory_search_kind_filter_routes_lookup_to_owning_store_on_id_collision() {
+        use crate::memory::kind::MemoryKind;
+        use crate::memory::scope::{MemoryType, StoreResult, WriteMeta, WriteScope};
+        use crate::memory::trust_defaults::MemorySource;
+
+        let s = split_fixture();
+        let record_meta = WriteMeta::for_source(MemorySource::UserRemember)
+            .with_type(MemoryType::Decision)
+            .with_tag("bug1-collision-record");
+        let history_meta = WriteMeta::for_source(MemorySource::RawTranscript)
+            .with_kind(MemoryKind::History)
+            .with_type(MemoryType::Factual)
+            .with_tag("bug1-collision-history");
+        let gid = match s
+            .stores
+            .global()
+            .store_scoped(
+                &WriteScope::Global,
+                "purple elephant convention",
+                &record_meta,
+            )
+            .await
+            .unwrap()
+        {
+            StoreResult::Inserted(id) => id,
+            other => panic!("expected fresh insert, got {other:?}"),
+        };
+        let wid = match s
+            .stores
+            .workspace()
+            .store_scoped(
+                &WriteScope::Workspace,
+                "purple elephant convention seen in transcript",
+                &history_meta,
+            )
+            .await
+            .unwrap()
+        {
+            StoreResult::Inserted(id) => id,
+            other => panic!("expected fresh insert, got {other:?}"),
+        };
+        // Precondition: the ids collide across the two DBs, and each
+        // DB reports a different kind for that id.
+        assert_eq!(
+            gid, wid,
+            "fresh in-memory DBs must hand out the same first id"
+        );
+        assert_eq!(
+            s.stores.global().get_memory_kind(gid).await.unwrap(),
+            Some(MemoryKind::Record)
+        );
+        assert_eq!(
+            s.stores.workspace().get_memory_kind(wid).await.unwrap(),
+            Some(MemoryKind::History)
+        );
+
+        let out = s
+            .memory_search(Parameters(MemorySearchInput {
+                query: "purple elephant convention".into(),
+                scope_hint: None,
+                limit: Some(10),
+                kind: None,
+            }))
+            .await
+            .unwrap();
+        assert!(
+            out.0
+                .results
+                .iter()
+                .any(|r| r.scope == "global" && !r.text.contains("transcript")),
+            "global record must be returned despite the id collision: {:?}",
+            out.0.results
+        );
+        // The workspace History row stays excluded under the default filter.
+        assert!(
+            out.0.results.iter().all(|r| !r.text.contains("transcript")),
+            "history row must not leak through the default filter: {:?}",
+            out.0.results
+        );
+    }
+
+    /// DRIFT-2 (scope_hint): restriction semantics over the reachable
+    /// levels. `"global"` returns only global rows, `"workspace"` only
+    /// workspace rows, omitted merges both; folder/run hints and
+    /// unknown values are loud invalid_params errors.
+    #[tokio::test]
+    async fn memory_search_scope_hint_restricts_levels() {
+        use crate::memory::scope::{MemoryType, WriteMeta, WriteScope};
+        use crate::memory::trust_defaults::MemorySource;
+
+        let s = split_fixture();
+        let meta = |tag: &str| {
+            WriteMeta::for_source(MemorySource::UserRemember)
+                .with_type(MemoryType::Decision)
+                .with_tag(tag)
+        };
+        s.stores
+            .global()
+            .store_scoped(
+                &WriteScope::Global,
+                "quantum banana global fact",
+                &meta("hint-global"),
+            )
+            .await
+            .unwrap();
+        s.stores
+            .workspace()
+            .store_scoped(
+                &WriteScope::Workspace,
+                "quantum banana workspace fact",
+                &meta("hint-workspace"),
+            )
+            .await
+            .unwrap();
+
+        let search = |hint: Option<&str>| {
+            let hint = hint.map(String::from);
+            let s = &s;
+            async move {
+                s.memory_search(Parameters(MemorySearchInput {
+                    query: "quantum banana fact".into(),
+                    scope_hint: hint,
+                    limit: Some(10),
+                    kind: None,
+                }))
+                .await
+            }
+        };
+
+        let both = search(None).await.unwrap().0.results;
+        assert!(both.iter().any(|r| r.scope == "global"), "{both:?}");
+        assert!(both.iter().any(|r| r.scope == "workspace"), "{both:?}");
+
+        let only_global = search(Some("global")).await.unwrap().0.results;
+        assert!(!only_global.is_empty());
+        assert!(
+            only_global.iter().all(|r| r.scope == "global"),
+            "{only_global:?}"
+        );
+
+        let only_ws = search(Some("workspace")).await.unwrap().0.results;
+        assert!(!only_ws.is_empty());
+        assert!(
+            only_ws.iter().all(|r| r.scope == "workspace"),
+            "{only_ws:?}"
+        );
+
+        for bad in ["repo", "module", "run", "solar"] {
+            match search(Some(bad)).await {
+                Err(err) => {
+                    assert!(err.message.contains("scope_hint"), "{bad}: {}", err.message)
+                }
+                Ok(_) => panic!("scope_hint {bad:?} must error"),
+            }
+        }
     }
 
     /// C1.6: unknown kinds produce a clear MCP invalid_params error,
@@ -1175,8 +1603,7 @@ mod tests {
         let pipe_name = format!(r"\\.\pipe\gaviero-test-{}", std::process::id());
         let server = fixture();
         let handle =
-            spawn_mcp_server(server, &super::super::McpEndpoint::Pipe(pipe_name.clone()))
-                .unwrap();
+            spawn_mcp_server(server, &super::super::McpEndpoint::Pipe(pipe_name.clone())).unwrap();
 
         let mut clients = Vec::new();
         for _ in 0..2 {
@@ -1212,6 +1639,159 @@ mod tests {
             .unwrap();
         assert_eq!(out.0.path, "src/lib.rs");
         assert_eq!(out.0.qualified_name, "src/lib.rs");
+    }
+
+    /// PR-4: `memory_get` routes by the scope string to the owning
+    /// store (disambiguating colliding ids), returns the full row,
+    /// treats misses as empty results, and rejects folder scopes.
+    #[tokio::test]
+    async fn memory_get_returns_row_per_scope_and_empty_on_miss() {
+        use crate::memory::scope::{MemoryType, StoreResult, WriteMeta, WriteScope};
+        use crate::memory::trust_defaults::MemorySource;
+
+        let s = split_fixture();
+        let meta = |tag: &str| {
+            WriteMeta::for_source(MemorySource::UserRemember)
+                .with_type(MemoryType::Decision)
+                .with_tag(tag)
+        };
+        let gid = match s
+            .stores
+            .global()
+            .store_scoped(
+                &WriteScope::Global,
+                "global memo about lighthouses",
+                &meta("get-global"),
+            )
+            .await
+            .unwrap()
+        {
+            StoreResult::Inserted(id) => id,
+            other => panic!("expected insert, got {other:?}"),
+        };
+        let wid = match s
+            .stores
+            .workspace()
+            .store_scoped(
+                &WriteScope::Workspace,
+                "workspace memo about beacons",
+                &meta("get-workspace"),
+            )
+            .await
+            .unwrap()
+        {
+            StoreResult::Inserted(id) => id,
+            other => panic!("expected insert, got {other:?}"),
+        };
+        // Fresh in-memory DBs: the ids collide, which is exactly why
+        // the scope parameter exists.
+        assert_eq!(gid, wid);
+
+        let get = |id: i64, scope: &str| {
+            let scope = scope.to_string();
+            let s = &s;
+            async move { s.memory_get(Parameters(MemoryGetInput { id, scope })).await }
+        };
+
+        let row = get(gid, "global")
+            .await
+            .unwrap()
+            .0
+            .memory
+            .expect("global row");
+        assert_eq!(row.id, gid);
+        assert_eq!(row.scope, "global");
+        assert_eq!(row.kind, "record");
+        assert!(row.text.contains("lighthouses"), "{row:?}");
+        assert_eq!(row.tag.as_deref(), Some("get-global"));
+
+        let row = get(wid, "workspace")
+            .await
+            .unwrap()
+            .0
+            .memory
+            .expect("workspace row");
+        assert_eq!(row.scope, "workspace");
+        assert!(row.text.contains("beacons"), "{row:?}");
+
+        // Miss (id that exists in neither store) → empty result.
+        let out = get(gid + 999, "workspace").await.unwrap();
+        assert!(out.0.memory.is_none());
+
+        // Folder scopes and unknown values → loud invalid_params.
+        for bad in ["repo", "module", "cosmic"] {
+            match get(gid, bad).await {
+                Err(err) => assert!(
+                    err.message.contains("memory_get.scope"),
+                    "{bad}: {}",
+                    err.message
+                ),
+                Ok(_) => panic!("scope {bad:?} must error"),
+            }
+        }
+    }
+
+    /// PR-3: `repo_outline` returns ranked entries from a real
+    /// workspace scan, respects the token cap, and parses modes.
+    #[tokio::test]
+    async fn repo_outline_returns_budgeted_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "pub fn alpha() {}\npub fn beta() { alpha(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("util.rs"),
+            "pub struct Widget;\npub fn gamma() {}\n",
+        )
+        .unwrap();
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let stores = MemoryStores::for_tests_in_memory(embedder).unwrap();
+        let s = GavieroMcpServer::with_defaults(stores, dir.path().to_path_buf());
+
+        let out = s
+            .repo_outline(Parameters(RepoOutlineInput {
+                seed_paths: None,
+                token_cap: Some(150),
+                mode: Some("callers".into()),
+            }))
+            .await
+            .unwrap();
+        assert!(!out.0.entries.is_empty(), "expected outline entries");
+        assert!(
+            out.0.token_estimate <= 150,
+            "budget exceeded: {}",
+            out.0.token_estimate
+        );
+        for e in &out.0.entries {
+            assert!(!e.rendered.is_empty());
+            assert!(!e.path.is_empty());
+        }
+    }
+
+    /// PR-3: the permission policy denies `repo_outline` server-side
+    /// like any other gaviero tool.
+    #[tokio::test]
+    async fn repo_outline_denied_by_permission_policy() {
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let stores = MemoryStores::for_tests_in_memory(embedder).unwrap();
+        let s = GavieroMcpServer::with_defaults(stores, std::path::PathBuf::from("/tmp"))
+            .with_permissions(super::super::McpPermissions {
+                allow: vec![],
+                deny: vec!["gaviero:repo_outline".into()],
+            });
+        match s
+            .repo_outline(Parameters(RepoOutlineInput::default()))
+            .await
+        {
+            Err(err) => assert!(
+                err.message.contains("mcp.permissions"),
+                "unexpected error: {}",
+                err.message
+            ),
+            Ok(_) => panic!("expected repo_outline to be denied by policy"),
+        }
     }
 
     #[tokio::test]

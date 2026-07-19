@@ -21,9 +21,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-use super::{
-    MemoryStore, chrono_now_utc, embedding_to_blob, hours_since,
-};
+use super::{MemoryStore, chrono_now_utc, embedding_to_blob, hours_since};
 use crate::memory::scope::{MemoryScope, MemoryType, ScopeFilter, Trust};
 use crate::memory::scoring::{self, ScoredMemory, SearchConfig};
 use crate::memory::trust_defaults::MemorySource;
@@ -81,6 +79,11 @@ impl MemoryStore {
 
         for level in config.scope.levels() {
             let scope_level_int = level.level_int();
+            if let Some(want) = config.level_restriction
+                && scope_level_int != want
+            {
+                continue;
+            }
             let vec_candidates = self.vec_search_at_level(
                 &conn,
                 &query_blob,
@@ -283,6 +286,11 @@ impl MemoryStore {
 
         for level in config.scope.levels() {
             let scope_level_int = level.level_int();
+            if let Some(want) = config.level_restriction
+                && scope_level_int != want
+            {
+                continue;
+            }
             let vec_candidates = self.vec_search_at_level(
                 &conn,
                 &query_blob,
@@ -405,6 +413,7 @@ impl MemoryStore {
             confidence_threshold: 1.0, // don't terminate early
             use_fts: true,
             scope,
+            level_restriction: None,
         };
 
         self.search_scoped(&config).await
@@ -768,4 +777,3 @@ impl MemoryStore {
         Ok(results)
     }
 }
-

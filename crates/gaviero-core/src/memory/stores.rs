@@ -238,6 +238,27 @@ impl MemoryStores {
         }))
     }
 
+    /// Build a registry whose global and workspace slots are two
+    /// *distinct* in-memory stores with `single_store_fallback` off.
+    /// Used by tests that need real cross-DB behavior — independent
+    /// rowid spaces, per-store kind lookups (BUG-1 regression
+    /// coverage). [`Self::for_tests_in_memory`] aliases every slot to
+    /// one store, which masks exactly that class of bug.
+    pub fn for_tests_split_in_memory(embedder: Arc<dyn Embedder>) -> Result<Arc<Self>> {
+        let global = Arc::new(MemoryStore::in_memory(embedder.clone())?);
+        let workspace = Arc::new(MemoryStore::in_memory(embedder.clone())?);
+        Ok(Arc::new(Self {
+            embedder_name: embedder.name().to_string(),
+            embedder,
+            global,
+            workspace,
+            workspace_path: None,
+            folder_paths: HashMap::new(),
+            folders: Mutex::new(HashMap::new()),
+            single_store_fallback: false,
+        }))
+    }
+
     /// Build a registry that wraps a single, already-opened store —
     /// behaves identically to the pre-registry single-store world.
     /// Used by transitional call sites and by [`super::init_workspace`]
@@ -399,6 +420,11 @@ impl MemoryStores {
         let mut by_hash: HashMap<String, usize> = HashMap::new();
 
         for level in config.scope.levels() {
+            if let Some(want) = config.level_restriction
+                && level.level_int() != want
+            {
+                continue;
+            }
             let kind = level.target_store();
             let store = self.get(&kind).await?;
             let level_results = store

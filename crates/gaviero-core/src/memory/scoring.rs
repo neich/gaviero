@@ -30,6 +30,12 @@ pub struct SearchConfig {
     pub use_fts: bool,
     /// The scope chain to cascade through.
     pub scope: MemoryScope,
+    /// Optional restriction to a single scope level (a `SCOPE_*`
+    /// constant from [`super::scope`]). When set, retrieval walks only
+    /// the matching level out of `scope.levels()`; `None` (default)
+    /// keeps every reachable level. Backs the MCP `memory_search`
+    /// `scope_hint` parameter.
+    pub level_restriction: Option<i32>,
 }
 
 impl SearchConfig {
@@ -43,6 +49,7 @@ impl SearchConfig {
             confidence_threshold: 0.70,
             use_fts: true,
             scope,
+            level_restriction: None,
         }
     }
 
@@ -58,6 +65,13 @@ impl SearchConfig {
 
     pub fn with_per_level_limit(mut self, n: usize) -> Self {
         self.per_level_limit = n;
+        self
+    }
+
+    /// Restrict retrieval to the single scope level `level` (a
+    /// `SCOPE_*` constant). `None` clears the restriction.
+    pub fn with_level_restriction(mut self, level: Option<i32>) -> Self {
+        self.level_restriction = level;
         self
     }
 }

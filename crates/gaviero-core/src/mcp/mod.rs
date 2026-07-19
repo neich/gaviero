@@ -2,8 +2,10 @@
 //!
 //! Exposes read-only tools to subprocess coding agents:
 //! * `memory_search` — merged multi-scope hybrid search over memories
+//! * `memory_get` — full stored row for one `memory_search` hit (id + scope)
 //! * `blast_radius` — graph impact / callers / tests for file paths
 //! * `node_doc` — per-file symbol signatures (+ `qualified_name` for chaining)
+//! * `repo_outline` — PageRank-ranked code outline (mid-run `<repo_outline>` pull)
 //! * `symbol_search` / `symbol_doc` — semantic symbol retrieval (when enrichment on)
 //!
 //! The server runs as an in-process tokio task launched at
@@ -18,9 +20,9 @@
 
 pub mod config_synth;
 pub mod external_memory;
+pub mod observer;
 pub mod preflight;
 pub mod resolver;
-pub mod observer;
 pub mod server;
 pub mod telemetry_sink;
 pub mod tools;
@@ -33,6 +35,11 @@ pub use config_synth::{
     host_from_mcp_url, mcp_json_has_remote_urls, synth_has_remote_url_servers,
     synthesize_for_worktree, worktree_has_remote_mcp_urls,
 };
+pub use external_memory::{
+    ExternalMemoryServer, detect_external_memory_servers, disable_external_memory_servers,
+    import_server_memory_jsonl,
+};
+pub use observer::{FanOutMcpObserver, McpCallLogEntry, McpToolCallObserver, NoopMcpObserver};
 pub use preflight::{
     PreflightOpts, plan_uses_codex, preflight_mcp, shim_binary_resolvable,
     validate_codex_trust_for_extras, validate_synthesized_cursor_remote_mcp,
@@ -42,21 +49,15 @@ pub use resolver::{
     parse_mcp_codex_trust_flag, parse_mcp_stdio_flag, parse_mcp_url_flag, resolve_context7_config,
     resolve_mcp_config_synth, resolve_mcp_permissions,
 };
-pub use external_memory::{
-    ExternalMemoryServer, detect_external_memory_servers, disable_external_memory_servers,
-    import_server_memory_jsonl,
-};
-pub use observer::{
-    FanOutMcpObserver, McpCallLogEntry, McpToolCallObserver, NoopMcpObserver,
-};
 pub use server::{GavieroMcpServer, McpServerHandle, spawn_mcp_server};
-pub use transport::McpEndpoint;
 pub use telemetry_sink::{
     McpCallRecord, NdjsonTelemetrySink, ToolStats, compute_stats, default_telemetry_path,
 };
 pub use tools::{
-    BlastRadiusInput, BlastRadiusOutput, BlastRadiusRelation, MemorySearchInput,
-    MemorySearchOutput, MemorySearchResult, NodeDoc, NodeDocInput, NodeDocSymbol,
-    SymbolDocInput, SymbolDocOutput, SymbolSearchInput, SymbolSearchOutput,
-    TOOL_BLAST_RADIUS, TOOL_MEMORY_SEARCH, TOOL_NODE_DOC, TOOL_SYMBOL_DOC, TOOL_SYMBOL_SEARCH,
+    BlastRadiusInput, BlastRadiusOutput, BlastRadiusRelation, MemoryGetInput, MemoryGetOutput,
+    MemoryGetRow, MemorySearchInput, MemorySearchOutput, MemorySearchResult, NodeDoc, NodeDocInput,
+    NodeDocSymbol, RepoOutlineEntry, RepoOutlineInput, RepoOutlineOutput, SymbolDocInput,
+    SymbolDocOutput, SymbolSearchInput, SymbolSearchOutput, TOOL_BLAST_RADIUS, TOOL_MEMORY_GET,
+    TOOL_MEMORY_SEARCH, TOOL_NODE_DOC, TOOL_REPO_OUTLINE, TOOL_SYMBOL_DOC, TOOL_SYMBOL_SEARCH,
 };
+pub use transport::McpEndpoint;
