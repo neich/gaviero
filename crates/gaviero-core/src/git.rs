@@ -1130,6 +1130,22 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let repo = git2::Repository::init(dir.path()).unwrap();
 
+        // CI runners (and fresh machines) often have no global git identity.
+        // `GitRepo::commit` / `commit_all` use `Repository::signature()`, and
+        // CLI `git commit` in worktree tests needs the same — match the local
+        // config setup used by git_worktree_lifecycle / swarm_branch_cleanup.
+        //
+        // Disable autocrlf so libgit2 checkouts and the git CLI agree on
+        // working-tree bytes (Git for Windows defaults autocrlf=true, which
+        // leaves "local changes" after a libgit2 branch switch and breaks
+        // merge-conflict setup).
+        {
+            let mut config = repo.config().unwrap();
+            config.set_str("user.name", "Test").unwrap();
+            config.set_str("user.email", "test@test.com").unwrap();
+            config.set_str("core.autocrlf", "false").unwrap();
+        }
+
         // Create initial commit
         let sig = git2::Signature::now("Test", "test@test.com").unwrap();
         let tree_oid = {
@@ -1226,6 +1242,10 @@ mod tests {
         repo.commit("side change").unwrap();
 
         repo.checkout(&main_branch).unwrap();
+        // Drop the libgit2 handle before invoking the git CLI. On Windows,
+        // an open Repository can leave the index / refs in a state the CLI
+        // merge does not observe as a conflict (empty --diff-filter=U).
+        drop(repo);
         let merge = Command::new("git")
             .args(["merge", "side", "--no-commit", "--no-ff"])
             .current_dir(dir.path())
@@ -1233,7 +1253,8 @@ mod tests {
             .unwrap();
         assert!(
             !merge.status.success(),
-            "merge should conflict: {}",
+            "merge should conflict: stdout={} stderr={}",
+            String::from_utf8_lossy(&merge.stdout),
             String::from_utf8_lossy(&merge.stderr)
         );
 
@@ -1241,8 +1262,10 @@ mod tests {
         let unmerged = opened.unmerged_paths().unwrap();
         assert!(
             unmerged.iter().any(|p| p == "README.md"),
-            "expected README.md unmerged, got {:?}",
-            unmerged
+            "expected README.md unmerged, got {:?}; merge stdout={} stderr={}",
+            unmerged,
+            String::from_utf8_lossy(&merge.stdout),
+            String::from_utf8_lossy(&merge.stderr)
         );
         let status = opened.file_status().unwrap();
         assert!(
@@ -1370,16 +1393,26 @@ mod tests {
             .provision_with_base("agent", "gaviero/agent-iter1", &head)
             .expect("provision iter1");
         fs::write(h1.path.join("a.txt"), "iter1\n").unwrap();
-        Command::new("git")
+        let add = Command::new("git")
             .args(["add", "."])
             .current_dir(&h1.path)
-            .status()
+            .output()
             .unwrap();
-        Command::new("git")
+        assert!(
+            add.status.success(),
+            "git add failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+        let commit = Command::new("git")
             .args(["commit", "-m", "iter1 commit"])
             .current_dir(&h1.path)
-            .status()
+            .output()
             .unwrap();
+        assert!(
+            commit.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
 
         let iter1_tip = wm
             .branch_tip("gaviero/agent-iter1")
