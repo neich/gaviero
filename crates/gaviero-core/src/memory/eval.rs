@@ -1795,32 +1795,32 @@ mod tests {
     }
 
     #[test]
-    fn empty_template_fixture_loads_to_zero_cases_with_finite_report() {
-        // The checked-in tier1.jsonl is comments-only by design.
-        // load_fixture must return an empty Vec; build_report on it
-        // must produce a NaN-free zero report.
+    fn tier1_fixture_loads_seedable_gold_set_cases() {
+        // PR-6 (v2 §8): the checked-in tier1.jsonl carries the
+        // embedder-ablation corpus — ≥30 gold-set cases, each seedable
+        // via `--seed-corpus-from-paths` (i.e. at least one gold_must
+        // File ref), with unique ids. (NaN-safety of empty reports is
+        // covered by `build_report_with_pools_zero_cases_is_safe`.)
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("eval")
             .join("tier1.jsonl");
         let cases = load_fixture(&path).expect("tier1.jsonl loads");
-        assert!(cases.is_empty(), "template should be header-only");
-        let r = build_report_with_pools(&cases, &[]);
-        assert_eq!(r.total, 0);
-        for v in [
-            r.recall_at_1,
-            r.recall_at_5,
-            r.recall_at_10,
-            r.mrr,
-            r.precision_at_5,
-            r.precision_at_10,
-            r.ndcg_at_5,
-            r.ndcg_at_10,
-            r.blast_leakage,
-            r.over_retrieval,
-            r.under_retrieval,
-            r.forbid_hit_rate,
-        ] {
-            assert!(v.is_finite(), "metric must be finite, got {v}");
+        assert!(
+            cases.len() >= 30,
+            "ablation corpus needs ≥30 cases, got {}",
+            cases.len()
+        );
+        let mut ids = std::collections::HashSet::new();
+        for case in &cases {
+            assert!(ids.insert(case.id.clone()), "duplicate case id {}", case.id);
+            assert!(!case.query.trim().is_empty(), "{}: empty query", case.id);
+            assert!(
+                case.gold_must
+                    .iter()
+                    .any(|g| matches!(g, GoldRef::File(_))),
+                "{}: no gold_must File ref — case would seed nothing",
+                case.id
+            );
         }
     }
 
