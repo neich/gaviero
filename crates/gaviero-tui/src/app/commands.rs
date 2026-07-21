@@ -1654,8 +1654,26 @@ pub(super) fn handle_detach_command(app: &mut App) {
     app.chat_state.add_user_message(&input);
 
     if arg.is_empty() {
-        app.chat_state
-            .add_system_message("Usage: /detach <name> or /detach all");
+        if app.chat_state.attachments.is_empty() {
+            app.chat_state.add_system_message(
+                "No attachments.\n\
+                 Usage: /detach <name>  — remove one (Tab completes names)\n\
+                 /detach all            — remove all",
+            );
+        } else {
+            let list: Vec<String> = app
+                .chat_state
+                .attachments
+                .iter()
+                .map(|a| format!("  {}", a.display_name))
+                .collect();
+            app.chat_state.add_system_message(&format!(
+                "Attachments:\n{}\n\n\
+                 /detach <name>  — remove one (Tab completes)\n\
+                 /detach all     — remove all",
+                list.join("\n")
+            ));
+        }
         return;
     }
 
