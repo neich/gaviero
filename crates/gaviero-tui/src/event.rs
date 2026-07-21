@@ -428,7 +428,9 @@ fn coalesce_bracketed_paste(first: crossterm::event::Event) -> Vec<crossterm::ev
     let mut trailing: Option<Event> = None;
     // Once we see the start marker, keep draining until the end marker even
     // across brief gaps — large text pastes still arrive as one burst, but
-    // the end marker must not be lost to a tight timeout.
+    // the end marker must not be lost to a tight timeout. ConPTY can stall
+    // tens of ms mid-paste under load; giving up early splits one gesture
+    // into multiple Event::Paste chunks (see paste_text cursor note).
     let mut saw_start = false;
     loop {
         let Ok(next) = event::read() else {
@@ -460,7 +462,9 @@ fn coalesce_bracketed_paste(first: crossterm::event::Event) -> Vec<crossterm::ev
         }
 
         let wait_ms = if saw_start && !text.contains(BP_END) {
-            crate::theme::PASTE_BURST_MS * 4
+            // Still inside a bracketed paste — wait much longer for the next
+            // byte / end marker than for a raw key-burst boundary.
+            crate::theme::PASTE_BURST_MS.saturating_mul(40).max(100)
         } else {
             crate::theme::PASTE_BURST_MS
         };

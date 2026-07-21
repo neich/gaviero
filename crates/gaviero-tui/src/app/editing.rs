@@ -321,9 +321,13 @@ pub(super) fn clipboard_paste(app: &mut App) {
     if text.is_empty() {
         return;
     }
+    if should_skip_duplicate_text_paste(app) {
+        return;
+    }
     if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
         buf.paste_text(&text);
     }
+    note_text_paste(app);
 }
 
 pub(super) fn set_clipboard(app: &mut App, text: &str) -> ClipboardResult {
@@ -1431,18 +1435,86 @@ pub(super) fn set_cursor_from_mouse(app: &mut App, col: u16, row: u16) {
     }
 }
 
+/// How long to ignore a follow-up text paste after one just landed.
+///
+/// On Windows, Ctrl+V can produce both an `Action::Paste` (arboard) and one or
+/// more terminal `Event::Paste` chunks (bracketed-paste / key-burst). Without
+/// a short debounce the second delivery double-inserts (or, historically,
+/// prepended and reversed the buffer when `paste_text` reset the cursor).
+pub(super) const TEXT_PASTE_DEBOUNCE_MS: u64 = 400;
+
+/// After a Windows text paste, ignore InsertChar/Enter/Tab for this long so
+/// ConPTY key-burst stragglers (often a lone `\` below the Paste coalescer's
+/// 2-char threshold) cannot append at the cursor.
+pub(super) const WINDOWS_PASTE_SETTLE_MS: u64 = 300;
+
+pub(super) fn note_text_paste(app: &mut App) {
+    let now = std::time::Instant::now();
+    app.last_text_paste = Some(now);
+    if cfg!(windows) {
+        app.windows_paste_settle_until =
+            Some(now + std::time::Duration::from_millis(WINDOWS_PASTE_SETTLE_MS));
+    }
+}
+
+pub(super) fn should_skip_duplicate_text_paste(app: &App) -> bool {
+    app.last_text_paste
+        .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(TEXT_PASTE_DEBOUNCE_MS))
+}
+
+/// Drop key actions that are almost certainly ConPTY paste residue.
+pub(super) fn should_drop_paste_straggler(app: &App, action: &Action) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    let Some(until) = app.windows_paste_settle_until else {
+        return false;
+    };
+    if std::time::Instant::now() >= until {
+        return false;
+    }
+    matches!(
+        action,
+        Action::InsertChar(_) | Action::Enter | Action::Tab
+    )
+}
+
 pub(super) fn handle_paste(app: &mut App, text: &str) {
     if app.has_active_review() {
         return;
     }
+
+    // Windows: ConPTY never surfaces a native crossterm Paste — the coalescer
+    // rebuilds one from `ESC[200~…ESC[201~` / raw key bursts, and a mid-burst
+    // timeout can split a single gesture into multiple Event::Paste values
+    // whose payloads are incomplete. When the system clipboard already holds
+    // the text, prefer that one clean copy over the reconstructed stream.
+    let paste_body = if cfg!(windows) {
+        let clip = get_clipboard(app);
+        if !clip.is_empty() {
+            clip
+        } else {
+            text.to_string()
+        }
+    } else {
+        text.to_string()
+    };
+
     match app.focus {
         Focus::Editor => {
+            if paste_body.is_empty() {
+                return;
+            }
+            if should_skip_duplicate_text_paste(app) {
+                return;
+            }
+            let area = app.layout.editor_area;
             if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
-                buf.paste_text(text);
-                let area = app.layout.editor_area;
+                buf.paste_text(&paste_body);
                 let (vp_h, vp_w) = editor_viewport(buf.line_count(), area);
                 buf.ensure_cursor_visible(vp_h, vp_w);
             }
+            note_text_paste(app);
         }
         Focus::SidePanel => {
             // Many terminals intercept Ctrl+V / Ctrl+Shift+V themselves and
@@ -1454,13 +1526,17 @@ pub(super) fn handle_paste(app: &mut App, text: &str) {
             // advertise `?2004h` and `event::read_crossterm_batch` to turn
             // the Esc-keyed `ESC[200~ESC[201~` burst into `Event::Paste("")`
             // — crossterm itself never emits Paste on the console backend.
-            if text.is_empty() && super::side_panel::try_attach_clipboard_image(app) {
+            if paste_body.is_empty() && super::side_panel::try_attach_clipboard_image(app) {
                 return;
             }
-            if text.is_empty() {
+            if paste_body.is_empty() {
                 return;
             }
-            app.chat_state.insert_str(text);
+            if should_skip_duplicate_text_paste(app) {
+                return;
+            }
+            app.chat_state.insert_str(&paste_body);
+            note_text_paste(app);
         }
         _ => {}
     }

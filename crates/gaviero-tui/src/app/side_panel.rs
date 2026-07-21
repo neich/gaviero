@@ -2665,10 +2665,15 @@ pub(super) fn chat_paste_from_clipboard(app: &mut App) {
     }
 
     let text = app.get_clipboard();
-    if !text.is_empty() {
-        app.chat_state.insert_str(&text);
-        app.refresh_chat_autocomplete();
+    if text.is_empty() {
+        return;
     }
+    if super::editing::should_skip_duplicate_text_paste(app) {
+        return;
+    }
+    app.chat_state.insert_str(&text);
+    super::editing::note_text_paste(app);
+    app.refresh_chat_autocomplete();
 }
 
 /// Try to read an image from the system clipboard and attach it as an

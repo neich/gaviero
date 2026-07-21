@@ -246,6 +246,16 @@ pub struct App {
     /// Debounce for clipboard-image attach (empty BP + Ctrl+V fallback can
     /// both fire for one gesture).
     pub last_clipboard_image_attach: Option<std::time::Instant>,
+
+    /// Debounce for text paste (Action::Paste + Event::Paste, or split
+    /// Windows bracketed-paste chunks) so one gesture inserts once.
+    pub last_text_paste: Option<std::time::Instant>,
+
+    /// Windows: drop InsertChar/Enter/Tab until this instant after a text
+    /// paste. ConPTY can still be injecting the key burst after we already
+    /// applied the clipboard contents; a lone leftover `\` (below the
+    /// 2-char Paste coalescer threshold) would otherwise append at EOF.
+    pub windows_paste_settle_until: Option<std::time::Instant>,
 }
 
 impl App {
@@ -469,6 +479,8 @@ impl App {
             last_vt_mouse_reassert: std::time::Instant::now(),
             windows_ctrl_v_pending: None,
             last_clipboard_image_attach: None,
+            last_text_paste: None,
+            windows_paste_settle_until: None,
         }
     }
 
