@@ -170,30 +170,80 @@ pub fn reassert_console_input_modes(_w: &mut impl Write) -> std::io::Result<()> 
     Ok(())
 }
 
-/// Enable/disable host-terminal bracketed paste where crossterm can actually
-/// deliver `Event::Paste` — Unix only.
+/// Enable/disable host-terminal bracketed paste.
 ///
-/// On Windows this is deliberately a no-op, for three verified reasons
-/// (crossterm 0.29 source):
-/// - the Windows event source builds only Key/Mouse/Resize/Focus events from
-///   console input records and can never surface `Event::Paste`; pastes are
-///   reconstructed from the key burst by `event::read_crossterm_batch`;
-/// - on a VT-capable host, `EnableBracketedPaste` *would* write `?2004h`
-///   through ConPTY, inviting `ESC[200~` marker bytes to arrive as ordinary
-///   key events for the coalescer to mangle;
-/// - on a legacy console (`supports_ansi()` = false), the command's WinAPI
-///   fallback returns `Err(Unsupported)`, which would abort startup.
+/// **Unix:** crossterm's `EnableBracketedPaste` both writes `?2004h` and makes
+/// the event source surface real `Event::Paste` values.
+///
+/// **Windows:** crossterm's console event source can never emit `Event::Paste`
+/// (Key/Mouse/Resize/Focus only), and its `EnableBracketedPaste` WinAPI
+/// fallback returns `Unsupported` on legacy consoles — so we write the VT
+/// sequences ourselves (same pattern as [`enable_vt_mouse_passthrough`]).
+/// Windows Terminal then emits `ESC[200~…ESC[201~` on Ctrl+V; for an
+/// image-only clipboard the payload is empty, and
+/// `event::read_crossterm_batch` turns that into `Event::Paste("")` so the
+/// chat path can attach the clipboard image (parity with Linux).
+#[cfg(windows)]
+const ENABLE_BRACKETED_PASTE: &str = "\x1b[?2004h";
+#[cfg(windows)]
+const DISABLE_BRACKETED_PASTE: &str = "\x1b[?2004l";
+
 pub fn set_bracketed_paste(w: &mut impl Write, enable: bool) -> std::io::Result<()> {
-    if cfg!(windows) {
-        return Ok(());
+    #[cfg(windows)]
+    {
+        let seq = if enable {
+            ENABLE_BRACKETED_PASTE
+        } else {
+            DISABLE_BRACKETED_PASTE
+        };
+        w.write_all(seq.as_bytes())?;
+        return w.flush();
     }
-    use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
-    if enable {
-        crossterm::execute!(w, EnableBracketedPaste)
-    } else {
-        crossterm::execute!(w, DisableBracketedPaste)
+    #[cfg(not(windows))]
+    {
+        use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+        if enable {
+            crossterm::execute!(w, EnableBracketedPaste)
+        } else {
+            crossterm::execute!(w, DisableBracketedPaste)
+        }
     }
 }
+
+/// Rising edge of physical Ctrl+V (Win32 `GetAsyncKeyState`), independent of
+/// whether Windows Terminal consumed the chord for its own paste.
+///
+/// WT intercepts Ctrl+V before ConPTY: text clipboards become a key burst (or
+/// bracketed paste), but an image-only clipboard often produces **no** input
+/// events at all — so the keymap never sees `Action::Paste`. Polling the
+/// hardware key state lets the chat tick attach the clipboard image after a
+/// short grace period when nothing else arrived. Always `false` off Windows.
+#[cfg(windows)]
+pub fn take_ctrl_v_press_edge() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+
+    const VK_CONTROL: i32 = 0x11;
+    const VK_V: i32 = 0x56;
+
+    static WAS_DOWN: AtomicBool = AtomicBool::new(false);
+
+    // High bit set ⇒ key currently down.
+    let ctrl = (unsafe { GetAsyncKeyState(VK_CONTROL) } as u16) & 0x8000 != 0;
+    let v = (unsafe { GetAsyncKeyState(VK_V) } as u16) & 0x8000 != 0;
+    let down = ctrl && v;
+    let was = WAS_DOWN.swap(down, Ordering::SeqCst);
+    down && !was
+}
+
+#[cfg(not(windows))]
+pub fn take_ctrl_v_press_edge() -> bool {
+    false
+}
+
+/// How long to wait after a physical Ctrl+V for the terminal to deliver a
+/// paste/key burst before falling back to a direct clipboard-image attach.
+pub const CTRL_V_IMAGE_FALLBACK_MS: u64 = 50;
 
 /// The character an AltGr chord resolves to, if this key event is one.
 ///
@@ -231,6 +281,19 @@ mod tests {
         enable_vt_mouse_passthrough(&mut out).unwrap();
         assert_eq!(out, b"\x1b[?1000h\x1b[?1002h\x1b[?1006h".to_vec());
         assert!(!out.contains(&b'l'), "no DECRST (mode-off) bytes");
+    }
+
+    /// Windows image paste depends on us advertising `?2004h` so Windows
+    /// Terminal emits empty `ESC[200~ESC[201~` for an image-only clipboard.
+    #[cfg(windows)]
+    #[test]
+    fn bracketed_paste_writes_vt_enable_and_disable() {
+        let mut on: Vec<u8> = Vec::new();
+        set_bracketed_paste(&mut on, true).unwrap();
+        assert_eq!(on, b"\x1b[?2004h".to_vec());
+        let mut off: Vec<u8> = Vec::new();
+        set_bracketed_paste(&mut off, false).unwrap();
+        assert_eq!(off, b"\x1b[?2004l".to_vec());
     }
 
     /// The handler must swallow Ctrl+C/Ctrl+Break (return TRUE — anything

@@ -334,12 +334,17 @@ fn path_is_excluded(path: &Path, roots: &[PathBuf], exclude_patterns: &[String])
 /// On Unix a paste already arrives as a single `Event::Paste`, so this is one
 /// `read()`. On Windows, crossterm's console event source can never surface
 /// `Event::Paste` (it builds only Key/Mouse/Resize/Focus events from console
-/// input records — see `platform::set_bracketed_paste`): a paste is delivered
-/// as a burst of individual key events, whose newlines fire as `Enter` —
-/// which submits the chat on the first line. The Windows path coalesces such
-/// a burst into a synthetic `Event::Paste` so both platforms behave
-/// identically. Runtime-gated (`cfg!`) rather than compile-time-gated so the
-/// coalescer builds and its tests run on every platform.
+/// input records — see `platform::set_bracketed_paste`). Pastes arrive as:
+///
+/// 1. **Bracketed-paste VT markers** (`ESC[200~…ESC[201~`) once we advertise
+///    `?2004h` — Windows Terminal uses an *empty* payload for image-only
+///    clipboards; we must recognize that and emit `Event::Paste("")` so the
+///    chat path can attach the image.
+/// 2. **Raw key bursts** (legacy / no BP) — newlines would otherwise submit
+///    the chat on the first line, so we coalesce them into one `Event::Paste`.
+///
+/// Runtime-gated (`cfg!`) rather than compile-time-gated so the coalescer
+/// builds and its tests run on every platform.
 fn read_crossterm_batch() -> Vec<crossterm::event::Event> {
     use crossterm::event::{self, Event, KeyEventKind};
 
@@ -350,7 +355,15 @@ fn read_crossterm_batch() -> Vec<crossterm::event::Event> {
         return vec![first];
     }
 
-    // Only an unmodified text key can begin a paste burst.
+    // Bracketed-paste sequences begin with Esc (KeyCode::Esc). A lone Esc
+    // (no follow-up within a short burst window) is a real keypress and must
+    // pass through. Use PASTE_BURST_MS rather than ZERO — ConPTY often
+    // delivers the `[200~` bytes a tick after Esc.
+    if is_escape_press(&first) {
+        return coalesce_bracketed_paste(first);
+    }
+
+    // Only an unmodified text key can begin a raw paste burst.
     let Some(first_ch) = paste_char(&first) else {
         return vec![first];
     };
@@ -394,6 +407,117 @@ fn read_crossterm_batch() -> Vec<crossterm::event::Event> {
     };
     out.extend(trailing);
     out
+}
+
+const BP_START: &str = "\x1b[200~";
+const BP_END: &str = "\x1b[201~";
+
+/// After an Esc press, drain a possible `ESC[200~…ESC[201~` burst into
+/// `Event::Paste`. Empty payload (image-only clipboard under Windows Terminal)
+/// is a successful paste — callers attach the clipboard image.
+fn coalesce_bracketed_paste(first: crossterm::event::Event) -> Vec<crossterm::event::Event> {
+    use crossterm::event::{self, Event, KeyEventKind};
+
+    // Wait briefly for `[200~…` — ConPTY may not have the next record ready
+    // at ZERO, and returning lone Esc would drop the image-paste signal.
+    if !event::poll(Duration::from_millis(crate::theme::PASTE_BURST_MS)).unwrap_or(false) {
+        return vec![first];
+    }
+
+    let mut text = String::from('\x1b');
+    let mut trailing: Option<Event> = None;
+    // Once we see the start marker, keep draining until the end marker even
+    // across brief gaps — large text pastes still arrive as one burst, but
+    // the end marker must not be lost to a tight timeout.
+    let mut saw_start = false;
+    loop {
+        let Ok(next) = event::read() else {
+            break;
+        };
+        if let Some(ch) = paste_or_escape_char(&next) {
+            text.push(ch);
+            if !saw_start && text.starts_with(BP_START) {
+                saw_start = true;
+            }
+            if saw_start && text.contains(BP_END) {
+                while event::poll(Duration::ZERO).unwrap_or(false) {
+                    let Ok(extra) = event::read() else {
+                        break;
+                    };
+                    if matches!(&extra, Event::Key(k) if k.kind == KeyEventKind::Release) {
+                        continue;
+                    }
+                    trailing = Some(extra);
+                    break;
+                }
+                break;
+            }
+        } else if matches!(&next, Event::Key(k) if k.kind == KeyEventKind::Release) {
+            // keep draining
+        } else {
+            trailing = Some(next);
+            break;
+        }
+
+        let wait_ms = if saw_start && !text.contains(BP_END) {
+            crate::theme::PASTE_BURST_MS * 4
+        } else {
+            crate::theme::PASTE_BURST_MS
+        };
+        if !event::poll(Duration::from_millis(wait_ms)).unwrap_or(false) {
+            break;
+        }
+    }
+
+    let mut out = if let Some(payload) = strip_bracketed_paste(&text) {
+        vec![Event::Paste(payload.to_string())]
+    } else if text == "\x1b" {
+        vec![first]
+    } else if text.starts_with(BP_START) {
+        let inner = text.strip_prefix(BP_START).unwrap_or(&text);
+        vec![Event::Paste(inner.to_string())]
+    } else {
+        let rest = &text[text.char_indices().nth(1).map(|(i, _)| i).unwrap_or(text.len())..];
+        if rest.chars().count() >= 2 {
+            vec![first, Event::Paste(rest.to_string())]
+        } else {
+            vec![first]
+        }
+    };
+    out.extend(trailing);
+    out
+}
+
+/// If `raw` is a complete bracketed-paste sequence, return the inner payload
+/// (may be empty). Used by the Windows coalescer and unit-tested directly.
+fn strip_bracketed_paste(raw: &str) -> Option<&str> {
+    let rest = raw.strip_prefix(BP_START)?;
+    let end = rest.find(BP_END)?;
+    if end + BP_END.len() != rest.len() {
+        // Trailing junk after the end marker — still accept the payload.
+        return Some(&rest[..end]);
+    }
+    Some(&rest[..end])
+}
+
+fn is_escape_press(event: &crossterm::event::Event) -> bool {
+    use crossterm::event::{Event, KeyCode, KeyEventKind};
+    matches!(
+        event,
+        Event::Key(k) if k.kind != KeyEventKind::Release && k.code == KeyCode::Esc
+    )
+}
+
+/// Like [`paste_char`], but also maps Esc → `\x1b` so bracketed-paste markers
+/// can be assembled from the key burst Windows Terminal injects.
+fn paste_or_escape_char(event: &crossterm::event::Event) -> Option<char> {
+    if let Some(c) = paste_char(event) {
+        return Some(c);
+    }
+    if is_escape_press(event) {
+        return Some('\x1b');
+    }
+    None
 }
 
 /// Character a key event contributes to a pasted burst, or `None` if it cannot
@@ -755,6 +879,29 @@ mod tests {
             paste_char(&key(KeyCode::Char('a'), KeyModifiers::NONE, KeyEventKind::Release)),
             None
         );
+    }
+
+    #[test]
+    fn strip_bracketed_paste_extracts_payload_including_empty() {
+        // Windows Terminal image paste: empty bracketed-paste payload.
+        assert_eq!(strip_bracketed_paste("\x1b[200~\x1b[201~"), Some(""));
+        assert_eq!(strip_bracketed_paste("\x1b[200~hello\x1b[201~"), Some("hello"));
+        assert_eq!(
+            strip_bracketed_paste("\x1b[200~a\nb\x1b[201~"),
+            Some("a\nb")
+        );
+        // Not a BP sequence.
+        assert_eq!(strip_bracketed_paste("hello"), None);
+        assert_eq!(strip_bracketed_paste("\x1b[200~no-end"), None);
+        assert_eq!(strip_bracketed_paste(""), None);
+    }
+
+    #[test]
+    fn paste_or_escape_char_maps_esc() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let esc = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(paste_or_escape_char(&esc), Some('\x1b'));
+        assert!(is_escape_press(&esc));
     }
 
     #[test]

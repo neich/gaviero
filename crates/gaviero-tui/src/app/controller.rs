@@ -156,6 +156,8 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             if app.has_active_review() {
                 return;
             }
+            // Terminal delivered a paste — cancel the Windows Ctrl+V image fallback.
+            app.clear_windows_ctrl_v_pending();
             if app.focus == Focus::Terminal {
                 if let Some(inst) = app.terminal_manager.active_instance_mut() {
                     if inst.spawned {
@@ -1410,6 +1412,13 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
         Event::Tick => {
             app.terminal_manager.tick();
             app.maybe_reassert_vt_mouse(false);
+            // Windows: WT often swallows Ctrl+V for image-only clipboards and
+            // emits nothing. Detect the physical chord and, after a short
+            // grace window with no Paste event, attach from arboard.
+            if crate::platform::take_ctrl_v_press_edge() {
+                app.note_windows_ctrl_v();
+            }
+            app.maybe_windows_image_paste_fallback();
             if app.chat_state.active_conv_streaming() {
                 app.chat_state.tick_count = app.chat_state.tick_count.wrapping_add(1);
             }

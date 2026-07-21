@@ -236,6 +236,16 @@ pub struct App {
     /// Last time the VT mouse-passthrough request was re-asserted to the
     /// host terminal (see `platform::enable_vt_mouse_passthrough`).
     pub last_vt_mouse_reassert: std::time::Instant,
+
+    /// Windows: instant of a physical Ctrl+V edge (`platform::take_ctrl_v_press_edge`)
+    /// while waiting to see if the terminal delivers a paste. Cleared on any
+    /// `Event::Paste` / `Action::Paste`; after `CTRL_V_IMAGE_FALLBACK_MS` with
+    /// nothing else, the tick path tries clipboard-image attach.
+    pub windows_ctrl_v_pending: Option<std::time::Instant>,
+
+    /// Debounce for clipboard-image attach (empty BP + Ctrl+V fallback can
+    /// both fire for one gesture).
+    pub last_clipboard_image_attach: Option<std::time::Instant>,
 }
 
 impl App {
@@ -457,6 +467,8 @@ impl App {
             ),
             terminal_selection: crate::panels::terminal::TerminalSelectionState::default(),
             last_vt_mouse_reassert: std::time::Instant::now(),
+            windows_ctrl_v_pending: None,
+            last_clipboard_image_attach: None,
         }
     }
 
@@ -483,6 +495,50 @@ impl App {
         // covers the gap in between). See platform.rs for both halves.
         let _ = crate::platform::reassert_console_input_modes(&mut stdout);
         let _ = crate::platform::enable_vt_mouse_passthrough(&mut stdout);
+        // Same insurance as mouse: mux/ConPTY can drop `?2004h`, and without
+        // it Windows Terminal will not emit empty bracketed paste for images.
+        let _ = crate::platform::set_bracketed_paste(&mut stdout, true);
+    }
+
+    /// Record a physical Ctrl+V edge; the tick path may attach a clipboard
+    /// image if the terminal never delivers a paste event.
+    pub(crate) fn note_windows_ctrl_v(&mut self) {
+        if cfg!(windows) {
+            self.windows_ctrl_v_pending = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Terminal delivered a paste (or keymap Paste ran) — cancel the image fallback.
+    pub(crate) fn clear_windows_ctrl_v_pending(&mut self) {
+        self.windows_ctrl_v_pending = None;
+    }
+
+    /// After `CTRL_V_IMAGE_FALLBACK_MS` with no paste event, try attaching a
+    /// clipboard image in agent chat. Text pastes are left to the terminal's
+    /// key-burst / bracketed-paste path so we do not double-insert.
+    pub(crate) fn maybe_windows_image_paste_fallback(&mut self) {
+        if !cfg!(windows) {
+            return;
+        }
+        let Some(at) = self.windows_ctrl_v_pending else {
+            return;
+        };
+        let grace = std::time::Duration::from_millis(crate::platform::CTRL_V_IMAGE_FALLBACK_MS);
+        if at.elapsed() < grace {
+            return;
+        }
+        self.windows_ctrl_v_pending = None;
+
+        if !self.terminal_has_focus {
+            return;
+        }
+        if self.focus != Focus::SidePanel || self.side_panel != SidePanelMode::AgentChat {
+            return;
+        }
+        if self.chat_state.active_conv_streaming() {
+            return;
+        }
+        let _ = side_panel::try_attach_clipboard_image(self);
     }
 
     /// Rescan skill roots after a `.gaviero/skills/` file change.
