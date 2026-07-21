@@ -6,6 +6,11 @@
 //
 // No verification loop needed: documentation changes don't break builds.
 //
+// Worktrees / merge: not used. `max_parallel 1` keeps execution in the
+// shared checkout (Repo mode still applies Write Gate + scope checks).
+// The three writers own disjoint doc sets, so isolation via git worktrees
+// adds merge risk without benefit for docs-only edits.
+//
 // Usage:
 //   gaviero-cli --script crates/gaviero-dsl/examples/update_docs.gaviero
 //
@@ -15,7 +20,8 @@
 
 // Client pool + default tier bindings (override with --tiers-file).
 include "clients.gaviero"
-include "profiles/doc-claude.gaviero"
+// include "profiles/doc-claude.gaviero"
+include "profiles/doc-cursor.gaviero"
 
 // ── Shared configuration ──────────────────────────────────────────────────────
 //
@@ -249,9 +255,10 @@ agent record_docs_update {
 // ── Workflow ──────────────────────────────────────────────────────────────────
 
 workflow update_docs {
-    // write agents run in parallel — they own disjoint file sets
+    // Writers own disjoint doc sets, but run sequentially so Repo mode
+    // does not provision worktrees or run a merge phase (see header).
     steps [inventory write_claude_md write_readme_md write_architecture_md record_docs_update]
-    max_parallel 3
+    max_parallel 1
     strategy single_pass
 
     memory {

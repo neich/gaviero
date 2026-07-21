@@ -44,3 +44,8 @@ client composer {
     privacy public
     effort medium
 }
+
+client grok {
+    model "cursor:grok-4.5"
+    privacy public
+    effort high
