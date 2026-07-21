@@ -1634,11 +1634,20 @@ impl Buffer {
             self.insert_text(&result);
         }
 
-        // Move cursor to the START of the pasted content so the user sees what was inserted.
-        self.cursor.line = self.text.char_to_line(paste_start);
-        let line_start = self.text.line_to_char(self.cursor.line);
-        self.cursor.col = paste_start - line_start;
+        // `insert_text` already left the cursor at the end of the insertion.
+        // Do **not** move it back to `paste_start`: on Windows a single gesture
+        // can arrive as multiple `Event::Paste` chunks (bracketed-paste
+        // coalescer timeout mid-burst). Returning to the start would prepend
+        // later chunks and reverse the file (e.g. a trailing `\` lands on
+        // line 1, the header comment sinks to the bottom).
         self.cursor.anchor = None;
+
+        // Keep the beginning of the paste on-screen when it scrolled above the
+        // viewport, without undoing the end-cursor position.
+        let paste_line = self.text.char_to_line(paste_start.min(self.text.len_chars()));
+        if paste_line < self.scroll.top_line {
+            self.scroll.top_line = paste_line;
+        }
     }
 
     /// Delete the entire current line (Ctrl+K).
@@ -3165,5 +3174,44 @@ mod tests {
         std::fs::write(&path, "hi\n").unwrap();
         let buf = Buffer::open(&path).unwrap();
         assert!(buf.should_suppress_post_open_watch());
+    }
+
+    #[test]
+    fn paste_text_normalizes_crlf_and_leaves_cursor_at_end() {
+        let mut buf = Buffer::empty();
+        buf.paste_text("// Default\r\n// cont \\\r\n// tail\r\n");
+        assert_eq!(buf.text.to_string(), "// Default\n// cont \\\n// tail\n");
+        // Cursor must stay at the end so a follow-up paste chunk appends
+        // instead of prepending (Windows multi-chunk paste regression).
+        assert_eq!(buf.cursor.line, 3);
+        assert_eq!(buf.cursor.col, 0);
+    }
+
+    #[test]
+    fn paste_text_chunks_append_in_order_when_cursor_stays_at_end() {
+        // Simulates a Windows bracketed-paste split mid-burst: first chunk
+        // ends at the line-continuation backslash; second chunk is the rest.
+        let mut buf = Buffer::empty();
+        buf.paste_text("// header\n// body \\\n");
+        buf.paste_text("// tail\n\ntier inventory fable\n");
+        assert_eq!(
+            buf.text.to_string(),
+            "// header\n// body \\\n// tail\n\ntier inventory fable\n"
+        );
+        // Regression: the old cursor-to-start behavior produced
+        // "\\\n// tail\n\ntier...\n// header\n// body ".
+        assert!(!buf.text.to_string().starts_with('\\'));
+    }
+
+    #[test]
+    fn paste_text_preserves_mid_file_line_continuation_backslash() {
+        // Profiles use `\` as a shell line-continuation mid-comment; that must
+        // stay in place (not migrate to EOF).
+        let src = "// cmd \\\n//   --flag\n\ntier x y\n";
+        let mut buf = Buffer::empty();
+        buf.paste_text(src);
+        assert_eq!(buf.text.to_string(), src);
+        assert!(buf.text.to_string().contains("\\\n"));
+        assert!(!buf.text.to_string().ends_with('\\'));
     }
 }

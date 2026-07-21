@@ -15,3 +15,14 @@ pub mod wrap;
 pub fn normalize_paste_newlines(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_paste_newlines_crlf_and_lone_cr() {
+        assert_eq!(normalize_paste_newlines("a\r\nb\rc"), "a\nb\nc");
+        assert_eq!(normalize_paste_newlines("a\nb"), "a\nb");
+    }
+}

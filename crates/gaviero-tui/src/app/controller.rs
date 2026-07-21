@@ -150,6 +150,12 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             }
 
             let action = Keymap::resolve(&key);
+            // Windows: after a clipboard-backed paste, ConPTY may still inject
+            // leftover key events from the same gesture (often a lone `\` that
+            // never reaches the 2-char Paste coalescer). Drop them.
+            if super::editing::should_drop_paste_straggler(app, &action) {
+                return;
+            }
             app.handle_action(action);
         }
         Event::Paste(text) => {
