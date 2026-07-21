@@ -58,6 +58,55 @@ impl McpEndpoint {
             McpEndpoint::Pipe(name) => ["--pipe".to_string(), name.clone()],
         }
     }
+
+    /// Whether a live MCP server is already accepting connections here.
+    ///
+    /// Lets a host (the CLI in particular) reuse the server another
+    /// gaviero process — typically the TUI — runs for the same workspace
+    /// instead of trying to rebind: the Windows accept loop holds the
+    /// name with `first_pipe_instance(true)`, so a second
+    /// [`super::server::spawn_mcp_server`] dies with `Access is denied`,
+    /// and the Unix arm would unlink a *live* socket and orphan the other
+    /// process's listener. Synthesized agent configs address the
+    /// endpoint, not a process, so shims reach whichever host owns it.
+    ///
+    /// The probe is a transport-level connect closed immediately — no MCP
+    /// handshake. A stale Unix socket file (connection refused) reports
+    /// `false` so the spawn path can unlink and rebind as before. The
+    /// foreign-platform variant (Unix socket on Windows, pipe on Unix)
+    /// reports `false`.
+    pub fn has_live_server(&self) -> bool {
+        match self {
+            McpEndpoint::Unix(path) => unix_socket_has_live_server(path),
+            McpEndpoint::Pipe(name) => pipe_has_live_server(name),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn unix_socket_has_live_server(path: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
+#[cfg(not(unix))]
+fn unix_socket_has_live_server(_path: &Path) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn pipe_has_live_server(name: &str) -> bool {
+    // ERROR_PIPE_BUSY: every instance is mid-handshake right now — a
+    // server exists even though this connect attempt couldn't land.
+    const ERROR_PIPE_BUSY: i32 = 231;
+    match std::fs::OpenOptions::new().read(true).write(true).open(name) {
+        Ok(_) => true,
+        Err(e) => e.raw_os_error() == Some(ERROR_PIPE_BUSY),
+    }
+}
+
+#[cfg(not(windows))]
+fn pipe_has_live_server(_name: &str) -> bool {
+    false
 }
 
 impl fmt::Display for McpEndpoint {
@@ -89,6 +138,51 @@ mod tests {
     fn for_workspace_is_socket_under_gaviero_dir() {
         let ep = McpEndpoint::for_workspace(Path::new("/ws"));
         assert_eq!(ep, McpEndpoint::Unix(PathBuf::from("/ws/.gaviero/mcp.sock")));
+    }
+
+    #[test]
+    fn has_live_server_is_false_for_foreign_platform_variant() {
+        #[cfg(windows)]
+        assert!(!McpEndpoint::Unix(PathBuf::from("/tmp/nope.sock")).has_live_server());
+        #[cfg(unix)]
+        assert!(!McpEndpoint::Pipe(r"\\.\pipe\gaviero-nope".to_string()).has_live_server());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn has_live_server_tracks_unix_socket_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("mcp.sock");
+        let ep = McpEndpoint::Unix(sock.clone());
+        assert!(!ep.has_live_server(), "missing socket file must probe false");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        assert!(ep.has_live_server(), "bound listener must probe true");
+        drop(listener);
+        // The socket file outlives the listener; a stale file must not
+        // count as live or the spawn path would never reclaim it.
+        assert!(sock.exists(), "socket file expected to persist after drop");
+        assert!(!ep.has_live_server(), "stale socket file must probe false");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn has_live_server_tracks_named_pipe_lifecycle() {
+        let name = format!(r"\\.\pipe\gaviero-test-probe-{}", std::process::id());
+        let ep = McpEndpoint::Pipe(name.clone());
+        assert!(!ep.has_live_server(), "unbound pipe name must probe false");
+        let instance = tokio::net::windows::named_pipe::ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&name)
+            .unwrap();
+        assert!(ep.has_live_server(), "pending instance must probe true");
+        // A second probe hits the now client-consumed single instance —
+        // ERROR_PIPE_BUSY, which still proves a server owns the name.
+        assert!(ep.has_live_server(), "busy instance must still probe true");
+        drop(instance);
+        assert!(
+            !ep.has_live_server(),
+            "dropping the last instance must free the name"
+        );
     }
 
     #[cfg(windows)]

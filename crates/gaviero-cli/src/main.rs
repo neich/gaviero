@@ -1070,6 +1070,10 @@ fn mcp_overrides_from_cli(
 /// Start the in-process MCP server (when memory is available), synthesize
 /// per-worktree provider configs at the repo root, and return the synth
 /// struct for the swarm pipeline (cloned per agent worktree).
+///
+/// When another gaviero process (e.g. the TUI) already serves the
+/// workspace endpoint, no server is spawned — the live endpoint is reused
+/// and the returned handle is `None`.
 fn prepare_mcp_for_swarm(
     repo: &std::path::Path,
     workspace: &gaviero_core::workspace::Workspace,
@@ -1102,10 +1106,18 @@ fn prepare_mcp_for_swarm(
     if !synth.enabled {
         return Ok((None, None));
     }
+    // Another gaviero process (typically the TUI editing this workspace)
+    // may already be serving the endpoint. Rebinding would fail on
+    // Windows (`first_pipe_instance`) and orphan the other listener on
+    // Unix, so reuse it: synthesized configs address the endpoint, not a
+    // process, and the served tools are identical for the same root.
+    let reuse_existing = synth.gaviero_enabled && synth.endpoint.has_live_server();
     // F3: memory being unavailable used to silently disable the gaviero
     // MCP server, downgrading every headless agent below the runtime
-    // parity contract. Loud error instead; --no-mcp is the opt-out.
-    if synth.gaviero_enabled && memory.is_none() {
+    // parity contract. Loud error instead; --no-mcp is the opt-out. A
+    // reused external server needs no local stores, so it satisfies the
+    // parity contract even without memory.
+    if synth.gaviero_enabled && !reuse_existing && memory.is_none() {
         anyhow::bail!(
             "gaviero MCP is enabled but memory stores are unavailable — fix memory \
              initialization (see earlier [memory] errors) or pass --no-mcp"
@@ -1118,7 +1130,14 @@ fn prepare_mcp_for_swarm(
 
     let mut handle = None;
     if synth.gaviero_enabled {
-        if let Some(stores) = memory {
+        if reuse_existing {
+            eprintln!(
+                "[mcp] reusing gaviero MCP server already listening on {} \
+                 (another gaviero instance — e.g. the TUI — serves this workspace; \
+                 keep it open for the duration of this run)",
+                synth.endpoint
+            );
+        } else if let Some(stores) = memory {
             let retrieval_cfg = workspace.resolve_retrieval_config(Some(repo));
             let rerank_cfg = workspace.resolve_rerank_config(Some(repo));
             let specificity = workspace.resolve_specificity_config(Some(repo));
@@ -1203,8 +1222,14 @@ fn prepare_mcp_for_swarm(
             // agent tool call doesn't pay a cold start.
             let warm = server.clone();
             tokio::spawn(async move { warm.warmup().await });
-            let h = spawn_mcp_server(server, &synth.endpoint)
-                .with_context(|| format!("starting gaviero MCP server at {}", synth.endpoint))?;
+            let h = spawn_mcp_server(server, &synth.endpoint).with_context(|| {
+                format!(
+                    "starting gaviero MCP server at {} — if another gaviero instance \
+                     (TUI or CLI) started serving this workspace just now, rerun to \
+                     reuse it, or close it to let this process host the server",
+                    synth.endpoint
+                )
+            })?;
             eprintln!("[mcp] gaviero server listening on {}", h.endpoint);
             handle = Some(h);
         }
