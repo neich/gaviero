@@ -51,6 +51,10 @@ All interactive coding providers — Claude Code, Codex, Cursor, Ollama — must
 - **Lock discipline.** Never hold a `Mutex` across I/O, parsing, or embedding. The memory `writer` task is the single owner of SQLite writes.
 - **Two-layer graph context.** The pre-prompt assembler injects `<repo_topology>` (shallow filesystem-only folder map, [crates/gaviero-core/src/repo_map/topology.rs](crates/gaviero-core/src/repo_map/topology.rs)) plus `<repo_outline>` (PageRank-ranked code outline). The TUI `/lite` chat command drops `<repo_outline>` + memory + impact and keeps only topology.
 
+## Dependencies
+
+Shared versions live in [`[workspace.dependencies]`](Cargo.toml) (tokio, serde, clap, reqwest, logos, chumsky, miette, …) — inherit with `{ workspace = true }`; add a crate-local version only for crate-specific deps. `tree-sitter 0.25` enters the graph exactly once, through `gaviero-core`'s re-exports ([crates/gaviero-core/src/lib.rs](crates/gaviero-core/src/lib.rs)) — never depend on it directly. Per-crate dependency lists live in each crate's CLAUDE.md.
+
 ## Plan Production
 
 When drafting implementation plans, assume the implementors are Claude Code Opus 4.7 or Codex 5.5 unless the user explicitly says they will implement the work themselves. Plans should be written for agent execution by default: concrete work units, ownership boundaries, expected files/modules, verification steps, sequencing constraints.

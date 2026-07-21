@@ -33,10 +33,10 @@ Gaviero works as a standalone editor even without AI features. Use it for everyd
 | Ctrl+p | Show/hide side panel |
 | Ctrl+j / F4 | Show/hide terminal |
 | Ctrl+t / Ctrl+w | New tab / close tab |
-| Alt+[ / Alt+] | Cycle tabs |
+| Alt+O / Alt+I | Cycle tabs forward / back |
 | F11 | Toggle fullscreen for current panel |
-| Alt+Shift+1..6 | Switch layout preset |
-| Alt+Up / Alt+Down or Ctrl+Up / Ctrl+Down | Resize focused panel (terminal split, chat input) — use Ctrl if your host terminal grabs Alt+arrows (Windows Terminal pane navigation) |
+| Alt+5 … Alt+0 | Switch layout preset (1–6) |
+| Ctrl+Up / Ctrl+Down | Resize focused panel (terminal split, chat input) — Alt+Up/Down is line-move, and Alt+arrows are reserved for multiplexer pane navigation |
 
 ### Editing
 
@@ -75,6 +75,7 @@ Switch between side panels with Alt+letter:
 | Alt+a | Agent Chat |
 | Alt+w | Swarm Dashboard |
 | Alt+g | Git |
+| Alt+m | Memory |
 
 ### Left panel modes
 
