@@ -135,6 +135,9 @@ impl Keymap {
             KeyCode::Char('c') if ctrl => Action::Copy,
             KeyCode::Char('x') if ctrl => Action::Cut,
             KeyCode::Char('v') if ctrl => Action::Paste,
+            // Alt+V: clipboard paste that reaches the app even when the host
+            // terminal intercepts Ctrl+V (Windows Terminal image clipboard).
+            KeyCode::Char('v') | KeyCode::Char('V') if alt => Action::Paste,
             KeyCode::Char('a') if ctrl => Action::SelectAll,
             KeyCode::Char('k') if ctrl => Action::DeleteLine,
             KeyCode::Char('d') if ctrl => Action::DuplicateLine,

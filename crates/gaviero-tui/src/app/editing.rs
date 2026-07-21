@@ -583,6 +583,16 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                         }
                     }
 
+                    if app.side_panel == SidePanelMode::AgentChat {
+                        if let Some(index) = app.chat_state.attachment_close_at(col, row) {
+                            if let Some(name) = app.chat_state.remove_attachment_at(index) {
+                                app.chat_state
+                                    .add_system_message(&format!("Removed: {}", name));
+                            }
+                            return;
+                        }
+                    }
+
                     if app.side_panel == SidePanelMode::GitPanel {
                         let rel_y = row.saturating_sub(area.y);
                         if let Some((region, idx)) =
@@ -1439,7 +1449,15 @@ pub(super) fn handle_paste(app: &mut App, text: &str) {
             // forward an empty bracketed-paste payload when the clipboard
             // holds an image (no text representation). Prefer attaching the
             // image in that case so the paste still works.
+            //
+            // On Windows this requires `platform::set_bracketed_paste` to
+            // advertise `?2004h` and `event::read_crossterm_batch` to turn
+            // the Esc-keyed `ESC[200~ESC[201~` burst into `Event::Paste("")`
+            // — crossterm itself never emits Paste on the console backend.
             if text.is_empty() && super::side_panel::try_attach_clipboard_image(app) {
+                return;
+            }
+            if text.is_empty() {
                 return;
             }
             app.chat_state.insert_str(text);

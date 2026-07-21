@@ -25,6 +25,17 @@ const DEFAULT_CHAT_RENDER_TRACE_MS: u128 = 16;
 
 // ── Data types ──────────────────────────────────────────────────
 
+/// Clickable close control for one attachment badge.
+#[derive(Debug, Clone)]
+pub struct AttachmentCloseHit {
+    /// Inclusive start column of the `x` glyph.
+    pub x: u16,
+    /// Row of the attachment bar.
+    pub y: u16,
+    /// Index into [`AgentChatState::attachments`] at render time.
+    pub index: usize,
+}
+
 /// Type of file attachment.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AttachmentKind {
@@ -95,13 +106,16 @@ pub enum AutocompleteMode {
     /// `/attach <path>` argument — workspace files plus filesystem listing
     /// when the partial starts with `/` or `~`, inserts the bare path.
     AttachPath,
+    /// `/detach <name|all>` argument — current attachment display names
+    /// plus `all`, inserts the bare token.
+    DetachName,
     /// `$skill` invocation — catalog-backed name completion.
     SkillRef,
     /// `/model <provider:model>` argument — provider prefix and model names.
     ModelSpec,
 }
 
-/// Autocomplete state for @file references or /attach path arguments.
+/// Autocomplete state for @file references or /attach|/detach arguments.
 #[derive(Debug)]
 pub struct FileAutocomplete {
     /// Whether the autocomplete popup is visible.
@@ -109,11 +123,12 @@ pub struct FileAutocomplete {
     /// The partial text being matched (excludes any leading `@`).
     pub query: String,
     /// Byte offset where the inserted path will be anchored. For [`FileRef`]
-    /// this points at the `@`; for [`AttachPath`] it points at the first
-    /// character of the path argument (after `/attach `).
+    /// this points at the `@`; for [`AttachPath`]/[`DetachName`] it points
+    /// at the first character of the argument (after `/attach ` / `/detach `).
     ///
     /// [`FileRef`]: AutocompleteMode::FileRef
     /// [`AttachPath`]: AutocompleteMode::AttachPath
+    /// [`DetachName`]: AutocompleteMode::DetachName
     pub at_pos: usize,
     /// What kind of completion is active.
     pub mode: AutocompleteMode,
@@ -384,6 +399,9 @@ pub struct AgentChatState {
     pub autocomplete: FileAutocomplete,
     /// Files attached to the next message.
     pub attachments: Vec<Attachment>,
+    /// Screen hit regions for attachment-bar close (`x`) buttons, rebuilt
+    /// each render. Absolute terminal coordinates.
+    pub attachment_close_hits: Vec<AttachmentCloseHit>,
 
     /// Global agent settings (from workspace config).
     pub agent_settings: AgentSettings,
@@ -460,6 +478,7 @@ impl AgentChatState {
             history_stash: String::new(),
             autocomplete: FileAutocomplete::new(),
             attachments: Vec::new(),
+            attachment_close_hits: Vec::new(),
             renaming: false,
             agent_settings: AgentSettings::default(),
             browse_mode: false,
@@ -1295,7 +1314,7 @@ impl AgentChatState {
                      Files & scripts:\n\
                      /attach <path>           — Attach a file (text or image)\n\
                      /attach                  — List current attachments\n\
-                     /detach <name|all>       — Remove attachment(s)\n\
+                     /detach <name|all>       — Remove attachment(s) (Tab completes names)\n\
                      /run <path>              — Execute a .gaviero DSL script (supports `client { effort ... extra { ... } }` and top-level `tier <name> <client>` aliases)\n\n\
                      Swarm:\n\
                      /swarm <task>            — Plan and execute a multi-agent swarm\n\
@@ -1330,6 +1349,7 @@ impl AgentChatState {
                      Ctrl+T                   — New conversation tab\n\
                      Ctrl+C                   — Cancel streaming / enter browse mode\n\
                      Ctrl+V                   — Paste text, or attach clipboard image\n\
+                     Alt+V                    — Same (use if Ctrl+V is swallowed by the terminal)\n\
                      Alt+Enter                — Insert newline in input\n\
                      PageUp / PageDown        — Scroll chat history\n\
                      Esc                      — Clear input / return to editor\n\n\
@@ -2268,6 +2288,18 @@ impl AgentChatState {
             }
         }
 
+        // ── /detach <name|all> completion ────────────────────────────────
+        if let Some(rest) = before_cursor.strip_prefix("/detach ") {
+            if !rest.contains('\n') {
+                self.autocomplete.active = true;
+                self.autocomplete.mode = AutocompleteMode::DetachName;
+                self.autocomplete.at_pos = "/detach ".len();
+                self.autocomplete.query = rest.to_string();
+                self.autocomplete.selected = 0;
+                return;
+            }
+        }
+
         // ── $skill invocation completion ────────────────────────────────
         let dollar_pos = before_cursor.rfind('$');
         if let Some(pos) = dollar_pos {
@@ -2376,6 +2408,7 @@ impl AgentChatState {
         if !self.autocomplete.active
             || self.autocomplete.mode == AutocompleteMode::SkillRef
             || self.autocomplete.mode == AutocompleteMode::ModelSpec
+            || self.autocomplete.mode == AutocompleteMode::DetachName
         {
             return;
         }
@@ -2437,9 +2470,9 @@ impl AgentChatState {
                 self.text_input.text.push_str(&path);
                 self.text_input.text.push(' ');
             }
-            AutocompleteMode::AttachPath => {
-                // Replace just the path argument; no trailing space because
-                // `/attach <path>` has no further tokens.
+            AutocompleteMode::AttachPath | AutocompleteMode::DetachName => {
+                // Replace just the argument; no trailing space because
+                // `/attach` / `/detach` take a single token.
                 self.text_input.text.push_str(&path);
             }
             AutocompleteMode::SkillRef => {
@@ -2496,9 +2529,52 @@ impl AgentChatState {
         self.attachments.len() < before
     }
 
+    /// Remove an attachment by index. Returns the display name if removed.
+    pub fn remove_attachment_at(&mut self, index: usize) -> Option<String> {
+        if index < self.attachments.len() {
+            let removed = self.attachments.remove(index);
+            Some(removed.display_name)
+        } else {
+            None
+        }
+    }
+
+    /// Hit-test a screen coordinate against attachment-bar close (`x`) buttons.
+    pub fn attachment_close_at(&self, col: u16, row: u16) -> Option<usize> {
+        self.attachment_close_hits
+            .iter()
+            .find(|h| h.y == row && h.x == col)
+            .map(|h| h.index)
+    }
+
     /// Take attachments for sending (clears the list).
     pub fn take_attachments(&mut self) -> Vec<Attachment> {
         std::mem::take(&mut self.attachments)
+    }
+
+    /// Populate `/detach` autocomplete matches from current attachments.
+    pub fn update_detach_autocomplete_matches(&mut self) {
+        if !self.autocomplete.active || self.autocomplete.mode != AutocompleteMode::DetachName {
+            return;
+        }
+        let q = self.autocomplete.query.to_lowercase();
+        let mut matches: Vec<String> = Vec::new();
+        // Always offer `all` first when it matches the partial (prefix or
+        // substring), so `/detach a` still suggests clearing everything.
+        if q.is_empty() || "all".contains(&q) {
+            matches.push("all".to_string());
+        }
+        for a in &self.attachments {
+            if q.is_empty() || a.display_name.to_lowercase().contains(&q) {
+                if !matches.iter().any(|m| m == &a.display_name) {
+                    matches.push(a.display_name.clone());
+                }
+            }
+        }
+        self.autocomplete.matches = matches;
+        if self.autocomplete.selected >= self.autocomplete.matches.len() {
+            self.autocomplete.selected = 0;
+        }
     }
 
     // ── Message management ─────────────────────────────────────
@@ -3609,7 +3685,9 @@ impl AgentChatState {
             // bare paths so they line up with what gets inserted on accept.
             let display = match self.autocomplete.mode {
                 AutocompleteMode::FileRef => format!(" @{}", path),
-                AutocompleteMode::AttachPath | AutocompleteMode::ModelSpec => {
+                AutocompleteMode::AttachPath
+                | AutocompleteMode::DetachName
+                | AutocompleteMode::ModelSpec => {
                     format!(" {}", path)
                 }
                 AutocompleteMode::SkillRef => path.clone(),
@@ -3623,12 +3701,17 @@ impl AgentChatState {
         }
     }
 
-    /// Render attachment badges in a single-line bar.
-    fn render_attachments(&self, area: Rect, buf: &mut RataBuf) {
+    /// Render attachment badges in a single-line bar and record close-button
+    /// hit regions. Each badge is ` name x ` — clicking the `x` removes it.
+    fn render_attachments(&mut self, area: Rect, buf: &mut RataBuf) {
+        self.attachment_close_hits.clear();
+
         let bg = theme::INPUT_BG;
         let badge_fg = theme::TEXT_BRIGHT;
         let badge_bg = theme::BADGE_BG;
         let img_badge_bg = theme::IMAGE_BADGE_BG;
+        let close_style = Style::default().fg(theme::ERROR).bg(theme::BADGE_BG);
+        let close_img_style = Style::default().fg(theme::ERROR).bg(theme::IMAGE_BADGE_BG);
         let label_style = Style::default().fg(theme::TEXT_DIM).bg(bg);
 
         let y = area.y;
@@ -3636,7 +3719,6 @@ impl AgentChatState {
             return;
         }
 
-        // Clear row
         for col in 0..area.width {
             let cx = area.x + col;
             if cx < buf.area().right() {
@@ -3647,8 +3729,6 @@ impl AgentChatState {
         }
 
         let mut x = area.x;
-
-        // Label
         let label = " Attached: ";
         for ch in label.chars() {
             if x < area.x + area.width && x < buf.area().right() {
@@ -3657,25 +3737,44 @@ impl AgentChatState {
             }
         }
 
-        // Badges
-        for attach in &self.attachments {
-            let this_bg = if attach.kind == AttachmentKind::Image {
+        for index in 0..self.attachments.len() {
+            let display_name = self.attachments[index].display_name.clone();
+            let kind = self.attachments[index].kind.clone();
+            let this_bg = if kind == AttachmentKind::Image {
                 img_badge_bg
             } else {
                 badge_bg
             };
             let style = Style::default().fg(badge_fg).bg(this_bg);
+            let x_style = if kind == AttachmentKind::Image {
+                close_img_style
+            } else {
+                close_style
+            };
 
-            // " name.ext " badge
-            let badge = format!(" {} ", attach.display_name);
-            for ch in badge.chars() {
+            let name_part = format!(" {} ", display_name);
+            for ch in name_part.chars() {
                 if x < area.x + area.width && x < buf.area().right() {
                     buf[(x, y)].set_char(ch).set_style(style);
                     x += 1;
                 }
             }
 
-            // Gap between badges
+            if x < area.x + area.width && x < buf.area().right() {
+                self.attachment_close_hits.push(AttachmentCloseHit {
+                    x,
+                    y,
+                    index,
+                });
+                buf[(x, y)].set_char('x').set_style(x_style);
+                x += 1;
+            }
+
+            if x < area.x + area.width && x < buf.area().right() {
+                buf[(x, y)].set_char(' ').set_style(style);
+                x += 1;
+            }
+
             if x < area.x + area.width && x < buf.area().right() {
                 buf[(x, y)].set_char(' ').set_style(Style::default().bg(bg));
                 x += 1;
@@ -4749,6 +4848,56 @@ mod tests {
 
         assert_eq!(state.text_input.text, "/attach /tmp/screenshot.png");
         assert!(!state.autocomplete.active);
+    }
+
+    #[test]
+    fn update_autocomplete_recognises_detach_argument() {
+        let mut state = AgentChatState::new();
+        state.add_attachment(
+            PathBuf::from("/tmp/shot.png"),
+            AttachmentKind::Image,
+        );
+        state.text_input.text = "/detach sh".to_string();
+        state.text_input.cursor = state.text_input.text.chars().count();
+        state.update_autocomplete();
+        state.update_detach_autocomplete_matches();
+
+        assert!(state.autocomplete.active);
+        assert_eq!(state.autocomplete.mode, AutocompleteMode::DetachName);
+        assert_eq!(state.autocomplete.query, "sh");
+        assert_eq!(
+            state.autocomplete.matches,
+            vec!["shot.png".to_string()]
+        );
+
+        state.autocomplete.query.clear();
+        state.update_detach_autocomplete_matches();
+        assert_eq!(
+            state.autocomplete.matches,
+            vec!["all".to_string(), "shot.png".to_string()]
+        );
+    }
+
+    #[test]
+    fn detach_autocomplete_accept_fills_name() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "/detach sh".to_string();
+        state.text_input.cursor = state.text_input.text.chars().count();
+        state.update_autocomplete();
+        state.autocomplete.matches = vec!["shot.png".to_string()];
+        state.autocomplete.selected = 0;
+        state.accept_autocomplete();
+        assert_eq!(state.text_input.text, "/detach shot.png");
+    }
+
+    #[test]
+    fn remove_attachment_at_removes_by_index() {
+        let mut state = AgentChatState::new();
+        state.add_attachment(PathBuf::from("/a/one.txt"), AttachmentKind::Text);
+        state.add_attachment(PathBuf::from("/a/two.txt"), AttachmentKind::Text);
+        assert_eq!(state.remove_attachment_at(0).as_deref(), Some("one.txt"));
+        assert_eq!(state.attachments.len(), 1);
+        assert_eq!(state.attachments[0].display_name, "two.txt");
     }
 
     #[test]

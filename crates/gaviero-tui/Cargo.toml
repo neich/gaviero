@@ -40,6 +40,9 @@ unicode-width = "0.2"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Console",
+    # GetAsyncKeyState for the Ctrl+V image-paste fallback when Windows
+    # Terminal swallows the chord and emits no bracketed-paste / key burst.
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 
 [dev-dependencies]

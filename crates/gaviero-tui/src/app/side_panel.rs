@@ -332,6 +332,7 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
         }
         Action::Paste => {
             if !app.chat_state.active_conv_streaming() {
+                app.clear_windows_ctrl_v_pending();
                 app.chat_paste_from_clipboard();
             }
         }
@@ -1592,6 +1593,13 @@ pub(super) fn refresh_chat_autocomplete(app: &mut App) {
         return;
     }
 
+    if app.chat_state.autocomplete.mode
+        == crate::panels::agent_chat::AutocompleteMode::DetachName
+    {
+        app.chat_state.update_detach_autocomplete_matches();
+        return;
+    }
+
     // `/attach` mode supports absolute and `~/`-rooted filesystem listings
     // so the user can attach screenshots / tempfiles outside the workspace
     // without typing the full path. Plain (relative) partials fall through
@@ -2668,6 +2676,13 @@ pub(super) fn chat_paste_from_clipboard(app: &mut App) {
 /// `debug!` (expected when the clipboard holds text), with `warn!` for the
 /// PNG-save error path so the user can find it in `~/.cache/gaviero/log`.
 pub(super) fn try_attach_clipboard_image(app: &mut App) -> bool {
+    // One gesture can hit both empty bracketed-paste and the Windows Ctrl+V
+    // fallback; ignore a second attach within the debounce window.
+    if let Some(at) = app.last_clipboard_image_attach {
+        if at.elapsed() < std::time::Duration::from_millis(300) {
+            return true;
+        }
+    }
     let cb = match app.clipboard.as_mut() {
         Some(cb) => cb,
         None => return false,
@@ -2694,6 +2709,7 @@ pub(super) fn try_attach_clipboard_image(app: &mut App) -> bool {
                 "Pasted clipboard image: {} ({}x{})",
                 display_name, img.width, img.height
             ));
+            app.last_clipboard_image_attach = Some(std::time::Instant::now());
             true
         }
         Err(e) => {
