@@ -12,7 +12,7 @@ cargo test -p gaviero-core --features api-embedders   # placeholder factory only
 
 Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presence) are `#[ignore]`.
 
-## Public Modules (23, from [src/lib.rs](src/lib.rs))
+## Public Modules (25, from [src/lib.rs](src/lib.rs))
 
 | Module | Purpose |
 |---|---|
@@ -28,16 +28,18 @@ Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presenc
 | `scope_enforcer` | `FileScope` enforcement on agent proposals. |
 | `path_pattern` | Glob-aware scope overlap detection (backs DSL scope validation). |
 | `session_state` | Checkpointable session state for resume. |
-| `repo_map` | Code knowledge graph (tree-sitter) + shallow `topology.rs` for `<repo_topology>` injection. |
+| `repo_map` | Code knowledge graph (tree-sitter) + shallow `topology.rs` for `<repo_topology>` injection + rustdoc symbol enrichment. |
 | `tree_sitter` | 16-language registry + query loader. |
 | `diff_engine` | Unified diff generation/application. |
 | `git` | `git2` wrapper, worktrees, branches. |
+| `git_conflict` | `<<<<<<<`/`>>>>>>>` conflict-marker parsing + region detection (backs the TUI Changes panel and F8/F9 navigation). |
 | `terminal` | PTY + OSC 133 + `vt100` emulation (12-file submodule). |
 | `indent` | Hybrid indent detection. |
 | `iteration` | Convergence + test-generator loop control. |
 | `observer` | `WriteGateObserver`, `AcpObserver`, `SwarmObserver` traits. |
 | `query_loader` | Tree-sitter query discovery. |
 | `types` | Shared boundary types (`FileScope`, `WriteProposal`, `ModelTier`, …). |
+| `util` | Cross-cutting helpers: [`util::fs`](src/util/fs.rs), [`util::spawn`](src/util/spawn.rs) (argv/tempfile spill threshold, Windows console isolation + kill-on-close job objects). |
 | `workspace` | `.gaviero/settings.json` cascade + workspace discovery. |
 
 `tree-sitter` types (`Language`, `Node`, `Parser`, `Query`, `Tree`, …) are re-exported here; downstream crates **must not** depend on the `tree-sitter` crate directly.
@@ -48,13 +50,13 @@ Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presenc
 
 **Memory** ([`memory/`](src/memory)) — SQLite + sqlite-vec, pluggable `Embedder` trait. Default `nomic-embed-text-v1.5` (768-dim, `memory.embedder.model = "nomic"` in `workspace.rs`; kept per the PR-6/G2 bench — `gte-modernbert` regressed on the code corpus). Symbol vectors default to `jina-code` (`repoMap.embedder.model`); the `symbol_docs` sidecar is stamped with its embedder and `symbol_search` refuses cross-model queries with a re-enrich remedy. Multi-DB registry (global / workspace / per-folder) via [`stores.rs`](src/memory/stores.rs). Single-consumer writer task owns all writes ([`writer.rs`](src/memory/writer.rs), `WriterMessage` mpsc) — no callsite holds the SQLite Mutex during embed. Default retrieval is merged multi-scope hybrid (RRF: vector 0.7 + FTS 0.3); legacy narrow→wide cascade with 0.70 early-exit is retained as a kill-switch behind `memory.retrieval.mode = "cascade"`. Optional cross-encoder reranker ([`reranker.rs`](src/memory/reranker.rs)) on by default (`memory.reranker.enabled = true`, model `minilm`). Three-cadence consolidation: per-turn [`extractor.rs`](src/memory/extractor.rs) → per-session [`session_consolidator.rs`](src/memory/session_consolidator.rs) → idle/weekly [`sleeptime.rs`](src/memory/sleeptime.rs) + [`sleeptime_scheduler.rs`](src/memory/sleeptime_scheduler.rs). Soft-delete via `/forget` writes a `deletions` audit row; History rows are immutable except via the C2.4 redaction path. Store I/O is split under [`store/`](src/memory/store): `search`, `write`, `panel_ops`, `deletions_ops`, `compression_ops`, `sleeptime_ops`, `telemetry_ops`, `manifest`. The `api-embedders` Cargo feature reserves the hosted-API surface but currently exposes a `NotImplemented` placeholder.
 
-**MCP** ([`mcp/`](src/mcp)) — in-process server exposing seven read-only tools to subprocess coding agents: `memory_search`, `memory_get`, `blast_radius`, `node_doc`, `repo_outline`, plus `symbol_search` / `symbol_doc` behind `repoMap.symbolEnrichment.enabled` ([`tools.rs`](src/mcp/tools.rs)). Listens on the workspace `McpEndpoint` (`<workspace>/.gaviero/mcp.sock` on Unix, a `\\.\pipe\gaviero-<hash>` named pipe on Windows — [`transport.rs`](src/mcp/transport.rs)); subprocess agents reach it through the `gaviero-mcp-shim` binary. One process owns an endpoint at a time (`first_pipe_instance` on Windows); hosts probe `McpEndpoint::has_live_server` and reuse a live endpoint instead of rebinding (this is how `gaviero-cli` coexists with a running TUI). [`config_synth.rs`](src/mcp/config_synth.rs) writes `.mcp.json` (Claude Code), `.codex/config.toml` (Codex), and `cursor.json` per-worktree configs that point at the shim. [`external_memory.rs`](src/mcp/external_memory.rs) detects and disables competing memory MCP servers in agent config with consent. [`observer.rs`](src/mcp/observer.rs) surfaces tool-call events to the host for the TUI audit panel. **Read-only by construction.**
+**MCP** ([`mcp/`](src/mcp)) — in-process server exposing seven read-only tools to subprocess coding agents: `memory_search`, `memory_get`, `blast_radius`, `node_doc`, `repo_outline`, plus `symbol_search` / `symbol_doc` behind `repoMap.symbolEnrichment.enabled` ([`tools.rs`](src/mcp/tools.rs)). Listens on the workspace `McpEndpoint` (`<workspace>/.gaviero/mcp.sock` on Unix, a `\\.\pipe\gaviero-<hash>` named pipe on Windows — [`transport.rs`](src/mcp/transport.rs)); subprocess agents reach it through the `gaviero-mcp-shim` binary. [`config_synth.rs`](src/mcp/config_synth.rs) writes `.mcp.json` (Claude Code), `.codex/config.toml` (Codex), and `cursor.json` per-worktree configs that point at the shim. [`preflight.rs`](src/mcp/preflight.rs) validates shim-on-PATH / URL shape before dispatch (bypass: `gaviero-cli --skip-mcp-preflight`). [`telemetry_sink.rs`](src/mcp/telemetry_sink.rs) appends per-call NDJSON to `.gaviero/mcp_calls.ndjson` (read by `gaviero-cli --mcp-stats`). [`external_memory.rs`](src/mcp/external_memory.rs) detects and disables competing memory MCP servers in agent config with consent. [`observer.rs`](src/mcp/observer.rs) surfaces tool-call events to the host for the TUI audit panel. **Read-only by construction.**
 
 **Agent session** ([`agent_session/`](src/agent_session)) — backend-neutral transport. Codex is dual-mode: [`codex_exec.rs`](src/agent_session/codex_exec.rs) for one-shot exec mode, [`codex_app_server.rs`](src/agent_session/codex_app_server.rs) for persistent app-server mode. [`cursor.rs`](src/agent_session/cursor.rs) wraps the Cursor CLI (native resume mode). [`tool_agent/`](src/agent_session/tool_agent) is the in-process API harness (`deepseek:` v1): SSE client, multi-round tool loop, Option-B writes, Bash + permission policy, cross-turn replay. [`registry.rs`](src/agent_session/registry.rs) routes by model-spec prefix.
 
 **ACP** ([`acp/`](src/acp)) — legacy direct Claude subprocess path: session factory, argv/tempfile prompt spill (`util::spawn::argv_threshold` — 8 KB on Windows, 32 KB elsewhere), streaming file-block extraction ([`protocol.rs`](src/acp/protocol.rs)). New code paths use `agent_session::claude` instead; the legacy path remains until parity is reached.
 
-**Repo map** ([`repo_map/`](src/repo_map)) — `builder.rs` walks the tree-sitter graph; `page_rank.rs` ranks nodes; `topology.rs` produces the shallow filesystem-only folder tree injected as `<repo_topology>` on every first turn. Together they back the two-layer graph context (`<repo_topology>` + `<repo_outline>`).
+**Repo map** ([`repo_map/`](src/repo_map)) — `builder.rs` walks the tree-sitter graph; `page_rank.rs` ranks nodes; `topology.rs` produces the shallow filesystem-only folder tree injected as `<repo_topology>` on every first turn. Together they back the two-layer graph context (`<repo_topology>` + `<repo_outline>`). [`symbol_enrichment.rs`](src/repo_map/symbol_enrichment.rs) ingests rustdoc JSON into the `symbol_docs` sidecar (explicit only — `gaviero-cli --graph --enrich`, needs nightly); [`symbol_search.rs`](src/repo_map/symbol_search.rs) backs the MCP `symbol_search` / `symbol_doc` tools.
 
 **Write Gate** ([`write_gate.rs`](src/write_gate.rs)) — modes: `Interactive` (queue → TUI review), `AutoAccept` (validate + write), `Deferred` (batch), `RejectAll` (drop silently). Diff review + scope validation + observer callbacks happen here.
 
@@ -81,12 +83,15 @@ Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presenc
 - `tree-sitter 0.25` + 16 grammars (Java, JS, TS, Rust, HTML, CSS, JSON, Bash, TOML, C, C++, LaTeX, Python, YAML, Kotlin, `tree-sitter-gaviero`).
 - `git2 0.19` — worktrees, branches, diff.
 - `rusqlite 0.32` (bundled) + `sqlite-vec 0.1.8` — memory store.
-- `ort 2.0.0-rc.12` + `tokenizers 0.19` + `ndarray 0.17` — ONNX inference.
+- `ort 2.0.0-rc.12` + `tokenizers 0.21` + `ndarray 0.17` — ONNX inference. `tokenizers` runs without default `esaxx_fast`: its build script hardcodes the static CRT (`/MT`), which cannot link with ort's `/MD` prebuilt onnxruntime on windows-msvc (see [Cargo.toml](Cargo.toml)).
+- `rustdoc-types 0.57` + `syn 2` — rustdoc-JSON symbol enrichment (S2.1).
 - `petgraph 0.8` — DAG ops in the swarm planner.
 - `portable-pty 0.9` + `vt100 0.16` — terminal emulation.
 - `rmcp 1.5` + `schemars 1.2` — in-process MCP server.
 - `zstd 0.13` + `bincode 1.3` — History compression (sleeptime, ≥90 days).
-- `reqwest 0.12`, `async-trait`, `futures`, `tokio-stream`, `tokio-util`, `chrono`, `toml`, `base64`, `sha2`, `tempfile`, `ropey`, `similar`, `streaming-iterator`.
+- `windows-sys 0.59` (Windows only) — kill-on-close Job Objects for agent process trees ([`util::spawn`](src/util/spawn.rs)).
+- `reqwest 0.12`, `async-trait`, `futures`, `tokio-stream`, `tokio-util`, `chrono`, `regex`, `walkdir`, `toml`, `base64`, `sha2`, `tempfile`, `ropey`, `similar`, `streaming-iterator`.
+- Dev: `wiremock 0.6` (HTTP mocks), `insta 1` (T1.6 prompt-structure snapshots under [tests/snapshots/](tests/snapshots)).
 
 ## See Also
 

@@ -18,6 +18,7 @@ cargo clippy -p gaviero-dsl
 | [`ast.rs`](src/ast.rs) | AST types: `Script`, `Item`, `AgentDecl`, `WorkflowDecl`, `PromptDecl`, `TierAlias`, blocks. **Authoritative** for the DSL surface — read here before extending docs. |
 | [`compiler.rs`](src/compiler.rs) | Semantic analysis → `CompiledPlan` (scope-overlap checks, dependency cycles, tier resolution, var substitution). |
 | [`workflow_params.rs`](src/workflow_params.rs) | Workflow `param` materialization: client params (`__param_*` clients) + roster expansion. |
+| [`reviewers.rs`](src/reviewers.rs) | Backward-compat re-exports only; implementation lives in `workflow_params.rs`. |
 | [`resolver.rs`](src/resolver.rs) | `include "..."` resolution: relative paths, cycle detection, idempotent dedup. Drives the `compile_file` entry point. |
 | [`tiers.rs`](src/tiers.rs) | `--tiers-file` loader: parses a `.gaviero` that contains only `tier <alias> <client-ref>` lines and returns `Vec<(alias, client)>`. |
 | [`error.rs`](src/error.rs) | `DslError` / `DslErrors` (miette diagnostics with source spans). |
@@ -31,12 +32,14 @@ compile_with_vars(source, filename, workflow, runtime_prompt,
 compile_file(entry_path, workflow, runtime_prompt,
              override_vars, override_tiers, override_params)
 load_tier_overrides(path) -> Result<Vec<(String, String)>>
+workflow_execution_mode(...) / peek_workflow_execution_mode(...) -> ExecutionMode
 ```
 
 - `compile_with_vars` backs `gaviero-cli --var KEY=VALUE`. **Var precedence:** agent-level `vars {}` > CLI `--var` overrides > script-level `vars {}`.
 - `compile_file` is the file-path entry point — it runs the include resolver first, then lex/parse/compile. Use it whenever inputs come from disk. `compile` / `compile_with_vars` reject `include` statements with a diagnostic pointing here.
 - `load_tier_overrides` + `override_tiers` backs `gaviero-cli --tiers-file <profile.gaviero>`. **Tier precedence:** CLI `--tiers-file` > script/includes `tier` lines.
 - `override_params` backs `gaviero-cli --param NAME=VALUE`. **Roster** params: `id=provider:model[@effort],...`. **Client** params: `provider:model[@effort]`. Required params (no in-script default) fail compilation if not supplied here.
+- `workflow_execution_mode` / `peek_workflow_execution_mode` report a workflow's `execution` mode (`repo` vs `document`, re-exported `ExecutionMode`) so the CLI can pick `--repo` vs `--workspace` anchoring before full compilation. `CompiledScript` is also re-exported from [`compiler.rs`](src/compiler.rs).
 
 ## DSL Surface (high-level)
 
@@ -77,6 +80,7 @@ For exact field names and shapes, [`ast.rs`](src/ast.rs) is the source of truth.
 - `chumsky 0.12` — parser combinators.
 - `miette 7` + `thiserror 2` — diagnostics.
 - `tracing` — debug telemetry.
+- Dev: `tempfile 3` — include-resolver tests.
 
 ## See Also
 

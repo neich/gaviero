@@ -1,68 +1,128 @@
 # gaviero-tui
 
-Interactive terminal editor and workspace for Gaviero. Multi-tab code editor, file tree, git integration, agent chat, swarm dashboard, and embedded terminal all in one full-screen TUI.
-
-This is the interactive front-end. All execution logic lives in `gaviero-core`; the TUI handles rendering and input only.
-
-## Installation & Build
-
-```bash
-cargo build -p gaviero-tui
-cargo run -p gaviero-tui              # launch editor
-cargo test -p gaviero-tui
-cargo clippy -p gaviero-tui
-```
-
-Binary name: `gaviero`
+Interactive terminal editor and workspace for Gaviero. A multi-tab code editor, file tree, git integration, agent chat, swarm dashboard, and embedded terminal in one full-screen TUI.
 
 ## Overview
 
-The TUI combines multiple editing and collaboration features:
+This is the interactive front-end. All execution logic lives in [`gaviero-core`](../gaviero-core/README.md); the TUI handles rendering and input only. It combines:
 
-- **Multi-tab editor** — Ropey-based rope buffer with syntax highlighting, word wrap, undo/redo, search
-- **File tree** — Navigate and open files from a left panel
-- **Git panel** — Stage/unstage, commit, branch management, diff review
-- **Agent chat** — Talk to Claude agents with file context, streaming output, and context-pressure indicators
-- **Swarm dashboard** — Monitor multi-agent tasks, view logs, check timing and cost
-- **Memory panel** — Inspect stored memories, query by scope, trigger consolidation, audit retrieval manifests
-- **Search panel** — Workspace-wide search with results navigation
-- **Embedded terminal** — Full PTY shell with OSC 133 support
-- **Session restore** — Persistent tabs, layout, and conversation history
+- **Multi-tab editor** — Ropey rope buffer with syntax highlighting, word wrap, undo/redo, and search.
+- **File tree** — navigate and open files from the left panel.
+- **Git panel** — stage/unstage, commit, branch management, diff review.
+- **Agent chat** — talk to Claude agents with file context, streaming output, and context-pressure indicators.
+- **Swarm dashboard** — monitor multi-agent tasks: logs, timing, and cost.
+- **Memory panel** — inspect stored memories, query by scope, trigger consolidation, audit retrieval manifests.
+- **Search panel** — workspace-wide search with results navigation.
+- **Embedded terminal** — a full PTY shell with OSC 133 support.
+- **Session restore** — persistent tabs, layout, and conversation history.
 
-## Running the Editor
+## Installation
 
 ```bash
-gaviero                    # current directory
-gaviero /path/to/repo      # specific project
-gaviero /path/to/workspace.gaviero-workspace  # multi-folder workspace
+cargo build  -p gaviero-tui
+cargo run    -p gaviero-tui        # launch editor in the current directory
+cargo test   -p gaviero-tui
+cargo clippy -p gaviero-tui
 ```
 
-On first run, you'll be prompted to create a workspace settings file.
+Binary name: `gaviero`.
+
+## Usage
+
+```bash
+gaviero                                        # current directory
+gaviero /path/to/repo                          # a specific project
+gaviero /path/to/workspace.gaviero-workspace   # a multi-folder workspace
+```
+
+On first run you'll be prompted to create a workspace settings file.
+
+## Examples
+
+Open a project, then in the agent chat panel (Alt+A):
+
+```
+review src/auth/session.rs for race conditions
+```
+
+Switch models and run a workflow mid-session:
+
+```
+/model claude:opus
+/run workflows/refactor.gaviero "extract the token cache into its own module"
+```
+
+Kick off an ad-hoc multi-agent swarm and watch it on the dashboard (Alt+W):
+
+```
+/cswarm add end-to-end tests for the billing API
+```
+
+## Keybindings
+
+| Context | Keys | Action |
+|---|---|---|
+| Focus | Alt+1 / Alt+2 / Alt+3 / Alt+4 | Left panel / editor / side panel / terminal |
+| Layout | Ctrl+B | Show/hide file tree |
+| Layout | Ctrl+P | Show/hide side panel |
+| Layout | Ctrl+J / F4 | Toggle bottom terminal panel |
+| Layout | F11 | Toggle fullscreen for the current panel |
+| Layout | Alt+5 … Alt+0 | Switch layout preset (1–6) |
+| Layout | Ctrl+Up / Ctrl+Down | Resize the focused panel (terminal split, chat input) |
+| Left panel | Alt+E / Alt+F / Alt+C | Explorer / Find / Changes |
+| Side panel | Alt+A / Alt+W / Alt+G / Alt+M | Agent Chat / Swarm / Git / Memory |
+| Tabs | Ctrl+T / Ctrl+W | New tab / close tab |
+| Tabs | Alt+O / Alt+I | Cycle tabs forward / back |
+| Edit | Ctrl+S | Save |
+| Edit | Ctrl+Z / Ctrl+Y | Undo / Redo |
+| Edit | Ctrl+C / Ctrl+X / Ctrl+V | Copy / Cut / Paste |
+| Edit | Ctrl+A | Select all |
+| Edit | Ctrl+Left / Ctrl+Right | Word movement |
+| Edit | Shift+Arrow / Ctrl+Shift+Arrow | Extend selection / by word |
+| Edit | Alt+Up / Alt+Down | Move line up / down |
+| Edit | Ctrl+K / Ctrl+D | Delete line / duplicate line |
+| Edit | Ctrl+H | Delete word backward |
+| Edit | F2 | Rename symbol |
+| Edit | F5 / F6 | Format buffer / cycle format level |
+| Edit | F7 (also Alt+Z / Alt+Shift+Z) | Toggle word wrap |
+| Editor (.md) | Alt+P (also Alt+Shift+P) | Cycle markdown view: source → split → preview |
+| Find | Ctrl+F | Find in file |
+| Find | F3 | Next in-file match (find bar open) / workspace search (closed) |
+| Chat | Alt+Y | Toggle auto-approve for the next tool prompt |
+| Merge conflict | F8 / F9 | Next / previous conflict region or file |
+| Diff review | `]h` / `[h` | Next / previous hunk |
+| Diff review | `a` / `r` | Accept / reject current hunk |
+| Diff review | `A` / `R` | Accept / reject all |
+| Diff review | `f` / `q` | Finalize (write to disk) / exit review |
+
+F7 is the reliable word-wrap chord on every host; plain Alt+Z is a fallback (NVIDIA's overlay registers it as a global hotkey on some machines, so the terminal never sees it). The status bar shows `[W]` when word wrap is active.
+
+Mouse drag selects text panel-by-panel and copies on release. If a drag instead spans the whole terminal window, your multiplexer is selecting on top of gaviero; under psmux, add `set -g mouse-selection off` to `~/.psmux.conf`.
 
 ## Chat Commands
 
-Type these in the agent chat panel to control execution:
+Type these in the agent chat panel:
 
 | Command | Purpose |
 |---|---|
 | `/model <spec>` | Switch active model (e.g., `claude:sonnet`, `ollama:qwen2.5-coder:7b`) |
-| `/set-model <spec>` | Alias for `/model` |
-| `/run <file.gaviero>` | Compile and execute a DSL workflow |
-| `/run <file> <prompt>` | Execute with runtime prompt substitution |
+| `/run <file.gaviero> [prompt]` | Compile and execute a DSL workflow, with optional runtime prompt |
 | `/swarm <task>` | Immediate multi-agent swarm (auto-decomposed) |
 | `/cswarm <task>` | Generate a reviewable coordinated plan (`.gaviero` file) |
 | `/undo-swarm` | Revert the last swarm result |
-| `/remember <text>` | Store a fact in semantic memory |
+| `/remember <text>` | Store a fact in semantic memory (`/remember-here`, `-module`, `-workspace`, `-global` scope it) |
 | `/forget <query>` | Soft-delete memories matching the query |
-| `/attach <path>` | Include a file in chat context |
-| `/detach <name\|all>` | Remove attachments |
-| `/lite` | Send a minimal-context turn (topology kept; outline, memory, and impact dropped) |
-| `/clear` | Clear conversation history |
+| `/skills [search <q>]` | List loaded skills, or search them semantically |
+| `/attach <path>` / `/detach <name\|all>` | Add/remove a file in chat context |
+| `/lite` | Send a minimal-context turn (topology kept; outline, memory, impact dropped) |
 | `/compact` | Trim conversation history while preserving key context |
+| `/clear` | Clear conversation history |
+
+Chat input also supports `$skill` invocation with `$`-prefix autocomplete at ≥2 characters.
 
 ## Configuration
 
-The TUI reads workspace settings from this cascade:
+The TUI reads workspace settings from this cascade (highest priority first):
 
 1. `.gaviero/settings.json` — project-level settings
 2. `.gaviero-workspace` file — multi-folder configuration
@@ -73,11 +133,7 @@ Example `.gaviero/settings.json`:
 
 ```json
 {
-  "editor": {
-    "tabSize": 4,
-    "insertSpaces": true,
-    "wordWrap": false
-  },
+  "editor": { "tabSize": 4, "insertSpaces": true, "wordWrap": false },
   "agent": {
     "model": "claude:sonnet",
     "maxTokens": 16384,
@@ -90,61 +146,45 @@ Example `.gaviero/settings.json`:
         "allowlist": ["cargo check", "cargo test", "git status", "rg "]
       }
     },
-    "coordinator": {
-      "model": "claude:opus"
-    }
+    "coordinator": { "model": "claude:opus" }
   },
-  "memory": {
-    "namespace": "my-project"
-  }
+  "memory": { "namespace": "my-project" }
 }
 ```
 
-Toggle word wrap at runtime with **Alt+Z**; the status bar shows a `[W]` indicator when it is active.
+Language-specific overrides use bracket syntax: `"[rust]": { "editor.tabSize": 4 }`.
 
 ## API / Architecture
 
-The TUI implements three observer interfaces from `gaviero-core`:
+The TUI implements three observer traits from `gaviero-core` — `WriteGateObserver`, `AcpObserver`, `SwarmObserver`. Each impl holds an event-channel sender, so core callbacks become `Event` variants handled on the main loop.
 
-- `WriteGateObserver` — receives proposal accept/reject events
-- `AcpObserver` — receives agent chat progress events
-- `SwarmObserver` — receives multi-agent coordination events
+**Event-loop golden rule:** `draw → recv event → handle → repeat`. Render is pure; mutation happens only in `handle`. No background task mutates the `App` struct directly — all state changes flow through a single `mpsc` event channel, and the TUI holds no `Mutex`.
 
-Each observer sends events to the main event loop as `Event` variants, which are processed synchronously.
+Module layout:
 
-**Event loop** — single-threaded: `draw → recv event → handle → repeat`
+- `app.rs` + `app/` — `App` struct, layout, focus, event dispatch, observer wiring, slash-command dispatch, context-pressure render.
+- `event.rs` — event variants from crossterm / notify / tick / observer callbacks; Windows paste-burst coalescer.
+- `keymap.rs` — keybindings (Ctrl = editor, Alt = workspace layering).
+- `platform.rs` — platform-specific terminal workarounds (VT mouse passthrough, bracketed-paste gating, AltGr detection).
+- `editor/` — Ropey buffer, viewport/gutter, tree-sitter highlight, markdown rendering, diff overlay, word-wrap layout.
+- `panels/` — `file_tree`, `agent_chat`, `swarm_dashboard`, `git_panel`, `terminal`, `search`, `memory_panel`, `status_bar`.
+- `widgets/` — tabs, scrollbar, scroll state, text input.
+- `theme.rs` — One Dark palette + timing constants.
 
-No background tasks mutate the `App` struct directly. All state changes flow through the event channel.
+## Dependencies
 
-### Keybindings
+- `ratatui 0.30` + `crossterm 0.29` — rendering, input
+- `ropey 1.6` — rope buffer; `notify 7` — filesystem watcher
+- `portable-pty 0.9` + `vt100 0.16` — embedded terminal
+- `arboard 3` + `png` — clipboard and image paste
+- `gaviero-core`, `gaviero-dsl` — runtime + DSL compilation
 
-| Context | Keys | Action |
-|---|---|---|
-| Workspace | Alt+1 / Alt+2 / Alt+3 / Alt+4 | Focus left panel / editor / side panel / terminal |
-| Workspace | Ctrl+b | Show/hide file tree |
-| Workspace | Ctrl+p | Show/hide side panel |
-| Workspace | F11 | Toggle fullscreen for current panel |
-| Workspace | Alt+Shift+1–6 | Switch layout preset |
-| Side panels | Alt+a | Agent Chat panel |
-| Side panels | Alt+w | Swarm Dashboard panel |
-| Side panels | Alt+g | Git panel |
-| Left panel modes | Alt+e | Explorer (file tree) |
-| Left panel modes | Alt+f | Find (workspace search) |
-| Left panel modes | Alt+c | Changes (git diff list) |
-| Editor | Ctrl+S | Save |
-| Editor | Ctrl+Z / Ctrl+Y | Undo / Redo |
-| Editor | Ctrl+F | Find in file |
-| Editor | F3 | Next match (in-file) / workspace search (no find bar) |
-| Editor | Alt+Z | Toggle word wrap |
-| Editor (.md) | Alt+P | Cycle markdown view: source → split preview → preview only |
-| Editor | Ctrl+T / Ctrl+W | New tab / close tab |
-| Editor | Alt+[ / Alt+] | Cycle tabs |
-| Terminal | Ctrl+J / F4 | Toggle bottom terminal panel |
-| Diff review | `]h` / `[h` | Next / previous hunk |
-| Merge conflict (editor / Changes) | F8 / F9 | Next / previous conflict region or file |
-| Diff review | `a` / `r` | Accept / reject current hunk |
-| Diff review | `A` / `R` | Accept / reject all |
-| Diff review | `f` | Finalize (write to disk) |
-| Diff review | `q` | Exit review |
+## See Also
 
-See the root [README.md](../../README.md) for a complete keybinding reference.
+- [CLAUDE.md](CLAUDE.md) — event loop, panel patterns, observer bridge conventions
+- [Root README](../../README.md) — full feature overview and settings reference
+- [`crates/gaviero-core/README.md`](../gaviero-core/README.md) — the runtime the TUI drives
+
+## License
+
+Apache-2.0 — see the workspace [LICENSE](../../LICENSE).

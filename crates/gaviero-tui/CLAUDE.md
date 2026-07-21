@@ -18,8 +18,8 @@ cargo run -p gaviero-tui -- name.gaviero-workspace
 
 - [`app.rs`](src/app.rs) + [`app/`](src/app) — `App` struct, layout, focus, event dispatch, observer wiring, chat-memory bridge ([`app/chat_memory.rs`](src/app/chat_memory.rs)), per-folder topology cache built asynchronously ([`app/session.rs`](src/app/session.rs)), slash-command dispatch ([`app/commands.rs`](src/app/commands.rs)), context-pressure + bootstrap-tokens render ([`app/render.rs`](src/app/render.rs)).
 - [`event.rs`](src/event.rs) — event variants from crossterm / notify / tick / core observer callbacks; Windows paste-burst coalescer (runtime-gated, compiled on all platforms).
-- [`keymap.rs`](src/keymap.rs) — keybindings: Ctrl = editor, Alt = workspace layering. `Alt+Z` toggles word wrap.
-- [`platform.rs`](src/platform.rs) — every platform-specific terminal workaround: VT mouse passthrough (Windows/ConPTY), bracketed-paste gating, AltGr chord detection. New platform quirks go here, not inline.
+- [`keymap.rs`](src/keymap.rs) — keybindings: Ctrl = editor, Alt = workspace layering. **F7** is the primary word-wrap chord (F-key CSI encodings survive every host layer; plain `Alt+Z` is globally registered by NVIDIA's overlay — `Alt+Shift+Z` is the fallback, same pattern as `Alt+Shift+P` for preview). `Ctrl+Up/Down` is the panel-resize fallback where hosts steal `Alt+arrows` (Windows Terminal binds them to pane navigation).
+- [`platform.rs`](src/platform.rs) — every platform-specific terminal workaround: VT mouse passthrough (Windows/ConPTY), bracketed-paste gating, AltGr chord detection, console Ctrl+C forwarder. New platform quirks go here, not inline.
 - [`editor/`](src/editor) — Ropey buffer ([`buffer.rs`](src/editor/buffer.rs)), viewport + gutter ([`view.rs`](src/editor/view.rs)), tree-sitter highlight ([`highlight.rs`](src/editor/highlight.rs)), markdown rendering ([`markdown.rs`](src/editor/markdown.rs)), diff-overlay state ([`diff_overlay.rs`](src/editor/diff_overlay.rs)), LCS line diff for diff-view buffers ([`diff.rs`](src/editor/diff.rs)), visual-line layout for word wrap ([`wrap.rs`](src/editor/wrap.rs)).
 - [`panels/`](src/panels) — `file_tree`, `agent_chat` (slash commands + context-pressure + bootstrap-tokens indicators), `swarm_dashboard`, `git_panel`, `terminal`, `search`, `memory_panel`, `status_bar` (mode / file / branch / agent / word-wrap indicator), `chat_markdown`.
 - [`widgets/`](src/widgets) — tabs, scrollbar, scroll state, text input, render utils.
@@ -33,7 +33,11 @@ The TUI implements `WriteGateObserver`, `AcpObserver`, `SwarmObserver` from [`ga
 
 Dispatched in [`app/commands.rs`](src/app/commands.rs) and [`panels/agent_chat.rs`](src/panels/agent_chat.rs). The active set:
 
-`/swarm`, `/cswarm`, `/undo-swarm`, `/run`, `/model` (set runtime model), `/compact` (compact chat context), `/clear` (alias `/reset`), `/lite` (alias `/minimal` — minimal-context turn: keeps `<repo_topology>`, drops `<repo_outline>` + memory + impact), `/skills` (list skills; `/skills search <q>` for semantic discovery), `/remember`, `/remember-here`, `/remember-module`, `/remember-workspace`, `/remember-global`, `/forget`, `/forget-scope`, `/forget-type`, `/forget-source`, `/forget-history`, `/restore`, `/attach`, `/detach`, `/help`.
+- **Session:** `/model`, `/effort` (alias `/thinking` — `off|auto|low|medium|high|xhigh|max`, per-conversation), `/autoapprove` (alias `/yolo` — toggle per-conversation auto-approve), `/rename [title]` (bare = interactive, same as F2), `/compact [keep]`, `/clear` (alias `/reset`), `/attach`, `/detach`, `/help`.
+- **Context:** `/context` (status report; `/context mode auto|minimal|manual|none|reset` sets per-conversation bootstrap mode), `/lite` (alias `/minimal` — one-shot minimal-context turn: keeps `<repo_topology>`, drops `<repo_outline>` + memory + impact), `/inject <memory|outline|graph|topology|impact|all>` + `/no-inject` (arm/suppress bootstrap layers for the next prompt), `/workspace` (alias `/ws` — one-shot workspace-wide planner scope).
+- **Swarm:** `/swarm`, `/cswarm`, `/undo-swarm`, `/run`.
+- **Memory:** `/remember`, `/remember-here`, `/remember-module`, `/remember-workspace`, `/remember-global`, `/forget`, `/forget-scope`, `/forget-type`, `/forget-source`, `/forget-history`, `/restore`, `/namespace` (alias `/ns` — show or set per-conversation write namespace), `/consolidate-session`, `/reembed` (re-embed the store after an embedder change; takes a backup first).
+- **Skills:** `/skills` (list; `/skills search <q>` for semantic discovery).
 
 Chat input also supports `$skill` invocation (see README § Skills) with `$`-prefix autocomplete at ≥2 name characters.
 
@@ -61,7 +65,9 @@ Chat input also supports `$skill` invocation (see README § Skills) with `$`-pre
 - `portable-pty 0.9` + `vt100 0.16` — embedded terminal.
 - `arboard 3` + `base64` + `png` — clipboard, image paste.
 - `unicode-width 0.2` — visual width for wrap.
-- `streaming-iterator`, `toml`, `tokio-util` — misc.
+- `windows-sys 0.59` (Windows only) — `SetConsoleCtrlHandler` for the Ctrl+C/Ctrl+Break → key-event forwarder ([`platform.rs`](src/platform.rs)).
+- `embed-manifest 1.4` (build) — Windows application manifest.
+- `streaming-iterator`, `toml`, `tokio-util`, `clap`, `dirs`, `tracing-subscriber` — misc.
 - `gaviero-core`, `gaviero-dsl` — runtime + DSL compilation.
 
 ## See Also
