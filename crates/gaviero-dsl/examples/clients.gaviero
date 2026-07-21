@@ -5,15 +5,21 @@
 // agents to concrete clients by name (`client opus`). Add top-level
 // `tier <alias> <client>` declarations when you want re-pointable routing.
 
-client opus {
-    model "claude:opus"
+client fable {
+    model "claude:fable"
     privacy public
     effort max
     default
 }
 
+client opus {
+    model "claude:opus"
+    privacy public
+    effort max
+}
+
 client sonnet {
-    model "claude:sonnet"
+    model "claude:sonnet-5"
     privacy public
     // The judge emits a short JSON verdict — no deep reasoning needed.
     effort medium

@@ -4,7 +4,7 @@
 //   gaviero-cli --script update_docs.gaviero \
 //     --tiers-file crates/gaviero-dsl/examples/profiles/doc-codex.gaviero
 
-tier inventory          opus
-tier writer_deep        opus
-tier writer_standard    sonnet
-tier recorder           sonnet
+tier inventory          fable
+tier writer_deep        fable
+tier writer_standard    opus
+tier recorder           opus
