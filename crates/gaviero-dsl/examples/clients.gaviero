@@ -49,3 +49,4 @@ client grok {
     model "cursor:grok-4.5"
     privacy public
     effort high
+}

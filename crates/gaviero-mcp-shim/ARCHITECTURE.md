@@ -1,152 +1,108 @@
 # gaviero-mcp-shim — Architecture
 
-A standalone stdio↔socket bridge. Subprocess coding agents (Claude Code, Codex, Cursor) spawn this binary as their MCP "server"; it opens a connection to Gaviero's workspace endpoint — the Unix socket `<workspace>/.gaviero/mcp.sock` on Unix, a `\\.\pipe\gaviero-<hash>` named pipe on Windows — and pipes bytes in both directions. The actual MCP protocol is handled by [`GavieroMcpServer`](../gaviero-core/src/mcp/server.rs) inside the host process.
+Standalone stdio↔endpoint bridge. Subprocess coding agents (Claude Code, Codex, Cursor) spawn this binary as their MCP "server"; it connects to Gaviero's workspace [`McpEndpoint`](../gaviero-core/src/mcp/transport.rs) and copies bytes bidirectionally. Protocol handling lives in [`GavieroMcpServer`](../gaviero-core/src/mcp/server.rs) inside the host.
 
-Binary: `gaviero-mcp-shim` (~200 lines of Rust, single source file)
-
----
-
-## 1. Topology
-
-```
-┌────────────────────────────┐
-│ Subprocess agent           │
-│ (claude-code / codex /     │
-│  cursor)                   │  ─── stdin/stdout (JSON-RPC 2.0)
-└────────────────┬───────────┘
-                 │
-                 ▼
-┌────────────────────────────┐
-│ gaviero-mcp-shim           │
-│                            │
-│  ┌──────────────────────┐  │
-│  │ connect_with_backoff │  │
-│  └──────────┬───────────┘  │
-│             ▼              │
-│  ┌──────────────────────┐  │
-│  │ bridge (tokio::io::  │  │
-│  │   copy bidirection)  │  │
-│  └──────────┬───────────┘  │
-└─────────────┼──────────────┘
-              │
-              ▼   <workspace>/.gaviero/mcp.sock (Unix socket)
-              │   \\.\pipe\gaviero-<hash>       (Windows named pipe)
-┌─────────────┴──────────────┐
-│ gaviero-core::mcp::server  │
-│ (in-process rmcp server)   │
-│   memory_search            │
-│   blast_radius             │
-│   node_doc                 │
-└────────────────────────────┘
-```
-
-**Standalone crate.** No workspace dependencies — only `tokio`, `clap`, `anyhow`, `tracing`. The shim builds and ships independently of the rest of the workspace.
+Binary: `gaviero-mcp-shim` (~187 lines, single source file). Conventions: [CLAUDE.md](CLAUDE.md).
 
 ---
 
-## 2. Modules
+## Topology
 
-The crate is a single source file:
+```
+Subprocess agent (claude / codex / cursor)
+        │ stdin/stdout  JSON-RPC 2.0 (MCP)
+        ▼
+gaviero-mcp-shim
+  connect_with_backoff → bridge (tokio::io::copy ×2)
+        │
+        ▼  Unix: <workspace>/.gaviero/mcp.sock
+           Windows: \\.\pipe\gaviero-<hash>
+gaviero-core::mcp::server  (rmcp, seven read-only tools)
+```
 
-| File | Purpose |
+**Zero workspace deps.** Only `tokio`, `clap`, `anyhow`, `tracing`. Speaks to core exclusively over the endpoint — never links `gaviero-core`.
+
+DeepSeek (`deepseek:`) runs in-process via `tool_agent` and does **not** use this shim.
+
+---
+
+## Modules
+
+| Path | Role |
 |---|---|
-| [`src/main.rs`](src/main.rs) | `Cli` (clap derive), `connect_with_backoff`, `bridge`, `main` |
-| [`Cargo.toml`](Cargo.toml) | Standalone manifest — no `gaviero-core` / `gaviero-dsl` deps |
+| [`src/main.rs`](src/main.rs) | `Cli`, `connect_with_backoff` (unix/windows), `bridge`, `main` |
+| [`Cargo.toml`](Cargo.toml) | Standalone manifest |
 
 ---
 
-## 3. Core Abstractions
+## Abstractions
 
-### `Cli` ([`src/main.rs`](src/main.rs))
+### `Cli`
 
 ```rust
 struct Cli {
-    /// Absolute path to <workspace>/.gaviero/mcp.sock (Unix only)
-    socket: Option<PathBuf>,
-    /// Windows named-pipe name (\\.\pipe\gaviero-…, Windows only)
-    pipe: Option<String>,
-    /// Retry window for the initial connect (default 5s)
-    connect_timeout_secs: u64,
+    socket: Option<PathBuf>,          // --socket (Unix)
+    pipe: Option<String>,             // --pipe (Windows)
+    connect_timeout_secs: u64,        // default 5
 }
 ```
 
-### `connect_with_backoff` (per-platform modules, [`src/main.rs`](src/main.rs))
+Args emitted by [`McpEndpoint::shim_args`](../gaviero-core/src/mcp/transport.rs) into synthesized agent configs ([`config_synth`](../gaviero-core/src/mcp/config_synth.rs)).
 
-Retries `UnixStream::connect` (Unix) / `ClientOptions::open` (Windows, folding `ERROR_PIPE_BUSY` into the loop) with exponential backoff (50 ms → 400 ms ceiling) until either the connection succeeds or the deadline (`Instant::now + connect_timeout_secs`) passes. Used so the subprocess can spawn before the host finishes `Workspace::open`.
+### `connect_with_backoff`
 
-### `bridge` ([`src/main.rs`](src/main.rs))
+Retries `UnixStream::connect` / Windows named-pipe open (folding `ERROR_PIPE_BUSY`) with exponential backoff (50 ms → 400 ms) until success or deadline. Lets the agent spawn before the host finishes binding.
 
-Generic over split `AsyncRead + AsyncWrite` halves; runs two async tasks under `tokio::select!`:
+### `bridge`
 
-- `to_endpoint`: `stdin → endpoint` with explicit `flush()` after every chunk.
-- `from_endpoint`: `endpoint → stdout` with explicit `flush()`.
+Splits the connected stream; two tasks under `tokio::select!`:
 
-Both tasks use a fixed 8192-byte buffer. The first task to return EOF or an error terminates the bridge.
+- stdin → endpoint (flush after each chunk)
+- endpoint → stdout (flush)
+
+Fixed 8192-byte buffers. Byte-faithful — no framing or JSON parsing.
 
 ---
 
-## 4. Data Flow — One Tool Call
+## Data Flow
 
 ```
-Agent sends JSON-RPC request line (memory_search …)
-   │
-   ▼
-stdin → 8192-byte buffer → sock_tx.write_all → flush
-   │
-   ▼
-.gaviero/mcp.sock
-   │
-   ▼
-rmcp server in gaviero-core (executes memory_search,
-   returns JSON-RPC response line)
-   │
-   ▼
-sock_rx → 8192-byte buffer → stdout.write_all → flush
-   │
-   ▼
-Agent reads response
+Agent JSON-RPC request line
+  → stdin → buffer → endpoint write + flush
+  → GavieroMcpServer executes tool (memory_search | memory_get |
+       blast_radius | node_doc | repo_outline | symbol_search | symbol_doc)
+  → response line → stdout + flush
+  → Agent
 ```
 
-MCP over stdio is line-delimited JSON-RPC 2.0; the shim is byte-faithful (no framing, no parsing) — exactly what `rmcp` expects on either end.
+Tool list and semantics: [`crates/gaviero-core/ARCHITECTURE.md`](../gaviero-core/ARCHITECTURE.md) (MCP section) / [`mcp/tools.rs`](../gaviero-core/src/mcp/tools.rs). All tools are read-only.
 
 ---
 
-## 5. Concurrency
+## Concurrency
 
-- Single-thread `tokio` runtime (`#[tokio::main]` default).
-- Two concurrent `async` tasks inside `bridge`; `tokio::select!` ensures the first to finish drops the other.
-- No shared state, no locks. Each direction owns its half of the split stream.
+Single-thread tokio runtime. Two concurrent copy tasks; first EOF/error wins via `select!`. No shared state, no locks.
 
 ---
 
-## 6. Error Handling
+## Error Handling
 
 | Failure | Handling |
 |---|---|
-| Socket missing / host not yet started | Retry with exponential backoff until `connect_timeout_secs` elapses, then exit with the underlying `io::Error` annotated by `anyhow::Context` |
-| Either pipe direction closes | Return cleanly; `tokio::select!` propagates the error wrapped with `.context("piping stdin → socket")` / `.context("piping socket → stdout")` |
-| `tracing` | Logged to stderr at `WARN` level — keeps stdout clean for JSON-RPC traffic |
+| Endpoint not ready | Backoff until `--connect-timeout-secs`, then exit with annotated `io::Error` |
+| Either direction closes | Propagate via `anyhow::Context`; peer task dropped |
+| Tracing | stderr at WARN — stdout reserved for JSON-RPC |
 
-The shim never invents framing or retries individual requests — that's the agent's job.
-
----
-
-## 7. Public API
-
-None — this is a binary crate. Subprocess agents launch it via their MCP config:
-
-- Claude Code: `<worktree>/.mcp.json`'s `gaviero` server entry (see [`claude_mcp_config_json`](../gaviero-core/src/mcp/config_synth.rs)).
-- Codex: `<worktree>/.codex/config.toml`'s `[mcp_servers.gaviero]` block (see [`codex_mcp_config_toml`](../gaviero-core/src/mcp/config_synth.rs)).
-- Cursor: `<worktree>/.cursor/mcp.json` (same schema as Claude, see [`cursor_mcp_config_json`](../gaviero-core/src/mcp/config_synth.rs)).
-
-Each config sets `command` to `gaviero-mcp-shim` and passes `--socket <abs-path>` (Unix) or `--pipe <name>` (Windows), emitted per-platform by [`McpEndpoint::shim_args`](../gaviero-core/src/mcp/transport.rs). The shim must therefore be on `PATH` or referenced by absolute path; otherwise the agent's MCP startup fails.
+No per-request retries (agent responsibility).
 
 ---
 
-## 8. Relationship to `gaviero-core`
+## API
 
-The shim is the only piece of glue that lets out-of-process agents reach the in-process MCP tools. The tools themselves — `memory_search`, `blast_radius`, `node_doc` — are read-only by construction (the server has no `WriterHandle`). See [`crates/gaviero-core/ARCHITECTURE.md`](../gaviero-core/ARCHITECTURE.md) §7 for the server side.
+None (binary). Agents launch via synthesized MCP config:
 
----
+- Claude: `<worktree>/.mcp.json` — [`claude_mcp_config_json`](../gaviero-core/src/mcp/config_synth.rs)
+- Codex: `<worktree>/.codex/config.toml` — [`codex_mcp_config_toml`](../gaviero-core/src/mcp/config_synth.rs)
+- Cursor: `<worktree>/.cursor/mcp.json` — [`cursor_mcp_config_json`](../gaviero-core/src/mcp/config_synth.rs)
 
-See [README.md](README.md) for installation and usage examples.
+`command` must resolve `gaviero-mcp-shim` on `PATH` or use an absolute path.
