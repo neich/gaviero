@@ -9,81 +9,60 @@ cargo test -p gaviero-dsl
 cargo clippy -p gaviero-dsl
 ```
 
-## Modules (from [src/lib.rs](src/lib.rs))
+Examples: **10** workflows + **3** tier profiles (`doc-claude`, `doc-codex`, `doc-cursor`) under [`examples/`](examples/).
 
-| File | Purpose |
+## Architecture
+
+**9 pub mods** — see [`src/lib.rs`](src/lib.rs):
+
+| Module | Role |
 |---|---|
-| [`lexer.rs`](src/lexer.rs) | Logos tokenizer. |
-| [`parser.rs`](src/parser.rs) | Chumsky combinators → AST. |
-| [`ast.rs`](src/ast.rs) | AST types: `Script`, `Item`, `AgentDecl`, `WorkflowDecl`, `PromptDecl`, `TierAlias`, blocks. **Authoritative** for the DSL surface — read here before extending docs. |
-| [`compiler.rs`](src/compiler.rs) | Semantic analysis → `CompiledPlan` (scope-overlap checks, dependency cycles, tier resolution, var substitution). |
-| [`workflow_params.rs`](src/workflow_params.rs) | Workflow `param` materialization: client params (`__param_*` clients) + roster expansion. |
-| [`reviewers.rs`](src/reviewers.rs) | Backward-compat re-exports only; implementation lives in `workflow_params.rs`. |
-| [`resolver.rs`](src/resolver.rs) | `include "..."` resolution: relative paths, cycle detection, idempotent dedup. Drives the `compile_file` entry point. |
-| [`tiers.rs`](src/tiers.rs) | `--tiers-file` loader: parses a `.gaviero` that contains only `tier <alias> <client-ref>` lines and returns `Vec<(alias, client)>`. |
-| [`error.rs`](src/error.rs) | `DslError` / `DslErrors` (miette diagnostics with source spans). |
+| [`ast.rs`](src/ast.rs) | AST types. **Authoritative** DSL surface — read before extending docs or the parser. |
+| [`lexer.rs`](src/lexer.rs) / [`parser.rs`](src/parser.rs) | Logos → chumsky → AST. |
+| [`compiler.rs`](src/compiler.rs) | Semantic analysis → `CompiledPlan` (scope overlap, cycles, tier resolution, var substitution). |
+| [`workflow_params.rs`](src/workflow_params.rs) | `param` materialization: client params + roster expansion (`--param`). |
+| [`reviewers.rs`](src/reviewers.rs) | Compat re-exports only; impl lives in `workflow_params`. |
+| [`resolver.rs`](src/resolver.rs) | `include` graph; drives `compile_file`. |
+| [`tiers.rs`](src/tiers.rs) | `--tiers-file` loader (`tier` lines only). |
+| [`error.rs`](src/error.rs) | `DslError` / `DslErrors` (miette spans). |
 
-## Public API
+**Public API** ([`lib.rs`](src/lib.rs)):
 
-```rust
-compile(source, filename, workflow, runtime_prompt) -> Result<CompiledPlan>
-compile_with_vars(source, filename, workflow, runtime_prompt,
-                  override_vars, override_tiers, override_params)
-compile_file(entry_path, workflow, runtime_prompt,
-             override_vars, override_tiers, override_params)
-load_tier_overrides(path) -> Result<Vec<(String, String)>>
-workflow_execution_mode(...) / peek_workflow_execution_mode(...) -> ExecutionMode
-```
+- `compile` / `compile_with_vars` / `compile_file` — `override_vars`, `override_tiers`, `override_params`.
+- `load_tier_overrides` — backs `--tiers-file`.
+- `workflow_execution_mode` / `peek_workflow_execution_mode` — `repo` vs `document` anchoring before full compile.
 
-- `compile_with_vars` backs `gaviero-cli --var KEY=VALUE`. **Var precedence:** agent-level `vars {}` > CLI `--var` overrides > script-level `vars {}`.
-- `compile_file` is the file-path entry point — it runs the include resolver first, then lex/parse/compile. Use it whenever inputs come from disk. `compile` / `compile_with_vars` reject `include` statements with a diagnostic pointing here.
-- `load_tier_overrides` + `override_tiers` backs `gaviero-cli --tiers-file <profile.gaviero>`. **Tier precedence:** CLI `--tiers-file` > script/includes `tier` lines.
-- `override_params` backs `gaviero-cli --param NAME=VALUE`. **Roster** params: `id=provider:model[@effort],...`. **Client** params: `provider:model[@effort]`. Required params (no in-script default) fail compilation if not supplied here.
-- `workflow_execution_mode` / `peek_workflow_execution_mode` report a workflow's `execution` mode (`repo` vs `document`, re-exported `ExecutionMode`) so the CLI can pick `--repo` vs `--workspace` anchoring before full compilation. `CompiledScript` is also re-exported from [`compiler.rs`](src/compiler.rs).
+**Precedence:** agent-level `vars {}` > CLI `--var` > script-level `vars {}`. Tier: `--tiers-file` > script/includes `tier` lines.
 
-## DSL Surface (high-level)
-
-- Top-level items: `client`, `agent`, `workflow`, `prompt`, `vars`, `tier <alias> <client-ref>`, `include "path.gaviero"`.
-- Workflow-level params:
-  - `param <name> [ { id "..." model "provider:model" effort ... } ]` — roster; referenced by `reviewers <name>`.
-  - `param <name> { model "provider:model" effort ... privacy ... extra { } }` — client; referenced by `client <name>` on an agent.
-  - Bare `param <name>` infers roster vs client from usage. CLI roster override: `id=provider:model[@effort],...`; client override: `provider:model[@effort]`.
-- `prompt <name> #" ... "#` — reusable named prompts; substitutes `{{AGENT}}`, `{{PROMPT}}`, and in-scope `vars`.
-- `vars {}` — compile-time substitution across prompts, descriptions, memory content, scope paths. Single-pass: `{{FOO}}` expands once; nested refs in values do not.
-- `tier <alias> <client-ref>` — re-pointable routing label so agents say `tier expensive` instead of binding to a specific client.
-- `client {}` fields: `tier`, `model`, `privacy`, `effort`, `default`, `extra { "k" "v" }` (provider-specific pass-through).
-- Model strings are provider-prefixed (`claude:`, `codex:`, `cursor:`, `ollama:`, `local:`); bare names are rejected at compile-dispatch by `gaviero-core::swarm::backend::shared::validate_model_spec`.
-- Scope glob patterns are enforced via [`gaviero_core::path_pattern::paths_overlap`](../gaviero-core/src/path_pattern.rs). Disjoint globs allowed; overlap within the same `loop { agents [...] }` group is allowed.
-- Workflow blocks: `steps`, `depends_on`, `max_parallel`, `loop { until agent <judge> ... }` with `stability`, `iter_start`, `max_iterations`, `judge_timeout`, `strict_judge`, `branch_chain stacked`, `until command "..."`.
-
-For exact field names and shapes, [`ast.rs`](src/ast.rs) is the source of truth.
+Exact field shapes: [`ast.rs`](src/ast.rs). Language reference: [README.md](README.md).
 
 ## Conventions
 
-- **Errors carry source spans.** Always propagate span info; never strip a `DslError` to its `Display` form before reporting.
-- **Compile-time validation.** Scope overlaps and dependency cycles are checked at compile time. **Never** bypass these — runtime callers assume the plan is consistent.
-- **Provider-neutral model strings.** Resolution to a backend happens in `gaviero-core` at dispatch; the DSL only validates the surface form.
-- **Single-pass var substitution.** Do not re-run substitution; emit a diagnostic instead of silently iterating to a fixpoint.
-- **Re-export of `CompiledPlan` is canonical.** Downstream crates use `gaviero_dsl::CompiledPlan`, not the path under `gaviero_core`.
+- **Errors carry source spans.** Never strip a `DslError` to bare `Display` before reporting.
+- **Compile-time validation.** Scope overlaps and dependency cycles are checked at compile time — runtime callers assume a consistent plan.
+- **Provider-neutral model strings.** Resolution happens in `gaviero-core` at dispatch. Prefixes: `claude:`, `codex:`, `cursor:`, `ollama:`, `local:`, `deepseek:` ([`validate_model_spec`](../gaviero-core/src/swarm/backend/shared.rs)).
+- **Single-pass var substitution.** Do not iterate to a fixpoint; emit a diagnostic instead.
+- **Canonical re-export:** downstream uses `gaviero_dsl::CompiledPlan`, not a path under core.
+- Scope globs via [`gaviero_core::path_pattern::paths_overlap`](../gaviero-core/src/path_pattern.rs). Overlap within the same `loop { agents [...] }` group is allowed.
 
 ## Rules
 
-- **Never extend the AST without also extending [`ast.rs`](src/ast.rs).** Drift between AST and parser is the most common source of DSL bugs.
-- **Tier-override files contain `tier` lines only** ([`tiers.rs`](src/tiers.rs)). Reject anything else with a diagnostic — do not silently ignore other items.
-- **`include` resolution is whole-file.** Inline-string compilation paths (`compile`, `compile_with_vars`) must reject `include` and direct callers to `compile_file`.
-- **Cycle detection happens in the resolver,** not the compiler. Compiler assumes a flat, deduplicated set of source files.
+- **Never extend the AST without updating [`ast.rs`](src/ast.rs).** Drift between AST and parser is the top DSL bug source.
+- **Tier-override files contain `tier` lines only** ([`tiers.rs`](src/tiers.rs)). Reject other items with a diagnostic.
+- **`include` is whole-file.** Inline paths (`compile`, `compile_with_vars`) must reject `include` and point callers to `compile_file`.
+- **Cycle detection lives in the resolver,** not the compiler.
 
 ## Dependencies
 
-- `gaviero-core` — `CompiledPlan`, `path_pattern::paths_overlap`, shared types.
+- `gaviero-core` — `CompiledPlan`, `path_pattern`, shared types.
 - `logos 0.14` — lexer.
-- `chumsky 0.12` — parser combinators.
+- `chumsky 0.12` — parser.
 - `miette 7` + `thiserror 2` — diagnostics.
 - `tracing` — debug telemetry.
-- Dev: `tempfile 3` — include-resolver tests.
+- Dev: `tempfile 3`.
 
 ## See Also
 
-- [README.md](README.md) — language reference, examples, full feature walkthrough.
-- [ARCHITECTURE.md](ARCHITECTURE.md) — compilation pipeline, output types, scope validation, name resolution.
+- [README.md](README.md) — language reference + examples.
+- [ARCHITECTURE.md](ARCHITECTURE.md) — compilation pipeline, output types, name resolution.
 - [`../gaviero-core/CLAUDE.md`](../gaviero-core/CLAUDE.md) — `CompiledPlan` consumer side.

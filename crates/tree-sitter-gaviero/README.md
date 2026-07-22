@@ -1,12 +1,8 @@
 # tree-sitter-gaviero
 
-Tree-sitter grammar and Rust binding for the `.gaviero` workflow language.
-
 ## Overview
 
-This crate is **syntax tooling** — it produces an incremental parse tree for `.gaviero` files. It is *not* the semantic compiler; name resolution, scope-overlap checks, tier resolution, and `CompiledPlan` generation all live in [`gaviero-dsl`](../gaviero-dsl/README.md).
-
-Reach for this crate when you need incremental parsing, syntax highlighting, editor integration, or tree-sitter-based structural queries. Reach for `gaviero-dsl` when you need execution semantics, provider routing, or workflow compilation.
+Tree-sitter grammar and Rust binding for the `.gaviero` workflow language. Produces an incremental parse tree for syntax highlighting and structural queries. Semantic compilation (name resolution, scope checks, `CompiledPlan` generation) lives in [`gaviero-dsl`](../gaviero-dsl/README.md).
 
 ## Installation
 
@@ -15,11 +11,9 @@ cargo build -p tree-sitter-gaviero
 cargo test  -p tree-sitter-gaviero
 ```
 
-The generated C parser (`src/parser.c`, `src/grammar.json`, `src/node-types.json`) is committed to the repo, so downstream crates build without the tree-sitter CLI. You only need the CLI to regenerate the parser after editing the grammar.
+Generated C parser (`src/parser.c`, `src/grammar.json`, `src/node-types.json`) is committed — downstream crates build without the tree-sitter CLI.
 
 ## Usage
-
-The crate exports a single `LANGUAGE` constant:
 
 ```rust
 let mut parser = tree_sitter::Parser::new();
@@ -32,49 +26,49 @@ let tree = parser.parse(
 );
 ```
 
-Inside the Gaviero workspace, use the re-exports from `gaviero-core` instead of depending on the `tree-sitter` crate directly — this keeps a single tree-sitter version in the dependency graph:
+Inside the Gaviero workspace, use re-exports from `gaviero-core` instead of depending on `tree-sitter` directly:
 
 ```rust
-// Correct — via the re-export
 use gaviero_core::tree_sitter::{Language, Parser, Query};
-
-// Avoid — never import the tree-sitter crate directly in downstream code
-// use tree_sitter::Parser;
 ```
 
-## What it parses
+## Examples
 
-The grammar covers the `.gaviero` surface syntax:
+Grammar surface includes `client`, `agent`, `workflow` declarations; `scope`, `memory`, `context`, `verify` blocks; explicit `loop {}` and `until` clauses; `include` directives; strings and comments.
 
-- `client`, `agent`, and `workflow` declarations
-- `scope`, `memory`, `context`, and `verify` blocks
-- explicit `loop {}` blocks and `until` clauses
-- `include` directives
-- quoted strings, raw strings, identifiers, integers, floats, and comments
-
-It intentionally accepts anything that should produce a meaningful downstream diagnostic — flagging semantic errors is `gaviero-dsl`'s job, not the grammar's.
-
-## Where things live
+The grammar accepts anything that should produce a meaningful downstream diagnostic — semantic errors are `gaviero-dsl`'s job.
 
 | Need | Crate |
 |---|---|
 | Syntax tree / incremental parsing | `tree-sitter-gaviero` (this crate) |
-| Semantic compilation, name resolution, `CompiledPlan` | [`gaviero-dsl`](../gaviero-dsl/README.md) |
-| Tree-sitter language registry (16 languages) | `gaviero-core::tree_sitter` |
-| Syntax highlighting in the editor | [`gaviero-tui`](../gaviero-tui/README.md) |
+| Semantic compilation | [`gaviero-dsl`](../gaviero-dsl/README.md) |
+| Language registry (16 langs) | `gaviero-core::tree_sitter` |
+| Editor highlighting | [`gaviero-tui`](../gaviero-tui/README.md) |
 
-## Updating the grammar
+## Configuration
 
-1. Edit `grammar.js` — the single source of truth.
-2. Run `npm run build` (requires the tree-sitter CLI) to regenerate `parser.c`, `grammar.json`, and `node-types.json`.
-3. Update the integration tests in `src/lib.rs`.
+No runtime configuration. To update the grammar:
+
+1. Edit `grammar.js` (single source of truth).
+2. Run `npm run build` (requires tree-sitter CLI) to regenerate `parser.c`, `grammar.json`, `node-types.json`.
+3. Update integration tests in `src/lib.rs`.
 4. Commit `grammar.js` and all generated artefacts together.
 
-**Never hand-edit `parser.c` or `grammar.json`.** Node shapes are part of the public contract with the editor's highlight queries ([`queries/gaviero/`](../../queries/gaviero)); renaming a node breaks highlighting, so bump those intentionally.
+**Never hand-edit `parser.c` or `grammar.json`.** Node shapes are part of the public contract with highlight queries in [`queries/gaviero/`](../../queries/gaviero).
+
+## API
+
+Exports a single public symbol:
+
+```rust
+pub const LANGUAGE: tree_sitter::Language;
+```
+
+Use via `tree_sitter_gaviero::LANGUAGE` or the `gaviero-core` re-export. No other public API surface.
 
 ## See Also
 
-- [`crates/gaviero-dsl/README.md`](../gaviero-dsl/README.md) — the semantic compiler
+- [gaviero-dsl](../gaviero-dsl/README.md) — semantic compiler
 - [Root README](../../README.md) — workflow DSL overview
 
 ## License

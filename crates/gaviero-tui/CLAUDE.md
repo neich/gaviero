@@ -14,48 +14,37 @@ cargo run -p gaviero-tui -- path/to/repo
 cargo run -p gaviero-tui -- name.gaviero-workspace
 ```
 
+Workspace dispatch: directory → `Workspace::single_folder`; `*.gaviero-workspace` → `Workspace::load` ([src/main.rs](src/main.rs)).
+
 ## Architecture
 
-- [`app.rs`](src/app.rs) + [`app/`](src/app) — `App` struct, layout, focus, event dispatch, observer wiring, chat-memory bridge ([`app/chat_memory.rs`](src/app/chat_memory.rs)), per-folder topology cache built asynchronously ([`app/session.rs`](src/app/session.rs)), slash-command dispatch ([`app/commands.rs`](src/app/commands.rs)), context-pressure + bootstrap-tokens render ([`app/render.rs`](src/app/render.rs)).
-- [`event.rs`](src/event.rs) — event variants from crossterm / notify / tick / core observer callbacks; Windows paste-burst coalescer (runtime-gated, compiled on all platforms).
-- [`keymap.rs`](src/keymap.rs) — keybindings: Ctrl = editor, Alt = workspace layering. **F7** is the primary word-wrap chord (F-key CSI encodings survive every host layer; plain `Alt+Z` is globally registered by NVIDIA's overlay — `Alt+Shift+Z` is the fallback, same pattern as `Alt+Shift+P` for preview). `Ctrl+Up/Down` is the panel-resize fallback where hosts steal `Alt+arrows` (Windows Terminal binds them to pane navigation).
-- [`platform.rs`](src/platform.rs) — every platform-specific terminal workaround: VT mouse passthrough (Windows/ConPTY), bracketed-paste gating, AltGr chord detection, console Ctrl+C forwarder. New platform quirks go here, not inline.
-- [`editor/`](src/editor) — Ropey buffer ([`buffer.rs`](src/editor/buffer.rs)), viewport + gutter ([`view.rs`](src/editor/view.rs)), tree-sitter highlight ([`highlight.rs`](src/editor/highlight.rs)), markdown rendering ([`markdown.rs`](src/editor/markdown.rs)), diff-overlay state ([`diff_overlay.rs`](src/editor/diff_overlay.rs)), LCS line diff for diff-view buffers ([`diff.rs`](src/editor/diff.rs)), visual-line layout for word wrap ([`wrap.rs`](src/editor/wrap.rs)).
-- [`panels/`](src/panels) — `file_tree`, `agent_chat` (slash commands + context-pressure + bootstrap-tokens indicators), `swarm_dashboard`, `git_panel`, `terminal`, `search`, `memory_panel`, `status_bar` (mode / file / branch / agent / word-wrap indicator), `chat_markdown`.
-- [`widgets/`](src/widgets) — tabs, scrollbar, scroll state, text input, render utils.
-- [`theme.rs`](src/theme.rs) — One Dark palette + timing constants.
+- [`app.rs`](src/app.rs) + [`app/`](src/app) — `App`, layout, focus, observers, chat-memory ([`app/chat_memory.rs`](src/app/chat_memory.rs)), topology cache ([`app/session.rs`](src/app/session.rs)), slash commands ([`app/commands.rs`](src/app/commands.rs)), render ([`app/render.rs`](src/app/render.rs)).
+- [`event.rs`](src/event.rs) — crossterm / notify / tick / observer events; Windows paste-burst coalescer.
+- [`keymap.rs`](src/keymap.rs) — Ctrl = editor, Alt = workspace. **F7** = word-wrap primary (`Alt+Shift+Z` fallback — NVIDIA steals plain `Alt+Z`). `Ctrl+Up/Down` when hosts steal `Alt+arrows`.
+- [`platform.rs`](src/platform.rs) — all platform quirks (ConPTY mouse, AltGr, Ctrl+C forwarder). New quirks go here, not inline.
+- [`editor/`](src/editor) — buffer, view, highlight, markdown, diff overlay, LCS diff, wrap.
+- [`panels/`](src/panels) — file tree, agent chat, swarm dashboard, git, terminal, search, memory, status bar.
+- [`widgets/`](src/widgets), [`theme.rs`](src/theme.rs).
 
-## Observer Bridge
+**Observer bridge:** implements `WriteGateObserver`, `AcpObserver`, `SwarmObserver` from [`gaviero_core::observer`](../gaviero-core/src/observer.rs). Each holds an event-channel sender. **No background task mutates `App` directly.**
 
-The TUI implements `WriteGateObserver`, `AcpObserver`, `SwarmObserver` from [`gaviero_core::observer`](../gaviero-core/src/observer.rs). Each impl holds an event-channel sender — core callbacks become `Event` variants processed on the main loop. **No background task mutates `App` directly.**
-
-## Slash Commands
-
-Dispatched in [`app/commands.rs`](src/app/commands.rs) and [`panels/agent_chat.rs`](src/panels/agent_chat.rs). The active set:
-
-- **Session:** `/model`, `/effort` (alias `/thinking` — `off|auto|low|medium|high|xhigh|max`, per-conversation), `/autoapprove` (alias `/yolo` — toggle per-conversation auto-approve), `/rename [title]` (bare = interactive, same as F2), `/compact [keep]`, `/clear` (alias `/reset`), `/attach`, `/detach`, `/help`.
-- **Context:** `/context` (status report; `/context mode auto|minimal|manual|none|reset` sets per-conversation bootstrap mode), `/lite` (alias `/minimal` — one-shot minimal-context turn: keeps `<repo_topology>`, drops `<repo_outline>` + memory + impact), `/inject <memory|outline|graph|topology|impact|all>` + `/no-inject` (arm/suppress bootstrap layers for the next prompt), `/workspace` (alias `/ws` — one-shot workspace-wide planner scope).
-- **Swarm:** `/swarm`, `/cswarm`, `/undo-swarm`, `/run`.
-- **Memory:** `/remember`, `/remember-here`, `/remember-module`, `/remember-workspace`, `/remember-global`, `/forget`, `/forget-scope`, `/forget-type`, `/forget-source`, `/forget-history`, `/restore`, `/namespace` (alias `/ns` — show or set per-conversation write namespace), `/consolidate-session`, `/reembed` (re-embed the store after an embedder change; takes a backup first).
-- **Skills:** `/skills` (list; `/skills search <q>` for semantic discovery).
-
-Chat input also supports `$skill` invocation (see README § Skills) with `$`-prefix autocomplete at ≥2 name characters.
+**Authoritative slash list:** [`app/commands.rs`](src/app/commands.rs) (and chat helpers in [`panels/agent_chat.rs`](src/panels/agent_chat.rs)). Groups: session (`/model`, `/effort`, `/autoapprove`/`/yolo`, …), context (`/lite`, `/inject`, `/context mode …`), swarm, memory, skills (`/skills`, `$skill`). Do not maintain a second inventory in ARCHITECTURE.md — point here.
 
 ## Conventions
 
-- **Single event channel.** All external sources (crossterm input, notify watchers, ticks, observer callbacks) funnel into one `mpsc::unbounded_channel<Event>`.
-- **Event-loop golden rule.** `draw → recv → handle → repeat`. Render is pure; mutation only happens in `handle`.
+- **Single event channel.** All external sources funnel into one `mpsc::unbounded_channel<Event>`.
+- **Event-loop golden rule.** `draw → recv → handle → repeat`. Render is pure; mutation only in `handle`.
 - **No `Mutex` in the TUI.** State changes go through the event loop.
-- Diff overlay keys: `]h` / `[h` navigate; `a` / `r` accept/reject; `A` / `R` all; `f` finalize; `q` exit.
-- Merge conflicts: F8 / F9 next/previous region (editor) or conflict file (Changes panel); save stages when markers are gone.
-- Editing actions that depend on wrapped layout receive viewport width via [`app/editing.rs`](src/app/editing.rs); never compute visual position outside the editor module.
+- Diff overlay: `]h`/`[h` navigate; `a`/`r` accept/reject; `A`/`R` all; `f` finalize; `q` exit.
+- Merge conflicts: F8/F9 next/previous region; save stages when markers are gone ([`gaviero_core::git_conflict`](../gaviero-core/src/git_conflict.rs)).
+- Wrapped-layout editing receives viewport width via [`app/editing.rs`](src/app/editing.rs); never compute visual position outside the editor module.
 
 ## Rules
 
-- **Never call core APIs from a panel render path.** Panels read from `App` state; all mutation goes through the event loop.
-- **Never hold a lock across `.await` on the UI side.** The TUI is single-task; if locking is tempting, use a channel instead.
-- **Topology prefetch is best-effort.** [`app/session.rs`](src/app/session.rs) and [`app/side_panel.rs`](src/app/side_panel.rs) build the per-folder topology asynchronously — UI must render correctly even before the cache resolves.
-- **Slash-command parsing is line-prefix only.** Use `strip_prefix("/cmd")` patterns ([`app/commands.rs`](src/app/commands.rs)); do not parse with regexes.
+- **Never call core APIs from a panel render path.** Panels read `App` state; mutation goes through the event loop.
+- **Never hold a lock across `.await` on the UI side.** Prefer a channel.
+- **Topology prefetch is best-effort.** UI must render before the cache resolves ([`app/session.rs`](src/app/session.rs)).
+- **Slash-command parsing is line-prefix only.** Use `strip_prefix("/cmd")` ([`app/commands.rs`](src/app/commands.rs)); no regex.
 
 ## Dependencies
 
@@ -63,11 +52,10 @@ Chat input also supports `$skill` invocation (see README § Skills) with `$`-pre
 - `ropey 1.6` — rope buffer.
 - `notify 7` — filesystem watcher.
 - `portable-pty 0.9` + `vt100 0.16` — embedded terminal.
-- `arboard 3` + `base64` + `png` — clipboard, image paste.
+- `arboard 3` + `base64` + `png` — clipboard / image paste.
 - `unicode-width 0.2` — visual width for wrap.
-- `windows-sys 0.59` (Windows only) — `SetConsoleCtrlHandler` for the Ctrl+C/Ctrl+Break → key-event forwarder ([`platform.rs`](src/platform.rs)).
+- `windows-sys 0.59` (Windows only) — Ctrl+C forwarder ([`platform.rs`](src/platform.rs)).
 - `embed-manifest 1.4` (build) — Windows application manifest.
-- `streaming-iterator`, `toml`, `tokio-util`, `clap`, `dirs`, `tracing-subscriber` — misc.
 - `gaviero-core`, `gaviero-dsl` — runtime + DSL compilation.
 
 ## See Also
