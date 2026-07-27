@@ -61,10 +61,10 @@ impl McpEndpoint {
 
     /// Whether a live MCP server is already accepting connections here.
     ///
-    /// Lets a host (the CLI in particular) reuse the server another
-    /// gaviero process — typically the TUI — runs for the same workspace
-    /// instead of trying to rebind: the Windows accept loop holds the
-    /// name with `first_pipe_instance(true)`, so a second
+    /// Lets a host (CLI or a second TUI) reuse the server another
+    /// gaviero process — typically the first TUI — runs for the same
+    /// workspace instead of trying to rebind: the Windows accept loop
+    /// holds the name with `first_pipe_instance(true)`, so a second
     /// [`super::server::spawn_mcp_server`] dies with `Access is denied`,
     /// and the Unix arm would unlink a *live* socket and orphan the other
     /// process's listener. Synthesized agent configs address the

@@ -20,7 +20,7 @@ Workspace dispatch: directory → `Workspace::single_folder`; `*.gaviero-workspa
 
 - [`app.rs`](src/app.rs) + [`app/`](src/app) — `App`, layout, focus, observers, chat-memory ([`app/chat_memory.rs`](src/app/chat_memory.rs)), topology cache ([`app/session.rs`](src/app/session.rs)), slash commands ([`app/commands.rs`](src/app/commands.rs)), render ([`app/render.rs`](src/app/render.rs)).
 - [`event.rs`](src/event.rs) — crossterm / notify / tick / observer events; Windows paste-burst coalescer.
-- [`keymap.rs`](src/keymap.rs) — Ctrl = editor, Alt = workspace. **F7** = word-wrap primary (`Alt+Shift+Z` fallback — NVIDIA steals plain `Alt+Z`). `Ctrl+Up/Down` when hosts steal `Alt+arrows`.
+- [`keymap.rs`](src/keymap.rs) — Ctrl = editor, Alt = workspace. **F7** = word-wrap primary (`Alt+Shift+Z` fallback — NVIDIA steals plain `Alt+Z`). `Ctrl+Up/Down` when hosts steal `Alt+arrows`. `Ctrl+Alt+Left/Right` resize explorer/editor/side widths (`Alt+Left/Right` reserved for tmux/psmux).
 - [`platform.rs`](src/platform.rs) — all platform quirks (ConPTY mouse, AltGr, Ctrl+C forwarder). New quirks go here, not inline.
 - [`editor/`](src/editor) — buffer, view, highlight, markdown, diff overlay, LCS diff, wrap.
 - [`panels/`](src/panels) — file tree, agent chat, swarm dashboard, git, terminal, search, memory, status bar.
