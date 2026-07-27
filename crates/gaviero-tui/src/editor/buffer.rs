@@ -6,6 +6,8 @@ use gaviero_core::{InputEdit, Language, Parser, Point, Tree};
 use ropey::Rope;
 use unicode_width::UnicodeWidthChar;
 
+use super::wrap::{char_display_width, VisualSegment};
+
 #[derive(Clone, Debug)]
 pub struct Cursor {
     pub line: usize,                    // 0-indexed line in rope
@@ -27,6 +29,21 @@ impl Default for Cursor {
 pub struct Scroll {
     pub top_line: usize,
     pub left_col: usize,
+}
+
+/// Sticky horizontal target for vertical cursor movement.
+///
+/// `visual` is a display column measured from the left edge of the cursor's
+/// *visual row* (the wrapped segment when word wrap is on, the logical line
+/// otherwise). `line`/`col` records where the cursor stood when the goal was
+/// set: the goal is only reused while the cursor is still exactly there, so any
+/// horizontal move, click, jump or edit invalidates it without needing an
+/// explicit reset at each of those call sites.
+#[derive(Clone, Copy, Debug)]
+struct GoalCol {
+    line: usize,
+    col: usize,
+    visual: usize,
 }
 
 /// All positions are **char indices** into the Rope (not byte offsets).
@@ -101,6 +118,8 @@ pub struct Buffer {
     pub modified: bool,
     pub cursor: Cursor,
     pub scroll: Scroll,
+    /// Horizontal position vertical movement tries to keep. See [`GoalCol`].
+    goal_col: Option<GoalCol>,
     pub undo_stack: Vec<Transaction>,
     pub redo_stack: Vec<Transaction>,
     parser: Option<Parser>,
@@ -152,6 +171,7 @@ impl Buffer {
             modified: false,
             cursor: Cursor::default(),
             scroll: Scroll::default(),
+            goal_col: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             parser: None,
@@ -264,6 +284,7 @@ impl Buffer {
             modified: false,
             cursor: Cursor::default(),
             scroll: Scroll::default(),
+            goal_col: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             parser,
@@ -333,6 +354,7 @@ impl Buffer {
             modified: false,
             cursor: Cursor::default(),
             scroll: Scroll::default(),
+            goal_col: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             parser,
@@ -639,6 +661,57 @@ impl Buffer {
         visual
     }
 
+    /// Display column of `col` measured from the left edge of `seg`.
+    ///
+    /// A wrapped row restarts tab stops at its own left edge — that is how
+    /// `wrap_line_segments` measures rows and how the renderer draws them — so
+    /// this is *not* `char_col_to_visual(col) - char_col_to_visual(start_col)`.
+    pub fn segment_char_col_to_visual(&self, seg: &VisualSegment, col: usize) -> usize {
+        let tab_width = self.tab_width as usize;
+        let line = self.text.line(seg.logical_line);
+        let stop = col.min(seg.end_col);
+        let mut visual = 0;
+        for (i, ch) in line.chars().enumerate().skip(seg.start_col) {
+            if i >= stop || ch == '\n' || ch == '\r' {
+                break;
+            }
+            visual += char_display_width(ch, visual, tab_width);
+        }
+        visual
+    }
+
+    /// Char column inside `seg` that sits at display column `visual_col`.
+    ///
+    /// A column past the row's text clamps to its end, which is what "keep the
+    /// horizontal position, or the line end when the row is shorter" means.
+    /// Only the final row of a logical line may hold the one-past-the-last-char
+    /// position; on an earlier row `end_col` is drawn on the row below, so the
+    /// clamp stops one char short to keep the cursor on the row it moved to.
+    pub fn segment_visual_to_char_col(
+        &self,
+        seg: &VisualSegment,
+        visual_col: usize,
+        is_last_of_line: bool,
+    ) -> usize {
+        let tab_width = self.tab_width as usize;
+        let line = self.text.line(seg.logical_line);
+        let mut visual = 0;
+        for (i, ch) in line.chars().enumerate().skip(seg.start_col) {
+            if i >= seg.end_col || ch == '\n' || ch == '\r' {
+                break;
+            }
+            if visual >= visual_col {
+                return i;
+            }
+            visual += char_display_width(ch, visual, tab_width);
+        }
+        if is_last_of_line {
+            seg.end_col
+        } else {
+            seg.end_col.saturating_sub(1)
+        }
+    }
+
     pub fn wrap_layout(&self, content_width: usize) -> super::wrap::WrapLayout {
         super::wrap::WrapLayout::build(self, content_width)
     }
@@ -703,27 +776,87 @@ impl Buffer {
         self.word_wrap
     }
 
-    fn move_cursor_vertical_wrapped(&mut self, delta: i32, content_width: usize, select: bool) {
+    /// Display column vertical movement aims for: the sticky goal while the
+    /// cursor still sits where the goal was recorded, else `current`.
+    fn goal_visual_col(&self, current: usize) -> usize {
+        match self.goal_col {
+            Some(goal) if goal.line == self.cursor.line && goal.col == self.cursor.col => {
+                goal.visual
+            }
+            _ => current,
+        }
+    }
+
+    /// Pin `visual` as the goal for the cursor's (new) position.
+    fn remember_goal_col(&mut self, visual: usize) {
+        self.goal_col = Some(GoalCol {
+            line: self.cursor.line,
+            col: self.cursor.col,
+            visual,
+        });
+    }
+
+    /// The cursor's display column within its own visual row, given a layout.
+    fn cursor_visual_col(&self, layout: &super::wrap::WrapLayout, vline: usize) -> usize {
+        match layout.segment_at(vline) {
+            Some(seg) => self.segment_char_col_to_visual(seg, self.cursor.col),
+            None => 0,
+        }
+    }
+
+    /// Move one row up (`delta < 0`) or down, keeping the goal column.
+    fn move_cursor_vertical(&mut self, delta: i32, content_width: usize, select: bool) {
+        if self.word_wrap && content_width > 0 {
+            self.move_cursor_vertical_wrapped(delta, content_width);
+        } else {
+            self.move_cursor_vertical_plain(delta);
+        }
+        if !select {
+            self.cursor.anchor = None;
+        }
+    }
+
+    /// Vertical movement across *visual* rows: a wrapped row of the same logical
+    /// line counts as a row of its own, so the cursor keeps its on-screen column
+    /// whether the row above belongs to the same file line or the previous one.
+    fn move_cursor_vertical_wrapped(&mut self, delta: i32, content_width: usize) {
         let layout = self.wrap_layout(content_width);
         if layout.segments.is_empty() {
             return;
         }
-        let (vline, seg_col) = layout.cursor_segment(self.cursor.line, self.cursor.col);
+        let vline = layout.cursor_segment(self.cursor.line, self.cursor.col);
+        let goal = self.goal_visual_col(self.cursor_visual_col(&layout, vline));
         let target_vline = if delta < 0 {
             vline.saturating_sub(1)
         } else {
             (vline + 1).min(layout.len().saturating_sub(1))
         };
-        if target_vline == vline {
-            return;
+        if target_vline != vline {
+            let seg = &layout.segments[target_vline];
+            let col =
+                self.segment_visual_to_char_col(seg, goal, layout.is_last_of_line(target_vline));
+            self.cursor.line = seg.logical_line;
+            self.cursor.col = col;
         }
-        let seg = &layout.segments[target_vline];
-        let target_col = seg_col.min(seg.end_col.saturating_sub(seg.start_col));
-        self.cursor.line = seg.logical_line;
-        self.cursor.col = seg.start_col + target_col;
-        if !select {
-            self.cursor.anchor = None;
+        // Keep the goal even when the move was clamped at the first/last row so
+        // a later move away from it still restores the horizontal position.
+        self.remember_goal_col(goal);
+    }
+
+    /// Vertical movement across logical lines (word wrap off).
+    fn move_cursor_vertical_plain(&mut self, delta: i32) {
+        let goal = self.goal_visual_col(self.char_col_to_visual(self.cursor.line, self.cursor.col));
+        let target = if delta < 0 {
+            self.cursor.line.saturating_sub(1)
+        } else {
+            (self.cursor.line + 1).min(self.text.len_lines().saturating_sub(1))
+        };
+        if target != self.cursor.line {
+            let col = self.visual_to_char_col(target, goal).min(self.line_len(target));
+            self.cursor.line = target;
+            self.cursor.col = col;
         }
+        self.remember_goal_col(goal);
     }
 
     /// Get the leading whitespace of the current line.
@@ -825,27 +958,11 @@ impl Buffer {
 
     /// Move cursor in a direction.
     pub fn move_cursor_up(&mut self, content_width: usize) {
-        if self.word_wrap && content_width > 0 {
-            self.move_cursor_vertical_wrapped(-1, content_width, false);
-            return;
-        }
-        if self.cursor.line > 0 {
-            self.cursor.line -= 1;
-            self.cursor.col = self.cursor.col.min(self.line_len(self.cursor.line));
-        }
-        self.cursor.anchor = None;
+        self.move_cursor_vertical(-1, content_width, false);
     }
 
     pub fn move_cursor_down(&mut self, content_width: usize) {
-        if self.word_wrap && content_width > 0 {
-            self.move_cursor_vertical_wrapped(1, content_width, false);
-            return;
-        }
-        if self.cursor.line < self.text.len_lines().saturating_sub(1) {
-            self.cursor.line += 1;
-            self.cursor.col = self.cursor.col.min(self.line_len(self.cursor.line));
-        }
-        self.cursor.anchor = None;
+        self.move_cursor_vertical(1, content_width, false);
     }
 
     pub fn move_cursor_left(&mut self) {
@@ -872,36 +989,33 @@ impl Buffer {
     pub fn move_cursor_home(&mut self) {
         self.cursor.col = 0;
         self.cursor.anchor = None;
+        self.reset_goal_col();
     }
 
     pub fn move_cursor_end(&mut self) {
         self.cursor.col = self.line_len(self.cursor.line);
         self.cursor.anchor = None;
+        self.reset_goal_col();
+    }
+
+    /// Forget the sticky column so the next vertical move re-aims at the cursor.
+    ///
+    /// Only needed where an explicit horizontal action can leave the cursor
+    /// exactly where the goal was recorded (Home on an already-column-0 line, a
+    /// click on the cursor cell); every other motion invalidates it by moving.
+    pub fn reset_goal_col(&mut self) {
+        self.goal_col = None;
     }
 
     /// Select (shift+arrow) variants — set anchor then move.
     pub fn select_up(&mut self, content_width: usize) {
         self.ensure_anchor();
-        if self.word_wrap && content_width > 0 {
-            self.move_cursor_vertical_wrapped(-1, content_width, true);
-            return;
-        }
-        if self.cursor.line > 0 {
-            self.cursor.line -= 1;
-            self.cursor.col = self.cursor.col.min(self.line_len(self.cursor.line));
-        }
+        self.move_cursor_vertical(-1, content_width, true);
     }
 
     pub fn select_down(&mut self, content_width: usize) {
         self.ensure_anchor();
-        if self.word_wrap && content_width > 0 {
-            self.move_cursor_vertical_wrapped(1, content_width, true);
-            return;
-        }
-        if self.cursor.line < self.text.len_lines().saturating_sub(1) {
-            self.cursor.line += 1;
-            self.cursor.col = self.cursor.col.min(self.line_len(self.cursor.line));
-        }
+        self.move_cursor_vertical(1, content_width, true);
     }
 
     pub fn select_left(&mut self) {
@@ -1007,41 +1121,55 @@ impl Buffer {
     pub fn page_up(&mut self, viewport_height: usize, content_width: usize) {
         if self.word_wrap && content_width > 0 {
             let layout = self.wrap_layout(content_width);
-            let (vline, _) = layout.cursor_segment(self.cursor.line, self.cursor.col);
+            let vline = layout.cursor_segment(self.cursor.line, self.cursor.col);
+            let goal = self.goal_visual_col(self.cursor_visual_col(&layout, vline));
             let target = vline.saturating_sub(viewport_height);
             if let Some(seg) = layout.segment_at(target) {
+                let col = self.segment_visual_to_char_col(seg, goal, layout.is_last_of_line(target));
                 self.cursor.line = seg.logical_line;
-                self.cursor.col = seg.start_col;
+                self.cursor.col = col;
             }
             self.cursor.anchor = None;
+            self.remember_goal_col(goal);
             self.scroll.top_line = self.scroll.top_line.saturating_sub(viewport_height);
             return;
         }
+        let goal = self.goal_visual_col(self.char_col_to_visual(self.cursor.line, self.cursor.col));
         self.cursor.line = self.cursor.line.saturating_sub(viewport_height);
-        self.cursor.col = self.cursor.col.min(self.line_len(self.cursor.line));
+        self.cursor.col = self
+            .visual_to_char_col(self.cursor.line, goal)
+            .min(self.line_len(self.cursor.line));
         self.cursor.anchor = None;
+        self.remember_goal_col(goal);
         self.scroll.top_line = self.scroll.top_line.saturating_sub(viewport_height);
     }
 
     pub fn page_down(&mut self, viewport_height: usize, content_width: usize) {
         if self.word_wrap && content_width > 0 {
             let layout = self.wrap_layout(content_width);
-            let (vline, _) = layout.cursor_segment(self.cursor.line, self.cursor.col);
+            let vline = layout.cursor_segment(self.cursor.line, self.cursor.col);
+            let goal = self.goal_visual_col(self.cursor_visual_col(&layout, vline));
             let max_v = layout.len().saturating_sub(1);
             let target = (vline + viewport_height).min(max_v);
             if let Some(seg) = layout.segment_at(target) {
+                let col = self.segment_visual_to_char_col(seg, goal, layout.is_last_of_line(target));
                 self.cursor.line = seg.logical_line;
-                self.cursor.col = seg.start_col;
+                self.cursor.col = col;
             }
             self.cursor.anchor = None;
+            self.remember_goal_col(goal);
             let max_scroll = layout.len().saturating_sub(viewport_height);
             self.scroll.top_line = (self.scroll.top_line + viewport_height).min(max_scroll);
             return;
         }
+        let goal = self.goal_visual_col(self.char_col_to_visual(self.cursor.line, self.cursor.col));
         let max_line = self.text.len_lines().saturating_sub(1);
         self.cursor.line = (self.cursor.line + viewport_height).min(max_line);
-        self.cursor.col = self.cursor.col.min(self.line_len(self.cursor.line));
+        self.cursor.col = self
+            .visual_to_char_col(self.cursor.line, goal)
+            .min(self.line_len(self.cursor.line));
         self.cursor.anchor = None;
+        self.remember_goal_col(goal);
         self.scroll.top_line = (self.scroll.top_line + viewport_height).min(max_line);
     }
 
@@ -1053,7 +1181,7 @@ impl Buffer {
         if self.word_wrap && content_width > 0 {
             self.scroll.left_col = 0;
             let layout = self.wrap_layout(content_width);
-            let (vline, _) = layout.cursor_segment(self.cursor.line, self.cursor.col);
+            let vline = layout.cursor_segment(self.cursor.line, self.cursor.col);
             if vline < self.scroll.top_line + margin {
                 self.scroll.top_line = vline.saturating_sub(margin);
             }
@@ -2931,6 +3059,166 @@ mod tests {
         assert_eq!(buf.cursor.col, 5);
         buf.move_cursor_home();
         assert_eq!(buf.cursor.col, 0);
+    }
+
+    #[test]
+    fn wrapped_vertical_move_keeps_column_within_one_logical_line() {
+        let mut buf = Buffer::empty();
+        buf.text = Rope::from_str("aaaa bbbb cccc dddd");
+        buf.word_wrap = true;
+        let width = 10;
+        assert_eq!(buf.wrap_layout(width).len(), 2, "fixture must wrap in two");
+
+        // Row 1 ("cccc dddd"), display column 5.
+        buf.cursor.col = 15;
+        buf.move_cursor_up(width);
+        assert_eq!((buf.cursor.line, buf.cursor.col), (0, 5));
+        buf.move_cursor_down(width);
+        assert_eq!((buf.cursor.line, buf.cursor.col), (0, 15));
+    }
+
+    #[test]
+    fn wrapped_vertical_walk_keeps_column_across_rows_and_lines() {
+        let mut buf = Buffer::empty();
+        // Rows: "aaaa bbbb " | "cccc dddd" | "hi" | "0123456789"
+        buf.text = Rope::from_str("aaaa bbbb cccc dddd\nhi\n0123456789");
+        buf.word_wrap = true;
+        let width = 10;
+        assert_eq!(buf.wrap_layout(width).len(), 4);
+
+        buf.cursor.col = 8; // row 0, display column 8
+        buf.move_cursor_down(width);
+        assert_eq!(
+            (buf.cursor.line, buf.cursor.col),
+            (0, 18),
+            "same file line, next wrapped row: hold display column 8"
+        );
+        buf.move_cursor_down(width);
+        assert_eq!(
+            (buf.cursor.line, buf.cursor.col),
+            (1, 2),
+            "next file line is shorter: land on its end"
+        );
+        buf.move_cursor_down(width);
+        assert_eq!(
+            (buf.cursor.line, buf.cursor.col),
+            (2, 8),
+            "long enough again: column 8 comes back"
+        );
+
+        buf.move_cursor_up(width);
+        assert_eq!((buf.cursor.line, buf.cursor.col), (1, 2));
+        buf.move_cursor_up(width);
+        assert_eq!((buf.cursor.line, buf.cursor.col), (0, 18));
+        buf.move_cursor_up(width);
+        assert_eq!((buf.cursor.line, buf.cursor.col), (0, 8));
+    }
+
+    #[test]
+    fn wrapped_up_from_a_row_start_moves_exactly_one_row() {
+        let mut buf = Buffer::empty();
+        buf.text = Rope::from_str("aaaa bbbb cccc dddd eeee ffff");
+        buf.word_wrap = true;
+        let width = 10;
+        assert_eq!(buf.wrap_layout(width).len(), 3);
+
+        // Col 10 is a wrap boundary: it is drawn as the first cell of row 1, so
+        // Up must reach row 0 instead of treating the cursor as row 0 already.
+        buf.cursor.col = 10;
+        buf.move_cursor_up(width);
+        assert_eq!(buf.cursor.col, 0);
+        buf.move_cursor_down(width);
+        assert_eq!(buf.cursor.col, 10);
+    }
+
+    #[test]
+    fn wrapped_vertical_move_restores_column_after_a_short_line() {
+        let mut buf = Buffer::empty();
+        buf.text = Rope::from_str("0123456789\nab\n0123456789");
+        buf.word_wrap = true;
+        let width = 40; // no line wraps: every row is a whole logical line
+
+        buf.cursor.col = 8;
+        buf.move_cursor_down(width);
+        assert_eq!(
+            (buf.cursor.line, buf.cursor.col),
+            (1, 2),
+            "shorter line clamps to its end"
+        );
+        buf.move_cursor_down(width);
+        assert_eq!(
+            (buf.cursor.line, buf.cursor.col),
+            (2, 8),
+            "column returns on the next long-enough line"
+        );
+        buf.move_cursor_up(width);
+        buf.move_cursor_up(width);
+        assert_eq!((buf.cursor.line, buf.cursor.col), (0, 8));
+    }
+
+    #[test]
+    fn unwrapped_vertical_move_restores_column_after_a_short_line() {
+        let mut buf = Buffer::empty();
+        buf.text = Rope::from_str("0123456789\nab\n0123456789");
+
+        buf.cursor.col = 8;
+        buf.move_cursor_down(0);
+        assert_eq!((buf.cursor.line, buf.cursor.col), (1, 2));
+        buf.move_cursor_down(0);
+        assert_eq!((buf.cursor.line, buf.cursor.col), (2, 8));
+    }
+
+    #[test]
+    fn horizontal_move_drops_the_goal_column() {
+        let mut buf = Buffer::empty();
+        buf.text = Rope::from_str("0123456789\nab\n0123456789");
+
+        buf.cursor.col = 8;
+        buf.move_cursor_down(0); // clamped to (1, 2)
+        buf.move_cursor_left(); // user re-aims horizontally
+        buf.move_cursor_down(0);
+        assert_eq!((buf.cursor.line, buf.cursor.col), (2, 1));
+    }
+
+    #[test]
+    fn vertical_move_keeps_the_display_column_across_tabs() {
+        let mut buf = Buffer::empty();
+        buf.text = Rope::from_str("\tabc\nxxxxxxxx");
+        buf.tab_width = 4;
+
+        buf.cursor.col = 2; // after the tab and 'a' → display column 5
+        buf.move_cursor_down(0);
+        assert_eq!((buf.cursor.line, buf.cursor.col), (1, 5));
+    }
+
+    #[test]
+    fn wrapped_vertical_move_uses_row_relative_tab_stops() {
+        let mut buf = Buffer::empty();
+        buf.text = Rope::from_str("abcdef\tij\nzzzzzz");
+        buf.tab_width = 4;
+        buf.word_wrap = true;
+        let width = 6;
+        // Rows: "abcdef" | "<tab>ij" | "zzzzzz"; the tab restarts at the row's
+        // own left edge, so 'i' is drawn at display column 4.
+        assert_eq!(buf.wrap_layout(width).len(), 3);
+
+        buf.cursor.col = 7; // 'i'
+        buf.move_cursor_down(width);
+        assert_eq!((buf.cursor.line, buf.cursor.col), (1, 4));
+    }
+
+    #[test]
+    fn select_down_keeps_anchor_and_goal_column() {
+        let mut buf = Buffer::empty();
+        buf.text = Rope::from_str("0123456789\nab\n0123456789");
+
+        buf.cursor.col = 8;
+        buf.select_down(0);
+        assert_eq!(buf.cursor.anchor, Some((0, 8)));
+        assert_eq!((buf.cursor.line, buf.cursor.col), (1, 2));
+        buf.select_down(0);
+        assert_eq!(buf.cursor.anchor, Some((0, 8)));
+        assert_eq!((buf.cursor.line, buf.cursor.col), (2, 8));
     }
 
     #[test]
