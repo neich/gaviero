@@ -471,17 +471,34 @@ impl ClaudeSession {
                                 tool_name,
                                 description,
                                 request_id,
+                                input,
                             } => {
-                                let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-                                self.observer
-                                    .on_permission_request(&tool_name, &description, tx);
-                                let allow = rx.await.unwrap_or(false);
+                                let (tx, rx) = tokio::sync::oneshot::channel::<
+                                    crate::observer::PermissionDecision,
+                                >();
+                                self.observer.on_permission_request(
+                                    &tool_name,
+                                    &description,
+                                    &input,
+                                    tx,
+                                );
+                                let decision = rx
+                                    .await
+                                    .unwrap_or_else(|_| crate::observer::PermissionDecision::deny());
                                 tracing::info!(
                                     "Permission request for '{}': {}",
                                     tool_name,
-                                    if allow { "allowed" } else { "denied" }
+                                    if decision.is_allow() {
+                                        "allowed"
+                                    } else {
+                                        "denied"
+                                    }
                                 );
-                                session.respond_permission(allow, &request_id);
+                                session.respond_permission_decision(
+                                    &decision,
+                                    &request_id,
+                                    &input,
+                                );
                                 idle_count = 0;
                             }
                             StreamEvent::SystemInit { session_id, .. } => {

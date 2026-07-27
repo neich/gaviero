@@ -132,6 +132,18 @@ pub const DEFAULT_AVAILABLE_TOOLS: &[&str] =
 /// Hardcoded fallback approved-tool subset (see `DEFAULT_AVAILABLE_TOOLS`).
 pub const DEFAULT_APPROVED_TOOLS: &[&str] = &["Read", "Glob", "Grep"];
 
+/// Tool name Claude uses for clarifying multiple-choice questions.
+/// Always injected into `--tools` for interactive chat so the model can
+/// surface questions through the control protocol instead of narrating them.
+pub const ASK_USER_QUESTION_TOOL: &str = "AskUserQuestion";
+
+/// Ensure `AskUserQuestion` is present in the available-tools list.
+pub fn ensure_ask_user_question(tools: &mut Vec<String>) {
+    if !tools.iter().any(|t| t == ASK_USER_QUESTION_TOOL) {
+        tools.push(ASK_USER_QUESTION_TOOL.to_string());
+    }
+}
+
 impl AgentOptions {
     /// Resolve the effective `(available, approved)` tool lists for the
     /// subprocess spawn. If `available_tools` is unset, falls back to
@@ -278,12 +290,27 @@ impl AcpSession {
             };
 
         let mut cmd = crate::util::spawn::agent_command("claude");
+        // Interactive turns need the Agent SDK control channel
+        // (`--permission-prompt-tool stdio` + stream-json stdin) so
+        // unapproved tools / AskUserQuestion emit `control_request` events
+        // the host can answer. Auto-approve keeps the classic `--print`
+        // one-shot shape with `--dangerously-skip-permissions`.
+        let interactive_permissions = !options.auto_approve;
         cmd.arg("--print")
             .arg("--output-format")
             .arg("stream-json")
             .arg("--verbose")
-            .arg("--include-partial-messages")
-            .arg("--model")
+            .arg("--include-partial-messages");
+        if interactive_permissions {
+            cmd.arg("--input-format").arg("stream-json");
+            cmd.arg("--permission-prompt-tool").arg("stdio");
+            cmd.arg("--permission-mode").arg("default");
+            // Exclude project/local Claude settings so
+            // `.claude/settings.json` permissions.allow / defaultMode
+            // cannot override Gaviero's `agent.approvedTools`.
+            cmd.arg("--setting-sources").arg("");
+        }
+        cmd.arg("--model")
             // Resolve alias→concrete id (e.g. `sonnet` → Sonnet 5) so the
             // `sonnet` alias pins to a specific model rather than the CLI's
             // drifting "latest sonnet". Every Claude spawn funnels through here.
@@ -330,8 +357,16 @@ impl AcpSession {
             cmd.arg("--append-system-prompt").arg(system_prompt);
         }
 
-        if !available_tools.is_empty() {
-            cmd.arg("--tools").arg(available_tools.join(","));
+        // Interactive chat always exposes AskUserQuestion so clarifying
+        // questions ride the same can_use_tool control channel as tool
+        // approvals. Auto-approve / swarm paths leave the caller's list alone.
+        let mut available_owned: Vec<String> =
+            available_tools.iter().map(|s| (*s).to_string()).collect();
+        if interactive_permissions {
+            ensure_ask_user_question(&mut available_owned);
+        }
+        if !available_owned.is_empty() {
+            cmd.arg("--tools").arg(available_owned.join(","));
         }
 
         // Load the per-worktree MCP config synthesized for this agent
@@ -376,8 +411,13 @@ impl AcpSession {
             cmd.arg("--add-dir").arg(extra);
         }
 
-        // Pass prompt as positional arg so stdin stays open for permission responses.
-        cmd.arg("--").arg(&argv_prompt);
+        // Interactive turns: prompt goes on stdin as a stream-json user
+        // message so the control channel stays bidirectional. Auto-approve
+        // keeps the classic positional argv prompt (stdin still piped for
+        // any late control traffic, but unused).
+        if !interactive_permissions {
+            cmd.arg("--").arg(&argv_prompt);
+        }
 
         cmd.current_dir(cwd)
             .stdout(Stdio::piped())
@@ -425,11 +465,21 @@ impl AcpSession {
             }
         })?;
 
-        // Keep stdin open for permission responses.
-        // When a PermissionRequest arrives, respond_permission() sends
-        // JSON via this channel. Dropping the sender closes stdin.
+        // Keep stdin open for control_response / permission replies.
+        // Interactive turns also enqueue the user prompt as the first
+        // stream-json line. Dropping the sender closes stdin.
         let stdin_tx = if let Some(mut stdin) = child.stdin.take() {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            if interactive_permissions {
+                let user_line = serde_json::json!({
+                    "type": "user",
+                    "message": { "role": "user", "content": argv_prompt },
+                    "parent_tool_use_id": serde_json::Value::Null,
+                })
+                .to_string()
+                    + "\n";
+                let _ = tx.send(user_line);
+            }
             tokio::spawn(async move {
                 while let Some(line) = rx.recv().await {
                     if stdin.write_all(line.as_bytes()).await.is_err() {
@@ -520,18 +570,63 @@ impl AcpSession {
         let _ = self.child.start_kill();
     }
 
+    /// Send a permission / AskUserQuestion decision back to the Claude
+    /// subprocess via the control protocol.
+    ///
+    /// Prefer this over [`Self::respond_permission`] when the caller has the
+    /// original tool `input` (needed so allow responses echo `updatedInput`).
+    pub fn respond_permission_decision(
+        &self,
+        decision: &crate::observer::PermissionDecision,
+        request_id: &str,
+        original_input: &serde_json::Value,
+    ) {
+        let Some(ref tx) = self.stdin_tx else { return };
+        let response_body = match decision {
+            crate::observer::PermissionDecision::Allow { updated_input } => {
+                let input = updated_input
+                    .clone()
+                    .unwrap_or_else(|| original_input.clone());
+                serde_json::json!({
+                    "behavior": "allow",
+                    "updatedInput": input,
+                })
+            }
+            crate::observer::PermissionDecision::Deny { message } => {
+                serde_json::json!({
+                    "behavior": "deny",
+                    "message": message.as_deref().unwrap_or("Denied by user"),
+                })
+            }
+        };
+        let msg = serde_json::json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": request_id,
+                "response": response_body,
+            }
+        })
+        .to_string()
+            + "\n";
+        let _ = tx.send(msg);
+    }
+
     /// Send a permission response back to the Claude subprocess via stdin.
     ///
-    /// Called after the pipeline receives a `PermissionRequest` event and
-    /// the user approves or denies the action in the TUI.
+    /// Convenience wrapper around [`Self::respond_permission_decision`] for
+    /// callers that only have a boolean (legacy tests / swarm).
     pub fn respond_permission(&self, allow: bool, request_id: &str) {
-        let Some(ref tx) = self.stdin_tx else { return };
-        let decision = if allow { "allow" } else { "deny" };
-        let msg = format!(
-            "{{\"type\":\"permission_response\",\"decision\":\"{}\",\"permission_request_id\":\"{}\"}}\n",
-            decision, request_id
+        let decision = if allow {
+            crate::observer::PermissionDecision::allow()
+        } else {
+            crate::observer::PermissionDecision::deny()
+        };
+        self.respond_permission_decision(
+            &decision,
+            request_id,
+            &serde_json::Value::Object(Default::default()),
         );
-        let _ = tx.send(msg);
     }
 
     /// Wait for the subprocess to exit and return its status.
@@ -620,6 +715,49 @@ mod tests {
         };
         let (available, approved) = opts.resolved_tools();
         assert_eq!(available, approved, "auto_approve approves everything available");
+    }
+
+    #[test]
+    fn ensure_ask_user_question_injects_once() {
+        let mut tools = vec!["Read".into(), "Bash".into()];
+        ensure_ask_user_question(&mut tools);
+        ensure_ask_user_question(&mut tools);
+        assert_eq!(
+            tools.iter().filter(|t| *t == ASK_USER_QUESTION_TOOL).count(),
+            1
+        );
+        assert!(tools.ends_with(&[ASK_USER_QUESTION_TOOL.to_string()]));
+    }
+
+    #[test]
+    fn control_response_allow_includes_updated_input() {
+        let decision = crate::observer::PermissionDecision::Allow {
+            updated_input: Some(serde_json::json!({"command": "echo hi"})),
+        };
+        let body = match &decision {
+            crate::observer::PermissionDecision::Allow { updated_input } => {
+                serde_json::json!({
+                    "behavior": "allow",
+                    "updatedInput": updated_input.clone().unwrap(),
+                })
+            }
+            _ => unreachable!(),
+        };
+        let msg = serde_json::json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": "req-1",
+                "response": body,
+            }
+        });
+        assert_eq!(msg["type"], "control_response");
+        assert_eq!(msg["response"]["request_id"], "req-1");
+        assert_eq!(msg["response"]["response"]["behavior"], "allow");
+        assert_eq!(
+            msg["response"]["response"]["updatedInput"]["command"],
+            "echo hi"
+        );
     }
 
     #[test]
