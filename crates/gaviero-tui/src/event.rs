@@ -371,18 +371,22 @@ fn read_crossterm_batch() -> Vec<crossterm::event::Event> {
     };
 
     // A console paste is injected as a batch, so the *next* event is already
-    // queued and a zero-wait poll succeeds. A physical keystroke leaves the
-    // queue empty here (its release lands ~tens of ms later), so it passes
-    // through untouched — a lone Enter still submits, a lone char still types,
-    // Tab still drives autocomplete.
+    // queued and a zero-wait poll succeeds. An isolated keystroke usually
+    // leaves the queue empty and passes straight through — but a queued event
+    // is only a hint, never proof of a paste: the key's own release, a mouse
+    // move, or anything typed while the UI thread was busy sits in the same
+    // console buffer. What the burst turns out to hold decides
+    // (`looks_like_raw_paste`), not the fact that it was drainable.
     if !event::poll(Duration::ZERO).unwrap_or(false) {
         return vec![first];
     }
 
-    // Drain the burst into one string. Windows emits a press + release per
-    // key; the releases are skipped. The first genuine non-text event ends the
-    // paste and is re-emitted after it.
+    // Drain the burst into one string, keeping the key events themselves so a
+    // burst that turns out to be typing can be replayed verbatim. Windows
+    // emits a press + release per key; the releases are skipped. The first
+    // genuine non-text event ends the burst and is re-emitted after it.
     let mut text = String::from(first_ch);
+    let mut keys = vec![first];
     let mut trailing: Option<Event> = None;
     while event::poll(Duration::from_millis(crate::theme::PASTE_BURST_MS)).unwrap_or(false) {
         let Ok(next) = event::read() else {
@@ -390,6 +394,7 @@ fn read_crossterm_batch() -> Vec<crossterm::event::Event> {
         };
         if let Some(ch) = paste_char(&next) {
             text.push(ch);
+            keys.push(next);
         } else if matches!(&next, Event::Key(k) if k.kind == KeyEventKind::Release) {
             continue;
         } else {
@@ -398,17 +403,40 @@ fn read_crossterm_batch() -> Vec<crossterm::event::Event> {
         }
     }
 
-    // A single drained character is a keystroke, not a paste: the zero-wait
-    // poll above also succeeds on unrelated queued events (mouse moves, focus
-    // changes, key releases), and rewriting a lone Enter/Tab/char into a
-    // `Paste` breaks chat submit and sends a raw `\n` to the embedded PTY.
-    let mut out = if text.chars().count() >= 2 {
+    let mut out = if looks_like_raw_paste(&text) {
         vec![Event::Paste(text)]
     } else {
-        vec![first]
+        // Ordinary typing the console happened to hand us in one batch — every
+        // drained key must still be delivered as a key (dropping them here ate
+        // keystrokes; rewriting them as a `Paste` inserted the clipboard).
+        keys
     };
     out.extend(trailing);
     out
+}
+
+/// Whether a drained raw key burst should be rewritten as one `Event::Paste`.
+///
+/// "Arrived back-to-back" does **not** mean "injected by a paste". The console
+/// input buffer holds every record typed while the UI thread was busy, so a
+/// fast two-key roll during a redraw reaches us with the same zero gap as a
+/// console-injected paste, and key auto-repeat delivers a long run the same
+/// way. Coalescing those is not harmless: the paste path arms the debounce and
+/// `WINDOWS_PASTE_SETTLE_MS` (swallowing the next keystrokes) and, on Windows,
+/// used to substitute the whole system clipboard for the burst.
+///
+/// Rewriting only *buys* anything for bursts long enough that replaying them
+/// key-by-key misbehaves (an embedded newline submitting the chat mid-paste),
+/// so require a length no typing roll reaches and reject a single repeated
+/// character. Everything below that replays as keys, which types the identical
+/// text. Bracketed paste (`ESC[200~…`) is unaffected — it is self-delimiting
+/// and handled by [`coalesce_bracketed_paste`].
+fn looks_like_raw_paste(text: &str) -> bool {
+    let mut rest = text.chars();
+    let Some(first) = rest.next() else {
+        return false;
+    };
+    text.chars().count() >= crate::theme::RAW_PASTE_MIN_CHARS && rest.any(|c| c != first)
 }
 
 const BP_START: &str = "\x1b[200~";
@@ -427,6 +455,7 @@ fn coalesce_bracketed_paste(first: crossterm::event::Event) -> Vec<crossterm::ev
     }
 
     let mut text = String::from('\x1b');
+    let mut keys = vec![first];
     let mut trailing: Option<Event> = None;
     // Once we see the start marker, keep draining until the end marker even
     // across brief gaps — large text pastes still arrive as one burst, but
@@ -440,6 +469,7 @@ fn coalesce_bracketed_paste(first: crossterm::event::Event) -> Vec<crossterm::ev
         };
         if let Some(ch) = paste_or_escape_char(&next) {
             text.push(ch);
+            keys.push(next);
             if !saw_start && text.starts_with(BP_START) {
                 saw_start = true;
             }
@@ -477,18 +507,23 @@ fn coalesce_bracketed_paste(first: crossterm::event::Event) -> Vec<crossterm::ev
 
     let mut out = if let Some(payload) = strip_bracketed_paste(&text) {
         vec![Event::Paste(payload.to_string())]
-    } else if text == "\x1b" {
-        vec![first]
-    } else if text.starts_with(BP_START) {
+    } else if !text.starts_with(BP_START) {
+        // No start marker: an Esc keypress, possibly followed by ordinary
+        // typing the console had already buffered. Replay every drained key —
+        // rewriting them as a `Paste` (or returning the lone Esc and dropping
+        // the rest) is how typing right after Esc turned into a clipboard
+        // dump / vanished characters.
+        let rest = &text[text.char_indices().nth(1).map(|(i, _)| i).unwrap_or(text.len())..];
+        if looks_like_raw_paste(rest) {
+            keys.truncate(1);
+            keys.push(Event::Paste(rest.to_string()));
+        }
+        keys
+    } else {
+        // Start marker seen but the end marker never arrived (mid-burst
+        // timeout) — the payload is still a genuine paste.
         let inner = text.strip_prefix(BP_START).unwrap_or(&text);
         vec![Event::Paste(inner.to_string())]
-    } else {
-        let rest = &text[text.char_indices().nth(1).map(|(i, _)| i).unwrap_or(text.len())..];
-        if rest.chars().count() >= 2 {
-            vec![first, Event::Paste(rest.to_string())]
-        } else {
-            vec![first]
-        }
     };
     out.extend(trailing);
     out
@@ -900,6 +935,23 @@ mod tests {
         assert_eq!(strip_bracketed_paste("hello"), None);
         assert_eq!(strip_bracketed_paste("\x1b[200~no-end"), None);
         assert_eq!(strip_bracketed_paste(""), None);
+    }
+
+    #[test]
+    fn looks_like_raw_paste_rejects_typing_and_key_repeat() {
+        // A fast roll (or keys buffered while the UI was busy) arrives with
+        // the same zero gap as an injected paste — length is the only signal.
+        assert!(!looks_like_raw_paste("ab"));
+        assert!(!looks_like_raw_paste("the quick"));
+        // Enter typed at the end of a roll must still submit, not paste.
+        assert!(!looks_like_raw_paste("ok\n"));
+        // Key auto-repeat: one character, however long the run.
+        assert!(!looks_like_raw_paste(&"a".repeat(64)));
+        assert!(!looks_like_raw_paste(""));
+
+        // A real legacy (non-bracketed) paste.
+        assert!(looks_like_raw_paste("cargo test -p gaviero-tui"));
+        assert!(looks_like_raw_paste("line one\nline two\n"));
     }
 
     #[test]

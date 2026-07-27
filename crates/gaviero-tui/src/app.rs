@@ -254,7 +254,7 @@ pub struct App {
     /// Windows: drop InsertChar/Enter/Tab until this instant after a text
     /// paste. ConPTY can still be injecting the key burst after we already
     /// applied the clipboard contents; a lone leftover `\` (below the
-    /// 2-char Paste coalescer threshold) would otherwise append at EOF.
+    /// Paste coalescer's `RAW_PASTE_MIN_CHARS` bar) would otherwise append at EOF.
     pub windows_paste_settle_until: Option<std::time::Instant>,
 }
 

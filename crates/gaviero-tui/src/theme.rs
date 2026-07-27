@@ -117,10 +117,17 @@ pub const CROSSTERM_POLL_MS: u64 = 50;
 /// UI tick interval in milliseconds (~30fps).
 pub const TICK_INTERVAL_MS: u64 = 33;
 /// Max gap between key events still treated as one pasted burst on Windows.
-/// Console paste injects events back-to-back (sub-millisecond); this stays far
-/// below human keystroke and key-repeat cadence (>= ~30 ms), so real typing is
-/// never merged into a paste.
+/// Console paste injects events back-to-back (sub-millisecond), but so does
+/// the console input buffer when it hands over keys typed while the UI thread
+/// was busy — the gap alone never proves a paste, which is why the raw path
+/// also requires `RAW_PASTE_MIN_CHARS`.
 pub const PASTE_BURST_MS: u64 = 5;
+/// Minimum characters in a raw (non-bracketed) Windows key burst before it is
+/// rewritten as a single `Event::Paste`. Typing rolls and key auto-repeat
+/// deliver several characters in one batch; shorter bursts are replayed as
+/// individual keys, which types the same text without arming the paste
+/// debounce and settle windows.
+pub const RAW_PASTE_MIN_CHARS: usize = 16;
 /// Interval for re-asserting VT mouse passthrough to the host terminal.
 /// A multiplexer between gaviero and the terminal keeps its own per-pane
 /// record of the requested mouse modes and can lose it without gaviero

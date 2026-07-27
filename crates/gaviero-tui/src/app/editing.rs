@@ -1453,7 +1453,7 @@ pub(super) const TEXT_PASTE_DEBOUNCE_MS: u64 = 400;
 
 /// After a Windows text paste, ignore InsertChar/Enter/Tab for this long so
 /// ConPTY key-burst stragglers (often a lone `\` below the Paste coalescer's
-/// 2-char threshold) cannot append at the cursor.
+/// `RAW_PASTE_MIN_CHARS` bar) cannot append at the cursor.
 pub(super) const WINDOWS_PASTE_SETTLE_MS: u64 = 300;
 
 pub(super) fn note_text_paste(app: &mut App) {
@@ -1487,6 +1487,31 @@ pub(super) fn should_drop_paste_straggler(app: &App, action: &Action) -> bool {
     )
 }
 
+/// Whether a Windows `Event::Paste` payload may be replaced by the system
+/// clipboard.
+///
+/// Only when the clipboard *corroborates* it: an empty payload (the terminal
+/// signalled a paste it could not represent as text — Windows Terminal does
+/// this for image clipboards) or a payload the clipboard starts with (the
+/// leading chunk of a gesture the coalescer split; later chunks are dropped by
+/// [`should_skip_duplicate_text_paste`]).
+///
+/// Substituting the clipboard unconditionally made every reconstructed paste a
+/// clipboard dump — including ones the coalescer built out of ordinary typing,
+/// which is how stale clipboard text appeared mid-line, and including pastes
+/// that never came from the clipboard at all (drag-and-drop paths).
+fn prefer_clipboard_paste(payload: &str, clipboard: &str) -> bool {
+    if clipboard.is_empty() {
+        return false;
+    }
+    if payload.is_empty() {
+        return true;
+    }
+    // Enter reaches the coalescer as `\n`; clipboards carry CRLF.
+    let normalize = |s: &str| s.replace("\r\n", "\n").replace('\r', "\n");
+    normalize(clipboard).starts_with(&normalize(payload))
+}
+
 pub(super) fn handle_paste(app: &mut App, text: &str) {
     if app.has_active_review() {
         return;
@@ -1495,11 +1520,11 @@ pub(super) fn handle_paste(app: &mut App, text: &str) {
     // Windows: ConPTY never surfaces a native crossterm Paste — the coalescer
     // rebuilds one from `ESC[200~…ESC[201~` / raw key bursts, and a mid-burst
     // timeout can split a single gesture into multiple Event::Paste values
-    // whose payloads are incomplete. When the system clipboard already holds
-    // the text, prefer that one clean copy over the reconstructed stream.
+    // whose payloads are incomplete. When the system clipboard corroborates
+    // the payload, prefer that one clean copy over the reconstructed stream.
     let paste_body = if cfg!(windows) {
         let clip = get_clipboard(app);
-        if !clip.is_empty() {
+        if prefer_clipboard_paste(text, &clip) {
             clip
         } else {
             text.to_string()
@@ -2036,6 +2061,23 @@ mod tests {
             side_panel: true,
             terminal: true,
         }
+    }
+
+    #[test]
+    fn clipboard_never_replaces_an_uncorroborated_paste_payload() {
+        // The reconstructed payload is the head of the clipboard: one gesture,
+        // possibly split into chunks — use the clean copy.
+        assert!(prefer_clipboard_paste("cargo te", "cargo test -p gaviero-tui"));
+        assert!(prefer_clipboard_paste("a\nb", "a\r\nb\r\n"));
+        // Empty payload: terminal signalled a paste it could not represent.
+        assert!(prefer_clipboard_paste("", "clipboard text"));
+
+        // Typing the coalescer mistook for a paste must never expand into the
+        // clipboard, and neither must a paste that did not come from it
+        // (drag-and-drop path, "paste as plain text" rewrites).
+        assert!(!prefer_clipboard_paste("ab", "some unrelated clipboard"));
+        assert!(!prefer_clipboard_paste("C:\\dropped\\file.rs", "unrelated"));
+        assert!(!prefer_clipboard_paste("anything", ""));
     }
 
     #[test]
