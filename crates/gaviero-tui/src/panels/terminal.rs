@@ -457,10 +457,14 @@ fn action_escapes_terminal(action: &Action) -> bool {
             | CycleTabBack
             // Alt+Up/Down and the Ctrl+Up/Down fallback (Windows Terminal
             // steals Alt+arrows for pane navigation) both resize the split.
+            // Ctrl+Alt+Left/Right resize explorer/editor/side widths
+            // (Alt+Left/Right are reserved for tmux/psmux window nav).
             | MoveLineUp
             | MoveLineDown
             | ResizePanelUp
             | ResizePanelDown
+            | ResizePanelLeft
+            | ResizePanelRight
             // Keyboard text selection in the terminal (TUI-side, not PTY).
             | SelectUp
             | SelectDown
@@ -590,6 +594,14 @@ mod tests {
         assert!(escapes(KeyCode::Up, KeyModifiers::CONTROL));
         assert!(escapes(KeyCode::PageUp, KeyModifiers::SHIFT));
         assert!(escapes(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        assert!(escapes(
+            KeyCode::Left,
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        ));
+        assert!(escapes(
+            KeyCode::Right,
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        ));
 
         // PTY-bound keys stay with the shell.
         assert!(!escapes(KeyCode::Char('c'), KeyModifiers::CONTROL)); // SIGINT

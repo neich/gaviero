@@ -91,6 +91,16 @@ pub enum Action {
     ResizePanelUp,
     /// Shrink the focused resizable panel. Ctrl+Down — see `ResizePanelUp`.
     ResizePanelDown,
+    /// Horizontal resize step toward the left.
+    /// Explorer: shrink. Side panel (agent chat): expand into the editor.
+    /// Editor/Terminal: shrink explorer (grow editor from the left).
+    /// Ctrl+Alt+Left — Alt+Left/Right are reserved for tmux/psmux windows.
+    ResizePanelLeft,
+    /// Horizontal resize step toward the right.
+    /// Explorer: grow. Side panel (agent chat): shrink.
+    /// Editor/Terminal: shrink side panel (grow editor from the right).
+    /// Ctrl+Alt+Right — see `ResizePanelLeft`.
+    ResizePanelRight,
 
     // Clipboard
     Copy,
@@ -200,6 +210,12 @@ impl Keymap {
 
             // ── Tab character ────────────────────────────────────
             KeyCode::Tab => Action::Tab,
+
+            // ── Horizontal panel resize: Ctrl+Alt+Left/Right ─────
+            // Alt+Left/Right navigate tmux/psmux windows; plain Ctrl+arrows
+            // are word motion. Ctrl+Alt passes through both host layers.
+            KeyCode::Left if ctrl && alt && !shift => Action::ResizePanelLeft,
+            KeyCode::Right if ctrl && alt && !shift => Action::ResizePanelRight,
 
             // ── Word movement: Ctrl+Arrow ────────────────────────
             KeyCode::Left if ctrl && shift => Action::SelectWordLeft,
@@ -449,6 +465,28 @@ mod tests {
         assert_eq!(
             Keymap::resolve(&key(KeyCode::Char('5'), KeyModifiers::NONE)),
             Action::InsertChar('5')
+        );
+    }
+
+    #[test]
+    fn test_ctrl_alt_arrow_resizes_horizontal_panels() {
+        let ctrl_alt = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::Left, ctrl_alt)),
+            Action::ResizePanelLeft
+        );
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::Right, ctrl_alt)),
+            Action::ResizePanelRight
+        );
+        // Ctrl alone stays word motion; Alt alone is not a horizontal resize.
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::Left, KeyModifiers::CONTROL)),
+            Action::WordLeft
+        );
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::Left, KeyModifiers::ALT)),
+            Action::CursorLeft
         );
     }
 }

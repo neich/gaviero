@@ -80,6 +80,147 @@ pub(super) fn effective_panel_constraints(app: &App, total_width: u16) -> (u16, 
     (app.file_tree_width, app.side_panel_width)
 }
 
+/// Total width available to the explorer/editor/side row (full terminal width).
+fn panels_row_width(app: &App) -> u16 {
+    app.layout
+        .status_area
+        .width
+        .max(app.layout.tab_area.width)
+        .max(1)
+}
+
+/// Leave a layout preset so absolute column widths become authoritative,
+/// seeding them from the preset's current on-screen sizes.
+fn materialize_preset_widths(app: &mut App) {
+    if app.active_preset.is_none() {
+        return;
+    }
+    let total = panels_row_width(app);
+    let (ft, sp) = effective_panel_constraints(app, total);
+    if app.panel_visible.file_tree {
+        app.file_tree_width = ft.max(theme::FILE_TREE_MIN_WIDTH);
+    }
+    if app.panel_visible.side_panel {
+        app.side_panel_width = sp.max(theme::SIDE_PANEL_MIN_WIDTH);
+    }
+    app.active_preset = None;
+}
+
+fn apply_width_delta(current: u16, delta: i16, min: u16, max: u16) -> u16 {
+    let next = (current as i16).saturating_add(delta);
+    (next.clamp(min as i16, max as i16)) as u16
+}
+
+/// Cap side panels so the editor keeps [`theme::EDITOR_MIN_WIDTH`].
+fn enforce_editor_min(app: &mut App, total: u16) {
+    let min_editor = theme::EDITOR_MIN_WIDTH;
+    let ft = if app.panel_visible.file_tree {
+        app.file_tree_width
+    } else {
+        0
+    };
+    let sp = if app.panel_visible.side_panel {
+        app.side_panel_width
+    } else {
+        0
+    };
+    let budget = total.saturating_sub(min_editor);
+    if ft.saturating_add(sp) <= budget {
+        return;
+    }
+    // Prefer shrinking the panel that was just grown is handled by callers;
+    // here we just clamp the overflow, shrinking side first then tree.
+    let overflow = ft.saturating_add(sp).saturating_sub(budget);
+    if app.panel_visible.side_panel {
+        let shrink = overflow.min(app.side_panel_width.saturating_sub(theme::SIDE_PANEL_MIN_WIDTH));
+        app.side_panel_width -= shrink;
+        let overflow = overflow.saturating_sub(shrink);
+        if overflow > 0 && app.panel_visible.file_tree {
+            let shrink =
+                overflow.min(app.file_tree_width.saturating_sub(theme::FILE_TREE_MIN_WIDTH));
+            app.file_tree_width -= shrink;
+        }
+    } else if app.panel_visible.file_tree {
+        let shrink = overflow.min(app.file_tree_width.saturating_sub(theme::FILE_TREE_MIN_WIDTH));
+        app.file_tree_width -= shrink;
+    }
+}
+
+/// Resize explorer / side / editor widths.
+///
+/// `delta_cols > 0` is Ctrl+Alt+Right; `< 0` is Ctrl+Alt+Left.
+///
+/// - Focus explorer → Right grows, Left shrinks (toward the right edge)
+/// - Focus side panel → Left grows, Right shrinks (toward the left into the editor)
+/// - Focus editor/terminal → Left takes space from explorer, Right from side
+///   (both grow the editor). Focus a side panel and press Left to reclaim width.
+pub(super) fn resize_horizontal(app: &mut App, delta_cols: i16) {
+    if delta_cols == 0 {
+        return;
+    }
+    materialize_preset_widths(app);
+    let total = panels_row_width(app);
+    let step = theme::PANEL_WIDTH_RESIZE_STEP as i16;
+    let delta = if delta_cols > 0 { step } else { -step };
+
+    match app.focus {
+        Focus::FileTree if app.panel_visible.file_tree => {
+            app.file_tree_width = apply_width_delta(
+                app.file_tree_width,
+                delta,
+                theme::FILE_TREE_MIN_WIDTH,
+                theme::FILE_TREE_MAX_WIDTH,
+            );
+        }
+        Focus::SidePanel if app.panel_visible.side_panel => {
+            // Spatial: Left expands chat into the editor; Right shrinks it.
+            app.side_panel_width = apply_width_delta(
+                app.side_panel_width,
+                -delta,
+                theme::SIDE_PANEL_MIN_WIDTH,
+                theme::SIDE_PANEL_MAX_WIDTH,
+            );
+        }
+        _ => {
+            // Editor/Terminal, or a hidden focused side: grow the editor by
+            // shrinking the neighbor on that side.
+            if delta < 0 {
+                if app.panel_visible.file_tree {
+                    app.file_tree_width = apply_width_delta(
+                        app.file_tree_width,
+                        delta,
+                        theme::FILE_TREE_MIN_WIDTH,
+                        theme::FILE_TREE_MAX_WIDTH,
+                    );
+                } else if app.panel_visible.side_panel {
+                    app.side_panel_width = apply_width_delta(
+                        app.side_panel_width,
+                        -delta,
+                        theme::SIDE_PANEL_MIN_WIDTH,
+                        theme::SIDE_PANEL_MAX_WIDTH,
+                    );
+                }
+            } else if app.panel_visible.side_panel {
+                app.side_panel_width = apply_width_delta(
+                    app.side_panel_width,
+                    -delta,
+                    theme::SIDE_PANEL_MIN_WIDTH,
+                    theme::SIDE_PANEL_MAX_WIDTH,
+                );
+            } else if app.panel_visible.file_tree {
+                app.file_tree_width = apply_width_delta(
+                    app.file_tree_width,
+                    delta,
+                    theme::FILE_TREE_MIN_WIDTH,
+                    theme::FILE_TREE_MAX_WIDTH,
+                );
+            }
+        }
+    }
+
+    enforce_editor_min(app, total);
+}
+
 pub(super) fn parse_layout_presets(workspace: &Workspace) -> Vec<LayoutPreset> {
     const DEFAULTS: &[(u16, u16, u16)] = &[(15, 60, 25), (15, 40, 45), (0, 100, 0), (0, 60, 40)];
 
@@ -148,5 +289,12 @@ mod tests {
         assert!(preset.file_tree_pct > 0);
         assert_eq!(preset.editor_pct > 0, false);
         assert!(preset.side_panel_pct > 0);
+    }
+
+    #[test]
+    fn apply_width_delta_clamps_to_min_max() {
+        assert_eq!(apply_width_delta(30, 5, 12, 80), 35);
+        assert_eq!(apply_width_delta(14, -5, 12, 80), 12);
+        assert_eq!(apply_width_delta(78, 5, 12, 80), 80);
     }
 }
