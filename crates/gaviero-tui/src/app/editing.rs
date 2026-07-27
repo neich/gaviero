@@ -1420,10 +1420,15 @@ pub(super) fn set_cursor_from_mouse(app: &mut App, col: u16, row: u16) {
         if buf.word_wrap && content_w > 0 {
             let layout = buf.wrap_layout(content_w);
             if let Some(seg) = layout.segment_at(click_row) {
+                // Click column is relative to the row's left edge, which is also
+                // where a wrapped row restarts its tab stops.
+                let char_col = buf.segment_visual_to_char_col(
+                    seg,
+                    visual_col,
+                    layout.is_last_of_line(click_row),
+                );
                 buf.cursor.line = seg.logical_line;
-                let base_visual = buf.char_col_to_visual(seg.logical_line, seg.start_col);
-                let char_col = buf.visual_to_char_col(seg.logical_line, base_visual + visual_col);
-                buf.cursor.col = char_col.min(buf.line_len(buf.cursor.line));
+                buf.cursor.col = char_col.min(buf.line_len(seg.logical_line));
             }
         } else {
             let max_line = buf.line_count().saturating_sub(1);
@@ -1432,6 +1437,9 @@ pub(super) fn set_cursor_from_mouse(app: &mut App, col: u16, row: u16) {
             let line_len = buf.line_len(buf.cursor.line);
             buf.cursor.col = char_col.min(line_len);
         }
+        // The click is the new horizontal intent, even when it lands on the cell
+        // the cursor already occupied.
+        buf.reset_goal_col();
     }
 }
 

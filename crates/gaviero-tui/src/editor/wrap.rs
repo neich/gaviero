@@ -51,25 +51,37 @@ impl WrapLayout {
         self.segments.len()
     }
 
-    /// Visual line index and char-column within that segment for a logical cursor.
-    pub fn cursor_segment(&self, line: usize, col: usize) -> (usize, usize) {
+    /// Visual line index holding the logical cursor position.
+    ///
+    /// At a wrap boundary `col` is both the end of one segment and the start of
+    /// the next; the later row wins, because that is where the character under
+    /// the cursor is drawn (the earlier row has no cell left for it). Positions
+    /// past the last segment's `end_col` (end of line) fall back to that row.
+    pub fn cursor_segment(&self, line: usize, col: usize) -> usize {
         for (idx, seg) in self.segments.iter().enumerate() {
-            if seg.logical_line == line && col >= seg.start_col && col <= seg.end_col {
-                return (idx, col.saturating_sub(seg.start_col));
+            if seg.logical_line == line && col >= seg.start_col && col < seg.end_col {
+                return idx;
             }
         }
         self.segments
             .iter()
             .rposition(|s| s.logical_line == line)
-            .map(|idx| {
-                let seg = &self.segments[idx];
-                (idx, seg.end_col.saturating_sub(seg.start_col))
-            })
-            .unwrap_or((0, 0))
+            .unwrap_or(0)
     }
 
     pub fn segment_at(&self, visual_line: usize) -> Option<&VisualSegment> {
         self.segments.get(visual_line)
+    }
+
+    /// Whether `visual_line` is the final visual row of its logical line.
+    ///
+    /// Only that row may hold the one-past-the-last-char cursor position; on an
+    /// earlier row `end_col` is already drawn on the row below.
+    pub fn is_last_of_line(&self, visual_line: usize) -> bool {
+        match (self.segments.get(visual_line), self.segments.get(visual_line + 1)) {
+            (Some(seg), Some(next)) => next.logical_line != seg.logical_line,
+            _ => true,
+        }
     }
 }
 
@@ -117,7 +129,11 @@ pub fn wrap_line_segments(text: &str, tab_width: usize, content_width: usize) ->
     segments
 }
 
-fn char_display_width(ch: char, visual_col: usize, tab_width: usize) -> usize {
+/// Display width of `ch` starting at `visual_col` *within its visual row*.
+///
+/// Tab stops are measured from the row's left edge, which is how both
+/// [`wrap_line_segments`] and the renderer lay wrapped rows out.
+pub(crate) fn char_display_width(ch: char, visual_col: usize, tab_width: usize) -> usize {
     if ch == '\t' {
         let next_stop = (visual_col / tab_width + 1) * tab_width;
         next_stop - visual_col
@@ -139,6 +155,31 @@ mod tests {
     #[test]
     fn wrap_empty_line() {
         assert_eq!(wrap_line_segments("", 4, 10), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn cursor_segment_prefers_the_row_the_char_is_drawn_on() {
+        let layout = WrapLayout {
+            segments: vec![
+                VisualSegment {
+                    logical_line: 0,
+                    start_col: 0,
+                    end_col: 10,
+                },
+                VisualSegment {
+                    logical_line: 0,
+                    start_col: 10,
+                    end_col: 19,
+                },
+            ],
+        };
+        assert_eq!(layout.cursor_segment(0, 9), 0);
+        // Boundary: col 10 is drawn as the first cell of row 1, not past row 0.
+        assert_eq!(layout.cursor_segment(0, 10), 1);
+        // End of line stays on the last row.
+        assert_eq!(layout.cursor_segment(0, 19), 1);
+        assert!(!layout.is_last_of_line(0));
+        assert!(layout.is_last_of_line(1));
     }
 
     #[test]

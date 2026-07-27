@@ -351,7 +351,7 @@ impl<'a> EditorView<'a> {
             self.buffer.scroll.left_col
         };
 
-        let (vline, _) = layout.cursor_segment(cursor_line, cursor_col);
+        let vline = layout.cursor_segment(cursor_line, cursor_col);
         if vline < top || vline >= top + code_area.height as usize {
             return;
         }
@@ -360,11 +360,10 @@ impl<'a> EditorView<'a> {
             Some(s) => s,
             None => return,
         };
-        let visual_col = self.buffer.char_col_to_visual(cursor_line, cursor_col);
-        let base_visual = self
-            .buffer
-            .char_col_to_visual(seg.logical_line, seg.start_col);
-        let rel_visual = visual_col.saturating_sub(base_visual);
+        // Column within the row as drawn: wrapped rows restart tab stops at
+        // their own left edge, so measure from the segment start rather than
+        // subtracting two whole-line visual columns.
+        let rel_visual = self.buffer.segment_char_col_to_visual(seg, cursor_col);
         if rel_visual < left {
             return;
         }
