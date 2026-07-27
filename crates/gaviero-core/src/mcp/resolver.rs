@@ -10,7 +10,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::workspace::{Workspace, settings as S};
 use crate::mcp::{
-    Context7Config, ExtraMcpServer, ExtraMcpTransport, McpConfigSynth, McpPermissions, TrustConsent,
+    BashPermissions, Context7Config, ExtraMcpServer, ExtraMcpTransport, McpConfigSynth,
+    McpPermissions, TrustConsent,
 };
 
 /// CLI / caller overrides layered on workspace defaults.
@@ -229,6 +230,34 @@ pub fn resolve_mcp_permissions(workspace: &Workspace, root: Option<&Path>) -> Mc
     parse_mcp_permissions_json(&val)
 }
 
+/// Load the gaviero-level shell permission policy from
+/// `agent.permissions.bash`.
+///
+/// Same object the in-process tool-agent reads, so shell rules are written
+/// once and reach both the built-in backends and the subprocess providers.
+/// Missing / malformed fields resolve to empty lists, which leaves each
+/// provider's own shell rules untouched.
+pub fn resolve_bash_permissions(workspace: &Workspace, root: Option<&Path>) -> BashPermissions {
+    let val = workspace.resolve_setting(S::AGENT_PERMISSIONS_BASH, root);
+    BashPermissions {
+        allowlist: string_list(&val, "allowlist"),
+        denylist: string_list(&val, "denylist"),
+    }
+}
+
+/// Read `val[key]` as a list of non-empty trimmed strings.
+fn string_list(val: &serde_json::Value, key: &str) -> Vec<String> {
+    val.get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()))
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn parse_mcp_permissions_json(val: &serde_json::Value) -> McpPermissions {
     let field = |key: &str| -> Vec<String> {
         val.get(key)
@@ -325,6 +354,7 @@ pub fn resolve_mcp_config_synth(
         context7: resolve_context7_config(workspace, Some(root)),
         extra_servers,
         permissions: resolve_mcp_permissions(workspace, Some(root)),
+        bash: resolve_bash_permissions(workspace, Some(root)),
     }
 }
 
@@ -332,6 +362,34 @@ pub fn resolve_mcp_config_synth(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn resolve_bash_permissions_reads_agent_permissions_bash() {
+        // The same `.gaviero/settings.json` block the in-process tool-agent
+        // reads must reach the provider translation, so shell rules are
+        // written once and applied everywhere.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".gaviero")).unwrap();
+        std::fs::write(
+            dir.path().join(".gaviero/settings.json"),
+            r#"{"agent":{"permissions":{"bash":{
+                 "allowlist":["cargo check","git status"],
+                 "denylist":["git push --force"]}}}}"#,
+        )
+        .unwrap();
+
+        let ws = Workspace::single_folder(dir.path().to_path_buf());
+        let bash = resolve_bash_permissions(&ws, Some(dir.path()));
+        assert_eq!(bash.allowlist, vec!["cargo check", "git status"]);
+        assert_eq!(bash.denylist, vec!["git push --force"]);
+    }
+
+    #[test]
+    fn resolve_bash_permissions_defaults_to_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::single_folder(dir.path().to_path_buf());
+        assert!(resolve_bash_permissions(&ws, Some(dir.path())).is_empty());
+    }
 
     #[test]
     fn parse_mcp_url_flag_splits_on_first_equals() {

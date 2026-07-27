@@ -144,6 +144,32 @@ pub fn ensure_ask_user_question(tools: &mut Vec<String>) {
     }
 }
 
+/// True for `agent.availableTools` entries naming an MCP server or tool
+/// (`mcp__gaviero`, `mcp__context7__query_docs`) rather than a built-in.
+///
+/// Such names are valid in `--allowedTools` (they are permission rules) but
+/// never in `--tools`, which selects from the built-in set only.
+pub fn is_mcp_tool_name(name: &str) -> bool {
+    name.starts_with("mcp__")
+}
+
+/// Build the `--tools` value for a Claude spawn from `agent.availableTools`.
+///
+/// Drops `mcp__…` entries — see [`is_mcp_tool_name`]; passing one costs the
+/// session every MCP server — and injects `AskUserQuestion` for interactive
+/// turns so clarifying questions ride the control channel.
+pub fn build_available_tools(available: &[&str], interactive: bool) -> Vec<String> {
+    let mut tools: Vec<String> = available
+        .iter()
+        .map(|s| (*s).to_string())
+        .filter(|t| !is_mcp_tool_name(t))
+        .collect();
+    if interactive {
+        ensure_ask_user_question(&mut tools);
+    }
+    tools
+}
+
 impl AgentOptions {
     /// Resolve the effective `(available, approved)` tool lists for the
     /// subprocess spawn. If `available_tools` is unset, falls back to
@@ -305,10 +331,17 @@ impl AcpSession {
             cmd.arg("--input-format").arg("stream-json");
             cmd.arg("--permission-prompt-tool").arg("stdio");
             cmd.arg("--permission-mode").arg("default");
-            // Exclude project/local Claude settings so
-            // `.claude/settings.json` permissions.allow / defaultMode
-            // cannot override Gaviero's `agent.approvedTools`.
-            cmd.arg("--setting-sources").arg("");
+            // Project/local Claude settings stay loaded on purpose. Gaviero
+            // translates `mcp.permissions` *and* `agent.permissions.bash`
+            // into `.claude/settings.json` (see
+            // `mcp::config_synth::synthesize_for_worktree`), and that file
+            // also carries the operator's own deny rules. Excluding it with
+            // `--setting-sources ""` dropped every allow *and* deny rule, so
+            // routine tools prompted on every turn while the safety denies
+            // silently stopped applying. Claude treats `permissions.allow` as
+            // "skip the prompt", never as a widening of the tool surface, so
+            // it cannot override the hard limits `--tools` / `--mcp-config`
+            // impose below.
         }
         cmd.arg("--model")
             // Resolve alias→concrete id (e.g. `sonnet` → Sonnet 5) so the
@@ -360,11 +393,16 @@ impl AcpSession {
         // Interactive chat always exposes AskUserQuestion so clarifying
         // questions ride the same can_use_tool control channel as tool
         // approvals. Auto-approve / swarm paths leave the caller's list alone.
-        let mut available_owned: Vec<String> =
-            available_tools.iter().map(|s| (*s).to_string()).collect();
-        if interactive_permissions {
-            ensure_ask_user_question(&mut available_owned);
-        }
+        //
+        // `mcp__…` entries are stripped first: `--tools` selects from Claude's
+        // *built-in* set only, and an unknown name there is not merely
+        // ignored. Verified against Claude Code 2.1.220 — passing `--tools`
+        // restricts the whole session and drops every MCP server with it
+        // (35 tools + context7 reachable without the flag; 4 tools and no
+        // context7 with it). MCP admission is governed by `.mcp.json` /
+        // `--mcp-config` below, so listing servers here only costs the agent
+        // its MCP tools.
+        let available_owned = build_available_tools(available_tools, interactive_permissions);
         if !available_owned.is_empty() {
             cmd.arg("--tools").arg(available_owned.join(","));
         }
@@ -715,6 +753,37 @@ mod tests {
         };
         let (available, approved) = opts.resolved_tools();
         assert_eq!(available, approved, "auto_approve approves everything available");
+    }
+
+    #[test]
+    fn build_available_tools_strips_mcp_names() {
+        // `mcp__…` in `--tools` costs the session every MCP server
+        // (Claude Code 2.1.220), so they must never reach the flag.
+        let available = [
+            "Read",
+            "Glob",
+            "Grep",
+            "Write",
+            "Edit",
+            "MultiEdit",
+            "Bash",
+            "mcp__gaviero",
+            "mcp__context7__query_docs",
+        ];
+        let tools = build_available_tools(&available, true);
+        assert!(
+            !tools.iter().any(|t| t.starts_with("mcp__")),
+            "MCP names must not reach --tools: {tools:?}"
+        );
+        assert!(tools.contains(&"Bash".to_string()));
+        assert!(tools.contains(&ASK_USER_QUESTION_TOOL.to_string()));
+        assert_eq!(tools.len(), 8, "7 built-ins + AskUserQuestion");
+    }
+
+    #[test]
+    fn build_available_tools_omits_ask_user_question_when_not_interactive() {
+        let tools = build_available_tools(&["Read", "mcp__gaviero"], false);
+        assert_eq!(tools, vec!["Read".to_string()]);
     }
 
     #[test]

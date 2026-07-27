@@ -260,6 +260,78 @@ fn synth_server_names(synth: &McpConfigSynth) -> Vec<String> {
     names
 }
 
+/// Shell-command permission policy defined once at the gaviero layer
+/// (`agent.permissions.bash`) and translated into each provider's native
+/// permission syntax, so shell rules are configured in one place instead of
+/// per provider.
+///
+/// Gaviero's own semantics (see
+/// [`crate::agent_session::tool_agent::policy::ToolPolicy`]) are:
+/// * `allowlist` — **prefix** match; `cargo check` clears
+///   `cargo check --all`.
+/// * `denylist` — case-insensitive **substring** match; `git push --force`
+///   blocks `cd x && git push --force`.
+///
+/// Provider fidelity differs, and neither Claude nor Cursor has a substring
+/// form:
+/// * **Claude** (`.claude/settings.json`) — `Bash(<prefix>:*)`, the
+///   documented prefix-match rule. Allow rules translate exactly; deny rules
+///   degrade to prefix matching, so a denied fragment buried mid-command is
+///   *not* caught by the provider. The in-process tool-agent still applies
+///   the full substring rule, and gaviero's built-in denylist is unaffected.
+/// * **Cursor** (`.cursor/cli.json`) — `Shell(<prefix>*)`, same caveat.
+/// * **Codex** has no per-command permission surface at all; its shell
+///   gating is the sandbox/approval policy, so nothing is emitted and the
+///   policy simply does not reach it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BashPermissions {
+    /// Command prefixes that run without a prompt.
+    pub allowlist: Vec<String>,
+    /// Command fragments that are always blocked. Deny wins over allow.
+    pub denylist: Vec<String>,
+}
+
+impl BashPermissions {
+    /// True when neither list is configured — nothing to translate.
+    pub fn is_empty(&self) -> bool {
+        self.allowlist.is_empty() && self.denylist.is_empty()
+    }
+
+    /// `(allow, deny)` rules for `.claude/settings.json`.
+    pub fn claude_rules(&self) -> (Vec<String>, Vec<String>) {
+        (
+            bash_rules(&self.allowlist, |p| format!("Bash({p}:*)")),
+            bash_rules(&self.denylist, |p| format!("Bash({p}:*)")),
+        )
+    }
+
+    /// `(allow, deny)` rules for `.cursor/cli.json`.
+    pub fn cursor_rules(&self) -> (Vec<String>, Vec<String>) {
+        (
+            bash_rules(&self.allowlist, |p| format!("Shell({p}*)")),
+            bash_rules(&self.denylist, |p| format!("Shell({p}*)")),
+        )
+    }
+}
+
+/// Render one gaviero shell pattern list into provider rule strings.
+///
+/// Entries are trimmed (the gaviero lists carry trailing spaces like `"cat "`
+/// to force a word boundary, which the provider's own prefix match already
+/// implies). Entries containing `(` or `)` are skipped: both providers
+/// delimit the rule payload with parentheses and have no escape form, so an
+/// unbalanced rule would corrupt the whole permissions block.
+fn bash_rules(patterns: &[String], render: impl Fn(&str) -> String) -> Vec<String> {
+    sorted_unique(
+        patterns
+            .iter()
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty() && !p.contains('(') && !p.contains(')'))
+            .map(render)
+            .collect(),
+    )
+}
+
 /// Configuration for a per-worktree MCP config synth.
 #[derive(Debug, Clone)]
 pub struct McpConfigSynth {
@@ -291,6 +363,10 @@ pub struct McpConfigSynth {
     /// Gaviero-level MCP permission policy (`mcp.permissions`), translated
     /// into each provider's native config. Default (empty) allows all.
     pub permissions: McpPermissions,
+    /// Gaviero-level shell permission policy (`agent.permissions.bash`),
+    /// translated into each provider's native config. Default (empty) leaves
+    /// provider shell rules alone.
+    pub bash: BashPermissions,
 }
 
 impl Default for McpConfigSynth {
@@ -305,6 +381,7 @@ impl Default for McpConfigSynth {
             context7: Context7Config::default(),
             extra_servers: Vec::new(),
             permissions: McpPermissions::default(),
+            bash: BashPermissions::default(),
         }
     }
 }
@@ -493,10 +570,13 @@ fn context7_server_entry(ctx7: &Context7Config) -> serde_json::Value {
 }
 
 /// Build the `permissions` object for `.claude/settings.json` from the
-/// gaviero MCP permission policy, or `None` when the policy is empty.
+/// gaviero MCP policy (`mcp.permissions`) and shell policy
+/// (`agent.permissions.bash`), or `None` when both are empty.
 ///
 /// Allow rules become Claude `permissions.allow` (auto-approve without a
-/// prompt); deny rules become `permissions.deny` (hard block). Claude
+/// prompt); deny rules become `permissions.deny` (hard block). Shell rules
+/// are rendered by [`BashPermissions::claude_rules`], whose doc records the
+/// prefix-vs-substring fidelity gap on the deny side. Claude
 /// forbids globs in the server segment, so a `*` server-part is expanded
 /// across the registered server list; the tool segment keeps its glob
 /// (Claude supports e.g. `mcp__github__get_*`).
@@ -508,16 +588,18 @@ fn context7_server_entry(ctx7: &Context7Config) -> serde_json::Value {
 /// per-tool hard restriction of a registered third-party server needs an
 /// explicit `deny` pattern.
 pub fn claude_settings_permissions(synth: &McpConfigSynth) -> Option<serde_json::Value> {
-    if synth.permissions.is_empty() {
+    if synth.permissions.is_empty() && synth.bash.is_empty() {
         return None;
     }
     let servers = synth_server_names(synth);
+    let (bash_allow, bash_deny) = synth.bash.claude_rules();
     let allow = sorted_unique(
         synth
             .permissions
             .allow
             .iter()
             .flat_map(|p| expand_claude_patterns(p, &servers))
+            .chain(bash_allow)
             .collect(),
     );
     let deny = sorted_unique(
@@ -526,6 +608,7 @@ pub fn claude_settings_permissions(synth: &McpConfigSynth) -> Option<serde_json:
             .deny
             .iter()
             .flat_map(|p| expand_claude_patterns(p, &servers))
+            .chain(bash_deny)
             .collect(),
     );
     if allow.is_empty() && deny.is_empty() {
@@ -555,21 +638,25 @@ fn expand_claude_patterns(pattern: &str, servers: &[String]) -> Vec<String> {
     }
 }
 
-/// `(allow, deny)` Cursor permission rule strings (`Mcp(server:tool)`) from
-/// the gaviero MCP permission policy. Cursor supports a `*` server segment
-/// natively (`Mcp(*:*)`), so patterns translate without expansion.
+/// `(allow, deny)` Cursor permission rule strings from the gaviero policies:
+/// `Mcp(server:tool)` for `mcp.permissions` and `Shell(prefix*)` for
+/// `agent.permissions.bash`. Cursor supports a `*` server segment natively
+/// (`Mcp(*:*)`), so MCP patterns translate without expansion.
 fn cursor_permission_rules(synth: &McpConfigSynth) -> (Vec<String>, Vec<String>) {
+    let (bash_allow, bash_deny) = synth.bash.cursor_rules();
     let allow = synth
         .permissions
         .allow
         .iter()
         .map(|p| cursor_rule(p))
+        .chain(bash_allow)
         .collect();
     let deny = synth
         .permissions
         .deny
         .iter()
         .map(|p| cursor_rule(p))
+        .chain(bash_deny)
         .collect();
     (allow, deny)
 }
@@ -584,6 +671,18 @@ fn sorted_unique(mut v: Vec<String>) -> Vec<String> {
     v.sort();
     v.dedup();
     v
+}
+
+/// Extract `doc[key]` as a string list, skipping non-string entries.
+fn json_string_array(doc: &serde_json::Value, key: &str) -> Vec<String> {
+    doc.get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Match a comma-form Cursor MCP permission entry like `Mcp(name, *)`
@@ -781,7 +880,10 @@ pub fn codex_mcp_config_toml(synth: &McpConfigSynth) -> Result<String> {
     );
     // Codex has no per-tool permission surface, so the server-registration
     // gate is the only place the permission policy applies: a disallowed
-    // server is omitted from the config entirely.
+    // server is omitted from the config entirely. `agent.permissions.bash`
+    // likewise has no Codex equivalent — shell gating there is the
+    // sandbox/approval policy, not a per-command allow list — so shell rules
+    // are not translated for this provider at all.
     if synth.gaviero_enabled && synth.permissions.server_allowed("gaviero") {
         body.push_str(&format!(
             "[mcp_servers.gaviero]\n\
@@ -890,13 +992,32 @@ pub fn synthesize_for_worktree(synth: &McpConfigSynth) -> Result<Vec<PathBuf>> {
     written.push(claude_path);
 
     // Claude permissions: <worktree>/.claude/settings.json — Claude reads
-    // project settings (including `permissions.allow/deny` with `mcp__…`
-    // rules) from this path. Only written when the gaviero permission policy
-    // has something to say; merged so user-authored settings are preserved.
-    if let Some(perms) = claude_settings_permissions(synth) {
+    // project settings (`permissions.allow/deny`, carrying both the `mcp__…`
+    // rules and the translated shell rules) from this path. Merged so
+    // user-authored settings are preserved. Runs whenever the policy has
+    // something to say *or* a previous synth left rules behind that now need
+    // retracting, so revoking a permission actually revokes it.
+    let marker_path = managed_marker_path(&synth.worktree);
+    let previous_claude = read_managed_rules(&marker_path, "claude");
+    let claude_perms = claude_settings_permissions(synth);
+    if claude_perms.is_some() || !previous_claude.is_empty() {
+        let perms = claude_perms.unwrap_or_else(|| serde_json::json!({ "allow": [], "deny": [] }));
         let claude_settings_path = synth.worktree.join(".claude/settings.json");
-        let settings_body = merge_claude_settings_permissions(&claude_settings_path, perms)?;
+        let settings_body = merge_claude_settings_permissions(
+            &claude_settings_path,
+            &previous_claude,
+            &perms,
+            !synth.permissions.is_empty(),
+        )?;
         write_if_changed(&claude_settings_path, &settings_body)?;
+        write_managed_rules(
+            &marker_path,
+            "claude",
+            &ManagedRules {
+                allow: json_string_array(&perms, "allow"),
+                deny: json_string_array(&perms, "deny"),
+            },
+        )?;
         written.push(claude_settings_path);
     }
 
@@ -953,11 +1074,14 @@ fn synthesize_cursor_cli(
 ) -> Result<Option<PathBuf>> {
     let remote = remote_mcp_servers_from_mcp_json_path(mcp_json_path);
     let (perm_allow, perm_deny) = cursor_permission_rules(synth);
-    // Write cli.json when there's a remote server to allow-list *or* an
-    // explicit gaviero permission policy to translate. Stdio-only worktrees
-    // with the default (empty) policy still skip it, preserving the prior
-    // behaviour where project cli.json was reserved for remote MCP.
-    if remote.is_empty() && perm_allow.is_empty() && perm_deny.is_empty() {
+    let marker_path = managed_marker_path(&synth.worktree);
+    let previous = read_managed_rules(&marker_path, "cursor");
+    // Write cli.json when there's a remote server to allow-list, an explicit
+    // gaviero permission policy to translate, *or* rules a previous synth
+    // left behind that now need retracting. Stdio-only worktrees with the
+    // default (empty) policy and no history still skip it, preserving the
+    // prior behaviour where project cli.json was reserved for remote MCP.
+    if remote.is_empty() && perm_allow.is_empty() && perm_deny.is_empty() && previous.is_empty() {
         return Ok(None);
     }
 
@@ -1009,6 +1133,26 @@ fn synthesize_cursor_cli(
     // with `Mcp(server:*)` it succeeds and the server receives the
     // request. Sourced from cursor.com/docs/cli/reference/permissions
     // (the docs example uses `Mcp(datadog:*)`).
+    // Everything gaviero injects into the allow array this synth: the
+    // remote-MCP baseline plus the translated policy. Recorded in the marker
+    // so the next synth retracts exactly these and nothing the operator added.
+    let mut injected_allow: Vec<String> = Vec::new();
+    if !remote.is_empty() {
+        // Baseline needed for streamable-HTTP MCP to register and for
+        // WebFetch fallbacks in headless `-p` runs. Only registered
+        // (permission-allowed) servers appear in `remote`, so the
+        // blanket `Mcp(*:*)` only affects servers the policy permits.
+        injected_allow.push("Mcp(*:*)".to_string());
+        injected_allow.extend(remote.iter().map(|(s, _)| format!("Mcp({s}:*)")));
+        injected_allow.extend(webfetch_patterns);
+    }
+    // Gaviero permission policy → explicit allow rules (auto-approve).
+    injected_allow.extend(perm_allow.iter().cloned());
+    let injected = ManagedRules {
+        allow: injected_allow,
+        deny: perm_deny.clone(),
+    };
+
     let permissions = root
         .entry("permissions".to_string())
         .or_insert_with(|| serde_json::json!({ "allow": [], "deny": [] }));
@@ -1016,57 +1160,33 @@ fn synthesize_cursor_cli(
         *permissions = serde_json::json!({ "allow": [], "deny": [] });
     }
     if let Some(obj) = permissions.as_object_mut() {
-        let allow = obj
-            .entry("allow".to_string())
-            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-        if let Some(arr) = allow.as_array_mut() {
-            let mut existing: std::collections::HashSet<String> = arr
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect();
-            // Strip any prior comma-format entries our earlier releases
-            // wrote — they don't grant access and are pure noise.
-            arr.retain(|v| match v.as_str() {
-                Some(s) => !is_legacy_comma_mcp_pattern(s),
-                None => true,
-            });
-            existing.retain(|s| !is_legacy_comma_mcp_pattern(s));
-            let mut patterns: Vec<String> = Vec::new();
-            if !remote.is_empty() {
-                // Baseline needed for streamable-HTTP MCP to register and for
-                // WebFetch fallbacks in headless `-p` runs. Only registered
-                // (permission-allowed) servers appear in `remote`, so the
-                // blanket `Mcp(*:*)` only affects servers the policy permits.
-                patterns.push("Mcp(*:*)".to_string());
-                patterns.extend(remote.iter().map(|(s, _)| format!("Mcp({s}:*)")));
-                patterns.extend(webfetch_patterns);
+        for (key, incoming, stale) in [
+            ("allow", &injected.allow, &previous.allow),
+            ("deny", &injected.deny, &previous.deny),
+        ] {
+            let slot = obj
+                .entry(key.to_string())
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+            if !slot.is_array() {
+                *slot = serde_json::Value::Array(Vec::new());
             }
-            // Gaviero permission policy → explicit allow rules (auto-approve).
-            patterns.extend(perm_allow.iter().cloned());
-            for pat in patterns {
-                if existing.insert(pat.clone()) {
-                    arr.push(serde_json::Value::String(pat));
-                }
-            }
-        }
-        // Deny array: preserve user entries, scrub legacy comma forms, then
-        // append the gaviero permission policy's deny rules.
-        let deny = obj
-            .entry("deny".to_string())
-            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-        if !deny.is_array() {
-            *deny = serde_json::Value::Array(Vec::new());
-        }
-        if let Some(arr) = deny.as_array_mut() {
+            let Some(arr) = slot.as_array_mut() else {
+                continue;
+            };
+            let stale: std::collections::HashSet<&String> = stale.iter().collect();
+            // Preserve user entries; drop the comma-format patterns our
+            // earlier releases wrote (they grant nothing and are pure noise)
+            // and the rules the previous synth injected, then re-add the
+            // current set.
             arr.retain(|v| match v.as_str() {
-                Some(s) => !is_legacy_comma_mcp_pattern(s),
+                Some(s) => !is_legacy_comma_mcp_pattern(s) && !stale.contains(&s.to_string()),
                 None => true,
             });
             let mut existing: std::collections::HashSet<String> = arr
                 .iter()
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect();
-            for pat in &perm_deny {
+            for pat in incoming {
                 if existing.insert(pat.clone()) {
                     arr.push(serde_json::Value::String(pat.clone()));
                 }
@@ -1077,6 +1197,7 @@ fn synthesize_cursor_cli(
     let body = serde_json::to_string_pretty(&serde_json::Value::Object(root))
         .context("serialising .cursor/cli.json")?;
     write_if_changed(&cli_path, &body)?;
+    write_managed_rules(&marker_path, "cursor", &injected)?;
     Ok(Some(cli_path))
 }
 
@@ -1143,16 +1264,110 @@ fn merge_mcp_json_servers_at_path(
         .context("serialising merged mcp servers JSON")
 }
 
-/// Merge gaviero's MCP permission rules into an existing
-/// `.claude/settings.json` (or a fresh document), preserving user-authored
-/// keys and non-MCP permission rules.
+/// Rules gaviero injected into one provider's settings file on the previous
+/// synth, so the next one can remove exactly those.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManagedRules {
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+}
+
+impl ManagedRules {
+    fn is_empty(&self) -> bool {
+        self.allow.is_empty() && self.deny.is_empty()
+    }
+}
+
+/// Sidecar recording which permission rules gaviero last wrote into each
+/// provider's settings file.
 ///
-/// Gaviero is the single source of MCP permissions, so every existing
-/// `mcp__…` rule under `permissions.allow` / `.deny` is dropped and replaced
-/// with the freshly generated set — this keeps re-synthesis idempotent when
-/// the policy changes. Non-MCP rules (e.g. `Bash`, `WebFetch`, `Read`) and
-/// all other settings keys are left untouched.
-fn merge_claude_settings_permissions(path: &Path, perms: serde_json::Value) -> Result<String> {
+/// Gaviero must be able to *remove* rules when the policy changes, but those
+/// files are shared with the operator and carry hand-authored rules that have
+/// to survive. Prefix ownership settles that for MCP — an `mcp__…` rule is
+/// unambiguously gaviero's — but not for shell rules: a `Bash(cargo check:*)`
+/// line is indistinguishable from one the operator typed. Recording the
+/// generated set makes removal exact instead of heuristic.
+fn managed_marker_path(worktree: &Path) -> PathBuf {
+    worktree.join(".gaviero").join("managed-permissions.json")
+}
+
+/// Read the rules gaviero last injected for `provider`.
+fn read_managed_rules(marker: &Path, provider: &str) -> ManagedRules {
+    let Some(doc) = std::fs::read_to_string(marker)
+        .ok()
+        .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
+    else {
+        return ManagedRules::default();
+    };
+    let list = |key: &str| -> Vec<String> {
+        doc.pointer(&format!("/{provider}/{key}"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    ManagedRules {
+        allow: list("allow"),
+        deny: list("deny"),
+    }
+}
+
+/// Record the rules just injected for `provider`, preserving the other
+/// providers' entries. Removes the marker once no provider owns any rule.
+fn write_managed_rules(marker: &Path, provider: &str, rules: &ManagedRules) -> Result<()> {
+    let mut doc = std::fs::read_to_string(marker)
+        .ok()
+        .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+
+    if rules.is_empty() {
+        doc.remove(provider);
+    } else {
+        doc.insert(
+            provider.to_string(),
+            serde_json::json!({ "allow": rules.allow, "deny": rules.deny }),
+        );
+    }
+
+    if doc.is_empty() {
+        if marker.is_file() {
+            std::fs::remove_file(marker)
+                .with_context(|| format!("removing {}", marker.display()))?;
+        }
+        return Ok(());
+    }
+
+    let mut body = serde_json::to_string_pretty(&serde_json::Value::Object(doc))
+        .context("serialising managed-permissions marker")?;
+    body.push('\n');
+    write_if_changed(marker, &body)
+}
+
+/// Merge gaviero's permission rules into an existing `.claude/settings.json`
+/// (or a fresh document), preserving user-authored keys and rules.
+///
+/// When `manages_mcp` (an `mcp.permissions` policy is configured) gaviero is
+/// the single source of MCP permissions, so every existing `mcp__…` rule
+/// under `permissions.allow` / `.deny` is dropped and replaced with the
+/// freshly generated set. With an **empty** MCP policy gaviero has no opinion
+/// on MCP access and must leave those rules alone — otherwise a shell-only
+/// policy would silently delete the operator's hand-written `mcp__…` allows
+/// and make every MCP tool prompt.
+///
+/// Shell rules cannot be identified by shape, so the ones gaviero wrote last
+/// time (`previous`) are removed by exact match. Everything else — the
+/// operator's own `Bash`, `WebFetch`, `Read` rules and all other settings
+/// keys — is left untouched.
+fn merge_claude_settings_permissions(
+    path: &Path,
+    previous: &ManagedRules,
+    perms: &serde_json::Value,
+    manages_mcp: bool,
+) -> Result<String> {
     let mut root = std::fs::read_to_string(path)
         .ok()
         .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
@@ -1167,15 +1382,11 @@ fn merge_claude_settings_permissions(path: &Path, perms: serde_json::Value) -> R
     }
     if let Some(obj) = permissions.as_object_mut() {
         for key in ["allow", "deny"] {
-            let incoming: Vec<String> = perms
-                .get(key)
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let incoming = json_string_array(perms, key);
+            let stale: std::collections::HashSet<&String> = match key {
+                "allow" => previous.allow.iter().collect(),
+                _ => previous.deny.iter().collect(),
+            };
             let slot = obj
                 .entry(key.to_string())
                 .or_insert_with(|| serde_json::Value::Array(Vec::new()));
@@ -1183,8 +1394,16 @@ fn merge_claude_settings_permissions(path: &Path, perms: serde_json::Value) -> R
                 *slot = serde_json::Value::Array(Vec::new());
             }
             if let Some(arr) = slot.as_array_mut() {
-                // Drop gaviero-owned MCP rules, then re-add the current set.
-                arr.retain(|v| !v.as_str().map(|s| s.starts_with("mcp__")).unwrap_or(false));
+                // Drop gaviero-owned rules — MCP by prefix (only while an MCP
+                // policy is configured), shell by exact match against the
+                // previous synth — then re-add the current set.
+                arr.retain(|v| match v.as_str() {
+                    Some(s) => {
+                        !(manages_mcp && s.starts_with("mcp__"))
+                            && !stale.contains(&s.to_string())
+                    }
+                    None => true,
+                });
                 let mut existing: std::collections::HashSet<String> = arr
                     .iter()
                     .filter_map(|v| v.as_str().map(str::to_string))
@@ -1241,6 +1460,7 @@ mod tests {
             },
             extra_servers: Vec::new(),
             permissions: McpPermissions::default(),
+            bash: BashPermissions::default(),
         }
     }
 
@@ -1720,6 +1940,193 @@ mod tests {
             host_from_mcp_url("https://mcp.wuilder.com/semantic-scholar/token/"),
             Some("mcp.wuilder.com".to_string())
         );
+    }
+
+
+    // ── Shell permission policy (agent.permissions.bash) ─────────────────
+
+    fn bash_fixture() -> BashPermissions {
+        BashPermissions {
+            allowlist: vec!["cargo check".into(), "git status".into(), "cat ".into()],
+            denylist: vec!["git push --force".into(), "mkfs.".into()],
+        }
+    }
+
+    #[test]
+    fn bash_rules_render_claude_and_cursor_syntax() {
+        let (allow, deny) = bash_fixture().claude_rules();
+        assert!(allow.contains(&"Bash(cargo check:*)".to_string()));
+        assert!(allow.contains(&"Bash(git status:*)".to_string()));
+        // Trailing space is trimmed — the provider prefix match implies it.
+        assert!(allow.contains(&"Bash(cat:*)".to_string()));
+        assert!(deny.contains(&"Bash(git push --force:*)".to_string()));
+
+        let (allow, deny) = bash_fixture().cursor_rules();
+        assert!(allow.contains(&"Shell(cargo check*)".to_string()));
+        assert!(deny.contains(&"Shell(mkfs.*)".to_string()));
+    }
+
+    #[test]
+    fn bash_rules_skip_patterns_that_would_corrupt_the_rule_syntax() {
+        // Neither provider has an escape form for the delimiters, so a
+        // pattern carrying them is dropped rather than emitted unbalanced.
+        let p = BashPermissions {
+            allowlist: vec!["echo (hi)".into(), "  ".into(), "ls".into()],
+            denylist: vec![],
+        };
+        let (allow, _) = p.claude_rules();
+        assert_eq!(allow, vec!["Bash(ls:*)".to_string()]);
+    }
+
+    #[test]
+    fn empty_bash_policy_emits_nothing() {
+        let p = BashPermissions::default();
+        assert!(p.is_empty());
+        assert!(p.claude_rules().0.is_empty());
+        assert!(p.cursor_rules().1.is_empty());
+    }
+
+    #[test]
+    fn claude_settings_permissions_includes_bash_rules() {
+        let mut synth = fixture(PathBuf::from("/tmp/wt"));
+        synth.bash = bash_fixture();
+        // Shell policy alone is enough to produce a permissions block, even
+        // with an empty MCP policy.
+        let perms = claude_settings_permissions(&synth).expect("bash policy present");
+        let allow = json_string_array(&perms, "allow");
+        let deny = json_string_array(&perms, "deny");
+        assert!(allow.contains(&"Bash(cargo check:*)".to_string()));
+        assert!(deny.contains(&"Bash(mkfs.:*)".to_string()));
+    }
+
+    #[test]
+    fn synthesize_writes_bash_rules_and_retracts_them_when_policy_shrinks() {
+        let dir = tempdir().unwrap();
+        let settings_path = dir.path().join(".claude/settings.json");
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        // A hand-authored shell rule that must survive every synth.
+        std::fs::write(
+            &settings_path,
+            r#"{"permissions":{"allow":["Bash(ls)"],"deny":[]}}"#,
+        )
+        .unwrap();
+
+        let mut synth = fixture(dir.path().to_path_buf());
+        synth.bash = bash_fixture();
+        synthesize_for_worktree(&synth).unwrap();
+
+        let read = |p: &Path| -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+        };
+        let allow = json_string_array(&read(&settings_path)["permissions"], "allow");
+        assert!(allow.contains(&"Bash(cargo check:*)".to_string()));
+        assert!(allow.contains(&"Bash(ls)".to_string()), "user rule kept");
+
+        // Drop `cargo check` from the policy: the generated rule must go,
+        // the operator's own rule must stay.
+        synth.bash.allowlist = vec!["git status".into()];
+        synthesize_for_worktree(&synth).unwrap();
+        let allow = json_string_array(&read(&settings_path)["permissions"], "allow");
+        assert!(
+            !allow.contains(&"Bash(cargo check:*)".to_string()),
+            "revoked rule must be retracted: {allow:?}"
+        );
+        assert!(allow.contains(&"Bash(git status:*)".to_string()));
+        assert!(allow.contains(&"Bash(ls)".to_string()), "user rule kept");
+
+        // Clearing the policy entirely retracts the rest and removes the
+        // marker, leaving only user-authored rules behind.
+        synth.bash = BashPermissions::default();
+        synthesize_for_worktree(&synth).unwrap();
+        let allow = json_string_array(&read(&settings_path)["permissions"], "allow");
+        assert_eq!(allow, vec!["Bash(ls)".to_string()]);
+        assert!(!managed_marker_path(dir.path()).exists(), "marker cleaned up");
+    }
+
+    #[test]
+    fn shell_only_policy_preserves_hand_written_mcp_rules() {
+        // Regression: a shell-only policy made the merge run for the first
+        // time on workspaces with an empty `mcp.permissions`, and the blanket
+        // "gaviero owns every mcp__ rule" drop deleted the operator's own MCP
+        // allows — making every MCP tool prompt again.
+        let dir = tempdir().unwrap();
+        let settings_path = dir.path().join(".claude/settings.json");
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings_path,
+            r#"{"permissions":{
+                 "allow":["mcp__gaviero__*","mcp__context7__*"],
+                 "deny":["mcp__gaviero__delete_*"]}}"#,
+        )
+        .unwrap();
+
+        let mut synth = fixture(dir.path().to_path_buf());
+        synth.permissions = McpPermissions::default(); // no MCP policy
+        synth.bash = bash_fixture();
+        synthesize_for_worktree(&synth).unwrap();
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let allow = json_string_array(&doc["permissions"], "allow");
+        let deny = json_string_array(&doc["permissions"], "deny");
+        assert!(allow.contains(&"mcp__gaviero__*".to_string()), "{allow:?}");
+        assert!(allow.contains(&"mcp__context7__*".to_string()), "{allow:?}");
+        assert!(
+            deny.contains(&"mcp__gaviero__delete_*".to_string()),
+            "{deny:?}"
+        );
+        // …and the shell rules still landed.
+        assert!(allow.contains(&"Bash(cargo check:*)".to_string()));
+    }
+
+    #[test]
+    fn configured_mcp_policy_still_owns_mcp_rules() {
+        // The converse: with a policy configured, gaviero *is* the source of
+        // truth and stale hand-edits are replaced.
+        let dir = tempdir().unwrap();
+        let settings_path = dir.path().join(".claude/settings.json");
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings_path,
+            r#"{"permissions":{"allow":["mcp__stale__*"],"deny":[]}}"#,
+        )
+        .unwrap();
+
+        let mut synth = fixture(dir.path().to_path_buf());
+        synth.permissions = McpPermissions {
+            allow: vec!["gaviero:*".into()],
+            deny: vec![],
+        };
+        synthesize_for_worktree(&synth).unwrap();
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let allow = json_string_array(&doc["permissions"], "allow");
+        assert!(!allow.contains(&"mcp__stale__*".to_string()), "{allow:?}");
+        assert!(allow.contains(&"mcp__gaviero__*".to_string()), "{allow:?}");
+    }
+
+    #[test]
+    fn synthesize_is_idempotent_for_bash_rules() {
+        let dir = tempdir().unwrap();
+        let mut synth = fixture(dir.path().to_path_buf());
+        synth.bash = bash_fixture();
+        synthesize_for_worktree(&synth).unwrap();
+        let first = std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
+        synthesize_for_worktree(&synth).unwrap();
+        let second = std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
+        assert_eq!(first, second, "re-synth must not duplicate rules");
+    }
+
+    #[test]
+    fn codex_config_omits_bash_rules_entirely() {
+        // Codex has no per-command permission surface; the policy must not
+        // leak into its TOML in any form.
+        let mut synth = fixture(PathBuf::from("/tmp/wt"));
+        synth.bash = bash_fixture();
+        let toml = codex_mcp_config_toml(&synth).unwrap();
+        assert!(!toml.contains("cargo check"), "{toml}");
+        assert!(!toml.contains("Bash("), "{toml}");
     }
 
     // ── MCP permission policy (Option A) ─────────────────────────────────
