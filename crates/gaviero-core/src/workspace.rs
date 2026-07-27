@@ -52,8 +52,17 @@ pub mod settings {
     /// backends honor the same list). Anything available but not approved
     /// triggers a `PermissionRequest` that the host must answer.
     pub const AGENT_APPROVED_TOOLS: &str = "agent.approvedTools";
-    /// Bash permission policy for in-process tool-agent backends (DeepSeek).
-    /// Sub-keys: `denylist`, `allowlist`, `timeoutSecs`, `outputCapBytes`.
+    /// Shell permission policy, defined once here and applied to every
+    /// backend. Sub-keys: `denylist`, `allowlist`, `timeoutSecs`,
+    /// `outputCapBytes`.
+    ///
+    /// In-process tool-agent backends enforce it directly
+    /// ([`crate::agent_session::tool_agent::policy::ToolPolicy`], which also
+    /// reads `timeoutSecs` / `outputCapBytes`). For subprocess providers the
+    /// `allowlist` / `denylist` are translated into native permission rules
+    /// by [`crate::mcp::synthesize_for_worktree`] — see
+    /// [`crate::mcp::BashPermissions`] for the per-provider fidelity notes.
+    /// Empty (the default) leaves each provider's own shell rules alone.
     pub const AGENT_PERMISSIONS_BASH: &str = "agent.permissions.bash";
 
     // Memory settings
@@ -987,6 +996,12 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         }
         settings::AGENT_APPROVED_TOOLS => {
             serde_json::json!(["Read", "Glob", "Grep"])
+        }
+        // Empty shell policy: only rules the operator wrote explicitly are
+        // translated into provider configs. The in-process tool-agent still
+        // falls back to its own built-in allowlist when this is unset.
+        settings::AGENT_PERMISSIONS_BASH => {
+            serde_json::json!({ "allowlist": [], "denylist": [] })
         }
 
         // Chat memory injection (S1)

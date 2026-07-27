@@ -29,7 +29,8 @@ pub mod tools;
 pub mod transport;
 
 pub use config_synth::{
-    Context7Config, ExtraMcpServer, ExtraMcpTransport, McpConfigSynth, McpPermissions,
+    BashPermissions, Context7Config, ExtraMcpServer, ExtraMcpTransport, ManagedRules,
+    McpConfigSynth, McpPermissions,
     TrustConsent, claude_mcp_config_json, claude_settings_permissions, codex_mcp_config_toml,
     codex_mcp_overrides_from_config_file, codex_synth_has_any_mcp, codex_synth_has_remote_mcp,
     host_from_mcp_url, mcp_json_has_remote_urls, synth_has_remote_url_servers,
@@ -46,8 +47,8 @@ pub use preflight::{
 };
 pub use resolver::{
     McpConfigOverrides, extra_servers_from_workspace, extra_urls_from_project_mcp_json,
-    parse_mcp_codex_trust_flag, parse_mcp_stdio_flag, parse_mcp_url_flag, resolve_context7_config,
-    resolve_mcp_config_synth, resolve_mcp_permissions,
+    parse_mcp_codex_trust_flag, parse_mcp_stdio_flag, parse_mcp_url_flag, resolve_bash_permissions,
+    resolve_context7_config, resolve_mcp_config_synth, resolve_mcp_permissions,
 };
 pub use server::{GavieroMcpServer, McpServerHandle, spawn_mcp_server};
 pub use telemetry_sink::{
