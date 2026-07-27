@@ -165,8 +165,155 @@ impl FileAutocomplete {
 pub struct PendingPermission {
     pub tool_name: String,
     pub description: String,
-    /// Send `true` to allow or `false`/drop to deny.
-    pub respond: tokio::sync::oneshot::Sender<bool>,
+    /// Original tool input (needed to echo `updatedInput` on allow, and to
+    /// drive the AskUserQuestion multi-choice UI).
+    pub input: serde_json::Value,
+    /// Send allow/deny (with optional updated input for AskUserQuestion).
+    pub respond: tokio::sync::oneshot::Sender<gaviero_core::observer::PermissionDecision>,
+    /// Interactive AskUserQuestion state. `None` for plain y/n tools.
+    pub ask: Option<AskUserQuestionState>,
+}
+
+impl PendingPermission {
+    pub fn new(
+        tool_name: String,
+        description: String,
+        input: serde_json::Value,
+        respond: tokio::sync::oneshot::Sender<gaviero_core::observer::PermissionDecision>,
+    ) -> Self {
+        let ask = if tool_name == "AskUserQuestion" {
+            AskUserQuestionState::from_input(&input)
+        } else {
+            None
+        };
+        Self {
+            tool_name,
+            description,
+            input,
+            respond,
+            ask,
+        }
+    }
+
+    pub fn is_ask_user_question(&self) -> bool {
+        self.ask.is_some()
+    }
+}
+
+/// One multiple-choice question from Claude's `AskUserQuestion` tool.
+#[derive(Debug, Clone)]
+pub struct AskQuestion {
+    pub question: String,
+    pub header: String,
+    pub multi_select: bool,
+    pub options: Vec<(String, String)>, // (label, description)
+}
+
+/// UI state while answering an `AskUserQuestion` prompt.
+#[derive(Debug, Clone)]
+pub struct AskUserQuestionState {
+    pub questions: Vec<AskQuestion>,
+    /// Selected option indices per question (multi-select uses a bitset via Vec).
+    pub selected: Vec<Vec<usize>>,
+    pub focus_q: usize,
+}
+
+impl AskUserQuestionState {
+    pub fn from_input(input: &serde_json::Value) -> Option<Self> {
+        let arr = input.get("questions")?.as_array()?;
+        if arr.is_empty() {
+            return None;
+        }
+        let mut questions = Vec::new();
+        for q in arr {
+            let question = q.get("question")?.as_str()?.to_string();
+            let header = q
+                .get("header")
+                .and_then(|h| h.as_str())
+                .unwrap_or("")
+                .to_string();
+            let multi_select = q
+                .get("multiSelect")
+                .and_then(|m| m.as_bool())
+                .unwrap_or(false);
+            let options = q
+                .get("options")
+                .and_then(|o| o.as_array())
+                .map(|opts| {
+                    opts.iter()
+                        .filter_map(|o| {
+                            Some((
+                                o.get("label")?.as_str()?.to_string(),
+                                o.get("description")
+                                    .and_then(|d| d.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                            ))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if options.is_empty() {
+                continue;
+            }
+            questions.push(AskQuestion {
+                question,
+                header,
+                multi_select,
+                options,
+            });
+        }
+        if questions.is_empty() {
+            return None;
+        }
+        let selected = vec![Vec::new(); questions.len()];
+        Some(Self {
+            questions,
+            selected,
+            focus_q: 0,
+        })
+    }
+
+    pub fn toggle_option(&mut self, opt_idx: usize) {
+        let Some(q) = self.questions.get(self.focus_q) else {
+            return;
+        };
+        if opt_idx >= q.options.len() {
+            return;
+        }
+        let sel = &mut self.selected[self.focus_q];
+        if q.multi_select {
+            if let Some(pos) = sel.iter().position(|&i| i == opt_idx) {
+                sel.remove(pos);
+            } else {
+                sel.push(opt_idx);
+            }
+        } else {
+            *sel = vec![opt_idx];
+        }
+    }
+
+    pub fn all_answered(&self) -> bool {
+        self.selected.iter().all(|s| !s.is_empty())
+    }
+
+    /// Build the `answers` map Claude expects (question text → label).
+    pub fn answers_map(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut answers = serde_json::Map::new();
+        for (qi, q) in self.questions.iter().enumerate() {
+            let labels: Vec<String> = self.selected[qi]
+                .iter()
+                .filter_map(|&oi| q.options.get(oi).map(|(l, _)| l.clone()))
+                .collect();
+            let value = if q.multi_select {
+                serde_json::Value::String(labels.join(", "))
+            } else {
+                serde_json::Value::String(labels.first().cloned().unwrap_or_default())
+            };
+            answers.insert(q.question.clone(), value);
+        }
+        answers
+    }
 }
 
 impl std::fmt::Debug for PendingPermission {
@@ -174,6 +321,7 @@ impl std::fmt::Debug for PendingPermission {
         f.debug_struct("PendingPermission")
             .field("tool_name", &self.tool_name)
             .field("description", &self.description)
+            .field("ask", &self.ask.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -571,7 +719,76 @@ impl AgentChatState {
     pub fn respond_active_permission(&mut self, allow: bool) {
         let conv = self.active_conversation_mut();
         if let Some(perm) = conv.pending_permission.take() {
-            let _ = perm.respond.send(allow);
+            let decision = if allow {
+                if let Some(ask) = perm.ask.as_ref() {
+                    let mut updated = perm.input.clone();
+                    if let Some(obj) = updated.as_object_mut() {
+                        obj.insert(
+                            "answers".into(),
+                            serde_json::Value::Object(ask.answers_map()),
+                        );
+                    }
+                    gaviero_core::observer::PermissionDecision::Allow {
+                        updated_input: Some(updated),
+                    }
+                } else {
+                    gaviero_core::observer::PermissionDecision::Allow {
+                        updated_input: Some(perm.input.clone()),
+                    }
+                }
+            } else {
+                gaviero_core::observer::PermissionDecision::deny_with_message("Denied by user")
+            };
+            let _ = perm.respond.send(decision);
+        }
+    }
+
+    /// Submit AskUserQuestion answers when every question has a selection.
+    pub fn submit_active_ask_answers(&mut self) -> bool {
+        let ready = self
+            .active_conversation()
+            .pending_permission
+            .as_ref()
+            .and_then(|p| p.ask.as_ref())
+            .map(|a| a.all_answered())
+            .unwrap_or(false);
+        if ready {
+            self.respond_active_permission(true);
+        }
+        ready
+    }
+
+    /// Toggle an option on the focused AskUserQuestion (1-based digit).
+    pub fn ask_toggle_option(&mut self, digit: u8) -> bool {
+        let conv = self.active_conversation_mut();
+        let Some(perm) = conv.pending_permission.as_mut() else {
+            return false;
+        };
+        let Some(ask) = perm.ask.as_mut() else {
+            return false;
+        };
+        if digit == 0 {
+            return false;
+        }
+        ask.toggle_option((digit - 1) as usize);
+        true
+    }
+
+    pub fn ask_next_question(&mut self) {
+        if let Some(perm) = self.active_conversation_mut().pending_permission.as_mut()
+            && let Some(ask) = perm.ask.as_mut()
+        {
+            if ask.focus_q + 1 < ask.questions.len() {
+                ask.focus_q += 1;
+            }
+        }
+    }
+
+    pub fn ask_prev_question(&mut self) {
+        if let Some(perm) = self.active_conversation_mut().pending_permission.as_mut()
+            && let Some(ask) = perm.ask.as_mut()
+        {
+            ask.focus_q = ask.focus_q.saturating_sub(1);
         }
     }
 
@@ -3480,7 +3697,7 @@ impl AgentChatState {
             }
         }
 
-        // Permission request overlay: replaces normal input area
+        // Permission / AskUserQuestion overlay: replaces normal input area
         if let Some(ref perm) = self.conversations[self.active_conv].pending_permission {
             let warn_style = Style::default()
                 .fg(theme::WARNING)
@@ -3491,59 +3708,108 @@ impl AgentChatState {
                 .fg(theme::ACCENT)
                 .bg(bg)
                 .add_modifier(Modifier::BOLD);
+            let muted = Style::default().fg(theme::TEXT_DIM).bg(bg);
 
-            // Line 0: header
-            let header = format!(" ⚠ Permission: {} ", perm.tool_name);
-            let mut cx = area.x;
-            for ch in header.chars() {
-                if cx < area.x + area.width
-                    && cx < buf.area().right()
-                    && area.y < buf.area().bottom()
-                {
-                    buf[(cx, area.y)].set_char(ch).set_style(warn_style);
-                    cx += 1;
-                }
-            }
-
-            // Line 1: description (truncated to fit)
-            if area.height > 1 {
-                let desc_y = area.y + 1;
-                let max_w = area.width as usize;
-                let desc: String = perm
-                    .description
-                    .chars()
-                    .take(max_w.saturating_sub(1))
-                    .collect();
+            let put_line = |buf: &mut RataBuf, y: u16, text: &str, style: Style| {
                 let mut cx = area.x;
-                buf[(cx, desc_y)].set_char(' ').set_style(text_style);
-                cx += 1;
-                for ch in desc.chars() {
+                for ch in text.chars() {
                     if cx < area.x + area.width
                         && cx < buf.area().right()
-                        && desc_y < buf.area().bottom()
+                        && y < buf.area().bottom()
                     {
-                        buf[(cx, desc_y)].set_char(ch).set_style(text_style);
+                        buf[(cx, y)].set_char(ch).set_style(style);
                         cx += 1;
                     }
                 }
-            }
+            };
 
-            // Last line: key hints
-            let hint_y = area.y + area.height.saturating_sub(1);
-            let keys = " [y] Allow  [n] Deny ";
-            let mut cx = area.x;
-            for ch in keys.chars() {
-                if cx < area.x + area.width
-                    && cx < buf.area().right()
-                    && hint_y < buf.area().bottom()
-                {
-                    let s = if ch == 'y' || ch == 'n' {
-                        key_style
+            if let Some(ref ask) = perm.ask {
+                put_line(buf, area.y, " ❓ Agent question ", warn_style);
+                let mut row = 1u16;
+                if let Some(q) = ask.questions.get(ask.focus_q) {
+                    let title = if q.header.is_empty() {
+                        format!(" {}. {}", ask.focus_q + 1, q.question)
                     } else {
-                        text_style
+                        format!(" {}. [{}] {}", ask.focus_q + 1, q.header, q.question)
                     };
-                    buf[(cx, hint_y)].set_char(ch).set_style(s);
-                    cx += 1;
+                    if row < area.height {
+                        put_line(
+                            buf,
+                            area.y + row,
+                            &title
+                                .chars()
+                                .take(area.width as usize)
+                                .collect::<String>(),
+                            text_style,
+                        );
+                        row += 1;
+                    }
+                    for (oi, (label, desc)) in q.options.iter().enumerate() {
+                        if row >= area.height.saturating_sub(1) {
+                            break;
+                        }
+                        let marked = ask.selected[ask.focus_q].contains(&oi);
+                        let mark = if marked { "●" } else { "○" };
+                        let line = if desc.is_empty() {
+                            format!("  {mark} {}. {label}", oi + 1)
+                        } else {
+                            format!("  {mark} {}. {label} — {desc}", oi + 1)
+                        };
+                        put_line(
+                            buf,
+                            area.y + row,
+                            &line.chars().take(area.width as usize).collect::<String>(),
+                            if marked { key_style } else { text_style },
+                        );
+                        row += 1;
+                    }
+                }
+                let hint_y = area.y + area.height.saturating_sub(1);
+                let hint = if ask.questions.len() > 1 {
+                    format!(
+                        " [1-9] select  ↑↓ question ({}/{})  Enter submit  n deny ",
+                        ask.focus_q + 1,
+                        ask.questions.len()
+                    )
+                } else {
+                    " [1-9] select  Enter submit  n deny ".into()
+                };
+                put_line(buf, hint_y, &hint, muted);
+            } else {
+                // Line 0: header
+                let header = format!(" ⚠ Permission: {} ", perm.tool_name);
+                put_line(buf, area.y, &header, warn_style);
+
+                // Line 1: description (truncated to fit)
+                if area.height > 1 {
+                    let max_w = area.width as usize;
+                    let desc: String = perm
+                        .description
+                        .chars()
+                        .take(max_w.saturating_sub(1))
+                        .collect();
+                    put_line(buf, area.y + 1, &format!(" {desc}"), text_style);
+                }
+
+                // Last line: key hints
+                let hint_y = area.y + area.height.saturating_sub(1);
+                put_line(buf, hint_y, " [y] Allow  [n] Deny ", text_style);
+                // Highlight y/n
+                let keys = " [y] Allow  [n] Deny ";
+                let mut cx = area.x;
+                for ch in keys.chars() {
+                    if cx < area.x + area.width
+                        && cx < buf.area().right()
+                        && hint_y < buf.area().bottom()
+                    {
+                        let s = if ch == 'y' || ch == 'n' {
+                            key_style
+                        } else {
+                            text_style
+                        };
+                        buf[(cx, hint_y)].set_char(ch).set_style(s);
+                        cx += 1;
+                    }
                 }
             }
             return;

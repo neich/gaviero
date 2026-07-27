@@ -124,14 +124,50 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
     }
 
     if app.chat_state.active_conv_pending_permission() {
-        match action {
-            Action::InsertChar('y') | Action::InsertChar('Y') => {
-                app.chat_state.respond_active_permission(true);
+        let is_ask = app
+            .chat_state
+            .active_conversation()
+            .pending_permission
+            .as_ref()
+            .map(|p| p.is_ask_user_question())
+            .unwrap_or(false);
+        if is_ask {
+            match action {
+                Action::InsertChar(c) if c.is_ascii_digit() => {
+                    let digit = c.to_digit(10).unwrap_or(0) as u8;
+                    app.chat_state.ask_toggle_option(digit);
+                }
+                Action::CursorDown | Action::Tab => {
+                    app.chat_state.ask_next_question();
+                }
+                Action::CursorUp => {
+                    app.chat_state.ask_prev_question();
+                }
+                Action::Enter => {
+                    if app.chat_state.submit_active_ask_answers() {
+                        // submitted
+                    } else {
+                        app.status_message = Some((
+                            "Select an option for each question (1-9), then Enter".into(),
+                            std::time::Instant::now(),
+                        ));
+                    }
+                }
+                Action::InsertChar('n') | Action::InsertChar('N') | Action::Quit => {
+                    app.chat_state.respond_active_permission(false);
+                }
+                _ => {}
             }
-            Action::InsertChar('n') | Action::InsertChar('N') | Action::Quit => {
-                app.chat_state.respond_active_permission(false);
+        } else {
+            match action {
+                Action::InsertChar('y') | Action::InsertChar('Y') => {
+                    app.chat_state.respond_active_permission(true);
+                }
+                Action::InsertChar('n') | Action::InsertChar('N') | Action::Quit => {
+                    app.chat_state.respond_active_permission(false);
+                }
+                _ => {}
             }
-            _ => {}
         }
         return;
     }
