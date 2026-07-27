@@ -181,6 +181,11 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
         Event::Mouse(mouse) => app.handle_mouse(mouse),
         Event::Resize(_w, _h) => {
             app.needs_full_redraw = true;
+            // Mux / WT resize is a known trigger for dropping pane mouse
+            // modes (and, one layer up, the psmux client's registration).
+            // Re-assert immediately so drag selection recovers with the
+            // resize rather than waiting for the throttled tick keep-alive.
+            app.maybe_reassert_vt_mouse(true);
         }
         Event::TerminalFocus(focused) => {
             app.terminal_has_focus = focused;
@@ -818,18 +823,24 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             conv_id,
             tool_name,
             description,
+            input,
             respond,
         } => {
             if let Some(idx) = app.chat_state.find_conv_idx(&conv_id) {
-                app.chat_state.conversations[idx].streaming_status =
-                    format!("Waiting for permission: {}", tool_name);
+                let is_ask = tool_name == "AskUserQuestion";
+                app.chat_state.conversations[idx].streaming_status = if is_ask {
+                    "Waiting for your answers…".into()
+                } else {
+                    format!("Waiting for permission: {}", tool_name)
+                };
                 app.chat_state.set_pending_permission(
                     &conv_id,
-                    crate::panels::agent_chat::PendingPermission {
+                    crate::panels::agent_chat::PendingPermission::new(
                         tool_name,
                         description,
+                        input,
                         respond,
-                    },
+                    ),
                 );
                 app.panel_visible.side_panel = true;
                 if app.side_panel != SidePanelMode::AgentChat {
@@ -838,7 +849,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 app.chat_state.active_conv = idx;
                 app.focus = Focus::SidePanel;
             } else {
-                let _ = respond.send(false);
+                let _ = respond.send(gaviero_core::observer::PermissionDecision::deny());
             }
         }
         Event::SwarmPhaseChanged(phase) => {
@@ -1261,125 +1272,157 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                         None
                     }
                 };
-                let mcp_retrieval_cfg = app
-                    .workspace
-                    .resolve_retrieval_config(Some(&workspace_root_for_mcp));
-                let mcp_rerank_cfg = app
-                    .workspace
-                    .resolve_rerank_config(Some(&workspace_root_for_mcp));
-                let mcp_specificity = app
-                    .workspace
-                    .resolve_specificity_config(Some(&workspace_root_for_mcp));
-                let mcp_edge_weights = app
-                    .workspace
-                    .resolve_all_edge_weights(Some(&workspace_root_for_mcp));
-                // Phase 1: fan the tool-call stream out to both the TUI
-                // audit panel and the host-side NDJSON telemetry sink
-                // (`<workspace>/.gaviero/mcp_calls.ndjson`, size-rotated,
-                // never via the memory writer).
-                let mcp_observer: std::sync::Arc<dyn gaviero_core::mcp::McpToolCallObserver> =
-                    std::sync::Arc::new(gaviero_core::mcp::FanOutMcpObserver::new(vec![
-                        std::sync::Arc::new(super::observers::TuiMcpObserver {
-                            tx: app.event_tx.clone(),
-                        }),
-                        std::sync::Arc::new(gaviero_core::mcp::NdjsonTelemetrySink::for_workspace(
-                            &workspace_root_for_mcp,
-                        )),
-                    ]));
-                let server = gaviero_core::mcp::GavieroMcpServer::new(
-                    stores.clone(),
-                    workspace_root_for_mcp.clone(),
-                    mcp_observer,
-                    mcp_retrieval_cfg,
-                    mcp_rerank_cfg,
-                    app.memory_reranker.clone(),
-                )
-                .with_specificity(mcp_specificity)
-                .with_edge_weights(mcp_edge_weights)
-                .with_permissions(gaviero_core::mcp::resolve_mcp_permissions(
-                    &app.workspace,
-                    Some(&workspace_root_for_mcp),
-                ))
-                .with_symbol_enrichment(
-                    app.workspace
+                // Synthesize provider configs for either path below
+                // (hosting or reusing). Agents address the endpoint, not
+                // which process owns the accept loop.
+                let synthesize_mcp_configs = |app: &App, endpoint: &gaviero_core::mcp::McpEndpoint| {
+                    let codex_trust = match app
+                        .workspace
                         .resolve_setting(
-                            gaviero_core::workspace::settings::REPO_MAP_SYMBOL_ENRICHMENT_ENABLED,
-                            Some(&workspace_root_for_mcp),
-                        )
-                        .as_bool()
-                        .unwrap_or(false),
-                )
-                // G2 / OD-2: symbol-vector queries embed with
-                // repoMap.embedder.model; "inherit" → memory embedder.
-                .with_symbol_embedder_name(
-                    app.workspace
-                        .resolve_setting(
-                            gaviero_core::workspace::settings::REPO_MAP_EMBEDDER_MODEL,
+                            gaviero_core::workspace::settings::MCP_GAVIERO_CODEX_TRUST,
                             Some(&workspace_root_for_mcp),
                         )
                         .as_str()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty() && *s != "inherit")
-                        .map(str::to_string),
-                );
-                // Phase 1: warm the graph cache + reranker in the
-                // background so the first user query never pays the cold
-                // start. The cache is shared via Arc with every spawned
-                // connection clone.
-                let warm = server.clone();
-                tokio::spawn(async move { warm.warmup().await });
-                match gaviero_core::mcp::spawn_mcp_server(server, &endpoint) {
-                    Ok(handle) => {
-                        tracing::info!(
-                            target: "mcp_server",
-                            endpoint = %handle.endpoint,
-                            "mcp server listening"
-                        );
-                        app.mcp_server = Some(handle);
-                        let codex_trust = match app
-                            .workspace
-                            .resolve_setting(
-                                gaviero_core::workspace::settings::MCP_GAVIERO_CODEX_TRUST,
-                                Some(&workspace_root_for_mcp),
-                            )
-                            .as_str()
-                            .unwrap_or("unknown")
-                        {
-                            "granted" | "trusted" => gaviero_core::mcp::TrustConsent::Granted,
-                            "denied" | "untrusted" => gaviero_core::mcp::TrustConsent::Denied,
-                            _ => gaviero_core::mcp::TrustConsent::Unknown,
-                        };
-                        let mut overrides = gaviero_core::mcp::McpConfigOverrides::default();
-                        overrides.codex_trust = Some(codex_trust);
-                        let synth = gaviero_core::mcp::resolve_mcp_config_synth(
-                            &app.workspace,
-                            &workspace_root_for_mcp,
-                            endpoint.clone(),
-                            &overrides,
-                        );
-                        if let Err(e) = gaviero_core::mcp::synthesize_for_worktree(&synth) {
-                            tracing::warn!(
-                                target: "mcp_server",
-                                error = %e,
-                                "failed to synthesize workspace MCP config"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        // C9: keep the session alive (prompt-time injection
-                        // still works) but surface the degradation in chat —
-                        // the violation was the silence, not the survival.
+                        .unwrap_or("unknown")
+                    {
+                        "granted" | "trusted" => gaviero_core::mcp::TrustConsent::Granted,
+                        "denied" | "untrusted" => gaviero_core::mcp::TrustConsent::Denied,
+                        _ => gaviero_core::mcp::TrustConsent::Unknown,
+                    };
+                    let mut overrides = gaviero_core::mcp::McpConfigOverrides::default();
+                    overrides.codex_trust = Some(codex_trust);
+                    let synth = gaviero_core::mcp::resolve_mcp_config_synth(
+                        &app.workspace,
+                        &workspace_root_for_mcp,
+                        endpoint.clone(),
+                        &overrides,
+                    );
+                    if let Err(e) = gaviero_core::mcp::synthesize_for_worktree(&synth) {
                         tracing::warn!(
                             target: "mcp_server",
                             error = %e,
-                            "mcp server failed to start — falling back to prompt-time injection only"
+                            "failed to synthesize workspace MCP config"
                         );
-                        app.chat_state.add_system_message(&format!(
-                            "MCP server failed to start ({e}). Subprocess agents lose the \
-                             gaviero MCP tools (memory_search, blast_radius, …) this session; \
-                             prompt-time context injection still applies. Check the endpoint \
-                             (socket/pipe) and restart gaviero to retry."
-                        ));
+                    }
+                };
+                // Another gaviero process (typically a first TUI, or a
+                // headless CLI) may already own this workspace endpoint.
+                // Rebinding fails on Windows (`first_pipe_instance`) and
+                // would orphan the other listener on Unix — same reuse
+                // contract as `gaviero-cli::prepare_mcp_for_swarm`.
+                if endpoint.has_live_server() {
+                    tracing::info!(
+                        target: "mcp_server",
+                        endpoint = %endpoint,
+                        "reusing mcp server already listening on workspace endpoint"
+                    );
+                    synthesize_mcp_configs(app, &endpoint);
+                    app.chat_state.add_system_message(&format!(
+                        "Reusing gaviero MCP server already listening on {endpoint} \
+                         (another gaviero instance serves this workspace). Keep that \
+                         instance open so subprocess agents keep memory_search, \
+                         blast_radius, and the other gaviero MCP tools."
+                    ));
+                } else {
+                    let mcp_retrieval_cfg = app
+                        .workspace
+                        .resolve_retrieval_config(Some(&workspace_root_for_mcp));
+                    let mcp_rerank_cfg = app
+                        .workspace
+                        .resolve_rerank_config(Some(&workspace_root_for_mcp));
+                    let mcp_specificity = app
+                        .workspace
+                        .resolve_specificity_config(Some(&workspace_root_for_mcp));
+                    let mcp_edge_weights = app
+                        .workspace
+                        .resolve_all_edge_weights(Some(&workspace_root_for_mcp));
+                    // Phase 1: fan the tool-call stream out to both the TUI
+                    // audit panel and the host-side NDJSON telemetry sink
+                    // (`<workspace>/.gaviero/mcp_calls.ndjson`, size-rotated,
+                    // never via the memory writer).
+                    let mcp_observer: std::sync::Arc<dyn gaviero_core::mcp::McpToolCallObserver> =
+                        std::sync::Arc::new(gaviero_core::mcp::FanOutMcpObserver::new(vec![
+                            std::sync::Arc::new(super::observers::TuiMcpObserver {
+                                tx: app.event_tx.clone(),
+                            }),
+                            std::sync::Arc::new(
+                                gaviero_core::mcp::NdjsonTelemetrySink::for_workspace(
+                                    &workspace_root_for_mcp,
+                                ),
+                            ),
+                        ]));
+                    let server = gaviero_core::mcp::GavieroMcpServer::new(
+                        stores.clone(),
+                        workspace_root_for_mcp.clone(),
+                        mcp_observer,
+                        mcp_retrieval_cfg,
+                        mcp_rerank_cfg,
+                        app.memory_reranker.clone(),
+                    )
+                    .with_specificity(mcp_specificity)
+                    .with_edge_weights(mcp_edge_weights)
+                    .with_permissions(gaviero_core::mcp::resolve_mcp_permissions(
+                        &app.workspace,
+                        Some(&workspace_root_for_mcp),
+                    ))
+                    .with_symbol_enrichment(
+                        app.workspace
+                            .resolve_setting(
+                                gaviero_core::workspace::settings::REPO_MAP_SYMBOL_ENRICHMENT_ENABLED,
+                                Some(&workspace_root_for_mcp),
+                            )
+                            .as_bool()
+                            .unwrap_or(false),
+                    )
+                    // G2 / OD-2: symbol-vector queries embed with
+                    // repoMap.embedder.model; "inherit" → memory embedder.
+                    .with_symbol_embedder_name(
+                        app.workspace
+                            .resolve_setting(
+                                gaviero_core::workspace::settings::REPO_MAP_EMBEDDER_MODEL,
+                                Some(&workspace_root_for_mcp),
+                            )
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty() && *s != "inherit")
+                            .map(str::to_string),
+                    );
+                    // Phase 1: warm the graph cache + reranker in the
+                    // background so the first user query never pays the cold
+                    // start. The cache is shared via Arc with every spawned
+                    // connection clone.
+                    let warm = server.clone();
+                    tokio::spawn(async move { warm.warmup().await });
+                    match gaviero_core::mcp::spawn_mcp_server(server, &endpoint) {
+                        Ok(handle) => {
+                            tracing::info!(
+                                target: "mcp_server",
+                                endpoint = %handle.endpoint,
+                                "mcp server listening"
+                            );
+                            app.mcp_server = Some(handle);
+                            synthesize_mcp_configs(app, &endpoint);
+                        }
+                        Err(e) => {
+                            // C9: keep the session alive (prompt-time injection
+                            // still works) but surface the degradation in chat —
+                            // the violation was the silence, not the survival.
+                            // A race remains: another instance can bind between
+                            // the live probe and spawn (same as CLI).
+                            tracing::warn!(
+                                target: "mcp_server",
+                                error = %e,
+                                "mcp server failed to start — falling back to prompt-time injection only"
+                            );
+                            app.chat_state.add_system_message(&format!(
+                                "MCP server failed to start ({e}). If another gaviero \
+                                 instance just claimed {endpoint}, restart this session \
+                                 to reuse it; otherwise subprocess agents lose the \
+                                 gaviero MCP tools (memory_search, blast_radius, …) \
+                                 this session while prompt-time context injection \
+                                 still applies."
+                            ));
+                        }
                     }
                 }
                 if let Some(summary) = disabled_external_summary {
@@ -1519,6 +1562,18 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
             }
             _ => {}
         }
+    }
+
+    match action {
+        Action::ResizePanelLeft => {
+            app.resize_horizontal_panels(-1);
+            return;
+        }
+        Action::ResizePanelRight => {
+            app.resize_horizontal_panels(1);
+            return;
+        }
+        _ => {}
     }
 
     if app.focus == Focus::Terminal {

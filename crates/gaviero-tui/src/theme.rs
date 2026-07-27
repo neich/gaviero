@@ -136,6 +136,18 @@ pub const TERMINAL_RESIZE_STEP: u16 = 5;
 pub const TERMINAL_MAX_PERCENT: u16 = 80;
 /// Terminal minimum split percentage.
 pub const TERMINAL_MIN_PERCENT: u16 = 10;
+/// Horizontal panel resize step (columns per Ctrl+Alt+Left/Right).
+pub const PANEL_WIDTH_RESIZE_STEP: u16 = 5;
+/// Explorer (file tree) minimum width in columns.
+pub const FILE_TREE_MIN_WIDTH: u16 = 12;
+/// Explorer (file tree) maximum width in columns.
+pub const FILE_TREE_MAX_WIDTH: u16 = 80;
+/// Side panel (agent chat / swarm / git / memory) minimum width.
+pub const SIDE_PANEL_MIN_WIDTH: u16 = 20;
+/// Side panel maximum width in columns.
+pub const SIDE_PANEL_MAX_WIDTH: u16 = 120;
+/// Editor pane must keep at least this many columns after a horizontal resize.
+pub const EDITOR_MIN_WIDTH: u16 = 20;
 /// Diff viewer page-scroll lines.
 pub const DIFF_PAGE_SCROLL: usize = 10;
 /// Mouse scroll delta (lines per wheel event).

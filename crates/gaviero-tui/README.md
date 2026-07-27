@@ -84,6 +84,8 @@ Chat input supports `$skill` invocation with `$`-prefix autocomplete. Full slash
 | Ctrl+F / F3 | Find in file / workspace search |
 | F5 / F7 | Format buffer / toggle word wrap |
 | Ctrl+T / Ctrl+W | New tab / close tab |
+| Alt+Up/Down (Ctrl+Up/Down fallback) | Resize terminal split / chat input height |
+| Ctrl+Alt+Left/Right | Resize explorer / editor / side panel widths |
 
 F7 is the reliable word-wrap chord on every host. See [Root README](../../README.md) for the full editor keybinding tables.
 

@@ -6,6 +6,44 @@ use crate::swarm::models::{AgentStatus, SwarmResult};
 use crate::swarm::verify::{CostEstimate, EscalationRecord, VerificationStep};
 use crate::types::{ModelTier, WriteProposal};
 
+/// Host decision for a tool-permission / AskUserQuestion prompt.
+///
+/// Claude Code's control protocol expects `updatedInput` on allow (especially
+/// for `AskUserQuestion`, which carries answers in the same object). Dropping
+/// the oneshot is treated as deny by callers.
+#[derive(Debug, Clone)]
+pub enum PermissionDecision {
+    Allow {
+        /// Tool input to execute with. `None` → use the original request input.
+        updated_input: Option<serde_json::Value>,
+    },
+    Deny {
+        message: Option<String>,
+    },
+}
+
+impl PermissionDecision {
+    pub fn allow() -> Self {
+        Self::Allow {
+            updated_input: None,
+        }
+    }
+
+    pub fn deny() -> Self {
+        Self::Deny { message: None }
+    }
+
+    pub fn deny_with_message(message: impl Into<String>) -> Self {
+        Self::Deny {
+            message: Some(message.into()),
+        }
+    }
+
+    pub fn is_allow(&self) -> bool {
+        matches!(self, Self::Allow { .. })
+    }
+}
+
 /// Observer trait for write gate lifecycle events.
 /// The TUI implements this to receive notifications and update the UI.
 pub trait WriteGateObserver: Send + Sync {
@@ -38,20 +76,23 @@ pub trait AcpObserver: Send + Sync {
     /// The TUI uses this to show a compact inline diff summary during streaming.
     fn on_proposal_deferred(&self, path: &Path, old_content: Option<&str>, new_content: &str);
 
-    /// Called when the agent subprocess needs user approval to run a tool.
+    /// Called when the agent subprocess needs user approval to run a tool
+    /// (or wants clarifying answers via `AskUserQuestion`).
     ///
     /// The pipeline blocks until the `respond` sender is used:
-    /// - `respond.send(true)` → allow the tool
-    /// - `respond.send(false)` (or drop) → deny the tool
+    /// - `PermissionDecision::Allow` → run the tool (optionally with
+    ///   `updated_input`, required for `AskUserQuestion` answers)
+    /// - `PermissionDecision::Deny` (or drop) → deny the tool
     ///
     /// The default implementation auto-allows (preserves existing non-TUI behaviour).
     fn on_permission_request(
         &self,
         _tool_name: &str,
         _description: &str,
-        respond: tokio::sync::oneshot::Sender<bool>,
+        _input: &serde_json::Value,
+        respond: tokio::sync::oneshot::Sender<PermissionDecision>,
     ) {
-        let _ = respond.send(true);
+        let _ = respond.send(PermissionDecision::allow());
     }
 
     // ── Inline validation (default no-op) ──────────────────────────

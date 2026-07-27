@@ -162,9 +162,14 @@ impl ToolPolicy {
             return Ok(());
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
-        observer.on_permission_request("Bash", command, tx);
+        observer.on_permission_request(
+            "Bash",
+            command,
+            &serde_json::json!({ "command": command }),
+            tx,
+        );
         match rx.await {
-            Ok(true) => Ok(()),
+            Ok(decision) if decision.is_allow() => Ok(()),
             _ => Err("permission denied".to_string()),
         }
     }
@@ -281,13 +286,19 @@ impl AcpObserver for ScriptingObserver {
         &self,
         tool_name: &str,
         description: &str,
-        respond: tokio::sync::oneshot::Sender<bool>,
+        _input: &serde_json::Value,
+        respond: tokio::sync::oneshot::Sender<crate::observer::PermissionDecision>,
     ) {
         self.prompted
             .lock()
             .unwrap()
             .push(format!("{tool_name}:{description}"));
-        let _ = respond.send(self.allow);
+        let decision = if self.allow {
+            crate::observer::PermissionDecision::allow()
+        } else {
+            crate::observer::PermissionDecision::deny()
+        };
+        let _ = respond.send(decision);
     }
 }
 

@@ -492,8 +492,9 @@ impl App {
     /// Re-assert the host-terminal VT mouse-passthrough request and (on
     /// Windows) the shared console *input* modes, throttled to
     /// `theme::VT_MOUSE_REASSERT_MS`. `force` skips the throttle — used
-    /// on host focus-gain, when a mux switch/reattach is the likeliest
-    /// moment for the outer layer to have dropped the pane's mouse modes.
+    /// on host focus-gain and resize, when a mux switch/reattach/resize is
+    /// the likeliest moment for the outer layer to have dropped the pane's
+    /// mouse modes.
     pub(crate) fn maybe_reassert_vt_mouse(&mut self, force: bool) {
         let interval = std::time::Duration::from_millis(crate::theme::VT_MOUSE_REASSERT_MS);
         if !force && self.last_vt_mouse_reassert.elapsed() < interval {
@@ -759,6 +760,11 @@ impl App {
     /// Get the effective layout constraints, honoring active preset.
     fn effective_panel_constraints(&self, total_width: u16) -> (u16, u16) {
         layout::effective_panel_constraints(self, total_width)
+    }
+
+    /// Ctrl+Alt+Left/Right — resize explorer / editor / side panel widths.
+    fn resize_horizontal_panels(&mut self, delta_cols: i16) {
+        layout::resize_horizontal(self, delta_cols);
     }
 
     // ── Review mode actions ──────────────────────────────────────

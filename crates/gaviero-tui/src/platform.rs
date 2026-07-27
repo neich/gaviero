@@ -37,15 +37,24 @@ const DISABLE_VT_MOUSE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 /// sequences). Must run after `EnterAlternateScreen`/`EnableMouseCapture`.
 ///
 /// Called once at startup AND re-asserted while running (throttled Tick +
-/// host focus-gain — `App::maybe_reassert_vt_mouse`): a multiplexer keeps
-/// its own per-pane record of these modes (psmux gates click forwarding on
-/// it) and can lose it without any signal to gaviero, e.g. on a pane
-/// respawn or vt100 state reset. Note the Jul 2026 "selection dead
-/// app-wide" incident turned out to be one layer up — Windows Terminal
-/// dropped the *psmux client's* mouse registration, which psmux only
-/// re-arms in SSH mode — so this keep-alive could not have fixed it; it
-/// remains as cheap insurance for the pane-level loss it does cover. The
-/// sequences are idempotent, so re-writing is safe on every host.
+/// host focus-gain / resize — `App::maybe_reassert_vt_mouse`): a multiplexer
+/// keeps its own per-pane record of these modes (psmux gates click/drag
+/// forwarding on `pane_wants_mouse`, which prefers DECSET 1000/1002) and
+/// can lose it without any signal to gaviero when ConPTY strips or resets
+/// the private modes. Re-writing is idempotent.
+///
+/// Two layers can kill selection under psmux; this keep-alive only covers
+/// the pane layer:
+/// 1. **Pane** — ConPTY drops DECSET 1000/1049h from the output pipe so
+///    psmux's vt100 parser loses `mouse_protocol_mode`. Gaviero's reassert
+///    tries to restore it; psmux also falls back to a last-row TUI
+///    heuristic (must not require cursor-at-bottom — gaviero's caret sits
+///    mid-pane).
+/// 2. **Client** — Windows Terminal drops the *psmux client's* mouse
+///    registration (keys fine, mouse dead). Fixed in psmux by
+///    `send_mouse_keepalive` on a 30s / resize cadence for *all* input
+///    modes (not only SSH). Detach/reattach or resize recovers on older
+///    psmux builds.
 #[cfg(windows)]
 pub fn enable_vt_mouse_passthrough(w: &mut impl Write) -> std::io::Result<()> {
     w.write_all(ENABLE_VT_MOUSE.as_bytes())?;

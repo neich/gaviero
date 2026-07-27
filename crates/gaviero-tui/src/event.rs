@@ -64,14 +64,16 @@ pub enum Event {
         deletions: usize,
     },
 
-    /// The agent subprocess needs user approval to run a tool.
+    /// The agent subprocess needs user approval to run a tool, or is asking
+    /// clarifying questions via `AskUserQuestion`.
     /// The pipeline is suspended until the `respond` channel is used.
     PermissionRequest {
         conv_id: String,
         tool_name: String,
         description: String,
-        /// Send `true` to allow, `false` (or drop) to deny.
-        respond: tokio::sync::oneshot::Sender<bool>,
+        input: serde_json::Value,
+        /// Allow / deny (optionally with updated tool input for AskUserQuestion).
+        respond: tokio::sync::oneshot::Sender<gaviero_core::observer::PermissionDecision>,
     },
 
     /// All file proposals from an agent response are ready for batch review.

@@ -93,10 +93,16 @@ pub enum StreamEvent {
 
     /// Permission request — Claude wants to execute a tool and needs user approval.
     /// The pipeline pauses until the user approves or denies via stdin.
+    ///
+    /// Emitted for both the legacy `type: permission_request` NDJSON line and
+    /// the modern control protocol (`type: control_request`,
+    /// `request.subtype: can_use_tool`).
     PermissionRequest {
         tool_name: String,
         description: String,
         request_id: String,
+        /// Tool arguments from the control request (empty object for legacy).
+        input: Value,
     },
 
     /// Anything we don't specifically handle.
@@ -295,7 +301,7 @@ pub fn parse_stream_line(line: &str) -> Result<StreamEvent> {
             })
         }
 
-        // Permission request: Claude wants to run a tool and needs approval.
+        // Permission request (legacy): Claude wants to run a tool and needs approval.
         // {"type":"permission_request","tool_name":"Bash","description":"Run ...","id":"req_123"}
         "permission_request" => {
             let tool_name = opt_str(&v, "tool_name").to_string();
@@ -307,14 +313,86 @@ pub fn parse_stream_line(line: &str) -> Result<StreamEvent> {
                 .and_then(|s| s.as_str())
                 .unwrap_or("")
                 .to_string();
+            let input = v.get("input").cloned().unwrap_or(Value::Object(Default::default()));
             Ok(StreamEvent::PermissionRequest {
                 tool_name,
                 description,
                 request_id,
+                input,
             })
         }
 
+        // Modern Agent SDK / CLI control protocol (Claude Code ≥2.1):
+        // {"type":"control_request","request_id":"...","request":{"subtype":"can_use_tool",
+        //   "tool_name":"Bash","input":{...},"description":"..."}}
+        "control_request" => parse_control_request(&v),
+
         _ => Ok(StreamEvent::Unknown(v)),
+    }
+}
+
+/// Parse a `control_request` envelope. Only `can_use_tool` is mapped to a
+/// typed event; other subtypes (initialize ACKs from the CLI, interrupt, …)
+/// pass through as [`StreamEvent::Unknown`].
+fn parse_control_request(v: &Value) -> Result<StreamEvent> {
+    let request = v.get("request").cloned().unwrap_or(Value::Null);
+    let subtype = opt_str(&request, "subtype");
+    if subtype != "can_use_tool" {
+        return Ok(StreamEvent::Unknown(v.clone()));
+    }
+
+    let tool_name = opt_str(&request, "tool_name").to_string();
+    let input = request
+        .get("input")
+        .cloned()
+        .unwrap_or(Value::Object(Default::default()));
+    let description = permission_description(&tool_name, &request, &input);
+    let request_id = v
+        .get("request_id")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    Ok(StreamEvent::PermissionRequest {
+        tool_name,
+        description,
+        request_id,
+        input,
+    })
+}
+
+/// Build a short human-readable description for the TUI permission overlay.
+pub fn permission_description(tool_name: &str, request: &Value, input: &Value) -> String {
+    if let Some(d) = request.get("description").and_then(|d| d.as_str())
+        && !d.is_empty()
+    {
+        return d.to_string();
+    }
+    if let Some(d) = input.get("description").and_then(|d| d.as_str())
+        && !d.is_empty()
+    {
+        return d.to_string();
+    }
+    match tool_name {
+        "Bash" => input
+            .get("command")
+            .and_then(|c| c.as_str())
+            .unwrap_or("(bash)")
+            .to_string(),
+        "AskUserQuestion" => {
+            let n = input
+                .get("questions")
+                .and_then(|q| q.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            format!("Clarifying question{s} ({n})", s = if n == 1 { "" } else { "s" })
+        }
+        "Write" | "Edit" | "MultiEdit" => input
+            .get("file_path")
+            .and_then(|p| p.as_str())
+            .unwrap_or(tool_name)
+            .to_string(),
+        _ => tool_name.to_string(),
     }
 }
 
@@ -1034,5 +1112,62 @@ bbb
         assert_eq!(regions.len(), 1);
         let (_, e) = regions[0];
         assert_eq!(e, text.len());
+    }
+
+    #[test]
+    fn test_parse_legacy_permission_request() {
+        let line = r#"{"type":"permission_request","tool_name":"Bash","description":"Run ls","id":"req_1"}"#;
+        let ev = parse_stream_line(line).unwrap();
+        match ev {
+            StreamEvent::PermissionRequest {
+                tool_name,
+                description,
+                request_id,
+                input,
+            } => {
+                assert_eq!(tool_name, "Bash");
+                assert_eq!(description, "Run ls");
+                assert_eq!(request_id, "req_1");
+                assert!(input.as_object().unwrap().is_empty());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_control_request_can_use_tool() {
+        let line = r#"{"type":"control_request","request_id":"8cf30a4a-ff9d-4066-87bd-2f2e76c904eb","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{"question":"Which?","options":[{"label":"A","description":"a"}]}]},"description":"pick one"}}"#;
+        let ev = parse_stream_line(line).unwrap();
+        match ev {
+            StreamEvent::PermissionRequest {
+                tool_name,
+                description,
+                request_id,
+                input,
+            } => {
+                assert_eq!(tool_name, "AskUserQuestion");
+                assert_eq!(description, "pick one");
+                assert_eq!(request_id, "8cf30a4a-ff9d-4066-87bd-2f2e76c904eb");
+                assert!(input.get("questions").is_some());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_control_request_other_subtype_is_unknown() {
+        let line = r#"{"type":"control_request","request_id":"r1","request":{"subtype":"interrupt"}}"#;
+        let ev = parse_stream_line(line).unwrap();
+        assert!(matches!(ev, StreamEvent::Unknown(_)));
+    }
+
+    #[test]
+    fn test_permission_description_bash_falls_back_to_command() {
+        let input = serde_json::json!({"command": "echo hi"});
+        let request = serde_json::json!({});
+        assert_eq!(
+            permission_description("Bash", &request, &input),
+            "echo hi"
+        );
     }
 }

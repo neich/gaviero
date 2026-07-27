@@ -287,14 +287,15 @@ impl AcpObserver for CapturingObserver {
         &self,
         tool_name: &str,
         _description: &str,
-        respond: oneshot::Sender<bool>,
+        _input: &serde_json::Value,
+        respond: oneshot::Sender<gaviero_core::observer::PermissionDecision>,
     ) {
         self.inner
             .lock()
             .unwrap()
             .denied_permissions
             .push(tool_name.to_string());
-        let _ = respond.send(false);
+        let _ = respond.send(gaviero_core::observer::PermissionDecision::deny());
     }
     fn on_claude_session_started(&self, session_id: &str) {
         self.inner.lock().unwrap().claude_session_id = Some(session_id.to_string());

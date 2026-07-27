@@ -121,12 +121,14 @@ impl AcpObserver for TuiAcpObserver {
         &self,
         tool_name: &str,
         description: &str,
-        respond: tokio::sync::oneshot::Sender<bool>,
+        input: &serde_json::Value,
+        respond: tokio::sync::oneshot::Sender<gaviero_core::observer::PermissionDecision>,
     ) {
         let _ = self.tx.send(Event::PermissionRequest {
             conv_id: self.conv_id.clone(),
             tool_name: tool_name.to_string(),
             description: description.to_string(),
+            input: input.clone(),
             respond,
         });
     }
