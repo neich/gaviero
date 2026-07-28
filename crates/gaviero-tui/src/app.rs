@@ -151,6 +151,12 @@ pub struct App {
     // Markdown preview (Alt+P cycles Off → Split → PreviewOnly)
     pub preview_mode: MarkdownPreviewMode,
     pub preview_scroll: usize,
+    /// `(active buffer, editor top source line)` the preview was last synced
+    /// to (split view). `None` in preview-only mode, or before the first sync.
+    /// Re-syncing only when this changes leaves an explicit preview scroll
+    /// alone until the source moves; keying on the buffer re-syncs on a tab
+    /// switch even when both buffers sit at the same top line.
+    pub preview_synced_top: Option<(usize, usize)>,
     /// Updated each preview render; used for PageUp/PageDown in preview-only mode.
     pub preview_viewport_lines: usize,
     pub preview_line_count: usize,
@@ -435,6 +441,7 @@ impl App {
             find_input: crate::widgets::text_input::TextInput::new(),
             preview_mode: MarkdownPreviewMode::Off,
             preview_scroll: 0,
+            preview_synced_top: None,
             preview_viewport_lines: 1,
             preview_line_count: 0,
             write_gate,

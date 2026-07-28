@@ -666,7 +666,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     return;
                 }
                 WheelTarget::Editor => {
-                    scroll_editor_group(app, up, col, row);
+                    scroll_editor_group(app, up);
                     return;
                 }
                 WheelTarget::SidePanel => {
@@ -692,15 +692,14 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     return;
                 }
             }
-            if let Some(preview) = app.layout.preview_area {
-                if preview.contains((col, row).into()) {
-                    let delta = theme::MOUSE_SCROLL_DELTA as i32;
-                    scroll_preview_lines(app, if up { -delta } else { delta });
-                    return;
-                }
-            }
-            if app.layout.editor_area.contains((col, row).into()) {
-                scroll_editor_content(app, up);
+            // Source and preview are one wheel target: the preview follows the
+            // editor, so both halves of the split take the same path.
+            let over_preview = app
+                .layout
+                .preview_area
+                .is_some_and(|preview| preview.contains((col, row).into()));
+            if over_preview || app.layout.editor_area.contains((col, row).into()) {
+                scroll_editor_group(app, up);
                 return;
             }
             if let Some(area) = app.layout.terminal_area {
@@ -1020,13 +1019,20 @@ fn scroll_editor_content(app: &mut App, up: bool) {
 /// pointer position (like the swarm dashboard's detail pane): pointer inside
 /// the preview scrolls it, anywhere else scrolls the source. In PreviewOnly
 /// mode the preview is the whole group, so it always takes the wheel.
-fn scroll_editor_group(app: &mut App, up: bool, col: u16, row: u16) {
-    if let Some(preview) = app.layout.preview_area {
-        if app.layout.editor_area.is_empty() || preview.contains((col, row).into()) {
-            let delta = theme::MOUSE_SCROLL_DELTA as i32;
-            scroll_preview_lines(app, if up { -delta } else { delta });
-            return;
-        }
+/// One wheel step on the focused editor group.
+///
+/// Preview-only mode has no source pane, so the wheel drives the preview. In
+/// split view it drives the *source* wherever the pointer sits, and the
+/// preview follows it (`render::sync_preview_to_editor`). Sub-routing by
+/// pointer is deliberately gone: focus here is keyboard-driven and the
+/// reported pointer is routinely stale, so whichever half the mouse happened
+/// to rest over captured every wheel event and the other half could not be
+/// scrolled at all.
+fn scroll_editor_group(app: &mut App, up: bool) {
+    if app.layout.preview_area.is_some() && app.layout.editor_area.is_empty() {
+        let delta = theme::MOUSE_SCROLL_DELTA as i32;
+        scroll_preview_lines(app, if up { -delta } else { delta });
+        return;
     }
     scroll_editor_content(app, up);
 }
@@ -1857,6 +1863,7 @@ pub(super) fn sync_preview_mode_for_active_buffer(app: &mut App) {
     if !is_current_buffer_markdown(app) && app.preview_mode != MarkdownPreviewMode::Off {
         app.preview_mode = MarkdownPreviewMode::Off;
         app.preview_scroll = 0;
+        app.preview_synced_top = None;
     }
 }
 

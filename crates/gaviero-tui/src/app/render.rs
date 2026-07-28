@@ -1048,14 +1048,16 @@ pub(super) fn render_markdown_preview(app: &mut App, frame: &mut Frame, area: Re
 
     if let Some(buf) = app.buffers.get(app.active_buffer) {
         let source = buf.text.to_string();
+        let editor_top = editor_top_source_line(buf, app.layout.editor_area);
         let content_width = inner.width.saturating_sub(2) as usize;
-        let lines = chat_markdown::format_chat_markdown(
+        let (lines, source_map) = chat_markdown::format_chat_markdown_mapped(
             &source,
             content_width.max(1),
             app.theme.default_style(),
         );
         app.preview_viewport_lines = inner.height.max(1) as usize;
         app.preview_line_count = lines.len();
+        sync_preview_to_editor(app, editor_top, &source_map);
         clamp_preview_scroll(app, lines.len());
 
         let scrollbar_col = inner.width.saturating_sub(1);
@@ -1078,6 +1080,53 @@ pub(super) fn render_markdown_preview(app: &mut App, frame: &mut Frame, area: Re
             app.preview_scroll,
         );
     }
+}
+
+/// Logical source line at the top of the editor viewport.
+///
+/// `scroll.top_line` is a *visual* row index while word wrap is on, so it has
+/// to go through the wrap layout before it can index the preview's
+/// source-line map.
+fn editor_top_source_line(buf: &crate::editor::buffer::Buffer, editor_area: Rect) -> Option<usize> {
+    if editor_area.is_empty() {
+        // Preview-only: no source pane on screen to follow.
+        return None;
+    }
+    let top = buf.scroll.top_line;
+    if !buf.word_wrap {
+        return Some(top);
+    }
+    let (_, content_width) = super::editing::editor_viewport(buf.line_count(), editor_area);
+    if content_width == 0 {
+        return Some(top);
+    }
+    Some(
+        buf.wrap_layout(content_width)
+            .segment_at(top)
+            .map(|seg| seg.logical_line)
+            .unwrap_or(top),
+    )
+}
+
+/// Scroll the preview to wherever the editor's top visible line is rendered.
+///
+/// Split view only (`editor_top` is `None` in preview-only mode). The sync
+/// fires when the editor's top line *changes*, so an explicit preview scroll —
+/// the scrollbar — still sticks until the source moves again. This is also why
+/// the wheel no longer sub-routes to the preview by pointer position: the
+/// pointer is routinely stale under psmux, which made the wheel stick to
+/// whichever half it happened to rest over.
+fn sync_preview_to_editor(app: &mut App, editor_top: Option<usize>, source_map: &[usize]) {
+    let Some(top) = editor_top else {
+        app.preview_synced_top = None;
+        return;
+    };
+    let anchor = (app.active_buffer, top);
+    if app.preview_synced_top == Some(anchor) {
+        return;
+    }
+    app.preview_synced_top = Some(anchor);
+    app.preview_scroll = source_map.get(top).copied().unwrap_or(0);
 }
 
 pub(super) fn clamp_preview_scroll(app: &mut App, line_count: usize) {
