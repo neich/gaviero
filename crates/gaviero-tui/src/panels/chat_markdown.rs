@@ -66,6 +66,22 @@ impl ChatLine {
 /// `**bold**`, `*italic*`, `` `code` ``, and `[text](url)` markers into styled
 /// segments that render with the corresponding visual attributes.
 pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<ChatLine> {
+    format_chat_markdown_mapped(text, width, base_style).0
+}
+
+/// [`format_chat_markdown`] plus a source-line → rendered-line index map.
+///
+/// `map[i]` is the first output line produced by source line `i`, so the
+/// markdown preview can scroll to the rendered position of the editor's top
+/// visible line. Source lines swallowed by a multi-line construct (table rows,
+/// fenced code) inherit the index of the line that opened it, and the map is
+/// non-decreasing, so it is safe to index with any source line and compare
+/// results.
+pub fn format_chat_markdown_mapped(
+    text: &str,
+    width: usize,
+    base_style: Style,
+) -> (Vec<ChatLine>, Vec<usize>) {
     let mut output = Vec::new();
     // Expand tabs to 4 spaces to prevent terminal rendering artifacts.
     // Tab characters in ratatui cells cause cursor jumps that corrupt display.
@@ -88,8 +104,12 @@ pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<
         .fg(theme::REASONING_FG)
         .add_modifier(Modifier::ITALIC);
     let mut in_thinking_block = false;
+    // Filled at the top of every iteration; entries for source lines consumed
+    // inside a multi-line construct stay `MAX` and are back-filled below.
+    let mut src_map = vec![usize::MAX; src_lines.len()];
 
     while i < src_lines.len() {
+        src_map[i] = output.len();
         let line = src_lines[i];
         let trimmed = line.trim();
 
@@ -297,7 +317,19 @@ pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<
         i += 1;
     }
 
-    reflow_overwide_lines(output, width)
+    let (lines, reflowed) = reflow_overwide_lines(output, width);
+    // Give the swallowed source lines the index of the construct that opened
+    // them, then translate every pre-reflow index into its final position.
+    let mut last = 0;
+    for entry in src_map.iter_mut() {
+        if *entry == usize::MAX {
+            *entry = last;
+        } else {
+            last = *entry;
+        }
+        *entry = reflowed.get(*entry).copied().unwrap_or(lines.len());
+    }
+    (lines, src_map)
 }
 
 /// Re-wrap any rendered line that still exceeds `width` display columns.
@@ -305,12 +337,19 @@ pub fn format_chat_markdown(text: &str, width: usize, base_style: Style) -> Vec<
 /// Catches formatted output that can exceed the panel budget after layout; uses
 /// the line's primary style for the wrapped parts. Table rows are left intact —
 /// they use multiline cells instead of post-hoc line breaking.
-fn reflow_overwide_lines(lines: Vec<ChatLine>, width: usize) -> Vec<ChatLine> {
+///
+/// Also returns an old-index → new-index map (with a trailing entry for the
+/// one-past-the-end index) so a caller holding pre-reflow line indices — the
+/// source-line map — can translate them.
+fn reflow_overwide_lines(lines: Vec<ChatLine>, width: usize) -> (Vec<ChatLine>, Vec<usize>) {
     if width == 0 {
-        return lines;
+        let identity = (0..=lines.len()).collect();
+        return (lines, identity);
     }
     let mut out = Vec::with_capacity(lines.len());
+    let mut index_map = Vec::with_capacity(lines.len() + 1);
     for line in lines {
+        index_map.push(out.len());
         let text = line.text();
         if UnicodeWidthStr::width(text.as_str()) <= width || is_table_rendered_line(&text) {
             out.push(line);
@@ -321,7 +360,8 @@ fn reflow_overwide_lines(lines: Vec<ChatLine>, width: usize) -> Vec<ChatLine> {
             out.push(ChatLine::single(wl, style));
         }
     }
-    out
+    index_map.push(out.len());
+    (out, index_map)
 }
 
 /// True for box-drawn table borders and data rows (already width-constrained).
@@ -770,6 +810,51 @@ mod tests {
         assert!(!is_table_row("not a table"));
         assert!(is_table_separator("|---|---|"));
         assert!(is_table_separator("| --- | :---: |"));
+    }
+
+    #[test]
+    fn source_map_points_at_the_rendered_position_of_each_source_line() {
+        // Constructs that break naive 1:1 line mapping: a fence (dropped),
+        // code lines (kept), a table (many source lines → one iteration), and
+        // a paragraph long enough to wrap into several rendered lines.
+        let text = "# Title\n\
+                    \n\
+                    ```rust\n\
+                    let x = 1;\n\
+                    ```\n\
+                    | a | b |\n\
+                    |---|---|\n\
+                    | 1 | 2 |\n\
+                    tail paragraph that is definitely wider than the panel budget\n\
+                    last";
+        let width = 24;
+        let (lines, map) = format_chat_markdown_mapped(text, width, Style::default());
+
+        assert_eq!(map.len(), text.lines().count(), "one entry per source line");
+        assert!(
+            map.windows(2).all(|w| w[0] <= w[1]),
+            "map must be non-decreasing: {map:?}"
+        );
+        assert!(
+            map.iter().all(|&idx| idx <= lines.len()),
+            "map must stay in range: {map:?}"
+        );
+
+        // Anchors: heading, the code line inside the fence, and the last line.
+        assert!(lines[map[0]].text().contains("Title"));
+        assert!(lines[map[3]].text().contains("let x = 1;"));
+        assert!(lines[map[9]].text().contains("last"));
+        // Table rows 6 and 7 are swallowed by the row-5 iteration, so they
+        // inherit its start rather than pointing past the table.
+        assert_eq!(map[5], map[6]);
+        assert_eq!(map[6], map[7]);
+    }
+
+    #[test]
+    fn source_map_is_empty_for_empty_input() {
+        let (lines, map) = format_chat_markdown_mapped("", 40, Style::default());
+        assert!(lines.is_empty());
+        assert!(map.is_empty());
     }
 
     #[test]

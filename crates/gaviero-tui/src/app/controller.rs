@@ -1886,6 +1886,9 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
             if app.is_current_buffer_markdown() {
                 app.preview_mode = app.preview_mode.cycle();
                 app.preview_scroll = 0;
+                // Force a re-sync: the editor top may be unchanged, and the
+                // preview must not stay pinned at 0 behind a scrolled source.
+                app.preview_synced_top = None;
                 app.status_message = Some((
                     format!("Markdown preview: {}", app.preview_mode.title_label()),
                     std::time::Instant::now(),
