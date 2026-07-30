@@ -17,6 +17,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::collapse_file_blocks;
 use crate::theme;
 use crate::theme::Theme;
+use crate::widgets::render_utils::write_text;
 use crate::widgets::text_input::TextInput;
 
 const CHAT_RENDER_TRACE_ENV: &str = "GAVIERO_CHAT_RENDER_TRACE";
@@ -160,6 +161,24 @@ impl FileAutocomplete {
     }
 }
 
+/// Word-wrap `text` to `width` columns, prefixing the first row with
+/// `first_indent` and every continuation row with `cont_indent`.
+///
+/// Overlay rows are written straight into the buffer, so each returned row
+/// already carries its indent and fits inside `width` columns.
+fn wrap_indented(text: &str, width: usize, first_indent: &str, cont_indent: &str) -> Vec<String> {
+    let indent_w = UnicodeWidthStr::width(cont_indent).max(UnicodeWidthStr::width(first_indent));
+    let body_w = width.saturating_sub(indent_w).max(1);
+    crate::widgets::render_utils::word_wrap(text, body_w)
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let indent = if i == 0 { first_indent } else { cont_indent };
+            format!("{indent}{line}")
+        })
+        .collect()
+}
+
 /// A pending permission request from the agent subprocess.
 /// Held in `Conversation::pending_permission` while the user decides.
 pub struct PendingPermission {
@@ -172,6 +191,10 @@ pub struct PendingPermission {
     pub respond: tokio::sync::oneshot::Sender<gaviero_core::observer::PermissionDecision>,
     /// Interactive AskUserQuestion state. `None` for plain y/n tools.
     pub ask: Option<AskUserQuestionState>,
+    /// First visible body row of the overlay (PgUp/PgDn). The request text is
+    /// word-wrapped, so a long question or command can still outgrow the
+    /// overlay even after it auto-grows.
+    pub scroll: usize,
 }
 
 impl PendingPermission {
@@ -192,11 +215,25 @@ impl PendingPermission {
             input,
             respond,
             ask,
+            scroll: 0,
         }
     }
 
     pub fn is_ask_user_question(&self) -> bool {
         self.ask.is_some()
+    }
+
+    /// Word-wrapped body rows of the overlay: `(text, is_selected_option)`.
+    /// `width` is the overlay's total column count; the header and key-hint
+    /// rows are not included.
+    pub fn overlay_rows(&self, width: usize) -> Vec<(String, bool)> {
+        match self.ask.as_ref() {
+            Some(ask) => ask.body_rows(width),
+            None => wrap_indented(&self.description, width, " ", " ")
+                .into_iter()
+                .map(|line| (line, false))
+                .collect(),
+        }
     }
 }
 
@@ -272,6 +309,40 @@ impl AskUserQuestionState {
             selected,
             focus_q: 0,
         })
+    }
+
+    /// Word-wrapped rows for the focused question: `(text, is_selected)`.
+    /// Continuation rows hang under the text they belong to.
+    pub fn body_rows(&self, width: usize) -> Vec<(String, bool)> {
+        let mut rows = Vec::new();
+        let Some(q) = self.questions.get(self.focus_q) else {
+            return rows;
+        };
+        let title = if q.header.is_empty() {
+            format!("{}. {}", self.focus_q + 1, q.question)
+        } else {
+            format!("{}. [{}] {}", self.focus_q + 1, q.header, q.question)
+        };
+        rows.extend(
+            wrap_indented(&title, width, " ", "    ")
+                .into_iter()
+                .map(|line| (line, false)),
+        );
+        for (oi, (label, desc)) in q.options.iter().enumerate() {
+            let marked = self.selected[self.focus_q].contains(&oi);
+            let mark = if marked { "●" } else { "○" };
+            let text = if desc.is_empty() {
+                format!("{mark} {}. {label}", oi + 1)
+            } else {
+                format!("{mark} {}. {label} — {desc}", oi + 1)
+            };
+            rows.extend(
+                wrap_indented(&text, width, "  ", "       ")
+                    .into_iter()
+                    .map(|line| (line, marked)),
+            );
+        }
+        rows
     }
 
     pub fn toggle_option(&mut self, opt_idx: usize) {
@@ -775,21 +846,52 @@ impl AgentChatState {
     }
 
     pub fn ask_next_question(&mut self) {
-        if let Some(perm) = self.active_conversation_mut().pending_permission.as_mut()
-            && let Some(ask) = perm.ask.as_mut()
-        {
-            if ask.focus_q + 1 < ask.questions.len() {
-                ask.focus_q += 1;
-            }
+        let Some(perm) = self.active_conversation_mut().pending_permission.as_mut() else {
+            return;
+        };
+        let Some(ask) = perm.ask.as_mut() else {
+            return;
+        };
+        if ask.focus_q + 1 >= ask.questions.len() {
+            return;
         }
+        ask.focus_q += 1;
+        perm.scroll = 0;
     }
 
     pub fn ask_prev_question(&mut self) {
-        if let Some(perm) = self.active_conversation_mut().pending_permission.as_mut()
-            && let Some(ask) = perm.ask.as_mut()
-        {
-            ask.focus_q = ask.focus_q.saturating_sub(1);
+        let Some(perm) = self.active_conversation_mut().pending_permission.as_mut() else {
+            return;
+        };
+        let Some(ask) = perm.ask.as_mut() else {
+            return;
+        };
+        if ask.focus_q == 0 {
+            return;
         }
+        ask.focus_q -= 1;
+        perm.scroll = 0;
+    }
+
+    /// Scroll the pending request overlay by `delta` rows (PgUp/PgDn).
+    /// `width` is the overlay's column count — the render pass clamps again
+    /// against the rows it can actually paint.
+    pub fn scroll_pending_permission(&mut self, delta: isize, width: usize) {
+        let Some(perm) = self.active_conversation_mut().pending_permission.as_mut() else {
+            return;
+        };
+        let max = perm.overlay_rows(width).len().saturating_sub(1);
+        perm.scroll = perm.scroll.saturating_add_signed(delta).min(max);
+    }
+
+    /// Rows the pending request overlay wants: header + wrapped body + hints.
+    /// `None` when no request is pending.
+    fn pending_overlay_height(&self, width: u16) -> Option<u16> {
+        let perm = self.conversations[self.active_conv]
+            .pending_permission
+            .as_ref()?;
+        let body = u16::try_from(perm.overlay_rows(width as usize).len()).unwrap_or(u16::MAX);
+        Some(body.saturating_add(2))
     }
 
     /// Toggle the one-shot auto-approve flag for the next prompt (Alt+Y).
@@ -3269,20 +3371,26 @@ impl AgentChatState {
         self.render_conv_tabs(tab_area, buf);
 
         // Split remaining: conversation area + [attachments] + input area (bottom)
-        // Input height: user override if set, otherwise auto-grow from newlines
+        let attach_height: u16 = if self.attachments.is_empty() { 0 } else { 1 };
+        let remaining_y = inner.y + 1;
+        let remaining_h = inner.height.saturating_sub(1);
+
+        // Input height: a pending permission / question overlay claims what its
+        // word-wrapped text needs, leaving the separator plus two conversation
+        // rows visible. Otherwise user override, else auto-grow from newlines.
         let max_input = (inner.height / 2).max(3);
+        let max_overlay = remaining_h.saturating_sub(attach_height + 3).max(3);
         let auto_height = {
             let newline_count = self.text_input.text.chars().filter(|&c| c == '\n').count() as u16;
             (newline_count + 2).clamp(3, max_input)
         };
-        let input_height: u16 = if self.input_area_rows > 0 {
+        let input_height: u16 = if let Some(rows) = self.pending_overlay_height(inner.width) {
+            rows.clamp(3, max_overlay)
+        } else if self.input_area_rows > 0 {
             self.input_area_rows.clamp(3, max_input)
         } else {
             auto_height
         };
-        let attach_height: u16 = if self.attachments.is_empty() { 0 } else { 1 };
-        let remaining_y = inner.y + 1;
-        let remaining_h = inner.height.saturating_sub(1);
         let conv_height = remaining_h.saturating_sub(input_height + 1 + attach_height); // +1 for separator
         let conv_area = Rect {
             x: inner.x,
@@ -3681,6 +3789,29 @@ impl AgentChatState {
         }
     }
 
+    /// Paint word-wrapped overlay rows between the header row and the hint row,
+    /// starting at `scroll`. Returns how many rows stay hidden below.
+    fn render_overlay_body(
+        area: Rect,
+        buf: &mut RataBuf,
+        rows: &[(String, bool)],
+        scroll: usize,
+        text_style: Style,
+        mark_style: Style,
+    ) -> usize {
+        let capacity = area.height.saturating_sub(2) as usize;
+        if capacity == 0 {
+            return rows.len();
+        }
+        let scroll = scroll.min(rows.len().saturating_sub(capacity));
+        let x_max = area.x + area.width;
+        for (i, (text, marked)) in rows.iter().skip(scroll).take(capacity).enumerate() {
+            let style = if *marked { mark_style } else { text_style };
+            write_text(buf, area.x, area.y + 1 + i as u16, x_max, text, style);
+        }
+        rows.len().saturating_sub(scroll + capacity)
+    }
+
     fn render_input(&self, area: Rect, buf: &mut RataBuf, focused: bool, _theme: &Theme) {
         let bg = theme::INPUT_BG;
         let fg = theme::TEXT_BRIGHT;
@@ -3710,61 +3841,24 @@ impl AgentChatState {
                 .add_modifier(Modifier::BOLD);
             let muted = Style::default().fg(theme::TEXT_DIM).bg(bg);
 
-            let put_line = |buf: &mut RataBuf, y: u16, text: &str, style: Style| {
-                let mut cx = area.x;
-                for ch in text.chars() {
-                    if cx < area.x + area.width
-                        && cx < buf.area().right()
-                        && y < buf.area().bottom()
-                    {
-                        buf[(cx, y)].set_char(ch).set_style(style);
-                        cx += 1;
-                    }
-                }
+            let x_max = area.x + area.width;
+            let hint_y = area.y + area.height.saturating_sub(1);
+
+            // Body rows are word-wrapped to the overlay width, so a long
+            // question or command stays readable instead of being cut off.
+            let rows = perm.overlay_rows(area.width as usize);
+            let hidden =
+                Self::render_overlay_body(area, buf, &rows, perm.scroll, text_style, key_style);
+            let scroll_hint = if hidden > 0 {
+                format!(" PgDn ▾ +{hidden} ")
+            } else if perm.scroll > 0 {
+                " PgUp ▴ ".to_string()
+            } else {
+                String::new()
             };
 
             if let Some(ref ask) = perm.ask {
-                put_line(buf, area.y, " ❓ Agent question ", warn_style);
-                let mut row = 1u16;
-                if let Some(q) = ask.questions.get(ask.focus_q) {
-                    let title = if q.header.is_empty() {
-                        format!(" {}. {}", ask.focus_q + 1, q.question)
-                    } else {
-                        format!(" {}. [{}] {}", ask.focus_q + 1, q.header, q.question)
-                    };
-                    if row < area.height {
-                        put_line(
-                            buf,
-                            area.y + row,
-                            &title
-                                .chars()
-                                .take(area.width as usize)
-                                .collect::<String>(),
-                            text_style,
-                        );
-                        row += 1;
-                    }
-                    for (oi, (label, desc)) in q.options.iter().enumerate() {
-                        if row >= area.height.saturating_sub(1) {
-                            break;
-                        }
-                        let marked = ask.selected[ask.focus_q].contains(&oi);
-                        let mark = if marked { "●" } else { "○" };
-                        let line = if desc.is_empty() {
-                            format!("  {mark} {}. {label}", oi + 1)
-                        } else {
-                            format!("  {mark} {}. {label} — {desc}", oi + 1)
-                        };
-                        put_line(
-                            buf,
-                            area.y + row,
-                            &line.chars().take(area.width as usize).collect::<String>(),
-                            if marked { key_style } else { text_style },
-                        );
-                        row += 1;
-                    }
-                }
-                let hint_y = area.y + area.height.saturating_sub(1);
+                write_text(buf, area.x, area.y, x_max, " ❓ Agent question ", warn_style);
                 let hint = if ask.questions.len() > 1 {
                     format!(
                         " [1-9] select  ↑↓ question ({}/{})  Enter submit  n deny ",
@@ -3772,45 +3866,21 @@ impl AgentChatState {
                         ask.questions.len()
                     )
                 } else {
-                    " [1-9] select  Enter submit  n deny ".into()
+                    " [1-9] select  Enter submit  n deny ".to_string()
                 };
-                put_line(buf, hint_y, &hint, muted);
+                let hx = write_text(buf, area.x, hint_y, x_max, &hint, muted);
+                write_text(buf, hx, hint_y, x_max, &scroll_hint, muted);
             } else {
-                // Line 0: header
                 let header = format!(" ⚠ Permission: {} ", perm.tool_name);
-                put_line(buf, area.y, &header, warn_style);
+                write_text(buf, area.x, area.y, x_max, &header, warn_style);
 
-                // Line 1: description (truncated to fit)
-                if area.height > 1 {
-                    let max_w = area.width as usize;
-                    let desc: String = perm
-                        .description
-                        .chars()
-                        .take(max_w.saturating_sub(1))
-                        .collect();
-                    put_line(buf, area.y + 1, &format!(" {desc}"), text_style);
-                }
-
-                // Last line: key hints
-                let hint_y = area.y + area.height.saturating_sub(1);
-                put_line(buf, hint_y, " [y] Allow  [n] Deny ", text_style);
-                // Highlight y/n
-                let keys = " [y] Allow  [n] Deny ";
-                let mut cx = area.x;
-                for ch in keys.chars() {
-                    if cx < area.x + area.width
-                        && cx < buf.area().right()
-                        && hint_y < buf.area().bottom()
-                    {
-                        let s = if ch == 'y' || ch == 'n' {
-                            key_style
-                        } else {
-                            text_style
-                        };
-                        buf[(cx, hint_y)].set_char(ch).set_style(s);
-                        cx += 1;
-                    }
-                }
+                // Last line: key hints, with y/n accented.
+                let mut hx = write_text(buf, area.x, hint_y, x_max, " [", text_style);
+                hx = write_text(buf, hx, hint_y, x_max, "y", key_style);
+                hx = write_text(buf, hx, hint_y, x_max, "] Allow  [", text_style);
+                hx = write_text(buf, hx, hint_y, x_max, "n", key_style);
+                hx = write_text(buf, hx, hint_y, x_max, "] Deny ", text_style);
+                write_text(buf, hx, hint_y, x_max, &scroll_hint, muted);
             }
             return;
         }
@@ -5500,5 +5570,194 @@ mod tests {
         assert!(state.select_up_in_input(15));
         assert_eq!(state.text_input.cursor, 3);
         assert_eq!(state.text_input.sel_anchor, Some(15));
+    }
+
+    fn ask_permission() -> PendingPermission {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        PendingPermission::new(
+            "AskUserQuestion".to_string(),
+            "ask".to_string(),
+            serde_json::json!({
+                "questions": [{
+                    "question": "Which retry policy should the dispatcher use when the upstream service keeps answering 503 for several minutes?",
+                    "header": "Retries",
+                    "multiSelect": false,
+                    "options": [
+                        {
+                            "label": "Exponential backoff",
+                            "description": "Wait longer after every failure, capped at one minute per attempt."
+                        },
+                        { "label": "Fail fast", "description": "Surface the error immediately." }
+                    ]
+                }]
+            }),
+            tx,
+        )
+    }
+
+    fn joined_rows(rows: &[(String, bool)]) -> String {
+        rows.iter()
+            .map(|(text, _)| text.trim())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn ask_overlay_rows_wrap_question_and_options_to_width() {
+        let perm = ask_permission();
+        let width = 40;
+        let rows = perm.overlay_rows(width);
+
+        for (text, _) in &rows {
+            assert!(
+                UnicodeWidthStr::width(text.as_str()) <= width,
+                "row wider than overlay: {text:?}"
+            );
+        }
+        let joined = joined_rows(&rows);
+        assert!(
+            joined.contains("answering 503 for several minutes?"),
+            "question truncated: {joined}"
+        );
+        assert!(
+            joined.contains("capped at one minute per attempt."),
+            "option description truncated: {joined}"
+        );
+    }
+
+    #[test]
+    fn ask_overlay_rows_flag_selected_option() {
+        let mut perm = ask_permission();
+        perm.ask.as_mut().unwrap().toggle_option(1);
+        let rows = perm.overlay_rows(60);
+
+        let selected: Vec<&str> = rows
+            .iter()
+            .filter(|(_, marked)| *marked)
+            .map(|(text, _)| text.as_str())
+            .collect();
+        assert!(!selected.is_empty(), "no row flagged as selected");
+        assert!(selected[0].contains("● 2. Fail fast"), "got {selected:?}");
+    }
+
+    #[test]
+    fn plain_permission_description_wraps_instead_of_truncating() {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let cmd = "cargo test -p gaviero-tui --all-features -- --nocapture overlay_rows_wrap";
+        let perm = PendingPermission::new(
+            "Bash".to_string(),
+            cmd.to_string(),
+            serde_json::json!({ "command": cmd }),
+            tx,
+        );
+
+        let rows = perm.overlay_rows(30);
+        assert!(rows.len() > 1, "description was not wrapped: {rows:?}");
+        for (text, _) in &rows {
+            assert!(
+                UnicodeWidthStr::width(text.as_str()) <= 30,
+                "row wider than overlay: {text:?}"
+            );
+        }
+        assert!(joined_rows(&rows).contains("--nocapture"));
+    }
+
+    #[test]
+    fn pending_overlay_height_covers_wrapped_rows() {
+        let mut state = AgentChatState::new();
+        assert!(state.pending_overlay_height(40).is_none());
+
+        let conv_id = state.active_conversation_id().to_string();
+        state.set_pending_permission(&conv_id, ask_permission());
+
+        let narrow = state.pending_overlay_height(40).unwrap();
+        let wide = state.pending_overlay_height(100).unwrap();
+        let rows = state.conversations[state.active_conv]
+            .pending_permission
+            .as_ref()
+            .unwrap()
+            .overlay_rows(40)
+            .len() as u16;
+
+        // header + body + hint row
+        assert_eq!(narrow, rows + 2);
+        assert!(narrow > wide, "narrow={narrow} wide={wide}");
+    }
+
+    fn row_text(buf: &RataBuf, y: u16, width: u16) -> String {
+        (0..width).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    #[test]
+    fn render_overlay_body_paints_wrapped_rows_and_reports_hidden() {
+        let perm = ask_permission();
+        // header + 4 body rows + hint
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 6,
+        };
+        let mut buf = RataBuf::empty(area);
+        let rows = perm.overlay_rows(area.width as usize);
+
+        let hidden = AgentChatState::render_overlay_body(
+            area,
+            &mut buf,
+            &rows,
+            0,
+            Style::default(),
+            Style::default(),
+        );
+        assert_eq!(hidden, rows.len() - 4);
+
+        for (i, expected) in rows.iter().take(4).enumerate() {
+            let painted = row_text(&buf, 1 + i as u16, area.width);
+            assert_eq!(painted.trim_end(), expected.0.trim_end());
+        }
+
+        // Scrolling past the end clamps to the last window, so the tail of the
+        // question is reachable instead of lost.
+        let hidden = AgentChatState::render_overlay_body(
+            area,
+            &mut buf,
+            &rows,
+            rows.len(),
+            Style::default(),
+            Style::default(),
+        );
+        assert_eq!(hidden, 0);
+        assert_eq!(
+            row_text(&buf, 4, area.width).trim_end(),
+            rows.last().unwrap().0.trim_end()
+        );
+    }
+
+    #[test]
+    fn scroll_pending_permission_clamps_to_row_count() {
+        let mut state = AgentChatState::new();
+        let conv_id = state.active_conversation_id().to_string();
+        state.set_pending_permission(&conv_id, ask_permission());
+        let rows = state.conversations[state.active_conv]
+            .pending_permission
+            .as_ref()
+            .unwrap()
+            .overlay_rows(40)
+            .len();
+
+        let scroll_of = |state: &AgentChatState| {
+            state
+                .active_conversation()
+                .pending_permission
+                .as_ref()
+                .unwrap()
+                .scroll
+        };
+
+        state.scroll_pending_permission(1_000, 40);
+        assert_eq!(scroll_of(&state), rows - 1);
+
+        state.scroll_pending_permission(-1_000, 40);
+        assert_eq!(scroll_of(&state), 0);
     }
 }
