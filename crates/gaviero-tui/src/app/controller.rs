@@ -782,9 +782,14 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 return;
             }
 
-            let roots = app.workspace.roots();
-            let scope_root = roots.first().copied();
-            let config = crate::notify::resolve_config(&app.workspace, scope_root);
+            let config = {
+                let roots = app.workspace.roots();
+                crate::notify::resolve_config(
+                    &app.workspace,
+                    roots.first().copied(),
+                    crate::notify::NotifyEvent::AgentFinished,
+                )
+            };
 
             let model = app
                 .chat_state
@@ -809,10 +814,15 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
 
             if config.enabled {
                 if config.status_bar {
-                    app.agent_finish_banner = Some((body.clone(), std::time::Instant::now()));
+                    app.agent_notice_banner = Some((
+                        body.clone(),
+                        std::time::Instant::now(),
+                        crate::notify::NotifyEvent::AgentFinished,
+                    ));
                 }
-                crate::notify::notify_agent_finished(
+                crate::notify::notify(
                     &config,
+                    crate::notify::NotifyEvent::AgentFinished,
                     app.terminal_has_focus,
                     "Gaviero — agent finished",
                     &body,
@@ -833,6 +843,12 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 } else {
                     format!("Waiting for permission: {}", tool_name)
                 };
+                // Built before the overlay takes ownership of `tool_name`.
+                let notify_body = if is_ask {
+                    "Agent is asking a question — answer in the chat panel".to_string()
+                } else {
+                    format!("Agent needs permission: {tool_name}")
+                };
                 app.chat_state.set_pending_permission(
                     &conv_id,
                     crate::panels::agent_chat::PendingPermission::new(
@@ -848,6 +864,34 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 }
                 app.chat_state.active_conv = idx;
                 app.focus = Focus::SidePanel;
+
+                // The turn is now blocked on the user: alert even though the
+                // overlay is already on screen, since the user may be in
+                // another window waiting for the agent to finish.
+                let config = {
+                    let roots = app.workspace.roots();
+                    crate::notify::resolve_config(
+                        &app.workspace,
+                        roots.first().copied(),
+                        crate::notify::NotifyEvent::AgentWaiting,
+                    )
+                };
+                if config.enabled {
+                    if config.status_bar {
+                        app.agent_notice_banner = Some((
+                            notify_body.clone(),
+                            std::time::Instant::now(),
+                            crate::notify::NotifyEvent::AgentWaiting,
+                        ));
+                    }
+                    crate::notify::notify(
+                        &config,
+                        crate::notify::NotifyEvent::AgentWaiting,
+                        app.terminal_has_focus,
+                        "Gaviero — agent needs you",
+                        &notify_body,
+                    );
+                }
             } else {
                 let _ = respond.send(gaviero_core::observer::PermissionDecision::deny());
             }

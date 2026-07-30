@@ -243,6 +243,21 @@ pub mod settings {
     pub const NOTIFICATIONS_AGENT_FINISHED_DESKTOP: &str = "notifications.agentFinished.desktop";
     pub const NOTIFICATIONS_AGENT_FINISHED_STATUS_BAR: &str =
         "notifications.agentFinished.statusBar";
+
+    /// Agent-waiting notifications (TUI): the agent stopped mid-turn and needs
+    /// a permission decision or an answer to `AskUserQuestion`. Separate from
+    /// `agentFinished` because the two mean different things to the user — one
+    /// is "come read this", the other is "the run is blocked on you".
+    pub const NOTIFICATIONS_AGENT_WAITING_ENABLED: &str = "notifications.agentWaiting.enabled";
+    pub const NOTIFICATIONS_AGENT_WAITING_SOUND: &str = "notifications.agentWaiting.sound";
+    pub const NOTIFICATIONS_AGENT_WAITING_DESKTOP: &str = "notifications.agentWaiting.desktop";
+    pub const NOTIFICATIONS_AGENT_WAITING_STATUS_BAR: &str = "notifications.agentWaiting.statusBar";
+
+    /// How notification sounds are produced: `"auto"` (default — Win32 system
+    /// sound on Windows, terminal BEL elsewhere), `"bell"`, `"system"`, or
+    /// `"both"`. An escape hatch for hosts that swallow BEL (multiplexers,
+    /// `bellStyle: none`) or for muted Windows sound schemes.
+    pub const NOTIFICATIONS_SOUND_STYLE: &str = "notifications.sound.style";
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1116,6 +1131,13 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::NOTIFICATIONS_AGENT_FINISHED_SOUND => serde_json::json!(true),
         settings::NOTIFICATIONS_AGENT_FINISHED_DESKTOP => serde_json::json!(true),
         settings::NOTIFICATIONS_AGENT_FINISHED_STATUS_BAR => serde_json::json!(true),
+
+        // Agent-waiting notifications (TUI) — permission / AskUserQuestion
+        settings::NOTIFICATIONS_AGENT_WAITING_ENABLED => serde_json::json!(true),
+        settings::NOTIFICATIONS_AGENT_WAITING_SOUND => serde_json::json!(true),
+        settings::NOTIFICATIONS_AGENT_WAITING_DESKTOP => serde_json::json!(true),
+        settings::NOTIFICATIONS_AGENT_WAITING_STATUS_BAR => serde_json::json!(true),
+        settings::NOTIFICATIONS_SOUND_STYLE => serde_json::json!("auto"),
 
         // Tier B / B5 — session consolidator + sleeptime
         settings::MEMORY_SESSION_CONSOLIDATE_ON_CLOSE => serde_json::json!(true),

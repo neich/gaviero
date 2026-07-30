@@ -550,31 +550,41 @@ fn editor_status_key_hints(app: &App, buf: &crate::editor::buffer::Buffer) -> St
     parts.join("  ")
 }
 
-/// How long the agent-finish banner stays visible (status bar + fullscreen toast).
+/// How long the agent notice banner stays visible (status bar + fullscreen toast).
 const AGENT_FINISH_BANNER_SECS: u64 = 8;
 
-fn active_agent_finish_message(app: &App) -> Option<&str> {
-    let (msg, when) = app.agent_finish_banner.as_ref()?;
+fn active_agent_notice(app: &App) -> Option<(&str, crate::notify::NotifyEvent)> {
+    let (msg, when, event) = app.agent_notice_banner.as_ref()?;
     if when.elapsed().as_secs() >= AGENT_FINISH_BANNER_SECS {
         return None;
     }
-    Some(msg.as_str())
+    Some((msg.as_str(), *event))
 }
 
-/// Floating toast over the main panel when an agent finishes during fullscreen
-/// (e.g. mpv in the terminal) — the status bar alone is easy to miss.
+/// Glyph + accent colour for a banner: a finished turn reads as success, a
+/// blocked turn as "your move".
+fn notice_decoration(event: crate::notify::NotifyEvent) -> (char, Color) {
+    match event {
+        crate::notify::NotifyEvent::AgentFinished => ('✓', theme::SUCCESS),
+        crate::notify::NotifyEvent::AgentWaiting => ('?', theme::WARNING),
+    }
+}
+
+/// Floating toast over the main panel when an agent milestone lands during
+/// fullscreen (e.g. mpv in the terminal) — the status bar alone is easy to miss.
 pub(super) fn render_agent_finish_toast(app: &App, frame: &mut Frame, area: Rect) {
     if app.fullscreen_panel.is_none() || !app.terminal_has_focus {
         return;
     }
-    let Some(msg) = active_agent_finish_message(app) else {
+    let Some((msg, event)) = active_agent_notice(app) else {
         return;
     };
     if area.width < 12 || area.height < 3 {
         return;
     }
 
-    let label = format!(" ✓ {msg}");
+    let (glyph, accent) = notice_decoration(event);
+    let label = format!(" {glyph} {msg}");
     let max_w = area.width.saturating_sub(4) as usize;
     let display: String = label.chars().take(max_w).collect();
     let text_w = display.chars().count() as u16;
@@ -583,8 +593,8 @@ pub(super) fn render_agent_finish_toast(app: &App, frame: &mut Frame, area: Rect
     let x = area.x + (area.width.saturating_sub(box_w)) / 2;
     let y = area.y + area.height.saturating_sub(box_h + 1);
 
-    let border_style = Style::default().fg(theme::SUCCESS);
-    let fill_style = Style::default().fg(Color::Black).bg(theme::SUCCESS);
+    let border_style = Style::default().fg(accent);
+    let fill_style = Style::default().fg(Color::Black).bg(accent);
     let buf = frame.buffer_mut();
 
     for row in 0..box_h {
@@ -697,18 +707,23 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
         return;
     }
 
-    if let Some(msg) = active_agent_finish_message(app) {
-        let status_text = format!(" ✓ {msg}");
-        let style = Style::default().fg(Color::Black).bg(theme::SUCCESS);
+    if let Some((msg, event)) = active_agent_notice(app) {
+        let (glyph, accent) = notice_decoration(event);
+        let status_text = format!(" {glyph} {msg}");
+        let style = Style::default().fg(Color::Black).bg(accent);
+        let mut painted = 0u16;
         for (i, ch) in status_text.chars().enumerate() {
             let x = area.x + i as u16;
             if x < area.right() {
                 frame.buffer_mut()[(x, area.y)]
                     .set_char(ch)
                     .set_style(style);
+                painted = i as u16 + 1;
             }
         }
-        for x in (area.x + status_text.len() as u16)..area.right() {
+        // Column count, not byte length: the glyph is multi-byte, and `len()`
+        // here would skip past cells and leave them unstyled.
+        for x in (area.x + painted)..area.right() {
             frame.buffer_mut()[(x, area.y)].set_style(style);
         }
         return;

@@ -131,8 +131,10 @@ pub struct App {
     // Transient status message (shown for a few seconds, then cleared)
     status_message: Option<(String, std::time::Instant)>,
 
-    /// Highlighted status-bar banner after an agent turn completes (8s TTL).
-    agent_finish_banner: Option<(String, std::time::Instant)>,
+    /// Highlighted status-bar banner for the latest agent milestone — turn
+    /// finished, or blocked on a permission / question (8s TTL). The
+    /// [`NotifyEvent`](crate::notify::NotifyEvent) picks the glyph and colour.
+    agent_notice_banner: Option<(String, std::time::Instant, crate::notify::NotifyEvent)>,
 
     /// Whether the host terminal window currently has OS focus.
     terminal_has_focus: bool,
@@ -432,7 +434,7 @@ impl App {
             scrollbar_dragging: None,
             last_click: None,
             status_message: None,
-            agent_finish_banner: None,
+            agent_notice_banner: None,
             terminal_has_focus: true,
             tree_dialog: None,
             move_state: None,
