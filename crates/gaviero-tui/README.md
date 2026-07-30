@@ -122,7 +122,13 @@ Two chat milestones announce themselves, each with its own `enabled` / `sound` /
 | `notifications.agentFinished.*` | The turn ended — an answer (or an error) is on screen |
 | `notifications.agentWaiting.*` | The turn is blocked on you — a tool permission prompt or an `AskUserQuestion` |
 
-The two use different sounds, glyphs, and banner colours (`✓` green vs `?` amber) so they are distinguishable without looking. **Sound ignores terminal focus** — it fires even when gaviero is backgrounded or minimized, which is the case the alert exists for. Desktop toasts stay focus-gated.
+The two use different sounds, glyphs, and banner colours (`✓` green vs `?` amber) so they are distinguishable without looking.
+
+Focus handling differs per channel, by design:
+
+- **Sound ignores focus** — it fires even when gaviero is backgrounded or minimized, which is the case the alert exists for.
+- **Desktop toasts fire only while the terminal is unfocused** — with gaviero on screen the status-bar banner already carries the news. (No-op on Windows: see `spawn_desktop_notification`.)
+- **The status-bar banner and fullscreen toast** are drawn while you are looking, for 8s.
 
 `notifications.sound.style` picks how the sound is produced:
 
