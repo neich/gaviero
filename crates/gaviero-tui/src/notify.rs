@@ -13,10 +13,11 @@
 //! gaviero has keyboard focus. The two events use different system sounds so
 //! they are distinguishable without looking.
 //!
-//! **Desktop toasts stay focus-gated** (crossterm `FocusGained` / `FocusLost`):
-//! unchanged from the original behaviour, where a backgrounded, minimized, or
-//! fullscreen-covered gaviero must not stack toasts over whatever the user is
-//! doing.
+//! **Desktop toasts fire only while the terminal is unfocused** (crossterm
+//! `FocusGained` / `FocusLost`) — the mirror image of the sound gate, not the
+//! same one. A toast exists to reach someone looking at another window; with
+//! gaviero on screen the status-bar banner and the chat panel already carry the
+//! news, so a toast there would be noise over the window being read.
 
 use gaviero_core::workspace::{Workspace, settings};
 use std::path::Path;
@@ -156,9 +157,16 @@ pub fn notify(
     if config.sound {
         play_notification_sound(config.sound_style, event);
     }
-    if config.desktop && terminal_focused {
+    if should_toast(config, terminal_focused) {
         spawn_desktop_notification(title, body);
     }
+}
+
+/// Whether to spawn a desktop toast. Split out from [`notify`] so the inverted
+/// focus gate is testable — `spawn_desktop_notification` is fire-and-forget and
+/// reports nothing back.
+fn should_toast(config: &NotifyConfig, terminal_focused: bool) -> bool {
+    config.desktop && !terminal_focused
 }
 
 pub fn play_notification_sound(style: SoundStyle, event: NotifyEvent) {
@@ -306,6 +314,25 @@ mod tests {
         // exactly when the alert matters most.
         let c = NotifyConfig::default();
         notify(&c, NotifyEvent::AgentFinished, false, "title", "body");
+    }
+
+    #[test]
+    fn toast_fires_only_while_terminal_unfocused() {
+        let on = NotifyConfig::default();
+        assert!(
+            should_toast(&on, false),
+            "away from gaviero — toast is the point"
+        );
+        assert!(
+            !should_toast(&on, true),
+            "gaviero on screen — the status-bar banner already says it"
+        );
+
+        let no_desktop = NotifyConfig {
+            desktop: false,
+            ..Default::default()
+        };
+        assert!(!should_toast(&no_desktop, false), "desktop=false wins");
     }
 
     #[test]
