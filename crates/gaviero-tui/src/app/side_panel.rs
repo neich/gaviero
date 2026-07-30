@@ -124,6 +124,15 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
     }
 
     if app.chat_state.active_conv_pending_permission() {
+        // The request text is word-wrapped; PgUp/PgDn reach what the overlay
+        // could not grow enough to show. Same keys in both modes.
+        if matches!(action, Action::PageUp | Action::PageDown) {
+            let width = chat_panel_content_width(app).saturating_sub(2) as usize;
+            let delta = if action == Action::PageUp { -3 } else { 3 };
+            app.chat_state.scroll_pending_permission(delta, width);
+            return;
+        }
+
         let is_ask = app
             .chat_state
             .active_conversation()

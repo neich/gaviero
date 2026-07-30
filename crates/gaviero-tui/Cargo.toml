@@ -43,6 +43,12 @@ windows-sys = { version = "0.59", features = [
     # GetAsyncKeyState for the Ctrl+V image-paste fallback when Windows
     # Terminal swallows the chord and emits no bracketed-paste / key burst.
     "Win32_UI_Input_KeyboardAndMouse",
+    # MessageBeep for agent notification sounds (notify::play_system_sound) —
+    # BEL is unreliable behind ConPTY + a multiplexer. win32metadata files the
+    # function under Diagnostics_Debug; its MB_* argument type lives in
+    # WindowsAndMessaging, so both features are required.
+    "Win32_System_Diagnostics_Debug",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [dev-dependencies]
