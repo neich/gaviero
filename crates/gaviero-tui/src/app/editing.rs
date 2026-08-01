@@ -657,6 +657,19 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     }
 
                     if app.side_panel == SidePanelMode::AgentChat {
+                        // Prompt input: place cursor / start drag-select.
+                        if !app.chat_state.active_conv_streaming()
+                            && app
+                                .chat_state
+                                .input_area_cache
+                                .is_some_and(|a| a.contains((col, row).into()))
+                        {
+                            if let Some(ci) = app.chat_state.screen_to_input_char(col, row) {
+                                app.chat_state.start_input_mouse_selection(ci);
+                            }
+                            return;
+                        }
+
                         if let Some((line, ci)) = app.chat_state.screen_to_text_pos(col, row) {
                             app.chat_state.start_text_selection(line, ci);
                         } else {
@@ -752,6 +765,20 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
         MouseEventKind::Drag(MouseButton::Left) => {
             if let Some(target) = app.scrollbar_dragging {
                 app.scroll_panel_to_row(target, row);
+                return;
+            }
+            if app.chat_state.input_dragging {
+                if let Some(ci) = app.chat_state.screen_to_input_char(col, row) {
+                    app.chat_state.extend_input_mouse_selection(ci);
+                } else if let Some(area) = app.chat_state.input_area_cache {
+                    // Dragged above/below the prompt box: clamp to ends.
+                    if row < area.y {
+                        app.chat_state.extend_input_mouse_selection(0);
+                    } else {
+                        let end = app.chat_state.text_input.char_count();
+                        app.chat_state.extend_input_mouse_selection(end);
+                    }
+                }
                 return;
             }
             if app.chat_state.chat_dragging {
@@ -886,6 +913,19 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 }
                 app.terminal_selection.dragging = false;
             }
+            if app.chat_state.input_dragging {
+                if let Some(text) = app
+                    .chat_state
+                    .text_input
+                    .selected_text()
+                    .map(str::to_owned)
+                {
+                    if !text.is_empty() {
+                        app.set_clipboard(&text);
+                    }
+                }
+                app.chat_state.end_input_mouse_selection();
+            }
             if app.chat_state.chat_dragging {
                 if let Some(text) = app.chat_state.selected_chat_text() {
                     app.set_clipboard(&text);
@@ -947,6 +987,16 @@ enum WheelTarget {
     Terminal,
     /// Route by pointer position (only when the focused panel is hidden).
     Hover,
+}
+
+/// Prefer scrolling the overflowing prompt unless the pointer is on the transcript.
+///
+/// Chat has no separate input vs output focus — `Focus::SidePanel` covers both.
+/// Focus-first wheel delivery still reports the physical pointer, which usually
+/// rests on the editor while composing, so requiring an input-rect hit would
+/// never scroll the prompt.
+fn chat_wheel_prefers_input(over_conv: bool, input_overflows: bool, streaming: bool) -> bool {
+    input_overflows && !streaming && !over_conv
 }
 
 /// Wheel events follow *focus*: the focused panel takes the wheel regardless
@@ -1105,6 +1155,33 @@ fn scroll_side_panel(app: &mut App, up: bool, col: u16, row: u16) {
             }
         }
         _ => {
+            // Wheel while chat is focused: prefer the overflowing prompt unless
+            // the pointer is explicitly over the transcript. Focus-first routing
+            // leaves the mouse parked on the editor while typing, so a strict
+            // input-rect hit-test would always miss and scroll the output instead.
+            let over_conv = app
+                .chat_state
+                .conv_area_cache
+                .is_some_and(|area| area.contains((col, row).into()));
+            let panel_w = app
+                .layout
+                .side_panel_area
+                .map(|a| a.width)
+                .unwrap_or(40);
+            if chat_wheel_prefers_input(
+                over_conv,
+                app.chat_state.input_overflows_viewport(panel_w),
+                app.chat_state.active_conv_streaming(),
+            ) {
+                let delta = theme::MOUSE_SCROLL_DELTA as i32;
+                let moved = app.chat_state.scroll_input_by_visual_lines(
+                    if up { -delta } else { delta },
+                    panel_w,
+                );
+                if moved {
+                    return;
+                }
+            }
             app.chat_state.scroll_offset = if up {
                 app.chat_state.scroll_offset.saturating_sub(theme::MOUSE_SCROLL_DELTA)
             } else {
@@ -2164,6 +2241,17 @@ mod tests {
             wheel_target(Focus::Terminal, &v, None),
             WheelTarget::Terminal
         );
+    }
+
+    #[test]
+    fn chat_wheel_prefers_overflowing_prompt_unless_pointer_on_transcript() {
+        // Pointer parked on the editor (common while typing): scroll the prompt.
+        assert!(chat_wheel_prefers_input(false, true, false));
+        // Pointer explicitly on the conversation: scroll the transcript.
+        assert!(!chat_wheel_prefers_input(true, true, false));
+        // Prompt fits / streaming: never steal the wheel from the transcript.
+        assert!(!chat_wheel_prefers_input(false, false, false));
+        assert!(!chat_wheel_prefers_input(false, true, true));
     }
 
     #[test]

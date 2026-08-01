@@ -639,12 +639,16 @@ pub struct AgentChatState {
     pub rendered_lines_cache: Vec<(String, Option<usize>)>,
     /// Cached conversation area rect (set during render).
     pub conv_area_cache: Option<Rect>,
+    /// Cached prompt-input area rect (set during render) for mouse wheel hit-testing.
+    pub input_area_cache: Option<Rect>,
     /// Text selection anchor: (rendered_line_index, char_index).
     pub text_sel_anchor: Option<(usize, usize)>,
     /// Text selection end: (rendered_line_index, char_index).
     pub text_sel_end: Option<(usize, usize)>,
     /// Whether mouse is currently dragging to select chat text.
     pub chat_dragging: bool,
+    /// Whether mouse is dragging a selection inside the prompt input.
+    pub input_dragging: bool,
     /// Keyboard cursor line index into rendered_lines_cache, for Shift+Arrow selection.
     pub chat_output_kb_cursor: Option<usize>,
     /// When true, the user has manually scrolled during streaming, so auto-scroll is paused.
@@ -706,9 +710,11 @@ impl AgentChatState {
             tick_count: 0,
             rendered_lines_cache: Vec::new(),
             conv_area_cache: None,
+            input_area_cache: None,
             text_sel_anchor: None,
             text_sel_end: None,
             chat_dragging: false,
+            input_dragging: false,
             chat_output_kb_cursor: None,
             user_scrolled_during_stream: false,
             auto_approve_next: false,
@@ -1670,7 +1676,7 @@ impl AgentChatState {
                      Ctrl+V                   — Paste text, or attach clipboard image\n\
                      Alt+V                    — Same (use if Ctrl+V is swallowed by the terminal)\n\
                      Alt+Enter                — Insert newline in input\n\
-                     PageUp / PageDown        — Scroll chat history\n\
+                     PageUp / PageDown        — Scroll prompt input when it overflows, else chat history\n\
                      Esc                      — Clear input / return to editor\n\n\
                      Use @filename to reference workspace files in your prompt.\n\
                      Use /attach to attach files from outside the workspace.",
@@ -2114,6 +2120,19 @@ impl AgentChatState {
         (full_w.saturating_sub(prompt_len), full_w)
     }
 
+    /// Auto-grow the prompt box from wrapped visual lines, capped at `max_input`.
+    ///
+    /// Empty input stays at the 3-row minimum so the hint + cursor have room.
+    pub(crate) fn auto_input_height(&self, inner_width: u16, max_input: u16) -> u16 {
+        let (first_w, full_w) = self.input_layout_widths_for_inner(inner_width);
+        let visual_lines = if self.text_input.text.is_empty() {
+            1usize
+        } else {
+            self.build_visual_lines(first_w, full_w).len()
+        };
+        (visual_lines as u16).clamp(3, max_input.max(3))
+    }
+
     /// Whether Up/Down should move within the input before history / chat scroll.
     pub fn input_has_multiple_visual_lines(&self, panel_content_width: u16) -> bool {
         if self.text_input.text.is_empty() {
@@ -2121,6 +2140,52 @@ impl AgentChatState {
         }
         let (first_w, full_w) = self.input_layout_widths(panel_content_width);
         self.build_visual_lines(first_w, full_w).len() > 1
+    }
+
+    /// Visual line count of the current prompt at `panel_content_width`.
+    pub fn input_visual_line_count(&self, panel_content_width: u16) -> usize {
+        if self.text_input.text.is_empty() {
+            return 1;
+        }
+        let (first_w, full_w) = self.input_layout_widths(panel_content_width);
+        self.build_visual_lines(first_w, full_w).len()
+    }
+
+    /// True when the prompt has more visual lines than the cached input viewport.
+    pub fn input_overflows_viewport(&self, panel_content_width: u16) -> bool {
+        let Some(area) = self.input_area_cache else {
+            return false;
+        };
+        if area.height == 0 || self.text_input.text.is_empty() {
+            return false;
+        }
+        self.input_visual_line_count(panel_content_width) > area.height as usize
+    }
+
+    /// Move the input cursor by `delta` visual lines (negative = up).
+    ///
+    /// Used by mouse wheel / PageUp/PageDown when the prompt exceeds the input
+    /// box; `render_input` keeps the cursor line visible via scroll-follow.
+    /// Returns `true` when the cursor moved at least once.
+    pub fn scroll_input_by_visual_lines(&mut self, delta: i32, panel_content_width: u16) -> bool {
+        if delta == 0 || self.text_input.text.is_empty() {
+            return false;
+        }
+        let before = self.text_input.cursor;
+        if delta < 0 {
+            for _ in 0..(-delta as usize) {
+                if !self.cursor_up_in_input(panel_content_width) {
+                    break;
+                }
+            }
+        } else {
+            for _ in 0..(delta as usize) {
+                if !self.cursor_down_in_input(panel_content_width) {
+                    break;
+                }
+            }
+        }
+        self.text_input.cursor != before
     }
 
     /// Move the cursor up within the input. Returns `true` when the cursor moved.
@@ -2344,6 +2409,85 @@ impl AgentChatState {
     }
 
     // ── Mouse text selection ─────────────────────────────────────
+
+    /// Map screen coordinates to a char index in the prompt input.
+    ///
+    /// Uses the same wrap + cursor-follow scroll as `render_input`, so hit
+    /// testing matches what the user sees.
+    pub fn screen_to_input_char(&self, col: u16, row: u16) -> Option<usize> {
+        let area = self.input_area_cache?;
+        if row < area.y || row >= area.y + area.height || col < area.x || col >= area.x + area.width
+        {
+            return None;
+        }
+        if self.text_input.text.is_empty() {
+            return Some(0);
+        }
+
+        let prompt_len = self.input_prompt_label().chars().count();
+        let text_width = (area.width as usize).saturating_sub(prompt_len);
+        if text_width == 0 {
+            return Some(0);
+        }
+
+        let lines = self.build_visual_lines(text_width, area.width as usize);
+        let (cursor_line, _) =
+            Self::find_cursor_in_visual_lines(&lines, self.text_input.cursor);
+        let total_rows = area.height as usize;
+        let scroll = if cursor_line >= total_rows {
+            cursor_line - total_rows + 1
+        } else {
+            0
+        };
+
+        let viewport_row = (row - area.y) as usize;
+        let line_idx = scroll + viewport_row;
+        if line_idx >= lines.len() {
+            return Some(self.text_input.char_count());
+        }
+
+        let (start, len) = lines[line_idx];
+        let x_start = if line_idx == 0 {
+            area.x.saturating_add(prompt_len as u16)
+        } else {
+            area.x
+        };
+        if col <= x_start {
+            return Some(start);
+        }
+
+        let col_in_line = (col - x_start) as usize;
+        let offset = col_in_line.min(len);
+        Some((start + offset).min(self.text_input.char_count()))
+    }
+
+    /// Begin a mouse selection in the prompt (click / drag start).
+    pub fn start_input_mouse_selection(&mut self, char_idx: usize) {
+        let ci = char_idx.min(self.text_input.char_count());
+        self.text_input.sel_anchor = Some(ci);
+        self.text_input.cursor = ci;
+        self.input_dragging = true;
+        self.clear_text_selection();
+    }
+
+    /// Extend the prompt mouse selection to `char_idx`.
+    pub fn extend_input_mouse_selection(&mut self, char_idx: usize) {
+        if !self.input_dragging {
+            return;
+        }
+        if self.text_input.sel_anchor.is_none() {
+            self.text_input.sel_anchor = Some(self.text_input.cursor);
+        }
+        self.text_input.cursor = char_idx.min(self.text_input.char_count());
+    }
+
+    /// End prompt mouse selection; collapse a zero-width (plain click) selection.
+    pub fn end_input_mouse_selection(&mut self) {
+        self.input_dragging = false;
+        if self.text_input.sel_anchor == Some(self.text_input.cursor) {
+            self.text_input.sel_anchor = None;
+        }
+    }
 
     /// Map screen coordinates to a position in the rendered lines cache.
     /// Returns (line_index, char_index) where char_index is the character offset.
@@ -3377,13 +3521,12 @@ impl AgentChatState {
 
         // Input height: a pending permission / question overlay claims what its
         // word-wrapped text needs, leaving the separator plus two conversation
-        // rows visible. Otherwise user override, else auto-grow from newlines.
+        // rows visible. Otherwise user override, else auto-grow from *visual*
+        // wrapped lines (not only explicit newlines — a long pasted paragraph
+        // must enlarge the box the same way multi-line text does).
         let max_input = (inner.height / 2).max(3);
         let max_overlay = remaining_h.saturating_sub(attach_height + 3).max(3);
-        let auto_height = {
-            let newline_count = self.text_input.text.chars().filter(|&c| c == '\n').count() as u16;
-            (newline_count + 2).clamp(3, max_input)
-        };
+        let auto_height = self.auto_input_height(inner.width, max_input);
         let input_height: u16 = if let Some(rows) = self.pending_overlay_height(inner.width) {
             rows.clamp(3, max_overlay)
         } else if self.input_area_rows > 0 {
@@ -3406,6 +3549,7 @@ impl AgentChatState {
             width: inner.width,
             height: input_height,
         };
+        self.input_area_cache = Some(input_area);
 
         // Render conversation
         self.render_conversation(conv_area, buf, theme);
@@ -3984,6 +4128,17 @@ impl AgentChatState {
                         buf[(cursor_x, y)].set_style(cursor_style);
                     }
                 }
+            }
+
+            // Scrollbar when the prompt exceeds the input viewport.
+            if lines.len() > total_rows {
+                crate::widgets::scrollbar::render_scrollbar(
+                    area,
+                    buf,
+                    lines.len(),
+                    total_rows,
+                    scroll,
+                );
             }
         }
     }
@@ -5526,6 +5681,83 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0], (0, 10));
         assert_eq!(lines[1], (10, 16));
+    }
+
+    #[test]
+    fn auto_input_height_grows_for_wrapped_text_without_newlines() {
+        let mut state = AgentChatState::new();
+        // 80 chars, inner width 20 → first line 18 ("> " prompt), then full 20s.
+        // 80 = 18 + 20 + 20 + 20 + 2 → 5 visual lines → height 5.
+        state.text_input.text = "a".repeat(80);
+        assert_eq!(state.auto_input_height(20, 10), 5);
+        // Cap at max_input.
+        assert_eq!(state.auto_input_height(20, 3), 3);
+        // Newline-only growth previously: 0 newlines → height 3; wrapping must exceed that.
+        assert!(state.auto_input_height(20, 10) > 3);
+    }
+
+    #[test]
+    fn scroll_input_by_visual_lines_moves_cursor_through_overflow() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "abcdefghijklmnopqrstuvwxyz".to_string();
+        state.text_input.cursor = state.text_input.char_count();
+        // Viewport shorter than wrapped lines.
+        state.input_area_cache = Some(Rect {
+            x: 0,
+            y: 0,
+            width: 15,
+            height: 1,
+        });
+        let panel_w = 15;
+        assert!(state.input_overflows_viewport(panel_w));
+        assert!(state.scroll_input_by_visual_lines(-1, panel_w));
+        assert_eq!(state.text_input.cursor, 12);
+        // At the top — further up does not move.
+        state.text_input.cursor = 0;
+        assert!(!state.scroll_input_by_visual_lines(-1, panel_w));
+    }
+
+    #[test]
+    fn screen_to_input_char_maps_click_into_wrapped_prompt() {
+        let mut state = AgentChatState::new();
+        // "> " prompt (2) + inner width 20 → first line holds 18 chars.
+        state.text_input.text = "abcdefghijklmnopqrstuvwxyz".to_string();
+        state.text_input.cursor = 0;
+        state.input_area_cache = Some(Rect {
+            x: 10,
+            y: 20,
+            width: 20,
+            height: 3,
+        });
+
+        // First visual line starts after the "> " prompt at x=12.
+        assert_eq!(state.screen_to_input_char(12, 20), Some(0));
+        assert_eq!(state.screen_to_input_char(14, 20), Some(2));
+        // Second visual line starts at area.x (no prompt).
+        assert_eq!(state.screen_to_input_char(10, 21), Some(18));
+        assert_eq!(state.screen_to_input_char(12, 21), Some(20));
+        // Outside the input area.
+        assert_eq!(state.screen_to_input_char(10, 19), None);
+    }
+
+    #[test]
+    fn input_mouse_selection_drag_selects_and_click_collapses() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "hello world".to_string();
+        state.start_input_mouse_selection(0);
+        assert!(state.input_dragging);
+        state.extend_input_mouse_selection(5);
+        assert_eq!(state.text_input.selection_range(), Some((0, 5)));
+        assert_eq!(state.text_input.selected_text(), Some("hello"));
+        state.end_input_mouse_selection();
+        assert!(!state.input_dragging);
+        assert!(state.text_input.has_selection());
+
+        // Plain click (no drag) clears selection.
+        state.start_input_mouse_selection(3);
+        state.end_input_mouse_selection();
+        assert!(!state.text_input.has_selection());
+        assert_eq!(state.text_input.cursor, 3);
     }
 
     #[test]
