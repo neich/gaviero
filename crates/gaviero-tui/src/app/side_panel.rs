@@ -356,15 +356,35 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
         Action::CursorUp => handle_chat_cursor_up(app),
         Action::CursorDown => handle_chat_cursor_down(app),
         Action::PageUp => {
-            app.chat_state.scroll_offset = app.chat_state.scroll_offset.saturating_sub(20);
-            if app.chat_state.active_conv_streaming() {
-                app.chat_state.user_scrolled_during_stream = true;
+            let panel_w = chat_panel_content_width(app);
+            if !app.chat_state.active_conv_streaming()
+                && app.chat_state.input_overflows_viewport(panel_w)
+                && app
+                    .chat_state
+                    .scroll_input_by_visual_lines(-10, panel_w)
+            {
+                // Prompt taller than the input box — page within it first.
+            } else {
+                app.chat_state.scroll_offset = app.chat_state.scroll_offset.saturating_sub(20);
+                if app.chat_state.active_conv_streaming() {
+                    app.chat_state.user_scrolled_during_stream = true;
+                }
             }
         }
         Action::PageDown => {
-            app.chat_state.scroll_offset = app.chat_state.scroll_offset.saturating_add(20);
-            if app.chat_state.active_conv_streaming() {
-                app.chat_state.user_scrolled_during_stream = true;
+            let panel_w = chat_panel_content_width(app);
+            if !app.chat_state.active_conv_streaming()
+                && app.chat_state.input_overflows_viewport(panel_w)
+                && app
+                    .chat_state
+                    .scroll_input_by_visual_lines(10, panel_w)
+            {
+                // Prompt taller than the input box — page within it first.
+            } else {
+                app.chat_state.scroll_offset = app.chat_state.scroll_offset.saturating_add(20);
+                if app.chat_state.active_conv_streaming() {
+                    app.chat_state.user_scrolled_during_stream = true;
+                }
             }
         }
         Action::Quit => {
