@@ -334,10 +334,34 @@ pub(super) fn set_clipboard(app: &mut App, text: &str) -> ClipboardResult {
     app.internal_clipboard = text.to_string();
     if let Some(cb) = &mut app.clipboard {
         if cb.set_text(text).is_ok() {
-            return ClipboardResult::System;
+            // ConPTY / host clipboard bridges have been observed to truncate
+            // at `~` (CSI final). Verify the round-trip; if the OS copy is a
+            // strict prefix of what we wrote and the missing tail starts with
+            // `~`, trust internal on read and treat the write as failed.
+            match cb.get_text() {
+                Ok(got) if got == text => return ClipboardResult::System,
+                Ok(got) if clipboard_looks_tilde_truncated(&got, text) => {
+                    tracing::warn!(
+                        "system clipboard truncated at '~' after set_text ({} → {} chars); using internal",
+                        text.len(),
+                        got.len()
+                    );
+                    return ClipboardResult::Unavailable;
+                }
+                Ok(_) => return ClipboardResult::System,
+                Err(_) => return ClipboardResult::System,
+            }
         }
-        tracing::warn!("arboard set_text failed, falling back to OSC 52");
+        tracing::warn!("arboard set_text failed");
     }
+    // Windows: prefer arboard only. OSC 52 through ConPTY/Windows Terminal has
+    // been a source of clipboard corruption; keep the internal buffer rather
+    // than writing a host sequence that may not round-trip reliably.
+    if cfg!(windows) {
+        tracing::warn!("system clipboard write failed; using internal clipboard only");
+        return ClipboardResult::Unavailable;
+    }
+    tracing::warn!("falling back to OSC 52");
     if osc52_copy(text) {
         ClipboardResult::Osc52
     } else {
@@ -345,9 +369,26 @@ pub(super) fn set_clipboard(app: &mut App, text: &str) -> ClipboardResult {
     }
 }
 
+/// True when `got` is a proper prefix of `want` and the first missing character
+/// is `~` — the failure mode reported when copying `topology: ~600 tok` etc.
+fn clipboard_looks_tilde_truncated(got: &str, want: &str) -> bool {
+    if got.is_empty() || got.len() >= want.len() || !want.starts_with(got) {
+        return false;
+    }
+    want[got.len()..].starts_with('~')
+}
+
 pub(super) fn get_clipboard(app: &mut App) -> String {
     if let Some(cb) = &mut app.clipboard {
         if let Ok(text) = cb.get_text() {
+            let internal = &app.internal_clipboard;
+            // If the OS clipboard was truncated at `~` but we still hold the
+            // full copy from [`set_clipboard`], prefer the internal buffer so
+            // paste (and Windows Event::Paste clipboard substitution) sees the
+            // complete payload.
+            if clipboard_looks_tilde_truncated(&text, internal) {
+                return internal.clone();
+            }
             return text;
         }
     }
@@ -1502,6 +1543,10 @@ pub(super) fn should_drop_paste_straggler(app: &App, action: &Action) -> bool {
 /// leading chunk of a gesture the coalescer split; later chunks are dropped by
 /// [`should_skip_duplicate_text_paste`]).
 ///
+/// Under psmux+ConPTY, AltGr-`~` used to abort the coalescer so the payload
+/// is often exactly the clipboard prefix ending at `topology: ` — preferring
+/// the OS clipboard recovers the full paste.
+///
 /// Substituting the clipboard unconditionally made every reconstructed paste a
 /// clipboard dump — including ones the coalescer built out of ordinary typing,
 /// which is how stale clipboard text appeared mid-line, and including pastes
@@ -2078,6 +2123,11 @@ mod tests {
         assert!(prefer_clipboard_paste("a\nb", "a\r\nb\r\n"));
         // Empty payload: terminal signalled a paste it could not represent.
         assert!(prefer_clipboard_paste("", "clipboard text"));
+        // Classic Windows split: coalescer stopped before `~600`.
+        assert!(prefer_clipboard_paste(
+            "  topology: ",
+            "  topology: ~600 tok (ceiling 600)\n  outline: ~1200 tok"
+        ));
 
         // Typing the coalescer mistook for a paste must never expand into the
         // clipboard, and neither must a paste that did not come from it
@@ -2085,6 +2135,17 @@ mod tests {
         assert!(!prefer_clipboard_paste("ab", "some unrelated clipboard"));
         assert!(!prefer_clipboard_paste("C:\\dropped\\file.rs", "unrelated"));
         assert!(!prefer_clipboard_paste("anything", ""));
+    }
+
+    #[test]
+    fn clipboard_looks_tilde_truncated_detects_topology_cutoff() {
+        let full = "  topology: ~600 tok (ceiling 600)\n  outline: ~1200 tok";
+        assert!(clipboard_looks_tilde_truncated("  topology: ", full));
+        assert!(clipboard_looks_tilde_truncated("path=", "path=~/foo"));
+        assert!(!clipboard_looks_tilde_truncated(full, full));
+        assert!(!clipboard_looks_tilde_truncated("  topology: ~600", full));
+        assert!(!clipboard_looks_tilde_truncated("other", full));
+        assert!(!clipboard_looks_tilde_truncated("", full));
     }
 
     #[test]

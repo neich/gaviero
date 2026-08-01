@@ -488,6 +488,13 @@ fn coalesce_bracketed_paste(first: crossterm::event::Event) -> Vec<crossterm::ev
             }
         } else if matches!(&next, Event::Key(k) if k.kind == KeyEventKind::Release) {
             // keep draining
+        } else if saw_start {
+            // Inside a bracketed-paste payload: ignore non-text keys (focus,
+            // mouse noise, odd VK mappings for `~` on some layouts) rather
+            // than aborting — aborting early left payloads truncated at the
+            // first `~` and armed the Windows settle window that then dropped
+            // the remaining characters as stragglers.
+            continue;
         } else {
             trailing = Some(next);
             break;
@@ -563,8 +570,14 @@ fn paste_or_escape_char(event: &crossterm::event::Event) -> Option<char> {
 
 /// Character a key event contributes to a pasted burst, or `None` if it cannot
 /// be part of a paste. Enter → `\n`, Tab → `\t`, plain chars → themselves;
-/// releases, control/alt/super chords, and navigation keys map to `None`.
+/// releases, real Ctrl/Alt/Super chords, and navigation keys map to `None`.
 /// Shift is allowed so pasted capitals survive.
+///
+/// **AltGr (Windows):** reported as `CONTROL|ALT`. ConPTY paste injection of
+/// characters that are AltGr-produced on the active layout (notably `~` on
+/// many European layouts) arrives with those modifiers. Rejecting them ended
+/// the raw-paste coalescer at the first `~` (e.g. `topology: ~600` →
+/// `topology: `), after which `WINDOWS_PASTE_SETTLE_MS` dropped the rest.
 fn paste_char(event: &crossterm::event::Event) -> Option<char> {
     use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
@@ -574,12 +587,29 @@ fn paste_char(event: &crossterm::event::Event) -> Option<char> {
     if key.kind == KeyEventKind::Release {
         return None;
     }
-    if key.modifiers.intersects(
-        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER | KeyModifiers::META,
-    ) {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::SUPER | KeyModifiers::META)
+    {
         return None;
     }
+
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    // AltGr == Ctrl+Alt on Windows. Printable non-lowercase chars with that
+    // chord are paste text (same rule psmux uses); lowercase C-M-x is a real
+    // chord and must not be swallowed into a paste burst.
+    let altgr = ctrl && alt;
+
     match key.code {
+        KeyCode::Char(c) if altgr => {
+            if c.is_ascii_lowercase() {
+                None
+            } else {
+                Some(c)
+            }
+        }
+        KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab if ctrl || alt => None,
         KeyCode::Char(c) => Some(c),
         KeyCode::Enter => Some('\n'),
         KeyCode::Tab => Some('\t'),
@@ -915,6 +945,14 @@ mod tests {
         assert_eq!(paste_char(&press(KeyCode::Char('v'), KeyModifiers::CONTROL)), None);
         assert_eq!(paste_char(&press(KeyCode::Enter, KeyModifiers::ALT)), None);
         assert_eq!(paste_char(&press(KeyCode::Left, KeyModifiers::NONE)), None);
+        // AltGr (Ctrl+Alt) printable chars — including `~` on many layouts —
+        // MUST be paste text; rejecting them truncated pastes at the first tilde.
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        assert_eq!(paste_char(&press(KeyCode::Char('~'), altgr)), Some('~'));
+        assert_eq!(paste_char(&press(KeyCode::Char('@'), altgr)), Some('@'));
+        assert_eq!(paste_char(&press(KeyCode::Char('\\'), altgr)), Some('\\'));
+        // Real Ctrl+Alt+letter chords stay rejected.
+        assert_eq!(paste_char(&press(KeyCode::Char('c'), altgr)), None);
         // Release halves of pasted keys must not contribute a character.
         assert_eq!(
             paste_char(&key(KeyCode::Char('a'), KeyModifiers::NONE, KeyEventKind::Release)),
@@ -930,6 +968,21 @@ mod tests {
         assert_eq!(
             strip_bracketed_paste("\x1b[200~a\nb\x1b[201~"),
             Some("a\nb")
+        );
+        // Payload may contain `~` — only the full `ESC[201~` end marker closes.
+        assert_eq!(
+            strip_bracketed_paste("\x1b[200~hello~world\x1b[201~"),
+            Some("hello~world")
+        );
+        assert_eq!(
+            strip_bracketed_paste("\x1b[200~path=~/foo\x1b[201~"),
+            Some("path=~/foo")
+        );
+        assert_eq!(
+            strip_bracketed_paste(
+                "\x1b[200~  topology: ~600 tok (ceiling 600)\n  outline: ~1200 tok\x1b[201~"
+            ),
+            Some("  topology: ~600 tok (ceiling 600)\n  outline: ~1200 tok")
         );
         // Not a BP sequence.
         assert_eq!(strip_bracketed_paste("hello"), None);
