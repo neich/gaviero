@@ -1092,7 +1092,7 @@ impl AgentChatState {
                 .map(|c| c.div_ceil(4).min(budgets.topology))
                 .unwrap_or(budgets.topology);
             lines.push(format!(
-                "  topology: ~{} tok (ceiling {})",
+                "  topology: ≈{} tok (ceiling {})",
                 projected, budgets.topology
             ));
         }
@@ -1105,12 +1105,12 @@ impl AgentChatState {
             } else {
                 (budgets.anchor, budgets.anchor)
             };
-            lines.push(format!("  outline: ~{} tok (ceiling {})", projected, ceiling));
+            lines.push(format!("  outline: ≈{} tok (ceiling {})", projected, ceiling));
         }
         if arms.memory {
             let projected = hints.memory_tokens.unwrap_or(budgets.memory);
             lines.push(format!(
-                "  memory: ~{} tok (ceiling {})",
+                "  memory: ≈{} tok (ceiling {})",
                 projected, budgets.memory
             ));
         }
@@ -1120,13 +1120,13 @@ impl AgentChatState {
                 .map(|c| c.div_ceil(4).min(budgets.impact))
                 .unwrap_or(budgets.impact);
             lines.push(format!(
-                "  impact: ~{} tok (ceiling {})",
+                "  impact: ≈{} tok (ceiling {})",
                 projected, budgets.impact
             ));
         }
         let total =
             gaviero_core::context_planner::estimate_bootstrap_tokens(arms, budgets, hints);
-        lines.push(format!("  total bootstrap: ~{} tok", total));
+        lines.push(format!("  total bootstrap: ≈{} tok", total));
         lines.join("\n")
     }
 
@@ -5004,7 +5004,7 @@ mod tests {
             last.content
         );
         assert!(
-            last.content.contains("outline: ~1200 tok"),
+            last.content.contains("outline: ≈1200 tok"),
             "default first turn should project the thin anchor, not the full push: {:?}",
             last.content
         );
@@ -5035,7 +5035,7 @@ mod tests {
             .last()
             .expect("reset emits a system message");
         assert!(
-            last.content.contains("topology: ~600 tok"),
+            last.content.contains("topology: ≈600 tok"),
             "armed /lite should project topology-only bootstrap: {:?}",
             last.content
         );

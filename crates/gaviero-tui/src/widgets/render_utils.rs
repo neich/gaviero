@@ -82,6 +82,18 @@ pub fn word_wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// CSI final bytes per ECMA-48 / xterm: `0x40`…`0x7E` (`@`…`~`).
+///
+/// Letters (`m`, `H`, …) are the common case, but many sequences terminate on
+/// non-letters — notably `~` (`ESC[3~` Delete, `ESC[200~` / `ESC[201~`
+/// bracketed-paste). Stopping only on `is_ascii_alphabetic()` eats the `~`
+/// and every following character until a letter, which truncates paths like
+/// `~/…` and any text after a CSI-`~` sequence.
+#[inline]
+fn is_csi_final_byte(c: char) -> bool {
+    matches!(c, '\x40'..='\x7E')
+}
+
 /// Strip ANSI escape sequences from text so it is safe to write into ratatui cells.
 ///
 /// Raw escape codes written char-by-char corrupt the terminal display — they bypass
@@ -96,7 +108,7 @@ pub fn strip_ansi(text: &str) -> String {
                 Some('[') => {
                     chars.next();
                     for c in chars.by_ref() {
-                        if c.is_ascii_alphabetic() {
+                        if is_csi_final_byte(c) {
                             break;
                         }
                     }
@@ -174,5 +186,20 @@ mod tests {
     #[test]
     fn test_strip_ansi_bold_reset() {
         assert_eq!(strip_ansi("\x1b[1mbold\x1b[0m normal"), "bold normal");
+    }
+
+    #[test]
+    fn strip_ansi_preserves_bare_tilde() {
+        assert_eq!(strip_ansi("hello~world"), "hello~world");
+        assert_eq!(strip_ansi("path=~/foo/bar"), "path=~/foo/bar");
+        assert_eq!(strip_ansi("\x1b[0m~/home"), "~/home");
+    }
+
+    #[test]
+    fn strip_ansi_csi_tilde_final_does_not_eat_following_text() {
+        // Delete / bracketed-paste finals use `~` (0x7E), not a letter.
+        assert_eq!(strip_ansi("before\x1b[3~after"), "beforeafter");
+        assert_eq!(strip_ansi("\x1b[200~PASTE\x1b[201~end"), "PASTEend");
+        assert_eq!(strip_ansi("x\x1b[1;2~y"), "xy");
     }
 }
