@@ -28,9 +28,20 @@ client sonnet {
 client codex-5-5 {
     model "codex:gpt-5.5"
     privacy public
-    // xhigh would clamp to Codex's `high` — ask for high directly so the
-    // intent is explicit.
+    // gpt-5.5 ceiling is xhigh; high is the everyday default.
     effort high
+}
+
+client codex-5-6-sol {
+    model "codex:gpt-5.6-sol"
+    privacy public
+    effort high
+}
+
+client codex-5-6-luna {
+    model "codex:gpt-5.6-luna"
+    privacy public
+    effort medium
 }
 
 client codex-5-4 {

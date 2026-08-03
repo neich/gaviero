@@ -299,7 +299,7 @@ fn codex_exec_args(
         args.push(root.to_string_lossy().into_owned());
     }
 
-    if let Some(codex_effort) = map_effort_to_codex(effort) {
+    if let Some(codex_effort) = map_effort_to_codex(effort, model) {
         args.push("--config".to_string());
         args.push(format!("model_reasoning_effort={codex_effort}"));
     }
@@ -384,28 +384,78 @@ async fn drive_codex_stdout(
 /// Map the DSL's provider-neutral `effort` vocabulary into Codex's
 /// `model_reasoning_effort` config value.
 ///
-/// Gaviero accepts `off`, `auto`, `low`, `medium`, `high`, `xhigh`, `max`
-/// (shared with Claude). Codex only understands `minimal`, `low`, `medium`,
-/// `high`. `None` means "omit the flag and let Codex use its default".
+/// Gaviero accepts `off`, `auto`, `minimal`, `low`, `medium`, `high`,
+/// `xhigh`, `max`, `ultra`. `None` / `off` / `auto` omit the flag so Codex
+/// uses its model default.
 ///
-/// `xhigh` / `max` are clamped to `high` — Codex has no tier above that.
-/// `off` / `auto` map to `None` so the user can use a single `client` block
-/// across providers without forcing Codex into a specific tier.
-fn map_effort_to_codex(effort: Option<&str>) -> Option<&'static str> {
-    match effort?.trim().to_ascii_lowercase().as_str() {
-        "off" | "auto" | "" => None,
-        "minimal" => Some("minimal"),
-        "low" => Some("low"),
-        "medium" => Some("medium"),
-        "high" | "xhigh" | "max" => Some("high"),
+/// Supported ceilings follow Codex `models.json` (2026-08):
+/// * `gpt-5.6-sol` / `gpt-5.6-terra` / bare `gpt-5.6` → up to `ultra`
+/// * `gpt-5.6-luna` → up to `max` (no `ultra`)
+/// * older models (`gpt-5.5`, `gpt-5.4`, `gpt-5.2`, …) → up to `xhigh`
+///
+/// Requests above the active model's ceiling are clamped down (not dropped).
+fn map_effort_to_codex(effort: Option<&str>, model: &str) -> Option<&'static str> {
+    let requested = match effort?.trim().to_ascii_lowercase().as_str() {
+        "off" | "auto" | "" => return None,
+        "minimal" => "minimal",
+        "low" => "low",
+        "medium" => "medium",
+        "high" => "high",
+        "xhigh" => "xhigh",
+        "max" => "max",
+        "ultra" => "ultra",
         other => {
             tracing::warn!(
                 target: "backend.codex",
                 effort = other,
-                "unknown effort value; not forwarding to codex (supported: minimal|low|medium|high|xhigh|max|off|auto)"
+                "unknown effort value; not forwarding to codex (supported: minimal|low|medium|high|xhigh|max|ultra|off|auto)"
             );
-            None
+            return None;
         }
+    };
+    Some(clamp_codex_effort(requested, model))
+}
+
+/// Highest `model_reasoning_effort` the given Codex model advertises.
+fn codex_effort_ceiling(model: &str) -> &'static str {
+    let m = model
+        .trim()
+        .strip_prefix("codex:")
+        .unwrap_or(model)
+        .trim()
+        .to_ascii_lowercase();
+    if m == "gpt-5.6" || m.starts_with("gpt-5.6-sol") || m.starts_with("gpt-5.6-terra") {
+        "ultra"
+    } else if m.starts_with("gpt-5.6-luna") {
+        "max"
+    } else if m.starts_with("gpt-5.6") {
+        // Unknown 5.6 variant — allow the common Sol/Terra ceiling.
+        "ultra"
+    } else {
+        // gpt-5.5 / gpt-5.4 / gpt-5.2 / legacy: Codex lists through xhigh.
+        "xhigh"
+    }
+}
+
+fn codex_effort_rank(effort: &str) -> u8 {
+    match effort {
+        "minimal" => 1,
+        "low" => 2,
+        "medium" => 3,
+        "high" => 4,
+        "xhigh" => 5,
+        "max" => 6,
+        "ultra" => 7,
+        _ => 0,
+    }
+}
+
+fn clamp_codex_effort(requested: &'static str, model: &str) -> &'static str {
+    let ceiling = codex_effort_ceiling(model);
+    if codex_effort_rank(requested) > codex_effort_rank(ceiling) {
+        ceiling
+    } else {
+        requested
     }
 }
 
@@ -595,34 +645,65 @@ url = "https://example/mcp/"
 
     #[test]
     fn test_map_effort_to_codex_known_values() {
-        assert_eq!(map_effort_to_codex(Some("low")), Some("low"));
-        assert_eq!(map_effort_to_codex(Some("medium")), Some("medium"));
-        assert_eq!(map_effort_to_codex(Some("high")), Some("high"));
-        assert_eq!(map_effort_to_codex(Some("minimal")), Some("minimal"));
+        assert_eq!(map_effort_to_codex(Some("low"), "gpt-5.5"), Some("low"));
+        assert_eq!(map_effort_to_codex(Some("medium"), "gpt-5.5"), Some("medium"));
+        assert_eq!(map_effort_to_codex(Some("high"), "gpt-5.5"), Some("high"));
+        assert_eq!(map_effort_to_codex(Some("minimal"), "gpt-5.5"), Some("minimal"));
+        assert_eq!(map_effort_to_codex(Some("xhigh"), "gpt-5.5"), Some("xhigh"));
     }
 
     #[test]
-    fn test_map_effort_to_codex_clamps_above_high() {
-        assert_eq!(map_effort_to_codex(Some("xhigh")), Some("high"));
-        assert_eq!(map_effort_to_codex(Some("max")), Some("high"));
+    fn test_map_effort_to_codex_gpt56_passes_max_and_ultra() {
+        assert_eq!(map_effort_to_codex(Some("xhigh"), "gpt-5.6-sol"), Some("xhigh"));
+        assert_eq!(map_effort_to_codex(Some("max"), "gpt-5.6-sol"), Some("max"));
+        assert_eq!(map_effort_to_codex(Some("ultra"), "gpt-5.6-sol"), Some("ultra"));
+        assert_eq!(map_effort_to_codex(Some("ultra"), "gpt-5.6-terra"), Some("ultra"));
+        assert_eq!(map_effort_to_codex(Some("ultra"), "gpt-5.6"), Some("ultra"));
+        assert_eq!(map_effort_to_codex(Some("max"), "codex:gpt-5.6-luna"), Some("max"));
+    }
+
+    #[test]
+    fn test_map_effort_to_codex_clamps_to_model_ceiling() {
+        // Older models top out at xhigh.
+        assert_eq!(map_effort_to_codex(Some("max"), "gpt-5.5"), Some("xhigh"));
+        assert_eq!(map_effort_to_codex(Some("ultra"), "gpt-5.5"), Some("xhigh"));
+        // Luna advertises through max, not ultra.
+        assert_eq!(map_effort_to_codex(Some("ultra"), "gpt-5.6-luna"), Some("max"));
     }
 
     #[test]
     fn test_map_effort_to_codex_off_and_auto_omit() {
-        assert_eq!(map_effort_to_codex(Some("off")), None);
-        assert_eq!(map_effort_to_codex(Some("auto")), None);
-        assert_eq!(map_effort_to_codex(None), None);
+        assert_eq!(map_effort_to_codex(Some("off"), "gpt-5.6-sol"), None);
+        assert_eq!(map_effort_to_codex(Some("auto"), "gpt-5.6-sol"), None);
+        assert_eq!(map_effort_to_codex(None, "gpt-5.6-sol"), None);
     }
 
     #[test]
     fn test_map_effort_to_codex_case_insensitive() {
-        assert_eq!(map_effort_to_codex(Some("HIGH")), Some("high"));
-        assert_eq!(map_effort_to_codex(Some("Medium")), Some("medium"));
+        assert_eq!(map_effort_to_codex(Some("HIGH"), "gpt-5.6-sol"), Some("high"));
+        assert_eq!(map_effort_to_codex(Some("Medium"), "gpt-5.6-sol"), Some("medium"));
+        assert_eq!(map_effort_to_codex(Some("ULTRA"), "gpt-5.6-sol"), Some("ultra"));
     }
 
     #[test]
     fn test_map_effort_to_codex_unknown_omitted() {
-        assert_eq!(map_effort_to_codex(Some("turbo")), None);
+        assert_eq!(map_effort_to_codex(Some("turbo"), "gpt-5.6-sol"), None);
+    }
+
+    #[test]
+    fn test_codex_exec_args_forwards_gpt56_ultra_effort() {
+        let args = codex_exec_args(
+            "gpt-5.6-sol",
+            Some("ultra"),
+            &[],
+            &[],
+            std::path::Path::new(""),
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--config", "model_reasoning_effort=ultra"]),
+            "expected model_reasoning_effort=ultra, got {args:?}"
+        );
     }
 
     #[test]
