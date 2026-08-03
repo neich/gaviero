@@ -25,6 +25,26 @@ pub const DEEPSEEK_API_MODELS: &[&str] = &["deepseek-v4-pro", "deepseek-v4-flash
 pub const CLAUDE_MODEL_ALIASES: &[&str] =
     &["fable", "sonnet", "opus", "haiku", "opusplan", "sonnet[1m]", "opus[1m]"];
 
+/// Canonical Codex model ids the `/model` picker always offers, without the
+/// `codex:` prefix. Codex has no CLI discovery path in Gaviero (unlike Claude
+/// `--help` / Cursor `--list-models`), so without this list Tab-completing
+/// `codex:` or typing a bare `gpt` fragment only surfaces Cursor's proxied
+/// `cursor:gpt-*` entries — Codex looks like it disappeared.
+///
+/// GPT-5.6 family slugs match Codex `models.json` / OpenAI docs:
+/// `gpt-5.6-sol` (flagship), `gpt-5.6-terra` (balanced), `gpt-5.6-luna`
+/// (fast/affordable). Older `gpt-5.5` / `gpt-5.4` / `gpt-5.2` stay for
+/// compatibility. Free-form ids still pass [`validate_model_spec`]; this
+/// list is picker UX only.
+pub const CODEX_MODEL_ALIASES: &[&str] = &[
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.2",
+];
+
 /// Concrete Claude CLI `--model` id that the bare `sonnet` alias resolves to.
 ///
 /// The picker, settings, and `backend.name()` display keep storing the
@@ -344,10 +364,11 @@ fn model_id_has_nested_provider(model: &str) -> bool {
 
 /// Static (discovery-independent) model ids for a provider, without the
 /// provider prefix. Providers whose model lists come only from CLI discovery
-/// (cursor, codex, ollama, local) have no static entries.
+/// (cursor, ollama, local) have no static entries.
 fn static_model_ids(provider: &str) -> Vec<String> {
     match provider {
         "claude" => CLAUDE_MODEL_ALIASES.iter().map(|s| s.to_string()).collect(),
+        "codex" => CODEX_MODEL_ALIASES.iter().map(|s| s.to_string()).collect(),
         "deepseek" => DEEPSEEK_API_MODELS.iter().map(|s| s.to_string()).collect(),
         _ => Vec::new(),
     }
@@ -953,6 +974,30 @@ mod tests {
         assert!(hits.contains(&"claude:fable".to_string()), "got {hits:?}");
         assert!(hits.contains(&"claude:sonnet".to_string()), "got {hits:?}");
         assert!(hits.contains(&"claude:opus".to_string()), "got {hits:?}");
+    }
+
+    #[test]
+    fn test_model_spec_completions_codex_models_from_static_aliases() {
+        // Regression: Codex has no CLI discovery. Without static aliases,
+        // `/model codex:` and bare `gpt` fragments only surface Cursor's
+        // proxied gpt models — Codex looks unavailable.
+        let hits = model_spec_completions("codex:", &[]);
+        assert!(hits.contains(&"codex:gpt-5.6-sol".to_string()), "got {hits:?}");
+        assert!(hits.contains(&"codex:gpt-5.6-terra".to_string()), "got {hits:?}");
+        assert!(hits.contains(&"codex:gpt-5.6-luna".to_string()), "got {hits:?}");
+        assert!(hits.contains(&"codex:gpt-5.5".to_string()), "got {hits:?}");
+        assert!(hits.contains(&"codex:gpt-5.4".to_string()), "got {hits:?}");
+        assert!(hits.contains(&"codex:gpt-5.2".to_string()), "got {hits:?}");
+
+        let family = model_spec_completions("codex:gpt-5.6", &[]);
+        assert!(family.contains(&"codex:gpt-5.6-sol".to_string()), "got {family:?}");
+        assert!(family.contains(&"codex:gpt-5.6-luna".to_string()), "got {family:?}");
+
+        let gpt_hits = model_spec_completions("gpt", &[]);
+        assert!(
+            gpt_hits.contains(&"codex:gpt-5.6-sol".to_string()),
+            "bare gpt fragment must offer Codex specs: {gpt_hits:?}"
+        );
     }
 
     #[test]

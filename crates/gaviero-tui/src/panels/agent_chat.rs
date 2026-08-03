@@ -735,6 +735,14 @@ impl AgentChatState {
                     options.push(spec);
                 }
             }
+            // Codex has no CLI discovery — pin the documented aliases so
+            // `/model` Available and Tab completion always offer them.
+            for alias in gaviero_core::swarm::backend::shared::CODEX_MODEL_ALIASES {
+                let spec = format!("codex:{alias}");
+                if !options.iter().any(|opt| opt == &spec) {
+                    options.push(spec);
+                }
+            }
             for cursor_model in gaviero_core::acp::session::discover_cursor_model_options() {
                 if !options.iter().any(|opt| opt == &cursor_model) {
                     options.push(cursor_model);
@@ -1220,7 +1228,7 @@ impl AgentChatState {
                     let list = if options.is_empty() {
                         "claude:fable, claude:sonnet, claude:opus, claude:haiku, \
                          claude:opusplan, claude:sonnet[1m], claude:opus[1m], \
-                         codex:<model>, ollama:qwen2.5-coder:7b"
+                         codex:gpt-5.6-sol, codex:gpt-5.6-luna, ollama:qwen2.5-coder:7b"
                             .to_string()
                     } else {
                         options.join(", ")
@@ -1251,12 +1259,13 @@ impl AgentChatState {
                     let current = self.effective_effort();
                     self.add_system_message(&format!(
                         "Effort level: {}.\n\
-                         Usage: /effort <off|auto|low|medium|high|xhigh|max>\n\
+                         Usage: /effort <off|auto|low|medium|high|xhigh|max|ultra>\n\
                          Applies to Claude and Codex sessions (Ollama ignores it).\n\
                          `xhigh` applies on Opus 4.7 (falls back to `high` on older \
-                         Claude models, and is clamped to `high` on Codex).\n\
+                         Claude models). On Codex: `xhigh`/`max`/`ultra` forward for \
+                         GPT-5.6 Sol/Terra; Luna caps at `max`; older models at `xhigh`.\n\
                          `off`/`auto` omit the reasoning hint entirely.\n\
-                         `max` is session-only.",
+                         `max`/`ultra` are session-only on Claude.",
                         current
                     ));
                 } else {
@@ -1268,9 +1277,10 @@ impl AgentChatState {
                         "high" | "h" => "high",
                         "xhigh" | "xh" => "xhigh",
                         "max" => "max",
+                        "ultra" | "u" => "ultra",
                         _ => {
                             self.add_system_message(
-                                "Invalid effort level. Use: off, auto, low, medium, high, xhigh, max",
+                                "Invalid effort level. Use: off, auto, low, medium, high, xhigh, max, ultra",
                             );
                             self.text_input.text.clear();
                             self.text_input.cursor = 0;
@@ -1624,7 +1634,7 @@ impl AgentChatState {
                     "Available commands:\n\n\
                      Conversation:\n\
                      /model <provider:model>  — Set model. Examples: claude:fable, claude:sonnet, claude:opus, claude:haiku, claude:opusplan, claude:sonnet[1m], claude:opus[1m], codex:<model>, ollama:<model>\n\
-                     /effort <level>          — Set effort/reasoning level for Claude + Codex (off, auto, low, medium, high, xhigh, max). Alias: /thinking\n\
+                     /effort <level>          — Set effort/reasoning level for Claude + Codex (off, auto, low, medium, high, xhigh, max, ultra). Alias: /thinking\n\
                      /namespace <name>        — Set memory namespace (or show current). Alias: /ns\n\
                      /autoapprove             — Toggle auto-approve for this conversation. Alias: /yolo\n\
                      /workspace               — Arm workspace-wide planner scope for the next prompt only (multi-folder workspaces). Default scope follows the active buffer's folder; use this when the prompt genuinely spans folders. Alias: /ws\n\
