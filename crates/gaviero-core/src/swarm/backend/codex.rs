@@ -1,10 +1,26 @@
 //! Codex CLI subprocess backend.
 //!
-//! Implements [`AgentBackend`] by spawning OpenAI's `codex exec` non-interactive
-//! subprocess and mapping its streaming stdout into the unified
-//! [`UnifiedStreamEvent`] stream. File changes are proposed via `<file>` blocks
-//! in the response text (detected and routed through the Write Gate), matching
-//! the pattern used by the Claude Code backend.
+//! Implements [`AgentBackend`] by spawning OpenAI's `codex exec --json`
+//! non-interactive subprocess and mapping its JSONL event stream into the
+//! unified [`UnifiedStreamEvent`] stream. File changes are proposed via
+//! `<file>` blocks in the response text (detected and routed through the Write
+//! Gate), matching the pattern used by the Claude Code backend.
+//!
+//! **Why `--json` is mandatory here.** Without it, `codex exec` splits its
+//! output: stdout carries *only the final agent message*, emitted after the
+//! turn ends, while the entire human-readable progress log (banner, echoed
+//! prompt, `exec <command>` lines, command output, token counts) goes to
+//! **stderr**. Reading stdout alone therefore produces no observable activity
+//! until the turn completes — the parity contract in
+//! `agent_session/mod.rs` requires the opposite. Forwarding stderr instead is
+//! not an option: it echoes the whole enriched prompt back, which would land
+//! in the chat panel and in the `<turn_annotations>` memory extractor.
+//! `--json` puts structured, per-item events on stdout and leaves stderr for
+//! real diagnostics. Verified against `codex-cli 0.146.0`.
+//!
+//! Granularity is per *item* (a whole message, a whole command), not
+//! token-level deltas. Token-level streaming exists only in the `app-server`
+//! protocol — see [`crate::agent_session::codex_app_server`].
 //!
 //! Codex is invoked with `--sandbox read-only` and `--config approval_policy=never`
 //! so that tool-use stays non-interactive; the model emits proposed writes as
@@ -16,15 +32,17 @@
 //! sibling folder beyond the cwd is forwarded as a `--add-dir <path>` flag so
 //! the model can read/write across the whole workspace.
 
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
 use futures::Stream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::acp::protocol::{find_next_file_block, parse_file_blocks};
+use crate::acp::protocol::find_next_file_block;
 
 use super::shared::{build_enriched_prompt, default_editor_system_prompt};
 use super::{
@@ -166,20 +184,37 @@ impl AgentBackend for CodexBackend {
             let duration_ms = Some(start.elapsed().as_millis() as u64);
 
             match result {
-                Ok(()) => {
-                    let ok = exit_status.as_ref().map(|s| s.success()).unwrap_or(false);
+                Ok(outcome) => {
+                    // `turn.failed` is authoritative; an `error` item is not
+                    // (codex emits those for warnings too, then exits 0).
+                    let exited_ok = exit_status.as_ref().map(|s| s.success()).unwrap_or(false);
+                    let ok = exited_ok && outcome.turn_failed.is_none();
                     if ok {
-                        let _ = tx_clone
-                            .send(Ok(UnifiedStreamEvent::Usage(TokenUsage {
-                                duration_ms,
-                                ..Default::default()
-                            })))
-                            .await;
+                        for diagnostic in &outcome.diagnostics {
+                            tracing::warn!(
+                                target: "backend.codex",
+                                %diagnostic,
+                                "codex reported a non-fatal error item"
+                            );
+                        }
+                        if outcome.saw_json && !outcome.saw_visible_text {
+                            tracing::warn!(
+                                target: "backend.codex",
+                                stderr = %stderr_text.trim(),
+                                "codex exec --json produced no assistant text — the event schema \
+                                 may have changed; expected `item.completed` with \
+                                 item.type=\"agent_message\""
+                            );
+                        }
+                        let mut usage = outcome.usage.unwrap_or_default();
+                        usage.duration_ms = duration_ms;
+                        let _ = tx_clone.send(Ok(UnifiedStreamEvent::Usage(usage))).await;
                         let _ = tx_clone
                             .send(Ok(UnifiedStreamEvent::Done(StopReason::EndTurn)))
                             .await;
                     } else {
-                        let msg = format_exit_error(&exit_status, &stderr_text);
+                        let msg =
+                            format_exit_error(&exit_status, &merge_diagnostics(&outcome, &stderr_text));
                         let _ = tx_clone.send(Ok(UnifiedStreamEvent::Error(msg))).await;
                         let _ = tx_clone
                             .send(Ok(UnifiedStreamEvent::Done(StopReason::Error)))
@@ -246,6 +281,10 @@ fn codex_exec_args(
 ) -> Vec<String> {
     let mut args = vec![
         "exec".to_string(),
+        // Structured event stream on stdout. Without this, stdout carries only
+        // the final message and every progress event goes to stderr — see the
+        // module docs. The whole observability contract depends on this flag.
+        "--json".to_string(),
         "--skip-git-repo-check".to_string(),
         "--model".to_string(),
         model.to_string(),
@@ -328,57 +367,291 @@ fn codex_exec_args(
     args
 }
 
-/// Read stdout in chunks and emit TextDelta + FileBlock events.
-async fn drive_codex_stdout(
-    stdout: tokio::process::ChildStdout,
-    tx: tokio::sync::mpsc::Sender<Result<UnifiedStreamEvent>>,
-) -> Result<()> {
-    let mut reader = BufReader::new(stdout);
-    let mut buf = [0u8; 4096];
-    let mut full_text = String::new();
-    let mut file_scan_pos: usize = 0;
+/// Whether an `item.*` event describes a starting or a finished item.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ItemPhase {
+    Started,
+    Completed,
+}
 
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .await
-            .context("reading codex stdout")?;
-        if n == 0 {
-            break;
+/// What the stdout drain learned beyond the events it already forwarded.
+#[derive(Debug, Default)]
+struct CodexStdoutOutcome {
+    /// Token counts from `turn.completed`. `duration_ms` is filled in by the
+    /// caller, which owns the wall clock.
+    usage: Option<TokenUsage>,
+    /// `turn.failed` — an unambiguous, authoritative failure signal.
+    turn_failed: Option<String>,
+    /// `error` items. These are *not* authoritative: codex also uses them for
+    /// non-fatal warnings (e.g. the under-development feature notice), and the
+    /// turn can still complete with exit code 0. Surfaced through the exit-code
+    /// path or logged, never bailed on directly.
+    diagnostics: Vec<String>,
+    /// Whether any visible assistant text was produced. Used to detect a
+    /// silent schema mismatch against a future/older codex build.
+    saw_visible_text: bool,
+    /// Whether any line parsed as JSON at all.
+    saw_json: bool,
+}
+
+/// Incremental `codex exec --json` JSONL parser.
+///
+/// Split from the IO loop so the event mapping is unit-testable without
+/// spawning a subprocess. Owns the running assistant text because `<file>`
+/// block detection scans across item boundaries.
+#[derive(Default)]
+struct CodexJsonParser {
+    /// Concatenated visible assistant text, in emission order.
+    full_text: String,
+    file_scan_pos: usize,
+    /// Item ids already announced via `ToolCallStart`, so an item that only
+    /// reports `item.completed` still produces a start/end pair.
+    started_tools: HashSet<String>,
+    outcome: CodexStdoutOutcome,
+}
+
+impl CodexJsonParser {
+    /// Map one stdout line to zero or more stream events.
+    fn push_line(&mut self, line: &str) -> Vec<UnifiedStreamEvent> {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return Vec::new();
         }
-        let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
-        full_text.push_str(&chunk);
 
-        if tx
-            .send(Ok(UnifiedStreamEvent::TextDelta(chunk)))
-            .await
-            .is_err()
-        {
-            return Ok(()); // receiver dropped
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            // Not JSON. Either a codex build that ignored `--json`, or stray
+            // output interleaved on stdout. Treat it as visible text rather
+            // than dropping it — degrading to the pre-`--json` behavior beats
+            // showing the user nothing.
+            let mut out = Vec::new();
+            self.emit_text(line, &mut out);
+            return out;
+        };
+
+        self.outcome.saw_json = true;
+        let mut out = Vec::new();
+        match value.get("type").and_then(Value::as_str).unwrap_or_default() {
+            "item.started" => self.push_item(&value, ItemPhase::Started, &mut out),
+            "item.completed" => self.push_item(&value, ItemPhase::Completed, &mut out),
+            "turn.completed" => {
+                self.outcome.usage = Some(parse_usage(value.get("usage")));
+            }
+            "turn.failed" => {
+                self.outcome.turn_failed = Some(
+                    error_message(value.get("error"))
+                        .unwrap_or_else(|| "codex turn failed".to_string()),
+                );
+            }
+            // Lifecycle events with nothing to show. `thread.started` carries
+            // a `thread_id`; `codex exec` is stateless per turn so gaviero has
+            // nowhere to persist it (the app-server session owns continuity).
+            "thread.started" | "turn.started" | "item.updated" => {}
+            other => {
+                tracing::debug!(
+                    target: "backend.codex",
+                    event = other,
+                    "unhandled codex event type"
+                );
+            }
         }
+        out
+    }
 
-        // Detect complete <file> blocks as they arrive.
-        while let Some((path, content, end)) = find_next_file_block(&full_text, file_scan_pos) {
-            file_scan_pos = end;
-            if tx
-                .send(Ok(UnifiedStreamEvent::FileBlock { path, content }))
-                .await
-                .is_err()
-            {
-                return Ok(());
+    fn push_item(&mut self, value: &Value, phase: ItemPhase, out: &mut Vec<UnifiedStreamEvent>) {
+        let Some(item) = value.get("item") else {
+            return;
+        };
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        let id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        match item_type {
+            // Assistant prose. A turn can contain several (a preamble before a
+            // command, then the answer); only the completed form carries text.
+            "agent_message" => {
+                if phase == ItemPhase::Completed
+                    && let Some(text) = item_text(item)
+                {
+                    self.emit_text(&text, out);
+                }
+            }
+            "reasoning" => {
+                if phase == ItemPhase::Completed
+                    && let Some(text) = item_text(item)
+                {
+                    out.push(UnifiedStreamEvent::ThinkingDelta(text));
+                }
+            }
+            // Non-fatal by default — collected, not raised. See
+            // `CodexStdoutOutcome::diagnostics`.
+            "error" => {
+                if let Some(msg) = error_message(Some(item)) {
+                    self.outcome.diagnostics.push(msg);
+                }
+            }
+            // Shell commands map onto the Bash tool so `format_tool_summary`
+            // renders the argv the same way it does for every other provider.
+            "command_execution" => {
+                let command = item
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                self.emit_tool(
+                    &id,
+                    "Bash",
+                    serde_json::json!({ "command": command }),
+                    phase,
+                    out,
+                );
+            }
+            // Anything else that isn't prose is activity worth showing. Naming
+            // the tool after the item type means a future codex tool surfaces
+            // as "Using <type>..." instead of vanishing.
+            other => {
+                let name = mcp_tool_name(item).unwrap_or_else(|| other.to_string());
+                self.emit_tool(&id, &name, item.clone(), phase, out);
             }
         }
     }
 
-    // Catch any trailing blocks not detected mid-stream (shouldn't normally happen
-    // because scan is incremental, but belt-and-suspenders).
-    for (path, content) in parse_file_blocks(&full_text[file_scan_pos..]) {
-        let _ = tx
-            .send(Ok(UnifiedStreamEvent::FileBlock { path, content }))
-            .await;
+    /// Emit `ToolCallStart` / `ToolCallEnd`, synthesizing the start when an
+    /// item reports only its completion.
+    fn emit_tool(
+        &mut self,
+        id: &str,
+        name: &str,
+        args: Value,
+        phase: ItemPhase,
+        out: &mut Vec<UnifiedStreamEvent>,
+    ) {
+        if !self.started_tools.contains(id) {
+            self.started_tools.insert(id.to_string());
+            out.push(UnifiedStreamEvent::ToolCallStart {
+                id: id.to_string(),
+                name: name.to_string(),
+                args,
+            });
+        }
+        if phase == ItemPhase::Completed {
+            out.push(UnifiedStreamEvent::ToolCallEnd { id: id.to_string() });
+        }
     }
 
-    Ok(())
+    /// Append visible text and drain any `<file>` blocks it completed.
+    ///
+    /// Blocks are scanned against the accumulated text, not the individual
+    /// item, so `file_scan_pos` stays meaningful across messages.
+    fn emit_text(&mut self, text: &str, out: &mut Vec<UnifiedStreamEvent>) {
+        if text.is_empty() {
+            return;
+        }
+        // Separate consecutive messages so they don't run together in chat and
+        // so a `<file>` block can't be glued onto the previous message's tail.
+        let chunk = if self.full_text.is_empty() || self.full_text.ends_with('\n') {
+            text.to_string()
+        } else {
+            format!("\n\n{text}")
+        };
+        self.full_text.push_str(&chunk);
+        self.outcome.saw_visible_text = true;
+        out.push(UnifiedStreamEvent::TextDelta(chunk));
+
+        while let Some((path, content, end)) =
+            find_next_file_block(&self.full_text, self.file_scan_pos)
+        {
+            self.file_scan_pos = end;
+            out.push(UnifiedStreamEvent::FileBlock { path, content });
+        }
+    }
+}
+
+/// Text payload of an item, tolerating the `text` / `summary` spellings codex
+/// uses for prose and reasoning respectively.
+fn item_text(item: &Value) -> Option<String> {
+    for key in ["text", "summary", "message"] {
+        match item.get(key) {
+            Some(Value::String(s)) if !s.is_empty() => return Some(s.clone()),
+            // Reasoning summaries can arrive as a list of paragraphs.
+            Some(Value::Array(parts)) => {
+                let joined = parts
+                    .iter()
+                    .filter_map(|p| {
+                        p.as_str()
+                            .map(str::to_string)
+                            .or_else(|| p.get("text").and_then(Value::as_str).map(str::to_string))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !joined.is_empty() {
+                    return Some(joined);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Pull a human-readable message out of an error-shaped value.
+fn error_message(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if let Some(s) = value.as_str() {
+        return Some(s.to_string());
+    }
+    for key in ["message", "error", "text"] {
+        if let Some(s) = value.get(key).and_then(Value::as_str) {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
+/// `server.tool` label for an MCP tool call, when the item carries one.
+fn mcp_tool_name(item: &Value) -> Option<String> {
+    let tool = item.get("tool").and_then(Value::as_str)?;
+    match item.get("server").and_then(Value::as_str) {
+        Some(server) => Some(format!("{server}.{tool}")),
+        None => Some(tool.to_string()),
+    }
+}
+
+/// `turn.completed.usage` → [`TokenUsage`]. `input_tokens` is the total codex
+/// reports (cached input included); `duration_ms` is filled in by the caller.
+fn parse_usage(usage: Option<&Value>) -> TokenUsage {
+    let get = |key: &str| {
+        usage
+            .and_then(|u| u.get(key))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    TokenUsage {
+        input_tokens: get("input_tokens"),
+        output_tokens: get("output_tokens"),
+        cost_usd: None,
+        duration_ms: None,
+    }
+}
+
+/// Read `codex exec --json` stdout line by line and forward mapped events.
+async fn drive_codex_stdout(
+    stdout: tokio::process::ChildStdout,
+    tx: tokio::sync::mpsc::Sender<Result<UnifiedStreamEvent>>,
+) -> Result<CodexStdoutOutcome> {
+    let mut lines = BufReader::new(stdout).lines();
+    let mut parser = CodexJsonParser::default();
+
+    while let Some(line) = lines.next_line().await.context("reading codex stdout")? {
+        for event in parser.push_line(&line) {
+            if tx.send(Ok(event)).await.is_err() {
+                return Ok(parser.outcome); // receiver dropped
+            }
+        }
+    }
+
+    Ok(parser.outcome)
 }
 
 /// Map the DSL's provider-neutral `effort` vocabulary into Codex's
@@ -457,6 +730,24 @@ fn clamp_codex_effort(requested: &'static str, model: &str) -> &'static str {
     } else {
         requested
     }
+}
+
+/// Combine the in-band failure signals with stderr for the error message.
+///
+/// `turn.failed` and `error` items are the only place codex explains a
+/// model-side failure; stderr covers process-level ones (missing auth, bad
+/// flags). A failing turn can have either, so report both.
+fn merge_diagnostics(outcome: &CodexStdoutOutcome, stderr_text: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(failure) = outcome.turn_failed.as_deref() {
+        parts.push(failure);
+    }
+    parts.extend(outcome.diagnostics.iter().map(String::as_str));
+    let trimmed_stderr = stderr_text.trim();
+    if !trimmed_stderr.is_empty() {
+        parts.push(trimmed_stderr);
+    }
+    parts.join("\n")
 }
 
 fn format_exit_error(
@@ -704,6 +995,283 @@ url = "https://example/mcp/"
                 .any(|w| w == ["--config", "model_reasoning_effort=ultra"]),
             "expected model_reasoning_effort=ultra, got {args:?}"
         );
+    }
+
+    /// Drive the parser over a transcript and collect everything it emitted.
+    fn parse_lines(lines: &[&str]) -> (Vec<UnifiedStreamEvent>, CodexStdoutOutcome) {
+        let mut parser = CodexJsonParser::default();
+        let mut events = Vec::new();
+        for line in lines {
+            events.extend(parser.push_line(line));
+        }
+        (events, parser.outcome)
+    }
+
+    fn text_of(events: &[UnifiedStreamEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                UnifiedStreamEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_codex_exec_args_request_json_event_stream() {
+        // The observability contract depends on this flag: without it stdout
+        // carries only the final message and all progress goes to stderr.
+        let args = codex_exec_args("gpt-5.5", None, &[], &[], std::path::Path::new(""));
+        assert!(args.iter().any(|a| a == "--json"), "missing --json in {args:?}");
+        // Must be an argument of the `exec` subcommand, not the top-level one.
+        let exec_pos = args.iter().position(|a| a == "exec").expect("exec subcommand");
+        let json_pos = args.iter().position(|a| a == "--json").expect("--json");
+        assert!(json_pos > exec_pos, "--json must follow `exec` in {args:?}");
+    }
+
+    #[test]
+    fn parses_live_transcript_into_text_tool_and_usage_events() {
+        // Verbatim stdout from `codex exec --json` (codex-cli 0.146.0), with
+        // the long Windows command elided. Pins the real schema so a codex
+        // upgrade that changes it fails here rather than silently in chat.
+        let (events, outcome) = parse_lines(&[
+            r#"{"type":"thread.started","thread_id":"019fc78f-c957-7d41-83a6-ffbcb903ec65"}"#,
+            r#"{"type":"turn.started"}"#,
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I'll count the Rust source files."}}"#,
+            r#"{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"pwsh -Command ls"}}"#,
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","exit_code":0}}"#,
+            r#"{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"There are 4 files."}}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":26571,"cached_input_tokens":11008,"output_tokens":121}}"#,
+        ]);
+
+        // Both assistant messages surface, separated so they don't run together.
+        assert_eq!(
+            text_of(&events),
+            "I'll count the Rust source files.\n\nThere are 4 files."
+        );
+
+        // The shell command becomes a Bash tool call — this is what drives the
+        // chat panel's "Using Bash..." indicator, which the pre-`--json`
+        // backend could never emit.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                UnifiedStreamEvent::ToolCallStart { name, args, .. }
+                    if name == "Bash"
+                        && args.get("command").and_then(|c| c.as_str())
+                            == Some("pwsh -Command ls")
+            )),
+            "expected a Bash ToolCallStart, got {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, UnifiedStreamEvent::ToolCallEnd { id } if id == "item_1"))
+        );
+
+        // Real token counts — the old backend hardcoded zeros.
+        let usage = outcome.usage.expect("turn.completed carries usage");
+        assert_eq!(usage.input_tokens, 26571);
+        assert_eq!(usage.output_tokens, 121);
+        assert!(outcome.saw_visible_text);
+        assert!(outcome.turn_failed.is_none());
+    }
+
+    #[test]
+    fn file_blocks_are_extracted_from_decoded_message_text() {
+        // The block lives inside a JSON-escaped string, so scanning the raw
+        // JSONL line would never match. Regression guard for the Write Gate.
+        let line = serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "id": "item_0",
+                "type": "agent_message",
+                "text": "Here you go:\n<file path=\"src/lib.rs\">fn main() {}\n</file>\nDone."
+            }
+        })
+        .to_string();
+        let (events, _) = parse_lines(&[&line]);
+
+        let blocks: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                UnifiedStreamEvent::FileBlock { path, content } => Some((path, content)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(blocks.len(), 1, "expected one file block in {events:?}");
+        assert_eq!(blocks[0].0, &std::path::PathBuf::from("src/lib.rs"));
+        // `find_next_file_block` drops the newline before the closing tag.
+        assert_eq!(blocks[0].1, "fn main() {}");
+    }
+
+    #[test]
+    fn file_block_split_across_two_messages_is_still_detected() {
+        // Scanning is against the accumulated text, not the individual item,
+        // so a block opened in one message and closed in the next resolves.
+        let (events, _) = parse_lines(&[
+            r#"{"type":"item.completed","item":{"id":"a","type":"agent_message","text":"<file path=\"a.txt\">first"}}"#,
+            r#"{"type":"item.completed","item":{"id":"b","type":"agent_message","text":"second</file>"}}"#,
+        ]);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, UnifiedStreamEvent::FileBlock { path, .. }
+                    if path == &std::path::PathBuf::from("a.txt"))),
+            "expected a file block spanning both messages, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn reasoning_items_map_to_thinking_deltas() {
+        let (events, _) = parse_lines(&[
+            r#"{"type":"item.completed","item":{"id":"r1","type":"reasoning","text":"weighing options"}}"#,
+        ]);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                UnifiedStreamEvent::ThinkingDelta(t) if t == "weighing options"
+            )),
+            "reasoning must not surface as visible text: {events:?}"
+        );
+        assert!(text_of(&events).is_empty());
+    }
+
+    #[test]
+    fn reasoning_summary_array_is_joined() {
+        let (events, _) = parse_lines(&[
+            r#"{"type":"item.completed","item":{"id":"r1","type":"reasoning","summary":["first","second"]}}"#,
+        ]);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            UnifiedStreamEvent::ThinkingDelta(t) if t == "first\nsecond"
+        )));
+    }
+
+    #[test]
+    fn error_items_are_collected_not_raised() {
+        // codex emits `error` items for warnings (e.g. the under-development
+        // feature notice) and still exits 0. Raising UnifiedStreamEvent::Error
+        // would make `complete_to_write_gate` bail on a successful turn.
+        let (events, outcome) = parse_lines(&[
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Under-development features enabled: x."}}"#,
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"done"}}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2}}"#,
+        ]);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, UnifiedStreamEvent::Error(_))),
+            "a non-fatal error item must not become an Error event: {events:?}"
+        );
+        assert_eq!(outcome.diagnostics.len(), 1);
+        assert!(outcome.turn_failed.is_none());
+        assert_eq!(text_of(&events), "done");
+    }
+
+    #[test]
+    fn turn_failed_is_recorded_as_authoritative_failure() {
+        let (_, outcome) = parse_lines(&[
+            r#"{"type":"turn.failed","error":{"message":"context window exceeded"}}"#,
+        ]);
+        assert_eq!(
+            outcome.turn_failed.as_deref(),
+            Some("context window exceeded")
+        );
+    }
+
+    #[test]
+    fn merge_diagnostics_reports_turn_failure_items_and_stderr() {
+        let outcome = CodexStdoutOutcome {
+            turn_failed: Some("turn blew up".into()),
+            diagnostics: vec!["bad tool".into()],
+            ..Default::default()
+        };
+        let merged = merge_diagnostics(&outcome, "  auth failure\n");
+        assert!(merged.contains("turn blew up"));
+        assert!(merged.contains("bad tool"));
+        assert!(merged.contains("auth failure"));
+    }
+
+    #[test]
+    fn non_json_stdout_falls_back_to_visible_text() {
+        // A codex build that ignores `--json` must still show *something*
+        // rather than silently producing an empty turn.
+        let (events, outcome) = parse_lines(&["I saw 36 entries."]);
+        assert_eq!(text_of(&events), "I saw 36 entries.");
+        assert!(outcome.saw_visible_text);
+        assert!(!outcome.saw_json);
+    }
+
+    #[test]
+    fn unknown_item_types_surface_as_tool_activity() {
+        // A future codex tool should appear as activity, not vanish. The item
+        // reports only `item.completed`, so the start is synthesized.
+        let (events, _) = parse_lines(&[
+            r#"{"type":"item.completed","item":{"id":"w1","type":"web_search","query":"rust"}}"#,
+        ]);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                UnifiedStreamEvent::ToolCallStart { name, .. } if name == "web_search"
+            )),
+            "expected synthesized ToolCallStart, got {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, UnifiedStreamEvent::ToolCallEnd { id } if id == "w1"))
+        );
+    }
+
+    #[test]
+    fn mcp_tool_calls_are_named_server_dot_tool() {
+        let (events, _) = parse_lines(&[
+            r#"{"type":"item.started","item":{"id":"m1","type":"mcp_tool_call","server":"gaviero","tool":"memory_search"}}"#,
+        ]);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                UnifiedStreamEvent::ToolCallStart { name, .. } if name == "gaviero.memory_search"
+            )),
+            "got {events:?}"
+        );
+    }
+
+    #[test]
+    fn started_then_completed_emits_a_single_tool_start() {
+        let (events, _) = parse_lines(&[
+            r#"{"type":"item.started","item":{"id":"c1","type":"command_execution","command":"ls"}}"#,
+            r#"{"type":"item.completed","item":{"id":"c1","type":"command_execution","exit_code":0}}"#,
+        ]);
+        let starts = events
+            .iter()
+            .filter(|e| matches!(e, UnifiedStreamEvent::ToolCallStart { .. }))
+            .count();
+        assert_eq!(starts, 1, "duplicate tool start in {events:?}");
+    }
+
+    #[test]
+    fn lifecycle_and_malformed_events_are_ignored_without_output() {
+        let (events, outcome) = parse_lines(&[
+            r#"{"type":"thread.started","thread_id":"t1"}"#,
+            r#"{"type":"turn.started"}"#,
+            r#"{"type":"item.updated","item":{"id":"x","type":"agent_message","text":"partial"}}"#,
+            r#"{"type":"future.event","payload":{}}"#,
+            r#"{"type":"item.completed"}"#,
+            "",
+        ]);
+        assert!(events.is_empty(), "unexpected events: {events:?}");
+        assert!(outcome.saw_json);
+        assert!(!outcome.saw_visible_text);
+    }
+
+    #[test]
+    fn missing_usage_yields_zeroed_counts() {
+        let (_, outcome) = parse_lines(&[r#"{"type":"turn.completed"}"#]);
+        let usage = outcome.usage.expect("usage present even when absent in JSON");
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 0);
     }
 
     #[test]
