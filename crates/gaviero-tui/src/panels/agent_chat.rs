@@ -2114,9 +2114,10 @@ impl AgentChatState {
         &self.active_conversation().messages
     }
 
-    fn messages_mut(&mut self) -> &mut Vec<ChatMessage> {
-        &mut self.active_conversation_mut().messages
-    }
+    // NOTE: no `messages_mut`. Mutating the message list must go through
+    // `Conversation::push_message` so every message gets its monotonic
+    // `seq` (§2.6); a raw `&mut Vec<ChatMessage>` made it easy to push one
+    // without an id.
 
     /// Create a new conversation and switch to it.
     /// Start renaming the active conversation. Puts current title into the input field.
@@ -2187,13 +2188,9 @@ impl AgentChatState {
 
     /// Reset the agent context: drop the session + planner ledger so the next
     /// turn bootstraps fresh. Visible chat history, attachments, scroll, and
-    /// input are preserved.
-    pub fn reset_conversation(&mut self) {
-        let idx = self.active_conv;
-        self.reset_conversation_at(idx);
-    }
-
-    /// Indexed reset core (shared reducer, §2.2).
+    /// input are preserved. Indexed because `/reset` can arrive from the
+    /// phone for a conversation that is not the active tab (shared reducer,
+    /// §2.2).
     pub fn reset_conversation_at(&mut self, idx: usize) {
         let Some(conv) = self.conversations.get_mut(idx) else {
             return;
@@ -3349,55 +3346,10 @@ impl AgentChatState {
         }
     }
 
-    /// Finalize the current streaming message.
-    pub fn finalize_message(&mut self, role: &str, content: &str) {
-        let chat_role = match role {
-            "user" => ChatRole::User,
-            "assistant" => ChatRole::Assistant,
-            _ => ChatRole::System,
-        };
-
-        if chat_role == ChatRole::Assistant {
-            if let Some(last) = self
-                .messages_mut()
-                .iter_mut()
-                .rev()
-                .find(|m| m.role == ChatRole::Assistant)
-            {
-                last.content = content.to_string();
-                return;
-            }
-            if !content.is_empty() {
-                self.active_conversation_mut().push_message(
-                    chat_role,
-                    content.to_string(),
-                    Vec::new(),
-                );
-            }
-            return;
-        }
-
-        // If the last message matches, just update its content
-        if let Some(last) = self.messages_mut().last_mut() {
-            if last.role == chat_role {
-                if !content.is_empty() {
-                    last.content = content.to_string();
-                }
-                return;
-            }
-        }
-
-        // Add new message if needed (e.g. system error)
-        if chat_role == ChatRole::System && !content.is_empty() {
-            self.active_conversation_mut().push_message(
-                chat_role,
-                content.to_string(),
-                Vec::new(),
-            );
-        }
-
-        self.scroll_to_bottom();
-    }
+    // NOTE: message finalization is `finalize_message_to(conv_id, …)`.
+    // There is no active-conversation variant: a turn can finish for a
+    // background conversation, and the remote mirror projects the
+    // finalized message by id.
 
     fn scroll_to_bottom(&mut self) {
         // Will be recalculated during render
@@ -5375,7 +5327,8 @@ mod tests {
         // Simulate a few prior turns so context_messages() has something
         // to inline.
         state.add_user_message("first user msg");
-        state.finalize_message("assistant", "first assistant reply");
+        let conv_id = state.active_conversation_id().to_string();
+        state.finalize_message_to(&conv_id, "assistant", "first assistant reply");
 
         state.text_input.text = "/reset".to_string();
         assert!(state.process_slash_command());
@@ -5976,7 +5929,7 @@ mod tests {
         let mut state = AgentChatState::new();
         state.add_user_message("first user msg");
         push_assistant(&mut state, "first assistant reply", Vec::new());
-        state.reset_conversation();
+        state.reset_conversation_at(state.active_conv);
 
         // Visible transcript stays, but after /reset it isn't re-inlined.
         assert!(
