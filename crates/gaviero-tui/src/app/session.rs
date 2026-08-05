@@ -1,42 +1,5 @@
 use super::*;
 
-pub(super) fn handle_first_run_key(app: &mut App, key: &crossterm::event::KeyEvent) {
-    let step = match &app.first_run_dialog {
-        Some(d) => d.step.clone(),
-        None => return,
-    };
-    match step {
-        FirstRunStep::AskSettings => match key.code {
-            crossterm::event::KeyCode::Char('y') | crossterm::event::KeyCode::Char('Y') => {
-                if let Some(d) = &mut app.first_run_dialog {
-                    d.create_settings = true;
-                    d.step = FirstRunStep::AskMemory;
-                }
-            }
-            crossterm::event::KeyCode::Char('n')
-            | crossterm::event::KeyCode::Char('N')
-            | crossterm::event::KeyCode::Esc => {
-                if let Some(d) = &mut app.first_run_dialog {
-                    d.create_settings = false;
-                    d.step = FirstRunStep::AskMemory;
-                }
-            }
-            _ => {}
-        },
-        FirstRunStep::AskMemory => match key.code {
-            crossterm::event::KeyCode::Char('y') | crossterm::event::KeyCode::Char('Y') => {
-                app.apply_first_run(true);
-            }
-            crossterm::event::KeyCode::Char('n')
-            | crossterm::event::KeyCode::Char('N')
-            | crossterm::event::KeyCode::Esc => {
-                app.apply_first_run(false);
-            }
-            _ => {}
-        },
-    }
-}
-
 /// Consume a keystroke while the Codex trust modal is open. Persists
 /// the answer to `.gaviero/settings.json` and replays the pending
 /// `/swarm` regardless of grant/deny — denial just means Gaviero will
@@ -96,51 +59,6 @@ pub(super) fn handle_codex_trust_key(app: &mut App, key: &crossterm::event::KeyE
             super::side_panel::send_chat_message(app);
         }
     }
-}
-
-pub(super) fn apply_first_run(app: &mut App, init_memory: bool) {
-    let create_settings = app
-        .first_run_dialog
-        .as_ref()
-        .map(|d| d.create_settings)
-        .unwrap_or(false);
-    app.first_run_dialog = None;
-
-    if create_settings {
-        app.workspace.ensure_settings();
-        app.status_message = Some((
-            "Created .gaviero/settings.json".to_string(),
-            std::time::Instant::now(),
-        ));
-        app.refresh_file_tree();
-    }
-
-    if init_memory {
-        if let Some(root) = app.workspace.roots().first().map(|r| r.to_path_buf()) {
-            let tx = app.event_tx.clone();
-            let ws = app.workspace.clone();
-            tokio::spawn(async move {
-                match tokio::task::spawn_blocking(move || {
-                    gaviero_core::memory::init_workspace_stores(&root, &ws)
-                })
-                .await
-                {
-                    Ok(Ok(stores)) => {
-                        let _ = tx.send(Event::MemoryReady(stores));
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!("Workspace memory init failed: {}", e);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Workspace memory init panicked: {}", e);
-                    }
-                }
-            });
-        }
-    }
-
-    // Warm up the code graph in the background so the first chat send doesn't pay build cost.
-    warm_up_repo_map(app);
 }
 
 /// Get the cached `RepoMap` or build it on demand.

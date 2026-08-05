@@ -215,18 +215,6 @@ pub enum MoveState {
     Confirming(PathBuf, PathBuf),
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub(super) enum FirstRunStep {
-    AskSettings,
-    AskMemory,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct FirstRunDialog {
-    pub step: FirstRunStep,
-    pub create_settings: bool,
-}
-
 /// Codex MCP trust prompt. Fires once before the first `/swarm` run
 /// when `mcp.gavieroServer.codexTrust` is still "unknown". Answering
 /// persists the choice to `.gaviero/settings.json` and resumes the

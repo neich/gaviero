@@ -5,6 +5,7 @@ mod keymap;
 mod notify;
 mod panels;
 mod platform;
+mod setup;
 mod theme;
 mod widgets;
 
@@ -15,6 +16,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -33,6 +35,12 @@ struct Cli {
     /// Path to open (directory or .gaviero-workspace file)
     #[arg(default_value = ".")]
     path: PathBuf,
+
+    /// Open PATH as a multi-folder workspace. Reuses the
+    /// `*.gaviero-workspace` file already in PATH, or asks which sub-folders
+    /// to include and writes `<dirname>.gaviero-workspace`.
+    #[arg(long)]
+    workspace: bool,
 }
 
 /// C1: synchronous yes/no prompt on stdin/stderr asking the user to
@@ -211,14 +219,53 @@ async fn main() -> Result<()> {
     let path = gaviero_core::util::fs::canonicalize_simplified(&cli.path)
         .with_context(|| format!("resolving path: {}", cli.path.display()))?;
 
-    let workspace = if path
+    // Launch dispatch. An explicit `*.gaviero-workspace` argument always wins.
+    // `--workspace` on a directory reuses the workspace file already inside it;
+    // when there is none — or, in plain folder mode, when there is no
+    // `.gaviero/settings.json` — the first-run wizard runs before the editor
+    // and writes the configuration it collects.
+    let is_workspace_file = path
         .extension()
-        .is_some_and(|ext| ext == "gaviero-workspace")
-    {
-        gaviero_core::workspace::Workspace::load(&path)?
+        .is_some_and(|ext| ext == "gaviero-workspace");
+    let launch_mode = if cli.workspace {
+        setup::LaunchMode::Workspace
     } else {
-        gaviero_core::workspace::Workspace::single_folder(path)
+        setup::LaunchMode::Folder
     };
+
+    let mut workspace_file: Option<PathBuf> = if is_workspace_file {
+        Some(path.clone())
+    } else if cli.workspace {
+        setup::existing_workspace_file(&path)
+    } else {
+        None
+    };
+    let mut init_providers = false;
+
+    // Skip the wizard without a TTY (piped stdin, CI): it needs raw mode, and
+    // built-in defaults still give a working session.
+    if workspace_file.is_none()
+        && !is_workspace_file
+        && setup::needs_setup(&path, launch_mode)
+        && std::io::stdin().is_terminal()
+        && let Some(outcome) = setup::run(&path, launch_mode)?
+    {
+        workspace_file = outcome.workspace_file;
+        init_providers = outcome.init_providers;
+    }
+
+    let workspace = match &workspace_file {
+        Some(file) => gaviero_core::workspace::Workspace::load(file)?,
+        None => gaviero_core::workspace::Workspace::single_folder(path),
+    };
+
+    if init_providers {
+        let written = setup::synthesize_provider_configs(&workspace);
+        tracing::info!(
+            "first-run setup wrote {} agent config file(s)",
+            written.len()
+        );
+    }
 
     // C1: prompt the user for consent on a pending typed-stores
     // migration BEFORE entering raw mode. If the user declines, exit

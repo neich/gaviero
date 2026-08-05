@@ -22,7 +22,9 @@ gaviero-dsl  ◄── compile_file (/run)
 └────────────────────────────────┘
 ```
 
-Workspace dispatch in [`main.rs`](src/main.rs): directory → [`Workspace::single_folder`](../gaviero-core/src/workspace.rs); `*.gaviero-workspace` → [`Workspace::load`](../gaviero-core/src/workspace.rs).
+Workspace dispatch in [`main.rs`](src/main.rs): directory → [`Workspace::single_folder`](../gaviero-core/src/workspace.rs); `*.gaviero-workspace` → [`Workspace::load`](../gaviero-core/src/workspace.rs); `--workspace <dir>` reuses the workspace file inside `<dir>` or creates one.
+
+Before that dispatch, [`setup.rs`](src/setup.rs) runs the first-run wizard when the target is unconfigured and stdin is a TTY. It enters and leaves its own raw-mode/alternate-screen session, writes `.gaviero/settings.json` (+ the `.gaviero-workspace` file in `--workspace` mode), and returns the launch target `main` then loads. Opt-in provider configs are synthesized afterwards, once the `Workspace` exists.
 
 ---
 

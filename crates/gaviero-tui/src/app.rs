@@ -44,7 +44,7 @@ mod state;
 use self::observers::{TuiAcpObserver, TuiSwarmObserver, TuiWriteGateObserver};
 use self::state::{
     BatchReviewState, BulkOpState, ChangesEntry, ChangesState, CodexTrustDialog, DiffHighlightCache,
-    DiffKind, FirstRunDialog, FirstRunStep, Focus, LayoutAreas, LayoutPreset, LeftPanelMode,
+    DiffKind, Focus, LayoutAreas, LayoutPreset, LeftPanelMode,
     MoveState, MarkdownPreviewMode, PanelVisibility, ReviewProposal, ScrollbarTarget,
     SidePanelMode, TreeDialog, TreeDialogKind,
     build_simple_diff,
@@ -88,8 +88,6 @@ pub struct App {
     pub should_quit: bool,
     /// When true, a quit-confirmation dialog is shown (unsaved files or active agents).
     quit_confirm: bool,
-    /// First-run setup dialog shown when no `.gaviero/settings.json` is found.
-    first_run_dialog: Option<FirstRunDialog>,
     /// Codex MCP trust prompt. `Some` while the user must answer the
     /// one-time consent modal before a pending `/swarm` run proceeds.
     pub(crate) codex_trust_dialog: Option<CodexTrustDialog>,
@@ -275,22 +273,9 @@ impl App {
         roots.extend(workspace.roots());
         let file_tree = FileTreeState::from_roots(&roots, &excludes, &git_allow);
 
-        // Detect first run: no .gaviero/settings.json anywhere we look.
-        // A workspace counts as configured if either:
-        //   - a workspace folder has its own .gaviero/settings.json, or
-        //   - a .gaviero/ sits next to (or one level above) the workspace
-        //     file (returned by Workspace::config_roots()).
-        let folder_configured = workspace
-            .roots()
-            .first()
-            .map(|root| root.join(".gaviero").join("settings.json").exists())
-            .unwrap_or(false);
-        let workspace_file_configured = config_roots
-            .iter()
-            .any(|p| p.file_name().is_some_and(|n| n == ".gaviero")
-                && p.join("settings.json").exists());
-        let is_first_run = !folder_configured && !workspace_file_configured;
-
+        // First-run configuration is handled before the editor starts, by the
+        // pre-TUI setup wizard (`crate::setup`), so `App` always opens against
+        // a workspace that is already configured (or explicitly left bare).
         let theme = Theme::load(Path::new("themes/default.toml"))
             .unwrap_or_else(|_| Theme::builtin_default());
 
@@ -401,14 +386,6 @@ impl App {
             should_quit: false,
             quit_confirm: false,
             codex_trust_dialog: None,
-            first_run_dialog: if is_first_run {
-                Some(FirstRunDialog {
-                    step: FirstRunStep::AskSettings,
-                    create_settings: false,
-                })
-            } else {
-                None
-            },
             needs_full_redraw: false,
             event_tx,
             theme,
@@ -1032,16 +1009,6 @@ impl App {
         editing::close_tab(self);
     }
 
-    /// Handle a key press while the first-run setup dialog is active.
-    fn handle_first_run_key(&mut self, key: &crossterm::event::KeyEvent) {
-        session::handle_first_run_key(self, key);
-    }
-
-    /// Execute first-run actions based on collected answers, then dismiss the dialog.
-    fn apply_first_run(&mut self, init_memory: bool) {
-        session::apply_first_run(self, init_memory);
-    }
-
     /// Check for unsaved files and active agents before quitting.
     /// If anything needs attention, show the confirmation dialog instead.
     fn try_quit(&mut self) {
@@ -1156,10 +1123,6 @@ impl App {
 
     fn render_quit_confirm(&self, frame: &mut Frame, area: Rect) {
         render::render_quit_confirm(self, frame, area);
-    }
-
-    fn render_first_run_dialog(&self, frame: &mut Frame, area: Rect) {
-        render::render_first_run_dialog(self, frame, area);
     }
 
     fn render_codex_trust_dialog(&self, frame: &mut Frame, area: Rect) {

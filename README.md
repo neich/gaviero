@@ -33,7 +33,10 @@ Binaries:
 gaviero                              # current directory
 gaviero /path/to/repo                # single-folder workspace
 gaviero /path/to/project.gaviero-workspace   # multi-folder workspace
+gaviero --workspace ~/src            # multi-folder workspace built from ~/src
 ```
+
+**First run.** Opening a folder with no Gaviero configuration starts a short setup wizard before the editor. It asks for an agent profile — *full capabilities* (shell plus the edit tools, auto-approved, allow/deny-listed) or *restricted* (identical minus `Bash`, which is never offered to the agent) — and whether to write the Claude, Codex and Cursor MCP configs. With `--workspace` it also asks which sub-folders join the workspace (git repositories pre-selected) and writes `<dirname>.gaviero-workspace`. Esc on the first screen skips setup and opens the folder with built-in defaults; existing files are never overwritten.
 
 The editor works standalone without AI features. Keybindings, panels, chat commands, and the Write Gate diff review are documented in [crates/gaviero-tui/README.md](crates/gaviero-tui/README.md).
 

@@ -57,11 +57,6 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 }
             }
 
-            if app.first_run_dialog.is_some() {
-                app.handle_first_run_key(&key);
-                return;
-            }
-
             if app.codex_trust_dialog.is_some() {
                 super::session::handle_codex_trust_key(app, &key);
                 return;
