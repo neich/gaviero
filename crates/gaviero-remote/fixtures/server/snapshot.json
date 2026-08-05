@@ -1,0 +1,100 @@
+{
+  "version": { "major": 1, "minor": 0 },
+  "instance_id": "a3f9c2e14b7d8650",
+  "seq": 2,
+  "revision": 7,
+  "type": "snapshot",
+  "payload": {
+    "revision": 7,
+    "conversations": [
+      {
+        "conv_id": "conv-3",
+        "conv_revision": 5,
+        "title": "Parser tests",
+        "model": "claude:fable",
+        "effort": "high",
+        "namespace": "parser",
+        "is_streaming": true,
+        "pending_turn_id": "turn-12",
+        "context_pressure": { "used_tokens": 41200, "max_tokens": 200000 },
+        "auto_approve": false,
+        "last_message_preview": "On it — writing the test now."
+      },
+      {
+        "conv_id": "conv-7",
+        "conv_revision": 1,
+        "title": "Chat 2",
+        "is_streaming": false,
+        "auto_approve": false
+      }
+    ],
+    "active_id": "conv-3",
+    "active_conversation": {
+      "summary": {
+        "conv_id": "conv-3",
+        "conv_revision": 5,
+        "title": "Parser tests",
+        "model": "claude:fable",
+        "effort": "high",
+        "namespace": "parser",
+        "is_streaming": true,
+        "pending_turn_id": "turn-12",
+        "context_pressure": { "used_tokens": 41200, "max_tokens": 200000 },
+        "auto_approve": false,
+        "last_message_preview": "On it — writing the test now."
+      },
+      "messages": [
+        {
+          "seq": 57,
+          "role": "user",
+          "content": "Add a unit test for the parser",
+          "truncated": false,
+          "tool_calls": [],
+          "code_blocks": []
+        },
+        {
+          "seq": 58,
+          "role": "assistant",
+          "content": "On it — writing the test now.",
+          "truncated": false,
+          "tool_calls": ["Edit"],
+          "code_blocks": []
+        }
+      ],
+      "oldest_seq": 57,
+      "has_older_messages": true
+    },
+    "open_permissions": [
+      {
+        "conv_id": "conv-3",
+        "request_id": "req-9b2e",
+        "tool_name": "Bash",
+        "description": "Run: cargo test -p parser",
+        "input": { "command": "cargo test -p parser" }
+      }
+    ],
+    "open_proposals": [
+      {
+        "proposal_id": 42,
+        "proposal_revision": 3,
+        "conv_id": "conv-3",
+        "source": "agent",
+        "path": "src/parser.rs",
+        "status": "pending",
+        "is_deletion": false,
+        "conflicts_with": [],
+        "hunk_count": 2,
+        "added_lines": 9,
+        "removed_lines": 2,
+        "hunks": [
+          { "index": 0, "hunk_type": "modified", "description": "fn parse_expr — widen error match", "status": "pending" },
+          { "index": 1, "hunk_type": "added", "description": "mod tests — new test parse_empty", "status": "pending" }
+        ]
+      }
+    ],
+    "settings": {
+      "default_model": "claude:fable",
+      "default_effort": "medium"
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "version": { "major": 1, "minor": 0 },
+  "instance_id": "a3f9c2e14b7d8650",
+  "seq": 19,
+  "revision": 14,
+  "type": "command_result",
+  "payload": {
+    "command_id": "cmd-1002",
+    "status": "accepted",
+    "result": { "turn_id": "turn-12" }
+  }
+}
