@@ -784,3 +784,32 @@ mod render_preview {
         println!("{qr}");
     }
 }
+
+#[cfg(test)]
+mod live_diagnostic {
+    use super::*;
+
+    /// Prints what `/remote` would report for THIS workspace right now.
+    /// `cargo test -p gaviero-tui live_remote_status -- --ignored --nocapture`
+    #[test]
+    #[ignore = "diagnostic: reports this machine's real remote readiness"]
+    fn live_remote_status() {
+        let ws = Workspace::single_folder(std::env::current_dir().unwrap());
+        match resolve_config(&ws) {
+            Ok(config) => {
+                println!("enabled:   {}", config.enabled);
+                println!("port:      {} (derived)", config.port);
+                println!("workspace: {} ({})", config.workspace_display_name, config.workspace_id);
+                println!("cert path: {}", config.cert_path.display());
+                match check_availability(&config) {
+                    Ok(a) => println!(
+                        "AVAILABLE — cert until {}, tailnet {:?}",
+                        a.cert.not_after, a.tailnet_addrs
+                    ),
+                    Err(e) => println!("UNAVAILABLE — {e}"),
+                }
+            }
+            Err(e) => println!("CONFIG ERROR — {e}"),
+        }
+    }
+}
