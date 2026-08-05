@@ -1,0 +1,61 @@
+{
+  "version": { "major": 1, "minor": 0 },
+  "instance_id": "a3f9c2e14b7d8650",
+  "seq": 11,
+  "revision": 10,
+  "type": "permission_request",
+  "payload": {
+    "conv_id": "conv-3",
+    "request_id": "req-c41a",
+    "tool_name": "AskUserQuestion",
+    "description": "The agent is asking for input",
+    "input": {
+      "questions": [
+        {
+          "question": "Which serializer should the new endpoint use?",
+          "header": "Serializer",
+          "multiSelect": false,
+          "options": [
+            { "label": "serde_json", "description": "Already a workspace dependency" },
+            { "label": "simd-json", "description": "Faster, adds a new dependency" }
+          ]
+        },
+        {
+          "question": "Which extra test suites should run?",
+          "header": "Tests",
+          "multiSelect": true,
+          "options": [
+            { "label": "unit", "description": "Fast" },
+            { "label": "integration", "description": "Slower" },
+            { "label": "fuzz", "description": "Slowest" },
+            { "label": "bench", "description": "Criterion benchmarks" }
+          ]
+        }
+      ]
+    },
+    "ask": {
+      "questions": [
+        {
+          "question": "Which serializer should the new endpoint use?",
+          "header": "Serializer",
+          "multi_select": false,
+          "options": [
+            { "label": "serde_json", "description": "Already a workspace dependency" },
+            { "label": "simd-json", "description": "Faster, adds a new dependency" }
+          ]
+        },
+        {
+          "question": "Which extra test suites should run?",
+          "header": "Tests",
+          "multi_select": true,
+          "options": [
+            { "label": "unit", "description": "Fast" },
+            { "label": "integration", "description": "Slower" },
+            { "label": "fuzz", "description": "Slowest" },
+            { "label": "bench", "description": "Criterion benchmarks" }
+          ]
+        }
+      ]
+    }
+  }
+}

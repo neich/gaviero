@@ -42,9 +42,6 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
         if app.quit_confirm {
             app.render_quit_confirm(frame, size);
         }
-        if app.first_run_dialog.is_some() {
-            app.render_first_run_dialog(frame, size);
-        }
         if app.codex_trust_dialog.is_some() {
             app.render_codex_trust_dialog(frame, size);
         }
@@ -190,9 +187,6 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
 
     if app.quit_confirm {
         app.render_quit_confirm(frame, size);
-    }
-    if app.first_run_dialog.is_some() {
-        app.render_first_run_dialog(frame, size);
     }
     if matches!(
         app.bulk_op_state,
@@ -1345,149 +1339,6 @@ pub(super) fn render_quit_confirm(app: &App, frame: &mut Frame, area: Rect) {
             break;
         }
         let is_title = line.trim_start().starts_with("Quit");
-        let is_hint = line.contains('[');
-        let style = if is_title {
-            title_style
-        } else if is_hint {
-            hint_style
-        } else {
-            bg_style
-        };
-        let mut cx = x + 1;
-        for ch in line.chars() {
-            if cx >= x + dialog_w - 1 {
-                break;
-            }
-            if cx < frame.area().right() {
-                frame.buffer_mut()[(cx, cy)].set_char(ch).set_style(style);
-            }
-            cx += 1;
-        }
-    }
-}
-
-pub(super) fn render_first_run_dialog(app: &App, frame: &mut Frame, area: Rect) {
-    let Some(dialog) = &app.first_run_dialog else {
-        return;
-    };
-
-    let mut lines: Vec<String> = Vec::new();
-    lines.push(String::new());
-    lines.push("  First-time setup".to_string());
-    lines.push("  No .gaviero/ configuration found in this folder.".to_string());
-    lines.push(String::new());
-
-    match dialog.step {
-        FirstRunStep::AskSettings => {
-            lines.push("  Create initial settings.json?".to_string());
-            lines.push(String::new());
-            lines.push("  [y] Yes   [n / Esc] No".to_string());
-        }
-        FirstRunStep::AskMemory => {
-            lines.push(format!(
-                "  settings.json: {}",
-                if dialog.create_settings {
-                    "will be created"
-                } else {
-                    "skipped"
-                }
-            ));
-            lines.push(String::new());
-            lines.push("  Initialize knowledge graph (memory.db)?".to_string());
-            lines.push(String::new());
-            lines.push("  [y] Yes   [n / Esc] No".to_string());
-        }
-    }
-    lines.push(String::new());
-
-    let dialog_w: u16 = lines
-        .iter()
-        .map(|l| l.chars().count() as u16)
-        .max()
-        .unwrap_or(50)
-        .max(50)
-        + 2;
-    let dialog_h = lines.len() as u16;
-
-    if area.width < dialog_w + 4 || area.height < dialog_h + 2 {
-        return;
-    }
-
-    let x = area.x + (area.width.saturating_sub(dialog_w)) / 2;
-    let y = area.y + (area.height.saturating_sub(dialog_h)) / 2;
-
-    let bg_style = Style::default().fg(theme::TEXT_BRIGHT).bg(theme::INPUT_BG);
-    let title_style = Style::default()
-        .fg(theme::FOCUS_BORDER)
-        .bg(theme::INPUT_BG)
-        .add_modifier(Modifier::BOLD);
-    let hint_style = Style::default().fg(theme::TEXT_DIM).bg(theme::INPUT_BG);
-
-    for row in 0..dialog_h {
-        for col in 0..dialog_w {
-            let cx = x + col;
-            let cy = y + row;
-            if cx < frame.area().right() && cy < frame.area().bottom() {
-                frame.buffer_mut()[(cx, cy)]
-                    .set_char(' ')
-                    .set_style(bg_style);
-            }
-        }
-    }
-
-    for col in 0..dialog_w {
-        let cx = x + col;
-        if cx < frame.area().right() {
-            let ch = if col == 0 {
-                '┌'
-            } else if col == dialog_w - 1 {
-                '┐'
-            } else {
-                '─'
-            };
-            if y < frame.area().bottom() {
-                frame.buffer_mut()[(cx, y)]
-                    .set_char(ch)
-                    .set_style(title_style);
-            }
-            let bottom_y = y + dialog_h - 1;
-            let ch = if col == 0 {
-                '└'
-            } else if col == dialog_w - 1 {
-                '┘'
-            } else {
-                '─'
-            };
-            if bottom_y < frame.area().bottom() {
-                frame.buffer_mut()[(cx, bottom_y)]
-                    .set_char(ch)
-                    .set_style(title_style);
-            }
-        }
-    }
-    for row in 1..dialog_h.saturating_sub(1) {
-        let cy = y + row;
-        if cy < frame.area().bottom() {
-            if x < frame.area().right() {
-                frame.buffer_mut()[(x, cy)]
-                    .set_char('│')
-                    .set_style(title_style);
-            }
-            let right_x = x + dialog_w - 1;
-            if right_x < frame.area().right() {
-                frame.buffer_mut()[(right_x, cy)]
-                    .set_char('│')
-                    .set_style(title_style);
-            }
-        }
-    }
-
-    for (i, line) in lines.iter().enumerate() {
-        let cy = y + i as u16;
-        if cy >= frame.area().bottom() {
-            break;
-        }
-        let is_title = line.trim_start().starts_with("First-time");
         let is_hint = line.contains('[');
         let style = if is_title {
             title_style

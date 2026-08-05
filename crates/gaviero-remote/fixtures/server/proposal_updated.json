@@ -1,0 +1,43 @@
+{
+  "version": { "major": 1, "minor": 0 },
+  "instance_id": "a3f9c2e14b7d8650",
+  "seq": 14,
+  "revision": 13,
+  "type": "proposal_updated",
+  "payload": {
+    "proposal": {
+      "proposal_id": 42,
+      "proposal_revision": 2,
+      "conv_id": "conv-3",
+      "source": "agent",
+      "path": "src/parser.rs",
+      "status": "partially_accepted",
+      "is_deletion": false,
+      "conflicts_with": [],
+      "hunks": [
+        {
+          "index": 0,
+          "original_range": { "start_line": 41, "end_line": 44 },
+          "proposed_range": { "start_line": 41, "end_line": 45 },
+          "original_text": "    match tok {\n        Tok::Num(n) => Expr::Num(n),\n        _ => panic!(\"bad token\"),\n    }\n",
+          "proposed_text": "    match tok {\n        Tok::Num(n) => Expr::Num(n),\n        Tok::Str(s) => Expr::Str(s),\n        other => return Err(ParseError::Unexpected(other)),\n    }\n",
+          "truncated": false,
+          "hunk_type": "modified",
+          "description": "fn parse_expr — widen error match",
+          "status": "accepted"
+        },
+        {
+          "index": 1,
+          "original_range": { "start_line": 88, "end_line": 88 },
+          "proposed_range": { "start_line": 89, "end_line": 93 },
+          "original_text": "",
+          "proposed_text": "#[cfg(test)]\nmod tests {\n    #[test]\n    fn parse_empty() { assert!(super::parse(\"\").is_err()); }\n}\n",
+          "truncated": false,
+          "hunk_type": "added",
+          "description": "mod tests — new test parse_empty",
+          "status": "pending"
+        }
+      ]
+    }
+  }
+}

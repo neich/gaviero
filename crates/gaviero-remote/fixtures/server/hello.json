@@ -1,0 +1,29 @@
+{
+  "version": { "major": 1, "minor": 0 },
+  "instance_id": "a3f9c2e14b7d8650",
+  "seq": 1,
+  "revision": 7,
+  "type": "hello",
+  "payload": {
+    "protocol_version": { "major": 1, "minor": 0 },
+    "instance_id": "a3f9c2e14b7d8650",
+    "tui_version": "0.1.0",
+    "workspace": {
+      "id": "4b156f1de41da274",
+      "display_name": "gaviero"
+    },
+    "capabilities": [],
+    "confirm_required": ["/autoapprove", "/yolo", "/reset", "/clear"],
+    "allowed_slash_commands": [
+      "/model", "/thinking", "/effort", "/compact", "/context", "/inject",
+      "/no-inject", "/reset", "/clear", "/rename", "/namespace", "/ns",
+      "/autoapprove", "/yolo", "/workspace", "/ws", "/lite", "/minimal",
+      "/help", "/skills"
+    ],
+    "limits": {
+      "max_frame_bytes": 262144,
+      "max_prompt_bytes": 131072,
+      "command_rate_per_second": 10
+    }
+  }
+}

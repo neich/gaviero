@@ -1,0 +1,12 @@
+{
+  "version": { "major": 1, "minor": 0 },
+  "instance_id": "a3f9c2e14b7d8650",
+  "seq": 16,
+  "revision": 14,
+  "type": "proposal_finalized",
+  "payload": {
+    "proposal_id": 42,
+    "path": "src/parser.rs",
+    "outcome": "partially_accepted"
+  }
+}

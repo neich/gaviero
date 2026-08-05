@@ -1,0 +1,10 @@
+{
+  "version": { "major": 1, "minor": 0 },
+  "instance_id": "a3f9c2e14b7d8650",
+  "command_id": "cmd-1009",
+  "type": "reset_conversation",
+  "payload": {
+    "conv_id": "conv-3",
+    "conv_revision": 5
+  }
+}

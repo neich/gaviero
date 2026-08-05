@@ -1,0 +1,10 @@
+{
+  "version": { "major": 1, "minor": 0 },
+  "instance_id": "a3f9c2e14b7d8650",
+  "command_id": "cmd-1002",
+  "type": "send_prompt",
+  "payload": {
+    "conv_id": "conv-3",
+    "text": "Add a unit test for the parser"
+  }
+}

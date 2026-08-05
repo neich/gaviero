@@ -1,11 +1,13 @@
 [workspace]
-members = ["crates/gaviero-core", "crates/gaviero-tui", "crates/gaviero-cli", "crates/gaviero-dsl", "crates/gaviero-mcp-shim", "crates/tree-sitter-gaviero"]
+members = ["crates/gaviero-core", "crates/gaviero-tui", "crates/gaviero-cli", "crates/gaviero-dsl", "crates/gaviero-mcp-shim", "crates/gaviero-remote", "crates/tree-sitter-gaviero"]
 resolver = "2"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+schemars = "1.2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }

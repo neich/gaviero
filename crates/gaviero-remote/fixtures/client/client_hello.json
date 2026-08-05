@@ -1,0 +1,11 @@
+{
+  "version": { "major": 1, "minor": 0 },
+  "instance_id": null,
+  "command_id": "cmd-1001",
+  "type": "client_hello",
+  "payload": {
+    "protocol_version": { "major": 1, "minor": 0 },
+    "client_name": "gaviero-remote-android",
+    "client_version": "0.1.0"
+  }
+}

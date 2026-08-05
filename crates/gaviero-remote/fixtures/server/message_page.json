@@ -1,0 +1,30 @@
+{
+  "version": { "major": 1, "minor": 0 },
+  "instance_id": "a3f9c2e14b7d8650",
+  "seq": 5,
+  "revision": 9,
+  "type": "message_page",
+  "payload": {
+    "conv_id": "conv-3",
+    "messages": [
+      {
+        "seq": 55,
+        "role": "user",
+        "content": "What does parse_expr return on an empty input?",
+        "truncated": false,
+        "tool_calls": [],
+        "code_blocks": []
+      },
+      {
+        "seq": 56,
+        "role": "assistant",
+        "content": "It currently panics — that is the bug.",
+        "truncated": false,
+        "tool_calls": [],
+        "code_blocks": []
+      }
+    ],
+    "oldest_seq": 55,
+    "has_older_messages": false
+  }
+}

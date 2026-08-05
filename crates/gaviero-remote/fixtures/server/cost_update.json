@@ -1,0 +1,12 @@
+{
+  "version": { "major": 1, "minor": 0 },
+  "instance_id": "a3f9c2e14b7d8650",
+  "seq": 18,
+  "revision": 14,
+  "type": "cost_update",
+  "payload": {
+    "conv_id": "conv-3",
+    "turn_id": "turn-12",
+    "usd": 0.0421
+  }
+}
