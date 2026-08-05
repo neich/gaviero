@@ -1,0 +1,38 @@
+[package]
+name = "gaviero-remote"
+version = "0.1.0"
+edition = "2024"
+
+# Remote-owned wire DTOs and (feature `server`) the WSS sidecar server.
+# This crate deliberately has NO dependency on gaviero-core or gaviero-tui:
+# wire DTOs are remote-owned (Plan A V3 invariant 5) and schema generation
+# must not drag a web server into every build.
+
+[features]
+default = ["dto"]
+# `dto` is the lightweight base: serde + schemars DTOs and PROTOCOL_VERSION.
+# It is an empty marker feature — DTO code is unconditional — kept so the
+# documented `--no-default-features --features dto` commands stay valid.
+dto = []
+server = ["dep:tokio", "dep:tokio-util", "dep:axum", "dep:axum-server", "dep:futures", "dep:subtle", "dep:rand", "dep:tracing"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+axum = { version = "0.8", features = ["ws"], optional = true }
+axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }
+futures = { version = "0.3", optional = true }
+subtle = { version = "2.6", optional = true }
+rand = { version = "0.9", optional = true }
+tracing = { workspace = true, optional = true }
+
+[dev-dependencies]
+# A2 adversarial tests: real WSS client + generated TLS fixtures.
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+rustls = "0.23"
+rcgen = "0.13"
+http = "1"

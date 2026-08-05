@@ -1,0 +1,2005 @@
+{
+  "$comment": "Generated from gaviero-remote DTOs — do not edit by hand.",
+  "client_envelope": {
+    "$defs": {
+      "ClientHello": {
+        "properties": {
+          "client_name": {
+            "type": "string"
+          },
+          "client_version": {
+            "type": "string"
+          },
+          "protocol_version": {
+            "$ref": "#/$defs/ProtocolVersion"
+          }
+        },
+        "required": [
+          "protocol_version",
+          "client_name",
+          "client_version"
+        ],
+        "type": "object"
+      },
+      "Interrupt": {
+        "properties": {
+          "conv_id": {
+            "type": "string"
+          },
+          "turn_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "conv_id"
+        ],
+        "type": "object"
+      },
+      "PermissionDecision": {
+        "properties": {
+          "allow": {
+            "type": "boolean"
+          },
+          "answers": {
+            "description": "Per question, selected option indices. Only valid for\n`AskUserQuestion` permissions; never a tool-input document.",
+            "items": {
+              "items": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "message": {
+            "description": "Free text on deny; size-limited, control-character filtered.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "request_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "allow"
+        ],
+        "type": "object"
+      },
+      "ProtocolVersion": {
+        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1).",
+        "properties": {
+          "major": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "minor": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "major",
+          "minor"
+        ],
+        "type": "object"
+      },
+      "RenameConversation": {
+        "properties": {
+          "conv_id": {
+            "type": "string"
+          },
+          "conv_revision": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "conv_id",
+          "conv_revision",
+          "title"
+        ],
+        "type": "object"
+      },
+      "RequestMessages": {
+        "properties": {
+          "before_seq": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "conv_id": {
+            "type": "string"
+          },
+          "limit": {
+            "description": "Clamped server-side to 1–200.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "conv_id",
+          "before_seq",
+          "limit"
+        ],
+        "type": "object"
+      },
+      "RequestProposal": {
+        "properties": {
+          "proposal_id": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "proposal_id"
+        ],
+        "type": "object"
+      },
+      "ResetConversation": {
+        "properties": {
+          "conv_id": {
+            "type": "string"
+          },
+          "conv_revision": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "conv_id",
+          "conv_revision"
+        ],
+        "type": "object"
+      },
+      "ReviewAction": {
+        "properties": {
+          "action": {
+            "$ref": "#/$defs/ReviewActionKind"
+          },
+          "hunk_index": {
+            "description": "Required for `accept_hunk` / `reject_hunk`.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "proposal_id": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "proposal_revision": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "proposal_id",
+          "proposal_revision",
+          "action"
+        ],
+        "type": "object"
+      },
+      "ReviewActionKind": {
+        "enum": [
+          "accept_hunk",
+          "reject_hunk",
+          "accept_all",
+          "reject_all",
+          "finalize"
+        ],
+        "type": "string"
+      },
+      "SendPrompt": {
+        "properties": {
+          "conv_id": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "conv_id",
+          "text"
+        ],
+        "type": "object"
+      },
+      "Slash": {
+        "properties": {
+          "confirmed": {
+            "description": "Must be true for commands listed in `hello.confirm_required`.",
+            "type": "boolean"
+          },
+          "conv_id": {
+            "type": "string"
+          },
+          "line": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "conv_id",
+          "line",
+          "confirmed"
+        ],
+        "type": "object"
+      },
+      "SwitchConversation": {
+        "properties": {
+          "conv_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "conv_id"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "oneOf": [
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ClientHello"
+          },
+          "type": {
+            "const": "client_hello",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/SendPrompt"
+          },
+          "type": {
+            "const": "send_prompt",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/Slash"
+          },
+          "type": {
+            "const": "slash",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/PermissionDecision"
+          },
+          "type": {
+            "const": "permission_decision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ReviewAction"
+          },
+          "type": {
+            "const": "review_action",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "type": "object"
+          },
+          "type": {
+            "const": "new_conversation",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/SwitchConversation"
+          },
+          "type": {
+            "const": "switch_conversation",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/RenameConversation"
+          },
+          "type": {
+            "const": "rename_conversation",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ResetConversation"
+          },
+          "type": {
+            "const": "reset_conversation",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/Interrupt"
+          },
+          "type": {
+            "const": "interrupt",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "type": "object"
+          },
+          "type": {
+            "const": "request_snapshot",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/RequestMessages"
+          },
+          "type": {
+            "const": "request_messages",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/RequestProposal"
+          },
+          "type": {
+            "const": "request_proposal",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      }
+    ],
+    "properties": {
+      "command_id": {
+        "description": "Client-generated, unique per command. The server deduplicates\nrepeats within a bounded recent-ID cache.",
+        "type": "string"
+      },
+      "instance_id": {
+        "description": "Always present on the wire. `None` (serialized as literal `null`)\nexactly on `client_hello` — the only frame sent before the server's\n`hello` delivers the id. Every later frame echoes it.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "version": {
+        "$ref": "#/$defs/ProtocolVersion"
+      }
+    },
+    "required": [
+      "version",
+      "command_id"
+    ],
+    "title": "ClientEnvelope",
+    "type": "object"
+  },
+  "protocol_version": {
+    "major": 1,
+    "minor": 0
+  },
+  "server_envelope": {
+    "$defs": {
+      "AnsweredBy": {
+        "enum": [
+          "desktop",
+          "remote",
+          "system"
+        ],
+        "type": "string"
+      },
+      "Ask": {
+        "properties": {
+          "questions": {
+            "items": {
+              "$ref": "#/$defs/AskQuestion"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "questions"
+        ],
+        "type": "object"
+      },
+      "AskOption": {
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "label",
+          "description"
+        ],
+        "type": "object"
+      },
+      "AskQuestion": {
+        "properties": {
+          "header": {
+            "type": "string"
+          },
+          "multi_select": {
+            "type": "boolean"
+          },
+          "options": {
+            "items": {
+              "$ref": "#/$defs/AskOption"
+            },
+            "type": "array"
+          },
+          "question": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "question",
+          "header",
+          "multi_select",
+          "options"
+        ],
+        "type": "object"
+      },
+      "CodeBlock": {
+        "properties": {
+          "end_byte": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "language": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "spans": {
+            "items": {
+              "$ref": "#/$defs/Span"
+            },
+            "type": "array"
+          },
+          "start_byte": {
+            "description": "Range of the entire fenced block, fences included.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "truncated": {
+            "description": "True ⇒ block over 256 KiB: no spans, render plain.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "start_byte",
+          "end_byte",
+          "truncated",
+          "spans"
+        ],
+        "type": "object"
+      },
+      "CommandError": {
+        "properties": {
+          "code": {
+            "$ref": "#/$defs/ErrorCode"
+          },
+          "command_id": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "code",
+          "message"
+        ],
+        "type": "object"
+      },
+      "CommandResult": {
+        "properties": {
+          "command_id": {
+            "type": "string"
+          },
+          "result": true,
+          "status": {
+            "$ref": "#/$defs/CommandStatus"
+          }
+        },
+        "required": [
+          "command_id",
+          "status"
+        ],
+        "type": "object"
+      },
+      "CommandStatus": {
+        "oneOf": [
+          {
+            "enum": [
+              "completed"
+            ],
+            "type": "string"
+          },
+          {
+            "const": "accepted",
+            "description": "Terminal: validated and started; outcome arrives as lifecycle\nevents keyed by ids in `result`. Never followed by `completed`.",
+            "type": "string"
+          }
+        ]
+      },
+      "ContextPressure": {
+        "properties": {
+          "max_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "used_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "used_tokens",
+          "max_tokens"
+        ],
+        "type": "object"
+      },
+      "ConversationRemoved": {
+        "properties": {
+          "active_id": {
+            "type": "string"
+          },
+          "conv_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "conv_id",
+          "active_id"
+        ],
+        "type": "object"
+      },
+      "ConversationState": {
+        "properties": {
+          "has_older_messages": {
+            "type": "boolean"
+          },
+          "messages": {
+            "description": "At most the latest 100 messages / 512 KiB encoded.",
+            "items": {
+              "$ref": "#/$defs/Message"
+            },
+            "type": "array"
+          },
+          "oldest_seq": {
+            "description": "When `messages` is empty this echoes the requested cursor.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "summary": {
+            "$ref": "#/$defs/ConversationSummary"
+          }
+        },
+        "required": [
+          "summary",
+          "messages",
+          "oldest_seq",
+          "has_older_messages"
+        ],
+        "type": "object"
+      },
+      "ConversationStateChanged": {
+        "properties": {
+          "active_id": {
+            "type": "string"
+          },
+          "conversation": {
+            "$ref": "#/$defs/ConversationSummary"
+          }
+        },
+        "required": [
+          "conversation",
+          "active_id"
+        ],
+        "type": "object"
+      },
+      "ConversationSummary": {
+        "properties": {
+          "auto_approve": {
+            "type": "boolean"
+          },
+          "context_pressure": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ContextPressure"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "conv_id": {
+            "type": "string"
+          },
+          "conv_revision": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "effort": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "is_streaming": {
+            "type": "boolean"
+          },
+          "last_message_preview": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "description": "Full `provider:model` spec.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pending_turn_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "conv_id",
+          "conv_revision",
+          "title",
+          "is_streaming",
+          "auto_approve"
+        ],
+        "type": "object"
+      },
+      "CostUpdate": {
+        "properties": {
+          "conv_id": {
+            "type": "string"
+          },
+          "turn_id": {
+            "type": "string"
+          },
+          "usd": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "conv_id",
+          "turn_id",
+          "usd"
+        ],
+        "type": "object"
+      },
+      "ErrorCode": {
+        "enum": [
+          "invalid_payload",
+          "unknown_type",
+          "unknown_conversation",
+          "unknown_request",
+          "unknown_proposal",
+          "invalid_hunk",
+          "stale_request",
+          "stale_proposal",
+          "stale_conversation",
+          "conversation_streaming",
+          "slash_not_allowed",
+          "confirm_required",
+          "too_large",
+          "rate_limited",
+          "duplicate_command",
+          "internal_error"
+        ],
+        "type": "string"
+      },
+      "Hello": {
+        "properties": {
+          "allowed_slash_commands": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "capabilities": {
+            "description": "Frozen shape, empty in 1.0. Clients ignore unknown entries.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "confirm_required": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "instance_id": {
+            "type": "string"
+          },
+          "limits": {
+            "$ref": "#/$defs/Limits"
+          },
+          "protocol_version": {
+            "$ref": "#/$defs/ProtocolVersion"
+          },
+          "tui_version": {
+            "type": "string"
+          },
+          "workspace": {
+            "$ref": "#/$defs/WorkspaceInfo"
+          }
+        },
+        "required": [
+          "protocol_version",
+          "instance_id",
+          "tui_version",
+          "workspace",
+          "capabilities",
+          "confirm_required",
+          "allowed_slash_commands",
+          "limits"
+        ],
+        "type": "object"
+      },
+      "Hunk": {
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "hunk_type": {
+            "$ref": "#/$defs/HunkType"
+          },
+          "index": {
+            "description": "Position in the gate's `structural_hunks` at proposal creation;\nstable for the proposal lifetime; echoed by `review_action`.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "original_range": {
+            "$ref": "#/$defs/LineRange"
+          },
+          "original_text": {
+            "type": "string"
+          },
+          "proposed_range": {
+            "$ref": "#/$defs/LineRange"
+          },
+          "proposed_text": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/$defs/HunkStatus"
+          },
+          "truncated": {
+            "description": "True ⇒ text elided (over 64 KiB per side). Still reviewable: the\nserver assembles from its own copy.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "index",
+          "original_range",
+          "proposed_range",
+          "original_text",
+          "proposed_text",
+          "truncated",
+          "hunk_type",
+          "description",
+          "status"
+        ],
+        "type": "object"
+      },
+      "HunkStatus": {
+        "enum": [
+          "pending",
+          "accepted",
+          "rejected"
+        ],
+        "type": "string"
+      },
+      "HunkSummary": {
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "hunk_type": {
+            "$ref": "#/$defs/HunkType"
+          },
+          "index": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/$defs/HunkStatus"
+          }
+        },
+        "required": [
+          "index",
+          "hunk_type",
+          "description",
+          "status"
+        ],
+        "type": "object"
+      },
+      "HunkType": {
+        "enum": [
+          "added",
+          "removed",
+          "modified"
+        ],
+        "type": "string"
+      },
+      "Limits": {
+        "properties": {
+          "command_rate_per_second": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_frame_bytes": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_prompt_bytes": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "max_frame_bytes",
+          "max_prompt_bytes",
+          "command_rate_per_second"
+        ],
+        "type": "object"
+      },
+      "LineRange": {
+        "description": "0-indexed line numbers, display-only.",
+        "properties": {
+          "end_line": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "start_line": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "start_line",
+          "end_line"
+        ],
+        "type": "object"
+      },
+      "Message": {
+        "properties": {
+          "code_blocks": {
+            "items": {
+              "$ref": "#/$defs/CodeBlock"
+            },
+            "type": "array"
+          },
+          "content": {
+            "type": "string"
+          },
+          "full_bytes": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "role": {
+            "$ref": "#/$defs/Role"
+          },
+          "seq": {
+            "description": "Monotonic per-conversation id. Survives /compact and /reset.\nNOT the envelope `seq`.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tool_calls": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "truncated": {
+            "description": "True ⇒ `content` is the head of a >128 KiB message.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "seq",
+          "role",
+          "content",
+          "truncated",
+          "tool_calls",
+          "code_blocks"
+        ],
+        "type": "object"
+      },
+      "MessageComplete": {
+        "properties": {
+          "conv_id": {
+            "type": "string"
+          },
+          "message": {
+            "$ref": "#/$defs/Message"
+          }
+        },
+        "required": [
+          "conv_id",
+          "message"
+        ],
+        "type": "object"
+      },
+      "MessagePage": {
+        "properties": {
+          "conv_id": {
+            "type": "string"
+          },
+          "has_older_messages": {
+            "type": "boolean"
+          },
+          "messages": {
+            "description": "Newest-first request semantics; page capped at 512 KiB.",
+            "items": {
+              "$ref": "#/$defs/Message"
+            },
+            "type": "array"
+          },
+          "oldest_seq": {
+            "description": "When `messages` is empty this echoes the requested cursor.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "conv_id",
+          "messages",
+          "oldest_seq",
+          "has_older_messages"
+        ],
+        "type": "object"
+      },
+      "PermissionClosed": {
+        "properties": {
+          "answered_by": {
+            "$ref": "#/$defs/AnsweredBy"
+          },
+          "conv_id": {
+            "type": "string"
+          },
+          "outcome": {
+            "$ref": "#/$defs/PermissionOutcome"
+          },
+          "request_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "conv_id",
+          "request_id",
+          "outcome",
+          "answered_by"
+        ],
+        "type": "object"
+      },
+      "PermissionOutcome": {
+        "enum": [
+          "allowed",
+          "denied",
+          "superseded",
+          "cancelled"
+        ],
+        "type": "string"
+      },
+      "PermissionRequest": {
+        "properties": {
+          "ask": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Ask"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "conv_id": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "input": {
+            "description": "Display-only. The client never sends tool input back."
+          },
+          "request_id": {
+            "type": "string"
+          },
+          "tool_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "conv_id",
+          "request_id",
+          "tool_name",
+          "description",
+          "input"
+        ],
+        "type": "object"
+      },
+      "Proposal": {
+        "properties": {
+          "conflicts_with": {
+            "items": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "conv_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "hunks": {
+            "items": {
+              "$ref": "#/$defs/Hunk"
+            },
+            "type": "array"
+          },
+          "is_deletion": {
+            "type": "boolean"
+          },
+          "path": {
+            "description": "Workspace-relative.",
+            "type": "string"
+          },
+          "proposal_id": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "proposal_revision": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/$defs/ProposalStatus"
+          }
+        },
+        "required": [
+          "proposal_id",
+          "proposal_revision",
+          "source",
+          "path",
+          "status",
+          "is_deletion",
+          "conflicts_with",
+          "hunks"
+        ],
+        "type": "object"
+      },
+      "ProposalEvent": {
+        "description": "Shared payload of `proposal_created` / `proposal_updated` /\n`proposal_detail` — one shape, three lifecycle meanings.",
+        "properties": {
+          "proposal": {
+            "$ref": "#/$defs/Proposal"
+          }
+        },
+        "required": [
+          "proposal"
+        ],
+        "type": "object"
+      },
+      "ProposalFinalized": {
+        "properties": {
+          "outcome": {
+            "$ref": "#/$defs/ProposalOutcome"
+          },
+          "path": {
+            "type": "string"
+          },
+          "proposal_id": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "proposal_id",
+          "path",
+          "outcome"
+        ],
+        "type": "object"
+      },
+      "ProposalOutcome": {
+        "enum": [
+          "accepted",
+          "partially_accepted",
+          "rejected"
+        ],
+        "type": "string"
+      },
+      "ProposalStatus": {
+        "enum": [
+          "pending",
+          "partially_accepted",
+          "accepted",
+          "rejected",
+          "superseded"
+        ],
+        "type": "string"
+      },
+      "ProposalSummary": {
+        "description": "Snapshot form: never carries hunk text.",
+        "properties": {
+          "added_lines": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "conflicts_with": {
+            "items": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "conv_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "hunk_count": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "hunks": {
+            "items": {
+              "$ref": "#/$defs/HunkSummary"
+            },
+            "type": "array"
+          },
+          "is_deletion": {
+            "type": "boolean"
+          },
+          "path": {
+            "type": "string"
+          },
+          "proposal_id": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "proposal_revision": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "removed_lines": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/$defs/ProposalStatus"
+          }
+        },
+        "required": [
+          "proposal_id",
+          "proposal_revision",
+          "source",
+          "path",
+          "status",
+          "is_deletion",
+          "conflicts_with",
+          "hunk_count",
+          "added_lines",
+          "removed_lines",
+          "hunks"
+        ],
+        "type": "object"
+      },
+      "ProtocolVersion": {
+        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1).",
+        "properties": {
+          "major": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "minor": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "major",
+          "minor"
+        ],
+        "type": "object"
+      },
+      "RemoteSettings": {
+        "description": "Explicit allow-list DTO — never raw workspace settings. Additions are\nminor-version bumps and must be added to the A4 field-level test.",
+        "properties": {
+          "default_effort": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "default_model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "Role": {
+        "enum": [
+          "user",
+          "assistant",
+          "system"
+        ],
+        "type": "string"
+      },
+      "Snapshot": {
+        "properties": {
+          "active_conversation": {
+            "$ref": "#/$defs/ConversationState"
+          },
+          "active_id": {
+            "type": "string"
+          },
+          "conversations": {
+            "items": {
+              "$ref": "#/$defs/ConversationSummary"
+            },
+            "type": "array"
+          },
+          "open_permissions": {
+            "items": {
+              "$ref": "#/$defs/PermissionRequest"
+            },
+            "type": "array"
+          },
+          "open_proposals": {
+            "items": {
+              "$ref": "#/$defs/ProposalSummary"
+            },
+            "type": "array"
+          },
+          "revision": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "settings": {
+            "$ref": "#/$defs/RemoteSettings"
+          }
+        },
+        "required": [
+          "revision",
+          "conversations",
+          "active_id",
+          "active_conversation",
+          "open_permissions",
+          "open_proposals",
+          "settings"
+        ],
+        "type": "object"
+      },
+      "Span": {
+        "description": "All offsets are UTF-8 byte offsets into `Message.content`, ends\nexclusive; spans are absolute (not block-relative). See PROTOCOL.md\n§Highlighting offsets.",
+        "properties": {
+          "class": {
+            "description": "Semantic tree-sitter capture name (`keyword`, `string`, …).",
+            "type": "string"
+          },
+          "end_byte": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "start_byte": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "start_byte",
+          "end_byte",
+          "class"
+        ],
+        "type": "object"
+      },
+      "StreamChunk": {
+        "properties": {
+          "conv_id": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "turn_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "conv_id",
+          "turn_id",
+          "text"
+        ],
+        "type": "object"
+      },
+      "StreamingEnded": {
+        "properties": {
+          "cancelled": {
+            "type": "boolean"
+          },
+          "conv_id": {
+            "type": "string"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "proposal_count": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "turn_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "conv_id",
+          "turn_id",
+          "cancelled",
+          "proposal_count"
+        ],
+        "type": "object"
+      },
+      "StreamingStatus": {
+        "properties": {
+          "conv_id": {
+            "type": "string"
+          },
+          "status": {
+            "description": "Free-form display string.",
+            "type": "string"
+          },
+          "turn_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "conv_id",
+          "turn_id",
+          "status"
+        ],
+        "type": "object"
+      },
+      "TokenUsage": {
+        "description": "Mirrors core's `TokenUsage` field-for-field (remote-owned copy).",
+        "properties": {
+          "cache_creation_input_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cache_read_input_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "input_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "input_tokens",
+          "cache_creation_input_tokens",
+          "cache_read_input_tokens",
+          "output_tokens"
+        ],
+        "type": "object"
+      },
+      "TokenUsageEvent": {
+        "properties": {
+          "conv_id": {
+            "type": "string"
+          },
+          "turn_id": {
+            "type": "string"
+          },
+          "usage": {
+            "$ref": "#/$defs/TokenUsage"
+          }
+        },
+        "required": [
+          "conv_id",
+          "turn_id",
+          "usage"
+        ],
+        "type": "object"
+      },
+      "ToolCallStarted": {
+        "properties": {
+          "conv_id": {
+            "type": "string"
+          },
+          "tool_name": {
+            "type": "string"
+          },
+          "turn_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "conv_id",
+          "turn_id",
+          "tool_name"
+        ],
+        "type": "object"
+      },
+      "WorkspaceInfo": {
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "id": {
+            "description": "Hex workspace identity (first 16 lowercase hex chars of the\ncanonical-root SHA-256). Never an absolute path.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "display_name"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "oneOf": [
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/Hello"
+          },
+          "type": {
+            "const": "hello",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/Snapshot"
+          },
+          "type": {
+            "const": "snapshot",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ConversationStateChanged"
+          },
+          "type": {
+            "const": "conversation_state_changed",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ConversationRemoved"
+          },
+          "type": {
+            "const": "conversation_removed",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/MessagePage"
+          },
+          "type": {
+            "const": "message_page",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/StreamChunk"
+          },
+          "type": {
+            "const": "stream_chunk",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/StreamingStatus"
+          },
+          "type": {
+            "const": "streaming_status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/StreamingEnded"
+          },
+          "type": {
+            "const": "streaming_ended",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ToolCallStarted"
+          },
+          "type": {
+            "const": "tool_call_started",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/MessageComplete"
+          },
+          "type": {
+            "const": "message_complete",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/PermissionRequest"
+          },
+          "type": {
+            "const": "permission_request",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/PermissionClosed"
+          },
+          "type": {
+            "const": "permission_closed",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ProposalEvent"
+          },
+          "type": {
+            "const": "proposal_created",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ProposalEvent"
+          },
+          "type": {
+            "const": "proposal_updated",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ProposalEvent"
+          },
+          "type": {
+            "const": "proposal_detail",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ProposalFinalized"
+          },
+          "type": {
+            "const": "proposal_finalized",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/TokenUsageEvent"
+          },
+          "type": {
+            "const": "token_usage",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/CostUpdate"
+          },
+          "type": {
+            "const": "cost_update",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/CommandResult"
+          },
+          "type": {
+            "const": "command_result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/CommandError"
+          },
+          "type": {
+            "const": "command_error",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "payload"
+        ],
+        "type": "object"
+      }
+    ],
+    "properties": {
+      "instance_id": {
+        "type": "string"
+      },
+      "revision": {
+        "description": "Global snapshot generation. Staleness display only — never a\ncommand precondition.",
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "seq": {
+        "description": "Monotonic per `instance_id`, assigned at emission, continues across\nsocket generations. A gap ⇒ `request_snapshot`.",
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "version": {
+        "$ref": "#/$defs/ProtocolVersion"
+      }
+    },
+    "required": [
+      "version",
+      "instance_id",
+      "seq",
+      "revision"
+    ],
+    "title": "ServerEnvelope",
+    "type": "object"
+  },
+  "subprotocol": "gaviero.v1",
+  "ws_path": "/v1/ws"
+}
