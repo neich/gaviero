@@ -789,12 +789,17 @@ mod render_preview {
 mod live_diagnostic {
     use super::*;
 
-    /// Prints what `/remote` would report for THIS workspace right now.
-    /// `cargo test -p gaviero-tui live_remote_status -- --ignored --nocapture`
+    /// Prints what `/remote` would report for a workspace right now.
+    /// Under `cargo test` the cwd is the crate dir, so pass the workspace
+    /// root explicitly:
+    /// `GAVIERO_WS=<root> cargo test -p gaviero-tui live_remote_status -- --ignored --nocapture`
     #[test]
     #[ignore = "diagnostic: reports this machine's real remote readiness"]
     fn live_remote_status() {
-        let ws = Workspace::single_folder(std::env::current_dir().unwrap());
+        let root = std::env::var("GAVIERO_WS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::current_dir().unwrap());
+        let ws = Workspace::single_folder(root);
         match resolve_config(&ws) {
             Ok(config) => {
                 println!("enabled:   {}", config.enabled);
