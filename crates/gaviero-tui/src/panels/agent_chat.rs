@@ -66,6 +66,12 @@ pub enum ChatRole {
 
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
+    /// Monotonic per-conversation identity (Plan A §2.6), assigned from
+    /// `Conversation::next_message_seq` when the message is pushed. NOT
+    /// reset by `/compact` or `/reset` — surviving messages keep their
+    /// `seq`, so a stale remote cursor resolves to an empty range instead
+    /// of different content. Distinct from the wire envelope's `seq`.
+    pub seq: u64,
     pub role: ChatRole,
     pub content: String,
     pub tool_calls: Vec<String>,
@@ -179,9 +185,26 @@ fn wrap_indented(text: &str, width: usize, first_indent: &str, cont_indent: &str
         .collect()
 }
 
+/// Process-unique id for a pending permission (Plan A §2.2): the remote
+/// client answers by `request_id`, and first-writer-wins races are decided
+/// by whether the id still names a parked request.
+fn next_request_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("req-{millis:x}-{n:x}")
+}
+
 /// A pending permission request from the agent subprocess.
 /// Held in `Conversation::pending_permission` while the user decides.
 pub struct PendingPermission {
+    /// Stable id the remote protocol addresses this request by. The first
+    /// valid local or remote answer takes the oneshot sender and wins.
+    pub request_id: String,
     pub tool_name: String,
     pub description: String,
     /// Original tool input (needed to echo `updatedInput` on allow, and to
@@ -210,6 +233,7 @@ impl PendingPermission {
             None
         };
         Self {
+            request_id: next_request_id(),
             tool_name,
             description,
             input,
@@ -387,6 +411,31 @@ impl AskUserQuestionState {
     }
 }
 
+/// Data for the `permission_closed` projection after an answer.
+#[derive(Debug, Clone)]
+pub struct PermissionClosedInfo {
+    pub conv_id: String,
+    pub request_id: String,
+    pub allowed: bool,
+}
+
+/// Why a permission answer was refused (the request stays parked on
+/// `Invalid`; `NoPending` means the id no longer names a live request —
+/// the other side answered first).
+#[derive(Debug, Clone)]
+pub enum PermissionAnswerError {
+    NoPending,
+    Invalid(String),
+}
+
+/// Who issued a slash command. Policy and desktop-only UI affordances
+/// branch on this; mutation semantics never do (Plan A §2.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlashOrigin {
+    Desktop,
+    Remote,
+}
+
 impl std::fmt::Debug for PendingPermission {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingPermission")
@@ -442,6 +491,14 @@ impl Default for TranscriptInlineMode {
 #[derive(Debug)]
 pub struct Conversation {
     pub id: String,
+    /// Per-entity freshness token (Plan A §4.8): bumped whenever
+    /// summary-visible state changes (title, model/effort/namespace,
+    /// auto-approve, streaming transitions). `rename_conversation` /
+    /// `reset_conversation` remote commands must present the current value.
+    pub conv_revision: u64,
+    /// Next `ChatMessage.seq` to assign — monotonic for the life of the
+    /// conversation, never reset by `/compact` or `/reset` (§2.6).
+    pub next_message_seq: u64,
     pub title: String,
     pub messages: Vec<ChatMessage>,
     /// Per-conversation model override (None = use global default).
@@ -528,6 +585,29 @@ pub struct Conversation {
     pub last_bootstrap_arms: gaviero_core::context_planner::BootstrapArms,
     /// Memory injection size from the last `ChatMemoryInjected` event.
     pub last_memory_injection_tokens: usize,
+}
+
+impl Conversation {
+    /// Push a message, assigning its monotonic `seq` (§2.6). The single
+    /// construction path for live messages — direct `ChatMessage {}`
+    /// literals outside restore/compact keep-list handling are a bug.
+    pub fn push_message(&mut self, role: ChatRole, content: String, tool_calls: Vec<String>) {
+        let seq = self.next_message_seq;
+        self.next_message_seq += 1;
+        self.messages.push(ChatMessage {
+            seq,
+            role,
+            content,
+            tool_calls,
+        });
+    }
+
+    /// Bump the per-entity freshness token after a summary-visible change
+    /// (§4.8). Callers that project `conversation_state_changed` read the
+    /// bumped value in the same transition.
+    pub fn bump_revision(&mut self) {
+        self.conv_revision += 1;
+    }
 }
 
 /// Context-window pressure shown in the status bar and `/context`.
@@ -662,6 +742,8 @@ impl AgentChatState {
     pub fn new() -> Self {
         let conv = Conversation {
             id: gaviero_core::session_state::new_conversation_id(),
+            conv_revision: 1,
+            next_message_seq: 1,
             title: "New Chat".to_string(),
             messages: Vec::new(),
             model_override: None,
@@ -801,31 +883,131 @@ impl AgentChatState {
     }
 
     /// Respond to the active conversation's pending permission and clear it.
+    /// Thin desktop wrapper over [`Self::respond_permission_at`] — the
+    /// shared reducer core (Plan A §2.2).
     pub fn respond_active_permission(&mut self, allow: bool) {
-        let conv = self.active_conversation_mut();
-        if let Some(perm) = conv.pending_permission.take() {
-            let decision = if allow {
-                if let Some(ask) = perm.ask.as_ref() {
-                    let mut updated = perm.input.clone();
-                    if let Some(obj) = updated.as_object_mut() {
-                        obj.insert(
-                            "answers".into(),
-                            serde_json::Value::Object(ask.answers_map()),
-                        );
+        let idx = self.active_conv;
+        let _ = self.respond_permission_at(idx, allow, None, None);
+    }
+
+    /// Conversation index holding the pending permission with `request_id`.
+    pub fn find_permission_conv(&self, request_id: &str) -> Option<usize> {
+        self.conversations.iter().position(|c| {
+            c.pending_permission
+                .as_ref()
+                .is_some_and(|p| p.request_id == request_id)
+        })
+    }
+
+    /// Answer the pending permission on conversation `idx` and clear it.
+    ///
+    /// `answers` is the remote path's per-question selected option indices
+    /// (§5.3): validated against the parked `AskUserQuestion`, then the tool
+    /// input is rebuilt through the SAME `answers_map` path the desktop
+    /// uses — remote and desktop produce byte-identical `updated_input`.
+    /// A permission decision can never carry a different tool input than
+    /// the one displayed. `None` uses the ask state's current UI
+    /// selections (desktop path).
+    pub fn respond_permission_at(
+        &mut self,
+        idx: usize,
+        allow: bool,
+        answers: Option<&[Vec<u32>]>,
+        deny_message: Option<&str>,
+    ) -> Result<PermissionClosedInfo, PermissionAnswerError> {
+        let Some(conv) = self.conversations.get_mut(idx) else {
+            return Err(PermissionAnswerError::NoPending);
+        };
+        let Some(perm) = conv.pending_permission.as_mut() else {
+            return Err(PermissionAnswerError::NoPending);
+        };
+
+        // §5.3 validation happens BEFORE the request is consumed, so an
+        // invalid remote answer leaves the request parked for a retry.
+        if allow {
+            match (perm.ask.as_mut(), answers) {
+                (None, Some(_)) => {
+                    return Err(PermissionAnswerError::Invalid(
+                        "answers are only valid for AskUserQuestion permissions".into(),
+                    ));
+                }
+                (Some(ask), Some(answers)) => {
+                    if answers.len() != ask.questions.len() {
+                        return Err(PermissionAnswerError::Invalid(format!(
+                            "expected {} answer group(s), got {}",
+                            ask.questions.len(),
+                            answers.len()
+                        )));
                     }
-                    gaviero_core::observer::PermissionDecision::Allow {
-                        updated_input: Some(updated),
+                    for (qi, (question, selection)) in
+                        ask.questions.iter().zip(answers.iter()).enumerate()
+                    {
+                        if selection.iter().any(|&i| i as usize >= question.options.len()) {
+                            return Err(PermissionAnswerError::Invalid(format!(
+                                "answer index out of range for question {}",
+                                qi + 1
+                            )));
+                        }
+                        if !question.multi_select && selection.len() != 1 {
+                            return Err(PermissionAnswerError::Invalid(format!(
+                                "question {} requires exactly one selection",
+                                qi + 1
+                            )));
+                        }
+                        if selection.is_empty() {
+                            return Err(PermissionAnswerError::Invalid(format!(
+                                "question {} has no selection",
+                                qi + 1
+                            )));
+                        }
                     }
-                } else {
-                    gaviero_core::observer::PermissionDecision::Allow {
-                        updated_input: Some(perm.input.clone()),
+                    for (sel, provided) in ask.selected.iter_mut().zip(answers.iter()) {
+                        *sel = provided.iter().map(|&i| i as usize).collect();
                     }
                 }
-            } else {
-                gaviero_core::observer::PermissionDecision::deny_with_message("Denied by user")
-            };
-            let _ = perm.respond.send(decision);
+                (Some(ask), None) => {
+                    if !ask.all_answered() {
+                        return Err(PermissionAnswerError::Invalid(
+                            "not every question has a selection".into(),
+                        ));
+                    }
+                }
+                (None, None) => {}
+            }
         }
+
+        let perm = conv
+            .pending_permission
+            .take()
+            .expect("pending permission checked above");
+        let decision = if allow {
+            if let Some(ask) = perm.ask.as_ref() {
+                let mut updated = perm.input.clone();
+                if let Some(obj) = updated.as_object_mut() {
+                    obj.insert(
+                        "answers".into(),
+                        serde_json::Value::Object(ask.answers_map()),
+                    );
+                }
+                gaviero_core::observer::PermissionDecision::Allow {
+                    updated_input: Some(updated),
+                }
+            } else {
+                gaviero_core::observer::PermissionDecision::Allow {
+                    updated_input: Some(perm.input.clone()),
+                }
+            }
+        } else {
+            gaviero_core::observer::PermissionDecision::deny_with_message(
+                deny_message.unwrap_or("Denied by user"),
+            )
+        };
+        let _ = perm.respond.send(decision);
+        Ok(PermissionClosedInfo {
+            conv_id: conv.id.clone(),
+            request_id: perm.request_id,
+            allowed: allow,
+        })
     }
 
     /// Submit AskUserQuestion answers when every question has a selection.
@@ -957,6 +1139,38 @@ impl AgentChatState {
 
     pub fn effective_bootstrap_mode(&self) -> gaviero_core::context_planner::BootstrapMode {
         self.active_conversation()
+            .context_mode_override
+            .unwrap_or(self.agent_settings.bootstrap_mode)
+    }
+
+    // ── Indexed effective-setting accessors (shared reducers, §2.2) ────
+
+    pub fn effective_model_at(&self, idx: usize) -> &str {
+        self.conversations[idx]
+            .model_override
+            .as_deref()
+            .unwrap_or(&self.agent_settings.model)
+    }
+
+    pub fn effective_effort_at(&self, idx: usize) -> &str {
+        self.conversations[idx]
+            .effort_override
+            .as_deref()
+            .unwrap_or(&self.agent_settings.effort)
+    }
+
+    pub fn effective_write_namespace_at(&self, idx: usize) -> &str {
+        self.conversations[idx]
+            .namespace_override
+            .as_deref()
+            .unwrap_or(&self.agent_settings.write_namespace)
+    }
+
+    pub fn effective_bootstrap_mode_at(
+        &self,
+        idx: usize,
+    ) -> gaviero_core::context_planner::BootstrapMode {
+        self.conversations[idx]
             .context_mode_override
             .unwrap_or(self.agent_settings.bootstrap_mode)
     }
@@ -1208,6 +1422,23 @@ impl AgentChatState {
             return false;
         }
 
+        // Clear the draft up-front (every handled arm used to do this at
+        // its end); `/rename`'s bare form re-fills it via `start_rename`.
+        self.text_input.text.clear();
+        self.text_input.cursor = 0;
+        let idx = self.active_conv;
+        self.apply_slash_line(idx, &input, SlashOrigin::Desktop)
+    }
+
+    /// Shared slash reducer (Plan A §2.2): one implementation of each
+    /// command's semantics, applied to the conversation at `idx`. Desktop
+    /// keyboard input and `Event::RemoteCommand` both land here. `origin`
+    /// exists only for policy and desktop-only UI affordances (interactive
+    /// rename) — never to fork a mutation.
+    pub fn apply_slash_line(&mut self, idx: usize, input: &str, origin: SlashOrigin) -> bool {
+        if idx >= self.conversations.len() {
+            return false;
+        }
         let parts: Vec<&str> = input.splitn(2, ' ').collect();
         let cmd = parts[0];
         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
@@ -1217,13 +1448,13 @@ impl AgentChatState {
         // auto-title a fresh conversation to the slash command text and
         // mangle the rename target.
         if cmd != "/rename" {
-            self.add_user_message(&input);
+            self.add_user_message_at(idx, input);
         }
 
         match cmd {
             "/model" => {
                 if arg.is_empty() {
-                    let current = self.effective_model().to_string();
+                    let current = self.effective_model_at(idx).to_string();
                     let options = self.model_options().to_vec();
                     let list = if options.is_empty() {
                         "claude:fable, claude:sonnet, claude:opus, claude:haiku, \
@@ -1233,7 +1464,7 @@ impl AgentChatState {
                     } else {
                         options.join(", ")
                     };
-                    self.add_system_message(&format!(
+                    self.add_system_message_at(idx, &format!(
                         "Current model: {}\nAvailable: {}\nUsage: /model <provider:model>\n\
                          Specs require a provider prefix: `claude:`, `codex:`, `cursor:`, \
                          `deepseek:`, `ollama:`, or `local:`.",
@@ -1244,20 +1475,19 @@ impl AgentChatState {
                     if let Err(err) =
                         gaviero_core::swarm::backend::shared::validate_model_spec(&model)
                     {
-                        self.add_system_message(&format!("Invalid model spec: {err:#}"));
+                        self.add_system_message_at(idx, &format!("Invalid model spec: {err:#}"));
                     } else {
-                        self.conversations[self.active_conv].model_override = Some(model.clone());
-                        self.add_system_message(&format!("Model set to: {}", model));
+                        self.conversations[idx].model_override = Some(model.clone());
+                        self.conversations[idx].bump_revision();
+                        self.add_system_message_at(idx, &format!("Model set to: {}", model));
                     }
                 }
-                self.text_input.text.clear();
-                self.text_input.cursor = 0;
                 true
             }
             "/thinking" | "/effort" => {
                 if arg.is_empty() {
-                    let current = self.effective_effort();
-                    self.add_system_message(&format!(
+                    let current = self.effective_effort_at(idx);
+                    self.add_system_message_at(idx, &format!(
                         "Effort level: {}.\n\
                          Usage: /effort <off|auto|low|medium|high|xhigh|max|ultra>\n\
                          Applies to Claude and Codex sessions (Ollama ignores it).\n\
@@ -1279,19 +1509,17 @@ impl AgentChatState {
                         "max" => "max",
                         "ultra" | "u" => "ultra",
                         _ => {
-                            self.add_system_message(
+                            self.add_system_message_at(
+                                idx,
                                 "Invalid effort level. Use: off, auto, low, medium, high, xhigh, max, ultra",
                             );
-                            self.text_input.text.clear();
-                            self.text_input.cursor = 0;
                             return true;
                         }
                     };
-                    self.conversations[self.active_conv].effort_override = Some(level.to_string());
-                    self.add_system_message(&format!("Effort level set to: {}", level));
+                    self.conversations[idx].effort_override = Some(level.to_string());
+                    self.conversations[idx].bump_revision();
+                    self.add_system_message_at(idx, &format!("Effort level set to: {}", level));
                 }
-                self.text_input.text.clear();
-                self.text_input.cursor = 0;
                 true
             }
             "/compact" => {
@@ -1300,52 +1528,66 @@ impl AgentChatState {
                 } else {
                     arg.parse::<usize>().unwrap_or(theme::DEFAULT_COMPACT_KEEP)
                 };
-                let conv = &mut self.conversations[self.active_conv];
+                let conv = &mut self.conversations[idx];
                 let total = conv.messages.len();
                 if total <= keep {
-                    self.add_system_message(&format!(
+                    self.add_system_message_at(idx, &format!(
                         "Nothing to compact ({} messages, keeping {})",
                         total, keep
                     ));
                 } else {
                     let removed = total - keep;
-                    // Summarize removed messages into a single system note
+                    // Summarize removed messages into a single system note.
+                    // The summary is a NEW message with a new seq (§2.6);
+                    // kept messages retain theirs, so remote cursors into
+                    // the removed range resolve to "no such range".
                     let summary = format!("[{} earlier messages compacted]", removed);
                     let kept: Vec<ChatMessage> = conv.messages.split_off(total - keep);
                     conv.messages.clear();
+                    let summary_seq = conv.next_message_seq;
+                    conv.next_message_seq += 1;
                     conv.messages.push(ChatMessage {
+                        seq: summary_seq,
                         role: ChatRole::System,
                         content: summary,
                         tool_calls: Vec::new(),
                     });
                     conv.messages.extend(kept);
 
-                    let (_tokens, pct) =
-                        self.estimate_context(&self.fallback_bootstrap_estimate_context());
-                    self.add_system_message(&format!(
-                        "Compacted: removed {} messages, kept {}. Context: ~{}% of limit",
-                        removed, keep, pct
-                    ));
+                    // The context estimate reads the ACTIVE conversation's
+                    // draft/usage state; skip the percentage for a
+                    // background target rather than report wrong numbers.
+                    if idx == self.active_conv {
+                        let (_tokens, pct) =
+                            self.estimate_context(&self.fallback_bootstrap_estimate_context());
+                        self.add_system_message_at(idx, &format!(
+                            "Compacted: removed {} messages, kept {}. Context: ~{}% of limit",
+                            removed, keep, pct
+                        ));
+                    } else {
+                        self.add_system_message_at(idx, &format!(
+                            "Compacted: removed {} messages, kept {}.",
+                            removed, keep
+                        ));
+                    }
                 }
-                self.text_input.text.clear();
-                self.text_input.cursor = 0;
                 true
             }
             "/context" => {
                 if let Some(mode_arg) = arg.strip_prefix("mode") {
                     let mode_str = mode_arg.trim();
-                    let conv = &mut self.conversations[self.active_conv];
+                    let conv = &mut self.conversations[idx];
                     if mode_str.is_empty() {
-                        self.add_system_message(&format!(
+                        self.add_system_message_at(idx, &format!(
                             "Bootstrap mode: {} (workspace default: {})\n\
                              Usage: /context mode auto|minimal|manual|none\n\
                              /context mode reset — clear per-conversation override",
-                            self.effective_bootstrap_mode().as_str(),
+                            self.effective_bootstrap_mode_at(idx).as_str(),
                             self.agent_settings.bootstrap_mode.as_str(),
                         ));
                     } else if mode_str == "reset" {
                         conv.context_mode_override = None;
-                        self.add_system_message(&format!(
+                        self.add_system_message_at(idx, &format!(
                             "Bootstrap mode reset to workspace default: {}",
                             self.agent_settings.bootstrap_mode.as_str()
                         ));
@@ -1353,17 +1595,37 @@ impl AgentChatState {
                         gaviero_core::context_planner::BootstrapMode::parse(mode_str)
                     {
                         conv.context_mode_override = Some(mode);
-                        self.add_system_message(&format!(
+                        self.add_system_message_at(idx, &format!(
                             "Bootstrap mode set to: {} (this conversation)",
                             mode.as_str()
                         ));
                     } else {
-                        self.add_system_message(
+                        self.add_system_message_at(
+                            idx,
                             "Invalid mode. Use: auto, minimal, manual, none, or reset",
                         );
                     }
-                    self.text_input.text.clear();
-                    self.text_input.cursor = 0;
+                    return true;
+                }
+
+                if idx != self.active_conv {
+                    // The rich report below reads active-conversation draft
+                    // and estimate state; give a background target an
+                    // honest per-conversation subset instead.
+                    let conv = &self.conversations[idx];
+                    let mut msg = format!(
+                        "Model: {} — context limit {} tokens",
+                        self.effective_model_at(idx),
+                        self.context_limit_tokens_for(self.effective_model_at(idx)),
+                    );
+                    if let Some(u) = &conv.last_token_usage {
+                        msg.push_str(&format!(
+                            "\nProvider usage (last turn): prefix {} | output {}",
+                            u.prefix_tokens(),
+                            u.output_tokens
+                        ));
+                    }
+                    self.add_system_message_at(idx, &msg);
                     return true;
                 }
 
@@ -1444,15 +1706,13 @@ impl AgentChatState {
                     ));
                 }
                 self.add_system_message(&msg);
-                self.text_input.text.clear();
-                self.text_input.cursor = 0;
                 true
             }
             "/inject" => {
-                let conv = &mut self.conversations[self.active_conv];
+                let conv = &mut self.conversations[idx];
                 let layer = arg.to_ascii_lowercase();
                 if layer.is_empty() {
-                    self.add_system_message(
+                    self.add_system_message_at(idx,
                         "Inject bootstrap layers on the next prompt:\n\
                          /inject memory    — <project_memory>\n\
                          /inject outline   — <repo_outline> (alias: graph)\n\
@@ -1467,7 +1727,8 @@ impl AgentChatState {
                         explicit: true,
                         ..gaviero_core::context_planner::BootstrapArms::all()
                     };
-                    self.add_system_message(
+                    self.add_system_message_at(
+                        idx,
                         "Inject all: ARMED for next prompt (topology, outline, memory, impact).",
                     );
                 } else {
@@ -1495,21 +1756,20 @@ impl AgentChatState {
                             conv.inject_arms_next.explicit = true;
                             Self::format_bootstrap_layers(conv.inject_arms_next)
                         };
-                        self.add_system_message(&format!(
+                        self.add_system_message_at(idx, &format!(
                             "Inject armed for next prompt: {layers}"
                         ));
                     } else {
-                        self.add_system_message(
+                        self.add_system_message_at(
+                            idx,
                             "Unknown layer. Use: memory, outline, topology, impact, or all",
                         );
                     }
                 }
-                self.text_input.text.clear();
-                self.text_input.cursor = 0;
                 true
             }
             "/no-inject" => {
-                let conv = &mut self.conversations[self.active_conv];
+                let conv = &mut self.conversations[idx];
                 conv.no_inject_next = !conv.no_inject_next;
                 let msg = if conv.no_inject_next {
                     "No-inject: ARMED for next prompt — suppresses all bootstrap layers \
@@ -1517,27 +1777,34 @@ impl AgentChatState {
                 } else {
                     "No-inject: cleared."
                 };
-                self.add_system_message(msg);
-                self.text_input.text.clear();
-                self.text_input.cursor = 0;
+                self.add_system_message_at(idx, msg);
                 true
             }
             "/reset" | "/clear" => {
-                self.reset_conversation();
+                self.reset_conversation_at(idx);
                 true
             }
             "/rename" => {
                 if arg.is_empty() {
-                    // Bare /rename → start interactive rename (same as F2).
-                    self.text_input.text.clear();
-                    self.text_input.cursor = 0;
-                    self.start_rename();
+                    match origin {
+                        SlashOrigin::Desktop => {
+                            // Bare /rename → interactive rename (same as F2).
+                            self.start_rename();
+                        }
+                        SlashOrigin::Remote => {
+                            // Interactive rename is a desktop focus
+                            // affordance; remote must not open it.
+                            self.add_system_message_at(
+                                idx,
+                                "Usage: /rename <new title>",
+                            );
+                        }
+                    }
                 } else {
-                    let old = self.active_conversation().title.clone();
-                    self.active_conversation_mut().title = arg.to_string();
-                    self.text_input.text.clear();
-                    self.text_input.cursor = 0;
-                    self.add_system_message(&format!(
+                    let old = self.conversations[idx].title.clone();
+                    self.conversations[idx].title = arg.to_string();
+                    self.conversations[idx].bump_revision();
+                    self.add_system_message_at(idx, &format!(
                         "Renamed conversation: \"{}\" → \"{}\"",
                         old, arg
                     ));
@@ -1546,8 +1813,13 @@ impl AgentChatState {
             }
             "/namespace" | "/ns" => {
                 if arg.is_empty() {
-                    let write = self.effective_write_namespace().to_string();
-                    let read = self.effective_read_namespaces();
+                    let write = self.effective_write_namespace_at(idx).to_string();
+                    let mut read = vec![write.clone()];
+                    for ns in &self.agent_settings.read_namespaces {
+                        if !read.contains(ns) {
+                            read.push(ns.clone());
+                        }
+                    }
                     let read_str = read
                         .iter()
                         .map(|ns| {
@@ -1559,28 +1831,29 @@ impl AgentChatState {
                         })
                         .collect::<Vec<_>>()
                         .join(", ");
-                    self.add_system_message(&format!(
+                    self.add_system_message_at(idx, &format!(
                         "Write namespace: {}\nRead namespaces: [{}]",
                         write, read_str
                     ));
                 } else {
-                    self.conversations[self.active_conv].namespace_override = Some(arg.to_string());
-                    self.add_system_message(&format!(
+                    self.conversations[idx].namespace_override = Some(arg.to_string());
+                    self.conversations[idx].bump_revision();
+                    self.add_system_message_at(idx, &format!(
                         "Write namespace set to: {} (for this conversation)",
                         arg
                     ));
                 }
-                self.text_input.text.clear();
-                self.text_input.cursor = 0;
                 true
             }
             "/autoapprove" | "/yolo" => {
-                let conv = &mut self.conversations[self.active_conv];
+                let conv = &mut self.conversations[idx];
                 conv.auto_approve = !conv.auto_approve;
+                conv.bump_revision();
                 let state = if conv.auto_approve { "ON" } else { "OFF" };
-                self.add_system_message(&format!("Auto-approve: {} for this conversation", state));
-                self.text_input.text.clear();
-                self.text_input.cursor = 0;
+                self.add_system_message_at(
+                    idx,
+                    &format!("Auto-approve: {} for this conversation", state),
+                );
                 true
             }
             "/workspace" | "/ws" => {
@@ -1590,7 +1863,7 @@ impl AgentChatState {
                 // Calling `/workspace` again before sending toggles back
                 // off, so the user can change their mind without a separate
                 // command.
-                let conv = &mut self.conversations[self.active_conv];
+                let conv = &mut self.conversations[idx];
                 conv.workspace_wide_next = !conv.workspace_wide_next;
                 let msg = if conv.workspace_wide_next {
                     "Workspace-wide scope: ARMED for next prompt. \
@@ -1600,9 +1873,7 @@ impl AgentChatState {
                     "Workspace-wide scope: cleared. Next prompt will use the \
                      focused folder default again."
                 };
-                self.add_system_message(msg);
-                self.text_input.text.clear();
-                self.text_input.cursor = 0;
+                self.add_system_message_at(idx, msg);
                 true
             }
             "/lite" | "/minimal" => {
@@ -1612,7 +1883,7 @@ impl AgentChatState {
                 // dispatch. Use this when the provider has a hard argv
                 // limit (cursor: 96 KB) and the default graph budget
                 // still pushes the prompt over.
-                let conv = &mut self.conversations[self.active_conv];
+                let conv = &mut self.conversations[idx];
                 conv.lite_next = !conv.lite_next;
                 let msg = if conv.lite_next {
                     "Minimal context: ARMED for next prompt. \
@@ -1624,13 +1895,11 @@ impl AgentChatState {
                     "Minimal context: cleared. Next prompt will include \
                      full bootstrap context normally."
                 };
-                self.add_system_message(msg);
-                self.text_input.text.clear();
-                self.text_input.cursor = 0;
+                self.add_system_message_at(idx, msg);
                 true
             }
             "/help" => {
-                self.add_system_message(
+                self.add_system_message_at(idx,
                     "Available commands:\n\n\
                      Conversation:\n\
                      /model <provider:model>  — Set model. Examples: claude:fable, claude:sonnet, claude:opus, claude:haiku, claude:opusplan, claude:sonnet[1m], claude:opus[1m], codex:<model>, ollama:<model>\n\
@@ -1691,19 +1960,15 @@ impl AgentChatState {
                      Use @filename to reference workspace files in your prompt.\n\
                      Use /attach to attach files from outside the workspace.",
                 );
-                self.text_input.text.clear();
-                self.text_input.cursor = 0;
                 true
             }
             _ => {
-                self.add_system_message(&format!(
+                self.add_system_message_at(idx, &format!(
                     "Unknown command: {}. Type /help for available commands. \
                      Prefix with `//` to send a slash command directly to the agent \
                      (e.g. `//init` for Claude Code skills).",
                     cmd
                 ));
-                self.text_input.text.clear();
-                self.text_input.cursor = 0;
                 true
             }
         }
@@ -1834,7 +2099,11 @@ impl AgentChatState {
 
     /// Context window size in tokens for the effective model.
     pub fn context_limit_tokens(&self) -> usize {
-        let model = self.effective_model();
+        self.context_limit_tokens_for(self.effective_model())
+    }
+
+    /// Context window size for an explicit model spec.
+    pub fn context_limit_tokens_for(&self, model: &str) -> usize {
         // Trailing `[1m]` (e.g. `claude:sonnet[1m]`, `claude:claude-opus-4-7[1m]`)
         // selects the 1M-token extended context variant — see Claude Code
         // model-config docs. Strip the suffix before matching the base alias.
@@ -1850,12 +2119,20 @@ impl AgentChatState {
     }
 
     pub fn add_system_message(&mut self, content: &str) {
-        self.active_conversation_mut().messages.push(ChatMessage {
-            role: ChatRole::System,
-            content: content.to_string(),
-            tool_calls: Vec::new(),
-        });
-        self.scroll_to_bottom();
+        let idx = self.active_conv;
+        self.add_system_message_at(idx, content);
+    }
+
+    /// System message on a specific conversation (remote reducers target
+    /// non-active tabs).
+    pub fn add_system_message_at(&mut self, idx: usize, content: &str) {
+        let Some(conv) = self.conversations.get_mut(idx) else {
+            return;
+        };
+        conv.push_message(ChatRole::System, content.to_string(), Vec::new());
+        if idx == self.active_conv {
+            self.scroll_to_bottom();
+        }
     }
 
     // ── Active conversation helpers ─────────────────────────────
@@ -1898,6 +2175,8 @@ impl AgentChatState {
     pub fn new_conversation(&mut self) {
         let conv = Conversation {
             id: gaviero_core::session_state::new_conversation_id(),
+            conv_revision: 1,
+            next_message_seq: 1,
             title: "New Chat".to_string(),
             messages: Vec::new(),
             model_override: None,
@@ -1937,7 +2216,15 @@ impl AgentChatState {
     /// turn bootstraps fresh. Visible chat history, attachments, scroll, and
     /// input are preserved.
     pub fn reset_conversation(&mut self) {
-        let conv = self.active_conversation_mut();
+        let idx = self.active_conv;
+        self.reset_conversation_at(idx);
+    }
+
+    /// Indexed reset core (shared reducer, §2.2).
+    pub fn reset_conversation_at(&mut self, idx: usize) {
+        let Some(conv) = self.conversations.get_mut(idx) else {
+            return;
+        };
         conv.claude_session_id = None;
         conv.session_ledger = None;
         conv.pending_persisted_ledger = None;
@@ -1970,11 +2257,18 @@ impl AgentChatState {
         // controller.rs flips this back to `Auto` once Claude opens the
         // fresh session, so subsequent /reset invocations behave the same.
         conv.transcript_inline_mode = TranscriptInlineMode::Suppress;
-        self.text_input.text.clear();
-        self.text_input.cursor = 0;
-        let estimate_ctx = self.fallback_bootstrap_estimate_context();
-        let msg = self.reset_post_bootstrap_message(&estimate_ctx);
-        self.add_system_message(&msg);
+        conv.bump_revision();
+        if idx == self.active_conv {
+            self.text_input.text.clear();
+            self.text_input.cursor = 0;
+            let estimate_ctx = self.fallback_bootstrap_estimate_context();
+            let msg = self.reset_post_bootstrap_message(&estimate_ctx);
+            self.add_system_message(&msg);
+        } else {
+            // The bootstrap breakdown reads active-conversation estimate
+            // state; a background reset gets the plain confirmation.
+            self.add_system_message_at(idx, "Context reset — next turn bootstraps fresh.");
+        }
     }
 
     /// Close the active conversation. If it's the last one, replace it with a fresh one.
@@ -2054,7 +2348,13 @@ impl AgentChatState {
 
     /// Get all messages for multi-turn context.
     pub fn context_messages(&self) -> Vec<(&str, &str)> {
-        self.messages()
+        self.context_messages_at(self.active_conv)
+    }
+
+    /// Indexed variant for the shared prompt-dispatch core (§2.2).
+    pub fn context_messages_at(&self, idx: usize) -> Vec<(&str, &str)> {
+        self.conversations[idx]
+            .messages
             .iter()
             .filter(|m| m.role == ChatRole::User || m.role == ChatRole::Assistant)
             .map(|m| {
@@ -3053,8 +3353,17 @@ impl AgentChatState {
     // ── Message management ─────────────────────────────────────
 
     pub fn add_user_message(&mut self, text: &str) {
+        let idx = self.active_conv;
+        self.add_user_message_at(idx, text);
+    }
+
+    /// User message on a specific conversation (shared by the desktop path
+    /// and the remote prompt reducer).
+    pub fn add_user_message_at(&mut self, idx: usize, text: &str) {
+        let Some(conv) = self.conversations.get_mut(idx) else {
+            return;
+        };
         // Auto-title: set title from first user message (truncated)
-        let conv = self.active_conversation_mut();
         if conv.title == "New Chat" && conv.messages.is_empty() {
             let title: String = text.chars().take(30).collect();
             conv.title = if text.chars().count() > 30 {
@@ -3062,14 +3371,12 @@ impl AgentChatState {
             } else {
                 title
             };
+            conv.bump_revision();
         }
-
-        self.messages_mut().push(ChatMessage {
-            role: ChatRole::User,
-            content: text.to_string(),
-            tool_calls: Vec::new(),
-        });
-        self.scroll_to_bottom();
+        conv.push_message(ChatRole::User, text.to_string(), Vec::new());
+        if idx == self.active_conv {
+            self.scroll_to_bottom();
+        }
     }
 
     /// Finalize the current streaming message.
@@ -3091,11 +3398,11 @@ impl AgentChatState {
                 return;
             }
             if !content.is_empty() {
-                self.messages_mut().push(ChatMessage {
-                    role: chat_role,
-                    content: content.to_string(),
-                    tool_calls: Vec::new(),
-                });
+                self.active_conversation_mut().push_message(
+                    chat_role,
+                    content.to_string(),
+                    Vec::new(),
+                );
             }
             return;
         }
@@ -3112,11 +3419,11 @@ impl AgentChatState {
 
         // Add new message if needed (e.g. system error)
         if chat_role == ChatRole::System && !content.is_empty() {
-            self.messages_mut().push(ChatMessage {
-                role: chat_role,
-                content: content.to_string(),
-                tool_calls: Vec::new(),
-            });
+            self.active_conversation_mut().push_message(
+                chat_role,
+                content.to_string(),
+                Vec::new(),
+            );
         }
 
         self.scroll_to_bottom();
@@ -3150,8 +3457,8 @@ impl AgentChatState {
         };
         self.conversations[idx].streaming_status = "Writing...".to_string();
         let clean = crate::widgets::render_utils::strip_ansi(text);
-        let msgs = &mut self.conversations[idx].messages;
-        if let Some(last) = msgs.last_mut() {
+        let conv = &mut self.conversations[idx];
+        if let Some(last) = conv.messages.last_mut() {
             if last.role == ChatRole::Assistant {
                 last.content.push_str(&clean);
                 if idx == self.active_conv {
@@ -3160,11 +3467,7 @@ impl AgentChatState {
                 return;
             }
         }
-        msgs.push(ChatMessage {
-            role: ChatRole::Assistant,
-            content: clean,
-            tool_calls: Vec::new(),
-        });
+        conv.push_message(ChatRole::Assistant, clean, Vec::new());
         if idx == self.active_conv {
             self.auto_scroll_during_stream();
         }
@@ -3174,23 +3477,19 @@ impl AgentChatState {
         let Some(idx) = self.find_conv_idx(conv_id) else {
             return;
         };
-        let msgs = &mut self.conversations[idx].messages;
+        let conv = &mut self.conversations[idx];
 
         // Inline tool call markers into the message content so they appear
         // in chronological order alongside text (not grouped at the end).
         let marker = format!("\n[{}]", tool_name);
-        if let Some(last) = msgs.last_mut() {
+        if let Some(last) = conv.messages.last_mut() {
             if last.role == ChatRole::Assistant {
                 last.content.push_str(&marker);
                 last.tool_calls.push(tool_name.to_string());
                 return;
             }
         }
-        msgs.push(ChatMessage {
-            role: ChatRole::Assistant,
-            content: marker,
-            tool_calls: vec![tool_name.to_string()],
-        });
+        conv.push_message(ChatRole::Assistant, marker, vec![tool_name.to_string()]);
     }
 
     /// Append a compact file proposal summary to the assistant's current streaming message.
@@ -3210,8 +3509,8 @@ impl AgentChatState {
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_else(|| path.to_string_lossy().to_string());
         let summary = format!("\n[wrote {} +{} -{}]", rel, additions, deletions);
-        let msgs = &mut self.conversations[idx].messages;
-        if let Some(last) = msgs.last_mut() {
+        let conv = &mut self.conversations[idx];
+        if let Some(last) = conv.messages.last_mut() {
             if last.role == ChatRole::Assistant {
                 last.content.push_str(&summary);
                 if idx == self.active_conv {
@@ -3221,11 +3520,7 @@ impl AgentChatState {
             }
         }
         // No assistant message yet — create one with just the summary
-        msgs.push(ChatMessage {
-            role: ChatRole::Assistant,
-            content: summary,
-            tool_calls: Vec::new(),
-        });
+        conv.push_message(ChatRole::Assistant, summary, Vec::new());
         if idx == self.active_conv {
             self.auto_scroll_during_stream();
         }
@@ -3254,11 +3549,7 @@ impl AgentChatState {
             if let Some(msg) = msgs.iter_mut().rev().find(|m| m.role == ChatRole::Assistant) {
                 msg.content = clean;
             } else if !clean.is_empty() {
-                msgs.push(ChatMessage {
-                    role: chat_role,
-                    content: clean,
-                    tool_calls: Vec::new(),
-                });
+                self.conversations[idx].push_message(chat_role, clean, Vec::new());
             }
             self.conversations[idx].is_streaming = false;
             self.conversations[idx].streaming_status.clear();
@@ -3285,11 +3576,7 @@ impl AgentChatState {
         }
 
         if !clean.is_empty() {
-            self.conversations[idx].messages.push(ChatMessage {
-                role: chat_role,
-                content: clean,
-                tool_calls: Vec::new(),
-            });
+            self.conversations[idx].push_message(chat_role, clean, Vec::new());
         }
 
         self.conversations[idx].is_streaming = false;
@@ -3325,10 +3612,12 @@ impl AgentChatState {
         self.active_conv = 0;
         for summary in &index.conversations {
             if let Some(stored) = ss::load_conversation(workspace_key, &summary.id) {
-                let messages = stored
+                let messages: Vec<ChatMessage> = stored
                     .messages
                     .into_iter()
-                    .map(|m| ChatMessage {
+                    .enumerate()
+                    .map(|(i, m)| ChatMessage {
+                        seq: i as u64 + 1,
                         role: match m.role.as_str() {
                             "user" => ChatRole::User,
                             "assistant" => ChatRole::Assistant,
@@ -3372,8 +3661,14 @@ impl AgentChatState {
                 // not zero-until-next-turn.
                 let pending_usage = stored.last_token_usage.map(Into::into);
 
+                // Restored messages are renumbered sequentially; the
+                // counter continues past them. Remote clients resnapshot
+                // on connect, so pre-restart cursors never survive anyway.
+                let next_message_seq = messages.last().map(|m: &ChatMessage| m.seq + 1).unwrap_or(1);
                 self.conversations.push(Conversation {
                     id: stored.id,
+                    conv_revision: 1,
+                    next_message_seq,
                     title: stored.title,
                     messages,
                     model_override: stored.model_override,
@@ -5493,18 +5788,188 @@ mod tests {
         assert_eq!(words_to_tokens(7), 9);
     }
 
+    // ── Plan A A3 reducer-boundary tests ────────────────────────────
+
+    fn ask_permission_with(
+        respond: tokio::sync::oneshot::Sender<gaviero_core::observer::PermissionDecision>,
+    ) -> PendingPermission {
+        PendingPermission::new(
+            "AskUserQuestion".to_string(),
+            "The agent is asking".to_string(),
+            serde_json::json!({
+                "questions": [
+                    {
+                        "question": "Which serializer?",
+                        "header": "Serializer",
+                        "multiSelect": false,
+                        "options": [
+                            { "label": "serde_json", "description": "" },
+                            { "label": "simd-json", "description": "" }
+                        ]
+                    },
+                    {
+                        "question": "Which suites?",
+                        "header": "Tests",
+                        "multiSelect": true,
+                        "options": [
+                            { "label": "unit", "description": "" },
+                            { "label": "integration", "description": "" },
+                            { "label": "fuzz", "description": "" }
+                        ]
+                    }
+                ]
+            }),
+            respond,
+        )
+    }
+
+    #[test]
+    fn message_seq_is_monotonic_across_compact_and_reset() {
+        let mut state = AgentChatState::new();
+        for i in 0..8 {
+            state.add_user_message(&format!("msg {i}"));
+        }
+        let before: Vec<u64> = state.active_conversation().messages.iter().map(|m| m.seq).collect();
+        assert_eq!(before, (1..=8).collect::<Vec<u64>>());
+
+        // Compact keeps the last 3; kept messages retain their seq and the
+        // summary takes a NEW seq (§2.6).
+        state.text_input.text = "/compact 3".to_string();
+        state.process_slash_command();
+        let conv = state.active_conversation();
+        let seqs: Vec<u64> = conv.messages.iter().map(|m| m.seq).collect();
+        // Layout: [summary(10), kept 7, 8, /compact echo 9, confirmation 11]
+        assert_eq!(seqs[0], 10, "summary is a new message with a new seq");
+        assert_eq!(&seqs[1..4], &[7, 8, 9], "kept messages retain their seq");
+        assert_eq!(seqs[4], 11, "the confirmation takes the next fresh seq");
+
+        // Reset does not rewind the counter.
+        let idx = state.active_conv;
+        state.reset_conversation_at(idx);
+        state.add_user_message("after reset");
+        let last = state.active_conversation().messages.last().unwrap().seq;
+        assert!(last > 10, "seq keeps growing after /reset, got {last}");
+    }
+
+    #[test]
+    fn remote_answer_targets_non_active_conversation_by_request_id() {
+        let mut state = AgentChatState::new();
+        let background_id = state.active_conversation_id().to_string();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        state.set_pending_permission(&background_id, ask_permission_with(tx));
+        let request_id = state.active_conversation().pending_permission.as_ref().unwrap().request_id.clone();
+
+        // Desktop switches to a NEW tab; the request stays on the old one.
+        state.new_conversation();
+        assert_ne!(state.active_conversation_id(), background_id);
+
+        let idx = state.find_permission_conv(&request_id).expect("request findable by id");
+        let info = state
+            .respond_permission_at(idx, true, Some(&[vec![1], vec![0, 2]]), None)
+            .expect("valid answers accepted");
+        assert_eq!(info.conv_id, background_id, "answered the conversation OWNING the request, not the active tab");
+        assert!(info.allowed);
+
+        // The rebuilt input went through the same answers_map path the
+        // desktop uses: labels, not indices.
+        let decision = rx.try_recv().expect("decision delivered");
+        match decision {
+            gaviero_core::observer::PermissionDecision::Allow { updated_input: Some(v) } => {
+                let answers = v.get("answers").expect("answers inserted");
+                assert_eq!(answers.get("Which serializer?").unwrap(), "simd-json");
+                assert_eq!(answers.get("Which suites?").unwrap(), "unit, fuzz");
+            }
+            other => panic!("expected Allow with updated_input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn permission_answer_validation_rejects_without_consuming() {
+        let mut state = AgentChatState::new();
+        let conv_id = state.active_conversation_id().to_string();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        state.set_pending_permission(&conv_id, ask_permission_with(tx));
+        let idx = state.active_conv;
+
+        // answers on a wrong shape: count mismatch, out-of-range index,
+        // multi-select violation — all rejected, request stays parked.
+        for bad in [vec![vec![0u32]], vec![vec![9], vec![0]], vec![vec![0, 1], vec![0]]] {
+            let err = state.respond_permission_at(idx, true, Some(&bad), None);
+            assert!(matches!(err, Err(PermissionAnswerError::Invalid(_))), "{bad:?}");
+            assert!(state.active_conversation().pending_permission.is_some());
+        }
+
+        // First valid answer wins; the second finds nothing (stale_request).
+        state.respond_permission_at(idx, true, Some(&[vec![0], vec![1]]), None).unwrap();
+        let second = state.respond_permission_at(idx, true, Some(&[vec![0], vec![1]]), None);
+        assert!(matches!(second, Err(PermissionAnswerError::NoPending)));
+    }
+
+    #[test]
+    fn answers_on_plain_permission_are_rejected() {
+        let mut state = AgentChatState::new();
+        let conv_id = state.active_conversation_id().to_string();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        state.set_pending_permission(
+            &conv_id,
+            PendingPermission::new(
+                "Bash".to_string(),
+                "Run: ls".to_string(),
+                serde_json::json!({"command": "ls"}),
+                tx,
+            ),
+        );
+        let idx = state.active_conv;
+        let err = state.respond_permission_at(idx, true, Some(&[vec![0]]), None);
+        assert!(matches!(err, Err(PermissionAnswerError::Invalid(_))),
+            "a permission decision must not be able to smuggle answers into a non-ask tool");
+        assert!(state.active_conversation().pending_permission.is_some());
+    }
+
+    #[test]
+    fn slash_reducer_mutates_target_conversation_and_bumps_revision() {
+        let mut state = AgentChatState::new();
+        let target = 0;
+        state.new_conversation(); // active becomes 1
+        assert_eq!(state.active_conv, 1);
+
+        let rev_before = state.conversations[target].conv_revision;
+        assert!(state.apply_slash_line(target, "/model claude:opus", SlashOrigin::Remote));
+        assert_eq!(
+            state.conversations[target].model_override.as_deref(),
+            Some("claude:opus"),
+            "the TARGET conversation got the override"
+        );
+        assert!(state.conversations[1].model_override.is_none(), "the active tab is untouched");
+        assert!(state.conversations[target].conv_revision > rev_before, "summary change bumped conv_revision");
+
+        // Remote bare /rename must not start the desktop interactive
+        // rename (focus affordance).
+        assert!(state.apply_slash_line(target, "/rename", SlashOrigin::Remote));
+        assert!(!state.renaming);
+    }
+
+    #[test]
+    fn rename_and_reset_bump_the_entity_revision_exactly_once() {
+        let mut state = AgentChatState::new();
+        let idx = state.active_conv;
+        let base = state.conversations[idx].conv_revision;
+        state.apply_slash_line(idx, "/rename Parser work", SlashOrigin::Desktop);
+        assert_eq!(state.conversations[idx].conv_revision, base + 1);
+        state.reset_conversation_at(idx);
+        assert_eq!(state.conversations[idx].conv_revision, base + 2);
+    }
+
     /// Push a fully-formed assistant message. `finalize_message` only
     /// rewrites an existing trailing assistant message (set up by the
     /// streaming pipeline), so tests that need a synthetic transcript
     /// push directly.
     fn push_assistant(state: &mut AgentChatState, content: &str, tool_calls: Vec<String>) {
-        state.conversations[state.active_conv]
-            .messages
-            .push(ChatMessage {
-                role: ChatRole::Assistant,
-                content: content.to_string(),
-                tool_calls,
-            });
+        state.conversations[state.active_conv].push_message(
+            ChatRole::Assistant,
+            content.to_string(),
+            tool_calls,
+        );
     }
 
     #[test]

@@ -153,8 +153,16 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
                     app.chat_state.ask_prev_question();
                 }
                 Action::Enter => {
-                    if app.chat_state.submit_active_ask_answers() {
-                        // submitted
+                    let ready = app
+                        .chat_state
+                        .active_conversation()
+                        .pending_permission
+                        .as_ref()
+                        .and_then(|p| p.ask.as_ref())
+                        .map(|a| a.all_answered())
+                        .unwrap_or(false);
+                    if ready {
+                        crate::app::remote::desktop_answer_active_permission(app, true);
                     } else {
                         app.status_message = Some((
                             "Select an option for each question (1-9), then Enter".into(),
@@ -163,17 +171,17 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
                     }
                 }
                 Action::InsertChar('n') | Action::InsertChar('N') | Action::Quit => {
-                    app.chat_state.respond_active_permission(false);
+                    crate::app::remote::desktop_answer_active_permission(app, false);
                 }
                 _ => {}
             }
         } else {
             match action {
                 Action::InsertChar('y') | Action::InsertChar('Y') => {
-                    app.chat_state.respond_active_permission(true);
+                    crate::app::remote::desktop_answer_active_permission(app, true);
                 }
                 Action::InsertChar('n') | Action::InsertChar('N') | Action::Quit => {
-                    app.chat_state.respond_active_permission(false);
+                    crate::app::remote::desktop_answer_active_permission(app, false);
                 }
                 _ => {}
             }
@@ -1805,6 +1813,43 @@ pub(super) fn send_chat_message(app: &mut App) {
     }
     let conv_id = app.chat_state.active_conversation_id().to_string();
     let prompt = app.chat_state.take_input();
+    // Desktop-only inputs: draft attachments and the Alt+Y one-shot. The
+    // remote path never consumes these (Plan A §2.4).
+    let attachments = app.chat_state.take_attachments();
+    let one_shot_auto = app.chat_state.auto_approve_next;
+    app.chat_state.auto_approve_next = false;
+    let _ = dispatch_prompt_core(app, &conv_id, prompt, attachments, one_shot_auto);
+}
+
+/// Parameterized prompt-dispatch core (Plan A §2.2 / §2.4): the single
+/// implementation behind desktop Enter and remote `send_prompt`. Applies
+/// the same model, effort, context, memory, Write Gate, and scope policies
+/// either way, and consumes the SAME one-shot conversation flags
+/// (`lite_next`, `workspace_wide_next`, no-inject) the desktop consumes.
+/// Returns the accepted `turn_id`.
+pub(crate) fn dispatch_prompt_core(
+    app: &mut App,
+    conv_id: &str,
+    prompt: String,
+    attachments: Vec<crate::panels::agent_chat::Attachment>,
+    one_shot_auto_approve: bool,
+) -> Result<String, String> {
+    let Some(conv_idx) = app.chat_state.find_conv_idx(conv_id) else {
+        return Err("unknown conversation".to_string());
+    };
+    let conv_id = conv_id.to_string();
+    if app.chat_state.conversations[conv_idx].is_streaming {
+        return Err("conversation is already streaming".to_string());
+    }
+    // Remote dispatch cannot grant codex MCP trust — that consent dialog is
+    // desktop-only. The desktop wrapper intercepts before reaching here.
+    if app.chat_state.effective_model_at(conv_idx).starts_with("codex:")
+        && super::commands::should_prompt_codex_trust(app)
+    {
+        return Err(
+            "Codex requires a one-time trust consent on the desktop first".to_string(),
+        );
+    }
     let root = app
         .workspace
         .roots()
@@ -1827,14 +1872,14 @@ pub(super) fn send_chat_message(app: &mut App) {
     // buffer's folder and let the planner fall back to the workspace
     // primary scope for this turn. Self-clears on dispatch.
     let workspace_wide = {
-        let conv = app.chat_state.active_conversation_mut();
+        let conv = &mut app.chat_state.conversations[conv_idx];
         let armed = conv.workspace_wide_next;
         conv.workspace_wide_next = false;
         armed
     };
     // One-shot bootstrap overrides consumed on dispatch.
     let (lite_turn, no_inject_turn, inject_arms_next, context_mode_override) = {
-        let conv = app.chat_state.active_conversation_mut();
+        let conv = &mut app.chat_state.conversations[conv_idx];
         let lite = conv.lite_next;
         let no_inject = conv.no_inject_next;
         let inject_arms = conv.inject_arms_next;
@@ -1871,15 +1916,16 @@ pub(super) fn send_chat_message(app: &mut App) {
         .map(|p| p.to_string_lossy().to_string())
         .filter(|p| !p.is_empty());
 
-    app.chat_state.add_user_message(&prompt);
+    app.chat_state.add_user_message_at(conv_idx, &prompt);
     {
-        let conv = app.chat_state.active_conversation_mut();
+        let conv = &mut app.chat_state.conversations[conv_idx];
         conv.pending_turn_id = Some(turn_id.clone());
         conv.pending_module_path = pending_module_path;
         conv.pending_focused_folder = focused_folder.clone();
         conv.is_streaming = true;
         conv.streaming_status = "Connecting...".to_string();
         conv.streaming_started_at = Some(std::time::Instant::now());
+        conv.bump_revision();
     }
 
     let tx = app.event_tx.clone();
@@ -1951,7 +1997,6 @@ pub(super) fn send_chat_message(app: &mut App) {
         }
     }
 
-    let attachments = app.chat_state.take_attachments();
     let mut cli_file_attachments: Vec<std::path::PathBuf> = Vec::new();
     for attach in &attachments {
         match attach.kind {
@@ -1973,7 +2018,7 @@ pub(super) fn send_chat_message(app: &mut App) {
     // `Conversation`. On every subsequent turn we pass that id back via
     // `--resume` and send only the new user message — Claude retains
     // history server-side, eliminating per-turn tempfile bloat.
-    let model = app.chat_state.effective_model().to_string();
+    let model = app.chat_state.effective_model_at(conv_idx).to_string();
 
     // M1: lazy-init the per-conversation SessionLedger now that we know the
     // model (needed by the ProviderProfile factory). The ledger is the
@@ -1989,7 +2034,7 @@ pub(super) fn send_chat_message(app: &mut App) {
         &runtime,
     );
     {
-        let conv = app.chat_state.active_conversation_mut();
+        let conv = &mut app.chat_state.conversations[conv_idx];
         let current_fp =
             gaviero_core::context_planner::PlannerFingerprint::from_profile(&provider_profile);
         // Step 1: rehydrate or lazy-init the ledger.
@@ -2032,9 +2077,7 @@ pub(super) fn send_chat_message(app: &mut App) {
     // (`ContinuityHandle::CursorThreadId`) — no legacy mirror — so
     // branch on the resolved provider here.
     let resume_session_id = match provider_profile.provider.as_str() {
-        "cursor" => app
-            .chat_state
-            .active_conversation()
+        "cursor" => app.chat_state.conversations[conv_idx]
             .session_ledger
             .as_ref()
             .and_then(|l| l.continuity_handle.as_ref())
@@ -2044,15 +2087,11 @@ pub(super) fn send_chat_message(app: &mut App) {
                 }
                 _ => None,
             }),
-        _ => app
-            .chat_state
-            .active_conversation()
+        _ => app.chat_state.conversations[conv_idx]
             .claude_session_id
             .clone(),
     };
-    let is_first_turn = app
-        .chat_state
-        .active_conversation()
+    let is_first_turn = app.chat_state.conversations[conv_idx]
         .session_ledger
         .as_ref()
         .map(|l| l.is_first_turn())
@@ -2064,10 +2103,7 @@ pub(super) fn send_chat_message(app: &mut App) {
     // Claude's Read-tool size limits on the prompt tempfile. After
     // /reset (Suppress) the user explicitly asked to start fresh, so the
     // visible transcript stays in the panel but does not re-enter the prompt.
-    let inline_mode = app
-        .chat_state
-        .active_conversation()
-        .transcript_inline_mode;
+    let inline_mode = app.chat_state.conversations[conv_idx].transcript_inline_mode;
     let inline_transcript = match inline_mode {
         crate::panels::agent_chat::TranscriptInlineMode::Auto => is_first_turn,
         crate::panels::agent_chat::TranscriptInlineMode::Suppress => false,
@@ -2075,7 +2111,7 @@ pub(super) fn send_chat_message(app: &mut App) {
     };
     let context: Vec<(String, String)> = if inline_transcript {
         app.chat_state
-            .context_messages()
+            .context_messages_at(conv_idx)
             .into_iter()
             .rev()
             .skip(1)
@@ -2086,10 +2122,11 @@ pub(super) fn send_chat_message(app: &mut App) {
         Vec::new()
     };
 
-    let effort = app.chat_state.effective_effort().to_string();
+    let effort = app.chat_state.effective_effort_at(conv_idx).to_string();
     let max_tokens = app.chat_state.agent_settings.max_tokens;
-    let auto_approve = app.chat_state.effective_auto_approve();
-    app.chat_state.auto_approve_next = false;
+    // Per-conversation persistent flag OR the desktop's consumed one-shot.
+    let auto_approve =
+        app.chat_state.conversations[conv_idx].auto_approve || one_shot_auto_approve;
 
     let (agent_available_tools, agent_approved_tools) =
         app.workspace.resolve_agent_tools(Some(&root));
@@ -2238,9 +2275,7 @@ pub(super) fn send_chat_message(app: &mut App) {
     // M2 (no mutation), so a clone is safe. The canonical ledger lives on
     // the Conversation and is updated by the SystemInit event handler in
     // the controller — same lifecycle as `claude_session_id`.
-    let ledger_snapshot = app
-        .chat_state
-        .active_conversation()
+    let ledger_snapshot = app.chat_state.conversations[conv_idx]
         .session_ledger
         .clone()
         .expect("session_ledger initialized above");
@@ -2254,6 +2289,7 @@ pub(super) fn send_chat_message(app: &mut App) {
     );
 
     let conv_id_clone = conv_id.clone();
+    let conv_id_outer = conv_id.clone();
     let turn_id_clone = turn_id.clone();
     // Per-turn cancellation token. The host (`cancel_agent`) fires this on
     // Ctrl+C; the session observes it and runs revert/cleanup before
@@ -2716,12 +2752,13 @@ pub(super) fn send_chat_message(app: &mut App) {
         });
     });
     app.acp_tasks.insert(
-        app.chat_state.active_conversation_id().to_string(),
+        conv_id_outer,
         crate::app::AcpTaskHandle {
             join: task,
             cancel: cancel_token,
         },
     );
+    Ok(turn_id)
 }
 
 pub(super) fn chat_paste_from_clipboard(app: &mut App) {
@@ -2793,6 +2830,14 @@ pub(super) fn try_attach_clipboard_image(app: &mut App) -> bool {
 
 pub(super) fn cancel_agent(app: &mut App) {
     let conv_id = app.chat_state.active_conversation_id().to_string();
+    cancel_agent_conv(app, &conv_id);
+}
+
+/// Parameterized cancel core (Plan A §2.2): `interrupt { conv_id }` can
+/// target a background conversation. Fires the per-turn
+/// `CancellationToken`; deliberately does NOT call `JoinHandle::abort()`
+/// on first cancel — the revert path must run.
+pub(crate) fn cancel_agent_conv(app: &mut App, conv_id: &str) {
     // Transactional cancel: signal the streaming task via its CancellationToken
     // and let it shut down cleanly — the Claude session observes the token
     // mid-stream, kills the subprocess, and runs the snapshot revert path so
@@ -2803,21 +2848,24 @@ pub(super) fn cancel_agent(app: &mut App) {
     // revert path. The handle stays in `acp_tasks` until the task completes
     // (the spawn site removes it via the message-complete event flow on
     // shutdown; for now it lingers, which is harmless).
-    if let Some(handle) = app.acp_tasks.get(&conv_id) {
+    if let Some(handle) = app.acp_tasks.get(conv_id) {
         if !handle.cancel.is_cancelled() {
             handle.cancel.cancel();
-            let conv = app.chat_state.active_conversation_mut();
-            conv.is_streaming = false;
-            conv.streaming_started_at = None;
+            if let Some(idx) = app.chat_state.find_conv_idx(conv_id) {
+                let conv = &mut app.chat_state.conversations[idx];
+                conv.is_streaming = false;
+                conv.streaming_started_at = None;
+                conv.bump_revision();
+            }
         } else {
             // Second Ctrl+C: escalate to abort as escape hatch when graceful
             // cancel hangs (e.g. revert blocked on disk I/O). `kill_on_drop`
             // on the subprocess Command still runs.
             tracing::warn!("cancel_agent: token already fired — escalating to abort");
-            if let Some(handle) = app.acp_tasks.remove(&conv_id) {
+            if let Some(handle) = app.acp_tasks.remove(conv_id) {
                 handle.join.abort();
                 app.chat_state
-                    .finalize_message("system", "Cancelled by user (forced).");
+                    .finalize_message_to(conv_id, "system", "Cancelled by user (forced).");
             }
         }
     }

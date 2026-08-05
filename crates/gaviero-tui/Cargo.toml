@@ -10,6 +10,9 @@ path = "src/main.rs"
 [dependencies]
 gaviero-core = { path = "../gaviero-core" }
 gaviero-dsl = { path = "../gaviero-dsl" }
+# Remote-control wire DTOs + WSS sidecar server (Plan A). The `server`
+# feature pulls axum/rustls; the TUI hosts the sidecar in-process.
+gaviero-remote = { path = "../gaviero-remote", features = ["server"] }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }
