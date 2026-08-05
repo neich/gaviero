@@ -153,15 +153,7 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
                     app.chat_state.ask_prev_question();
                 }
                 Action::Enter => {
-                    let ready = app
-                        .chat_state
-                        .active_conversation()
-                        .pending_permission
-                        .as_ref()
-                        .and_then(|p| p.ask.as_ref())
-                        .map(|a| a.all_answered())
-                        .unwrap_or(false);
-                    if ready {
+                    if app.chat_state.active_ask_is_answered() {
                         crate::app::remote::desktop_answer_active_permission(app, true);
                     } else {
                         app.status_message = Some((

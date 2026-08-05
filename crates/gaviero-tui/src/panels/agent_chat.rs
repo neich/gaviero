@@ -882,13 +882,11 @@ impl AgentChatState {
         }
     }
 
-    /// Respond to the active conversation's pending permission and clear it.
-    /// Thin desktop wrapper over [`Self::respond_permission_at`] — the
-    /// shared reducer core (Plan A §2.2).
-    pub fn respond_active_permission(&mut self, allow: bool) {
-        let idx = self.active_conv;
-        let _ = self.respond_permission_at(idx, allow, None, None);
-    }
+    // NOTE: there is deliberately no `respond_active_permission` helper.
+    // Answering must also project `permission_closed`, so the only desktop
+    // entry point is `app::remote::desktop_answer_active_permission`, which
+    // wraps `respond_permission_at` and emits the frame (invariant 3: one
+    // implementation of each mutation's semantics).
 
     /// Conversation index holding the pending permission with `request_id`.
     pub fn find_permission_conv(&self, request_id: &str) -> Option<usize> {
@@ -1010,19 +1008,15 @@ impl AgentChatState {
         })
     }
 
-    /// Submit AskUserQuestion answers when every question has a selection.
-    pub fn submit_active_ask_answers(&mut self) -> bool {
-        let ready = self
-            .active_conversation()
+    /// Whether every `AskUserQuestion` question has a selection — the
+    /// desktop Enter gate before answering through the shared reducer.
+    pub fn active_ask_is_answered(&self) -> bool {
+        self.active_conversation()
             .pending_permission
             .as_ref()
             .and_then(|p| p.ask.as_ref())
             .map(|a| a.all_answered())
-            .unwrap_or(false);
-        if ready {
-            self.respond_active_permission(true);
-        }
-        ready
+            .unwrap_or(false)
     }
 
     /// Toggle an option on the focused AskUserQuestion (1-based digit).
@@ -1114,27 +1108,6 @@ impl AgentChatState {
             .effort_override
             .as_deref()
             .unwrap_or(&self.agent_settings.effort)
-    }
-
-    /// Get the effective write namespace for the active conversation.
-    pub fn effective_write_namespace(&self) -> &str {
-        self.active_conversation()
-            .namespace_override
-            .as_deref()
-            .unwrap_or(&self.agent_settings.write_namespace)
-    }
-
-    /// Get all namespaces to search when reading memory.
-    /// Always includes the write namespace.
-    pub fn effective_read_namespaces(&self) -> Vec<String> {
-        let write_ns = self.effective_write_namespace().to_string();
-        let mut nss = vec![write_ns.clone()];
-        for ns in &self.agent_settings.read_namespaces {
-            if !nss.contains(ns) {
-                nss.push(ns.clone());
-            }
-        }
-        nss
     }
 
     pub fn effective_bootstrap_mode(&self) -> gaviero_core::context_planner::BootstrapMode {
@@ -2346,12 +2319,9 @@ impl AgentChatState {
         }
     }
 
-    /// Get all messages for multi-turn context.
-    pub fn context_messages(&self) -> Vec<(&str, &str)> {
-        self.context_messages_at(self.active_conv)
-    }
-
-    /// Indexed variant for the shared prompt-dispatch core (§2.2).
+    /// Messages for multi-turn context, for the shared prompt-dispatch
+    /// core (§2.2). Indexed because a remote prompt can target a
+    /// conversation that is not the active tab.
     pub fn context_messages_at(&self, idx: usize) -> Vec<(&str, &str)> {
         self.conversations[idx]
             .messages

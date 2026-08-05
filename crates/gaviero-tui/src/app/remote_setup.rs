@@ -362,6 +362,9 @@ pub async fn start(
 
 // ── QR rendering ────────────────────────────────────────────────────
 
+/// QR quiet zone, in modules (spec minimum is 4).
+const QUIET_ZONE: usize = 4;
+
 /// Render the pairing payload as a half-block QR sized for a terminal.
 /// Two vertical modules per character row keeps it scannable in a side
 /// panel; a quiet zone is included because scanners need it.
@@ -369,7 +372,9 @@ pub fn render_qr(payload: &str) -> Result<String, String> {
     let code = qrcode::QrCode::new(payload.as_bytes())
         .map_err(|e| format!("could not encode the pairing QR: {e}"))?;
     let width = code.width();
-    let quiet = 2usize;
+    // The spec requires a 4-module quiet zone; phone scanners are much
+    // less reliable without it, and this code has exactly one job.
+    let quiet = QUIET_ZONE;
     let side = width + quiet * 2;
     let dark = |x: usize, y: usize| -> bool {
         if x < quiet || y < quiet || x >= quiet + width || y >= quiet + width {
@@ -660,5 +665,122 @@ mod tests {
         assert!(qr.lines().count() > 10);
         let width = qr.lines().next().unwrap().chars().count();
         assert!(qr.lines().all(|l| l.chars().count() == width), "square");
+    }
+
+    /// The realistic worst case: a 64-hex token, a long MagicDNS hostname,
+    /// and a long workspace name must still encode, and the rendering must
+    /// stay inside a normal terminal width (the QR is useless if it wraps).
+    #[test]
+    fn worst_case_payload_encodes_and_fits_a_terminal() {
+        let payload = pairing::qr_payload_json(
+            "wss://very-long-machine-name.tail9f2c81.ts.net:65535/v1/ws",
+            &pairing::generate_token(),
+            "a-fairly-long-workspace-display-name",
+        );
+        let qr = render_qr(&payload).expect("worst-case payload still encodes");
+        let width = qr.lines().next().unwrap().chars().count();
+        assert!(
+            width <= 120,
+            "QR is {width} columns wide — too wide for a terminal panel"
+        );
+        // Half-block rendering: two QR rows per text row, plus quiet zone.
+        assert!(qr.lines().count() >= width / 2 - 1);
+    }
+
+    /// The rendering must reproduce the encoder's module grid exactly.
+    /// Parses the half-block output back into modules and compares against
+    /// `QrCode` itself — this is what catches an inverted palette, an
+    /// off-by-one quiet zone, or mispacked half-blocks, any of which
+    /// produces a picture that looks like a QR code and does not scan.
+    #[test]
+    fn rendered_modules_match_the_encoder_exactly() {
+        let payload = pairing::qr_payload_json(
+            "wss://host.tailnet.ts.net:50123/v1/ws",
+            &pairing::generate_token(),
+            "gaviero",
+        );
+        let code = qrcode::QrCode::new(payload.as_bytes()).unwrap();
+        let width = code.width();
+        let quiet = QUIET_ZONE;
+        let rendered = render_qr(&payload).unwrap();
+        let rows: Vec<Vec<char>> = rendered.lines().map(|l| l.chars().collect()).collect();
+
+        // Half-block glyph → (top dark, bottom dark). Terminal is
+        // light-on-dark, so a lit block means a LIGHT module.
+        let unpack = |c: char| -> (bool, bool) {
+            match c {
+                ' ' => (true, true),
+                '▄' => (true, false),
+                '▀' => (false, true),
+                '█' => (false, false),
+                other => panic!("unexpected glyph {other:?}"),
+            }
+        };
+
+        for y in 0..width {
+            for x in 0..width {
+                let expected = code[(x, y)] == qrcode::Color::Dark;
+                let row = rows[(y + quiet) / 2].clone();
+                let (top, bottom) = unpack(row[x + quiet]);
+                let actual = if (y + quiet).is_multiple_of(2) { top } else { bottom };
+                assert_eq!(
+                    actual, expected,
+                    "module ({x},{y}) mismatched — the rendered code would not scan"
+                );
+            }
+        }
+
+        // Quiet zone must be entirely light (lit blocks) on all four sides.
+        for row in &rows {
+            assert!(row[..quiet].iter().all(|&c| c == '█'), "left quiet zone");
+            assert!(
+                row[row.len() - quiet..].iter().all(|&c| c == '█'),
+                "right quiet zone"
+            );
+        }
+        assert!(rows[0].iter().all(|&c| c == '█'), "top quiet zone");
+    }
+
+    /// The payload the app validates: `kind` and `protocol_major` gate
+    /// pairing on the client (Plan B B9), so they must survive the exact
+    /// path `/remote` uses.
+    #[test]
+    fn rendered_pairing_payload_carries_what_the_app_validates() {
+        let (_dir, ws) = workspace_with(serde_json::json!({
+            "remote": { "magicDnsHost": "host.tailnet.ts.net", "port": 50123 }
+        }));
+        let config = resolve_config(&ws).unwrap();
+        let token = load_or_create_token(&config).unwrap();
+        let payload =
+            pairing::qr_payload_json(&pairing_url(&config), &token, &config.workspace_display_name);
+        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(v["kind"], "gaviero-remote");
+        assert_eq!(v["protocol_major"], 1);
+        assert_eq!(v["url"], "wss://host.tailnet.ts.net:50123/v1/ws");
+        assert_eq!(v["token"], token);
+        render_qr(&payload).expect("the /remote payload encodes");
+    }
+}
+
+#[cfg(test)]
+mod render_preview {
+    /// Prints the actual pairing QR. Run explicitly:
+    /// `cargo test -p gaviero-tui preview_pairing_qr -- --ignored --nocapture`
+    #[test]
+    #[ignore = "visual check: prints a scannable QR to stdout"]
+    fn preview_pairing_qr() {
+        let payload = gaviero_remote::pairing::qr_payload_json(
+            "wss://host.tailnet.ts.net:50123/v1/ws",
+            &gaviero_remote::pairing::generate_token(),
+            "gaviero",
+        );
+        let qr = super::render_qr(&payload).unwrap();
+        println!("payload {} bytes", payload.len());
+        println!(
+            "{} columns x {} rows",
+            qr.lines().next().unwrap().chars().count(),
+            qr.lines().count()
+        );
+        println!("{qr}");
     }
 }
