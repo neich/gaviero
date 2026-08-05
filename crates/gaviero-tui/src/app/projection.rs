@@ -65,7 +65,7 @@ pub(crate) fn message_dto(msg: &ChatMessage) -> rdto::Message {
 fn context_pressure_dto(app: &App, idx: usize) -> Option<rdto::ContextPressure> {
     let conv = &app.chat_state.conversations[idx];
     let usage = conv.last_token_usage.as_ref()?;
-    let used = usage.prefix_tokens() as u64;
+    let used = usage.prefix_tokens();
     if used == 0 {
         return None;
     }
@@ -331,12 +331,12 @@ pub fn build_proposal_detail(
     proposal_id: u64,
 ) -> Result<renv::ProposalEvent, CommandFailure> {
     let revision = app.remote.proposal_revision(proposal_id);
-    if let Some(review) = app.diff_review.as_ref() {
-        if review.proposal.id == proposal_id {
-            return Ok(renv::ProposalEvent {
-                proposal: proposal_dto(app, &review.proposal, revision),
-            });
-        }
+    if let Some(review) = app.diff_review.as_ref()
+        && review.proposal.id == proposal_id
+    {
+        return Ok(renv::ProposalEvent {
+            proposal: proposal_dto(app, &review.proposal, revision),
+        });
     }
     let Ok(gate) = app.write_gate.try_lock() else {
         return Err(CommandFailure::new(
@@ -412,17 +412,16 @@ pub fn build_snapshot(app: &App) -> renv::Snapshot {
         }
     }
     // The overlay may hold a proposal the gate no longer lists.
-    if let Some(review) = app.diff_review.as_ref() {
-        if !open_proposals
+    if let Some(review) = app.diff_review.as_ref()
+        && !open_proposals
             .iter()
             .any(|p| p.proposal_id == review.proposal.id)
-        {
-            open_proposals.push(proposal_summary_dto(
-                app,
-                &review.proposal,
-                app.remote.proposal_revision(review.proposal.id),
-            ));
-        }
+    {
+        open_proposals.push(proposal_summary_dto(
+            app,
+            &review.proposal,
+            app.remote.proposal_revision(review.proposal.id),
+        ));
     }
 
     renv::Snapshot {

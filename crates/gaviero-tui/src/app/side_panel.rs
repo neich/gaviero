@@ -313,6 +313,12 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
                     app.handle_forget_command();
                 } else if app.chat_state.text_input.text.trim().starts_with("/skills") {
                     handle_skills_command(app);
+                } else if app.chat_state.text_input.text.trim().starts_with("/remote") {
+                    let line = app.chat_state.text_input.text.trim().to_string();
+                    app.chat_state.add_user_message(&line);
+                    app.chat_state.text_input.text.clear();
+                    app.chat_state.text_input.cursor = 0;
+                    crate::app::remote_setup::handle_remote_command(app, &line);
                 } else if !app.chat_state.process_slash_command() {
                     app.send_chat_message();
                 }

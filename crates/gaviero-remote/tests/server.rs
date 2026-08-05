@@ -44,6 +44,7 @@ fn make_tls() -> TestTls {
 fn test_config(tls: &TestTls) -> RemoteServerConfig {
     RemoteServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
+        extra_bind_addrs: Vec::new(),
         tls_cert_pem: tls.cert_pem.clone(),
         tls_key_pem: tls.key_pem.clone(),
         token: TOKEN.to_string(),

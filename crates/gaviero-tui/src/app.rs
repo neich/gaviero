@@ -37,6 +37,7 @@ mod left_panel;
 mod observers;
 pub(crate) mod projection;
 pub(crate) mod remote;
+pub(crate) mod remote_setup;
 mod render;
 mod review;
 pub(crate) mod session;

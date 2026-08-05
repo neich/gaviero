@@ -12,6 +12,8 @@ pub mod schema;
 pub mod version;
 
 #[cfg(feature = "server")]
+pub mod pairing;
+#[cfg(feature = "server")]
 pub mod server;
 
 pub use envelope::{ClientEnvelope, ClientFrame, ServerEnvelope, ServerFrame};

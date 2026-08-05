@@ -29,6 +29,10 @@ use crate::dto::{Limits, WorkspaceInfo};
 
 pub struct RemoteServerConfig {
     pub bind_addr: SocketAddr,
+    /// Additional listeners sharing the same hub and TLS material —
+    /// §3.2 binds loopback AND detected tailnet addresses, never a
+    /// wildcard. Empty for tests.
+    pub extra_bind_addrs: Vec<SocketAddr>,
     pub tls_cert_pem: Vec<u8>,
     pub tls_key_pem: Vec<u8>,
     pub token: String,
@@ -137,12 +141,27 @@ pub async fn spawn(config: RemoteServerConfig) -> Result<SpawnedServer, ServerEr
         .with_state(state);
 
     let axum_handle = axum_server::Handle::new();
-    let server = axum_server::bind_rustls(config.bind_addr, rustls_config)
+    let server = axum_server::bind_rustls(config.bind_addr, rustls_config.clone())
         .handle(axum_handle.clone());
-    tokio::spawn(server.serve(app.into_make_service()));
+    tokio::spawn(server.serve(app.clone().into_make_service()));
     let local_addr = axum_handle.listening().await.ok_or(ServerError::Bind)?;
 
-    let hub = hub::RemoteHub::new(config, token, registration_rx, inbound_rx, input_rx, output_tx, axum_handle);
+    // §3.2: extra listeners (loopback + tailnet) share the hub. A failed
+    // extra bind is reported by log, not fatal — the primary carries the QR.
+    let mut handles = vec![axum_handle];
+    for addr in &config.extra_bind_addrs {
+        let handle = axum_server::Handle::new();
+        let server = axum_server::bind_rustls(*addr, rustls_config.clone())
+            .handle(handle.clone());
+        tokio::spawn(server.serve(app.clone().into_make_service()));
+        if handle.listening().await.is_none() {
+            tracing::warn!(%addr, "extra remote listener failed to bind");
+            continue;
+        }
+        handles.push(handle);
+    }
+
+    let hub = hub::RemoteHub::new(config, token, registration_rx, inbound_rx, input_rx, output_tx, handles);
     tokio::spawn(hub.run());
 
     Ok(SpawnedServer {
