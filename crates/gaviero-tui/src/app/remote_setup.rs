@@ -502,6 +502,21 @@ pub fn handle_remote_command(app: &mut App, line: &str) {
                             "listening, no client connected"
                         }
                     ));
+                    // Listening but nothing has ever connected is, on
+                    // Windows, almost always the host firewall dropping
+                    // inbound on the tailnet interface — the phone just
+                    // reports "instance offline" with no other clue.
+                    #[cfg(windows)]
+                    if app.remote.handle.is_some() && !app.remote.client_connected {
+                        report.push_str(&format!(
+                            "\nIf the app says \"instance offline\", Windows Firewall is \
+                             probably dropping the connection. In an ADMIN PowerShell:\n  \
+                             New-NetFirewallRule -DisplayName \"Gaviero Remote (tailnet)\" \
+                             -Direction Inbound -Action Allow -Protocol TCP -LocalPort {} \
+                             -RemoteAddress 100.64.0.0/10,fd7a:115c:a1e0::/48\n",
+                            config.port
+                        ));
+                    }
                     match load_or_create_token(&config) {
                         Ok(token) => {
                             let url = pairing_url(&config);
