@@ -437,6 +437,92 @@ pub(super) fn finalize_current_review(app: &mut App) {
         }
     }
 
+    push_finalized_frame(app, &proposal);
+    let wg = app.write_gate.clone();
+    let id = proposal.id;
+    tokio::spawn(async move {
+        let mut gate = wg.lock().await;
+        gate.finalize(id);
+    });
+}
+
+/// Remote projection (A4): `proposal_finalized` must be built from reducer
+/// state — `Event::ProposalFinalized` carries only a path. Outcome mirrors
+/// the final hunk statuses.
+fn push_finalized_frame(app: &mut App, proposal: &WriteProposal) {
+    use gaviero_core::types::HunkStatus;
+    let accepted = proposal
+        .structural_hunks
+        .iter()
+        .filter(|h| h.status == HunkStatus::Accepted)
+        .count();
+    let outcome = if accepted == proposal.structural_hunks.len() {
+        gaviero_remote::dto::ProposalOutcome::Accepted
+    } else if accepted == 0 {
+        gaviero_remote::dto::ProposalOutcome::Rejected
+    } else {
+        gaviero_remote::dto::ProposalOutcome::PartiallyAccepted
+    };
+    let path = crate::app::projection::relative_path(app, &proposal.file_path);
+    app.remote.push_frame(gaviero_remote::envelope::ServerFrame::ProposalFinalized(
+        gaviero_remote::envelope::ProposalFinalized {
+            proposal_id: proposal.id,
+            path,
+            outcome,
+        },
+    ));
+    app.remote.retire_proposal(proposal.id);
+    app.remote.bump_global();
+    app.remote.snapshot_dirty = true;
+}
+
+/// Finalize a gate-owned proposal (remote review on a proposal that is NOT
+/// open in any desktop overlay — Plan A §2.5 rule 3). Identical semantics
+/// to [`finalize_current_review`] — pending hunks accept, stale-disk
+/// refusal, deletion handling, buffer reload, then `gate.finalize` — but
+/// sourced from the gate's copy and never touching desktop focus or
+/// overlays.
+pub(crate) fn finalize_gate_proposal(app: &mut App, mut proposal: WriteProposal) {
+    for hunk in &mut proposal.structural_hunks {
+        if hunk.status == gaviero_core::types::HunkStatus::Pending {
+            hunk.status = gaviero_core::types::HunkStatus::Accepted;
+        }
+    }
+    let is_deletion = proposal.is_deletion;
+    let content = gaviero_core::write_gate::assemble_final_content(&proposal);
+    let path = proposal.file_path.clone();
+    let expected_old = if proposal.original_content.is_empty() && !path.exists() {
+        None
+    } else {
+        Some(proposal.original_content.as_str())
+    };
+
+    match apply_proposal_to_disk(&path, expected_old, &content, is_deletion) {
+        ApplyOutcome::Written => {
+            for buf in &mut app.buffers {
+                if buf.path.as_deref() == Some(path.as_path()) {
+                    let _ = buf.reload();
+                }
+            }
+        }
+        ApplyOutcome::Stale { path } => {
+            tracing::warn!(
+                "Refusing to apply stale proposal for {} — disk changed since proposal was created",
+                path.display()
+            );
+            let msg = format!("⚠ Stale: {} changed on disk; review skipped", path.display());
+            app.chat_state.add_system_message(&msg);
+            app.status_message = Some((msg, std::time::Instant::now()));
+        }
+        ApplyOutcome::Failed { path, error } => {
+            tracing::error!("Failed to write finalized file {}: {}", path.display(), error);
+            let msg = format!("✖ Failed to apply {}: {}", path.display(), error);
+            app.chat_state.add_system_message(&msg);
+            app.status_message = Some((msg, std::time::Instant::now()));
+        }
+    }
+
+    push_finalized_frame(app, &proposal);
     let wg = app.write_gate.clone();
     let id = proposal.id;
     tokio::spawn(async move {

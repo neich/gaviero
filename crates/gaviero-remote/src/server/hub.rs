@@ -70,7 +70,7 @@ pub(crate) struct RemoteHub {
     inbound_rx: mpsc::Receiver<ConnIn>,
     input_rx: mpsc::Receiver<HubInput>,
     output_tx: mpsc::Sender<HubOutput>,
-    axum_handle: axum_server::Handle,
+    axum_handles: Vec<axum_server::Handle>,
 
     seq: u64,
     revision: u64,
@@ -92,7 +92,7 @@ impl RemoteHub {
         inbound_rx: mpsc::Receiver<ConnIn>,
         input_rx: mpsc::Receiver<HubInput>,
         output_tx: mpsc::Sender<HubOutput>,
-        axum_handle: axum_server::Handle,
+        axum_handles: Vec<axum_server::Handle>,
     ) -> Self {
         let rate = config.limits.command_rate_per_second;
         let hello = Hello {
@@ -114,7 +114,7 @@ impl RemoteHub {
             inbound_rx,
             input_rx,
             output_tx,
-            axum_handle,
+            axum_handles,
             seq: 0,
             revision: 0,
             active: None,
@@ -305,8 +305,9 @@ impl RemoteHub {
                     reason: "server shutdown",
                 })
                 .await;
-                self.axum_handle
-                    .graceful_shutdown(Some(Duration::from_millis(250)));
+                for handle in &self.axum_handles {
+                    handle.graceful_shutdown(Some(Duration::from_millis(250)));
+                }
                 true
             }
         }

@@ -262,6 +262,14 @@ pub enum Event {
     // Memory
     MemoryReady(Arc<gaviero_core::memory::MemoryStores>),
 
+    // Remote sidecar (Plan A A3/A4): decoded, deduplicated, rate-limited
+    // client commands plus connection lifecycle from the RemoteHub.
+    RemoteCommand(Box<gaviero_remote::envelope::ClientEnvelope>),
+    /// A client (re)connected and needs a full snapshot.
+    RemoteSnapshotNeeded,
+    RemoteClientConnected,
+    RemoteClientDisconnected,
+
     // Internal
     Tick,
 }

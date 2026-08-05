@@ -204,10 +204,41 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             app.refresh_git_panel();
         }
         Event::ProposalCreated(proposal) => {
+            // Remote projection (A4/A5): full-hunk lifecycle frame before
+            // the overlay takes ownership of the proposal.
+            let revision = app.remote.proposal_revision(proposal.id);
+            let dto = crate::app::projection::proposal_dto(app, &proposal, revision);
+            app.remote.push_frame(
+                gaviero_remote::envelope::ServerFrame::ProposalCreated(
+                    gaviero_remote::envelope::ProposalEvent { proposal: dto },
+                ),
+            );
+            app.remote.bump_global();
             app.enter_review_mode(*proposal, DiffSource::Acp);
         }
         Event::ProposalUpdated(id) => {
             review::sync_batch_proposal_from_gate(app, id);
+            // Gate-side state moved (conflicts/supersede): bump the token
+            // and mirror the refreshed proposal.
+            let revision = app.remote.bump_proposal_revision(id);
+            let wg = app.write_gate.clone();
+            let dto = match wg.try_lock() {
+                Ok(gate) => gate
+                    .get_proposal(id)
+                    .map(|p| crate::app::projection::proposal_dto(app, p, revision)),
+                Err(_) => {
+                    app.remote.snapshot_dirty = true;
+                    None
+                }
+            };
+            if let Some(dto) = dto {
+                app.remote.push_frame(
+                    gaviero_remote::envelope::ServerFrame::ProposalUpdated(
+                        gaviero_remote::envelope::ProposalEvent { proposal: dto },
+                    ),
+                );
+            }
+            app.remote.bump_global();
         }
         Event::BatchProposalSynced {
             id,
@@ -284,6 +315,27 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                     .finalize_message_to(&conv_id, &role, &visible_content);
                 if role == "assistant" {
                     app.chat_state.collapse_file_blocks_in(&conv_id);
+                }
+                // Remote projection (A4): mirror the finalized message and
+                // the streaming→idle summary transition. Built from reducer
+                // state (post-strip, post-collapse) so remote and desktop
+                // show identical content.
+                if let Some(ridx) = app.chat_state.find_conv_idx(&conv_id) {
+                    app.chat_state.conversations[ridx].bump_revision();
+                    if let Some(last) = app.chat_state.conversations[ridx].messages.last() {
+                        let message = crate::app::projection::message_dto(last);
+                        app.remote.push_frame(
+                            gaviero_remote::envelope::ServerFrame::MessageComplete(
+                                gaviero_remote::envelope::MessageComplete {
+                                    conv_id: conv_id.clone(),
+                                    message,
+                                },
+                            ),
+                        );
+                        app.remote.bump_global();
+                    }
+                }
+                if role == "assistant" {
                     // S3 + A1: hand the turn transcript and (if parsed)
                     // the annotations sidecar to the extractor via the
                     // writer task. Fire-and-forget; the writer applies
@@ -763,6 +815,10 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 ));
             } else {
                 app.enter_batch_review(proposals);
+                // Batch proposals were TAKEN from the gate; the mirror's
+                // open-proposal view must be rebuilt (A4; A5 refines batch
+                // whole-file semantics remotely).
+                app.remote.snapshot_dirty = true;
             }
         }
         Event::AgentTurnFinished {
@@ -772,6 +828,28 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             proposal_count,
         } => {
             app.acp_tasks.remove(&conv_id);
+
+            // Remote projection (A4): the turn ended — streaming state is a
+            // summary-visible change (the pump sweep emits it), and the
+            // mirror needs the explicit lifecycle frame.
+            if let Some(idx) = app.chat_state.find_conv_idx(&conv_id) {
+                let turn_id = app.chat_state.conversations[idx]
+                    .pending_turn_id
+                    .clone()
+                    .unwrap_or_default();
+                app.chat_state.conversations[idx].bump_revision();
+                app.remote.push_frame(
+                    gaviero_remote::envelope::ServerFrame::StreamingEnded(
+                        gaviero_remote::envelope::StreamingEnded {
+                            conv_id: conv_id.clone(),
+                            turn_id,
+                            cancelled,
+                            error: error.clone(),
+                            proposal_count: proposal_count as u32,
+                        },
+                    ),
+                );
+            }
 
             if cancelled {
                 return;
@@ -853,6 +931,17 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                         respond,
                     ),
                 );
+                // Remote projection (A4): mirror the parked request. Built
+                // from reducer state so it carries the generated request_id.
+                if let Some(perm) = app.chat_state.conversations[idx].pending_permission.as_ref()
+                {
+                    app.remote.push_frame(
+                        gaviero_remote::envelope::ServerFrame::PermissionRequest(
+                            crate::app::projection::permission_request_dto(&conv_id, perm),
+                        ),
+                    );
+                    app.remote.bump_global();
+                }
                 app.panel_visible.side_panel = true;
                 if app.side_panel != SidePanelMode::AgentChat {
                     app.side_panel = SidePanelMode::AgentChat;
@@ -1496,6 +1585,27 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             } else {
                 app.terminal_manager.process_event(term_event);
             }
+        }
+        // Remote sidecar (Plan A A3/A4). Commands were already decoded,
+        // deduplicated, and rate-limited by the hub; the dispatcher routes
+        // them through the shared reducers and queues exactly one terminal
+        // command_result / command_error.
+        Event::RemoteCommand(envelope) => {
+            let max_prompt_bytes = app.remote.max_prompt_bytes;
+            crate::app::remote::handle_remote_command(app, *envelope, max_prompt_bytes);
+        }
+        Event::RemoteSnapshotNeeded => {
+            app.remote.snapshot_dirty = true;
+        }
+        Event::RemoteClientConnected => {
+            app.remote.client_connected = true;
+            app.status_message = Some((
+                "Remote client connected".to_string(),
+                std::time::Instant::now(),
+            ));
+        }
+        Event::RemoteClientDisconnected => {
+            app.remote.client_connected = false;
         }
         Event::Tick => {
             app.terminal_manager.tick();

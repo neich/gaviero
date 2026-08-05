@@ -258,6 +258,82 @@ pub mod settings {
     /// `"both"`. An escape hatch for hosts that swallow BEL (multiplexers,
     /// `bellStyle: none`) or for muted Windows sound schemes.
     pub const NOTIFICATIONS_SOUND_STYLE: &str = "notifications.sound.style";
+
+    // Remote sidecar (Plan A §3.2). `remote.port` absent/null means derived
+    // from the workspace identity; `0` is a configuration ERROR (it
+    // conventionally means OS-assigned ephemeral, which would break QR
+    // stability) — reject it, never bind it.
+    pub const REMOTE_ENABLED: &str = "remote.enabled";
+    pub const REMOTE_BIND_MODE: &str = "remote.bindMode";
+    pub const REMOTE_PORT: &str = "remote.port";
+    pub const REMOTE_MAGIC_DNS_HOST: &str = "remote.magicDnsHost";
+    pub const REMOTE_CERT_PATH: &str = "remote.certPath";
+    pub const REMOTE_KEY_PATH: &str = "remote.keyPath";
+    pub const REMOTE_ALLOW_PUBLIC_BIND: &str = "remote.allowPublicBind";
+    pub const REMOTE_MAX_FRAME_BYTES: &str = "remote.maxFrameBytes";
+    pub const REMOTE_MAX_PROMPT_BYTES: &str = "remote.maxPromptBytes";
+    pub const REMOTE_COMMAND_RATE_PER_SECOND: &str = "remote.commandRatePerSecond";
+}
+
+/// Canonical workspace identity (Plan A §3.3) — the ONE portable helper
+/// behind the Windows MCP pipe suffix, the remote sidecar's `workspace.id`,
+/// its derived port, and the token location. Canonicalizes the root
+/// (falling back to the raw path when it does not exist yet) and hashes
+/// with SHA-256.
+pub mod identity {
+    use sha2::{Digest, Sha256};
+    use std::path::Path;
+
+    pub fn workspace_id_hash(root: &Path) -> [u8; 32] {
+        let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        Sha256::digest(canon.to_string_lossy().as_bytes()).into()
+    }
+
+    /// First 16 lowercase hex chars of the identity hash. On Windows this
+    /// MUST stay byte-identical to the historical MCP pipe suffix
+    /// (`\\.\pipe\gaviero-<hex16>`) — a pinned test guards the refactor.
+    pub fn workspace_id_hex16(root: &Path) -> String {
+        workspace_id_hash(root)
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// Stable IANA-dynamic-range port derived from the identity (§3.3):
+    /// identical across restarts, different across workspaces.
+    pub fn derive_remote_port(root: &Path) -> u16 {
+        let hash = workspace_id_hash(root);
+        49152 + (u16::from_be_bytes([hash[0], hash[1]]) % 16384)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use sha2::{Digest, Sha256};
+
+        /// Pin: hex16 equals the first 16 hex chars of SHA-256 over the
+        /// (fallback, nonexistent) root path — the exact algorithm
+        /// `McpEndpoint::for_workspace` used before the refactor.
+        #[test]
+        fn hex16_matches_the_historical_pipe_suffix_algorithm() {
+            let root = Path::new("/nonexistent/gaviero-identity-pin");
+            let digest = Sha256::digest(root.to_string_lossy().as_bytes());
+            let full: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(workspace_id_hex16(root), full[..16]);
+        }
+
+        #[test]
+        fn derived_port_is_stable_and_in_dynamic_range() {
+            let root = Path::new("/nonexistent/gaviero-port-pin");
+            let a = derive_remote_port(root);
+            let b = derive_remote_port(root);
+            assert_eq!(a, b, "identical across calls/restarts");
+            assert!((49152..=65535).contains(&a));
+            let other = derive_remote_port(Path::new("/nonexistent/gaviero-port-pin-2"));
+            assert_ne!(a, other, "distinct workspaces derive distinct ports");
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -294,6 +370,21 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    /// Root directory for remote-sidecar state (Plan A §3.3): the bearer
+    /// token, TLS material, and pairing artifacts. Single-folder:
+    /// `<primary-root>/.gaviero/remote`; multi-folder:
+    /// `<workspace-file-parent>/.gaviero/remote`.
+    pub fn remote_state_dir(&self) -> Option<PathBuf> {
+        if self.folders.len() > 1 {
+            if let Some(ws_path) = &self.workspace_path {
+                return ws_path.parent().map(|p| p.join(".gaviero").join("remote"));
+            }
+        }
+        self.roots()
+            .first()
+            .map(|r| r.join(".gaviero").join("remote"))
+    }
+
     /// Load a `.gaviero-workspace` file.
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path).context("reading .gaviero-workspace file")?;
@@ -1155,6 +1246,18 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::MEMORY_TELEMETRY_MIN_INJECTIONS_FOR_TRUST => serde_json::json!(5),
         settings::MEMORY_TELEMETRY_TRUST_ADJUST_DELTA => serde_json::json!(0.05),
         settings::MEMORY_TELEMETRY_MIN_RESPONSE_TOKENS => serde_json::json!(20),
+
+        // Remote sidecar (Plan A §3.2). `REMOTE_PORT` deliberately has NO
+        // default: absent/null means "derive from the workspace identity".
+        settings::REMOTE_ENABLED => serde_json::json!(false),
+        settings::REMOTE_BIND_MODE => serde_json::json!("loopback+tailnet"),
+        settings::REMOTE_MAGIC_DNS_HOST => serde_json::json!(""),
+        settings::REMOTE_CERT_PATH => serde_json::json!(".gaviero/remote/tls/cert.pem"),
+        settings::REMOTE_KEY_PATH => serde_json::json!(".gaviero/remote/tls/key.pem"),
+        settings::REMOTE_ALLOW_PUBLIC_BIND => serde_json::json!(false),
+        settings::REMOTE_MAX_FRAME_BYTES => serde_json::json!(262_144),
+        settings::REMOTE_MAX_PROMPT_BYTES => serde_json::json!(131_072),
+        settings::REMOTE_COMMAND_RATE_PER_SECOND => serde_json::json!(10),
 
         _ => serde_json::Value::Null,
     }

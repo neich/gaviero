@@ -14,7 +14,7 @@ default = ["dto"]
 # It is an empty marker feature — DTO code is unconditional — kept so the
 # documented `--no-default-features --features dto` commands stay valid.
 dto = []
-server = ["dep:tokio", "dep:tokio-util", "dep:axum", "dep:axum-server", "dep:futures", "dep:subtle", "dep:rand", "dep:tracing"]
+server = ["dep:tokio", "dep:tokio-util", "dep:axum", "dep:axum-server", "dep:futures", "dep:subtle", "dep:rand", "dep:tracing", "dep:if-addrs", "dep:x509-parser"]
 
 [dependencies]
 serde = { workspace = true }
@@ -29,6 +29,10 @@ futures = { version = "0.3", optional = true }
 subtle = { version = "2.6", optional = true }
 rand = { version = "0.9", optional = true }
 tracing = { workspace = true, optional = true }
+# A6: Tailscale interface detection (bind policy §3.2) and certificate
+# hostname/expiry diagnostics (§3.1).
+if-addrs = { version = "0.13", optional = true }
+x509-parser = { version = "0.17", optional = true }
 
 [dev-dependencies]
 # A2 adversarial tests: real WSS client + generated TLS fixtures.

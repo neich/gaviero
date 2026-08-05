@@ -35,6 +35,9 @@ mod editing;
 mod layout;
 mod left_panel;
 mod observers;
+pub(crate) mod projection;
+pub(crate) mod remote;
+pub(crate) mod remote_setup;
 mod render;
 mod review;
 pub(crate) mod session;
@@ -178,6 +181,9 @@ pub struct App {
 
     // Agent chat
     pub chat_state: AgentChatState,
+    /// Remote sidecar state: global revision, per-proposal freshness
+    /// tokens, and the outbound frame buffer (Plan A A3/A4).
+    pub remote: remote::RemoteState,
     /// Per-conversation streaming task + cancel handle. The token signals
     /// the in-task `tokio::select!` to bail; the task always exits cleanly
     /// after it observes the signal (running revert / cleanup paths). The
@@ -444,6 +450,7 @@ impl App {
                 };
                 cs
             },
+            remote: remote::RemoteState::default(),
             acp_tasks: HashMap::new(),
             memory: None,
             memory_writer: None,
@@ -472,7 +479,18 @@ impl App {
 
     /// Handle an incoming event.
     pub fn handle_event(&mut self, event: Event) {
+        // Hot-event projection (Plan A §2.1 path 1, invariant 12): chunks
+        // and status events carry complete wire data and are forwarded
+        // before the reducer consumes the event.
+        if self.remote.handle.is_some() {
+            if let Some(frame) = projection::project_hot_event(self, &event) {
+                self.remote.push_frame(frame);
+            }
+        }
         controller::handle_event(self, event);
+        // Post-reducer projection + delivery (§2.1 path 2, invariant 11):
+        // drain reducer frames and summary changes with try_send only.
+        projection::pump_remote(self);
     }
 
     /// Re-assert the host-terminal VT mouse-passthrough request and (on

@@ -37,14 +37,13 @@ impl McpEndpoint {
         }
         #[cfg(not(unix))]
         {
-            use sha2::{Digest, Sha256};
-            // Canonicalize so `C:\ws`, `C:/ws/.` and relative spellings
-            // hash identically; fall back to the raw path when the root
-            // doesn't exist yet (tests, races at startup).
-            let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-            let digest = Sha256::digest(canon.to_string_lossy().as_bytes());
-            let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-            McpEndpoint::Pipe(format!(r"\\.\pipe\gaviero-{}", &hex[..16]))
+            // Shared workspace identity (Plan A §3.3): canonicalize so
+            // `C:\ws`, `C:/ws/.` and relative spellings hash identically,
+            // falling back to the raw path when the root doesn't exist yet
+            // (tests, races at startup). The resulting pipe name is
+            // byte-identical to the pre-refactor derivation — pinned below.
+            let hex = crate::workspace::identity::workspace_id_hex16(root);
+            McpEndpoint::Pipe(format!(r"\\.\pipe\gaviero-{hex}"))
         }
     }
 
@@ -183,6 +182,21 @@ mod tests {
             !ep.has_live_server(),
             "dropping the last instance must free the name"
         );
+    }
+
+    /// Pin (Plan A A6): the pipe name must be byte-identical before and
+    /// after the identity refactor, or the refactor silently orphans
+    /// running shims. Expected value computed with the ORIGINAL inline
+    /// algorithm over a nonexistent (fallback-path) root.
+    #[cfg(windows)]
+    #[test]
+    fn for_workspace_pipe_name_is_byte_identical_after_identity_refactor() {
+        use sha2::{Digest, Sha256};
+        let root = Path::new(r"C:\nonexistent\gaviero-pipe-pin");
+        let digest = Sha256::digest(root.to_string_lossy().as_bytes());
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        let expected = McpEndpoint::Pipe(format!(r"\\.\pipe\gaviero-{}", &hex[..16]));
+        assert_eq!(McpEndpoint::for_workspace(root), expected);
     }
 
     #[cfg(windows)]
