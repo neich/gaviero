@@ -5,6 +5,7 @@ pub mod workflow_params;
 pub mod error;
 pub mod lexer;
 pub mod parser;
+pub mod patterns;
 pub mod resolver;
 pub mod tiers;
 

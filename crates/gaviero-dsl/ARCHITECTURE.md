@@ -79,8 +79,9 @@ source / entry_path
       index items → duplicate checks → select workflow
       merge vars (agent > CLI --var > script; AGENT/PROMPT reserved)
       resolve prompts + tier aliases (--tiers-file last)
-      apply_vars → path_pattern::patterns_overlap scope check
+      apply_vars
       build WorkUnit / LoopConfig / IterationConfig / VerificationConfig
+      (scope overlap is NOT checked here — swarm `validate_scopes` at execute)
   ▼ CompiledPlan
 ```
 
@@ -104,7 +105,7 @@ enum DslError { Lex {..}, Parse {..}, Compile {..}, Resolve {..} }
 
 Spans point at the originating file (multi-file via `NamedSource` in `compile_file`). No panics on the public API.
 
-Representative failures: unknown client/tier/prompt, duplicate name, circular `depends_on`, scope overlap, reserved var shadow, missing workflow, unknown `{{KEY}}`, include cycle, `include` under inline `compile`.
+Representative failures: unknown client/tier/prompt, duplicate name, circular `depends_on`, reserved var shadow, missing workflow, unknown `{{KEY}}`, include cycle, `include` under inline `compile`. Scope overlap is a swarm-runtime failure (`validate_scopes`), not a DSL diagnostic.
 
 ---
 

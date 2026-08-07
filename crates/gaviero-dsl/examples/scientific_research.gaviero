@@ -18,15 +18,39 @@
 //     classifies the iteration; the loop exits on PASS after `stability`
 //     consecutive passes, or hits `max_iterations 10`.
 //
+// Execution mode:
+//
+//   `execution_mode document` — one shared working directory, no git
+//   worktrees, no branch merge, no repo-map. This is load-bearing, not
+//   a preference: refine agents read every peer's prior conclusion,
+//   summary, and evidence, and worktrees are merged only *after* the
+//   loop exits. Under the default `repo` mode each reviewer would see
+//   an empty {{OUT_DIR}}/ and every refine pass would silently degrade
+//   to a solo pass with no error raised.
+//
+//   Parallelism is unaffected: each reviewer's `owned` globs are
+//   prefixed with its own {{REVIEWER_ID}}, so the scope enforcer keeps
+//   concurrent writes disjoint. Never drop that id prefix.
+//
+//   Omit `--repo` entirely — the CLI rejects it for document
+//   workflows. `--workspace <dir>` sets the shared write root; without
+//   it the CLI falls back to the current directory. {{PROBLEM_FILE}}
+//   and {{OUT_DIR}} are relative to whichever root is chosen.
+//
 // Roster:
 //
 //   The reviewer panel is a workflow parameter — supplied via
-//   `--param roster=...`. The in-script default below runs the same
-//   three-provider panel (Claude Opus + Codex GPT-5.5 + Cursor Composer)
-//   the legacy template used. Each roster entry is
-//   `id=provider:model[@effort]`; the id becomes the filename prefix
-//   and the model + effort bind the cloned reviewer agent to an
-//   anonymous client. Use distinct ids per reviewer.
+//   `--param roster=...`. The in-script default below runs a
+//   three-provider frontier panel at maximum research depth:
+//   Claude Opus + Codex GPT-5.6 Sol + Cursor Grok 4.5 Sol, all at
+//   `xhigh` effort. Each roster entry is `id=provider:model[@effort]`;
+//   the id becomes the filename prefix and the model + effort bind the
+//   cloned reviewer agent to an anonymous client. Use distinct ids per
+//   reviewer.
+//
+//   The judge stays on `claude:sonnet` at `medium` — it only classifies
+//   summaries against a fixed rubric and runs once per iteration, so
+//   raising its effort multiplies cost without improving the verdict.
 //
 // Files written per iteration N (N=1 for init, N=2..11 for refinement):
 //
@@ -75,17 +99,29 @@
 //   If the run ends without consensus, read each reviewer's latest
 //   `*-summary-v*.md` — when status is `Consensus not reached.` the
 //   summary must explain why (see refine prompt). Then either accept
-//   the best-effort conclusions for human merge, or start a **new** CLI
-//   run with a fresh `--var OUT_DIR=...` (or archive the old tree),
-//   an updated {{PROBLEM_FILE}}, a smaller roster, or higher
-//   `max_iterations` if you edit the script. Reusing the same OUT_DIR
-//   without archiving mixes independent-init baselines with stale peers.
+//   the best-effort conclusions for human merge, or re-run the same
+//   command to carry the panel further.
+//
+//   Re-running against the same OUT_DIR **resumes**: the runtime finds
+//   the newest version every reviewer completed and continues at the
+//   next one, so the init round is skipped and round N+1 reads round
+//   N's conclusions. `max_iterations` is the budget for the new run,
+//   counted from the resumed start. A round that only some reviewers
+//   finished is discarded and re-run in full. Pass `--fresh` to ignore
+//   what is on disk and restart the panel from `iter_start` instead;
+//   use a new `--var OUT_DIR=...` when the {{PROBLEM_FILE}} or roster
+//   changed, since those artefacts answer a different question.
 //
 // Usage:
+//
+//   Document mode: omit `--repo`. `--workspace` is optional (defaults
+//   to the current directory); PROBLEM_FILE and OUT_DIR are relative
+//   to that root.
 //
 //   Default 3-provider panel:
 //     gaviero-cli --script crates/gaviero-dsl/examples/scientific_research.gaviero \
 //       --workflow scientific-research-consensus \
+//       --workspace /path/to/research-workspace \
 //       --prompt "Short topic title for logs" \
 //       --var PROBLEM_FILE=research_problem.md \
 //       --var OUT_DIR=research
@@ -93,9 +129,10 @@
 //   Custom 2-provider panel:
 //     gaviero-cli --script crates/gaviero-dsl/examples/scientific_research.gaviero \
 //       --workflow scientific-research-consensus \
+//       --workspace /path/to/research-workspace \
 //       --prompt "Short topic title for logs" \
 //       --var PROBLEM_FILE=research_problem.md \
-//       --param roster=claude=claude:opus@max,codex=codex:gpt-5.5@high
+//       --param roster=claude=claude:opus@xhigh,codex=codex:gpt-5.6-sol@xhigh
 
 // ── Shared configuration ──────────────────────────────────────────────────────
 //
@@ -584,11 +621,15 @@ agent convergence-judge {
 // The `roster` workflow parameter binds the loop's `reviewers` slot to
 // a list of provider entries. Override entirely from the CLI:
 //
-//   --param roster=claude=claude:opus@max,codex=codex:gpt-5.5@high,cursor=cursor:composer-2.5@high
+//   --param roster=claude=claude:opus@xhigh,codex=codex:gpt-5.6-sol@xhigh,cursor=cursor:grok-4.5-sol@xhigh
 //
-// The in-script default below runs the legacy three-provider panel
-// (Claude Opus + Codex GPT-5.5 + Cursor Composer at maximum research
-// depth) so the example works with no flag.
+// The in-script default below runs that same three-provider frontier
+// panel (Claude Opus + Codex GPT-5.6 Sol + Cursor Grok 4.5 Sol, all at
+// `xhigh`) so the example works with no flag.
+//
+// `execution_mode document` (see header) is declared on this workflow:
+// refine agents must read peer artefacts under {{OUT_DIR}}/, which
+// per-agent git worktrees would hide until after the loop exits.
 //
 // Loop knobs:
 //
@@ -629,14 +670,15 @@ agent convergence-judge {
 // parallel; the default 3-reviewer panel uses three of those slots.
 
 workflow scientific-research-consensus {
+    execution_mode document
     param judge {
         model "claude:sonnet"
         effort medium
     }
     param roster [
-        { id "claude" model "claude:opus"         effort max  }
-        { id "codex"  model "codex:gpt-5.5"       effort high }
-        { id "cursor" model "cursor:composer-2.5" effort high }
+        { id "claude" model "claude:opus"        effort xhigh }
+        { id "codex"  model "codex:gpt-5.6-sol"  effort xhigh }
+        { id "cursor" model "cursor:grok-4.5-high" effort xhigh }
     ]
 
     steps [

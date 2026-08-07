@@ -5,14 +5,16 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use tokio::sync::{Mutex, Semaphore};
 
+use super::backend::shared;
 use super::board::SharedBoard;
 use super::bus::AgentBus;
 use super::context_bundle::build_bundle;
 use super::coordinator::{Coordinator, CoordinatorConfig};
 use super::execution_state::{ExecutionState, NodeStatus};
+use super::loop_resume;
 use super::merge;
 use super::models::{AgentManifest, AgentStatus, MergeResult, SwarmResult, WorkUnit};
 use super::plan::{CompiledPlan, ExecutionMode};
@@ -24,6 +26,73 @@ use crate::memory::{MemoryStores, StoreOptions, WriterConfig, WriterHandle, spaw
 use crate::observer::{AcpObserver, SwarmObserver};
 use crate::types::{EntryMetadata, PrivacyLevel};
 use crate::write_gate::{WriteGatePipeline, WriteMode};
+
+/// Build the tier router used for dispatch from the swarm fallback model.
+pub fn tier_router_for_model(fallback_model: &str, ollama_base_url: Option<&str>) -> TierRouter {
+    let mut tier_config = TierConfig::default();
+    let selected_local_model = fallback_model
+        .strip_prefix("ollama:")
+        .or_else(|| fallback_model.strip_prefix("local:"))
+        .map(str::to_string);
+    if let Some(base_url) = ollama_base_url {
+        tier_config.local.base_url = base_url.to_string();
+    }
+    if let Some(local_model) = selected_local_model.as_ref() {
+        tier_config.local.enabled = true;
+        tier_config.local.model = local_model.clone();
+        tier_config.cheap_model = local_model.clone();
+        tier_config.expensive_model = local_model.clone();
+    } else if shared::is_codex_model(fallback_model) {
+        // Codex is API-backed like Claude. Propagate to both tier defaults so
+        // work units without an explicit `model` override stay on Codex.
+        tier_config.cheap_model = fallback_model.to_string();
+        tier_config.expensive_model = fallback_model.to_string();
+    }
+    TierRouter::new(tier_config, selected_local_model.is_some())
+}
+
+/// Fail fast if any planned agent (or fan-out default) cannot be dispatched.
+///
+/// Call before launching agents so invalid `provider:model` specs surface
+/// immediately instead of after earlier agents / loop iterations finish.
+pub fn preflight_plan_models(
+    plan: &CompiledPlan,
+    fallback_model: &str,
+    ollama_base_url: Option<&str>,
+) -> Result<()> {
+    shared::validate_model_spec(fallback_model)
+        .context("invalid swarm fallback model")?;
+
+    for op in &plan.fanout_ops {
+        if let Some(ref model) = op.default_model {
+            shared::validate_model_spec(model).with_context(|| {
+                format!(
+                    "invalid fan-out default_model after '{}'",
+                    op.after_unit
+                )
+            })?;
+        }
+    }
+
+    let router = tier_router_for_model(fallback_model, ollama_base_url);
+    let ordered = plan
+        .work_units_ordered()
+        .map_err(|e| anyhow::anyhow!("plan graph error: {}", e))?;
+    let units: Vec<&WorkUnit> = ordered
+        .iter()
+        .chain(plan.loop_judge_units.iter())
+        .collect();
+    let errors = validation::validate_backends(&units, &router);
+    if !errors.is_empty() {
+        let msg = errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        bail!("model / backend preflight failed: {}", msg);
+    }
+    Ok(())
+}
 
 /// Configuration for a swarm execution.
 pub struct SwarmConfig {
@@ -81,12 +150,21 @@ pub struct SwarmConfig {
     /// headless CLI's fallback writer does not, so leave this `false`
     /// there until a CLI extractor LLM is wired). Default `false`.
     pub extract_agent_findings: bool,
+    /// When true (the default for both front ends), a `loop { }` block whose
+    /// `OUT_DIR` already holds versioned artefacts resumes after the newest
+    /// iteration the whole reviewer panel completed, instead of overwriting
+    /// it from `iter_start`. See [`crate::swarm::loop_resume`]. Set `false`
+    /// (CLI `--fresh`) to force a clean run.
+    pub resume_from_artifacts: bool,
+    /// Optional callback to invalidate MCP / repo-map caches after a
+    /// file-mutating fan-out wave (TUI wires graph cache drop).
+    pub knowledge_invalidation: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Execute a swarm of work units from a compiled plan.
 ///
 /// 1. Extract work units from plan graph (topological order)
-/// 2. Validate scopes (no overlaps)
+/// 2. Validate scopes (no overlaps) and model / backend preflight
 /// 3. Compute dependency tiers
 /// 4. For each tier: provision worktrees, run agents in parallel, collect manifests
 /// 5. Merge agent branches into main
@@ -174,27 +252,8 @@ pub async fn execute(
     } else {
         false
     };
-    let mut tier_config = TierConfig::default();
-    let selected_local_model = config
-        .model
-        .strip_prefix("ollama:")
-        .or_else(|| config.model.strip_prefix("local:"))
-        .map(str::to_string);
-    if let Some(base_url) = config.ollama_base_url.as_ref() {
-        tier_config.local.base_url = base_url.clone();
-    }
-    if let Some(local_model) = selected_local_model.as_ref() {
-        tier_config.local.enabled = true;
-        tier_config.local.model = local_model.clone();
-        tier_config.cheap_model = local_model.clone();
-        tier_config.expensive_model = local_model.clone();
-    } else if crate::swarm::backend::shared::is_codex_model(&config.model) {
-        // Codex is API-backed like Claude. Propagate to both tier defaults so
-        // work units without an explicit `model` override stay on Codex.
-        tier_config.cheap_model = config.model.clone();
-        tier_config.expensive_model = config.model.clone();
-    }
-    let tier_router = TierRouter::new(tier_config, selected_local_model.is_some());
+    let tier_router =
+        tier_router_for_model(&config.model, config.ollama_base_url.as_deref());
     let git_coordinator = Arc::new(GitCoordinator::new());
     let memory_writer = config.memory_writer.clone().or_else(|| {
         memory.as_ref().map(|stores| {
@@ -261,6 +320,11 @@ pub async fn execute(
         anyhow::bail!("scope validation failed: {}", msg);
     }
 
+    // 2. Validate every agent model / backend can be resolved before launch.
+    // Dynamic fan-out workers are checked later when their manifest lands;
+    // static units, loop judges, and fan-out default_model are checked here.
+    preflight_plan_models(plan, &config.model, config.ollama_base_url.as_deref())?;
+
     // ── Single-agent fast path ────────────────────────────────────────────────
     // One work unit → bypass worktrees, bus, and merge; run directly through
     // the IterationEngine so strategy / retry / model-escalation all apply.
@@ -305,7 +369,7 @@ pub async fn execute(
             };
         let analysis = WorkspaceAnalysis::build(config, std::slice::from_ref(&unit)).await;
 
-        let effective_read_ns = effective_read_namespaces(&unit, config);
+        let effective_read_ns = effective_read_namespaces(&unit, config, &memory);
         // Single-agent fast path: no shared board, no bundle pre-fetch
         // (coordinator + runner = 2 queries, already within M7 ≤2 gate).
         let agent_ctx = AgentRunContext::for_run(
@@ -340,10 +404,7 @@ pub async fn execute(
         );
 
         if agent_completed {
-            let effective_write_ns = unit
-                .write_namespace
-                .as_deref()
-                .unwrap_or(&config.write_namespace);
+            let effective_write_ns = effective_write_namespace(&unit, config);
             store_agent_result(
                 &memory,
                 &memory_writer,
@@ -461,8 +522,11 @@ pub async fn execute(
         }
     }
 
-    // Shared discovery board: agents post tagged findings for downstream agents
+    // Shared discovery / artifact blackboard
     let shared_board = Arc::new(SharedBoard::new());
+    shared_board
+        .bind_run(&config.workspace_root, &plan.hash())
+        .await;
 
     // Optional worktree manager (see `use_worktrees` computed above).
     let mut worktree_mgr = if use_worktrees {
@@ -477,13 +541,40 @@ pub async fn execute(
         None
     };
 
+    // ── Artefact-based loop resume ────────────────────────────────────────────
+    // A refine loop's only durable record is the versioned files it writes
+    // under OUT_DIR — the checkpoint in `exec_state` tracks node completion,
+    // not iteration progress. When those artefacts show a fully completed
+    // round, advance the loop's `iter_start` past it so the panel continues
+    // instead of overwriting its own earlier work. `max_iterations` keeps its
+    // meaning: a budget of rounds for *this* run, counted from the new start.
+    let mut effective_loop_configs: Vec<crate::swarm::plan::LoopConfig> =
+        plan.loop_configs.clone();
+    if config.resume_from_artifacts {
+        for lc in effective_loop_configs.iter_mut() {
+            let Some(resume) = loop_resume::detect(&config.workspace_root, lc, &unit_map) else {
+                continue;
+            };
+            tracing::info!("loop resume: {}", resume.summary());
+            for note in &resume.notes {
+                tracing::debug!("loop resume: {}", note);
+            }
+            // Baseline (`<id>-init`) units already have their output on disk;
+            // marking them Completed keeps the tier dispatch from rewriting it.
+            for init_id in &resume.satisfied_init_units {
+                exec_state.set_status(init_id, NodeStatus::Completed);
+            }
+            lc.iter_start = resume.resume_iter_start;
+            observer.on_loop_resumed(&resume);
+        }
+    }
+
     observer.on_phase_changed("running");
 
     // Build a map from loop-agent id → iter_start for first-pass {{ITER}} substitution.
     // Agents that appear in a loop block get {{ITER}}/{{PREV_ITER}} substituted before
     // every dispatch (first pass uses iter_start; subsequent passes increment).
-    let loop_agent_first_iter: std::collections::HashMap<String, u32> = plan
-        .loop_configs
+    let loop_agent_first_iter: std::collections::HashMap<String, u32> = effective_loop_configs
         .iter()
         .flat_map(|lc| {
             lc.agent_ids
@@ -496,8 +587,7 @@ pub async fn execute(
     // entirely inside the loop block (so iteration 1 also runs with the
     // per-iteration branch + chain anchor). The tier dispatch below
     // skips them.
-    let stacked_loop_agents: std::collections::HashSet<String> = plan
-        .loop_configs
+    let stacked_loop_agents: std::collections::HashSet<String> = effective_loop_configs
         .iter()
         .filter(|lc| {
             matches!(
@@ -517,8 +607,7 @@ pub async fn execute(
     // execute_module's loop iterations 2..N actually run, so test_audit sees
     // an empty workspace state. The deferral makes "depends on a loop body
     // agent" mean "depends on the loop body having fully iterated".
-    let loop_body_agents: std::collections::HashSet<String> = plan
-        .loop_configs
+    let loop_body_agents: std::collections::HashSet<String> = effective_loop_configs
         .iter()
         .flat_map(|lc| lc.agent_ids.iter().cloned())
         .collect();
@@ -592,7 +681,7 @@ pub async fn execute(
 
                 invalidate_stale_sources(&memory, unit, &config.workspace_root).await;
 
-                let effective_read_ns = effective_read_namespaces(unit, config);
+                let effective_read_ns = effective_read_namespaces(unit, config, &memory);
 
                 let agent_ctx = AgentRunContext::for_run(
                     config,
@@ -625,10 +714,7 @@ pub async fn execute(
                         &format!("completed: {}", manifest.summary.as_deref().unwrap_or("")),
                     );
                     // Store result to memory
-                    let effective_write_ns = unit
-                        .write_namespace
-                        .as_deref()
-                        .unwrap_or(&config.write_namespace);
+                    let effective_write_ns = effective_write_namespace(&unit, config);
                     store_agent_result(
                         &memory,
                         &memory_writer,
@@ -649,6 +735,37 @@ pub async fn execute(
                 all_manifests.push(manifest);
                 if failed {
                     break;
+                }
+
+                // Runtime fan-out: materialize + run SpawnManifest workers
+                if !failed {
+                    if let Err(e) = run_fanout_wave_if_needed(
+                        unit_id,
+                        plan,
+                        config,
+                        &context_files,
+                        &memory,
+                        &memory_writer,
+                        observer,
+                        git_coordinator.clone(),
+                        validation_pipeline.clone(),
+                        shared_board.clone(),
+                        &analysis,
+                        pre_fetched_memory.clone(),
+                        &tier_router,
+                        &plan.iteration_config,
+                        &bus,
+                        &mut all_manifests,
+                        &mut exec_state,
+                        &run_id,
+                        &plan_hash,
+                        worktree_mgr.as_mut(),
+                        &make_observer,
+                    )
+                    .await
+                    {
+                        tracing::warn!("fan-out after '{unit_id}' failed: {e:#}");
+                    }
                 }
             }
         } else {
@@ -751,9 +868,15 @@ pub async fn execute(
                             .to_string();
                         let agent_root_c = agent_root.clone();
                         let unit_id_c = unit.id.clone();
+                        let owned_c = unit.scope.owned_paths.clone();
                         let changed = git_coord
                             .lock_git(move || {
-                                commit_agent_changes(&agent_root_c, &unit_id_c, &summary)
+                                commit_agent_changes(
+                                    &agent_root_c,
+                                    &unit_id_c,
+                                    &summary,
+                                    &owned_c,
+                                )
                             })
                             .await
                             .unwrap_or_else(|e| {
@@ -792,10 +915,7 @@ pub async fn execute(
                             );
                             // Store result to memory
                             if let Some(unit) = unit_map.get(manifest.work_unit_id.as_str()) {
-                                let effective_write_ns = unit
-                                    .write_namespace
-                                    .as_deref()
-                                    .unwrap_or(&config.write_namespace);
+                                let effective_write_ns = effective_write_namespace(&unit, config);
                                 store_agent_result(
                                     &memory,
                                     &memory_writer,
@@ -857,7 +977,7 @@ pub async fn execute(
     }
 
     // 3b. Execute explicit loops (re-run loop agents until condition met)
-    for loop_config in &plan.loop_configs {
+    for loop_config in &effective_loop_configs {
         // First iteration was already executed in the tier loop above.
         // Now check the condition and re-iterate if needed.
         //
@@ -993,7 +1113,7 @@ pub async fn execute(
 
                 observer.on_agent_state_changed(agent_id, &AgentStatus::Running, &unit.description);
                 invalidate_stale_sources(&memory, unit, &config.workspace_root).await;
-                let effective_read_ns = effective_read_namespaces(unit, config);
+                let effective_read_ns = effective_read_namespaces(unit, config, &memory);
                 let agent_ctx = AgentRunContext::for_run(
                     config,
                     &context_files,
@@ -1025,10 +1145,7 @@ pub async fn execute(
                         &format!("completed: {}", manifest.summary.as_deref().unwrap_or("")),
                     );
                     drop(b);
-                    let effective_write_ns = unit
-                        .write_namespace
-                        .as_deref()
-                        .unwrap_or(&config.write_namespace);
+                    let effective_write_ns = effective_write_namespace(&unit, config);
                     store_agent_result(
                         &memory,
                         &memory_writer,
@@ -1259,9 +1376,15 @@ pub async fn execute(
                                     .to_string();
                                 let agent_root_c = agent_root.clone();
                                 let unit_id_c = unit.id.clone();
+                                let owned_c = unit.scope.owned_paths.clone();
                                 let changed = git_coord
                                     .lock_git(move || {
-                                        commit_agent_changes(&agent_root_c, &unit_id_c, &summary)
+                                        commit_agent_changes(
+                                            &agent_root_c,
+                                            &unit_id_c,
+                                            &summary,
+                                            &owned_c,
+                                        )
                                     })
                                     .await
                                     .unwrap_or_else(|e| {
@@ -1324,10 +1447,7 @@ pub async fn execute(
                             &format!("completed: {}", manifest.summary.as_deref().unwrap_or("")),
                         );
                         drop(b);
-                        let effective_write_ns = unit
-                            .write_namespace
-                            .as_deref()
-                            .unwrap_or(&config.write_namespace);
+                        let effective_write_ns = effective_write_namespace(&unit, config);
                         store_agent_result(
                             &memory,
                             &memory_writer,
@@ -1362,7 +1482,7 @@ pub async fn execute(
 
                     invalidate_stale_sources(&memory, unit, &config.workspace_root).await;
 
-                    let effective_read_ns = effective_read_namespaces(unit, config);
+                    let effective_read_ns = effective_read_namespaces(unit, config, &memory);
 
                     let agent_ctx = AgentRunContext::for_run(
                         config,
@@ -1407,10 +1527,7 @@ pub async fn execute(
                             &manifest.work_unit_id,
                             &format!("completed: {}", manifest.summary.as_deref().unwrap_or("")),
                         );
-                        let effective_write_ns = unit
-                            .write_namespace
-                            .as_deref()
-                            .unwrap_or(&config.write_namespace);
+                        let effective_write_ns = effective_write_namespace(&unit, config);
                         store_agent_result(
                             &memory,
                             &memory_writer,
@@ -1528,7 +1645,7 @@ pub async fn execute(
                 observer.on_agent_state_changed(unit_id, &AgentStatus::Running, &unit.description);
                 invalidate_stale_sources(&memory, unit, &config.workspace_root).await;
 
-                let effective_read_ns = effective_read_namespaces(unit, config);
+                let effective_read_ns = effective_read_namespaces(unit, config, &memory);
                 let agent_ctx = AgentRunContext::for_run(
                     config,
                     &context_files,
@@ -1558,10 +1675,7 @@ pub async fn execute(
                         &manifest.work_unit_id,
                         &format!("completed: {}", manifest.summary.as_deref().unwrap_or("")),
                     );
-                    let effective_write_ns = unit
-                        .write_namespace
-                        .as_deref()
-                        .unwrap_or(&config.write_namespace);
+                    let effective_write_ns = effective_write_namespace(&unit, config);
                     store_agent_result(
                         &memory,
                         &memory_writer,
@@ -1925,12 +2039,35 @@ impl WorkspaceAnalysis {
 }
 
 /// Resolve the effective read-namespace list for a work unit: the unit's
-/// own list if set, otherwise the swarm-config default.
-fn effective_read_namespaces(unit: &WorkUnit, config: &SwarmConfig) -> Vec<String> {
-    unit.read_namespaces
+/// own list if set, otherwise the swarm-config default. When memory is open
+/// and both are empty, fall back to `shared` (dual-surface contract).
+fn effective_read_namespaces(
+    unit: &WorkUnit,
+    config: &SwarmConfig,
+    memory: &Option<Arc<MemoryStores>>,
+) -> Vec<String> {
+    let mut ns = unit
+        .read_namespaces
         .as_deref()
         .unwrap_or(config.read_namespaces.as_slice())
-        .to_vec()
+        .to_vec();
+    if memory.is_some() && ns.is_empty() {
+        ns.push("shared".into());
+    }
+    ns
+}
+
+fn effective_write_namespace<'a>(unit: &'a WorkUnit, config: &'a SwarmConfig) -> &'a str {
+    unit.write_namespace
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            if config.write_namespace.is_empty() {
+                "swarm"
+            } else {
+                config.write_namespace.as_str()
+            }
+        })
 }
 
 struct LoopConditionContext<'a> {
@@ -2318,8 +2455,11 @@ async fn run_agent_inner(
             .to_string();
         let agent_root_c = agent_root.clone();
         let unit_id_c = unit.id.clone();
+        let owned_c = unit.scope.owned_paths.clone();
         let changed = git_coordinator
-            .lock_git(move || commit_agent_changes(&agent_root_c, &unit_id_c, &summary))
+            .lock_git(move || {
+                commit_agent_changes(&agent_root_c, &unit_id_c, &summary, &owned_c)
+            })
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!("Failed to commit worktree changes for {}: {}", unit.id, e);
@@ -2496,12 +2636,23 @@ async fn run_conservative_impact_tests(
 ///
 /// Stages everything with `git add -A` then commits. Returns the list of files
 /// changed in the commit, or an empty vec if the working tree was already clean.
+/// Commit all changes in an agent's worktree.
+///
+/// Stages with `git add -A`, then force-adds any **owned** paths that are
+/// gitignored (e.g. `plans/` in this repo). Without `-f`, ignored artefact
+/// directories look like an empty worktree: agents "succeed", merge has
+/// nothing to bring back, and teardown deletes the only copies.
+///
+/// Returns the list of files in the resulting commit (empty if nothing to commit).
 fn commit_agent_changes(
     worktree_path: &std::path::Path,
     agent_id: &str,
     summary: &str,
+    owned_paths: &[String],
 ) -> Result<Vec<std::path::PathBuf>> {
     use std::process::Command;
+
+    force_stage_owned_ignored(worktree_path, owned_paths)?;
 
     // Check for changes
     let status = Command::new("git")
@@ -2527,6 +2678,9 @@ fn commit_agent_changes(
         "git add failed in worktree {}",
         worktree_path.display()
     );
+
+    // Re-force owned ignored paths after `git add -A` (which won't include them).
+    force_stage_owned_ignored(worktree_path, owned_paths)?;
 
     // Commit — silence stdout/stderr so git's progress output doesn't corrupt the TUI
     let msg = format!(
@@ -2555,11 +2709,269 @@ fn commit_agent_changes(
     Ok(files)
 }
 
+/// `git add -f` every ignored path under the worktree that matches the agent's
+/// owned scope. Skips empty / `.` owned entries so we never force-add the whole tree.
+fn force_stage_owned_ignored(
+    worktree_path: &std::path::Path,
+    owned_paths: &[String],
+) -> Result<()> {
+    use std::process::Command;
+
+    if owned_paths.is_empty() {
+        return Ok(());
+    }
+
+    let scope = crate::types::FileScope {
+        owned_paths: owned_paths.to_vec(),
+        ..Default::default()
+    };
+
+    // Ask git which ignored paths exist; filter to owned scope only.
+    let output = Command::new("git")
+        .args(["status", "--porcelain", "--ignored=matching"])
+        .current_dir(worktree_path)
+        .output()
+        .context("git status --ignored in worktree")?;
+    if !output.status.success() {
+        return Ok(());
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut to_force: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let path = line
+            .strip_prefix("!! ")
+            .or_else(|| line.strip_prefix("!!"))
+            .map(str::trim)
+            .unwrap_or("");
+        if path.is_empty() {
+            continue;
+        }
+        // Directories may appear as `plans/`; also try without trailing slash.
+        let candidates = [path, path.trim_end_matches('/')];
+        let owned = candidates.iter().any(|c| scope.is_owned(c))
+            || scope.owned_paths.iter().any(|owned| {
+                let prefix = owned
+                    .split(['*', '?'])
+                    .next()
+                    .unwrap_or(owned)
+                    .trim_end_matches(['/', '\\']);
+                !prefix.is_empty()
+                    && prefix != "."
+                    && (path == prefix
+                        || path.starts_with(&format!("{prefix}/"))
+                        || path.starts_with(&format!("{prefix}\\")))
+            });
+        if owned {
+            to_force.push(path.to_string());
+        }
+    }
+
+    if to_force.is_empty() {
+        return Ok(());
+    }
+
+    let mut args = vec!["add".to_string(), "-f".to_string(), "--".to_string()];
+    args.extend(to_force);
+    let add = Command::new("git")
+        .args(&args)
+        .current_dir(worktree_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("git add -f owned ignored paths")?;
+    anyhow::ensure!(
+        add.success(),
+        "git add -f failed in worktree {}",
+        worktree_path.display()
+    );
+    Ok(())
+}
+
 /// Store an agent's execution result to memory (best-effort, never fails the pipeline).
 ///
 /// Writes one aggregate entry for the agent's run, plus one sentinel entry per
 /// `staleness_source` path recording the current file hash. On the next run,
 /// `invalidate_stale_sources` checks these hashes and marks changed entries stale.
+async fn run_fanout_wave_if_needed(
+    completed_unit_id: &str,
+    plan: &CompiledPlan,
+    config: &SwarmConfig,
+    context_files: &[(String, String)],
+    memory: &Option<Arc<MemoryStores>>,
+    memory_writer: &Option<WriterHandle>,
+    observer: &dyn SwarmObserver,
+    git_coordinator: Arc<GitCoordinator>,
+    validation: Option<Arc<crate::validation_gate::ValidationPipeline>>,
+    shared_board: Arc<SharedBoard>,
+    analysis: &WorkspaceAnalysis,
+    pre_fetched_memory: Arc<Option<String>>,
+    tier_router: &TierRouter,
+    iteration_config: &crate::iteration::IterationConfig,
+    bus: &Arc<tokio::sync::Mutex<AgentBus>>,
+    all_manifests: &mut Vec<AgentManifest>,
+    exec_state: &mut ExecutionState,
+    run_id: &str,
+    plan_hash: &str,
+    mut worktree_mgr: Option<&mut WorktreeManager>,
+    make_observer: &impl Fn(&str) -> Box<dyn AcpObserver>,
+) -> Result<()> {
+    let Some(op) = plan
+        .fanout_ops
+        .iter()
+        .find(|op| op.after_unit == completed_unit_id)
+    else {
+        return Ok(());
+    };
+
+    // Resume: skip if we already spawned for this after_unit
+    if exec_state
+        .spawned_ids
+        .iter()
+        .any(|id| id.starts_with(&format!("{}::", op.after_unit)))
+    {
+        tracing::info!(
+            "fan-out after '{}' already materialized (resume); skipping",
+            op.after_unit
+        );
+        return Ok(());
+    }
+
+    let manifest_path = shared_board
+        .spawn_manifest_path(completed_unit_id)
+        .await
+        .or_else(|| {
+            // Also accept workspace-root spawn_manifest.json / from-<id>.json
+            let candidates = [
+                config
+                    .workspace_root
+                    .join(format!("from-{completed_unit_id}.json")),
+                config.workspace_root.join("spawn_manifest.json"),
+                config
+                    .workspace_root
+                    .join(".gaviero")
+                    .join("runs")
+                    .join(plan_hash)
+                    .join("artifacts")
+                    .join("spawn_manifest")
+                    .join(format!("from-{completed_unit_id}.json")),
+            ];
+            candidates.into_iter().find(|p| p.exists())
+        });
+
+    let Some(path) = manifest_path else {
+        tracing::warn!(
+            "FanoutOp after '{}' but no spawn_manifest found on blackboard",
+            completed_unit_id
+        );
+        return Ok(());
+    };
+
+    let parsed = crate::swarm::spawn::load_manifest_file(&path)?;
+    let workers = crate::swarm::spawn::materialize_from_manifest(&parsed, op)?;
+
+    let fanout_group: Vec<Vec<String>> = vec![workers.iter().map(|w| w.id.clone()).collect()];
+    let scope_errors = validation::validate_scopes(&workers, &fanout_group);
+    if !scope_errors.is_empty() {
+        anyhow::bail!(
+            "fan-out scope validation failed: {}",
+            scope_errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+
+    {
+        let mut b = bus.lock().await;
+        for w in &workers {
+            b.register(&w.id);
+        }
+    }
+
+    tracing::info!(
+        "fan-out after '{}': materializing {} workers from {}",
+        completed_unit_id,
+        workers.len(),
+        path.display()
+    );
+
+    for unit in &workers {
+        if exec_state.status(&unit.id) == NodeStatus::Completed {
+            continue;
+        }
+        exec_state.set_status(&unit.id, NodeStatus::Running);
+        observer.on_agent_state_changed(&unit.id, &AgentStatus::Running, &unit.description);
+
+        let effective_read_ns = effective_read_namespaces(unit, config, &memory);
+        let agent_ctx = AgentRunContext::for_run(
+            config,
+            context_files,
+            &effective_read_ns,
+            observer,
+            memory.clone(),
+            git_coordinator.clone(),
+            validation.clone(),
+            Some(shared_board.clone()),
+            analysis,
+            pre_fetched_memory.clone(),
+        );
+        let manifest = run_single_agent(
+            unit,
+            worktree_mgr.as_deref_mut(),
+            &agent_ctx,
+            tier_router,
+            iteration_config,
+            make_observer(&unit.id),
+        )
+        .await?;
+
+        if matches!(manifest.status, AgentStatus::Completed) {
+            let effective_write_ns = effective_write_namespace(&unit, config);
+            store_agent_result(
+                memory,
+                memory_writer,
+                effective_write_ns,
+                &manifest,
+                unit,
+                run_id,
+                &config.workspace_root,
+                config.extract_agent_findings,
+            )
+            .await;
+        }
+        exec_state
+            .spawned_ids
+            .push(format!("{}::{}", op.after_unit, unit.id));
+        exec_state.record_result(&unit.id, manifest.clone());
+        let _ = exec_state.save(plan_hash);
+        all_manifests.push(manifest);
+    }
+
+    // Refresh knowledge impact texts after a mutating fan-out wave
+    if config.execution_mode == ExecutionMode::Repo {
+        let remaining: Vec<WorkUnit> = plan
+            .work_units_unordered()
+            .into_iter()
+            .filter(|u| !exec_state.status(&u.id).is_terminal())
+            .cloned()
+            .collect();
+        if !remaining.is_empty() {
+            let refreshed = WorkspaceAnalysis::build(config, &remaining).await;
+            // Best-effort: callers hold analysis by ref; we only log refresh.
+            // Full Arc swap would require refactoring execute()'s analysis binding.
+            let _ = refreshed;
+            tracing::info!("fan-out: rebuilt workspace analysis for remaining units");
+            if let Some(cb) = &config.knowledge_invalidation {
+                cb();
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn store_agent_result(
     memory: &Option<Arc<MemoryStores>>,
     writer: &Option<WriterHandle>,
@@ -3256,7 +3668,7 @@ async fn evaluate_loop_condition(
             let unit = apply_iter_vars_with_evidence(unit_template, current_iter_abs, &evidence);
             invalidate_stale_sources(ctx.memory, &unit, &ctx.config.workspace_root).await;
 
-            let effective_read_ns = effective_read_namespaces(&unit, ctx.config);
+            let effective_read_ns = effective_read_namespaces(&unit, ctx.config, ctx.memory);
             let analysis = WorkspaceAnalysis {
                 repo_map: ctx.repo_map.clone(),
                 impact_texts: ctx.impact_texts.clone(),

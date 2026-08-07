@@ -1,5 +1,10 @@
 // N-provider *implementation-plan* refinement with a convergence judge.
 //
+// `execution_mode document` — shared workspace, no git worktrees/merge. Required
+// because default `OUT_DIR=plans` is gitignored: Repo-mode worktrees write the
+// artefacts, `git status` hides them, merge commits nothing, and teardown
+// deletes the worktree copies. Document mode keeps files on disk under OUT_DIR.
+//
 // Produces a plan written exclusively for a frontier AI coding agent with
 // high reasoning capability — the sole implementor. The feature brief is
 // supplied by the operator via `--prompt-file`; its contents replace every
@@ -18,17 +23,27 @@
 // Round 2+ (`{{PREV_ITER}}` >= 1): each provider reads every other provider's
 // prior plan and summary, then writes a refined plan + summary.
 //
-// Usage:
+// Usage (research-consensus UX plan review from repo root):
 //   gaviero-cli --script crates/gaviero-dsl/examples/plan_refinement.gaviero \
 //     --workflow feature-plan-refinement \
-//     --prompt-file /path/to/feature-brief.md \
-//     --var OUT_DIR=plans/my-feature
+//     --prompt-file plans/research-consensus-ux-brief.md \
+//     --var OUT_DIR=plans/research-consensus-ux
 //
-// Three-provider panel:
+// Default roster is Claude + Codex + Cursor (own models). Override with:
 //   --param roster=claude=claude:opus@max,codex=codex:gpt-5.5@high,cursor=cursor:composer-2.5@medium
+// Grok (Cursor CLI id embeds effort — omit @effort):
+//   --param roster=...,cursor=cursor:cursor-grok-4.5-high
 //
 // Roster entry format: `id=provider:model[@effort]` (comma-separated).
 // Each `id` becomes {{REVIEWER_ID}} in artefact paths under {{OUT_DIR}}/.
+//
+// Resuming: re-running the same command against an {{OUT_DIR}} that
+// already holds artefacts continues the panel instead of overwriting it.
+// The runtime takes the newest `-v<N>` every reviewer completed, resumes
+// at N+1 (so {{PREV_ITER}} = N), and re-runs any round only some
+// reviewers finished. `max_iterations` is the budget for the new run,
+// counted from the resumed start. Pass `--fresh` to restart at
+// `iter_start` and overwrite what is there.
 
 
 vars {
@@ -171,13 +186,15 @@ agent convergence-judge {
 }
 
 workflow feature-plan-refinement {
+    execution_mode document
     param judge {
         model "claude:sonnet"
         effort medium
     }
     param roster [
-        { id "claude" model "claude:opus"   effort max  }
-        { id "codex"  model "codex:gpt-5.5" effort high }
+        { id "claude" model "claude:opus"           effort xhigh    }
+        { id "codex"  model "codex:gpt-5.6-sol"         effort xhigh   }
+        { id "cursor" model "cursor:cursor-grok-4.5-high"   effort medium }
     ]
 
     steps [

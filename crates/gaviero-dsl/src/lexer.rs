@@ -15,6 +15,8 @@ pub enum Token {
     KwAgent,
     #[token("workflow")]
     KwWorkflow,
+    #[token("pattern")]
+    KwPattern,
     #[token("include")]
     KwInclude,
 
@@ -211,6 +213,7 @@ impl fmt::Display for Token {
             Token::KwClient => write!(f, "client"),
             Token::KwAgent => write!(f, "agent"),
             Token::KwWorkflow => write!(f, "workflow"),
+            Token::KwPattern => write!(f, "pattern"),
             Token::KwInclude => write!(f, "include"),
             Token::KwTier => write!(f, "tier"),
             Token::KwModel => write!(f, "model"),
@@ -596,5 +599,13 @@ mod tests {
         assert!(matches!(toks[3].0, Token::KwCallersOf));
         assert!(matches!(toks[4].0, Token::KwTestsFor));
         assert!(matches!(toks[5].0, Token::KwDepth));
+    }
+
+    #[test]
+    fn pattern_keyword() {
+        let (toks, errs) = lex("pattern map_reduce");
+        assert!(errs.is_empty(), "lex errors: {:?}", errs);
+        assert!(matches!(toks[0].0, Token::KwPattern));
+        assert!(matches!(&toks[1].0, Token::Ident(s) if s == "map_reduce"));
     }
 }

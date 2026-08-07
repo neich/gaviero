@@ -105,6 +105,8 @@ fn make_config(workspace: &std::path::Path) -> SwarmConfig {
         specificity: SpecificityConfig::default(),
         swarm_extra_tools: vec![],
         extract_agent_findings: false,
+        resume_from_artifacts: false,
+        knowledge_invalidation: None,
     }
 }
 
@@ -163,5 +165,59 @@ async fn execute_rejects_plans_with_directory_prefix_overlap() {
     assert!(
         msg.to_lowercase().contains("scope"),
         "error must mention scope, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn execute_rejects_plans_with_invalid_model_specs_before_dispatch() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let workspace = tmp.path();
+
+    // First agent is fine; second has a bare model name. Preflight must reject
+    // the whole plan before either agent is launched.
+    let mut alpha = unit("alpha", &["src/a.rs"]);
+    alpha.model = Some("claude:sonnet".into());
+    let mut beta = unit("beta", &["src/b.rs"]);
+    beta.model = Some("sonnet".into());
+    let plan = CompiledPlan::from_work_units(vec![alpha, beta], Some(2));
+
+    let config = make_config(workspace);
+    let observer = NoopSwarmObserver;
+    let make_obs = |_id: &str| -> Box<dyn AcpObserver> { Box::new(NoopAcpObserver) };
+
+    let err = execute(&plan, &config, None, None, &observer, make_obs)
+        .await
+        .expect_err("execute must reject invalid model specs at preflight");
+
+    let msg = format!("{err:#}");
+    assert!(
+        msg.to_lowercase().contains("preflight") || msg.to_lowercase().contains("model"),
+        "error must mention model preflight, got: {msg}"
+    );
+    assert!(
+        msg.contains("beta"),
+        "error must name the bad agent, got: {msg}"
+    );
+}
+
+#[test]
+fn preflight_plan_models_rejects_bad_fanout_default() {
+    use gaviero_core::swarm::pipeline::preflight_plan_models;
+    use gaviero_core::swarm::plan::FanoutOp;
+
+    let mut plan = CompiledPlan::from_work_units(vec![unit("discover", &["src/"])], Some(1));
+    plan.fanout_ops.push(FanoutOp {
+        after_unit: "discover".into(),
+        max_spawn: 4,
+        default_model: Some("sonnet".into()),
+        barrier_id: None,
+    });
+
+    let err = preflight_plan_models(&plan, "claude:sonnet", None)
+        .expect_err("fan-out default_model must be validated");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("fan-out") || msg.contains("default_model") || msg.contains("provider"),
+        "expected fan-out model diagnostic, got: {msg}"
     );
 }

@@ -143,6 +143,43 @@ No public library API. The `Cli` struct in `src/main.rs` is authoritative; this 
 | `--test-first` | — | Generate failing tests before the edit loop (TDD) |
 | `--no-iterate` | — | Single pass only (overrides `--max-retries`) |
 | `--resume` | — | Resume from `.gaviero/state/<plan-hash>.json` |
+| `--fresh` | — | Ignore artefacts in a `loop` block's `OUT_DIR`; restart every loop at its script `iter_start` |
+
+### Resuming a consensus loop
+
+A `loop { }` block writes one versioned artefact set per reviewer per
+iteration under `OUT_DIR` (`<id>-refine-plan-v3.md`, `<id>-conclusion-v3.md`,
+…). Re-running the same command against that `OUT_DIR` **continues the panel
+instead of overwriting it** — no flag required:
+
+```bash
+# First run: rounds v1..v3, then interrupted
+gaviero-cli --script crates/gaviero-dsl/examples/plan_refinement.gaviero \
+  --workflow feature-plan-refinement \
+  --prompt-file brief.md --var OUT_DIR=plans/my-feature \
+  --param roster=claude=claude:opus@max,codex=codex:gpt-5.5@high
+
+# Same command again: detects v3, resumes at v4 reading the v3 plans
+```
+
+The runtime picks the newest iteration for which **every** reviewer produced
+its full artefact set, and starts at the next one. A round only some
+reviewers finished — or one with an empty file — is reported and re-run from
+scratch, so no agent reads peer input its peers never saw. Baseline
+(`<id>-init`) agents are skipped when the artefacts already cover them.
+`--verbose` is not needed; the `[resume]` lines list every file reused and
+discarded.
+
+Two things to know:
+
+- `max_iterations` is a budget for *this* run, counted from the resumed
+  start — resuming at v4 with `max_iterations 5` runs v4–v8.
+- The `stability` PASS streak is not carried across runs; it restarts at
+  zero and the judge re-evaluates as usual.
+
+Use a new `OUT_DIR` (or `--fresh`) when the problem statement or roster
+changed — the existing artefacts answer a different question. This is
+independent of `--resume`, which restores the node-level checkpoint.
 
 ### Output
 

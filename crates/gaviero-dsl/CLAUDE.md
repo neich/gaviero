@@ -19,7 +19,7 @@ Examples: **10** workflows + **3** tier profiles (`doc-claude`, `doc-codex`, `do
 |---|---|
 | [`ast.rs`](src/ast.rs) | AST types. **Authoritative** DSL surface — read before extending docs or the parser. |
 | [`lexer.rs`](src/lexer.rs) / [`parser.rs`](src/parser.rs) | Logos → chumsky → AST. |
-| [`compiler.rs`](src/compiler.rs) | Semantic analysis → `CompiledPlan` (scope overlap, cycles, tier resolution, var substitution). |
+| [`compiler.rs`](src/compiler.rs) | Semantic analysis → `CompiledPlan` (cycles, tier resolution, var substitution). Scope overlap is validated at swarm runtime. |
 | [`workflow_params.rs`](src/workflow_params.rs) | `param` materialization: client params + roster expansion (`--param`). |
 | [`reviewers.rs`](src/reviewers.rs) | Compat re-exports only; impl lives in `workflow_params`. |
 | [`resolver.rs`](src/resolver.rs) | `include` graph; drives `compile_file`. |
@@ -39,11 +39,10 @@ Exact field shapes: [`ast.rs`](src/ast.rs). Language reference: [README.md](READ
 ## Conventions
 
 - **Errors carry source spans.** Never strip a `DslError` to bare `Display` before reporting.
-- **Compile-time validation.** Scope overlaps and dependency cycles are checked at compile time — runtime callers assume a consistent plan.
+- **Compile-time validation.** Dependency cycles and name resolution are checked at compile time. **Scope overlaps are not** — the DSL accepts overlapping `owned` globs; [`gaviero_core::swarm::validation::validate_scopes`](../gaviero-core/src/swarm/validation.rs) rejects them at execute time (see `dsl_does_not_catch_scope_overlap_swarm_validator_does` in [`tests/swarm_contract.rs`](tests/swarm_contract.rs)). Overlap within the same `loop { agents [...] }` group is allowed by that runtime validator.
 - **Provider-neutral model strings.** Resolution happens in `gaviero-core` at dispatch. Prefixes: `claude:`, `codex:`, `cursor:`, `ollama:`, `local:`, `deepseek:` ([`validate_model_spec`](../gaviero-core/src/swarm/backend/shared.rs)).
 - **Single-pass var substitution.** Do not iterate to a fixpoint; emit a diagnostic instead.
 - **Canonical re-export:** downstream uses `gaviero_dsl::CompiledPlan`, not a path under core.
-- Scope globs via [`gaviero_core::path_pattern::paths_overlap`](../gaviero-core/src/path_pattern.rs). Overlap within the same `loop { agents [...] }` group is allowed.
 
 ## Rules
 
@@ -54,7 +53,7 @@ Exact field shapes: [`ast.rs`](src/ast.rs). Language reference: [README.md](READ
 
 ## Dependencies
 
-- `gaviero-core` — `CompiledPlan`, `path_pattern`, shared types.
+- `gaviero-core` — `CompiledPlan`, shared types. (Scope overlap uses core `path_pattern` at **swarm runtime**, not in this crate.)
 - `logos 0.14` — lexer.
 - `chumsky 0.12` — parser.
 - `miette 7` + `thiserror 2` — diagnostics.
