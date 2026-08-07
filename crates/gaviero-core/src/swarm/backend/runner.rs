@@ -242,11 +242,17 @@ pub async fn run_backend(
 
     let mut base_prompt = render_swarm_prompt(&selections, &work_unit.scope, &task_text);
 
-    // Prepend any relevant discoveries from other agents
+    // Prepend discoveries + peer artifact lists from the shared blackboard
     if let Some(b) = board {
         let discoveries = b.format_for_prompt(&work_unit.scope.owned_paths).await;
         if !discoveries.is_empty() {
             base_prompt = format!("{}\n\n{}", discoveries, base_prompt);
+        }
+        let peers = b
+            .format_peer_block(&work_unit.id, Some(&crate::swarm::board::ArtifactKind::Conclusion))
+            .await;
+        if !peers.is_empty() {
+            base_prompt = format!("{}\n\n{}", peers, base_prompt);
         }
     }
 
@@ -458,6 +464,48 @@ pub async fn run_backend(
         }
 
         all_modified.extend(attempt_modified.iter().cloned());
+
+        // Auto-register conclusion artifacts written by this unit
+        if let Some(b) = board {
+            for path in attempt_modified.iter() {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                if name.contains("-conclusion-v") && name.ends_with(".md") {
+                    let key = name.trim_end_matches(".md").to_string();
+                    let _ = b
+                        .publish(
+                            crate::swarm::board::ArtifactKind::Conclusion,
+                            &work_unit.id,
+                            &key,
+                            Some(path),
+                            None,
+                            work_unit.scope.owned_paths.clone(),
+                            None,
+                        )
+                        .await;
+                }
+                if name == "spawn_manifest.json"
+                    || (name.starts_with("from-") && name.ends_with(".json"))
+                {
+                    let _ = b
+                        .publish(
+                            crate::swarm::board::ArtifactKind::SpawnManifest,
+                            &work_unit.id,
+                            name.trim_end_matches(".json"),
+                            Some(path),
+                            None,
+                            vec![],
+                            None,
+                        )
+                        .await;
+                }
+            }
+            // Also scan workspace shallowly for conclusion files this agent owns
+            b.auto_register_conclusions(&work_unit.id, workspace_root, None)
+                .await;
+        }
 
         // 4. Inline validation
         if let Some(vp) = validation {
