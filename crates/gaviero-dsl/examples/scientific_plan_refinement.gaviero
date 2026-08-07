@@ -36,6 +36,11 @@
 //     --var SEMANTIC_SCHOLAR_MCP_URL=https://YOUR-MCP-ENDPOINT/ \
 //     --mcp-codex-trust granted
 //
+// Default roster is Claude + Codex + Cursor (own models). Override with:
+//   --param roster=claude=claude:opus@max,codex=codex:gpt-5.5@high,cursor=cursor:composer-2.5@medium
+// Grok (Cursor CLI id embeds effort — omit @effort):
+//   --param roster=...,cursor=cursor:cursor-grok-4.5-high
+//
 include "clients.gaviero"
 
 vars {
@@ -233,10 +238,10 @@ workflow scientific-plan-refinement {
         effort medium
     }
     param roster [
-        { id "claude" model "claude:opus"         effort xhigh  }
-        { id "codex"  model "codex:gpt-5.6-sol"       effort xhigh }
-        { id "cursor" model "cursor:grok-4.5-high" effort high }
-    ]   
+        { id "claude" model "claude:opus"          effort xhigh }
+        { id "codex"  model "codex:gpt-5.6-sol"    effort xhigh }
+        { id "cursor" model "cursor:grok-4.5-high" effort high  }
+    ]
 
     steps [
         loop {
@@ -252,7 +257,7 @@ workflow scientific-plan-refinement {
             until agent     convergence-judge
         }
     ]
-    max_parallel 3
+    max_parallel 4
     memory {
         write_ns "scientific-plan-refinement"
     }

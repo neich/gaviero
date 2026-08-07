@@ -208,6 +208,7 @@ pub(crate) fn run_swarm(app: &mut App, task_desc: String) {
             swarm_extra_tools,
             extract_agent_findings,
             resume_from_artifacts: true,
+            knowledge_invalidation: None,
         };
 
         let observer = TuiSwarmObserver { tx: tx.clone() };
@@ -239,18 +240,29 @@ pub(super) fn handle_run_script_command(app: &mut App) {
     let input = app.chat_state.take_input();
     let rest = input.trim().strip_prefix("/run").unwrap_or("").trim();
 
-    let (raw_path_token, runtime_prompt) = match rest.find(|c: char| c.is_ascii_whitespace()) {
-        Some(idx) => {
-            let path_tok = &rest[..idx];
-            let remainder = rest[idx..].trim();
-            let prompt = if remainder.is_empty() {
-                None
-            } else {
-                Some(remainder.to_string())
-            };
-            (path_tok, prompt)
+    let (raw_path_token, runtime_prompt, override_vars) = {
+        let tokens: Vec<&str> = rest.split_whitespace().collect();
+        let path_tok = tokens.first().copied().unwrap_or("");
+        let mut vars = Vec::new();
+        let mut prompt_parts = Vec::new();
+        for tok in tokens.iter().skip(1) {
+            if let Some((k, v)) = tok.split_once('=') {
+                if !k.is_empty()
+                    && k.chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                {
+                    vars.push((k.to_string(), v.to_string()));
+                    continue;
+                }
+            }
+            prompt_parts.push(*tok);
         }
-        None => (rest, None),
+        let prompt = if prompt_parts.is_empty() {
+            None
+        } else {
+            Some(prompt_parts.join(" "))
+        };
+        (path_tok, prompt, vars)
     };
 
     let script_path = raw_path_token
@@ -260,11 +272,13 @@ pub(super) fn handle_run_script_command(app: &mut App) {
 
     if script_path.is_empty() {
         app.chat_state.add_system_message(
-            "Usage: /run <path.gaviero> [prompt]\n\
+            "Usage: /run <path.gaviero> [prompt...] [KEY=VALUE...]\n\
              Compiles and executes a .gaviero DSL script.\n\
+             Trailing KEY=VALUE tokens become var overrides.\n\
              Use {{PROMPT}} in agent prompts for runtime substitution.\n\
              Example: /run workflows/security_audit.gaviero\n\
-             Example: /run @workflows/tdd.gaviero implement OAuth login",
+             Example: /run @workflows/tdd.gaviero implement OAuth login\n\
+             Example: /run workflows/x.gaviero OUT_DIR=tmp/run1",
         );
         return;
     }
@@ -305,12 +319,20 @@ pub(super) fn handle_run_script_command(app: &mut App) {
             &resolved,
             None,
             runtime_prompt.as_deref(),
-            &[],
+            &override_vars,
             &[],
             &[],
         )
     } else {
-        gaviero_dsl::compile(&source, &filename, None, runtime_prompt.as_deref())
+        gaviero_dsl::compile_with_vars(
+            &source,
+            &filename,
+            None,
+            runtime_prompt.as_deref(),
+            &override_vars,
+            &[],
+            &[],
+        )
     };
     let compiled = match compiled {
         Ok(c) => c,
@@ -359,6 +381,7 @@ pub(super) fn handle_run_script_command(app: &mut App) {
         )
         .as_bool()
         .unwrap_or(true);
+    let plan_execution_mode = compiled.execution_mode;
 
     tokio::spawn(async move {
         use gaviero_core::swarm::pipeline;
@@ -366,12 +389,13 @@ pub(super) fn handle_run_script_command(app: &mut App) {
         let effective_max_parallel = compiled.max_parallel.unwrap_or_else(|| unit_count.min(4));
 
         let config = pipeline::SwarmConfig {
-            execution_mode: gaviero_core::swarm::plan::ExecutionMode::Repo,
+            execution_mode: plan_execution_mode,
             max_parallel: effective_max_parallel,
             workspace_root: root,
             model,
             ollama_base_url: Some(ollama_base_url),
-            use_worktrees: effective_max_parallel > 1,
+            use_worktrees: effective_max_parallel > 1
+                && plan_execution_mode == gaviero_core::swarm::plan::ExecutionMode::Repo,
             read_namespaces: read_ns,
             write_namespace: write_ns,
             context_files: vec![],
@@ -383,6 +407,7 @@ pub(super) fn handle_run_script_command(app: &mut App) {
             swarm_extra_tools,
             extract_agent_findings,
             resume_from_artifacts: true,
+            knowledge_invalidation: None,
         };
 
         let observer = TuiSwarmObserver { tx: tx.clone() };
@@ -536,6 +561,7 @@ pub(super) fn handle_coordinated_swarm_command(app: &mut App) {
             swarm_extra_tools,
             extract_agent_findings,
             resume_from_artifacts: true,
+            knowledge_invalidation: None,
         };
 
         let coord_config = coordinator::CoordinatorConfig {

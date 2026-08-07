@@ -32,9 +32,10 @@
 //   prefixed with its own {{REVIEWER_ID}}, so the scope enforcer keeps
 //   concurrent writes disjoint. Never drop that id prefix.
 //
-//   The CLI requires `--workspace <dir>` for this workflow (and no
-//   `--repo`); {{PROBLEM_FILE}} and {{OUT_DIR}} are then relative to
-//   that directory.
+//   Omit `--repo` entirely — the CLI rejects it for document
+//   workflows. `--workspace <dir>` sets the shared write root; without
+//   it the CLI falls back to the current directory. {{PROBLEM_FILE}}
+//   and {{OUT_DIR}} are relative to whichever root is chosen.
 //
 // Roster:
 //
@@ -113,8 +114,9 @@
 //
 // Usage:
 //
-//   `--workspace` is required (document mode); omit `--repo` entirely.
-//   PROBLEM_FILE and OUT_DIR are relative to the workspace directory.
+//   Document mode: omit `--repo`. `--workspace` is optional (defaults
+//   to the current directory); PROBLEM_FILE and OUT_DIR are relative
+//   to that root.
 //
 //   Default 3-provider panel:
 //     gaviero-cli --script crates/gaviero-dsl/examples/scientific_research.gaviero \
@@ -676,7 +678,7 @@ workflow scientific-research-consensus {
     param roster [
         { id "claude" model "claude:opus"        effort xhigh }
         { id "codex"  model "codex:gpt-5.6-sol"  effort xhigh }
-        { id "cursor" model "cursor:grok-4.5-sol" effort xhigh }
+        { id "cursor" model "cursor:grok-4.5-high" effort xhigh }
     ]
 
     steps [

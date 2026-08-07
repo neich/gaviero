@@ -102,6 +102,9 @@ pub struct ExecutionState {
     pub node_states: HashMap<String, NodeState>,
     /// Accumulated cost estimate across all nodes.
     pub cost_estimate_usd: f64,
+    /// Work unit ids materialized by runtime fan-out (for resume: skip re-spawn).
+    #[serde(default)]
+    pub spawned_ids: Vec<String>,
 }
 
 impl ExecutionState {
@@ -115,6 +118,7 @@ impl ExecutionState {
         Self {
             node_states,
             cost_estimate_usd: 0.0,
+            spawned_ids: Vec::new(),
         }
     }
 

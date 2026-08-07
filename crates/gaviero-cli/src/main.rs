@@ -38,16 +38,20 @@ struct Cli {
     workspace: Option<PathBuf>,
 
     /// Single task description (creates one WorkUnit with full repo scope).
-    #[arg(long, conflicts_with = "work_units")]
+    #[arg(long, conflicts_with_all = ["work_units", "script", "plan"])]
     task: Option<String>,
 
     /// JSON array of WorkUnit definitions.
-    #[arg(long, conflicts_with = "task")]
+    #[arg(long, conflicts_with_all = ["task", "script", "plan"])]
     work_units: Option<String>,
 
     /// Path to a .gaviero DSL script file.
-    #[arg(long, conflicts_with_all = ["task", "work_units"])]
+    #[arg(long, conflicts_with_all = ["task", "work_units", "plan"])]
     script: Option<PathBuf>,
+
+    /// Path to a PlanDocument JSON file (loops + fanout preserved).
+    #[arg(long, conflicts_with_all = ["task", "work_units", "script"])]
+    plan: Option<PathBuf>,
 
     /// Inline value to substitute for every `{{PROMPT}}` placeholder in the
     /// DSL script. Also becomes the full prompt for any agent without a
@@ -881,6 +885,15 @@ fn prepare_swarm_workspace(
                 );
             }
             apply_out_dir_default_from_plan(&mut vars, &repo_path, &plan_host);
+        } else if cli_repo_is_default(cli) {
+            // Document workflows that only need a shared write root (e.g.
+            // plan_refinement with OUT_DIR under a gitignored `plans/`) can
+            // run against the current checkout without PLAN_FILE.
+            repo_path = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+            eprintln!(
+                "[execution] document workspace: {} (cwd; pass --workspace to override)",
+                repo_path.display()
+            );
         } else {
             anyhow::bail!(
                 "execution document requires --workspace <dir> or --var PLAN_FILE=<path>"
@@ -3144,15 +3157,24 @@ async fn main() -> Result<()> {
     if let Err(e) = gaviero_core::util::spawn::kill_tree_on_exit() {
         tracing::warn!(
             "could not arm kill-on-exit job object: {e} — \
-             agent subprocesses may outlive a Ctrl+C"
+             Ctrl+C will fall back to Toolhelp process-tree kill"
         );
     }
-    // Ctrl+C → deterministic hard exit. tokio's handler swallows the
-    // console event / SIGINT, so exiting is on us; process death then
-    // triggers the job-object tree kill above. 130 = 128 + SIGINT.
+    // Windows: synchronous SetConsoleCtrlHandler calls TerminateJobObject /
+    // Toolhelp on the ctrl thread. Do **not** also register tokio's
+    // ctrl_c handler here — it is LIFO and would swallow the event before
+    // our handler runs, leaving teardown to an async task that may not be
+    // scheduled promptly (and `process::exit` skips kill_on_drop).
+    // Unix: tokio swallows SIGINT for this process; children in the
+    // foreground group already received SIGINT from the terminal.
+    gaviero_core::util::spawn::install_cli_interrupt_handler();
+    #[cfg(unix)]
     tokio::spawn(async {
         if tokio::signal::ctrl_c().await.is_ok() {
             eprintln!("Interrupted — terminating agent process tree.");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            gaviero_core::util::spawn::terminate_agent_tree();
+            // 130 = 128 + SIGINT
             std::process::exit(130);
         }
     });
@@ -3645,8 +3667,16 @@ async fn main() -> Result<()> {
         let units =
             serde_json::from_str::<Vec<WorkUnit>>(json).context("parsing --work-units JSON")?;
         gaviero_core::swarm::plan::CompiledPlan::from_work_units(units, None)
+    } else if let Some(ref plan_path) = cli.plan {
+        let text = std::fs::read_to_string(plan_path)
+            .with_context(|| format!("reading --plan {}", plan_path.display()))?;
+        let doc: gaviero_core::swarm::plan_document::PlanDocument =
+            serde_json::from_str(&text).context("parsing PlanDocument JSON")?;
+        // Apply memory defaults from the document onto SwarmConfig later via fields on doc;
+        // compiled plan carries fanout/loops.
+        doc.into_compiled()
     } else {
-        anyhow::bail!("Either --task, --work-units, or --script is required");
+        anyhow::bail!("Either --task, --work-units, --script, or --plan is required");
     };
 
     // Apply iteration CLI flags (override DSL / defaults).
@@ -3705,6 +3735,16 @@ async fn main() -> Result<()> {
             );
         }
     }
+
+    // Fail fast on invalid model specs / unresolvable backends before MCP
+    // setup or any agent launch. Pipeline execute repeats this check, but
+    // catching it here avoids spending time on memory/MCP for a doomed plan.
+    gaviero_core::swarm::pipeline::preflight_plan_models(
+        &plan,
+        &execution_model,
+        ollama_base_url.as_deref(),
+    )?;
+    eprintln!("[plan] model preflight ok");
 
     // MCP: synthesize per-worktree provider configs + optional in-process server.
     let mcp_script_vars = swarm_workspace.override_vars.as_deref().unwrap_or(&[]);
@@ -3779,6 +3819,7 @@ async fn main() -> Result<()> {
         swarm_extra_tools,
         extract_agent_findings,
         resume_from_artifacts: !cli.fresh,
+        knowledge_invalidation: None,
     };
 
     // --coordinated: produce a DSL plan file for review, then exit.

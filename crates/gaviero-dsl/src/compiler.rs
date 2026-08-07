@@ -10,6 +10,7 @@ use gaviero_core::types::{FileScope, ModelTier, PrivacyLevel};
 
 use crate::ast::*;
 use crate::error::{DslError, DslErrors};
+use crate::patterns;
 use crate::workflow_params::expand_workflow_params_in_script;
 
 // ── Public types ───────────────────────────────────────────────────────────
@@ -493,6 +494,73 @@ pub fn compile_ast_with_sources(
     plan.loop_configs = loop_configs;
     plan.loop_judge_units = loop_judge_units;
     plan.execution_mode = workflow_execution;
+
+    // Pattern sugar → fanout_ops (map_reduce only in v1).
+    if let Some(wf) = selected_workflow {
+        if let Some(pattern) = &wf.pattern {
+            match patterns::expand_fanout_ops(pattern) {
+                Ok(ops) => {
+                    // Soft-check: discover / reduce agents should exist in the plan.
+                    for op in &ops {
+                        if !agent_map.contains_key(op.after_unit.as_str()) {
+                            let span = match pattern {
+                                PatternDecl::MapReduce(mr) => mr.discover.1,
+                            };
+                            errors.push(DslError::Compile {
+                                src: src_for(wf.file_id),
+                                span: (
+                                    span.start,
+                                    span.end.saturating_sub(span.start).max(1),
+                                )
+                                    .into(),
+                                reason: format!(
+                                    "`pattern map_reduce` discover agent `{}` is not defined",
+                                    op.after_unit
+                                ),
+                            });
+                        }
+                    }
+                    match pattern {
+                        PatternDecl::MapReduce(mr) => {
+                            if !mr.reduce.0.is_empty()
+                                && !agent_map.contains_key(mr.reduce.0.as_str())
+                            {
+                                errors.push(DslError::Compile {
+                                    src: src_for(wf.file_id),
+                                    span: (
+                                        mr.reduce.1.start,
+                                        mr.reduce.1.end.saturating_sub(mr.reduce.1.start).max(1),
+                                    )
+                                        .into(),
+                                    reason: format!(
+                                        "`pattern map_reduce` reduce agent `{}` is not defined",
+                                        mr.reduce.0
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    plan.fanout_ops = ops;
+                }
+                Err(e) => {
+                    errors.push(DslError::Compile {
+                        src: src_for(wf.file_id),
+                        span: (
+                            e.span.start,
+                            e.span.end.saturating_sub(e.span.start).max(1),
+                        )
+                            .into(),
+                        reason: e.reason,
+                    });
+                }
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        return Err(DslErrors::new(errors));
+    }
+
     Ok(plan)
 }
 
@@ -2635,5 +2703,49 @@ mod tests {
 
         // max_parallel preserved
         assert_eq!(plan.max_parallel, Some(2));
+    }
+
+    #[test]
+    fn map_reduce_pattern_emits_fanout_ops() {
+        let src = r#"
+            agent discover { description "write spawn_manifest.json" }
+            agent reduce {
+                description "aggregate"
+                depends_on [discover]
+            }
+            workflow map-reduce {
+                pattern map_reduce {
+                    discover discover
+                    reduce reduce
+                    max_spawn 8
+                }
+                steps [discover reduce]
+            }
+        "#;
+        let plan = compile_plan(src).unwrap();
+        assert_eq!(plan.fanout_ops.len(), 1);
+        assert_eq!(plan.fanout_ops[0].after_unit, "discover");
+        assert_eq!(plan.fanout_ops[0].max_spawn, 8);
+    }
+
+    #[test]
+    fn map_reduce_pattern_defaults_max_spawn() {
+        let src = r#"
+            agent discover { description "d" }
+            agent reduce { description "r" depends_on [discover] }
+            workflow w {
+                pattern map_reduce {
+                    discover discover
+                    reduce reduce
+                }
+                steps [discover reduce]
+            }
+        "#;
+        let plan = compile_plan(src).unwrap();
+        assert_eq!(plan.fanout_ops.len(), 1);
+        assert_eq!(
+            plan.fanout_ops[0].max_spawn,
+            gaviero_core::swarm::plan::DEFAULT_MAX_SPAWN
+        );
     }
 }

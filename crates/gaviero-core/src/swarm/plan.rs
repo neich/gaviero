@@ -106,6 +106,63 @@ pub enum ConsensusMode {
     Explore,
 }
 
+/// Soft cap on workers materialized from one SpawnManifest (v1).
+pub const DEFAULT_MAX_SPAWN: u32 = 16;
+
+/// One worker entry inside a spawn manifest (dynamic fan-out).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpawnWorkerSpec {
+    pub id: String,
+    pub model: String,
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub owned: Vec<String>,
+    #[serde(default)]
+    pub read_only: Vec<String>,
+    #[serde(default)]
+    pub write_ns: Option<String>,
+}
+
+/// JSON document agents write to trigger runtime fan-out.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpawnManifest {
+    #[serde(default = "spawn_manifest_version")]
+    pub version: u32,
+    pub workers: Vec<SpawnWorkerSpec>,
+}
+
+fn spawn_manifest_version() -> u32 {
+    1
+}
+
+/// Plan-level fan-out: after `after_unit` succeeds, materialize workers from
+/// the blackboard SpawnManifest and run them before dependents of the
+/// optional `barrier_id` (defaults to `after_unit`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FanoutOp {
+    /// Work unit that must complete before fan-out runs.
+    pub after_unit: String,
+    /// Max workers to spawn (default [`DEFAULT_MAX_SPAWN`]).
+    #[serde(default = "default_max_spawn")]
+    pub max_spawn: u32,
+    /// Optional default model when a worker omits `model`.
+    #[serde(default)]
+    pub default_model: Option<String>,
+    /// Optional synthetic barrier id that reduce agents `depends_on`.
+    /// Spawned workers are recorded as completing this barrier as a group.
+    #[serde(default)]
+    pub barrier_id: Option<String>,
+}
+
+fn default_max_spawn() -> u32 {
+    DEFAULT_MAX_SPAWN
+}
+
 /// Configuration for an explicit `loop { ... }` block in a workflow.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopConfig {
@@ -165,6 +222,7 @@ fn default_judge_timeout_secs() -> u32 {
 
 /// How a workflow uses the filesystem and git.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ExecutionMode {
     /// Git worktrees (when parallel), branch merge, repo-map and code graph.
     #[default]
@@ -200,6 +258,9 @@ pub struct CompiledPlan {
     pub loop_judge_units: Vec<WorkUnit>,
     /// `execution repo` (default) or `execution document` on the workflow block.
     pub execution_mode: ExecutionMode,
+    /// Runtime fan-out ops: after `after_unit` completes, load a SpawnManifest
+    /// from the blackboard and materialize additional work units (capped).
+    pub fanout_ops: Vec<FanoutOp>,
 }
 
 impl CompiledPlan {
@@ -300,6 +361,7 @@ impl CompiledPlan {
             loop_configs: Vec::new(),
             loop_judge_units: Vec::new(),
             execution_mode: ExecutionMode::default(),
+            fanout_ops: Vec::new(),
         }
     }
 
