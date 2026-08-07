@@ -903,6 +903,11 @@ fn compile_file_scientific_research_default_roster() {
     assert_eq!(plan.loop_configs[0].agent_ids.len(), 3);
     assert_eq!(plan.loop_configs[0].max_iterations, 10);
     assert_eq!(plan.loop_configs[0].iter_start, 2);
+    assert_eq!(plan.max_parallel, Some(5));
+    assert_eq!(
+        plan.execution_mode,
+        gaviero_core::swarm::plan::ExecutionMode::Document
+    );
 }
 
 #[test]
