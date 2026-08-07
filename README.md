@@ -56,7 +56,7 @@ In coordinated mode, model selection is automatic — the coordinator plans, the
 
 ### Workflow scripts
 
-Define reusable multi-agent workflows in `.gaviero` files and run them with `gaviero-cli --script` or `/run` in the TUI. See [crates/gaviero-dsl/README.md](crates/gaviero-dsl/README.md) for the language reference.
+Define reusable multi-agent workflows in `.gaviero` files and run them with `gaviero-cli --script` or `/run` in the TUI. Shipped templates live under [`crates/gaviero-dsl/examples/`](crates/gaviero-dsl/examples/) (e.g. scientific research consensus). See [crates/gaviero-dsl/README.md](crates/gaviero-dsl/README.md) for the language reference.
 
 ## Examples
 
