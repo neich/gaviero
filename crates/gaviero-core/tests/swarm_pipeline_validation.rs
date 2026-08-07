@@ -105,6 +105,7 @@ fn make_config(workspace: &std::path::Path) -> SwarmConfig {
         specificity: SpecificityConfig::default(),
         swarm_extra_tools: vec![],
         extract_agent_findings: false,
+        resume_from_artifacts: false,
     }
 }
 

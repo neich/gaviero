@@ -207,6 +207,7 @@ pub(crate) fn run_swarm(app: &mut App, task_desc: String) {
             specificity,
             swarm_extra_tools,
             extract_agent_findings,
+            resume_from_artifacts: true,
         };
 
         let observer = TuiSwarmObserver { tx: tx.clone() };
@@ -381,6 +382,7 @@ pub(super) fn handle_run_script_command(app: &mut App) {
             specificity,
             swarm_extra_tools,
             extract_agent_findings,
+            resume_from_artifacts: true,
         };
 
         let observer = TuiSwarmObserver { tx: tx.clone() };
@@ -533,6 +535,7 @@ pub(super) fn handle_coordinated_swarm_command(app: &mut App) {
             specificity,
             swarm_extra_tools,
             extract_agent_findings,
+            resume_from_artifacts: true,
         };
 
         let coord_config = coordinator::CoordinatorConfig {

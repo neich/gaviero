@@ -253,6 +253,12 @@ pub trait SwarmObserver: Send + Sync {
 
     // ── Loop lifecycle ──────────────────────────────────────────────
 
+    /// Called once per loop block that resumed from artefacts already on
+    /// disk, before any agent is dispatched. Reports what was detected,
+    /// what will be reused as peer input, and what partial output will be
+    /// overwritten. See [`crate::swarm::loop_resume`].
+    fn on_loop_resumed(&self, _resume: &crate::swarm::loop_resume::LoopResume) {}
+
     /// Called when a loop iteration is about to start.
     ///
     /// `current` is 1-based; `max` is the configured `max_iterations`.

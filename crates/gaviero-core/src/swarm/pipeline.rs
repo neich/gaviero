@@ -13,6 +13,7 @@ use super::bus::AgentBus;
 use super::context_bundle::build_bundle;
 use super::coordinator::{Coordinator, CoordinatorConfig};
 use super::execution_state::{ExecutionState, NodeStatus};
+use super::loop_resume;
 use super::merge;
 use super::models::{AgentManifest, AgentStatus, MergeResult, SwarmResult, WorkUnit};
 use super::plan::{CompiledPlan, ExecutionMode};
@@ -81,6 +82,12 @@ pub struct SwarmConfig {
     /// headless CLI's fallback writer does not, so leave this `false`
     /// there until a CLI extractor LLM is wired). Default `false`.
     pub extract_agent_findings: bool,
+    /// When true (the default for both front ends), a `loop { }` block whose
+    /// `OUT_DIR` already holds versioned artefacts resumes after the newest
+    /// iteration the whole reviewer panel completed, instead of overwriting
+    /// it from `iter_start`. See [`crate::swarm::loop_resume`]. Set `false`
+    /// (CLI `--fresh`) to force a clean run.
+    pub resume_from_artifacts: bool,
 }
 
 /// Execute a swarm of work units from a compiled plan.
@@ -477,13 +484,40 @@ pub async fn execute(
         None
     };
 
+    // ── Artefact-based loop resume ────────────────────────────────────────────
+    // A refine loop's only durable record is the versioned files it writes
+    // under OUT_DIR — the checkpoint in `exec_state` tracks node completion,
+    // not iteration progress. When those artefacts show a fully completed
+    // round, advance the loop's `iter_start` past it so the panel continues
+    // instead of overwriting its own earlier work. `max_iterations` keeps its
+    // meaning: a budget of rounds for *this* run, counted from the new start.
+    let mut effective_loop_configs: Vec<crate::swarm::plan::LoopConfig> =
+        plan.loop_configs.clone();
+    if config.resume_from_artifacts {
+        for lc in effective_loop_configs.iter_mut() {
+            let Some(resume) = loop_resume::detect(&config.workspace_root, lc, &unit_map) else {
+                continue;
+            };
+            tracing::info!("loop resume: {}", resume.summary());
+            for note in &resume.notes {
+                tracing::debug!("loop resume: {}", note);
+            }
+            // Baseline (`<id>-init`) units already have their output on disk;
+            // marking them Completed keeps the tier dispatch from rewriting it.
+            for init_id in &resume.satisfied_init_units {
+                exec_state.set_status(init_id, NodeStatus::Completed);
+            }
+            lc.iter_start = resume.resume_iter_start;
+            observer.on_loop_resumed(&resume);
+        }
+    }
+
     observer.on_phase_changed("running");
 
     // Build a map from loop-agent id → iter_start for first-pass {{ITER}} substitution.
     // Agents that appear in a loop block get {{ITER}}/{{PREV_ITER}} substituted before
     // every dispatch (first pass uses iter_start; subsequent passes increment).
-    let loop_agent_first_iter: std::collections::HashMap<String, u32> = plan
-        .loop_configs
+    let loop_agent_first_iter: std::collections::HashMap<String, u32> = effective_loop_configs
         .iter()
         .flat_map(|lc| {
             lc.agent_ids
@@ -496,8 +530,7 @@ pub async fn execute(
     // entirely inside the loop block (so iteration 1 also runs with the
     // per-iteration branch + chain anchor). The tier dispatch below
     // skips them.
-    let stacked_loop_agents: std::collections::HashSet<String> = plan
-        .loop_configs
+    let stacked_loop_agents: std::collections::HashSet<String> = effective_loop_configs
         .iter()
         .filter(|lc| {
             matches!(
@@ -517,8 +550,7 @@ pub async fn execute(
     // execute_module's loop iterations 2..N actually run, so test_audit sees
     // an empty workspace state. The deferral makes "depends on a loop body
     // agent" mean "depends on the loop body having fully iterated".
-    let loop_body_agents: std::collections::HashSet<String> = plan
-        .loop_configs
+    let loop_body_agents: std::collections::HashSet<String> = effective_loop_configs
         .iter()
         .flat_map(|lc| lc.agent_ids.iter().cloned())
         .collect();
@@ -857,7 +889,7 @@ pub async fn execute(
     }
 
     // 3b. Execute explicit loops (re-run loop agents until condition met)
-    for loop_config in &plan.loop_configs {
+    for loop_config in &effective_loop_configs {
         // First iteration was already executed in the tier loop above.
         // Now check the condition and re-iterate if needed.
         //
