@@ -29,6 +29,14 @@
 //
 // Roster entry format: `id=provider:model[@effort]` (comma-separated).
 // Each `id` becomes {{REVIEWER_ID}} in artefact paths under {{OUT_DIR}}/.
+//
+// Resuming: re-running the same command against an {{OUT_DIR}} that
+// already holds artefacts continues the panel instead of overwriting it.
+// The runtime takes the newest `-v<N>` every reviewer completed, resumes
+// at N+1 (so {{PREV_ITER}} = N), and re-runs any round only some
+// reviewers finished. `max_iterations` is the budget for the new run,
+// counted from the resumed start. Pass `--fresh` to restart at
+// `iter_start` and overwrite what is there.
 
 
 vars {
