@@ -109,6 +109,17 @@ impl ScrollState {
         self.pending_focus = true;
     }
 
+    /// Restore a previously captured cursor + offset after the list was
+    /// rebuilt underneath it. Unlike `set_selected`, the offset the user
+    /// scrolled to is kept as-is: the next render must not re-pin it to the
+    /// selection, or a background rebuild would jump the view.
+    pub fn restore_position(&mut self, selected: usize, offset: usize, item_count: usize) {
+        let last = item_count.saturating_sub(1);
+        self.selected = selected.min(last);
+        self.offset = offset.min(last);
+        self.pending_focus = false;
+    }
+
     /// Clamp `selected` and `offset` to a list of `item_count` items.
     #[allow(dead_code)] // exercised by tests; reserved for list-panel paging
     pub fn clamp(&mut self, item_count: usize) {

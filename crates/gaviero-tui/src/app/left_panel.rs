@@ -639,10 +639,9 @@ pub(super) fn refresh_file_tree(app: &mut App) {
     let config_roots = app.workspace.config_roots();
     let mut roots: Vec<&std::path::Path> = config_roots.iter().map(|p| p.as_path()).collect();
     roots.extend(app.workspace.roots());
-    let expanded = app.file_tree.expanded_paths();
-    let selected = app.file_tree.scroll.selected;
+    // A filesystem event can land while the user is in another window (or
+    // another mux pane); the rebuild must come back looking untouched.
+    let view = app.file_tree.view_state();
     app.file_tree = FileTreeState::from_roots(&roots, &excludes, &git_allow);
-    app.file_tree.restore_expanded(&expanded);
-    let count = app.file_tree.entries.len();
-    app.file_tree.scroll.set_selected(selected, count);
+    app.file_tree.restore_view(view);
 }
