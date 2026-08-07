@@ -61,6 +61,14 @@ enum WorkflowField {
     EscalateAfter(u32, Span),
     Verify(VerifyBlock),
     Param(ParamDecl),
+    Pattern(PatternDecl),
+}
+
+#[derive(Debug)]
+enum MapReduceField {
+    Discover(String, Span),
+    Reduce(String, Span),
+    MaxSpawn(u32, Span),
 }
 
 #[derive(Debug)]
@@ -150,6 +158,7 @@ where
         Token::KwDepth      => "depth".to_owned(),
         // vars contextual keyword
         Token::KwVars       => "vars".to_owned(),
+        Token::KwPattern    => "pattern".to_owned(),
     };
 
     let string = select! {
@@ -990,6 +999,57 @@ where
             })
         });
 
+    // ── pattern map_reduce { discover … reduce … max_spawn … } ───
+    //
+    // Field names are Ident-matched (not reserved keywords) so agents may
+    // still be named `discover` / `reduce`. Only `pattern` is a keyword.
+    let map_reduce_field = choice((
+        select! { Token::Ident(s) if s == "discover" => () }
+            .ignore_then(ident.map_with(|n, e| (n, e.span())))
+            .map(|(n, s)| MapReduceField::Discover(n, s)),
+        select! { Token::Ident(s) if s == "reduce" => () }
+            .ignore_then(ident.map_with(|n, e| (n, e.span())))
+            .map(|(n, s)| MapReduceField::Reduce(n, s)),
+        select! { Token::Ident(s) if s == "max_spawn" => () }
+            .ignore_then(integer.map_with(|n, e| (n, e.span())))
+            .map(|(n, s)| MapReduceField::MaxSpawn(n as u32, s)),
+    ));
+
+    let pattern_block = just(Token::KwPattern)
+        .ignore_then(select! { Token::Ident(s) if s == "map_reduce" => () })
+        .ignore_then(
+            map_reduce_field
+                .repeated()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::LBrace), just(Token::RBrace)),
+        )
+        .map_with(|fields, e| {
+            let mut discover = None;
+            let mut reduce = None;
+            let mut max_spawn = None;
+            for f in fields {
+                match f {
+                    MapReduceField::Discover(n, s) => {
+                        discover.get_or_insert((n, s));
+                    }
+                    MapReduceField::Reduce(n, s) => {
+                        reduce.get_or_insert((n, s));
+                    }
+                    MapReduceField::MaxSpawn(n, s) => {
+                        max_spawn.get_or_insert((n, s));
+                    }
+                }
+            }
+            // Missing required fields are reported as empty names; the
+            // patterns expander / compiler emits a proper diagnostic.
+            PatternDecl::MapReduce(MapReducePattern {
+                discover: discover.unwrap_or_else(|| (String::new(), e.span())),
+                reduce: reduce.unwrap_or_else(|| (String::new(), e.span())),
+                max_spawn,
+                span: e.span(),
+            })
+        });
+
     let workflow_field = choice((
         param_decl,
         just(Token::KwSteps)
@@ -1023,6 +1083,7 @@ where
             .ignore_then(integer.map_with(|n, e| (n, e.span())))
             .map(|(n, s)| WorkflowField::EscalateAfter(n as u32, s)),
         verify_block.map(WorkflowField::Verify),
+        pattern_block.map(WorkflowField::Pattern),
     ));
 
     let workflow_decl = just(Token::KwWorkflow)
@@ -1045,6 +1106,7 @@ where
             let mut escalate_after = None;
             let mut verify = None;
             let mut params: Vec<ParamDecl> = Vec::new();
+            let mut pattern = None;
             for f in fields {
                 match f {
                     WorkflowField::Steps(v, s) => {
@@ -1080,6 +1142,9 @@ where
                     WorkflowField::Param(p) => {
                         params.push(p);
                     }
+                    WorkflowField::Pattern(p) => {
+                        pattern.get_or_insert(p);
+                    }
                 }
             }
             WorkflowDecl {
@@ -1096,6 +1161,7 @@ where
                 escalate_after,
                 verify,
                 params,
+                pattern,
                 span: e.span(),
                 file_id: 0,
             }
