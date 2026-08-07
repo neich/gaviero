@@ -903,6 +903,11 @@ fn compile_file_scientific_research_default_roster() {
     assert_eq!(plan.loop_configs[0].agent_ids.len(), 3);
     assert_eq!(plan.loop_configs[0].max_iterations, 10);
     assert_eq!(plan.loop_configs[0].iter_start, 2);
+    assert_eq!(plan.max_parallel, Some(5));
+    assert_eq!(
+        plan.execution_mode,
+        gaviero_core::swarm::plan::ExecutionMode::Document
+    );
 }
 
 #[test]
@@ -942,45 +947,6 @@ fn compile_file_scientific_research_param_roster_override_to_two() {
         "cursor should be absent after override, got {ids:?}"
     );
     assert_eq!(plan.loop_configs[0].agent_ids.len(), 2);
-}
-
-#[test]
-fn compile_file_scientific_plan_refinement_default_roster() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("examples/scientific_plan_refinement.gaviero");
-    let plan = gaviero_dsl::compile_file(
-        &path,
-        Some("scientific-plan-refinement"),
-        Some("sparse attention study"),
-        &[],
-        &[],
-        &[],
-    )
-    .expect("scientific_plan_refinement default roster should compile");
-    let ids: Vec<String> = plan
-        .work_units_unordered()
-        .into_iter()
-        .map(|u| u.id.clone())
-        .collect();
-    // Default roster: Claude + Codex + Cursor (own models).
-    for prefix in &["claude", "codex", "cursor"] {
-        assert!(
-            ids.iter().any(|id| id == &format!("{prefix}-init")),
-            "missing {prefix}-init in {ids:?}"
-        );
-        assert!(
-            ids.iter().any(|id| id == &format!("{prefix}-refine")),
-            "missing {prefix}-refine in {ids:?}"
-        );
-    }
-    assert_eq!(plan.loop_configs.len(), 1);
-    assert_eq!(plan.loop_configs[0].agent_ids.len(), 3);
-    assert_eq!(plan.loop_configs[0].max_iterations, 8);
-    assert_eq!(plan.max_parallel, Some(4));
-    assert_eq!(
-        plan.execution_mode,
-        gaviero_core::swarm::plan::ExecutionMode::Document
-    );
 }
 
 #[test]

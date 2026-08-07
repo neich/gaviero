@@ -1,22 +1,33 @@
 // Template: iterative scientific-research consensus with a variable
-// roster of providers.
+// roster of providers. One panel shape, two uses:
+//
+//   - de-novo research: the anchor file is a *problem statement*
+//     (data references, prior results, constraints, success criteria);
+//   - research-plan refinement: the anchor file is a *draft research
+//     plan* whose hypotheses, methodology, evidence bars, milestones,
+//     and stopping rules the panel strengthens.
+//
+// This file supersedes scientific_plan_refinement.gaviero — the prompts
+// tell reviewers to detect which kind of anchor they were given; the
+// artefact contract is identical either way.
 //
 // Shape:
 //
 //   Phase 1 (parallel, one per reviewer): each reviewer reads the
-//     problem file ({{PROBLEM_FILE}}) plus any optional local material
+//     anchor document ({{PLAN_FILE}}) plus any optional local material
 //     under {{DATA_DIR}} / {{LOCAL_LIT_DIR}}, performs extensive
-//     independent literature research via web tools, and writes
-//     (a) a conclusion document and (b) an evidence log. Reviewers do
-//     NOT read each other's work in this phase — the point is an
-//     independent baseline.
+//     independent literature research (Semantic Scholar MCP and/or web
+//     tools — see "Research channels"), and writes (a) a conclusion
+//     document and (b) an evidence log. Reviewers do NOT read each
+//     other's work in this phase — the point is an independent
+//     baseline.
 //
 //   Phase 2 (loop up to 10): each reviewer reads every peer's prior
-//     conclusion + summary + evidence, performs ADDITIONAL targeted web
-//     research, and writes a new conclusion, comparison summary, and
-//     evidence log. After each pass `convergence-judge` (sonnet)
-//     classifies the iteration; the loop exits on PASS after `stability`
-//     consecutive passes, or hits `max_iterations 10`.
+//     conclusion + summary + evidence, performs ADDITIONAL targeted
+//     literature research, and writes a new conclusion, comparison
+//     summary, and evidence log. After each pass `convergence-judge`
+//     (sonnet) classifies the iteration; the loop exits on PASS after
+//     `stability` consecutive passes, or hits `max_iterations 10`.
 //
 // Execution mode:
 //
@@ -32,31 +43,70 @@
 //   prefixed with its own {{REVIEWER_ID}}, so the scope enforcer keeps
 //   concurrent writes disjoint. Never drop that id prefix.
 //
-//   Omit `--repo` entirely — the CLI rejects it for document
-//   workflows. `--workspace <dir>` sets the shared write root; without
-//   it the CLI falls back to the current directory. {{PROBLEM_FILE}}
-//   and {{OUT_DIR}} are relative to whichever root is chosen.
+// Anchoring (two ways to run — omit `--repo` in both):
+//
+//   With `--workspace <dir>` (research layout): {{PLAN_FILE}} and
+//   {{OUT_DIR}} are relative to that directory; artefacts collect
+//   under {{OUT_DIR}} (default `research/`).
+//
+//   With `--var PLAN_FILE=/abs/path.md` and no `--workspace`
+//   (plan-refinement layout): gaviero-cli special-cases the PLAN_FILE
+//   var name — it anchors the workspace to the plan's folder and
+//   defaults OUT_DIR there, so the versioned panel artefacts land
+//   alongside the plan. Pass `--var OUT_DIR=...` to redirect them.
+//
+// Research channels:
+//
+//   Reviewers prefer the operator-configured Semantic Scholar MCP
+//   server (id {{SEMANTIC_SCHOLAR_SERVER}}) when one is available and
+//   use WebSearch/WebFetch when ENABLE_WEB_FALLBACK=true (the default)
+//   or when no MCP server is configured. Set
+//   `--var ENABLE_WEB_FALLBACK=false` for an MCP-only panel; a
+//   reviewer left without any working channel must say so in its
+//   evidence log and rely on local material.
+//
+//   Configure the MCP server any one of these ways:
+//     --mcp-url semantic-scholar=URL
+//     --var SEMANTIC_SCHOLAR_MCP_URL=URL
+//     a server entry in <workspace>/.cursor/mcp.json (gaviero-cli
+//     imports it).
+//   (Wuilder URLs need a trailing slash; gaviero-cli adds it for
+//   mcp.wuilder.com.) Cursor agents get `--approve-mcps` and
+//   `--sandbox disabled` plus `.cursor/cli.json` network/MCP
+//   allowlists when a remote Semantic Scholar URL is configured; the
+//   synthesized Cursor `.cursor/mcp.json` omits context7 (npx) so the
+//   remote server can register. Agents call tools by server id
+//   `{{SEMANTIC_SCHOLAR_SERVER}}` (default `semantic-scholar`).
 //
 // Roster:
 //
 //   The reviewer panel is a workflow parameter — supplied via
 //   `--param roster=...`. The in-script default below runs a
 //   three-provider frontier panel at maximum research depth:
-//   Claude Opus + Codex GPT-5.6 Sol + Cursor Grok 4.5 Sol, all at
-//   `xhigh` effort. Each roster entry is `id=provider:model[@effort]`;
-//   the id becomes the filename prefix and the model + effort bind the
-//   cloned reviewer agent to an anonymous client. Use distinct ids per
-//   reviewer.
+//   Claude Opus + Codex GPT-5.6 Sol + Cursor Grok 4.5. Each roster
+//   entry is `id=provider:model[@effort]`; the id becomes the filename
+//   prefix and the model + effort bind the cloned reviewer agent to an
+//   anonymous client. Use distinct ids per reviewer.
 //
-//   The judge stays on `claude:sonnet` at `medium` — it only classifies
-//   summaries against a fixed rubric and runs once per iteration, so
-//   raising its effort multiplies cost without improving the verdict.
+//   Cursor note: the Cursor backend does not forward `effort`;
+//   reasoning depth rides on the model id itself. `cursor:grok-4.5`
+//   is the canonical id (see clients.gaviero) — check variants with
+//   `agent --list-models` before inventing suffixes.
+//
+//   The judge stays on `claude:sonnet` at `medium` — it only
+//   classifies summaries against a fixed rubric and runs once per
+//   iteration, so raising its effort multiplies cost without
+//   improving the verdict.
 //
 // Files written per iteration N (N=1 for init, N=2..11 for refinement):
 //
 //   {{OUT_DIR}}/<id>-conclusion-v{N}.md      (init + every refine pass)
 //   {{OUT_DIR}}/<id>-summary-v{N}.md         (refine only — iteration metadata)
 //   {{OUT_DIR}}/<id>-evidence-v{N}.md        (init + every refine pass — audit log)
+//
+//   Artefacts are write-once: create each versioned file exactly once,
+//   read it later, never overwrite a prior version. They are scratch
+//   outputs, not meant to be committed.
 //
 // Conclusion / summary / evidence contract:
 //   - conclusion: standalone hand-off document. No peer ids, no
@@ -69,17 +119,25 @@
 //     escalation and for the human handoff at the end.
 //
 // Inputs (set via --var):
-//   PROBLEM_FILE  — markdown file with the problem statement, data
-//                   references, prior results, and success criteria.
-//                   The {{PROMPT}} CLI argument is treated as a short
-//                   topic title; the substantive description lives in
-//                   this file so every reviewer anchors to the same
-//                   source of truth. (default: research_problem.md)
-//   OUT_DIR       — directory for all generated files. (default: research)
+//   PLAN_FILE     — the anchor document: a problem statement or a
+//                   draft research plan (see above). The {{PROMPT}}
+//                   CLI argument is treated as a short topic title;
+//                   the substantive description lives in this file so
+//                   every reviewer anchors to the same source of
+//                   truth. (default: research_problem.md)
+//   OUT_DIR       — directory for all generated files. (default:
+//                   research; plan-anchored runs default it to the
+//                   plan's own folder instead)
 //   DATA_DIR      — optional local data directory, read-only for every
 //                   reviewer. May be empty or non-existent. (default: data)
 //   LOCAL_LIT_DIR — optional local literature directory, read-only for
 //                   every reviewer. May be empty. (default: literature)
+//   SEMANTIC_SCHOLAR_SERVER  — MCP server id agents call tools on.
+//                   (default: semantic-scholar)
+//   SEMANTIC_SCHOLAR_MCP_URL — remote MCP URL for operator setup; may
+//                   also come from --mcp-url or .cursor/mcp.json.
+//   ENABLE_WEB_FALLBACK — allow WebSearch/WebFetch. (default: true;
+//                   set false for an MCP-only panel)
 //
 // Cost note:
 //   Multiple frontier providers x up to 10 refinement passes plus init
@@ -109,50 +167,56 @@
 //   counted from the resumed start. A round that only some reviewers
 //   finished is discarded and re-run in full. Pass `--fresh` to ignore
 //   what is on disk and restart the panel from `iter_start` instead;
-//   use a new `--var OUT_DIR=...` when the {{PROBLEM_FILE}} or roster
+//   use a new `--var OUT_DIR=...` when the {{PLAN_FILE}} or roster
 //   changed, since those artefacts answer a different question.
 //
 // Usage:
 //
-//   Document mode: omit `--repo`. `--workspace` is optional (defaults
-//   to the current directory); PROBLEM_FILE and OUT_DIR are relative
-//   to that root.
-//
-//   Default 3-provider panel:
+//   Research mode — default 3-provider panel:
 //     gaviero-cli --script crates/gaviero-dsl/examples/scientific_research.gaviero \
 //       --workflow scientific-research-consensus \
 //       --workspace /path/to/research-workspace \
 //       --prompt "Short topic title for logs" \
-//       --var PROBLEM_FILE=research_problem.md \
+//       --var PLAN_FILE=research_problem.md \
 //       --var OUT_DIR=research
+//
+//   Plan-refinement mode — no --workspace; artefacts land next to the plan:
+//     gaviero-cli --script crates/gaviero-dsl/examples/scientific_research.gaviero \
+//       --workflow scientific-research-consensus \
+//       --prompt "Sparse attention mechanisms" \
+//       --var PLAN_FILE=/path/to/draft-research-plan.md \
+//       --var SEMANTIC_SCHOLAR_MCP_URL=https://YOUR-MCP-ENDPOINT/ \
+//       --mcp-codex-trust granted
 //
 //   Custom 2-provider panel:
 //     gaviero-cli --script crates/gaviero-dsl/examples/scientific_research.gaviero \
 //       --workflow scientific-research-consensus \
 //       --workspace /path/to/research-workspace \
 //       --prompt "Short topic title for logs" \
-//       --var PROBLEM_FILE=research_problem.md \
 //       --param roster=claude=claude:opus@xhigh,codex=codex:gpt-5.6-sol@xhigh
 
 // ── Shared configuration ──────────────────────────────────────────────────────
 //
-// PROBLEM_FILE: external problem statement. {{PROMPT}} from the CLI is
+// PLAN_FILE: the external anchor document. {{PROMPT}} from the CLI is
 // the short title; the substantive description lives in this file.
 //
 // DATA_DIR / LOCAL_LIT_DIR: optional local context. When the directories
-// don't exist or are empty, agents fall back to web research + the
-// problem file. The defaults match the conventional layout but are
-// fully overridable.
+// don't exist or are empty, agents fall back to literature research +
+// the anchor. The defaults match the conventional layout but are fully
+// overridable.
 //
 // INIT_VER: the version written by the init phase; read by the first
 // loop pass as PREV_ITER (iter_start 2 -> PREV_ITER=1 on iteration 1).
 
 vars {
-    OUT_DIR       "research"
-    INIT_VER      "1"
-    PROBLEM_FILE  "research_problem.md"
-    DATA_DIR      "data"
-    LOCAL_LIT_DIR "literature"
+    OUT_DIR                   "research"
+    INIT_VER                  "1"
+    PLAN_FILE                 "research_problem.md"
+    DATA_DIR                  "data"
+    LOCAL_LIT_DIR             "literature"
+    SEMANTIC_SCHOLAR_SERVER   "semantic-scholar"
+    SEMANTIC_SCHOLAR_MCP_URL  ""
+    ENABLE_WEB_FALLBACK       "true"
 }
 
 // ── Prompts ───────────────────────────────────────────────────────────────────
@@ -171,19 +235,32 @@ prompt init-body #"
     You are an independent senior scientific research strategist.
 
     Short topic title: {{PROMPT}}
-    Full problem statement: {{PROBLEM_FILE}}
+    Anchor document: {{PLAN_FILE}}
+
+    Research channels:
+      - Semantic Scholar MCP server id: {{SEMANTIC_SCHOLAR_SERVER}}
+        (operator-configured; remote URL when set: {{SEMANTIC_SCHOLAR_MCP_URL}})
+      - Web fallback (WebSearch/WebFetch) enabled: {{ENABLE_WEB_FALLBACK}}
 
     Optional local material:
       - Data:              {{DATA_DIR}}/
       - Local literature:  {{LOCAL_LIT_DIR}}/
     These directories may not exist or may be empty — treat them as
-    optional. When absent, focus on web research and the problem file.
+    optional. When absent, focus on literature research and the anchor.
 
-    1. Read {{PROBLEM_FILE}} in full. Treat it as the authoritative
-       description of the endeavour — the available data, the existing
-       results, the constraints, and what success looks like. Do NOT
-       paraphrase loosely; every downstream conclusion you draw must
-       trace back to something in that file.
+    1. Read {{PLAN_FILE}} in full. Treat it as the authoritative
+       description of the endeavour and decide which kind of anchor
+       it is:
+         - a *problem statement* (available data, existing results,
+           constraints, what success looks like): build the research
+           programme from it;
+         - a *draft research plan* (it already proposes hypotheses,
+           methodology, milestones): treat your conclusion as that
+           plan's refined successor — strengthen its hypotheses,
+           methodology, evidence bars, milestones, and stopping rules
+           rather than answering from scratch.
+       Either way, do NOT paraphrase loosely; every downstream
+       conclusion you draw must trace back to something in that file.
 
     2. Inspect {{DATA_DIR}}/ and {{LOCAL_LIT_DIR}}/ for relevant local
        material. Treat any local data as evidence to be characterised,
@@ -192,11 +269,14 @@ prompt init-body #"
     3. Do NOT read any peer outputs (other reviewers' conclusion /
        summary / evidence files) under {{OUT_DIR}}/. This is the
        independent first pass; peer analyses arrive only in the refine
-       phase. Reading {{PROBLEM_FILE}} is fine even when it lives
+       phase. Reading {{PLAN_FILE}} is fine even when it lives
        inside {{OUT_DIR}}/.
 
-    4. Conduct EXTENSIVE current web research using every web search
-       and fetch tool available to you. Prioritise:
+    4. Conduct EXTENSIVE current literature research. Prefer the
+       Semantic Scholar MCP server ({{SEMANTIC_SCHOLAR_SERVER}}) when
+       its tools are available; use WebSearch/WebFetch when
+       ENABLE_WEB_FALLBACK=true (current: {{ENABLE_WEB_FALLBACK}}) or
+       when no MCP server is configured. Prioritise:
          - peer-reviewed papers, preprints, datasets, benchmarks,
            standards, and reputable technical reports;
          - literature from the last 24–36 months when the field is
@@ -216,20 +296,29 @@ prompt init-body #"
     5. Think from first principles AFTER the research, not before. The
        literature constrains what's been tried and what failed;
        first-principles thinking constrains what's plausible under the
-       {{PROBLEM_FILE}} constraints. Combine them.
+       {{PLAN_FILE}} constraints. Combine them.
 
     Hard rules:
       - Be critical, honest, and specific. State your real best
         assessment, including where you think the problem may be
         ill-posed or where the available data is likely insufficient.
       - Distinguish what is known from what is inferred.
-      - Do NOT invent citations, datasets, or results. If web tools are
-        unavailable, state that explicitly in the evidence log and rely
-        only on local material.
+      - Do NOT invent citations, datasets, or results. If no research
+        channel is available, state that explicitly in the evidence
+        log and rely only on local material.
       - Do NOT optimise for agreement; optimise for truth and for
         useful next research actions.
+      - The scientific topic has no relationship to whatever
+        repository or folder hosts this run unless the anchor itself
+        says so — do not read or search the host checkout beyond the
+        inputs listed above.
+      - Do NOT produce an implementation roadmap (no code modules,
+        PR phases, or software-project decomposition) — this holds
+        for draft-plan anchors too.
 
-    Write TWO files.
+    Write TWO files. Create each exactly once with the version suffix
+    below; never edit or overwrite a file from a prior iteration or
+    peer.
 
     File 1 — the conclusion:
       {{OUT_DIR}}/{{REVIEWER_ID}}-conclusion-v{{INIT_VER}}.md
@@ -264,7 +353,8 @@ prompt init-body #"
       - `## Research limitations`
 
     Requirements for File 2:
-      - List the search queries and discovery paths used.
+      - List the search queries, Semantic Scholar MCP tool calls, and
+        discovery paths used.
       - For each source, include title, authors (when available),
         venue/source, year/date, URL or DOI, and the specific claim it
         supports or weakens.
@@ -280,16 +370,20 @@ prompt refine-body #"
     You are refining your independent scientific research conclusion.
 
     Short topic title: {{PROMPT}}
-    Full problem statement: {{PROBLEM_FILE}}
+    Anchor document: {{PLAN_FILE}}
     Optional local material: {{DATA_DIR}}/ and {{LOCAL_LIT_DIR}}/
+
+    Research channels:
+      - Semantic Scholar MCP server id: {{SEMANTIC_SCHOLAR_SERVER}}
+      - Web fallback (WebSearch/WebFetch) enabled: {{ENABLE_WEB_FALLBACK}}
 
     There are {{PEER_COUNT}} other reviewers in this iteration: {{PEER_IDS}}.
     Your reviewer id is {{REVIEWER_ID}}.
 
     Inputs to read this pass:
 
-    1. Re-read {{PROBLEM_FILE}} in full. The problem statement is the
-       anchor — every conclusion must trace back to a constraint,
+    1. Re-read {{PLAN_FILE}} in full. The anchor is the source of
+       truth — every conclusion must trace back to a constraint,
        datum, or goal listed there.
 
     2. Read your own previous work:
@@ -308,8 +402,10 @@ prompt refine-body #"
        generated list above shows conclusion + summary; the evidence
        log lives under the same `-evidence-v{{PREV_ITER}}.md` suffix.)
 
-    4. Conduct ADDITIONAL targeted web research this iteration. Do NOT
-       merely repeat the searches from the previous pass. Specifically:
+    4. Conduct ADDITIONAL targeted literature research this iteration
+       through the same channels (Semantic Scholar MCP first; web
+       tools per the fallback rules above). Do NOT merely repeat the
+       searches from the previous pass. Specifically:
          - Read primary sources peers cited that you did not. If a peer
            grounds a claim in a paper outside your prior bibliography,
            fetch and read that paper before evaluating their argument.
@@ -365,7 +461,9 @@ prompt refine-body #"
            changes needed to close the actual gaps — do not invent
            additional refinements beyond what the disagreements demand.
 
-    Outputs to write this pass — THREE files.
+    Outputs to write this pass — THREE files. Write NEW versioned
+    paths for this iteration only (`-v{{ITER}}`); never modify files
+    from earlier iterations (including your own).
 
     7. The conclusion:
        {{OUT_DIR}}/{{REVIEWER_ID}}-conclusion-v{{ITER}}.md
@@ -454,8 +552,8 @@ prompt refine-body #"
          - `## Research limitations`
 
        Requirements:
-         - Include the search queries and discovery paths used this
-           iteration.
+         - Include the search queries, Semantic Scholar MCP tool
+           calls, and discovery paths used this iteration.
          - For each source, include title, authors (when available),
            venue/source, year/date, URL or DOI, and the specific
            claim it supports or weakens.
@@ -466,8 +564,8 @@ prompt judge-body #"
     You are deciding whether a panel of independently refined scientific
     research conclusions has reached consensus for:
 
-    Topic:             {{PROMPT}}
-    Problem statement: {{PROBLEM_FILE}}
+    Topic:           {{PROMPT}}
+    Anchor document: {{PLAN_FILE}}
 
     {{ITER_EVIDENCE}}
 
@@ -555,6 +653,10 @@ prompt judge-body #"
 //   - Refine clones additionally get {{PEER_IDS}}, {{PEER_COUNT}}, and
 //     {{PEER_READ_BLOCK}} substituted for cross-reviewer prompting.
 //
+// The `tools` list covers the web fallback channel only; Semantic
+// Scholar arrives through the MCP configuration (see header), not
+// through this list.
+//
 // Init agents deliberately do NOT have {{OUT_DIR}}/ in their read_only
 // scope — they form an independent baseline and the prompt forbids
 // reading peer outputs. Refine agents do read {{OUT_DIR}}/.
@@ -569,7 +671,7 @@ agent reviewer-init {
             "{{OUT_DIR}}/{{REVIEWER_ID}}-evidence-v*.md"
         ]
         read_only [
-            "{{PROBLEM_FILE}}"
+            "{{PLAN_FILE}}"
             "{{DATA_DIR}}/"
             "{{LOCAL_LIT_DIR}}/"
         ]
@@ -589,7 +691,7 @@ agent reviewer-refine {
             "{{OUT_DIR}}/{{REVIEWER_ID}}-evidence-v*.md"
         ]
         read_only [
-            "{{PROBLEM_FILE}}"
+            "{{PLAN_FILE}}"
             "{{DATA_DIR}}/"
             "{{LOCAL_LIT_DIR}}/"
             "{{OUT_DIR}}/"
@@ -601,7 +703,7 @@ agent reviewer-refine {
         write_ns   "scientific-research-consensus"
         importance 0.8
         write_content #"
-            Scientific research refinement for {{PROMPT}} anchored to {{PROBLEM_FILE}}.
+            Scientific research refinement for {{PROMPT}} anchored to {{PLAN_FILE}}.
         "#
     }
 }
@@ -610,7 +712,7 @@ agent convergence-judge {
     description "Judge consensus across reviewer panel: {{PROMPT}}"
     client judge
     scope {
-        read_only ["{{OUT_DIR}}/" "{{PROBLEM_FILE}}"]
+        read_only ["{{OUT_DIR}}/" "{{PLAN_FILE}}"]
     }
     prompt judge-body
     max_retries 1
@@ -621,11 +723,12 @@ agent convergence-judge {
 // The `roster` workflow parameter binds the loop's `reviewers` slot to
 // a list of provider entries. Override entirely from the CLI:
 //
-//   --param roster=claude=claude:opus@xhigh,codex=codex:gpt-5.6-sol@xhigh,cursor=cursor:grok-4.5-sol@xhigh
+//   --param roster=claude=claude:opus@xhigh,codex=codex:gpt-5.6-sol@xhigh,cursor=cursor:grok-4.5@xhigh
 //
 // The in-script default below runs that same three-provider frontier
-// panel (Claude Opus + Codex GPT-5.6 Sol + Cursor Grok 4.5 Sol, all at
-// `xhigh`) so the example works with no flag.
+// panel (Claude Opus + Codex GPT-5.6 Sol + Cursor Grok 4.5) so the
+// example works with no flag. The Cursor entry's `effort` is a no-op —
+// the Cursor backend does not forward it (see header roster note).
 //
 // `execution_mode document` (see header) is declared on this workflow:
 // refine agents must read peer artefacts under {{OUT_DIR}}/, which
@@ -676,9 +779,9 @@ workflow scientific-research-consensus {
         effort medium
     }
     param roster [
-        { id "claude" model "claude:opus"        effort xhigh }
-        { id "codex"  model "codex:gpt-5.6-sol"  effort xhigh }
-        { id "cursor" model "cursor:grok-4.5-high" effort xhigh }
+        { id "claude" model "claude:opus"       effort xhigh }
+        { id "codex"  model "codex:gpt-5.6-sol" effort xhigh }
+        { id "cursor" model "cursor:grok-4.5"   effort xhigh }
     ]
 
     steps [

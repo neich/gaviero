@@ -9,7 +9,7 @@ cargo test -p gaviero-dsl
 cargo clippy -p gaviero-dsl
 ```
 
-Examples: **10** workflows + **3** tier profiles (`doc-claude`, `doc-codex`, `doc-cursor`) under [`examples/`](examples/).
+Examples: **9** workflows + **3** tier profiles (`doc-claude`, `doc-codex`, `doc-cursor`) under [`examples/`](examples/).
 
 ## Architecture
 
