@@ -117,6 +117,16 @@ struct Cli {
     #[arg(long)]
     resume: bool,
 
+    /// Ignore artefacts already present in a `loop` block's `OUT_DIR` and
+    /// restart every loop at the `iter_start` its script declares.
+    ///
+    /// By default a consensus loop whose `OUT_DIR` already holds a complete
+    /// versioned round (e.g. `<id>-refine-plan-v3.md` for every reviewer)
+    /// continues at the next iteration instead of overwriting it. Pass
+    /// `--fresh` to start the panel over — existing files are then replaced.
+    #[arg(long)]
+    fresh: bool,
+
     /// Maximum inner-loop retries per attempt (iteration mode).
     #[arg(long, default_value = "5")]
     max_retries: u32,
@@ -682,6 +692,29 @@ impl SwarmObserver for CliSwarmObserver {
             unit_id,
             backend,
             format!("{:?}", tier).to_lowercase()
+        );
+    }
+
+    fn on_loop_resumed(&self, resume: &gaviero_core::swarm::loop_resume::LoopResume) {
+        eprintln!(
+            "[resume] {} — found complete iteration v{} from {} reviewer(s): {}",
+            resume.out_dir,
+            resume.last_complete_iter,
+            resume.reviewers.len(),
+            resume.reviewers.join(", ")
+        );
+        for path in &resume.reused {
+            eprintln!("[resume]   reuse   {}", path);
+        }
+        for path in &resume.discarded {
+            eprintln!("[resume]   discard {} (partial round)", path);
+        }
+        for note in &resume.notes {
+            eprintln!("[resume]   note    {}", note);
+        }
+        eprintln!(
+            "[resume] continuing at iteration {} (script declared iter_start {}); pass --fresh to restart",
+            resume.resume_iter_start, resume.original_iter_start
         );
     }
 
@@ -3745,6 +3778,7 @@ async fn main() -> Result<()> {
         specificity,
         swarm_extra_tools,
         extract_agent_findings,
+        resume_from_artifacts: !cli.fresh,
     };
 
     // --coordinated: produce a DSL plan file for review, then exit.
