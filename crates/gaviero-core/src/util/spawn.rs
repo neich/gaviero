@@ -138,6 +138,17 @@ pub fn isolate_console_std(cmd: &mut std::process::Command) {
 #[cfg(not(windows))]
 pub fn isolate_console_std(_cmd: &mut std::process::Command) {}
 
+/// Windows job-object handle for the CLI process tree (`0` = unarmed).
+/// Stored so Ctrl+C can [`TerminateJobObject`](terminate_agent_tree) instead
+/// of relying solely on handle-close-at-exit (and so we still tear down
+/// when `std::process::exit` skips `kill_on_drop` Drop glue).
+#[cfg(windows)]
+static JOB_HANDLE: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// Arm state: 0 = idle, 1 = armed, 2 = failed (do not retry).
+#[cfg(windows)]
+static JOB_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 /// Terminate every descendant process when this process exits — however
 /// it exits (Windows).
 ///
@@ -146,11 +157,9 @@ pub fn isolate_console_std(_cmd: &mut std::process::Command) {}
 /// process creation, so every future descendant — including grandchildren
 /// spawned by agent CLIs (node → bash → cargo) — lands in the job with no
 /// per-spawn bookkeeping and no assign-after-spawn race. The job handle is
-/// deliberately leaked: it must stay open for the process lifetime,
-/// because the kernel terminates all members when the last handle closes.
-/// That close happens on any death — clean exit, Ctrl+C's default
-/// `ExitProcess`, panic, `std::process::exit`, or Task Manager — so this
-/// is strictly stronger than a signal handler.
+/// kept in [`JOB_HANDLE`] (never closed while running): the kernel
+/// terminates all members when the last handle closes on any death, and
+/// [`terminate_agent_tree`] can also call `TerminateJobObject` on Ctrl+C.
 ///
 /// Exists for `gaviero-cli`: agent children run on private consoles
 /// ([`isolate_console`]), so a terminal Ctrl+C no longer reaches them via
@@ -162,13 +171,15 @@ pub fn isolate_console_std(_cmd: &mut std::process::Command) {}
 /// No-op on Unix, where the terminal already delivers SIGINT to the whole
 /// foreground process group (children inherit the pgid — nothing in this
 /// module calls `setsid`/`process_group`), which is the platform's native
-/// tree-teardown contract.
+/// tree-teardown contract. Prefer [`install_cli_interrupt_handler`] plus
+/// [`terminate_agent_tree`] so a swallowed tokio Ctrl+C still reaps the
+/// group.
 ///
 /// Idempotent. Nested jobs are fine on Windows 8+ — the process may
 /// already sit in a terminal- or CI-managed job.
 #[cfg(windows)]
 pub fn kill_tree_on_exit() -> std::io::Result<()> {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::Ordering;
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -177,16 +188,21 @@ pub fn kill_tree_on_exit() -> std::io::Result<()> {
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-    // First caller arms; the rest return. A failed arm stays "armed" —
-    // callers treat failure as log-and-degrade, not retry.
-    static ARMED: AtomicBool = AtomicBool::new(false);
-    if ARMED.swap(true, Ordering::SeqCst) {
-        return Ok(());
+    match JOB_STATE.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(_) => {}
+        Err(1) => return Ok(()), // already armed
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "kill-on-exit job object previously failed to arm",
+            ));
+        }
     }
 
     unsafe {
         let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
         if job.is_null() {
+            JOB_STATE.store(2, Ordering::SeqCst);
             return Err(std::io::Error::last_os_error());
         }
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
@@ -198,17 +214,19 @@ pub fn kill_tree_on_exit() -> std::io::Result<()> {
             std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
         ) == 0
         {
-            // Not yet a member — closing an unarmed, empty job is safe.
             let e = std::io::Error::last_os_error();
             CloseHandle(job);
+            JOB_STATE.store(2, Ordering::SeqCst);
             return Err(e);
         }
         if AssignProcessToJobObject(job, GetCurrentProcess()) == 0 {
             let e = std::io::Error::last_os_error();
             CloseHandle(job);
+            JOB_STATE.store(2, Ordering::SeqCst);
             return Err(e);
         }
         // Member now — never CloseHandle from here on: closing IS the kill.
+        JOB_HANDLE.store(job as isize, Ordering::SeqCst);
     }
     Ok(())
 }
@@ -216,6 +234,145 @@ pub fn kill_tree_on_exit() -> std::io::Result<()> {
 #[cfg(not(windows))]
 pub fn kill_tree_on_exit() -> std::io::Result<()> {
     Ok(())
+}
+
+/// Force-kill this process and every tracked agent descendant.
+///
+/// On Windows: `TerminateJobObject` when [`kill_tree_on_exit`] armed the
+/// job (kills the CLI too); otherwise walks the process tree via Toolhelp
+/// and terminates descendants. On Unix this is a no-op — the terminal
+/// already delivered SIGINT to the foreground process group, and the CLI
+/// exits immediately afterward.
+///
+/// Safe to call from a console-control handler or after `ctrl_c().await`.
+/// May not return on Windows when the job is armed.
+pub fn terminate_agent_tree() {
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::Ordering;
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+        let job = JOB_HANDLE.load(Ordering::SeqCst);
+        if job != 0 {
+            unsafe {
+                // Exit code 130 = 128 + SIGINT. Kills every job member,
+                // including this process — typically does not return.
+                TerminateJobObject(job as _, 130);
+            }
+        }
+        kill_descendant_processes_windows();
+    }
+}
+
+/// Install a process-wide interrupt handler for headless CLI use.
+///
+/// Windows: `SetConsoleCtrlHandler` runs on the console control thread and
+/// calls [`terminate_agent_tree`] immediately — more reliable than waiting
+/// for a tokio task to be polled after `ctrl_c` wakes. Unix: no-op here;
+/// the CLI still awaits `tokio::signal::ctrl_c` and then calls
+/// [`terminate_agent_tree`].
+///
+/// Do **not** call from the TUI (it installs its own forwarder that turns
+/// Ctrl+C into a key event).
+pub fn install_cli_interrupt_handler() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::TRUE;
+        use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+
+        let ok = unsafe { SetConsoleCtrlHandler(Some(cli_console_ctrl_handler), TRUE) };
+        if ok == 0 {
+            tracing::warn!(
+                "SetConsoleCtrlHandler failed ({}) — Ctrl+C may not tear down agent trees",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn cli_console_ctrl_handler(ctrl_type: u32) -> i32 {
+    use windows_sys::Win32::Foundation::FALSE;
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+    use windows_sys::Win32::System::Threading::ExitProcess;
+
+    if ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT {
+        // Keep this handler minimal (console ctrl thread restrictions).
+        // Best-effort notice; teardown must not depend on it succeeding.
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            b"Interrupted - terminating agent process tree.\n",
+        );
+        terminate_agent_tree();
+        // If the job was unarmed, descendants are gone but we are still
+        // alive — exit explicitly. 130 = 128 + SIGINT.
+        unsafe { ExitProcess(130) };
+    }
+    FALSE
+}
+
+/// Kill every process whose parent chain leads to this PID (Windows).
+/// Used when the kill-on-close job could not be armed (nested-job hosts).
+#[cfg(windows)]
+fn kill_descendant_processes_windows() {
+    use std::collections::{HashMap, HashSet, VecDeque};
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+    };
+
+    let self_pid = std::process::id();
+    let mut parent_of: HashMap<u32, u32> = HashMap::new();
+
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                parent_of.insert(entry.th32ProcessID, entry.th32ParentProcessID);
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+    }
+
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (&pid, &ppid) in &parent_of {
+        children.entry(ppid).or_default().push(pid);
+    }
+
+    let mut descendants = HashSet::new();
+    let mut queue = VecDeque::new();
+    if let Some(direct) = children.get(&self_pid) {
+        queue.extend(direct.iter().copied());
+    }
+    while let Some(pid) = queue.pop_front() {
+        if descendants.insert(pid) {
+            if let Some(kids) = children.get(&pid) {
+                queue.extend(kids.iter().copied());
+            }
+        }
+    }
+
+    for pid in descendants {
+        unsafe {
+            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if !handle.is_null() {
+                TerminateProcess(handle, 1);
+                CloseHandle(handle);
+            }
+        }
+    }
 }
 
 /// A resolved agent-CLI invocation: the program to execute plus any
@@ -554,10 +711,25 @@ mod tests {
     /// really adopts the test process into a kill-on-close job — safe:
     /// membership restricts nothing while running, and at exit the job
     /// only reaps members that are already dying with the harness.
+    /// `terminate_agent_tree` is smoke-tested only when unarmed (no job
+    /// handle): calling it while armed would TerminateJobObject the test
+    /// process itself.
     #[test]
     fn kill_tree_on_exit_arms_and_is_idempotent() {
         kill_tree_on_exit().expect("first arm");
         kill_tree_on_exit().expect("second arm (no-op)");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn terminate_agent_tree_when_unarmed_is_safe() {
+        // If a prior test armed the job, TerminateJobObject would kill us —
+        // skip in that case. Fresh processes (and failed-arm runs) hit the
+        // Toolhelp path only.
+        if JOB_HANDLE.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            return;
+        }
+        terminate_agent_tree();
     }
 
     #[test]
