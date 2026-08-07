@@ -62,10 +62,12 @@ gaviero-cli --script workflows/feature.gaviero --test-first --max-retries 3
 gaviero-cli --task "Update docstrings" \
   --model ollama:qwen2.5-coder:7b --ollama-base-url http://localhost:11434
 
-# Document workflow with remote MCP
-gaviero-cli --script examples/scientific_plan_refinement.gaviero \
-  --workflow scientific-plan-refinement \
+# Document workflow with remote MCP (plan-refinement mode: no --workspace,
+# artefacts land next to the plan)
+gaviero-cli --script examples/scientific_research.gaviero \
+  --workflow scientific-research-consensus \
   --prompt "Sparse attention study" \
+  --var PLAN_FILE=/path/to/draft-research-plan.md \
   --mcp-url semantic-scholar=https://YOUR-MCP-ENDPOINT \
   --mcp-codex-trust granted
 
