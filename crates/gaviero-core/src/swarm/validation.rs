@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::models::WorkUnit;
+use super::router::TierRouter;
 
 /// Errors from scope validation.
 #[derive(Debug, Clone)]
@@ -20,6 +21,40 @@ impl std::fmt::Display for ScopeError {
             self.overlapping_paths.join(", ")
         )
     }
+}
+
+/// Errors from backend / model-spec preflight.
+#[derive(Debug, Clone)]
+pub struct BackendError {
+    pub unit_id: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for BackendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "agent '{}': {}",
+            self.unit_id, self.message
+        )
+    }
+}
+
+/// Resolve every work unit through the tier router and collect failures.
+///
+/// Catches invalid `provider:model` specs, privacy blocks, and other
+/// dispatch-time backend errors **before** any agent is launched.
+pub fn validate_backends(units: &[&WorkUnit], router: &TierRouter) -> Vec<BackendError> {
+    let mut errors = Vec::new();
+    for unit in units {
+        if let Err(reason) = router.resolve_backend(unit) {
+            errors.push(BackendError {
+                unit_id: unit.id.clone(),
+                message: reason,
+            });
+        }
+    }
+    errors
 }
 
 /// Errors from dependency validation.
@@ -201,6 +236,7 @@ pub fn dependency_tiers(units: &[WorkUnit]) -> Result<Vec<Vec<String>>, CycleErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::swarm::router::{TierConfig, TierRouter};
     use crate::types::FileScope;
     use std::collections::HashMap;
 
@@ -321,6 +357,30 @@ mod tests {
             let pair = (err.unit_a.as_str(), err.unit_b.as_str());
             assert!(pair == ("a", "c") || pair == ("b", "c"));
         }
+    }
+
+    #[test]
+    fn test_validate_backends_rejects_bare_model_name() {
+        let router = TierRouter::new(TierConfig::default(), false);
+        let mut bad = unit("writer", &["src/"], &[]);
+        bad.model = Some("sonnet".into());
+        let errors = validate_backends(&[&bad], &router);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].unit_id, "writer");
+        assert!(
+            errors[0].message.to_lowercase().contains("provider")
+                || errors[0].message.contains("missing"),
+            "expected provider-prefix diagnostic, got: {}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn test_validate_backends_accepts_canonical_specs() {
+        let router = TierRouter::new(TierConfig::default(), false);
+        let mut ok = unit("writer", &["src/"], &[]);
+        ok.model = Some("claude:sonnet".into());
+        assert!(validate_backends(&[&ok], &router).is_empty());
     }
 
     // ── Dependency tier tests ───────────────────────────────────
