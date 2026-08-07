@@ -456,8 +456,12 @@ fn template_update_docs() {
     let units = plan.work_units_ordered().expect("toposort");
     assert_eq!(units.len(), 5);
     let inventory = units.iter().find(|u| u.id == "inventory").expect("inventory");
-    // Default profile is doc-cursor.gaviero (inventory → grok).
-    assert_eq!(inventory.model.as_deref(), Some("cursor:grok-4.5"));
+    // Default profile is doc-cursor.gaviero (inventory → grok). The Cursor CLI
+    // id embeds the effort level, so `clients.gaviero` pins the full id.
+    assert_eq!(
+        inventory.model.as_deref(),
+        Some("cursor:cursor-grok-4.5-high")
+    );
     let readme = units
         .iter()
         .find(|u| u.id == "write_readme_md")

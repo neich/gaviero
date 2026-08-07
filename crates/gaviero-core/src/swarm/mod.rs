@@ -6,6 +6,7 @@ pub mod context;
 pub mod context_bundle;
 pub mod coordinator;
 pub mod execution_state;
+pub mod loop_resume;
 pub mod merge;
 pub mod models;
 pub mod ollama;
