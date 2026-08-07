@@ -456,12 +456,13 @@ fn template_update_docs() {
     let units = plan.work_units_ordered().expect("toposort");
     assert_eq!(units.len(), 5);
     let inventory = units.iter().find(|u| u.id == "inventory").expect("inventory");
-    assert_eq!(inventory.model.as_deref(), Some("claude:opus"));
+    // Default profile is doc-cursor.gaviero (inventory → grok).
+    assert_eq!(inventory.model.as_deref(), Some("cursor:grok-4.5"));
     let readme = units
         .iter()
         .find(|u| u.id == "write_readme_md")
         .expect("write_readme_md");
-    assert_eq!(readme.model.as_deref(), Some("claude:sonnet"));
+    assert_eq!(readme.model.as_deref(), Some("cursor:composer-2.5"));
     assert_eq!(units[0].id, "inventory");
     // Three write agents depend on inventory
     assert!(units[1].depends_on.contains(&"inventory".to_string()));
@@ -472,8 +473,21 @@ fn template_update_docs() {
     assert_eq!(units[4].depends_on.len(), 3);
     // No loops
     assert!(plan.loop_configs.is_empty());
-    // Max parallel 3
-    assert_eq!(plan.max_parallel, Some(3));
+    // Max parallel 1 (shared checkout; docs writers own disjoint paths)
+    assert_eq!(plan.max_parallel, Some(1));
+}
+
+#[test]
+fn example_pattern_map_reduce_emits_fanout() {
+    let plan = compile_example_plan("pattern_map_reduce.gaviero");
+    assert_eq!(plan.fanout_ops.len(), 1);
+    assert_eq!(plan.fanout_ops[0].after_unit, "discover");
+    assert_eq!(plan.fanout_ops[0].max_spawn, 8);
+    let units = plan.work_units_ordered().expect("toposort");
+    assert_eq!(units.len(), 2);
+    assert_eq!(units[0].id, "discover");
+    assert_eq!(units[1].id, "reduce");
+    assert!(units[1].depends_on.contains(&"discover".to_string()));
 }
 
 #[test]
@@ -499,8 +513,8 @@ fn template_plan_refinement() {
     let plan = compile_example_plan("plan_refinement.gaviero");
     let units = plan.work_units_ordered().expect("toposort");
 
-    // Refine-only roster: 2 panel agents (no separate init step)
-    assert_eq!(units.len(), 2);
+    // Refine-only roster: Claude + Codex + Cursor (no separate init step)
+    assert_eq!(units.len(), 3);
 
     let crefine = units
         .iter()
@@ -510,9 +524,13 @@ fn template_plan_refinement() {
         .iter()
         .find(|u| u.id == "codex-refine")
         .expect("codex-refine");
+    let urefine = units
+        .iter()
+        .find(|u| u.id == "cursor-refine")
+        .expect("cursor-refine");
 
     let expected_default = gaviero_core::types::ModelTier::default();
-    for u in &[crefine, xrefine] {
+    for u in &[crefine, xrefine, urefine] {
         assert_eq!(
             u.tier, expected_default,
             "agent {} should resolve to the default tier (roster synth client)",
@@ -520,7 +538,11 @@ fn template_plan_refinement() {
         );
     }
     assert_eq!(crefine.model.as_deref(), Some("claude:opus"));
-    assert_eq!(xrefine.model.as_deref(), Some("codex:gpt-5.5"));
+    assert_eq!(xrefine.model.as_deref(), Some("codex:gpt-5.6-sol"));
+    assert_eq!(
+        urefine.model.as_deref(),
+        Some("cursor:cursor-grok-4.5-high")
+    );
 
     assert!(
         crefine.coordinator_instructions.contains("providers in this panel"),
@@ -529,6 +551,10 @@ fn template_plan_refinement() {
     assert!(
         crefine.coordinator_instructions.contains("codex"),
         "claude-refine should list codex as a peer"
+    );
+    assert!(
+        crefine.coordinator_instructions.contains("cursor"),
+        "claude-refine should list cursor as a peer"
     );
     assert!(
         crefine.coordinator_instructions.contains("PREV_ITER}}` = 0"),
@@ -553,6 +579,12 @@ fn template_plan_refinement() {
         "codex-refine should reference codex-refine-plan-v{{ITER}}.md"
     );
     assert!(
+        urefine
+            .coordinator_instructions
+            .contains("cursor-refine-plan-v{{ITER}}.md"),
+        "cursor-refine should reference cursor-refine-plan-v{{ITER}}.md"
+    );
+    assert!(
         crefine
             .coordinator_instructions
             .contains("refine-plan-v{{PREV_ITER}}.md"),
@@ -570,11 +602,15 @@ fn template_plan_refinement() {
     // Refine agents write to memory
     assert_eq!(crefine.write_namespace.as_deref(), Some("plan-evolution"));
     assert_eq!(xrefine.write_namespace.as_deref(), Some("plan-evolution"));
+    assert_eq!(urefine.write_namespace.as_deref(), Some("plan-evolution"));
 
-    // Loop config: 2 refine agents, 5 iterations, iter_start=1 (round 1 PREV_ITER=0).
+    // Loop config: 3 refine agents, 5 iterations, iter_start=1 (round 1 PREV_ITER=0).
     assert_eq!(plan.loop_configs.len(), 1);
     let lc = &plan.loop_configs[0];
-    assert_eq!(lc.agent_ids, vec!["claude-refine", "codex-refine"]);
+    assert_eq!(
+        lc.agent_ids,
+        vec!["claude-refine", "codex-refine", "cursor-refine"]
+    );
     assert_eq!(lc.max_iterations, 5);
     assert_eq!(lc.iter_start, 1);
     assert_eq!(lc.stability, 2);
@@ -604,6 +640,10 @@ fn template_plan_refinement() {
 
     // max_parallel sized for 3+ provider panels
     assert_eq!(plan.max_parallel, Some(4));
+    assert_eq!(
+        plan.execution_mode,
+        gaviero_core::swarm::plan::ExecutionMode::Document
+    );
 }
 
 #[test]
@@ -694,8 +734,8 @@ fn template_phased_plan() {
     assert_eq!(model_of("analyse_plan").as_deref(), Some("claude:opus"));
     assert_eq!(model_of("phase_executor").as_deref(), Some("claude:opus"));
     assert_eq!(model_of("final_audit").as_deref(), Some("claude:opus"));
-    assert_eq!(model_of("phase_gate").as_deref(), Some("claude:sonnet"));
-    assert_eq!(model_of("phase_judge").as_deref(), Some("claude:sonnet"));
+    assert_eq!(model_of("phase_gate").as_deref(), Some("claude:sonnet-5"));
+    assert_eq!(model_of("phase_judge").as_deref(), Some("claude:sonnet-5"));
 
     // Dependency chain: phase_executor → analyse_plan; phase_gate →
     // phase_executor; final_audit → phase_gate (loop exit).
@@ -918,8 +958,8 @@ fn compile_file_scientific_plan_refinement_default_roster() {
         .into_iter()
         .map(|u| u.id.clone())
         .collect();
-    // Default roster in the example ships claude + codex (no cursor).
-    for prefix in &["claude", "codex"] {
+    // Default roster: Claude + Codex + Cursor (own models).
+    for prefix in &["claude", "codex", "cursor"] {
         assert!(
             ids.iter().any(|id| id == &format!("{prefix}-init")),
             "missing {prefix}-init in {ids:?}"
@@ -930,8 +970,9 @@ fn compile_file_scientific_plan_refinement_default_roster() {
         );
     }
     assert_eq!(plan.loop_configs.len(), 1);
-    assert_eq!(plan.loop_configs[0].agent_ids.len(), 2);
+    assert_eq!(plan.loop_configs[0].agent_ids.len(), 3);
     assert_eq!(plan.loop_configs[0].max_iterations, 8);
+    assert_eq!(plan.max_parallel, Some(4));
     assert_eq!(
         plan.execution_mode,
         gaviero_core::swarm::plan::ExecutionMode::Document

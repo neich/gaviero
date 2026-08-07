@@ -494,6 +494,38 @@ pub struct LoopBlock {
 
 // ── workflow ──────────────────────────────────────────────────────────────
 
+/// A workflow-level `pattern <kind> { ... }` sugar block.
+///
+/// Currently only [`PatternDecl::MapReduce`] is supported. Consensus-style
+/// multi-reviewer workflows use existing `loop { reviewers ... }` (see
+/// `examples/generic_consensus.gaviero`) — there is no `pattern consensus` sugar.
+#[derive(Debug, Clone)]
+pub enum PatternDecl {
+    /// After `discover` succeeds, fan out workers from a SpawnManifest, then
+    /// continue to `reduce` (which should `depends_on` the discover agent).
+    ///
+    /// ```text
+    /// pattern map_reduce {
+    ///     discover discoverer
+    ///     reduce   aggregator
+    ///     max_spawn 8
+    /// }
+    /// ```
+    MapReduce(MapReducePattern),
+}
+
+/// Fields for `pattern map_reduce { ... }`.
+#[derive(Debug, Clone)]
+pub struct MapReducePattern {
+    /// Agent that writes `spawn_manifest.json` / posts the SpawnManifest.
+    pub discover: (String, Span),
+    /// Downstream agent that waits on discover (and thus on the fan-out wave).
+    pub reduce: (String, Span),
+    /// Cap on materialized workers. When omitted, core's `DEFAULT_MAX_SPAWN`.
+    pub max_spawn: Option<(u32, Span)>,
+    pub span: Span,
+}
+
 /// Declares an optional execution plan (ordered steps, concurrency cap).
 ///
 /// ```text
@@ -528,6 +560,9 @@ pub struct WorkflowDecl {
     /// Workflow-level parameter declarations. Resolved at compile time via
     /// CLI `--param NAME=VALUE` overrides; required when no default present.
     pub params: Vec<ParamDecl>,
+    /// Optional pattern sugar (`pattern map_reduce { ... }`). Expanded into
+    /// `CompiledPlan.fanout_ops` at compile time.
+    pub pattern: Option<PatternDecl>,
     pub span: Span,
     #[doc(hidden)]
     pub file_id: u32,

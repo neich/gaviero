@@ -502,6 +502,21 @@ pub fn handle_remote_command(app: &mut App, line: &str) {
                             "listening, no client connected"
                         }
                     ));
+                    // Listening but nothing has ever connected is, on
+                    // Windows, almost always the host firewall dropping
+                    // inbound on the tailnet interface — the phone just
+                    // reports "instance offline" with no other clue.
+                    #[cfg(windows)]
+                    if app.remote.handle.is_some() && !app.remote.client_connected {
+                        report.push_str(&format!(
+                            "\nIf the app says \"instance offline\", Windows Firewall is \
+                             probably dropping the connection. In an ADMIN PowerShell:\n  \
+                             New-NetFirewallRule -DisplayName \"Gaviero Remote (tailnet)\" \
+                             -Direction Inbound -Action Allow -Protocol TCP -LocalPort {} \
+                             -RemoteAddress 100.64.0.0/10,fd7a:115c:a1e0::/48\n",
+                            config.port
+                        ));
+                    }
                     match load_or_create_token(&config) {
                         Ok(token) => {
                             let url = pairing_url(&config);
@@ -789,12 +804,17 @@ mod render_preview {
 mod live_diagnostic {
     use super::*;
 
-    /// Prints what `/remote` would report for THIS workspace right now.
-    /// `cargo test -p gaviero-tui live_remote_status -- --ignored --nocapture`
+    /// Prints what `/remote` would report for a workspace right now.
+    /// Under `cargo test` the cwd is the crate dir, so pass the workspace
+    /// root explicitly:
+    /// `GAVIERO_WS=<root> cargo test -p gaviero-tui live_remote_status -- --ignored --nocapture`
     #[test]
     #[ignore = "diagnostic: reports this machine's real remote readiness"]
     fn live_remote_status() {
-        let ws = Workspace::single_folder(std::env::current_dir().unwrap());
+        let root = std::env::var("GAVIERO_WS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::current_dir().unwrap());
+        let ws = Workspace::single_folder(root);
         match resolve_config(&ws) {
             Ok(config) => {
                 println!("enabled:   {}", config.enabled);

@@ -57,7 +57,8 @@ client composer {
 }
 
 client grok {
-    model "cursor:grok-4.5"
+    // Cursor CLI id embeds effort (`agent --list-models`); use the full id.
+    model "cursor:cursor-grok-4.5-high"
     privacy public
     effort high
 }
