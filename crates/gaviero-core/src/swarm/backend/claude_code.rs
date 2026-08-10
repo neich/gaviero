@@ -166,7 +166,18 @@ async fn drive_session(
     tx: tokio::sync::mpsc::Sender<Result<UnifiedStreamEvent>>,
 ) -> Result<()> {
     loop {
-        match session.next_event().await {
+        // Abandonment check. `tx.send(...).is_err()` below only fires on the
+        // *next* event, which never arrives when a subprocess wedges — the
+        // exact case the dispatch budget exists for. Racing `closed()` against
+        // the wait means dropping the stream (timeout, cancel) drops the
+        // session here and `kill_on_drop` reaps the child, instead of leaving
+        // it running against the provider's API.
+        let event = tokio::select! {
+            biased;
+            _ = tx.closed() => return Ok(()),
+            e = session.next_event() => e,
+        };
+        match event {
             Ok(Some(event)) => {
                 let unified = map_acp_event(&event);
                 for ev in unified {

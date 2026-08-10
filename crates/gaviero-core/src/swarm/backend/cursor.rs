@@ -332,7 +332,16 @@ async fn drive_cursor_stdout_unified(
     tx: tokio::sync::mpsc::Sender<Result<UnifiedStreamEvent>>,
 ) -> Result<()> {
     let mut lines = BufReader::new(stdout).lines();
-    while let Some(line) = lines.next_line().await.context("reading cursor stdout")? {
+    loop {
+        // See the codex driver: `closed()` is the only signal that arrives
+        // when the subprocess has gone silent, so it is what lets a dropped
+        // stream reap the child instead of leaking it.
+        let line = tokio::select! {
+            biased;
+            _ = tx.closed() => return Ok(()),
+            l = lines.next_line() => l.context("reading cursor stdout")?,
+        };
+        let Some(line) = line else { break };
         let Some(event) = parse_cursor_event(&line) else {
             continue;
         };

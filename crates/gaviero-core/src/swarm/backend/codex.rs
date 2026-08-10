@@ -643,7 +643,17 @@ async fn drive_codex_stdout(
     let mut lines = BufReader::new(stdout).lines();
     let mut parser = CodexJsonParser::default();
 
-    while let Some(line) = lines.next_line().await.context("reading codex stdout")? {
+    loop {
+        // Racing `closed()` against the read means a dropped stream (dispatch
+        // budget, cancel) ends this task immediately, so `kill_on_drop` reaps
+        // the codex child. Waiting for the next line would never return when
+        // the subprocess has gone silent — the case the budget exists for.
+        let line = tokio::select! {
+            biased;
+            _ = tx.closed() => return Ok(parser.outcome),
+            l = lines.next_line() => l.context("reading codex stdout")?,
+        };
+        let Some(line) = line else { break };
         for event in parser.push_line(&line) {
             if tx.send(Ok(event)).await.is_err() {
                 return Ok(parser.outcome); // receiver dropped
