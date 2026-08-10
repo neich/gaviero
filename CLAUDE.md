@@ -43,7 +43,7 @@ All interactive coding providers — Claude Code, Codex, Cursor, Ollama, DeepSee
 - **File edits never bypass review.** Native edit-capable providers (Claude Code, Codex, Cursor) route writes through their tool-call channel; the host turns each into a `WriteProposal` and runs it through the Write Gate. Stream-only providers (Ollama) and in-process tool agents (DeepSeek Option-B) emit complete `<file path="relative/path">…</file>` blocks; the host extracts them via [crates/gaviero-core/src/acp/protocol.rs](crates/gaviero-core/src/acp/protocol.rs) and routes them through the same Write Gate.
 - **Single Write Gate.** Every file change passes through `write_gate::WriteGatePipeline` ([crates/gaviero-core/src/write_gate.rs](crates/gaviero-core/src/write_gate.rs)). No backend writes to disk directly.
 - **Scope enforcement.** Proposals are checked against the active `FileScope` ([crates/gaviero-core/src/scope_enforcer.rs](crates/gaviero-core/src/scope_enforcer.rs)) before they leave the gate.
-- **MCP is read-only.** Seven tools: `memory_search`, `memory_get`, `blast_radius`, `node_doc`, `repo_outline`, plus `symbol_search` / `symbol_doc` behind `repoMap.symbolEnrichment.enabled` ([crates/gaviero-core/src/mcp/tools.rs](crates/gaviero-core/src/mcp/tools.rs)). Never add a write tool; route writes through the Write Gate or the memory writer task.
+- **MCP routes every effect through the writer task.** Eight tools ([crates/gaviero-core/src/mcp/tools.rs](crates/gaviero-core/src/mcp/tools.rs)). Seven read-only: `memory_search`, `memory_get`, `blast_radius`, `node_doc`, `repo_outline`, plus `symbol_search` / `symbol_doc` behind `repoMap.symbolEnrichment.enabled`. One write-adjacent: `memory_flag` (`mcp.flag.enabled`, default true) demotes a stale memory's trust — it creates and deletes nothing, refuses user-authored and History rows, is idempotent, and every applied flag writes a reversible audit row. It reaches the writer through the narrow [`MemorySignalSink`](crates/gaviero-core/src/mcp/signal.rs), so `mcp/server.rs` still holds no `WriterHandle`.
 
 ## Conventions
 
@@ -55,7 +55,7 @@ All interactive coding providers — Claude Code, Codex, Cursor, Ollama, DeepSee
 ## Rules
 
 - Never bypass the Write Gate. Every file change is a `WriteProposal`.
-- Never add write tools to `mcp/`. MCP is read-only by construction.
+- Never let an MCP tool touch a store directly. Any tool with an effect goes through the writer task or the Write Gate — that is the invariant. A read-only surface is the default posture, not a hard rule: each tool costs ~150–250 prompt tokens on every subprocess turn (provenance: `git show f11eca9:tier-a-part-2-surface.md` §A5), so make it earn that.
 - Never hold a `Mutex` across `.await`, embeddings, or filesystem I/O.
 - Never emit a bare model name; always `provider:model`.
 - Never edit `tree-sitter-gaviero/src/parser.c` or `grammar.json` by hand — regenerate from `grammar.js`.

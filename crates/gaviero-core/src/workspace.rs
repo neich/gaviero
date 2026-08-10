@@ -214,6 +214,13 @@ pub mod settings {
     pub const MCP_GAVIERO_SHIM_BINARY: &str = "mcp.gavieroServer.shimBinary";
     pub const MCP_GAVIERO_CODEX_TRUST: &str = "mcp.gavieroServer.codexTrust";
 
+    /// Expose the `memory_flag` MCP tool. Defaults to `true` (D3). When
+    /// false the server is built without a signal sink, so the tool is
+    /// still listed but every call errors — never a silent no-op. The
+    /// per-deployment off switch that also removes the schema from the
+    /// prompt is an `mcp.permissions` deny on `gaviero:memory_flag`.
+    pub const MCP_FLAG_ENABLED: &str = "mcp.flag.enabled";
+
     // context7 docs-lookup MCP server (opt-in, OD-6; when enabled it is
     // injected into every swarm worktree's .mcp.json +
     // .codex/config.toml alongside the gaviero shim). Enable with
@@ -1201,6 +1208,11 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::MCP_GAVIERO_DISABLE_EXTERNAL => serde_json::json!(true),
         settings::MCP_GAVIERO_SHIM_BINARY => serde_json::json!("gaviero-mcp-shim"),
         settings::MCP_GAVIERO_CODEX_TRUST => serde_json::json!("unknown"),
+        // D3: memory_flag ships enabled. The blast radius is bounded —
+        // trust never drops below FLAG_TRUST_FLOOR, user and History rows
+        // are untouchable, repeat flags are no-ops, and every applied
+        // flag writes a reversible audit row.
+        settings::MCP_FLAG_ENABLED => serde_json::json!(true),
 
         // context7 docs-lookup MCP server: opt-in (OD-6). It is a
         // network dependency (`npx` fetch on first agent spawn), so a

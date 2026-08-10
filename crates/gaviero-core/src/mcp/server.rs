@@ -4,14 +4,24 @@
 //! at `.gaviero/mcp.sock` on Unix, a `\\.\pipe\gaviero-…` named pipe
 //! on Windows. Each shim connection is a single MCP session
 //! speaking JSON-RPC 2.0 over `AsyncRead + AsyncWrite` — rmcp handles
-//! framing, initialize, and tools/list. Gaviero owns only the three
-//! tool handlers.
+//! framing, initialize, and tools/list. Gaviero owns only the eight
+//! tool handlers below.
 //!
-//! **Read-only invariant**: the handler takes an `Arc<MemoryStore>` for
-//! search + a `RepoMap`-backed graph accessor for `blast_radius`, but
-//! never a `WriterHandle`. There is no code path from here to
-//! `store_scoped`. Plan-rejected `memory_store` / `memory_update` /
+//! **The invariant this module enforces is #11: every write goes
+//! through the Tier S2 writer task.** The enforcement at this boundary
+//! is that the server holds `Arc<MemoryStores>` for search and a
+//! `RepoMap`-backed graph accessor for `blast_radius`, but never a
+//! [`crate::memory::WriterHandle`] — there is no code path from here to
+//! `store_scoped`. Rejected `memory_store` / `memory_update` /
 //! `memory_delete` tools remain unimplementable by construction.
+//!
+//! Seven of the eight tools are strictly read-only. `memory_flag` is
+//! write-adjacent: it emits a signal through
+//! [`super::signal::MemorySignalSink`] — a narrow trait object, not the
+//! writer handle — which the writer task turns into a trust demotion
+//! plus an audit row. It creates and deletes nothing. See
+//! `mcp/mod.rs`'s header for why read-only is a default posture rather
+//! than a hard constraint.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,17 +40,20 @@ use crate::memory::{
 use crate::repo_map::store::BlastRadiusMode;
 
 use super::observer::{McpCallLogEntry, McpToolCallObserver, NoopMcpObserver};
+use super::signal::{MemoryFlagRequest, MemorySignalSink};
 use super::tools::{
-    BlastRadiusInput, BlastRadiusOutput, BlastRadiusRelation, MemoryGetInput, MemoryGetOutput,
-    MemoryGetRow, MemorySearchInput, MemorySearchOutput, MemorySearchResult, NodeDoc, NodeDocInput,
-    NodeDocSymbol, RepoOutlineEntry, RepoOutlineInput, RepoOutlineOutput,
-    SYMBOL_DOC_SNIPPET_MAX_CHARS, SymbolDocImpl, SymbolDocInput, SymbolDocOutput, SymbolSearchHit,
-    SymbolSearchInput, SymbolSearchOutput, clamp_blast_depth, clamp_memory_search_limit,
-    clamp_repo_outline_token_cap, clamp_symbol_search_limit, truncate_symbol_snippet,
+    BlastRadiusInput, BlastRadiusOutput, BlastRadiusRelation, MemoryFlagInput, MemoryFlagOutput,
+    MemoryGetInput, MemoryGetOutput, MemoryGetRow, MemorySearchInput, MemorySearchOutput,
+    MemorySearchResult, NodeDoc, NodeDocInput, NodeDocSymbol, RepoOutlineEntry, RepoOutlineInput,
+    RepoOutlineOutput, SYMBOL_DOC_SNIPPET_MAX_CHARS, SymbolDocImpl, SymbolDocInput,
+    SymbolDocOutput, SymbolSearchHit, SymbolSearchInput, SymbolSearchOutput, clamp_blast_depth,
+    clamp_memory_search_limit, clamp_repo_outline_token_cap, clamp_symbol_search_limit,
+    truncate_symbol_snippet,
 };
 
 /// Gaviero's MCP server. One instance lives per workspace; it
-/// dispatches tool calls to the three read-only handlers below.
+/// dispatches tool calls to the eight handlers below (seven read-only
+/// plus write-adjacent `memory_flag`).
 ///
 /// `tool_router` is the rmcp-macro-generated dispatch table — see
 /// `rmcp::handler::server::router::tool` for the shape.
@@ -115,6 +128,14 @@ pub struct GavieroMcpServer {
     /// `Arc` so any per-request clone rmcp makes still sees one latch per
     /// connection.
     first_tool_call_done: Arc<AtomicBool>,
+    /// The one seam through which a tool call can cause a write: the
+    /// `memory_flag` signal sink. Deliberately an
+    /// `Arc<dyn MemorySignalSink>` and *not* a `WriterHandle` — the
+    /// server cannot construct a write, pick a scope, or reach a store
+    /// through it. `None` (the default, and the state of any server built
+    /// without [`Self::with_signal_sink`]) makes `memory_flag` return a
+    /// clear error rather than silently no-op.
+    signal_sink: Option<Arc<dyn MemorySignalSink>>,
     #[allow(dead_code)] // populated and dispatched via the `#[tool_router]` macro
     tool_router: ToolRouter<Self>,
 }
@@ -145,6 +166,7 @@ impl GavieroMcpServer {
             symbol_embedder: Arc::new(tokio::sync::Mutex::new(None)),
             permissions: super::McpPermissions::default(),
             first_tool_call_done: Arc::new(AtomicBool::new(false)),
+            signal_sink: None,
             tool_router: Self::tool_router(),
         }
     }
@@ -211,6 +233,17 @@ impl GavieroMcpServer {
     /// populated `symbol_docs` sidecar from `gaviero-cli --graph --enrich`.
     pub fn with_symbol_enrichment(mut self, enabled: bool) -> Self {
         self.symbol_enrichment_enabled = enabled;
+        self
+    }
+
+    /// Install the `memory_flag` signal sink. Without it the tool stays
+    /// listed but every call errors — the same "listed but gated" shape
+    /// as `symbol_enrichment_enabled`, never a silent no-op.
+    ///
+    /// Post-construction builder so `new`'s signature stays stable across
+    /// its three call sites.
+    pub fn with_signal_sink(mut self, sink: Arc<dyn MemorySignalSink>) -> Self {
+        self.signal_sink = Some(sink);
         self
     }
 
@@ -364,7 +397,7 @@ impl GavieroMcpServer {
         description = "Call this when you need a fact a prior session or the user already \
                        established — conventions, decisions, past bugs, project context — \
                        before reading code to rediscover it. Merged multi-scope hybrid \
-                       search (workspace + global, RRF) over Gaviero's memory store; \
+                       search (repo + workspace + global, RRF) over Gaviero's memory store; \
                        returns up to `limit` scored memories (id, scope, type, text, \
                        importance, trust). Read-only. Token cost: roughly 50-150 tokens \
                        per result.",
@@ -384,19 +417,22 @@ impl GavieroMcpServer {
         let kind_filter = super::tools::resolve_memory_search_kind(input.kind.as_deref())
             .map_err(|e| ErrorData::invalid_params(e, None))?;
         // DRIFT-2: `scope_hint` is a *restriction* over the levels the
-        // MCP context can reach ([Workspace, Global] — no folder/run
-        // identity crosses the shim). Folder/run hints are a loud
-        // error rather than a silent widen; unknown values likewise.
+        // MCP context can reach. `repo` is reachable because the server
+        // knows its own `workspace_root` (see the folder resolution
+        // below); `module` and `run` still need per-file / per-run
+        // identity that does not cross the shim, so they stay a loud
+        // error rather than a silent widen. Unknown values likewise.
         let level_restriction = match input.scope_hint.as_deref() {
             None => None,
             Some("workspace") => Some(crate::memory::scope::SCOPE_WORKSPACE),
             Some("global") => Some(crate::memory::scope::SCOPE_GLOBAL),
-            Some(other @ ("repo" | "module" | "run")) => {
+            Some("repo") => Some(crate::memory::scope::SCOPE_REPO),
+            Some(other @ ("module" | "run")) => {
                 return Err(ErrorData::invalid_params(
                     format!(
-                        "memory_search.scope_hint: {other:?} needs folder/run context that the \
-                         MCP surface does not carry; reachable scopes are 'workspace' and \
-                         'global' (omit the hint to merge both)"
+                        "memory_search.scope_hint: {other:?} needs per-file / per-run context \
+                         that the MCP surface does not carry; reachable scopes are 'repo', \
+                         'workspace' and 'global' (omit the hint to merge all three)"
                     ),
                     None,
                 ));
@@ -405,16 +441,40 @@ impl GavieroMcpServer {
                 return Err(ErrorData::invalid_params(
                     format!(
                         "memory_search.scope_hint: unknown value {other:?}; expected \
-                         'workspace' | 'global', or omit to merge both"
+                         'repo' | 'workspace' | 'global', or omit to merge all three"
                     ),
                     None,
                 ));
             }
         };
-        // MCP has no active-file context → folder = None. The
-        // registry's scope.levels() emits [Workspace, Global], which
-        // is the correct default for an unscoped tool query.
-        let scope = MemoryScope::from_context(&self.workspace_root, None, None, None);
+
+        // Repo scope is where the bulk of a mature workspace's memory
+        // lives, so the folder identity is supplied from the server's own
+        // `workspace_root` rather than left as `None` — otherwise
+        // `MemoryScope::levels()` emits only [Workspace, Global] and every
+        // repo-scoped memory is invisible to subprocess agents.
+        //
+        // Guarded, not unconditional: `multi_scope_retrieve` propagates
+        // `MemoryStores::get`'s "unknown repo_id — not registered in
+        // workspace" error, so handing it a folder the registry does not
+        // know would turn every search into a hard failure. Registries
+        // without the root registered (and `single_store_fallback` off)
+        // therefore keep the old [Workspace, Global] behaviour.
+        //
+        // `module` is deliberately still out of reach: it derives from
+        // `owned_paths`, which is per-file context the shim does not carry.
+        let repo_folder = {
+            let repo_id = crate::memory::hash_path(&self.workspace_root);
+            match self
+                .stores
+                .get(&crate::memory::StoreKind::Folder { repo_id })
+                .await
+            {
+                Ok(_) => Some(self.workspace_root.as_path()),
+                Err(_) => None,
+            }
+        };
+        let scope = MemoryScope::from_context(&self.workspace_root, repo_folder, None, None);
         let reranker_ref: Option<&dyn Reranker> = self.reranker.as_deref();
         // C1.6: when filtering to a non-default kind, over-fetch so the
         // post-filter can still return up to `limit` results. Cheap
@@ -784,6 +844,120 @@ impl GavieroMcpServer {
         };
         self.emit_tool_call(
             super::tools::TOOL_MEMORY_GET,
+            serde_json::to_value(&input).unwrap_or_default(),
+            serde_json::to_value(&out).unwrap_or_default(),
+            started,
+            None,
+        );
+        Ok(Json(out))
+    }
+
+    // ── memory_flag ─────────────────────────────────────────────────
+    #[tool(
+        name = "memory_flag",
+        description = "Call this when a memory_search hit is wrong, stale, or contradicted by \
+                       what you just observed — pass the hit's `id` and `scope` plus a short \
+                       `reason`. Halves the memory's trust so it ranks lower; it is never \
+                       deleted and its text is never changed. User-authored and transcript \
+                       rows are refused (`accepted: false`). Flagging the same row twice is a \
+                       no-op.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn memory_flag(
+        &self,
+        Parameters(input): Parameters<MemoryFlagInput>,
+    ) -> Result<Json<MemoryFlagOutput>, ErrorData> {
+        let started = Instant::now();
+        self.ensure_tool_allowed("memory_flag")?;
+
+        let fail = |server: &Self, msg: String, err: ErrorData| -> ErrorData {
+            server.emit_tool_call(
+                super::tools::TOOL_MEMORY_FLAG,
+                serde_json::to_value(&input).unwrap_or_default(),
+                serde_json::Value::Null,
+                started,
+                Some(msg),
+            );
+            err
+        };
+
+        let Some(sink) = self.signal_sink.as_ref() else {
+            let msg = "memory_flag is not wired on this server (no signal sink); \
+                       enable it with mcp.flag.enabled and restart the workspace"
+                .to_string();
+            return Err(fail(
+                self,
+                msg.clone(),
+                ErrorData::invalid_request(msg, None),
+            ));
+        };
+
+        // Same routing rule as `memory_get`: `scope` names the owning
+        // *store*, because ids are only unique per physical DB.
+        let (scope_level, repo_id) = match input.scope.trim() {
+            "global" => (crate::memory::scope::SCOPE_GLOBAL, None),
+            "workspace" => (crate::memory::scope::SCOPE_WORKSPACE, None),
+            "run" => (crate::memory::scope::SCOPE_RUN, None),
+            other @ ("repo" | "module") => {
+                let msg = format!(
+                    "memory_flag.scope: {other:?} rows live in per-folder DBs keyed by a \
+                     repo_id the MCP surface does not carry; reachable scopes are \
+                     'global', 'workspace', and 'run'"
+                );
+                return Err(fail(
+                    self,
+                    msg.clone(),
+                    ErrorData::invalid_params(msg, None),
+                ));
+            }
+            other => {
+                let msg = format!(
+                    "memory_flag.scope: unknown value {other:?}; expected 'global' | \
+                     'workspace' | 'run' (as returned by memory_search)"
+                );
+                return Err(fail(
+                    self,
+                    msg.clone(),
+                    ErrorData::invalid_params(msg, None),
+                ));
+            }
+        };
+
+        let reason = input.reason.trim();
+        if reason.is_empty() {
+            let msg = "memory_flag.reason must not be empty — it is recorded in the \
+                       audit row so a human can reverse the demotion"
+                .to_string();
+            return Err(fail(
+                self,
+                msg.clone(),
+                ErrorData::invalid_params(msg, None),
+            ));
+        }
+
+        let outcome = sink
+            .flag(MemoryFlagRequest {
+                memory_id: input.id,
+                scope_level,
+                repo_id,
+                reason: reason.to_string(),
+            })
+            .await
+            .map_err(|e| {
+                let msg = format!("memory_flag: {e}");
+                fail(self, msg.clone(), ErrorData::internal_error(msg, None))
+            })?;
+
+        let out = MemoryFlagOutput {
+            accepted: outcome.accepted,
+            detail: outcome.detail,
+        };
+        self.emit_tool_call(
+            super::tools::TOOL_MEMORY_FLAG,
             serde_json::to_value(&input).unwrap_or_default(),
             serde_json::to_value(&out).unwrap_or_default(),
             started,
@@ -1576,7 +1750,11 @@ mod tests {
             "{only_ws:?}"
         );
 
-        for bad in ["repo", "module", "run", "solar"] {
+        // `module` / `run` still need per-file / per-run identity that
+        // does not cross the shim. `repo` is no longer in this list — the
+        // server supplies its own workspace_root as the folder, so repo
+        // scope is reachable (see `memory_search_reaches_repo_scope`).
+        for bad in ["module", "run", "solar"] {
             match search(Some(bad)).await {
                 Err(err) => {
                     assert!(err.message.contains("scope_hint"), "{bad}: {}", err.message)
@@ -1584,6 +1762,15 @@ mod tests {
                 Ok(_) => panic!("scope_hint {bad:?} must error"),
             }
         }
+
+        // This fixture registers no folders, so the repo level is skipped
+        // by the guard and the restriction simply matches nothing —
+        // it must not error.
+        let only_repo = search(Some("repo")).await.unwrap().0.results;
+        assert!(
+            only_repo.is_empty(),
+            "no folder is registered here, so repo scope has nothing to return: {only_repo:?}"
+        );
     }
 
     /// C1.6: unknown kinds produce a clear MCP invalid_params error,
@@ -1786,6 +1973,269 @@ mod tests {
                 Ok(_) => panic!("scope {bad:?} must error"),
             }
         }
+    }
+
+    /// A server whose registry has the workspace root registered as a
+    /// folder — i.e. what production looks like. `split_fixture` cannot
+    /// exercise repo scope because `for_tests_split_in_memory` registers
+    /// no folders at all.
+    fn folder_fixture(root: &std::path::Path, global_dir: &std::path::Path) -> GavieroMcpServer {
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let workspace = crate::workspace::Workspace::single_folder(root.to_path_buf());
+        let stores = MemoryStores::open_with_paths(
+            root,
+            &workspace,
+            embedder,
+            "mock".to_string(),
+            &global_dir.join("global.db"),
+        )
+        .expect("open registry");
+        GavieroMcpServer::with_defaults(stores, root.to_path_buf())
+    }
+
+    /// Repo-scope memories must be reachable from the MCP surface: the
+    /// server supplies its own `workspace_root` as the folder, so
+    /// `MemoryScope::levels()` includes Repo. Before this, `folder = None`
+    /// meant every repo-scoped row was invisible to subprocess agents —
+    /// in a mature workspace that is the majority of the corpus.
+    #[tokio::test]
+    async fn memory_search_reaches_repo_scope() {
+        use crate::memory::scope::{MemoryType, WriteMeta, WriteScope};
+        use crate::memory::trust_defaults::MemorySource;
+
+        let root = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let s = folder_fixture(root.path(), global.path());
+        let repo_id = crate::memory::hash_path(root.path());
+
+        let meta = WriteMeta::for_source(MemorySource::UserRemember)
+            .with_type(MemoryType::Decision)
+            .with_tag("repo-reachable");
+        s.stores
+            .store_scoped(
+                &WriteScope::Repo {
+                    repo_id: repo_id.clone(),
+                },
+                "purple pelican repo-scoped convention",
+                &meta,
+            )
+            .await
+            .unwrap();
+
+        let out = s
+            .memory_search(Parameters(MemorySearchInput {
+                query: "purple pelican convention".into(),
+                scope_hint: None,
+                limit: Some(10),
+                kind: None,
+            }))
+            .await
+            .unwrap()
+            .0
+            .results;
+        assert!(
+            out.iter().any(|r| r.scope == "repo"),
+            "repo-scoped memory must be reachable from MCP; got {out:?}"
+        );
+
+        // And `scope_hint: "repo"` is now a real restriction rather than
+        // an invalid_params error.
+        let only_repo = s
+            .memory_search(Parameters(MemorySearchInput {
+                query: "purple pelican convention".into(),
+                scope_hint: Some("repo".into()),
+                limit: Some(10),
+                kind: None,
+            }))
+            .await
+            .unwrap()
+            .0
+            .results;
+        assert!(!only_repo.is_empty(), "scope_hint=repo returned nothing");
+        assert!(
+            only_repo.iter().all(|r| r.scope == "repo"),
+            "scope_hint=repo must return only repo rows; got {only_repo:?}"
+        );
+    }
+
+    /// The folder guard: a registry that does not know the workspace root
+    /// (no folders registered, fallback off) must fall back to
+    /// [Workspace, Global] instead of failing every search with
+    /// "unknown repo_id — not registered in workspace".
+    #[tokio::test]
+    async fn memory_search_survives_an_unregistered_workspace_root() {
+        use crate::memory::scope::{MemoryType, WriteMeta, WriteScope};
+        use crate::memory::trust_defaults::MemorySource;
+
+        let s = split_fixture();
+        s.stores
+            .workspace()
+            .store_scoped(
+                &WriteScope::Workspace,
+                "amber wombat workspace fact",
+                &WriteMeta::for_source(MemorySource::UserRemember).with_type(MemoryType::Decision),
+            )
+            .await
+            .unwrap();
+
+        let out = s
+            .memory_search(Parameters(MemorySearchInput {
+                query: "amber wombat fact".into(),
+                scope_hint: None,
+                limit: Some(5),
+                kind: None,
+            }))
+            .await
+            .expect("must not error when the root is not a registered folder")
+            .0
+            .results;
+        assert!(out.iter().any(|r| r.scope == "workspace"), "{out:?}");
+    }
+
+    /// A recording sink: captures the request the handler builds without
+    /// touching a writer or a store.
+    #[derive(Default)]
+    struct RecordingSink {
+        seen: std::sync::Mutex<Vec<super::super::signal::MemoryFlagRequest>>,
+        accepted: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl MemorySignalSink for RecordingSink {
+        async fn flag(
+            &self,
+            req: super::super::signal::MemoryFlagRequest,
+        ) -> anyhow::Result<super::super::signal::MemoryFlagOutcome> {
+            self.seen.lock().unwrap().push(req);
+            Ok(super::super::signal::MemoryFlagOutcome {
+                accepted: self.accepted,
+                detail: "recorded".into(),
+            })
+        }
+    }
+
+    fn flag_input(id: i64, scope: &str) -> MemoryFlagInput {
+        MemoryFlagInput {
+            id,
+            scope: scope.to_string(),
+            reason: "contradicted by the code I just read".into(),
+        }
+    }
+
+    /// `Json<T>` is not `Debug`, so `expect_err` is unavailable.
+    fn expect_flag_error(
+        res: Result<Json<MemoryFlagOutput>, ErrorData>,
+        context: &str,
+    ) -> ErrorData {
+        match res {
+            Err(e) => e,
+            Ok(ok) => panic!(
+                "{context}: expected an error, got accepted={}",
+                ok.0.accepted
+            ),
+        }
+    }
+
+    /// (ii) Without a sink the tool must error, never silently no-op.
+    #[tokio::test]
+    async fn memory_flag_without_a_sink_errors() {
+        let s = split_fixture();
+        let err = expect_flag_error(
+            s.memory_flag(Parameters(flag_input(1, "workspace"))).await,
+            "unwired server",
+        );
+        assert!(
+            err.message.contains("mcp.flag.enabled"),
+            "the error should name the setting that enables it: {}",
+            err.message
+        );
+    }
+
+    /// (iii) Folder scopes and unknown values are invalid_params, same
+    /// rule as `memory_get` — the MCP surface carries no repo_id.
+    #[tokio::test]
+    async fn memory_flag_rejects_unreachable_and_unknown_scopes() {
+        let sink = Arc::new(RecordingSink {
+            accepted: true,
+            ..Default::default()
+        });
+        let s = split_fixture().with_signal_sink(sink.clone());
+
+        for bad in ["repo", "module", "cosmic"] {
+            let err = expect_flag_error(s.memory_flag(Parameters(flag_input(1, bad))).await, bad);
+            assert!(
+                err.message.contains("memory_flag.scope"),
+                "{bad}: {}",
+                err.message
+            );
+        }
+        assert!(
+            sink.seen.lock().unwrap().is_empty(),
+            "a rejected scope must never reach the sink"
+        );
+    }
+
+    /// (iv) A `mcp.permissions` deny on `gaviero:memory_flag` is
+    /// enforced server-side, before the sink is consulted.
+    #[tokio::test]
+    async fn memory_flag_honours_a_permissions_deny() {
+        let sink = Arc::new(RecordingSink {
+            accepted: true,
+            ..Default::default()
+        });
+        let permissions = super::super::McpPermissions {
+            allow: Vec::new(),
+            deny: vec!["gaviero:memory_flag".to_string()],
+        };
+        let s = split_fixture()
+            .with_signal_sink(sink.clone())
+            .with_permissions(permissions);
+
+        let err = expect_flag_error(
+            s.memory_flag(Parameters(flag_input(1, "workspace"))).await,
+            "denied tool",
+        );
+        assert!(err.message.contains("mcp.permissions"), "{}", err.message);
+        assert!(sink.seen.lock().unwrap().is_empty());
+    }
+
+    /// The scope string resolves to the `(scope_level, repo_id)` pair the
+    /// writer routes on, and an empty reason is refused before it can
+    /// reach the audit row.
+    #[tokio::test]
+    async fn memory_flag_resolves_scope_and_requires_a_reason() {
+        let sink = Arc::new(RecordingSink {
+            accepted: true,
+            ..Default::default()
+        });
+        let s = split_fixture().with_signal_sink(sink.clone());
+
+        for (scope, expected) in [
+            ("global", crate::memory::scope::SCOPE_GLOBAL),
+            ("workspace", crate::memory::scope::SCOPE_WORKSPACE),
+            ("run", crate::memory::scope::SCOPE_RUN),
+        ] {
+            let out = s
+                .memory_flag(Parameters(flag_input(7, scope)))
+                .await
+                .expect("wired sink accepts");
+            assert!(out.0.accepted);
+            let last = sink.seen.lock().unwrap().last().cloned().unwrap();
+            assert_eq!(last.memory_id, 7);
+            assert_eq!(last.scope_level, expected, "scope {scope}");
+            assert!(last.repo_id.is_none());
+        }
+
+        let err = expect_flag_error(
+            s.memory_flag(Parameters(MemoryFlagInput {
+                id: 7,
+                scope: "workspace".into(),
+                reason: "   ".into(),
+            }))
+            .await,
+            "empty reason",
+        );
+        assert!(err.message.contains("reason"), "{}", err.message);
     }
 
     /// PR-3: `repo_outline` returns ranked entries from a real
