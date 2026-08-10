@@ -1,67 +1,31 @@
-//! Codex `app-server` session (V9 §11 M8).
+//! Codex `app-server` session.
 //!
-//! [`CodexAppServerSession`] implements [`AgentSession`] by keeping a single
-//! `codex app-server --listen stdio://` subprocess alive across turns.
-//! This achieves `ProcessBound` continuity: the model retains in-context state
-//! for the lifetime of the subprocess.
+//! [`CodexAppServerSession`] keeps a `codex app-server --listen stdio://`
+//! subprocess alive for the lifetime of the session and translates its JSON-RPC
+//! event stream into [`UnifiedStreamEvent`] values.
 //!
-//! # Protocol (JSON-RPC 2.0 over NDJSON stdio)
+//! File edits use Codex's native `fileChange` protocol. Gaviero runs the thread
+//! in a read-only sandbox with `approvalPolicy=on-request`, snapshots every
+//! proposed path when `item/started` arrives, then accepts the corresponding
+//! `item/fileChange/requestApproval`. At turn completion it captures Codex's
+//! final contents, restores the pre-turn state, and inserts ordinary Write Gate
+//! proposals. This gives Codex the same review semantics as Claude without
+//! forcing whole files through assistant text.
 //!
-//! The `codex app-server` protocol is JSON-RPC 2.0 (not bare NDJSON with a
-//! `"type"` field). **Note: V9 §6's event-mapping table uses shorthand names
-//! that do not match the real method names exactly — this file implements
-//! the actual protocol sourced from the openai/codex README.**
+//! Direct, workspace-scoped `cargo fmt` and `cargo test` commands are approved
+//! through Codex's command-execution approval protocol. Before approving
+//! `cargo fmt`, Gaviero snapshots every Rust source under the configured roots,
+//! so formatter changes are included in the same transactional review.
 //!
-//! ## Startup handshake
-//! ```text
-//! → {"method":"initialize","id":0,"params":{"clientInfo":{"name":"gaviero"}}}
-//! ← {"id":0,"result":{"userAgent":"...","codexHome":"...",...}}
-//! → {"method":"initialized","params":{}}
-//! → {"method":"thread/start","id":1,"params":{"model":"...","cwd":"...","approvalPolicy":"never"}}
-//! ←  (response) + {"method":"thread/started","params":{"thread":{"id":"<threadId>","status":"idle"}}}
-//! ```
-//! When a `CodexThreadId` continuity handle exists, `thread/resume` is sent
-//! instead of `thread/start`.
-//!
-//! ## Per turn
-//! ```text
-//! → {"method":"turn/start","id":N,"params":{"threadId":"...","input":[{"type":"text","text":"..."}]}}
-//! ← {"method":"turn/started","params":{"turn":{"id":"...","status":"inProgress"}}}
-//! ← {"method":"item/started","params":{"item":{"type":"agentMessage","id":"...","text":""}}}
-//! ← {"method":"item/agentMessage/delta","params":{"itemId":"...","delta":"..."}}
-//! ← {"method":"item/completed","params":{"item":{"type":"agentMessage","id":"...","text":"..."}}}
-//! ← {"method":"turn/completed","params":{"turn":{"status":"completed","tokenUsage":{...}}}}
-//! ```
-//!
-//! ## Event → UnifiedStreamEvent mapping (V9 §6, corrected to real method names)
-//!
-//! | JSON-RPC method | UnifiedStreamEvent |
-//! |---|---|
-//! | `item/agentMessage/delta` (`params.delta`) | `TextDelta` |
-//! | `item/reasoningMessage/delta` (`params.delta`) | `ThinkingDelta` |
-//! | `item/started` (item.type=`commandExecution`) | `ToolCallStart` |
-//! | `item/commandExecution/outputDelta` (`params.deltaBase64`, base64) | `ToolCallDelta` |
-//! | `item/completed` (item.type=`commandExecution`) | `ToolCallEnd` |
-//! | `turn/completed` (turn.status=`completed`) | `Usage + Done(EndTurn)` |
-//! | `turn/completed` (turn.status=`failed`) | `Error + Done(Error)` |
-//!
-//! Unknown methods are logged at `warn!` per V9 §6.
-//!
-//! ## Reconnect on crash
-//!
-//! Stdin write failure (broken pipe) → `Error + Done(Error)` → `inner = None`.
-//! Next `send_turn` spawns a fresh subprocess.
-//!
-//! ## `CodexThreadId` persistence
-//!
-//! `continuity_handle()` returns `Some(ContinuityHandle::CodexThreadId(id))`
-//! once `thread/started` is received. M4's `StoredConversation::continuity_handle`
-//! persists it across restarts without additional `session_state.rs` changes.
+//! Standard `codex:` chat sessions remain `StatelessReplay`: the TUI creates a
+//! fresh session per turn and the planner supplies replay history. The explicit
+//! `codex-app-server:` profile remains `ProcessBound`.
 
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -71,25 +35,28 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::acp::client::{propose_delete, propose_write};
 use crate::context_planner::{ContinuityHandle, ContinuityMode};
-use crate::swarm::backend::shared::default_editor_system_prompt;
+use crate::observer::AcpObserver;
+use crate::swarm::backend::shared::{
+    build_enriched_prompt, default_editor_system_prompt, render_graph_block, render_memory_block,
+    render_skill_block,
+};
 use crate::swarm::backend::{
     Capabilities, RetrievalToolset, StopReason, TokenUsage, UnifiedStreamEvent,
 };
+use crate::write_gate::WriteGatePipeline;
 
 use super::registry::SessionConstruction;
 use super::{AgentSession, Turn};
 
-// ── JSON-RPC helpers ──────────────────────────────────────────────────────────
-
-/// Global monotonic request ID counter (per process, not per session).
 static NEXT_RPC_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_id() -> u64 {
     NEXT_RPC_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-fn codex_file_block_capabilities() -> Capabilities {
+fn codex_native_edit_capabilities() -> Capabilities {
     Capabilities {
         tool_use: true,
         streaming: true,
@@ -97,9 +64,7 @@ fn codex_file_block_capabilities() -> Capabilities {
         extended_thinking: false,
         max_context_tokens: 200_000,
         supports_system_prompt: true,
-        supports_file_blocks: true,
-        // PUSH→PULL Phase 1: the gaviero MCP server is wired for Codex, so the
-        // always-on retrieval tools are live.
+        supports_file_blocks: false,
         retrieval: RetrievalToolset {
             graph_and_memory: true,
             symbols: false,
@@ -107,77 +72,99 @@ fn codex_file_block_capabilities() -> Capabilities {
     }
 }
 
-fn codex_file_block_developer_instructions(
-    cwd: &PathBuf,
-    additional_roots: &[PathBuf],
-) -> String {
-    let base = default_editor_system_prompt(&codex_file_block_capabilities());
+fn codex_native_edit_developer_instructions(cwd: &Path, additional_roots: &[PathBuf]) -> String {
+    let mut instructions = default_editor_system_prompt(&codex_native_edit_capabilities());
+    instructions.push_str(
+        "\n\nFor Codex, `apply_patch` is the native file-edit tool. Use it for all \
+         source-file additions, updates, moves, and deletions. Do not write files \
+         through shell redirection or helper scripts. Gaviero snapshots each native \
+         file change, restores the original after the turn, and sends the intended \
+         result to its review queue. Do not print complete files in assistant text.\n\n\
+         You may run direct, workspace-scoped `cargo fmt ...` and `cargo test ...` \
+         verification commands against the temporary edited workspace. Invoke Cargo \
+         directly, without shell chaining, pipes, redirection, command wrappers, \
+         network escalation, or manifests outside the configured workspace roots. \
+         Other write-capable shell commands are declined. Prefer the narrowest \
+         package and test scope that validates the change.\n",
+    );
+
     if additional_roots.is_empty() {
-        return base;
+        return instructions;
     }
-    // Workspace-mode multi-folder: the codex app-server protocol takes a
-    // single `cwd` field, and the only protocol-level "additional writable
-    // roots" is `WorkspaceWriteSandboxPolicy.writableRoots` — which would
-    // require switching the sandbox to write-mode and bypass the Write
-    // Gate. Instead, surface the sibling folders as a workspace hint in
-    // the developer instructions so the model knows it can read/edit
-    // across them. File edits still flow through `<file>` proposals.
-    let mut hint = String::from("\n\nWorkspace folders (workspace-mode):\n");
-    hint.push_str(&format!("  primary: {}\n", cwd.to_string_lossy()));
-    for r in additional_roots {
-        if r.as_os_str().is_empty() || r == cwd {
+
+    instructions.push_str("\nWorkspace folders (workspace-mode):\n");
+    instructions.push_str(&format!("  primary: {}\n", cwd.to_string_lossy()));
+    for root in additional_roots {
+        if root.as_os_str().is_empty() || root == cwd {
             continue;
         }
-        hint.push_str(&format!("  sibling: {}\n", r.to_string_lossy()));
+        instructions.push_str(&format!("  sibling: {}\n", root.to_string_lossy()));
     }
-    hint.push_str(
-        "Read freely from any folder above. File edits across any folder are emitted as <file path=\"...\"> ... </file> proposals — gaviero routes them through its review queue.\n",
+    instructions.push_str(
+        "Read from any folder above. Native edits inside those folders are captured \
+         transactionally and routed through the same review queue.\n",
     );
-    format!("{base}{hint}")
+    instructions
 }
 
 fn thread_start_params(
     model: &str,
-    cwd: &PathBuf,
+    cwd: &Path,
     additional_roots: &[PathBuf],
     allow_network: bool,
 ) -> serde_json::Value {
     serde_json::json!({
         "model": model,
         "cwd": cwd.to_string_lossy(),
-        "approvalPolicy": "never",
+        "approvalPolicy": "on-request",
         "sandbox": "read-only",
         "sandboxPolicy": { "type": "readOnly", "networkAccess": allow_network },
-        "developerInstructions": codex_file_block_developer_instructions(cwd, additional_roots),
+        "developerInstructions": codex_native_edit_developer_instructions(cwd, additional_roots),
     })
 }
 
 fn thread_resume_params(
     thread_id: &str,
-    cwd: &PathBuf,
+    cwd: &Path,
     additional_roots: &[PathBuf],
     allow_network: bool,
 ) -> serde_json::Value {
     serde_json::json!({
         "threadId": thread_id,
         "cwd": cwd.to_string_lossy(),
-        "approvalPolicy": "never",
+        "approvalPolicy": "on-request",
         "sandbox": "read-only",
         "sandboxPolicy": { "type": "readOnly", "networkAccess": allow_network },
-        "developerInstructions": codex_file_block_developer_instructions(cwd, additional_roots),
+        "developerInstructions": codex_native_edit_developer_instructions(cwd, additional_roots),
     })
 }
 
-fn turn_start_params(thread_id: &str, user_message: &str, allow_network: bool) -> serde_json::Value {
+fn turn_start_params(
+    thread_id: &str,
+    user_message: &str,
+    allow_network: bool,
+) -> serde_json::Value {
     serde_json::json!({
         "threadId": thread_id,
         "input": [{ "type": "text", "text": user_message }],
-        "approvalPolicy": "never",
+        "approvalPolicy": "on-request",
         "sandboxPolicy": { "type": "readOnly", "networkAccess": allow_network },
     })
 }
 
-/// Serialize a JSON-RPC 2.0 request (with `id`, expects a response).
+/// `initialize` params. Codex's `ClientInfo` requires both `name` and
+/// `version`; omitting `version` fails the request with
+/// `-32600 Invalid request: missing field \`version\``.
+fn client_info_params() -> serde_json::Value {
+    serde_json::json!({
+        "clientInfo": {
+            "name": "gaviero",
+            "title": "Gaviero",
+            "version": env!("CARGO_PKG_VERSION"),
+        }
+    })
+}
+
 fn rpc_request(method: &str, id: u64, params: serde_json::Value) -> String {
     format!(
         "{}\n",
@@ -185,7 +172,6 @@ fn rpc_request(method: &str, id: u64, params: serde_json::Value) -> String {
     )
 }
 
-/// Serialize a JSON-RPC 2.0 notification (no `id`, no response expected).
 fn rpc_notification(method: &str, params: serde_json::Value) -> String {
     format!(
         "{}\n",
@@ -193,41 +179,140 @@ fn rpc_notification(method: &str, params: serde_json::Value) -> String {
     )
 }
 
-// ── Internal subprocess state ─────────────────────────────────────────────────
+fn rpc_response(id: &serde_json::Value, result: serde_json::Value) -> String {
+    format!("{}\n", serde_json::json!({"id": id, "result": result}))
+}
+
+type EventSender = mpsc::Sender<Result<UnifiedStreamEvent>>;
+type SharedStdin = Arc<Mutex<BufWriter<ChildStdin>>>;
+type WeakStdin = Weak<Mutex<BufWriter<ChildStdin>>>;
+type SharedActiveTurn = Arc<Mutex<Option<ActiveTurn>>>;
+
+#[derive(Default)]
+struct TurnSnapshot {
+    originals: HashMap<PathBuf, Option<String>>,
+}
+
+impl TurnSnapshot {
+    async fn capture_before_write(&mut self, path: &Path) -> Result<()> {
+        if self.originals.contains_key(path) {
+            return Ok(());
+        }
+        let content = read_optional_text(path)
+            .await
+            .with_context(|| format!("snapshot read of {}", path.display()))?;
+        self.originals.insert(path.to_path_buf(), content);
+        Ok(())
+    }
+
+    fn original(&self, path: &Path) -> Option<&Option<String>> {
+        self.originals.get(path)
+    }
+
+    fn edits(&self) -> Vec<(PathBuf, Option<String>)> {
+        self.originals
+            .iter()
+            .map(|(path, content)| (path.clone(), content.clone()))
+            .collect()
+    }
+
+    async fn revert_path(&self, path: &Path) -> Result<()> {
+        let Some(original) = self.originals.get(path) else {
+            return Ok(());
+        };
+        match original {
+            Some(content) => {
+                if let Some(parent) = path.parent() {
+                    tokio::fs::create_dir_all(parent)
+                        .await
+                        .with_context(|| format!("creating {}", parent.display()))?;
+                }
+                tokio::fs::write(path, content)
+                    .await
+                    .with_context(|| format!("restoring {}", path.display()))?;
+            }
+            None => match tokio::fs::remove_file(path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).with_context(|| format!("removing {}", path.display()));
+                }
+            },
+        }
+        Ok(())
+    }
+}
+
+struct ActiveTurn {
+    tx: EventSender,
+    snapshot: TurnSnapshot,
+    seen_file_items: HashSet<String>,
+    declined_file_items: HashSet<String>,
+    item_paths: HashMap<String, Vec<PathBuf>>,
+}
+
+impl ActiveTurn {
+    fn new(tx: EventSender) -> Self {
+        Self {
+            tx,
+            snapshot: TurnSnapshot::default(),
+            seen_file_items: HashSet::new(),
+            declined_file_items: HashSet::new(),
+            item_paths: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ReviewContext {
+    write_gate: Arc<Mutex<WriteGatePipeline>>,
+    observer: Arc<dyn AcpObserver>,
+    primary_root: PathBuf,
+    allowed_roots: Vec<PathBuf>,
+    agent_id: String,
+    conv_id: Option<String>,
+}
+
+impl ReviewContext {
+    fn root_for_path(&self, path: &Path) -> Option<&PathBuf> {
+        self.allowed_roots
+            .iter()
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.components().count())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CargoVerificationKind {
+    Format,
+    Test,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CargoVerificationRequest {
+    kind: CargoVerificationKind,
+    cwd: PathBuf,
+}
 
 struct AppServerInner {
     child: Child,
-    stdin: BufWriter<ChildStdin>,
+    stdin: SharedStdin,
     thread_id: String,
-    /// Current per-turn event channel. Replaced each turn by `send_turn`.
-    active_tx: Arc<Mutex<Option<mpsc::Sender<Result<UnifiedStreamEvent>>>>>,
+    active_turn: SharedActiveTurn,
+    reader_task: tokio::task::JoinHandle<()>,
 }
 
-// ── CodexAppServerSession ─────────────────────────────────────────────────────
-
-/// M8 `AgentSession` for Codex `app-server` mode (`codex-app-server:` prefix).
 pub struct CodexAppServerSession {
     model: String,
     workspace_root: PathBuf,
-    /// Sibling workspace folders (workspace-mode multi-folder). The codex
-    /// app-server RPC has no `--add-dir` analog while in `read-only`
-    /// sandbox, so these are passed through `developerInstructions` as a
-    /// workspace hint. File edits still flow through the in-band `<file>`
-    /// proposal channel and gaviero's Write Gate.
     additional_roots: Vec<PathBuf>,
+    continuity_mode: ContinuityMode,
     inner: Option<AppServerInner>,
     handle: Option<ContinuityHandle>,
+    review: ReviewContext,
 }
 
-/// Build the argv (after the `codex` binary) for the `app-server` invocation.
-///
-/// Top-level `-c mcp_servers.X.Y=Z` overrides go **before** the `app-server`
-/// subcommand because codex CLI applies `--config` on the top-level command
-/// and dispatches to subcommands afterwards. The MCP entries themselves come
-/// from the synthesized `<workspace_root>/.codex/config.toml`, since codex's
-/// CLI only auto-loads `$CODEX_HOME/config.toml` — without these overrides
-/// the per-worktree MCP servers stay invisible to the chat session.
-fn codex_app_server_args(workspace_root: &std::path::Path) -> Vec<String> {
+fn codex_app_server_args(workspace_root: &Path) -> Vec<String> {
     let mut args = Vec::new();
     let codex_config = workspace_root.join(".codex/config.toml");
     for pair in crate::mcp::codex_mcp_overrides_from_config_file(&codex_config) {
@@ -241,36 +326,58 @@ fn codex_app_server_args(workspace_root: &std::path::Path) -> Vec<String> {
 }
 
 impl CodexAppServerSession {
-    pub(super) fn new(args: SessionConstruction) -> Self {
+    pub(super) fn new(args: SessionConstruction, observer: Arc<dyn AcpObserver>) -> Self {
         let model = args
             .model
             .strip_prefix("codex-app-server:")
+            .or_else(|| args.model.strip_prefix("codex:"))
             .unwrap_or(&args.model)
             .to_string();
+        let continuity_mode = args.profile.continuity_mode;
 
-        // Restore a previously persisted CodexThreadId so `ensure_running`
-        // can send `thread/resume` instead of `thread/start`.
         #[allow(deprecated)]
-        let handle = args
-            .options
-            .resume_session_id
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .map(|id| ContinuityHandle::CodexThreadId(id.to_string()));
+        let handle = if continuity_mode == ContinuityMode::ProcessBound {
+            args.options
+                .resume_session_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .map(|id| ContinuityHandle::CodexThreadId(id.to_string()))
+        } else {
+            None
+        };
+
+        let primary_root = normalize_lexically(&args.workspace_root)
+            .unwrap_or_else(|| args.workspace_root.clone());
+        let mut allowed_roots = vec![primary_root.clone()];
+        for root in &args.additional_roots {
+            let Some(root) = normalize_lexically(root) else {
+                continue;
+            };
+            if !allowed_roots.contains(&root) {
+                allowed_roots.push(root);
+            }
+        }
+
+        let review = ReviewContext {
+            write_gate: args.write_gate,
+            observer,
+            primary_root,
+            allowed_roots,
+            agent_id: args.agent_id,
+            conv_id: args.conv_id,
+        };
 
         Self {
             model,
             workspace_root: args.workspace_root,
             additional_roots: args.additional_roots,
+            continuity_mode,
             inner: None,
             handle,
+            review,
         }
     }
 
-    /// Spawn the subprocess and run the full startup handshake.
-    ///
-    /// On return, `self.inner` is `Some(_)` and `self.handle` holds the
-    /// `CodexThreadId`.
     async fn ensure_running(&mut self) -> Result<()> {
         if self.inner.is_some() {
             return Ok(());
@@ -290,8 +397,7 @@ impl CodexAppServerSession {
         let mut child = cmd.spawn().map_err(|e| {
             anyhow::anyhow!(
                 "spawning codex app-server: {e}\n\
-                 Ensure `codex` is on PATH and OPENAI_API_KEY is set.\n\
-                 Use `codex:` prefix to fall back to `codex exec`."
+                 Ensure a current `codex` CLI is installed and authenticated."
             )
         })?;
 
@@ -306,14 +412,7 @@ impl CodexAppServerSession {
         let mut stdin = BufWriter::new(stdin);
         let mut lines = BufReader::new(stdout).lines();
 
-        // Grant network access at thread start when the synthesized MCP
-        // config declares an HTTP server. Same logic as `send_turn` so
-        // the policy stays consistent between the initial handshake and
-        // every subsequent turn.
         let allow_network = crate::mcp::codex_synth_has_remote_mcp(&self.workspace_root);
-
-        // Run the startup handshake synchronously before handing stdout to the
-        // background reader — avoids races between init messages and turn events.
         let thread_id = tokio::time::timeout(
             std::time::Duration::from_secs(15),
             handshake(
@@ -330,35 +429,43 @@ impl CodexAppServerSession {
         .context("codex app-server: handshake timed out")??;
 
         tracing::debug!(thread_id, "codex app-server: ready");
-        self.handle = Some(ContinuityHandle::CodexThreadId(thread_id.clone()));
+        if self.continuity_mode == ContinuityMode::ProcessBound {
+            self.handle = Some(ContinuityHandle::CodexThreadId(thread_id.clone()));
+        }
 
-        let active_tx: Arc<Mutex<Option<mpsc::Sender<Result<UnifiedStreamEvent>>>>> =
-            Arc::new(Mutex::new(None));
-        let active_tx_bg = active_tx.clone();
+        let stdin = Arc::new(Mutex::new(stdin));
+        let stdin_bg = Arc::downgrade(&stdin);
+        let active_turn: SharedActiveTurn = Arc::new(Mutex::new(None));
+        let active_turn_bg = active_turn.clone();
+        let review = self.review.clone();
 
-        // Background stdout reader: routes events to the per-turn channel.
-        tokio::spawn(async move {
+        let reader_task = tokio::spawn(async move {
+            let mut terminal_error: Option<String> = None;
             while let Ok(Some(line)) = lines.next_line().await {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let (events, is_done) = parse_rpc_event(&line);
+                if let Err(e) =
+                    route_app_server_line(&line, &stdin_bg, &active_turn_bg, &review).await
                 {
-                    let guard = active_tx_bg.lock().await;
-                    if let Some(tx) = guard.as_ref() {
-                        for ev in events {
-                            if tx.send(Ok(ev)).await.is_err() {
-                                break;
-                            }
-                        }
-                    } else if !events.is_empty() {
-                        tracing::warn!("codex app-server: event outside active turn: {line}");
-                    }
-                }
-                if is_done {
-                    active_tx_bg.lock().await.take();
+                    terminal_error = Some(format!("{e:#}"));
+                    break;
                 }
             }
+
+            if let Some(active) = active_turn_bg.lock().await.take() {
+                let mut message = terminal_error
+                    .unwrap_or_else(|| "codex app-server stdout closed unexpectedly".to_string());
+                if let Err(e) = finalize_native_edits(&review, active.snapshot).await {
+                    message.push_str(&format!("\ncleanup failed: {e:#}"));
+                }
+                let _ = active.tx.send(Ok(UnifiedStreamEvent::Error(message))).await;
+                let _ = active
+                    .tx
+                    .send(Ok(UnifiedStreamEvent::Done(StopReason::Error)))
+                    .await;
+            }
+
             tracing::debug!("codex app-server: stdout closed");
         });
 
@@ -366,7 +473,8 @@ impl CodexAppServerSession {
             child,
             stdin,
             thread_id,
-            active_tx,
+            active_turn,
+            reader_task,
         });
         Ok(())
     }
@@ -375,6 +483,7 @@ impl CodexAppServerSession {
         if let Some(mut inner) = self.inner.take() {
             drop(inner.stdin);
             let _ = inner.child.wait().await;
+            let _ = inner.reader_task.await;
             tracing::debug!("codex app-server: subprocess reaped");
         }
     }
@@ -392,27 +501,35 @@ impl AgentSession for CodexAppServerSession {
             return Ok(error_then_done(msg));
         }
 
-        let inner = self.inner.as_mut().unwrap();
+        let rendered_message = render_turn_prompt(turn);
+        let inner = self.inner.as_mut().expect("ensure_running set inner");
         let thread_id = inner.thread_id.clone();
 
-        // Install per-turn channel before writing stdin.
         let (tx, rx) = mpsc::channel::<Result<UnifiedStreamEvent>>(64);
-        *inner.active_tx.lock().await = Some(tx);
+        {
+            let mut active = inner.active_turn.lock().await;
+            if active.is_some() {
+                return Ok(error_then_done(
+                    "codex app-server already has an active turn".to_string(),
+                ));
+            }
+            *active = Some(ActiveTurn::new(tx));
+        }
 
-        // Grant network access to read-only sandbox when the synthesized
-        // MCP config declares an HTTP server — otherwise Codex's network
-        // sandbox blocks MCP tool calls before they leave the process.
         let allow_network = crate::mcp::codex_synth_has_remote_mcp(&self.workspace_root);
-
-        // Send turn/start request.
-        let req = rpc_request(
+        let request = rpc_request(
             "turn/start",
             next_id(),
-            turn_start_params(&thread_id, &turn.user_message, allow_network),
+            turn_start_params(&thread_id, &rendered_message, allow_network),
         );
-        if let Err(e) = write_msg(&mut inner.stdin, &req).await {
-            tracing::warn!("codex app-server: stdin write failed (crash?): {e}");
-            inner.active_tx.lock().await.take();
+
+        let write_result = {
+            let mut stdin = inner.stdin.lock().await;
+            write_msg(&mut stdin, &request).await
+        };
+        if let Err(e) = write_result {
+            tracing::warn!("codex app-server: stdin write failed: {e}");
+            inner.active_turn.lock().await.take();
             self.tear_down().await;
             return Ok(error_then_done(format!("codex app-server crashed: {e:#}")));
         }
@@ -421,11 +538,15 @@ impl AgentSession for CodexAppServerSession {
     }
 
     fn continuity_mode(&self) -> ContinuityMode {
-        ContinuityMode::ProcessBound
+        self.continuity_mode
     }
 
     fn continuity_handle(&self) -> Option<&ContinuityHandle> {
-        self.handle.as_ref()
+        if self.continuity_mode == ContinuityMode::ProcessBound {
+            self.handle.as_ref()
+        } else {
+            None
+        }
     }
 
     async fn close(mut self: Box<Self>) {
@@ -433,41 +554,80 @@ impl AgentSession for CodexAppServerSession {
     }
 }
 
-// ── Startup handshake ─────────────────────────────────────────────────────────
+fn render_turn_prompt(turn: Turn) -> String {
+    let Turn {
+        user_message,
+        memory_selections,
+        graph_selections,
+        file_refs,
+        skill_selections,
+        replay_history,
+        ..
+    } = turn;
 
-/// Run the full JSON-RPC 2.0 startup sequence and return the thread ID.
+    let mut prompt_parts = vec![user_message];
+    if let Some(block) = render_graph_block(&graph_selections) {
+        prompt_parts.push(block);
+    }
+    if let Some(block) = render_memory_block(&memory_selections) {
+        prompt_parts.push(block);
+    }
+    if let Some(block) = render_skill_block(&skill_selections) {
+        prompt_parts.push(block);
+    }
+
+    let history = replay_history
+        .map(|payload| {
+            payload
+                .entries
+                .into_iter()
+                .map(|(role, content)| {
+                    let role = match role {
+                        crate::context_planner::ledger::Role::User => "user",
+                        crate::context_planner::ledger::Role::Assistant => "assistant",
+                        crate::context_planner::ledger::Role::System => "system",
+                    };
+                    (role.to_string(), content)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let text_refs = file_refs
+        .into_iter()
+        .filter_map(|attachment| {
+            attachment
+                .content
+                .map(|content| (attachment.path.to_string_lossy().into_owned(), content))
+        })
+        .collect::<Vec<_>>();
+
+    build_enriched_prompt(&prompt_parts.join("\n\n"), &history, &text_refs)
+}
+
 async fn handshake(
     stdin: &mut BufWriter<ChildStdin>,
     lines: &mut Lines<BufReader<ChildStdout>>,
     model: &str,
-    cwd: &PathBuf,
+    cwd: &Path,
     additional_roots: &[PathBuf],
     existing_handle: &Option<ContinuityHandle>,
     allow_network: bool,
 ) -> Result<String> {
-    // 1. initialize
     let init_id = next_id();
     write_msg(
         stdin,
-        &rpc_request(
-            "initialize",
-            init_id,
-            serde_json::json!({ "clientInfo": { "name": "gaviero" } }),
-        ),
+        &rpc_request("initialize", init_id, client_info_params()),
     )
     .await?;
-
-    // Read until we see the response for init_id (has "id" == init_id).
     read_until_response(lines, init_id).await?;
 
-    // 2. initialized notification (no response expected)
     write_msg(
         stdin,
         &rpc_notification("initialized", serde_json::json!({})),
     )
     .await?;
 
-    // 3. thread/start or thread/resume
     let (method, params) = match existing_handle {
         Some(ContinuityHandle::CodexThreadId(id)) => (
             "thread/resume",
@@ -479,25 +639,22 @@ async fn handshake(
         ),
     };
 
-    let thread_req_id = next_id();
-    write_msg(stdin, &rpc_request(method, thread_req_id, params)).await?;
-
-    // Read until thread/started notification, capture thread_id.
+    let request_id = next_id();
+    write_msg(stdin, &rpc_request(method, request_id, params)).await?;
     read_thread_id(lines).await
 }
 
-/// Discard lines until a response for `expected_id` arrives (has `"id"` field).
 async fn read_until_response(
     lines: &mut Lines<BufReader<ChildStdout>>,
     expected_id: u64,
 ) -> Result<()> {
     while let Ok(Some(line)) = lines.next_line().await {
-        let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
-        if val.get("id").and_then(|v| v.as_u64()) == Some(expected_id) {
-            if let Some(err) = val.get("error") {
-                anyhow::bail!("codex app-server RPC error: {err}");
+        if value.get("id").and_then(|id| id.as_u64()) == Some(expected_id) {
+            if let Some(error) = value.get("error") {
+                anyhow::bail!("codex app-server RPC error: {error}");
             }
             return Ok(());
         }
@@ -505,112 +662,831 @@ async fn read_until_response(
     anyhow::bail!("codex app-server: stdout closed before receiving response id={expected_id}")
 }
 
-/// Read lines until `thread/started` notification, extract and return thread ID.
 async fn read_thread_id(lines: &mut Lines<BufReader<ChildStdout>>) -> Result<String> {
     while let Ok(Some(line)) = lines.next_line().await {
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
-        if val.get("method").and_then(|v| v.as_str()) == Some("thread/started") {
-            let id = val
+        if value.get("method").and_then(|method| method.as_str()) == Some("thread/started") {
+            return Ok(value
                 .pointer("/params/thread/id")
-                .and_then(|v| v.as_str())
+                .and_then(|id| id.as_str())
                 .unwrap_or("unknown")
-                .to_string();
-            return Ok(id);
+                .to_string());
         }
-        // Also accept a response that carries the thread id directly.
-        if let Some(thread_id) = val.pointer("/result/thread/id").and_then(|v| v.as_str()) {
+        if let Some(thread_id) = value
+            .pointer("/result/thread/id")
+            .and_then(|id| id.as_str())
+        {
             return Ok(thread_id.to_string());
         }
     }
     anyhow::bail!("codex app-server: stdout closed before thread/started")
 }
 
-// ── Event parser ──────────────────────────────────────────────────────────────
+async fn route_app_server_line(
+    line: &str,
+    stdin: &WeakStdin,
+    active_turn: &SharedActiveTurn,
+    review: &ReviewContext,
+) -> Result<()> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        let (events, _) = parse_rpc_event(line);
+        send_to_active(active_turn, events).await;
+        return Ok(());
+    };
 
-/// Parse one NDJSON line into `(events, is_done)`.
-///
-/// Implements the corrected V9 §6 mapping using real JSON-RPC 2.0 method names.
-/// Unknown methods are logged at `warn!` per V9 §6.
+    let method = value
+        .get("method")
+        .and_then(|method| method.as_str())
+        .unwrap_or_default();
+
+    match method {
+        "item/started"
+            if value
+                .pointer("/params/item/type")
+                .and_then(|kind| kind.as_str())
+                == Some("fileChange") =>
+        {
+            capture_file_change_start(&value, active_turn, review).await;
+            let (events, _) = parse_rpc_event(line);
+            send_to_active(active_turn, events).await;
+        }
+        "item/fileChange/requestApproval" => {
+            let id = value
+                .get("id")
+                .context("file-change approval request missing id")?;
+            let item_id = value
+                .pointer("/params/itemId")
+                .and_then(|item| item.as_str())
+                .unwrap_or_default();
+            let accept = file_change_is_safe_to_approve(item_id, active_turn, review).await;
+            let decision = if accept { "accept" } else { "decline" };
+            write_shared(
+                stdin,
+                &rpc_response(id, serde_json::json!({ "decision": decision })),
+            )
+            .await?;
+        }
+        "item/commandExecution/requestApproval" => {
+            let id = value
+                .get("id")
+                .context("command approval request missing id")?;
+            let accept =
+                cargo_verification_is_safe_to_approve(&value, active_turn, review).await;
+            let decision = if accept { "accept" } else { "decline" };
+            write_shared(
+                stdin,
+                &rpc_response(id, serde_json::json!({ "decision": decision })),
+            )
+            .await?;
+        }
+        "turn/completed" => {
+            let active = { active_turn.lock().await.take() };
+            let (events, _) = parse_rpc_event(line);
+            if let Some(active) = active {
+                if let Err(e) = finalize_native_edits(review, active.snapshot).await {
+                    let _ = active
+                        .tx
+                        .send(Ok(UnifiedStreamEvent::Error(format!("{e:#}"))))
+                        .await;
+                }
+                send_events(&active.tx, events).await;
+            } else if !events.is_empty() {
+                tracing::warn!("codex app-server: turn completed without an active receiver");
+            }
+        }
+        _ => {
+            let (events, _) = parse_rpc_event(line);
+            send_to_active(active_turn, events).await;
+        }
+    }
+
+    Ok(())
+}
+
+async fn cargo_verification_is_safe_to_approve(
+    value: &serde_json::Value,
+    active_turn: &SharedActiveTurn,
+    review: &ReviewContext,
+) -> bool {
+    let request = match parse_cargo_verification_request(value, review) {
+        Ok(request) => request,
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "declining Codex command outside the Cargo verification policy"
+            );
+            return false;
+        }
+    };
+
+    if active_turn.lock().await.is_none() {
+        tracing::warn!("declining Cargo verification outside an active Codex turn");
+        return false;
+    }
+
+    if request.kind == CargoVerificationKind::Format
+        && let Err(e) = capture_rust_sources_before_format(active_turn, review).await
+    {
+        tracing::warn!(
+            error = %e,
+            "declining cargo fmt because the source snapshot failed"
+        );
+        review.observer.on_message_complete(
+            "system",
+            &format!(
+                "Declined `cargo fmt` because Gaviero could not snapshot all Rust sources: {e:#}"
+            ),
+        );
+        return false;
+    }
+
+    tracing::debug!(
+        kind = ?request.kind,
+        cwd = %request.cwd.display(),
+        "approving workspace-scoped Cargo verification"
+    );
+    true
+}
+
+fn parse_cargo_verification_request(
+    value: &serde_json::Value,
+    review: &ReviewContext,
+) -> Result<CargoVerificationRequest> {
+    if value
+        .pointer("/params/networkApprovalContext")
+        .is_some_and(|context| !context.is_null())
+    {
+        anyhow::bail!("network approval requests are not Cargo verification commands");
+    }
+    if value
+        .pointer("/params/additionalPermissions")
+        .is_some_and(|permissions| !permissions.is_null())
+    {
+        anyhow::bail!("additional permission requests are not auto-approved");
+    }
+
+    let command = value
+        .pointer("/params/command")
+        .context("command approval request missing command")?;
+    let tokens = cargo_command_tokens(command)?;
+
+    if tokens.is_empty() {
+        anyhow::bail!("empty command");
+    }
+    if tokens.iter().any(|token| contains_shell_control(token)) {
+        anyhow::bail!("shell composition is not allowed");
+    }
+
+    let executable = trim_matching_quotes(&tokens[0]);
+    if executable != "cargo" && !executable.eq_ignore_ascii_case("cargo.exe") {
+        anyhow::bail!("only direct Cargo commands are auto-approved");
+    }
+
+    let mut subcommand_index = 1;
+    if tokens
+        .get(subcommand_index)
+        .map(|token| trim_matching_quotes(token))
+        .is_some_and(|token| token.starts_with('+') && token.len() > 1)
+    {
+        subcommand_index += 1;
+    }
+
+    let subcommand = tokens
+        .get(subcommand_index)
+        .map(|token| trim_matching_quotes(token))
+        .context("Cargo command missing subcommand")?;
+    let kind = match subcommand {
+        "fmt" => CargoVerificationKind::Format,
+        "test" => CargoVerificationKind::Test,
+        _ => anyhow::bail!("only cargo fmt and cargo test are auto-approved"),
+    };
+
+    let cwd = resolve_command_cwd(value, review)?;
+    validate_cargo_scope_arguments(&tokens[subcommand_index + 1..], &cwd, review)?;
+
+    Ok(CargoVerificationRequest { kind, cwd })
+}
+
+fn cargo_command_tokens(command: &serde_json::Value) -> Result<Vec<String>> {
+    match command {
+        serde_json::Value::String(command) => {
+            if contains_shell_control(command) {
+                anyhow::bail!("shell composition is not allowed");
+            }
+            Ok(command
+                .split_whitespace()
+                .map(ToString::to_string)
+                .collect())
+        }
+        serde_json::Value::Array(command) => command
+            .iter()
+            .map(|token| {
+                token
+                    .as_str()
+                    .map(ToString::to_string)
+                    .context("command argv contained a non-string value")
+            })
+            .collect(),
+        _ => anyhow::bail!("unsupported command representation"),
+    }
+}
+
+fn contains_shell_control(command: &str) -> bool {
+    command
+        .chars()
+        .any(|ch| matches!(ch, '\0' | '\r' | '\n' | ';' | '&' | '|' | '<' | '>' | '`' | '$' | '^'))
+        || command.contains("@(")
+}
+
+fn trim_matching_quotes(token: &str) -> &str {
+    let token = token.trim();
+    if token.len() >= 2 {
+        let bytes = token.as_bytes();
+        if (bytes[0] == b'"' && bytes[token.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[token.len() - 1] == b'\'')
+        {
+            return &token[1..token.len() - 1];
+        }
+    }
+    token
+}
+
+fn resolve_command_cwd(
+    value: &serde_json::Value,
+    review: &ReviewContext,
+) -> Result<PathBuf> {
+    let candidate = match value.pointer("/params/cwd").and_then(|cwd| cwd.as_str()) {
+        Some(raw_cwd) => {
+            let raw_cwd = PathBuf::from(raw_cwd);
+            if raw_cwd.is_absolute() {
+                raw_cwd
+            } else {
+                review.primary_root.join(raw_cwd)
+            }
+        }
+        None => review.primary_root.clone(),
+    };
+
+    let candidate_text = candidate.to_string_lossy();
+    let cwd = resolve_allowed_path(&candidate_text, review)?;
+    if !cwd.is_dir() {
+        anyhow::bail!("command cwd {} is not a directory", cwd.display());
+    }
+    Ok(cwd)
+}
+
+fn validate_cargo_scope_arguments(
+    arguments: &[String],
+    cwd: &Path,
+    review: &ReviewContext,
+) -> Result<()> {
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = trim_matching_quotes(&arguments[index]);
+        if argument == "--" {
+            break;
+        }
+
+        if argument == "--config"
+            || argument.starts_with("--config=")
+            || argument == "--target-dir"
+            || argument.starts_with("--target-dir=")
+            || argument == "-C"
+            || argument.starts_with("-Z")
+        {
+            anyhow::bail!("Cargo execution-scope overrides are not auto-approved");
+        }
+
+        let manifest_path = if argument == "--manifest-path" {
+            index += 1;
+            Some(
+                arguments
+                    .get(index)
+                    .map(|path| trim_matching_quotes(path))
+                    .context("--manifest-path missing its value")?,
+            )
+        } else {
+            argument.strip_prefix("--manifest-path=")
+        };
+
+        if let Some(manifest_path) = manifest_path {
+            validate_manifest_path(manifest_path, cwd, review)?;
+        }
+
+        index += 1;
+    }
+    Ok(())
+}
+
+fn validate_manifest_path(
+    raw_path: &str,
+    cwd: &Path,
+    review: &ReviewContext,
+) -> Result<()> {
+    let raw_path = PathBuf::from(raw_path);
+    let candidate = if raw_path.is_absolute() {
+        raw_path
+    } else {
+        cwd.join(raw_path)
+    };
+    let candidate_text = candidate.to_string_lossy();
+    let manifest = resolve_allowed_path(&candidate_text, review)?;
+    if !manifest.is_file() {
+        anyhow::bail!("manifest {} does not exist", manifest.display());
+    }
+    Ok(())
+}
+
+async fn capture_rust_sources_before_format(
+    active_turn: &SharedActiveTurn,
+    review: &ReviewContext,
+) -> Result<()> {
+    let roots = review.allowed_roots.clone();
+    let paths = tokio::task::spawn_blocking(move || collect_rust_sources(&roots))
+        .await
+        .context("joining Rust source scan")??;
+
+    let mut active = active_turn.lock().await;
+    let active = active
+        .as_mut()
+        .context("cargo fmt requested outside an active turn")?;
+    for path in paths {
+        active.snapshot.capture_before_write(&path).await?;
+    }
+    Ok(())
+}
+
+fn collect_rust_sources(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+
+    for root in roots {
+        let entries = walkdir::WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| !ignored_verification_directory(entry));
+
+        for entry in entries {
+            let entry = entry.with_context(|| format!("walking {}", root.display()))?;
+            let path = entry.path();
+
+            if entry.file_type().is_symlink() {
+                let points_to_directory = std::fs::metadata(path)
+                    .map(|metadata| metadata.is_dir())
+                    .unwrap_or(false);
+                let could_affect_rustfmt = points_to_directory
+                    || path.extension().and_then(|extension| extension.to_str()) == Some("rs")
+                    || path.file_name().and_then(|name| name.to_str()) == Some("Cargo.toml");
+                if could_affect_rustfmt {
+                    anyhow::bail!(
+                        "cannot safely snapshot formatter input through symlink {}",
+                        path.display()
+                    );
+                }
+                continue;
+            }
+
+            if entry.file_type().is_file()
+                && path.extension().and_then(|extension| extension.to_str()) == Some("rs")
+            {
+                paths.push(path.to_path_buf());
+            }
+        }
+    }
+
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn ignored_verification_directory(entry: &walkdir::DirEntry) -> bool {
+    entry.depth() > 0
+        && entry.file_type().is_dir()
+        && matches!(
+            entry.file_name().to_str(),
+            Some(".git" | ".gaviero" | "target" | "node_modules")
+        )
+}
+
+async fn capture_file_change_start(
+    value: &serde_json::Value,
+    active_turn: &SharedActiveTurn,
+    review: &ReviewContext,
+) {
+    let item = value
+        .pointer("/params/item")
+        .unwrap_or(&serde_json::Value::Null);
+    let item_id = item
+        .get("id")
+        .and_then(|id| id.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let paths = resolve_file_change_paths(item, review);
+    let mut active = active_turn.lock().await;
+    let Some(active) = active.as_mut() else {
+        tracing::warn!("codex app-server: fileChange started outside an active turn");
+        return;
+    };
+
+    active.seen_file_items.insert(item_id.clone());
+
+    let paths = match paths {
+        Ok(paths) => paths,
+        Err(e) => {
+            active.declined_file_items.insert(item_id.clone());
+            review.observer.on_message_complete(
+                "system",
+                &format!("Declined unsafe Codex file change {item_id}: {e:#}"),
+            );
+            return;
+        }
+    };
+
+    active.item_paths.insert(item_id.clone(), paths.clone());
+    for path in paths {
+        if let Err(e) = active.snapshot.capture_before_write(&path).await {
+            active.declined_file_items.insert(item_id.clone());
+            review.observer.on_message_complete(
+                "system",
+                &format!(
+                    "Declined Codex file change {item_id}: could not snapshot {}: {e:#}",
+                    path.display()
+                ),
+            );
+        }
+    }
+}
+
+async fn file_change_is_safe_to_approve(
+    item_id: &str,
+    active_turn: &SharedActiveTurn,
+    review: &ReviewContext,
+) -> bool {
+    let mut active = active_turn.lock().await;
+    let Some(active) = active.as_mut() else {
+        return false;
+    };
+    if !active.seen_file_items.contains(item_id) || active.declined_file_items.contains(item_id) {
+        return false;
+    }
+
+    let Some(paths) = active.item_paths.get(item_id).cloned() else {
+        return false;
+    };
+    for path in paths {
+        let Some(original) = active.snapshot.original(&path) else {
+            active.declined_file_items.insert(item_id.to_string());
+            return false;
+        };
+        let current = match read_optional_text(&path).await {
+            Ok(current) => current,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "declining Codex file change: approval drift check failed"
+                );
+                active.declined_file_items.insert(item_id.to_string());
+                return false;
+            }
+        };
+        if current.as_deref() != original.as_deref() {
+            active.declined_file_items.insert(item_id.to_string());
+            review.observer.on_message_complete(
+                "system",
+                &format!(
+                    "Declined Codex file change for {} because the file changed before approval.",
+                    path.display()
+                ),
+            );
+            return false;
+        }
+    }
+
+    true
+}
+
+fn resolve_file_change_paths(
+    item: &serde_json::Value,
+    review: &ReviewContext,
+) -> Result<Vec<PathBuf>> {
+    let changes = item
+        .get("changes")
+        .and_then(|changes| changes.as_array())
+        .context("fileChange item missing changes")?;
+    let mut paths = Vec::new();
+
+    for change in changes {
+        let raw_path = change
+            .get("path")
+            .and_then(|path| path.as_str())
+            .context("fileChange entry missing path")?;
+        paths.push(resolve_allowed_path(raw_path, review)?);
+
+        if let Some(move_path) = change
+            .pointer("/kind/move_path")
+            .or_else(|| change.pointer("/kind/movePath"))
+            .and_then(|path| path.as_str())
+        {
+            paths.push(resolve_allowed_path(move_path, review)?);
+        }
+    }
+
+    paths.sort();
+    paths.dedup();
+    if paths.is_empty() {
+        anyhow::bail!("fileChange item contained no paths");
+    }
+    Ok(paths)
+}
+
+fn resolve_allowed_path(raw_path: &str, review: &ReviewContext) -> Result<PathBuf> {
+    let raw = PathBuf::from(raw_path);
+    let candidate = if raw.is_absolute() {
+        raw
+    } else {
+        review.primary_root.join(raw)
+    };
+    let normalized = normalize_lexically(&candidate)
+        .with_context(|| format!("invalid path {}", candidate.display()))?;
+
+    if review.root_for_path(&normalized).is_none() {
+        anyhow::bail!(
+            "path {} is outside the configured workspace roots",
+            normalized.display()
+        );
+    }
+
+    let existing_ancestor = nearest_existing_ancestor(&normalized)
+        .with_context(|| format!("no existing ancestor for {}", normalized.display()))?;
+    let canonical_ancestor = crate::util::fs::canonicalize_simplified(&existing_ancestor)
+        .with_context(|| format!("canonicalizing {}", existing_ancestor.display()))?;
+
+    let canonically_allowed = review.allowed_roots.iter().any(|root| {
+        crate::util::fs::canonicalize_simplified(root)
+            .map(|canonical_root| canonical_ancestor.starts_with(canonical_root))
+            .unwrap_or(false)
+    });
+    if !canonically_allowed {
+        anyhow::bail!(
+            "path {} escapes the workspace through a symlink",
+            normalized.display()
+        );
+    }
+
+    Ok(normalized)
+}
+
+fn normalize_lexically(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::Normal(part) => normalized.push(part),
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(normalized)
+}
+
+fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut candidate = path.to_path_buf();
+    loop {
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        if !candidate.pop() {
+            return None;
+        }
+    }
+}
+
+async fn finalize_native_edits(review: &ReviewContext, snapshot: TurnSnapshot) -> Result<()> {
+    let mut errors = Vec::new();
+    let mut completed = Vec::new();
+
+    for (path, original) in snapshot.edits() {
+        match read_optional_text(&path).await {
+            Ok(current) if current.as_deref() == original.as_deref() => {}
+            Ok(current) => completed.push((path, original, current)),
+            Err(e) => {
+                errors.push(format!("reading changed file {}: {e:#}", path.display()));
+                if let Err(revert_error) = snapshot.revert_path(&path).await {
+                    errors.push(format!(
+                        "restoring unreadable file {}: {revert_error:#}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    if !completed.is_empty() {
+        review.observer.on_streaming_status(&format!(
+            "Processing {} Codex file change{}...",
+            completed.len(),
+            if completed.len() == 1 { "" } else { "s" }
+        ));
+    }
+
+    for (path, original, current) in completed {
+        let on_disk_now = match read_optional_text(&path).await {
+            Ok(content) => content,
+            Err(e) => {
+                errors.push(format!("drift-checking {}: {e:#}", path.display()));
+                continue;
+            }
+        };
+        if on_disk_now.as_deref() != current.as_deref() {
+            review.observer.on_message_complete(
+                "system",
+                &format!(
+                    "Disk drifted on {} after Codex completed; leaving it untouched to avoid \
+                     clobbering a concurrent write.",
+                    path.display()
+                ),
+            );
+            continue;
+        }
+
+        if let Err(e) = snapshot.revert_path(&path).await {
+            errors.push(format!("restoring {}: {e:#}", path.display()));
+            continue;
+        }
+
+        let Some(root) = review.root_for_path(&path) else {
+            errors.push(format!("no proposal root for {}", path.display()));
+            continue;
+        };
+        let rel_path = path.strip_prefix(root).unwrap_or(path.as_path());
+
+        let proposal_result = match (current.as_deref(), original.as_deref()) {
+            (Some(proposed), _) => {
+                propose_write(
+                    &review.write_gate,
+                    review.observer.as_ref(),
+                    root,
+                    &review.agent_id,
+                    review.conv_id.as_deref(),
+                    rel_path,
+                    proposed,
+                )
+                .await
+            }
+            (None, Some(original)) => {
+                propose_delete(
+                    &review.write_gate,
+                    review.observer.as_ref(),
+                    root,
+                    &review.agent_id,
+                    review.conv_id.as_deref(),
+                    rel_path,
+                    original,
+                )
+                .await
+            }
+            (None, None) => Ok(()),
+        };
+
+        if let Err(e) = proposal_result {
+            errors.push(format!("creating proposal for {}: {e:#}", path.display()));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(errors.join("\n"))
+    }
+}
+
+async fn read_optional_text(path: &Path) -> Result<Option<String>> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(content) => Ok(Some(content)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+async fn write_shared(stdin: &WeakStdin, message: &str) -> Result<()> {
+    let stdin = stdin
+        .upgrade()
+        .context("codex app-server stdin closed during approval")?;
+    let mut stdin = stdin.lock().await;
+    write_msg(&mut stdin, message)
+        .await
+        .context("responding to codex app-server approval")
+}
+
+async fn send_to_active(active_turn: &SharedActiveTurn, events: Vec<UnifiedStreamEvent>) {
+    let tx = active_turn
+        .lock()
+        .await
+        .as_ref()
+        .map(|active| active.tx.clone());
+    if let Some(tx) = tx {
+        send_events(&tx, events).await;
+    } else if !events.is_empty() {
+        tracing::warn!("codex app-server: event outside active turn");
+    }
+}
+
+async fn send_events(tx: &EventSender, events: Vec<UnifiedStreamEvent>) {
+    for event in events {
+        if tx.send(Ok(event)).await.is_err() {
+            break;
+        }
+    }
+}
+
 fn parse_rpc_event(line: &str) -> (Vec<UnifiedStreamEvent>, bool) {
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
         tracing::warn!("codex app-server: malformed JSON: {line}");
         return (vec![], false);
     };
 
-    // Skip responses (they have an "id" but no "method").
-    let Some(method) = val.get("method").and_then(|v| v.as_str()) else {
+    let Some(method) = value.get("method").and_then(|method| method.as_str()) else {
         return (vec![], false);
     };
-
-    let params = val.get("params").unwrap_or(&serde_json::Value::Null);
+    let params = value.get("params").unwrap_or(&serde_json::Value::Null);
 
     match method {
-        // V9 §6: item/agentMessage/delta → TextDelta(delta)
         "item/agentMessage/delta" => {
             let delta = params
                 .get("delta")
-                .and_then(|v| v.as_str())
+                .and_then(|delta| delta.as_str())
                 .unwrap_or("")
                 .to_string();
             (vec![UnifiedStreamEvent::TextDelta(delta)], false)
         }
-
-        // V9 §6: item/reasoningMessage/delta → ThinkingDelta(delta)
-        "item/reasoningMessage/delta" | "item/reasoning/delta" => {
+        "item/reasoningMessage/delta"
+        | "item/reasoning/delta"
+        | "item/reasoning/summaryTextDelta" => {
             let delta = params
                 .get("delta")
-                .and_then(|v| v.as_str())
+                .and_then(|delta| delta.as_str())
                 .unwrap_or("")
                 .to_string();
             (vec![UnifiedStreamEvent::ThinkingDelta(delta)], false)
         }
-
-        // V9 §6: item/commandExecution start → ToolCallStart { id, name:"Bash" }
-        // Real method: item/started with item.type == "commandExecution"
         "item/started" => {
             let item = params.get("item").unwrap_or(&serde_json::Value::Null);
-            if item.get("type").and_then(|v| v.as_str()) == Some("commandExecution") {
-                let id = item
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let args = match item.get("command") {
-                    Some(cmd) => serde_json::json!({ "command": cmd }),
-                    None => serde_json::Value::Null,
-                };
-                (
+            let id = item
+                .get("id")
+                .and_then(|id| id.as_str())
+                .unwrap_or("")
+                .to_string();
+            match item.get("type").and_then(|kind| kind.as_str()) {
+                Some("commandExecution") => {
+                    let args = match item.get("command") {
+                        Some(command) => serde_json::json!({ "command": command }),
+                        None => serde_json::Value::Null,
+                    };
+                    (
+                        vec![UnifiedStreamEvent::ToolCallStart {
+                            id,
+                            name: "Bash".to_string(),
+                            args,
+                        }],
+                        false,
+                    )
+                }
+                Some("fileChange") => (
                     vec![UnifiedStreamEvent::ToolCallStart {
                         id,
-                        name: "Bash".to_string(),
-                        args,
+                        name: "Edit".to_string(),
+                        args: serde_json::json!({
+                            "changes": item.get("changes").cloned().unwrap_or_default()
+                        }),
                     }],
                     false,
-                )
-            } else {
-                (vec![], false)
+                ),
+                _ => (vec![], false),
             }
         }
-
-        // V9 §6: item/commandExecution/outputDelta → ToolCallDelta
-        // Real: params.deltaBase64 (base64-encoded stdout/stderr)
         "item/commandExecution/outputDelta" => {
             let id = params
                 .get("itemId")
-                .and_then(|v| v.as_str())
+                .and_then(|id| id.as_str())
                 .unwrap_or("")
                 .to_string();
             let chunk = params
                 .get("deltaBase64")
-                .and_then(|v| v.as_str())
-                .and_then(|b64| {
+                .and_then(|delta| delta.as_str())
+                .and_then(|encoded| {
                     base64::engine::general_purpose::STANDARD
-                        .decode(b64)
+                        .decode(encoded)
                         .ok()
                         .and_then(|bytes| String::from_utf8(bytes).ok())
                 })
@@ -623,71 +1499,71 @@ fn parse_rpc_event(line: &str) -> (Vec<UnifiedStreamEvent>, bool) {
                 false,
             )
         }
-
-        // V9 §6: item/commandExecution final → ToolCallEnd { id }
-        // Real method: item/completed with item.type == "commandExecution"
         "item/completed" => {
             let item = params.get("item").unwrap_or(&serde_json::Value::Null);
-            if item.get("type").and_then(|v| v.as_str()) == Some("commandExecution") {
-                let id = item
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                (vec![UnifiedStreamEvent::ToolCallEnd { id }], false)
-            } else {
-                (vec![], false)
+            match item.get("type").and_then(|kind| kind.as_str()) {
+                Some("commandExecution") | Some("fileChange") => {
+                    let id = item
+                        .get("id")
+                        .and_then(|id| id.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    (vec![UnifiedStreamEvent::ToolCallEnd { id }], false)
+                }
+                _ => (vec![], false),
             }
         }
-
-        // V9 §6: turn/completed (status=completed) → Usage + Done(EndTurn)
-        //        turn/completed (status=failed)    → Error + Done(Error)
         "turn/completed" => {
             let turn = params.get("turn").unwrap_or(&serde_json::Value::Null);
             let status = turn
                 .get("status")
-                .and_then(|v| v.as_str())
+                .and_then(|status| status.as_str())
                 .unwrap_or("completed");
-            let events: Vec<UnifiedStreamEvent> = if status == "completed" {
+            if status == "completed" {
                 let usage = turn.get("tokenUsage");
                 let input_tokens = usage
-                    .and_then(|u| u.get("inputTokens"))
-                    .and_then(|v| v.as_u64())
+                    .and_then(|usage| usage.get("inputTokens"))
+                    .and_then(|tokens| tokens.as_u64())
                     .unwrap_or(0);
                 let output_tokens = usage
-                    .and_then(|u| u.get("outputTokens"))
-                    .and_then(|v| v.as_u64())
+                    .and_then(|usage| usage.get("outputTokens"))
+                    .and_then(|tokens| tokens.as_u64())
                     .unwrap_or(0);
-                vec![
-                    UnifiedStreamEvent::Usage(TokenUsage {
-                        input_tokens,
-                        output_tokens,
-                        ..Default::default()
-                    }),
-                    UnifiedStreamEvent::Done(StopReason::EndTurn),
-                ]
+                (
+                    vec![
+                        UnifiedStreamEvent::Usage(TokenUsage {
+                            input_tokens,
+                            output_tokens,
+                            ..Default::default()
+                        }),
+                        UnifiedStreamEvent::Done(StopReason::EndTurn),
+                    ],
+                    true,
+                )
             } else {
-                let msg = turn
+                let message = turn
                     .pointer("/error/message")
-                    .and_then(|v| v.as_str())
+                    .and_then(|message| message.as_str())
                     .unwrap_or("turn failed")
                     .to_string();
-                vec![
-                    UnifiedStreamEvent::Error(msg),
-                    UnifiedStreamEvent::Done(StopReason::Error),
-                ]
-            };
-            (events, true)
+                (
+                    vec![
+                        UnifiedStreamEvent::Error(message),
+                        UnifiedStreamEvent::Done(StopReason::Error),
+                    ],
+                    true,
+                )
+            }
         }
-
-        // Informational lifecycle events — no UnifiedStreamEvent equivalent.
         "turn/started"
+        | "turn/diff/updated"
+        | "turn/plan/updated"
         | "thread/started"
         | "thread/status/changed"
         | "thread/closed"
-        | "thread/archived" => (vec![], false),
-
-        // V9 §6: "Unknown events: log at warn! Do not silently drop."
+        | "thread/archived"
+        | "serverRequest/resolved"
+        | "item/reasoning/summaryPartAdded" => (vec![], false),
         other => {
             tracing::warn!("codex app-server: unknown event '{other}': {line}");
             (vec![], false)
@@ -695,29 +1571,89 @@ fn parse_rpc_event(line: &str) -> (Vec<UnifiedStreamEvent>, bool) {
     }
 }
 
-// ── I/O helpers ───────────────────────────────────────────────────────────────
-
-async fn write_msg(stdin: &mut BufWriter<ChildStdin>, msg: &str) -> std::io::Result<()> {
-    stdin.write_all(msg.as_bytes()).await?;
+async fn write_msg(stdin: &mut BufWriter<ChildStdin>, message: &str) -> std::io::Result<()> {
+    stdin.write_all(message.as_bytes()).await?;
     stdin.flush().await
 }
 
-fn error_then_done(msg: String) -> Pin<Box<dyn Stream<Item = Result<UnifiedStreamEvent>> + Send>> {
+fn error_then_done(
+    message: String,
+) -> Pin<Box<dyn Stream<Item = Result<UnifiedStreamEvent>> + Send>> {
     Box::pin(futures::stream::iter(vec![
-        Ok(UnifiedStreamEvent::Error(msg)),
+        Ok(UnifiedStreamEvent::Error(message)),
         Ok(UnifiedStreamEvent::Done(StopReason::Error)),
     ]))
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context_planner::types::PlannerMetadata;
+    use crate::observer::WriteGateObserver;
+    use crate::types::WriteProposal;
+    use crate::write_gate::WriteMode;
 
-    // Helper: parse and assert event list + done flag.
+    struct NoopAcpObserver;
+
+    impl AcpObserver for NoopAcpObserver {
+        fn on_stream_chunk(&self, _text: &str) {}
+        fn on_tool_call_started(&self, _tool_name: &str) {}
+        fn on_streaming_status(&self, _status: &str) {}
+        fn on_message_complete(&self, _role: &str, _content: &str) {}
+        fn on_proposal_deferred(
+            &self,
+            _path: &Path,
+            _old_content: Option<&str>,
+            _new_content: &str,
+        ) {
+        }
+    }
+
+    struct NoopWriteGateObserver;
+
+    impl WriteGateObserver for NoopWriteGateObserver {
+        fn on_proposal_created(&self, _proposal: &WriteProposal) {}
+        fn on_proposal_updated(&self, _proposal_id: u64) {}
+        fn on_proposal_finalized(&self, _path: &str) {}
+    }
+
     fn parse(line: &str) -> (Vec<UnifiedStreamEvent>, bool) {
         parse_rpc_event(line)
+    }
+
+    fn review_context(
+        root: &Path,
+        write_gate: Arc<Mutex<WriteGatePipeline>>,
+    ) -> ReviewContext {
+        ReviewContext {
+            write_gate,
+            observer: Arc::new(NoopAcpObserver),
+            primary_root: root.to_path_buf(),
+            allowed_roots: vec![root.to_path_buf()],
+            agent_id: "codex-test".to_string(),
+            conv_id: None,
+        }
+    }
+
+    fn command_request(command: serde_json::Value, cwd: &Path) -> serde_json::Value {
+        serde_json::json!({
+            "method": "item/commandExecution/requestApproval",
+            "id": 7,
+            "params": {
+                "itemId": "command-1",
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "command": command,
+                "cwd": cwd.to_string_lossy(),
+            }
+        })
+    }
+
+    fn test_write_gate() -> Arc<Mutex<WriteGatePipeline>> {
+        Arc::new(Mutex::new(WriteGatePipeline::new(
+            WriteMode::Interactive,
+            Box::new(NoopWriteGateObserver),
+        )))
     }
 
     #[test]
@@ -737,149 +1673,272 @@ url = "https://example/mcp/"
 "#,
         )
         .unwrap();
+
         let args = codex_app_server_args(dir.path());
-        // The `--config` pairs must come before `app-server` so codex parses
-        // them at the top-level command rather than passing them to the
-        // subcommand (where they would be rejected as unknown flags).
-        let app_server_idx = args.iter().position(|a| a == "app-server").expect("app-server arg");
-        let last_config_idx = args
+        let app_server_index = args
+            .iter()
+            .position(|arg| arg == "app-server")
+            .expect("app-server arg");
+        let last_config_index = args
             .iter()
             .enumerate()
-            .filter(|(_, a)| a.as_str() == "--config")
-            .map(|(i, _)| i)
+            .filter(|(_, arg)| arg.as_str() == "--config")
+            .map(|(index, _)| index)
             .last()
-            .expect("at least one --config pair");
-        assert!(
-            last_config_idx < app_server_idx,
-            "--config must precede app-server in {args:?}",
-        );
-        assert!(
-            args.windows(2)
-                .any(|w| w[0] == "--config" && w[1] == r#"mcp_servers.gaviero.command="gaviero-mcp-shim""#),
-            "missing gaviero.command override in {args:?}",
-        );
-        assert!(
-            args.windows(2).any(|w| w[0] == "--config"
-                && w[1] == r#"mcp_servers.semantic-scholar.url="https://example/mcp/""#),
-            "missing semantic-scholar.url override in {args:?}",
-        );
-        // The literal subcommand wiring stays intact.
-        assert_eq!(
-            args.iter().rev().take(3).cloned().collect::<Vec<_>>(),
-            vec!["stdio://".to_string(), "--listen".to_string(), "app-server".to_string()],
-        );
+            .expect("config override");
+
+        assert!(last_config_index < app_server_index);
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == "--config" && pair[1] == r#"mcp_servers.gaviero.command="gaviero-mcp-shim""#
+        }));
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == "--config"
+                && pair[1] == r#"mcp_servers.semantic-scholar.url="https://example/mcp/""#
+        }));
     }
 
     #[test]
     fn codex_app_server_args_emit_no_config_when_synth_file_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let args = codex_app_server_args(dir.path());
-        assert!(
-            !args.iter().any(|a| a == "--config"),
-            "expected no --config overrides, got {args:?}",
-        );
         assert_eq!(
-            args,
-            vec!["app-server".to_string(), "--listen".to_string(), "stdio://".to_string()],
+            codex_app_server_args(dir.path()),
+            vec![
+                "app-server".to_string(),
+                "--listen".to_string(),
+                "stdio://".to_string()
+            ]
         );
     }
 
     #[test]
-    fn thread_start_policy_forces_file_blocks_and_read_only() {
-        let params = thread_start_params("gpt-5.5", &PathBuf::from("/tmp/work"), &[], false);
-        assert_eq!(params["approvalPolicy"], "never");
+    fn thread_policy_uses_native_edit_and_verification_approvals() {
+        let params = thread_start_params("gpt-5.6-sol", Path::new("/tmp/work"), &[], false);
+        assert_eq!(params["approvalPolicy"], "on-request");
         assert_eq!(params["sandbox"], "read-only");
         assert_eq!(params["sandboxPolicy"]["type"], "readOnly");
         assert_eq!(params["sandboxPolicy"]["networkAccess"], false);
+
         let instructions = params["developerInstructions"].as_str().unwrap();
-        assert!(instructions.contains("All code edits must be proposed"));
-        assert!(instructions.contains("<file path=\"relative/path\">...</file>"));
-        // Single-folder mode: no workspace-folders hint appended.
-        assert!(!instructions.contains("Workspace folders"));
+        assert!(instructions.contains("apply_patch"));
+        assert!(instructions.contains("snapshots each native file change"));
+        assert!(instructions.contains("Do not print complete files"));
+        assert!(instructions.contains("cargo fmt"));
+        assert!(instructions.contains("cargo test"));
+        assert!(instructions.contains("without shell chaining"));
+        assert!(!instructions.contains("All code edits must be proposed"));
     }
 
     #[test]
-    fn thread_start_grants_network_when_remote_mcp_present() {
-        let params = thread_start_params("gpt-5.5", &PathBuf::from("/tmp/work"), &[], true);
-        // Filesystem stays read-only — only the network layer opens up.
-        assert_eq!(params["sandboxPolicy"]["type"], "readOnly");
-        assert_eq!(params["sandboxPolicy"]["networkAccess"], true);
+    fn resume_and_turn_reassert_native_edit_policy() {
+        let resume = thread_resume_params("thread-1", Path::new("/tmp/work"), &[], true);
+        assert_eq!(resume["threadId"], "thread-1");
+        assert_eq!(resume["approvalPolicy"], "on-request");
+        assert_eq!(resume["sandboxPolicy"]["type"], "readOnly");
+        assert_eq!(resume["sandboxPolicy"]["networkAccess"], true);
+
+        let turn = turn_start_params("thread-1", "hello", false);
+        assert_eq!(turn["approvalPolicy"], "on-request");
+        assert_eq!(turn["sandboxPolicy"]["type"], "readOnly");
+        assert_eq!(turn["sandboxPolicy"]["networkAccess"], false);
     }
 
     #[test]
-    fn thread_resume_policy_reasserts_file_blocks_and_read_only() {
-        let params = thread_resume_params("thread-1", &PathBuf::from("/tmp/work"), &[], false);
-        assert_eq!(params["threadId"], "thread-1");
-        assert_eq!(params["approvalPolicy"], "never");
-        assert_eq!(params["sandbox"], "read-only");
-        assert_eq!(params["sandboxPolicy"]["networkAccess"], false);
-        let instructions = params["developerInstructions"].as_str().unwrap();
-        assert!(instructions.contains("All code edits must be proposed"));
-    }
-
-    #[test]
-    fn thread_resume_grants_network_when_remote_mcp_present() {
-        let params = thread_resume_params("thread-1", &PathBuf::from("/tmp/work"), &[], true);
-        assert_eq!(params["sandboxPolicy"]["networkAccess"], true);
-    }
-
-    #[test]
-    fn thread_start_appends_sibling_folders_to_developer_instructions() {
+    fn thread_start_appends_sibling_folders() {
         let extras = vec![
             PathBuf::from("/tmp/sibling-a"),
             PathBuf::from("/tmp/sibling-b"),
         ];
-        let params = thread_start_params("gpt-5.5", &PathBuf::from("/tmp/work"), &extras, false);
+        let params =
+            thread_start_params("gpt-5.6-sol", Path::new("/tmp/work"), &extras, false);
         let instructions = params["developerInstructions"].as_str().unwrap();
-        assert!(instructions.contains("Workspace folders"));
         assert!(instructions.contains("primary: /tmp/work"));
         assert!(instructions.contains("sibling: /tmp/sibling-a"));
         assert!(instructions.contains("sibling: /tmp/sibling-b"));
     }
 
     #[test]
-    fn thread_start_skips_empty_or_duplicate_sibling_folders() {
-        let extras = vec![
-            PathBuf::new(),
-            PathBuf::from("/tmp/work"), // same as cwd; should be skipped
-            PathBuf::from("/tmp/sibling"),
+    fn render_turn_prompt_preserves_stateless_replay_and_context() {
+        use crate::context_planner::ledger::Role;
+        use crate::context_planner::{GraphSelection, GraphSelectionKind, ReplayPayload};
+
+        let turn = Turn {
+            user_message: "current".to_string(),
+            memory_selections: vec![],
+            graph_selections: vec![GraphSelection {
+                path: None,
+                kind: GraphSelectionKind::OutlineOnly,
+                token_estimate: 1,
+                content: "graph-context".to_string(),
+                rank_score: None,
+                confidence: None,
+                symbols: vec![],
+                content_digest: None,
+            }],
+            file_refs: vec![],
+            skill_selections: vec![],
+            replay_history: Some(ReplayPayload {
+                entries: vec![
+                    (Role::System, "system guidance".to_string()),
+                    (Role::User, "prior question".to_string()),
+                    (Role::Assistant, "prior answer".to_string()),
+                ],
+            }),
+            effort: None,
+            auto_approve: false,
+            metadata: PlannerMetadata::default(),
+        };
+
+        let rendered = render_turn_prompt(turn);
+        assert!(rendered.contains("current"));
+        assert!(rendered.contains("graph-context"));
+        assert!(rendered.contains("S: system guidance"));
+        assert!(rendered.contains("U: prior question"));
+        assert!(rendered.contains("A: prior answer"));
+    }
+
+    #[test]
+    fn direct_cargo_fmt_and_test_commands_are_approved() {
+        let dir = tempfile::tempdir().unwrap();
+        let review = review_context(dir.path(), test_write_gate());
+
+        let cases = [
+            (
+                "cargo fmt -p gaviero-core --check",
+                CargoVerificationKind::Format,
+            ),
+            (
+                "cargo fmt --all -- --config newline_style=Unix",
+                CargoVerificationKind::Format,
+            ),
+            (
+                "cargo test -p gaviero-core native_edits -- --nocapture",
+                CargoVerificationKind::Test,
+            ),
+            (
+                "cargo +nightly test --workspace --no-run",
+                CargoVerificationKind::Test,
+            ),
         ];
-        let params = thread_start_params("gpt-5.5", &PathBuf::from("/tmp/work"), &extras, false);
-        let instructions = params["developerInstructions"].as_str().unwrap();
-        // The cwd appears once as "primary"; not as a sibling line.
-        let sibling_lines = instructions.matches("sibling:").count();
-        assert_eq!(sibling_lines, 1, "only /tmp/sibling is a real sibling");
-        assert!(instructions.contains("sibling: /tmp/sibling"));
+
+        for (command, expected_kind) in cases {
+            let request = command_request(serde_json::json!(command), dir.path());
+            let parsed = parse_cargo_verification_request(&request, &review).unwrap();
+            assert_eq!(parsed.kind, expected_kind, "{command}");
+            assert_eq!(parsed.cwd, dir.path());
+        }
+
+        let argv_request = command_request(
+            serde_json::json!(["cargo.exe", "test", "-p", "gaviero-core"]),
+            dir.path(),
+        );
+        assert_eq!(
+            parse_cargo_verification_request(&argv_request, &review)
+                .unwrap()
+                .kind,
+            CargoVerificationKind::Test
+        );
     }
 
     #[test]
-    fn turn_start_policy_reasserts_read_only_sandbox() {
-        let params = turn_start_params("thread-1", "hello", false);
-        assert_eq!(params["threadId"], "thread-1");
-        assert_eq!(params["approvalPolicy"], "never");
-        assert_eq!(params["sandboxPolicy"]["type"], "readOnly");
-        assert_eq!(params["sandboxPolicy"]["networkAccess"], false);
+    fn composed_or_unrelated_commands_are_declined() {
+        let dir = tempfile::tempdir().unwrap();
+        let review = review_context(dir.path(), test_write_gate());
+
+        for command in [
+            "cargo test; Remove-Item source.rs",
+            "cargo test && git clean -fdx",
+            "cargo fmt | Out-File result.txt",
+            "cargo build",
+            "rustfmt src/lib.rs",
+            "pwsh -Command cargo test",
+            "CARGO_TARGET_DIR=target cargo test",
+            "cargo --config net.retry=1 test",
+            "cargo test --target-dir C:\\outside",
+        ] {
+            let request = command_request(serde_json::json!(command), dir.path());
+            assert!(
+                parse_cargo_verification_request(&request, &review).is_err(),
+                "{command}"
+            );
+        }
     }
 
     #[test]
-    fn turn_start_grants_network_when_remote_mcp_present() {
-        let params = turn_start_params("thread-1", "hello", true);
-        // Filesystem stays read-only — only the network bit flips.
-        assert_eq!(params["sandboxPolicy"]["type"], "readOnly");
-        assert_eq!(params["sandboxPolicy"]["networkAccess"], true);
+    fn command_network_and_extra_permission_escalations_are_declined() {
+        let dir = tempfile::tempdir().unwrap();
+        let review = review_context(dir.path(), test_write_gate());
+
+        let mut network = command_request(serde_json::json!("cargo test"), dir.path());
+        network["params"]["networkApprovalContext"] =
+            serde_json::json!({ "host": "example.com", "protocol": "https" });
+        assert!(parse_cargo_verification_request(&network, &review).is_err());
+
+        let mut extra = command_request(serde_json::json!("cargo test"), dir.path());
+        extra["params"]["additionalPermissions"] =
+            serde_json::json!({ "writableRoots": ["C:\\outside"] });
+        assert!(parse_cargo_verification_request(&extra, &review).is_err());
     }
 
     #[test]
-    fn parse_agent_message_delta() {
+    fn cargo_manifest_must_stay_inside_workspace_roots() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let inside_manifest = workspace.path().join("Cargo.toml");
+        let outside_manifest = outside.path().join("Cargo.toml");
+        std::fs::write(&inside_manifest, "[package]\nname='inside'\nversion='0.1.0'\n").unwrap();
+        std::fs::write(
+            &outside_manifest,
+            "[package]\nname='outside'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+
+        let review = review_context(workspace.path(), test_write_gate());
+        let inside = command_request(
+            serde_json::json!(format!(
+                "cargo test --manifest-path={}",
+                inside_manifest.display()
+            )),
+            workspace.path(),
+        );
+        assert!(parse_cargo_verification_request(&inside, &review).is_ok());
+
+        let outside = command_request(
+            serde_json::json!(format!(
+                "cargo test --manifest-path={}",
+                outside_manifest.display()
+            )),
+            workspace.path(),
+        );
+        assert!(parse_cargo_verification_request(&outside, &review).is_err());
+    }
+
+    #[test]
+    fn formatter_snapshot_scan_excludes_build_and_internal_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("src/lib.rs");
+        let nested = dir.path().join("crates/example/src/main.rs");
+        let target = dir.path().join("target/generated.rs");
+        let git = dir.path().join(".git/internal.rs");
+        let gaviero = dir.path().join(".gaviero/worktrees/other/src/lib.rs");
+        let node_modules = dir.path().join("node_modules/package/index.rs");
+
+        for path in [&source, &nested, &target, &git, &gaviero, &node_modules] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "fn main() {}\n").unwrap();
+        }
+
+        let sources = collect_rust_sources(&[dir.path().to_path_buf()]).unwrap();
+        assert_eq!(sources, vec![nested, source]);
+    }
+
+    #[test]
+    fn parse_agent_message_and_reasoning_deltas() {
         let (events, done) = parse(
             r#"{"method":"item/agentMessage/delta","params":{"itemId":"i1","delta":"hello"}}"#,
         );
         assert_eq!(events, vec![UnifiedStreamEvent::TextDelta("hello".into())]);
         assert!(!done);
-    }
 
-    #[test]
-    fn parse_reasoning_delta() {
         let (events, done) = parse(
             r#"{"method":"item/reasoningMessage/delta","params":{"itemId":"i2","delta":"thinking"}}"#,
         );
@@ -891,8 +1950,8 @@ url = "https://example/mcp/"
     }
 
     #[test]
-    fn parse_item_started_command_execution() {
-        let (events, done) = parse(
+    fn parse_command_and_file_change_lifecycles() {
+        let (events, _) = parse(
             r#"{"method":"item/started","params":{"item":{"type":"commandExecution","id":"cmd1","command":"ls"}}}"#,
         );
         assert_eq!(
@@ -903,23 +1962,29 @@ url = "https://example/mcp/"
                 args: serde_json::json!({ "command": "ls" }),
             }]
         );
-        assert!(!done);
-    }
 
-    #[test]
-    fn parse_item_started_non_command_produces_no_event() {
+        let file_line = r#"{"method":"item/started","params":{"item":{"type":"fileChange","id":"edit1","status":"inProgress","changes":[{"path":"src/lib.rs","kind":{"type":"update"},"diff":"@@ -1 +1 @@"}]}}}"#;
+        let (events, _) = parse(file_line);
+        assert!(matches!(
+            &events[0],
+            UnifiedStreamEvent::ToolCallStart { id, name, .. }
+                if id == "edit1" && name == "Edit"
+        ));
+
         let (events, _) = parse(
-            r#"{"method":"item/started","params":{"item":{"type":"agentMessage","id":"m1","text":""}}}"#,
+            r#"{"method":"item/completed","params":{"item":{"type":"fileChange","id":"edit1","status":"completed","changes":[]}}}"#,
         );
-        assert!(events.is_empty());
+        assert_eq!(
+            events,
+            vec![UnifiedStreamEvent::ToolCallEnd { id: "edit1".into() }]
+        );
     }
 
     #[test]
     fn parse_command_output_delta_decodes_base64() {
-        // "ls\n" in base64 is "bHMK"
-        let b64 = base64::engine::general_purpose::STANDARD.encode("ls\n");
+        let encoded = base64::engine::general_purpose::STANDARD.encode("ls\n");
         let line = format!(
-            r#"{{"method":"item/commandExecution/outputDelta","params":{{"itemId":"cmd1","stream":"stdout","deltaBase64":"{b64}"}}}}"#
+            r#"{{"method":"item/commandExecution/outputDelta","params":{{"itemId":"cmd1","deltaBase64":"{encoded}"}}}}"#
         );
         let (events, done) = parse(&line);
         assert!(!done);
@@ -927,104 +1992,162 @@ url = "https://example/mcp/"
             events,
             vec![UnifiedStreamEvent::ToolCallDelta {
                 id: "cmd1".into(),
-                args_chunk: "ls\n".into()
+                args_chunk: "ls\n".into(),
             }]
         );
     }
 
     #[test]
-    fn parse_item_completed_command_execution() {
-        let (events, done) = parse(
-            r#"{"method":"item/completed","params":{"item":{"type":"commandExecution","id":"cmd1","status":"completed","exitCode":0}}}"#,
-        );
-        assert_eq!(
-            events,
-            vec![UnifiedStreamEvent::ToolCallEnd { id: "cmd1".into() }]
-        );
-        assert!(!done);
-    }
-
-    #[test]
-    fn parse_turn_completed_success() {
+    fn parse_turn_completion() {
         let (events, done) = parse(
             r#"{"method":"turn/completed","params":{"turn":{"id":"t1","status":"completed","tokenUsage":{"inputTokens":10,"outputTokens":5}}}}"#,
         );
         assert!(done);
-        assert_eq!(events.len(), 2);
         assert!(matches!(
             &events[0],
-            UnifiedStreamEvent::Usage(u) if u.input_tokens == 10 && u.output_tokens == 5
+            UnifiedStreamEvent::Usage(usage)
+                if usage.input_tokens == 10 && usage.output_tokens == 5
         ));
         assert_eq!(events[1], UnifiedStreamEvent::Done(StopReason::EndTurn));
-    }
 
-    #[test]
-    fn parse_turn_completed_failed() {
         let (events, done) = parse(
             r#"{"method":"turn/completed","params":{"turn":{"status":"failed","error":{"message":"context exceeded"}}}}"#,
         );
         assert!(done);
         assert_eq!(
-            events[0],
-            UnifiedStreamEvent::Error("context exceeded".into())
+            events,
+            vec![
+                UnifiedStreamEvent::Error("context exceeded".into()),
+                UnifiedStreamEvent::Done(StopReason::Error),
+            ]
         );
-        assert_eq!(events[1], UnifiedStreamEvent::Done(StopReason::Error));
     }
 
     #[test]
-    fn parse_informational_events_emit_nothing() {
-        for line in &[
-            r#"{"method":"turn/started","params":{"turn":{"id":"t1"}}}"#,
-            r#"{"method":"thread/started","params":{"thread":{"id":"th1"}}}"#,
-            r#"{"method":"thread/status/changed","params":{"threadId":"th1","status":{"type":"idle"}}}"#,
-            r#"{"method":"thread/closed","params":{"threadId":"th1"}}"#,
-        ] {
-            let (events, done) = parse(line);
-            assert!(events.is_empty(), "expected empty for {line}");
-            assert!(!done);
-        }
-    }
+    fn rpc_serializers_match_protocol() {
+        let request = rpc_request("initialize", 1, client_info_params());
+        let request: serde_json::Value = serde_json::from_str(request.trim()).unwrap();
+        assert_eq!(request["method"], "initialize");
+        assert_eq!(request["id"], 1);
 
-    #[test]
-    fn parse_rpc_response_emits_nothing() {
-        // Responses have "id" but no "method" — should be silently skipped.
-        let (events, done) = parse(r#"{"id":1,"result":{"userAgent":"codex/1.0"}}"#);
-        assert!(events.is_empty());
-        assert!(!done);
-    }
-
-    #[test]
-    fn parse_unknown_method_emits_nothing_but_is_logged() {
-        let (events, done) = parse(r#"{"method":"future/unknown","params":{}}"#);
-        assert!(events.is_empty());
-        assert!(!done);
-    }
-
-    #[test]
-    fn parse_malformed_json_emits_nothing() {
-        let (events, done) = parse("not json");
-        assert!(events.is_empty());
-        assert!(!done);
-    }
-
-    #[test]
-    fn rpc_request_format() {
-        let msg = rpc_request(
-            "initialize",
-            0,
-            serde_json::json!({"clientInfo":{"name":"x"}}),
+        let response = rpc_response(
+            &serde_json::json!(7),
+            serde_json::json!({"decision":"accept"}),
         );
-        let val: serde_json::Value = serde_json::from_str(msg.trim()).unwrap();
-        assert_eq!(val["method"], "initialize");
-        assert_eq!(val["id"], 0);
-        assert!(val.get("params").is_some());
+        let response: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["result"]["decision"], "accept");
+        assert!(response.get("method").is_none());
+    }
+
+    /// Codex's `ClientInfo` schema marks `name` and `version` as required;
+    /// dropping either makes `initialize` fail with `-32600 Invalid request`.
+    #[test]
+    fn initialize_params_carry_required_client_info() {
+        let params = client_info_params();
+        assert_eq!(params["clientInfo"]["name"], "gaviero");
+        assert_eq!(params["clientInfo"]["version"], env!("CARGO_PKG_VERSION"));
+        assert!(
+            params["clientInfo"]["version"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty())
+        );
     }
 
     #[test]
-    fn rpc_notification_has_no_id() {
-        let msg = rpc_notification("initialized", serde_json::json!({}));
-        let val: serde_json::Value = serde_json::from_str(msg.trim()).unwrap();
-        assert_eq!(val["method"], "initialized");
-        assert!(val.get("id").is_none());
+    fn path_resolution_rejects_workspace_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let review = review_context(dir.path(), test_write_gate());
+        assert!(resolve_allowed_path("../outside.txt", &review).is_err());
+    }
+
+    #[tokio::test]
+    async fn native_edits_are_reverted_and_become_review_proposals() {
+        let dir = tempfile::tempdir().unwrap();
+        let changed = dir.path().join("changed.txt");
+        let created = dir.path().join("created.txt");
+        let deleted = dir.path().join("deleted.txt");
+        tokio::fs::write(&changed, "before\n").await.unwrap();
+        tokio::fs::write(&deleted, "remove me\n").await.unwrap();
+
+        let gate = test_write_gate();
+        let review = review_context(dir.path(), gate.clone());
+
+        let mut snapshot = TurnSnapshot::default();
+        snapshot.capture_before_write(&changed).await.unwrap();
+        snapshot.capture_before_write(&created).await.unwrap();
+        snapshot.capture_before_write(&deleted).await.unwrap();
+
+        tokio::fs::write(&changed, "after\n").await.unwrap();
+        tokio::fs::write(&created, "new\n").await.unwrap();
+        tokio::fs::remove_file(&deleted).await.unwrap();
+
+        finalize_native_edits(&review, snapshot).await.unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(&changed).await.unwrap(),
+            "before\n"
+        );
+        assert!(!created.exists());
+        assert_eq!(
+            tokio::fs::read_to_string(&deleted).await.unwrap(),
+            "remove me\n"
+        );
+
+        // Interactive is the mode the TUI runs the gate in, so proposals land
+        // in the active map. `pending_proposals()` reads the deferred queue and
+        // is empty here by construction.
+        let gate = gate.lock().await;
+        assert_eq!(gate.active_proposal_ids().len(), 3);
+
+        let changed_proposal = gate.proposal_for_path(&changed).unwrap();
+        assert_eq!(changed_proposal.proposed_content, "after\n");
+        assert!(!changed_proposal.is_deletion);
+
+        let created_proposal = gate.proposal_for_path(&created).unwrap();
+        assert_eq!(created_proposal.proposed_content, "new\n");
+        assert!(!created_proposal.is_deletion);
+
+        let deleted_proposal = gate.proposal_for_path(&deleted).unwrap();
+        assert!(deleted_proposal.is_deletion);
+        assert_eq!(deleted_proposal.original_content, "remove me\n");
+    }
+
+    #[tokio::test]
+    async fn formatter_changes_join_the_transactional_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("src/lib.rs");
+        tokio::fs::create_dir_all(source.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&source, "fn before() {}\n")
+            .await
+            .unwrap();
+
+        let gate = test_write_gate();
+        let review = review_context(dir.path(), gate.clone());
+        let (tx, _rx) = mpsc::channel(1);
+        let active_turn = Arc::new(Mutex::new(Some(ActiveTurn::new(tx))));
+
+        capture_rust_sources_before_format(&active_turn, &review)
+            .await
+            .unwrap();
+        tokio::fs::write(&source, "fn after() {}\n")
+            .await
+            .unwrap();
+
+        let active = active_turn.lock().await.take().unwrap();
+        finalize_native_edits(&review, active.snapshot)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(&source).await.unwrap(),
+            "fn before() {}\n"
+        );
+        let gate = gate.lock().await;
+        assert_eq!(gate.active_proposal_ids().len(), 1);
+        let proposal = gate.proposal_for_path(&source).unwrap();
+        assert_eq!(proposal.proposed_content, "fn after() {}\n");
     }
 }
