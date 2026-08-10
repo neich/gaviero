@@ -189,8 +189,26 @@ pub struct AgentDecl {
     pub tier_ref: Option<(String, Span)>,
     pub scope: Option<ScopeBlock>,
     pub depends_on: Option<(Vec<(String, Span)>, Span)>,
+    /// Exact artefact paths this agent must have written when its turn ends.
+    ///
+    /// Unlike `scope.owned` these are literal paths, not globs, and they may
+    /// carry `{{ITER}}` — the runtime substitutes the iteration before
+    /// checking. Declaring them turns "the agent completed" into "the agent
+    /// delivered": a loop pass in which any declared path is missing or empty
+    /// aborts the run instead of handing an incomplete panel to the judge.
+    /// Empty means no contract, and the runtime falls back to detecting
+    /// whether the agent's owned files changed at all.
+    pub produces: Vec<String>,
     pub prompt: Option<(PromptSource, Span)>,
     pub max_retries: Option<(u8, Span)>,
+    /// Wall-clock budget for one dispatch of this agent, in seconds.
+    /// `Some(0)` disables the bound; `None` takes the runtime default
+    /// ([`gaviero_core::swarm::models::DEFAULT_AGENT_TIMEOUT_SECS`]).
+    ///
+    /// This is what makes a run finite: provider sessions only give up when
+    /// their subprocess exits, so a wedged-but-alive CLI otherwise hangs the
+    /// whole workflow with no upper bound.
+    pub timeout_secs: Option<(u64, Span)>,
     pub memory: Option<MemoryBlock>,
     pub context: Option<ContextBlock>,
     /// Per-agent compile-time substitution variables.
@@ -472,6 +490,10 @@ pub struct LoopBlock {
     /// Hard timeout for each judge invocation, in seconds. 0 = disabled.
     /// Only meaningful for `until agent <name>`.
     pub judge_timeout_secs: u32,
+    /// Stop the loop once the judge reports the same blocking disagreement
+    /// this many consecutive times (default 2; `0` disables). The mirror of
+    /// `stability` on the failure side.
+    pub irreconcilable_after: u32,
     /// When `true` (default), unparseable judge output is treated as a hard
     /// failure; when `false`, legacy silent-FAIL behaviour.
     pub strict_judge: bool,

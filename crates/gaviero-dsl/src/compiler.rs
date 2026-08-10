@@ -1007,6 +1007,12 @@ fn compile_agent(
         }
     };
 
+    // `produces` gets the same compile-time substitution as scope paths, so a
+    // declaration can be written against {{OUT_DIR}} / {{REVIEWER_ID}}.
+    // {{ITER}} / {{PREV_ITER}} deliberately survive — the loop substitutes
+    // them per pass so one declaration covers every iteration.
+    let produces: Vec<String> = decl.produces.iter().map(|p| sub(p)).collect();
+
     let depends_on = decl
         .depends_on
         .as_ref()
@@ -1063,6 +1069,12 @@ fn compile_agent(
     };
 
     let max_retries = decl.max_retries.as_ref().map(|(n, _)| *n).unwrap_or(1);
+    // `None` = runtime default; `Some(0)` = explicitly unbounded.
+    let timeout_secs = decl
+        .timeout_secs
+        .as_ref()
+        .map(|(n, _)| *n)
+        .unwrap_or(gaviero_core::swarm::models::DEFAULT_AGENT_TIMEOUT_SECS);
 
     // ── Memory merge logic ────────────────────────────────────────
     //
@@ -1174,6 +1186,7 @@ fn compile_agent(
         id: decl.name.clone(),
         description,
         scope,
+        produces,
         depends_on,
         backend: AgentBackend::default(),
         model,
@@ -1184,6 +1197,7 @@ fn compile_agent(
         coordinator_instructions,
         estimated_tokens: 0,
         max_retries,
+        timeout_secs,
         escalation_tier: None,
         read_namespaces,
         write_namespace,
@@ -1322,6 +1336,7 @@ fn extract_loop_configs(
                     strict_judge: lb.strict_judge,
                     stability: lb.stability.max(1),
                     judge_timeout_secs: lb.judge_timeout_secs,
+                    irreconcilable_after: lb.irreconcilable_after,
                     branch_chain: match lb.branch_chain {
                         BranchChainLit::None => {
                             gaviero_core::swarm::plan::BranchChainMode::None
@@ -1424,6 +1439,91 @@ mod tests {
 
         workflow feature_dev { steps [researcher implementer] }
     "##;
+
+    /// `produces` gets the same compile-time var substitution as scope paths,
+    /// but `{{ITER}}` must survive — the loop substitutes it per pass so one
+    /// declaration covers every iteration.
+    #[test]
+    fn produces_substitutes_vars_but_defers_iter() {
+        let src = r##"
+            vars { OUT_DIR "plans/out" }
+            client sonnet { tier execution model "claude:sonnet" }
+            agent writer {
+                client sonnet
+                scope { owned ["{{OUT_DIR}}/report-v*.md"] }
+                produces [
+                    "{{OUT_DIR}}/report-v{{ITER}}.md"
+                    "{{OUT_DIR}}/log-v{{ITER}}.md"
+                ]
+                prompt #"Write the report."#
+            }
+            workflow w { steps [writer] }
+        "##;
+        let units = compile_str(src).expect("should compile");
+        assert_eq!(
+            units[0].produces,
+            vec!["plans/out/report-v{{ITER}}.md", "plans/out/log-v{{ITER}}.md"]
+        );
+    }
+
+    #[test]
+    fn produces_defaults_to_empty_when_absent() {
+        let units = compile_str(FULL_EXAMPLE).expect("should compile");
+        assert!(units[0].produces.is_empty());
+    }
+
+    /// The dispatch budget is what bounds a run, so an agent that declares
+    /// nothing must still get one — the default cannot be "unbounded".
+    #[test]
+    fn agent_timeout_defaults_to_a_finite_budget() {
+        let units = compile_str(FULL_EXAMPLE).expect("should compile");
+        assert_eq!(
+            units[0].timeout_secs,
+            gaviero_core::swarm::models::DEFAULT_AGENT_TIMEOUT_SECS
+        );
+        assert!(units[0].timeout_secs > 0);
+    }
+
+    #[test]
+    fn agent_timeout_is_declarable_and_zero_means_unbounded() {
+        let src = r##"
+            client sonnet { tier execution model "claude:sonnet" }
+            agent quick  { client sonnet timeout 90 prompt #"go"# }
+            agent unbounded { client sonnet timeout 0 prompt #"go"# }
+            workflow w { steps [quick unbounded] }
+        "##;
+        let units = compile_str(src).expect("should compile");
+        let by = |id: &str| units.iter().find(|u| u.id == id).unwrap();
+        assert_eq!(by("quick").timeout_secs, 90);
+        assert_eq!(by("unbounded").timeout_secs, 0);
+    }
+
+    #[test]
+    fn loop_irreconcilable_after_is_declarable_and_defaults_to_two() {
+        let base = r##"
+            client sonnet { tier execution model "claude:sonnet" }
+            agent worker { client sonnet scope { owned ["a/"] } prompt #"go"# }
+            agent judge  { client sonnet prompt #"judge"# }
+        "##;
+        let plan = |extra: &str| {
+            let src = format!(
+                "{base}\nworkflow w {{ steps [ loop {{ agents [worker] until agent judge {extra} }} ] }}"
+            );
+            let (tokens, _) = lexer::lex(&src);
+            let (ast, errs) = parser::parse(&tokens, &src, "test.gaviero");
+            assert!(errs.is_empty(), "parse errors: {errs:?}");
+            compile_ast(&ast.unwrap(), &src, "test.gaviero", None, None).expect("compiles")
+        };
+        assert_eq!(plan("").loop_configs[0].irreconcilable_after, 2);
+        assert_eq!(
+            plan("irreconcilable_after 3").loop_configs[0].irreconcilable_after,
+            3
+        );
+        assert_eq!(
+            plan("irreconcilable_after 0").loop_configs[0].irreconcilable_after,
+            0
+        );
+    }
 
     #[test]
     fn full_example_compiles() {

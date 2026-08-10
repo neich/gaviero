@@ -898,7 +898,8 @@
   },
   {
     "type": "comment",
-    "named": true
+    "named": true,
+    "extra": true
   },
   {
     "type": "compile",
@@ -1001,6 +1002,10 @@
     "named": true
   },
   {
+    "type": "irreconcilable_after",
+    "named": false
+  },
+  {
     "type": "iter_start",
     "named": false
   },
@@ -1058,6 +1063,10 @@
   },
   {
     "type": "privacy",
+    "named": false
+  },
+  {
+    "type": "produces",
     "named": false
   },
   {
@@ -1170,6 +1179,10 @@
   },
   {
     "type": "tier",
+    "named": false
+  },
+  {
+    "type": "timeout",
     "named": false
   },
   {

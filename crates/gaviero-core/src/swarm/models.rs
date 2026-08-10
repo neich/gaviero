@@ -20,6 +20,18 @@ pub struct WorkUnit {
     /// File scope defining which paths this agent can write to.
     #[serde(default)]
     pub scope: FileScope,
+    /// Exact artefact paths this agent must have written when its turn ends
+    /// (DSL `agent { produces [...] }`).
+    ///
+    /// Literal workspace-relative paths, not globs. `{{ITER}}` / `{{PREV_ITER}}`
+    /// survive compilation and are substituted per loop pass, so a reviewer can
+    /// declare `"{{OUT_DIR}}/{{REVIEWER_ID}}-conclusion-v{{ITER}}.md"` once and
+    /// have every iteration checked against the right version.
+    ///
+    /// Empty means the agent declares no output contract; the loop's delivery
+    /// gate then falls back to detecting whether its owned files changed at all.
+    #[serde(default)]
+    pub produces: Vec<String>,
     /// IDs of work units that must complete before this one starts.
     #[serde(default)]
     pub depends_on: Vec<String>,
@@ -61,6 +73,19 @@ pub struct WorkUnit {
     /// Max retries before escalation (default: 1).
     #[serde(default = "default_max_retries")]
     pub max_retries: u8,
+
+    /// Wall-clock budget for one dispatch of this agent, in seconds
+    /// (DSL `agent { timeout <secs> }`). `0` disables the bound.
+    ///
+    /// This is what makes a run finite. Provider sessions only give up when
+    /// their subprocess *exits* — a wedged-but-alive CLI keeps the idle loop
+    /// spinning forever, and the swarm's stream consumer has no deadline of
+    /// its own. With a per-dispatch bound the worst case for a loop workflow
+    /// is `(1 + max_iterations) × (agents × timeout + judge_timeout)`, which
+    /// is finite by construction. Disable it only when something upstream
+    /// already guarantees termination.
+    #[serde(default = "default_agent_timeout_secs")]
+    pub timeout_secs: u64,
     /// Tier to escalate to on failure.
     #[serde(default)]
     pub escalation_tier: Option<ModelTier>,
@@ -130,12 +155,61 @@ pub struct WorkUnit {
     pub extra_allowed_tools: Vec<String>,
 }
 
+impl WorkUnit {
+    /// Declared artefacts (`produces`) that are absent or empty under `root`.
+    ///
+    /// `root` is the directory the agent actually wrote to — the worktree in
+    /// repo mode, the workspace root in document mode.
+    ///
+    /// A zero-byte file counts as missing: every declared path is a document
+    /// something downstream is about to read, and an empty one carries no more
+    /// information than no file at all while satisfying a naive existence
+    /// check. Entries that still contain an unsubstituted `{{…}}` placeholder
+    /// are skipped with a warning rather than reported missing — the literal
+    /// path could never exist, so failing on it would only mask the real
+    /// script bug behind a confusing "missing file" error.
+    pub fn missing_declared_artifacts(&self, root: &std::path::Path) -> Vec<String> {
+        self.produces
+            .iter()
+            .filter(|rel| {
+                if rel.contains("{{") {
+                    tracing::warn!(
+                        "work unit '{}' declares produces path '{}' with an unsubstituted \
+                         placeholder; skipping it in the output-contract check",
+                        self.id,
+                        rel
+                    );
+                    return false;
+                }
+                match std::fs::metadata(root.join(rel)) {
+                    Ok(meta) => !meta.is_file() || meta.len() == 0,
+                    Err(_) => true,
+                }
+            })
+            .cloned()
+            .collect()
+    }
+}
+
 fn default_context_depth() -> u32 {
     2
 }
 
 fn default_max_retries() -> u8 {
     1
+}
+
+/// One hour per agent dispatch.
+///
+/// Deliberately generous: a reviewer doing deep literature research through
+/// MCP legitimately runs for tens of minutes, and a timeout that fires on
+/// healthy work is worse than no timeout at all — it would silently truncate
+/// the panel the delivery gate is there to protect. This is a liveness
+/// backstop, not a cost control; use `run_timeout_secs` for the latter.
+pub const DEFAULT_AGENT_TIMEOUT_SECS: u64 = 3600;
+
+fn default_agent_timeout_secs() -> u64 {
+    DEFAULT_AGENT_TIMEOUT_SECS
 }
 
 /// The backend used to execute an agent's work.
