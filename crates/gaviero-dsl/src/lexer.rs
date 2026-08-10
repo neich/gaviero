@@ -43,6 +43,8 @@ pub enum Token {
     KwReadOnly,
     #[token("depends_on")]
     KwDependsOn,
+    #[token("produces")]
+    KwProduces,
     #[token("prompt")]
     KwPrompt,
     #[token("description")]
@@ -109,6 +111,11 @@ pub enum Token {
     KwStability,
     #[token("judge_timeout")]
     KwJudgeTimeout,
+    // Longest-match keeps `judge_timeout` intact; this is the per-agent form.
+    #[token("timeout")]
+    KwTimeout,
+    #[token("irreconcilable_after")]
+    KwIrreconcilableAfter,
     #[token("strict_judge")]
     KwStrictJudge,
     #[token("branch_chain")]
@@ -225,6 +232,7 @@ impl fmt::Display for Token {
             Token::KwOwned => write!(f, "owned"),
             Token::KwReadOnly => write!(f, "read_only"),
             Token::KwDependsOn => write!(f, "depends_on"),
+            Token::KwProduces => write!(f, "produces"),
             Token::KwPrompt => write!(f, "prompt"),
             Token::KwDescription => write!(f, "description"),
             Token::KwMaxRetries => write!(f, "max_retries"),
@@ -255,6 +263,8 @@ impl fmt::Display for Token {
             Token::KwMaxIterations => write!(f, "max_iterations"),
             Token::KwStability => write!(f, "stability"),
             Token::KwJudgeTimeout => write!(f, "judge_timeout"),
+            Token::KwTimeout => write!(f, "timeout"),
+            Token::KwIrreconcilableAfter => write!(f, "irreconcilable_after"),
             Token::KwStrictJudge => write!(f, "strict_judge"),
             Token::KwBranchChain => write!(f, "branch_chain"),
             Token::KwReviewers => write!(f, "reviewers"),

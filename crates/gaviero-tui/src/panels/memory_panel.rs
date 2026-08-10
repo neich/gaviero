@@ -20,9 +20,9 @@
 //! Lock / event discipline:
 //! * All observer callbacks fan out through `Event::Memory*` into the
 //!   single TUI event loop — no background task mutates `App` directly.
-//! * All destructive ops enqueue `WriterMessage::PanelEdit` and await a
-//!   500ms oneshot ack; the panel renders a pending spinner until the
-//!   ack fires.
+//! * All destructive ops enqueue `WriterMessage::PanelEdit` with
+//!   `ack: None`; the panel renders a pending spinner until the row
+//!   refresh reflects the write.
 
 use std::time::{Duration, Instant};
 

@@ -910,6 +910,51 @@ fn compile_file_scientific_research_default_roster() {
     );
 }
 
+/// Each reviewer clone must carry its own output contract — an un-prefixed
+/// `produces` would have every clone claim the same artefacts, so a panel
+/// where one member wrote nothing would still look complete.
+#[test]
+fn compile_file_scientific_research_produces_is_per_reviewer() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/scientific_research.gaviero");
+    let plan = gaviero_dsl::compile_file(
+        &path,
+        Some("scientific-research-consensus"),
+        Some("test topic"),
+        &[],
+        &[],
+        &[("roster".into(), "a=claude:opus,b=codex:gpt-5.6-sol".into())],
+    )
+    .expect("two-reviewer roster should compile");
+
+    let units = plan.work_units_unordered();
+    let by_id = |id: &str| {
+        units
+            .iter()
+            .find(|u| u.id == id)
+            .unwrap_or_else(|| panic!("missing {id}"))
+    };
+
+    // Init is versioned by INIT_VER, substituted at compile time.
+    assert_eq!(
+        by_id("a-init").produces,
+        vec!["research/a-conclusion-v1.md", "research/a-summary-v1.md"]
+    );
+    // Refine keeps {{ITER}} for the runtime to substitute per pass.
+    assert_eq!(
+        by_id("b-refine").produces,
+        vec![
+            "research/b-conclusion-v{{ITER}}.md",
+            "research/b-summary-v{{ITER}}.md"
+        ]
+    );
+    // The judge declares no artefacts — it only reads.
+    assert!(
+        plan.loop_judge_units.iter().all(|u| u.produces.is_empty()),
+        "judges must not declare produced artefacts"
+    );
+}
+
 #[test]
 fn compile_file_scientific_research_param_roster_override_to_two() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

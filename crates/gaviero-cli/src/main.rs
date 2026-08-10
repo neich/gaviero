@@ -131,6 +131,15 @@ struct Cli {
     #[arg(long)]
     fresh: bool,
 
+    /// Wall-clock cap for the whole run, in seconds (0 = no cap).
+    ///
+    /// Termination is already guaranteed by each agent's dispatch budget
+    /// (DSL `agent { timeout <secs> }`, default 3600); this is the outer cap
+    /// for cost and latency. On expiry the run stops between agents and keeps
+    /// every artefact written so far, so `--resume` can continue from them.
+    #[arg(long, default_value = "0")]
+    run_timeout: u64,
+
     /// Maximum inner-loop retries per attempt (iteration mode).
     #[arg(long, default_value = "5")]
     max_retries: u32,
@@ -800,6 +809,71 @@ fn set_var(vars: &mut Vec<(String, String)>, key: &str, value: String) {
     }
 }
 
+/// Re-anchor an explicitly supplied `OUT_DIR` after `PLAN_FILE` moved the
+/// document workspace root.
+///
+/// `--var OUT_DIR=plans/out` written for a repo-root invocation stays
+/// repo-root-relative once the workspace anchors to the plan's own folder, so
+/// it resolves one level too deep (`<plan_dir>/plans/out`). Agents that write
+/// through their own tools probe the filesystem and silently self-correct;
+/// agents that write through the in-band `<file>` channel do not — the host
+/// joins their path onto the workspace root and the artefact lands in a
+/// directory nobody reads. Rewrite the var when the value clearly named a
+/// path inside the new workspace, and reject one that names a path outside it,
+/// which scope enforcement cannot honour.
+fn reanchor_out_dir_to_workspace(
+    vars: &mut Vec<(String, String)>,
+    cwd: &std::path::Path,
+    workspace: &std::path::Path,
+) -> Result<()> {
+    let Some(out) = vars
+        .iter()
+        .find(|(k, _)| k == "OUT_DIR")
+        .map(|(_, v)| v.clone())
+    else {
+        return Ok(());
+    };
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    let as_given = std::path::Path::new(trimmed);
+    let cwd_canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let from_cwd = if as_given.is_absolute() {
+        as_given.to_path_buf()
+    } else {
+        cwd_canon.join(as_given)
+    };
+
+    // Interpreting the value against the new root already lands where the
+    // caller meant it to — the common case of running from inside the plan's
+    // own directory.
+    if !as_given.is_absolute() && workspace.join(as_given) == from_cwd {
+        return Ok(());
+    }
+
+    match from_cwd.strip_prefix(workspace) {
+        Ok(_) => {
+            let rel = path_spec_for_worktree(workspace, &from_cwd);
+            set_var(vars, "OUT_DIR", rel.clone());
+            eprintln!("[execution] OUT_DIR re-anchored to workspace: {out} -> {rel}");
+            Ok(())
+        }
+        // A value like `research` from an unrelated cwd was always meant to be
+        // workspace-relative; leave it alone.
+        Err(_) if !as_given.is_absolute() => Ok(()),
+        Err(_) => anyhow::bail!(
+            "--var OUT_DIR={out} points outside the document workspace {} \
+             (anchored to the PLAN_FILE directory). Agent scopes are enforced \
+             on workspace-relative paths, so artefacts written there would \
+             escape the scope check. Pass a path inside the workspace, or use \
+             --workspace <dir> to anchor the run somewhere that contains both.",
+            workspace.display()
+        ),
+    }
+}
+
 fn apply_out_dir_default_from_plan(
     vars: &mut Vec<(String, String)>,
     repo: &std::path::Path,
@@ -883,6 +957,9 @@ fn prepare_swarm_workspace(
                         .map(|(_, v)| v.as_str())
                         .unwrap_or("?")
                 );
+                // After the anchor line, so the rewrite reads as a consequence
+                // of it rather than as an unexplained edit to the caller's var.
+                reanchor_out_dir_to_workspace(&mut vars, cwd, &plan_dir)?;
             }
             apply_out_dir_default_from_plan(&mut vars, &repo_path, &plan_host);
         } else if cli_repo_is_default(cli) {
@@ -3637,6 +3714,7 @@ async fn main() -> Result<()> {
                 read_only_paths: Vec::new(),
                 interface_contracts: std::collections::HashMap::new(),
             },
+            produces: vec![],
             depends_on: Vec::new(),
             #[allow(deprecated)]
             backend: Default::default(),
@@ -3648,6 +3726,7 @@ async fn main() -> Result<()> {
             coordinator_instructions: String::new(),
             estimated_tokens: 0,
             max_retries: 1,
+            timeout_secs: 3600,
             escalation_tier: None,
             read_namespaces: None,
             write_namespace: None,
@@ -3820,6 +3899,7 @@ async fn main() -> Result<()> {
         extract_agent_findings,
         resume_from_artifacts: !cli.fresh,
         knowledge_invalidation: None,
+        run_timeout_secs: cli.run_timeout,
     };
 
     // --coordinated: produce a DSL plan file for review, then exit.
@@ -4200,6 +4280,95 @@ mod tests {
                 .map(|(_, v)| v.as_str()),
             Some("draft.md")
         );
+    }
+
+    fn out_dir_of(vars: &[(String, String)]) -> &str {
+        vars.iter()
+            .find(|(k, _)| k == "OUT_DIR")
+            .map(|(_, v)| v.as_str())
+            .unwrap()
+    }
+
+    /// The production failure: `--var OUT_DIR=plans/out` written for a
+    /// repo-root invocation stayed repo-root-relative after PLAN_FILE
+    /// anchored the workspace to `plans/`, so it resolved to
+    /// `plans/plans/out` and in-band file proposals landed nowhere.
+    #[test]
+    fn reanchor_out_dir_rewrites_a_repo_relative_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(dir.path()).unwrap();
+        let workspace = cwd.join("plans");
+        std::fs::create_dir_all(workspace.join("out")).unwrap();
+
+        let mut vars = vec![("OUT_DIR".to_string(), "plans/out".to_string())];
+        reanchor_out_dir_to_workspace(&mut vars, &cwd, &workspace).unwrap();
+        assert_eq!(out_dir_of(&vars), "out");
+    }
+
+    /// A bare `research` from an unrelated cwd was always meant to be
+    /// workspace-relative — rewriting it would point outside the workspace.
+    #[test]
+    fn reanchor_out_dir_leaves_workspace_relative_values_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(dir.path()).unwrap();
+        let workspace = cwd.join("plans");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let mut vars = vec![("OUT_DIR".to_string(), "research".to_string())];
+        reanchor_out_dir_to_workspace(&mut vars, &cwd, &workspace).unwrap();
+        assert_eq!(out_dir_of(&vars), "research");
+    }
+
+    /// Running from inside the plan's own directory already resolves
+    /// correctly; the value must survive untouched.
+    #[test]
+    fn reanchor_out_dir_noop_when_cwd_is_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(workspace.join("out")).unwrap();
+
+        let mut vars = vec![("OUT_DIR".to_string(), "out".to_string())];
+        reanchor_out_dir_to_workspace(&mut vars, &workspace, &workspace).unwrap();
+        assert_eq!(out_dir_of(&vars), "out");
+    }
+
+    #[test]
+    fn reanchor_out_dir_relativizes_an_absolute_value_inside_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(dir.path()).unwrap();
+        let workspace = cwd.join("plans");
+        let out = workspace.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let mut vars = vec![("OUT_DIR".to_string(), out.display().to_string())];
+        reanchor_out_dir_to_workspace(&mut vars, &cwd, &workspace).unwrap();
+        assert_eq!(out_dir_of(&vars), "out");
+    }
+
+    #[test]
+    fn reanchor_out_dir_rejects_an_absolute_value_outside_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(dir.path()).unwrap();
+        let workspace = cwd.join("plans");
+        let elsewhere = cwd.join("elsewhere");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+
+        let mut vars = vec![("OUT_DIR".to_string(), elsewhere.display().to_string())];
+        let err = reanchor_out_dir_to_workspace(&mut vars, &cwd, &workspace).unwrap_err();
+        assert!(
+            err.to_string().contains("outside the document workspace"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn reanchor_out_dir_is_a_noop_without_the_var() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(dir.path()).unwrap();
+        let mut vars: Vec<(String, String)> = vec![];
+        reanchor_out_dir_to_workspace(&mut vars, &cwd, &cwd).unwrap();
+        assert!(vars.is_empty());
     }
 
     #[test]

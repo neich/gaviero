@@ -65,6 +65,9 @@ fn worker_to_unit(w: &SpawnWorkerSpec, op: &FanoutOp) -> Result<WorkUnit> {
             read_only_paths: w.read_only.clone(),
             interface_contracts: Default::default(),
         },
+        // Runtime fan-out workers come from a SpawnManifest, which carries
+        // scope but no output contract.
+        produces: Vec::new(),
         depends_on: vec![op.after_unit.clone()],
         backend: Default::default(),
         model: Some(model),
@@ -75,6 +78,7 @@ fn worker_to_unit(w: &SpawnWorkerSpec, op: &FanoutOp) -> Result<WorkUnit> {
         coordinator_instructions: prompt,
         estimated_tokens: 0,
         max_retries: 1,
+        timeout_secs: crate::swarm::models::DEFAULT_AGENT_TIMEOUT_SECS,
         escalation_tier: None,
         read_namespaces: None,
         write_namespace: w.write_ns.clone(),

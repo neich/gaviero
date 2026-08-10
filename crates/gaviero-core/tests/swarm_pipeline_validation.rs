@@ -28,6 +28,7 @@ fn unit(id: &str, owned: &[&str]) -> WorkUnit {
             read_only_paths: vec![],
             interface_contracts: HashMap::new(),
         },
+        produces: vec![],
         depends_on: vec![],
         backend: Default::default(),
         model: None,
@@ -38,6 +39,7 @@ fn unit(id: &str, owned: &[&str]) -> WorkUnit {
         coordinator_instructions: String::new(),
         estimated_tokens: 0,
         max_retries: 1,
+        timeout_secs: 3600,
         escalation_tier: None,
         read_namespaces: None,
         write_namespace: None,
@@ -107,6 +109,7 @@ fn make_config(workspace: &std::path::Path) -> SwarmConfig {
         extract_agent_findings: false,
         resume_from_artifacts: false,
         knowledge_invalidation: None,
+        run_timeout_secs: 0,
     }
 }
 

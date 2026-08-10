@@ -12,6 +12,7 @@
 //!    get promoted to repo scope.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tracing;
@@ -20,6 +21,24 @@ use super::scope::{WriteMeta, WriteScope};
 use super::store::MemoryStore;
 use super::stores::MemoryStores;
 use super::writer::{WriteResult, WriterConfig, WriterHandle, spawn_writer_task};
+
+/// Wall-clock budget for one [`Consolidator::consolidate_run`] pass.
+///
+/// The pass awaits a writer ack per promotion and a run can carry an
+/// unbounded number of rows, so without a shared deadline its worst case
+/// is `rows × ACK_TIMEOUT_MS`. Once the budget is spent the remaining
+/// promotions are enqueued without waiting: the writer is FIFO, so they
+/// still land, and still land ahead of the `DeleteRun` that follows them
+/// — only the acks (and therefore the per-row counters) are given up.
+const CONSOLIDATION_BUDGET: Duration = Duration::from_secs(90);
+
+/// Slice of [`CONSOLIDATION_BUDGET`] spent draining writes that were
+/// already queued when the pass started.
+const FLUSH_BUDGET: Duration = Duration::from_secs(30);
+
+/// Below this an ack has no realistic chance of arriving, so stop waiting
+/// rather than burn the tail of the budget on timeouts.
+const MIN_ACK_BUDGET: Duration = Duration::from_secs(1);
 
 /// Policy for consolidation during store operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +96,14 @@ impl Consolidator {
     /// Step 7: registry-aware constructor. The consolidator's writer
     /// dispatches per-scope and the maintenance passes fan out across
     /// every opened DB.
+    ///
+    /// Spawns a **private** writer task. Any caller that already owns a
+    /// writer for these stores must use [`Self::with_stores_and_writer`]
+    /// instead: a second writer breaks the single-consumer invariant
+    /// (both tasks then contend for the store connection and the ONNX
+    /// session), and nothing outside this struct can flush the private
+    /// one, so writes still queued when the handle drops race process
+    /// exit. This constructor is for standalone / test use.
     pub fn with_stores(stores: Arc<MemoryStores>) -> Self {
         let writer = spawn_writer_task(WriterConfig {
             stores: stores.clone(),
@@ -109,12 +136,37 @@ impl Consolidator {
     /// module scope (if module_path is set) or repo scope.
     ///
     /// After promotion, deletes all run-level memories.
+    ///
+    /// Always terminates: the drain-and-promote phase spends at most
+    /// [`CONSOLIDATION_BUDGET`], the prune at most one
+    /// [`super::writer::ACK_TIMEOUT_MS`]. Best-effort throughout — a
+    /// promotion or prune that cannot be *confirmed* is logged, never
+    /// propagated, because the writer commits it regardless. The only
+    /// error this returns is a failed read of the run set, which leaves
+    /// nothing to report on.
     pub async fn consolidate_run(
         &self,
         run_id: &str,
         repo_id: &str,
     ) -> Result<ConsolidationReport> {
+        let deadline = Instant::now() + CONSOLIDATION_BUDGET;
         let mut report = ConsolidationReport::default();
+
+        // Drain writes already queued before reading the run set. The
+        // per-turn extractor writes run-scope rows through this same
+        // writer right up to the end of the swarm, so triaging without
+        // the barrier can miss rows still in flight — and those rows
+        // would then be neither promoted nor pruned.
+        if tokio::time::timeout(FLUSH_BUDGET, self.writer.flush())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                run_id,
+                budget_secs = FLUSH_BUDGET.as_secs(),
+                "consolidation: writer still draining; triaging what has landed so far"
+            );
+        }
 
         // Run rows live in the workspace store (StoreKind::Workspace
         // routing for WriteScope::Run). Promotions land in the folder
@@ -131,6 +183,7 @@ impl Consolidator {
             "consolidation: triaging run memories"
         );
 
+        let mut unconfirmed = 0usize;
         for mem in &run_memories {
             // Only promote memories with meaningful importance
             if mem.importance < 0.4 {
@@ -158,9 +211,25 @@ impl Consolidator {
                         .unwrap_or_else(|| format!("consolidation:run:{run_id}")),
                 );
 
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining < MIN_ACK_BUDGET {
+                // Budget spent. Enqueue without waiting rather than drop
+                // the promotion: FIFO keeps it ahead of the `DeleteRun`
+                // below, so the row is still promoted before its
+                // run-scope original is removed.
+                if self
+                    .writer
+                    .swarm_consolidate(target, mem.content.clone(), meta)
+                    .is_ok()
+                {
+                    unconfirmed += 1;
+                }
+                continue;
+            }
+
             match self
                 .writer
-                .swarm_consolidate_wait(target, mem.content.clone(), meta)
+                .swarm_consolidate_wait_within(target, mem.content.clone(), meta, remaining)
                 .await
             {
                 Ok(WriteResult::Inserted(_)) => {
@@ -183,13 +252,30 @@ impl Consolidator {
             }
         }
 
-        // Delete all run-level memories
-        match self.writer.delete_run(run_id).await? {
-            WriteResult::Inserted(deleted) => {
+        if unconfirmed > 0 {
+            tracing::warn!(
+                run_id,
+                unconfirmed,
+                budget_secs = CONSOLIDATION_BUDGET.as_secs(),
+                "consolidation: budget spent; remaining promotions enqueued unconfirmed"
+            );
+        }
+
+        // Delete all run-level memories. Best-effort: a failure here
+        // leaves the rows at run scope, where decay ages them out, and
+        // must not mask the promotions that did land.
+        match self.writer.delete_run(run_id).await {
+            Ok(WriteResult::Inserted(deleted)) => {
                 report.pruned = deleted as usize;
             }
-            WriteResult::Skipped => {}
-            _ => {}
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    run_id,
+                    error = %e,
+                    "consolidation: run-row prune unconfirmed; rows stay at run scope"
+                );
+            }
         }
 
         tracing::info!(
@@ -197,6 +283,7 @@ impl Consolidator {
             promoted = report.promoted,
             reinforced = report.reinforced,
             pruned = report.pruned,
+            unconfirmed,
             "consolidation: run triage complete"
         );
 
@@ -389,5 +476,72 @@ mod tests {
         let consolidator = Consolidator::new(store);
         let report = consolidator.maintain().await.unwrap();
         assert_eq!(report.prune_count, 0);
+    }
+
+    /// Embeds slower than the 500ms the ack budget used to allow.
+    struct SlowEmbedder;
+    #[async_trait::async_trait]
+    impl Embedder for SlowEmbedder {
+        fn name(&self) -> &str {
+            "slow-mock"
+        }
+
+        fn dimension(&self) -> usize {
+            8
+        }
+
+        async fn embed(
+            &self,
+            text: &str,
+            purpose: crate::memory::embedder::EmbeddingPurpose,
+        ) -> Result<Vec<f32>> {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            MockEmbedder.embed(text, purpose).await
+        }
+    }
+
+    /// Regression: a `store_scoped` slower than the legacy 500ms ack
+    /// budget made every promotion report `writer ack timeout` — and,
+    /// because the ack clock starts at *enqueue*, every message queued
+    /// behind it as well — while the writer was committing them all
+    /// along. The prune then propagated that timeout as a hard error.
+    #[tokio::test]
+    async fn consolidate_run_confirms_promotions_slower_than_the_legacy_ack_budget() {
+        let store = Arc::new(MemoryStore::in_memory(Arc::new(SlowEmbedder)).unwrap());
+        let stores = MemoryStores::from_single_store(store.clone());
+        let writer = spawn_writer_task(WriterConfig {
+            stores: stores.clone(),
+            llm: None,
+            observer: None,
+            manifest_observer: None,
+        });
+
+        let run_scope = WriteScope::Run {
+            repo_id: "repo1".to_string(),
+            run_id: "run1".to_string(),
+        };
+        let meta = WriteMeta::for_source(crate::memory::trust_defaults::MemorySource::LlmExtracted)
+            .with_importance(0.8);
+        for text in ["alpha finding about parsers", "omega note on write gates"] {
+            store.store_scoped(&run_scope, text, &meta).await.unwrap();
+        }
+
+        let consolidator = Consolidator::with_stores_and_writer(stores, writer);
+        let report = consolidator.consolidate_run("run1", "repo1").await.unwrap();
+
+        // Promoted vs reinforced depends on the mock's similarity; what
+        // matters is that both rows were accounted for rather than lost
+        // to a timeout, and that the prune was confirmed.
+        assert_eq!(
+            report.promoted + report.reinforced,
+            2,
+            "both run rows should be confirmed (promoted={}, reinforced={})",
+            report.promoted,
+            report.reinforced
+        );
+        assert_eq!(
+            report.pruned, 2,
+            "run rows should be pruned after promotion"
+        );
     }
 }

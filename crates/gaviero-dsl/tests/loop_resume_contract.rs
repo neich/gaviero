@@ -176,18 +176,9 @@ fn a_crashed_round_is_discarded_rather_than_resumed_into() {
 fn scientific_research_resume_suppresses_the_init_round() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let out_dir = "research/run-a";
+    // Every iteration, init included, writes the conclusion + summary pair.
     for id in ["claude", "codex"] {
-        write(
-            tmp.path(),
-            &format!("{out_dir}/{id}-conclusion-v1.md"),
-            "# conclusion",
-        );
-        write(
-            tmp.path(),
-            &format!("{out_dir}/{id}-evidence-v1.md"),
-            "# evidence",
-        );
-        for v in 2..=4 {
+        for v in 1..=4 {
             write(
                 tmp.path(),
                 &format!("{out_dir}/{id}-conclusion-v{v}.md"),
@@ -197,11 +188,6 @@ fn scientific_research_resume_suppresses_the_init_round() {
                 tmp.path(),
                 &format!("{out_dir}/{id}-summary-v{v}.md"),
                 "# summary",
-            );
-            write(
-                tmp.path(),
-                &format!("{out_dir}/{id}-evidence-v{v}.md"),
-                "# evidence",
             );
         }
     }
@@ -213,10 +199,7 @@ fn scientific_research_resume_suppresses_the_init_round() {
         Some("research topic"),
         &[
             ("OUT_DIR".to_string(), out_dir.to_string()),
-            (
-                "PROBLEM_FILE".to_string(),
-                format!("{out_dir}/problem.md"),
-            ),
+            ("PLAN_FILE".to_string(), format!("{out_dir}/problem.md")),
         ],
         &[],
         &[(

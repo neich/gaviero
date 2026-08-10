@@ -423,6 +423,19 @@
           "members": [
             {
               "type": "STRING",
+              "value": "produces"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "string_list"
+            }
+          ]
+        },
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
               "value": "prompt"
             },
             {
@@ -446,6 +459,19 @@
             {
               "type": "STRING",
               "value": "max_retries"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "integer"
+            }
+          ]
+        },
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "timeout"
             },
             {
               "type": "SYMBOL",
@@ -980,6 +1006,19 @@
             {
               "type": "STRING",
               "value": "judge_timeout"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "integer"
+            }
+          ]
+        },
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "irreconcilable_after"
             },
             {
               "type": "SYMBOL",
@@ -1701,5 +1740,6 @@
   "precedences": [],
   "externals": [],
   "inline": [],
-  "supertypes": []
+  "supertypes": [],
+  "reserved": {}
 }

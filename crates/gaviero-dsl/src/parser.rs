@@ -25,8 +25,10 @@ enum AgentField {
     TierRef(String, Span),
     Scope(ScopeBlock),
     DependsOn(Vec<(String, Span)>, Span),
+    Produces(Vec<String>),
     Prompt(PromptSource, Span),
     MaxRetries(u8, Span),
+    Timeout(u64, Span),
     Memory(MemoryBlock),
     Context(ContextBlock),
     Vars(Vec<(String, String)>),
@@ -87,6 +89,7 @@ enum LoopField {
     IterStart(u32),
     Stability(u32),
     JudgeTimeout(u32),
+    IrreconcilableAfter(u32),
     StrictJudge(bool),
     BranchChain(BranchChainLit),
     Reviewers(ReviewerSource),
@@ -594,6 +597,9 @@ where
         just(Token::KwDependsOn)
             .ignore_then(ident_list.clone().map_with(|v, e| (v, e.span())))
             .map(|(v, s)| AgentField::DependsOn(v, s)),
+        just(Token::KwProduces)
+            .ignore_then(str_list.clone())
+            .map(AgentField::Produces),
         just(Token::KwPrompt)
             .ignore_then(choice((
                 string.map_with(|s, e| (PromptSource::Inline(s), e.span())),
@@ -603,6 +609,9 @@ where
         just(Token::KwMaxRetries)
             .ignore_then(integer.map_with(|n, e| (n, e.span())))
             .map(|(n, s)| AgentField::MaxRetries(n.min(255) as u8, s)),
+        just(Token::KwTimeout)
+            .ignore_then(integer.map_with(|n, e| (n, e.span())))
+            .map(|(n, s)| AgentField::Timeout(n, s)),
         memory_block.clone().map(AgentField::Memory),
         context_block.map(AgentField::Context),
         vars_block.clone().map(AgentField::Vars),
@@ -630,10 +639,12 @@ where
             let mut depends_on = None;
             let mut prompt = None;
             let mut max_retries = None;
+            let mut timeout_secs = None;
             let mut memory = None;
             let mut context = None;
             let mut vars: Vec<(String, String)> = Vec::new();
             let mut tools: Vec<String> = Vec::new();
+            let mut produces: Vec<String> = Vec::new();
             let mut template = false;
             for f in fields {
                 match f {
@@ -652,11 +663,17 @@ where
                     AgentField::DependsOn(v, s) => {
                         depends_on.get_or_insert((v, s));
                     }
+                    AgentField::Produces(paths) => {
+                        produces.extend(paths);
+                    }
                     AgentField::Prompt(v, s) => {
                         prompt.get_or_insert((v, s));
                     }
                     AgentField::MaxRetries(n, s) => {
                         max_retries.get_or_insert((n, s));
+                    }
+                    AgentField::Timeout(n, s) => {
+                        timeout_secs.get_or_insert((n, s));
                     }
                     AgentField::Memory(b) => {
                         memory.get_or_insert(b);
@@ -683,8 +700,10 @@ where
                 tier_ref,
                 scope,
                 depends_on,
+                produces,
                 prompt,
                 max_retries,
+                timeout_secs,
                 memory,
                 context,
                 vars,
@@ -835,6 +854,9 @@ where
         just(Token::KwJudgeTimeout)
             .ignore_then(integer)
             .map(|n| LoopField::JudgeTimeout(n as u32)),
+        just(Token::KwIrreconcilableAfter)
+            .ignore_then(integer)
+            .map(|n| LoopField::IrreconcilableAfter(n as u32)),
         just(Token::KwStrictJudge)
             .ignore_then(bool_lit)
             .map(LoopField::StrictJudge),
@@ -874,6 +896,7 @@ where
             let mut iter_start = None;
             let mut stability = None;
             let mut judge_timeout_secs = None;
+            let mut irreconcilable_after = None;
             let mut strict_judge = None;
             let mut branch_chain: Option<BranchChainLit> = None;
             let mut reviewers: ReviewerSource = ReviewerSource::None;
@@ -898,6 +921,9 @@ where
                     }
                     LoopField::JudgeTimeout(n) => {
                         judge_timeout_secs.get_or_insert(n);
+                    }
+                    LoopField::IrreconcilableAfter(n) => {
+                        irreconcilable_after.get_or_insert(n);
                     }
                     LoopField::StrictJudge(b) => {
                         strict_judge.get_or_insert(b);
@@ -927,6 +953,7 @@ where
                 iter_start: iter_start.unwrap_or(1),
                 stability: stability.unwrap_or(1),
                 judge_timeout_secs: judge_timeout_secs.unwrap_or(120),
+                irreconcilable_after: irreconcilable_after.unwrap_or(2),
                 strict_judge: strict_judge.unwrap_or(true),
                 branch_chain: branch_chain.unwrap_or(BranchChainLit::None),
                 reviewers,

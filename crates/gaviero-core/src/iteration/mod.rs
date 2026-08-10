@@ -460,6 +460,7 @@ mod tests {
                 read_only_paths: vec![],
                 interface_contracts: HashMap::new(),
             },
+            produces: vec![],
             depends_on: vec![],
             #[allow(deprecated)]
             backend: Default::default(),
@@ -471,6 +472,7 @@ mod tests {
             coordinator_instructions: "do something".into(),
             estimated_tokens: 0,
             max_retries: 1,
+            timeout_secs: 3600,
             escalation_tier: None,
             read_namespaces: None,
             write_namespace: None,

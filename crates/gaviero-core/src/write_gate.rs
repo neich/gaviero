@@ -96,6 +96,17 @@ impl WriteGatePipeline {
         }
     }
 
+    /// The owned globs registered for `agent_id`, for diagnostics.
+    ///
+    /// Empty when no scope is registered — which [`Self::is_scope_allowed`]
+    /// treats as "unrestricted", not "nothing allowed".
+    pub fn owned_paths_for(&self, agent_id: &str) -> &[String] {
+        self.agent_scopes
+            .get(agent_id)
+            .map(|s| s.owned_paths.as_slice())
+            .unwrap_or(&[])
+    }
+
     /// Allocate the next proposal ID.
     pub fn next_id(&mut self) -> u64 {
         let id = self.next_id;

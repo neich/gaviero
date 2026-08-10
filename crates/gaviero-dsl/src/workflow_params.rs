@@ -630,6 +630,11 @@ fn clone_reviewer_agent(
             *path = path.replace("{{REVIEWER_ID}}", &entry.id);
         }
     }
+    // The output contract is per-reviewer for the same reason the owned globs
+    // are: without the id prefix every clone would claim the same artefacts.
+    for path in agent.produces.iter_mut() {
+        *path = path.replace("{{REVIEWER_ID}}", &entry.id);
+    }
     agent
 }
 
@@ -642,8 +647,10 @@ fn clone_agent_shell(template: &AgentDecl) -> AgentDecl {
         tier_ref: None,
         scope: template.scope.clone(),
         depends_on: template.depends_on.clone(),
+        produces: template.produces.clone(),
         prompt: template.prompt.clone(),
         max_retries: template.max_retries,
+        timeout_secs: template.timeout_secs,
         memory: template.memory.clone(),
         context: template.context.clone(),
         vars: Vec::new(),
@@ -688,9 +695,16 @@ fn build_peer_read_block(peers: &[&str]) -> String {
         "    Peer documents to read (all other providers for this iteration):\n",
     );
     for peer in peers {
+        // `{{{{OUT_DIR}}}}` is the format-string escape for a literal
+        // `{{OUT_DIR}}` — the double-brace form the var substituter looks for.
+        // Emitting `{{OUT_DIR}}` here would produce a single-braced
+        // `{OUT_DIR}` that survives substitution and reaches the agent as a
+        // literal path segment.
         s.push_str(&format!(
-            "      - {{OUT_DIR}}/{peer}-conclusion-v{{{{PREV_ITER}}}}.md (or -init- on first refine pass)\n\
-               - {{OUT_DIR}}/{peer}-summary-v{{{{PREV_ITER}}}}.md (omit on PREV_ITER=1)\n"
+            "      - {{{{OUT_DIR}}}}/{peer}-conclusion-v{{{{PREV_ITER}}}}.md (or -init- on first refine pass)\n"
+        ));
+        s.push_str(&format!(
+            "      - {{{{OUT_DIR}}}}/{peer}-summary-v{{{{PREV_ITER}}}}.md (skip if the file does not exist)\n"
         ));
     }
     if peers.is_empty() {
@@ -738,5 +752,45 @@ mod tests {
     fn parse_rejects_missing_provider() {
         let err = parse_reviewers_override("claude=opus").unwrap_err();
         assert!(err.contains("provider:model"), "got: {err}");
+    }
+
+    /// The block is substituted like any other prompt text, so its
+    /// placeholders must survive `format!` in the double-brace form. A
+    /// single-braced `{OUT_DIR}` reaches the agent verbatim and sends it
+    /// looking for a directory literally named `{OUT_DIR}`.
+    #[test]
+    fn peer_read_block_emits_substitutable_placeholders() {
+        let block = build_peer_read_block(&["codex", "cursor"]);
+        assert_eq!(
+            block.matches("{{OUT_DIR}}").count(),
+            4,
+            "expected one {{{{OUT_DIR}}}} per peer file, got: {block}"
+        );
+        assert_eq!(block.matches("{{PREV_ITER}}").count(), 4, "got: {block}");
+        assert!(
+            !block.contains("{OUT_DIR}/"),
+            "single-braced placeholder leaked: {block}"
+        );
+    }
+
+    /// Both bullets belong to the same indented list; a line-continuation
+    /// escape silently ate the second one's indentation.
+    #[test]
+    fn peer_read_block_indents_every_bullet() {
+        let block = build_peer_read_block(&["codex"]);
+        let bullets: Vec<&str> = block
+            .lines()
+            .filter(|l| l.trim().starts_with('-'))
+            .collect();
+        assert_eq!(bullets.len(), 2, "got: {block}");
+        for line in bullets {
+            assert!(line.starts_with("      - "), "unindented bullet: {line:?}");
+        }
+    }
+
+    #[test]
+    fn peer_read_block_handles_solo_panel() {
+        let block = build_peer_read_block(&[]);
+        assert!(block.contains("(none)"), "got: {block}");
     }
 }

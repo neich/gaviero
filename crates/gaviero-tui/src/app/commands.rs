@@ -209,6 +209,7 @@ pub(crate) fn run_swarm(app: &mut App, task_desc: String) {
             extract_agent_findings,
             resume_from_artifacts: true,
             knowledge_invalidation: None,
+            run_timeout_secs: 0,
         };
 
         let observer = TuiSwarmObserver { tx: tx.clone() };
@@ -408,6 +409,7 @@ pub(super) fn handle_run_script_command(app: &mut App) {
             extract_agent_findings,
             resume_from_artifacts: true,
             knowledge_invalidation: None,
+            run_timeout_secs: 0,
         };
 
         let observer = TuiSwarmObserver { tx: tx.clone() };
@@ -562,6 +564,7 @@ pub(super) fn handle_coordinated_swarm_command(app: &mut App) {
             extract_agent_findings,
             resume_from_artifacts: true,
             knowledge_invalidation: None,
+            run_timeout_secs: 0,
         };
 
         let coord_config = coordinator::CoordinatorConfig {

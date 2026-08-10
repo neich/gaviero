@@ -178,7 +178,7 @@ UnifiedStreamEvent::FileBlock (or Cursor snapshot+revert / tool_agent PathsModif
 ### Memory write + retrieve
 
 ```
-WRITE     WriterHandle::send → writer task: embed (no lock) → brief DB lock → optional 500ms ack
+WRITE     WriterHandle::send → writer task: embed (no lock) → brief DB lock → optional ack (ACK_TIMEOUT_MS, 30s)
 RETRIEVE  retrieve_ranked: embed → MemoryStores::search_scoped (merged RRF default | cascade kill-switch)
           → score → optional rerank → injection_manifests
 ```

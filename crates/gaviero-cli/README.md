@@ -145,6 +145,19 @@ No public library API. The `Cli` struct in `src/main.rs` is authoritative; this 
 | `--no-iterate` | — | Single pass only (overrides `--max-retries`) |
 | `--resume` | — | Resume from `.gaviero/state/<plan-hash>.json` |
 | `--fresh` | — | Ignore artefacts in a `loop` block's `OUT_DIR`; restart every loop at its script `iter_start` |
+| `--run-timeout` | `<secs>` | Wall-clock cap on the whole run (default `0` = no cap) |
+
+### Bounding a run
+
+A run is already finite without `--run-timeout`: every agent dispatch is bounded
+by the DSL's `agent { timeout <secs> }` (default 3600), so the worst case for a
+loop workflow is `(1 + max_iterations) × (agents × timeout + judge_timeout)`.
+That bound is what stops a wedged provider subprocess from hanging the workflow —
+provider sessions only give up when their process *exits*, not when it goes quiet.
+
+`--run-timeout` is the outer cap for cost and latency. It is checked between
+agents, so the run stops cleanly and keeps every artefact written so far;
+re-running the same command resumes from them.
 
 ### Resuming a consensus loop
 
