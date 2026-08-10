@@ -36,8 +36,8 @@ pub struct ChatMemoryRequest<'a> {
     /// `<project_memory>` block).
     pub writer: Option<&'a WriterHandle>,
     pub workspace_root: &'a Path,
-    /// Optional folder root if a buffer is focused — propagated into
-    /// the retrieval scope so module-scope memories can rank.
+    /// Optional workspace-folder root. When supplied, repo-scoped
+    /// memories from that folder participate in retrieval.
     pub folder_root: Option<&'a Path>,
     /// User message that drives retrieval.
     pub user_prompt: &'a str,
@@ -70,21 +70,33 @@ pub struct ChatMemoryOutcome {
     pub summary: ChatInjectionSummary,
 }
 
-/// Run S1 retrieval and persist the S4 manifest.
+/// Run S1 retrieval without module context.
 ///
-/// Behaviour:
-/// 1. If `injection_config.enabled` is false, returns an empty
-///    outcome — no retrieval, no manifest.
-/// 2. Otherwise runs `retrieve_for_chat_with_reranker` over the
-///    workspace + folder context.
-/// 3. If retrieval surfaces any items and `manifests_enabled` and a
-///    writer is supplied, enqueues `WriterMessage::InjectionManifest`
-///    fire-and-forget. Manifest persistence failure never fails the
-///    turn (Tier S acceptance criterion #8).
+/// This preserves the original API for workspace-wide and headless
+/// callers. Interactive callers that captured a module path at turn
+/// dispatch should use [`perform_injection_with_module`] so reads and
+/// post-turn writes resolve against the same scope.
 ///
 /// On retrieval error this returns an empty outcome and logs at
 /// `warn!` — the turn proceeds without memory rather than aborting.
 pub async fn perform_injection(req: ChatMemoryRequest<'_>) -> ChatMemoryOutcome {
+    perform_injection_with_module(req, None).await
+}
+
+/// Run S1 retrieval with the module path captured for the current turn.
+///
+/// `module_path` must use the same repo-relative representation supplied
+/// to the post-turn writer. Keeping that value unchanged makes the read
+/// scope and write scope symmetric without changing persisted rows or
+/// widening module visibility.
+///
+/// A module requires `req.folder_root`: without a folder there is no
+/// stable `repo_id`, so the module context is ignored and retrieval
+/// safely falls back to workspace/global scope.
+pub async fn perform_injection_with_module(
+    req: ChatMemoryRequest<'_>,
+    module_path: Option<&str>,
+) -> ChatMemoryOutcome {
     if !req.injection_config.enabled {
         return ChatMemoryOutcome {
             injection: None,
@@ -97,7 +109,14 @@ pub async fn perform_injection(req: ChatMemoryRequest<'_>) -> ChatMemoryOutcome 
         };
     }
 
-    let scope = MemoryScope::from_context(req.workspace_root, req.folder_root, None, None);
+    let mut scope = MemoryScope::from_context(req.workspace_root, req.folder_root, None, None);
+    if scope.repo_id.is_some() {
+        scope.module_path = module_path
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned);
+    }
+
     let injection = match retrieve_for_chat_with_reranker(
         req.stores,
         &scope,
@@ -338,7 +357,9 @@ fn build_manifest_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{MemoryServices, ScopeMix};
+    use crate::memory::{
+        MemoryServices, ScopeMix, WriteMeta, WriteScope, hash_path,
+    };
 
     fn null_injection_config(enabled: bool) -> ChatInjectionConfig {
         ChatInjectionConfig {
@@ -385,6 +406,63 @@ mod tests {
         assert!(outcome.injection.is_none());
         assert_eq!(outcome.summary.items_injected, 0);
         assert_eq!(outcome.summary.token_budget, 1000);
+    }
+
+    #[tokio::test]
+    async fn module_context_makes_module_memory_retrievable() {
+        let services = MemoryServices::for_tests_in_memory().unwrap();
+        let root = std::path::Path::new("/tmp/wsx");
+        let repo_id = hash_path(root);
+        let module_path = "crates/gaviero-core/src";
+        let content = "module-local retrieval sentinel";
+
+        services
+            .stores
+            .store_scoped(
+                &WriteScope::Module {
+                    repo_id,
+                    module_path: module_path.to_string(),
+                },
+                content,
+                &WriteMeta::default(),
+            )
+            .await
+            .unwrap();
+
+        let cfg = null_injection_config(true);
+        let rcfg = null_retrieval_config();
+        let outcome = perform_injection_with_module(
+            ChatMemoryRequest {
+                stores: &services.stores,
+                writer: None,
+                workspace_root: root,
+                folder_root: Some(root),
+                user_prompt: content,
+                turn_id: "t-module",
+                session_id: "s-module",
+                injection_config: &cfg,
+                retrieval_config: &rcfg,
+                reranker: None,
+                rerank_config: None,
+                manifests_enabled: false,
+                capture_candidate_pool: true,
+                embedder_name: "null",
+                reranker_name: None,
+            },
+            Some(module_path),
+        )
+        .await;
+
+        let injection = outcome
+            .injection
+            .expect("module context should make the module row eligible");
+        assert!(
+            injection.items.iter().any(|item| {
+                item.content == content
+                    && item.module_path.as_deref() == Some(module_path)
+            }),
+            "expected the matching module-scoped row in the injection"
+        );
     }
 
     #[tokio::test]
