@@ -29,6 +29,9 @@
 
 use serde::{Deserialize, Serialize};
 
+const OPEN_TAG: &str = "<turn_annotations>";
+const CLOSE_TAG: &str = "</turn_annotations>";
+
 /// Current schema version. Bump when the JSON shape changes.
 pub const CURRENT_VERSION: u32 = 1;
 
@@ -91,9 +94,10 @@ fn default_version() -> u32 {
 pub struct ParsedResponse {
     pub stripped: String,
     pub annotations: Option<TurnAnnotations>,
-    /// Present-but-malformed: the block delimiters were found but the
-    /// JSON inside failed to parse. Callers should log a warning and
-    /// emit a metric — prompt may need iteration.
+    /// Present-but-malformed: the block delimiters were found or a
+    /// trailing opener was emitted without its closing delimiter.
+    /// Callers should log a warning and emit a metric — prompt may need
+    /// iteration.
     pub parse_error: Option<String>,
 }
 
@@ -105,10 +109,24 @@ pub struct ParsedResponse {
 /// so the convention's place-at-end nature survives mid-response
 /// explanations of the tag. Lines starting with ``` are skipped on the
 /// outer pass so fenced-code examples don't match.
+///
+/// A trailing, unfenced, standalone opener without a matching close is
+/// also stripped. This quarantines truncated sidecars and leaked
+/// provider/tool markup so neither reaches the user nor flows into the
+/// safety-net memory extractor.
 pub fn parse_and_strip(response: &str) -> ParsedResponse {
     let (start, end) = match find_annotation_span(response) {
         Some(span) => span,
         None => {
+            if let Some(start) = find_unclosed_annotation_start(response) {
+                let body_end = body_end_before_annotation(response, start);
+                return ParsedResponse {
+                    stripped: response[..body_end].to_string(),
+                    annotations: None,
+                    parse_error: Some(format!("missing closing {CLOSE_TAG} delimiter")),
+                };
+            }
+
             return ParsedResponse {
                 stripped: response.to_string(),
                 annotations: None,
@@ -117,20 +135,14 @@ pub fn parse_and_strip(response: &str) -> ParsedResponse {
         }
     };
 
-    let open_tag = "<turn_annotations>";
-    let close_tag = "</turn_annotations>";
-    let inner_start = start + open_tag.len();
+    let inner_start = start + OPEN_TAG.len();
     let inner_end = end;
     let inner = response[inner_start..inner_end].trim();
 
     // Strip the block (and a preceding newline if present) from the
     // response text so it never surfaces to the user.
-    let mut body_end = start;
-    // Trim one trailing newline before the block to avoid a gap.
-    if body_end > 0 && response.as_bytes()[body_end - 1] == b'\n' {
-        body_end -= 1;
-    }
-    let after = end + close_tag.len();
+    let body_end = body_end_before_annotation(response, start);
+    let after = end + CLOSE_TAG.len();
     let mut stripped = String::with_capacity(response.len() - (after - start));
     stripped.push_str(&response[..body_end]);
     if after < response.len() {
@@ -212,14 +224,11 @@ pub fn apply_short_turn_cap(flags: &mut [AnnotationFlag], elapsed_ms: u64) {
 /// If no non-fenced open exists for a given close, retry with the next
 /// earlier close.
 fn find_annotation_span(response: &str) -> Option<(usize, usize)> {
-    let open_tag = "<turn_annotations>";
-    let close_tag = "</turn_annotations>";
-
     let mut search_end = response.len();
     loop {
-        let close_off = response[..search_end].rfind(close_tag)?;
+        let close_off = response[..search_end].rfind(CLOSE_TAG)?;
         let candidates: Vec<usize> = response[..close_off]
-            .match_indices(open_tag)
+            .match_indices(OPEN_TAG)
             .filter(|(off, _)| !is_inside_fence(response, *off))
             .map(|(off, _)| off)
             .collect();
@@ -230,7 +239,7 @@ fn find_annotation_span(response: &str) -> Option<(usize, usize)> {
             continue;
         }
         for &open_off in &candidates {
-            let body = &response[open_off + open_tag.len()..close_off];
+            let body = &response[open_off + OPEN_TAG.len()..close_off];
             if serde_json::from_str::<serde_json::Value>(body.trim()).is_ok() {
                 return Some((open_off, close_off));
             }
@@ -241,6 +250,46 @@ fn find_annotation_span(response: &str) -> Option<(usize, usize)> {
         let latest = *candidates.last().unwrap();
         return Some((latest, close_off));
     }
+}
+
+/// Find the last unfenced opener occupying its own line.
+///
+/// This is only called after `find_annotation_span` has established that
+/// no delimiter pair exists. Requiring a standalone tag prevents an
+/// ordinary inline mention such as "the `<turn_annotations>` tag" from
+/// truncating visible prose.
+fn find_unclosed_annotation_start(response: &str) -> Option<usize> {
+    response
+        .match_indices(OPEN_TAG)
+        .filter(|(off, _)| !is_inside_fence(response, *off))
+        .map(|(off, _)| off)
+        .filter(|off| is_standalone_tag(response, *off, OPEN_TAG))
+        .last()
+}
+
+/// Return the end of the visible body immediately before an annotation
+/// opener, removing one separating LF or CRLF.
+fn body_end_before_annotation(response: &str, start: usize) -> usize {
+    let prefix = &response[..start];
+    if prefix.ends_with("\r\n") {
+        start - 2
+    } else if prefix.ends_with('\n') {
+        start - 1
+    } else {
+        start
+    }
+}
+
+/// True when `tag` is the only non-whitespace content on its line.
+fn is_standalone_tag(response: &str, position: usize, tag: &str) -> bool {
+    let line_start = response[..position]
+        .rfind('\n')
+        .map_or(0, |offset| offset + 1);
+    let line_end = response[position..]
+        .find('\n')
+        .map_or(response.len(), |offset| position + offset);
+
+    response[line_start..line_end].trim() == tag
 }
 
 /// True iff `position` falls inside a triple-backtick fenced code block,
@@ -302,6 +351,50 @@ mod tests {
         assert!(p.annotations.is_none());
         assert!(p.parse_error.is_some(), "should record parse_error");
         assert!(!p.stripped.contains("<turn_annotations>"));
+    }
+
+    #[test]
+    fn parse_and_strip_unclosed_sidecar_is_reported_and_quarantined() {
+        let resp = r#"Visible reply.
+
+<turn_annotations>
+{"v":1,"flags":[{"type":"decision","importance":0.85,"scope":"repo","text":"wrong recommendation"}]}
+</parameter></invoke>"#;
+        let p = parse_and_strip(resp);
+
+        assert!(p.annotations.is_none());
+        assert_eq!(
+            p.parse_error.as_deref(),
+            Some("missing closing </turn_annotations> delimiter")
+        );
+        assert_eq!(p.stripped, "Visible reply.");
+        assert!(!p.stripped.contains("wrong recommendation"));
+        assert!(!p.stripped.contains("</parameter></invoke>"));
+    }
+
+    #[test]
+    fn parse_and_strip_ignores_unclosed_example_inside_code_fence() {
+        let resp = r#"Example:
+```
+<turn_annotations>
+{"flags":[]}
+```
+Visible reply."#;
+        let p = parse_and_strip(resp);
+
+        assert_eq!(p.stripped, resp);
+        assert!(p.annotations.is_none());
+        assert!(p.parse_error.is_none());
+    }
+
+    #[test]
+    fn parse_and_strip_ignores_inline_open_tag_mention() {
+        let resp = "Document the <turn_annotations> tag in the parser guide.";
+        let p = parse_and_strip(resp);
+
+        assert_eq!(p.stripped, resp);
+        assert!(p.annotations.is_none());
+        assert!(p.parse_error.is_none());
     }
 
     #[test]
