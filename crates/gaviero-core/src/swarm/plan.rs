@@ -200,6 +200,21 @@ pub struct LoopConfig {
     /// on partial exit. Populated by the DSL compiler from script `OUT_DIR`.
     #[serde(default)]
     pub verdict_output_dir: Option<String>,
+    /// Stop the loop once the judge reports the *same* blocking disagreement
+    /// this many consecutive times (default 2; `0` disables).
+    ///
+    /// `stability` is the mirror of this on the success side: N consecutive
+    /// PASS verdicts means agreement is real rather than a fluke, and N
+    /// consecutive identical FAIL verdicts means the disagreement is
+    /// structural rather than a pass away from resolution. Without it a panel
+    /// that has said the same thing twice keeps paying for `max_iterations`
+    /// rounds of restating it.
+    #[serde(default = "default_irreconcilable_after")]
+    pub irreconcilable_after: u32,
+}
+
+fn default_irreconcilable_after() -> u32 {
+    2
 }
 
 fn default_iter_start() -> u32 {

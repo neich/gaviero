@@ -73,6 +73,7 @@ impl TestGenerator {
             id: "test-generator".into(),
             description: format!("Generate tests for: {}", &task[..task.len().min(80)]),
             scope: scope.clone(),
+            produces: vec![],
             depends_on: vec![],
             #[allow(deprecated)]
             backend: Default::default(),
@@ -84,6 +85,7 @@ impl TestGenerator {
             coordinator_instructions: prompt,
             estimated_tokens: 0,
             max_retries: 1,
+            timeout_secs: crate::swarm::models::DEFAULT_AGENT_TIMEOUT_SECS,
             escalation_tier: None,
             read_namespaces: None,
             write_namespace: None,

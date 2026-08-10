@@ -337,6 +337,7 @@ mod tests {
             branch_chain: Default::default(),
             consensus_mode: Default::default(),
             verdict_output_dir: Some(out_dir.to_string()),
+            irreconcilable_after: 2,
         }
     }
 
