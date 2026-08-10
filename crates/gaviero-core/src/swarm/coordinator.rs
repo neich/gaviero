@@ -645,6 +645,9 @@ fn parse_work_unit_lenient(v: &serde_json::Value) -> Result<WorkUnit> {
         id,
         description,
         scope,
+        // Coordinator-planned units have no declared output contract; the DSL
+        // `produces` clause is the only source for one.
+        produces: Vec::new(),
         depends_on,
         backend: AgentBackend::default(),
         model,
@@ -655,6 +658,7 @@ fn parse_work_unit_lenient(v: &serde_json::Value) -> Result<WorkUnit> {
         coordinator_instructions,
         estimated_tokens,
         max_retries,
+        timeout_secs: super::models::DEFAULT_AGENT_TIMEOUT_SECS,
         escalation_tier,
         read_namespaces: None,
         write_namespace: None,
@@ -1092,6 +1096,7 @@ mod tests {
                 read_only_paths: vec![],
                 interface_contracts: HashMap::new(),
             },
+            produces: vec![],
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             backend: Default::default(),
             model: None,
@@ -1102,6 +1107,7 @@ mod tests {
             coordinator_instructions: String::new(),
             estimated_tokens: 4000,
             max_retries: 1,
+            timeout_secs: crate::swarm::models::DEFAULT_AGENT_TIMEOUT_SECS,
             escalation_tier: Some(ModelTier::Expensive),
             read_namespaces: None,
             write_namespace: None,

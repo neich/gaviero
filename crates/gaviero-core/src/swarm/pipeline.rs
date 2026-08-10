@@ -94,6 +94,34 @@ pub fn preflight_plan_models(
     Ok(())
 }
 
+/// Wall-clock budget for a whole swarm run.
+///
+/// Checked cooperatively rather than by wrapping `execute` in a timeout: a
+/// hard cancel would throw away every manifest collected so far, and the
+/// artefacts on disk are the point of a document workflow. Because every
+/// dispatch is bounded by `WorkUnit::timeout_secs`, the gap between two checks
+/// is bounded too, so cooperative checking cannot be starved.
+struct RunDeadline {
+    start: std::time::Instant,
+    budget: Option<std::time::Duration>,
+}
+
+impl RunDeadline {
+    fn new(secs: u64) -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            budget: (secs > 0).then_some(std::time::Duration::from_secs(secs)),
+        }
+    }
+
+    /// `Some(elapsed_secs)` once the budget is spent.
+    fn expired(&self) -> Option<u64> {
+        let budget = self.budget?;
+        let elapsed = self.start.elapsed();
+        (elapsed >= budget).then_some(elapsed.as_secs())
+    }
+}
+
 /// Configuration for a swarm execution.
 pub struct SwarmConfig {
     /// `Repo` (default): git worktrees, merge, repo-map / code graph.
@@ -159,6 +187,15 @@ pub struct SwarmConfig {
     /// Optional callback to invalidate MCP / repo-map caches after a
     /// file-mutating fan-out wave (TUI wires graph cache drop).
     pub knowledge_invalidation: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Wall-clock budget for the entire swarm run, in seconds. `0` disables it.
+    ///
+    /// Termination is already guaranteed by `WorkUnit::timeout_secs` bounding
+    /// every dispatch; this is the outer belt — a single number an operator can
+    /// set to cap a run's cost and latency without reasoning about
+    /// `max_iterations × roster × per-agent budget`. On expiry the run stops
+    /// where it is and returns the manifests collected so far, so partial
+    /// artefacts stay usable and `--resume` can pick up from them.
+    pub run_timeout_secs: u64,
 }
 
 /// Execute a swarm of work units from a compiled plan.
@@ -639,8 +676,35 @@ pub async fn execute(
         .map(|u| (u.id.as_str(), u))
         .collect();
 
+    // Baseline for the "every reviewer delivered" gate (see
+    // `assert_loop_agents_produced_output`). The loop body's first pass runs
+    // in the tier dispatch below rather than in the explicit-loops block, so
+    // its `before` snapshot has to be taken here, ahead of any agent.
+    let mut loop_output_baseline: std::collections::HashMap<String, OwnedSnapshot> =
+        std::collections::HashMap::new();
+    for lc in &effective_loop_configs {
+        loop_output_baseline.extend(snapshot_loop_agents(
+            &lc.agent_ids,
+            &unit_map,
+            &config.workspace_root,
+        ));
+    }
+
+    let deadline = RunDeadline::new(config.run_timeout_secs);
+
     // 3. Execute tiers
     for (tier_idx, tier) in tiers.iter().enumerate() {
+        if let Some(elapsed) = deadline.expired() {
+            tracing::error!(
+                "Run budget of {}s exhausted after {}s — stopping before tier {}/{}",
+                config.run_timeout_secs,
+                elapsed,
+                tier_idx + 1,
+                tiers.len()
+            );
+            observer.on_phase_changed("run budget exhausted");
+            break;
+        }
         observer.on_tier_started(tier_idx + 1, tiers.len());
 
         if effective_max_parallel <= 1 || tier.len() <= 1 {
@@ -988,6 +1052,11 @@ pub async fn execute(
         let mut loop_terminated = false;
         let stability_target = loop_config.stability.max(1);
         let mut consecutive_pass: u32 = 0;
+        // Repeat detection for `irreconcilable_after`: the fingerprint of the
+        // last FAIL's blocking disagreement and how many times running it has
+        // been reported.
+        let mut last_blocker_fingerprint: Option<String> = None;
+        let mut repeat_streak: u32 = 0;
 
         // Stacked-mode chain anchor: the SHA each next agent's worktree
         // is based on. Starts at the pre-swarm HEAD; advances to each
@@ -1172,6 +1241,39 @@ pub async fn execute(
 
         for iteration in 1..loop_config.max_iterations {
             let current_iter_abs = loop_config.iter_start + iteration - 1;
+
+            if let Some(elapsed) = deadline.expired() {
+                tracing::error!(
+                    "Run budget of {}s exhausted after {}s — stopping the loop at iteration {}",
+                    config.run_timeout_secs,
+                    elapsed,
+                    current_iter_abs
+                );
+                observer.on_phase_changed("run budget exhausted");
+                loop_terminated = true;
+                break;
+            }
+
+            // Every body agent has finished the pass being judged (the tier
+            // dispatch for iteration 1, the barrier at the end of this loop
+            // afterwards). Confirm each one actually delivered before paying
+            // for a judge turn.
+            {
+                let after =
+                    snapshot_loop_agents(&loop_config.agent_ids, &unit_map, &config.workspace_root);
+                assert_loop_agents_produced_output(DeliveryCheck {
+                    until: &loop_config.until,
+                    agent_ids: &loop_config.agent_ids,
+                    unit_map: &unit_map,
+                    all_manifests: &all_manifests,
+                    before: &loop_output_baseline,
+                    after: &after,
+                    workspace_root: &config.workspace_root,
+                    iter_abs: current_iter_abs,
+                })?;
+                loop_output_baseline.extend(after);
+            }
+
             let outcome = {
                 let mut loop_ctx = LoopConditionContext {
                     config,
@@ -1232,7 +1334,24 @@ pub async fn execute(
                         loop_config.agent_ids
                     );
                 }
-                LoopConditionOutcome::Continue => {
+                LoopConditionOutcome::Irreconcilable(report) => {
+                    tracing::warn!(
+                        "Loop stopped at iteration {}: judge ruled the disagreement irreconcilable for agents {:?}",
+                        current_iter_abs,
+                        loop_config.agent_ids
+                    );
+                    write_irreconcilable_report(
+                        &config.workspace_root,
+                        loop_config.verdict_output_dir.as_deref(),
+                        current_iter_abs,
+                        "judge verdict",
+                        &report,
+                        &loop_config.agent_ids,
+                    );
+                    loop_terminated = true;
+                    break;
+                }
+                LoopConditionOutcome::Continue(report) => {
                     if consecutive_pass > 0 {
                         tracing::debug!(
                             "Loop PASS streak broken by FAIL at iteration {}, resetting counter",
@@ -1241,6 +1360,42 @@ pub async fn execute(
                     }
                     consecutive_pass = 0;
                     observer.on_loop_verdict(false, 0, stability_target);
+
+                    // Deterministic counterpart to `stability`: the same
+                    // blocking disagreement, reported N times running, is a
+                    // structural deadlock rather than a round away from
+                    // resolution. Detected in the runtime so it holds even
+                    // when the judge never reaches the `irreconcilable`
+                    // verdict on its own.
+                    if loop_config.irreconcilable_after > 0 {
+                        let fingerprint = report.fingerprint();
+                        if fingerprint.is_empty() {
+                            repeat_streak = 0;
+                        } else if Some(&fingerprint) == last_blocker_fingerprint.as_ref() {
+                            repeat_streak = repeat_streak.saturating_add(1);
+                        } else {
+                            repeat_streak = 1;
+                            last_blocker_fingerprint = Some(fingerprint);
+                        }
+                        if repeat_streak >= loop_config.irreconcilable_after {
+                            tracing::warn!(
+                                "Loop stopped at iteration {}: the same blocking disagreement was reported {} times running for agents {:?}",
+                                current_iter_abs,
+                                repeat_streak,
+                                loop_config.agent_ids
+                            );
+                            write_irreconcilable_report(
+                                &config.workspace_root,
+                                loop_config.verdict_output_dir.as_deref(),
+                                current_iter_abs,
+                                &format!("same disagreement reported {repeat_streak} times running"),
+                                &report,
+                                &loop_config.agent_ids,
+                            );
+                            loop_terminated = true;
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -1561,6 +1716,21 @@ pub async fn execute(
         if !loop_terminated {
             let final_iter_abs =
                 loop_config.iter_start + loop_config.max_iterations.saturating_sub(1);
+            {
+                let after =
+                    snapshot_loop_agents(&loop_config.agent_ids, &unit_map, &config.workspace_root);
+                assert_loop_agents_produced_output(DeliveryCheck {
+                    until: &loop_config.until,
+                    agent_ids: &loop_config.agent_ids,
+                    unit_map: &unit_map,
+                    all_manifests: &all_manifests,
+                    before: &loop_output_baseline,
+                    after: &after,
+                    workspace_root: &config.workspace_root,
+                    iter_abs: final_iter_abs,
+                })?;
+                loop_output_baseline.extend(after);
+            }
             let final_outcome = {
                 let mut loop_ctx = LoopConditionContext {
                     config,
@@ -1609,7 +1779,22 @@ pub async fn execute(
                         loop_config.agent_ids
                     );
                 }
-                LoopConditionOutcome::Continue => {
+                LoopConditionOutcome::Irreconcilable(report) => {
+                    tracing::warn!(
+                        "Loop exhausted max_iterations ({}) and the final judge ruled the disagreement irreconcilable for agents {:?}",
+                        loop_config.max_iterations,
+                        loop_config.agent_ids
+                    );
+                    write_irreconcilable_report(
+                        &config.workspace_root,
+                        loop_config.verdict_output_dir.as_deref(),
+                        final_iter_abs,
+                        "judge verdict on the final check",
+                        &report,
+                        &loop_config.agent_ids,
+                    );
+                }
+                LoopConditionOutcome::Continue(_) => {
                     tracing::warn!(
                         "Loop exhausted max_iterations ({}) without condition being met for agents {:?}",
                         loop_config.max_iterations,
@@ -1779,7 +1964,17 @@ pub async fn execute(
 
     // 6. Post-execution memory consolidation (best-effort)
     if let Some(mem) = memory.as_ref() {
-        let consolidator = crate::memory::consolidation::Consolidator::with_stores(Arc::clone(mem));
+        // Reuse the pipeline's writer. A private consolidator writer
+        // would run concurrently with the extractor writes this phase is
+        // supposed to triage — racing it for the store connection and the
+        // ONNX session — and the host's exit flush only covers this one.
+        let consolidator = match memory_writer.as_ref() {
+            Some(writer) => crate::memory::consolidation::Consolidator::with_stores_and_writer(
+                Arc::clone(mem),
+                writer.clone(),
+            ),
+            None => crate::memory::consolidation::Consolidator::with_stores(Arc::clone(mem)),
+        };
         let repo_id = crate::memory::hash_path(&config.workspace_root);
         match consolidator.consolidate_run(&run_id, &repo_id).await {
             Ok(report) => {
@@ -2105,16 +2300,100 @@ struct LoopConditionContext<'a> {
 enum JudgeVerdict {
     Pass,
     Fail,
+    /// Substantive agreement not reached, but the panel should stop: the
+    /// disagreement is structural, not a round away from resolving.
+    Irreconcilable,
     Partial,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// One reviewer's position in a disagreement the judge ruled irreconcilable.
+///
+/// The judge supplies the prose (it is the only party that has read every
+/// conclusion); the runtime decides what to do with it and renders the
+/// hand-off document. Every field is optional because a judge that gets the
+/// shape half-right should still produce a usable report rather than a parse
+/// error that discards the whole verdict.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct JudgeBlocker {
+    #[serde(default)]
+    agent: String,
+    /// What this reviewer holds, in its own terms.
+    #[serde(default)]
+    position: String,
+    /// Which reviewer(s) it conflicts with.
+    #[serde(default)]
+    conflicts_with: String,
+    /// Which convergence criterion the conflict falls under (framing, avenues,
+    /// risks, evidence bar, stopping rules).
+    #[serde(default)]
+    criterion: String,
+    /// What evidence would settle it — the actionable part for a human.
+    #[serde(default)]
+    evidence_gap: String,
+}
+
+/// A judge verdict plus the structured detail the runtime keeps.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct JudgeReport {
+    reason: String,
+    blockers: Vec<JudgeBlocker>,
+}
+
+impl JudgeReport {
+    /// Stable identity of the blocking disagreement, for repeat detection.
+    ///
+    /// Keyed on the blockers when the judge supplied them (agent + criterion +
+    /// who it conflicts with) and on the normalized reason otherwise. Prose
+    /// wording drifts between iterations even when the substance does not, so
+    /// matching on the reason alone would under-detect; matching on the
+    /// criterion pairing is what actually stays constant while a panel
+    /// restates the same deadlock.
+    fn fingerprint(&self) -> String {
+        if self.blockers.is_empty() {
+            return normalize_for_fingerprint(&self.reason);
+        }
+        let mut parts: Vec<String> = self
+            .blockers
+            .iter()
+            .map(|b| {
+                format!(
+                    "{}|{}|{}",
+                    normalize_for_fingerprint(&b.agent),
+                    normalize_for_fingerprint(&b.criterion),
+                    normalize_for_fingerprint(&b.conflicts_with),
+                )
+            })
+            .collect();
+        parts.sort();
+        parts.join("\n")
+    }
+}
+
+/// Lowercase, collapse whitespace, drop punctuation — so "avenue A vs B."
+/// and "avenue a vs b" fingerprint identically.
+fn normalize_for_fingerprint(s: &str) -> String {
+    s.split_whitespace()
+        .map(|w| {
+            w.chars()
+                .filter(|c| c.is_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect::<String>()
+        })
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum LoopConditionOutcome {
-    /// Keep iterating (FAIL, unparseable, or not yet converged).
-    Continue,
+    /// Keep iterating (FAIL, unparseable, or not yet converged). Carries the
+    /// judge's report so the loop can detect a disagreement that repeats.
+    Continue(JudgeReport),
     Pass,
     /// Substantive agreement not reached but the run should stop (partial_ok).
     Partial,
+    /// The judge ruled the disagreement structural. Stop and hand off.
+    Irreconcilable(JudgeReport),
 }
 
 /// Clone `unit` and substitute `{{ITER}}` / `{{PREV_ITER}}` with `iter_abs`
@@ -2137,6 +2416,11 @@ fn apply_iter_vars_with_evidence(unit: &WorkUnit, iter_abs: u32, evidence: &str)
     };
     WorkUnit {
         description: sub(&unit.description),
+        // The output contract is versioned per pass, so it has to be
+        // substituted alongside the prompt that tells the agent which version
+        // to write — otherwise the gate would check iteration 1's paths for
+        // every iteration.
+        produces: unit.produces.iter().map(|p| sub(p)).collect(),
         coordinator_instructions: unit
             .coordinator_instructions
             .replace("{{ITER}}", &iter_str)
@@ -2144,6 +2428,249 @@ fn apply_iter_vars_with_evidence(unit: &WorkUnit, iter_abs: u32, evidence: &str)
             .replace("{{ITER_EVIDENCE}}", evidence),
         ..unit.clone()
     }
+}
+
+/// Fingerprints of the files an agent owns: workspace-relative path → (len, mtime).
+///
+/// Two snapshots taken around a loop pass tell us whether the agent actually
+/// delivered anything, independently of how it writes (native tool calls,
+/// in-band file blocks, or worktree commits).
+type OwnedSnapshot = std::collections::BTreeMap<String, (u64, Option<std::time::SystemTime>)>;
+
+/// Widen an `owned` glob so it covers every version an agent may write.
+///
+/// A workflow that versions artefacts per pass (`{{OUT_DIR}}/x-v{{ITER}}.md`)
+/// leaves `{{ITER}}` in the glob when the snapshot is taken outside a
+/// specific iteration; collapsing any surviving `{{…}}` placeholder to `*`
+/// keeps the snapshot iteration-agnostic, which is what a
+/// "did this agent write anything at all" check wants.
+fn widen_owned_glob(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    let mut rest = pattern;
+    while let Some(open) = rest.find("{{") {
+        let Some(close) = rest[open..].find("}}") else {
+            break;
+        };
+        out.push_str(&rest[..open]);
+        out.push('*');
+        rest = &rest[open + close + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Snapshot the files under `root` owned by each of `agents`, in one walk.
+///
+/// Depth is bounded and the usual build/VCS directories are pruned: owned
+/// globs address source and artefact directories, and an unbounded walk of a
+/// large checkout — repeated per agent, per iteration — would cost more than
+/// the check saves.
+fn snapshot_owned_files(
+    agents: &[(&str, &WorkUnit)],
+    root: &std::path::Path,
+) -> std::collections::HashMap<String, OwnedSnapshot> {
+    let mut snaps: std::collections::HashMap<String, OwnedSnapshot> = agents
+        .iter()
+        .map(|(id, _)| ((*id).to_string(), OwnedSnapshot::new()))
+        .collect();
+    let widened: Vec<(&str, Vec<String>)> = agents
+        .iter()
+        .map(|(id, u)| {
+            (
+                *id,
+                u.scope
+                    .owned_paths
+                    .iter()
+                    .map(|p| widen_owned_glob(p))
+                    .collect(),
+            )
+        })
+        .filter(|(_, pats): &(&str, Vec<String>)| !pats.is_empty())
+        .collect();
+    if widened.is_empty() {
+        return snaps;
+    }
+
+    for entry in walkdir::WalkDir::new(root)
+        .max_depth(8)
+        .into_iter()
+        .filter_entry(|e| {
+            // depth 0 is `root` itself — never prune it on its own name.
+            e.depth() == 0
+                || e.file_name()
+                    .to_str()
+                    .map(|n| n != ".git" && n != "target" && n != "node_modules")
+                    .unwrap_or(false)
+        })
+        .flatten()
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(root) else {
+            continue;
+        };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        let mut meta = None;
+        for (id, patterns) in &widened {
+            if !patterns
+                .iter()
+                .any(|p| crate::path_pattern::matches(p, &rel))
+            {
+                continue;
+            }
+            let meta = meta.get_or_insert_with(|| entry.metadata().ok());
+            let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let mtime = meta.as_ref().and_then(|m| m.modified().ok());
+            if let Some(snap) = snaps.get_mut(*id) {
+                snap.insert(rel.clone(), (len, mtime));
+            }
+        }
+    }
+    snaps
+}
+
+/// Snapshot every loop-body agent's owned files.
+fn snapshot_loop_agents(
+    agent_ids: &[String],
+    unit_map: &std::collections::HashMap<&str, &WorkUnit>,
+    root: &std::path::Path,
+) -> std::collections::HashMap<String, OwnedSnapshot> {
+    let agents: Vec<(&str, &WorkUnit)> = agent_ids
+        .iter()
+        .filter_map(|id| unit_map.get(id.as_str()).map(|u| (id.as_str(), *u)))
+        .collect();
+    snapshot_owned_files(&agents, root)
+}
+
+/// Inputs to [`assert_loop_agents_produced_output`].
+struct DeliveryCheck<'a> {
+    until: &'a super::plan::LoopUntilCondition,
+    agent_ids: &'a [String],
+    /// Templates, with `{{ITER}}` still unsubstituted — the check applies
+    /// `iter_abs` itself so a versioned contract names the right pass.
+    unit_map: &'a std::collections::HashMap<&'a str, &'a WorkUnit>,
+    all_manifests: &'a [AgentManifest],
+    /// Owned-file snapshots bracketing the pass, for agents that declare no
+    /// `produces` contract.
+    before: &'a std::collections::HashMap<String, OwnedSnapshot>,
+    after: &'a std::collections::HashMap<String, OwnedSnapshot>,
+    workspace_root: &'a std::path::Path,
+    /// The absolute iteration being judged.
+    iter_abs: u32,
+}
+
+/// Abort the run when a loop pass finished without every reviewer delivering.
+///
+/// The judge that follows compares reviewers against each other, so a pass in
+/// which one reviewer wrote nothing produces a verdict about a panel that
+/// silently shrank — the judge reads the surviving reviewer's "consensus not
+/// reached" and fails the iteration forever, burning `max_iterations` worth of
+/// frontier-model turns. Neither an empty manifest nor a completed status
+/// catches this on its own: providers that write through their own tools
+/// (Claude Code) report no `modified_files` even on success, and a proposal
+/// dropped by scope or path resolution still completes the turn. So an agent
+/// counts as having delivered when *either* its manifest lists modified files
+/// *or* its owned files on disk changed across the pass.
+fn assert_loop_agents_produced_output(check: DeliveryCheck<'_>) -> Result<()> {
+    let DeliveryCheck {
+        until,
+        agent_ids,
+        unit_map,
+        all_manifests,
+        before,
+        after,
+        workspace_root,
+        iter_abs,
+    } = check;
+
+    // Only agent judges read the body's artefacts. `verify` / `command`
+    // conditions test the workspace itself, so an iteration that changed
+    // nothing is a legitimate (if unproductive) outcome for them.
+    if !matches!(until, super::plan::LoopUntilCondition::Agent(_)) {
+        return Ok(());
+    }
+
+    let mut silent: Vec<String> = Vec::new();
+    for agent_id in agent_ids {
+        let Some(template) = unit_map.get(agent_id.as_str()).copied() else {
+            continue;
+        };
+        // Substitute the iteration being judged so a versioned contract
+        // ("…-conclusion-v{{ITER}}.md") names this pass's artefacts.
+        let unit = apply_iter_vars(template, iter_abs);
+        let unit = &unit;
+        let status = || match all_manifests
+            .iter()
+            .rev()
+            .find(|m| m.work_unit_id == *agent_id)
+            .map(|m| &m.status)
+        {
+            Some(AgentStatus::Completed) => "completed".to_string(),
+            Some(AgentStatus::Failed(msg)) => format!("failed ({msg})"),
+            Some(other) => format!("{other:?}"),
+            None => "never dispatched".to_string(),
+        };
+
+        // Declared contract: check the exact artefacts for THIS iteration.
+        // `unit` has already had {{ITER}} substituted for the pass being
+        // judged, so a reviewer that wrote v3 when v4 was due fails here.
+        if !unit.produces.is_empty() {
+            let missing = unit.missing_declared_artifacts(workspace_root);
+            if !missing.is_empty() {
+                silent.push(format!(
+                    "'{agent_id}' [{}] missing: {}",
+                    status(),
+                    missing.join(", ")
+                ));
+            }
+            continue;
+        }
+
+        // No declared contract — fall back to "did anything this agent owns
+        // change during the pass". An agent that owns nothing promises
+        // nothing, so there is nothing to assert.
+        if unit.scope.owned_paths.is_empty() {
+            continue;
+        }
+        if all_manifests
+            .iter()
+            .rev()
+            .find(|m| m.work_unit_id == *agent_id)
+            .is_some_and(|m| !m.modified_files.is_empty())
+        {
+            continue;
+        }
+        let changed = match (before.get(agent_id), after.get(agent_id)) {
+            (Some(b), Some(a)) => a != b,
+            // No snapshot means no owned globs to watch; the manifest is the
+            // only signal available and it said nothing, so don't guess.
+            _ => true,
+        };
+        if changed {
+            continue;
+        }
+        silent.push(format!(
+            "'{agent_id}' [{}] wrote nothing under: {}",
+            status(),
+            unit.scope.owned_paths.join(", ")
+        ));
+    }
+
+    if silent.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "loop iteration {} did not deliver for {} of {} agent(s): {}. \
+         Refusing to run the loop's judge against an incomplete panel — its verdict \
+         would describe a panel that silently lost a member. Check the run log for \
+         'Scope rejected' or 'failed to apply file proposal' lines, and verify that \
+         the agents' declared paths resolve inside the workspace root.",
+        iter_abs,
+        silent.len(),
+        agent_ids.len(),
+        silent.join("; ")
+    );
 }
 
 /// Build a compact, deterministic textual digest of the most recent loop
@@ -3268,6 +3795,7 @@ mod tests {
                 read_only_paths: vec![],
                 interface_contracts: HashMap::new(),
             },
+            produces: vec![],
             depends_on: vec![],
             #[allow(deprecated)]
             backend: Default::default(),
@@ -3279,6 +3807,7 @@ mod tests {
             coordinator_instructions: String::new(),
             estimated_tokens: 0,
             max_retries: 1,
+            timeout_secs: 3600,
             escalation_tier: None,
             read_namespaces: None,
             write_namespace: None,
@@ -3505,6 +4034,610 @@ mod tests {
         let prose = "Looking at apply-1.md. First line: 'HALTED: nothing to plan'.\nVERDICT: PASS\n<turn_annotations>{\"v\":1,\"flags\":[]}</turn_annotations>";
         assert_eq!(parse_judge_verdict(prose), Some(JudgeVerdict::Pass));
     }
+
+    // ── Loop delivery gate ───────────────────────────────────────────────
+
+    fn reviewer_unit(id: &str, owned: &[&str]) -> WorkUnit {
+        let mut u = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
+        u.id = id.to_string();
+        u.scope.owned_paths = owned.iter().map(|s| s.to_string()).collect();
+        u
+    }
+
+    fn completed(id: &str, modified: &[&str]) -> AgentManifest {
+        AgentManifest {
+            work_unit_id: id.into(),
+            status: AgentStatus::Completed,
+            modified_files: modified.iter().map(std::path::PathBuf::from).collect(),
+            branch: None,
+            summary: Some("done".into()),
+            output: None,
+            cost_usd: 0.0,
+        }
+    }
+
+    fn judge_until() -> super::super::plan::LoopUntilCondition {
+        super::super::plan::LoopUntilCondition::Agent("convergence-judge".into())
+    }
+
+    /// Positional shorthand so the gate tests read as a table of cases.
+    #[allow(clippy::too_many_arguments)]
+    fn delivery_check<'a>(
+        until: &'a super::super::plan::LoopUntilCondition,
+        agent_ids: &'a [String],
+        unit_map: &'a HashMap<&'a str, &'a WorkUnit>,
+        all_manifests: &'a [AgentManifest],
+        before: &'a std::collections::HashMap<String, OwnedSnapshot>,
+        after: &'a std::collections::HashMap<String, OwnedSnapshot>,
+        workspace_root: &'a std::path::Path,
+        iter_abs: u32,
+    ) -> DeliveryCheck<'a> {
+        DeliveryCheck {
+            until,
+            agent_ids,
+            unit_map,
+            all_manifests,
+            before,
+            after,
+            workspace_root,
+            iter_abs,
+        }
+    }
+
+    #[test]
+    fn widen_owned_glob_collapses_placeholders() {
+        assert_eq!(
+            widen_owned_glob("{{OUT_DIR}}/{{REVIEWER_ID}}-conclusion-v{{ITER}}.md"),
+            "*/*-conclusion-v*.md"
+        );
+        // Already-substituted globs pass through untouched.
+        assert_eq!(
+            widen_owned_glob("out/claude-summary-v*.md"),
+            "out/claude-summary-v*.md"
+        );
+    }
+
+    #[test]
+    fn snapshot_owned_files_tracks_only_owned_globs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("out")).unwrap();
+        std::fs::write(root.join("out/claude-summary-v1.md"), "a").unwrap();
+        std::fs::write(root.join("out/codex-summary-v1.md"), "b").unwrap();
+
+        let unit = reviewer_unit("claude-refine", &["out/claude-summary-v*.md"]);
+        let snaps = snapshot_owned_files(&[("claude-refine", &unit)], root);
+        let snap = &snaps["claude-refine"];
+        assert_eq!(snap.len(), 1);
+        assert!(snap.contains_key("out/claude-summary-v1.md"));
+    }
+
+    /// The production failure: one reviewer writes every version, the other
+    /// completes its turn having written nothing at all. The judge that
+    /// follows would score a panel of one.
+    #[test]
+    fn delivery_gate_rejects_a_reviewer_that_wrote_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("out")).unwrap();
+
+        let claude = reviewer_unit("claude-refine", &["out/claude-summary-v*.md"]);
+        let codex = reviewer_unit("codex-refine", &["out/codex-summary-v*.md"]);
+        let unit_map: HashMap<&str, &WorkUnit> =
+            [("claude-refine", &claude), ("codex-refine", &codex)]
+                .into_iter()
+                .collect();
+        let ids = vec!["claude-refine".to_string(), "codex-refine".to_string()];
+
+        let before = snapshot_loop_agents(&ids, &unit_map, root);
+        std::fs::write(root.join("out/claude-summary-v2.md"), "written").unwrap();
+        let after = snapshot_loop_agents(&ids, &unit_map, root);
+
+        // Both providers report Completed with no modified_files — exactly
+        // what Claude Code produces on success and what a dropped file-block
+        // proposal produces on failure.
+        let manifests = vec![
+            completed("claude-refine", &[]),
+            completed("codex-refine", &[]),
+        ];
+
+        let err = assert_loop_agents_produced_output(delivery_check(
+            &judge_until(),
+            &ids,
+            &unit_map,
+            &manifests,
+            &before,
+            &after,
+            root,
+            2,
+        ))
+        .expect_err("codex wrote nothing");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("codex-refine"), "got: {msg}");
+        assert!(!msg.contains("'claude-refine'"), "claude delivered: {msg}");
+        assert!(msg.contains("1 of 2"), "got: {msg}");
+    }
+
+    #[test]
+    fn delivery_gate_passes_when_every_reviewer_wrote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("out")).unwrap();
+
+        let claude = reviewer_unit("claude-refine", &["out/claude-summary-v*.md"]);
+        let codex = reviewer_unit("codex-refine", &["out/codex-summary-v*.md"]);
+        let unit_map: HashMap<&str, &WorkUnit> =
+            [("claude-refine", &claude), ("codex-refine", &codex)]
+                .into_iter()
+                .collect();
+        let ids = vec!["claude-refine".to_string(), "codex-refine".to_string()];
+
+        let before = snapshot_loop_agents(&ids, &unit_map, root);
+        std::fs::write(root.join("out/claude-summary-v2.md"), "a").unwrap();
+        std::fs::write(root.join("out/codex-summary-v2.md"), "b").unwrap();
+        let after = snapshot_loop_agents(&ids, &unit_map, root);
+
+        let manifests = vec![
+            completed("claude-refine", &[]),
+            completed("codex-refine", &[]),
+        ];
+        assert_loop_agents_produced_output(delivery_check(
+            &judge_until(),
+            &ids,
+            &unit_map,
+            &manifests,
+            &before,
+            &after,
+            root,
+            2,
+        ))
+        .expect("both delivered");
+    }
+
+    /// Worktree runs report their deliverables through `modified_files`
+    /// (the branch commit), not through files under the shared workspace root.
+    #[test]
+    fn delivery_gate_accepts_manifest_modified_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let codex = reviewer_unit("codex-refine", &["out/codex-summary-v*.md"]);
+        let unit_map: HashMap<&str, &WorkUnit> = [("codex-refine", &codex)].into_iter().collect();
+        let ids = vec!["codex-refine".to_string()];
+
+        let snap = snapshot_loop_agents(&ids, &unit_map, root);
+        let manifests = vec![completed("codex-refine", &["out/codex-summary-v2.md"])];
+
+        assert_loop_agents_produced_output(delivery_check(
+            &judge_until(),
+            &ids,
+            &unit_map,
+            &manifests,
+            &snap,
+            &snap,
+            root,
+            2,
+        ))
+        .expect("manifest reports the commit");
+    }
+
+    #[test]
+    fn delivery_gate_ignores_agents_without_owned_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let analyst = reviewer_unit("analyst", &[]);
+        let unit_map: HashMap<&str, &WorkUnit> = [("analyst", &analyst)].into_iter().collect();
+        let ids = vec!["analyst".to_string()];
+
+        let snap = snapshot_loop_agents(&ids, &unit_map, root);
+        let manifests = vec![completed("analyst", &[])];
+
+        assert_loop_agents_produced_output(delivery_check(
+            &judge_until(),
+            &ids,
+            &unit_map,
+            &manifests,
+            &snap,
+            &snap,
+            root,
+            2,
+        ))
+        .expect("no declared deliverables to assert on");
+    }
+
+    // ── Irreconcilable disagreement ──────────────────────────────────────
+
+    fn blocker(agent: &str, criterion: &str, conflicts_with: &str) -> JudgeBlocker {
+        JudgeBlocker {
+            agent: agent.into(),
+            position: format!("{agent}'s position"),
+            conflicts_with: conflicts_with.into(),
+            criterion: criterion.into(),
+            evidence_gap: "an unrun experiment".into(),
+        }
+    }
+
+    /// Repeat detection has to survive the judge rephrasing itself, or a
+    /// deadlock would never be recognised — models rarely emit byte-identical
+    /// prose twice.
+    #[test]
+    fn fingerprint_ignores_wording_and_ordering_drift() {
+        let a = JudgeReport {
+            reason: "Panel splits on the evidence bar.".into(),
+            blockers: vec![
+                blocker("claude", "evidence bar", "codex"),
+                blocker("codex", "evidence bar", "claude"),
+            ],
+        };
+        let b = JudgeReport {
+            reason: "Completely different wording this pass!".into(),
+            blockers: vec![
+                blocker("codex", "Evidence Bar", "claude"),
+                blocker("claude", "evidence  bar.", "codex"),
+            ],
+        };
+        assert_eq!(a.fingerprint(), b.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_changes_when_the_dispute_moves() {
+        let a = JudgeReport {
+            reason: String::new(),
+            blockers: vec![blocker("claude", "evidence bar", "codex")],
+        };
+        let b = JudgeReport {
+            reason: String::new(),
+            blockers: vec![blocker("claude", "stopping criteria", "codex")],
+        };
+        assert_ne!(a.fingerprint(), b.fingerprint());
+    }
+
+    /// With no blockers the reason is the only signal available.
+    #[test]
+    fn fingerprint_falls_back_to_the_reason() {
+        let a = JudgeReport {
+            reason: "Avenue A vs B.".into(),
+            blockers: vec![],
+        };
+        let b = JudgeReport {
+            reason: "avenue   a vs b".into(),
+            blockers: vec![],
+        };
+        assert_eq!(a.fingerprint(), b.fingerprint());
+        assert!(!a.fingerprint().is_empty());
+        assert!(JudgeReport::default().fingerprint().is_empty());
+    }
+
+    #[test]
+    fn judge_verdict_parser_accepts_irreconcilable() {
+        for text in [
+            "```json\n{\"verdict\":\"irreconcilable\",\"reason\":\"x\"}\n```",
+            "VERDICT: IRRECONCILABLE",
+            "Deadlock.",
+        ] {
+            assert_eq!(
+                parse_judge_verdict(text),
+                Some(JudgeVerdict::Irreconcilable),
+                "got none for {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn judge_report_parses_blockers() {
+        let text = "prose\n```json\n{\"verdict\":\"irreconcilable\",\
+                    \"reason\":\"values conflict\",\
+                    \"blockers\":[{\"agent\":\"claude\",\"position\":\"gate on correctness\",\
+                    \"conflicts_with\":\"codex\",\"criterion\":\"evidence bar\",\
+                    \"evidence_gap\":\"no honest-student study\"}]}\n```";
+        let report = parse_judge_report(text);
+        assert_eq!(report.reason, "values conflict");
+        assert_eq!(report.blockers.len(), 1);
+        assert_eq!(report.blockers[0].agent, "claude");
+        assert_eq!(report.blockers[0].criterion, "evidence bar");
+    }
+
+    /// A malformed or absent `blockers` array must not discard the verdict —
+    /// stopping for a stated reason beats continuing because the JSON was off.
+    #[test]
+    fn judge_report_survives_missing_or_malformed_blockers() {
+        let report = parse_judge_report("```json\n{\"verdict\":\"fail\",\"reason\":\"r\"}\n```");
+        assert_eq!(report.reason, "r");
+        assert!(report.blockers.is_empty());
+
+        let junk = parse_judge_report("```json\n{\"reason\":\"r\",\"blockers\":\"nope\"}\n```");
+        assert_eq!(junk.reason, "r");
+        assert!(junk.blockers.is_empty());
+
+        assert_eq!(parse_judge_report("no json here"), JudgeReport::default());
+    }
+
+    #[test]
+    fn irreconcilable_report_documents_every_reviewer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let report = JudgeReport {
+            reason: "values conflict".into(),
+            blockers: vec![blocker("claude", "evidence bar", "codex")],
+        };
+        let ids = vec![
+            "claude".to_string(),
+            "codex".to_string(),
+            "cursor".to_string(),
+        ];
+
+        write_irreconcilable_report(root, Some("out"), 4, "test trigger", &report, &ids);
+
+        let md = std::fs::read_to_string(root.join("out/consensus-irreconcilable.md")).unwrap();
+        assert!(md.contains("### claude"));
+        assert!(md.contains("claude's position"));
+        assert!(md.contains("an unrun experiment"));
+        // Reviewers the judge did not name still get a section — silence must
+        // not read as agreement.
+        assert!(md.contains("### codex"));
+        assert!(md.contains("### cursor"));
+        assert!(md.contains("did not attribute a blocking position"));
+        assert!(md.contains("test trigger"));
+
+        let json =
+            std::fs::read_to_string(root.join("out/consensus-verdict.json")).unwrap();
+        assert!(json.contains("\"irreconcilable\""), "got: {json}");
+        assert!(json.contains("\"iter\": 4"), "got: {json}");
+    }
+
+    /// The shape a real roster run produces: the judge names reviewer ids
+    /// (`claude`) because that is what the artefact filenames carry, while the
+    /// loop's work units are the cloned templates (`claude-refine`). A live run
+    /// filed every blocker under "Unattributed" and told the operator that
+    /// neither reviewer held a blocking position — the one thing this document
+    /// must never say when the judge did attribute one.
+    #[test]
+    fn irreconcilable_report_attributes_roster_ids_to_template_clones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let report = JudgeReport {
+            reason: "topic-vs-anchor framing deadlock".into(),
+            blockers: vec![
+                blocker("claude", "framing", "codex"),
+                blocker("codex", "framing", "claude"),
+            ],
+        };
+        let ids = vec!["claude-refine".to_string(), "codex-refine".to_string()];
+
+        write_irreconcilable_report(root, Some("out"), 2, "judge verdict", &report, &ids);
+
+        let md = std::fs::read_to_string(root.join("out/consensus-irreconcilable.md")).unwrap();
+        assert!(!md.contains("Unattributed blockers"), "got: {md}");
+        assert!(
+            !md.contains("did not attribute a blocking position"),
+            "got: {md}"
+        );
+        assert!(md.contains("claude's position"), "got: {md}");
+        assert!(md.contains("codex's position"), "got: {md}");
+    }
+
+    /// Prefix matching must not swallow a different reviewer: `claude` is not
+    /// `claude-2-refine`'s reviewer id, and a bare `-refine` matches nobody.
+    #[test]
+    fn blocker_attribution_requires_a_role_suffix_boundary() {
+        assert!(blocker_names_agent("claude", "claude"));
+        assert!(blocker_names_agent("claude", "claude-refine"));
+        assert!(!blocker_names_agent("claude", "claude2-refine"));
+        assert!(!blocker_names_agent("claude", "anthropic-claude-refine"));
+        assert!(!blocker_names_agent("", "claude-refine"));
+    }
+
+    /// A blocker naming someone outside the roster (judge typo, hallucinated
+    /// id) must still appear, not vanish into a filter.
+    #[test]
+    fn irreconcilable_report_keeps_unattributed_blockers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let report = JudgeReport {
+            reason: String::new(),
+            blockers: vec![blocker("ghost", "framing", "claude")],
+        };
+        write_irreconcilable_report(
+            root,
+            Some("out"),
+            2,
+            "t",
+            &report,
+            &["claude".to_string()],
+        );
+        let md = std::fs::read_to_string(root.join("out/consensus-irreconcilable.md")).unwrap();
+        assert!(md.contains("Unattributed blockers"), "got: {md}");
+        assert!(md.contains("ghost"), "got: {md}");
+    }
+
+    /// Without an output directory there is nowhere to write; the run has
+    /// already stopped, so this must not panic.
+    #[test]
+    fn irreconcilable_report_without_out_dir_is_a_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_irreconcilable_report(
+            tmp.path(),
+            None,
+            2,
+            "t",
+            &JudgeReport::default(),
+            &["claude".to_string()],
+        );
+        assert!(std::fs::read_dir(tmp.path()).unwrap().next().is_none());
+    }
+
+    /// `verify` / `command` conditions inspect the workspace itself, so an
+    /// iteration that changed nothing is a legitimate outcome for them.
+    #[test]
+    fn delivery_gate_only_applies_to_agent_judges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let codex = reviewer_unit("codex-refine", &["out/codex-summary-v*.md"]);
+        let unit_map: HashMap<&str, &WorkUnit> = [("codex-refine", &codex)].into_iter().collect();
+        let ids = vec!["codex-refine".to_string()];
+
+        let snap = snapshot_loop_agents(&ids, &unit_map, root);
+        let manifests = vec![completed("codex-refine", &[])];
+
+        let until = super::super::plan::LoopUntilCondition::Command("cargo test".into());
+        assert_loop_agents_produced_output(delivery_check(
+            &until, &ids, &unit_map, &manifests, &snap, &snap, root, 2,
+        ))
+        .expect("command conditions are exempt");
+    }
+
+    // ── Declared output contract (`agent { produces [...] }`) ────────────
+
+    fn producing_unit(id: &str, owned: &[&str], produces: &[&str]) -> WorkUnit {
+        let mut u = reviewer_unit(id, owned);
+        u.produces = produces.iter().map(|s| s.to_string()).collect();
+        u
+    }
+
+    /// The contract is versioned: `{{ITER}}` is substituted for the pass being
+    /// judged, so writing the previous version is a failure, not a pass. The
+    /// snapshot heuristic alone cannot see this — the owned file set did change.
+    #[test]
+    fn declared_contract_rejects_the_wrong_iteration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("out")).unwrap();
+
+        let codex = producing_unit(
+            "codex-refine",
+            &["out/codex-summary-v*.md"],
+            &["out/codex-summary-v{{ITER}}.md"],
+        );
+        let unit_map: HashMap<&str, &WorkUnit> = [("codex-refine", &codex)].into_iter().collect();
+        let ids = vec!["codex-refine".to_string()];
+
+        let before = snapshot_loop_agents(&ids, &unit_map, root);
+        // Wrote v3 when the pass being judged is v4.
+        std::fs::write(root.join("out/codex-summary-v3.md"), "stale").unwrap();
+        let after = snapshot_loop_agents(&ids, &unit_map, root);
+        let manifests = vec![completed("codex-refine", &[])];
+
+        let err = assert_loop_agents_produced_output(delivery_check(
+            &judge_until(),
+            &ids,
+            &unit_map,
+            &manifests,
+            &before,
+            &after,
+            root,
+            4,
+        ))
+        .expect_err("v4 was never written");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("out/codex-summary-v4.md"), "got: {msg}");
+        assert!(msg.contains("missing"), "got: {msg}");
+    }
+
+    #[test]
+    fn declared_contract_passes_when_every_path_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("out")).unwrap();
+
+        let codex = producing_unit(
+            "codex-refine",
+            &["out/codex-*-v*.md"],
+            &[
+                "out/codex-conclusion-v{{ITER}}.md",
+                "out/codex-summary-v{{ITER}}.md",
+            ],
+        );
+        let unit_map: HashMap<&str, &WorkUnit> = [("codex-refine", &codex)].into_iter().collect();
+        let ids = vec!["codex-refine".to_string()];
+
+        std::fs::write(root.join("out/codex-conclusion-v4.md"), "c").unwrap();
+        std::fs::write(root.join("out/codex-summary-v4.md"), "s").unwrap();
+        let snap = snapshot_loop_agents(&ids, &unit_map, root);
+        let manifests = vec![completed("codex-refine", &[])];
+
+        assert_loop_agents_produced_output(delivery_check(
+            &judge_until(),
+            &ids,
+            &unit_map,
+            &manifests,
+            &snap,
+            &snap,
+            root,
+            4,
+        ))
+        .expect("both declared artefacts exist");
+    }
+
+    /// A zero-byte artefact satisfies a naive existence check while carrying
+    /// no information — the judge would read an empty consensus summary.
+    #[test]
+    fn declared_contract_rejects_an_empty_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("out")).unwrap();
+
+        let codex = producing_unit(
+            "codex-refine",
+            &["out/codex-summary-v*.md"],
+            &["out/codex-summary-v{{ITER}}.md"],
+        );
+        let unit_map: HashMap<&str, &WorkUnit> = [("codex-refine", &codex)].into_iter().collect();
+        let ids = vec!["codex-refine".to_string()];
+
+        std::fs::write(root.join("out/codex-summary-v4.md"), "").unwrap();
+        let snap = snapshot_loop_agents(&ids, &unit_map, root);
+        let manifests = vec![completed("codex-refine", &[])];
+
+        let err = assert_loop_agents_produced_output(delivery_check(
+            &judge_until(),
+            &ids,
+            &unit_map,
+            &manifests,
+            &snap,
+            &snap,
+            root,
+            4,
+        ))
+        .expect_err("empty file is not a deliverable");
+        assert!(
+            format!("{err:#}").contains("out/codex-summary-v4.md"),
+            "got: {err:#}"
+        );
+    }
+
+    /// A declared contract is authoritative: a non-empty `modified_files`
+    /// must not excuse a missing artefact the way it does for the fallback.
+    #[test]
+    fn declared_contract_overrides_the_manifest_shortcut() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let codex = producing_unit(
+            "codex-refine",
+            &["out/codex-summary-v*.md"],
+            &["out/codex-summary-v{{ITER}}.md"],
+        );
+        let unit_map: HashMap<&str, &WorkUnit> = [("codex-refine", &codex)].into_iter().collect();
+        let ids = vec!["codex-refine".to_string()];
+
+        let snap = snapshot_loop_agents(&ids, &unit_map, root);
+        // The agent touched *something*, just not what it promised.
+        let manifests = vec![completed("codex-refine", &["out/scratch.md"])];
+
+        assert_loop_agents_produced_output(delivery_check(
+            &judge_until(),
+            &ids,
+            &unit_map,
+            &manifests,
+            &snap,
+            &snap,
+            root,
+            4,
+        ))
+        .expect_err("declared artefact is still missing");
+    }
 }
 
 /// Collect a list of git-tracked files in the workspace for coordinator context.
@@ -3625,7 +4758,7 @@ async fn evaluate_loop_condition(
     ctx: &mut LoopConditionContext<'_>,
 ) -> LoopConditionOutcome {
     if ctx.consensus_mode == crate::swarm::plan::ConsensusMode::Explore {
-        return LoopConditionOutcome::Continue;
+        return LoopConditionOutcome::Continue(JudgeReport::default());
     }
     match condition {
         super::plan::LoopUntilCondition::Verify(config) => {
@@ -3640,7 +4773,7 @@ async fn evaluate_loop_condition(
             {
                 LoopConditionOutcome::Pass
             } else {
-                LoopConditionOutcome::Continue
+                LoopConditionOutcome::Continue(JudgeReport::default())
             }
         }
         super::plan::LoopUntilCondition::Agent(agent_id) => {
@@ -3649,7 +4782,7 @@ async fn evaluate_loop_condition(
                     "loop judge agent '{}' not found in compiled plan (judges must be declared distinct from workflow agents)",
                     agent_id
                 );
-                return LoopConditionOutcome::Continue;
+                return LoopConditionOutcome::Continue(JudgeReport::default());
             };
 
             // Build a compact digest of the most recent worker manifests for
@@ -3737,10 +4870,18 @@ async fn evaluate_loop_condition(
             }
 
             let verdict = manifest.output.as_deref().and_then(parse_judge_verdict);
+            let report = manifest
+                .output
+                .as_deref()
+                .map(parse_judge_report)
+                .unwrap_or_default();
             manifest.summary = Some(match (verdict, &manifest.status) {
                 (Some(JudgeVerdict::Pass), _) => "Judge verdict: PASS".into(),
                 (Some(JudgeVerdict::Fail), _) => "Judge verdict: FAIL".into(),
                 (Some(JudgeVerdict::Partial), _) => "Judge verdict: PARTIAL".into(),
+                (Some(JudgeVerdict::Irreconcilable), _) => {
+                    "Judge verdict: IRRECONCILABLE".into()
+                }
                 (None, AgentStatus::Failed(msg)) => format!("Judge failed: {}", msg),
                 (None, _) => "Judge verdict: unparseable".into(),
             });
@@ -3798,6 +4939,13 @@ async fn evaluate_loop_condition(
 
             let outcome = match verdict {
                 Some(JudgeVerdict::Pass) => LoopConditionOutcome::Pass,
+                // The judge itself ruled the disagreement structural. Honour
+                // it in every consensus mode: continuing would spend the
+                // remaining budget re-deriving a conclusion the judge has
+                // already read and rejected as unreachable.
+                Some(JudgeVerdict::Irreconcilable) => {
+                    LoopConditionOutcome::Irreconcilable(report)
+                }
                 Some(JudgeVerdict::Partial)
                     if ctx.consensus_mode == crate::swarm::plan::ConsensusMode::PartialOk =>
                 {
@@ -3813,8 +4961,8 @@ async fn evaluate_loop_condition(
                     }
                     LoopConditionOutcome::Partial
                 }
-                Some(JudgeVerdict::Partial) => LoopConditionOutcome::Continue,
-                _ => LoopConditionOutcome::Continue,
+                Some(JudgeVerdict::Partial) => LoopConditionOutcome::Continue(report),
+                _ => LoopConditionOutcome::Continue(report),
             };
 
             ctx.all_manifests.push(manifest);
@@ -3841,10 +4989,154 @@ async fn evaluate_loop_condition(
             if result.map(|s| s.success()).unwrap_or(false) {
                 LoopConditionOutcome::Pass
             } else {
-                LoopConditionOutcome::Continue
+                LoopConditionOutcome::Continue(JudgeReport::default())
             }
         }
     }
+}
+
+/// Does a judge-reported `agent` name this loop work unit?
+///
+/// The judge is asked for the *reviewer id* as it appears in the artefact
+/// filenames (`claude`), but the loop's work units are the roster's cloned
+/// templates (`claude-refine`). Matching on equality alone dropped every
+/// blocker of a real run into "Unattributed" and reported each reviewer as
+/// unnamed — the exact ambiguity `consensus-irreconcilable.md` exists to
+/// remove. Roster clones are always `<reviewer-id>-<template-role>`
+/// (`workflow_params.rs`), so the prefix is the reviewer id.
+fn blocker_names_agent(blocker_agent: &str, agent_id: &str) -> bool {
+    if blocker_agent.is_empty() {
+        return false;
+    }
+    agent_id == blocker_agent
+        || agent_id
+            .strip_prefix(blocker_agent)
+            .is_some_and(|role| role.starts_with('-'))
+}
+
+/// Render the irreconcilable-disagreement hand-off.
+///
+/// Writes `consensus-irreconcilable.md` (one section per reviewer, so a human
+/// can see which position each one holds and what evidence would settle it)
+/// plus the machine-readable `consensus-verdict.json` the partial path already
+/// emits. Reviewers the judge did not name still get a section saying so —
+/// a silent omission would read as "this reviewer agreed", which is exactly
+/// the ambiguity the document exists to remove.
+///
+/// Best-effort: the run has already stopped, and failing to write the report
+/// must not mask the reason it stopped.
+fn write_irreconcilable_report(
+    workspace_root: &std::path::Path,
+    out_dir: Option<&str>,
+    iter_abs: u32,
+    trigger: &str,
+    report: &JudgeReport,
+    reviewer_ids: &[String],
+) {
+    let Some(out_dir) = out_dir else {
+        tracing::warn!(
+            "irreconcilable disagreement at iteration {iter_abs} ({trigger}), but the loop has no \
+             verdict output directory — skipping the hand-off document. Reason: {}",
+            report.reason
+        );
+        return;
+    };
+
+    let mut md = String::with_capacity(2048);
+    md.push_str("# Consensus not reachable\n\n");
+    md.push_str(&format!(
+        "The panel stopped at iteration {iter_abs} because the disagreement is structural, \
+         not because it ran out of iterations.\n\n\
+         - **Trigger:** {trigger}\n\
+         - **Judge's reason:** {}\n\n",
+        if report.reason.is_empty() {
+            "(the judge gave no reason)"
+        } else {
+            report.reason.as_str()
+        }
+    ));
+
+    md.push_str("## Positions by reviewer\n\n");
+    for id in reviewer_ids {
+        md.push_str(&format!("### {id}\n\n"));
+        let mine: Vec<&JudgeBlocker> = report
+            .blockers
+            .iter()
+            .filter(|b| blocker_names_agent(&b.agent, id))
+            .collect();
+        if mine.is_empty() {
+            md.push_str(
+                "The judge did not attribute a blocking position to this reviewer. That is not \
+                 the same as agreement — read this reviewer's latest `*-summary-v*.md` \
+                 (`## Substantive disagreements`) before assuming it was aligned.\n\n",
+            );
+            continue;
+        }
+        for b in mine {
+            if !b.position.is_empty() {
+                md.push_str(&format!("- **Holds:** {}\n", b.position));
+            }
+            if !b.conflicts_with.is_empty() {
+                md.push_str(&format!("- **Conflicts with:** {}\n", b.conflicts_with));
+            }
+            if !b.criterion.is_empty() {
+                md.push_str(&format!("- **Convergence criterion:** {}\n", b.criterion));
+            }
+            if !b.evidence_gap.is_empty() {
+                md.push_str(&format!("- **Would be settled by:** {}\n", b.evidence_gap));
+            }
+            md.push('\n');
+        }
+    }
+
+    // Blockers naming a reviewer outside the roster would otherwise vanish.
+    let orphans: Vec<&JudgeBlocker> = report
+        .blockers
+        .iter()
+        .filter(|b| {
+            !reviewer_ids
+                .iter()
+                .any(|id| blocker_names_agent(&b.agent, id))
+        })
+        .collect();
+    if !orphans.is_empty() {
+        md.push_str("## Unattributed blockers\n\n");
+        for b in orphans {
+            md.push_str(&format!(
+                "- ({}) {} — conflicts with {}\n",
+                if b.agent.is_empty() { "?" } else { &b.agent },
+                b.position,
+                b.conflicts_with
+            ));
+        }
+        md.push('\n');
+    }
+
+    md.push_str(
+        "## What to do next\n\n\
+         Nothing further will change by re-running the same panel on the same anchor: it has \
+         restated this disagreement rather than closing it. Either resolve the conflict outside \
+         the panel (gather the evidence named above, or amend the anchor so the question is \
+         decidable), or accept the competing conclusions as the deliverable and choose between \
+         them yourself.\n",
+    );
+
+    let dir = workspace_root.join(out_dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let md_path = dir.join("consensus-irreconcilable.md");
+    match std::fs::write(&md_path, md) {
+        Ok(()) => tracing::info!("Wrote irreconcilable report to {}", md_path.display()),
+        Err(e) => tracing::warn!("Failed to write {}: {}", md_path.display(), e),
+    }
+
+    write_consensus_verdict_file(
+        workspace_root,
+        out_dir,
+        iter_abs,
+        "irreconcilable",
+        &report.reason,
+        reviewer_ids,
+    );
 }
 
 fn write_consensus_verdict_file(
@@ -4025,8 +5317,42 @@ fn parse_judge_token(token: &str) -> Option<JudgeVerdict> {
         }
         "FAIL" | "FAILED" | "REJECTED" | "REJECT" => Some(JudgeVerdict::Fail),
         "PARTIAL" | "PARTIALLY" => Some(JudgeVerdict::Partial),
+        // `irreconcilable` is the whole token; `deadlock`/`impasse` are the
+        // words models reach for when asked to name a structural disagreement.
+        "IRRECONCILABLE" | "DEADLOCK" | "DEADLOCKED" | "IMPASSE" => {
+            Some(JudgeVerdict::Irreconcilable)
+        }
         _ => None,
     }
+}
+
+/// Extract the judge's `reason` and `blockers` from whatever JSON it emitted.
+///
+/// Independent of verdict parsing: a judge that returns FAIL with blockers is
+/// still telling the runtime what the deadlock is, which is what repeat
+/// detection fingerprints. Returns an empty report when nothing parses — the
+/// verdict alone is still actionable.
+fn parse_judge_report(text: &str) -> JudgeReport {
+    let stripped = strip_turn_annotations(text);
+    let trimmed = stripped.trim();
+    let value = extract_fenced_json(trimmed)
+        .and_then(|f| serde_json::from_str::<serde_json::Value>(f.trim()).ok())
+        .or_else(|| serde_json::from_str::<serde_json::Value>(trimmed).ok());
+
+    let Some(obj) = value.as_ref().and_then(|v| v.as_object()) else {
+        return JudgeReport::default();
+    };
+    let reason = ["reason", "explanation", "summary", "detail"]
+        .iter()
+        .find_map(|k| obj.get(*k).and_then(|v| v.as_str()))
+        .unwrap_or_default()
+        .to_string();
+    let blockers = ["blockers", "disagreements", "conflicts"]
+        .iter()
+        .find_map(|k| obj.get(*k))
+        .and_then(|v| serde_json::from_value::<Vec<JudgeBlocker>>(v.clone()).ok())
+        .unwrap_or_default();
+    JudgeReport { reason, blockers }
 }
 
 /// No-op write gate observer for parallel agents (AutoAccept mode).

@@ -112,6 +112,72 @@ pub(super) fn swarm_graph_budget(
 ///
 /// When `repo_map` is provided, a ranked context outline is prepended to the
 /// agent's base prompt so that even cheap-tier models have optimal scope.
+///
+/// The whole dispatch — every retry included — is bounded by
+/// `work_unit.timeout_secs`. This is the single choke point every swarm agent
+/// passes through, so the bound holds regardless of which backend, dispatch
+/// path, or provider session is involved. On expiry the agent becomes a
+/// `Failed` manifest rather than an error, so the caller's normal
+/// failure handling (delivery gate, loop verdict, merge skip) applies instead
+/// of the run unwinding.
+pub async fn run_backend(
+    backend: &dyn AgentBackend,
+    work_unit: &WorkUnit,
+    write_gate: Arc<Mutex<WriteGatePipeline>>,
+    workspace_root: &Path,
+    memory: Option<&Arc<MemoryStores>>,
+    read_namespaces: &[String],
+    observer: &dyn AcpObserver,
+    validation: Option<&ValidationPipeline>,
+    board: Option<&SharedBoard>,
+    repo_map: Option<&RepoMap>,
+    impact_text: Option<&str>,
+    pre_fetched_memory: Option<&str>,
+    workspace_extra_tools: &[String],
+    skip_repo_context: bool,
+) -> Result<AgentManifest> {
+    let inner = run_backend_inner(
+        backend,
+        work_unit,
+        write_gate,
+        workspace_root,
+        memory,
+        read_namespaces,
+        observer,
+        validation,
+        board,
+        repo_map,
+        impact_text,
+        pre_fetched_memory,
+        workspace_extra_tools,
+        skip_repo_context,
+    );
+    if work_unit.timeout_secs == 0 {
+        return inner.await;
+    }
+    let budget = std::time::Duration::from_secs(work_unit.timeout_secs);
+    match tokio::time::timeout(budget, inner).await {
+        Ok(result) => result,
+        Err(_) => {
+            let msg = format!(
+                "agent '{}' exceeded its {}s dispatch budget",
+                work_unit.id, work_unit.timeout_secs
+            );
+            tracing::error!("{}", msg);
+            observer.on_streaming_status("timed out");
+            Ok(AgentManifest {
+                work_unit_id: work_unit.id.clone(),
+                status: AgentStatus::Failed(msg.clone()),
+                modified_files: vec![],
+                branch: None,
+                summary: Some(msg),
+                output: None,
+                cost_usd: 0.0,
+            })
+        }
+    }
+}
+
 #[tracing::instrument(
     skip(backend, write_gate, memory, observer, validation, board, repo_map, impact_text, pre_fetched_memory),
     fields(
@@ -121,7 +187,8 @@ pub(super) fn swarm_graph_budget(
         read_namespaces = read_namespaces.len(),
     )
 )]
-pub async fn run_backend(
+#[allow(clippy::too_many_arguments)]
+async fn run_backend_inner(
     backend: &dyn AgentBackend,
     work_unit: &WorkUnit,
     write_gate: Arc<Mutex<WriteGatePipeline>>,
@@ -386,12 +453,21 @@ pub async fn run_backend(
                             attempt_modified.push(workspace_root.join(&path));
                         }
                         Ok(false) => {}
+                        // A proposal that cannot be written is a silent data
+                        // loss bug, not a warning: the agent believes it
+                        // delivered the file, the manifest reports Completed
+                        // with no modified files, and downstream consumers
+                        // (loop judges, merge, verification) score a panel
+                        // that is missing a member. Fail the attempt so the
+                        // retry path — and ultimately the manifest — sees it.
                         Err(e) => {
-                            tracing::error!(
-                                "Failed to create proposal for {}: {}",
-                                path.display(),
-                                e
+                            had_error = true;
+                            error_msg = format!(
+                                "failed to apply file proposal for {}: {e:#}",
+                                path.display()
                             );
+                            tracing::error!("{}", error_msg);
+                            break;
                         }
                     }
                 }
@@ -564,6 +640,53 @@ pub async fn run_backend(
             }
         }
 
+        // 5. Output contract (DSL `agent { produces [...] }`).
+        //
+        // Completing a turn is not the same as delivering. A model can
+        // narrate a file it never wrote, a proposal can be dropped by scope,
+        // and a provider that edits through its own tools reports no
+        // modified_files either way — all three end here as `Completed` with
+        // the artefact absent. Checking the declared paths is the only signal
+        // that distinguishes them, so it decides the manifest status.
+        let missing = work_unit.missing_declared_artifacts(workspace_root);
+        if !missing.is_empty() {
+            let next_attempt = attempt + 1;
+            if next_attempt < max_attempts {
+                observer.on_validation_retry(next_attempt as u8, work_unit.max_retries);
+                corrective = Some(format!(
+                    "You did not write the file(s) you were required to produce: {}.\n\
+                     Paths are relative to the workspace root. Write each one now, in full, \
+                     with the exact path given — do not rename, do not write a different \
+                     version, and do not describe the content instead of writing it.",
+                    missing.join(", ")
+                ));
+                continue; // retry
+            }
+            tracing::error!(
+                "Agent {} completed without producing {:?} after {} attempt(s)",
+                work_unit.id,
+                missing,
+                max_attempts
+            );
+            return Ok(AgentManifest {
+                work_unit_id: work_unit.id.clone(),
+                status: AgentStatus::Failed(format!(
+                    "declared output missing after {} attempt(s): {}",
+                    max_attempts,
+                    missing.join(", ")
+                )),
+                modified_files: all_modified.into_iter().collect(),
+                branch: None,
+                summary: Some(format!("Missing declared output: {}", missing.join(", "))),
+                output: if full_text.is_empty() {
+                    None
+                } else {
+                    Some(full_text.clone())
+                },
+                cost_usd: turn_cost_usd,
+            });
+        }
+
         // Validation passed (or no validator) — done
         return Ok(AgentManifest {
             work_unit_id: work_unit.id.clone(),
@@ -614,7 +737,16 @@ pub(crate) async fn propose_write(
         let mut gate = write_gate.lock().await;
         let path_str = rel_path.to_string_lossy();
         if !gate.is_scope_allowed(agent_id, &path_str) {
-            tracing::warn!("Scope rejected for {}", rel_path.display());
+            // Dropping the proposal is correct, but say whose it was and
+            // against what — an out-of-scope path is usually a workflow
+            // misconfiguration (wrong OUT_DIR, stale glob) and the agent
+            // otherwise completes as if the file had been written.
+            tracing::warn!(
+                "Scope rejected: agent '{}' may not write '{}' (owned: {:?})",
+                agent_id,
+                rel_path.display(),
+                gate.owned_paths_for(agent_id)
+            );
             return Ok(false);
         }
         let peers = gate.conflict_candidates_for_path(&abs_path);
@@ -684,6 +816,20 @@ pub(crate) async fn propose_write(
     if let Some(action) = auto_accept_result {
         match action {
             AutoAcceptAction::Write { path, content } => {
+                // Agents legitimately create the first file in a new artefact
+                // directory ({{OUT_DIR}} on the init pass, for instance), so a
+                // missing parent is expected rather than an error.
+                if let Some(parent) = path.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                        anyhow::anyhow!(
+                            "creating parent directory {} for auto-accepted file: {}",
+                            parent.display(),
+                            e
+                        )
+                    })?;
+                }
                 tokio::fs::write(&path, &content)
                     .await
                     .map_err(|e| anyhow::anyhow!("writing auto-accepted file: {}", e))?;
@@ -762,6 +908,7 @@ mod tests {
                 read_only_paths: vec![],
                 interface_contracts: HashMap::new(),
             },
+            produces: vec![],
             depends_on: vec![],
             backend: Default::default(),
             model: None,
@@ -772,6 +919,7 @@ mod tests {
             coordinator_instructions: String::new(),
             estimated_tokens: 0,
             max_retries: 1,
+            timeout_secs: 3600,
             escalation_tier: None,
             read_namespaces: None,
             write_namespace: None,
@@ -1023,6 +1171,249 @@ mod tests {
         // Should complete but with no modified files (scope rejected)
         assert!(matches!(manifest.status, AgentStatus::Completed));
         assert_eq!(manifest.modified_files.len(), 0);
+    }
+
+    // Test 21: Auto-accepted file blocks create their parent directory.
+    //
+    // The init pass of a document workflow writes the first artefact into an
+    // {{OUT_DIR}} that does not exist yet. Without `create_dir_all` the write
+    // failed, the error was logged and swallowed, and the agent reported
+    // Completed having produced nothing.
+    #[tokio::test]
+    async fn test_run_backend_file_block_creates_missing_parent_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+
+        let events = vec![
+            UnifiedStreamEvent::FileBlock {
+                path: PathBuf::from("src/deeply/nested/out.md"),
+                content: "## Conclusion\n".into(),
+            },
+            UnifiedStreamEvent::Done(StopReason::EndTurn),
+        ];
+        let backend = MockBackend::new("test", events);
+        let write_gate = Arc::new(Mutex::new(WriteGatePipeline::new(
+            WriteMode::AutoAccept,
+            Box::new(NoopWriteGateObserver),
+        )));
+        let observer = TestObserver::new();
+        let unit = test_work_unit(); // owns src/
+
+        let manifest = run_backend(
+            &backend,
+            &unit,
+            write_gate,
+            workspace,
+            None,
+            &["default".to_string()],
+            &observer,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(manifest.status, AgentStatus::Completed));
+        assert_eq!(manifest.modified_files.len(), 1);
+        // Trailing whitespace is normalized when the gate reassembles the
+        // accepted hunks; what matters here is that the file exists at all.
+        let written = std::fs::read_to_string(workspace.join("src/deeply/nested/out.md")).unwrap();
+        assert_eq!(written.trim_end(), "## Conclusion");
+    }
+
+    // Test 21b: `produces` turns "completed but empty-handed" into Failed.
+    //
+    // The agent narrates success and the stream ends cleanly; nothing was
+    // written. Without the output contract this is indistinguishable from a
+    // real success, which is what let a silent reviewer survive four
+    // iterations of a consensus loop.
+    #[tokio::test]
+    async fn test_run_backend_fails_when_declared_output_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+
+        let events = vec![
+            UnifiedStreamEvent::TextDelta("Both files written.".into()),
+            UnifiedStreamEvent::Done(StopReason::EndTurn),
+        ];
+        let backend = MockBackend::new("test", events);
+        let write_gate = Arc::new(Mutex::new(WriteGatePipeline::new(
+            WriteMode::AutoAccept,
+            Box::new(NoopWriteGateObserver),
+        )));
+        let observer = TestObserver::new();
+        let mut unit = test_work_unit();
+        unit.max_retries = 0; // single attempt, no corrective retry
+        unit.produces = vec!["src/report.md".into()];
+
+        let manifest = run_backend(
+            &backend,
+            &unit,
+            write_gate,
+            workspace,
+            None,
+            &["default".to_string()],
+            &observer,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .await
+        .unwrap();
+
+        match &manifest.status {
+            AgentStatus::Failed(msg) => assert!(msg.contains("src/report.md"), "got: {msg}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_backend_completes_when_declared_output_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+
+        let events = vec![
+            UnifiedStreamEvent::FileBlock {
+                path: PathBuf::from("src/report.md"),
+                content: "## Report\n".into(),
+            },
+            UnifiedStreamEvent::Done(StopReason::EndTurn),
+        ];
+        let backend = MockBackend::new("test", events);
+        let write_gate = Arc::new(Mutex::new(WriteGatePipeline::new(
+            WriteMode::AutoAccept,
+            Box::new(NoopWriteGateObserver),
+        )));
+        let observer = TestObserver::new();
+        let mut unit = test_work_unit();
+        unit.max_retries = 0;
+        unit.produces = vec!["src/report.md".into()];
+
+        let manifest = run_backend(
+            &backend,
+            &unit,
+            write_gate,
+            workspace,
+            None,
+            &["default".to_string()],
+            &observer,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(manifest.status, AgentStatus::Completed),
+            "got {:?}",
+            manifest.status
+        );
+    }
+
+    // Test 21c: the dispatch budget is what makes a run finite.
+    //
+    // A backend that never yields Done models the observed freeze: the
+    // provider subprocess stays alive but silent, so the session's idle loop
+    // spins forever and the stream consumer waits on it. The budget turns
+    // that into a Failed manifest the loop can act on.
+    #[tokio::test]
+    async fn test_run_backend_times_out_on_a_silent_backend() {
+        let backend = MockBackend::new(
+            "test",
+            vec![UnifiedStreamEvent::TextDelta("thinking...".into())],
+        )
+        .with_delay(std::time::Duration::from_secs(3600));
+        let write_gate = Arc::new(Mutex::new(WriteGatePipeline::new(
+            WriteMode::AutoAccept,
+            Box::new(NoopWriteGateObserver),
+        )));
+        let observer = TestObserver::new();
+        let mut unit = test_work_unit();
+        unit.timeout_secs = 1;
+
+        let manifest = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_backend(
+                &backend,
+                &unit,
+                write_gate,
+                Path::new("/tmp/workspace"),
+                None,
+                &["default".to_string()],
+                &observer,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                false,
+            ),
+        )
+        .await
+        .expect("the budget must fire well inside the test's own guard")
+        .unwrap();
+
+        match &manifest.status {
+            AgentStatus::Failed(msg) => {
+                assert!(msg.contains("dispatch budget"), "got: {msg}");
+                assert!(msg.contains("test-unit"), "got: {msg}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// `timeout 0` is the documented opt-out; it must not degenerate into an
+    /// instant timeout.
+    #[tokio::test]
+    async fn test_run_backend_zero_timeout_disables_the_budget() {
+        let events = vec![
+            UnifiedStreamEvent::TextDelta("done".into()),
+            UnifiedStreamEvent::Done(StopReason::EndTurn),
+        ];
+        let backend = MockBackend::new("test", events);
+        let write_gate = Arc::new(Mutex::new(WriteGatePipeline::new(
+            WriteMode::AutoAccept,
+            Box::new(NoopWriteGateObserver),
+        )));
+        let observer = TestObserver::new();
+        let mut unit = test_work_unit();
+        unit.timeout_secs = 0;
+
+        let manifest = run_backend(
+            &backend,
+            &unit,
+            write_gate,
+            Path::new("/tmp/workspace"),
+            None,
+            &["default".to_string()],
+            &observer,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(manifest.status, AgentStatus::Completed));
     }
 
     // Test 22: Stream contract — runner always terminates even with just Done
