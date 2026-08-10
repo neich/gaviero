@@ -3600,7 +3600,9 @@ async fn store_agent_result(
     // aggregate above (which serves run bookkeeping + staleness). No-op
     // unless enabled; degrades to a History row when `writer` carries no
     // extraction LLM (e.g. the headless CLI fallback writer).
-    if extract_findings && let Some(transcript) = agent_findings_transcript(unit, manifest) {
+    if extract_findings
+        && let Some((transcript, annotations)) = agent_findings_transcript(unit, manifest)
+    {
         let turn_id = format!("swarm:{run_id}:{}", manifest.work_unit_id);
         let repo_id = crate::memory::hash_path(workspace_root);
         crate::context_planner::enqueue_post_turn(crate::context_planner::PostTurnRequest {
@@ -3608,10 +3610,12 @@ async fn store_agent_result(
             session_id: run_id,
             turn_id: &turn_id,
             repo_id: &repo_id,
+            // `resolve_scope` falls back Module → Repo when there is no
+            // module context, so leaving this `None` is safe.
             module_path: None,
             run_id,
             transcript,
-            annotations: None,
+            annotations,
             // Telemetry is off for swarm findings, so `response_text` is unused.
             response_text: String::new(),
             extractor_enabled: true,
@@ -3620,20 +3624,72 @@ async fn store_agent_result(
     }
 }
 
+/// D2: the widest scope a swarm-originated annotation flag may claim.
+///
+/// Chat turns keep the full range (`extractor::resolve_scope` is
+/// untouched) because they are human-supervised, one turn at a time. The
+/// swarm firehose — many agents × many units × every run — is what would
+/// actually accumulate global-scope rows, so it is clamped here.
+const SWARM_MAX_ANNOTATION_SCOPE: &str = "repo";
+
 /// Build the per-turn-extractor transcript for a completed swarm agent's
 /// findings: the unit's task plus the agent's full text output (falling
 /// back to its short summary). Returns `None` when there is no usable
 /// output, so the caller skips the extractor enqueue entirely.
-fn agent_findings_transcript(unit: &WorkUnit, manifest: &AgentManifest) -> Option<String> {
-    let body = manifest
+///
+/// The agent's output still carries its `<turn_annotations>` sidecar at
+/// this point. It is parsed out here so the flags reach the writer as
+/// `LlmAnnotated` memories (trust 0.70) instead of being buried in the
+/// transcript for the extractor to re-derive at `LlmExtracted` (0.60).
+/// The stripped text is what goes into the transcript.
+fn agent_findings_transcript(
+    unit: &WorkUnit,
+    manifest: &AgentManifest,
+) -> Option<(String, Option<serde_json::Value>)> {
+    let raw = manifest
         .output
         .as_deref()
         .or(manifest.summary.as_deref())
         .map(str::trim)
         .filter(|s| !s.is_empty())?;
-    Some(format!(
-        "TASK: {}\n\nAGENT {} OUTPUT:\n{}",
-        unit.description, manifest.work_unit_id, body
+
+    let parsed = crate::memory::parse_and_strip(raw);
+    if let Some(err) = &parsed.parse_error {
+        // Delimiters were present but the JSON did not parse. Same
+        // treatment as the chat path in `memory/writer.rs`: warn loudly
+        // so prompt drift is visible, keep the transcript.
+        tracing::warn!(
+            target: "memory_annotations",
+            work_unit_id = %manifest.work_unit_id,
+            error = %err,
+            "swarm agent emitted a malformed <turn_annotations> block — \
+             dropping annotations, keeping the transcript"
+        );
+    }
+
+    let annotations = parsed.annotations.and_then(|mut ann| {
+        for f in &mut ann.flags {
+            if matches!(f.scope.to_ascii_lowercase().as_str(), "workspace" | "global") {
+                tracing::debug!(
+                    target: "memory_annotations",
+                    work_unit_id = %manifest.work_unit_id,
+                    from = %f.scope,
+                    to = SWARM_MAX_ANNOTATION_SCOPE,
+                    "D2: clamping swarm annotation scope"
+                );
+                f.scope = SWARM_MAX_ANNOTATION_SCOPE.to_string();
+            }
+        }
+        serde_json::to_value(&ann).ok()
+    });
+
+    let body = parsed.stripped.trim();
+    Some((
+        format!(
+            "TASK: {}\n\nAGENT {} OUTPUT:\n{}",
+            unit.description, manifest.work_unit_id, body
+        ),
+        annotations,
     ))
 }
 
@@ -3840,19 +3896,21 @@ mod tests {
     fn agent_findings_transcript_prefers_output_and_tags_task() {
         let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
         let manifest = manifest_with(Some("Refactored the parser; added 3 tests."), Some("done"));
-        let t = agent_findings_transcript(&unit, &manifest).expect("output present");
+        let (t, annotations) = agent_findings_transcript(&unit, &manifest).expect("output present");
         assert!(t.contains("TASK: test task"));
         assert!(t.contains("AGENT unit-a OUTPUT:"));
         assert!(t.contains("Refactored the parser"));
         // The full output wins over the short summary.
         assert!(!t.contains("done"));
+        // No sidecar in the output → nothing to hand the writer.
+        assert!(annotations.is_none());
     }
 
     #[test]
     fn agent_findings_transcript_falls_back_to_summary() {
         let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
         let manifest = manifest_with(None, Some("Summary only."));
-        let t = agent_findings_transcript(&unit, &manifest).expect("summary present");
+        let (t, _) = agent_findings_transcript(&unit, &manifest).expect("summary present");
         assert!(t.contains("Summary only."));
     }
 
@@ -3862,6 +3920,59 @@ mod tests {
         assert!(agent_findings_transcript(&unit, &manifest_with(None, None)).is_none());
         // Whitespace-only output is treated as empty → skipped.
         assert!(agent_findings_transcript(&unit, &manifest_with(Some("  \n "), None)).is_none());
+    }
+
+    /// Build an agent output that ends with a `<turn_annotations>` block
+    /// carrying a single flag at `scope`.
+    fn output_with_annotation(scope: &str) -> String {
+        format!(
+            "Refactored the parser.\n\n<turn_annotations>\n{{\
+             \"v\": 1, \"flags\": [{{\"type\": \"decision\", \"importance\": 0.8, \
+             \"scope\": \"{scope}\", \"text\": \"parser owns tokenisation\", \"refs\": []}}], \
+             \"session_thread\": \"parser work\", \"open_questions\": []}}\n\
+             </turn_annotations>"
+        )
+    }
+
+    #[test]
+    fn agent_findings_transcript_extracts_and_strips_annotations() {
+        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
+        let manifest = manifest_with(Some(&output_with_annotation("repo")), None);
+        let (t, annotations) = agent_findings_transcript(&unit, &manifest).expect("output present");
+
+        assert!(
+            !t.contains("turn_annotations"),
+            "the sidecar must be stripped from the transcript: {t}"
+        );
+        assert!(t.contains("Refactored the parser."));
+
+        let json = annotations.expect("a valid block must yield annotations");
+        assert_eq!(json["flags"][0]["scope"], "repo");
+        assert_eq!(json["flags"][0]["text"], "parser owns tokenisation");
+    }
+
+    #[test]
+    fn agent_findings_transcript_clamps_global_scope_to_repo() {
+        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
+
+        for declared in ["global", "workspace"] {
+            let manifest = manifest_with(Some(&output_with_annotation(declared)), None);
+            let (_, annotations) =
+                agent_findings_transcript(&unit, &manifest).expect("output present");
+            let json = annotations.expect("annotations present");
+            assert_eq!(
+                json["flags"][0]["scope"], "repo",
+                "D2: a swarm flag declaring `{declared}` must be clamped to repo"
+            );
+        }
+
+        // Narrower scopes pass through untouched.
+        let manifest = manifest_with(Some(&output_with_annotation("run")), None);
+        let (_, annotations) = agent_findings_transcript(&unit, &manifest).expect("output present");
+        assert_eq!(
+            annotations.expect("annotations present")["flags"][0]["scope"],
+            "run"
+        );
     }
 
     #[test]

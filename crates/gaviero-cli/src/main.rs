@@ -1203,6 +1203,10 @@ fn prepare_mcp_for_swarm(
     cli: &Cli,
     script_vars: &[(String, String)],
     memory: &Option<Arc<gaviero_core::memory::MemoryStores>>,
+    // `memory_writer` backs the `memory_flag` signal sink. `None`
+    // (extractor off, or no memory) leaves the tool unwired, so a call
+    // errors loudly instead of silently no-oping.
+    memory_writer: Option<&gaviero_core::memory::WriterHandle>,
 ) -> Result<(
     Option<gaviero_core::mcp::McpConfigSynth>,
     Option<gaviero_core::mcp::McpServerHandle>,
@@ -1340,6 +1344,21 @@ fn prepare_mcp_for_swarm(
                     .filter(|s| !s.is_empty() && *s != "inherit")
                     .map(str::to_string),
             );
+            // D3: memory_flag ships enabled, but it needs a writer to
+            // signal. No writer → leave it unwired.
+            let flag_enabled = workspace
+                .resolve_setting(
+                    gaviero_core::workspace::settings::MCP_FLAG_ENABLED,
+                    Some(repo),
+                )
+                .as_bool()
+                .unwrap_or(true);
+            let server = match memory_writer {
+                Some(w) if flag_enabled => {
+                    server.with_signal_sink(gaviero_core::memory::WriterSignalSink::arc(w.clone()))
+                }
+                _ => server,
+            };
             // Phase 1: warm the graph cache, repo-map cache, and (when
             // configured) the reranker in the background so the first
             // agent tool call doesn't pay a cold start.
@@ -3825,10 +3844,44 @@ async fn main() -> Result<()> {
     )?;
     eprintln!("[plan] model preflight ok");
 
+    // PR-6-replacement (scope-B follow-up): give the headless swarm an
+    // extraction-LLM-equipped writer so completed agents' findings flow
+    // through the per-turn extractor, mirroring the TUI. Falls back to no
+    // extraction (writer = None → swarm's own raw-only writer) when the
+    // extractor is disabled or the backend can't be built.
+    //
+    // Built before MCP setup because the `memory_flag` signal sink needs
+    // this same handle — the tool is the only MCP surface that can cause
+    // a write, and it goes through this writer task like everything else.
+    let extractor_enabled = workspace
+        .resolve_setting(
+            gaviero_core::workspace::settings::MEMORY_EXTRACTOR_ENABLED,
+            Some(&repo),
+        )
+        .as_bool()
+        .unwrap_or(true);
+    let swarm_memory_writer = build_swarm_extractor_writer(
+        &workspace,
+        &repo,
+        &memory,
+        extractor_enabled,
+        &execution_model,
+        ollama_base_url.as_deref(),
+    );
+    let extract_agent_findings = swarm_memory_writer.is_some();
+    // Keep a handle to drain in-flight extractions before the process exits.
+    let swarm_writer_drain = swarm_memory_writer.clone();
+
     // MCP: synthesize per-worktree provider configs + optional in-process server.
     let mcp_script_vars = swarm_workspace.override_vars.as_deref().unwrap_or(&[]);
-    let (mcp_config, _mcp_server_guard) =
-        prepare_mcp_for_swarm(&repo, &workspace, &cli, mcp_script_vars, &memory)?;
+    let (mcp_config, _mcp_server_guard) = prepare_mcp_for_swarm(
+        &repo,
+        &workspace,
+        &cli,
+        mcp_script_vars,
+        &memory,
+        swarm_memory_writer.as_ref(),
+    )?;
     if let Some(ref synth) = mcp_config {
         gaviero_core::mcp::validate_codex_trust_for_extras(synth, &plan, &execution_model)?;
     }
@@ -3856,29 +3909,6 @@ async fn main() -> Result<()> {
     let swarm_observer = CliSwarmObserver;
     let specificity = workspace.resolve_specificity_config(Some(&repo));
     let (swarm_extra_tools, _) = workspace.resolve_agent_tools(Some(&repo));
-    // PR-6-replacement (scope-B follow-up): give the headless swarm an
-    // extraction-LLM-equipped writer so completed agents' findings flow
-    // through the per-turn extractor, mirroring the TUI. Falls back to no
-    // extraction (writer = None → swarm's own raw-only writer) when the
-    // extractor is disabled or the backend can't be built.
-    let extractor_enabled = workspace
-        .resolve_setting(
-            gaviero_core::workspace::settings::MEMORY_EXTRACTOR_ENABLED,
-            Some(&repo),
-        )
-        .as_bool()
-        .unwrap_or(true);
-    let swarm_memory_writer = build_swarm_extractor_writer(
-        &workspace,
-        &repo,
-        &memory,
-        extractor_enabled,
-        &execution_model,
-        ollama_base_url.as_deref(),
-    );
-    let extract_agent_findings = swarm_memory_writer.is_some();
-    // Keep a handle to drain in-flight extractions before the process exits.
-    let swarm_writer_drain = swarm_memory_writer.clone();
     let config = gaviero_core::swarm::pipeline::SwarmConfig {
         execution_mode: plan.execution_mode,
         max_parallel: effective_max_parallel,

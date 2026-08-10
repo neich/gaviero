@@ -1515,6 +1515,23 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                             .filter(|s| !s.is_empty() && *s != "inherit")
                             .map(str::to_string),
                     );
+                    // D3: memory_flag ships enabled. The sink is the only
+                    // seam through which a tool call can cause a write, and
+                    // it goes through the S2 writer task like everything else.
+                    let flag_enabled = app
+                        .workspace
+                        .resolve_setting(
+                            gaviero_core::workspace::settings::MCP_FLAG_ENABLED,
+                            Some(&workspace_root_for_mcp),
+                        )
+                        .as_bool()
+                        .unwrap_or(true);
+                    let server = match app.memory_writer.clone() {
+                        Some(w) if flag_enabled => {
+                            server.with_signal_sink(gaviero_core::memory::WriterSignalSink::arc(w))
+                        }
+                        _ => server,
+                    };
                     // Phase 1: warm the graph cache + reranker in the
                     // background so the first user query never pays the cold
                     // start. The cache is shared via Arc with every spawned
