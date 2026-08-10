@@ -37,6 +37,10 @@ pub struct MemoryRow {
     pub content: String,
     pub importance: f32,
     pub trust_score: f32,
+    /// Write origin. Drives the `memory_flag` source gate (user-authored
+    /// and History rows are not agent-flaggable) and the trust the
+    /// demotion is computed against.
+    pub source: super::super::trust_defaults::MemorySource,
     pub created_at: String,
     pub updated_at: String,
     pub tag: Option<String>,
@@ -330,11 +334,12 @@ impl MemoryStore {
             Option<String>,
             i32,
             Option<String>,
+            String,
         );
         let row: Result<RawRow, rusqlite::Error> = conn.query_row(
             "SELECT id, scope_level, memory_kind, memory_type, content,
                     importance, trust_score, created_at, updated_at, tag,
-                    access_count, last_accessed_at
+                    access_count, last_accessed_at, source
              FROM memories WHERE id = ?1",
             rusqlite::params![memory_id],
             |r| {
@@ -351,6 +356,7 @@ impl MemoryStore {
                     r.get(9)?,
                     r.get(10)?,
                     r.get(11)?,
+                    r.get(12)?,
                 ))
             },
         );
@@ -368,6 +374,7 @@ impl MemoryStore {
                 tag,
                 access_count,
                 accessed_at,
+                source_str,
             )) => {
                 let kind = super::super::kind::MemoryKind::from_str(&kind_str)
                     .map_err(|e| anyhow!("invalid memory_kind '{kind_str}' on row {id}: {e}"))?;
@@ -379,6 +386,7 @@ impl MemoryStore {
                     content,
                     importance,
                     trust_score,
+                    source: super::super::trust_defaults::MemorySource::parse_str(&source_str),
                     created_at,
                     updated_at,
                     tag,
@@ -502,6 +510,33 @@ impl MemoryStore {
             )
             .context("count_audit_for_test")?;
         Ok(n)
+    }
+
+    /// Test-only helper: the `payload` JSON of every `sleeptime_audit`
+    /// row of `kind` targeting `memory_id`, oldest first. Used by the
+    /// `memory_flag` tests to assert the D1 audit contract (one row per
+    /// applied flag, carrying before/after trust and the reason) without
+    /// exposing the raw SQLite connection.
+    #[doc(hidden)]
+    pub async fn audit_payloads_for_test(&self, kind: &str, memory_id: i64) -> Result<Vec<String>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload FROM sleeptime_audit
+                 WHERE kind = ?1 AND memory_id = ?2
+                 ORDER BY id ASC",
+            )
+            .context("preparing audit_payloads_for_test")?;
+        let rows = stmt
+            .query_map(rusqlite::params![kind, memory_id], |r| {
+                r.get::<_, String>(0)
+            })
+            .context("running audit_payloads_for_test")?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.context("reading audit payload")?);
+        }
+        Ok(out)
     }
 
     /// Set `trust_score` on an existing row. Panel `p` (pin) calls this
