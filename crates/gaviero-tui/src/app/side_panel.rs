@@ -878,7 +878,9 @@ pub(super) fn open_selected_git_file(app: &mut App) {
 /// * `/` activates search; printable chars type into the query; `Esc`
 ///    clears search.
 pub(super) fn handle_memory_panel_action(app: &mut App, action: Action) {
-    use crate::panels::memory_panel::{PanelPromptMode, PanelSection, ScopeChoice};
+    use crate::panels::memory_panel::{
+        PanelEditTarget, PanelPromptMode, PanelSection, ScopeChoice,
+    };
     use gaviero_core::memory::writer::PanelEditOp;
 
     // Inline `e` / `s` prompts hijack input until Enter / Esc.
@@ -959,21 +961,25 @@ pub(super) fn handle_memory_panel_action(app: &mut App, action: Action) {
     }
 
     // Pending delete confirmation short-circuits.
-    if let Some(memory_id) = app.memory_panel.confirm_delete_id {
+    if let Some(target) = app.memory_panel.confirm_delete.clone() {
         match action {
             Action::InsertChar('y') | Action::InsertChar('Y') => {
-                app.memory_panel.confirm_delete_id = None;
+                app.memory_panel.confirm_delete = None;
                 if let Some(writer) = app.memory_writer.as_ref().cloned() {
                     tokio::spawn(async move {
                         let _ = writer.enqueue(gaviero_core::memory::WriterMessage::PanelEdit {
-                            op: PanelEditOp::Delete { memory_id },
+                            op: PanelEditOp::Delete {
+                                memory_id: target.memory_id,
+                            },
+                            scope_level: target.scope_level,
+                            repo_id: target.repo_id,
                             ack: None,
                         });
                     });
                 }
             }
             Action::InsertChar('n') | Action::InsertChar('N') | Action::Quit => {
-                app.memory_panel.confirm_delete_id = None;
+                app.memory_panel.confirm_delete = None;
             }
             _ => {}
         }
@@ -1173,7 +1179,7 @@ pub(super) fn handle_memory_panel_action(app: &mut App, action: Action) {
                 .recent_rows
                 .get(app.memory_panel.recent_cursor)
             {
-                app.memory_panel.confirm_delete_id = Some(row.id);
+                app.memory_panel.confirm_delete = Some(PanelEditTarget::from_row(row));
             }
         }
         Action::InsertChar('p') if app.memory_panel.focused == PanelSection::RecentlyWritten => {
@@ -1184,12 +1190,15 @@ pub(super) fn handle_memory_panel_action(app: &mut App, action: Action) {
                     .cloned(),
                 app.memory_writer.clone(),
             ) {
+                let target = PanelEditTarget::from_row(&row);
                 tokio::spawn(async move {
                     let _ = writer.enqueue(gaviero_core::memory::WriterMessage::PanelEdit {
                         op: PanelEditOp::Pin {
-                            memory_id: row.id,
+                            memory_id: target.memory_id,
                             trust_score: 1.0,
                         },
+                        scope_level: target.scope_level,
+                        repo_id: target.repo_id,
                         ack: None,
                     });
                 });
@@ -1203,7 +1212,7 @@ pub(super) fn handle_memory_panel_action(app: &mut App, action: Action) {
                 .cloned()
             {
                 app.memory_panel.prompt_mode = PanelPromptMode::EditText {
-                    memory_id: row.id,
+                    target: PanelEditTarget::from_row(&row),
                     buffer: row.text,
                 };
             }
@@ -1223,7 +1232,7 @@ pub(super) fn handle_memory_panel_action(app: &mut App, action: Action) {
                     _ => ScopeChoice::Run,
                 };
                 app.memory_panel.prompt_mode = PanelPromptMode::SetScope {
-                    memory_id: row.id,
+                    target: PanelEditTarget::from_row(&row),
                     selected: current,
                 };
             }
@@ -1253,7 +1262,7 @@ fn commit_panel_prompt(app: &mut App) {
     };
 
     match mode {
-        PanelPromptMode::EditText { memory_id, buffer } => {
+        PanelPromptMode::EditText { target, buffer } => {
             let trimmed = buffer.trim().to_string();
             if trimmed.is_empty() {
                 return;
@@ -1261,17 +1270,16 @@ fn commit_panel_prompt(app: &mut App) {
             tokio::spawn(async move {
                 let _ = writer.enqueue(gaviero_core::memory::WriterMessage::PanelEdit {
                     op: PanelEditOp::UpdateText {
-                        memory_id,
+                        memory_id: target.memory_id,
                         new_text: trimmed,
                     },
+                    scope_level: target.scope_level,
+                    repo_id: target.repo_id,
                     ack: None,
                 });
             });
         }
-        PanelPromptMode::SetScope {
-            memory_id,
-            selected,
-        } => {
+        PanelPromptMode::SetScope { target, selected } => {
             let workspace_root = match app.workspace.roots().first().cloned() {
                 Some(r) => r,
                 None => return,
@@ -1307,9 +1315,13 @@ fn commit_panel_prompt(app: &mut App) {
             tokio::spawn(async move {
                 let _ = writer.enqueue(gaviero_core::memory::WriterMessage::PanelEdit {
                     op: PanelEditOp::SetScope {
-                        memory_id,
+                        memory_id: target.memory_id,
                         new_scope,
                     },
+                    // The row's *current* scope decides which DB owns it;
+                    // `new_scope` is where the op moves it to.
+                    scope_level: target.scope_level,
+                    repo_id: target.repo_id,
                     ack: None,
                 });
             });
