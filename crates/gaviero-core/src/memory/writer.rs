@@ -4,7 +4,7 @@
 //! behind `WriterHandle`; swapping mpsc for an IPC channel would touch only
 //! this file. Callers never hold a `MemoryStore` reference for writes — they
 //! enqueue a `WriterMessage` and, if they need confirmation, await the
-//! optional `oneshot` ack with a 500ms timeout.
+//! optional `oneshot` ack under [`ACK_TIMEOUT_MS`].
 //!
 //! Lock discipline: the writer task body never holds a `tokio::sync::Mutex`
 //! guard across an `await`, tree-sitter call, or filesystem I/O. Embedding
@@ -30,7 +30,17 @@ use super::stores::MemoryStores;
 use super::trust_defaults::MemorySource;
 
 /// Default ack timeout for synchronous variants.
-pub const ACK_TIMEOUT_MS: u64 = 500;
+///
+/// Sized for the slowest thing a handler does before it can ack, not the
+/// fastest. Every acked variant reaches `store_scoped` — an ONNX embed
+/// plus up to three cosine dedup scans — or a bulk store operation, and
+/// the clock starts at *enqueue*, so time spent waiting behind other
+/// messages counts against it too. At the previous 500ms one slow embed
+/// made every message queued behind it report a spurious timeout while
+/// the writer was still committing them, and the caller had no way to
+/// tell that from a real failure. Matches the 30s the restore, forget,
+/// and redact paths already use for the same reason.
+pub const ACK_TIMEOUT_MS: u64 = 30_000;
 
 /// Outcome of a processed write message.
 #[derive(Debug, Clone)]
@@ -367,11 +377,20 @@ impl WriterHandle {
     }
 
     async fn await_ack(rx: oneshot::Receiver<Result<WriteResult, String>>) -> Result<WriteResult> {
-        match tokio::time::timeout(Duration::from_millis(ACK_TIMEOUT_MS), rx).await {
+        Self::await_ack_within(rx, Duration::from_millis(ACK_TIMEOUT_MS)).await
+    }
+
+    /// [`Self::await_ack`] with a caller-supplied budget, for call sites
+    /// that consolidate several writes under one overall deadline.
+    async fn await_ack_within(
+        rx: oneshot::Receiver<Result<WriteResult, String>>,
+        budget: Duration,
+    ) -> Result<WriteResult> {
+        match tokio::time::timeout(budget, rx).await {
             Ok(Ok(Ok(r))) => Ok(r),
             Ok(Ok(Err(e))) => Err(anyhow!(e)),
             Ok(Err(_)) => Err(anyhow!("writer dropped ack channel")),
-            Err(_) => Err(anyhow!("writer ack timeout after {}ms", ACK_TIMEOUT_MS)),
+            Err(_) => Err(anyhow!("writer ack timeout after {}ms", budget.as_millis())),
         }
     }
 
@@ -415,6 +434,26 @@ impl WriterHandle {
         content: impl Into<String>,
         meta: WriteMeta,
     ) -> Result<WriteResult> {
+        self.swarm_consolidate_wait_within(
+            scope,
+            content,
+            meta,
+            Duration::from_millis(ACK_TIMEOUT_MS),
+        )
+        .await
+    }
+
+    /// [`Self::swarm_consolidate_wait`] bounded by an explicit budget.
+    /// Consolidation promotes a whole run's worth of rows one message at
+    /// a time and must still terminate, so it spends a single wall-clock
+    /// budget across the batch rather than [`ACK_TIMEOUT_MS`] per row.
+    pub async fn swarm_consolidate_wait_within(
+        &self,
+        scope: WriteScope,
+        content: impl Into<String>,
+        meta: WriteMeta,
+        budget: Duration,
+    ) -> Result<WriteResult> {
         let (tx, rx) = oneshot::channel();
         self.enqueue(WriterMessage::SwarmConsolidate {
             scope,
@@ -422,7 +461,7 @@ impl WriterHandle {
             meta,
             ack: Some(tx),
         })?;
-        Self::await_ack(rx).await
+        Self::await_ack_within(rx, budget).await
     }
 
     /// Delete all memories associated with a run through the writer task.
