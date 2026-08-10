@@ -178,7 +178,6 @@ impl AcpPipeline {
         );
         Ok(())
     }
-
 }
 
 /// Create a write proposal through the Write Gate.
@@ -213,7 +212,12 @@ pub(crate) async fn propose_write(
         let mut gate = write_gate.lock().await;
         let path_str = rel_path.to_string_lossy();
         if !gate.is_scope_allowed(agent_id, &path_str) {
-            tracing::warn!("Scope rejected for {}", rel_path.display());
+            tracing::warn!(
+                "Scope rejected: agent '{}' may not write '{}' (owned: {:?})",
+                agent_id,
+                rel_path.display(),
+                gate.owned_paths_for(agent_id)
+            );
             return Ok(());
         }
         let peers = gate.conflict_candidates_for_path(&abs_path);
