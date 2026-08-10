@@ -116,7 +116,7 @@ Authoritative inventory: [`app/commands.rs`](src/app/commands.rs) + chat helpers
 
 ## Concurrency
 
-Single-threaded UI + async producers. **No `Mutex` in TUI state.** Observers clone `Arc` senders into core tasks. Memory panel destructive ops enqueue `WriterMessage::PanelEdit` and await a 500 ms oneshot. Topology cache uses `RwLock` write from a tokio task.
+Single-threaded UI + async producers. **No `Mutex` in TUI state.** Observers clone `Arc` senders into core tasks. Memory panel destructive ops enqueue `WriterMessage::PanelEdit` with `ack: None`. Topology cache uses `RwLock` write from a tokio task.
 
 ---
 
