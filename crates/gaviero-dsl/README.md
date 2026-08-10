@@ -158,10 +158,62 @@ All compile functions return `Result<CompiledPlan, miette::Report>` with source 
 ### Language surface (summary)
 
 - **Client** — model + tier + effort + optional `extra {}` provider pairs
-- **Agent** — scope, prompt, dependencies, `context {}`, `memory {}`, `tools []`
+- **Agent** — scope, prompt, dependencies, `produces []`, `context {}`, `memory {}`, `tools []`
 - **Workflow** — steps, `verify {}`, iteration strategy, explicit `loop {}` blocks
 - **Include** — splice shared declarations; cycles rejected; requires `compile_file`
 - **Scope** — `owned`, `read_only`, `impact_scope` with glob patterns
+- **Produces** — exact artefact paths the agent must have written when its turn
+  ends; enforced by the runtime, not by the prompt
+
+### Output contracts (`produces`)
+
+```
+agent reviewer-refine {
+    scope { owned ["{{OUT_DIR}}/{{REVIEWER_ID}}-summary-v*.md"] }
+    produces ["{{OUT_DIR}}/{{REVIEWER_ID}}-summary-v{{ITER}}.md"]
+}
+```
+
+Unlike `owned` these are literal paths, not globs. Compile-time vars are
+substituted as usual; `{{ITER}}` / `{{PREV_ITER}}` survive to the runtime and
+are substituted per loop pass, so one declaration covers every iteration.
+
+Two checks enforce it, neither of which costs a model call:
+
+- **Per agent** — an agent that ends its turn with a declared path missing or
+  empty gets one corrective retry, then a `Failed` manifest. Without this,
+  a model that narrates a file it never wrote, a proposal dropped by scope,
+  and a genuine success are all indistinguishable `Completed` manifests.
+- **Per loop iteration** — a `loop { until agent … }` refuses to invoke its
+  judge unless every body agent delivered that pass, and aborts the run naming
+  the agent and the missing paths. A judge scoring a panel that silently lost
+  a member returns a meaningless verdict and burns the iteration budget.
+
+Agents that declare no `produces` fall back to a weaker check: the loop
+verifies that *something* the agent owns changed during the pass.
+
+### Termination (`timeout`, `irreconcilable_after`)
+
+```
+agent reviewer { timeout 3600 }              # per-dispatch budget, seconds
+workflow w { steps [ loop { irreconcilable_after 2 } ] }
+```
+
+`timeout` bounds one dispatch of an agent — every retry included — and defaults
+to 3600s. It is what makes a run finite: provider sessions only give up when
+their subprocess *exits*, so a wedged-but-alive CLI otherwise hangs the workflow
+with no upper bound. `timeout 0` opts out. A blown budget becomes a `Failed`
+manifest, not an error, so the delivery gate and loop verdict handle it normally.
+`gaviero-cli --run-timeout <secs>` adds an outer cap on the whole run.
+
+`irreconcilable_after` is the failure-side mirror of `stability`: N consecutive
+PASS verdicts mean the agreement is real, and N consecutive *identical* blocking
+disagreements mean the deadlock is structural. Either that counter or an
+explicit `"verdict": "irreconcilable"` from the judge stops the loop and writes
+`consensus-irreconcilable.md` — one section per reviewer, from the judge's
+`blockers` array. Repeat detection fingerprints the blockers' agent/criterion
+pairing rather than the prose, so a judge rephrasing itself does not reset the
+count. `0` disables it.
 - **Params** — typed `param` on workflows; roster `id=provider:model[@effort],…`
 
 Full language reference: see the prior detailed blocks in [ARCHITECTURE.md](ARCHITECTURE.md) or browse `examples/`.

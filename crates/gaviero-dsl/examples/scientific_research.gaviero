@@ -17,15 +17,15 @@
 //     anchor document ({{PLAN_FILE}}) plus any optional local material
 //     under {{DATA_DIR}} / {{LOCAL_LIT_DIR}}, performs extensive
 //     independent literature research (Semantic Scholar MCP and/or web
-//     tools — see "Research channels"), and writes (a) a conclusion
-//     document and (b) an evidence log. Reviewers do NOT read each
-//     other's work in this phase — the point is an independent
-//     baseline.
+//     tools — see "Research channels"), and writes (a) a standalone
+//     conclusion document carrying its own bibliography and (b) a
+//     production summary. Reviewers do NOT read each other's work in
+//     this phase — the point is an independent baseline.
 //
 //   Phase 2 (loop up to 10): each reviewer reads every peer's prior
-//     conclusion + summary + evidence, performs ADDITIONAL targeted
-//     literature research, and writes a new conclusion, comparison
-//     summary, and evidence log. After each pass `convergence-judge`
+//     conclusion + summary, performs ADDITIONAL targeted literature
+//     research, and writes a new conclusion and a new production
+//     summary. After each pass `convergence-judge`
 //     (sonnet) classifies the iteration; the loop exits on PASS after
 //     `stability` consecutive passes, or hits `max_iterations 10`.
 //
@@ -33,8 +33,8 @@
 //
 //   `execution_mode document` — one shared working directory, no git
 //   worktrees, no branch merge, no repo-map. This is load-bearing, not
-//   a preference: refine agents read every peer's prior conclusion,
-//   summary, and evidence, and worktrees are merged only *after* the
+//   a preference: refine agents read every peer's prior conclusion
+//   and summary, and worktrees are merged only *after* the
 //   loop exits. Under the default `repo` mode each reviewer would see
 //   an empty {{OUT_DIR}}/ and every refine pass would silently degrade
 //   to a solo pass with no error raised.
@@ -42,6 +42,43 @@
 //   Parallelism is unaffected: each reviewer's `owned` globs are
 //   prefixed with its own {{REVIEWER_ID}}, so the scope enforcer keeps
 //   concurrent writes disjoint. Never drop that id prefix.
+//
+// Anchor precedence:
+//
+//   {{PLAN_FILE}} is the run's ONLY source of truth. It alone fixes
+//   what the panel studies.
+//
+//   `--prompt` ({{PROMPT}}) is a run label: a short human-readable
+//   string for logs, agent descriptions, and memory entries. It has
+//   no authority. When the label and the anchor appear to name
+//   different subjects, the anchor wins — every prompt in this file
+//   says so explicitly, because a reviewer left to resolve it alone
+//   will not resolve it the same way as its peers.
+//
+//   That is not hypothetical. A run whose label was a CS-education
+//   topic and whose anchor was a software feature brief produced two
+//   conclusions about two different subjects: one reviewer read the
+//   label as authoritative (on the ground that the anchor asked for
+//   an implementation roadmap these rules forbid), the other read the
+//   anchor as authoritative and forced it into the nearest permitted
+//   category. Both diagnosed the mismatch correctly; neither could
+//   converge with the other, because they were not studying the same
+//   thing. Two frontier iterations went into arguing about which CLI
+//   argument wins.
+//
+//   An anchor the panel cannot use is a reportable defect, never a
+//   licence to substitute a subject. Reviewers name the defect in
+//   their summary's `## Problems found` and analyse what the anchor
+//   does name; the judge returns `irreconcilable` with
+//   `criterion: framing` the first time it sees a split subject or an
+//   unusable anchor, so the run stops after one iteration with an
+//   actionable hand-off instead of burning the panel's budget.
+//
+//   Practical consequence: pick the anchor first and let the label
+//   describe it. A software-engineering brief (implementation plan,
+//   PR decomposition, module ownership) is not a valid anchor for
+//   this workflow at all — its Hard rules forbid producing that
+//   artefact. Use a plan-refinement workflow for those.
 //
 // Anchoring (two ways to run — omit `--repo` in both):
 //
@@ -63,7 +100,7 @@
 //   or when no MCP server is configured. Set
 //   `--var ENABLE_WEB_FALLBACK=false` for an MCP-only panel; a
 //   reviewer left without any working channel must say so in its
-//   evidence log and rely on local material.
+//   summary and rely on local material.
 //
 //   Configure the MCP server any one of these ways:
 //     --mcp-url semantic-scholar=URL
@@ -100,31 +137,99 @@
 //
 // Files written per iteration N (N=1 for init, N=2..11 for refinement):
 //
-//   {{OUT_DIR}}/<id>-conclusion-v{N}.md      (init + every refine pass)
-//   {{OUT_DIR}}/<id>-summary-v{N}.md         (refine only — iteration metadata)
-//   {{OUT_DIR}}/<id>-evidence-v{N}.md        (init + every refine pass — audit log)
+//   {{OUT_DIR}}/<id>-conclusion-v{N}.md      (the deliverable)
+//   {{OUT_DIR}}/<id>-summary-v{N}.md         (the production log)
 //
-//   Artefacts are write-once: create each versioned file exactly once,
-//   read it later, never overwrite a prior version. They are scratch
-//   outputs, not meant to be committed.
+//   Exactly two files, every iteration including init. Artefacts are
+//   write-once: create each versioned file exactly once, read it
+//   later, never overwrite a prior version. They are scratch outputs,
+//   not meant to be committed.
 //
-// Conclusion / summary / evidence contract:
-//   - conclusion: standalone hand-off document. No peer ids, no
-//     version numbers, no iteration narrative. Pure deliverable.
-//   - summary: every iteration-meta lives here — convergence status,
-//     comparison findings, what changed, what was rejected, remaining
-//     research questions. The judge's cheap path reads only summaries.
-//   - evidence: search strategy, sources, claim-to-source mapping. The
-//     audit trail; never read by the judge but available for borderline
-//     escalation and for the human handoff at the end.
+//   Both templates declare these paths in a `produces [...]` block, so
+//   the contract is enforced by the runtime rather than trusted to the
+//   prompt. Two checks, neither of which costs a model call:
+//
+//     - Per agent: a reviewer that ends its turn without writing both
+//       files (or writes an empty one) gets one corrective retry and
+//       then a Failed manifest — instead of "completed, 0 files".
+//     - Per iteration: the loop refuses to invoke `convergence-judge`
+//       unless every reviewer delivered this pass, and aborts the run
+//       naming the reviewer and the missing paths. A judge scoring a
+//       panel that silently lost a member returns a meaningless
+//       verdict and burns the whole iteration budget doing it.
+//
+//   `{{ITER}}` in a `produces` path is substituted per pass, so writing
+//   the previous version does not satisfy the contract.
+//
+// Termination:
+//
+//   The run is finite by construction, not by hoping every agent
+//   returns. Three independent bounds, none of which costs a model
+//   call:
+//
+//     1. `timeout 3600` on each reviewer template caps one dispatch.
+//        This is the load-bearing one. Provider sessions only give up
+//        when their subprocess *exits*; a wedged-but-alive CLI keeps
+//        the idle loop spinning forever, which is exactly how a run
+//        freezes after the last iteration. With a per-dispatch cap the
+//        worst case is (1 + max_iterations) x (reviewers x timeout +
+//        judge_timeout) — large, but finite.
+//     2. `max_iterations 10` caps how many passes can happen at all.
+//     3. `gaviero-cli --run-timeout <secs>` caps the whole run. It
+//        stops between agents and keeps everything written so far, so
+//        re-running resumes rather than restarting.
+//
+//   A reviewer that blows its budget becomes a Failed manifest, which
+//   the delivery gate then turns into a clean abort naming it — the
+//   run stops with a diagnosis instead of hanging.
+//
+// Stopping early on a deadlock:
+//
+//   `irreconcilable_after 2` — a panel can disagree for reasons no
+//   further iteration will resolve: the reviewers agree on the
+//   evidence and still differ on values, or the deciding experiment
+//   has not been run. Two mechanisms catch that, and either stops the
+//   loop and writes {{OUT_DIR}}/consensus-irreconcilable.md — one
+//   section per reviewer, giving its position, who it conflicts with,
+//   which convergence criterion is at stake, and what evidence would
+//   settle it:
+//
+//     - The judge returns `"verdict": "irreconcilable"` with a
+//       `blockers` array (see the judge prompt for the schema and the
+//       test it applies).
+//     - The runtime notices the judge reporting the *same* blocking
+//       disagreement twice running, whatever verdict it returns.
+//       Fingerprinting is on the blockers' agent/criterion pairing,
+//       not the prose, so rephrasing does not reset the count.
+//
+//   One case skips the wait: a panel that is not studying one
+//   subject, or that reports the anchor as unusable, is a broken
+//   input rather than a disagreement, so the judge is told to return
+//   `irreconcilable` on the FIRST iteration where it appears (see
+//   "Anchor precedence"). `irreconcilable_after` still governs every
+//   genuine deadlock.
+//
+//   This is the failure-side mirror of `stability 2`: two identical
+//   FAILs mean the disagreement is structural, exactly as two
+//   consecutive PASSes mean the agreement is real. Set it to 0 to
+//   disable and let the panel run to `max_iterations`.
+//
+// Conclusion / summary contract:
+//   - conclusion: standalone hand-off document, complete on its own —
+//     no peer ids, no version numbers, no iteration narrative, and no
+//     reference to any other document. Its only external references
+//     are the sources in its own `## Bibliography` section.
+//   - summary: how that conclusion was produced. Every bit of history
+//     lives here — convergence status, problems found, comparison
+//     findings, what changed, what was rejected, the literature
+//     research performed this pass, remaining research questions. The
+//     judge's cheap path reads only summaries.
 //
 // Inputs (set via --var):
 //   PLAN_FILE     — the anchor document: a problem statement or a
-//                   draft research plan (see above). The {{PROMPT}}
-//                   CLI argument is treated as a short topic title;
-//                   the substantive description lives in this file so
-//                   every reviewer anchors to the same source of
-//                   truth. (default: research_problem.md)
+//                   draft research plan (see above). This is the
+//                   run's only source of truth — see "Anchor
+//                   precedence". (default: research_problem.md)
 //   OUT_DIR       — directory for all generated files. (default:
 //                   research; plan-anchored runs default it to the
 //                   plan's own folder instead)
@@ -197,8 +302,9 @@
 
 // ── Shared configuration ──────────────────────────────────────────────────────
 //
-// PLAN_FILE: the external anchor document. {{PROMPT}} from the CLI is
-// the short title; the substantive description lives in this file.
+// PLAN_FILE: the external anchor document — the run's only source of
+// truth. {{PROMPT}} from the CLI is a non-authoritative label; see
+// "Anchor precedence" in the header.
 //
 // DATA_DIR / LOCAL_LIT_DIR: optional local context. When the directories
 // don't exist or are empty, agents fall back to literature research +
@@ -222,8 +328,8 @@ vars {
 // ── Prompts ───────────────────────────────────────────────────────────────────
 //
 // Three prompts:
-//   - init-body:     independent first pass, conclusion + evidence
-//   - refine-body:   peer-aware refinement, conclusion + summary + evidence
+//   - init-body:     independent first pass, conclusion + summary
+//   - refine-body:   peer-aware refinement, conclusion + summary
 //   - judge-body:    two-pass convergence judgement
 //
 // All three reference {{REVIEWER_ID}} (the roster entry id),
@@ -234,8 +340,16 @@ vars {
 prompt init-body #"
     You are an independent senior scientific research strategist.
 
-    Short topic title: {{PROMPT}}
-    Anchor document: {{PLAN_FILE}}
+    Run label (NOT a source of truth): {{PROMPT}}
+    Anchor document — the subject of this study: {{PLAN_FILE}}
+
+    Precedence, before anything else. {{PLAN_FILE}} defines what is
+    being studied. The run label above is a short human-readable
+    string for logs and filenames only; it carries no authority, it
+    may be stale, and it may name something else entirely. If the two
+    appear to name different subjects, the anchor wins — without
+    exception. Never adopt the label's subject, never blend the two,
+    and never read the label as a hint about scope.
 
     Research channels:
       - Semantic Scholar MCP server id: {{SEMANTIC_SCHOLAR_SERVER}}
@@ -262,12 +376,25 @@ prompt init-body #"
        Either way, do NOT paraphrase loosely; every downstream
        conclusion you draw must trace back to something in that file.
 
+       If the anchor turns out to be unusable — it falls outside what
+       a scientific research study can address, it asks only for an
+       artefact the Hard rules below forbid, or it is too ambiguous
+       to yield a research question — then that is your finding, and
+       reporting it is the deliverable. Still write both files: name
+       the defect as the FIRST item of the summary's
+       `## Problems found`, state precisely what the operator must
+       change in {{PLAN_FILE}}, and give the best analysis you can of
+       the subject the anchor actually names. Do NOT fall back to the
+       run label's subject, and do NOT invent a research question the
+       anchor does not contain. A broken anchor is a defect for the
+       operator to fix, never a gap for you to fill.
+
     2. Inspect {{DATA_DIR}}/ and {{LOCAL_LIT_DIR}}/ for relevant local
        material. Treat any local data as evidence to be characterised,
        not as proof. If a directory does not exist, skip it.
 
     3. Do NOT read any peer outputs (other reviewers' conclusion /
-       summary / evidence files) under {{OUT_DIR}}/. This is the
+       summary files) under {{OUT_DIR}}/. This is the
        independent first pass; peer analyses arrive only in the refine
        phase. Reading {{PLAN_FILE}} is fine even when it lives
        inside {{OUT_DIR}}/.
@@ -304,8 +431,8 @@ prompt init-body #"
         ill-posed or where the available data is likely insufficient.
       - Distinguish what is known from what is inferred.
       - Do NOT invent citations, datasets, or results. If no research
-        channel is available, state that explicitly in the evidence
-        log and rely only on local material.
+        channel is available, state that explicitly in the summary
+        and rely only on local material.
       - Do NOT optimise for agreement; optimise for truth and for
         useful next research actions.
       - The scientific topic has no relationship to whatever
@@ -315,6 +442,10 @@ prompt init-body #"
       - Do NOT produce an implementation roadmap (no code modules,
         PR phases, or software-project decomposition) — this holds
         for draft-plan anchors too.
+      - {{PLAN_FILE}} is the only thing that fixes the subject. If
+        you find yourself analysing something the anchor does not
+        describe, stop and re-read it. An anchor you cannot use is a
+        reportable defect, not a licence to pick your own subject.
 
     Write TWO files. Create each exactly once with the version suffix
     below; never edit or overwrite a file from a prior iteration or
@@ -331,8 +462,12 @@ prompt init-body #"
       - `## Data and literature gaps`
       - `## Proposed research programme`
       - `## Decision points and stopping criteria`
+      - `## Bibliography`
 
     Requirements for File 1:
+      - The document must stand entirely on its own: a reader with
+        only this file (and the sources its bibliography points to)
+        has everything. No pointers to any other document.
       - Rank the best avenues for advance.
       - For each avenue, state the central hypothesis, evidence
         needed, expected upside, main risks, first decisive experiment
@@ -341,25 +476,28 @@ prompt init-body #"
       - Decision points and stopping criteria must be specific enough
         to act on — e.g. "abandon if SNR < 3σ on dataset X" rather
         than "abandon if results are weak".
-
-    File 2 — the evidence log:
-      {{OUT_DIR}}/{{REVIEWER_ID}}-evidence-v{{INIT_VER}}.md
-
-    It must contain exactly these sections, in this order:
-      - `## Search strategy`
-      - `## Sources reviewed`
-      - `## Evidence extracted`
-      - `## Claims needing verification`
-      - `## Research limitations`
-
-    Requirements for File 2:
-      - List the search queries, Semantic Scholar MCP tool calls, and
-        discovery paths used.
-      - For each source, include title, authors (when available),
-        venue/source, year/date, URL or DOI, and the specific claim it
-        supports or weakens.
-      - Mark each source as `local`, `web`, `peer-reviewed`,
+      - `## Bibliography` lists every source the document relies on:
+        title, authors (when available), venue/source, year/date, URL
+        or DOI. Mark each as `local`, `web`, `peer-reviewed`,
         `preprint`, `dataset`, `standard`, or `report` when possible.
+        Every claim in the body must trace to the anchor, local
+        material, or a bibliography entry.
+
+    File 2 — the production summary:
+      {{OUT_DIR}}/{{REVIEWER_ID}}-summary-v{{INIT_VER}}.md
+
+    This is the log of how File 1 was produced. It must contain
+    exactly these sections, in this order:
+      - `## How this version was produced` — state that this is the
+        independent first pass (no peer input), which anchor kind you
+        detected, and how you approached it.
+      - `## Search strategy` — the search queries, Semantic Scholar
+        MCP tool calls, and discovery paths used, and which channels
+        were actually available.
+      - `## Problems found` — where the anchor is ambiguous,
+        ill-posed, or under-specified; claims you could not verify;
+        evidence that surprised you.
+      - `## Research limitations` — what you could not cover and why.
 
     Aim for depth over breadth. A 3000-word conclusion engaging
     seriously with 15 sources beats a 1500-word conclusion name-dropping
@@ -369,9 +507,17 @@ prompt init-body #"
 prompt refine-body #"
     You are refining your independent scientific research conclusion.
 
-    Short topic title: {{PROMPT}}
-    Anchor document: {{PLAN_FILE}}
+    Run label (NOT a source of truth): {{PROMPT}}
+    Anchor document — the subject of this study: {{PLAN_FILE}}
     Optional local material: {{DATA_DIR}}/ and {{LOCAL_LIT_DIR}}/
+
+    Precedence, before anything else. {{PLAN_FILE}} defines what is
+    being studied. The run label above is a short human-readable
+    string for logs and filenames only; it carries no authority, it
+    may be stale, and it may name something else entirely. If the two
+    appear to name different subjects, the anchor wins — without
+    exception. Never adopt the label's subject, never blend the two,
+    and never read the label as a hint about scope.
 
     Research channels:
       - Semantic Scholar MCP server id: {{SEMANTIC_SCHOLAR_SERVER}}
@@ -386,21 +532,33 @@ prompt refine-body #"
        truth — every conclusion must trace back to a constraint,
        datum, or goal listed there.
 
+       Every reviewer on this panel was given the same anchor, so all
+       of you are studying the same subject. If a peer's conclusion
+       is about something the anchor does not describe — the run
+       label's subject, say — that is a DEFECT in that peer's output,
+       not a position to be adjudicated. Record it under
+       `## Merits of each proposal`, keep your own analysis anchored,
+       and do not move toward it; a panel cannot converge by picking
+       a subject. Likewise, if the anchor itself is unusable (see the
+       init instructions), every reviewer should be reporting that
+       same defect rather than each choosing a different way around
+       it — state the defect and what the operator must change, and
+       do not negotiate a substitute subject with your peers.
+
     2. Read your own previous work:
          - {{OUT_DIR}}/{{REVIEWER_ID}}-conclusion-v{{PREV_ITER}}.md
-         - {{OUT_DIR}}/{{REVIEWER_ID}}-evidence-v{{PREV_ITER}}.md
-       When {{PREV_ITER}} >= 2, also re-read your previous summary:
          - {{OUT_DIR}}/{{REVIEWER_ID}}-summary-v{{PREV_ITER}}.md
+       (Every iteration, including the v1 init pass, writes both.)
 
     3. Read every peer's previous work IN FULL.
 
 {{PEER_READ_BLOCK}}
 
-       Additionally, for each peer id in {{PEER_IDS}}, read
-         {{OUT_DIR}}/<peer>-evidence-v{{PREV_ITER}}.md
-       so you can verify the sources behind their claims. (The
-       generated list above shows conclusion + summary; the evidence
-       log lives under the same `-evidence-v{{PREV_ITER}}.md` suffix.)
+       Do read peer summaries even for v1 — the init pass writes one
+       too, and it carries that peer's search trail and the problems
+       they found. A peer's sources live in their conclusion's
+       `## Bibliography` and their summary's research sections; use
+       them to verify the claims behind each peer's argument.
 
     4. Conduct ADDITIONAL targeted literature research this iteration
        through the same channels (Semantic Scholar MCP first; web
@@ -418,9 +576,9 @@ prompt refine-body #"
            summaries.
 
        Each refinement pass MUST be backed by fresh searches, not just
-       re-reading the prior trio. A refinement that adds no new sources
-       adds no new signal — the whole point of iterating is to deepen
-       the evidence base.
+       re-reading the prior documents. A refinement that adds no new
+       sources adds no new signal — the whole point of iterating is to
+       deepen the evidence base.
 
     Then synthesise:
 
@@ -461,9 +619,9 @@ prompt refine-body #"
            changes needed to close the actual gaps — do not invent
            additional refinements beyond what the disagreements demand.
 
-    Outputs to write this pass — THREE files. Write NEW versioned
-    paths for this iteration only (`-v{{ITER}}`); never modify files
-    from earlier iterations (including your own).
+    Outputs to write this pass — exactly TWO files. Write NEW
+    versioned paths for this iteration only (`-v{{ITER}}`); never
+    modify files from earlier iterations (including your own).
 
     7. The conclusion:
        {{OUT_DIR}}/{{REVIEWER_ID}}-conclusion-v{{ITER}}.md
@@ -476,15 +634,26 @@ prompt refine-body #"
          - `## Data and literature gaps`
          - `## Proposed research programme`
          - `## Decision points and stopping criteria`
+         - `## Bibliography`
 
        Same shape as the init body — this is the document a human
        reviewer would read at the end of the run. Hard rules — failing
        any of these makes the conclusion unfit for hand-off:
          - Present your current best conclusion as a standalone
-           document. Rank the avenues for advance. For each avenue,
+           document, complete without reading anything else: no
+           pointers to other files, no assumed context beyond the
+           anchor. Rank the avenues for advance. For each avenue,
            state hypothesis, evidence needed, expected upside, main
            risks, first decisive experiment or analysis, and stopping
            criteria.
+         - `## Bibliography` is the ONLY place external references
+           live: every source the body relies on, with title, authors
+           (when available), venue/source, year/date, URL or DOI, and
+           a `local` / `web` / `peer-reviewed` / `preprint` /
+           `dataset` / `standard` / `report` mark when possible.
+           Carry forward the bibliography entries that still back the
+           document — the previous version's bibliography is your
+           starting point, not a reference target.
          - Do NOT write "I previously said X but now…", "peer Y
            proposed Z which I reject…", or any first-person iteration
            narrative.
@@ -497,10 +666,15 @@ prompt refine-body #"
        All iteration metadata, peer comparison, and version references
        belong in the summary file (step 8) — never the conclusion.
 
-    8. The comparison summary:
+    8. The production summary:
        {{OUT_DIR}}/{{REVIEWER_ID}}-summary-v{{ITER}}.md
 
-       Keep it under ~900 words. Use these sections, in this order:
+       Everything about HOW this version came to be lives here and
+       only here: the iteration history, the problems found, what was
+       agreed and what was not, and the research that backed it. Keep
+       it under ~1200 words, with the consensus sections first and
+       tight — the judge's cheap pass reads only the top of this file.
+       Use these sections, in this order:
          - `## Consensus status` — the very first sentence MUST be
            EXACTLY one of these two strings, with no other content
            before it:
@@ -534,38 +708,35 @@ prompt refine-body #"
          - `## Changes made in this iteration` — what you changed in
            your conclusion this pass and why. If you copied the
            previous version verbatim, say so here too.
+         - `## Research performed this iteration` — the search
+           queries, Semantic Scholar MCP tool calls, and discovery
+           paths used this pass; the new or revalidated sources (one
+           line each: title, venue, year, URL or DOI) and which claim
+           each supports or weakens; which prior claims this pass
+           strengthened or weakened; and any channel limitations. If
+           the panel converged and you ran only verification searches,
+           say so in one line.
          - `## Remaining research questions` — the disagreements you
            expect the next iteration to address. Empty list if
            converged.
 
        Write the summary for a human skimming the iteration evolution.
-
-    9. The evidence log:
-       {{OUT_DIR}}/{{REVIEWER_ID}}-evidence-v{{ITER}}.md
-
-       Exactly these sections, in this order:
-         - `## New search strategy`
-         - `## New or revalidated sources`
-         - `## Evidence extracted`
-         - `## Claims strengthened`
-         - `## Claims weakened`
-         - `## Research limitations`
-
-       Requirements:
-         - Include the search queries, Semantic Scholar MCP tool
-           calls, and discovery paths used this iteration.
-         - For each source, include title, authors (when available),
-           venue/source, year/date, URL or DOI, and the specific
-           claim it supports or weakens.
-         - Clearly mark sources as newly discovered or revalidated.
 "#
 
 prompt judge-body #"
     You are deciding whether a panel of independently refined scientific
     research conclusions has reached consensus for:
 
-    Topic:           {{PROMPT}}
-    Anchor document: {{PLAN_FILE}}
+    Run label (NOT a source of truth): {{PROMPT}}
+    Anchor document — the subject under study: {{PLAN_FILE}}
+
+    The anchor defines the subject. The run label is a short string
+    for logs; it carries no authority and may name something else
+    entirely. A reviewer whose conclusion studies the label's
+    subject — or any subject the anchor does not describe — has
+    produced a DEFECTIVE artefact, not a competing position. Never
+    score that as a substantive disagreement for further iterations
+    to resolve; see the IRRECONCILABLE rule below.
 
     {{ITER_EVIDENCE}}
 
@@ -583,12 +754,15 @@ prompt judge-body #"
     1. Read every reviewer's summary for iteration {{ITER}}. The files
        live under {{OUT_DIR}}/ and match the glob:
          {{OUT_DIR}}/*-summary-v{{ITER}}.md
-       Each summary is ≤ ~900 words and carries the convergence
-       status, comparison findings, changes, and remaining open
-       questions for this pass.
+       Each summary is ≤ ~1200 words with the consensus sections at
+       the top; it carries the convergence status, comparison
+       findings, changes, the research log, and remaining open
+       questions for this pass. You normally only need the top
+       consensus sections — the trailing research log is for peers
+       and the human handoff.
 
-    2. From the summaries alone, classify the iteration (strict
-       consensus — only `pass` or `fail`, never partial):
+    2. From the summaries alone, classify the iteration (`pass`,
+       `fail`, or `irreconcilable` — never partial):
 
        - **PASS**: EVERY summary's first sentence is exactly
          `Consensus reached.`. A single `Consensus not reached.`
@@ -597,10 +771,48 @@ prompt judge-body #"
          minor editorial tweaks — those do not negate consensus.
 
        - **FAIL**: ANY summary's first sentence is exactly
-         `Consensus not reached.`. Read that reviewer's
+         `Consensus not reached.`, AND the disagreement still looks
+         closable by another round of evidence. Read that reviewer's
          `## Why consensus was not reached` (and
          `## Substantive disagreements`) for the reason; you do not
          need Pass 2 unless summaries are contradictory or evasive.
+
+       - **IRRECONCILABLE**: consensus was not reached AND another
+         round would not change that. Return this — do not spend the
+         panel's remaining budget — when any of these hold:
+
+           * the same substantive disagreement appears in this
+             iteration and in v{{PREV_ITER}}, restated rather than
+             narrowed (compare the `## Substantive disagreements`
+             sections of both);
+           * the reviewers agree on the evidence and still reach
+             opposite conclusions — the conflict is about values,
+             risk tolerance, or interpretation, not about facts;
+           * the evidence that would settle it does not exist yet
+             (an unrun experiment, an unpublished dataset), so no
+             amount of further literature search can adjudicate it;
+           * the anchor document is ambiguous on the exact point in
+             dispute, so the panel is arguing about the question
+             rather than the answer;
+           * **the panel is not studying one subject** — reviewers
+             analysed different endeavours, or one or more reported
+             the anchor as unusable, out of scope, or too ambiguous
+             to yield a research question. This is a broken input,
+             and no iteration repairs a broken input. Return
+             IRRECONCILABLE the FIRST time it appears — do not wait
+             for it to repeat — with `criterion` set to `framing`
+             and `evidence_gap` naming exactly what the operator must
+             change in {{PLAN_FILE}} or in the run's parameters.
+             Emit one blocker per affected reviewer so the hand-off
+             document names them.
+
+         Being reluctant to declare this is expensive: every extra
+         iteration re-derives the same deadlock at frontier-model
+         rates. Being hasty is also expensive — a disagreement that
+         is merely *unresolved after one pass* is a FAIL, not an
+         impasse. The distinguishing test is whether you can name the
+         specific evidence that would settle it and whether that
+         evidence is reachable this run.
 
        - **Borderline**: first sentences disagree with body content,
          or some summaries lack `## Why consensus was not reached`
@@ -625,19 +837,48 @@ prompt judge-body #"
        DO NOT block convergence — they are expected artefacts of
        independent literature reviews.
 
-    6. Otherwise return FAIL.
+    6. Otherwise return FAIL, or IRRECONCILABLE if the step-2 test for
+       a structural deadlock applies.
 
     Output format — emit exactly one fenced JSON object as your last
-    output. Keep the reason terse (one short sentence) so the response
+    output. Keep `reason` terse (one short sentence) so the response
     fits inside the judge timeout:
 
     ```json
-    {"verdict": "pass" | "fail", "reason": "<one short sentence>"}
+    {"verdict": "pass" | "fail" | "irreconcilable",
+     "reason": "<one short sentence>",
+     "blockers": []}
     ```
 
-    A plain `VERDICT: PASS` / `VERDICT: FAIL` line is also accepted as
-    a fallback, but the JSON form is preferred for machine
-    parseability.
+    `blockers` is REQUIRED whenever the verdict is `fail` or
+    `irreconcilable`, and must contain one entry per reviewer that
+    holds a blocking position — the runtime writes the human hand-off
+    document straight from these fields, and it also compares them
+    across iterations to detect a disagreement that is merely being
+    restated. Keep the wording of `criterion` and `conflicts_with`
+    stable between iterations when the underlying dispute has not
+    changed; that stability is the signal:
+
+    ```json
+    {"verdict": "irreconcilable",
+     "reason": "Panel splits on whether executable correctness gates release.",
+     "blockers": [
+       {"agent": "claude",
+        "position": "Executable correctness is a necessary release gate.",
+        "conflicts_with": "codex",
+        "criterion": "evidence bar",
+        "evidence_gap": "No study measures honest-student outcomes under perturbation."}
+     ]}
+    ```
+
+    Use exactly one of `framing`, `avenues`, `risks`, `evidence bar`,
+    or `stopping criteria` for `criterion` — these are the convergence
+    criteria the reviewers were given. `agent` must be a reviewer id
+    exactly as it appears in the artefact filenames.
+
+    A plain `VERDICT: PASS` / `VERDICT: FAIL` line is accepted as a
+    fallback, but it carries no blockers, so the hand-off document
+    would be empty — always prefer the JSON form.
 "#
 
 // ── Agents ────────────────────────────────────────────────────────────────────
@@ -668,7 +909,7 @@ agent reviewer-init {
     scope {
         owned [
             "{{OUT_DIR}}/{{REVIEWER_ID}}-conclusion-v*.md"
-            "{{OUT_DIR}}/{{REVIEWER_ID}}-evidence-v*.md"
+            "{{OUT_DIR}}/{{REVIEWER_ID}}-summary-v*.md"
         ]
         read_only [
             "{{PLAN_FILE}}"
@@ -676,8 +917,15 @@ agent reviewer-init {
             "{{LOCAL_LIT_DIR}}/"
         ]
     }
+    produces [
+        "{{OUT_DIR}}/{{REVIEWER_ID}}-conclusion-v{{INIT_VER}}.md"
+        "{{OUT_DIR}}/{{REVIEWER_ID}}-summary-v{{INIT_VER}}.md"
+    ]
     prompt init-body
     max_retries 1
+    // Deep literature research legitimately runs long; this is the
+    // liveness backstop, not a target. See the header "Termination".
+    timeout 3600
 }
 
 agent reviewer-refine {
@@ -688,7 +936,6 @@ agent reviewer-refine {
         owned [
             "{{OUT_DIR}}/{{REVIEWER_ID}}-conclusion-v*.md"
             "{{OUT_DIR}}/{{REVIEWER_ID}}-summary-v*.md"
-            "{{OUT_DIR}}/{{REVIEWER_ID}}-evidence-v*.md"
         ]
         read_only [
             "{{PLAN_FILE}}"
@@ -697,8 +944,13 @@ agent reviewer-refine {
             "{{OUT_DIR}}/"
         ]
     }
+    produces [
+        "{{OUT_DIR}}/{{REVIEWER_ID}}-conclusion-v{{ITER}}.md"
+        "{{OUT_DIR}}/{{REVIEWER_ID}}-summary-v{{ITER}}.md"
+    ]
     prompt refine-body
     max_retries 1
+    timeout 3600
     memory {
         write_ns   "scientific-research-consensus"
         importance 0.8
@@ -759,9 +1011,9 @@ agent convergence-judge {
 //
 // Post-run artefacts:
 //
-//   On consensus: one conclusion + summary + evidence triple per
-//   reviewer for the iteration that converged. None is canonical —
-//   the operator picks one or merges.
+//   On consensus: one conclusion + summary pair per reviewer for the
+//   iteration that converged. None is canonical — the operator picks
+//   one or merges.
 //
 //   Without consensus: the loop stops after `max_iterations` or a
 //   failed final judge check. Use the highest `*-summary-v{{ITER}}.md`
@@ -781,7 +1033,6 @@ workflow scientific-research-consensus {
     param roster [
         { id "claude" model "claude:opus"       effort xhigh }
         { id "codex"  model "codex:gpt-5.6-sol" effort xhigh }
-        { id "cursor" model "cursor:grok-4.5"   effort xhigh }
     ]
 
     steps [
@@ -795,6 +1046,7 @@ workflow scientific-research-consensus {
             judge_timeout   240
             strict_judge    false
             consensus_mode  strict
+            irreconcilable_after 2
             until agent     convergence-judge
         }
     ]
