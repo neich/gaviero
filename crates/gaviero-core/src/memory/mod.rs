@@ -47,7 +47,7 @@ pub use retrieval::{
 };
 pub use scope::{
     MemoryScope, MemoryType, ScopeFilter, StoreKind, StoreResult, Trust, WriteMeta, WriteScope,
-    hash_path,
+    hash_path, module_path_for_file,
 };
 pub use scoring::{ScoredMemory, SearchConfig, format_memories_for_prompt};
 pub use services::{MemoryServices, ServicesOpts};

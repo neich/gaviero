@@ -1284,19 +1284,23 @@ fn commit_panel_prompt(app: &mut App) {
                 Some(r) => r,
                 None => return,
             };
-            let repo_id = hash_path(&workspace_root);
+            let active_path = app
+                .buffers
+                .get(app.active_buffer)
+                .and_then(|b| b.path.as_deref());
+            let focused_folder = active_path.and_then(|path| app.workspace.folder_for_path(path));
+            let repo_id = hash_path(focused_folder.unwrap_or(&workspace_root));
             let new_scope = match selected {
                 ScopeChoice::Global => WriteScope::Global,
                 ScopeChoice::Workspace => WriteScope::Workspace,
                 ScopeChoice::Repo => WriteScope::Repo { repo_id },
                 ScopeChoice::Module => {
-                    let module_path = app
-                        .buffers
-                        .get(app.active_buffer)
-                        .and_then(|b| b.path.as_ref())
-                        .and_then(|p| p.strip_prefix(&workspace_root).ok())
-                        .and_then(|rel| rel.parent().map(|p| p.to_string_lossy().to_string()))
-                        .filter(|s| !s.is_empty())
+                    let module_path = active_path
+                        .and_then(|path| {
+                            focused_folder.and_then(|folder| {
+                                gaviero_core::memory::module_path_for_file(folder, path)
+                            })
+                        })
                         .unwrap_or_else(|| "".to_string());
                     if module_path.is_empty() {
                         WriteScope::Repo { repo_id }
@@ -1907,10 +1911,6 @@ pub(crate) fn dispatch_prompt_core(
             .and_then(|p| app.workspace.folder_for_path(p))
             .map(|p| p.to_path_buf())
     };
-    // Strip the buffer's path against the focused folder so the module path
-    // is relative to the right repo. Falls back to `root` so single-folder
-    // workspaces (and buffers outside every folder) keep behaving as before.
-    let module_path_root = focused_folder.as_ref().unwrap_or(&root);
     let turn_id = format!(
         "{}-{}",
         conv_id,
@@ -1919,18 +1919,23 @@ pub(crate) fn dispatch_prompt_core(
             .map(|d| d.as_millis())
             .unwrap_or(0)
     );
-    let pending_module_path = active_buffer_path
+    // Module context is meaningful only inside a focused workspace folder.
+    // In particular, `/workspace` clears `focused_folder`, so a workspace-wide
+    // turn cannot accidentally inherit the active buffer's module.
+    let pending_module_path = focused_folder
         .as_deref()
-        .and_then(|p| p.strip_prefix(module_path_root).ok())
-        .and_then(|rel| rel.parent())
-        .map(|p| p.to_string_lossy().to_string())
-        .filter(|p| !p.is_empty());
+        .and_then(|folder| {
+            active_buffer_path
+                .as_deref()
+                .and_then(|path| gaviero_core::memory::module_path_for_file(folder, path))
+        })
+        ;
 
     app.chat_state.add_user_message_at(conv_idx, &prompt);
     {
         let conv = &mut app.chat_state.conversations[conv_idx];
         conv.pending_turn_id = Some(turn_id.clone());
-        conv.pending_module_path = pending_module_path;
+        conv.pending_module_path = pending_module_path.clone();
         conv.pending_focused_folder = focused_folder.clone();
         conv.is_streaming = true;
         conv.streaming_status = "Connecting...".to_string();
@@ -2554,12 +2559,12 @@ pub(crate) fn dispatch_prompt_core(
                 let mem = memory.as_ref().expect("checked above");
                 let reranker_ref: Option<&dyn gaviero_core::memory::Reranker> =
                     memory_reranker.as_deref();
-                let outcome = gaviero_core::context_planner::perform_injection(
+                let outcome = gaviero_core::context_planner::perform_injection_with_module(
                     gaviero_core::context_planner::ChatMemoryRequest {
                         stores: mem,
                         writer: memory_writer.as_ref(),
-                        workspace_root: &graph_root,
-                        folder_root: None,
+                        workspace_root: &root,
+                        folder_root: focused_folder.as_deref(),
                         user_prompt: &prompt,
                         turn_id: &turn_id_clone,
                         session_id: &conv_id_clone,
@@ -2572,6 +2577,7 @@ pub(crate) fn dispatch_prompt_core(
                         embedder_name: &embedder_name,
                         reranker_name: reranker_name.as_deref(),
                     },
+                    pending_module_path.as_deref(),
                 )
                 .await;
                 let _ = tx.send(Event::ChatMemoryInjected {
