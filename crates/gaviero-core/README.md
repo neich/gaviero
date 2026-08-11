@@ -101,7 +101,7 @@ Reads `.gaviero/settings.json` (cascade documented in [gaviero-tui](../gaviero-t
 | `acp/` | Claude subprocess protocol, session factory, file-block routing |
 | `agent_session/` | Per-provider sessions: `claude`, `codex_exec`, `codex_app_server`, `cursor`, `ollama`, `tool_agent` (DeepSeek), `registry` |
 | `swarm/` | Orchestration, tier routing, DAG execution, backends, verification, git merge |
-| `mcp/` | In-process MCP server (seven read-only tools), config synthesis, transport |
+| `mcp/` | In-process MCP server (seven read-only tools + write-adjacent `memory_flag`), config synthesis, transport |
 | `memory/` | Five-level scoped embeddings, RRF retrieval, consolidation, soft-delete |
 | `write_gate/` | Diff review, hunk acceptance, scope enforcement |
 | `validation_gate/` | tree-sitter syntax, cargo compile, test verification |

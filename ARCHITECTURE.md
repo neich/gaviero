@@ -80,7 +80,7 @@ Terminal editor + headless CLI for AI agent orchestration. Rust 2024.
 ### Memory + MCP + write path
 
 - [`MemoryStores`](crates/gaviero-core/src/memory/stores.rs) + [`WriterHandle`](crates/gaviero-core/src/memory/writer.rs) — multi-DB; single writer task.
-- [`GavieroMcpServer`](crates/gaviero-core/src/mcp/server.rs) — seven read-only tools over [`McpEndpoint`](crates/gaviero-core/src/mcp/transport.rs); subprocess agents use `gaviero-mcp-shim`. DeepSeek does not.
+- [`GavieroMcpServer`](crates/gaviero-core/src/mcp/server.rs) — eight tools over [`McpEndpoint`](crates/gaviero-core/src/mcp/transport.rs): seven read-only plus write-adjacent `memory_flag` (trust demotion via the writer task; no `WriterHandle` on the server). Subprocess agents use `gaviero-mcp-shim`. DeepSeek does not.
 - [`WriteGatePipeline`](crates/gaviero-core/src/write_gate.rs) — every agent file change.
 
 ### Observers

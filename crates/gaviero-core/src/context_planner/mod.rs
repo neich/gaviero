@@ -22,7 +22,7 @@ pub use bootstrap::{
 };
 pub use chat_memory::{
     ChatMemoryOutcome, ChatMemoryRequest, PostTurnRequest, enqueue_post_turn, perform_injection,
-    splice_into_selections,
+    perform_injection_with_module, splice_into_selections,
 };
 pub use compaction::{CompactionPolicy, compact_replay, should_compact};
 pub use ledger::{

@@ -13,7 +13,7 @@ use tempfile::TempDir;
 
 use gaviero_core::memory::{
     Embedder, MemorySource, MemoryStores, ScopeFilter, StoreKind, StoreResult, WriteMeta,
-    WriteScope, hash_path,
+    WriteScope, WriterConfig, WriterMessage, hash_path, spawn_writer_task,
 };
 use gaviero_core::workspace::Workspace;
 
@@ -80,6 +80,19 @@ fn workspace_with_library(workspace_root: PathBuf, library_root: PathBuf) -> Wor
     let mut ws = Workspace::single_folder(workspace_root);
     ws.add_root(library_root, Some("library".into()));
     ws
+}
+
+/// One `<turn_annotations>` flag, already shaped as the JSON envelope the
+/// chat path hands to `WriterMessage::TurnComplete`.
+fn annotations_with_flag(scope: &str, text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "v": 1,
+        "flags": [
+            { "type": "decision", "importance": 0.8, "scope": scope, "text": text, "refs": [] }
+        ],
+        "session_thread": "scope-routing regression",
+        "open_questions": []
+    })
 }
 
 fn open_registry(
@@ -1224,4 +1237,288 @@ async fn bootstrap_init_workspace_stores_with_two_folders_writes_to_correct_dbs(
     assert!(project_folder.join(".gaviero/memory.db").exists());
     assert!(library_root.path().join(".gaviero/memory.db").exists());
     assert!(workspace_root.path().join(".gaviero/memory.db").exists());
+}
+
+// ── BUG-2: TurnComplete scope routing ───────────────────────────────
+//
+// `WriterMessage::TurnComplete` used to be handed a single
+// `Arc<MemoryStore>` (the workspace store), so every annotation flag and
+// every extractor row landed in the workspace DB regardless of the scope
+// the flag declared. Retrieval asks the *global* store for Global-level
+// rows and the *folder* store for Repo/Module-level rows, so those rows
+// were write-only. These two tests pin the routing.
+
+#[tokio::test]
+async fn turn_complete_global_scope_flag_lands_in_global_store() {
+    const FLAG_TEXT: &str = "global-scope flag emitted by a chat turn";
+
+    let global = TempDir::new().unwrap();
+    let workspace_root = TempDir::new().unwrap();
+    let library_root = TempDir::new().unwrap();
+    let ws = workspace_with_library(
+        workspace_root.path().to_path_buf(),
+        library_root.path().to_path_buf(),
+    );
+    let stores = open_registry(workspace_root.path(), &ws, global.path());
+
+    // `llm: None` is deliberate: process_turn_complete handles the
+    // annotation block *before* the no-LLM fallback returns, so the
+    // routing under test does not need an extraction backend.
+    let writer = spawn_writer_task(WriterConfig {
+        stores: stores.clone(),
+        llm: None,
+        observer: None,
+        manifest_observer: None,
+    });
+
+    writer
+        .enqueue(WriterMessage::TurnComplete {
+            session_id: "session-1".into(),
+            turn_id: "turn-1".into(),
+            repo_id: hash_path(library_root.path()),
+            module_path: None,
+            run_id: "run-1".into(),
+            transcript: "user: why?\nassistant: because.".into(),
+            annotations: Some(annotations_with_flag("global", FLAG_TEXT)),
+        })
+        .unwrap();
+    writer.flush().await.unwrap();
+
+    let global_store = stores.get(&StoreKind::Global).await.unwrap();
+    let workspace_store = stores.get(&StoreKind::Workspace).await.unwrap();
+
+    let global_rows = global_store
+        .search_at_level(&ScopeFilter::Global, "", 50)
+        .await
+        .unwrap();
+    assert!(
+        global_rows.iter().any(|m| m.content == FLAG_TEXT),
+        "a `\"scope\": \"global\"` flag must be written to the global DB; \
+         global rows were {:?}",
+        global_rows.iter().map(|m| &m.content).collect::<Vec<_>>()
+    );
+
+    let misfiled = workspace_store
+        .search_at_level(&ScopeFilter::Global, "", 50)
+        .await
+        .unwrap();
+    assert!(
+        misfiled.iter().all(|m| m.content != FLAG_TEXT),
+        "global-scope flag must not be parked in the workspace DB — \
+         retrieval never queries the workspace store at Global level"
+    );
+}
+
+#[tokio::test]
+async fn turn_complete_repo_scope_flag_lands_in_folder_store() {
+    const FLAG_TEXT: &str = "repo-scope flag emitted by a chat turn";
+
+    let global = TempDir::new().unwrap();
+    let workspace_root = TempDir::new().unwrap();
+    let library_root = TempDir::new().unwrap();
+    let ws = workspace_with_library(
+        workspace_root.path().to_path_buf(),
+        library_root.path().to_path_buf(),
+    );
+    let stores = open_registry(workspace_root.path(), &ws, global.path());
+    let library_repo_id = hash_path(library_root.path());
+
+    let writer = spawn_writer_task(WriterConfig {
+        stores: stores.clone(),
+        llm: None,
+        observer: None,
+        manifest_observer: None,
+    });
+
+    writer
+        .enqueue(WriterMessage::TurnComplete {
+            session_id: "session-1".into(),
+            turn_id: "turn-1".into(),
+            repo_id: library_repo_id.clone(),
+            module_path: None,
+            run_id: "run-1".into(),
+            transcript: "user: why?\nassistant: because.".into(),
+            annotations: Some(annotations_with_flag("repo", FLAG_TEXT)),
+        })
+        .unwrap();
+    writer.flush().await.unwrap();
+
+    let folder_store = stores
+        .get(&StoreKind::Folder {
+            repo_id: library_repo_id.clone(),
+        })
+        .await
+        .unwrap();
+    let workspace_store = stores.get(&StoreKind::Workspace).await.unwrap();
+
+    let folder_rows = folder_store
+        .search_at_level(
+            &ScopeFilter::Repo {
+                repo_id: library_repo_id.clone(),
+            },
+            "",
+            50,
+        )
+        .await
+        .unwrap();
+    assert!(
+        folder_rows.iter().any(|m| m.content == FLAG_TEXT),
+        "a `\"scope\": \"repo\"` flag must be written to the owning folder DB; \
+         folder rows were {:?}",
+        folder_rows.iter().map(|m| &m.content).collect::<Vec<_>>()
+    );
+
+    let misfiled = workspace_store
+        .search_at_level(
+            &ScopeFilter::Repo {
+                repo_id: library_repo_id,
+            },
+            "",
+            50,
+        )
+        .await
+        .unwrap();
+    assert!(
+        misfiled.iter().all(|m| m.content != FLAG_TEXT),
+        "repo-scope flag must not be parked in the workspace DB"
+    );
+}
+
+#[tokio::test]
+async fn panel_edit_pin_targets_owning_store() {
+    use gaviero_core::memory::scope::SCOPE_GLOBAL;
+    use gaviero_core::memory::writer::PanelEditOp;
+
+    let global = TempDir::new().unwrap();
+    let workspace_root = TempDir::new().unwrap();
+    let ws = single_folder_workspace(workspace_root.path().to_path_buf());
+    let stores = open_registry(workspace_root.path(), &ws, global.path());
+
+    let global_store = stores.get(&StoreKind::Global).await.unwrap();
+    let workspace_store = stores.get(&StoreKind::Workspace).await.unwrap();
+
+    // Both DBs get a row first, so both hand out the same low rowid —
+    // that collision is the whole reason PanelEdit has to carry scope.
+    let meta = WriteMeta::for_source(MemorySource::LlmAnnotated).with_importance(0.6);
+    let workspace_id = match stores
+        .store_scoped(&WriteScope::Workspace, "workspace decoy row", &meta)
+        .await
+        .unwrap()
+    {
+        StoreResult::Inserted(id) => id,
+        other => panic!("workspace insert should succeed, got {other:?}"),
+    };
+    let global_id = match stores
+        .store_scoped(&WriteScope::Global, "global row to pin", &meta)
+        .await
+        .unwrap()
+    {
+        StoreResult::Inserted(id) => id,
+        other => panic!("global insert should succeed, got {other:?}"),
+    };
+    assert_eq!(
+        global_id, workspace_id,
+        "precondition: independent rowid spaces must hand out the same id"
+    );
+
+    let writer = spawn_writer_task(WriterConfig {
+        stores: stores.clone(),
+        llm: None,
+        observer: None,
+        manifest_observer: None,
+    });
+    writer
+        .enqueue(WriterMessage::PanelEdit {
+            op: PanelEditOp::Pin {
+                memory_id: global_id,
+                trust_score: 1.0,
+            },
+            scope_level: SCOPE_GLOBAL,
+            repo_id: None,
+            ack: None,
+        })
+        .unwrap();
+    writer.flush().await.unwrap();
+
+    let global_row = global_store
+        .get_memory_row(global_id)
+        .await
+        .unwrap()
+        .expect("global row still present");
+    assert_eq!(
+        global_row.trust_score, 1.0,
+        "pin must raise trust on the row in the global DB"
+    );
+
+    let workspace_row = workspace_store
+        .get_memory_row(workspace_id)
+        .await
+        .unwrap()
+        .expect("workspace row still present");
+    assert_eq!(
+        workspace_row.trust_score,
+        MemorySource::LlmAnnotated.default_trust(),
+        "the same-id row in the workspace DB must be untouched"
+    );
+}
+
+#[tokio::test]
+async fn panel_edit_with_unresolvable_scope_is_refused() {
+    use gaviero_core::memory::scope::SCOPE_REPO;
+    use gaviero_core::memory::writer::PanelEditOp;
+
+    let global = TempDir::new().unwrap();
+    let workspace_root = TempDir::new().unwrap();
+    let ws = single_folder_workspace(workspace_root.path().to_path_buf());
+    let stores = open_registry(workspace_root.path(), &ws, global.path());
+
+    let meta = WriteMeta::for_source(MemorySource::LlmAnnotated).with_importance(0.6);
+    let workspace_id = match stores
+        .store_scoped(&WriteScope::Workspace, "must not be touched", &meta)
+        .await
+        .unwrap()
+    {
+        StoreResult::Inserted(id) => id,
+        other => panic!("workspace insert should succeed, got {other:?}"),
+    };
+
+    let writer = spawn_writer_task(WriterConfig {
+        stores: stores.clone(),
+        llm: None,
+        observer: None,
+        manifest_observer: None,
+    });
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    writer
+        .enqueue(WriterMessage::PanelEdit {
+            // Repo scope without a repo_id is unresolvable.
+            op: PanelEditOp::Pin {
+                memory_id: workspace_id,
+                trust_score: 1.0,
+            },
+            scope_level: SCOPE_REPO,
+            repo_id: None,
+            ack: Some(tx),
+        })
+        .unwrap();
+    let result = rx.await.expect("writer acks");
+    assert!(
+        result.is_err(),
+        "an unresolvable (scope_level, repo_id) pair must error, not fall back \
+         to the workspace store; got {result:?}"
+    );
+
+    let row = stores
+        .get(&StoreKind::Workspace)
+        .await
+        .unwrap()
+        .get_memory_row(workspace_id)
+        .await
+        .unwrap()
+        .expect("workspace row still present");
+    assert_eq!(
+        row.trust_score,
+        MemorySource::LlmAnnotated.default_trust(),
+        "refused edit must not have mutated the workspace row"
+    );
 }

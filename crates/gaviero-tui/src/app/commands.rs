@@ -687,7 +687,12 @@ fn resolve_remember_scope(
         .first()
         .cloned()
         .ok_or_else(|| "no workspace root".to_string())?;
-    let repo_id = hash_path(&workspace_root);
+    let active_path = app
+        .buffers
+        .get(app.active_buffer)
+        .and_then(|b| b.path.as_deref());
+    let focused_folder = active_path.and_then(|path| app.workspace.folder_for_path(path));
+    let repo_id = hash_path(focused_folder.unwrap_or(&workspace_root));
 
     match variant {
         "here" => {
@@ -695,13 +700,10 @@ fn resolve_remember_scope(
             Ok((WriteScope::Run { repo_id, run_id }, "Run", None))
         }
         "module" => {
-            let module_path = app
-                .buffers
-                .get(app.active_buffer)
-                .and_then(|b| b.path.as_ref())
-                .and_then(|p| p.strip_prefix(&workspace_root).ok())
-                .and_then(|rel| rel.parent().map(|p| p.to_string_lossy().to_string()))
-                .filter(|s| !s.is_empty());
+            let module_path = active_path.and_then(|path| {
+                focused_folder
+                    .and_then(|folder| gaviero_core::memory::module_path_for_file(folder, path))
+            });
             match module_path {
                 Some(m) => Ok((
                     WriteScope::Module {

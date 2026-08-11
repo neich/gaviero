@@ -10,9 +10,12 @@
 //!    cosine ≥ 0.92 same-type pairs and merge them. **Source-aware**:
 //!    `user_remember` is ground truth and never silently merged
 //!    *into*.
-//! 3. **Cross-scope promotion** — runs the existing consolidator's
-//!    "3+ module hits → repo" lift; lowers the threshold to 1 hit for
-//!    `decision|convention|invariant` types.
+//! 3. **Cross-scope promotion** — **not implemented.**
+//!    [`super::store::MemoryStore::sleeptime_promote`] is a stub that
+//!    returns an empty vec. The design was the existing consolidator's
+//!    "3+ module hits → repo" lift, with the threshold lowered to 1 hit
+//!    for `decision|convention|invariant`; nothing auto-promotes into a
+//!    broader scope today.
 //! 4. **Trust re-scoring** — uses B6 `retrieval_use` rates when
 //!    available; falls back to raw injection counts (manifest hits)
 //!    until B6 has produced enough rows.

@@ -74,6 +74,11 @@ pub struct ScopeSummaryRow {
 pub struct MemoryRow {
     pub id: i64,
     pub scope_level: i32,
+    /// Persisted `repo_id` of the row. Together with `scope_level` this
+    /// identifies the physical DB that owns the row — memory ids are only
+    /// unique within one store, so every `WriterMessage::PanelEdit` has
+    /// to carry the pair.
+    pub repo_id: Option<String>,
     pub scope_label: String,
     pub memory_type: String,
     pub text: String,
@@ -94,6 +99,7 @@ impl MemoryRow {
         Self {
             id: m.id,
             scope_level: m.scope_level,
+            repo_id: m.repo_id.clone(),
             scope_label: format_scope_short(m.scope_level),
             memory_type: m.memory_type.as_str().to_string(),
             text: truncate(&m.content, 80),
@@ -103,6 +109,29 @@ impl MemoryRow {
             final_score: m.final_score,
             created_at: m.created_at.clone(),
             utilization_rate: None,
+        }
+    }
+}
+
+/// Identifies the row a `WriterMessage::PanelEdit` targets.
+///
+/// The memory id alone is ambiguous: the global, workspace, and folder
+/// DBs have independent rowid spaces, so id `42` names a different row in
+/// each. The row's persisted `(scope_level, repo_id)` travels with it and
+/// the writer task resolves the owning store from that pair.
+#[derive(Debug, Clone)]
+pub struct PanelEditTarget {
+    pub memory_id: i64,
+    pub scope_level: i32,
+    pub repo_id: Option<String>,
+}
+
+impl PanelEditTarget {
+    pub fn from_row(row: &MemoryRow) -> Self {
+        Self {
+            memory_id: row.id,
+            scope_level: row.scope_level,
+            repo_id: row.repo_id.clone(),
         }
     }
 }
@@ -137,7 +166,7 @@ pub enum PanelPromptMode {
     /// `e`: replace the memory's text. Cursor always at the end of
     /// `buffer` — MVP input, not a full editor.
     EditText {
-        memory_id: i64,
+        target: PanelEditTarget,
         buffer: String,
     },
     /// `s`: cycle through the 5 scope levels. `selected` is the
@@ -146,7 +175,7 @@ pub enum PanelPromptMode {
     /// `module_path` resolve from the current app context at commit
     /// time — the prompt only carries the level choice.
     SetScope {
-        memory_id: i64,
+        target: PanelEditTarget,
         selected: ScopeChoice,
     },
 }
@@ -247,7 +276,7 @@ pub struct MemoryPanelState {
     pub recent_rows: Vec<MemoryRow>,
     pub recent_cursor: usize,
     /// Pending delete confirmation — set on `d`, cleared on `y`/`n`.
-    pub confirm_delete_id: Option<i64>,
+    pub confirm_delete: Option<PanelEditTarget>,
     /// Inline `e` (edit text) or `s` (change scope) prompt.
     pub prompt_mode: PanelPromptMode,
 
@@ -310,7 +339,7 @@ impl Default for MemoryPanelState {
             history_cursor: 0,
             recent_rows: Vec::new(),
             recent_cursor: 0,
-            confirm_delete_id: None,
+            confirm_delete: None,
             prompt_mode: PanelPromptMode::None,
             scope_summary: Vec::new(),
             search_active: false,
@@ -628,14 +657,16 @@ impl MemoryPanelState {
             }
         }
 
-        if let Some(pending_id) = self.confirm_delete_id {
+        if let Some(pending) = &self.confirm_delete {
+            let pending_id = pending.memory_id;
             lines.push(Line::from(Span::styled(
                 format!("Delete memory #{pending_id}? [y/n]"),
                 Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD),
             )));
         } else {
             match &self.prompt_mode {
-                PanelPromptMode::EditText { memory_id, buffer } => {
+                PanelPromptMode::EditText { target, buffer } => {
+                    let memory_id = target.memory_id;
                     lines.push(Line::from(Span::styled(
                         format!("Edit #{memory_id}: [Enter] save  [Esc] cancel"),
                         Style::default()
@@ -647,10 +678,8 @@ impl MemoryPanelState {
                         Style::default().fg(COLOR_TEXT),
                     )));
                 }
-                PanelPromptMode::SetScope {
-                    memory_id,
-                    selected,
-                } => {
+                PanelPromptMode::SetScope { target, selected } => {
+                    let memory_id = target.memory_id;
                     lines.push(Line::from(Span::styled(
                         format!("Scope #{memory_id}: [←/→] change  [Enter] save  [Esc] cancel"),
                         Style::default()

@@ -102,6 +102,40 @@ pub fn clamp_trust(t: f32) -> f32 {
     if t.is_nan() { 0.0 } else { t.clamp(0.0, 1.0) }
 }
 
+/// Fraction of a source's default trust an agent flag demotes to (D1).
+pub const FLAG_DEMOTION_FACTOR: f32 = 0.5;
+
+/// Floor an agent flag will never demote below (D1). Trust multiplies
+/// the composite score, so a flagged row loses ranking weight without
+/// being erased — consistent with OD-3 (down-weight + soft-delete only).
+pub const FLAG_TRUST_FLOOR: f32 = 0.2;
+
+/// Trust a row should carry after an agent flag.
+///
+/// Computed from the source's *default* trust rather than as a repeated
+/// decrement, so flagging the same row twice is a genuine no-op — which
+/// is what makes `idempotent_hint = true` on the `memory_flag` tool
+/// truthful and removes any need for a dedup table.
+///
+/// `max(FLAG_TRUST_FLOOR, min(current, default * FLAG_DEMOTION_FACTOR))`
+pub fn flagged_trust(source: MemorySource, current_trust: f32) -> f32 {
+    let demoted = source.default_trust() * FLAG_DEMOTION_FACTOR;
+    clamp_trust(current_trust.min(demoted).max(FLAG_TRUST_FLOOR))
+}
+
+/// Whether an agent may flag a row with this source (D1).
+///
+/// `UserRemember` / `UserPanel` are user ground truth; `RawTranscript` is
+/// the immutable History row whose trust is 1.0 by definition. Everything
+/// else — including `ToolOutput` — is flaggable: compiler and test output
+/// is deterministic at capture time but goes stale like anything else.
+pub fn is_agent_flaggable(source: MemorySource) -> bool {
+    !matches!(
+        source,
+        MemorySource::UserRemember | MemorySource::UserPanel | MemorySource::RawTranscript
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +184,46 @@ mod tests {
         assert_eq!(clamp_trust(-1.0), 0.0);
         assert_eq!(clamp_trust(2.0), 1.0);
         assert_eq!(clamp_trust(f32::NAN), 0.0);
+    }
+
+    #[test]
+    fn flagged_trust_matches_d1_table() {
+        for (source, expected) in [
+            (MemorySource::LlmAnnotated, 0.35),
+            (MemorySource::SwarmConsolidated, 0.375),
+            (MemorySource::LlmExtracted, 0.30),
+            (MemorySource::McpImport, 0.25),
+        ] {
+            let got = flagged_trust(source, source.default_trust());
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "{source:?}: expected {expected}, got {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn flagged_trust_is_idempotent() {
+        let s = MemorySource::LlmAnnotated;
+        let once = flagged_trust(s, s.default_trust());
+        let twice = flagged_trust(s, once);
+        assert_eq!(once, twice, "a repeat flag must be a no-op");
+    }
+
+    #[test]
+    fn flagged_trust_never_goes_below_the_floor() {
+        // McpImport halves to 0.25, but a row already sitting at 0.05
+        // must not be pushed further down.
+        let got = flagged_trust(MemorySource::McpImport, 0.05);
+        assert_eq!(got, FLAG_TRUST_FLOOR);
+    }
+
+    #[test]
+    fn agent_flaggable_excludes_user_and_history_sources() {
+        assert!(!is_agent_flaggable(MemorySource::UserRemember));
+        assert!(!is_agent_flaggable(MemorySource::UserPanel));
+        assert!(!is_agent_flaggable(MemorySource::RawTranscript));
+        assert!(is_agent_flaggable(MemorySource::ToolOutput));
+        assert!(is_agent_flaggable(MemorySource::LlmAnnotated));
     }
 }

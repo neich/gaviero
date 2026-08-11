@@ -21,7 +21,7 @@ Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presenc
 | Swarm | [`swarm/`](src/swarm) | Six-phase pipeline; backends in [`swarm/backend/`](src/swarm/backend): `claude_code`, `codex`, `cursor`, `ollama`, `deepseek`, `mock`, `Custom` — all behind [`AgentBackend`](src/swarm/backend/mod.rs). |
 | Agent session | [`agent_session/`](src/agent_session) | `claude`, `codex_exec`, `codex_app_server`, `cursor`, `ollama`, [`tool_agent/`](src/agent_session/tool_agent) (`deepseek:` + future API providers), `registry`. |
 | Memory | [`memory/`](src/memory) | Multi-DB ONNX store; single writer task ([`writer.rs`](src/memory/writer.rs)); merged multi-scope hybrid retrieval (RRF). |
-| MCP | [`mcp/`](src/mcp) | Seven read-only tools ([`tools.rs`](src/mcp/tools.rs)); endpoint via [`transport.rs`](src/mcp/transport.rs); config synth / preflight / telemetry. |
+| MCP | [`mcp/`](src/mcp) | Eight tools — seven read-only + write-adjacent `memory_flag` ([`tools.rs`](src/mcp/tools.rs)); endpoint via [`transport.rs`](src/mcp/transport.rs); signal sink ([`signal.rs`](src/mcp/signal.rs)); config synth / preflight / telemetry. |
 | Write path | [`write_gate.rs`](src/write_gate.rs), [`scope_enforcer.rs`](src/scope_enforcer.rs) | Modes: Interactive / AutoAccept / Deferred / RejectAll. |
 | Repo map | [`repo_map/`](src/repo_map) | Graph + [`topology.rs`](src/repo_map/topology.rs) + symbol enrichment/search. |
 | Skills | [`skills/`](src/skills) | Frontmatter, catalog, planner `ResolvedSkill` seam. |
@@ -46,7 +46,7 @@ Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presenc
 
 ## Rules
 
-- **MCP tools are read-only.** Never add a write tool to [`mcp/tools.rs`](src/mcp/tools.rs); route writes through the Write Gate or the memory writer task.
+- **Every write goes through the writer task or the Write Gate.** No MCP tool may touch a store directly. The read-only surface is the default posture, not a hard rule — `memory_flag` is the one write-adjacent tool, and it signals through [`mcp/signal.rs`](src/mcp/signal.rs) into the writer task. Each added tool costs ~150–250 prompt tokens on every subprocess turn; make it earn that.
 - **No UI deps.** Compiles without `ratatui` / `crossterm`. `vt100`/`portable-pty` are allowed (embedded terminal lives here).
 - **No DSL deps.** Must not depend on `gaviero-dsl`.
 - **History rows are immutable** except via the C2.4 redaction path (`forget_history` requires explicit literal-string confirm + reason).

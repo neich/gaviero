@@ -18,6 +18,7 @@ pub mod scope;
 pub mod scoring;
 pub mod services;
 pub mod session_consolidator;
+pub mod signal_sink;
 pub mod sleeptime;
 pub mod sleeptime_scheduler;
 pub mod store;
@@ -46,7 +47,7 @@ pub use retrieval::{
 };
 pub use scope::{
     MemoryScope, MemoryType, ScopeFilter, StoreKind, StoreResult, Trust, WriteMeta, WriteScope,
-    hash_path,
+    hash_path, module_path_for_file,
 };
 pub use scoring::{ScoredMemory, SearchConfig, format_memories_for_prompt};
 pub use services::{MemoryServices, ServicesOpts};
@@ -54,6 +55,7 @@ pub use session_consolidator::{
     CandidateBrief, ConsolidationOp, ConsolidatorResponse, ExistingBrief, PROMPT_VERSION,
     PromotionRequest,
 };
+pub use signal_sink::WriterSignalSink;
 pub use sleeptime::{
     SleeptimeConfig, SleeptimeObserver, SleeptimeOperation, SleeptimeReport, run_sleeptime,
 };
@@ -66,9 +68,13 @@ pub use stores::{EmbedderMismatch, MemoryStores};
 pub use telemetry::{
     ClassifiedItem, ClassifyConfig, TelemetryObserver, TelemetryReport, UseClass, classify_turn,
 };
-pub use trust_defaults::{MemorySource, clamp_trust};
+pub use trust_defaults::{
+    FLAG_DEMOTION_FACTOR, FLAG_TRUST_FLOOR, MemorySource, clamp_trust, flagged_trust,
+    is_agent_flaggable,
+};
 pub use writer::{
-    ACK_TIMEOUT_MS, WriteResult, WriterConfig, WriterHandle, WriterMessage, spawn_writer_task,
+    ACK_TIMEOUT_MS, AgentFlagOutcome, WriteResult, WriterConfig, WriterHandle, WriterMessage,
+    spawn_writer_task,
 };
 
 use std::path::{Path, PathBuf};

@@ -48,6 +48,50 @@ pub fn hash_path(path: &Path) -> String {
         })
 }
 
+/// Resolve the stable module key for a file inside a repository folder.
+///
+/// The nearest package manifest wins, so files below a Rust crate, Node
+/// package, Python project, Go module, JVM project, or Ruby bundle share one
+/// module key. Repositories without package metadata retain the historical
+/// file-parent behavior. A package rooted at `folder` is repo scope rather
+/// than a redundant empty module scope.
+pub fn module_path_for_file(folder: &Path, file: &Path) -> Option<String> {
+    const PACKAGE_MARKERS: &[&str] = &[
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "Gemfile",
+    ];
+
+    let relative = file.strip_prefix(folder).ok()?;
+    let fallback = relative.parent()?;
+    let mut current = file.parent()?;
+    let boundary = loop {
+        if PACKAGE_MARKERS.iter().any(|marker| current.join(marker).is_file()) {
+            break current;
+        }
+        if current == folder {
+            break fallback;
+        }
+        current = current.parent()?;
+        if !current.starts_with(folder) {
+            break fallback;
+        }
+    };
+
+    let relative = if boundary.is_absolute() {
+        boundary.strip_prefix(folder).ok()?
+    } else {
+        boundary
+    };
+    let key = relative.to_string_lossy().replace('\\', "/");
+    (!key.is_empty() && key != ".").then_some(key)
+}
+
 // ── StoreKind ─────────────────────────────────────────────────
 
 /// Identifies which physical SQLite file a scope is stored in.
@@ -687,6 +731,57 @@ impl WriteMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_module_path_uses_nearest_package_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path();
+        let package = folder.join("crates/core");
+        let source = package.join("src/store");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(package.join("Cargo.toml"), "[package]\nname = \"core\"\n").unwrap();
+
+        assert_eq!(
+            module_path_for_file(folder, &source.join("mod.rs")).as_deref(),
+            Some("crates/core")
+        );
+    }
+
+    #[test]
+    fn test_module_path_repo_manifest_falls_back_to_repo_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path();
+        let source = folder.join("src");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(folder.join("Cargo.toml"), "[workspace]\n").unwrap();
+
+        assert_eq!(module_path_for_file(folder, &source.join("lib.rs")), None);
+    }
+
+    #[test]
+    fn test_module_path_without_manifest_uses_file_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path();
+        let source = folder.join("features/auth");
+        fs::create_dir_all(&source).unwrap();
+
+        assert_eq!(
+            module_path_for_file(folder, &source.join("login.rs")).as_deref(),
+            Some("features/auth")
+        );
+    }
+
+    #[test]
+    fn test_module_path_rejects_file_outside_folder() {
+        let folder = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            module_path_for_file(folder.path(), &outside.path().join("src/lib.rs")),
+            None
+        );
+    }
 
     #[test]
     fn test_hash_path_deterministic() {

@@ -70,9 +70,10 @@ gaviero-core/src/
 │     ├─ replay.rs / snapshot.rs / swarm.rs
 │     └─ tools/           read / write / bash / glob / grep
 ├─ context_planner/       Bootstrap / delta / replay → PlannerSelections
-├─ mcp/                   In-process MCP server (read-only)
+├─ mcp/                   In-process MCP server
 │  ├─ server.rs           spawn_mcp_server, GavieroMcpServer
-│  ├─ tools.rs            Seven tools (see MCP below)
+│  ├─ signal.rs           MemorySignalSink — the one write-adjacent seam
+│  ├─ tools.rs            Eight tools (see MCP below)
 │  ├─ transport.rs        McpEndpoint (Unix socket / Windows named pipe)
 │  ├─ config_synth.rs     Per-worktree .mcp.json / .codex/ / .cursor/
 │  ├─ preflight.rs        Shim PATH + URL checks
@@ -145,7 +146,7 @@ Writes: native edit tools (Claude/Codex/Cursor) or Option-B `<file>` blocks (Oll
 ### Memory / MCP / observers
 
 - [`MemoryStores`](src/memory/stores.rs) + [`WriterHandle`](src/memory/writer.rs) — multi-DB; single writer task.
-- [`GavieroMcpServer`](src/mcp/server.rs) — seven read-only tools; **no `WriterHandle`**.
+- [`GavieroMcpServer`](src/mcp/server.rs) — eight tools (seven read-only + write-adjacent `memory_flag`); **no `WriterHandle`** — `memory_flag` signals through [`mcp/signal.rs`](src/mcp/signal.rs) into the writer task.
 - Observers in [`observer.rs`](src/observer.rs) / [`memory/observer.rs`](src/memory/observer.rs) / [`mcp/observer.rs`](src/mcp/observer.rs).
 
 ---

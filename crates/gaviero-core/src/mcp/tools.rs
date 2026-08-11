@@ -1,6 +1,8 @@
 //! Tool input/output schemas (Tier A / A5).
 //!
-//! Read-only MCP tools. Each input/output struct derives
+//! Seven read-only tools plus `memory_flag`, which is write-adjacent: it
+//! emits a signal that the S2 writer task turns into a trust demotion. It
+//! creates and deletes nothing. Each input/output struct derives
 //! `schemars::JsonSchema` so rmcp's tool macro can emit the JSON-RPC
 //! schema at server-handshake time.
 
@@ -14,6 +16,7 @@ pub const TOOL_SYMBOL_SEARCH: &str = "symbol_search";
 pub const TOOL_SYMBOL_DOC: &str = "symbol_doc";
 pub const TOOL_REPO_OUTLINE: &str = "repo_outline";
 pub const TOOL_MEMORY_GET: &str = "memory_get";
+pub const TOOL_MEMORY_FLAG: &str = "memory_flag";
 
 // ── memory_search ─────────────────────────────────────────────────
 
@@ -23,12 +26,13 @@ pub struct MemorySearchInput {
     /// Free-form natural-language query. Same shape as a chat prompt's
     /// retrieval query.
     pub query: String,
-    /// Optional scope *restriction*. `"workspace"` searches only the
-    /// workspace store; `"global"` only the global store. When
-    /// omitted, retrieval merges both via multi-scope hybrid search
-    /// (RRF), not a narrow→wide cascade. `"repo"`, `"module"`, and
-    /// `"run"` need folder/run context the MCP surface does not carry
-    /// and produce an invalid_params error, as do unknown values.
+    /// Optional scope *restriction*. `"repo"` searches only memories
+    /// scoped to this repository; `"workspace"` only the workspace
+    /// store; `"global"` only the global store. When omitted, retrieval
+    /// merges all three via multi-scope hybrid search (RRF), not a
+    /// narrow→wide cascade. `"module"` and `"run"` need per-file /
+    /// per-run context the MCP surface does not carry and produce an
+    /// invalid_params error, as do unknown values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope_hint: Option<String>,
     /// Maximum results. Server clamps to [1, 20] to protect token
@@ -235,6 +239,34 @@ pub struct MemoryGetRow {
 pub struct MemoryGetOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemoryGetRow>,
+}
+
+// ── memory_flag ───────────────────────────────────────────────────
+
+/// Input schema for `memory_flag`. `scope` is required for the same
+/// reason as [`MemoryGetInput`]: a bare id is ambiguous across the
+/// physical DBs (independent rowid spaces — the BUG-1 root cause).
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
+pub struct MemoryFlagInput {
+    /// Row id from a `memory_search` result.
+    pub id: i64,
+    /// Owning scope, as returned by `memory_search`: `"global"` |
+    /// `"workspace"` | `"run"` (run rows live in the workspace store).
+    /// `"repo"` / `"module"` need folder context the MCP surface does
+    /// not carry and produce an invalid_params error.
+    pub scope: String,
+    /// Why the memory is wrong or stale. Recorded verbatim in the audit
+    /// row so a human can reverse the demotion by hand.
+    pub reason: String,
+}
+
+/// Outcome of a `memory_flag` call. `accepted: false` is a *successful*
+/// call that declined to mutate — user-authored and History rows are not
+/// agent-flaggable — not a protocol error.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct MemoryFlagOutput {
+    pub accepted: bool,
+    pub detail: String,
 }
 
 // ── symbol_search / symbol_doc (S2.3 / PR-3) ─────────────────────
@@ -445,6 +477,7 @@ mod tests {
         assert_eq!(TOOL_SYMBOL_DOC, "symbol_doc");
         assert_eq!(TOOL_REPO_OUTLINE, "repo_outline");
         assert_eq!(TOOL_MEMORY_GET, "memory_get");
+        assert_eq!(TOOL_MEMORY_FLAG, "memory_flag");
         // C1.6: documented default kind is record.
         assert_eq!(MEMORY_SEARCH_DEFAULT_KIND, "record");
     }

@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::consolidation_llm::ConsolidationLlm;
 use super::observer::{ManifestObserver, MemoryObserver};
-use super::scope::{StoreResult, WriteMeta, WriteScope};
+use super::scope::{StoreResult, WriteMeta, WriteScope, store_kind_for_scope};
 use super::store::{MemoryStore, StoreOptions};
 use super::stores::MemoryStores;
 use super::trust_defaults::MemorySource;
@@ -64,6 +64,17 @@ impl From<StoreResult> for WriteResult {
             StoreResult::AlreadyCovered => Self::AlreadyCovered,
         }
     }
+}
+
+/// Outcome of a [`WriterMessage::AgentFlag`].
+///
+/// `accepted: false` is a *successful* refusal — the row's source is not
+/// agent-flaggable (D1) — not an error. Errors are reserved for "the row
+/// or its owning store could not be resolved".
+#[derive(Debug, Clone)]
+pub struct AgentFlagOutcome {
+    pub accepted: bool,
+    pub detail: String,
 }
 
 /// Every write to `MemoryStore` flows through one of these variants.
@@ -127,8 +138,19 @@ pub enum WriterMessage {
     /// pin (trust raise to 1.0), scope change, and text edit. All four
     /// route through the writer task so the Tier S2 single-consumer
     /// invariant holds; the panel never touches `MemoryStore` directly.
+    ///
+    /// `scope_level` / `repo_id` are the *persisted* scope of the row
+    /// being edited (not a new scope — `PanelEditOp::SetScope` carries
+    /// that separately). They exist because memory ids are only unique
+    /// within one physical DB: the global, workspace, and folder stores
+    /// have independent rowid spaces, so an id alone cannot identify a
+    /// row. The writer resolves the owning store with
+    /// [`store_kind_for_scope`] and refuses the edit when the pair is
+    /// inconsistent rather than guessing.
     PanelEdit {
         op: PanelEditOp,
+        scope_level: i32,
+        repo_id: Option<String>,
         ack: Option<oneshot::Sender<Result<WriteResult, String>>>,
     },
     /// Injection manifest produced by the chat retrieval stage (Phase 3).
@@ -209,6 +231,21 @@ pub enum WriterMessage {
         reason: String,
         ack: Option<oneshot::Sender<Result<i64, String>>>,
     },
+    /// Agent-raised "this memory is wrong or stale" signal, arriving from
+    /// the `memory_flag` MCP tool through
+    /// [`crate::mcp::signal::MemorySignalSink`].
+    ///
+    /// The handler demotes `trust_score` and writes an audit row. It never
+    /// creates or deletes memory content, and it refuses user-authored and
+    /// History rows outright (D1). `scope_level` / `repo_id` identify the
+    /// owning physical DB, same as [`Self::PanelEdit`].
+    AgentFlag {
+        memory_id: i64,
+        scope_level: i32,
+        repo_id: Option<String>,
+        reason: String,
+        ack: Option<oneshot::Sender<Result<AgentFlagOutcome, String>>>,
+    },
     /// No-op drain barrier. Because the writer processes messages strictly
     /// FIFO, acking this guarantees every message enqueued before it has
     /// been fully processed. Used by headless callers ([`WriterHandle::flush`])
@@ -255,6 +292,7 @@ impl WriterMessage {
             WriterMessage::RestoreSince { .. } => "RestoreSince",
             WriterMessage::BulkForget { .. } => "BulkForget",
             WriterMessage::RedactHistory { .. } => "RedactHistory",
+            WriterMessage::AgentFlag { .. } => "AgentFlag",
             WriterMessage::Flush { .. } => "Flush",
         }
     }
@@ -391,6 +429,32 @@ impl WriterHandle {
             Ok(Ok(Err(e))) => Err(anyhow!(e)),
             Ok(Err(_)) => Err(anyhow!("writer dropped ack channel")),
             Err(_) => Err(anyhow!("writer ack timeout after {}ms", budget.as_millis())),
+        }
+    }
+
+    /// Enqueue a [`WriterMessage::AgentFlag`] and await the writer's
+    /// decision under the standard ack budget. Used by the `memory_flag`
+    /// MCP tool through [`crate::mcp::signal::MemorySignalSink`].
+    pub async fn agent_flag(
+        &self,
+        memory_id: i64,
+        scope_level: i32,
+        repo_id: Option<String>,
+        reason: impl Into<String>,
+    ) -> Result<AgentFlagOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.enqueue(WriterMessage::AgentFlag {
+            memory_id,
+            scope_level,
+            repo_id,
+            reason: reason.into(),
+            ack: Some(tx),
+        })?;
+        match tokio::time::timeout(Duration::from_millis(ACK_TIMEOUT_MS), rx).await {
+            Ok(Ok(Ok(outcome))) => Ok(outcome),
+            Ok(Ok(Err(e))) => Err(anyhow!(e)),
+            Ok(Err(_)) => Err(anyhow!("writer dropped ack channel")),
+            Err(_) => Err(anyhow!("writer ack timeout after {ACK_TIMEOUT_MS}ms")),
         }
     }
 
@@ -837,15 +901,53 @@ async fn process_message(
             send_ack(ack, &res);
             res
         }
-        WriterMessage::PanelEdit { op, ack } => {
-            // Panel edits operate on rows in the store that owns the
-            // selected memory id. Today every memory id is unique within
-            // the workspace DB, so we route there. Step 7 generalises
-            // this to look up the owning store by scope.
-            let store = stores.workspace().clone();
-            let res = process_panel_edit(&store, op).await;
+        WriterMessage::PanelEdit {
+            op,
+            scope_level,
+            repo_id,
+            ack,
+        } => {
+            // Route to the DB that owns the row. No workspace fallback:
+            // an unresolvable (scope_level, repo_id) pair means we would
+            // be mutating an unrelated row that happens to share the id
+            // in another DB.
+            let res = match store_kind_for_scope(scope_level, repo_id.as_deref()) {
+                Some(kind) => match stores.get(&kind).await {
+                    Ok(store) => process_panel_edit(&store, op).await,
+                    Err(e) => Err(e),
+                },
+                None => Err(anyhow!(
+                    "panel edit: cannot resolve the store owning scope_level \
+                     {scope_level} (repo_id {repo_id:?}) — refusing to guess"
+                )),
+            };
             send_ack(ack, &res);
             res
+        }
+        WriterMessage::AgentFlag {
+            memory_id,
+            scope_level,
+            repo_id,
+            reason,
+            ack,
+        } => {
+            let res =
+                process_agent_flag(stores, memory_id, scope_level, repo_id.as_deref(), &reason)
+                    .await;
+            if let Some(tx) = ack {
+                let payload = match &res {
+                    Ok(outcome) => Ok(outcome.clone()),
+                    Err(e) => Err(e.to_string()),
+                };
+                let _ = tx.send(payload);
+            }
+            res.map(|outcome| {
+                if outcome.accepted {
+                    WriteResult::Inserted(memory_id)
+                } else {
+                    WriteResult::Skipped
+                }
+            })
         }
         WriterMessage::TurnComplete {
             session_id,
@@ -856,12 +958,13 @@ async fn process_message(
             transcript,
             annotations,
         } => {
-            // Turn-complete extraction writes run-scope rows; lives in the
-            // workspace store. Step 7 generalises if extractor promotes
-            // to broader scopes.
-            let store = stores.workspace().clone();
+            // Annotation flags and extractor rows carry their own scope,
+            // which may target any of the three physical DBs — the whole
+            // registry goes in so `MemoryStores::store_scoped` can route
+            // by `WriteScope::target_store`. History rows and the session
+            // ledger stay on the workspace store (see below).
             process_turn_complete(
-                &store,
+                stores,
                 llm,
                 session_id,
                 turn_id,
@@ -1296,6 +1399,94 @@ async fn process_panel_edit(store: &Arc<MemoryStore>, op: PanelEditOp) -> Result
     }
 }
 
+/// Audit `kind` recorded in `sleeptime_audit` for an applied agent flag.
+/// Shares the table with the sleeptime operations so the Tier C2
+/// `/forget` audit trail can reverse a demotion by hand — the convention
+/// `memory/sleeptime.rs` sets for every trust-changing path.
+const AGENT_FLAG_AUDIT_KIND: &str = "agent_flag";
+
+/// D1: demote one memory's trust in response to an agent flag.
+///
+/// Refuses user-authored and History rows (returns `accepted: false`,
+/// which is a successful call). Errors only when the owning store or the
+/// row itself cannot be resolved — never falls back to another DB.
+async fn process_agent_flag(
+    stores: &Arc<MemoryStores>,
+    memory_id: i64,
+    scope_level: i32,
+    repo_id: Option<&str>,
+    reason: &str,
+) -> Result<AgentFlagOutcome> {
+    use super::trust_defaults::{flagged_trust, is_agent_flaggable};
+
+    let kind = store_kind_for_scope(scope_level, repo_id).ok_or_else(|| {
+        anyhow!(
+            "memory_flag: cannot resolve the store owning scope_level {scope_level} \
+             (repo_id {repo_id:?})"
+        )
+    })?;
+    let store = stores.get(&kind).await?;
+    let row = store
+        .get_memory_row(memory_id)
+        .await?
+        .ok_or_else(|| anyhow!("memory_flag: no memory {memory_id} in the {kind:?} store"))?;
+
+    if !is_agent_flaggable(row.source) {
+        return Ok(AgentFlagOutcome {
+            accepted: false,
+            detail: format!("{} rows are not agent-flaggable", row.source.as_str()),
+        });
+    }
+
+    let prior = row.trust_score;
+    let next = flagged_trust(row.source, prior);
+    store.set_trust_score(memory_id, next).await?;
+
+    // Without an audit row a flag would be an unreversible mutation,
+    // which no other trust-changing path in the codebase is.
+    let payload = serde_json::json!({
+        "memory_id": memory_id,
+        "scope_level": scope_level,
+        "repo_id": repo_id,
+        "source": row.source.as_str(),
+        "trust_before": prior,
+        "trust_after": next,
+        "reason": reason,
+    })
+    .to_string();
+    if let Err(e) = store
+        .log_sleeptime_audit(
+            AGENT_FLAG_AUDIT_KIND,
+            AGENT_FLAG_AUDIT_KIND,
+            Some(memory_id),
+            None,
+            &payload,
+            false,
+        )
+        .await
+    {
+        tracing::warn!(
+            target: "memory_writer",
+            memory_id = memory_id,
+            error = %e,
+            "agent flag audit row write failed"
+        );
+    }
+
+    tracing::info!(
+        target: "memory_writer",
+        memory_id = memory_id,
+        source = row.source.as_str(),
+        trust_before = prior,
+        trust_after = next,
+        "agent flag applied"
+    );
+    Ok(AgentFlagOutcome {
+        accepted: true,
+        detail: format!("trust {prior:.2} → {next:.2}"),
+    })
+}
+
 /// Per-turn extractor path (Tier S / S3).
 ///
 /// Flow:
@@ -1304,8 +1495,15 @@ async fn process_panel_edit(store: &Arc<MemoryStore>, op: PanelEditOp) -> Result
 /// 2. Parse 0–5 candidates; drop below-threshold importance.
 /// 3. Resolve each `scope_hint` to a concrete `WriteScope`, build
 ///    `WriteMeta` with `source="llm_extracted"` + `trust=Medium`, and
-///    call `MemoryStore::store_scoped` (which owns SHA + cosine dedup
-///    inside the brief connection lock — see `store.rs`).
+///    call `MemoryStores::store_scoped`, which routes the row to the DB
+///    named by [`WriteScope::target_store`] and then delegates to that
+///    store's own SHA + cosine dedup (see `stores.rs` / `store.rs`).
+///
+/// Scope routing matters here: a flag or extraction declaring `global` /
+/// `repo` / `module` scope belongs in the global or folder DB. Writing it
+/// to the workspace DB makes it unreachable — retrieval asks the global
+/// store for Global-level rows and folder stores for Repo/Module-level
+/// rows (`MemoryStores::multi_scope_retrieve`).
 /// 4. On LLM unavailable / JSON parse failure: write one Run-scope raw
 ///    record so the turn is never lost.
 ///
@@ -1314,7 +1512,7 @@ async fn process_panel_edit(store: &Arc<MemoryStore>, op: PanelEditOp) -> Result
 /// Per-stage latency is logged via `tracing` with a correlation id built
 /// from `turn_id` for post-hoc perf work.
 async fn process_turn_complete(
-    store: &Arc<MemoryStore>,
+    stores: &Arc<MemoryStores>,
     llm: Option<&Arc<dyn ConsolidationLlm>>,
     session_id: String,
     turn_id: String,
@@ -1337,18 +1535,27 @@ async fn process_turn_complete(
     // does not lose records and vice versa." We capture errors but
     // never propagate — the extractor path below still runs even if
     // this write fails.
-    let history_id =
-        write_history_row(store, &session_id, &turn_id, &repo_id, &run_id, &transcript)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    target: "memory_history",
-                    turn_id = %turn_id,
-                    error = %e,
-                    "history-row write failed; proceeding to extractor path"
-                );
-                None
-            });
+    //
+    // History rows are Run scope, which routes to the workspace store by
+    // definition (`store_kind_for_scope`), so this one stays store-local.
+    let history_id = write_history_row(
+        stores.workspace(),
+        &session_id,
+        &turn_id,
+        &repo_id,
+        &run_id,
+        &transcript,
+    )
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(
+            target: "memory_history",
+            turn_id = %turn_id,
+            error = %e,
+            "history-row write failed; proceeding to extractor path"
+        );
+        None
+    });
     if let Some(id) = history_id {
         tracing::debug!(
             target: "memory_history",
@@ -1375,9 +1582,11 @@ async fn process_turn_complete(
     if let Some(raw) = &annotations {
         match serde_json::from_value::<ann_mod::TurnAnnotations>(raw.clone()) {
             Ok(parsed) => {
-                // Persist session ledger row (best-effort).
+                // Persist session ledger row (best-effort). The ledger is
+                // workspace-level bookkeeping, not a scoped memory.
                 let annotations_json = serde_json::to_string(&parsed).ok();
-                if let Err(e) = store
+                if let Err(e) = stores
+                    .workspace()
                     .store_session_ledger_turn(
                         &session_id,
                         &turn_id,
@@ -1411,7 +1620,7 @@ async fn process_turn_complete(
                         &run_id,
                     );
                     let meta = super::extractor::build_annotated_write_meta(&ext_shape);
-                    match store.store_scoped(&scope, &f.text, &meta).await {
+                    match stores.store_scoped(&scope, &f.text, &meta).await {
                         Ok(super::scope::StoreResult::Inserted(id)) => {
                             annotated_ids.push(id);
                         }
@@ -1461,7 +1670,7 @@ async fn process_turn_complete(
                     error = %e,
                     "extractor failed — writing Run-scope fallback"
                 );
-                return fallback_raw_turn(store, &repo_id, &run_id, &transcript).await;
+                return fallback_raw_turn(stores.workspace(), &repo_id, &run_id, &transcript).await;
             }
         },
         None => {
@@ -1470,7 +1679,7 @@ async fn process_turn_complete(
                 turn_id = %turn_id,
                 "no ConsolidationLlm configured — writing Run-scope fallback"
             );
-            return fallback_raw_turn(store, &repo_id, &run_id, &transcript).await;
+            return fallback_raw_turn(stores.workspace(), &repo_id, &run_id, &transcript).await;
         }
     };
 
@@ -1490,7 +1699,7 @@ async fn process_turn_complete(
         let scope =
             extractor::resolve_scope(&ext.scope_hint, &repo_id, module_path.as_deref(), &run_id);
         let meta = extractor::build_write_meta(&ext, extractor::PROMPT_VERSION);
-        match store.store_scoped(&scope, &ext.text, &meta).await {
+        match stores.store_scoped(&scope, &ext.text, &meta).await {
             Ok(res) => {
                 if matches!(res, super::scope::StoreResult::Inserted(_)) {
                     inserted_count += 1;
@@ -1569,6 +1778,9 @@ async fn write_history_row(
 /// down, parse error, no backend configured). Writes a single Run-scope
 /// record with the raw transcript so the turn isn't lost — consolidation
 /// passes can upgrade or prune it later.
+///
+/// Run scope always resolves to the workspace store, so this takes the
+/// concrete store rather than the registry.
 async fn fallback_raw_turn(
     store: &Arc<MemoryStore>,
     repo_id: &str,
@@ -2042,6 +2254,8 @@ mod tests {
                 op: PanelEditOp::Delete {
                     memory_id: history_id,
                 },
+                scope_level: super::super::scope::SCOPE_RUN,
+                repo_id: Some("repo-x".into()),
                 ack: Some(tx),
             })
             .unwrap();
@@ -2066,6 +2280,8 @@ mod tests {
                 op: PanelEditOp::Delete {
                     memory_id: record_id,
                 },
+                scope_level: super::super::scope::SCOPE_RUN,
+                repo_id: Some("repo-x".into()),
                 ack: Some(tx),
             })
             .unwrap();

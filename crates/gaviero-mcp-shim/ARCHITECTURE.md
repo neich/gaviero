@@ -17,7 +17,7 @@ gaviero-mcp-shim
         │
         ▼  Unix: <workspace>/.gaviero/mcp.sock
            Windows: \\.\pipe\gaviero-<hash>
-gaviero-core::mcp::server  (rmcp, seven read-only tools)
+gaviero-core::mcp::server  (rmcp, 8 tools: 7 read-only + memory_flag)
 ```
 
 **Zero workspace deps.** Only `tokio`, `clap`, `anyhow`, `tracing`. Speaks to core exclusively over the endpoint — never links `gaviero-core`.
