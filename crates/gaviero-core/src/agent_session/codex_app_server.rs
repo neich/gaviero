@@ -161,7 +161,10 @@ fn client_info_params() -> serde_json::Value {
             "name": "gaviero",
             "title": "Gaviero",
             "version": env!("CARGO_PKG_VERSION"),
-        }
+        },
+        "capabilities": {
+            "experimentalApi": true,
+        },
     })
 }
 
@@ -284,6 +287,8 @@ impl ReviewContext {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CargoVerificationKind {
+    Build,
+    Check,
     Format,
     Test,
 }
@@ -778,6 +783,7 @@ async fn cargo_verification_is_safe_to_approve(
         Err(e) => {
             tracing::debug!(
                 error = %e,
+                params = %value.pointer("/params").unwrap_or(&serde_json::Value::Null),
                 "declining Codex command outside the Cargo verification policy"
             );
             return false;
@@ -823,17 +829,13 @@ fn parse_cargo_verification_request(
     {
         anyhow::bail!("network approval requests are not Cargo verification commands");
     }
-    if value
-        .pointer("/params/additionalPermissions")
-        .is_some_and(|permissions| !permissions.is_null())
-    {
-        anyhow::bail!("additional permission requests are not auto-approved");
-    }
+    validate_additional_permissions(value, review)?;
 
     let command = value
         .pointer("/params/command")
         .context("command approval request missing command")?;
     let tokens = cargo_command_tokens(command)?;
+    let tokens = unwrap_windows_shell_cargo_command(tokens)?;
 
     if tokens.is_empty() {
         anyhow::bail!("empty command");
@@ -861,9 +863,11 @@ fn parse_cargo_verification_request(
         .map(|token| trim_matching_quotes(token))
         .context("Cargo command missing subcommand")?;
     let kind = match subcommand {
+        "build" => CargoVerificationKind::Build,
+        "check" => CargoVerificationKind::Check,
         "fmt" => CargoVerificationKind::Format,
         "test" => CargoVerificationKind::Test,
-        _ => anyhow::bail!("only cargo fmt and cargo test are auto-approved"),
+        _ => anyhow::bail!("only cargo build, check, fmt, and test are auto-approved"),
     };
 
     let cwd = resolve_command_cwd(value, review)?;
@@ -872,16 +876,111 @@ fn parse_cargo_verification_request(
     Ok(CargoVerificationRequest { kind, cwd })
 }
 
+fn unwrap_windows_shell_cargo_command(tokens: Vec<String>) -> Result<Vec<String>> {
+    let Some(executable) = tokens.first() else {
+        return Ok(tokens);
+    };
+    let executable = Path::new(trim_matching_quotes(executable))
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if !matches!(
+        executable.to_ascii_lowercase().as_str(),
+        "pwsh" | "pwsh.exe" | "powershell" | "powershell.exe"
+    ) {
+        return Ok(tokens);
+    }
+
+    if tokens.len() != 3 || !trim_matching_quotes(&tokens[1]).eq_ignore_ascii_case("-Command") {
+        anyhow::bail!("only the standard PowerShell Cargo transport wrapper is auto-approved");
+    }
+
+    let inner = trim_matching_quotes(&tokens[2]);
+    if contains_shell_control(inner) {
+        anyhow::bail!("shell composition is not allowed");
+    }
+    cargo_command_tokens(&serde_json::Value::String(inner.to_string()))
+}
+
+fn validate_additional_permissions(
+    value: &serde_json::Value,
+    review: &ReviewContext,
+) -> Result<()> {
+    let Some(permissions) = value.pointer("/params/additionalPermissions") else {
+        return Ok(());
+    };
+    if permissions.is_null() {
+        return Ok(());
+    }
+
+    let permissions = permissions
+        .as_object()
+        .context("additional permissions must be an object")?;
+    if permissions
+        .keys()
+        .any(|key| key != "writableRoots" && key != "fileSystem" && key != "network")
+    {
+        anyhow::bail!("unsupported additional permission requested");
+    }
+
+    if let Some(network) = permissions.get("network") {
+        let network = network
+            .as_object()
+            .context("additional network permission must be an object")?;
+        if network.keys().any(|key| key != "enabled") {
+            anyhow::bail!("unsupported additional network permission requested");
+        }
+        if network
+            .get("enabled")
+            .is_some_and(|enabled| enabled != false)
+        {
+            anyhow::bail!("network access is not allowed for Cargo verification");
+        }
+    }
+
+    let mut writable_roots = Vec::new();
+    if let Some(roots) = permissions.get("writableRoots") {
+        writable_roots.extend(
+            roots
+                .as_array()
+                .context("additional writable roots must be an array")?,
+        );
+    }
+    if let Some(file_system) = permissions.get("fileSystem") {
+        let file_system = file_system
+            .as_object()
+            .context("additional file-system permission must be an object")?;
+        if file_system.keys().any(|key| key != "write") {
+            anyhow::bail!("only additional file-system write access is supported");
+        }
+        if let Some(roots) = file_system.get("write") {
+            writable_roots.extend(
+                roots
+                    .as_array()
+                    .context("additional file-system write roots must be an array")?,
+            );
+        }
+    }
+
+    for root in writable_roots {
+        let root = root
+            .as_str()
+            .context("additional writable root must be a path string")?;
+        resolve_allowed_path(root, review).with_context(|| {
+            format!("additional writable root {root:?} is outside the workspace")
+        })?;
+    }
+
+    Ok(())
+}
+
 fn cargo_command_tokens(command: &serde_json::Value) -> Result<Vec<String>> {
     match command {
         serde_json::Value::String(command) => {
             if contains_shell_control(command) {
                 anyhow::bail!("shell composition is not allowed");
             }
-            Ok(command
-                .split_whitespace()
-                .map(ToString::to_string)
-                .collect())
+            split_quoted_command(command)
         }
         serde_json::Value::Array(command) => command
             .iter()
@@ -894,6 +993,34 @@ fn cargo_command_tokens(command: &serde_json::Value) -> Result<Vec<String>> {
             .collect(),
         _ => anyhow::bail!("unsupported command representation"),
     }
+}
+
+fn split_quoted_command(command: &str) -> Result<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+
+    for ch in command.chars() {
+        match (quote, ch) {
+            (Some(expected), current) if current == expected => quote = None,
+            (Some(_), current) => token.push(current),
+            (None, '\'' | '"') => quote = Some(ch),
+            (None, current) if current.is_whitespace() => {
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+            }
+            (None, current) => token.push(current),
+        }
+    }
+
+    if quote.is_some() {
+        anyhow::bail!("command contains an unmatched quote");
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    Ok(tokens)
 }
 
 fn contains_shell_control(command: &str) -> bool {
@@ -1797,11 +1924,19 @@ url = "https://example/mcp/"
     }
 
     #[test]
-    fn direct_cargo_fmt_and_test_commands_are_approved() {
+    fn direct_cargo_verification_commands_are_approved() {
         let dir = tempfile::tempdir().unwrap();
         let review = review_context(dir.path(), test_write_gate());
 
         let cases = [
+            (
+                "cargo build --release",
+                CargoVerificationKind::Build,
+            ),
+            (
+                "cargo check --workspace --all-targets",
+                CargoVerificationKind::Check,
+            ),
             (
                 "cargo fmt -p gaviero-core --check",
                 CargoVerificationKind::Format,
@@ -1840,6 +1975,57 @@ url = "https://example/mcp/"
     }
 
     #[test]
+    fn windows_powershell_cargo_transport_wrapper_is_approved() {
+        let dir = tempfile::tempdir().unwrap();
+        let review = review_context(dir.path(), test_write_gate());
+
+        for executable in [
+            "pwsh.exe",
+            r#"C:\Program Files\PowerShell\7\pwsh.exe"#,
+            "powershell.exe",
+        ] {
+            let request = command_request(
+                serde_json::json!([executable, "-Command", "cargo build --release"]),
+                dir.path(),
+            );
+            assert_eq!(
+                parse_cargo_verification_request(&request, &review)
+                    .unwrap()
+                    .kind,
+                CargoVerificationKind::Build
+            );
+        }
+
+        let captured_request = command_request(
+            serde_json::json!(
+                r#""C:\Program Files\PowerShell\7\pwsh.exe" -Command 'cargo build --release'"#
+            ),
+            dir.path(),
+        );
+        assert_eq!(
+            parse_cargo_verification_request(&captured_request, &review)
+                .unwrap()
+                .kind,
+            CargoVerificationKind::Build
+        );
+    }
+
+    #[test]
+    fn unsafe_powershell_wrappers_are_declined() {
+        let dir = tempfile::tempdir().unwrap();
+        let review = review_context(dir.path(), test_write_gate());
+
+        for command in [
+            serde_json::json!(["pwsh.exe", "-Command", "cargo test; Remove-Item source.rs"]),
+            serde_json::json!(["pwsh.exe", "-NoProfile", "-Command", "cargo test"]),
+            serde_json::json!(["pwsh.exe", "-Command", "git status"]),
+        ] {
+            let request = command_request(command, dir.path());
+            assert!(parse_cargo_verification_request(&request, &review).is_err());
+        }
+    }
+
+    #[test]
     fn composed_or_unrelated_commands_are_declined() {
         let dir = tempfile::tempdir().unwrap();
         let review = review_context(dir.path(), test_write_gate());
@@ -1848,7 +2034,7 @@ url = "https://example/mcp/"
             "cargo test; Remove-Item source.rs",
             "cargo test && git clean -fdx",
             "cargo fmt | Out-File result.txt",
-            "cargo build",
+            "cargo run",
             "rustfmt src/lib.rs",
             "pwsh -Command cargo test",
             "CARGO_TARGET_DIR=target cargo test",
@@ -1877,6 +2063,38 @@ url = "https://example/mcp/"
         extra["params"]["additionalPermissions"] =
             serde_json::json!({ "writableRoots": ["C:\\outside"] });
         assert!(parse_cargo_verification_request(&extra, &review).is_err());
+    }
+
+    #[test]
+    fn workspace_write_permissions_are_approved_in_current_and_legacy_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let review = review_context(dir.path(), test_write_gate());
+        let root = dir.path().to_string_lossy();
+
+        for permissions in [
+            serde_json::json!({ "fileSystem": { "write": [root.as_ref()] } }),
+            serde_json::json!({ "writableRoots": [root.as_ref()] }),
+        ] {
+            let mut request = command_request(serde_json::json!("cargo build --release"), dir.path());
+            request["params"]["additionalPermissions"] = permissions;
+            assert!(parse_cargo_verification_request(&request, &review).is_ok());
+        }
+    }
+
+    #[test]
+    fn network_and_unknown_additional_permissions_are_declined() {
+        let dir = tempfile::tempdir().unwrap();
+        let review = review_context(dir.path(), test_write_gate());
+
+        for permissions in [
+            serde_json::json!({ "network": { "enabled": true } }),
+            serde_json::json!({ "fileSystem": { "read": [dir.path()] } }),
+            serde_json::json!({ "unknownCapability": true }),
+        ] {
+            let mut request = command_request(serde_json::json!("cargo test"), dir.path());
+            request["params"]["additionalPermissions"] = permissions;
+            assert!(parse_cargo_verification_request(&request, &review).is_err());
+        }
     }
 
     #[test]
