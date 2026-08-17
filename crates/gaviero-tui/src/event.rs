@@ -254,6 +254,11 @@ pub enum Event {
         tier: gaviero_core::types::ModelTier,
         backend: String,
     },
+    SwarmLoopGateFailed {
+        probe: String,
+        status: String,
+        output: String,
+    },
     SwarmCostUpdate(gaviero_core::swarm::verify::CostEstimate),
     /// Coordinator produced a `.gaviero` DSL plan file ready for user review.
     /// The path is absolute. The user should review/edit it, then `/run` it.

@@ -758,6 +758,13 @@ impl SwarmObserver for CliSwarmObserver {
         }
     }
 
+    fn on_loop_gate_failed(&self, probe: &str, status: &str, output: &str) {
+        eprintln!("[loop] gate FAIL - {} ({})", probe, status);
+        if !output.trim().is_empty() {
+            eprintln!("{}", output.trim_end());
+        }
+    }
+
     fn on_cost_update(&self, estimate: &gaviero_core::swarm::verify::CostEstimate) {
         eprintln!("[cost] ~${:.4}", estimate.estimated_usd);
     }
@@ -4014,7 +4021,10 @@ async fn main() -> Result<()> {
     // Load checkpoint for --resume
     let initial_state = if cli.resume {
         let hash = plan.hash();
-        match gaviero_core::swarm::execution_state::ExecutionState::load(&hash) {
+        match gaviero_core::swarm::execution_state::ExecutionState::load(
+            &config.workspace_root,
+            &hash,
+        ) {
             Ok(Some(state)) => {
                 let completed = state
                     .node_states

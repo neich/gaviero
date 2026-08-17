@@ -85,6 +85,14 @@ impl gaviero_core::observer::SwarmObserver for TuiSwarmObserver {
         });
     }
 
+    fn on_loop_gate_failed(&self, probe: &str, status: &str, output: &str) {
+        let _ = self.tx.send(Event::SwarmLoopGateFailed {
+            probe: probe.to_string(),
+            status: status.to_string(),
+            output: output.to_string(),
+        });
+    }
+
     fn on_cost_update(&self, estimate: &gaviero_core::swarm::verify::CostEstimate) {
         let _ = self.tx.send(Event::SwarmCostUpdate(estimate.clone()));
     }
