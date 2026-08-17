@@ -280,6 +280,14 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
                     .starts_with("/consolidate-session")
                 {
                     app.handle_consolidate_session_command();
+                } else if app
+                    .chat_state
+                    .text_input
+                    .text
+                    .trim()
+                    .starts_with("/consolidate")
+                {
+                    app.handle_consolidate_command();
                 } else if app.chat_state.text_input.text.trim().starts_with("/sleep") {
                     app.handle_sleep_command();
                 } else if app.chat_state.text_input.text.trim().starts_with("/restore") {

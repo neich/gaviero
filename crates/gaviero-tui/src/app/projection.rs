@@ -555,6 +555,7 @@ pub fn project_hot_event(app: &App, event: &Event) -> Option<ServerFrame> {
         | Event::SwarmCoordinationStarted(_)
         | Event::SwarmCoordinationComplete { .. }
         | Event::SwarmTierDispatch { .. }
+        | Event::SwarmLoopGateFailed { .. }
         | Event::SwarmCostUpdate(_)
         | Event::SwarmDslPlanReady(_)
         | Event::MemoryReady(_)

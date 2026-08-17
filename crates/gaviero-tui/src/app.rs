@@ -706,6 +706,12 @@ impl App {
         commands::handle_reembed_command(self);
     }
 
+    /// Handle `/consolidate history [n]` and
+    /// `/consolidate rollback <run_id>` — Tier H / H1 audit surface.
+    fn handle_consolidate_command(&mut self) {
+        commands::handle_consolidate_command(self);
+    }
+
     /// Handle `/consolidate-session` — Tier B / B5 session
     /// consolidator (manual trigger).
     fn handle_consolidate_session_command(&mut self) {

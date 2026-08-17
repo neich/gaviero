@@ -801,6 +801,118 @@ pub(super) fn handle_consolidate_session_command(app: &mut App) {
     });
 }
 
+/// Tier H / H1: `/consolidate history [n]` and
+/// `/consolidate rollback <run_id>`.
+///
+/// `history` is a read, so it goes straight to the store. `rollback`
+/// mutates memory and therefore goes through the writer task like every
+/// other mutation.
+pub(super) fn handle_consolidate_command(app: &mut App) {
+    let input = app.chat_state.take_input();
+    let trimmed = input.trim().to_string();
+    app.chat_state.add_user_message(&trimmed);
+
+    let mut args = trimmed.split_whitespace().skip(1);
+    match args.next() {
+        Some("history") => {
+            let limit = args
+                .next()
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(10);
+            let Some(stores) = app.memory.clone() else {
+                app.chat_state
+                    .add_system_message("Memory not initialised; no consolidation history.");
+                return;
+            };
+            let tx = app.event_tx.clone();
+            tokio::spawn(async move {
+                let msg = match stores.workspace().recent_consolidation_runs(limit).await {
+                    Ok(runs) if runs.is_empty() => {
+                        "No consolidation runs recorded yet.".to_string()
+                    }
+                    Ok(runs) => {
+                        let mut out = String::from("Consolidation history (newest first):\n");
+                        for r in runs {
+                            out.push_str(&format!(
+                                "  {}  {}/{} applied{}{}  {}\n",
+                                r.run_id,
+                                r.applied,
+                                r.ops,
+                                r.scope
+                                    .as_deref()
+                                    .map(|s| format!("  [{s}]"))
+                                    .unwrap_or_default(),
+                                if r.rolled_back { "  (rolled back)" } else { "" },
+                                r.started_at,
+                            ));
+                        }
+                        out.push_str("\nUndo one with: /consolidate rollback <run_id>");
+                        out
+                    }
+                    Err(e) => format!("Could not read consolidation history: {e}"),
+                };
+                let _ = tx.send(Event::MessageComplete {
+                    conv_id: String::new(),
+                    role: "system".to_string(),
+                    content: msg,
+                });
+            });
+        }
+
+        Some("rollback") => {
+            let Some(run_id) = args.next().map(str::to_string) else {
+                app.chat_state.add_system_message(
+                    "Usage: /consolidate rollback <run_id>  (see /consolidate history)",
+                );
+                return;
+            };
+            let Some(writer) = app.memory_writer.clone() else {
+                app.chat_state
+                    .add_system_message("Memory writer not initialised; cannot roll back.");
+                return;
+            };
+            let tx = app.event_tx.clone();
+            tokio::spawn(async move {
+                let msg = match writer.consolidation_rollback(run_id.clone()).await {
+                    Ok(outcome) => {
+                        let mut out = format!(
+                            "Rolled back consolidation run {}: {} operation(s) reversed",
+                            outcome.run_id, outcome.reversed
+                        );
+                        if outcome.skipped > 0 {
+                            out.push_str(&format!(", {} skipped (never applied)", outcome.skipped));
+                        }
+                        if !outcome.failed.is_empty() {
+                            out.push_str(&format!(
+                                ".\n{} inverse operation(s) failed:\n  {}",
+                                outcome.failed.len(),
+                                outcome.failed.join("\n  ")
+                            ));
+                        } else {
+                            out.push('.');
+                        }
+                        out
+                    }
+                    Err(e) => format!("Rollback of {run_id} failed: {e}"),
+                };
+                let _ = tx.send(Event::MessageComplete {
+                    conv_id: String::new(),
+                    role: "system".to_string(),
+                    content: msg,
+                });
+            });
+        }
+
+        other => {
+            let what = other.unwrap_or("(nothing)");
+            app.chat_state.add_system_message(&format!(
+                "Unknown /consolidate subcommand `{what}`. \
+                 Try `/consolidate history [n]` or `/consolidate rollback <run_id>`."
+            ));
+        }
+    }
+}
+
 /// Tier B / B5: `/sleep [--dry-run]` — kick off the sleeptime pass.
 /// Fire-and-forget; the writer task handles audit + observer events.
 pub(super) fn handle_sleep_command(app: &mut App) {
