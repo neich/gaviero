@@ -65,24 +65,6 @@ fn manifest(id: &str, status: AgentStatus, modified: Vec<&str>, cost: f64) -> Ag
     }
 }
 
-/// Run `f` with the working directory temporarily set to `dir`. Required
-/// because `ExecutionState::save` / `load` use a hardcoded `.gaviero/state/`
-/// path relative to CWD.
-///
-/// Cargo runs each integration-test binary as a single process, but
-/// `cargo test` may schedule tests in this binary in parallel — guard
-/// with a process-wide mutex so the chdir doesn't race across tests.
-fn with_cwd<P: AsRef<std::path::Path>, R>(dir: P, f: impl FnOnce() -> R) -> R {
-    use std::sync::Mutex;
-    static LOCK: Mutex<()> = Mutex::new(());
-    let _guard = LOCK.lock().unwrap();
-    let prev = std::env::current_dir().expect("getcwd");
-    std::env::set_current_dir(dir.as_ref()).expect("set cwd to tempdir");
-    let result = f();
-    std::env::set_current_dir(prev).expect("restore cwd");
-    result
-}
-
 #[test]
 fn save_then_load_preserves_per_node_state() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -105,7 +87,12 @@ fn save_then_load_preserves_per_node_state() {
     );
     state.record_result(
         "beta",
-        manifest("beta", AgentStatus::Failed("model timeout".into()), vec![], 0.02),
+        manifest(
+            "beta",
+            AgentStatus::Failed("model timeout".into()),
+            vec![],
+            0.02,
+        ),
     );
     // Leave `gamma` Pending — `load` must reconstruct it without a result.
 
@@ -114,58 +101,65 @@ fn save_then_load_preserves_per_node_state() {
     assert_eq!(state.status("gamma"), NodeStatus::Pending);
     let pre_save_cost = state.cost_estimate_usd;
 
-    with_cwd(tmp.path(), || {
-        state.save(&plan_hash).expect("save state");
+    let workspace = tmp.path();
+    state.save(workspace, &plan_hash).expect("save state");
 
-        let path = ExecutionState::checkpoint_path(&plan_hash);
-        assert!(
-            path.exists(),
-            "checkpoint file must exist after save: {}",
-            path.display()
-        );
+    let path = ExecutionState::checkpoint_path(workspace, &plan_hash);
+    assert!(
+        path.exists(),
+        "checkpoint file must exist after save: {}",
+        path.display()
+    );
+    assert!(
+        path.starts_with(workspace),
+        "the checkpoint belongs to the workspace, not the process cwd: {}",
+        path.display()
+    );
 
-        let loaded = ExecutionState::load(&plan_hash)
-            .expect("load state")
-            .expect("checkpoint must be present");
+    let loaded = ExecutionState::load(workspace, &plan_hash)
+        .expect("load state")
+        .expect("checkpoint must be present");
 
-        assert_eq!(loaded.status("alpha"), NodeStatus::Completed);
-        assert_eq!(loaded.status("beta"), NodeStatus::HardFailure);
-        assert_eq!(loaded.status("gamma"), NodeStatus::Pending);
-        assert!(
-            (loaded.cost_estimate_usd - pre_save_cost).abs() < 1e-9,
-            "cost estimate must round-trip: {} vs {}",
-            loaded.cost_estimate_usd,
-            pre_save_cost,
-        );
-        // The recorded manifest survives — used by `--resume` to skip
-        // completed nodes and surface their summaries.
-        let alpha_state = loaded
-            .node_states
-            .get("alpha")
-            .expect("alpha node present");
-        let alpha_manifest = alpha_state.result.as_ref().expect("alpha manifest saved");
-        assert_eq!(alpha_manifest.work_unit_id, "alpha");
-        assert!(matches!(alpha_manifest.status, AgentStatus::Completed));
-        assert_eq!(alpha_manifest.modified_files, vec![PathBuf::from("src/a.rs")]);
-    });
+    assert_eq!(loaded.status("alpha"), NodeStatus::Completed);
+    assert_eq!(loaded.status("beta"), NodeStatus::HardFailure);
+    assert_eq!(loaded.status("gamma"), NodeStatus::Pending);
+    assert!(
+        (loaded.cost_estimate_usd - pre_save_cost).abs() < 1e-9,
+        "cost estimate must round-trip: {} vs {}",
+        loaded.cost_estimate_usd,
+        pre_save_cost,
+    );
+    // The recorded manifest survives — used by `--resume` to skip
+    // completed nodes and surface their summaries.
+    let alpha_state = loaded.node_states.get("alpha").expect("alpha node present");
+    let alpha_manifest = alpha_state.result.as_ref().expect("alpha manifest saved");
+    assert_eq!(alpha_manifest.work_unit_id, "alpha");
+    assert!(matches!(alpha_manifest.status, AgentStatus::Completed));
+    assert_eq!(
+        alpha_manifest.modified_files,
+        vec![PathBuf::from("src/a.rs")]
+    );
 }
 
 #[test]
 fn load_returns_none_when_no_checkpoint_exists() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    with_cwd(tmp.path(), || {
-        let result = ExecutionState::load("ffffffffffffffff").expect("load is Ok-None");
-        assert!(result.is_none(), "missing checkpoint must return Ok(None)");
-    });
+    let result = ExecutionState::load(tmp.path(), "ffffffffffffffff").expect("load is Ok-None");
+    assert!(result.is_none(), "missing checkpoint must return Ok(None)");
 }
 
 #[test]
 fn checkpoint_path_uses_plan_hash() {
-    let path = ExecutionState::checkpoint_path("deadbeef");
+    let root = std::path::Path::new("/some/workspace");
+    let path = ExecutionState::checkpoint_path(root, "deadbeef");
     let s = path.to_string_lossy();
     // Stable shape — `gaviero-cli --resume` and any external tooling
     // assume `.gaviero/state/<hash>.json`.
     assert!(s.ends_with("deadbeef.json"), "got {s}");
     assert!(s.contains(".gaviero"), "got {s}");
     assert!(s.contains("state"), "got {s}");
+    assert!(
+        path.starts_with(root),
+        "the path must be anchored on the workspace root, got {s}"
+    );
 }
