@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Increment when adding a new migration.
-const CURRENT_VERSION: u32 = 13;
+const CURRENT_VERSION: u32 = 15;
 
 /// First schema version where the `memory_kind` discriminator exists.
 /// Used by [`needs_c1_backup`] to decide whether to take a one-shot
@@ -74,6 +74,12 @@ pub fn run_migrations(conn: &Connection, embedding_dims: usize) -> Result<()> {
     }
     if version < 13 {
         migrate_v13(conn).context("migration v13")?;
+    }
+    if version < 14 {
+        migrate_v14(conn).context("migration v14")?;
+    }
+    if version < 15 {
+        migrate_v15(conn).context("migration v15")?;
     }
 
     // Stamp the current version
@@ -810,6 +816,84 @@ fn migrate_v13(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Add `column` to `table` unless it is already there.
+///
+/// `ALTER TABLE … ADD COLUMN` has no `IF NOT EXISTS`, and migrations must
+/// stay idempotent, so presence is checked against `pragma_table_info`
+/// first — the same guard [`migrate_v9`] uses for `superseded_by`.
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let present: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2")
+        .and_then(|mut s| s.query_row(rusqlite::params![table, column], |_| Ok(true)))
+        .unwrap_or(false);
+    if !present {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))
+            .with_context(|| format!("adding {table}.{column}"))?;
+    }
+    Ok(())
+}
+
+/// v14 — Tier H / H1: widen `sleeptime_audit` into the single audit
+/// surface for *every* automatic memory mutation, not just sleeptime's.
+///
+/// The consolidator applies LLM-proposed operations with no record of
+/// what it did or why an op failed, which makes both diagnosis and the
+/// PR-6 rollback path impossible. Rather than a second near-identical
+/// table, `origin` discriminates the producer and the existing columns
+/// keep their meaning:
+///
+/// - `origin` — `sleeptime` (the default, so every existing row stays
+///   correct without a backfill) or `consolidation`.
+/// - `payload` — unchanged contract: the opaque JSON for this row. For
+///   consolidation that is the operation itself, so no separate
+///   `op_json` column is added.
+/// - `before_json` / `after_json` — structured snapshots either side of
+///   the change. Rollback composes its inverse from these, which is why
+///   they are columns rather than nested inside `payload`.
+/// - `applied` — did the operation actually land. Defaults to 1:
+///   existing sleeptime rows all describe applied work, and a dry run is
+///   already recorded by `dry_run`.
+/// - `error` — why it did not, when `applied = 0`.
+/// - `prompt_version` — which consolidator prompt produced the op, so a
+///   later revision can be judged against the op quality it caused.
+/// - `scope` — the scope the write landed in (`Module` or `Repo`), which
+///   #229 made variable.
+fn migrate_v14(conn: &Connection) -> Result<()> {
+    for (column, decl) in [
+        ("origin", "TEXT NOT NULL DEFAULT 'sleeptime'"),
+        ("before_json", "TEXT"),
+        ("after_json", "TEXT"),
+        ("applied", "INTEGER NOT NULL DEFAULT 1"),
+        ("error", "TEXT"),
+        ("prompt_version", "TEXT"),
+        ("scope", "TEXT"),
+    ] {
+        add_column_if_missing(conn, "sleeptime_audit", column, decl)?;
+    }
+
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_sleeptime_audit_origin
+             ON sleeptime_audit(origin);
+         CREATE INDEX IF NOT EXISTS idx_sleeptime_audit_origin_run
+             ON sleeptime_audit(origin, run_id);",
+    )
+    .context("indexing sleeptime_audit by origin")?;
+    Ok(())
+}
+
+/// v15 — Tier H / H1 (PR-7): record what the consolidator *expected* an
+/// operation to achieve.
+///
+/// `session_v2` asks for a one-line `expected_outcome` per operation.
+/// Kept as its own column rather than read back out of `payload`
+/// because the history replayed into the next prompt pairs it with the
+/// operation's actual verdict, row by row — "you expected X; here is
+/// what happened" is the whole self-correction mechanism, and it should
+/// not depend on re-parsing a JSON blob.
+fn migrate_v15(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "sleeptime_audit", "expected_outcome", "TEXT")
+}
+
 /// Drop the C1.3 immutability triggers. **Crate-private and only the
 /// C2.4 `RedactHistory` handler may call this**, inside a transaction
 /// that re-installs them before commit. Any other callsite is a bug
@@ -983,6 +1067,127 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    // ── H1 / PR-5: sleeptime_audit widened for consolidation ─────────
+
+    fn audit_columns(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_table_info('sleeptime_audit')")
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    const V14_COLUMNS: [&str; 7] = [
+        "origin",
+        "before_json",
+        "after_json",
+        "applied",
+        "error",
+        "prompt_version",
+        "scope",
+    ];
+
+    #[test]
+    fn a_fresh_database_has_the_consolidation_audit_columns() {
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+
+        let cols = audit_columns(&conn);
+        for c in V14_COLUMNS {
+            assert!(cols.contains(&c.to_string()), "missing {c} in {cols:?}");
+        }
+    }
+
+    #[test]
+    fn upgrading_from_v13_adds_the_columns_and_keeps_existing_rows() {
+        let conn = setup_conn();
+
+        // Build a genuine v13 database by running the migrations that
+        // existed before v14, rather than migrating fully and undoing
+        // it — a dropped column leaves its indexes behind.
+        migrate_v1(&conn).unwrap();
+        migrate_v2(&conn).unwrap();
+        migrate_v3(&conn, 8).unwrap();
+        migrate_v4(&conn, 8).unwrap();
+        migrate_v5(&conn).unwrap();
+        migrate_v6(&conn).unwrap();
+        migrate_v7(&conn).unwrap();
+        migrate_v8(&conn).unwrap();
+        migrate_v9(&conn).unwrap();
+        migrate_v10(&conn).unwrap();
+        migrate_v11(&conn).unwrap();
+        migrate_v12(&conn).unwrap();
+        migrate_v13(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 13u32).unwrap();
+
+        let before = audit_columns(&conn);
+        for c in V14_COLUMNS {
+            assert!(!before.contains(&c.to_string()), "{c} should not exist yet");
+        }
+        conn.execute(
+            "INSERT INTO sleeptime_audit (run_id, kind, payload) VALUES ('r1', 'decay_flag', '{}')",
+            [],
+        )
+        .unwrap();
+
+        run_migrations(&conn, 8).unwrap();
+
+        let cols = audit_columns(&conn);
+        for c in V14_COLUMNS {
+            assert!(cols.contains(&c.to_string()), "missing {c} after upgrade");
+        }
+
+        // The pre-existing row survives and reads as applied sleeptime
+        // work — that is what the column defaults are for.
+        let (origin, applied): (String, i64) = conn
+            .query_row(
+                "SELECT origin, applied FROM sleeptime_audit WHERE run_id = 'r1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(origin, "sleeptime");
+        assert_eq!(applied, 1);
+    }
+
+    #[test]
+    fn upgrading_from_v14_adds_expected_outcome() {
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+        conn.execute_batch("ALTER TABLE sleeptime_audit DROP COLUMN expected_outcome;")
+            .unwrap();
+        conn.pragma_update(None, "user_version", 14u32).unwrap();
+        assert!(!audit_columns(&conn).contains(&"expected_outcome".to_string()));
+
+        run_migrations(&conn, 8).unwrap();
+
+        assert!(audit_columns(&conn).contains(&"expected_outcome".to_string()));
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn the_v15_migration_is_idempotent() {
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+        migrate_v15(&conn).unwrap();
+        migrate_v15(&conn).unwrap();
+    }
+
+    #[test]
+    fn the_v14_migration_is_idempotent() {
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+        // Re-running must not fail on ALTER TABLE ADD COLUMN, which has
+        // no IF NOT EXISTS.
+        migrate_v14(&conn).unwrap();
+        migrate_v14(&conn).unwrap();
     }
 
     #[test]

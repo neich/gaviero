@@ -6,6 +6,7 @@
 // blocks. The struct definition + connection ownership stay here in
 // the parent module so all submodules see the same `MemoryStore` type.
 pub mod compression_ops;
+pub mod consolidation_ops;
 pub mod deletions_ops;
 pub mod manifest;
 pub mod panel_ops;
