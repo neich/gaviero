@@ -86,6 +86,7 @@ pub async fn run(
             duration: Duration::ZERO,
             targeted_filter: None,
             parsed_results: None,
+            execution_error: None,
         });
     };
 
@@ -128,6 +129,7 @@ pub async fn run(
                 duration,
                 targeted_filter: filter,
                 parsed_results: parsed,
+                execution_error: None,
             })
         }
         Ok(Err(e)) => Ok(TestReport {
@@ -138,6 +140,7 @@ pub async fn run(
             duration,
             targeted_filter: filter,
             parsed_results: None,
+            execution_error: Some(format!("test command could not be executed: {e}")),
         }),
         Err(_) => Ok(TestReport {
             exit_code: -1,
@@ -147,6 +150,7 @@ pub async fn run(
             duration,
             targeted_filter: filter,
             parsed_results: None,
+            execution_error: None,
         }),
     }
 }

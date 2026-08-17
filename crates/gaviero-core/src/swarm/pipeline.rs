@@ -14,6 +14,10 @@ use super::bus::AgentBus;
 use super::context_bundle::build_bundle;
 use super::coordinator::{Coordinator, CoordinatorConfig};
 use super::execution_state::{ExecutionState, NodeStatus};
+use super::loop_gate::{
+    GATE_FEEDBACK_PLACEHOLDER, GATE_OUTPUT_CAP, GateFailure, ProbeDedup, VERIFY_DEDUP_KEY,
+    evaluate_deterministic_gate, merge_command_output, run_command_probe, truncate_gate_output,
+};
 use super::loop_resume;
 use super::merge;
 use super::models::{AgentManifest, AgentStatus, MergeResult, SwarmResult, WorkUnit};
@@ -455,7 +459,7 @@ pub async fn execute(
             .await;
         }
         exec_state.record_result(&unit.id, manifest.clone());
-        let _ = exec_state.save(&plan_hash);
+        let _ = exec_state.save(&config.workspace_root, &plan_hash);
 
         let verification_passed = run_post_execution_verification(
             &plan.verification_config,
@@ -793,7 +797,7 @@ pub async fn execute(
                 }
                 // Record result in execution state and checkpoint
                 exec_state.record_result(unit_id, manifest.clone());
-                if let Err(e) = exec_state.save(&plan_hash) {
+                if let Err(e) = exec_state.save(&config.workspace_root, &plan_hash) {
                     tracing::warn!("Failed to save execution state checkpoint: {}", e);
                 }
                 all_manifests.push(manifest);
@@ -1057,6 +1061,11 @@ pub async fn execute(
         // been reported.
         let mut last_blocker_fingerprint: Option<String> = None;
         let mut repeat_streak: u32 = 0;
+        // Skips a deterministic gate whose answer cannot have changed.
+        // Lives across iterations; only the loop owns it.
+        let mut probe_dedup = ProbeDedup::default();
+        // Consecutive passes in which no loop agent delivered anything.
+        let mut silent_streak: u32 = 0;
 
         // Stacked-mode chain anchor: the SHA each next agent's worktree
         // is based on. Starts at the pre-swarm HEAD; advances to each
@@ -1256,22 +1265,52 @@ pub async fn execute(
 
             // Every body agent has finished the pass being judged (the tier
             // dispatch for iteration 1, the barrier at the end of this loop
-            // afterwards). Confirm each one actually delivered before paying
-            // for a judge turn.
+            // afterwards). A panel where every agent errored cannot be fixed
+            // by another round, whatever the `until` condition is.
+            assert_loop_pass_was_not_a_total_failure(
+                &loop_config.agent_ids,
+                &all_manifests,
+                current_iter_abs,
+            )?;
+
+            // Then confirm each one actually delivered, before paying for a
+            // judge turn.
+            // Snapshot the pass now; the delivery gate itself runs only
+            // if a judge is about to be dispatched (D-7).
+            let delivery_after =
+                snapshot_loop_agents(&loop_config.agent_ids, &unit_map, &config.workspace_root);
+
+            // A panel that delivers nothing at all, pass after pass, is
+            // stuck. Deterministic conditions never reach the delivery
+            // gate, so without this they would iterate to the budget.
             {
-                let after =
-                    snapshot_loop_agents(&loop_config.agent_ids, &unit_map, &config.workspace_root);
-                assert_loop_agents_produced_output(DeliveryCheck {
-                    until: &loop_config.until,
+                let silent = loop_agents_without_delivery(DeliveryCheck {
                     agent_ids: &loop_config.agent_ids,
                     unit_map: &unit_map,
                     all_manifests: &all_manifests,
                     before: &loop_output_baseline,
-                    after: &after,
+                    after: &delivery_after,
                     workspace_root: &config.workspace_root,
                     iter_abs: current_iter_abs,
-                })?;
-                loop_output_baseline.extend(after);
+                });
+                let whole_panel_silent =
+                    !loop_config.agent_ids.is_empty() && silent.len() == loop_config.agent_ids.len();
+                silent_streak = if whole_panel_silent {
+                    silent_streak.saturating_add(1)
+                } else {
+                    0
+                };
+                if silent_streak >= MAX_SILENT_LOOP_PASSES {
+                    tracing::warn!(
+                        "Loop stopped at iteration {}: no agent produced anything for {} consecutive passes ({})",
+                        current_iter_abs,
+                        silent_streak,
+                        silent.join("; ")
+                    );
+                    observer.on_phase_changed("loop made no progress");
+                    loop_terminated = true;
+                    break;
+                }
             }
 
             let outcome = {
@@ -1299,9 +1338,23 @@ pub async fn execute(
                     loop_agent_ids: &loop_config.agent_ids,
                     consensus_mode: loop_config.consensus_mode,
                     verdict_output_dir: loop_config.verdict_output_dir.as_deref(),
+                    probe_dedup: &mut probe_dedup,
+                    delivery: DeliveryInputs {
+                        unit_map: &unit_map,
+                        before: &loop_output_baseline,
+                        after: &delivery_after,
+                    },
                 };
-                evaluate_loop_condition(&loop_config.until, current_iter_abs, &mut loop_ctx).await
+                evaluate_loop_condition(&loop_config.until, current_iter_abs, &mut loop_ctx).await?
             };
+            // Scoped to this pass: the agents dispatched below are the
+            // ones that must react to it, so stale feedback can never
+            // outlive the failure that produced it.
+            let (outcome, last_gate_failure) = outcome;
+            // Advance the baseline whether or not a judge ran: the
+            // question each pass asks is "did this agent write during
+            // *this* pass", so the window always moves.
+            loop_output_baseline.extend(delivery_after);
 
             match outcome {
                 LoopConditionOutcome::Partial => {
@@ -1367,7 +1420,13 @@ pub async fn execute(
                     // resolution. Detected in the runtime so it holds even
                     // when the judge never reaches the `irreconcilable`
                     // verdict on its own.
-                    if loop_config.irreconcilable_after > 0 {
+                    //
+                    // Only judge verdicts count. Under `until … and …` a
+                    // deterministic condition can fail the iteration before
+                    // the judge is dispatched; that pass carries no verdict,
+                    // so it must neither extend a disagreement streak nor
+                    // reset one that a later judge round would continue.
+                    if loop_config.irreconcilable_after > 0 && last_gate_failure.is_none() {
                         let fingerprint = report.fingerprint();
                         if fingerprint.is_empty() {
                             repeat_streak = 0;
@@ -1431,7 +1490,11 @@ pub async fn execute(
                         Some(u) => u,
                         None => continue,
                     };
-                    let unit = apply_iter_vars(unit_template, iter_abs);
+                    let unit = apply_iter_vars_with_gate_feedback(
+                        unit_template,
+                        iter_abs,
+                        last_gate_failure.as_ref(),
+                    );
                     invalidate_stale_sources(&memory, &unit, &config.workspace_root).await;
 
                     let branch_override = if stacked && chain_anchor.is_some() {
@@ -1626,7 +1689,11 @@ pub async fn execute(
                         None => continue,
                     };
 
-                    let iter_unit = apply_iter_vars(unit_template, iter_abs);
+                    let iter_unit = apply_iter_vars_with_gate_feedback(
+                        unit_template,
+                        iter_abs,
+                        last_gate_failure.as_ref(),
+                    );
                     let unit = &iter_unit;
 
                     observer.on_agent_state_changed(
@@ -1716,21 +1783,10 @@ pub async fn execute(
         if !loop_terminated {
             let final_iter_abs =
                 loop_config.iter_start + loop_config.max_iterations.saturating_sub(1);
-            {
-                let after =
-                    snapshot_loop_agents(&loop_config.agent_ids, &unit_map, &config.workspace_root);
-                assert_loop_agents_produced_output(DeliveryCheck {
-                    until: &loop_config.until,
-                    agent_ids: &loop_config.agent_ids,
-                    unit_map: &unit_map,
-                    all_manifests: &all_manifests,
-                    before: &loop_output_baseline,
-                    after: &after,
-                    workspace_root: &config.workspace_root,
-                    iter_abs: final_iter_abs,
-                })?;
-                loop_output_baseline.extend(after);
-            }
+            // Snapshot the pass now; the delivery gate itself runs only
+            // if a judge is about to be dispatched (D-7).
+            let delivery_after =
+                snapshot_loop_agents(&loop_config.agent_ids, &unit_map, &config.workspace_root);
             let final_outcome = {
                 let mut loop_ctx = LoopConditionContext {
                     config,
@@ -1756,9 +1812,19 @@ pub async fn execute(
                     loop_agent_ids: &loop_config.agent_ids,
                     consensus_mode: loop_config.consensus_mode,
                     verdict_output_dir: loop_config.verdict_output_dir.as_deref(),
+                    probe_dedup: &mut probe_dedup,
+                    delivery: DeliveryInputs {
+                        unit_map: &unit_map,
+                        before: &loop_output_baseline,
+                        after: &delivery_after,
+                    },
                 };
-                evaluate_loop_condition(&loop_config.until, final_iter_abs, &mut loop_ctx).await
+                evaluate_loop_condition(&loop_config.until, final_iter_abs, &mut loop_ctx).await?
             };
+            // The run is over after this evaluation, so a gate failure
+            // here has no next iteration to inform.
+            let (final_outcome, _) = final_outcome;
+            loop_output_baseline.extend(delivery_after);
             match final_outcome {
                 LoopConditionOutcome::Pass => {
                     consecutive_pass = consecutive_pass.saturating_add(1);
@@ -1874,7 +1940,7 @@ pub async fn execute(
                     .await;
                 }
                 exec_state.record_result(unit_id, manifest.clone());
-                if let Err(e) = exec_state.save(&plan_hash) {
+                if let Err(e) = exec_state.save(&config.workspace_root, &plan_hash) {
                     tracing::warn!("Failed to save execution state checkpoint: {}", e);
                 }
                 all_manifests.push(manifest);
@@ -2294,6 +2360,24 @@ struct LoopConditionContext<'a> {
     loop_agent_ids: &'a [String],
     consensus_mode: crate::swarm::plan::ConsensusMode,
     verdict_output_dir: Option<&'a str>,
+    /// Dedup state for deterministic gates, owned by the loop so it
+    /// survives across iterations. Judges are never deduplicated.
+    probe_dedup: &'a mut ProbeDedup,
+    /// Inputs for the delivery gate, consulted only if a judge is about
+    /// to be dispatched.
+    delivery: DeliveryInputs<'a>,
+}
+
+/// What the delivery gate needs to decide whether the panel is intact.
+///
+/// Carried on the condition context rather than checked in the loop head
+/// because the check belongs immediately before a judge runs — see
+/// [`evaluate_agent_condition`].
+struct DeliveryInputs<'a> {
+    unit_map: &'a std::collections::HashMap<&'a str, &'a WorkUnit>,
+    /// Owned-file snapshots bracketing the pass being judged.
+    before: &'a std::collections::HashMap<String, OwnedSnapshot>,
+    after: &'a std::collections::HashMap<String, OwnedSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2396,10 +2480,44 @@ enum LoopConditionOutcome {
     Irreconcilable(JudgeReport),
 }
 
+/// Turn a deterministic gate result into a loop outcome.
+fn report_deterministic_gate(
+    failure: Option<GateFailure>,
+    iter_abs: u32,
+    observer: &dyn SwarmObserver,
+) -> (LoopConditionOutcome, Option<GateFailure>) {
+    match failure {
+        None => (LoopConditionOutcome::Pass, None),
+        Some(failure) => {
+            tracing::info!(
+                "Loop gate failed at iteration {}: `{}` ({})",
+                iter_abs,
+                failure.probe,
+                failure.status
+            );
+            observer.on_loop_gate_failed(&failure.probe, &failure.status, &failure.output);
+            (
+                LoopConditionOutcome::Continue(JudgeReport::default()),
+                Some(failure),
+            )
+        }
+    }
+}
+
 /// Clone `unit` and substitute `{{ITER}}` / `{{PREV_ITER}}` with `iter_abs`
 /// and `iter_abs - 1` respectively. Called for every loop-agent dispatch.
 fn apply_iter_vars(unit: &WorkUnit, iter_abs: u32) -> WorkUnit {
-    apply_iter_vars_with_evidence(unit, iter_abs, "")
+    apply_iter_vars_full(unit, iter_abs, "", None)
+}
+
+/// `apply_iter_vars` plus the previous iteration's gate failure, for
+/// loop-body agents dispatched after a deterministic condition failed.
+fn apply_iter_vars_with_gate_feedback(
+    unit: &WorkUnit,
+    iter_abs: u32,
+    gate: Option<&GateFailure>,
+) -> WorkUnit {
+    apply_iter_vars_full(unit, iter_abs, "", gate)
 }
 
 /// Clone `unit` and substitute `{{ITER}}`, `{{PREV_ITER}}`, and
@@ -2407,25 +2525,68 @@ fn apply_iter_vars(unit: &WorkUnit, iter_abs: u32) -> WorkUnit {
 /// for judge agents — it summarises the previous iteration's manifests and
 /// modified files so the judge can decide on facts instead of hallucinating.
 fn apply_iter_vars_with_evidence(unit: &WorkUnit, iter_abs: u32, evidence: &str) -> WorkUnit {
+    apply_iter_vars_full(unit, iter_abs, evidence, None)
+}
+
+/// Substitute every iteration variable in one pass.
+///
+/// `{{GATE_FEEDBACK}}` is substituted wherever the author placed it. When
+/// a gate failed but no template mentions the placeholder, the detail is
+/// appended as a `## Previous gate failure` section instead — the
+/// feedback has to reach the agent whether or not the script was written
+/// to expect it. With no failure to report the placeholder collapses to
+/// nothing, so a template that always references it stays clean on a
+/// passing iteration.
+fn apply_iter_vars_full(
+    unit: &WorkUnit,
+    iter_abs: u32,
+    evidence: &str,
+    gate: Option<&GateFailure>,
+) -> WorkUnit {
     let prev = iter_abs.saturating_sub(1);
     let iter_str = iter_abs.to_string();
     let prev_str = prev.to_string();
+    let feedback = gate.map(|g| g.render()).unwrap_or_default();
     let sub = |s: &str| {
         s.replace("{{ITER}}", &iter_str)
             .replace("{{PREV_ITER}}", &prev_str)
+            .replace(GATE_FEEDBACK_PLACEHOLDER, &feedback)
     };
+
+    let author_placed_feedback = unit.description.contains(GATE_FEEDBACK_PLACEHOLDER)
+        || unit
+            .coordinator_instructions
+            .contains(GATE_FEEDBACK_PLACEHOLDER);
+
+    let mut coordinator_instructions = unit
+        .coordinator_instructions
+        .replace("{{ITER}}", &iter_str)
+        .replace("{{PREV_ITER}}", &prev_str)
+        .replace("{{ITER_EVIDENCE}}", evidence)
+        .replace(GATE_FEEDBACK_PLACEHOLDER, &feedback);
+
+    if let Some(gate) = gate
+        && !author_placed_feedback
+    {
+        coordinator_instructions.push_str("\n\n## Previous gate failure\n\n");
+        coordinator_instructions.push_str(&gate.render());
+    }
+
     WorkUnit {
         description: sub(&unit.description),
         // The output contract is versioned per pass, so it has to be
         // substituted alongside the prompt that tells the agent which version
         // to write — otherwise the gate would check iteration 1's paths for
         // every iteration.
-        produces: unit.produces.iter().map(|p| sub(p)).collect(),
-        coordinator_instructions: unit
-            .coordinator_instructions
-            .replace("{{ITER}}", &iter_str)
-            .replace("{{PREV_ITER}}", &prev_str)
-            .replace("{{ITER_EVIDENCE}}", evidence),
+        produces: unit
+            .produces
+            .iter()
+            .map(|p| {
+                p.replace("{{ITER}}", &iter_str)
+                    .replace("{{PREV_ITER}}", &prev_str)
+            })
+            .collect(),
+        coordinator_instructions,
         ..unit.clone()
     }
 }
@@ -2491,19 +2652,7 @@ fn snapshot_owned_files(
         return snaps;
     }
 
-    for entry in walkdir::WalkDir::new(root)
-        .max_depth(8)
-        .into_iter()
-        .filter_entry(|e| {
-            // depth 0 is `root` itself — never prune it on its own name.
-            e.depth() == 0
-                || e.file_name()
-                    .to_str()
-                    .map(|n| n != ".git" && n != "target" && n != "node_modules")
-                    .unwrap_or(false)
-        })
-        .flatten()
-    {
+    for entry in crate::swarm::workspace_snapshot::pruned_walk(root).flatten() {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -2545,7 +2694,6 @@ fn snapshot_loop_agents(
 
 /// Inputs to [`assert_loop_agents_produced_output`].
 struct DeliveryCheck<'a> {
-    until: &'a super::plan::LoopUntilCondition,
     agent_ids: &'a [String],
     /// Templates, with `{{ITER}}` still unsubstituted — the check applies
     /// `iter_abs` itself so a versioned contract names the right pass.
@@ -2560,7 +2708,85 @@ struct DeliveryCheck<'a> {
     iter_abs: u32,
 }
 
-/// Abort the run when a loop pass finished without every reviewer delivering.
+/// Abort the run when *every* agent in a loop pass hard-failed.
+///
+/// The delivery gate below never runs for `command` / `verify`
+/// conditions: those measure the workspace rather than the panel, so an
+/// iteration that produced nothing is an unproductive but legitimate
+/// outcome. "Every agent errored" has no such reading. It is a broken
+/// panel — a bad model spec, a missing CLI, an unreachable provider —
+/// and re-dispatching it cannot succeed, so the loop would spend every
+/// remaining iteration on it and still report success at the end.
+///
+/// Deliberately narrow. A *partially* failing panel can still make
+/// progress, and the delivery gate plus the judge already reason about
+/// that; only a unanimous failure is unambiguous enough to stop on.
+fn assert_loop_pass_was_not_a_total_failure(
+    agent_ids: &[String],
+    all_manifests: &[AgentManifest],
+    iter_abs: u32,
+) -> Result<()> {
+    if agent_ids.is_empty() {
+        return Ok(());
+    }
+
+    let latest: Vec<Option<&AgentManifest>> = agent_ids
+        .iter()
+        .map(|id| all_manifests.iter().rev().find(|m| m.work_unit_id == *id))
+        .collect();
+
+    // An agent that never reported at all is the delivery gate's
+    // business, not ours — it can distinguish "never dispatched" from
+    // "ran and wrote nothing" and says so in its diagnostic.
+    if latest.iter().any(|m| m.is_none()) {
+        return Ok(());
+    }
+
+    let failures: Vec<String> = agent_ids
+        .iter()
+        .zip(&latest)
+        .filter_map(|(id, m)| match m.map(|m| &m.status) {
+            Some(AgentStatus::Failed(msg)) => Some(format!("'{id}': {msg}")),
+            _ => None,
+        })
+        .collect();
+
+    if failures.len() < agent_ids.len() {
+        return Ok(());
+    }
+
+    bail!(
+        "loop iteration {} failed for all {} of its agent(s): {}. \
+         Stopping rather than re-dispatching a panel that cannot run — the loop \
+         would otherwise spend every remaining iteration on it and still report \
+         success. Check the model specs, provider CLIs, and endpoints for these agents.",
+        iter_abs,
+        agent_ids.len(),
+        failures.join("; ")
+    );
+}
+
+/// How many consecutive passes a loop may produce nothing at all before
+/// it is treated as stuck.
+///
+/// The delivery gate exempts deterministic conditions because *one*
+/// unproductive iteration is a legitimate outcome for a probe that
+/// measures the workspace. That reasoning does not survive repetition: a
+/// panel delivering nothing every pass will keep doing so, and without a
+/// bound it spends the whole iteration budget proving it.
+///
+/// Mirrors `irreconcilable_after`'s default and its logic — a repeated
+/// identical non-result is structural, not transient. Kept a constant
+/// rather than a `LoopConfig` field so PR-4 adds no DSL surface; promote
+/// it if a workflow ever needs a different bound.
+const MAX_SILENT_LOOP_PASSES: u32 = 2;
+
+/// Abort the run when the pass about to be judged lost a reviewer.
+///
+/// Called immediately before a judge is dispatched, never from the loop
+/// head: under `until … and …` a cheaper condition may fail first, in
+/// which case no judge runs and there is nothing to protect (D-7).
+///
 ///
 /// The judge that follows compares reviewers against each other, so a pass in
 /// which one reviewer wrote nothing produces a verdict about a panel that
@@ -2573,8 +2799,34 @@ struct DeliveryCheck<'a> {
 /// counts as having delivered when *either* its manifest lists modified files
 /// *or* its owned files on disk changed across the pass.
 fn assert_loop_agents_produced_output(check: DeliveryCheck<'_>) -> Result<()> {
+    let iter_abs = check.iter_abs;
+    let total = check.agent_ids.len();
+    let silent = loop_agents_without_delivery(check);
+
+    if silent.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "loop iteration {} did not deliver for {} of {} agent(s): {}. \
+         Refusing to run the loop's judge against an incomplete panel — its verdict \
+         would describe a panel that silently lost a member. Check the run log for \
+         'Scope rejected' or 'failed to apply file proposal' lines, and verify that \
+         the agents' declared paths resolve inside the workspace root.",
+        iter_abs,
+        silent.len(),
+        total,
+        silent.join("; ")
+    );
+}
+
+/// Which agents produced nothing during the pass, and why we say so.
+///
+/// The judgement itself, without the verdict on what to do about it: the
+/// delivery gate turns a non-empty result into an abort, while the
+/// no-progress tracker only counts passes where *every* agent came back
+/// empty.
+fn loop_agents_without_delivery(check: DeliveryCheck<'_>) -> Vec<String> {
     let DeliveryCheck {
-        until,
         agent_ids,
         unit_map,
         all_manifests,
@@ -2583,13 +2835,6 @@ fn assert_loop_agents_produced_output(check: DeliveryCheck<'_>) -> Result<()> {
         workspace_root,
         iter_abs,
     } = check;
-
-    // Only agent judges read the body's artefacts. `verify` / `command`
-    // conditions test the workspace itself, so an iteration that changed
-    // nothing is a legitimate (if unproductive) outcome for them.
-    if !matches!(until, super::plan::LoopUntilCondition::Agent(_)) {
-        return Ok(());
-    }
 
     let mut silent: Vec<String> = Vec::new();
     for agent_id in agent_ids {
@@ -2657,20 +2902,7 @@ fn assert_loop_agents_produced_output(check: DeliveryCheck<'_>) -> Result<()> {
         ));
     }
 
-    if silent.is_empty() {
-        return Ok(());
-    }
-    bail!(
-        "loop iteration {} did not deliver for {} of {} agent(s): {}. \
-         Refusing to run the loop's judge against an incomplete panel — its verdict \
-         would describe a panel that silently lost a member. Check the run log for \
-         'Scope rejected' or 'failed to apply file proposal' lines, and verify that \
-         the agents' declared paths resolve inside the workspace root.",
-        iter_abs,
-        silent.len(),
-        agent_ids.len(),
-        silent.join("; ")
-    );
+    silent
 }
 
 /// Build a compact, deterministic textual digest of the most recent loop
@@ -3027,14 +3259,14 @@ async fn run_post_execution_verification(
     observer.on_verification_started("workflow_config");
 
     let modified_files = collect_completed_modified_files(manifests);
-    let passed = run_verification_checks(
+    let outcome = run_verification_checks(
         config,
         workspace_root,
         excludes,
         Some(modified_files.as_slice()),
     )
     .await?;
-    if !passed {
+    if !outcome.passed() {
         observer.on_verification_complete(false);
         return Ok(false);
     }
@@ -3051,62 +3283,121 @@ fn collect_completed_modified_files(manifests: &[AgentManifest]) -> Vec<std::pat
         .collect()
 }
 
+/// Outcome of a `verify {}` block.
+///
+/// Names the first check that failed rather than collapsing to `false`,
+/// so a loop gate can tell the next iteration's agents *which* check
+/// blocked them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum VerificationOutcome {
+    Passed,
+    /// The failing check and its bounded diagnostic output.
+    Failed {
+        check: String,
+        output: String,
+    },
+}
+
+impl VerificationOutcome {
+    fn passed(&self) -> bool {
+        matches!(self, Self::Passed)
+    }
+}
+
 async fn run_verification_checks(
     config: &super::plan::VerificationConfig,
     workspace_root: &std::path::Path,
     excludes: &[String],
     modified_files: Option<&[std::path::PathBuf]>,
-) -> Result<bool> {
-    if config.compile && !run_verification_command(workspace_root, "cargo", &["check"]).await {
-        return Ok(false);
+) -> Result<VerificationOutcome> {
+    if config.compile
+        && let Some(output) = run_verification_command(workspace_root, "cargo", &["check"]).await?
+    {
+        return Ok(VerificationOutcome::Failed {
+            check: "cargo check".into(),
+            output,
+        });
     }
 
-    if config.test && !run_test_verification(workspace_root, &[], false).await? {
-        return Ok(false);
+    if config.test
+        && let Some(output) = run_test_verification(workspace_root, &[], false).await?
+    {
+        return Ok(VerificationOutcome::Failed {
+            check: "cargo test".into(),
+            output,
+        });
     }
 
     if config.impact_tests {
-        let passed = if let Some(files) = modified_files {
+        let failure = if let Some(files) = modified_files {
             run_test_verification(workspace_root, files, true).await?
         } else {
-            run_conservative_impact_tests(workspace_root, excludes).await
+            run_conservative_impact_tests(workspace_root, excludes).await?
         };
-        if !passed {
-            return Ok(false);
+        if let Some(output) = failure {
+            return Ok(VerificationOutcome::Failed {
+                check: "impact tests".into(),
+                output,
+            });
         }
     }
 
+    let clippy_args = ["clippy", "--", "-D", "warnings"];
     if config.clippy
-        && !run_verification_command(workspace_root, "cargo", &["clippy", "--", "-D", "warnings"])
-            .await
+        && let Some(output) =
+            run_verification_command(workspace_root, "cargo", &clippy_args).await?
     {
-        return Ok(false);
+        return Ok(VerificationOutcome::Failed {
+            check: "cargo clippy -- -D warnings".into(),
+            output,
+        });
     }
 
-    Ok(true)
+    Ok(VerificationOutcome::Passed)
 }
 
 async fn run_verification_command(
     workspace_root: &std::path::Path,
     program: &str,
     args: &[&str],
-) -> bool {
-    tokio::process::Command::new(program)
+) -> Result<Option<String>> {
+    let output = tokio::process::Command::new(program)
         .args(args)
         .current_dir(workspace_root)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
         .await
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .with_context(|| {
+            format!(
+                "verification command could not be executed: `{} {}`",
+                program,
+                args.join(" ")
+            )
+        })?;
+    if output.status.success() {
+        return Ok(None);
+    }
+    let combined = merge_command_output(
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    );
+    Ok(Some(truncate_gate_output(&combined, GATE_OUTPUT_CAP)))
 }
 
+/// Run the test suite as a verification check.
+///
+/// Same tri-state as [`run_verification_command`]: `Err` when the suite
+/// could not be run at all, `Ok(None)` on pass, `Ok(Some(output))` on
+/// failure with bounded diagnostics.
+///
+/// A timeout stays an ordinary failure — a suite too slow to finish is a
+/// verdict the agent can act on, unlike a harness that never started.
 async fn run_test_verification(
     workspace_root: &std::path::Path,
     modified_files: &[std::path::PathBuf],
     targeted: bool,
-) -> Result<bool> {
+) -> Result<Option<String>> {
     let report = super::verify::test_runner::run(
         &super::verify::test_runner::TestRunnerConfig {
             command: None,
@@ -3117,13 +3408,39 @@ async fn run_test_verification(
         workspace_root,
     )
     .await?;
-    Ok(report.passed)
+
+    classify_test_report(report)
 }
 
+/// Map a [`TestReport`] onto the verification tri-state.
+///
+/// Split out from the runner call so the distinction that matters —
+/// "could not run" versus "ran and failed" — is testable without a real
+/// cargo project on disk.
+fn classify_test_report(report: crate::swarm::verify::TestReport) -> Result<Option<String>> {
+    if let Some(cause) = report.execution_error {
+        bail!("test verification could not be run: {cause}");
+    }
+
+    if report.passed {
+        return Ok(None);
+    }
+
+    Ok(Some(truncate_gate_output(
+        &merge_command_output(&report.stdout, &report.stderr),
+        GATE_OUTPUT_CAP,
+    )))
+}
+
+/// Run only the tests in the blast radius of the workspace's sources.
+///
+/// Same tri-state as [`run_verification_command`]; the failing module's
+/// own diagnostics are what comes back, since that is what the agent
+/// needs to fix.
 async fn run_conservative_impact_tests(
     workspace_root: &std::path::Path,
     excludes: &[String],
-) -> bool {
+) -> Result<Option<String>> {
     match crate::repo_map::graph_builder::build_graph(workspace_root, excludes) {
         Ok((store, _)) => {
             let all_src: Vec<String> = store
@@ -3141,13 +3458,15 @@ async fn run_conservative_impact_tests(
                     .filter_map(|t| t.strip_suffix(".rs").map(|s| s.replace('/', "::")))
                     .collect();
                 for test_mod in &test_modules {
-                    if !run_verification_command(workspace_root, "cargo", &["test", test_mod]).await
+                    if let Some(output) =
+                        run_verification_command(workspace_root, "cargo", &["test", test_mod])
+                            .await?
                     {
-                        return false;
+                        return Ok(Some(output));
                     }
                 }
             }
-            true
+            Ok(None)
         }
         Err(e) => {
             tracing::warn!(
@@ -3472,7 +3791,7 @@ async fn run_fanout_wave_if_needed(
             .spawned_ids
             .push(format!("{}::{}", op.after_unit, unit.id));
         exec_state.record_result(&unit.id, manifest.clone());
-        let _ = exec_state.save(plan_hash);
+        let _ = exec_state.save(&config.workspace_root, plan_hash);
         all_manifests.push(manifest);
     }
 
@@ -4122,6 +4441,220 @@ mod tests {
         assert!(!out.coordinator_instructions.contains("{{ITER_EVIDENCE}}"));
     }
 
+    // ── H0 / PR-2: gate feedback in iteration prompts ────────────────
+    //
+    // The gate machinery itself is tested in `swarm::loop_gate`; these
+    // cover only how a failure reaches the next iteration's agents.
+
+    fn gate_failure(probe: &str, output: &str) -> GateFailure {
+        GateFailure {
+            probe: probe.to_string(),
+            status: "exit status: 1".to_string(),
+            output: output.to_string(),
+        }
+    }
+
+    #[test]
+    fn gate_feedback_substitutes_the_author_placeholder() {
+        let mut unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
+        unit.coordinator_instructions =
+            "Fix iteration {{ITER}}.\n\nGate said:\n{{GATE_FEEDBACK}}".into();
+        let failure = gate_failure("cargo test", "assertion failed at line 12");
+
+        let out = apply_iter_vars_with_gate_feedback(&unit, 3, Some(&failure));
+
+        assert!(out.coordinator_instructions.contains("Fix iteration 3."));
+        assert!(
+            out.coordinator_instructions
+                .contains("assertion failed at line 12")
+        );
+        assert!(
+            !out.coordinator_instructions
+                .contains(GATE_FEEDBACK_PLACEHOLDER)
+        );
+        // The author chose the position, so no section is appended.
+        assert!(
+            !out.coordinator_instructions
+                .contains("## Previous gate failure")
+        );
+    }
+
+    #[test]
+    fn gate_feedback_appends_a_section_when_the_script_has_no_placeholder() {
+        let mut unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
+        unit.coordinator_instructions = "Keep going.".into();
+        let failure = gate_failure("cargo test", "assertion failed at line 12");
+
+        let out = apply_iter_vars_with_gate_feedback(&unit, 2, Some(&failure));
+
+        assert!(out.coordinator_instructions.starts_with("Keep going."));
+        assert!(
+            out.coordinator_instructions
+                .contains("## Previous gate failure")
+        );
+        assert!(
+            out.coordinator_instructions
+                .contains("assertion failed at line 12")
+        );
+    }
+
+    #[test]
+    fn gate_feedback_placeholder_collapses_when_nothing_failed() {
+        let mut unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
+        unit.coordinator_instructions = "Body.\n{{GATE_FEEDBACK}}".into();
+
+        let out = apply_iter_vars_with_gate_feedback(&unit, 2, None);
+
+        assert!(
+            !out.coordinator_instructions
+                .contains(GATE_FEEDBACK_PLACEHOLDER)
+        );
+        assert!(
+            !out.coordinator_instructions
+                .contains("## Previous gate failure")
+        );
+        assert_eq!(out.coordinator_instructions.trim(), "Body.");
+    }
+
+    #[test]
+    fn gate_feedback_never_touches_the_produces_contract() {
+        let mut unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
+        unit.produces = vec!["out/report-v{{ITER}}.md".into()];
+        let failure = gate_failure("cargo test", "boom");
+
+        let out = apply_iter_vars_with_gate_feedback(&unit, 4, Some(&failure));
+
+        assert_eq!(out.produces, vec!["out/report-v4.md".to_string()]);
+    }
+
+    // ── H0 / PR-2: verification checks report like command probes ────
+
+    /// A shell invocation valid for `run_verification_command`, which
+    /// takes program + args directly rather than a shell string.
+    fn shell(script: &'static str) -> (&'static str, Vec<&'static str>) {
+        if cfg!(windows) {
+            ("cmd", vec!["/C", script])
+        } else {
+            ("sh", vec!["-c", script])
+        }
+    }
+
+    #[tokio::test]
+    async fn verification_command_passes_on_exit_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let (program, args) = shell("exit 0");
+
+        let result = run_verification_command(dir.path(), program, &args)
+            .await
+            .unwrap();
+
+        assert!(result.is_none(), "exit 0 means the check passed");
+    }
+
+    #[tokio::test]
+    async fn verification_command_captures_diagnostics_on_failure() {
+        // Finding 2: a failing `cargo check` must tell the agent *why*,
+        // not just that it failed.
+        let dir = tempfile::tempdir().unwrap();
+        let (program, args) = shell("echo compiler-diagnostic && exit 3");
+
+        let output = run_verification_command(dir.path(), program, &args)
+            .await
+            .unwrap()
+            .expect("non-zero exit is a failing check");
+
+        assert!(
+            output.contains("compiler-diagnostic"),
+            "diagnostics must be captured, got {output:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_command_that_cannot_spawn_is_a_hard_error() {
+        // Finding 1: this used to be `.unwrap_or(false)`, i.e. an
+        // ordinary failing gate that burned every remaining iteration.
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = run_verification_command(dir.path(), "definitely-not-a-real-binary-xyz", &[])
+            .await
+            .expect_err("an unspawnable verification command must be a hard error");
+
+        assert!(
+            format!("{err:#}").contains("could not be executed"),
+            "error must name the failure mode, got {err:#}"
+        );
+    }
+
+    fn test_report(passed: bool, stdout: &str, stderr: &str) -> crate::swarm::verify::TestReport {
+        crate::swarm::verify::TestReport {
+            exit_code: if passed { 0 } else { 101 },
+            passed,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            duration: std::time::Duration::ZERO,
+            targeted_filter: None,
+            parsed_results: None,
+            execution_error: None,
+        }
+    }
+
+    #[test]
+    fn a_passing_test_suite_is_not_a_gate_failure() {
+        let outcome = classify_test_report(test_report(true, "ok", "")).unwrap();
+        assert!(outcome.is_none());
+    }
+
+    #[test]
+    fn a_failing_test_suite_carries_its_diagnostics() {
+        let output = classify_test_report(test_report(false, "running 2 tests", "assert failed"))
+            .unwrap()
+            .expect("a failing suite is a gate failure");
+
+        assert!(output.contains("running 2 tests"));
+        assert!(output.contains("assert failed"));
+    }
+
+    #[test]
+    fn a_test_suite_that_could_not_run_is_a_hard_error() {
+        let mut report = test_report(false, "", "Test execution error: no such file");
+        report.execution_error = Some("test command could not be executed: no such file".into());
+
+        let err = classify_test_report(report)
+            .expect_err("a harness that never started is not a verdict");
+
+        assert!(format!("{err:#}").contains("could not be run"));
+    }
+
+    #[test]
+    fn a_timed_out_test_suite_stays_an_ordinary_failure() {
+        // A suite too slow to finish is still a verdict the agent can
+        // act on, unlike a harness that never started.
+        let report = test_report(false, "", "Test execution timed out after 600s");
+
+        let output = classify_test_report(report)
+            .unwrap()
+            .expect("still a failure");
+
+        assert!(output.contains("timed out"));
+    }
+
+    #[test]
+    fn verification_outcome_names_the_failing_check() {
+        assert!(VerificationOutcome::Passed.passed());
+        let failed = VerificationOutcome::Failed {
+            check: "cargo check".into(),
+            output: "compiler diagnostic".into(),
+        };
+        assert!(!failed.passed());
+        assert_eq!(
+            failed,
+            VerificationOutcome::Failed {
+                check: "cargo check".into(),
+                output: "compiler diagnostic".into(),
+            }
+        );
+    }
+
     #[test]
     fn judge_verdict_parser_extracts_fenced_json_block() {
         let text = "Reasoning: the diff looks clean.\n\n```json\n{\"verdict\":\"pass\",\"reason\":\"stable\"}\n```\n";
@@ -4174,7 +4707,6 @@ mod tests {
     /// Positional shorthand so the gate tests read as a table of cases.
     #[allow(clippy::too_many_arguments)]
     fn delivery_check<'a>(
-        until: &'a super::super::plan::LoopUntilCondition,
         agent_ids: &'a [String],
         unit_map: &'a HashMap<&'a str, &'a WorkUnit>,
         all_manifests: &'a [AgentManifest],
@@ -4184,7 +4716,6 @@ mod tests {
         iter_abs: u32,
     ) -> DeliveryCheck<'a> {
         DeliveryCheck {
-            until,
             agent_ids,
             unit_map,
             all_manifests,
@@ -4253,7 +4784,6 @@ mod tests {
         ];
 
         let err = assert_loop_agents_produced_output(delivery_check(
-            &judge_until(),
             &ids,
             &unit_map,
             &manifests,
@@ -4293,7 +4823,6 @@ mod tests {
             completed("codex-refine", &[]),
         ];
         assert_loop_agents_produced_output(delivery_check(
-            &judge_until(),
             &ids,
             &unit_map,
             &manifests,
@@ -4320,7 +4849,6 @@ mod tests {
         let manifests = vec![completed("codex-refine", &["out/codex-summary-v2.md"])];
 
         assert_loop_agents_produced_output(delivery_check(
-            &judge_until(),
             &ids,
             &unit_map,
             &manifests,
@@ -4345,7 +4873,6 @@ mod tests {
         let manifests = vec![completed("analyst", &[])];
 
         assert_loop_agents_produced_output(delivery_check(
-            &judge_until(),
             &ids,
             &unit_map,
             &manifests,
@@ -4578,10 +5105,18 @@ mod tests {
         assert!(std::fs::read_dir(tmp.path()).unwrap().next().is_none());
     }
 
-    /// `verify` / `command` conditions inspect the workspace itself, so an
-    /// iteration that changed nothing is a legitimate outcome for them.
+    /// The gate no longer inspects the `until` condition at all (D-7).
+    ///
+    /// `verify` / `command` conditions stay exempt, but structurally:
+    /// the gate is only ever called from `evaluate_agent_condition`, so
+    /// a loop those conditions decide never reaches it. What that buys
+    /// is `until … and …` — a failing `command` short-circuits before
+    /// the judge, and a silent agent must not abort a run whose judge
+    /// was never going to be dispatched. Once called, the gate always
+    /// applies; there is no condition that exempts a member of a panel
+    /// that is about to be judged.
     #[test]
-    fn delivery_gate_only_applies_to_agent_judges() {
+    fn delivery_gate_applies_whenever_it_is_reached() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
 
@@ -4592,11 +5127,146 @@ mod tests {
         let snap = snapshot_loop_agents(&ids, &unit_map, root);
         let manifests = vec![completed("codex-refine", &[])];
 
-        let until = super::super::plan::LoopUntilCondition::Command("cargo test".into());
         assert_loop_agents_produced_output(delivery_check(
-            &until, &ids, &unit_map, &manifests, &snap, &snap, root, 2,
+            &ids, &unit_map, &manifests, &snap, &snap, root, 2,
         ))
-        .expect("command conditions are exempt");
+        .expect_err("a reviewer that wrote nothing must not be judged");
+    }
+
+    // ── H0 / PR-4: `until … and …` ordering ──────────────────────────────
+
+    #[test]
+    fn conditions_evaluate_cheapest_first_regardless_of_author_order() {
+        use super::super::plan::{LoopUntilCondition as C, VerificationConfig};
+
+        // Author order is deliberately the reverse of the cost order.
+        let authored = [
+            C::Agent("reviewer".into()),
+            C::Command("cargo test".into()),
+            C::Verify(VerificationConfig {
+                compile: true,
+                clippy: false,
+                test: false,
+                impact_tests: false,
+            }),
+        ];
+
+        let mut ordered: Vec<(usize, &C)> = authored.iter().enumerate().collect();
+        ordered.sort_by_key(|(_, c)| condition_rank(c));
+
+        let ranks: Vec<u8> = ordered.iter().map(|(_, c)| condition_rank(c)).collect();
+        assert_eq!(ranks, vec![0, 1, 2], "verify → command → agent");
+        // The original slots travel with the conditions, so dedup memos
+        // stay attached to the condition the author wrote.
+        assert_eq!(
+            ordered.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![2, 1, 0]
+        );
+    }
+
+    #[test]
+    fn equal_cost_conditions_keep_author_order() {
+        use super::super::plan::LoopUntilCondition as C;
+
+        let authored = [C::Command("first".into()), C::Command("second".into())];
+        let mut ordered: Vec<(usize, &C)> = authored.iter().enumerate().collect();
+        ordered.sort_by_key(|(_, c)| condition_rank(c));
+
+        assert_eq!(
+            ordered.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![0, 1],
+            "the sort must be stable"
+        );
+    }
+
+    #[test]
+    fn judge_agent_is_found_inside_a_composition() {
+        use super::super::plan::LoopUntilCondition as C;
+
+        let composed = C::All(vec![
+            C::Command("cargo test".into()),
+            C::Agent("reviewer".into()),
+        ]);
+        assert_eq!(composed.judge_agent(), Some("reviewer"));
+        assert_eq!(C::Command("x".into()).judge_agent(), None);
+    }
+
+    // ── Total-failure guard (condition-independent) ──────────────────────
+
+    fn failed(id: &str, why: &str) -> AgentManifest {
+        AgentManifest {
+            work_unit_id: id.into(),
+            status: AgentStatus::Failed(why.into()),
+            modified_files: vec![],
+            branch: None,
+            summary: Some(why.into()),
+            output: None,
+            cost_usd: 0.0,
+        }
+    }
+
+    #[test]
+    fn a_pass_where_every_agent_failed_stops_the_loop() {
+        let ids = vec!["alpha".to_string(), "beta".to_string()];
+        let manifests = vec![
+            failed("alpha", "backend resolution failed"),
+            failed("beta", "backend resolution failed"),
+        ];
+
+        let err = assert_loop_pass_was_not_a_total_failure(&ids, &manifests, 2)
+            .expect_err("a unanimously failed panel cannot be fixed by another round");
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("all 2"), "got {msg}");
+        assert!(msg.contains("backend resolution failed"), "got {msg}");
+    }
+
+    #[test]
+    fn the_total_failure_guard_ignores_the_until_condition() {
+        // This is the whole point: unlike the delivery gate, a broken
+        // panel is caught under `until command` too.
+        let ids = vec!["alpha".to_string()];
+        let manifests = vec![failed("alpha", "spawn error")];
+
+        assert!(assert_loop_pass_was_not_a_total_failure(&ids, &manifests, 1).is_err());
+    }
+
+    #[test]
+    fn a_partially_failing_panel_keeps_going() {
+        // One agent still delivered, so the panel can make progress and
+        // the delivery gate / judge decide what that is worth.
+        let ids = vec!["alpha".to_string(), "beta".to_string()];
+        let manifests = vec![failed("alpha", "timeout"), completed("beta", &["out/b.md"])];
+
+        assert_loop_pass_was_not_a_total_failure(&ids, &manifests, 2)
+            .expect("a partial failure is not unambiguous");
+    }
+
+    #[test]
+    fn an_agent_that_never_reported_is_left_to_the_delivery_gate() {
+        // No manifest at all means "never dispatched", which the
+        // delivery gate diagnoses far better than we could here.
+        let ids = vec!["alpha".to_string(), "ghost".to_string()];
+        let manifests = vec![failed("alpha", "timeout")];
+
+        assert_loop_pass_was_not_a_total_failure(&ids, &manifests, 2)
+            .expect("an absent manifest is not this guard's business");
+    }
+
+    #[test]
+    fn the_total_failure_guard_uses_the_most_recent_pass() {
+        // `all_manifests` accumulates across iterations; a failure from
+        // an earlier pass must not condemn a later successful one.
+        let ids = vec!["alpha".to_string()];
+        let manifests = vec![failed("alpha", "transient"), completed("alpha", &["out/a.md"])];
+
+        assert_loop_pass_was_not_a_total_failure(&ids, &manifests, 3)
+            .expect("the latest pass succeeded");
+    }
+
+    #[test]
+    fn an_empty_panel_is_not_a_failure() {
+        assert_loop_pass_was_not_a_total_failure(&[], &[], 1).expect("nothing to judge");
     }
 
     // ── Declared output contract (`agent { produces [...] }`) ────────────
@@ -4631,7 +5301,6 @@ mod tests {
         let manifests = vec![completed("codex-refine", &[])];
 
         let err = assert_loop_agents_produced_output(delivery_check(
-            &judge_until(),
             &ids,
             &unit_map,
             &manifests,
@@ -4669,7 +5338,6 @@ mod tests {
         let manifests = vec![completed("codex-refine", &[])];
 
         assert_loop_agents_produced_output(delivery_check(
-            &judge_until(),
             &ids,
             &unit_map,
             &manifests,
@@ -4702,7 +5370,6 @@ mod tests {
         let manifests = vec![completed("codex-refine", &[])];
 
         let err = assert_loop_agents_produced_output(delivery_check(
-            &judge_until(),
             &ids,
             &unit_map,
             &manifests,
@@ -4738,7 +5405,6 @@ mod tests {
         let manifests = vec![completed("codex-refine", &["out/scratch.md"])];
 
         assert_loop_agents_produced_output(delivery_check(
-            &judge_until(),
             &ids,
             &unit_map,
             &manifests,
@@ -4862,246 +5528,403 @@ async fn invalidate_stale_sources(
     }
 }
 
+/// Cheapest-first ordering for `until … and …`.
+///
+/// A judge is an LLM call; a `verify` block is a local build. Evaluating
+/// in cost order and short-circuiting means a panel is never paid for
+/// when a compile already says the iteration is not done — regardless of
+/// the order the script author happened to write the conditions in.
+fn condition_rank(condition: &super::plan::LoopUntilCondition) -> u8 {
+    match condition {
+        super::plan::LoopUntilCondition::Verify(_) => 0,
+        super::plan::LoopUntilCondition::Command(_) => 1,
+        super::plan::LoopUntilCondition::Agent(_) => 2,
+        // The parser flattens nested `All`s, so this is unreachable in
+        // practice; rank it last rather than assuming.
+        super::plan::LoopUntilCondition::All(_) => 3,
+    }
+}
+
+/// Run a `verify {}` loop condition. `Ok(None)` means it passed.
+///
+/// `index` is the condition's slot in its enclosing `All`, which keys
+/// the dedup memo — two `verify` blocks in one composition must not
+/// share one.
+async fn evaluate_verify_condition(
+    config: &super::plan::VerificationConfig,
+    index: usize,
+    ctx: &mut LoopConditionContext<'_>,
+) -> Result<Option<GateFailure>> {
+        // Bind the config reference out of `ctx` so the closure below
+        // borrows the SwarmConfig, not the context we mutate.
+        let cfg = ctx.config;
+
+        let failure = evaluate_deterministic_gate(
+            ctx.probe_dedup,
+            index,
+            VERIFY_DEDUP_KEY,
+            &cfg.workspace_root,
+            || async {
+                // A verify block that cannot be run at all is a broken
+                // gate, not a failing one — propagate instead of reading
+                // it as "not converged yet" and burning every remaining
+                // iteration.
+                let outcome =
+                    run_verification_checks(config, &cfg.workspace_root, &cfg.excludes, None)
+                        .await
+                        .context("loop `until` verification checks could not be run")?;
+
+                Ok(match outcome {
+                    VerificationOutcome::Passed => None,
+                    VerificationOutcome::Failed { check, output } => Some(GateFailure {
+                        probe: check,
+                        status: "verification check failed".to_string(),
+                        output,
+                    }),
+                })
+            },
+        )
+        .await?;
+
+        Ok(failure)
+}
+
+/// Run an `until command` probe. `Ok(None)` means it passed.
+async fn evaluate_command_condition(
+    cmd: &str,
+    index: usize,
+    current_iter_abs: u32,
+    ctx: &mut LoopConditionContext<'_>,
+) -> Result<Option<GateFailure>> {
+        // Substitute {{ITER}}/{{PREV_ITER}} so iteration-aware probes
+        // (e.g. `git show gaviero/foo-iter{{ITER}}:path/file.md`) can be
+        // expressed without going through an LLM judge.
+        let iter_str = current_iter_abs.to_string();
+        let prev_str = current_iter_abs.saturating_sub(1).to_string();
+        let expanded = cmd
+            .replace("{{ITER}}", &iter_str)
+            .replace("{{PREV_ITER}}", &prev_str);
+        let cfg = ctx.config;
+
+        // The expanded command is part of the dedup key: an
+        // iteration-aware probe addresses a different target each
+        // pass, so an unchanged workspace does not make it redundant.
+        let failure = evaluate_deterministic_gate(
+            ctx.probe_dedup,
+            index,
+            &expanded,
+            &cfg.workspace_root,
+            || run_command_probe(&expanded, &cfg.workspace_root),
+        )
+        .await?;
+
+        Ok(failure)
+}
+
+/// Dispatch the judge agent and turn its verdict into a loop outcome.
+///
+/// The delivery gate runs here rather than in the loop head: it exists
+/// to stop a judge rendering a verdict on a panel that silently lost a
+/// member, so it is a precondition of *judging*, not of iterating. Under
+/// `until … and …` a cheaper condition may fail first and the judge is
+/// never reached — aborting the run for a silent agent in that case
+/// would kill a run the loop could still have recovered (D-7).
+async fn evaluate_agent_condition(
+    agent_id: &str,
+    current_iter_abs: u32,
+    ctx: &mut LoopConditionContext<'_>,
+) -> Result<LoopConditionOutcome> {
+    assert_loop_agents_produced_output(DeliveryCheck {
+        agent_ids: ctx.loop_agent_ids,
+        unit_map: ctx.delivery.unit_map,
+        all_manifests: ctx.all_manifests,
+        before: ctx.delivery.before,
+        after: ctx.delivery.after,
+        workspace_root: &ctx.config.workspace_root,
+        iter_abs: current_iter_abs,
+    })?;
+
+    let agent_id = &agent_id.to_string();
+        let Some(unit_template) = ctx.loop_judge_map.get(agent_id.as_str()).copied() else {
+            tracing::warn!(
+                "loop judge agent '{}' not found in compiled plan (judges must be declared distinct from workflow agents)",
+                agent_id
+            );
+            return Ok(LoopConditionOutcome::Continue(JudgeReport::default()));
+        };
+
+        // Build a compact digest of the most recent worker manifests for
+        // this loop, substituted into `{{ITER_EVIDENCE}}` if the judge's
+        // `coordinator_instructions` template references it. Authors who
+        // already supply their own evidence text (or omit the placeholder)
+        // are unaffected — the placeholder is only replaced when present.
+        let evidence = if unit_template
+            .coordinator_instructions
+            .contains("{{ITER_EVIDENCE}}")
+        {
+            build_iter_evidence(ctx.all_manifests, ctx.loop_agent_ids, current_iter_abs)
+        } else {
+            String::new()
+        };
+        let unit = apply_iter_vars_with_evidence(unit_template, current_iter_abs, &evidence);
+        invalidate_stale_sources(ctx.memory, &unit, &ctx.config.workspace_root).await;
+
+        let effective_read_ns = effective_read_namespaces(&unit, ctx.config, ctx.memory);
+        let analysis = WorkspaceAnalysis {
+            repo_map: ctx.repo_map.clone(),
+            impact_texts: ctx.impact_texts.clone(),
+        };
+        let agent_ctx = AgentRunContext::for_run(
+            ctx.config,
+            ctx.context_files,
+            &effective_read_ns,
+            ctx.observer,
+            ctx.memory.clone(),
+            ctx.git_coordinator.clone(),
+            ctx.validation.clone(),
+            Some(ctx.shared_board.clone()),
+            &analysis,
+            ctx.pre_fetched_memory.clone(),
+        );
+
+        // Judges run in read-only mode: the write gate rejects any write
+        // proposals the backend tries to emit. See `run_readonly_agent`.
+        let run_future = run_readonly_agent(
+            &unit,
+            &agent_ctx,
+            ctx.tier_router,
+            ctx.iteration_config,
+            (ctx.make_observer)(agent_id),
+        );
+
+        // Apply judge timeout if configured (0 = disabled).
+        let manifest_result = if ctx.judge_timeout_secs > 0 {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(ctx.judge_timeout_secs as u64),
+                run_future,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::anyhow!(
+                    "judge agent '{}' timed out after {}s",
+                    agent_id,
+                    ctx.judge_timeout_secs
+                )),
+            }
+        } else {
+            run_future.await
+        };
+
+        let mut manifest = match manifest_result {
+            Ok(manifest) => manifest,
+            Err(e) => AgentManifest {
+                work_unit_id: agent_id.clone(),
+                status: AgentStatus::Failed(e.to_string()),
+                modified_files: vec![],
+                branch: None,
+                summary: Some(format!("Judge evaluation error: {}", e)),
+                output: None,
+                cost_usd: 0.0,
+            },
+        };
+
+        if !manifest.modified_files.is_empty() {
+            tracing::warn!(
+                "loop judge agent '{}' modified files during evaluation: {:?}",
+                agent_id,
+                manifest.modified_files
+            );
+        }
+
+        let verdict = manifest.output.as_deref().and_then(parse_judge_verdict);
+        let report = manifest
+            .output
+            .as_deref()
+            .map(parse_judge_report)
+            .unwrap_or_default();
+        manifest.summary = Some(match (verdict, &manifest.status) {
+            (Some(JudgeVerdict::Pass), _) => "Judge verdict: PASS".into(),
+            (Some(JudgeVerdict::Fail), _) => "Judge verdict: FAIL".into(),
+            (Some(JudgeVerdict::Partial), _) => "Judge verdict: PARTIAL".into(),
+            (Some(JudgeVerdict::Irreconcilable), _) => {
+                "Judge verdict: IRRECONCILABLE".into()
+            }
+            (None, AgentStatus::Failed(msg)) => format!("Judge failed: {}", msg),
+            (None, _) => "Judge verdict: unparseable".into(),
+        });
+
+        // Under strict mode, an unparseable verdict on an otherwise completed
+        // run is promoted to a hard failure so it surfaces in the manifest/UI
+        // instead of silently being treated as FAIL.
+        if verdict.is_none() && matches!(manifest.status, AgentStatus::Completed) {
+            if ctx.strict_judge {
+                tracing::error!(
+                    "loop judge agent '{}' returned unparseable output (strict mode)",
+                    agent_id
+                );
+                manifest.status = AgentStatus::Failed(
+                    "judge returned unparseable verdict (enable strict_judge=false for legacy behaviour)"
+                        .into(),
+                );
+            } else {
+                tracing::warn!(
+                    "loop judge agent '{}' completed without a parseable PASS/FAIL verdict",
+                    agent_id
+                );
+            }
+        }
+
+        if matches!(manifest.status, AgentStatus::Completed) {
+            {
+                let b = ctx.bus.lock().await;
+                b.broadcast(
+                    &manifest.work_unit_id,
+                    &format!("completed: {}", manifest.summary.as_deref().unwrap_or("")),
+                );
+            }
+            let worker_ns = unit
+                .write_namespace
+                .as_deref()
+                .unwrap_or(&ctx.config.write_namespace);
+            // Route judge artefacts to a dedicated sub-namespace so they do
+            // not pollute worker memory. The store's namespace is treated as
+            // an opaque key by callers, so the `judge/` prefix is a pure
+            // convention the consolidator and TUI can key off.
+            let judge_ns = format!("judge/{}", worker_ns);
+            store_agent_result(
+                ctx.memory,
+                ctx.memory_writer,
+                &judge_ns,
+                &manifest,
+                &unit,
+                ctx.run_id,
+                &ctx.config.workspace_root,
+                ctx.config.extract_agent_findings,
+            )
+            .await;
+        }
+
+        let outcome = match verdict {
+            Some(JudgeVerdict::Pass) => LoopConditionOutcome::Pass,
+            // The judge itself ruled the disagreement structural. Honour
+            // it in every consensus mode: continuing would spend the
+            // remaining budget re-deriving a conclusion the judge has
+            // already read and rejected as unreachable.
+            Some(JudgeVerdict::Irreconcilable) => {
+                LoopConditionOutcome::Irreconcilable(report)
+            }
+            Some(JudgeVerdict::Partial)
+                if ctx.consensus_mode == crate::swarm::plan::ConsensusMode::PartialOk =>
+            {
+                if let Some(dir) = ctx.verdict_output_dir {
+                    write_consensus_verdict_file(
+                        &ctx.config.workspace_root,
+                        dir,
+                        current_iter_abs,
+                        "partial",
+                        manifest.summary.as_deref().unwrap_or(""),
+                        &ctx.loop_agent_ids,
+                    );
+                }
+                LoopConditionOutcome::Partial
+            }
+            Some(JudgeVerdict::Partial) => LoopConditionOutcome::Continue(report),
+            _ => LoopConditionOutcome::Continue(report),
+        };
+
+        ctx.all_manifests.push(manifest);
+        Ok(outcome)
+}
+
+/// Evaluate `until … and …`: every condition must pass.
+///
+/// Conditions run cheapest-first and short-circuit on the first that
+/// does not pass, so the expensive judge is only consulted once the
+/// deterministic conditions already agree.
+async fn evaluate_all_conditions(
+    conditions: &[super::plan::LoopUntilCondition],
+    current_iter_abs: u32,
+    ctx: &mut LoopConditionContext<'_>,
+) -> Result<(LoopConditionOutcome, Option<GateFailure>)> {
+    let mut ordered: Vec<(usize, &super::plan::LoopUntilCondition)> =
+        conditions.iter().enumerate().collect();
+    // Stable, so author order still decides between conditions of equal
+    // cost.
+    ordered.sort_by_key(|(_, c)| condition_rank(c));
+
+    for (index, condition) in ordered {
+        match condition {
+            super::plan::LoopUntilCondition::Verify(config) => {
+                if let Some(failure) = evaluate_verify_condition(config, index, ctx).await? {
+                    let observer = ctx.observer;
+                    return Ok(report_deterministic_gate(
+                        Some(failure),
+                        current_iter_abs,
+                        observer,
+                    ));
+                }
+            }
+            super::plan::LoopUntilCondition::Command(cmd) => {
+                if let Some(failure) =
+                    evaluate_command_condition(cmd, index, current_iter_abs, ctx).await?
+                {
+                    let observer = ctx.observer;
+                    return Ok(report_deterministic_gate(
+                        Some(failure),
+                        current_iter_abs,
+                        observer,
+                    ));
+                }
+            }
+            super::plan::LoopUntilCondition::Agent(agent_id) => {
+                let outcome = evaluate_agent_condition(agent_id, current_iter_abs, ctx).await?;
+                if !matches!(outcome, LoopConditionOutcome::Pass) {
+                    return Ok((outcome, None));
+                }
+            }
+            // Flattened by the parser; nothing sensible to do but skip.
+            super::plan::LoopUntilCondition::All(_) => {}
+        }
+    }
+
+    Ok((LoopConditionOutcome::Pass, None))
+}
+
 /// Evaluate a loop's exit condition.
 async fn evaluate_loop_condition(
     condition: &super::plan::LoopUntilCondition,
     current_iter_abs: u32,
     ctx: &mut LoopConditionContext<'_>,
-) -> LoopConditionOutcome {
+) -> Result<(LoopConditionOutcome, Option<GateFailure>)> {
     if ctx.consensus_mode == crate::swarm::plan::ConsensusMode::Explore {
-        return LoopConditionOutcome::Continue(JudgeReport::default());
+        return Ok((LoopConditionOutcome::Continue(JudgeReport::default()), None));
     }
     match condition {
         super::plan::LoopUntilCondition::Verify(config) => {
-            if run_verification_checks(
-                config,
-                &ctx.config.workspace_root,
-                &ctx.config.excludes,
-                None,
-            )
-            .await
-            .unwrap_or(false)
-            {
-                LoopConditionOutcome::Pass
-            } else {
-                LoopConditionOutcome::Continue(JudgeReport::default())
-            }
-        }
-        super::plan::LoopUntilCondition::Agent(agent_id) => {
-            let Some(unit_template) = ctx.loop_judge_map.get(agent_id.as_str()).copied() else {
-                tracing::warn!(
-                    "loop judge agent '{}' not found in compiled plan (judges must be declared distinct from workflow agents)",
-                    agent_id
-                );
-                return LoopConditionOutcome::Continue(JudgeReport::default());
-            };
-
-            // Build a compact digest of the most recent worker manifests for
-            // this loop, substituted into `{{ITER_EVIDENCE}}` if the judge's
-            // `coordinator_instructions` template references it. Authors who
-            // already supply their own evidence text (or omit the placeholder)
-            // are unaffected — the placeholder is only replaced when present.
-            let evidence = if unit_template
-                .coordinator_instructions
-                .contains("{{ITER_EVIDENCE}}")
-            {
-                build_iter_evidence(ctx.all_manifests, ctx.loop_agent_ids, current_iter_abs)
-            } else {
-                String::new()
-            };
-            let unit = apply_iter_vars_with_evidence(unit_template, current_iter_abs, &evidence);
-            invalidate_stale_sources(ctx.memory, &unit, &ctx.config.workspace_root).await;
-
-            let effective_read_ns = effective_read_namespaces(&unit, ctx.config, ctx.memory);
-            let analysis = WorkspaceAnalysis {
-                repo_map: ctx.repo_map.clone(),
-                impact_texts: ctx.impact_texts.clone(),
-            };
-            let agent_ctx = AgentRunContext::for_run(
-                ctx.config,
-                ctx.context_files,
-                &effective_read_ns,
-                ctx.observer,
-                ctx.memory.clone(),
-                ctx.git_coordinator.clone(),
-                ctx.validation.clone(),
-                Some(ctx.shared_board.clone()),
-                &analysis,
-                ctx.pre_fetched_memory.clone(),
-            );
-
-            // Judges run in read-only mode: the write gate rejects any write
-            // proposals the backend tries to emit. See `run_readonly_agent`.
-            let run_future = run_readonly_agent(
-                &unit,
-                &agent_ctx,
-                ctx.tier_router,
-                ctx.iteration_config,
-                (ctx.make_observer)(agent_id),
-            );
-
-            // Apply judge timeout if configured (0 = disabled).
-            let manifest_result = if ctx.judge_timeout_secs > 0 {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(ctx.judge_timeout_secs as u64),
-                    run_future,
-                )
-                .await
-                {
-                    Ok(r) => r,
-                    Err(_) => Err(anyhow::anyhow!(
-                        "judge agent '{}' timed out after {}s",
-                        agent_id,
-                        ctx.judge_timeout_secs
-                    )),
-                }
-            } else {
-                run_future.await
-            };
-
-            let mut manifest = match manifest_result {
-                Ok(manifest) => manifest,
-                Err(e) => AgentManifest {
-                    work_unit_id: agent_id.clone(),
-                    status: AgentStatus::Failed(e.to_string()),
-                    modified_files: vec![],
-                    branch: None,
-                    summary: Some(format!("Judge evaluation error: {}", e)),
-                    output: None,
-                    cost_usd: 0.0,
-                },
-            };
-
-            if !manifest.modified_files.is_empty() {
-                tracing::warn!(
-                    "loop judge agent '{}' modified files during evaluation: {:?}",
-                    agent_id,
-                    manifest.modified_files
-                );
-            }
-
-            let verdict = manifest.output.as_deref().and_then(parse_judge_verdict);
-            let report = manifest
-                .output
-                .as_deref()
-                .map(parse_judge_report)
-                .unwrap_or_default();
-            manifest.summary = Some(match (verdict, &manifest.status) {
-                (Some(JudgeVerdict::Pass), _) => "Judge verdict: PASS".into(),
-                (Some(JudgeVerdict::Fail), _) => "Judge verdict: FAIL".into(),
-                (Some(JudgeVerdict::Partial), _) => "Judge verdict: PARTIAL".into(),
-                (Some(JudgeVerdict::Irreconcilable), _) => {
-                    "Judge verdict: IRRECONCILABLE".into()
-                }
-                (None, AgentStatus::Failed(msg)) => format!("Judge failed: {}", msg),
-                (None, _) => "Judge verdict: unparseable".into(),
-            });
-
-            // Under strict mode, an unparseable verdict on an otherwise completed
-            // run is promoted to a hard failure so it surfaces in the manifest/UI
-            // instead of silently being treated as FAIL.
-            if verdict.is_none() && matches!(manifest.status, AgentStatus::Completed) {
-                if ctx.strict_judge {
-                    tracing::error!(
-                        "loop judge agent '{}' returned unparseable output (strict mode)",
-                        agent_id
-                    );
-                    manifest.status = AgentStatus::Failed(
-                        "judge returned unparseable verdict (enable strict_judge=false for legacy behaviour)"
-                            .into(),
-                    );
-                } else {
-                    tracing::warn!(
-                        "loop judge agent '{}' completed without a parseable PASS/FAIL verdict",
-                        agent_id
-                    );
-                }
-            }
-
-            if matches!(manifest.status, AgentStatus::Completed) {
-                {
-                    let b = ctx.bus.lock().await;
-                    b.broadcast(
-                        &manifest.work_unit_id,
-                        &format!("completed: {}", manifest.summary.as_deref().unwrap_or("")),
-                    );
-                }
-                let worker_ns = unit
-                    .write_namespace
-                    .as_deref()
-                    .unwrap_or(&ctx.config.write_namespace);
-                // Route judge artefacts to a dedicated sub-namespace so they do
-                // not pollute worker memory. The store's namespace is treated as
-                // an opaque key by callers, so the `judge/` prefix is a pure
-                // convention the consolidator and TUI can key off.
-                let judge_ns = format!("judge/{}", worker_ns);
-                store_agent_result(
-                    ctx.memory,
-                    ctx.memory_writer,
-                    &judge_ns,
-                    &manifest,
-                    &unit,
-                    ctx.run_id,
-                    &ctx.config.workspace_root,
-                    ctx.config.extract_agent_findings,
-                )
-                .await;
-            }
-
-            let outcome = match verdict {
-                Some(JudgeVerdict::Pass) => LoopConditionOutcome::Pass,
-                // The judge itself ruled the disagreement structural. Honour
-                // it in every consensus mode: continuing would spend the
-                // remaining budget re-deriving a conclusion the judge has
-                // already read and rejected as unreachable.
-                Some(JudgeVerdict::Irreconcilable) => {
-                    LoopConditionOutcome::Irreconcilable(report)
-                }
-                Some(JudgeVerdict::Partial)
-                    if ctx.consensus_mode == crate::swarm::plan::ConsensusMode::PartialOk =>
-                {
-                    if let Some(dir) = ctx.verdict_output_dir {
-                        write_consensus_verdict_file(
-                            &ctx.config.workspace_root,
-                            dir,
-                            current_iter_abs,
-                            "partial",
-                            manifest.summary.as_deref().unwrap_or(""),
-                            &ctx.loop_agent_ids,
-                        );
-                    }
-                    LoopConditionOutcome::Partial
-                }
-                Some(JudgeVerdict::Partial) => LoopConditionOutcome::Continue(report),
-                _ => LoopConditionOutcome::Continue(report),
-            };
-
-            ctx.all_manifests.push(manifest);
-            outcome
+            let failure = evaluate_verify_condition(config, 0, ctx).await?;
+            let observer = ctx.observer;
+            Ok(report_deterministic_gate(
+                failure,
+                current_iter_abs,
+                observer,
+            ))
         }
         super::plan::LoopUntilCondition::Command(cmd) => {
-            // Substitute {{ITER}}/{{PREV_ITER}} so iteration-aware probes
-            // (e.g. `git show gaviero/foo-iter{{ITER}}:path/file.md`) can be
-            // expressed without going through an LLM judge.
-            let iter_str = current_iter_abs.to_string();
-            let prev_str = current_iter_abs.saturating_sub(1).to_string();
-            let expanded = cmd
-                .replace("{{ITER}}", &iter_str)
-                .replace("{{PREV_ITER}}", &prev_str);
-            // Run the shell command; exit code 0 = condition met.
-            // User-authored probe — POSIX shell when available, pwsh
-            // otherwise (Tier W1 / PR-4, W-D5).
-            let result = crate::util::spawn::shell_command_lenient(expanded.as_str())
-                .current_dir(&ctx.config.workspace_root)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .await;
-            if result.map(|s| s.success()).unwrap_or(false) {
-                LoopConditionOutcome::Pass
-            } else {
-                LoopConditionOutcome::Continue(JudgeReport::default())
-            }
+            let failure = evaluate_command_condition(cmd, 0, current_iter_abs, ctx).await?;
+            let observer = ctx.observer;
+            Ok(report_deterministic_gate(
+                failure,
+                current_iter_abs,
+                observer,
+            ))
+        }
+        super::plan::LoopUntilCondition::Agent(agent_id) => {
+            let outcome = evaluate_agent_condition(agent_id, current_iter_abs, ctx).await?;
+            Ok((outcome, None))
+        }
+        super::plan::LoopUntilCondition::All(conditions) => {
+            evaluate_all_conditions(conditions, current_iter_abs, ctx).await
         }
     }
 }

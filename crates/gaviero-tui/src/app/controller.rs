@@ -1038,6 +1038,18 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             app.swarm_dashboard
                 .set_tier_dispatch(&unit_id, tier, &backend);
         }
+        Event::SwarmLoopGateFailed {
+            probe,
+            status,
+            output,
+        } => {
+            let diagnostic = output.lines().next().unwrap_or_default().trim();
+            app.swarm_dashboard.status_message = if diagnostic.is_empty() {
+                format!("Loop gate failed: {probe} ({status})")
+            } else {
+                format!("Loop gate failed: {probe} ({status}) - {diagnostic}")
+            };
+        }
         Event::SwarmCostUpdate(estimate) => {
             app.swarm_dashboard.set_cost(estimate.estimated_usd);
         }

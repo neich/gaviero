@@ -270,6 +270,16 @@ pub trait SwarmObserver: Send + Sync {
     /// reflect the running PASS streak and its required target.
     fn on_loop_verdict(&self, _passed: bool, _consecutive: u32, _stability: u32) {}
 
+    /// Called when a deterministic loop gate (`until command "…"` or
+    /// `until { … }`) fails, carrying what the probe reported.
+    ///
+    /// `probe` is the command as executed — already `{{ITER}}`-substituted
+    /// — or a description of the failing verification check. `output` is
+    /// the probe's combined stdout+stderr, already truncated. The same
+    /// detail is fed into the next iteration's prompt; this event exists
+    /// so a UI can surface it live rather than only in the transcript.
+    fn on_loop_gate_failed(&self, _probe: &str, _status: &str, _output: &str) {}
+
     // ── Cost tracking ───────────────────────────────────────────────
 
     /// Called with updated cost estimates during execution.

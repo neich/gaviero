@@ -170,6 +170,15 @@ pub struct TestReport {
     pub duration: Duration,
     pub targeted_filter: Option<String>,
     pub parsed_results: Option<ParsedTestResults>,
+    /// Set when the suite could not be *run* at all, as opposed to
+    /// running and reporting failures.
+    ///
+    /// The two are not interchangeable to a caller gating on this
+    /// report: "the tests fail" is actionable, "cargo could not be
+    /// started" is a broken harness. Callers that must tell them apart
+    /// check this; callers that only care about pass/fail keep using
+    /// `passed` and are unaffected.
+    pub execution_error: Option<String>,
 }
 
 /// Parsed test output (best-effort).

@@ -1904,6 +1904,8 @@ impl AgentChatState {
                      /remember-workspace <text>\n                              — Store at workspace scope\n\
                      /remember-global <text>  — Store at global scope\n\
                      /consolidate-session     — Run end-of-session consolidator over the active conversation\n\
+                     /consolidate history [n] — List recent consolidator runs and whether they were rolled back\n\
+                     /consolidate rollback <run_id>\n                              — Undo a consolidator run's memory changes\n\
                      /sleep [--dry-run]       — Trigger the sleeptime maintenance pass\n\
                      /reembed                 — Re-embed every memory under the configured embedder (takes a backup first)\n\
                      /forget <query>          — Soft-delete records matching a fuzzy query (never history)\n\

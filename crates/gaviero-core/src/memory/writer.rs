@@ -18,8 +18,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use serde_json::Value as JsonValue;
+use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 
 use super::consolidation_llm::ConsolidationLlm;
@@ -246,6 +247,13 @@ pub enum WriterMessage {
         reason: String,
         ack: Option<oneshot::Sender<Result<AgentFlagOutcome, String>>>,
     },
+    /// Tier H / H1: undo a consolidation run by replaying the inverse
+    /// of each audited operation. Always acked — a rollback is a
+    /// user-initiated mutation whose result they are waiting on.
+    ConsolidationRollback {
+        run_id: String,
+        ack: oneshot::Sender<Result<RollbackOutcome, String>>,
+    },
     /// No-op drain barrier. Because the writer processes messages strictly
     /// FIFO, acking this guarantees every message enqueued before it has
     /// been fully processed. Used by headless callers ([`WriterHandle::flush`])
@@ -293,6 +301,7 @@ impl WriterMessage {
             WriterMessage::BulkForget { .. } => "BulkForget",
             WriterMessage::RedactHistory { .. } => "RedactHistory",
             WriterMessage::AgentFlag { .. } => "AgentFlag",
+            WriterMessage::ConsolidationRollback { .. } => "ConsolidationRollback",
             WriterMessage::Flush { .. } => "Flush",
         }
     }
@@ -681,6 +690,25 @@ impl WriterHandle {
         Self::await_ack(rx).await
     }
 
+    /// Tier H / H1: undo a consolidation run, blocking until the
+    /// writer has replayed every inverse operation.
+    pub async fn consolidation_rollback(
+        &self,
+        run_id: impl Into<String>,
+    ) -> Result<RollbackOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.enqueue(WriterMessage::ConsolidationRollback {
+            run_id: run_id.into(),
+            ack: tx,
+        })?;
+        match tokio::time::timeout(Duration::from_millis(ACK_TIMEOUT_MS), rx).await {
+            Ok(Ok(Ok(outcome))) => Ok(outcome),
+            Ok(Ok(Err(e))) => Err(anyhow!(e)),
+            Ok(Err(_)) => Err(anyhow!("writer dropped ack channel")),
+            Err(_) => Err(anyhow!("writer ack timeout after {ACK_TIMEOUT_MS}ms")),
+        }
+    }
+
     /// Tier B / B5: enqueue a sleeptime pass. Fire-and-forget; the
     /// caller observes progress via [`SleeptimeObserver`] events.
     pub fn sleeptime(&self, payload: JsonValue) -> Result<()> {
@@ -1066,6 +1094,14 @@ async fn process_message(
             let store = stores.workspace().clone();
             process_telemetry_classify(&store, &turn_id, &session_id, &response).await
         }
+        WriterMessage::ConsolidationRollback { run_id, ack } => {
+            // Consolidation writes land in the workspace store, so its
+            // audit trail and the rows to reverse are both there.
+            let store = stores.workspace().clone();
+            let res = process_consolidation_rollback(&store, &run_id).await;
+            send_ack_typed(Some(ack), &res);
+            res.map(|_| WriteResult::Skipped)
+        }
         WriterMessage::Restore { deletion_id, ack } => {
             // C2.2: deletions audit is per-DB, and current soft-delete
             // call sites only land into workspace. Step 7 generalises
@@ -1180,7 +1216,7 @@ async fn process_session_consolidate(
     transcript: String,
 ) -> Result<WriteResult> {
     use super::session_consolidator::{
-        CandidateBrief, ExistingBrief, build_prompt, parse_response,
+        CandidateBrief, ExistingBrief, MAX_EXISTING_MEMORIES, build_prompt, parse_response,
     };
 
     let Some(llm) = llm else {
@@ -1223,7 +1259,42 @@ async fn process_session_consolidate(
         return Ok(WriteResult::Skipped);
     }
 
-    let prompt = build_prompt(&transcript, &candidates, &[] as &[ExistingBrief]);
+    // C-5 fix: the prompt used to be built with an empty existing set,
+    // so every id the model produced was necessarily invented and every
+    // MERGE / SUPERSEDE it emitted was rejected at apply time. Give it
+    // the rows it is actually allowed to name.
+    let landing_scope_level = if module_path.is_some() {
+        super::scope::SCOPE_MODULE
+    } else {
+        super::scope::SCOPE_REPO
+    };
+    let existing: Vec<ExistingBrief> = store
+        .consolidation_existing_memories(
+            landing_scope_level,
+            Some(repo_id.as_str()),
+            MAX_EXISTING_MEMORIES,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                target: "memory_consolidator",
+                error = %e,
+                "could not load existing memories; MERGE/SUPERSEDE will have no valid targets"
+            );
+            Vec::new()
+        })
+        .into_iter()
+        .map(|r| ExistingBrief {
+            id: r.id,
+            text: r.content,
+            kind: r.memory_type,
+            scope_label: r.scope_label,
+        })
+        .collect();
+
+    let history = load_consolidation_history(store).await;
+
+    let prompt = build_prompt(&transcript, &candidates, &existing, &history);
     let raw = match llm.complete(prompt).await {
         Ok(s) => s,
         Err(e) => {
@@ -1252,6 +1323,11 @@ async fn process_session_consolidate(
             repo_id: repo_id.clone(),
         }
     };
+    let scope_label = match &module_path {
+        Some(m) => format!("module:{m}"),
+        None => "repo".to_string(),
+    };
+
     if !parsed.session_summary.trim().is_empty() {
         // C1: the consolidator's session-summary blob is the canonical
         // Summary kind row — semantic merge across similar sessions,
@@ -1261,56 +1337,562 @@ async fn process_session_consolidate(
             .with_type(super::scope::MemoryType::Factual)
             .with_kind(super::kind::MemoryKind::Summary)
             .with_tag(format!("session_summary:{run_id}"));
-        let _ = store
+        let outcome = store
             .store_scoped(&summary_scope, &parsed.session_summary, &meta)
             .await;
+        let (memory_id, error) = match outcome {
+            Ok(res) => (stored_id(&res), None),
+            Err(e) => {
+                tracing::warn!(
+                    target: "memory_consolidator",
+                    error = %e,
+                    "session summary could not be stored"
+                );
+                (None, Some(format!("{e:#}")))
+            }
+        };
+        record_consolidation_op(
+            store,
+            ConsolidationAudit {
+                run_id: &run_id,
+                kind: "session_summary",
+                memory_id,
+                related_id: None,
+                op_json: &json!({ "op": "SESSION_SUMMARY" }).to_string(),
+                before_json: None,
+                after_json: None,
+                error: error.as_deref(),
+                scope: &scope_label,
+                expected_outcome: None,
+            },
+        )
+        .await;
     }
 
-    for op in parsed.operations {
+    for annotated in parsed.operations {
         use super::session_consolidator::ConsolidationOp;
+
+        let op_json = serde_json::to_string(&annotated).unwrap_or_else(|_| "null".to_string());
+        let expected = annotated.expected_outcome.clone();
+        let op = annotated.op;
+        let kind = op.kind_str();
+
+        // Validate references *before* touching the store. An op naming
+        // a candidate that does not exist, or a memory id the model
+        // invented, used to be silently skipped by `if let Some(..)` —
+        // indistinguishable from an op that ran.
+        if candidates.get(op.candidate_index()).is_none()
+            && !matches!(op, ConsolidationOp::Merge { .. })
+        {
+            let error = format!(
+                "candidate_index {} out of range (batch had {} candidates)",
+                op.candidate_index(),
+                candidates.len()
+            );
+            tracing::warn!(target: "memory_consolidator", %error, op = kind, "rejecting op");
+            record_consolidation_op(
+                store,
+                ConsolidationAudit {
+                    run_id: &run_id,
+                    kind,
+                    memory_id: None,
+                    related_id: None,
+                    op_json: &op_json,
+                    before_json: None,
+                    after_json: None,
+                    error: Some(&error),
+                    scope: &scope_label,
+                    expected_outcome: expected.as_deref(),
+                },
+            )
+            .await;
+            continue;
+        }
+
         match op {
             ConsolidationOp::Add { candidate_index } => {
-                if let Some(c) = candidates.get(candidate_index) {
-                    let meta = WriteMeta::for_source(MemorySource::LlmConsolidated)
-                        .with_importance(c.importance)
-                        .with_type(super::scope::MemoryType::parse_str(&c.kind));
-                    let _ = store.store_scoped(&summary_scope, &c.text, &meta).await;
-                }
+                let c = &candidates[candidate_index];
+                let meta = WriteMeta::for_source(MemorySource::LlmConsolidated)
+                    .with_importance(c.importance)
+                    .with_type(super::scope::MemoryType::parse_str(&c.kind));
+                let (memory_id, error) =
+                    match store.store_scoped(&summary_scope, &c.text, &meta).await {
+                        Ok(res) => (stored_id(&res), None),
+                        Err(e) => {
+                            tracing::warn!(target: "memory_consolidator", error = %e, "ADD failed");
+                            (None, Some(format!("{e:#}")))
+                        }
+                    };
+                record_consolidation_op(
+                    store,
+                    ConsolidationAudit {
+                        run_id: &run_id,
+                        kind,
+                        memory_id,
+                        related_id: None,
+                        op_json: &op_json,
+                        before_json: None,
+                        after_json: None,
+                        error: error.as_deref(),
+                        scope: &scope_label,
+                        expected_outcome: expected.as_deref(),
+                    },
+                )
+                .await;
             }
+
             ConsolidationOp::Merge { into_memory_id, .. } => {
                 // Best-effort trust bump on the surviving row;
                 // text-merge is deferred (the LLM picked the existing
                 // row to "fold into" — keeping its content).
-                let _ = store.set_trust_score(into_memory_id, 0.8).await;
+                let before = store.get_memory_row(into_memory_id).await.ok().flatten();
+                let (error, before_json) = match &before {
+                    None => (
+                        Some(format!(
+                            "merge target memory {into_memory_id} does not exist"
+                        )),
+                        None,
+                    ),
+                    Some(row) => {
+                        let before_json =
+                            json!({ "trust_score": row.trust_score, "memory_id": row.id })
+                                .to_string();
+                        match store.set_trust_score(into_memory_id, MERGE_TRUST).await {
+                            Ok(()) => (None, Some(before_json)),
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "memory_consolidator", error = %e, "MERGE failed"
+                                );
+                                (Some(format!("{e:#}")), Some(before_json))
+                            }
+                        }
+                    }
+                };
+                if let Some(ref cause) = error {
+                    tracing::warn!(target: "memory_consolidator", %cause, "rejecting MERGE");
+                }
+                let after_json = error
+                    .is_none()
+                    .then(|| json!({ "trust_score": MERGE_TRUST }).to_string());
+                record_consolidation_op(
+                    store,
+                    ConsolidationAudit {
+                        run_id: &run_id,
+                        kind,
+                        memory_id: Some(into_memory_id),
+                        related_id: None,
+                        op_json: &op_json,
+                        before_json: before_json.as_deref(),
+                        after_json: after_json.as_deref(),
+                        error: error.as_deref(),
+                        scope: &scope_label,
+                        expected_outcome: expected.as_deref(),
+                    },
+                )
+                .await;
             }
+
             ConsolidationOp::Supersede {
                 candidate_index,
                 supersedes_memory_id,
             } => {
-                if let Some(c) = candidates.get(candidate_index) {
-                    let meta = WriteMeta::for_source(MemorySource::LlmConsolidated)
-                        .with_importance(c.importance)
-                        .with_type(super::scope::MemoryType::parse_str(&c.kind));
-                    if let Ok(res) = store.store_scoped(&summary_scope, &c.text, &meta).await {
-                        let new_id = match res {
-                            super::scope::StoreResult::Inserted(id)
-                            | super::scope::StoreResult::Deduplicated(id) => Some(id),
-                            super::scope::StoreResult::AlreadyCovered => None,
-                        };
-                        if let Some(id) = new_id {
-                            let _ = store.supersede_memory(supersedes_memory_id, id).await;
+                let c = &candidates[candidate_index];
+                let superseded = store
+                    .get_memory_row(supersedes_memory_id)
+                    .await
+                    .ok()
+                    .flatten();
+                if superseded.is_none() {
+                    let error = format!("superseded memory {supersedes_memory_id} does not exist");
+                    tracing::warn!(target: "memory_consolidator", %error, "rejecting SUPERSEDE");
+                    record_consolidation_op(
+                        store,
+                        ConsolidationAudit {
+                            run_id: &run_id,
+                            kind,
+                            memory_id: None,
+                            related_id: Some(supersedes_memory_id),
+                            op_json: &op_json,
+                            before_json: None,
+                            after_json: None,
+                            error: Some(&error),
+                            scope: &scope_label,
+                            expected_outcome: expected.as_deref(),
+                        },
+                    )
+                    .await;
+                    continue;
+                }
+
+                let meta = WriteMeta::for_source(MemorySource::LlmConsolidated)
+                    .with_importance(c.importance)
+                    .with_type(super::scope::MemoryType::parse_str(&c.kind));
+                let (memory_id, mut error) =
+                    match store.store_scoped(&summary_scope, &c.text, &meta).await {
+                        Ok(res) => (stored_id(&res), None),
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    };
+                match memory_id {
+                    Some(id) if error.is_none() => {
+                        if let Err(e) = store.supersede_memory(supersedes_memory_id, id).await {
+                            error = Some(format!("{e:#}"));
                         }
                     }
+                    // The replacement was already covered by an existing
+                    // row, so there is nothing to supersede *with*.
+                    None if error.is_none() => {
+                        error = Some(
+                            "replacement text was already covered; nothing to supersede with"
+                                .to_string(),
+                        );
+                    }
+                    _ => {}
                 }
+                if let Some(ref cause) = error {
+                    tracing::warn!(target: "memory_consolidator", %cause, "SUPERSEDE failed");
+                }
+                record_consolidation_op(
+                    store,
+                    ConsolidationAudit {
+                        run_id: &run_id,
+                        kind,
+                        memory_id,
+                        related_id: Some(supersedes_memory_id),
+                        op_json: &op_json,
+                        before_json: None,
+                        after_json: None,
+                        error: error.as_deref(),
+                        scope: &scope_label,
+                        expected_outcome: expected.as_deref(),
+                    },
+                )
+                .await;
             }
+
             ConsolidationOp::Drop { .. } => {
                 // Drop is the no-op decision (don't promote the
                 // candidate beyond Run scope). Per-turn extractor's
-                // run-scope row stays; nothing to do here.
+                // run-scope row stays; nothing to do here — but it is
+                // still a decision the model made, so it is recorded.
+                record_consolidation_op(
+                    store,
+                    ConsolidationAudit {
+                        run_id: &run_id,
+                        kind,
+                        memory_id: None,
+                        related_id: None,
+                        op_json: &op_json,
+                        before_json: None,
+                        after_json: None,
+                        error: None,
+                        scope: &scope_label,
+                        expected_outcome: expected.as_deref(),
+                    },
+                )
+                .await;
             }
         }
     }
     Ok(WriteResult::Skipped)
+}
+
+/// Trust score a `MERGE` promotes its surviving row to.
+const MERGE_TRUST: f32 = 0.8;
+
+/// Replay the last few consolidation runs for the prompt.
+///
+/// Best-effort: a consolidator that cannot see its history is worse at
+/// self-correcting but still perfectly able to run, so a read failure
+/// degrades to no history rather than aborting the pass.
+async fn load_consolidation_history(
+    store: &Arc<MemoryStore>,
+) -> Vec<super::session_consolidator::ConsolidationRunBrief> {
+    use super::session_consolidator::{ConsolidationRunBrief, MAX_HISTORY_RUNS};
+
+    let runs = match store.recent_consolidation_runs(MAX_HISTORY_RUNS).await {
+        Ok(runs) => runs,
+        Err(e) => {
+            tracing::warn!(
+                target: "memory_consolidator",
+                error = %e,
+                "could not read consolidation history"
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut out = Vec::with_capacity(runs.len());
+    for run in runs {
+        let rows = match store.consolidation_audit_for_run(&run.run_id).await {
+            Ok(rows) => rows,
+            Err(_) => continue,
+        };
+        let ops = rows
+            .iter()
+            .map(|r| {
+                let target = r
+                    .related_id
+                    .or(r.memory_id)
+                    .map(|id| format!(" -> {id}"))
+                    .unwrap_or_default();
+                let verdict = match (&r.applied, &r.error) {
+                    (true, _) => "ok".to_string(),
+                    (false, Some(e)) => format!("rejected ({e})"),
+                    (false, None) => "rejected".to_string(),
+                };
+                // The prediction is what makes the outcome instructive:
+                // "you said X would be true; here is what happened".
+                match &r.expected_outcome {
+                    Some(x) if !x.trim().is_empty() => {
+                        format!("{}{target}: {verdict} — you expected: {x}", r.kind)
+                    }
+                    _ => format!("{}{target}: {verdict}", r.kind),
+                }
+            })
+            .collect();
+        out.push(ConsolidationRunBrief {
+            run_id: run.run_id,
+            ops,
+            rolled_back: run.rolled_back,
+        });
+    }
+    out
+}
+
+/// What a `/consolidate rollback` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollbackOutcome {
+    pub run_id: String,
+    /// Operations successfully reversed.
+    pub reversed: usize,
+    /// Rows skipped because the original operation never applied.
+    pub skipped: usize,
+    /// Inverse operations that themselves failed, with the reason.
+    pub failed: Vec<String>,
+}
+
+/// Undo a consolidation run.
+///
+/// Walks the run's audit rows in reverse and applies the inverse of
+/// each: an `ADD` becomes a soft-delete, a `SUPERSEDE` soft-deletes the
+/// replacement and reinstates what it retired, a `MERGE` restores the
+/// trust score it overwrote. `DROP` decided nothing, so it undoes to
+/// nothing.
+///
+/// Reverse order matters for the same reason it does in a database
+/// undo log: a later operation may depend on an earlier one, so
+/// unwinding forwards could remove a row the next inverse still needs.
+///
+/// Rows whose operation never applied are skipped — there is nothing to
+/// reverse, and re-deleting on their behalf would destroy state the
+/// consolidator never created.
+async fn process_consolidation_rollback(
+    store: &Arc<MemoryStore>,
+    run_id: &str,
+) -> Result<RollbackOutcome> {
+    use super::session_consolidator::ConsolidationOp;
+
+    if store.consolidation_run_was_rolled_back(run_id).await? {
+        bail!(
+            "consolidation run '{run_id}' has already been rolled back; the inverse \
+             operations are not idempotent, so applying them twice would delete rows \
+             the first rollback already restored"
+        );
+    }
+
+    let rows = store.consolidation_audit_for_run(run_id).await?;
+    if rows.is_empty() {
+        bail!("no consolidation run '{run_id}' found in the audit trail");
+    }
+
+    let mut outcome = RollbackOutcome {
+        run_id: run_id.to_string(),
+        reversed: 0,
+        skipped: 0,
+        failed: Vec::new(),
+    };
+
+    for row in rows.iter().rev() {
+        if !row.applied {
+            outcome.skipped += 1;
+            continue;
+        }
+
+        let reason = format!("consolidate rollback of run {run_id}");
+        let result: Result<()> = match row.kind.as_str() {
+            // Both created a row; undoing means retiring it again.
+            "add" | "session_summary" => match row.memory_id {
+                Some(id) => store
+                    .soft_delete_memory(
+                        id,
+                        super::deletions::DeletedBy::ConsolidationRollback,
+                        Some(&reason),
+                        None,
+                    )
+                    .await
+                    .map(|_| ()),
+                None => Ok(()),
+            },
+
+            "supersede" => {
+                // Reinstate the retired row *first*, then delete the
+                // replacement. Not a preference — `memories.superseded_by`
+                // is a foreign key onto `memories(id)`, so while the old
+                // row still points at the replacement the replacement
+                // cannot be deleted at all.
+                let mut res = Ok(());
+                if let Some(old_id) = row.related_id {
+                    res = store.clear_supersede(old_id).await.map(|_| ());
+                }
+                if res.is_ok()
+                    && let Some(new_id) = row.memory_id
+                {
+                    res = store
+                        .soft_delete_memory(
+                            new_id,
+                            super::deletions::DeletedBy::ConsolidationRollback,
+                            Some(&reason),
+                            None,
+                        )
+                        .await
+                        .map(|_| ());
+                }
+                res
+            }
+
+            "merge" => match (row.memory_id, trust_from(row.before_json.as_deref())) {
+                (Some(id), Some(before)) => store.set_trust_score(id, before).await,
+                (Some(_), None) => Err(anyhow!(
+                    "merge audit row {} has no recorded prior trust to restore",
+                    row.id
+                )),
+                (None, _) => Ok(()),
+            },
+
+            // A DROP declined to promote a candidate. Nothing happened,
+            // so nothing comes back.
+            "drop" => Ok(()),
+
+            other => Err(anyhow!("unknown consolidation op kind '{other}'")),
+        };
+
+        let (applied, error) = match &result {
+            Ok(()) => {
+                outcome.reversed += 1;
+                (true, None)
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                tracing::warn!(
+                    target: "memory_consolidator",
+                    run_id,
+                    audit_id = row.id,
+                    error = %msg,
+                    "could not reverse consolidation op"
+                );
+                outcome.failed.push(format!("{}: {msg}", row.kind));
+                (false, Some(msg))
+            }
+        };
+
+        let op_json = serde_json::to_string(&json!({
+            "reverses_audit_id": row.id,
+            "op": row.kind,
+        }))
+        .unwrap_or_else(|_| "null".to_string());
+        if let Err(e) = store
+            .log_consolidation_rollback(super::store::consolidation_ops::RollbackAuditRow {
+                run_id,
+                kind: &row.kind,
+                memory_id: row.memory_id,
+                related_id: row.related_id,
+                op_json: &op_json,
+                applied,
+                error: error.as_deref(),
+            })
+            .await
+        {
+            tracing::warn!(
+                target: "memory_consolidator",
+                error = %e,
+                "could not record rollback audit row"
+            );
+        }
+    }
+
+    // Referenced so the op enum stays wired to this path if its shape
+    // changes; the audit rows carry the kind as a string.
+    let _: Option<ConsolidationOp> = None;
+
+    Ok(outcome)
+}
+
+/// The `trust_score` a merge recorded before it overwrote it.
+fn trust_from(before_json: Option<&str>) -> Option<f32> {
+    let parsed: JsonValue = serde_json::from_str(before_json?).ok()?;
+    parsed
+        .get("trust_score")
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32)
+}
+
+/// The id a store write landed on, if it produced one.
+fn stored_id(result: &super::scope::StoreResult) -> Option<i64> {
+    match result {
+        super::scope::StoreResult::Inserted(id) | super::scope::StoreResult::Deduplicated(id) => {
+            Some(*id)
+        }
+        super::scope::StoreResult::AlreadyCovered => None,
+    }
+}
+
+/// Fields of one consolidation audit row, before it gains the details
+/// this module fills in (`applied`, prompt version).
+struct ConsolidationAudit<'a> {
+    run_id: &'a str,
+    kind: &'a str,
+    memory_id: Option<i64>,
+    related_id: Option<i64>,
+    op_json: &'a str,
+    before_json: Option<&'a str>,
+    after_json: Option<&'a str>,
+    /// `None` means the operation landed.
+    error: Option<&'a str>,
+    scope: &'a str,
+    /// What the consolidator predicted this op would achieve.
+    expected_outcome: Option<&'a str>,
+}
+
+/// Write one consolidation audit row.
+///
+/// Audit failure must not abort the batch — losing the record of an
+/// operation is bad, losing the *remaining operations* is worse — so it
+/// is logged and swallowed here, the one place that is the right
+/// trade-off.
+async fn record_consolidation_op(store: &Arc<MemoryStore>, audit: ConsolidationAudit<'_>) {
+    use super::store::consolidation_ops::ConsolidationAuditRow;
+
+    let row = ConsolidationAuditRow {
+        run_id: audit.run_id,
+        kind: audit.kind,
+        memory_id: audit.memory_id,
+        related_id: audit.related_id,
+        op_json: audit.op_json,
+        before_json: audit.before_json,
+        after_json: audit.after_json,
+        applied: audit.error.is_none(),
+        error: audit.error,
+        prompt_version: super::session_consolidator::PROMPT_VERSION,
+        scope: audit.scope,
+        expected_outcome: audit.expected_outcome,
+    };
+    if let Err(e) = store.log_consolidation_audit(row).await {
+        tracing::warn!(
+            target: "memory_consolidator",
+            error = %e,
+            "could not record consolidation audit row"
+        );
+    }
 }
 
 async fn process_telemetry_classify(
@@ -1887,6 +2469,701 @@ mod tests {
         fn on_write_failed(&self, kind: &str, _error: &str) {
             self.events.lock().unwrap().push(format!("failed:{kind}"));
         }
+    }
+
+    // ── H1 / PR-5: consolidation audit rows ──────────────────────────
+
+    /// Returns one fixed consolidator response, whatever the prompt.
+    struct ScriptedLlm(String);
+
+    #[async_trait::async_trait]
+    impl ConsolidationLlm for ScriptedLlm {
+        async fn complete(&self, _prompt: String) -> Result<String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// A store holding `count` run-scoped candidate rows, which is what
+    /// the consolidator reads as its CANDIDATES list.
+    async fn store_with_candidates(run_id: &str, count: usize) -> Arc<MemoryStore> {
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let store = Arc::new(MemoryStore::in_memory(embedder).unwrap());
+        for i in 0..count {
+            store
+                .store_scoped(
+                    &WriteScope::Run {
+                        repo_id: "r1".into(),
+                        run_id: run_id.to_string(),
+                    },
+                    &format!("candidate number {i}"),
+                    &WriteMeta::default(),
+                )
+                .await
+                .unwrap();
+        }
+        store
+    }
+
+    #[tokio::test]
+    async fn every_consolidation_op_is_audited_applied_or_not() {
+        let run_id = "run-audit-1";
+        let store = store_with_candidates(run_id, 2).await;
+
+        // One op that should land, one naming a memory id that does not
+        // exist, one naming a candidate outside the batch.
+        let response = json!({
+            "session_summary": "the session did things",
+            "operations": [
+                { "op": "ADD", "candidate_index": 0 },
+                { "op": "MERGE", "candidate_index": 0, "into_memory_id": 999_999 },
+                { "op": "ADD", "candidate_index": 42 },
+            ]
+        })
+        .to_string();
+        let llm: Arc<dyn ConsolidationLlm> = Arc::new(ScriptedLlm(response));
+
+        process_session_consolidate(
+            &store,
+            Some(&llm),
+            "sess".into(),
+            "r1".into(),
+            None,
+            run_id.into(),
+            "transcript".into(),
+        )
+        .await
+        .expect("consolidation runs to completion");
+
+        let rows = store.consolidation_audit_for_run(run_id).await.unwrap();
+        let ops: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind != "session_summary")
+            .collect();
+        assert_eq!(ops.len(), 3, "one row per attempted op: {rows:?}");
+
+        // 1. The valid ADD landed and names the row it created.
+        let add = ops[0];
+        assert_eq!(add.kind, "add");
+        assert!(add.applied, "valid ADD should apply: {:?}", add.error);
+        assert!(add.error.is_none());
+        assert!(add.memory_id.is_some(), "an applied ADD records its row");
+
+        // 2. The MERGE named an id the model invented.
+        let merge = ops[1];
+        assert_eq!(merge.kind, "merge");
+        assert!(!merge.applied, "merge into a missing id must not apply");
+        let merge_error = merge.error.as_deref().unwrap_or_default();
+        assert!(
+            merge_error.contains("999999") || merge_error.contains("does not exist"),
+            "error should name the missing target: {merge_error:?}"
+        );
+
+        // 3. The out-of-range candidate.
+        let bad = ops[2];
+        assert!(!bad.applied);
+        assert!(
+            bad.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("out of range"),
+            "error should name the bad index: {:?}",
+            bad.error
+        );
+
+        // Every row carries the prompt version that produced it.
+        for r in &rows {
+            assert_eq!(
+                r.prompt_version.as_deref(),
+                Some(super::super::session_consolidator::PROMPT_VERSION)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_module_scoped_consolidation_records_its_scope() {
+        let run_id = "run-audit-scope";
+        let store = store_with_candidates(run_id, 1).await;
+
+        let response = json!({
+            "session_summary": "",
+            "operations": [{ "op": "ADD", "candidate_index": 0 }]
+        })
+        .to_string();
+        let llm: Arc<dyn ConsolidationLlm> = Arc::new(ScriptedLlm(response));
+
+        process_session_consolidate(
+            &store,
+            Some(&llm),
+            "sess".into(),
+            "r1".into(),
+            Some("crates/gaviero-core".into()),
+            run_id.into(),
+            "transcript".into(),
+        )
+        .await
+        .unwrap();
+
+        let rows = store.consolidation_audit_for_run(run_id).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].scope.as_deref(),
+            Some("module:crates/gaviero-core"),
+            "#229 made the landing scope variable; the audit records which"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_merge_records_the_trust_it_overwrote() {
+        // Rollback (PR-6) restores the prior trust from `before_json`,
+        // so a successful merge has to capture it.
+        let run_id = "run-audit-merge";
+        let store = store_with_candidates(run_id, 1).await;
+        let target = store
+            .store_scoped(
+                &WriteScope::Repo {
+                    repo_id: "r1".into(),
+                },
+                "an existing repo-scoped memory",
+                &WriteMeta::default(),
+            )
+            .await
+            .unwrap();
+        let target_id = match target {
+            StoreResult::Inserted(id) | StoreResult::Deduplicated(id) => id,
+            StoreResult::AlreadyCovered => panic!("expected an id"),
+        };
+        let before_trust = store
+            .get_memory_row(target_id)
+            .await
+            .unwrap()
+            .expect("target exists")
+            .trust_score;
+
+        let response = json!({
+            "session_summary": "",
+            "operations": [
+                { "op": "MERGE", "candidate_index": 0, "into_memory_id": target_id }
+            ]
+        })
+        .to_string();
+        let llm: Arc<dyn ConsolidationLlm> = Arc::new(ScriptedLlm(response));
+
+        process_session_consolidate(
+            &store,
+            Some(&llm),
+            "sess".into(),
+            "r1".into(),
+            None,
+            run_id.into(),
+            "transcript".into(),
+        )
+        .await
+        .unwrap();
+
+        let rows = store.consolidation_audit_for_run(run_id).await.unwrap();
+        let merge = rows.iter().find(|r| r.kind == "merge").expect("merge row");
+        assert!(
+            merge.applied,
+            "merge into a real id applies: {:?}",
+            merge.error
+        );
+
+        let before: JsonValue =
+            serde_json::from_str(merge.before_json.as_deref().expect("before_json")).unwrap();
+        assert_eq!(
+            before["trust_score"].as_f64().unwrap() as f32,
+            before_trust,
+            "before_json must capture the trust rollback will restore"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sleeptime_pass_still_writes_its_own_origin() {
+        // Regression: widening the table must not reclassify the rows
+        // it already served.
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let store = MemoryStore::in_memory(embedder).unwrap();
+
+        store
+            .log_sleeptime_audit("run-s", "decay_flag", Some(1), None, "{}", false)
+            .await
+            .unwrap();
+
+        // The row landed …
+        assert_eq!(store.count_audit_for_test("decay_flag").await.unwrap(), 1);
+        // … and is not visible to the consolidation reader, which proves
+        // it kept `origin = 'sleeptime'` rather than being reclassified.
+        assert!(
+            store
+                .consolidation_audit_for_run("run-s")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // ── H1 / PR-7: session_v2 end to end ─────────────────────────────
+
+    /// Captures the prompt it was given, so a test can assert on what
+    /// the consolidator was actually told.
+    struct CapturingLlm {
+        response: String,
+        seen: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ConsolidationLlm for CapturingLlm {
+        async fn complete(&self, prompt: String) -> Result<String> {
+            self.seen.lock().unwrap().push(prompt);
+            Ok(self.response.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_prompt_lists_real_existing_memories() {
+        // C-5: this is the whole point of PR-7. Before it, the prompt
+        // was built with an empty existing set, so every id the model
+        // emitted was invented and every MERGE was rejected.
+        let run_id = "run-v2-existing";
+        let store = store_with_candidates(run_id, 1).await;
+        let target = store
+            .store_scoped(
+                &WriteScope::Repo {
+                    repo_id: "r1".into(),
+                },
+                "a repo-scoped belief the model may merge into",
+                &WriteMeta::default(),
+            )
+            .await
+            .unwrap();
+        let target_id = match target {
+            StoreResult::Inserted(id) | StoreResult::Deduplicated(id) => id,
+            StoreResult::AlreadyCovered => panic!("expected an id"),
+        };
+
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let llm: Arc<dyn ConsolidationLlm> = Arc::new(CapturingLlm {
+            response: json!({ "session_summary": "", "operations": [] }).to_string(),
+            seen: seen.clone(),
+        });
+        process_session_consolidate(
+            &store,
+            Some(&llm),
+            "sess".into(),
+            "r1".into(),
+            None,
+            run_id.into(),
+            "transcript".into(),
+        )
+        .await
+        .unwrap();
+
+        let prompt = seen.lock().unwrap()[0].clone();
+        assert!(
+            prompt.contains(&format!("id={target_id} ")),
+            "the prompt must list the id the model is allowed to name"
+        );
+        assert!(prompt.contains("a repo-scoped belief"));
+    }
+
+    #[tokio::test]
+    async fn a_merge_naming_an_injected_id_applies() {
+        // The acceptance criterion for PR-7: with real ids in the
+        // prompt, reference validation stops rejecting everything.
+        let run_id = "run-v2-merge";
+        let store = store_with_candidates(run_id, 1).await;
+        let target = store
+            .store_scoped(
+                &WriteScope::Repo {
+                    repo_id: "r1".into(),
+                },
+                "the belief being merged into",
+                &WriteMeta::default(),
+            )
+            .await
+            .unwrap();
+        let target_id = match target {
+            StoreResult::Inserted(id) | StoreResult::Deduplicated(id) => id,
+            StoreResult::AlreadyCovered => panic!("expected an id"),
+        };
+
+        consolidate(
+            &store,
+            run_id,
+            json!({
+                "session_summary": "",
+                "operations": [{
+                    "op": "MERGE",
+                    "candidate_index": 0,
+                    "into_memory_id": target_id,
+                    "expected_outcome": "the existing belief absorbs this session's note"
+                }]
+            }),
+        )
+        .await;
+
+        let rows = store.consolidation_audit_for_run(run_id).await.unwrap();
+        let merge = rows.iter().find(|r| r.kind == "merge").expect("merge row");
+        assert!(merge.applied, "should apply: {:?}", merge.error);
+        assert_eq!(
+            merge.prompt_version.as_deref(),
+            Some("session_v2"),
+            "the audit row records which rubric produced the op"
+        );
+        assert_eq!(
+            merge.expected_outcome.as_deref(),
+            Some("the existing belief absorbs this session's note")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_run_sees_what_happened_to_the_earlier_one() {
+        // The self-correction loop: run 1's verdicts, including its
+        // rejections and the user's rollback, are replayed to run 2.
+        let store = store_with_candidates("run-v2-a", 1).await;
+        consolidate(
+            &store,
+            "run-v2-a",
+            json!({
+                "session_summary": "",
+                "operations": [{
+                    "op": "MERGE",
+                    "candidate_index": 0,
+                    "into_memory_id": 999_111,
+                    "expected_outcome": "this will not work"
+                }]
+            }),
+        )
+        .await;
+
+        // The second run needs candidates of its own, or the
+        // consolidator skips before it ever builds a prompt.
+        store
+            .store_scoped(
+                &WriteScope::Run {
+                    repo_id: "r1".into(),
+                    run_id: "run-v2-b".into(),
+                },
+                "something learned in the second session",
+                &WriteMeta::default(),
+            )
+            .await
+            .unwrap();
+
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let llm: Arc<dyn ConsolidationLlm> = Arc::new(CapturingLlm {
+            response: json!({ "session_summary": "", "operations": [] }).to_string(),
+            seen: seen.clone(),
+        });
+        process_session_consolidate(
+            &store,
+            Some(&llm),
+            "sess".into(),
+            "r1".into(),
+            None,
+            "run-v2-b".into(),
+            "transcript".into(),
+        )
+        .await
+        .unwrap();
+
+        let prompt = seen.lock().unwrap()[0].clone();
+        assert!(prompt.contains("CONSOLIDATION_HISTORY (your previous runs)"));
+        assert!(prompt.contains("run run-v2-a"));
+        assert!(
+            prompt.contains("rejected"),
+            "the failed merge should be replayed as a rejection"
+        );
+        assert!(
+            prompt.contains("this will not work"),
+            "and paired with what the model predicted"
+        );
+    }
+
+    // ── H1 / PR-6: /consolidate rollback ─────────────────────────────
+
+    /// Every live (not soft-deleted) memory id in the store.
+    async fn live_ids(store: &Arc<MemoryStore>) -> Vec<i64> {
+        let mut ids: Vec<i64> = store
+            .recent_memories(24 * 365, 500)
+            .await
+            .unwrap()
+            .iter()
+            .map(|m| m.id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    async fn consolidate(store: &Arc<MemoryStore>, run_id: &str, response: serde_json::Value) {
+        let llm: Arc<dyn ConsolidationLlm> = Arc::new(ScriptedLlm(response.to_string()));
+        process_session_consolidate(
+            store,
+            Some(&llm),
+            "sess".into(),
+            "r1".into(),
+            None,
+            run_id.into(),
+            "transcript".into(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rollback_restores_the_rows_a_run_created() {
+        let run_id = "run-rb-1";
+        let store = store_with_candidates(run_id, 2).await;
+        let before = live_ids(&store).await;
+
+        consolidate(
+            &store,
+            run_id,
+            json!({
+                "session_summary": "a summary",
+                "operations": [
+                    { "op": "ADD", "candidate_index": 0 },
+                    { "op": "ADD", "candidate_index": 1 },
+                ]
+            }),
+        )
+        .await;
+
+        let after_apply = live_ids(&store).await;
+        assert!(
+            after_apply.len() > before.len(),
+            "the run should have added rows"
+        );
+
+        let outcome = process_consolidation_rollback(&store, run_id)
+            .await
+            .unwrap();
+        assert_eq!(outcome.reversed, 3, "2 adds + the session summary");
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+
+        assert_eq!(
+            live_ids(&store).await,
+            before,
+            "rollback must leave exactly the rows that existed before the run"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_restores_the_trust_a_merge_overwrote() {
+        let run_id = "run-rb-merge";
+        let store = store_with_candidates(run_id, 1).await;
+        let target = store
+            .store_scoped(
+                &WriteScope::Repo {
+                    repo_id: "r1".into(),
+                },
+                "a long-lived repo memory",
+                &WriteMeta::default(),
+            )
+            .await
+            .unwrap();
+        let target_id = match target {
+            StoreResult::Inserted(id) | StoreResult::Deduplicated(id) => id,
+            StoreResult::AlreadyCovered => panic!("expected an id"),
+        };
+        let original_trust = store
+            .get_memory_row(target_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .trust_score;
+
+        consolidate(
+            &store,
+            run_id,
+            json!({
+                "session_summary": "",
+                "operations": [
+                    { "op": "MERGE", "candidate_index": 0, "into_memory_id": target_id }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(
+            store
+                .get_memory_row(target_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .trust_score,
+            MERGE_TRUST,
+            "the merge should have bumped trust"
+        );
+
+        process_consolidation_rollback(&store, run_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_memory_row(target_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .trust_score,
+            original_trust,
+            "rollback must restore the trust the merge overwrote"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_reinstates_a_superseded_memory() {
+        let run_id = "run-rb-supersede";
+        let store = store_with_candidates(run_id, 1).await;
+        let old = store
+            .store_scoped(
+                &WriteScope::Repo {
+                    repo_id: "r1".into(),
+                },
+                "the older belief about the thing",
+                &WriteMeta::default(),
+            )
+            .await
+            .unwrap();
+        let old_id = match old {
+            StoreResult::Inserted(id) | StoreResult::Deduplicated(id) => id,
+            StoreResult::AlreadyCovered => panic!("expected an id"),
+        };
+
+        consolidate(
+            &store,
+            run_id,
+            json!({
+                "session_summary": "",
+                "operations": [
+                    { "op": "SUPERSEDE", "candidate_index": 0, "supersedes_memory_id": old_id }
+                ]
+            }),
+        )
+        .await;
+
+        let rows = store.consolidation_audit_for_run(run_id).await.unwrap();
+        let sup = rows.iter().find(|r| r.kind == "supersede").unwrap();
+        assert!(sup.applied, "supersede should apply: {:?}", sup.error);
+
+        let outcome = process_consolidation_rollback(&store, run_id)
+            .await
+            .unwrap();
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+
+        // The retired row is back in play …
+        let restored = store.get_memory_row(old_id).await.unwrap().unwrap();
+        assert_eq!(restored.id, old_id);
+        // … and its replacement is gone.
+        assert!(
+            !live_ids(&store).await.contains(&sup.memory_id.unwrap()),
+            "the replacement row should have been retired by the rollback"
+        );
+    }
+
+    #[tokio::test]
+    async fn rolling_back_twice_is_refused() {
+        let run_id = "run-rb-twice";
+        let store = store_with_candidates(run_id, 1).await;
+        consolidate(
+            &store,
+            run_id,
+            json!({
+                "session_summary": "",
+                "operations": [{ "op": "ADD", "candidate_index": 0 }]
+            }),
+        )
+        .await;
+
+        process_consolidation_rollback(&store, run_id)
+            .await
+            .unwrap();
+        let err = process_consolidation_rollback(&store, run_id)
+            .await
+            .expect_err("a second rollback must be refused");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("already been rolled back"),
+            "error should say why: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_skips_ops_that_never_applied() {
+        let run_id = "run-rb-partial";
+        let store = store_with_candidates(run_id, 1).await;
+        let before = live_ids(&store).await;
+
+        consolidate(
+            &store,
+            run_id,
+            json!({
+                "session_summary": "",
+                "operations": [
+                    { "op": "ADD", "candidate_index": 0 },
+                    // Never applies: the id is invented.
+                    { "op": "MERGE", "candidate_index": 0, "into_memory_id": 987_654 },
+                    // Never applies: out of range.
+                    { "op": "ADD", "candidate_index": 99 },
+                ]
+            }),
+        )
+        .await;
+
+        let outcome = process_consolidation_rollback(&store, run_id)
+            .await
+            .unwrap();
+        assert_eq!(outcome.reversed, 1, "only the ADD actually landed");
+        assert_eq!(
+            outcome.skipped, 2,
+            "the two rejected ops have nothing to undo"
+        );
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+        assert_eq!(live_ids(&store).await, before);
+    }
+
+    #[tokio::test]
+    async fn rolling_back_an_unknown_run_is_an_error() {
+        let store = store_with_candidates("run-rb-none", 1).await;
+        let err = process_consolidation_rollback(&store, "no-such-run")
+            .await
+            .expect_err("there is nothing to roll back");
+        assert!(format!("{err:#}").contains("no consolidation run"));
+    }
+
+    #[tokio::test]
+    async fn history_summarises_runs_and_marks_rollbacks() {
+        let store = store_with_candidates("run-h1", 1).await;
+        consolidate(
+            &store,
+            "run-h1",
+            json!({
+                "session_summary": "",
+                "operations": [
+                    { "op": "ADD", "candidate_index": 0 },
+                    { "op": "ADD", "candidate_index": 42 },
+                ]
+            }),
+        )
+        .await;
+
+        let runs = store.recent_consolidation_runs(10).await.unwrap();
+        let run = runs
+            .iter()
+            .find(|r| r.run_id == "run-h1")
+            .expect("run listed");
+        assert_eq!(run.ops, 2);
+        assert_eq!(run.applied, 1, "one op was rejected");
+        assert!(!run.rolled_back);
+
+        process_consolidation_rollback(&store, "run-h1")
+            .await
+            .unwrap();
+
+        let runs = store.recent_consolidation_runs(10).await.unwrap();
+        let run = runs.iter().find(|r| r.run_id == "run-h1").unwrap();
+        assert!(run.rolled_back, "history must show the run was reversed");
     }
 
     #[tokio::test]

@@ -70,6 +70,10 @@ pub enum DeletedBy {
     /// `original_row_json` stores the post-redaction tombstone, not
     /// the original transcript.
     UserRedaction,
+    /// Tier H / H1: `/consolidate rollback` undoing a row the session
+    /// consolidator created. Restorable like any other soft delete —
+    /// rolling back a rollback is just a restore.
+    ConsolidationRollback,
 }
 
 impl DeletedBy {
@@ -80,6 +84,7 @@ impl DeletedBy {
             Self::SleeptimeMerge => "sleeptime_merge",
             Self::SleeptimePrune => "sleeptime_prune",
             Self::UserRedaction => "user_redaction",
+            Self::ConsolidationRollback => "consolidation_rollback",
         }
     }
 
@@ -90,6 +95,7 @@ impl DeletedBy {
             "sleeptime_merge" => Some(Self::SleeptimeMerge),
             "sleeptime_prune" => Some(Self::SleeptimePrune),
             "user_redaction" => Some(Self::UserRedaction),
+            "consolidation_rollback" => Some(Self::ConsolidationRollback),
             _ => None,
         }
     }
@@ -125,6 +131,7 @@ mod tests {
             DeletedBy::SleeptimeMerge,
             DeletedBy::SleeptimePrune,
             DeletedBy::UserRedaction,
+            DeletedBy::ConsolidationRollback,
         ] {
             assert_eq!(DeletedBy::parse_str(v.as_str()), Some(v));
         }

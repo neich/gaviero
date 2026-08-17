@@ -139,8 +139,8 @@ pub fn parse_and_strip(response: &str) -> ParsedResponse {
     let inner_end = end;
     let inner = response[inner_start..inner_end].trim();
 
-    // Strip the block (and a preceding newline if present) from the
-    // response text so it never surfaces to the user.
+    // Strip the block (and the whitespace separating it from the body)
+    // from the response text so it never surfaces to the user.
     let body_end = body_end_before_annotation(response, start);
     let after = end + CLOSE_TAG.len();
     let mut stripped = String::with_capacity(response.len() - (after - start));
@@ -268,16 +268,15 @@ fn find_unclosed_annotation_start(response: &str) -> Option<usize> {
 }
 
 /// Return the end of the visible body immediately before an annotation
-/// opener, removing one separating LF or CRLF.
+/// opener, dropping the whitespace that separated the two.
+///
+/// All trailing whitespace goes, not just one newline: the block is
+/// conventionally emitted after a blank line, so `body\n\n<tag>` is the
+/// ordinary shape and removing a single LF would leave a stray trailing
+/// newline on every reply. Whitespace here is pure separator — the
+/// sidecar is always last — so there is nothing meaningful to preserve.
 fn body_end_before_annotation(response: &str, start: usize) -> usize {
-    let prefix = &response[..start];
-    if prefix.ends_with("\r\n") {
-        start - 2
-    } else if prefix.ends_with('\n') {
-        start - 1
-    } else {
-        start
-    }
+    response[..start].trim_end().len()
 }
 
 /// True when `tag` is the only non-whitespace content on its line.
@@ -332,7 +331,31 @@ mod tests {
         assert_eq!(ann.session_thread.as_deref(), Some("git2 vs shell git"));
         assert_eq!(ann.open_questions.len(), 1);
         assert!(!p.stripped.contains("<turn_annotations>"));
-        assert!(p.stripped.contains("Here's your answer."));
+        // Exact, not `contains`: the separator whitespace before the
+        // block must not survive into the user-visible reply.
+        assert_eq!(p.stripped, "Here's your answer.");
+    }
+
+    #[test]
+    fn parse_and_strip_drops_a_crlf_separator() {
+        let resp = "Here's your answer.\r\n\r\n<turn_annotations>\r\n\
+                    {\"v\":1,\"flags\":[]}\r\n\
+                    </turn_annotations>";
+        let p = parse_and_strip(resp);
+
+        assert!(p.parse_error.is_none());
+        assert_eq!(p.stripped, "Here's your answer.");
+    }
+
+    #[test]
+    fn parse_and_strip_keeps_content_after_the_block_separated() {
+        let resp = "Body text.\n\n<turn_annotations>\n\
+                    {\"v\":1,\"flags\":[]}\n\
+                    </turn_annotations>\nOne final period.";
+        let p = parse_and_strip(resp);
+
+        assert!(p.parse_error.is_none());
+        assert_eq!(p.stripped, "Body text.\nOne final period.");
     }
 
     #[test]

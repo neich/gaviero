@@ -184,13 +184,38 @@ Two checks enforce it, neither of which costs a model call:
   empty gets one corrective retry, then a `Failed` manifest. Without this,
   a model that narrates a file it never wrote, a proposal dropped by scope,
   and a genuine success are all indistinguishable `Completed` manifests.
-- **Per loop iteration** — a `loop { until agent … }` refuses to invoke its
-  judge unless every body agent delivered that pass, and aborts the run naming
-  the agent and the missing paths. A judge scoring a panel that silently lost
-  a member returns a meaningless verdict and burns the iteration budget.
+- **Per loop iteration** — a loop refuses to invoke its judge unless every body
+  agent delivered that pass, and aborts the run naming the agent and the missing
+  paths. A judge scoring a panel that silently lost a member returns a
+  meaningless verdict and burns the iteration budget. The check runs immediately
+  before the judge is dispatched, so under `until … and …` a cheaper condition
+  that fails first leaves it untouched.
 
 Agents that declare no `produces` fall back to a weaker check: the loop
 verifies that *something* the agent owns changed during the pass.
+
+### Composed exit conditions (`until … and …`)
+
+```
+loop {
+    agents [impl]
+    until { compile true } and command "cargo test --quiet" and agent reviewer
+}
+```
+
+A loop exits when **every** condition passes. Conditions are evaluated
+cheapest-first — `verify` block, then `command`, then the judge agent — regardless
+of the order they are written in, and evaluation stops at the first one that does
+not pass. A judge is an LLM call, so it is only consulted once the deterministic
+conditions already agree; a failing `cargo test` costs nothing but the test run.
+
+At most one `agent` may appear: a loop produces a single verdict, so a second
+judge has no defined precedence and is a compile error. `and` is a soft keyword —
+a script that already uses `and` as a name keeps working.
+
+A pass failed by a deterministic condition issues no judge verdict, so it leaves
+the `irreconcilable_after` disagreement counter untouched, and the delivery gate
+does not run — there is no panel to protect when no judge was dispatched.
 
 ### Termination (`timeout`, `irreconcilable_after`)
 

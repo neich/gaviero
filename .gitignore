@@ -35,3 +35,4 @@ plans/
 .codex-tmp
 .codex
 .cursor
+**/node_modules

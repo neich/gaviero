@@ -191,7 +191,9 @@ module.exports = grammar({
     branch_chain_value: (_) => choice("stacked", "none"),
 
     // ── Until clause (3 variants) ────────────────────────────────
-    until_clause: ($) => seq("until", $._until_condition),
+    // `until <cond> and <cond> …` — every condition must pass.
+    until_clause: ($) =>
+      seq("until", $._until_condition, repeat(seq("and", $._until_condition))),
 
     _until_condition: ($) =>
       choice($.until_verify, $.until_agent, $.until_command),

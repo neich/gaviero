@@ -752,7 +752,23 @@ fn collect_loop_judge_agents<'a>(
         if lb.consensus_mode == ConsensusModeLit::Explore {
             continue;
         }
-        let UntilCondition::Agent(name, span) = &lb.until else {
+        // A judge can sit inside an `until … and …` composition, so ask
+        // the condition rather than pattern-matching the outer shape.
+        let named = lb.until.agents();
+        if named.len() > 1 {
+            let (_, span) = named[1];
+            errors.push(DslError::Compile {
+                src: src(),
+                span: (span.start, span.end.saturating_sub(span.start).max(1)).into(),
+                reason: format!(
+                    "`until` names {} judge agents; at most one is allowed — a loop has a single \
+                     verdict, so a second judge has no defined precedence",
+                    named.len()
+                ),
+            });
+            continue;
+        }
+        let Some((name, span)) = named.into_iter().next() else {
             continue;
         };
 
@@ -1400,6 +1416,12 @@ fn map_until_condition(
             let expanded = apply_vars(cmd, script_vars, override_vars, &[], "", None);
             LoopUntilCondition::Command(expanded)
         }
+        UntilCondition::All(conditions, _) => LoopUntilCondition::All(
+            conditions
+                .iter()
+                .map(|c| map_until_condition(c, script_vars, override_vars))
+                .collect(),
+        ),
     }
 }
 
@@ -2495,6 +2517,123 @@ mod tests {
             assert!(v.impact_tests);
         } else {
             panic!("expected Verify");
+        }
+    }
+
+    // ── H0 / PR-4: `until … and …` ───────────────────────────────────────────
+
+    /// A workflow whose loop uses `until <body>`, with a judge declared.
+    fn loop_script(until_body: &str) -> String {
+        format!(
+            r#"
+            agent a {{ description "impl" }}
+            agent judge {{ description "evaluate" }}
+            agent judge2 {{ description "also evaluate" }}
+            workflow w {{
+                steps [
+                    loop {{
+                        agents [a]
+                        max_iterations 3
+                        {until_body}
+                    }}
+                ]
+            }}
+        "#
+        )
+    }
+
+    #[test]
+    fn until_and_compiles_to_an_all_condition() {
+        let plan = compile_plan(&loop_script(
+            r#"until command "cargo test --quiet" and agent judge"#,
+        ))
+        .unwrap();
+
+        let LoopUntilCondition::All(conditions) = &plan.loop_configs[0].until else {
+            panic!("expected All, got {:?}", plan.loop_configs[0].until);
+        };
+        assert_eq!(conditions.len(), 2);
+        assert!(
+            matches!(&conditions[0], LoopUntilCondition::Command(c) if c == "cargo test --quiet")
+        );
+        assert!(matches!(&conditions[1], LoopUntilCondition::Agent(n) if n == "judge"));
+    }
+
+    #[test]
+    fn a_judge_inside_an_all_is_still_compiled_as_a_judge_unit() {
+        // Judge extraction used to pattern-match the outer condition, so
+        // a judge behind `and` would have been silently dropped and then
+        // "not found in compiled plan" at runtime.
+        let plan = compile_plan(&loop_script(
+            r#"until command "cargo check" and agent judge"#,
+        ))
+        .unwrap();
+
+        assert!(
+            plan.loop_judge_units.iter().any(|u| u.id == "judge"),
+            "judge unit missing: {:?}",
+            plan.loop_judge_units
+                .iter()
+                .map(|u| &u.id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(plan.loop_configs[0].until.judge_agent(), Some("judge"));
+    }
+
+    #[test]
+    fn until_rejects_more_than_one_judge() {
+        let err = compile_plan(&loop_script("until agent judge and agent judge2"))
+            .expect_err("a loop has one verdict, so two judges have no precedence");
+
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("judge agents") || msg.contains("at most one"),
+            "diagnostic should explain the one-judge rule, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn until_and_substitutes_vars_in_every_command() {
+        let src = r#"
+            vars { OUT_DIR "reports" }
+            agent a { description "impl" }
+            agent judge { description "evaluate" }
+            workflow w {
+                steps [
+                    loop {
+                        agents [a]
+                        max_iterations 3
+                        until command "test -f {{OUT_DIR}}/a.md" and agent judge
+                    }
+                ]
+            }
+        "#;
+        let plan = compile_plan(src).unwrap();
+
+        let LoopUntilCondition::All(conditions) = &plan.loop_configs[0].until else {
+            panic!("expected All");
+        };
+        assert!(
+            matches!(&conditions[0], LoopUntilCondition::Command(c) if c == "test -f reports/a.md"),
+            "vars must be substituted inside a composed command: {:?}",
+            conditions[0]
+        );
+    }
+
+    #[test]
+    fn single_conditions_compile_exactly_as_before() {
+        for (body, check) in [
+            ("until agent judge", "Agent"),
+            (r#"until command "cargo check""#, "Command"),
+            ("until { compile true }", "Verify"),
+        ] {
+            let plan = compile_plan(&loop_script(body)).unwrap();
+            let until = &plan.loop_configs[0].until;
+            assert!(
+                !matches!(until, LoopUntilCondition::All(_)),
+                "{body} must not become an All"
+            );
+            assert!(format!("{until:?}").contains(check), "{body} -> {until:?}");
         }
     }
 

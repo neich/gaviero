@@ -768,7 +768,37 @@ where
             .ignore_then(string.map_with(|s, e| (s, e.span())))
             .map(|(cmd, span)| UntilCondition::Command(cmd, span));
 
-        choice((until_verify, until_agent, until_command))
+        let single = choice((until_verify, until_agent, until_command));
+
+        // `and` is a soft keyword — matched as an identifier rather than
+        // reserved in the lexer, so a script may still name an agent or
+        // var `and`. Same trick as `id` in the roster block below.
+        let kw_and = select! { Token::Ident(s) if s == "and" => () };
+
+        single
+            .separated_by(kw_and)
+            .at_least(1)
+            .collect::<Vec<_>>()
+            .map_with(|mut conditions, e| {
+                if conditions.len() == 1 {
+                    // A lone condition stays exactly what it was, so
+                    // every existing script compiles byte-identically.
+                    conditions.pop().expect("at_least(1)")
+                } else {
+                    // Flatten: `a and b and c` is one `All` of three.
+                    // Nesting can only arrive from a future grouping
+                    // syntax, but flattening now keeps the runtime's
+                    // ordering rule total.
+                    let flat = conditions
+                        .into_iter()
+                        .flat_map(|c| match c {
+                            UntilCondition::All(inner, _) => inner,
+                            other => vec![other],
+                        })
+                        .collect();
+                    UntilCondition::All(flat, e.span())
+                }
+            })
     };
 
     let kw_id = select! { Token::Ident(s) if s == "id" => () };
@@ -1785,6 +1815,113 @@ mod tests {
                 panic!("expected Loop step");
             }
         }
+    }
+
+    // ── H0 / PR-4: `until … and …` ───────────────────────────────────
+
+    /// Parse one loop block and hand back its `until` condition.
+    fn until_of(body: &str) -> UntilCondition {
+        let src = format!(
+            r#"
+            agent impl_agent {{ description "implement" }}
+            agent judge {{ description "evaluate" }}
+            workflow w {{
+                steps [
+                    loop {{
+                        agents [impl_agent]
+                        max_iterations 3
+                        {body}
+                    }}
+                ]
+            }}
+        "#
+        );
+        let (ast, errs) = parse_str(&src);
+        assert!(errs.is_empty(), "{errs:?}");
+        let Item::Workflow(w) = &ast.unwrap().items[2] else {
+            panic!("expected workflow");
+        };
+        let (steps, _) = w.steps.as_ref().unwrap();
+        let StepItem::Loop(lb) = &steps[0] else {
+            panic!("expected Loop step");
+        };
+        lb.until.clone()
+    }
+
+    #[test]
+    fn until_composes_a_command_and_a_judge_with_and() {
+        let until = until_of(r#"until command "cargo test --quiet" and agent judge"#);
+
+        let UntilCondition::All(conditions, _) = until else {
+            panic!("expected All, got {until:?}");
+        };
+        assert_eq!(conditions.len(), 2);
+        assert!(
+            matches!(&conditions[0], UntilCondition::Command(c, _) if c == "cargo test --quiet")
+        );
+        assert!(matches!(&conditions[1], UntilCondition::Agent(n, _) if n == "judge"));
+    }
+
+    #[test]
+    fn until_and_accepts_a_verify_block_on_either_side() {
+        let until = until_of("until { compile true test true } and agent judge");
+
+        let UntilCondition::All(conditions, _) = until else {
+            panic!("expected All, got {until:?}");
+        };
+        assert_eq!(conditions.len(), 2);
+        assert!(matches!(&conditions[0], UntilCondition::Verify(v) if v.compile && v.test));
+        assert!(matches!(&conditions[1], UntilCondition::Agent(n, _) if n == "judge"));
+    }
+
+    #[test]
+    fn until_and_flattens_a_three_way_composition() {
+        let until = until_of(r#"until { compile true } and command "cargo test" and agent judge"#);
+
+        let UntilCondition::All(conditions, _) = until else {
+            panic!("expected All, got {until:?}");
+        };
+        assert_eq!(conditions.len(), 3, "no nesting: {conditions:?}");
+        assert!(
+            conditions
+                .iter()
+                .all(|c| !matches!(c, UntilCondition::All(..))),
+            "nested All survived flattening"
+        );
+    }
+
+    #[test]
+    fn a_single_until_condition_is_not_wrapped_in_all() {
+        // Every existing script must keep parsing to exactly what it
+        // parsed to before `and` existed.
+        assert!(matches!(
+            until_of("until agent judge"),
+            UntilCondition::Agent(..)
+        ));
+        assert!(matches!(
+            until_of(r#"until command "cargo check""#),
+            UntilCondition::Command(..)
+        ));
+        assert!(matches!(
+            until_of("until { compile true }"),
+            UntilCondition::Verify(..)
+        ));
+    }
+
+    #[test]
+    fn and_is_a_soft_keyword_and_still_usable_as_a_name() {
+        // `and` is matched as an identifier, not reserved in the lexer,
+        // so a script that already has an agent called `and` keeps
+        // working.
+        let src = r#"
+            agent and { description "unfortunately named" }
+            workflow w {
+                steps [and]
+            }
+        "#;
+        let (ast, errs) = parse_str(src);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(ast.is_some());
     }
 
     #[test]

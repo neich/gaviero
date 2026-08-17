@@ -1033,6 +1033,7 @@ workflow scientific-research-consensus {
     param roster [
         { id "claude" model "claude:opus"       effort xhigh }
         { id "codex"  model "codex:gpt-5.6-sol" effort xhigh }
+        { id "cursor" model "cursor:grok-4.5"   effort xhigh }
     ]
 
     steps [

@@ -1178,6 +1178,22 @@
         {
           "type": "SYMBOL",
           "name": "_until_condition"
+        },
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "SEQ",
+            "members": [
+              {
+                "type": "STRING",
+                "value": "and"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "_until_condition"
+              }
+            ]
+          }
         }
       ]
     },

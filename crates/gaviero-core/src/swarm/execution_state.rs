@@ -10,7 +10,7 @@
 //! are skipped.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -163,15 +163,24 @@ impl ExecutionState {
     // ── Checkpoint I/O ───────────────────────────────────────
 
     /// Path to the checkpoint file for a given plan hash.
-    pub fn checkpoint_path(plan_hash: &str) -> PathBuf {
-        PathBuf::from(".gaviero")
+    ///
+    /// Anchored on the workspace root, not the process working
+    /// directory. A checkpoint describes *that workspace's* run, so
+    /// `gaviero-cli --resume` has to find it again regardless of where
+    /// the binary was invoked from. Resolving it relatively meant a run
+    /// started from one directory left a checkpoint `--resume` could not
+    /// see from another, and scattered `.gaviero/state/` directories
+    /// wherever the process happened to be.
+    pub fn checkpoint_path(workspace_root: &Path, plan_hash: &str) -> PathBuf {
+        workspace_root
+            .join(".gaviero")
             .join("state")
             .join(format!("{}.json", plan_hash))
     }
 
-    /// Serialize state to `.gaviero/state/{hash}.json`.
-    pub fn save(&self, plan_hash: &str) -> anyhow::Result<()> {
-        let path = Self::checkpoint_path(plan_hash);
+    /// Serialize state to `<workspace_root>/.gaviero/state/{hash}.json`.
+    pub fn save(&self, workspace_root: &Path, plan_hash: &str) -> anyhow::Result<()> {
+        let path = Self::checkpoint_path(workspace_root, plan_hash);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -180,10 +189,10 @@ impl ExecutionState {
         Ok(())
     }
 
-    /// Load state from `.gaviero/state/{hash}.json`.
+    /// Load state from `<workspace_root>/.gaviero/state/{hash}.json`.
     /// Returns `Ok(None)` if the file does not exist.
-    pub fn load(plan_hash: &str) -> anyhow::Result<Option<Self>> {
-        let path = Self::checkpoint_path(plan_hash);
+    pub fn load(workspace_root: &Path, plan_hash: &str) -> anyhow::Result<Option<Self>> {
+        let path = Self::checkpoint_path(workspace_root, plan_hash);
         if !path.exists() {
             return Ok(None);
         }
