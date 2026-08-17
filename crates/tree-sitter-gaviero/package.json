@@ -4,6 +4,6 @@
   "description": "Tree-sitter grammar for the Gaviero DSL",
   "main": "bindings/node",
   "devDependencies": {
-    "tree-sitter-cli": "^0.24.0"
+    "tree-sitter-cli": "^0.25.10"
   }
 }

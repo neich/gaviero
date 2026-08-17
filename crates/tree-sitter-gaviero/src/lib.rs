@@ -221,6 +221,33 @@ mod tests {
         );
     }
 
+    /// H0 / PR-4: `until <cond> and <cond> …`.
+    #[test]
+    fn parse_loop_with_composed_until() {
+        let mut parser = tree_sitter::Parser::new();
+        let lang: tree_sitter::Language = LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        let src = r#"
+            agent impl { description "i" }
+            agent judge { description "j" }
+            workflow w {
+                steps [
+                    loop {
+                        agents [impl]
+                        max_iterations 5
+                        until { compile true } and command "cargo test" and agent judge
+                    }
+                ]
+            }
+        "#;
+        let tree = parser.parse(src, None).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "parse tree: {}",
+            tree.root_node().to_sexp()
+        );
+    }
+
     #[test]
     fn parse_loop_with_branch_chain() {
         let mut parser = tree_sitter::Parser::new();

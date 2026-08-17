@@ -440,6 +440,26 @@ pub enum UntilCondition {
     Agent(String, Span),
     /// A shell command — exit code 0 means condition met.
     Command(String, Span),
+    /// `until <cond> and <cond> …` — every sub-condition must pass.
+    ///
+    /// Always flattened: `a and b and c` is one `All` of three, never
+    /// nested. At most one `Agent` may appear inside, which the compiler
+    /// enforces.
+    All(Vec<UntilCondition>, Span),
+}
+
+impl UntilCondition {
+    /// Every judge agent named by this condition, with its span.
+    ///
+    /// Returns more than one only for a malformed `All`, which is
+    /// exactly the case the compiler needs to diagnose.
+    pub fn agents(&self) -> Vec<(&String, &Span)> {
+        match self {
+            Self::Agent(name, span) => vec![(name, span)],
+            Self::All(conditions, _) => conditions.iter().flat_map(Self::agents).collect(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// How successive iterations of a `loop {}` block relate to each other in

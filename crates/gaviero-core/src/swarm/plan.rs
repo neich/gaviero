@@ -72,6 +72,26 @@ pub enum LoopUntilCondition {
     Agent(String),
     /// A shell command exits with code 0.
     Command(String),
+    /// Every sub-condition must pass — the DSL's `until … and …`.
+    ///
+    /// Evaluated cheapest-first at runtime (`Verify` → `Command` →
+    /// `Agent`) regardless of the order the author wrote, so a judge is
+    /// only paid for once the deterministic conditions already agree.
+    All(Vec<LoopUntilCondition>),
+}
+
+impl LoopUntilCondition {
+    /// The judge agent this condition will consult, if any.
+    ///
+    /// `All` holds at most one — the compiler rejects more — so this is
+    /// unambiguous.
+    pub fn judge_agent(&self) -> Option<&str> {
+        match self {
+            Self::Agent(name) => Some(name.as_str()),
+            Self::All(conditions) => conditions.iter().find_map(Self::judge_agent),
+            _ => None,
+        }
+    }
 }
 
 /// How successive iterations of a loop relate to each other in git terms.
