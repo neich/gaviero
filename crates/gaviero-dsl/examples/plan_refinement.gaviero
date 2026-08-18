@@ -32,7 +32,7 @@
 // Default roster is Claude + Codex + Cursor (own models). Override with:
 //   --param roster=claude=claude:opus@max,codex=codex:gpt-5.5@high,cursor=cursor:composer-2.5@medium
 // Grok (Cursor CLI id embeds effort — omit @effort):
-//   --param roster=...,cursor=cursor:cursor-grok-4.5-high
+//   --param roster=...,cursor=cursor:cursor-grok-4.6-high
 //
 // Roster entry format: `id=provider:model[@effort]` (comma-separated).
 // Each `id` becomes {{REVIEWER_ID}} in artefact paths under {{OUT_DIR}}/.
@@ -194,7 +194,7 @@ workflow feature-plan-refinement {
     param roster [
         { id "claude" model "claude:opus"           effort xhigh    }
         { id "codex"  model "codex:gpt-5.6-sol"         effort xhigh   }
-        { id "cursor" model "cursor:cursor-grok-4.5-high"   effort medium }
+        { id "cursor" model "cursor:cursor-grok-4.6-high"   effort medium }
     ]
 
     steps [
