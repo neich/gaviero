@@ -764,13 +764,42 @@ pub(super) fn handle_consolidate_session_command(app: &mut App) {
     };
 
     let conv_id = app.chat_state.active_conversation_id().to_string();
-    let workspace_root = app
-        .workspace
-        .roots()
-        .first()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let repo_id = gaviero_core::memory::hash_path(&workspace_root);
+
+    // Same landing-scope rule as `/remember-module`: focused file →
+    // Module via `module_path_for_file`; no file → Repo plus the notice.
+    // Do not reuse `pending_module_path` — that is `take()`n at turn-complete.
+    let (repo_id, module_path) = match resolve_remember_scope(app, "module") {
+        Ok((
+            gaviero_core::memory::WriteScope::Module {
+                repo_id,
+                module_path,
+            },
+            _,
+            _,
+        )) => (repo_id, Some(module_path)),
+        Ok((scope, _, note)) => {
+            if let Some(note) = note {
+                app.chat_state.add_system_message(&note);
+            }
+            let repo_id = match scope {
+                gaviero_core::memory::WriteScope::Repo { repo_id } => repo_id,
+                _ => {
+                    let workspace_root = app
+                        .workspace
+                        .roots()
+                        .first()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| std::path::PathBuf::from("."));
+                    gaviero_core::memory::hash_path(&workspace_root)
+                }
+            };
+            (repo_id, None)
+        }
+        Err(e) => {
+            app.chat_state.add_system_message(&e);
+            return;
+        }
+    };
 
     // Concat the conversation's visible turn texts as a coarse
     // transcript. Good enough for an explicit /consolidate-session
@@ -788,7 +817,13 @@ pub(super) fn handle_consolidate_session_command(app: &mut App) {
     let tx = app.event_tx.clone();
     tokio::spawn(async move {
         let res = writer
-            .session_consolidate(conv_id.clone(), repo_id, None, conv_id.clone(), transcript)
+            .session_consolidate(
+                conv_id.clone(),
+                repo_id,
+                module_path,
+                conv_id.clone(),
+                transcript,
+            )
             .await;
         // The model call runs off the writer task, so `Queued` is the
         // honest synchronous answer — the operations land minutes later.
@@ -816,7 +851,7 @@ pub(super) fn handle_consolidate_session_command(app: &mut App) {
 }
 
 /// Tier H / H1: `/consolidate history [n]` and
-/// `/consolidate rollback <run_id>`.
+/// `/consolidate rollback <batch_id>`.
 ///
 /// `history` is a read, so it goes straight to the store. `rollback`
 /// mutates memory and therefore goes through the writer task like every
@@ -927,7 +962,7 @@ pub(super) fn handle_consolidate_command(app: &mut App) {
             let what = other.unwrap_or("(nothing)");
             app.chat_state.add_system_message(&format!(
                 "Unknown /consolidate subcommand `{what}`. \
-                 Try `/consolidate history [n]` or `/consolidate rollback <run_id>`."
+                 Try `/consolidate history [n]` or `/consolidate rollback <batch_id>`."
             ));
         }
     }
