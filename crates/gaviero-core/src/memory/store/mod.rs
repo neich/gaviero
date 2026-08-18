@@ -2285,6 +2285,106 @@ mod tests {
         assert!(empty.is_empty(), "empty run_id must return empty");
     }
 
+    /// Build a repo-scope store where the high-importance rows are all
+    /// off-topic bulk, and the one on-topic row is unimportant.
+    ///
+    /// This is the live shape: 327 of 2 782 eligible rows in the real
+    /// workspace sit at importance ≥ 0.99, all of them swarm-output
+    /// dumps, so a 20-row importance-ordered cap never reaches anything
+    /// a session could actually merge into.
+    async fn store_with_bulk_and_one_relevant(target: &str) -> MemoryStore {
+        const FILLER_WORDS: [&str; 25] = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+            "juliet", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo",
+            "sierra", "tango", "uniform", "victor", "whiskey", "xray", "yankee",
+        ];
+        let store = MemoryStore::in_memory(mock_embedder()).unwrap();
+        let scope = WriteScope::Repo {
+            repo_id: "r1".into(),
+        };
+        for (i, word) in FILLER_WORDS.iter().enumerate() {
+            store
+                .store_scoped(
+                    &scope,
+                    &format!("{word} swarm agent output dump number {i}"),
+                    &WriteMeta::default().with_importance(1.0),
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .store_scoped(&scope, target, &WriteMeta::default().with_importance(0.1))
+            .await
+            .unwrap();
+        store
+    }
+
+    /// The reason four consecutive live consolidations produced zero
+    /// MERGE and zero SUPERSEDE: the model's only legal targets were 20
+    /// rows about an unrelated subject, so declining was correct.
+    #[tokio::test]
+    async fn existing_memories_rank_by_relevance_not_importance() {
+        let target = "the memory writer task is the single owner of SQLite writes";
+        let store = store_with_bulk_and_one_relevant(target).await;
+
+        let ranked = store
+            .consolidation_existing_memories(crate::memory::scope::SCOPE_REPO, Some("r1"), 20, Some(target))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ranked.first().map(|r| r.content.as_str()),
+            Some(target),
+            "the on-topic row should rank first, got: {:?}",
+            ranked.iter().map(|r| &r.content).take(3).collect::<Vec<_>>()
+        );
+    }
+
+    /// Pins the bug the ranking replaced — if this ever stops failing to
+    /// find the row, the fixture no longer reproduces the condition and
+    /// the test above proves nothing.
+    #[tokio::test]
+    async fn importance_order_cannot_reach_the_relevant_row() {
+        let target = "the memory writer task is the single owner of SQLite writes";
+        let store = store_with_bulk_and_one_relevant(target).await;
+
+        let by_importance = store
+            .consolidation_existing_memories(crate::memory::scope::SCOPE_REPO, Some("r1"), 20, None)
+            .await
+            .unwrap();
+
+        assert_eq!(by_importance.len(), 20, "the cap should be saturated");
+        assert!(
+            !by_importance.iter().any(|r| r.content == target),
+            "fixture must reproduce the importance-order blind spot"
+        );
+    }
+
+    /// A store whose rows were embedded by a different model has nothing
+    /// comparable to rank. Falling back beats handing the prompt an
+    /// empty list, which tells it not to emit MERGE at all.
+    #[tokio::test]
+    async fn ranking_falls_back_to_importance_when_nothing_is_comparable() {
+        let target = "the memory writer task is the single owner of SQLite writes";
+        let store = store_with_bulk_and_one_relevant(target).await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute("UPDATE memories SET model_id = 'some-other-model'", [])
+                .unwrap();
+        }
+
+        let ranked = store
+            .consolidation_existing_memories(crate::memory::scope::SCOPE_REPO, Some("r1"), 20, Some(target))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ranked.len(),
+            20,
+            "should fall back rather than return nothing"
+        );
+    }
+
     #[tokio::test]
     async fn b5_audit_rows_persist_with_dry_run_marker() {
         let store = Arc::new(MemoryStore::in_memory(mock_embedder()).unwrap());
