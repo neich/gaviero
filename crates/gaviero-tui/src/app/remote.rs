@@ -51,10 +51,7 @@ pub const REMOTE_CONFIRM_REQUIRED: &[&str] = &["/autoapprove", "/yolo", "/reset"
 /// First whitespace-delimited token of a slash line. Preserves the desktop
 /// parser's token boundary — `/runaway` does not match `/run`.
 pub fn slash_command_token(line: &str) -> &str {
-    line.trim_start()
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
+    line.trim_start().split_whitespace().next().unwrap_or("")
 }
 
 /// A rejected command: maps directly onto `command_error`.
@@ -123,7 +120,10 @@ impl Default for RemoteState {
 impl RemoteState {
     /// Current freshness token for a proposal.
     pub fn proposal_revision(&self, proposal_id: u64) -> u64 {
-        self.proposal_revisions.get(&proposal_id).copied().unwrap_or(1)
+        self.proposal_revisions
+            .get(&proposal_id)
+            .copied()
+            .unwrap_or(1)
     }
 
     /// Bump a proposal's token in the same transition that mutated it.
@@ -182,10 +182,14 @@ pub fn handle_remote_command(app: &mut App, envelope: ClientEnvelope, max_prompt
                 AnsweredBy::Remote,
             )
             .map(|_| (CommandStatus::Completed, None)),
-            ClientFrame::ReviewAction(r) => {
-                apply_review_action(app, r.proposal_id, r.proposal_revision, r.action, r.hunk_index)
-                    .map(|()| (CommandStatus::Completed, None))
-            }
+            ClientFrame::ReviewAction(r) => apply_review_action(
+                app,
+                r.proposal_id,
+                r.proposal_revision,
+                r.action,
+                r.hunk_index,
+            )
+            .map(|()| (CommandStatus::Completed, None)),
             ClientFrame::NewConversation {} => apply_new_conversation(app).map(|conv_id| {
                 (
                     CommandStatus::Completed,
@@ -224,18 +228,20 @@ pub fn handle_remote_command(app: &mut App, envelope: ClientEnvelope, max_prompt
         };
     match outcome {
         Ok((status, result)) => {
-            app.remote.push_frame(ServerFrame::CommandResult(CommandResult {
-                command_id,
-                status,
-                result,
-            }));
+            app.remote
+                .push_frame(ServerFrame::CommandResult(CommandResult {
+                    command_id,
+                    status,
+                    result,
+                }));
         }
         Err(failure) => {
-            app.remote.push_frame(ServerFrame::CommandError(CommandError {
-                command_id,
-                code: failure.code,
-                message: failure.message,
-            }));
+            app.remote
+                .push_frame(ServerFrame::CommandError(CommandError {
+                    command_id,
+                    code: failure.code,
+                    message: failure.message,
+                }));
         }
     }
 }
@@ -284,7 +290,8 @@ pub fn apply_permission_decision(
                 },
                 answered_by,
             };
-            app.remote.push_frame(ServerFrame::PermissionClosed(closed.clone()));
+            app.remote
+                .push_frame(ServerFrame::PermissionClosed(closed.clone()));
             app.remote.bump_global();
             Ok(closed)
         }
@@ -311,14 +318,7 @@ pub fn desktop_answer_active_permission(app: &mut App, allow: bool) {
     else {
         return;
     };
-    let _ = apply_permission_decision(
-        app,
-        &request_id,
-        allow,
-        None,
-        None,
-        AnsweredBy::Desktop,
-    );
+    let _ = apply_permission_decision(app, &request_id, allow, None, None, AnsweredBy::Desktop);
 }
 
 // ── Conversation commands (§4.4 / §4.8) ─────────────────────────────
@@ -488,7 +488,10 @@ pub fn apply_remote_slash(
     if REMOTE_CONFIRM_REQUIRED.contains(&command) && !confirmed {
         // Redacted audit trail: the command name is policy metadata, the
         // argument tail may hold user content.
-        tracing::warn!(command, "remote confirm-required command without confirmation");
+        tracing::warn!(
+            command,
+            "remote confirm-required command without confirmation"
+        );
         return Err(CommandFailure::new(
             ErrorCode::ConfirmRequired,
             format!("{command} requires confirmed: true"),
@@ -554,8 +557,10 @@ pub fn apply_review_action(
             format!("proposal {proposal_id} is at revision {current}"),
         ));
     }
-    if matches!(action, ReviewActionKind::AcceptHunk | ReviewActionKind::RejectHunk)
-        && hunk_index.is_none()
+    if matches!(
+        action,
+        ReviewActionKind::AcceptHunk | ReviewActionKind::RejectHunk
+    ) && hunk_index.is_none()
     {
         return Err(CommandFailure::new(
             ErrorCode::InvalidPayload,

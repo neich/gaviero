@@ -144,8 +144,7 @@ fn parse_usage_object(obj: &serde_json::Map<String, Value>) -> TokenUsage {
         .and_then(|arr| arr.last())
         .and_then(|it| it.as_object());
 
-    let (input_tokens, cache_creation_input_tokens, cache_read_input_tokens) = match last_iter
-    {
+    let (input_tokens, cache_creation_input_tokens, cache_read_input_tokens) = match last_iter {
         Some(it) => {
             let get = |k: &str| it.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
             (
@@ -313,7 +312,10 @@ pub fn parse_stream_line(line: &str) -> Result<StreamEvent> {
                 .and_then(|s| s.as_str())
                 .unwrap_or("")
                 .to_string();
-            let input = v.get("input").cloned().unwrap_or(Value::Object(Default::default()));
+            let input = v
+                .get("input")
+                .cloned()
+                .unwrap_or(Value::Object(Default::default()));
             Ok(StreamEvent::PermissionRequest {
                 tool_name,
                 description,
@@ -385,7 +387,10 @@ pub fn permission_description(tool_name: &str, request: &Value, input: &Value) -
                 .and_then(|q| q.as_array())
                 .map(|a| a.len())
                 .unwrap_or(0);
-            format!("Clarifying question{s} ({n})", s = if n == 1 { "" } else { "s" })
+            format!(
+                "Clarifying question{s} ({n})",
+                s = if n == 1 { "" } else { "s" }
+            )
         }
         "Write" | "Edit" | "MultiEdit" => input
             .get("file_path")
@@ -694,8 +699,7 @@ fn fenced_code_regions(text: &str) -> Vec<(usize, usize)> {
                     q += 1;
                     ind += 1;
                 }
-                if q + fence_len <= bytes.len()
-                    && bytes[q..q + fence_len].iter().all(|&c| c == fc)
+                if q + fence_len <= bytes.len() && bytes[q..q + fence_len].iter().all(|&c| c == fc)
                 {
                     let after = q + fence_len;
                     let line_end = bytes[after..]
@@ -1156,7 +1160,8 @@ bbb
 
     #[test]
     fn test_parse_control_request_other_subtype_is_unknown() {
-        let line = r#"{"type":"control_request","request_id":"r1","request":{"subtype":"interrupt"}}"#;
+        let line =
+            r#"{"type":"control_request","request_id":"r1","request":{"subtype":"interrupt"}}"#;
         let ev = parse_stream_line(line).unwrap();
         assert!(matches!(ev, StreamEvent::Unknown(_)));
     }
@@ -1165,9 +1170,6 @@ bbb
     fn test_permission_description_bash_falls_back_to_command() {
         let input = serde_json::json!({"command": "echo hi"});
         let request = serde_json::json!({});
-        assert_eq!(
-            permission_description("Bash", &request, &input),
-            "echo hi"
-        );
+        assert_eq!(permission_description("Bash", &request, &input), "echo hi");
     }
 }

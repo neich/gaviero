@@ -675,9 +675,9 @@ impl WorktreeManager {
             .ok()
             .map(PathBuf::from)
             .or_else(|| {
-                std::env::var("XDG_CACHE_HOME").ok().map(|x| {
-                    PathBuf::from(x).join("gaviero-worktrees")
-                })
+                std::env::var("XDG_CACHE_HOME")
+                    .ok()
+                    .map(|x| PathBuf::from(x).join("gaviero-worktrees"))
             })
             .or_else(|| {
                 #[cfg(windows)]
@@ -771,7 +771,9 @@ impl WorktreeManager {
         let commit = self
             .head_commit()
             .context("repo must have at least one commit for worktree isolation")?;
-        self.provision_inner(agent_id, &branch, &commit, /* delete_existing_branch = */ true)
+        self.provision_inner(
+            agent_id, &branch, &commit, /* delete_existing_branch = */ true,
+        )
     }
 
     /// Provision a worktree on a specific branch and base SHA, leaving any
@@ -797,7 +799,9 @@ impl WorktreeManager {
         branch: &str,
         base_sha: &str,
     ) -> Result<WorktreeHandle> {
-        self.provision_inner(agent_id, branch, base_sha, /* delete_existing_branch = */ true)
+        self.provision_inner(
+            agent_id, branch, base_sha, /* delete_existing_branch = */ true,
+        )
     }
 
     /// Internal: do the actual worktree provisioning. `delete_existing_branch`
@@ -928,18 +932,16 @@ impl WorktreeManager {
             format!("creating shared cargo target dir: {}", target_dir.display())
         })?;
         let cargo_dir = wt_path.join(".cargo");
-        std::fs::create_dir_all(&cargo_dir).with_context(|| {
-            format!("creating worktree .cargo dir: {}", cargo_dir.display())
-        })?;
+        std::fs::create_dir_all(&cargo_dir)
+            .with_context(|| format!("creating worktree .cargo dir: {}", cargo_dir.display()))?;
         // target-dir must be an absolute path so cargo resolves it the
         // same way regardless of where in the worktree it runs from.
         // Use forward-slashes for cross-platform consistency (toml
         // accepts both; backslashes need escaping).
         let abs = target_dir.to_string_lossy().replace('\\', "/");
         let body = format!("[build]\ntarget-dir = \"{}\"\n", abs);
-        std::fs::write(cargo_dir.join("config.toml"), body).with_context(|| {
-            format!("writing {}/.cargo/config.toml", wt_path.display())
-        })?;
+        std::fs::write(cargo_dir.join("config.toml"), body)
+            .with_context(|| format!("writing {}/.cargo/config.toml", wt_path.display()))?;
 
         // Per-worktree gitignore via info/exclude. Path comes from
         // `git rev-parse --git-path` which resolves correctly whether the
@@ -960,8 +962,7 @@ impl WorktreeManager {
                     if let Some(parent) = exclude_path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    let existing =
-                        std::fs::read_to_string(&exclude_path).unwrap_or_default();
+                    let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
                     if !existing.lines().any(|l| l.trim() == ".cargo/") {
                         let mut new_body = existing;
                         if !new_body.is_empty() && !new_body.ends_with('\n') {
@@ -1012,9 +1013,7 @@ impl WorktreeManager {
             // Retry the directory removal ourselves, then prune the
             // now-dangling worktree metadata.
             let wt_path = self.worktree_base.join(name);
-            if wt_path.exists()
-                && crate::util::fs::remove_dir_all_retry(&wt_path).is_ok()
-            {
+            if wt_path.exists() && crate::util::fs::remove_dir_all_retry(&wt_path).is_ok() {
                 let _ = Command::new("git")
                     .args(["worktree", "prune"])
                     .current_dir(&self.repo_dir)
@@ -1354,7 +1353,9 @@ mod tests {
         // Checkout may apply core.autocrlf (Git for Windows defaults it
         // to true) — compare content, not line endings.
         assert_eq!(
-            std::fs::read_to_string(&path).unwrap().replace("\r\n", "\n"),
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .replace("\r\n", "\n"),
             "# Test\n"
         );
     }
@@ -1484,7 +1485,10 @@ mod tests {
         );
 
         // Sanity: the shared dir was actually created on disk.
-        assert!(expected_abs.exists(), "shared target dir created at provision time");
+        assert!(
+            expected_abs.exists(),
+            "shared target dir created at provision time"
+        );
 
         // Critical: .cargo/config.toml must be ignored by git so the
         // agent's `git add -A; git commit` step doesn't sweep it into

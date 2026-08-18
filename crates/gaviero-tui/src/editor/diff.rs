@@ -15,9 +15,7 @@ pub enum DiffKind {
 }
 
 /// Map a git-conflict line classification to diff rendering kind.
-pub fn diff_kind_from_conflict(
-    kind: gaviero_core::git_conflict::ConflictLineKind,
-) -> DiffKind {
+pub fn diff_kind_from_conflict(kind: gaviero_core::git_conflict::ConflictLineKind) -> DiffKind {
     use gaviero_core::git_conflict::ConflictLineKind;
     match kind {
         ConflictLineKind::Start | ConflictLineKind::Sep | ConflictLineKind::End => {

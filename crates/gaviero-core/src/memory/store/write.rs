@@ -35,8 +35,8 @@ use super::{
     MemoryEntry, MemoryStore, SEMANTIC_DEDUP_THRESHOLD, StoreOptions, blob_to_embedding,
     cosine_similarity, embedding_to_blob, file_hash,
 };
-use crate::memory::scope::{StoreResult, WriteMeta, WriteScope};
 use crate::memory::schema;
+use crate::memory::scope::{StoreResult, WriteMeta, WriteScope};
 
 impl MemoryStore {
     // ── Legacy namespace writes ────────────────────────────────────

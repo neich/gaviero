@@ -555,7 +555,10 @@ mod tests {
             let left = KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL);
             assert_eq!(key_event_to_bytes(&left, app_cursor), b"\x1b[1;5D".to_vec());
             let right = KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL);
-            assert_eq!(key_event_to_bytes(&right, app_cursor), b"\x1b[1;5C".to_vec());
+            assert_eq!(
+                key_event_to_bytes(&right, app_cursor),
+                b"\x1b[1;5C".to_vec()
+            );
         }
     }
 

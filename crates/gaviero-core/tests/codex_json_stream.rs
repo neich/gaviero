@@ -106,7 +106,10 @@ async fn codex_exec_streams_tool_and_text_events_before_the_turn_ends() {
     eprintln!("text: {text}");
 
     assert!(errors.is_empty(), "stream reported errors: {errors:?}");
-    assert_eq!(done, Some(gaviero_core::swarm::backend::StopReason::EndTurn));
+    assert_eq!(
+        done,
+        Some(gaviero_core::swarm::backend::StopReason::EndTurn)
+    );
 
     // The core regression: activity must be observable, and it must arrive
     // strictly before the turn ends rather than all at once on exit.

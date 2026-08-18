@@ -13,9 +13,9 @@ use std::path::Path;
 
 use gaviero_core::observer::{AcpObserver, SwarmObserver};
 use gaviero_core::repo_map::SpecificityConfig;
+use gaviero_core::swarm::models::WorkUnit;
 use gaviero_core::swarm::pipeline::{SwarmConfig, execute};
 use gaviero_core::swarm::plan::CompiledPlan;
-use gaviero_core::swarm::models::WorkUnit;
 use gaviero_core::types::{FileScope, ModelTier, PrivacyLevel};
 
 #[allow(deprecated)]
@@ -77,13 +77,7 @@ impl AcpObserver for NoopAcpObserver {
     fn on_tool_call_started(&self, _tool_name: &str) {}
     fn on_streaming_status(&self, _status: &str) {}
     fn on_message_complete(&self, _role: &str, _content: &str) {}
-    fn on_proposal_deferred(
-        &self,
-        _path: &Path,
-        _old_content: Option<&str>,
-        _new_content: &str,
-    ) {
-    }
+    fn on_proposal_deferred(&self, _path: &Path, _old_content: Option<&str>, _new_content: &str) {}
 }
 
 fn make_config(workspace: &std::path::Path) -> SwarmConfig {

@@ -135,8 +135,7 @@ pub fn ensure_pwsh_version(shell_path: &std::path::Path) -> anyhow::Result<()> {
     use std::sync::OnceLock;
     static PREFLIGHT: OnceLock<Result<(), String>> = OnceLock::new();
 
-    const INSTALL_HINT: &str =
-        "Gaviero requires PowerShell 7.2+ on Windows — install with `winget install Microsoft.PowerShell`";
+    const INSTALL_HINT: &str = "Gaviero requires PowerShell 7.2+ on Windows — install with `winget install Microsoft.PowerShell`";
 
     PREFLIGHT
         .get_or_init(|| {

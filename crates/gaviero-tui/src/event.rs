@@ -533,7 +533,11 @@ fn coalesce_bracketed_paste(first: crossterm::event::Event) -> Vec<crossterm::ev
         // rewriting them as a `Paste` (or returning the lone Esc and dropping
         // the rest) is how typing right after Esc turned into a clipboard
         // dump / vanished characters.
-        let rest = &text[text.char_indices().nth(1).map(|(i, _)| i).unwrap_or(text.len())..];
+        let rest = &text[text
+            .char_indices()
+            .nth(1)
+            .map(|(i, _)| i)
+            .unwrap_or(text.len())..];
         if looks_like_raw_paste(rest) {
             keys.truncate(1);
             keys.push(Event::Paste(rest.to_string()));
@@ -849,7 +853,11 @@ mod tests {
     fn path_is_excluded_skips_dot_git_and_node_modules() {
         let root = PathBuf::from("/ws");
         let roots = vec![root.clone()];
-        assert!(path_is_excluded(&root.join(".git/objects/abc"), &roots, &[]));
+        assert!(path_is_excluded(
+            &root.join(".git/objects/abc"),
+            &roots,
+            &[]
+        ));
         assert!(path_is_excluded(
             &root.join("node_modules/foo/index.js"),
             &roots,
@@ -948,14 +956,29 @@ mod tests {
         let press = |code, mods| key(code, mods, KeyEventKind::Press);
 
         // Text-bearing keys contribute their character; Enter/Tab normalize.
-        assert_eq!(paste_char(&press(KeyCode::Char('a'), KeyModifiers::NONE)), Some('a'));
-        assert_eq!(paste_char(&press(KeyCode::Enter, KeyModifiers::NONE)), Some('\n'));
-        assert_eq!(paste_char(&press(KeyCode::Tab, KeyModifiers::NONE)), Some('\t'));
+        assert_eq!(
+            paste_char(&press(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Some('a')
+        );
+        assert_eq!(
+            paste_char(&press(KeyCode::Enter, KeyModifiers::NONE)),
+            Some('\n')
+        );
+        assert_eq!(
+            paste_char(&press(KeyCode::Tab, KeyModifiers::NONE)),
+            Some('\t')
+        );
         // Shift is part of pasted capitals, not a chord.
-        assert_eq!(paste_char(&press(KeyCode::Char('A'), KeyModifiers::SHIFT)), Some('A'));
+        assert_eq!(
+            paste_char(&press(KeyCode::Char('A'), KeyModifiers::SHIFT)),
+            Some('A')
+        );
 
         // Ctrl/Alt chords and navigation keys are never pasted text.
-        assert_eq!(paste_char(&press(KeyCode::Char('v'), KeyModifiers::CONTROL)), None);
+        assert_eq!(
+            paste_char(&press(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            None
+        );
         assert_eq!(paste_char(&press(KeyCode::Enter, KeyModifiers::ALT)), None);
         assert_eq!(paste_char(&press(KeyCode::Left, KeyModifiers::NONE)), None);
         // AltGr (Ctrl+Alt) printable chars — including `~` on many layouts —
@@ -968,7 +991,11 @@ mod tests {
         assert_eq!(paste_char(&press(KeyCode::Char('c'), altgr)), None);
         // Release halves of pasted keys must not contribute a character.
         assert_eq!(
-            paste_char(&key(KeyCode::Char('a'), KeyModifiers::NONE, KeyEventKind::Release)),
+            paste_char(&key(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release
+            )),
             None
         );
     }
@@ -977,7 +1004,10 @@ mod tests {
     fn strip_bracketed_paste_extracts_payload_including_empty() {
         // Windows Terminal image paste: empty bracketed-paste payload.
         assert_eq!(strip_bracketed_paste("\x1b[200~\x1b[201~"), Some(""));
-        assert_eq!(strip_bracketed_paste("\x1b[200~hello\x1b[201~"), Some("hello"));
+        assert_eq!(
+            strip_bracketed_paste("\x1b[200~hello\x1b[201~"),
+            Some("hello")
+        );
         assert_eq!(
             strip_bracketed_paste("\x1b[200~a\nb\x1b[201~"),
             Some("a\nb")

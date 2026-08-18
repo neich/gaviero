@@ -2328,7 +2328,12 @@ mod tests {
         let store = store_with_bulk_and_one_relevant(target).await;
 
         let ranked = store
-            .consolidation_existing_memories(crate::memory::scope::SCOPE_REPO, Some("r1"), 20, Some(target))
+            .consolidation_existing_memories(
+                crate::memory::scope::SCOPE_REPO,
+                Some("r1"),
+                20,
+                Some(target),
+            )
             .await
             .unwrap();
 
@@ -2336,7 +2341,11 @@ mod tests {
             ranked.first().map(|r| r.content.as_str()),
             Some(target),
             "the on-topic row should rank first, got: {:?}",
-            ranked.iter().map(|r| &r.content).take(3).collect::<Vec<_>>()
+            ranked
+                .iter()
+                .map(|r| &r.content)
+                .take(3)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -2374,7 +2383,12 @@ mod tests {
         }
 
         let ranked = store
-            .consolidation_existing_memories(crate::memory::scope::SCOPE_REPO, Some("r1"), 20, Some(target))
+            .consolidation_existing_memories(
+                crate::memory::scope::SCOPE_REPO,
+                Some("r1"),
+                20,
+                Some(target),
+            )
             .await
             .unwrap();
 

@@ -586,7 +586,8 @@ pub(super) fn execute_bulk_delete(app: &mut App, paths: &[std::path::PathBuf]) {
         match result {
             Ok(()) => {
                 deleted_count += 1;
-                app.buffers.retain(|b| b.path.as_deref() != Some(path.as_path()));
+                app.buffers
+                    .retain(|b| b.path.as_deref() != Some(path.as_path()));
             }
             Err(e) => tracing::error!("bulk delete {}: {}", path.display(), e),
         }
@@ -623,10 +624,7 @@ pub(super) fn execute_bulk_move(
     app.file_tree.clear_selection();
     app.bulk_op_state = None;
     app.refresh_file_tree();
-    let dest_name = dest_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("?");
+    let dest_name = dest_dir.file_name().and_then(|n| n.to_str()).unwrap_or("?");
     app.status_message = Some((
         format!("Moved {} item(s) → {}", moved_count, dest_name),
         std::time::Instant::now(),

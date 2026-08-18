@@ -247,7 +247,11 @@ pub fn compute_stats(path: &Path) -> std::io::Result<Vec<ToolStats>> {
             }
         })
         .collect();
-    out.sort_by(|a, b| b.calls.cmp(&a.calls).then_with(|| a.tool_name.cmp(&b.tool_name)));
+    out.sort_by(|a, b| {
+        b.calls
+            .cmp(&a.calls)
+            .then_with(|| a.tool_name.cmp(&b.tool_name))
+    });
     Ok(out)
 }
 
@@ -302,7 +306,12 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn entry(tool: &str, dur: Duration, error: Option<&str>, output: serde_json::Value) -> McpCallLogEntry {
+    fn entry(
+        tool: &str,
+        dur: Duration,
+        error: Option<&str>,
+        output: serde_json::Value,
+    ) -> McpCallLogEntry {
         McpCallLogEntry {
             tool_name: tool.to_string(),
             input: serde_json::json!({"query": "q"}),

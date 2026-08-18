@@ -295,10 +295,7 @@ impl WriteGatePipeline {
     /// proposals whose `conv_id` matches. Proposals owned by other
     /// conversations stay queued so a finishing chat task does not sweep up
     /// a concurrent conversation's pending work.
-    pub fn take_pending_proposals_for_conv(
-        &mut self,
-        conv_id: Option<&str>,
-    ) -> Vec<WriteProposal> {
+    pub fn take_pending_proposals_for_conv(&mut self, conv_id: Option<&str>) -> Vec<WriteProposal> {
         let mut keep = Vec::new();
         let mut drained = Vec::new();
         for proposal in std::mem::take(&mut self.deferred_proposals) {
@@ -322,11 +319,7 @@ impl WriteGatePipeline {
     /// `conflict_candidates_for_path` still sees them after deferred drain.
     pub fn hold_for_review(&mut self, proposals: &[WriteProposal]) {
         for proposal in proposals {
-            if self
-                .review_hold
-                .iter()
-                .any(|held| held.id == proposal.id)
-            {
+            if self.review_hold.iter().any(|held| held.id == proposal.id) {
                 continue;
             }
             self.review_hold.push(proposal.clone());
@@ -351,11 +344,7 @@ impl WriteGatePipeline {
     pub fn proposal_by_id(&self, proposal_id: u64) -> Option<&WriteProposal> {
         self.proposals
             .get(&proposal_id)
-            .or_else(|| {
-                self.deferred_proposals
-                    .iter()
-                    .find(|p| p.id == proposal_id)
-            })
+            .or_else(|| self.deferred_proposals.iter().find(|p| p.id == proposal_id))
             .or_else(|| self.review_hold.iter().find(|p| p.id == proposal_id))
     }
 
@@ -446,11 +435,7 @@ impl WriteGatePipeline {
                 peer.status = ProposalStatus::Superseded;
                 updated = true;
             }
-            if let Some(peer) = self
-                .review_hold
-                .iter_mut()
-                .find(|p| p.id == *peer_id)
-            {
+            if let Some(peer) = self.review_hold.iter_mut().find(|p| p.id == *peer_id) {
                 peer.status = ProposalStatus::Superseded;
                 updated = true;
             }
@@ -570,10 +555,7 @@ impl WriteGatePipeline {
                 peer.conflicts_with.push(new_id);
                 updated = true;
             }
-            if let Some(peer) = self
-                .review_hold
-                .iter_mut()
-                .find(|p| p.id == *peer_id)
+            if let Some(peer) = self.review_hold.iter_mut().find(|p| p.id == *peer_id)
                 && !peer.conflicts_with.contains(&new_id)
             {
                 peer.conflicts_with.push(new_id);
@@ -911,7 +893,11 @@ mod tests {
         assert_eq!(peers, vec![id_a]);
 
         pipeline.release_review_hold_ids(&[id_a]);
-        assert!(pipeline.conflict_candidates_for_path(Path::new("src/shared.rs")).is_empty());
+        assert!(
+            pipeline
+                .conflict_candidates_for_path(Path::new("src/shared.rs"))
+                .is_empty()
+        );
     }
 
     #[test]

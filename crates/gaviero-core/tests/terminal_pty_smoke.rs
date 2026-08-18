@@ -28,9 +28,13 @@ fn default_shell_emits_output_through_pty() {
         shell_config.shell_path, shell_config.shell_type, shell_config.shell_args
     );
 
-    let handle =
-        gaviero_core::terminal::pty::spawn_pty(&shell_config, std::env::temp_dir().as_path(), 24, 80)
-            .expect("spawn_pty");
+    let handle = gaviero_core::terminal::pty::spawn_pty(
+        &shell_config,
+        std::env::temp_dir().as_path(),
+        24,
+        80,
+    )
+    .expect("spawn_pty");
 
     let mut reader = handle.reader;
     let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();

@@ -55,13 +55,7 @@ impl AcpObserver for NoopAcpObserver {
     fn on_tool_call_started(&self, _tool_name: &str) {}
     fn on_streaming_status(&self, _status: &str) {}
     fn on_message_complete(&self, _role: &str, _content: &str) {}
-    fn on_proposal_deferred(
-        &self,
-        _path: &Path,
-        _old_content: Option<&str>,
-        _new_content: &str,
-    ) {
-    }
+    fn on_proposal_deferred(&self, _path: &Path, _old_content: Option<&str>, _new_content: &str) {}
 }
 
 struct ObservedStreamSession {
@@ -129,11 +123,8 @@ impl ObservedStreamSession {
                     self.observer.on_stream_chunk(&text);
                 }
                 UnifiedStreamEvent::ToolCallStart { name, args, .. } => {
-                    let summary = crate::acp::client::format_tool_summary(
-                        &name,
-                        &args,
-                        &self.workspace_root,
-                    );
+                    let summary =
+                        crate::acp::client::format_tool_summary(&name, &args, &self.workspace_root);
                     self.observer.on_tool_call_started(&summary);
                     self.observer
                         .on_streaming_status(&format!("Using {name}..."));
@@ -244,10 +235,7 @@ fn create_observed_codex_session(args: SessionConstruction) -> Box<dyn AgentSess
     };
 
     Box::new(ObservedStreamSession {
-        inner: Box::new(CodexAppServerSession::new(
-            inner_args,
-            observer.clone(),
-        )),
+        inner: Box::new(CodexAppServerSession::new(inner_args, observer.clone())),
         observer,
         write_gate,
         workspace_root,
@@ -312,10 +300,7 @@ mod tests {
         }
 
         fn on_streaming_status(&self, status: &str) {
-            self.events
-                .lock()
-                .unwrap()
-                .push(format!("status:{status}"));
+            self.events.lock().unwrap().push(format!("status:{status}"));
         }
 
         fn on_message_complete(&self, role: &str, content: &str) {
@@ -338,13 +323,10 @@ mod tests {
         }
 
         fn on_turn_token_usage(&self, usage: &crate::acp::protocol::TokenUsage) {
-            self.events
-                .lock()
-                .unwrap()
-                .push(format!(
-                    "usage:{}/{}",
-                    usage.input_tokens, usage.output_tokens
-                ));
+            self.events.lock().unwrap().push(format!(
+                "usage:{}/{}",
+                usage.input_tokens, usage.output_tokens
+            ));
         }
     }
 

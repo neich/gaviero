@@ -8,11 +8,11 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-use crate::workspace::{Workspace, settings as S};
 use crate::mcp::{
     BashPermissions, Context7Config, ExtraMcpServer, ExtraMcpTransport, McpConfigSynth,
     McpPermissions, TrustConsent,
 };
+use crate::workspace::{Workspace, settings as S};
 
 /// CLI / caller overrides layered on workspace defaults.
 #[derive(Debug, Clone, Default)]
@@ -51,7 +51,11 @@ pub fn parse_mcp_stdio_flag(raw: &str) -> Result<(String, String, Vec<String>)> 
     if name.is_empty() {
         bail!("--mcp-stdio name must be non-empty: {raw:?}");
     }
-    let parts: Vec<&str> = rest.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let parts: Vec<&str> = rest
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     if parts.is_empty() {
         bail!("--mcp-stdio command must be non-empty: {raw:?}");
     }
@@ -66,14 +70,17 @@ pub fn parse_mcp_codex_trust_flag(raw: &str) -> Result<TrustConsent> {
         "granted" | "trusted" => Ok(TrustConsent::Granted),
         "denied" | "untrusted" => Ok(TrustConsent::Denied),
         "unknown" => Ok(TrustConsent::Unknown),
-        other => bail!(
-            "invalid --mcp-codex-trust {other:?} (expected granted, denied, or unknown)"
-        ),
+        other => {
+            bail!("invalid --mcp-codex-trust {other:?} (expected granted, denied, or unknown)")
+        }
     }
 }
 
 /// Load `mcp.extraServers` from workspace settings.
-pub fn extra_servers_from_workspace(workspace: &Workspace, root: Option<&Path>) -> Vec<ExtraMcpServer> {
+pub fn extra_servers_from_workspace(
+    workspace: &Workspace,
+    root: Option<&Path>,
+) -> Vec<ExtraMcpServer> {
     let val = workspace.resolve_setting(S::MCP_EXTRA_SERVERS, root);
     match parse_extra_servers_json(&val) {
         Ok(servers) => servers,
@@ -97,9 +104,9 @@ fn parse_extra_servers_json(val: &serde_json::Value) -> Result<Vec<ExtraMcpServe
     };
     let mut out = Vec::with_capacity(arr.len());
     for (i, item) in arr.iter().enumerate() {
-        out.push(parse_extra_server_object(item).with_context(|| {
-            format!("mcp.extraServers[{i}]")
-        })?);
+        out.push(
+            parse_extra_server_object(item).with_context(|| format!("mcp.extraServers[{i}]"))?,
+        );
     }
     Ok(out)
 }
@@ -393,8 +400,7 @@ mod tests {
 
     #[test]
     fn parse_mcp_url_flag_splits_on_first_equals() {
-        let (name, url) =
-            parse_mcp_url_flag("semantic-scholar=https://example.com/mcp").unwrap();
+        let (name, url) = parse_mcp_url_flag("semantic-scholar=https://example.com/mcp").unwrap();
         assert_eq!(name, "semantic-scholar");
         assert_eq!(url, "https://example.com/mcp");
     }

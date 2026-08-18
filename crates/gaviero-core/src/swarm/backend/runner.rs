@@ -316,7 +316,10 @@ async fn run_backend_inner(
             base_prompt = format!("{}\n\n{}", discoveries, base_prompt);
         }
         let peers = b
-            .format_peer_block(&work_unit.id, Some(&crate::swarm::board::ArtifactKind::Conclusion))
+            .format_peer_block(
+                &work_unit.id,
+                Some(&crate::swarm::board::ArtifactKind::Conclusion),
+            )
             .await;
         if !peers.is_empty() {
             base_prompt = format!("{}\n\n{}", peers, base_prompt);
@@ -544,10 +547,7 @@ async fn run_backend_inner(
         // Auto-register conclusion artifacts written by this unit
         if let Some(b) = board {
             for path in attempt_modified.iter() {
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if name.contains("-conclusion-v") && name.ends_with(".md") {
                     let key = name.trim_end_matches(".md").to_string();
                     let _ = b
@@ -948,8 +948,10 @@ mod tests {
     #[test]
     fn swarm_graph_budget_thin_anchor_for_strong_tool_capable() {
         let unit = test_work_unit(); // default context_depth 2, no callers/tests
-        let strong =
-            build_provider_profile(&ModelSpec::parse("claude:sonnet"), &RuntimeConfig::default());
+        let strong = build_provider_profile(
+            &ModelSpec::parse("claude:sonnet"),
+            &RuntimeConfig::default(),
+        );
         // Strong, tool-capable, default depth → thin 1200 anchor (pull on demand).
         assert_eq!(swarm_graph_budget(&unit, &strong, false), 1_200);
         // Document mode (skip_repo_context) → nothing injected.
@@ -959,16 +961,20 @@ mod tests {
     #[test]
     fn swarm_graph_budget_full_push_for_small_local() {
         let unit = test_work_unit();
-        let small =
-            build_provider_profile(&ModelSpec::parse("ollama:llama3"), &RuntimeConfig::default());
+        let small = build_provider_profile(
+            &ModelSpec::parse("ollama:llama3"),
+            &RuntimeConfig::default(),
+        );
         // Small-local / non-tool agents keep the full 8000 push (can't pull).
         assert_eq!(swarm_graph_budget(&unit, &small, false), 8_000);
     }
 
     #[test]
     fn swarm_graph_budget_explicit_context_forces_push() {
-        let strong =
-            build_provider_profile(&ModelSpec::parse("claude:sonnet"), &RuntimeConfig::default());
+        let strong = build_provider_profile(
+            &ModelSpec::parse("claude:sonnet"),
+            &RuntimeConfig::default(),
+        );
         // Explicit callers_of → full push even for a strong agent.
         let mut callers = test_work_unit();
         callers.context_callers_of = vec!["src/lib.rs".to_string()];
@@ -981,8 +987,10 @@ mod tests {
 
     #[test]
     fn swarm_graph_budget_depth_zero_optout_is_pull_only() {
-        let strong =
-            build_provider_profile(&ModelSpec::parse("claude:sonnet"), &RuntimeConfig::default());
+        let strong = build_provider_profile(
+            &ModelSpec::parse("claude:sonnet"),
+            &RuntimeConfig::default(),
+        );
         let mut unit = test_work_unit();
         unit.context_depth = 0; // explicit `context { depth 0 }`, no callers/tests
         assert_eq!(swarm_graph_budget(&unit, &strong, false), 0);
@@ -1467,7 +1475,16 @@ mod tests {
         let tools = resolve_swarm_tools(&dsl, &[]);
         assert_eq!(
             tools,
-            vec!["Read", "Glob", "Grep", "Write", "Edit", "MultiEdit", "Bash", "WebFetch"]
+            vec![
+                "Read",
+                "Glob",
+                "Grep",
+                "Write",
+                "Edit",
+                "MultiEdit",
+                "Bash",
+                "WebFetch"
+            ]
         );
     }
 

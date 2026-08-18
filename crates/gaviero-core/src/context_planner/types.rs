@@ -307,10 +307,7 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
 /// full push (`smalllocal`). An empty or unrecognized setting falls back to the
 /// derived tier — keeping [`BootstrapTier::derive`] the default source of truth.
 pub fn resolve_bootstrap_tier(profile: &ProviderProfile, setting: Option<&str>) -> BootstrapTier {
-    match setting
-        .map(|s| s.trim().to_ascii_lowercase())
-        .as_deref()
-    {
+    match setting.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
         Some("strong") => BootstrapTier::Strong,
         Some("smalllocal" | "small_local" | "small-local" | "local" | "weak") => {
             BootstrapTier::SmallLocal
@@ -700,14 +697,29 @@ mod tests {
         let claude = build_provider_profile(&ModelSpec::parse("claude:sonnet"), &runtime);
 
         // No / empty / unrecognized setting → the derived tier.
-        assert_eq!(resolve_bootstrap_tier(&ollama, None), BootstrapTier::SmallLocal);
-        assert_eq!(resolve_bootstrap_tier(&ollama, Some("")), BootstrapTier::SmallLocal);
-        assert_eq!(resolve_bootstrap_tier(&ollama, Some("nonsense")), BootstrapTier::SmallLocal);
+        assert_eq!(
+            resolve_bootstrap_tier(&ollama, None),
+            BootstrapTier::SmallLocal
+        );
+        assert_eq!(
+            resolve_bootstrap_tier(&ollama, Some("")),
+            BootstrapTier::SmallLocal
+        );
+        assert_eq!(
+            resolve_bootstrap_tier(&ollama, Some("nonsense")),
+            BootstrapTier::SmallLocal
+        );
         assert_eq!(resolve_bootstrap_tier(&claude, None), BootstrapTier::Strong);
 
         // Explicit override wins, case/whitespace-insensitive.
-        assert_eq!(resolve_bootstrap_tier(&ollama, Some("strong")), BootstrapTier::Strong);
-        assert_eq!(resolve_bootstrap_tier(&ollama, Some("  Strong ")), BootstrapTier::Strong);
+        assert_eq!(
+            resolve_bootstrap_tier(&ollama, Some("strong")),
+            BootstrapTier::Strong
+        );
+        assert_eq!(
+            resolve_bootstrap_tier(&ollama, Some("  Strong ")),
+            BootstrapTier::Strong
+        );
         assert_eq!(
             resolve_bootstrap_tier(&claude, Some("small-local")),
             BootstrapTier::SmallLocal

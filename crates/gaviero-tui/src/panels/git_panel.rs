@@ -139,11 +139,7 @@ impl GitPanelState {
     /// Returns the (region, index) of the file row at `rel_y`, or None if
     /// the row is a header / branch line / commit input / outside the file
     /// list. Selecting that file is the caller's responsibility.
-    pub fn hit_test_file(
-        &self,
-        rel_y: u16,
-        area_height: u16,
-    ) -> Option<(GitRegion, usize)> {
+    pub fn hit_test_file(&self, rel_y: u16, area_height: u16) -> Option<(GitRegion, usize)> {
         if area_height < 6 {
             return None;
         }

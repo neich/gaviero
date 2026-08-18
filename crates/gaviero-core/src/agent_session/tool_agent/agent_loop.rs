@@ -171,11 +171,13 @@ pub(crate) async fn run_agent_loop(
                     total_cost_usd: total_cost,
                 };
             }
-            let summary =
-                crate::acp::client::format_tool_summary(&call.name, &call.args, &ctx.workspace_root);
+            let summary = crate::acp::client::format_tool_summary(
+                &call.name,
+                &call.args,
+                &ctx.workspace_root,
+            );
             observer.on_tool_call_started(&summary);
-            observer
-                .on_streaming_status(&format!("Using {}...", call.name));
+            observer.on_streaming_status(&format!("Using {}...", call.name));
 
             let content = match tools.get(&call.name) {
                 Some(tool) => tool.run(call.args.clone(), ctx).await.content,
@@ -238,13 +240,13 @@ mod tests {
     use super::*;
     use crate::swarm::backend::{StopReason, TokenUsage};
     use crate::types::FileScope;
+    use anyhow::Result;
+    use futures::Stream;
     use serde_json::json;
     use std::collections::VecDeque;
     use std::path::Path;
     use std::pin::Pin;
     use std::sync::Mutex;
-    use anyhow::Result;
-    use futures::Stream;
 
     use super::super::tools::{Tool, ToolOutcome};
 

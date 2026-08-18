@@ -318,12 +318,10 @@ fn kill_descendant_processes_windows() {
     use std::collections::{HashMap, HashSet, VecDeque};
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
         TH32CS_SNAPPROCESS,
     };
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, TerminateProcess, PROCESS_TERMINATE,
-    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
 
     let self_pid = std::process::id();
     let mut parent_of: HashMap<u32, u32> = HashMap::new();
@@ -423,8 +421,7 @@ fn is_batch_file(path: &Path) -> bool {
 /// Spawn sites use it to replace the bare "batch file arguments are
 /// invalid" with an actionable explanation.
 pub fn is_batch_arg_error(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::InvalidInput
-        && e.to_string().contains("batch file arguments")
+    e.kind() == std::io::ErrorKind::InvalidInput && e.to_string().contains("batch file arguments")
 }
 
 /// Recognize the Cursor CLI's Windows install layout and return the
@@ -483,7 +480,9 @@ fn cursor_shim_bypass(shim: &Path) -> Option<AgentInvocation> {
     {
         envs.push((
             "NODE_COMPILE_CACHE",
-            Path::new(&local).join("cursor-compile-cache").into_os_string(),
+            Path::new(&local)
+                .join("cursor-compile-cache")
+                .into_os_string(),
         ));
     }
 
@@ -655,8 +654,7 @@ mod tests {
         std::fs::write(dir.path().join("fake-agent.cmd"), "@echo off\r\n").unwrap();
         let old_path = std::env::var_os("PATH").unwrap_or_default();
         let joined = std::env::join_paths(
-            std::iter::once(dir.path().to_path_buf())
-                .chain(std::env::split_paths(&old_path)),
+            std::iter::once(dir.path().to_path_buf()).chain(std::env::split_paths(&old_path)),
         )
         .unwrap();
         // Serialize PATH mutation against other tests in this binary.
@@ -665,11 +663,10 @@ mod tests {
         unsafe { std::env::set_var("PATH", &old_path) };
         // PATHEXT extensions are conventionally uppercase; the hit's
         // extension case follows PATHEXT, not the on-disk name.
-        assert!(
-            hit.is_some_and(|h| h
-                .to_string_lossy()
-                .eq_ignore_ascii_case(&dir.path().join("fake-agent.cmd").to_string_lossy())),
-        );
+        assert!(hit.is_some_and(|h| {
+            h.to_string_lossy()
+                .eq_ignore_ascii_case(&dir.path().join("fake-agent.cmd").to_string_lossy())
+        }),);
     }
 
     #[cfg(windows)]
@@ -680,11 +677,10 @@ mod tests {
         std::fs::write(dir.path().join("dual.exe"), "MZ").unwrap();
         // Path-qualified lookup avoids touching PATH.
         let hit = resolve_program(&dir.path().join("dual").to_string_lossy());
-        assert!(
-            hit.is_some_and(|h| h
-                .to_string_lossy()
-                .eq_ignore_ascii_case(&dir.path().join("dual.exe").to_string_lossy())),
-        );
+        assert!(hit.is_some_and(|h| {
+            h.to_string_lossy()
+                .eq_ignore_ascii_case(&dir.path().join("dual.exe").to_string_lossy())
+        }),);
     }
 
     #[cfg(unix)]
@@ -785,8 +781,7 @@ mod tests {
             dir.path(),
             &[("2026.07.09-aaa", true), ("2026.07.16-bbb", true)],
         );
-        let inv =
-            resolve_agent_invocation(&dir.path().join("agent.cmd").to_string_lossy());
+        let inv = resolve_agent_invocation(&dir.path().join("agent.cmd").to_string_lossy());
         let expected = dir.path().join("versions").join("2026.07.16-bbb");
         assert_eq!(inv.program, expected.join("node.exe"));
         assert_eq!(inv.prepend_args, vec![expected.join("index.js")]);
@@ -805,8 +800,7 @@ mod tests {
             dir.path(),
             &[("2026.07.09-aaa", true), ("2026.07.16-bbb", false)],
         );
-        let inv =
-            resolve_agent_invocation(&dir.path().join("agent.cmd").to_string_lossy());
+        let inv = resolve_agent_invocation(&dir.path().join("agent.cmd").to_string_lossy());
         let expected = dir.path().join("versions").join("2026.07.09-aaa");
         assert_eq!(inv.program, expected.join("node.exe"));
     }
@@ -818,8 +812,7 @@ mod tests {
         fake_cursor_install(dir.path(), &[("2026.07.09-aaa", true)]);
         std::fs::write(dir.path().join("node.exe"), "MZ").unwrap();
         std::fs::write(dir.path().join("index.js"), "// entry\n").unwrap();
-        let inv =
-            resolve_agent_invocation(&dir.path().join("agent.cmd").to_string_lossy());
+        let inv = resolve_agent_invocation(&dir.path().join("agent.cmd").to_string_lossy());
         assert_eq!(inv.program, dir.path().join("node.exe"));
         assert_eq!(inv.prepend_args, vec![dir.path().join("index.js")]);
     }

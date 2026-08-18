@@ -133,8 +133,8 @@ fn pick_api_key(env_val: Option<String>, secrets_path: &Path) -> Result<ApiKey> 
     if secrets_path.exists() {
         let body = std::fs::read_to_string(secrets_path)
             .with_context(|| format!("reading {}", secrets_path.display()))?;
-        let parsed: SecretsToml = toml::from_str(&body)
-            .with_context(|| format!("parsing {}", secrets_path.display()))?;
+        let parsed: SecretsToml =
+            toml::from_str(&body).with_context(|| format!("parsing {}", secrets_path.display()))?;
         if let Some(k) = parsed.deepseek.and_then(|d| d.api_key) {
             let k = k.trim().to_string();
             if !k.is_empty() {

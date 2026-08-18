@@ -115,7 +115,10 @@ mod tests {
         );
         // Over-MAX_PATH keeps the verbatim prefix (still needed).
         let long = format!(r"\\?\C:\{}", "a".repeat(300));
-        assert_eq!(simplify_path(Path::new(&long)), std::path::PathBuf::from(&long));
+        assert_eq!(
+            simplify_path(Path::new(&long)),
+            std::path::PathBuf::from(&long)
+        );
     }
 
     #[cfg(windows)]

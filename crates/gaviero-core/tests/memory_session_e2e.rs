@@ -121,20 +121,26 @@ async fn e2e_one_shot_session_writes_memory() -> Result<()> {
     r.section("annotation parse");
     let parsed = gaviero_core::memory::parse_and_strip(&assistant_reply);
     if let Some(err) = parsed.parse_error.as_ref() {
-        r.line(format!("    ⚠ <turn_annotations> block found but malformed: {err}"));
+        r.line(format!(
+            "    ⚠ <turn_annotations> block found but malformed: {err}"
+        ));
     }
     let annotations = match parsed.annotations.clone() {
         Some(a) => a,
         None => {
-            r.line(
-                "    ⨯ FAIL: claude reply did not carry a <turn_annotations> block.",
-            );
-            r.line(format!("      reply (first 500 chars): {}", truncate(&assistant_reply, 500)));
+            r.line("    ⨯ FAIL: claude reply did not carry a <turn_annotations> block.");
+            r.line(format!(
+                "      reply (first 500 chars): {}",
+                truncate(&assistant_reply, 500)
+            ));
             anyhow::bail!("no <turn_annotations> block in reply");
         }
     };
     r.kv("flags", annotations.flags.len());
-    r.kv("session_thread", annotations.session_thread.as_deref().unwrap_or("<none>"));
+    r.kv(
+        "session_thread",
+        annotations.session_thread.as_deref().unwrap_or("<none>"),
+    );
     for f in &annotations.flags {
         r.line(format!(
             "    • flag type={} scope={} importance={:.2} text=\"{}\"",
@@ -213,9 +219,9 @@ async fn e2e_multi_shot_session_writes_per_turn_memory() -> Result<()> {
             .map(|(_, c)| c.clone())
             .unwrap_or(snap.streamed.clone());
         let parsed = gaviero_core::memory::parse_and_strip(&reply);
-        let annotations = parsed.annotations.with_context(|| {
-            format!("turn {turn_id}: no <turn_annotations> block in reply")
-        })?;
+        let annotations = parsed
+            .annotations
+            .with_context(|| format!("turn {turn_id}: no <turn_annotations> block in reply"))?;
         r.kv("flags", annotations.flags.len());
 
         if annotations.flags.is_empty() {
@@ -243,10 +249,7 @@ async fn e2e_multi_shot_session_writes_per_turn_memory() -> Result<()> {
     r.section("verification");
     let mut all_passed = true;
     for (turn_id, fact) in &facts {
-        let marker = fact
-            .split_whitespace()
-            .last()
-            .expect("fact has whitespace");
+        let marker = fact.split_whitespace().last().expect("fact has whitespace");
         let hits = env.search_repo(marker).await?;
         let has = hits.iter().any(|m| m.content.contains(marker));
         r.line(format!(
@@ -723,9 +726,7 @@ async fn e2e_full_dev_session_simulation() -> Result<()> {
     // overall as a hard floor (proves the extractor path is alive),
     // then surface per-marker presence as soft signal.
     if records.is_empty() {
-        anyhow::bail!(
-            "extractor produced zero record rows — writer never reached the store"
-        );
+        anyhow::bail!("extractor produced zero record rows — writer never reached the store");
     }
 
     r.section("per-marker recall");
@@ -743,7 +744,10 @@ async fn e2e_full_dev_session_simulation() -> Result<()> {
             hit_markers += 1;
         }
     }
-    r.kv("markers_recalled", format!("{hit_markers}/{}", transcripts.len()));
+    r.kv(
+        "markers_recalled",
+        format!("{hit_markers}/{}", transcripts.len()),
+    );
 
     // ── Turn 4: retrieval over a question that overlaps the seed topics
     r.section("retrieval turn (Q4)");
@@ -787,7 +791,15 @@ async fn e2e_full_dev_session_simulation() -> Result<()> {
     // The extractor paraphrases at will. Treat per-marker recall on Q4
     // as soft signal but require *at least one* overlap with the
     // original facts (caching / LRU / rate-limit / anyhow / error).
-    let topical = ["caching", "lru", "rate", "limit", "anyhow", "error", "convention"];
+    let topical = [
+        "caching",
+        "lru",
+        "rate",
+        "limit",
+        "anyhow",
+        "error",
+        "convention",
+    ];
     let touched: Vec<&str> = topical
         .iter()
         .filter(|kw| {
@@ -828,7 +840,6 @@ async fn e2e_full_dev_session_simulation() -> Result<()> {
 
     Ok(())
 }
-
 
 // SCOPE_REPO is reachable only through `gaviero_core::memory::scope`; pin
 // the import here so future tests that filter by scope_level stay

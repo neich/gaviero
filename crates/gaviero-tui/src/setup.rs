@@ -133,11 +133,7 @@ pub fn existing_workspace_file(root: &Path) -> Option<PathBuf> {
         .ok()?
         .flatten()
         .map(|e| e.path())
-        .filter(|p| {
-            p.is_file()
-                && p.extension()
-                    .is_some_and(|ext| ext == "gaviero-workspace")
-        })
+        .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "gaviero-workspace"))
         .collect();
     matches.sort();
     matches.into_iter().next()
@@ -192,9 +188,7 @@ pub fn run(root: &Path, mode: LaunchMode) -> Result<Option<SetupOutcome>> {
 /// the whole workspace — and Codex trust is granted, which is what makes
 /// `.codex/config.toml` get written at all. Best-effort: a failing folder is
 /// logged and the rest still run.
-pub fn synthesize_provider_configs(
-    workspace: &gaviero_core::workspace::Workspace,
-) -> Vec<PathBuf> {
+pub fn synthesize_provider_configs(workspace: &gaviero_core::workspace::Workspace) -> Vec<PathBuf> {
     use gaviero_core::mcp;
 
     let roots: Vec<PathBuf> = workspace.roots().iter().map(|r| r.to_path_buf()).collect();
@@ -400,7 +394,10 @@ impl Wizard {
         if self.folders.is_empty() {
             vec![self.root.clone()]
         } else {
-            self.selected_folders().iter().map(|f| f.path.clone()).collect()
+            self.selected_folders()
+                .iter()
+                .map(|f| f.path.clone())
+                .collect()
         }
     }
 
@@ -414,7 +411,10 @@ impl Wizard {
         match self.mode {
             LaunchMode::Folder => {
                 let mut settings = base_settings(&dir_name(&self.root));
-                merge_into(&mut settings, profile_settings(self.profile, self.init_providers));
+                merge_into(
+                    &mut settings,
+                    profile_settings(self.profile, self.init_providers),
+                );
                 write_json_if_absent(&self.root.join(".gaviero").join("settings.json"), &settings)?;
                 Ok(SetupOutcome {
                     workspace_file: None,
@@ -430,7 +430,10 @@ impl Wizard {
                 write_workspace_file(&path, &members, &workspace_settings)?;
                 for member in &members {
                     let settings = base_settings(&dir_name(member));
-                    write_json_if_absent(&member.join(".gaviero").join("settings.json"), &settings)?;
+                    write_json_if_absent(
+                        &member.join(".gaviero").join("settings.json"),
+                        &settings,
+                    )?;
                 }
                 Ok(SetupOutcome {
                     workspace_file: Some(path),
@@ -558,7 +561,11 @@ impl Wizard {
         let visible = (height as usize).saturating_sub(10).max(1);
         let start = self.folder_cursor.saturating_sub(visible.saturating_sub(1));
         for (idx, folder) in self.folders.iter().enumerate().skip(start).take(visible) {
-            let cursor = if idx == self.folder_cursor { "▸" } else { " " };
+            let cursor = if idx == self.folder_cursor {
+                "▸"
+            } else {
+                " "
+            };
             let check = if folder.selected { "[x]" } else { "[ ]" };
             let tag = if folder.is_git { "  (git)" } else { "" };
             lines.push(Line::from(Span::styled(
@@ -647,12 +654,18 @@ impl Wizard {
         let mut files: Vec<String> = Vec::new();
         match self.mode {
             LaunchMode::Folder => {
-                files.push(format!("{}", self.root.join(".gaviero/settings.json").display()));
+                files.push(format!(
+                    "{}",
+                    self.root.join(".gaviero/settings.json").display()
+                ));
             }
             LaunchMode::Workspace => {
                 files.push(format!("{}", self.workspace_file_path().display()));
                 for member in self.workspace_members() {
-                    files.push(format!("{}", member.join(".gaviero/settings.json").display()));
+                    files.push(format!(
+                        "{}",
+                        member.join(".gaviero/settings.json").display()
+                    ));
                 }
             }
         }
@@ -909,7 +922,9 @@ mod tests {
     #[test]
     fn existing_workspace_file_prefers_dir_named_file() {
         let dir = tempdir();
-        let named = dir.path().join(format!("{}.gaviero-workspace", dir_name(dir.path())));
+        let named = dir
+            .path()
+            .join(format!("{}.gaviero-workspace", dir_name(dir.path())));
         std::fs::write(dir.path().join("aaa.gaviero-workspace"), "{}").unwrap();
         std::fs::write(&named, "{}").unwrap();
         assert_eq!(existing_workspace_file(dir.path()), Some(named));
@@ -970,8 +985,7 @@ mod tests {
         let outcome = wizard.apply().unwrap();
         assert!(outcome.workspace_file.is_none());
 
-        let body =
-            std::fs::read_to_string(dir.path().join(".gaviero/settings.json")).unwrap();
+        let body = std::fs::read_to_string(dir.path().join(".gaviero/settings.json")).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(doc["memory"]["namespace"], dir_name(dir.path()).as_str());
         assert!(doc["files"]["exclude"]["target"].as_bool().unwrap());

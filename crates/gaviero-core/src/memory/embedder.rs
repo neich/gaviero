@@ -263,10 +263,14 @@ pub mod api {
     /// the factory shape.
     pub fn build_api_embedder(name: &str) -> Option<Arc<dyn Embedder>> {
         match name {
-            "voyage-code-3" => Some(Arc::new(UnimplementedApiEmbedder::new("voyage-code-3", 1024))),
-            "cohere-embed-v3" => {
-                Some(Arc::new(UnimplementedApiEmbedder::new("cohere-embed-v3", 1024)))
-            }
+            "voyage-code-3" => Some(Arc::new(UnimplementedApiEmbedder::new(
+                "voyage-code-3",
+                1024,
+            ))),
+            "cohere-embed-v3" => Some(Arc::new(UnimplementedApiEmbedder::new(
+                "cohere-embed-v3",
+                1024,
+            ))),
             "openai-text-embedding-3-large" => Some(Arc::new(UnimplementedApiEmbedder::new(
                 "openai-text-embedding-3-large",
                 3072,

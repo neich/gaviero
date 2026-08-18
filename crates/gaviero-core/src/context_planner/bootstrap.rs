@@ -297,13 +297,15 @@ mod tests {
 
     #[test]
     fn auto_first_turn_injects_all() {
-        let arms = resolve_chat_bootstrap_arms(BootstrapMode::Auto, true, None, BootstrapArms::none());
+        let arms =
+            resolve_chat_bootstrap_arms(BootstrapMode::Auto, true, None, BootstrapArms::none());
         assert!(arms.memory && arms.outline && arms.topology && arms.impact);
     }
 
     #[test]
     fn auto_follow_up_injects_nothing() {
-        let arms = resolve_chat_bootstrap_arms(BootstrapMode::Auto, false, None, BootstrapArms::none());
+        let arms =
+            resolve_chat_bootstrap_arms(BootstrapMode::Auto, false, None, BootstrapArms::none());
         assert_eq!(arms, BootstrapArms::none());
     }
 
@@ -333,7 +335,8 @@ mod tests {
 
     #[test]
     fn manual_first_turn_default_empty() {
-        let arms = resolve_chat_bootstrap_arms(BootstrapMode::Manual, true, None, BootstrapArms::none());
+        let arms =
+            resolve_chat_bootstrap_arms(BootstrapMode::Manual, true, None, BootstrapArms::none());
         assert_eq!(arms, BootstrapArms::none());
     }
 
@@ -413,12 +416,8 @@ mod tests {
         };
         let hints = BootstrapEstimateHints::default();
 
-        let auto = resolve_chat_bootstrap_arms(
-            BootstrapMode::Auto,
-            true,
-            None,
-            BootstrapArms::none(),
-        );
+        let auto =
+            resolve_chat_bootstrap_arms(BootstrapMode::Auto, true, None, BootstrapArms::none());
         assert_eq!(
             estimate_bootstrap_tokens(auto, &budgets, &hints),
             1_200,
@@ -458,7 +457,8 @@ mod tests {
 
         // Auto first turn arms every layer, but only impact has a non-zero
         // budget here → the summary, not the full push.
-        let auto = resolve_chat_bootstrap_arms(BootstrapMode::Auto, true, None, BootstrapArms::none());
+        let auto =
+            resolve_chat_bootstrap_arms(BootstrapMode::Auto, true, None, BootstrapArms::none());
         assert!(auto.impact);
         assert_eq!(
             estimate_bootstrap_tokens(auto, &budgets, &hints),

@@ -442,13 +442,14 @@ pub(super) fn restore_session(app: &mut App) {
     app.file_tree.restore_expanded(&state.tree_expanded);
     if state.tree_selected < app.file_tree.entries.len() {
         let count = app.file_tree.entries.len();
-        app.file_tree.scroll.set_selected(state.tree_selected, count);
+        app.file_tree
+            .scroll
+            .set_selected(state.tree_selected, count);
     }
 
     for tab in &state.tabs {
-        let path = crate::editor::buffer::Buffer::resolve_editor_path(std::path::Path::new(
-            &tab.path,
-        ));
+        let path =
+            crate::editor::buffer::Buffer::resolve_editor_path(std::path::Path::new(&tab.path));
         if path.exists() {
             app.open_file(&path);
             if let Some(buf) = app.buffers.last_mut() {

@@ -205,11 +205,7 @@ impl AcpObserver for TuiAcpObserver {
         });
     }
 
-    fn on_tool_agent_edit_captured(
-        &self,
-        path: &std::path::Path,
-        pre_turn_content: Option<&str>,
-    ) {
+    fn on_tool_agent_edit_captured(&self, path: &std::path::Path, pre_turn_content: Option<&str>) {
         let _ = self.tx.send(Event::ToolAgentEditCaptured {
             path: path.to_path_buf(),
             pre_turn_content: pre_turn_content.map(str::to_string),

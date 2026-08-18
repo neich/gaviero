@@ -7,11 +7,9 @@
 
 use serde_json::{Value, json};
 
-use crate::context_planner::compaction::{
-    CompactionPolicy, compact_replay, should_compact,
-};
-use crate::context_planner::ledger::Role;
 use crate::context_planner::ReplayPayload;
+use crate::context_planner::compaction::{CompactionPolicy, compact_replay, should_compact};
+use crate::context_planner::ledger::Role;
 
 use crate::agent_session::Turn;
 

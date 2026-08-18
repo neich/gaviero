@@ -132,16 +132,24 @@ fn enforce_editor_min(app: &mut App, total: u16) {
     // here we just clamp the overflow, shrinking side first then tree.
     let overflow = ft.saturating_add(sp).saturating_sub(budget);
     if app.panel_visible.side_panel {
-        let shrink = overflow.min(app.side_panel_width.saturating_sub(theme::SIDE_PANEL_MIN_WIDTH));
+        let shrink = overflow.min(
+            app.side_panel_width
+                .saturating_sub(theme::SIDE_PANEL_MIN_WIDTH),
+        );
         app.side_panel_width -= shrink;
         let overflow = overflow.saturating_sub(shrink);
         if overflow > 0 && app.panel_visible.file_tree {
-            let shrink =
-                overflow.min(app.file_tree_width.saturating_sub(theme::FILE_TREE_MIN_WIDTH));
+            let shrink = overflow.min(
+                app.file_tree_width
+                    .saturating_sub(theme::FILE_TREE_MIN_WIDTH),
+            );
             app.file_tree_width -= shrink;
         }
     } else if app.panel_visible.file_tree {
-        let shrink = overflow.min(app.file_tree_width.saturating_sub(theme::FILE_TREE_MIN_WIDTH));
+        let shrink = overflow.min(
+            app.file_tree_width
+                .saturating_sub(theme::FILE_TREE_MIN_WIDTH),
+        );
         app.file_tree_width -= shrink;
     }
 }

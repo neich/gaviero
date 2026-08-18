@@ -28,9 +28,7 @@ impl Default for TopologyConfig {
     }
 }
 
-const PRIORITY_DIRS: &[&str] = &[
-    "crates", "src", "lib", "apps", "packages", "docs", "tests",
-];
+const PRIORITY_DIRS: &[&str] = &["crates", "src", "lib", "apps", "packages", "docs", "tests"];
 
 /// Build a directory-only tree for the workspace root (no XML wrapper).
 pub fn build_folder_topology(
@@ -117,10 +115,7 @@ fn walk_dirs(
         *dir_count += 1;
         let rel = child.strip_prefix(workspace).unwrap_or(&child);
         let indent = "  ".repeat(depth as usize + 1);
-        let name = rel
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("?");
+        let name = rel.file_name().and_then(|n| n.to_str()).unwrap_or("?");
         lines.push(format!("{indent}{name}/"));
         walk_dirs(
             workspace,
@@ -172,7 +167,11 @@ fn scan_cargo_members(workspace: &Path) -> Option<String> {
         if !in_workspace {
             continue;
         }
-        let rest = trimmed.strip_prefix("members")?.trim().strip_prefix('=')?.trim();
+        let rest = trimmed
+            .strip_prefix("members")?
+            .trim()
+            .strip_prefix('=')?
+            .trim();
         let members = parse_members_list(rest)?;
         if members.is_empty() {
             return None;
@@ -312,7 +311,10 @@ members = ["foo", "bar"]
             enabled: false,
             ..cfg()
         };
-        assert!(build_folder_topology(dir.path(), &[], &off).unwrap().is_empty());
+        assert!(
+            build_folder_topology(dir.path(), &[], &off)
+                .unwrap()
+                .is_empty()
+        );
     }
-
 }

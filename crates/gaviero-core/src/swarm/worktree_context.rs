@@ -136,13 +136,7 @@ pub fn apply_worktree_path_rewrites(
                 .scope
                 .read_only_paths
                 .iter()
-                .map(|p| {
-                    if p == from {
-                        to.clone()
-                    } else {
-                        p.clone()
-                    }
-                })
+                .map(|p| if p == from { to.clone() } else { p.clone() })
                 .collect();
         }
     }
@@ -182,11 +176,9 @@ mod tests {
         let plan = outside.path().join("plan.md");
         fs::write(&plan, "# outside plan").unwrap();
 
-        let prep = prepare_worktree_read_only_context(
-            ws.path(),
-            &[plan.to_str().unwrap().to_string()],
-        )
-        .unwrap();
+        let prep =
+            prepare_worktree_read_only_context(ws.path(), &[plan.to_str().unwrap().to_string()])
+                .unwrap();
         assert_eq!(prep.injections.len(), 1);
         assert!(prep.injections[0].0.starts_with(".gaviero/injected/"));
         assert!(!prep.path_rewrites.is_empty());

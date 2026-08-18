@@ -180,7 +180,10 @@ impl AgentOptions {
     pub fn resolved_tools(&self) -> (Vec<String>, Vec<String>) {
         let available: Vec<String> = match self.available_tools.as_ref() {
             Some(list) => list.clone(),
-            None => DEFAULT_AVAILABLE_TOOLS.iter().map(|s| s.to_string()).collect(),
+            None => DEFAULT_AVAILABLE_TOOLS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         };
         let approved: Vec<String> = match self.approved_tools.as_ref() {
             Some(list) => list
@@ -347,7 +350,9 @@ impl AcpSession {
             // Resolve alias→concrete id (e.g. `sonnet` → Sonnet 5) so the
             // `sonnet` alias pins to a specific model rather than the CLI's
             // drifting "latest sonnet". Every Claude spawn funnels through here.
-            .arg(crate::swarm::backend::shared::resolve_claude_cli_model(model));
+            .arg(crate::swarm::backend::shared::resolve_claude_cli_model(
+                model,
+            ));
 
         // Session reuse: when a prior session_id is known (captured from the
         // first turn's SystemInit event), resume it so Claude's model keeps
@@ -752,7 +757,10 @@ mod tests {
             ..AgentOptions::default()
         };
         let (available, approved) = opts.resolved_tools();
-        assert_eq!(available, approved, "auto_approve approves everything available");
+        assert_eq!(
+            available, approved,
+            "auto_approve approves everything available"
+        );
     }
 
     #[test]
@@ -792,7 +800,10 @@ mod tests {
         ensure_ask_user_question(&mut tools);
         ensure_ask_user_question(&mut tools);
         assert_eq!(
-            tools.iter().filter(|t| *t == ASK_USER_QUESTION_TOOL).count(),
+            tools
+                .iter()
+                .filter(|t| *t == ASK_USER_QUESTION_TOOL)
+                .count(),
             1
         );
         assert!(tools.ends_with(&[ASK_USER_QUESTION_TOOL.to_string()]));
@@ -1025,11 +1036,7 @@ pub fn discover_cursor_model_options() -> Vec<String> {
 /// the remainder in `--list-models` order. Dedup preserves the order
 /// established above. Extracted so tests can pin the rule without
 /// shelling out to the `agent` CLI.
-fn pin_cursor_picker_order(
-    parsed: Vec<String>,
-    default_pin: &str,
-    auto_alt: &str,
-) -> Vec<String> {
+fn pin_cursor_picker_order(parsed: Vec<String>, default_pin: &str, auto_alt: &str) -> Vec<String> {
     let mut deduped: Vec<String> = Vec::with_capacity(parsed.len() + 2);
     deduped.push(default_pin.to_string());
     if parsed.iter().any(|m| m == auto_alt) {
@@ -1188,7 +1195,10 @@ mod discover_claude_tests {
         // The apostrophe in "model's" must not swallow the later
         // 'claude-fable-5' id, and must not leak a garbage entry.
         let out = parse_claude_help_models(WRAPPED_HELP);
-        assert!(out.contains(&"claude:claude-fable-5".to_string()), "got {out:?}");
+        assert!(
+            out.contains(&"claude:claude-fable-5".to_string()),
+            "got {out:?}"
+        );
         assert!(
             out.iter().all(|m| !m.contains(' ')),
             "no model id should contain spaces: {out:?}"

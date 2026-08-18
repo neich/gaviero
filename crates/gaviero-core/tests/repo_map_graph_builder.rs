@@ -135,10 +135,7 @@ fn impact_radius_finds_caller_of_changed_file() {
 
     assert_eq!(impact.changed_files, vec!["src/helper.rs"]);
     assert!(
-        impact
-            .affected_files
-            .iter()
-            .any(|f| f == "src/lib.rs"),
+        impact.affected_files.iter().any(|f| f == "src/lib.rs"),
         "lib.rs must be marked as affected by changes to helper.rs, got {:?}",
         impact.affected_files,
     );

@@ -121,8 +121,7 @@ impl MemoryStore {
             let tx = conn.transaction().context("compress: begin transaction")?;
             // Drop the C1.3 triggers ONLY for the duration of this
             // write (single UPDATE, no await between drop + reinstall).
-            schema::drop_history_immutable_triggers(&tx)
-                .context("compress: drop triggers")?;
+            schema::drop_history_immutable_triggers(&tx).context("compress: drop triggers")?;
             let updated = tx.execute(
                 "UPDATE memories
                     SET content = ?1,

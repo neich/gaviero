@@ -49,8 +49,7 @@ pub fn compress_with_verify(content: &str) -> Result<CompressedBlob> {
     let original_len = original_bytes.len();
     let original_sha = sha_hex(original_bytes);
 
-    let bytes = zstd::encode_all(original_bytes, ZSTD_LEVEL)
-        .context("zstd encode failed")?;
+    let bytes = zstd::encode_all(original_bytes, ZSTD_LEVEL).context("zstd encode failed")?;
 
     // End-to-end round-trip: decompress what we just produced and
     // verify it matches the original SHA + content. Any mismatch here
@@ -71,7 +70,9 @@ pub fn compress_with_verify(content: &str) -> Result<CompressedBlob> {
         ));
     }
     if round_trip != original_bytes {
-        return Err(anyhow!("zstd round-trip byte mismatch despite SHA equality"));
+        return Err(anyhow!(
+            "zstd round-trip byte mismatch despite SHA equality"
+        ));
     }
 
     Ok(CompressedBlob {
@@ -94,8 +95,7 @@ pub fn decompress_with_verify(blob: &[u8], expected_sha_hex: &str) -> Result<Str
              (data integrity alarm — row may be corrupted)"
         ));
     }
-    String::from_utf8(decoded)
-        .context("decompressed history blob was not valid UTF-8")
+    String::from_utf8(decoded).context("decompressed history blob was not valid UTF-8")
 }
 
 fn sha_hex(bytes: &[u8]) -> String {
@@ -158,7 +158,8 @@ mod tests {
             let recovered = decompress_with_verify(&blob.bytes, &blob.sha_hex)
                 .unwrap_or_else(|e| panic!("decode failed at {idx}: {e}"));
             assert_eq!(
-                recovered, *original,
+                recovered,
+                *original,
                 "byte mismatch at fixture {idx} (len {})",
                 original.len()
             );

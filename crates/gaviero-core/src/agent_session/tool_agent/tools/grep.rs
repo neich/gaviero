@@ -103,7 +103,9 @@ impl Tool for GrepTool {
         .await;
 
         match result {
-            Ok((hits, _)) if hits.is_empty() => ToolOutcome::ok(format!("No matches for /{pattern}/")),
+            Ok((hits, _)) if hits.is_empty() => {
+                ToolOutcome::ok(format!("No matches for /{pattern}/"))
+            }
             Ok((hits, truncated)) => {
                 let mut out = hits.join("\n");
                 if truncated {

@@ -9,8 +9,8 @@ use gaviero_remote::envelope as renv;
 use gaviero_remote::envelope::ServerFrame;
 use gaviero_remote::server::HubInput;
 
-use crate::app::remote::CommandFailure;
 use crate::app::App;
+use crate::app::remote::CommandFailure;
 use crate::event::Event;
 use crate::panels::agent_chat::{ChatMessage, ChatRole, Conversation, PendingPermission};
 
@@ -365,7 +365,9 @@ pub fn build_snapshot(app: &App) -> renv::Snapshot {
     let conversations: Vec<rdto::ConversationSummary> = (0..chat.conversations.len())
         .map(|idx| conversation_summary_dto(app, idx))
         .collect();
-    let active_idx = chat.active_conv.min(chat.conversations.len().saturating_sub(1));
+    let active_idx = chat
+        .active_conv
+        .min(chat.conversations.len().saturating_sub(1));
     let active = &chat.conversations[active_idx];
 
     // Bounded active tail: latest 100 messages / 512 KiB encoded.
@@ -614,10 +616,12 @@ pub fn pump_remote(app: &mut App) {
         .collect();
     for conv_id in removed {
         app.remote.projected_conv_revisions.remove(&conv_id);
-        summary_frames.push(ServerFrame::ConversationRemoved(renv::ConversationRemoved {
-            conv_id,
-            active_id: active_id.clone(),
-        }));
+        summary_frames.push(ServerFrame::ConversationRemoved(
+            renv::ConversationRemoved {
+                conv_id,
+                active_id: active_id.clone(),
+            },
+        ));
     }
     // Active-tab change without a revision change (switch_conversation).
     if app.remote.projected_active_id.as_deref() != Some(active_id.as_str()) {

@@ -88,7 +88,11 @@ pub fn find_conflict_regions(content: &str) -> Vec<ConflictRegion> {
 }
 
 /// Classify a single line within a file that may contain conflict markers.
-pub fn classify_conflict_line(line: &str, line_idx: usize, regions: &[ConflictRegion]) -> ConflictLineKind {
+pub fn classify_conflict_line(
+    line: &str,
+    line_idx: usize,
+    regions: &[ConflictRegion],
+) -> ConflictLineKind {
     for region in regions {
         if line_idx == region.start_line {
             return ConflictLineKind::Start;

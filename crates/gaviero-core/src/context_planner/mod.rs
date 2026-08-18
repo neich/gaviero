@@ -185,13 +185,19 @@ impl<'a> ContextPlanner<'a> {
         // changing `MemoryScope`'s single-repo shape.
         let cfg = crate::memory::RetrievalConfig::default();
         let candidates = if input.extra_folder_paths.is_empty() {
-            let scope = crate::memory::MemoryScope::from_context(
-                self.workspace_root,
+            let scope =
+                crate::memory::MemoryScope::from_context(self.workspace_root, None, None, None);
+            match crate::memory::retrieve_ranked(
+                mem,
+                &scope,
+                query,
+                input.memory_limit,
+                &cfg,
                 None,
                 None,
-                None,
-            );
-            match crate::memory::retrieve_ranked(mem, &scope, query, input.memory_limit, &cfg, None, None).await {
+            )
+            .await
+            {
                 Ok(out) => out
                     .items
                     .iter()
@@ -207,7 +213,8 @@ impl<'a> ContextPlanner<'a> {
             // each extra). Oversample per scope: limit*2 keeps the
             // dedup pool meaningful without ballooning total work.
             let per_scope_limit = input.memory_limit.saturating_mul(2).max(input.memory_limit);
-            let mut roots: Vec<&std::path::Path> = Vec::with_capacity(input.extra_folder_paths.len() + 1);
+            let mut roots: Vec<&std::path::Path> =
+                Vec::with_capacity(input.extra_folder_paths.len() + 1);
             roots.push(self.workspace_root);
             for p in input.extra_folder_paths {
                 if !roots.iter().any(|r| *r == *p) {
@@ -218,7 +225,17 @@ impl<'a> ContextPlanner<'a> {
             let mut seen_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
             for root in roots {
                 let scope = crate::memory::MemoryScope::from_context(root, Some(root), None, None);
-                match crate::memory::retrieve_ranked(mem, &scope, query, per_scope_limit, &cfg, None, None).await {
+                match crate::memory::retrieve_ranked(
+                    mem,
+                    &scope,
+                    query,
+                    per_scope_limit,
+                    &cfg,
+                    None,
+                    None,
+                )
+                .await
+                {
                     Ok(out) => {
                         for item in &out.items {
                             let cand = crate::memory::store::MemoryCandidate::from_scored(item);
@@ -319,10 +336,8 @@ impl<'a> ContextPlanner<'a> {
             symbols: Vec::new(),
             content_digest: None,
         });
-        out.metadata.graph_token_estimate = out
-            .metadata
-            .graph_token_estimate
-            .saturating_add(tokens);
+        out.metadata.graph_token_estimate =
+            out.metadata.graph_token_estimate.saturating_add(tokens);
     }
 
     fn collect_graph(&mut self, input: &PlannerInput<'_>, out: &mut PlannerSelections) {

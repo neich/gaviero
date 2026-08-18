@@ -208,11 +208,7 @@ impl AgentSession for ToolAgentSession {
         &mut self,
         mut turn: Turn,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<UnifiedStreamEvent>> + Send>>> {
-        apply_replay_compaction(
-            &mut turn,
-            &self.compaction,
-            self.profile.max_context_tokens,
-        );
+        apply_replay_compaction(&mut turn, &self.compaction, self.profile.max_context_tokens);
 
         let system = default_editor_system_prompt(&self.capabilities());
         let prompt = Self::build_prompt(&turn);

@@ -222,7 +222,7 @@ First turn: `<repo_topology>` ([`topology::build_folder_topology`](src/repo_map/
 | Memory init | Non-fatal `Option<Arc<MemoryStores>>` |
 | C1 migration pending | Refuse open until consent |
 | MCP bind failure | Log; agents fall back |
-| Cursor argv overflow | Explicit reject (~96 KB) |
+| Cursor argv overflow | Spill to tempfile (Windows 30 KB / Unix 96 KB) |
 
 ---
 

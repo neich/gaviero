@@ -135,9 +135,7 @@ pub(super) fn handle_editor_action(app: &mut App, action: Action) {
         }
     }
 
-    if app.preview_mode == MarkdownPreviewMode::PreviewOnly
-        && is_current_buffer_markdown(app)
-    {
+    if app.preview_mode == MarkdownPreviewMode::PreviewOnly && is_current_buffer_markdown(app) {
         match action {
             Action::PageUp => {
                 scroll_preview_lines(app, -(app.preview_viewport_lines as i32));
@@ -640,8 +638,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
 
                     if app.side_panel == SidePanelMode::GitPanel {
                         let rel_y = row.saturating_sub(area.y);
-                        if let Some((region, idx)) =
-                            app.git_panel.hit_test_file(rel_y, area.height)
+                        if let Some((region, idx)) = app.git_panel.hit_test_file(rel_y, area.height)
                         {
                             app.git_panel.select_file(region, idx);
                             super::side_panel::open_selected_git_file(app);
@@ -914,12 +911,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 app.terminal_selection.dragging = false;
             }
             if app.chat_state.input_dragging {
-                if let Some(text) = app
-                    .chat_state
-                    .text_input
-                    .selected_text()
-                    .map(str::to_owned)
-                {
+                if let Some(text) = app.chat_state.text_input.selected_text().map(str::to_owned) {
                     if !text.is_empty() {
                         app.set_clipboard(&text);
                     }
@@ -1141,12 +1133,14 @@ fn scroll_side_panel(app: &mut App, up: bool, col: u16, row: u16) {
             if dash.detail_rect.contains(pos) {
                 if up {
                     dash.detail_auto_scroll = false;
-                    dash.detail_scroll = dash.detail_scroll.saturating_sub(theme::MOUSE_SCROLL_DELTA);
+                    dash.detail_scroll =
+                        dash.detail_scroll.saturating_sub(theme::MOUSE_SCROLL_DELTA);
                 } else if let Some(agent) = dash.agents.get(dash.scroll.selected) {
                     let w = dash.detail_rect.width.saturating_sub(1) as usize;
                     let total =
                         crate::panels::swarm_dashboard::count_display_lines(&agent.activity, w);
-                    dash.detail_scroll = (dash.detail_scroll + theme::MOUSE_SCROLL_DELTA).min(total.saturating_sub(1));
+                    dash.detail_scroll = (dash.detail_scroll + theme::MOUSE_SCROLL_DELTA)
+                        .min(total.saturating_sub(1));
                 }
             } else if up {
                 dash.scroll.scroll_up(1);
@@ -1163,29 +1157,28 @@ fn scroll_side_panel(app: &mut App, up: bool, col: u16, row: u16) {
                 .chat_state
                 .conv_area_cache
                 .is_some_and(|area| area.contains((col, row).into()));
-            let panel_w = app
-                .layout
-                .side_panel_area
-                .map(|a| a.width)
-                .unwrap_or(40);
+            let panel_w = app.layout.side_panel_area.map(|a| a.width).unwrap_or(40);
             if chat_wheel_prefers_input(
                 over_conv,
                 app.chat_state.input_overflows_viewport(panel_w),
                 app.chat_state.active_conv_streaming(),
             ) {
                 let delta = theme::MOUSE_SCROLL_DELTA as i32;
-                let moved = app.chat_state.scroll_input_by_visual_lines(
-                    if up { -delta } else { delta },
-                    panel_w,
-                );
+                let moved = app
+                    .chat_state
+                    .scroll_input_by_visual_lines(if up { -delta } else { delta }, panel_w);
                 if moved {
                     return;
                 }
             }
             app.chat_state.scroll_offset = if up {
-                app.chat_state.scroll_offset.saturating_sub(theme::MOUSE_SCROLL_DELTA)
+                app.chat_state
+                    .scroll_offset
+                    .saturating_sub(theme::MOUSE_SCROLL_DELTA)
             } else {
-                app.chat_state.scroll_offset.saturating_add(theme::MOUSE_SCROLL_DELTA)
+                app.chat_state
+                    .scroll_offset
+                    .saturating_add(theme::MOUSE_SCROLL_DELTA)
             };
             if app.chat_state.active_conv_streaming() {
                 app.chat_state.user_scrolled_during_stream = true;
@@ -1303,7 +1296,8 @@ fn handle_mouse_review(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     br.diff_scroll = br.diff_scroll.saturating_sub(theme::MOUSE_SCROLL_DELTA);
                 } else if let Some(area) = app.layout.file_tree_area {
                     if area.contains((col, row).into()) {
-                        br.scroll_offset = br.scroll_offset.saturating_sub(theme::MOUSE_SCROLL_DELTA);
+                        br.scroll_offset =
+                            br.scroll_offset.saturating_sub(theme::MOUSE_SCROLL_DELTA);
                     }
                 }
             } else if let Some(ref mut review) = app.diff_review {
@@ -1334,17 +1328,15 @@ fn handle_mouse_review(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 scroll_chat_output(app, theme::MOUSE_SCROLL_DELTA as i32);
             }
         }
-        MouseEventKind::Drag(MouseButton::Left) => {
-            match app.scrollbar_dragging {
-                Some(ScrollbarTarget::ReviewDiff) => {
-                    app.scroll_panel_to_row(ScrollbarTarget::ReviewDiff, row);
-                }
-                Some(ScrollbarTarget::Chat) => {
-                    app.scroll_panel_to_row(ScrollbarTarget::Chat, row);
-                }
-                _ => {}
+        MouseEventKind::Drag(MouseButton::Left) => match app.scrollbar_dragging {
+            Some(ScrollbarTarget::ReviewDiff) => {
+                app.scroll_panel_to_row(ScrollbarTarget::ReviewDiff, row);
             }
-        }
+            Some(ScrollbarTarget::Chat) => {
+                app.scroll_panel_to_row(ScrollbarTarget::Chat, row);
+            }
+            _ => {}
+        },
         MouseEventKind::Up(MouseButton::Left) => {
             app.scrollbar_dragging = None;
         }
@@ -1503,12 +1495,10 @@ pub(super) fn scroll_panel_to_row(app: &mut App, target: ScrollbarTarget, row: u
                 let row_in_track = row
                     .saturating_sub(area.y + 1)
                     .min(area.height.saturating_sub(2)) as usize;
-                let fraction =
-                    row_in_track as f64 / track_height.saturating_sub(1).max(1) as f64;
+                let fraction = row_in_track as f64 / track_height.saturating_sub(1).max(1) as f64;
                 br.diff_scroll = (fraction * max_scroll as f64)
                     .round()
-                    .min(max_scroll as f64)
-                    as usize;
+                    .min(max_scroll as f64) as usize;
             } else if let Some(ref mut review) = app.diff_review {
                 // The single-proposal overlay fills the whole pane (no header).
                 let track_height = area.height as usize;
@@ -1520,12 +1510,10 @@ pub(super) fn scroll_panel_to_row(app: &mut App, target: ScrollbarTarget, row: u
                 let row_in_track = row
                     .saturating_sub(area.y)
                     .min(area.height.saturating_sub(1)) as usize;
-                let fraction =
-                    row_in_track as f64 / track_height.saturating_sub(1).max(1) as f64;
+                let fraction = row_in_track as f64 / track_height.saturating_sub(1).max(1) as f64;
                 review.scroll_top = (fraction * max_scroll as f64)
                     .round()
-                    .min(max_scroll as f64)
-                    as usize;
+                    .min(max_scroll as f64) as usize;
             }
         }
     }
@@ -1605,10 +1593,7 @@ pub(super) fn should_drop_paste_straggler(app: &App, action: &Action) -> bool {
     if std::time::Instant::now() >= until {
         return false;
     }
-    matches!(
-        action,
-        Action::InsertChar(_) | Action::Enter | Action::Tab
-    )
+    matches!(action, Action::InsertChar(_) | Action::Enter | Action::Tab)
 }
 
 /// Whether a Windows `Event::Paste` payload may be replaced by the system
@@ -1803,10 +1788,9 @@ fn pending_pre_turn_content(
     if let Some(content) = pending.get(path) {
         return Some(content.clone());
     }
-    pending.iter().find_map(|(p, content)| {
-        Buffer::paths_refer_to_same_file(p, path)
-            .then(|| content.clone())
-    })
+    pending
+        .iter()
+        .find_map(|(p, content)| Buffer::paths_refer_to_same_file(p, path).then(|| content.clone()))
 }
 
 /// Resolve the "before" side of an external-change diff for a tool-agent edit.
@@ -1874,9 +1858,9 @@ pub(super) fn handle_file_changed(app: &mut App, path: &Path) {
     }
 
     let buf_idx = app.buffers.iter().position(|b| {
-        b.path.as_deref().is_some_and(|buf_path| {
-            Buffer::paths_refer_to_same_file(buf_path, path) && !b.modified
-        })
+        b.path
+            .as_deref()
+            .is_some_and(|buf_path| Buffer::paths_refer_to_same_file(buf_path, path) && !b.modified)
     });
     let Some(buf_idx) = buf_idx else {
         return;
@@ -1917,14 +1901,8 @@ pub(super) fn handle_file_changed(app: &mut App, path: &Path) {
     } else {
         "external"
     };
-    let proposal = WriteGatePipeline::build_proposal(
-        0,
-        source,
-        None,
-        &read_path,
-        &old_content,
-        &new_content,
-    );
+    let proposal =
+        WriteGatePipeline::build_proposal(0, source, None, &read_path, &old_content, &new_content);
 
     app.active_buffer = buf_idx;
     app.focus = Focus::Editor;
@@ -1937,12 +1915,7 @@ pub(super) fn handle_file_changed(app: &mut App, path: &Path) {
 /// a diff-view tab for the same path is already open, it is reused (and
 /// recomputed against the latest contents). A separate writable buffer for
 /// the same path can coexist as another tab.
-pub(super) fn open_diff_view(
-    app: &mut App,
-    path: &Path,
-    original: String,
-    current: String,
-) {
+pub(super) fn open_diff_view(app: &mut App, path: &Path, original: String, current: String) {
     // Reuse an existing diff-view tab for the same path if any.
     for (i, b) in app.buffers.iter().enumerate() {
         if b.diff_view.is_some() && b.path.as_deref() == Some(path) {
@@ -2122,10 +2095,7 @@ pub(super) fn save_current_buffer(app: &mut App) {
     if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
         if let Err(e) = buf.save() {
             tracing::error!("Save failed: {}", e);
-            app.status_message = Some((
-                format!("Save failed: {e}"),
-                std::time::Instant::now(),
-            ));
+            app.status_message = Some((format!("Save failed: {e}"), std::time::Instant::now()));
             return;
         }
         buf.refresh_conflict_metadata(buf.git_unmerged);
@@ -2196,7 +2166,10 @@ mod tests {
     fn clipboard_never_replaces_an_uncorroborated_paste_payload() {
         // The reconstructed payload is the head of the clipboard: one gesture,
         // possibly split into chunks — use the clean copy.
-        assert!(prefer_clipboard_paste("cargo te", "cargo test -p gaviero-tui"));
+        assert!(prefer_clipboard_paste(
+            "cargo te",
+            "cargo test -p gaviero-tui"
+        ));
         assert!(prefer_clipboard_paste("a\nb", "a\r\nb\r\n"));
         // Empty payload: terminal signalled a paste it could not represent.
         assert!(prefer_clipboard_paste("", "clipboard text"));

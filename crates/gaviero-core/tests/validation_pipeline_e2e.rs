@@ -25,10 +25,7 @@ async fn fast_only_passes_valid_rust_file() {
     .unwrap();
 
     let pipeline = ValidationPipeline::fast_only();
-    let files = vec![
-        PathBuf::from("src/ok.rs"),
-        PathBuf::from("src/module.rs"),
-    ];
+    let files = vec![PathBuf::from("src/ok.rs"), PathBuf::from("src/module.rs")];
     let result = pipeline.run(&files, workdir, /* fast_only */ true).await;
 
     assert!(
@@ -59,7 +56,10 @@ async fn fast_only_fails_broken_rust_file() {
     let (gate, outcome) = result.expect("broken Rust must produce a failure");
     assert_eq!(gate, "tree-sitter");
     match outcome {
-        ValidationResult::Fail { message, suggestion } => {
+        ValidationResult::Fail {
+            message,
+            suggestion,
+        } => {
             assert!(
                 message.contains("bad.rs"),
                 "failure message must reference the broken file, got: {message}"

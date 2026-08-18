@@ -154,7 +154,9 @@ impl<'a> EditorView<'a> {
         let style = match diff_kind {
             Some(DiffKind::Added) => ratatui::style::Style::default().fg(DIFF_ADD_GUTTER_FG),
             Some(DiffKind::Removed) => ratatui::style::Style::default().fg(DIFF_REM_GUTTER_FG),
-            Some(DiffKind::Context) | None if is_current => self.theme.ui_style("line_number.active"),
+            Some(DiffKind::Context) | None if is_current => {
+                self.theme.ui_style("line_number.active")
+            }
             _ => self.theme.ui_style("line_number"),
         };
 
@@ -336,12 +338,7 @@ impl<'a> EditorView<'a> {
         }
     }
 
-    fn render_cursor(
-        &self,
-        code_area: Rect,
-        layout: &super::wrap::WrapLayout,
-        buf: &mut RataBuf,
-    ) {
+    fn render_cursor(&self, code_area: Rect, layout: &super::wrap::WrapLayout, buf: &mut RataBuf) {
         let cursor_line = self.buffer.cursor.line;
         let cursor_col = self.buffer.cursor.col;
         let top = self.buffer.scroll.top_line;
@@ -383,9 +380,9 @@ impl<'a> EditorView<'a> {
     }
 
     fn compute_highlights(&self, viewport_height: usize, content_width: usize) -> Vec<StyledSpan> {
-        let Some((start_byte, end_byte)) =
-            self.buffer
-                .highlight_viewport_byte_range(viewport_height, content_width)
+        let Some((start_byte, end_byte)) = self
+            .buffer
+            .highlight_viewport_byte_range(viewport_height, content_width)
         else {
             return Vec::new();
         };

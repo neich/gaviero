@@ -155,7 +155,10 @@ fn extract_via_edges_query(ext: &str, source: &str) -> Option<Vec<RawReference>>
             }),
         };
         let Some(target) = target else { continue };
-        let target = target.trim().trim_matches(|c: char| c == '"' || c == '\'').to_string();
+        let target = target
+            .trim()
+            .trim_matches(|c: char| c == '"' || c == '\'')
+            .to_string();
         if target.is_empty() {
             continue;
         }
@@ -634,8 +637,8 @@ pub fn node_kind_from_ts(ts_kind: &str, file_path: &str) -> NodeKind {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::store::BlastRadiusMode;
+    use super::*;
 
     #[test]
     fn extract_use_statements() {
@@ -740,7 +743,8 @@ function run() {
             refs
         );
         assert!(
-            refs.iter().any(|r| r.kind == RefKind::Call && r.target_name == "compute"),
+            refs.iter()
+                .any(|r| r.kind == RefKind::Call && r.target_name == "compute"),
             "refs: {:?}",
             refs
         );
@@ -760,7 +764,8 @@ def run():
             refs
         );
         assert!(
-            refs.iter().any(|r| r.kind == RefKind::Call && r.target_name == "process"),
+            refs.iter()
+                .any(|r| r.kind == RefKind::Call && r.target_name == "process"),
             "refs: {:?}",
             refs
         );
@@ -916,9 +921,8 @@ fn main() {
             line: 7,
         }];
 
-        let count =
-            resolve_and_insert_edges(&store, "tests/lib_test.rs", "tests::lib_test", &refs)
-                .unwrap();
+        let count = resolve_and_insert_edges(&store, "tests/lib_test.rs", "tests::lib_test", &refs)
+            .unwrap();
 
         // One Calls edge (preserves intent) AND one TestOf edge (so
         // `mode=tests` finds the test from the symbol-under-test).

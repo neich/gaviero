@@ -7,8 +7,7 @@ use super::*;
 fn unique_root_labels(roots: &[(String, std::path::PathBuf)]) -> Vec<String> {
     let mut labels: Vec<String> = roots.iter().map(|(n, _)| n.clone()).collect();
     loop {
-        let mut counts: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
+        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for l in &labels {
             *counts.entry(l.as_str()).or_insert(0) += 1;
         }
@@ -26,7 +25,10 @@ fn unique_root_labels(roots: &[(String, std::path::PathBuf)]) -> Vec<String> {
                 continue;
             }
             let path = &roots[i].1;
-            let parent = path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str());
+            let parent = path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str());
             if let Some(p) = parent.filter(|p| !p.is_empty()) {
                 *label = format!("{}/{}", p, label);
                 changed = true;
@@ -43,10 +45,7 @@ fn unique_root_labels(roots: &[(String, std::path::PathBuf)]) -> Vec<String> {
 }
 
 fn chat_panel_content_width(app: &App) -> u16 {
-    app.layout
-        .side_panel_area
-        .map(|a| a.width)
-        .unwrap_or(40)
+    app.layout.side_panel_area.map(|a| a.width).unwrap_or(40)
 }
 
 /// Up in chat: move within wrapped/multiline input, else message history, else scroll output.
@@ -290,7 +289,13 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
                     app.handle_consolidate_command();
                 } else if app.chat_state.text_input.text.trim().starts_with("/sleep") {
                     app.handle_sleep_command();
-                } else if app.chat_state.text_input.text.trim().starts_with("/restore") {
+                } else if app
+                    .chat_state
+                    .text_input
+                    .text
+                    .trim()
+                    .starts_with("/restore")
+                {
                     app.handle_restore_command();
                 } else if app
                     .chat_state
@@ -373,9 +378,7 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
             let panel_w = chat_panel_content_width(app);
             if !app.chat_state.active_conv_streaming()
                 && app.chat_state.input_overflows_viewport(panel_w)
-                && app
-                    .chat_state
-                    .scroll_input_by_visual_lines(-10, panel_w)
+                && app.chat_state.scroll_input_by_visual_lines(-10, panel_w)
             {
                 // Prompt taller than the input box — page within it first.
             } else {
@@ -389,9 +392,7 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
             let panel_w = chat_panel_content_width(app);
             if !app.chat_state.active_conv_streaming()
                 && app.chat_state.input_overflows_viewport(panel_w)
-                && app
-                    .chat_state
-                    .scroll_input_by_visual_lines(10, panel_w)
+                && app.chat_state.scroll_input_by_visual_lines(10, panel_w)
             {
                 // Prompt taller than the input box — page within it first.
             } else {
@@ -1134,8 +1135,7 @@ pub(super) fn handle_memory_panel_action(app: &mut App, action: Action) {
             };
             if !row.restorable {
                 app.memory_panel.last_error = Some((
-                    "redactions are permanent — `u` cannot restore user_redaction rows"
-                        .to_string(),
+                    "redactions are permanent — `u` cannot restore user_redaction rows".to_string(),
                     std::time::Instant::now(),
                 ));
                 return;
@@ -1608,9 +1608,7 @@ pub(super) fn handle_skills_command(app: &mut App) {
                 let hits = if let Some(ref r) = reranker {
                     catalog.search(&q_owned, &embedder, r.as_ref()).await
                 } else {
-                    catalog
-                        .search(&q_owned, &embedder, &NullReranker)
-                        .await
+                    catalog.search(&q_owned, &embedder, &NullReranker).await
                 };
                 let body = if hits.is_empty() {
                     format!("No skills matched \"{q_owned}\".")
@@ -1626,8 +1624,7 @@ pub(super) fn handle_skills_command(app: &mut App) {
                     content: body,
                 });
             });
-            app.chat_state
-                .add_system_message("Searching skills…");
+            app.chat_state.add_system_message("Searching skills…");
         } else {
             app.chat_state.add_system_message(
                 "Semantic skill search requires memory (embedder) to be ready.",
@@ -1663,34 +1660,26 @@ pub(super) fn refresh_chat_autocomplete(app: &mut App) {
         return;
     }
 
-    if app.chat_state.autocomplete.mode
-        == crate::panels::agent_chat::AutocompleteMode::SkillRef
-    {
+    if app.chat_state.autocomplete.mode == crate::panels::agent_chat::AutocompleteMode::SkillRef {
         let active_repo_id = app
             .buffers
             .get(app.active_buffer)
             .and_then(|b| b.path.as_deref())
             .and_then(|p| app.workspace.folder_for_path(p))
             .map(|p| gaviero_core::memory::scope::hash_path(p));
-        app.chat_state.update_skill_autocomplete_matches(
-            &app.skill_catalog,
-            active_repo_id.as_deref(),
-        );
+        app.chat_state
+            .update_skill_autocomplete_matches(&app.skill_catalog, active_repo_id.as_deref());
         return;
     }
 
-    if app.chat_state.autocomplete.mode
-        == crate::panels::agent_chat::AutocompleteMode::ModelSpec
-    {
+    if app.chat_state.autocomplete.mode == crate::panels::agent_chat::AutocompleteMode::ModelSpec {
         let discovered = app.chat_state.model_options().to_vec();
         app.chat_state
             .update_model_autocomplete_matches(&discovered);
         return;
     }
 
-    if app.chat_state.autocomplete.mode
-        == crate::panels::agent_chat::AutocompleteMode::DetachName
-    {
+    if app.chat_state.autocomplete.mode == crate::panels::agent_chat::AutocompleteMode::DetachName {
         app.chat_state.update_detach_autocomplete_matches();
         return;
     }
@@ -1699,16 +1688,13 @@ pub(super) fn refresh_chat_autocomplete(app: &mut App) {
     // so the user can attach screenshots / tempfiles outside the workspace
     // without typing the full path. Plain (relative) partials fall through
     // to the shared workspace-file path used by `@` and `/run`.
-    if app.chat_state.autocomplete.mode == crate::panels::agent_chat::AutocompleteMode::AttachPath
-    {
+    if app.chat_state.autocomplete.mode == crate::panels::agent_chat::AutocompleteMode::AttachPath {
         let query = app.chat_state.autocomplete.query.clone();
         let trimmed = query.trim_start();
         if trimmed.starts_with('/') || trimmed.starts_with("~/") || trimmed == "~" {
             let matches = list_filesystem_matches(trimmed);
             app.chat_state.autocomplete.matches = matches;
-            if app.chat_state.autocomplete.selected
-                >= app.chat_state.autocomplete.matches.len()
-            {
+            if app.chat_state.autocomplete.selected >= app.chat_state.autocomplete.matches.len() {
                 app.chat_state.autocomplete.selected = 0;
             }
             return;
@@ -1865,12 +1851,13 @@ pub(crate) fn dispatch_prompt_core(
     }
     // Remote dispatch cannot grant codex MCP trust — that consent dialog is
     // desktop-only. The desktop wrapper intercepts before reaching here.
-    if app.chat_state.effective_model_at(conv_idx).starts_with("codex:")
+    if app
+        .chat_state
+        .effective_model_at(conv_idx)
+        .starts_with("codex:")
         && super::commands::should_prompt_codex_trust(app)
     {
-        return Err(
-            "Codex requires a one-time trust consent on the desktop first".to_string(),
-        );
+        return Err("Codex requires a one-time trust consent on the desktop first".to_string());
     }
     let root = app
         .workspace
@@ -1930,14 +1917,11 @@ pub(crate) fn dispatch_prompt_core(
     // Module context is meaningful only inside a focused workspace folder.
     // In particular, `/workspace` clears `focused_folder`, so a workspace-wide
     // turn cannot accidentally inherit the active buffer's module.
-    let pending_module_path = focused_folder
-        .as_deref()
-        .and_then(|folder| {
-            active_buffer_path
-                .as_deref()
-                .and_then(|path| gaviero_core::memory::module_path_for_file(folder, path))
-        })
-        ;
+    let pending_module_path = focused_folder.as_deref().and_then(|folder| {
+        active_buffer_path
+            .as_deref()
+            .and_then(|path| gaviero_core::memory::module_path_for_file(folder, path))
+    });
 
     app.chat_state.add_user_message_at(conv_idx, &prompt);
     {
@@ -1977,10 +1961,8 @@ pub(crate) fn dispatch_prompt_core(
             active_repo_id.as_deref(),
         );
     for w in skill_warnings {
-        app.chat_state.add_system_message(&format!(
-            "Skill warning ({}): {}",
-            w.name, w.message
-        ));
+        app.chat_state
+            .add_system_message(&format!("Skill warning ({}): {}", w.name, w.message));
     }
     let refs = crate::panels::agent_chat::parse_file_references(&task_text);
     let mut file_refs: Vec<(String, String)> = Vec::new();
@@ -2148,8 +2130,7 @@ pub(crate) fn dispatch_prompt_core(
     let effort = app.chat_state.effective_effort_at(conv_idx).to_string();
     let max_tokens = app.chat_state.agent_settings.max_tokens;
     // Per-conversation persistent flag OR the desktop's consumed one-shot.
-    let auto_approve =
-        app.chat_state.conversations[conv_idx].auto_approve || one_shot_auto_approve;
+    let auto_approve = app.chat_state.conversations[conv_idx].auto_approve || one_shot_auto_approve;
 
     let (agent_available_tools, agent_approved_tools) =
         app.workspace.resolve_agent_tools(Some(&root));
@@ -2230,7 +2211,11 @@ pub(crate) fn dispatch_prompt_core(
     let ollama_base_url = app.chat_state.agent_settings.ollama_base_url.clone();
     let graph_budget_tokens = app.chat_state.agent_settings.graph_budget_tokens;
     let anchor_budget_tokens = app.chat_state.agent_settings.anchor_budget_tokens;
-    let bootstrap_tier_override = app.chat_state.agent_settings.bootstrap_tier_override.clone();
+    let bootstrap_tier_override = app
+        .chat_state
+        .agent_settings
+        .bootstrap_tier_override
+        .clone();
     let repo_map_cache = app.repo_map.clone();
     // In workspace mode (multi-folder), every sibling folder is forwarded to
     // the agent CLI as a `--add-dir`. The primary cwd is `root`; siblings are
@@ -2324,8 +2309,8 @@ pub(crate) fn dispatch_prompt_core(
     let topology_cache = app.topology_cache.clone();
     let planner_task_text = task_text.clone();
     let planner_resolved_skills = resolved_skills_buf.clone();
-    let bootstrap_mode = context_mode_override
-        .unwrap_or(app.chat_state.agent_settings.bootstrap_mode);
+    let bootstrap_mode =
+        context_mode_override.unwrap_or(app.chat_state.agent_settings.bootstrap_mode);
     let bootstrap_one_shot = if lite_turn {
         Some(gaviero_core::context_planner::BootstrapOneShot::Lite)
     } else if no_inject_turn {
@@ -2342,8 +2327,7 @@ pub(crate) fn dispatch_prompt_core(
     let bootstrap_outline = bootstrap_arms.outline;
     let bootstrap_memory = bootstrap_arms.memory;
     let bootstrap_impact = bootstrap_arms.impact;
-    let bootstrap_topology =
-        bootstrap_arms.topology && topology_config.enabled;
+    let bootstrap_topology = bootstrap_arms.topology && topology_config.enabled;
     let task = tokio::spawn(async move {
         {
             let mut gate = wg.lock().await;
@@ -2407,10 +2391,7 @@ pub(crate) fn dispatch_prompt_core(
                     if let Some(rm) = crate::app::session::get_or_build_repo_map_cached(
                         repo_map_cache.clone(),
                         folder.clone(),
-                        extra_workspace_excludes
-                            .get(i)
-                            .cloned()
-                            .unwrap_or_default(),
+                        extra_workspace_excludes.get(i).cloned().unwrap_or_default(),
                     )
                     .await
                     {
@@ -2433,10 +2414,7 @@ pub(crate) fn dispatch_prompt_core(
                 if let Some(body) = crate::app::session::get_or_build_topology_cached(
                     topology_cache.clone(),
                     folder.clone(),
-                    extra_workspace_excludes
-                        .get(i)
-                        .cloned()
-                        .unwrap_or_default(),
+                    extra_workspace_excludes.get(i).cloned().unwrap_or_default(),
                     topology_config.clone(),
                 )
                 .await
@@ -2481,8 +2459,11 @@ pub(crate) fn dispatch_prompt_core(
         } else {
             Vec::new()
         };
-        let read_ns_for_planner: &[String] =
-            if bootstrap_outline || bootstrap_memory { &read_ns } else { &[] };
+        let read_ns_for_planner: &[String] = if bootstrap_outline || bootstrap_memory {
+            &read_ns
+        } else {
+            &[]
+        };
         // PUSH→PULL Phase 1: pick the outline budget by provider tier.
         //   - no outline arm           → 0 (nothing injected)
         //   - explicit /inject all|outline → full push (any tier)
@@ -2501,12 +2482,12 @@ pub(crate) fn dispatch_prompt_core(
         let mut local_ledger = ledger_snapshot;
         // Borrow slices for the planner. Owned storage above lives for
         // the duration of the spawned task so these references are safe.
-        let extra_folder_path_refs: Vec<&std::path::Path> =
-            extra_workspace_folders.iter().map(|p| p.as_path()).collect();
-        let extra_repo_map_refs: Vec<&gaviero_core::repo_map::RepoMap> = extra_repo_map_arcs
+        let extra_folder_path_refs: Vec<&std::path::Path> = extra_workspace_folders
             .iter()
-            .map(|a| a.as_ref())
+            .map(|p| p.as_path())
             .collect();
+        let extra_repo_map_refs: Vec<&gaviero_core::repo_map::RepoMap> =
+            extra_repo_map_arcs.iter().map(|a| a.as_ref()).collect();
         let planner_input = gaviero_core::context_planner::PlannerInput {
             user_message: &planner_task_text,
             explicit_refs: &[],
@@ -2562,43 +2543,42 @@ pub(crate) fn dispatch_prompt_core(
         // contributes only TUI-specific bits: emitting the
         // `ChatMemoryInjected` event for the panel and supplying
         // workspace-resolved configs.
-        let (chat_injection, memory_tok) =
-            if bootstrap_memory && memory.is_some() {
-                let mem = memory.as_ref().expect("checked above");
-                let reranker_ref: Option<&dyn gaviero_core::memory::Reranker> =
-                    memory_reranker.as_deref();
-                let outcome = gaviero_core::context_planner::perform_injection_with_module(
-                    gaviero_core::context_planner::ChatMemoryRequest {
-                        stores: mem,
-                        writer: memory_writer.as_ref(),
-                        workspace_root: &root,
-                        folder_root: focused_folder.as_deref(),
-                        user_prompt: &prompt,
-                        turn_id: &turn_id_clone,
-                        session_id: &conv_id_clone,
-                        injection_config: &chat_injection_config,
-                        retrieval_config: &retrieval_cfg,
-                        reranker: reranker_ref,
-                        rerank_config: memory_rerank_cfg.as_ref(),
-                        manifests_enabled,
-                        capture_candidate_pool,
-                        embedder_name: &embedder_name,
-                        reranker_name: reranker_name.as_deref(),
-                    },
-                    pending_module_path.as_deref(),
-                )
-                .await;
-                let _ = tx.send(Event::ChatMemoryInjected {
-                    conv_id: conv_id_clone.clone(),
-                    items_injected: outcome.summary.items_injected,
-                    pool_size: outcome.summary.pool_size,
-                    tokens_used: outcome.summary.tokens_used,
-                    token_budget: outcome.summary.token_budget,
-                });
-                (outcome.injection, outcome.summary.tokens_used)
-            } else {
-                (None, 0)
-            };
+        let (chat_injection, memory_tok) = if bootstrap_memory && memory.is_some() {
+            let mem = memory.as_ref().expect("checked above");
+            let reranker_ref: Option<&dyn gaviero_core::memory::Reranker> =
+                memory_reranker.as_deref();
+            let outcome = gaviero_core::context_planner::perform_injection_with_module(
+                gaviero_core::context_planner::ChatMemoryRequest {
+                    stores: mem,
+                    writer: memory_writer.as_ref(),
+                    workspace_root: &root,
+                    folder_root: focused_folder.as_deref(),
+                    user_prompt: &prompt,
+                    turn_id: &turn_id_clone,
+                    session_id: &conv_id_clone,
+                    injection_config: &chat_injection_config,
+                    retrieval_config: &retrieval_cfg,
+                    reranker: reranker_ref,
+                    rerank_config: memory_rerank_cfg.as_ref(),
+                    manifests_enabled,
+                    capture_candidate_pool,
+                    embedder_name: &embedder_name,
+                    reranker_name: reranker_name.as_deref(),
+                },
+                pending_module_path.as_deref(),
+            )
+            .await;
+            let _ = tx.send(Event::ChatMemoryInjected {
+                conv_id: conv_id_clone.clone(),
+                items_injected: outcome.summary.items_injected,
+                pool_size: outcome.summary.pool_size,
+                tokens_used: outcome.summary.tokens_used,
+                token_budget: outcome.summary.token_budget,
+            });
+            (outcome.injection, outcome.summary.tokens_used)
+        } else {
+            (None, 0)
+        };
 
         // V9 §11 M5: lift `PlannerSelections` into a transport `Turn` and
         // dispatch through `AgentSession`. The registry hands back a
@@ -2742,8 +2722,7 @@ pub(crate) fn dispatch_prompt_core(
 
         let proposals = {
             let mut gate = wg.lock().await;
-            let proposals =
-                gate.take_pending_proposals_for_conv(Some(&conv_id_clone));
+            let proposals = gate.take_pending_proposals_for_conv(Some(&conv_id_clone));
             tracing::info!(
                 "Draining deferred proposals for conv {}: count={}",
                 conv_id_clone,
@@ -2756,10 +2735,7 @@ pub(crate) fn dispatch_prompt_core(
         };
         let proposal_count = proposals.len();
         if !proposals.is_empty() {
-            tracing::info!(
-                "Sending AcpTaskCompleted with {} proposals",
-                proposal_count
-            );
+            tracing::info!("Sending AcpTaskCompleted with {} proposals", proposal_count);
             let _ = tx.send(Event::AcpTaskCompleted {
                 conv_id: conv_id_clone.clone(),
                 proposals,
@@ -2888,8 +2864,11 @@ pub(crate) fn cancel_agent_conv(app: &mut App, conv_id: &str) {
             tracing::warn!("cancel_agent: token already fired — escalating to abort");
             if let Some(handle) = app.acp_tasks.remove(conv_id) {
                 handle.join.abort();
-                app.chat_state
-                    .finalize_message_to(conv_id, "system", "Cancelled by user (forced).");
+                app.chat_state.finalize_message_to(
+                    conv_id,
+                    "system",
+                    "Cancelled by user (forced).",
+                );
             }
         }
     }

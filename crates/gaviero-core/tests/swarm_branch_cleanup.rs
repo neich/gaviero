@@ -97,8 +97,7 @@ fn force_run_deletes_only_gaviero_prefixed_branches() {
     let tmp = make_repo_with_branches(&["gaviero/foo", "gaviero/bar", "feature/x"]);
     let repo = tmp.path();
 
-    let report =
-        cleanup_gaviero_branches(repo, /* dry_run */ false).expect("cleanup force");
+    let report = cleanup_gaviero_branches(repo, /* dry_run */ false).expect("cleanup force");
 
     let mut matched = report.matched.clone();
     matched.sort();
@@ -114,8 +113,14 @@ fn force_run_deletes_only_gaviero_prefixed_branches() {
         "no `gaviero/*` branch should remain, got {after:?}"
     );
     // Untouched branches survive.
-    assert!(after.iter().any(|b| b == "feature/x"), "feature branch must survive");
-    assert!(after.iter().any(|b| b == "initial"), "initial branch must survive");
+    assert!(
+        after.iter().any(|b| b == "feature/x"),
+        "feature branch must survive"
+    );
+    assert!(
+        after.iter().any(|b| b == "initial"),
+        "initial branch must survive"
+    );
 }
 
 #[test]
@@ -126,8 +131,7 @@ fn force_run_skips_currently_checked_out_branch() {
     // Check out the branch we expect to be protected.
     git(repo, &["checkout", "-q", "gaviero/keep-me"]);
 
-    let report =
-        cleanup_gaviero_branches(repo, /* dry_run */ false).expect("cleanup force");
+    let report = cleanup_gaviero_branches(repo, /* dry_run */ false).expect("cleanup force");
 
     assert_eq!(report.skipped_current, vec!["gaviero/keep-me"]);
     assert_eq!(report.deleted, vec!["gaviero/delete-me"]);

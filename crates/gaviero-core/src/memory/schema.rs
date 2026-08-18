@@ -1562,7 +1562,10 @@ mod tests {
         migrate_v8(&conn).unwrap();
         migrate_v9(&conn).unwrap();
         conn.pragma_update(None, "user_version", 9_u32).unwrap();
-        assert!(needs_c1_backup(&conn), "v9 → v10 upgrade should request a backup");
+        assert!(
+            needs_c1_backup(&conn),
+            "v9 → v10 upgrade should request a backup"
+        );
 
         // After v10 lands, no backup is requested again.
         run_migrations(&conn, 8).unwrap();
@@ -1710,11 +1713,11 @@ mod tests {
         let conn = setup_conn();
         run_migrations(&conn, 8).unwrap();
         let _ = seed_history_row(&conn);
-        let r = conn.execute(
-            "DELETE FROM memories WHERE run_id = 'run-1'",
-            [],
+        let r = conn.execute("DELETE FROM memories WHERE run_id = 'run-1'", []);
+        assert!(
+            r.is_err(),
+            "DeleteRun-style sweep must skip / abort on history"
         );
-        assert!(r.is_err(), "DeleteRun-style sweep must skip / abort on history");
     }
 
     #[test]

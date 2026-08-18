@@ -120,12 +120,7 @@ async fn scheduler_loop(
         }
 
         let last_sleeptime_at = read_last_sleeptime_at(&stores).await;
-        let decision = decide_trigger(
-            &cfg,
-            last_sleeptime_at,
-            last_busy_at,
-            Utc::now(),
-        );
+        let decision = decide_trigger(&cfg, last_sleeptime_at, last_busy_at, Utc::now());
         match decision {
             Decision::Skip { reason } => {
                 tracing::trace!(target: "memory_sleeptime_scheduler", reason, "skip tick");
@@ -136,9 +131,7 @@ async fn scheduler_loop(
                     trigger = kind.as_str(),
                     "enqueueing Sleeptime"
                 );
-                if let Err(e) = writer.enqueue(WriterMessage::Sleeptime {
-                    payload: json!({}),
-                }) {
+                if let Err(e) = writer.enqueue(WriterMessage::Sleeptime { payload: json!({}) }) {
                     tracing::warn!(
                         target: "memory_sleeptime_scheduler",
                         error = %e,

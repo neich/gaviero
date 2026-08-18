@@ -411,7 +411,8 @@ mod tests {
             WriteMode::RejectAll,
             Box::new(NoopWriteGateObserver),
         )));
-        let _ = complete_to_write_gate(&backend, request, &NoopObserver, gate, "agent-x", None).await;
+        let _ =
+            complete_to_write_gate(&backend, request, &NoopObserver, gate, "agent-x", None).await;
     }
 
     #[tokio::test]
@@ -460,9 +461,10 @@ mod tests {
             WriteMode::RejectAll,
             Box::new(NoopWriteGateObserver),
         )));
-        let outcome = complete_to_write_gate(&backend, request, &NoopObserver, gate, "agent-x", None)
-            .await
-            .unwrap();
+        let outcome =
+            complete_to_write_gate(&backend, request, &NoopObserver, gate, "agent-x", None)
+                .await
+                .unwrap();
         assert_eq!(outcome.modified_files.len(), 1);
     }
 

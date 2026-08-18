@@ -10,7 +10,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
-use gaviero_core::workspace::{identity, settings, Workspace};
+use gaviero_core::workspace::{Workspace, identity, settings};
 use gaviero_remote::pairing;
 use gaviero_remote::server::{HubOutput, RemoteServerConfig};
 
@@ -47,8 +47,12 @@ pub enum RemoteUnavailable {
     PortZero,
     MissingMagicDnsHost,
     CertLoad(String),
-    CertHostMismatch { host: String },
-    CertExpired { not_after: String },
+    CertHostMismatch {
+        host: String,
+    },
+    CertExpired {
+        not_after: String,
+    },
     NoTailnetAddress,
     Bind(String),
     /// Token read/create failure; the startup path reports it through its
@@ -236,12 +240,10 @@ pub fn check_availability(config: &RemoteConfig) -> Result<Availability, RemoteU
     if config.magic_dns_host.trim().is_empty() {
         return Err(RemoteUnavailable::MissingMagicDnsHost);
     }
-    let cert_pem = std::fs::read(&config.cert_path).map_err(|e| {
-        RemoteUnavailable::CertLoad(format!("{}: {e}", config.cert_path.display()))
-    })?;
-    let key_pem = std::fs::read(&config.key_path).map_err(|e| {
-        RemoteUnavailable::CertLoad(format!("{}: {e}", config.key_path.display()))
-    })?;
+    let cert_pem = std::fs::read(&config.cert_path)
+        .map_err(|e| RemoteUnavailable::CertLoad(format!("{}: {e}", config.cert_path.display())))?;
+    let key_pem = std::fs::read(&config.key_path)
+        .map_err(|e| RemoteUnavailable::CertLoad(format!("{}: {e}", config.key_path.display())))?;
     let cert = pairing::inspect_cert(&cert_pem, &config.magic_dns_host)
         .map_err(RemoteUnavailable::CertLoad)?;
     if !cert.covers_host {
@@ -430,8 +432,7 @@ pub fn handle_remote_command(app: &mut App, line: &str) {
             let conv = &mut app.chat_state.conversations[idx];
             for msg in &mut conv.messages {
                 if msg.content.contains("gaviero-remote pairing") {
-                    msg.content =
-                        "[pairing QR hidden — run /remote to show it again]".to_string();
+                    msg.content = "[pairing QR hidden — run /remote to show it again]".to_string();
                 }
             }
             app.chat_state
@@ -646,7 +647,11 @@ mod tests {
         ];
         let addrs = bind_addrs(&config, &tailnet);
         assert!(addrs.iter().any(|a| a.ip().is_loopback()));
-        assert!(addrs.iter().any(|a| a.ip().to_string() == "100.101.102.103"));
+        assert!(
+            addrs
+                .iter()
+                .any(|a| a.ip().to_string() == "100.101.102.103")
+        );
         assert!(
             !addrs.iter().any(|a| a.ip().to_string() == "192.168.1.5"),
             "LAN address must be refused without allowPublicBind"
@@ -737,7 +742,11 @@ mod tests {
                 let expected = code[(x, y)] == qrcode::Color::Dark;
                 let row = rows[(y + quiet) / 2].clone();
                 let (top, bottom) = unpack(row[x + quiet]);
-                let actual = if (y + quiet).is_multiple_of(2) { top } else { bottom };
+                let actual = if (y + quiet).is_multiple_of(2) {
+                    top
+                } else {
+                    bottom
+                };
                 assert_eq!(
                     actual, expected,
                     "module ({x},{y}) mismatched — the rendered code would not scan"
@@ -766,8 +775,11 @@ mod tests {
         }));
         let config = resolve_config(&ws).unwrap();
         let token = load_or_create_token(&config).unwrap();
-        let payload =
-            pairing::qr_payload_json(&pairing_url(&config), &token, &config.workspace_display_name);
+        let payload = pairing::qr_payload_json(
+            &pairing_url(&config),
+            &token,
+            &config.workspace_display_name,
+        );
         let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(v["kind"], "gaviero-remote");
         assert_eq!(v["protocol_major"], 1);
@@ -819,7 +831,10 @@ mod live_diagnostic {
             Ok(config) => {
                 println!("enabled:   {}", config.enabled);
                 println!("port:      {} (derived)", config.port);
-                println!("workspace: {} ({})", config.workspace_display_name, config.workspace_id);
+                println!(
+                    "workspace: {} ({})",
+                    config.workspace_display_name, config.workspace_id
+                );
                 println!("cert path: {}", config.cert_path.display());
                 match check_availability(&config) {
                     Ok(a) => println!(

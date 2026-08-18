@@ -97,10 +97,7 @@ impl MemoryStore {
     /// [`SleeptimeOperation::DecayFlagged`] for rows at the floor.
     /// **Never deletes.** `dry_run` only affects the audit-log marker
     /// — flagging is itself non-destructive.
-    pub async fn sleeptime_decay_sweep(
-        &self,
-        _dry_run: bool,
-    ) -> Result<Vec<SleeptimeOperation>> {
+    pub async fn sleeptime_decay_sweep(&self, _dry_run: bool) -> Result<Vec<SleeptimeOperation>> {
         use crate::memory::scoring::recency_factor;
         let cfg = self.scoring_cfg();
         let conn = self.conn.lock().await;
@@ -298,10 +295,7 @@ impl MemoryStore {
     /// applied. Currently a no-op skeleton — wiring to the existing
     /// promotion path is a follow-up; the sleeptime caller still gets
     /// a structured empty result.
-    pub async fn sleeptime_promote(
-        &self,
-        _dry_run: bool,
-    ) -> Result<Vec<SleeptimeOperation>> {
+    pub async fn sleeptime_promote(&self, _dry_run: bool) -> Result<Vec<SleeptimeOperation>> {
         Ok(Vec::new())
     }
 
