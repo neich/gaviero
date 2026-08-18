@@ -1540,6 +1540,7 @@ async fn run_remember_cli(repo: &std::path::Path, text: &str, scope: &str) -> Re
             gaviero_core::memory::WriteResult::AlreadyCovered =>
                 "already covered by broader scope".to_string(),
             gaviero_core::memory::WriteResult::Skipped => "skipped".to_string(),
+            gaviero_core::memory::WriteResult::Queued => "queued".to_string(),
         },
         scope,
         trimmed.len(),

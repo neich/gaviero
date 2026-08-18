@@ -55,6 +55,17 @@ pub enum WriteResult {
     /// Message was accepted but no store write was performed (placeholder /
     /// not-yet-implemented variants — Phase 3/4 will fill these in).
     Skipped,
+    /// Accepted and handed to a background task; the resulting writes
+    /// arrive later as their own message. Only
+    /// [`WriterMessage::SessionConsolidate`] returns this: its LLM call
+    /// runs off the writer task, so "the request was taken" is the most
+    /// the caller can be told synchronously.
+    ///
+    /// Distinct from [`Self::Skipped`] on purpose — "nothing will
+    /// happen" and "something is happening elsewhere" are different
+    /// answers, and conflating them is what made the old ack timeout
+    /// unreadable.
+    Queued,
 }
 
 impl From<StoreResult> for WriteResult {
@@ -166,17 +177,42 @@ pub enum WriterMessage {
     /// send; defaults are resolved from settings inside the writer
     /// task when `payload` is empty.
     Sleeptime { payload: JsonValue },
-    /// Tier B / B5: end-of-session consolidator. The writer task
-    /// gathers transcript + recent extractions, calls
-    /// [`ConsolidationLlm`], parses the response into
-    /// [`ConsolidationOp`]s, and applies them. `ack` lets the TUI's
-    /// `/consolidate-session` command surface success/failure inline.
+    /// Tier B / B5: end-of-session consolidator, phase 1 of 2.
+    ///
+    /// The writer gathers transcript + recent extractions and builds the
+    /// prompt — all cheap reads — then hands the [`ConsolidationLlm`]
+    /// call to a background task and acks [`WriteResult::Queued`]
+    /// immediately. The model's operations come back as
+    /// [`Self::SessionConsolidateApply`].
+    ///
+    /// The LLM call used to run inline here. It is a full model
+    /// round-trip on a whole-session prompt — one measured run took
+    /// **3m41s** — and the writer is deliberately single-consumer, so
+    /// every other memory write in the process queued behind it for that
+    /// whole time while the caller's 30s ack budget expired and reported
+    /// a failure for work that in fact succeeded.
     SessionConsolidate {
         session_id: String,
         repo_id: String,
         module_path: Option<String>,
         run_id: String,
         transcript: String,
+        ack: Option<oneshot::Sender<Result<WriteResult, String>>>,
+    },
+    /// Tier B / B5: end-of-session consolidator, phase 2 of 2 — apply
+    /// the operations the model produced.
+    ///
+    /// Normally enqueued by the background task that
+    /// [`Self::SessionConsolidate`] spawned, so `ack` is `None`; it is
+    /// `Some` when a test drives the apply path directly. Every write
+    /// still happens here, on the writer task — the split moves the
+    /// *thinking* off it, not the writing.
+    SessionConsolidateApply {
+        repo_id: String,
+        module_path: Option<String>,
+        run_id: String,
+        candidates: Vec<super::session_consolidator::CandidateBrief>,
+        parsed: Box<super::session_consolidator::ConsolidatorResponse>,
         ack: Option<oneshot::Sender<Result<WriteResult, String>>>,
     },
     /// Tier B / B6: post-turn retrieval-use telemetry. Reads the S4
@@ -295,6 +331,7 @@ impl WriterMessage {
             WriterMessage::InjectionManifest { .. } => "InjectionManifest",
             WriterMessage::Sleeptime { .. } => "Sleeptime",
             WriterMessage::SessionConsolidate { .. } => "SessionConsolidate",
+            WriterMessage::SessionConsolidateApply { .. } => "SessionConsolidateApply",
             WriterMessage::TelemetryClassify { .. } => "TelemetryClassify",
             WriterMessage::Restore { .. } => "Restore",
             WriterMessage::RestoreSince { .. } => "RestoreSince",
@@ -334,6 +371,41 @@ struct WriterHandleInner {
     enqueued: AtomicU64,
     drained: AtomicU64,
 }
+
+/// Weak re-entry point into the writer's own queue.
+///
+/// The writer task holds only a `Weak` to the handle state on purpose
+/// (see [`spawn_writer_task`]): a strong sender living inside the task
+/// would keep the channel — and the SQLite handles behind it — alive
+/// forever. Work the task spawns and that needs to enqueue a follow-up
+/// message goes through this, and degrades to a plain error once the
+/// last external handle has dropped.
+#[derive(Clone)]
+struct Reenqueue(Weak<WriterHandleInner>);
+
+impl Reenqueue {
+    /// Enqueue through a temporarily-reconstructed handle, so observer
+    /// notifications and queue-depth accounting stay identical to an
+    /// external caller's.
+    fn send(&self, msg: WriterMessage) -> Result<()> {
+        let inner = self
+            .0
+            .upgrade()
+            .ok_or_else(|| anyhow!("writer task is shutting down"))?;
+        WriterHandle { inner }.enqueue(msg)
+    }
+}
+
+/// Run ids with a consolidation LLM call in flight.
+///
+/// Before the LLM moved off the writer task, two `/consolidate-session`
+/// invocations on one conversation serialized behind the single
+/// consumer. They now overlap, and because a consolidation run is keyed
+/// by `run_id` — the conversation id — two concurrent runs write
+/// interleaved audit rows that `recent_consolidation_runs` cannot tell
+/// apart and `consolidation_rollback` cannot undo separately. A second
+/// request for a run already in flight is refused instead.
+type InFlightRuns = Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
 
 impl WriterHandle {
     /// Enqueue a raw message. Fires `on_write_enqueued` synchronously.
@@ -776,6 +848,8 @@ async fn writer_task(
         observer,
         manifest_observer,
     } = cfg;
+    let reenqueue = Reenqueue(state.clone());
+    let in_flight: InFlightRuns = Default::default();
 
     while let Some(msg) = rx.recv().await {
         // Drain barrier: ack and move on. Reaching it in FIFO order means
@@ -813,7 +887,7 @@ async fn writer_task(
             _ => None,
         };
 
-        let outcome = process_message(&stores, llm.as_ref(), msg).await;
+        let outcome = process_message(&stores, llm.as_ref(), &reenqueue, &in_flight, msg).await;
         match outcome {
             Ok(result) => {
                 if let Some(obs) = &observer {
@@ -845,6 +919,8 @@ async fn writer_task(
 async fn process_message(
     stores: &Arc<MemoryStores>,
     llm: Option<&Arc<dyn ConsolidationLlm>>,
+    reenqueue: &Reenqueue,
+    in_flight: &InFlightRuns,
     msg: WriterMessage,
 ) -> Result<WriteResult> {
     match msg {
@@ -1073,9 +1149,11 @@ async fn process_message(
             // promotion path; for now both stay in the workspace store
             // (legacy single-DB behaviour).
             let store = stores.workspace().clone();
-            let res = process_session_consolidate(
+            let res = start_session_consolidate(
                 &store,
                 llm,
+                reenqueue,
+                in_flight,
                 session_id,
                 repo_id,
                 module_path,
@@ -1083,6 +1161,33 @@ async fn process_message(
                 transcript,
             )
             .await;
+            send_ack(ack, &res);
+            res
+        }
+        WriterMessage::SessionConsolidateApply {
+            repo_id,
+            module_path,
+            run_id,
+            candidates,
+            parsed,
+            ack,
+        } => {
+            let store = stores.workspace().clone();
+            // Release the in-flight slot whatever happens, so a failed
+            // run never wedges the conversation out of consolidating
+            // again.
+            let res = apply_session_consolidate(
+                &store,
+                repo_id,
+                module_path,
+                &run_id,
+                &candidates,
+                *parsed,
+            )
+            .await;
+            if let Ok(mut guard) = in_flight.lock() {
+                guard.remove(&run_id);
+            }
             send_ack(ack, &res);
             res
         }
@@ -1206,18 +1311,143 @@ fn parse_sleeptime_payload(payload: &JsonValue) -> super::sleeptime::SleeptimeCo
     cfg
 }
 
-async fn process_session_consolidate(
+/// Everything a consolidation run needs before it can ask the model.
+struct ConsolidationPrep {
+    /// The CANDIDATES list, in prompt order. The apply phase resolves
+    /// `candidate_index` against exactly this slice, so it must travel
+    /// with the response.
+    candidates: Vec<super::session_consolidator::CandidateBrief>,
+    prompt: String,
+}
+
+/// Read the inputs for one consolidation run and render the prompt.
+///
+/// Split out of [`start_session_consolidate`] so the tests can drive a
+/// whole run inline (prepare → model → apply) while production keeps the
+/// model call off the writer task. Both paths therefore exercise the
+/// same candidate selection and the same prompt.
+///
+/// `None` means "nothing to consolidate" — the session produced no
+/// run-scoped rows at all.
+async fn prepare_session_consolidate(
+    store: &Arc<MemoryStore>,
+    repo_id: &str,
+    module_path: &Option<String>,
+    run_id: &str,
+    transcript: &str,
+) -> Option<ConsolidationPrep> {
+    use super::session_consolidator::{
+        CandidateBrief, ExistingBrief, MAX_EXISTING_MEMORIES, build_prompt,
+    };
+
+    let recent = match store.recent_memories_for_run(run_id, 24, 50).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(target: "memory_consolidator", error = %e, "skipping consolidate");
+            return None;
+        }
+    };
+    if recent.is_empty() {
+        return None;
+    }
+
+    // A-fix: History rows are not consolidation candidates.
+    //
+    // `recent_memories_for_run` returns every run-scoped row, which
+    // includes the verbatim `RawTranscript` turn records. Shown as
+    // undifferentiated CANDIDATES, the model dutifully kept them: the
+    // first live run ADDed five raw `USER:` / `ASSISTANT:` blobs (2.7–5.4
+    // KB each) into the durable repo record at importance 1.0. That is
+    // History being copied into Records — the transcript is already in
+    // the prompt's own TRANSCRIPT section, and the session summary is
+    // the intended distillation of it.
+    //
+    // An all-transcript session still runs: it yields an empty CANDIDATES
+    // list and a session summary, which is the honest output for a
+    // session that extracted nothing.
+    let candidates: Vec<CandidateBrief> = recent
+        .iter()
+        .filter(|m| m.source != MemorySource::RawTranscript)
+        .map(|m| CandidateBrief {
+            text: m.content.clone(),
+            kind: m.memory_type.as_str().to_string(),
+            importance: m.importance,
+        })
+        .collect();
+
+    // C-5 fix: the prompt used to be built with an empty existing set,
+    // so every id the model produced was necessarily invented and every
+    // MERGE / SUPERSEDE it emitted was rejected at apply time. Give it
+    // the rows it is actually allowed to name.
+    //
+    // Ranking fix: *which* rows matters as much as having any. Ranked by
+    // relevance to this session's candidates rather than by importance —
+    // see `consolidation_existing_memories` for why importance order
+    // made MERGE structurally impossible.
+    //
+    // With no candidates there is nothing to rank against, and no
+    // MERGE / SUPERSEDE can be valid anyway: both carry a
+    // `candidate_index`. Skip the lookup and let the prompt say so.
+    let landing_scope_level = if module_path.is_some() {
+        super::scope::SCOPE_MODULE
+    } else {
+        super::scope::SCOPE_REPO
+    };
+    let existing: Vec<ExistingBrief> = if candidates.is_empty() {
+        Vec::new()
+    } else {
+        let ranking_query = candidates
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        store
+            .consolidation_existing_memories(
+                landing_scope_level,
+                Some(repo_id),
+                MAX_EXISTING_MEMORIES,
+                Some(&ranking_query),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    target: "memory_consolidator",
+                    error = %e,
+                    "could not load existing memories; MERGE/SUPERSEDE will have no valid targets"
+                );
+                Vec::new()
+            })
+            .into_iter()
+            .map(|r| ExistingBrief {
+                id: r.id,
+                text: r.content,
+                kind: r.memory_type,
+                scope_label: r.scope_label,
+            })
+            .collect()
+    };
+
+    let history = load_consolidation_history(store).await;
+    let prompt = build_prompt(transcript, &candidates, &existing, &history);
+    Some(ConsolidationPrep { candidates, prompt })
+}
+
+/// Phase 1: gather inputs, build the prompt, hand the model call to a
+/// background task. Everything here is a cheap read; the expensive part
+/// deliberately leaves the writer task before returning.
+#[allow(clippy::too_many_arguments)]
+async fn start_session_consolidate(
     store: &Arc<MemoryStore>,
     llm: Option<&Arc<dyn ConsolidationLlm>>,
+    reenqueue: &Reenqueue,
+    in_flight: &InFlightRuns,
     _session_id: String,
     repo_id: String,
     module_path: Option<String>,
     run_id: String,
     transcript: String,
 ) -> Result<WriteResult> {
-    use super::session_consolidator::{
-        CandidateBrief, ExistingBrief, MAX_EXISTING_MEMORIES, build_prompt, parse_response,
-    };
+    use super::session_consolidator::parse_response;
 
     let Some(llm) = llm else {
         tracing::warn!(target: "memory_consolidator", "no LLM configured; skipping session consolidate");
@@ -1240,76 +1470,126 @@ async fn process_session_consolidate(
         );
         return Ok(WriteResult::Skipped);
     }
-    let recent = match store.recent_memories_for_run(&run_id, 24, 50).await {
-        Ok(rows) => rows,
+    // Refuse a second concurrent run for the same conversation. A run is
+    // identified by `run_id` throughout the audit trail, so overlapping
+    // runs are indistinguishable afterwards and cannot be rolled back
+    // apart. Claim the slot before the spawn and release it in the apply
+    // arm (or below, on any early return).
+    match in_flight.lock() {
+        Ok(mut guard) => {
+            if !guard.insert(run_id.clone()) {
+                tracing::warn!(
+                    target: "memory_consolidator",
+                    %run_id,
+                    "a consolidation for this session is already running; ignoring"
+                );
+                return Ok(WriteResult::Skipped);
+            }
+        }
         Err(e) => {
-            tracing::warn!(target: "memory_consolidator", error = %e, "skipping consolidate");
+            tracing::warn!(target: "memory_consolidator", error = %e, "in-flight set poisoned");
             return Ok(WriteResult::Skipped);
         }
-    };
-    let candidates: Vec<CandidateBrief> = recent
-        .iter()
-        .map(|m| CandidateBrief {
-            text: m.content.clone(),
-            kind: m.memory_type.as_str().to_string(),
-            importance: m.importance,
-        })
-        .collect();
-    if candidates.is_empty() {
-        return Ok(WriteResult::Skipped);
     }
-
-    // C-5 fix: the prompt used to be built with an empty existing set,
-    // so every id the model produced was necessarily invented and every
-    // MERGE / SUPERSEDE it emitted was rejected at apply time. Give it
-    // the rows it is actually allowed to name.
-    let landing_scope_level = if module_path.is_some() {
-        super::scope::SCOPE_MODULE
-    } else {
-        super::scope::SCOPE_REPO
+    // Any early return from here on must give the slot back.
+    let release = |in_flight: &InFlightRuns, run_id: &str| {
+        if let Ok(mut guard) = in_flight.lock() {
+            guard.remove(run_id);
+        }
     };
-    let existing: Vec<ExistingBrief> = store
-        .consolidation_existing_memories(
-            landing_scope_level,
-            Some(repo_id.as_str()),
-            MAX_EXISTING_MEMORIES,
-        )
-        .await
-        .unwrap_or_else(|e| {
+
+    let Some(prep) =
+        prepare_session_consolidate(store, &repo_id, &module_path, &run_id, &transcript).await
+    else {
+        release(in_flight, &run_id);
+        return Ok(WriteResult::Skipped);
+    };
+    let ConsolidationPrep { candidates, prompt } = prep;
+
+    // B-fix: the model call leaves the writer task here.
+    //
+    // Everything above is SQLite reads measured in milliseconds. What
+    // follows is a full round-trip on a session-sized prompt. Running it
+    // inline blocked every other memory write for its duration and blew
+    // the caller's ack budget; the writes it produces still land on the
+    // writer, as `SessionConsolidateApply`.
+    let llm = Arc::clone(llm);
+    let reenqueue = reenqueue.clone();
+    let in_flight = Arc::clone(in_flight);
+    let spawn_run_id = run_id.clone();
+    tokio::spawn(async move {
+        let finish = |in_flight: &InFlightRuns| {
+            if let Ok(mut guard) = in_flight.lock() {
+                guard.remove(&spawn_run_id);
+            }
+        };
+        let raw = match llm.complete(prompt).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(target: "memory_consolidator", error = %e, "LLM failure; deferring");
+                finish(&in_flight);
+                return;
+            }
+        };
+        let parsed = match parse_response(&raw) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(target: "memory_consolidator", error = %e, "parse failed; logging raw");
+                finish(&in_flight);
+                return;
+            }
+        };
+        // Ownership of the in-flight slot passes to the apply arm, which
+        // releases it once the operations have landed.
+        if let Err(e) = reenqueue.send(WriterMessage::SessionConsolidateApply {
+            repo_id,
+            module_path,
+            run_id: spawn_run_id.clone(),
+            candidates,
+            parsed: Box::new(parsed),
+            ack: None,
+        }) {
             tracing::warn!(
                 target: "memory_consolidator",
                 error = %e,
-                "could not load existing memories; MERGE/SUPERSEDE will have no valid targets"
+                "consolidation finished but its operations could not be enqueued"
             );
-            Vec::new()
-        })
-        .into_iter()
-        .map(|r| ExistingBrief {
-            id: r.id,
-            text: r.content,
-            kind: r.memory_type,
-            scope_label: r.scope_label,
-        })
-        .collect();
-
-    let history = load_consolidation_history(store).await;
-
-    let prompt = build_prompt(&transcript, &candidates, &existing, &history);
-    let raw = match llm.complete(prompt).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(target: "memory_consolidator", error = %e, "LLM failure; deferring");
-            return Ok(WriteResult::Skipped);
+            finish(&in_flight);
         }
-    };
-    let parsed = match parse_response(&raw) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(target: "memory_consolidator", error = %e, "parse failed; logging raw");
-            return Ok(WriteResult::Skipped);
-        }
-    };
+    });
 
+    Ok(WriteResult::Queued)
+}
+
+/// Identify one consolidation invocation.
+///
+/// Ten hex characters — short enough to retype after
+/// `/consolidate history`, and sortable, since the high bits are the
+/// timestamp. The counter makes two consolidations in the same second
+/// distinct, which a bare timestamp would not.
+fn new_batch_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{:08x}{:02x}", ts as u32, seq & 0xFF)
+}
+
+/// Phase 2: apply the operations the model produced. Runs on the writer
+/// task — every write in this function is why the split exists.
+async fn apply_session_consolidate(
+    store: &Arc<MemoryStore>,
+    repo_id: String,
+    module_path: Option<String>,
+    run_id: &str,
+    candidates: &[super::session_consolidator::CandidateBrief],
+    parsed: super::session_consolidator::ConsolidatorResponse,
+) -> Result<WriteResult> {
+    // One identity for every row this invocation writes.
+    let batch_id = new_batch_id();
+    let batch_id = batch_id.as_str();
     // Apply: ADD as a session_summary memory + apply each op against
     // the matching candidate. MERGE / SUPERSEDE / DROP are best-effort
     // and never block on each other.
@@ -1354,7 +1634,8 @@ async fn process_session_consolidate(
         record_consolidation_op(
             store,
             ConsolidationAudit {
-                run_id: &run_id,
+                run_id,
+                batch_id,
                 kind: "session_summary",
                 memory_id,
                 related_id: None,
@@ -1393,7 +1674,8 @@ async fn process_session_consolidate(
             record_consolidation_op(
                 store,
                 ConsolidationAudit {
-                    run_id: &run_id,
+                    run_id,
+                    batch_id,
                     kind,
                     memory_id: None,
                     related_id: None,
@@ -1426,7 +1708,8 @@ async fn process_session_consolidate(
                 record_consolidation_op(
                     store,
                     ConsolidationAudit {
-                        run_id: &run_id,
+                        run_id,
+                        batch_id,
                         kind,
                         memory_id,
                         related_id: None,
@@ -1477,7 +1760,8 @@ async fn process_session_consolidate(
                 record_consolidation_op(
                     store,
                     ConsolidationAudit {
-                        run_id: &run_id,
+                        run_id,
+                        batch_id,
                         kind,
                         memory_id: Some(into_memory_id),
                         related_id: None,
@@ -1508,7 +1792,8 @@ async fn process_session_consolidate(
                     record_consolidation_op(
                         store,
                         ConsolidationAudit {
-                            run_id: &run_id,
+                            run_id,
+                            batch_id,
                             kind,
                             memory_id: None,
                             related_id: Some(supersedes_memory_id),
@@ -1554,7 +1839,8 @@ async fn process_session_consolidate(
                 record_consolidation_op(
                     store,
                     ConsolidationAudit {
-                        run_id: &run_id,
+                        run_id,
+                        batch_id,
                         kind,
                         memory_id,
                         related_id: Some(supersedes_memory_id),
@@ -1577,7 +1863,8 @@ async fn process_session_consolidate(
                 record_consolidation_op(
                     store,
                     ConsolidationAudit {
-                        run_id: &run_id,
+                        run_id,
+                        batch_id,
                         kind,
                         memory_id: None,
                         related_id: None,
@@ -1623,7 +1910,11 @@ async fn load_consolidation_history(
 
     let mut out = Vec::with_capacity(runs.len());
     for run in runs {
-        let rows = match store.consolidation_audit_for_run(&run.run_id).await {
+        // Per invocation, not per session. Reading by `run_id` replayed
+        // every consolidation this conversation ever ran as one blob,
+        // and — because the rolled-back flag was equally session-wide —
+        // told the model its whole history had been rejected.
+        let rows = match store.consolidation_audit_for_batch(&run.batch_id).await {
             Ok(rows) => rows,
             Err(_) => continue,
         };
@@ -1651,7 +1942,7 @@ async fn load_consolidation_history(
             })
             .collect();
         out.push(ConsolidationRunBrief {
-            run_id: run.run_id,
+            run_id: run.batch_id,
             ops,
             rolled_back: run.rolled_back,
         });
@@ -1662,7 +1953,8 @@ async fn load_consolidation_history(
 /// What a `/consolidate rollback` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RollbackOutcome {
-    pub run_id: String,
+    /// The invocation that was undone.
+    pub batch_id: String,
     /// Operations successfully reversed.
     pub reversed: usize,
     /// Rows skipped because the original operation never applied.
@@ -1688,25 +1980,27 @@ pub struct RollbackOutcome {
 /// consolidator never created.
 async fn process_consolidation_rollback(
     store: &Arc<MemoryStore>,
-    run_id: &str,
+    batch_key: &str,
 ) -> Result<RollbackOutcome> {
     use super::session_consolidator::ConsolidationOp;
 
-    if store.consolidation_run_was_rolled_back(run_id).await? {
+    if store.consolidation_run_was_rolled_back(batch_key).await? {
         bail!(
-            "consolidation run '{run_id}' has already been rolled back; the inverse \
+            "consolidation run '{batch_key}' has already been rolled back; the inverse \
              operations are not idempotent, so applying them twice would delete rows \
              the first rollback already restored"
         );
     }
 
-    let rows = store.consolidation_audit_for_run(run_id).await?;
+    // Scoped to the invocation, not the session: rolling back one run
+    // must not touch what a later run of the same conversation did.
+    let rows = store.consolidation_audit_for_batch(batch_key).await?;
     if rows.is_empty() {
-        bail!("no consolidation run '{run_id}' found in the audit trail");
+        bail!("no consolidation run '{batch_key}' found in the audit trail");
     }
 
     let mut outcome = RollbackOutcome {
-        run_id: run_id.to_string(),
+        batch_id: batch_key.to_string(),
         reversed: 0,
         skipped: 0,
         failed: Vec::new(),
@@ -1718,7 +2012,7 @@ async fn process_consolidation_rollback(
             continue;
         }
 
-        let reason = format!("consolidate rollback of run {run_id}");
+        let reason = format!("consolidate rollback of run {batch_key}");
         let result: Result<()> = match row.kind.as_str() {
             // Both created a row; undoing means retiring it again.
             "add" | "session_summary" => match row.memory_id {
@@ -1785,7 +2079,7 @@ async fn process_consolidation_rollback(
                 let msg = format!("{e:#}");
                 tracing::warn!(
                     target: "memory_consolidator",
-                    run_id,
+                    batch_key,
                     audit_id = row.id,
                     error = %msg,
                     "could not reverse consolidation op"
@@ -1802,7 +2096,8 @@ async fn process_consolidation_rollback(
         .unwrap_or_else(|_| "null".to_string());
         if let Err(e) = store
             .log_consolidation_rollback(super::store::consolidation_ops::RollbackAuditRow {
-                run_id,
+                run_id: &row.run_id,
+                batch_id: batch_key,
                 kind: &row.kind,
                 memory_id: row.memory_id,
                 related_id: row.related_id,
@@ -1850,6 +2145,8 @@ fn stored_id(result: &super::scope::StoreResult) -> Option<i64> {
 /// this module fills in (`applied`, prompt version).
 struct ConsolidationAudit<'a> {
     run_id: &'a str,
+    /// Identifies this one invocation — see [`new_batch_id`].
+    batch_id: &'a str,
     kind: &'a str,
     memory_id: Option<i64>,
     related_id: Option<i64>,
@@ -1874,6 +2171,7 @@ async fn record_consolidation_op(store: &Arc<MemoryStore>, audit: ConsolidationA
 
     let row = ConsolidationAuditRow {
         run_id: audit.run_id,
+        batch_id: audit.batch_id,
         kind: audit.kind,
         memory_id: audit.memory_id,
         related_id: audit.related_id,
@@ -2483,6 +2781,40 @@ mod tests {
         }
     }
 
+    /// Drive one consolidation run start to finish, inline.
+    ///
+    /// Production splits this across the writer queue — the model call
+    /// must not occupy the single-consumer writer task — but these tests
+    /// are about what the operations *do*, so they run the same three
+    /// production steps back to back rather than reimplementing any of
+    /// them. `WriterMessage::SessionConsolidateApply` is what carries the
+    /// middle result in the real path.
+    async fn consolidate_inline(
+        store: &Arc<MemoryStore>,
+        llm: &Arc<dyn ConsolidationLlm>,
+        repo_id: &str,
+        module_path: Option<String>,
+        run_id: &str,
+        transcript: &str,
+    ) -> Result<WriteResult> {
+        let Some(prep) =
+            prepare_session_consolidate(store, repo_id, &module_path, run_id, transcript).await
+        else {
+            return Ok(WriteResult::Skipped);
+        };
+        let raw = llm.complete(prep.prompt).await?;
+        let parsed = super::super::session_consolidator::parse_response(&raw)?;
+        apply_session_consolidate(
+            store,
+            repo_id.to_string(),
+            module_path,
+            run_id,
+            &prep.candidates,
+            parsed,
+        )
+        .await
+    }
+
     /// A store holding `count` run-scoped candidate rows, which is what
     /// the consolidator reads as its CANDIDATES list.
     async fn store_with_candidates(run_id: &str, count: usize) -> Arc<MemoryStore> {
@@ -2522,17 +2854,9 @@ mod tests {
         .to_string();
         let llm: Arc<dyn ConsolidationLlm> = Arc::new(ScriptedLlm(response));
 
-        process_session_consolidate(
-            &store,
-            Some(&llm),
-            "sess".into(),
-            "r1".into(),
-            None,
-            run_id.into(),
-            "transcript".into(),
-        )
-        .await
-        .expect("consolidation runs to completion");
+        consolidate_inline(&store, &llm, "r1", None, run_id, "transcript")
+            .await
+            .expect("consolidation runs to completion");
 
         let rows = store.consolidation_audit_for_run(run_id).await.unwrap();
         let ops: Vec<_> = rows
@@ -2591,14 +2915,13 @@ mod tests {
         .to_string();
         let llm: Arc<dyn ConsolidationLlm> = Arc::new(ScriptedLlm(response));
 
-        process_session_consolidate(
+        consolidate_inline(
             &store,
-            Some(&llm),
-            "sess".into(),
-            "r1".into(),
+            &llm,
+            "r1",
             Some("crates/gaviero-core".into()),
-            run_id.into(),
-            "transcript".into(),
+            run_id,
+            "transcript",
         )
         .await
         .unwrap();
@@ -2609,6 +2932,175 @@ mod tests {
             rows[0].scope.as_deref(),
             Some("module:crates/gaviero-core"),
             "#229 made the landing scope variable; the audit records which"
+        );
+    }
+
+    // ── Consolidator candidate pool ──────────────────────────────────
+
+    /// Store one extracted row and one verbatim History row under the
+    /// same run, in the shape `/consolidate-session` actually sees.
+    async fn store_with_transcript_and_extraction(run_id: &str) -> Arc<MemoryStore> {
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let store = Arc::new(MemoryStore::in_memory(embedder).unwrap());
+        let scope = WriteScope::Run {
+            repo_id: "r1".into(),
+            run_id: run_id.to_string(),
+        };
+        store
+            .store_scoped(
+                &scope,
+                "the writer task is the single owner of SQLite writes",
+                &WriteMeta::for_source(MemorySource::LlmExtracted),
+            )
+            .await
+            .unwrap();
+        store
+            .store_scoped(
+                &scope,
+                "USER: go for pr-6\n\nASSISTANT: PR-6 — rollback. Let me first find the C2 primitives",
+                &WriteMeta::for_source(MemorySource::RawTranscript),
+            )
+            .await
+            .unwrap();
+        store
+    }
+
+    /// A-fix. The first live run promoted five raw transcript blobs into
+    /// the durable repo record at importance 1.0, because they were shown
+    /// to the model as ordinary candidates.
+    #[tokio::test]
+    async fn raw_transcript_rows_never_become_candidates() {
+        let run_id = "run-transcript-filter";
+        let store = store_with_transcript_and_extraction(run_id).await;
+
+        let prep = prepare_session_consolidate(&store, "r1", &None, run_id, "the transcript")
+            .await
+            .expect("a session with rows prepares a run");
+
+        assert_eq!(
+            prep.candidates.len(),
+            1,
+            "only the extracted row is a candidate: {:?}",
+            prep.candidates
+        );
+        assert!(prep.candidates[0].text.contains("single owner"));
+        assert!(
+            !prep
+                .candidates
+                .iter()
+                .any(|c| c.text.starts_with("USER: go for pr-6")),
+            "a History row reached the candidate list"
+        );
+    }
+
+    /// The transcript belongs in the prompt — once, in the TRANSCRIPT
+    /// section — not a second time as a candidate the model can ADD.
+    #[tokio::test]
+    async fn the_prompt_shows_the_transcript_but_not_as_a_candidate() {
+        let run_id = "run-transcript-prompt";
+        let store = store_with_transcript_and_extraction(run_id).await;
+
+        let prep = prepare_session_consolidate(&store, "r1", &None, run_id, "USER: hello there")
+            .await
+            .unwrap();
+
+        assert!(
+            prep.prompt.contains("USER: hello there"),
+            "transcript section missing"
+        );
+        let candidates_section = prep
+            .prompt
+            .split("CANDIDATES (extracted this session):")
+            .nth(1)
+            .expect("prompt has a candidates section");
+        assert!(
+            !candidates_section.contains("USER: go for pr-6"),
+            "History row rendered into CANDIDATES"
+        );
+    }
+
+    /// Filtering must not turn a transcript-only session into a silent
+    /// no-op: the session summary is still worth producing.
+    #[tokio::test]
+    async fn a_transcript_only_session_still_prepares_a_run() {
+        let run_id = "run-transcript-only";
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let store = Arc::new(MemoryStore::in_memory(embedder).unwrap());
+        store
+            .store_scoped(
+                &WriteScope::Run {
+                    repo_id: "r1".into(),
+                    run_id: run_id.into(),
+                },
+                "USER: only chatter here",
+                &WriteMeta::for_source(MemorySource::RawTranscript),
+            )
+            .await
+            .unwrap();
+
+        let prep = prepare_session_consolidate(&store, "r1", &None, run_id, "t")
+            .await
+            .expect("a transcript-only session still runs");
+        assert!(prep.candidates.is_empty());
+    }
+
+    /// With no candidates there is nothing to rank against, and no
+    /// MERGE / SUPERSEDE could be valid anyway — both carry a
+    /// `candidate_index`. The prompt should say so rather than list
+    /// targets the model cannot legally use.
+    #[tokio::test]
+    async fn a_session_with_no_candidates_offers_no_merge_targets() {
+        let run_id = "run-no-candidates";
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let store = Arc::new(MemoryStore::in_memory(embedder).unwrap());
+        // A repo-scope row that would otherwise be an eligible target.
+        store
+            .store_scoped(
+                &WriteScope::Repo {
+                    repo_id: "r1".into(),
+                },
+                "an existing repo-scope belief",
+                &WriteMeta::default(),
+            )
+            .await
+            .unwrap();
+        store
+            .store_scoped(
+                &WriteScope::Run {
+                    repo_id: "r1".into(),
+                    run_id: run_id.into(),
+                },
+                "USER: only chatter",
+                &WriteMeta::for_source(MemorySource::RawTranscript),
+            )
+            .await
+            .unwrap();
+
+        let prep = prepare_session_consolidate(&store, "r1", &None, run_id, "t")
+            .await
+            .unwrap();
+
+        assert!(prep.candidates.is_empty());
+        assert!(
+            prep.prompt.contains("do not emit MERGE or SUPERSEDE"),
+            "empty-candidate prompt should forbid merges outright"
+        );
+        assert!(
+            !prep.prompt.contains("an existing repo-scope belief"),
+            "listed a target no operation could legally reference"
+        );
+    }
+
+    /// A session that produced nothing at all is still skipped, so an
+    /// idle conversation never spends a model call.
+    #[tokio::test]
+    async fn a_session_with_no_rows_prepares_nothing() {
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let store = Arc::new(MemoryStore::in_memory(embedder).unwrap());
+        assert!(
+            prepare_session_consolidate(&store, "r1", &None, "run-empty", "t")
+                .await
+                .is_none()
         );
     }
 
@@ -2648,17 +3140,9 @@ mod tests {
         .to_string();
         let llm: Arc<dyn ConsolidationLlm> = Arc::new(ScriptedLlm(response));
 
-        process_session_consolidate(
-            &store,
-            Some(&llm),
-            "sess".into(),
-            "r1".into(),
-            None,
-            run_id.into(),
-            "transcript".into(),
-        )
-        .await
-        .unwrap();
+        consolidate_inline(&store, &llm, "r1", None, run_id, "transcript")
+            .await
+            .unwrap();
 
         let rows = store.consolidation_audit_for_run(run_id).await.unwrap();
         let merge = rows.iter().find(|r| r.kind == "merge").expect("merge row");
@@ -2746,17 +3230,9 @@ mod tests {
             response: json!({ "session_summary": "", "operations": [] }).to_string(),
             seen: seen.clone(),
         });
-        process_session_consolidate(
-            &store,
-            Some(&llm),
-            "sess".into(),
-            "r1".into(),
-            None,
-            run_id.into(),
-            "transcript".into(),
-        )
-        .await
-        .unwrap();
+        consolidate_inline(&store, &llm, "r1", None, run_id, "transcript")
+            .await
+            .unwrap();
 
         let prompt = seen.lock().unwrap()[0].clone();
         assert!(
@@ -2807,7 +3283,7 @@ mod tests {
         assert!(merge.applied, "should apply: {:?}", merge.error);
         assert_eq!(
             merge.prompt_version.as_deref(),
-            Some("session_v2"),
+            Some(super::super::session_consolidator::PROMPT_VERSION),
             "the audit row records which rubric produced the op"
         );
         assert_eq!(
@@ -2855,21 +3331,23 @@ mod tests {
             response: json!({ "session_summary": "", "operations": [] }).to_string(),
             seen: seen.clone(),
         });
-        process_session_consolidate(
-            &store,
-            Some(&llm),
-            "sess".into(),
-            "r1".into(),
-            None,
-            "run-v2-b".into(),
-            "transcript".into(),
-        )
-        .await
-        .unwrap();
+        consolidate_inline(&store, &llm, "r1", None, "run-v2-b", "transcript")
+            .await
+            .unwrap();
 
         let prompt = seen.lock().unwrap()[0].clone();
         assert!(prompt.contains("CONSOLIDATION_HISTORY (your previous runs)"));
-        assert!(prompt.contains("run run-v2-a"));
+        // Replayed per invocation, so the entry is keyed by batch id
+        // rather than by the session it belonged to.
+        let first_batch = store
+            .recent_consolidation_runs(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.run_id == "run-v2-a")
+            .expect("the earlier run is in history")
+            .batch_id;
+        assert!(prompt.contains(&format!("run {first_batch}")));
         assert!(
             prompt.contains("rejected"),
             "the failed merge should be replayed as a rejection"
@@ -2897,17 +3375,26 @@ mod tests {
 
     async fn consolidate(store: &Arc<MemoryStore>, run_id: &str, response: serde_json::Value) {
         let llm: Arc<dyn ConsolidationLlm> = Arc::new(ScriptedLlm(response.to_string()));
-        process_session_consolidate(
-            store,
-            Some(&llm),
-            "sess".into(),
-            "r1".into(),
-            None,
-            run_id.into(),
-            "transcript".into(),
-        )
-        .await
-        .unwrap();
+        consolidate_inline(store, &llm, "r1", None, run_id, "transcript")
+            .await
+            .unwrap();
+    }
+
+    /// The id of the most recent consolidation invocation.
+    ///
+    /// Tests discover it the way a user does — from the history — rather
+    /// than assuming it equals `run_id`. That assumption is exactly what
+    /// schema v16 removed: several invocations share one `run_id`, so it
+    /// cannot identify which of them to undo.
+    async fn latest_batch_id(store: &Arc<MemoryStore>) -> String {
+        store
+            .recent_consolidation_runs(1)
+            .await
+            .unwrap()
+            .first()
+            .expect("a consolidation run should exist")
+            .batch_id
+            .clone()
     }
 
     #[tokio::test]
@@ -2935,7 +3422,7 @@ mod tests {
             "the run should have added rows"
         );
 
-        let outcome = process_consolidation_rollback(&store, run_id)
+        let outcome = process_consolidation_rollback(&store, &latest_batch_id(&store).await)
             .await
             .unwrap();
         assert_eq!(outcome.reversed, 3, "2 adds + the session summary");
@@ -2995,7 +3482,7 @@ mod tests {
             "the merge should have bumped trust"
         );
 
-        process_consolidation_rollback(&store, run_id)
+        process_consolidation_rollback(&store, &latest_batch_id(&store).await)
             .await
             .unwrap();
 
@@ -3046,7 +3533,7 @@ mod tests {
         let sup = rows.iter().find(|r| r.kind == "supersede").unwrap();
         assert!(sup.applied, "supersede should apply: {:?}", sup.error);
 
-        let outcome = process_consolidation_rollback(&store, run_id)
+        let outcome = process_consolidation_rollback(&store, &latest_batch_id(&store).await)
             .await
             .unwrap();
         assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
@@ -3075,10 +3562,10 @@ mod tests {
         )
         .await;
 
-        process_consolidation_rollback(&store, run_id)
+        process_consolidation_rollback(&store, &latest_batch_id(&store).await)
             .await
             .unwrap();
-        let err = process_consolidation_rollback(&store, run_id)
+        let err = process_consolidation_rollback(&store, &latest_batch_id(&store).await)
             .await
             .expect_err("a second rollback must be refused");
 
@@ -3111,7 +3598,7 @@ mod tests {
         )
         .await;
 
-        let outcome = process_consolidation_rollback(&store, run_id)
+        let outcome = process_consolidation_rollback(&store, &latest_batch_id(&store).await)
             .await
             .unwrap();
         assert_eq!(outcome.reversed, 1, "only the ADD actually landed");
@@ -3157,13 +3644,339 @@ mod tests {
         assert_eq!(run.applied, 1, "one op was rejected");
         assert!(!run.rolled_back);
 
-        process_consolidation_rollback(&store, "run-h1")
+        let batch = run.batch_id.clone();
+        process_consolidation_rollback(&store, &batch)
             .await
             .unwrap();
 
         let runs = store.recent_consolidation_runs(10).await.unwrap();
-        let run = runs.iter().find(|r| r.run_id == "run-h1").unwrap();
+        let run = runs.iter().find(|r| r.batch_id == batch).unwrap();
         assert!(run.rolled_back, "history must show the run was reversed");
+    }
+
+    /// The v16 fix. A rollback must mark the invocation it undid and
+    /// nothing else — the flag is replayed into the consolidator prompt
+    /// as "[ROLLED BACK BY THE USER]", so a session-wide flag told every
+    /// later run that all its own work had been rejected.
+    #[tokio::test]
+    async fn rolling_back_one_run_does_not_mark_the_next_one() {
+        let run_id = "run-two-batches";
+        let store = store_with_candidates(run_id, 2).await;
+
+        let add_first = json!({
+            "session_summary": "",
+            "operations": [{ "op": "ADD", "candidate_index": 0 }]
+        });
+        consolidate(&store, run_id, add_first.clone()).await;
+        let first = latest_batch_id(&store).await;
+
+        consolidate(&store, run_id, add_first).await;
+        let second = latest_batch_id(&store).await;
+        assert_ne!(
+            first, second,
+            "two consolidations of one session must get distinct ids"
+        );
+
+        process_consolidation_rollback(&store, &first)
+            .await
+            .unwrap();
+
+        let runs = store.recent_consolidation_runs(10).await.unwrap();
+        let first_run = runs.iter().find(|r| r.batch_id == first).unwrap();
+        let second_run = runs.iter().find(|r| r.batch_id == second).unwrap();
+        assert!(first_run.rolled_back, "the undone run should be marked");
+        assert!(
+            !second_run.rolled_back,
+            "the untouched run must not inherit the flag"
+        );
+
+        // And the second run is still undoable in its own right.
+        process_consolidation_rollback(&store, &second)
+            .await
+            .expect("a later run stays rollable after an earlier one is undone");
+    }
+
+    /// The prompt-facing consequence of the same fix.
+    #[tokio::test]
+    async fn a_rolled_back_run_does_not_taint_the_next_prompt() {
+        let run_id = "run-taint";
+        let store = store_with_candidates(run_id, 2).await;
+
+        consolidate(
+            &store,
+            run_id,
+            json!({
+                "session_summary": "",
+                "operations": [{ "op": "ADD", "candidate_index": 0 }]
+            }),
+        )
+        .await;
+        let first = latest_batch_id(&store).await;
+        process_consolidation_rollback(&store, &first)
+            .await
+            .unwrap();
+
+        consolidate(
+            &store,
+            run_id,
+            json!({
+                "session_summary": "",
+                "operations": [{ "op": "ADD", "candidate_index": 1 }]
+            }),
+        )
+        .await;
+
+        // A third run's prompt sees both: the undone one marked, the
+        // other not. Before v16 every entry carried the marker.
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let llm: Arc<dyn ConsolidationLlm> = Arc::new(CapturingLlm {
+            response: json!({ "session_summary": "", "operations": [] }).to_string(),
+            seen: seen.clone(),
+        });
+        consolidate_inline(&store, &llm, "r1", None, run_id, "transcript")
+            .await
+            .unwrap();
+
+        let prompt = seen.lock().unwrap()[0].clone();
+        let marker = "[ROLLED BACK BY THE USER]";
+        assert_eq!(
+            prompt.matches(marker).count(),
+            1,
+            "exactly the undone run should carry the marker:\n{prompt}"
+        );
+    }
+
+    // ── B-fix: the model call runs off the writer task ───────────────
+
+    /// A consolidator that takes a visible amount of wall-clock time,
+    /// like the real one (a measured live run took 3m41s).
+    struct SlowLlm {
+        delay: Duration,
+        response: String,
+        calls: Arc<AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl ConsolidationLlm for SlowLlm {
+        async fn complete(&self, _prompt: String) -> Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            Ok(self.response.clone())
+        }
+    }
+
+    /// How long the fake model "thinks". Generous enough that the
+    /// assertions below are about ordering, not about machine speed.
+    const LLM_DELAY: Duration = Duration::from_millis(1500);
+    /// Budget for work that must complete *while* the model is thinking.
+    const WHILE_THINKING: Duration = Duration::from_millis(600);
+
+    async fn writer_with_slow_llm(
+        store: Arc<MemoryStore>,
+        response: &str,
+    ) -> (WriterHandle, Arc<AtomicU64>) {
+        let calls = Arc::new(AtomicU64::new(0));
+        let llm: Arc<dyn ConsolidationLlm> = Arc::new(SlowLlm {
+            delay: LLM_DELAY,
+            response: response.to_string(),
+            calls: calls.clone(),
+        });
+        let handle = spawn_writer_task(WriterConfig {
+            stores: MemoryStores::from_single_store(store),
+            llm: Some(llm),
+            observer: None,
+            manifest_observer: None,
+        });
+        (handle, calls)
+    }
+
+    fn one_add_response() -> String {
+        json!({
+            "session_summary": "the session did things",
+            "operations": [{ "op": "ADD", "candidate_index": 0 }]
+        })
+        .to_string()
+    }
+
+    /// The regression this whole split exists for. The caller used to
+    /// wait out the entire model round-trip under a 30s ack budget, and
+    /// report "writer ack timeout after 30000ms" for work that in fact
+    /// succeeded three minutes later.
+    #[tokio::test]
+    async fn session_consolidate_acks_before_the_model_answers() {
+        let run_id = "run-ack-fast";
+        let store = store_with_candidates(run_id, 1).await;
+        let (handle, calls) = writer_with_slow_llm(store, &one_add_response()).await;
+
+        let started = tokio::time::Instant::now();
+        let res = handle
+            .session_consolidate("sess", "r1", None, run_id, "transcript")
+            .await
+            .expect("ack arrives");
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(res, WriteResult::Queued),
+            "expected Queued, got {res:?}"
+        );
+        assert!(
+            elapsed < WHILE_THINKING,
+            "ack waited on the model: {elapsed:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the model was still asked");
+    }
+
+    /// The other half of the same defect: the writer is single-consumer,
+    /// so an inline model call stalled *every* memory write for its
+    /// duration.
+    #[tokio::test]
+    async fn other_writes_proceed_while_the_model_is_thinking() {
+        let run_id = "run-not-blocking";
+        let store = store_with_candidates(run_id, 1).await;
+        let (handle, _) = writer_with_slow_llm(store, &one_add_response()).await;
+
+        handle
+            .session_consolidate("sess", "r1", None, run_id, "transcript")
+            .await
+            .unwrap();
+
+        let started = tokio::time::Instant::now();
+        let result = handle
+            .user_remember("ns", "k1", "an unrelated write", None)
+            .await
+            .expect("unrelated write is not blocked by the consolidator");
+        let elapsed = started.elapsed();
+
+        assert!(matches!(result, WriteResult::Inserted(_)));
+        assert!(
+            elapsed < WHILE_THINKING,
+            "the writer was blocked behind the model call: {elapsed:?}"
+        );
+    }
+
+    /// The operations must still land — off the writer task, but on it
+    /// for the writes themselves, via `SessionConsolidateApply`.
+    #[tokio::test]
+    async fn the_operations_land_once_the_model_answers() {
+        let run_id = "run-deferred-apply";
+        let store = store_with_candidates(run_id, 1).await;
+        let (handle, _) = writer_with_slow_llm(store.clone(), &one_add_response()).await;
+
+        handle
+            .session_consolidate("sess", "r1", None, run_id, "transcript")
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .consolidation_audit_for_run(run_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing should have been applied before the model answered"
+        );
+
+        let rows = await_audit_rows(&store, run_id).await;
+        let kinds: Vec<&str> = rows.iter().map(|r| r.kind.as_str()).collect();
+        assert!(kinds.contains(&"session_summary"), "kinds: {kinds:?}");
+        assert!(kinds.contains(&"add"), "kinds: {kinds:?}");
+        assert!(
+            rows.iter().all(|r| r.applied),
+            "every op should have applied: {rows:?}"
+        );
+    }
+
+    /// Poll until the background consolidation has enqueued and the
+    /// writer has applied it.
+    async fn await_audit_rows(
+        store: &Arc<MemoryStore>,
+        run_id: &str,
+    ) -> Vec<crate::memory::store::consolidation_ops::ConsolidationAuditRecord> {
+        for _ in 0..100 {
+            let rows = store.consolidation_audit_for_run(run_id).await.unwrap();
+            if !rows.is_empty() {
+                return rows;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("consolidation never applied its operations");
+    }
+
+    /// Moving the model call off the writer let two `/consolidate-session`
+    /// invocations overlap — which the observed double-run did. Runs are
+    /// keyed by `run_id`, so overlapping ones cannot be told apart in
+    /// history or rolled back separately.
+    #[tokio::test]
+    async fn a_second_run_for_the_same_session_is_refused_while_one_is_in_flight() {
+        let run_id = "run-duplicate";
+        let store = store_with_candidates(run_id, 1).await;
+        let (handle, calls) = writer_with_slow_llm(store.clone(), &one_add_response()).await;
+
+        let first = handle
+            .session_consolidate("sess", "r1", None, run_id, "transcript")
+            .await
+            .unwrap();
+        let second = handle
+            .session_consolidate("sess", "r1", None, run_id, "transcript")
+            .await
+            .unwrap();
+
+        assert!(matches!(first, WriteResult::Queued));
+        assert!(
+            matches!(second, WriteResult::Skipped),
+            "a concurrent duplicate should be refused, got {second:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the duplicate must not spend a second model call"
+        );
+
+        // And the slot is released, so the session can consolidate again
+        // once the first run has landed.
+        await_audit_rows(&store, run_id).await;
+        let third = handle
+            .session_consolidate("sess", "r1", None, run_id, "transcript")
+            .await
+            .unwrap();
+        assert!(
+            matches!(third, WriteResult::Queued),
+            "in-flight slot was never released, got {third:?}"
+        );
+    }
+
+    /// A different conversation is unrelated and must not be blocked by
+    /// the guard.
+    #[tokio::test]
+    async fn a_different_session_may_consolidate_concurrently() {
+        let store = store_with_candidates("run-a", 1).await;
+        store
+            .store_scoped(
+                &WriteScope::Run {
+                    repo_id: "r1".into(),
+                    run_id: "run-b".into(),
+                },
+                "a candidate belonging to the other session",
+                &WriteMeta::default(),
+            )
+            .await
+            .unwrap();
+        let (handle, _) = writer_with_slow_llm(store, &one_add_response()).await;
+
+        let a = handle
+            .session_consolidate("sess", "r1", None, "run-a", "transcript")
+            .await
+            .unwrap();
+        let b = handle
+            .session_consolidate("sess", "r1", None, "run-b", "transcript")
+            .await
+            .unwrap();
+
+        assert!(matches!(a, WriteResult::Queued));
+        assert!(
+            matches!(b, WriteResult::Queued),
+            "the guard is per-session, got {b:?}"
+        );
     }
 
     #[tokio::test]
