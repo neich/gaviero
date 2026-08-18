@@ -11,6 +11,8 @@
 //! table is the single audit surface for automatic memory mutation
 //! (schema v14); `origin` discriminates the producer.
 
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 
 use super::MemoryStore;
@@ -41,8 +43,8 @@ pub struct ConsolidationAuditRow<'a> {
     pub op_json: &'a str,
     /// State before the change, for rollback to restore.
     pub before_json: Option<&'a str>,
-    /// State after it, so a rollback can tell whether the row it is
-    /// about to reverse still looks the way this operation left it.
+    /// Snapshot of post-op state for inspection. Rollback does not
+    /// consult this column (MERGE trust is restored from `before_json`).
     pub after_json: Option<&'a str>,
     /// Whether the operation actually landed.
     pub applied: bool,
@@ -248,16 +250,49 @@ impl MemoryStore {
         Ok(())
     }
 
-    /// Has this consolidation *invocation* already been rolled back?
+    /// Audit ids of originally-applied ops that already have a
+    /// successful inverse (`applied = 1`) whose payload names them as
+    /// `reverses_audit_id`.
     ///
-    /// Guards against a second rollback re-deleting rows the first one
-    /// already reversed — the inverse operations are not idempotent.
+    /// The rollback latch is "every originally-applied op is in this
+    /// set", not "any rollback row exists" — a partial undo must be
+    /// allowed to finish the rest. History still uses an EXISTS check
+    /// so a partial undo is visible there.
+    pub async fn successful_rollback_targets(&self, batch_key: &str) -> Result<HashSet<i64>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload FROM sleeptime_audit
+                  WHERE origin = ?1 AND COALESCE(batch_id, run_id) = ?2 AND applied = 1",
+            )
+            .context("preparing successful-rollback-target query")?;
+        let payloads = stmt
+            .query_map(rusqlite::params![ROLLBACK_ORIGIN, batch_key], |r| {
+                r.get::<_, String>(0)
+            })
+            .context("querying successful rollback payloads")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("reading successful rollback payloads")?;
+        drop(stmt);
+        drop(conn);
+
+        let mut out = HashSet::new();
+        for payload in payloads {
+            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&payload) else {
+                continue;
+            };
+            if let Some(id) = parsed.get("reverses_audit_id").and_then(|v| v.as_i64()) {
+                out.insert(id);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Has this consolidation *invocation* produced any rollback row?
     ///
-    /// Scoped to the batch. Scoped to `run_id`, as it was before v16,
-    /// this answered "has *any* run of this conversation been rolled
-    /// back" — which blocked every later run from being undone and, far
-    /// worse, latched the `rolled_back` flag that
-    /// `recent_consolidation_runs` feeds into the consolidator prompt.
+    /// Used by history's `rolled_back` EXISTS check. The apply latch is
+    /// stricter — [`Self::successful_rollback_targets`] — so a partial
+    /// undo can finish the remaining inverses.
     pub async fn consolidation_run_was_rolled_back(&self, batch_key: &str) -> Result<bool> {
         let conn = self.conn.lock().await;
         let n: i64 = conn
