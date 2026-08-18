@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Increment when adding a new migration.
-const CURRENT_VERSION: u32 = 15;
+const CURRENT_VERSION: u32 = 16;
 
 /// First schema version where the `memory_kind` discriminator exists.
 /// Used by [`needs_c1_backup`] to decide whether to take a one-shot
@@ -80,6 +80,9 @@ pub fn run_migrations(conn: &Connection, embedding_dims: usize) -> Result<()> {
     }
     if version < 15 {
         migrate_v15(conn).context("migration v15")?;
+    }
+    if version < 16 {
+        migrate_v16(conn).context("migration v16")?;
     }
 
     // Stamp the current version
@@ -894,6 +897,36 @@ fn migrate_v15(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "sleeptime_audit", "expected_outcome", "TEXT")
 }
 
+/// v16 — give each consolidation *invocation* its own identity.
+///
+/// Until now a consolidation run was identified by `run_id`, which is
+/// the conversation id. Every consolidation of the same conversation
+/// therefore shared one identity, with three consequences:
+///
+/// 1. `/consolidate history` summed unrelated runs into a single line.
+/// 2. `/consolidate rollback` could not target one of them.
+/// 3. Worst: the `rolled_back` flag latched for the conversation, and it
+///    is replayed into the consolidator prompt as `[ROLLED BACK BY THE
+///    USER]`. One rollback therefore told *every subsequent run on that
+///    conversation* that all its previous operations had been rejected —
+///    silently steering the model for the rest of the conversation's
+///    life.
+///
+/// `batch_id` is that missing identity. It is nullable: rows written
+/// before this migration keep `NULL` and are grouped under their
+/// `run_id`, so existing history and rollbacks still resolve. Every
+/// query that means "one consolidation run" uses
+/// `COALESCE(batch_id, run_id)`.
+fn migrate_v16(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "sleeptime_audit", "batch_id", "TEXT")?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_sleeptime_audit_batch
+             ON sleeptime_audit(batch_id);",
+    )
+    .context("indexing sleeptime_audit by batch_id")?;
+    Ok(())
+}
+
 /// Drop the C1.3 immutability triggers. **Crate-private and only the
 /// C2.4 `RedactHistory` handler may call this**, inside a transaction
 /// that re-installs them before commit. Any other callsite is a bug
@@ -1178,6 +1211,61 @@ mod tests {
         run_migrations(&conn, 8).unwrap();
         migrate_v15(&conn).unwrap();
         migrate_v15(&conn).unwrap();
+    }
+
+    #[test]
+    fn upgrading_from_v15_adds_batch_id() {
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_sleeptime_audit_batch;
+             ALTER TABLE sleeptime_audit DROP COLUMN batch_id;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 15u32).unwrap();
+        assert!(!audit_columns(&conn).contains(&"batch_id".to_string()));
+
+        run_migrations(&conn, 8).unwrap();
+
+        assert!(audit_columns(&conn).contains(&"batch_id".to_string()));
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    /// Pre-v16 rows have no `batch_id`, and every query that means "one
+    /// consolidation run" reads `COALESCE(batch_id, run_id)`. A row
+    /// written before the migration must therefore still be reachable
+    /// under the `run_id` it was recorded with.
+    #[test]
+    fn a_pre_v16_audit_row_still_resolves_under_its_run_id() {
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+        conn.execute(
+            "INSERT INTO sleeptime_audit (run_id, kind, payload, origin)
+             VALUES ('legacy-run', 'add', '{}', 'consolidation')",
+            [],
+        )
+        .unwrap();
+
+        let key: String = conn
+            .query_row(
+                "SELECT COALESCE(batch_id, run_id) FROM sleeptime_audit
+                  WHERE run_id = 'legacy-run'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(key, "legacy-run");
+    }
+
+    #[test]
+    fn the_v16_migration_is_idempotent() {
+        let conn = setup_conn();
+        run_migrations(&conn, 8).unwrap();
+        migrate_v16(&conn).unwrap();
+        migrate_v16(&conn).unwrap();
     }
 
     #[test]
