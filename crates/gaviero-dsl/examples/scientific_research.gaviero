@@ -126,7 +126,7 @@
 //   anonymous client. Use distinct ids per reviewer.
 //
 //   Cursor note: the Cursor backend does not forward `effort`;
-//   reasoning depth rides on the model id itself. `cursor:grok-4.5`
+//   reasoning depth rides on the model id itself. `cursor:grok-4.6`
 //   is the canonical id (see clients.gaviero) — check variants with
 //   `agent --list-models` before inventing suffixes.
 //
@@ -975,10 +975,10 @@ agent convergence-judge {
 // The `roster` workflow parameter binds the loop's `reviewers` slot to
 // a list of provider entries. Override entirely from the CLI:
 //
-//   --param roster=claude=claude:opus@xhigh,codex=codex:gpt-5.6-sol@xhigh,cursor=cursor:grok-4.5@xhigh
+//   --param roster=claude=claude:opus@xhigh,codex=codex:gpt-5.6-sol@xhigh,cursor=cursor:grok-4.6@xhigh
 //
 // The in-script default below runs that same three-provider frontier
-// panel (Claude Opus + Codex GPT-5.6 Sol + Cursor Grok 4.5) so the
+// panel (Claude Opus + Codex GPT-5.6 Sol + Cursor Grok 4.6) so the
 // example works with no flag. The Cursor entry's `effort` is a no-op —
 // the Cursor backend does not forward it (see header roster note).
 //
@@ -1033,7 +1033,7 @@ workflow scientific-research-consensus {
     param roster [
         { id "claude" model "claude:opus"       effort xhigh }
         { id "codex"  model "codex:gpt-5.6-sol" effort xhigh }
-        { id "cursor" model "cursor:grok-4.5"   effort xhigh }
+        { id "cursor" model "cursor:grok-4.6"   effort xhigh }
     ]
 
     steps [
