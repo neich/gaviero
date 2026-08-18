@@ -7,7 +7,7 @@
 //! parses the response, and applies the operations through the
 //! Tier S2 writer task. **The LLM proposes; the writer applies.**
 //!
-//! The prompt is version-pinned (see `PROMPT_V2`); future revisions
+//! The prompt is version-pinned (see `PROMPT_V4`); future revisions
 //! bump the version so the audit trail can identify which rubric
 //! produced a given operation. Every applied operation records its
 //! prompt version, so a revision can be judged against the op quality
@@ -19,15 +19,32 @@ use serde::{Deserialize, Serialize};
 /// Pinned consolidator prompt. Revisions bump the version suffix and
 /// must keep the JSON output schema stable; downstream parsers key on
 /// the field names below.
-pub const PROMPT_VERSION: &str = "session_v2";
+///
+/// `session_v3` added the verbatim-ADD rule. The first live run of
+/// `session_v2` emitted six ADDs of which five stored raw `USER:` /
+/// `ASSISTANT:` transcript blobs into the durable repo record at
+/// importance 1.0 — the model read "ADD it as-is" as an instruction to
+/// keep whatever it was shown. The candidate pool no longer contains
+/// transcript rows at all (see `prepare_session_consolidate`), and the
+/// rule is the second line of defence for any other bulky candidate.
+///
+/// `session_v4` replaces "Prefer DROP over MERGE if uncertain" with an
+/// operation-selection rule keyed on what the candidate *does* to
+/// existing knowledge. The old wording routed reconfirmations —
+/// candidates restating a memory already held — to DROP, which discards
+/// the very signal `MERGE` exists to record (it raises the surviving
+/// row's trust to `MERGE_TRUST`). Across five live runs the consolidator
+/// emitted zero MERGE and zero SUPERSEDE while repeatedly seeing
+/// candidates identical to stored rows.
+pub const PROMPT_VERSION: &str = "session_v4";
 
 /// Verbatim consolidator prompt. Kept as a single &'static so the
 /// prompt and its version travel together.
-pub const PROMPT_V2: &str = r#"
+pub const PROMPT_V4: &str = r#"
 You are Gaviero's session consolidator. Read the chat transcript and the
 list of CANDIDATE memories that were extracted from it. For each candidate,
 decide whether to ADD it as-is, MERGE it into a similar existing memory,
-SUPERSEDE an obsolete memory with it, or DROP it (low value / duplicate).
+SUPERSEDE an obsolete memory with it, or DROP it (not worth storing).
 
 Also produce one SHORT session summary (≤400 tokens) capturing the thread
 of the conversation. The summary is stored as a long-lived memory at the
@@ -53,7 +70,25 @@ Rules:
 - Never invent memory ids. `into_memory_id` and `supersedes_memory_id`
   MUST be ids listed in EXISTING_MEMORIES below. An operation naming any
   other id is rejected and recorded as a failure.
-- Prefer DROP over MERGE if uncertain.
+- ADD stores the candidate's text **verbatim** as a long-lived memory —
+  it does not rewrite or shorten it. So only ADD a candidate that already
+  reads as a standalone durable fact. DROP anything that reads like raw
+  conversation, a narrated work log, or a restatement of the transcript:
+  the session summary already covers that ground, and a verbatim
+  conversation excerpt in the durable store is worse than nothing.
+- Choose the operation by what the candidate does to what is already
+  known, not by how confident you feel:
+  * It says the same thing as a memory in EXISTING_MEMORIES → MERGE into
+    that id. This is a *reconfirmation*: the fact came up again and still
+    holds, and merging raises that memory's trust. Do not DROP it — that
+    silently discards the evidence.
+  * It contradicts, corrects, or supersedes a memory in
+    EXISTING_MEMORIES → SUPERSEDE that id.
+  * It is new and worth keeping → ADD.
+  * It is genuinely low-value, or a restatement of something already in
+    this same batch → DROP.
+- DROP is for candidates not worth storing at all. It is not the safe
+  default for "already known" — MERGE is.
 - Promotions are optional; only include rows you actively want widened.
 - `expected_outcome` is one short sentence saying what should be true of
   the memory store after the operation lands, e.g. "the older tokio
@@ -228,6 +263,48 @@ pub const MAX_HISTORY_CHARS: usize = 2400;
 /// How many previous runs to replay.
 pub const MAX_HISTORY_RUNS: usize = 5;
 
+/// Character budget for the transcript section.
+///
+/// The prompt has always announced "truncated to last N turns", but
+/// nothing truncated: `/consolidate-session` joins *every* message in
+/// the active conversation. A 98-message session produced a 187 KB
+/// transcript (~47k tokens) in one consolidation call, which is most of
+/// why a single run took 3m41s. ~24 000 chars is ~6k tokens — enough
+/// tail for the summary to be faithful, bounded enough that the call
+/// stays predictable however long a conversation runs.
+///
+/// A byte budget rather than a token count, for the same reason
+/// [`MAX_EXISTING_MEMORIES_CHARS`] is: the consolidator has no
+/// tokenizer to hand.
+pub const MAX_TRANSCRIPT_CHARS: usize = 24_000;
+
+/// Marker prefixed to a transcript that lost its head.
+pub const TRANSCRIPT_ELISION: &str = "[… earlier turns elided …]";
+
+/// Keep the tail of `transcript` within [`MAX_TRANSCRIPT_CHARS`].
+///
+/// The *tail*, not the head: the most recent turns are the ones the
+/// candidates were extracted from, and the ones a session summary is
+/// most likely to be asked about. Cuts on a `char` boundary and then
+/// forward to the next line break, so the excerpt starts on a whole
+/// line instead of mid-word.
+pub fn truncate_transcript(transcript: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if transcript.len() <= MAX_TRANSCRIPT_CHARS {
+        return Cow::Borrowed(transcript);
+    }
+    let mut cut = transcript.len() - MAX_TRANSCRIPT_CHARS;
+    while !transcript.is_char_boundary(cut) {
+        cut += 1;
+    }
+    let tail = &transcript[cut..];
+    let tail = match tail.find('\n') {
+        Some(nl) => &tail[nl + 1..],
+        None => tail,
+    };
+    Cow::Owned(format!("{TRANSCRIPT_ELISION}\n{tail}"))
+}
+
 /// Build the prompt body for one session.
 ///
 /// Assembles the template, the transcript, this session's candidates,
@@ -239,10 +316,15 @@ pub fn build_prompt(
     existing: &[ExistingBrief],
     history: &[ConsolidationRunBrief],
 ) -> String {
+    // The header used to promise truncation that never happened. Do the
+    // truncation here rather than at the call site so every caller gets
+    // the bound, and so the promise and the mechanism cannot drift apart
+    // again.
+    let transcript = truncate_transcript(transcript);
     let mut body = String::with_capacity(transcript.len() + 2048);
-    body.push_str(PROMPT_V2.trim_start());
-    body.push_str("\n\nTRANSCRIPT (truncated to last N turns):\n");
-    body.push_str(transcript);
+    body.push_str(PROMPT_V4.trim_start());
+    body.push_str("\n\nTRANSCRIPT (most recent turns; earlier ones may be elided):\n");
+    body.push_str(&transcript);
     body.push_str("\n\nCANDIDATES (extracted this session):\n");
     for (i, c) in candidates.iter().enumerate() {
         body.push_str(&format!(
@@ -441,9 +523,94 @@ Hope that helps."#;
     }
 
     #[test]
-    fn the_prompt_version_is_v2() {
-        assert_eq!(PROMPT_VERSION, "session_v2");
-        assert!(PROMPT_V2.contains("expected_outcome"));
+    fn the_prompt_version_is_v4() {
+        assert_eq!(PROMPT_VERSION, "session_v4");
+        assert!(PROMPT_V4.contains("expected_outcome"));
+    }
+
+    /// The v4 rubric change. A candidate restating a known memory is a
+    /// reconfirmation, and `MERGE` is what records reconfirmation —
+    /// `set_trust_score(target, MERGE_TRUST)`. The old wording
+    /// ("Prefer DROP over MERGE if uncertain") threw that away.
+    #[test]
+    fn the_prompt_routes_reconfirmation_to_merge_not_drop() {
+        assert!(
+            !PROMPT_V4.contains("Prefer DROP over MERGE"),
+            "the rule that suppressed every MERGE is back"
+        );
+        assert!(PROMPT_V4.contains("reconfirmation"));
+        assert!(PROMPT_V4.contains("It is not the safe"));
+    }
+
+    /// The rubric change that earned the v3 bump. Pinned so a future
+    /// prompt edit that drops it has to bump the version deliberately.
+    #[test]
+    fn the_prompt_forbids_adding_raw_conversation() {
+        assert!(PROMPT_V4.contains("verbatim"));
+        assert!(PROMPT_V4.contains("narrated work log"));
+    }
+
+    // ── Transcript truncation ────────────────────────────────────────
+
+    #[test]
+    fn a_short_transcript_is_passed_through_untouched() {
+        let t = "USER: hi\nASSISTANT: hello\n";
+        let got = truncate_transcript(t);
+        assert_eq!(got, t);
+        assert!(
+            matches!(got, std::borrow::Cow::Borrowed(_)),
+            "no allocation for a transcript already under budget"
+        );
+    }
+
+    #[test]
+    fn a_long_transcript_keeps_its_tail_within_budget() {
+        let mut t = String::new();
+        for i in 0..4000 {
+            t.push_str(&format!("USER: turn number {i}\n"));
+        }
+        assert!(t.len() > MAX_TRANSCRIPT_CHARS, "fixture must overflow");
+
+        let got = truncate_transcript(&t);
+        assert!(
+            got.len() <= MAX_TRANSCRIPT_CHARS + TRANSCRIPT_ELISION.len() + 1,
+            "truncated transcript still over budget: {}",
+            got.len()
+        );
+        assert!(got.starts_with(TRANSCRIPT_ELISION), "elision not marked");
+        assert!(
+            got.contains("turn number 3999"),
+            "kept the head instead of the tail"
+        );
+        assert!(
+            !got.contains("turn number 0\n"),
+            "oldest turn survived truncation"
+        );
+    }
+
+    /// The cut lands at an arbitrary byte offset, so it must not split a
+    /// multi-byte character.
+    #[test]
+    fn truncation_never_splits_a_multibyte_char() {
+        let t = "é".repeat(MAX_TRANSCRIPT_CHARS);
+        let got = truncate_transcript(&t);
+        assert!(got.len() <= MAX_TRANSCRIPT_CHARS + TRANSCRIPT_ELISION.len() + 1);
+    }
+
+    /// C-fix: the header promised truncation that never happened. Prove
+    /// the promise is now backed by the mechanism, at the choke point
+    /// every caller shares.
+    #[test]
+    fn build_prompt_bounds_an_oversized_transcript() {
+        let huge = "USER: filler line that goes on\n".repeat(4000);
+        assert!(huge.len() > MAX_TRANSCRIPT_CHARS);
+
+        let body = build_prompt(&huge, &[], &[], &[]);
+        assert!(body.contains(TRANSCRIPT_ELISION));
+        assert!(
+            body.len() < huge.len(),
+            "prompt embedded the whole transcript"
+        );
     }
 
     #[test]

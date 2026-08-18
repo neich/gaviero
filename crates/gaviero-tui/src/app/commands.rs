@@ -789,8 +789,21 @@ pub(super) fn handle_consolidate_session_command(app: &mut App) {
         let res = writer
             .session_consolidate(conv_id.clone(), repo_id, None, conv_id.clone(), transcript)
             .await;
+        // The model call runs off the writer task, so `Queued` is the
+        // honest synchronous answer — the operations land minutes later.
+        // `Skipped` used to render as "queued" too, which is how a run
+        // that never started looked identical to one that did.
+        use gaviero_core::memory::WriteResult;
         let msg = match res {
-            Ok(_) => "Session consolidator: queued for processing.".to_string(),
+            Ok(WriteResult::Queued) => "Session consolidator: running in the background. \
+                 `/consolidate history` will list it once the operations land."
+                .to_string(),
+            Ok(WriteResult::Skipped) => {
+                "Session consolidator: nothing to do — this session has no \
+                 memories to consolidate, or a run is already in flight."
+                    .to_string()
+            }
+            Ok(_) => "Session consolidator: done.".to_string(),
             Err(e) => format!("Session consolidator failed: {e}"),
         };
         let _ = tx.send(Event::MessageComplete {
@@ -833,9 +846,14 @@ pub(super) fn handle_consolidate_command(app: &mut App) {
                     Ok(runs) => {
                         let mut out = String::from("Consolidation history (newest first):\n");
                         for r in runs {
+                            // One line per invocation. Before schema v16
+                            // these were grouped by conversation, so
+                            // repeated consolidations of one chat showed
+                            // as a single summed row that could not be
+                            // undone individually.
                             out.push_str(&format!(
-                                "  {}  {}/{} applied{}{}  {}\n",
-                                r.run_id,
+                                "  {}  {}/{} applied{}{}  {}  (session {})\n",
+                                r.batch_id,
                                 r.applied,
                                 r.ops,
                                 r.scope
@@ -844,9 +862,10 @@ pub(super) fn handle_consolidate_command(app: &mut App) {
                                     .unwrap_or_default(),
                                 if r.rolled_back { "  (rolled back)" } else { "" },
                                 r.started_at,
+                                r.run_id,
                             ));
                         }
-                        out.push_str("\nUndo one with: /consolidate rollback <run_id>");
+                        out.push_str("\nUndo one with: /consolidate rollback <id>");
                         out
                     }
                     Err(e) => format!("Could not read consolidation history: {e}"),
@@ -862,7 +881,7 @@ pub(super) fn handle_consolidate_command(app: &mut App) {
         Some("rollback") => {
             let Some(run_id) = args.next().map(str::to_string) else {
                 app.chat_state.add_system_message(
-                    "Usage: /consolidate rollback <run_id>  (see /consolidate history)",
+                    "Usage: /consolidate rollback <id>  (the first column of /consolidate history)",
                 );
                 return;
             };
@@ -877,7 +896,7 @@ pub(super) fn handle_consolidate_command(app: &mut App) {
                     Ok(outcome) => {
                         let mut out = format!(
                             "Rolled back consolidation run {}: {} operation(s) reversed",
-                            outcome.run_id, outcome.reversed
+                            outcome.batch_id, outcome.reversed
                         );
                         if outcome.skipped > 0 {
                             out.push_str(&format!(", {} skipped (never applied)", outcome.skipped));

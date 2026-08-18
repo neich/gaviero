@@ -242,6 +242,10 @@ impl Consolidator {
                     // Already exists at broader scope — skip
                 }
                 Ok(WriteResult::Skipped) => {}
+                // `SwarmConsolidate` is applied inline by the writer and
+                // never defers, so this is unreachable in practice; count
+                // it as not-yet-promoted rather than silently as success.
+                Ok(WriteResult::Queued) => {}
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
