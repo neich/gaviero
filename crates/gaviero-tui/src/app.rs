@@ -46,11 +46,10 @@ mod state;
 
 use self::observers::{TuiAcpObserver, TuiSwarmObserver, TuiWriteGateObserver};
 use self::state::{
-    BatchReviewState, BulkOpState, ChangesEntry, ChangesState, CodexTrustDialog, DiffHighlightCache,
-    DiffKind, Focus, LayoutAreas, LayoutPreset, LeftPanelMode,
-    MoveState, MarkdownPreviewMode, PanelVisibility, ReviewProposal, ScrollbarTarget,
-    SidePanelMode, TreeDialog, TreeDialogKind,
-    build_simple_diff,
+    BatchReviewState, BulkOpState, ChangesEntry, ChangesState, CodexTrustDialog,
+    DiffHighlightCache, DiffKind, Focus, LayoutAreas, LayoutPreset, LeftPanelMode,
+    MarkdownPreviewMode, MoveState, PanelVisibility, ReviewProposal, ScrollbarTarget,
+    SidePanelMode, TreeDialog, TreeDialogKind, build_simple_diff,
 };
 
 // ── Constants ────────────────────────────────────────────────────
@@ -170,10 +169,7 @@ pub struct App {
     pub diff_review: Option<DiffReviewState>,
     /// Pre-turn on-disk snapshots for in-process tool-agent edits awaiting
     /// external-change review. Cleared when the user accepts or reverts.
-    pub pending_tool_agent_edits: std::collections::HashMap<
-        std::path::PathBuf,
-        Option<String>,
-    >,
+    pub pending_tool_agent_edits: std::collections::HashMap<std::path::PathBuf, Option<String>>,
     /// Batch review state — entered after agent response with deferred writes.
     pub batch_review: Option<BatchReviewState>,
     /// Git changes panel state — populated when cycling to Changes mode via F7.
@@ -216,7 +212,8 @@ pub struct App {
     // support per-folder caches while keeping today's path (single-folder
     // chat dispatch) working: callers still ask for the focused folder's
     // map and get a one-entry cache miss on first use.
-    pub repo_map: Arc<tokio::sync::RwLock<std::collections::HashMap<std::path::PathBuf, Arc<RepoMap>>>>,
+    pub repo_map:
+        Arc<tokio::sync::RwLock<std::collections::HashMap<std::path::PathBuf, Arc<RepoMap>>>>,
     /// Shallow directory topology cache (per folder root).
     pub topology_cache:
         Arc<tokio::sync::RwLock<std::collections::HashMap<std::path::PathBuf, String>>>,
@@ -355,10 +352,12 @@ impl App {
             .folders()
             .iter()
             .filter_map(|f| {
-                gaviero_core::git::GitRepo::open(&f.path).ok().map(|repo| GitRepoEntry {
-                    name: f.display_name().to_string(),
-                    repo,
-                })
+                gaviero_core::git::GitRepo::open(&f.path)
+                    .ok()
+                    .map(|repo| GitRepoEntry {
+                        name: f.display_name().to_string(),
+                        repo,
+                    })
             })
             .collect();
 
@@ -561,8 +560,7 @@ impl App {
     /// Rescan skill roots after a `.gaviero/skills/` file change.
     pub fn rebuild_skill_catalog(&mut self) {
         let global = gaviero_core::skills::SkillCatalog::global_skills_dir();
-        let (fresh, warnings) =
-            gaviero_core::skills::SkillCatalog::scan(&self.workspace, &global);
+        let (fresh, warnings) = gaviero_core::skills::SkillCatalog::scan(&self.workspace, &global);
         for w in &warnings {
             tracing::warn!("skill catalog rebuild: {} — {}", w.name, w.message);
         }
@@ -592,9 +590,7 @@ impl App {
             .or_else(|| self.workspace.roots().first().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-        let topology_cfg = self
-            .workspace
-            .resolve_topology_config(Some(&graph_root));
+        let topology_cfg = self.workspace.resolve_topology_config(Some(&graph_root));
         let memory_cfg = self
             .workspace
             .resolve_chat_injection_config(Some(&graph_root));
@@ -951,11 +947,7 @@ impl App {
         left_panel::execute_bulk_delete(self, paths);
     }
 
-    fn execute_bulk_move(
-        &mut self,
-        paths: &[std::path::PathBuf],
-        dest_dir: &std::path::PathBuf,
-    ) {
+    fn execute_bulk_move(&mut self, paths: &[std::path::PathBuf], dest_dir: &std::path::PathBuf) {
         left_panel::execute_bulk_move(self, paths, dest_dir);
     }
 
@@ -1331,7 +1323,13 @@ fn list_workspace_files(root: &std::path::Path, limit: usize, excludes: &[String
                 continue;
             }
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                walk(&entry.path(), &format!("{}/", rel_path), files, limit, excludes);
+                walk(
+                    &entry.path(),
+                    &format!("{}/", rel_path),
+                    files,
+                    limit,
+                    excludes,
+                );
             } else {
                 files.push(rel_path);
             }

@@ -483,7 +483,6 @@ async fn run_coordinator_request(
     Ok(response.text)
 }
 
-
 fn extract_run_id(prompt: &str) -> Option<String> {
     for word in prompt.split_whitespace() {
         if let Some(id) = word.strip_prefix("run:") {

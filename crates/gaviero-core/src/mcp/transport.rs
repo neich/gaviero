@@ -97,7 +97,11 @@ fn pipe_has_live_server(name: &str) -> bool {
     // ERROR_PIPE_BUSY: every instance is mid-handshake right now — a
     // server exists even though this connect attempt couldn't land.
     const ERROR_PIPE_BUSY: i32 = 231;
-    match std::fs::OpenOptions::new().read(true).write(true).open(name) {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(name)
+    {
         Ok(_) => true,
         Err(e) => e.raw_os_error() == Some(ERROR_PIPE_BUSY),
     }
@@ -136,7 +140,10 @@ mod tests {
     #[test]
     fn for_workspace_is_socket_under_gaviero_dir() {
         let ep = McpEndpoint::for_workspace(Path::new("/ws"));
-        assert_eq!(ep, McpEndpoint::Unix(PathBuf::from("/ws/.gaviero/mcp.sock")));
+        assert_eq!(
+            ep,
+            McpEndpoint::Unix(PathBuf::from("/ws/.gaviero/mcp.sock"))
+        );
     }
 
     #[test]
@@ -153,7 +160,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("mcp.sock");
         let ep = McpEndpoint::Unix(sock.clone());
-        assert!(!ep.has_live_server(), "missing socket file must probe false");
+        assert!(
+            !ep.has_live_server(),
+            "missing socket file must probe false"
+        );
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         assert!(ep.has_live_server(), "bound listener must probe true");
         drop(listener);

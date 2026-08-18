@@ -242,9 +242,7 @@ pub fn create_backend(config: &BackendConfig) -> Result<Box<dyn AgentBackend>> {
             let url = base_url.as_deref().unwrap_or("http://localhost:11434");
             Ok(Box::new(ollama::OllamaStreamBackend::new(url, model)))
         }
-        BackendConfig::Deepseek { model } => {
-            Ok(Box::new(deepseek::DeepseekBackend::new(model)))
-        }
+        BackendConfig::Deepseek { model } => Ok(Box::new(deepseek::DeepseekBackend::new(model))),
         BackendConfig::Custom { command, args } => {
             anyhow::bail!(
                 "Custom backend not yet implemented (command={}, args={:?})",

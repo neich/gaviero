@@ -46,8 +46,6 @@ impl ScrollState {
         self.viewport = viewport;
     }
 
-
-
     /// Move selection up by one. Adjusts scroll to keep selection visible.
     pub fn move_up(&mut self) {
         self.selected = self.selected.saturating_sub(1);
@@ -273,7 +271,10 @@ mod tests {
         s.scroll_down(3, 20); // wheel scroll past the (still-at-0) selection
         s.ensure_visible_on_render(); // simulate next render
 
-        assert_eq!(s.offset, 3, "render should not snap offset back to selection");
+        assert_eq!(
+            s.offset, 3,
+            "render should not snap offset back to selection"
+        );
         assert_eq!(s.selected, 0, "selection unchanged by wheel scroll");
     }
 

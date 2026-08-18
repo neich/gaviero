@@ -740,8 +740,7 @@ async fn route_app_server_line(
             let id = value
                 .get("id")
                 .context("command approval request missing id")?;
-            let accept =
-                cargo_verification_is_safe_to_approve(&value, active_turn, review).await;
+            let accept = cargo_verification_is_safe_to_approve(&value, active_turn, review).await;
             let decision = if accept { "accept" } else { "decline" };
             write_shared(
                 stdin,
@@ -1024,10 +1023,12 @@ fn split_quoted_command(command: &str) -> Result<Vec<String>> {
 }
 
 fn contains_shell_control(command: &str) -> bool {
-    command
-        .chars()
-        .any(|ch| matches!(ch, '\0' | '\r' | '\n' | ';' | '&' | '|' | '<' | '>' | '`' | '$' | '^'))
-        || command.contains("@(")
+    command.chars().any(|ch| {
+        matches!(
+            ch,
+            '\0' | '\r' | '\n' | ';' | '&' | '|' | '<' | '>' | '`' | '$' | '^'
+        )
+    }) || command.contains("@(")
 }
 
 fn trim_matching_quotes(token: &str) -> &str {
@@ -1043,10 +1044,7 @@ fn trim_matching_quotes(token: &str) -> &str {
     token
 }
 
-fn resolve_command_cwd(
-    value: &serde_json::Value,
-    review: &ReviewContext,
-) -> Result<PathBuf> {
+fn resolve_command_cwd(value: &serde_json::Value, review: &ReviewContext) -> Result<PathBuf> {
     let candidate = match value.pointer("/params/cwd").and_then(|cwd| cwd.as_str()) {
         Some(raw_cwd) => {
             let raw_cwd = PathBuf::from(raw_cwd);
@@ -1110,11 +1108,7 @@ fn validate_cargo_scope_arguments(
     Ok(())
 }
 
-fn validate_manifest_path(
-    raw_path: &str,
-    cwd: &Path,
-    review: &ReviewContext,
-) -> Result<()> {
+fn validate_manifest_path(raw_path: &str, cwd: &Path, review: &ReviewContext) -> Result<()> {
     let raw_path = PathBuf::from(raw_path);
     let candidate = if raw_path.is_absolute() {
         raw_path
@@ -1748,10 +1742,7 @@ mod tests {
         parse_rpc_event(line)
     }
 
-    fn review_context(
-        root: &Path,
-        write_gate: Arc<Mutex<WriteGatePipeline>>,
-    ) -> ReviewContext {
+    fn review_context(root: &Path, write_gate: Arc<Mutex<WriteGatePipeline>>) -> ReviewContext {
         ReviewContext {
             write_gate,
             observer: Arc::new(NoopAcpObserver),
@@ -1875,8 +1866,7 @@ url = "https://example/mcp/"
             PathBuf::from("/tmp/sibling-a"),
             PathBuf::from("/tmp/sibling-b"),
         ];
-        let params =
-            thread_start_params("gpt-5.6-sol", Path::new("/tmp/work"), &extras, false);
+        let params = thread_start_params("gpt-5.6-sol", Path::new("/tmp/work"), &extras, false);
         let instructions = params["developerInstructions"].as_str().unwrap();
         assert!(instructions.contains("primary: /tmp/work"));
         assert!(instructions.contains("sibling: /tmp/sibling-a"));
@@ -1929,10 +1919,7 @@ url = "https://example/mcp/"
         let review = review_context(dir.path(), test_write_gate());
 
         let cases = [
-            (
-                "cargo build --release",
-                CargoVerificationKind::Build,
-            ),
+            ("cargo build --release", CargoVerificationKind::Build),
             (
                 "cargo check --workspace --all-targets",
                 CargoVerificationKind::Check,
@@ -2075,7 +2062,8 @@ url = "https://example/mcp/"
             serde_json::json!({ "fileSystem": { "write": [root.as_ref()] } }),
             serde_json::json!({ "writableRoots": [root.as_ref()] }),
         ] {
-            let mut request = command_request(serde_json::json!("cargo build --release"), dir.path());
+            let mut request =
+                command_request(serde_json::json!("cargo build --release"), dir.path());
             request["params"]["additionalPermissions"] = permissions;
             assert!(parse_cargo_verification_request(&request, &review).is_ok());
         }
@@ -2103,7 +2091,11 @@ url = "https://example/mcp/"
         let outside = tempfile::tempdir().unwrap();
         let inside_manifest = workspace.path().join("Cargo.toml");
         let outside_manifest = outside.path().join("Cargo.toml");
-        std::fs::write(&inside_manifest, "[package]\nname='inside'\nversion='0.1.0'\n").unwrap();
+        std::fs::write(
+            &inside_manifest,
+            "[package]\nname='inside'\nversion='0.1.0'\n",
+        )
+        .unwrap();
         std::fs::write(
             &outside_manifest,
             "[package]\nname='outside'\nversion='0.1.0'\n",
@@ -2338,9 +2330,7 @@ url = "https://example/mcp/"
         tokio::fs::create_dir_all(source.parent().unwrap())
             .await
             .unwrap();
-        tokio::fs::write(&source, "fn before() {}\n")
-            .await
-            .unwrap();
+        tokio::fs::write(&source, "fn before() {}\n").await.unwrap();
 
         let gate = test_write_gate();
         let review = review_context(dir.path(), gate.clone());
@@ -2350,9 +2340,7 @@ url = "https://example/mcp/"
         capture_rust_sources_before_format(&active_turn, &review)
             .await
             .unwrap();
-        tokio::fs::write(&source, "fn after() {}\n")
-            .await
-            .unwrap();
+        tokio::fs::write(&source, "fn after() {}\n").await.unwrap();
 
         let active = active_turn.lock().await.take().unwrap();
         finalize_native_edits(&review, active.snapshot)

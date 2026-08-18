@@ -23,8 +23,8 @@ use anyhow::{Context, Result, anyhow};
 
 use super::MemoryStore;
 use crate::memory::deletions::{DeletedBy, DeletedRow};
-use crate::memory::scope::{MemoryType, StoreResult, WriteMeta, WriteScope};
 use crate::memory::schema;
+use crate::memory::scope::{MemoryType, StoreResult, WriteMeta, WriteScope};
 use crate::memory::trust_defaults::MemorySource;
 
 // ── Public types ───────────────────────────────────────────────
@@ -47,7 +47,10 @@ pub enum ForgetFilter {
     /// Every row at a specific scope (canonical `scope_path` value).
     /// Pass the same string [`crate::memory::scope::WriteScope::to_path_string`]
     /// produces.
-    ByScope { scope_level: i32, scope_path: String },
+    ByScope {
+        scope_level: i32,
+        scope_path: String,
+    },
     /// Every row of a given [`MemoryType`].
     ByType(MemoryType),
     /// Every row produced by a given [`MemorySource`] — e.g.
@@ -638,9 +641,8 @@ impl MemoryStore {
         let original_sha = format!("{:x}", Sha256::digest(original_content.as_bytes()));
         let timestamp = chrono::Utc::now().to_rfc3339();
         let safe_reason = reason.replace(['\n', ']'], " ");
-        let tombstone = format!(
-            "[REDACTED: sha={original_sha} redacted_at={timestamp} reason={safe_reason}]"
-        );
+        let tombstone =
+            format!("[REDACTED: sha={original_sha} redacted_at={timestamp} reason={safe_reason}]");
 
         // Build the audit-row JSON now (outside the privileged window)
         // so the tx body stays minimal. The audit captures the
@@ -657,8 +659,8 @@ impl MemoryStore {
             "redacted_at": timestamp,
             "reason": safe_reason,
         });
-        let audit_json = serde_json::to_string(&audit_payload)
-            .context("serializing redaction audit payload")?;
+        let audit_json =
+            serde_json::to_string(&audit_payload).context("serializing redaction audit payload")?;
 
         // Pre-read the row's `source` and `trust_score` so the audit
         // table's `memory_source` / `memory_trust` columns are populated
@@ -679,8 +681,7 @@ impl MemoryStore {
         let audit_id = {
             let mut conn = self.conn.lock().await;
             let tx = conn.transaction().context("redact: begin transaction")?;
-            schema::drop_history_immutable_triggers(&tx)
-                .context("redact: drop triggers")?;
+            schema::drop_history_immutable_triggers(&tx).context("redact: drop triggers")?;
             // Wipe content + blob; reset compressed flag. Update
             // content_hash to the tombstone's hash so the canonical
             // column matches the new body.
@@ -819,14 +820,15 @@ fn meta_from_payload(payload: &serde_json::Value) -> WriteMeta {
     use std::str::FromStr;
 
     let str_field = |k: &str| -> Option<&str> { payload.get(k).and_then(|v| v.as_str()) };
-    let f32_field = |k: &str| -> Option<f32> {
-        payload.get(k).and_then(|v| v.as_f64()).map(|x| x as f32)
-    };
+    let f32_field =
+        |k: &str| -> Option<f32> { payload.get(k).and_then(|v| v.as_f64()).map(|x| x as f32) };
 
     let memory_type = str_field("memory_type")
         .map(MemoryType::parse_str)
         .unwrap_or(MemoryType::Factual);
-    let trust = str_field("trust").map(Trust::parse_str).unwrap_or(Trust::Medium);
+    let trust = str_field("trust")
+        .map(Trust::parse_str)
+        .unwrap_or(Trust::Medium);
     let source_kind = str_field("source")
         .map(MemorySource::parse_str)
         .unwrap_or(MemorySource::UnknownLegacy);

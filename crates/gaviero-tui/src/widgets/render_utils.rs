@@ -26,7 +26,6 @@ pub fn write_text(buf: &mut Buffer, x: u16, y: u16, x_max: u16, text: &str, styl
     cx
 }
 
-
 /// Word-wrap text into lines that fit within `width` display columns.
 ///
 /// - Expands tabs to 4 spaces

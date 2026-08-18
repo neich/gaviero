@@ -1399,8 +1399,7 @@ fn merge_claude_settings_permissions(
                 // previous synth — then re-add the current set.
                 arr.retain(|v| match v.as_str() {
                     Some(s) => {
-                        !(manages_mcp && s.starts_with("mcp__"))
-                            && !stale.contains(&s.to_string())
+                        !(manages_mcp && s.starts_with("mcp__")) && !stale.contains(&s.to_string())
                     }
                     None => true,
                 });
@@ -1942,7 +1941,6 @@ mod tests {
         );
     }
 
-
     // ── Shell permission policy (agent.permissions.bash) ─────────────────
 
     fn bash_fixture() -> BashPermissions {
@@ -2040,7 +2038,10 @@ mod tests {
         synthesize_for_worktree(&synth).unwrap();
         let allow = json_string_array(&read(&settings_path)["permissions"], "allow");
         assert_eq!(allow, vec!["Bash(ls)".to_string()]);
-        assert!(!managed_marker_path(dir.path()).exists(), "marker cleaned up");
+        assert!(
+            !managed_marker_path(dir.path()).exists(),
+            "marker cleaned up"
+        );
     }
 
     #[test]

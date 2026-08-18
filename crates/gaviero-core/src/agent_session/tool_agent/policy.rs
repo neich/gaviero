@@ -352,10 +352,7 @@ mod tests {
             allow: true,
             prompted: std::sync::Mutex::new(vec![]),
         };
-        let err = p
-            .gate_bash("sudo reboot", true, &obs)
-            .await
-            .unwrap_err();
+        let err = p.gate_bash("sudo reboot", true, &obs).await.unwrap_err();
         assert!(err.contains("sudo"));
         assert!(obs.prompted.lock().unwrap().is_empty());
     }
@@ -423,10 +420,7 @@ mod tests {
             allow: false,
             prompted: std::sync::Mutex::new(vec![]),
         };
-        let err = p
-            .gate_bash("npm install", false, &obs)
-            .await
-            .unwrap_err();
+        let err = p.gate_bash("npm install", false, &obs).await.unwrap_err();
         assert!(err.contains("denied"));
     }
 

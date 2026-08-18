@@ -47,16 +47,11 @@ impl SkillCatalog {
 
         for folder in folders {
             let folder_canon = canonicalize_path(&folder.path);
-            catalog.folder_index.insert(
-                folder_canon.clone(),
-                folder.display_name().to_string(),
-            );
+            catalog
+                .folder_index
+                .insert(folder_canon.clone(), folder.display_name().to_string());
             let skills_dir = folder.path.join(".gaviero").join("skills");
-            catalog.scan_dir(
-                &skills_dir,
-                SCOPE_REPO,
-                &mut warnings,
-            );
+            catalog.scan_dir(&skills_dir, SCOPE_REPO, &mut warnings);
         }
 
         if !single_folder {
@@ -84,10 +79,7 @@ impl SkillCatalog {
             if !folder.is_dir() {
                 continue;
             }
-            let folder_name = folder
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("?");
+            let folder_name = folder.file_name().and_then(|s| s.to_str()).unwrap_or("?");
             if folder_name.starts_with('.') {
                 continue;
             }
@@ -95,10 +87,7 @@ impl SkillCatalog {
             if !skill_md.is_file() {
                 warnings.push(SkillWarning {
                     name: folder_name.to_string(),
-                    message: format!(
-                        "skill folder {} is missing SKILL.md",
-                        folder.display()
-                    ),
+                    message: format!("skill folder {} is missing SKILL.md", folder.display()),
                 });
                 continue;
             }
@@ -114,10 +103,7 @@ impl SkillCatalog {
             };
             match parse_skill(&skill_md, &contents) {
                 Ok(mut skill) => {
-                    debug_assert_eq!(
-                        skill_name_from_path(&skill_md),
-                        Some(skill.name.as_str())
-                    );
+                    debug_assert_eq!(skill_name_from_path(&skill_md), Some(skill.name.as_str()));
                     skill.scope_level = scope_level;
                     self.by_name
                         .entry(skill.name.clone())
@@ -207,9 +193,9 @@ impl SkillCatalog {
             let rank = |s: &Skill| -> (u8, String) {
                 let scope_rank = match s.scope_level {
                     SCOPE_REPO => {
-                        if active_repo_id.is_some_and(|id| {
-                            self.repo_id_for_skill(s).as_deref() == Some(id)
-                        }) {
+                        if active_repo_id
+                            .is_some_and(|id| self.repo_id_for_skill(s).as_deref() == Some(id))
+                        {
                             0
                         } else {
                             1
@@ -263,9 +249,10 @@ impl SkillCatalog {
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let candidates: Vec<&str> = scored.iter().map(|(i, _)| descriptions[*i]).collect();
-        let rerank_scores = reranker.rerank(query, &candidates).await.unwrap_or_else(|_| {
-            scored.iter().map(|(_, s)| *s).collect()
-        });
+        let rerank_scores = reranker
+            .rerank(query, &candidates)
+            .await
+            .unwrap_or_else(|_| scored.iter().map(|(_, s)| *s).collect());
 
         let mut indexed: Vec<(usize, f32)> = scored
             .iter()
@@ -277,11 +264,7 @@ impl SkillCatalog {
         indexed.into_iter().map(|(i, _)| all[i]).collect()
     }
 
-    pub fn rebuild(
-        &mut self,
-        workspace: &Workspace,
-        global_dir: &Path,
-    ) -> Vec<SkillWarning> {
+    pub fn rebuild(&mut self, workspace: &Workspace, global_dir: &Path) -> Vec<SkillWarning> {
         let (fresh, warnings) = Self::scan(workspace, global_dir);
         *self = fresh;
         warnings
@@ -376,9 +359,7 @@ mod tests {
     fn write_skill(dir: &Path, name: &str, description: &str) {
         let skill_dir = dir.join(name);
         fs::create_dir_all(&skill_dir).unwrap();
-        let body = format!(
-            "---\ndescription: {description}\n---\nBody for {name}\n"
-        );
+        let body = format!("---\ndescription: {description}\n---\nBody for {name}\n");
         fs::write(skill_dir.join("SKILL.md"), body).unwrap();
     }
 
@@ -404,9 +385,7 @@ mod tests {
         let ws = Workspace::single_folder(tmp.path().to_path_buf());
         let (catalog, _) = SkillCatalog::scan(&ws, Path::new("/nonexistent"));
         let label = catalog.source_label(catalog.resolve(None, "deploy", None).unwrap());
-        assert!(catalog
-            .resolve(Some(&label), "deploy", None)
-            .is_some());
+        assert!(catalog.resolve(Some(&label), "deploy", None).is_some());
     }
 
     #[test]

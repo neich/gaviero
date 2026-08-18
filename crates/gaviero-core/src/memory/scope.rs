@@ -71,7 +71,10 @@ pub fn module_path_for_file(folder: &Path, file: &Path) -> Option<String> {
     let fallback = relative.parent()?;
     let mut current = file.parent()?;
     let boundary = loop {
-        if PACKAGE_MARKERS.iter().any(|marker| current.join(marker).is_file()) {
+        if PACKAGE_MARKERS
+            .iter()
+            .any(|marker| current.join(marker).is_file())
+        {
             break current;
         }
         if current == folder {

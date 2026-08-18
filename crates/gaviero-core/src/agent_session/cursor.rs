@@ -37,7 +37,7 @@ use crate::acp::client::{propose_delete, propose_write};
 use crate::context_planner::{ContinuityHandle, ContinuityMode, ProviderProfile};
 use crate::observer::AcpObserver;
 use crate::swarm::backend::cursor::{
-    CursorEvent, cursor_argv, cursor_argv_limit, is_auth_error, parse_cursor_event,
+    CursorEvent, cursor_argv, is_auth_error, parse_cursor_event, prepare_cursor_prompt,
     tool_display_name, write_tool_args,
 };
 use crate::swarm::backend::shared;
@@ -121,8 +121,11 @@ impl CursorSession {
 
     async fn run_cursor_turn(&mut self, turn: &Turn) -> Result<()> {
         // ── Reconstruct the enriched prompt ─────────────────────────────
-        let user_message =
-            embed_workspace_folders(&turn.user_message, &self.workspace_root, &self.additional_roots);
+        let user_message = embed_workspace_folders(
+            &turn.user_message,
+            &self.workspace_root,
+            &self.additional_roots,
+        );
 
         let mut parts: Vec<String> = Vec::new();
         parts.push(format!("<user_message>\n{}\n</user_message>", user_message));
@@ -186,20 +189,10 @@ impl CursorSession {
         let user_prompt =
             shared::build_enriched_prompt(&enriched_prompt, &conversation_history, &file_refs);
         let combined_prompt = format!("{system_prompt}\n\n{user_prompt}");
-
-        if combined_prompt.len() >= cursor_argv_limit() {
-            anyhow::bail!(
-                "cursor prompt is {} bytes which exceeds the {}-byte argv limit. \
-                 The `agent` CLI has no stdin or `--prompt-file` fallback. \
-                 Most of a first-turn prompt is bootstrap context: run `/lite` \
-                 to drop <repo_outline> + memory + impact (keeps topology) for \
-                 the next turn, then send. You can also trim the user message / \
-                 attachments, or switch to a provider with stdin support \
-                 (claude, codex, ollama).",
-                combined_prompt.len(),
-                cursor_argv_limit(),
-            );
-        }
+        // Held until this function returns (after child.wait) so the
+        // spilled file survives the whole `agent` turn.
+        let (_prompt_tempfile, argv_prompt) =
+            prepare_cursor_prompt(&self.workspace_root, &combined_prompt)?;
 
         // ── M0 instrumentation ──────────────────────────────────────────
         let history_chars: usize = conversation_history
@@ -237,7 +230,7 @@ impl CursorSession {
         ) {
             cmd.arg(arg);
         }
-        cmd.arg(&combined_prompt)
+        cmd.arg(&argv_prompt)
             .current_dir(&self.workspace_root)
             .env("NO_COLOR", "1")
             .stdin(Stdio::null())
@@ -546,7 +539,10 @@ impl CursorSession {
             };
             self.observer.on_message_complete(
                 "system",
-                &format!("cursor `agent` produced no output.\n{}{hint}", stderr_text.trim()),
+                &format!(
+                    "cursor `agent` produced no output.\n{}{hint}",
+                    stderr_text.trim()
+                ),
             );
         } else {
             self.observer.on_message_complete(

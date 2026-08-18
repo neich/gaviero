@@ -18,8 +18,7 @@ use serde_json::Value as JsonValue;
 
 use crate::memory::{
     ChatInjection, ChatInjectionConfig, MemoryScope, MemoryStores, RerankConfig, Reranker,
-    RetrievalConfig, WriterHandle, WriterMessage,
-    retrieval::retrieve_for_chat_with_reranker,
+    RetrievalConfig, WriterHandle, WriterMessage, retrieval::retrieve_for_chat_with_reranker,
 };
 use crate::observer::ChatInjectionSummary;
 
@@ -357,9 +356,7 @@ fn build_manifest_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{
-        MemoryServices, ScopeMix, WriteMeta, WriteScope, hash_path,
-    };
+    use crate::memory::{MemoryServices, ScopeMix, WriteMeta, WriteScope, hash_path};
 
     fn null_injection_config(enabled: bool) -> ChatInjectionConfig {
         ChatInjectionConfig {
@@ -458,8 +455,7 @@ mod tests {
             .expect("module context should make the module row eligible");
         assert!(
             injection.items.iter().any(|item| {
-                item.content == content
-                    && item.module_path.as_deref() == Some(module_path)
+                item.content == content && item.module_path.as_deref() == Some(module_path)
             }),
             "expected the matching module-scoped row in the injection"
         );

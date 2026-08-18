@@ -100,11 +100,9 @@ async fn e2e_reset_residual_zero() -> Result<()> {
         "Read crates/gaviero-core/src/memory/retrieval.rs and summarise the composite \
          scoring formula. Reference the canary marker {CANARY_MARKER} in your reply."
     );
-    let user_t2 =
-        "List every callsite of retrieve_for_chat in the workspace.".to_string();
-    let user_t3 =
-        "Propose a refactor that extracts the rerank blending into a separate function."
-            .to_string();
+    let user_t2 = "List every callsite of retrieve_for_chat in the workspace.".to_string();
+    let user_t3 = "Propose a refactor that extracts the rerank blending into a separate function."
+        .to_string();
     // t4 is identical to t1.
     let user_t4 = user_t1.clone();
 
@@ -150,7 +148,10 @@ async fn e2e_reset_residual_zero() -> Result<()> {
     )
     .await?;
     wait_for_writer_drain(&env, r, WRITER_DRAIN_TIMEOUT).await?;
-    r.kv("session_id", outcome_t1.session_id.as_deref().unwrap_or("?"));
+    r.kv(
+        "session_id",
+        outcome_t1.session_id.as_deref().unwrap_or("?"),
+    );
     r.kv("elapsed_ms", outcome_t1.elapsed.as_millis());
     history_after_t1 = append_to_history("", &user_t1, &outcome_t1.assistant_text);
 
@@ -172,7 +173,10 @@ async fn e2e_reset_residual_zero() -> Result<()> {
     )
     .await?;
     wait_for_writer_drain(&env, r, WRITER_DRAIN_TIMEOUT).await?;
-    r.kv("session_id", outcome_t2.session_id.as_deref().unwrap_or("?"));
+    r.kv(
+        "session_id",
+        outcome_t2.session_id.as_deref().unwrap_or("?"),
+    );
     r.kv("elapsed_ms", outcome_t2.elapsed.as_millis());
     history_after_t2 = append_to_history(&history_after_t1, &user_t2, &outcome_t2.assistant_text);
 
@@ -192,7 +196,10 @@ async fn e2e_reset_residual_zero() -> Result<()> {
     )
     .await?;
     wait_for_writer_drain(&env, r, WRITER_DRAIN_TIMEOUT).await?;
-    r.kv("session_id", outcome_t3.session_id.as_deref().unwrap_or("?"));
+    r.kv(
+        "session_id",
+        outcome_t3.session_id.as_deref().unwrap_or("?"),
+    );
     r.kv("elapsed_ms", outcome_t3.elapsed.as_millis());
     history_after_t3 = append_to_history(&history_after_t2, &user_t3, &outcome_t3.assistant_text);
     let _ = history_after_t3; // retained for diagnostic symmetry
@@ -220,7 +227,10 @@ async fn e2e_reset_residual_zero() -> Result<()> {
     )
     .await?;
     wait_for_writer_drain(&env, r, WRITER_DRAIN_TIMEOUT).await?;
-    r.kv("session_id", outcome_t4.session_id.as_deref().unwrap_or("?"));
+    r.kv(
+        "session_id",
+        outcome_t4.session_id.as_deref().unwrap_or("?"),
+    );
     r.kv("elapsed_ms", outcome_t4.elapsed.as_millis());
 
     // ── Pull captured PromptEvents and classify ─────────────────────
@@ -245,11 +255,17 @@ async fn e2e_reset_residual_zero() -> Result<()> {
     let ratio = if t1_tok > 0.0 { t4_tok / t1_tok } else { 1.0 };
     r.kv(
         "tokens(t1)",
-        format!("{} tok ({} B)", digest_t1.total_tokens_approx, digest_t1.total_bytes),
+        format!(
+            "{} tok ({} B)",
+            digest_t1.total_tokens_approx, digest_t1.total_bytes
+        ),
     );
     r.kv(
         "tokens(t4)",
-        format!("{} tok ({} B)", digest_t4.total_tokens_approx, digest_t4.total_bytes),
+        format!(
+            "{} tok ({} B)",
+            digest_t4.total_tokens_approx, digest_t4.total_bytes
+        ),
     );
     r.kv("tokens(t4)/tokens(t1)", format!("{:.3}", ratio));
     if ratio > SLO1_BULK_RATIO {
@@ -323,8 +339,7 @@ async fn e2e_reset_residual_zero() -> Result<()> {
     // Group manifests by turn_id so we can compare t1 ↔ t4 directly
     // rather than relying on the newest/oldest insertion order, which
     // can be perturbed by writer reordering across drains.
-    let mut by_turn: std::collections::HashMap<String, Vec<i64>> =
-        std::collections::HashMap::new();
+    let mut by_turn: std::collections::HashMap<String, Vec<i64>> = std::collections::HashMap::new();
     for row in &manifests {
         let ids = extract_selected_ids(&row.payload)?;
         by_turn.entry(row.turn_id.clone()).or_default().extend(ids);
@@ -339,14 +354,10 @@ async fn e2e_reset_residual_zero() -> Result<()> {
     r.kv("manifest(t4).selected_ids", format!("{:?}", t4_ids));
 
     if t1_ids.is_empty() {
-        anyhow::bail!(
-            "SLO 3 violated: no manifest emitted for turn t1 (writer pipeline misfire)"
-        );
+        anyhow::bail!("SLO 3 violated: no manifest emitted for turn t1 (writer pipeline misfire)");
     }
     if t4_ids.is_empty() {
-        anyhow::bail!(
-            "SLO 3 violated: no manifest emitted for turn t4 (writer pipeline misfire)"
-        );
+        anyhow::bail!("SLO 3 violated: no manifest emitted for turn t4 (writer pipeline misfire)");
     }
     if t1_ids != t4_ids {
         anyhow::bail!(
@@ -506,10 +517,7 @@ fn log_digest(r: &mut support::env::TestReport, d: &PromptDigest) {
         entry.1 += s.tokens_approx;
     }
     for (k, (b, t)) in by_kind {
-        r.line(format!(
-            "    {} · {:?} = {} B ({} tok)",
-            d.turn_id, k, b, t
-        ));
+        r.line(format!("    {} · {:?} = {} B ({} tok)", d.turn_id, k, b, t));
     }
 }
 
@@ -535,18 +543,15 @@ fn history_section_shas(d: &PromptDigest) -> HashSet<&str> {
 }
 
 fn extract_selected_ids(payload: &str) -> Result<Vec<i64>> {
-    let v: serde_json::Value = serde_json::from_str(payload)
-        .context("parsing manifest payload as JSON")?;
+    let v: serde_json::Value =
+        serde_json::from_str(payload).context("parsing manifest payload as JSON")?;
     let arr = v
         .get("selected_ids")
         .and_then(|x| x.as_array())
         .with_context(|| "manifest payload missing selected_ids array")?;
     let mut out = Vec::with_capacity(arr.len());
     for x in arr {
-        out.push(
-            x.as_i64()
-                .with_context(|| "selected_ids entry not i64")?,
-        );
+        out.push(x.as_i64().with_context(|| "selected_ids entry not i64")?);
     }
     Ok(out)
 }
@@ -589,19 +594,15 @@ async fn e2e_parallel_sessions_isolated() -> Result<()> {
 
     // S0 seeds a unique marker into its own store.
     let s0_marker = format!("EMBED_MARKER_S0_{}", uuid_like());
-    let seed_text = format!(
-        "Cross-session isolation canary: this fact must not leak. Marker: {s0_marker}"
-    );
+    let seed_text =
+        format!("Cross-session isolation canary: this fact must not leak. Marker: {s0_marker}");
     let res = env_s0
         .services
         .writer
         .user_remember_scoped(env_s0.repo_scope(), &seed_text)
         .await
         .context("seeding S0 marker")?;
-    r.kv(
-        "s0_seed",
-        format!("{:?}", res),
-    );
+    r.kv("s0_seed", format!("{:?}", res));
     wait_for_writer_drain(&env_s0, r, WRITER_DRAIN_TIMEOUT).await?;
 
     let s0_marker_for_assert = s0_marker.clone();
@@ -680,20 +681,21 @@ async fn e2e_parallel_sessions_isolated() -> Result<()> {
         .iter()
         .any(|m| m.content.contains(&s0_marker_for_assert));
     if s1_leaked || s2_leaked {
-        anyhow::bail!(
-            "Probe 1 violated: S0 marker leaked into S1={s1_leaked} S2={s2_leaked}"
-        );
+        anyhow::bail!("Probe 1 violated: S0 marker leaked into S1={s1_leaked} S2={s2_leaked}");
     }
     r.line("    ✓ PASS: S0 marker does not appear in S1 / S2 stores");
 
     // ── Probe 2: manifest separation ────────────────────────────────
     r.section("probe 2 — manifest separation");
     for env in [&env_s0, &env_s1, &env_s2] {
-        let store = env.services.stores.get(&env.repo_scope().target_store()).await?;
+        let store = env
+            .services
+            .stores
+            .get(&env.repo_scope().target_store())
+            .await?;
         let manifests = store.recent_manifests(64).await?;
         let recent = env.recent_all(24).await?;
-        let local_ids: std::collections::HashSet<i64> =
-            recent.iter().map(|m| m.id).collect();
+        let local_ids: std::collections::HashSet<i64> = recent.iter().map(|m| m.id).collect();
         let mut foreign: Vec<i64> = Vec::new();
         for m in &manifests {
             let payload: serde_json::Value = match serde_json::from_str(&m.payload) {
@@ -712,11 +714,7 @@ async fn e2e_parallel_sessions_isolated() -> Result<()> {
         }
         r.kv(
             &format!("manifests({})", env.repo_id),
-            format!(
-                "rows={} foreign_ids={}",
-                manifests.len(),
-                foreign.len()
-            ),
+            format!("rows={} foreign_ids={}", manifests.len(), foreign.len()),
         );
         if !foreign.is_empty() {
             anyhow::bail!(
@@ -824,7 +822,11 @@ async fn e2e_prompt_bloat_baseline() -> Result<()> {
         bugfix_session("snap_bugfix", "EMBED_MARKER_SNAP_B"),
         feature_session("snap_feature", "EMBED_MARKER_SNAP_F"),
     ];
-    let envs = [Arc::clone(&env_s0), Arc::clone(&env_s1), Arc::clone(&env_s2)];
+    let envs = [
+        Arc::clone(&env_s0),
+        Arc::clone(&env_s1),
+        Arc::clone(&env_s2),
+    ];
 
     // Run each script sequentially. Skip Barrier steps (only meaningful
     // in run_parallel) so the same script bodies work in both contexts.

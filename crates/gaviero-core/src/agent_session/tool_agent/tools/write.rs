@@ -222,9 +222,7 @@ pub(crate) fn apply_single_edit(
 }
 
 async fn commit_write(ctx: &ToolCtx, file_path: &str, contents: &str) -> Result<String, String> {
-    let path = ctx
-        .confine(file_path)
-        .map_err(|e| e.to_string())?;
+    let path = ctx.confine(file_path).map_err(|e| e.to_string())?;
     ctx.check_write(&path).map_err(|e| e.to_string())?;
 
     snapshot(ctx, &path).await?;
@@ -241,10 +239,7 @@ async fn commit_write(ctx: &ToolCtx, file_path: &str, contents: &str) -> Result<
     if let (Some(obs), Some(snap)) = (&ctx.observer, &ctx.snapshot) {
         let pre = snap.lock().await.pre_turn_content(&path);
         if let Some(pre_turn) = pre {
-            obs.on_tool_agent_edit_captured(
-                &path,
-                pre_turn.as_deref(),
-            );
+            obs.on_tool_agent_edit_captured(&path, pre_turn.as_deref());
         }
     }
 
@@ -304,10 +299,7 @@ mod tests {
         let snap = Arc::new(Mutex::new(TurnSnapshot::new()));
         let ctx = ctx_for(dir.path(), snap.clone());
         let out = WriteTool
-            .run(
-                json!({ "file_path": "x.txt", "contents": "hello\n" }),
-                &ctx,
-            )
+            .run(json!({ "file_path": "x.txt", "contents": "hello\n" }), &ctx)
             .await;
         assert!(!out.is_error, "{}", out.content);
         assert_eq!(
@@ -346,10 +338,7 @@ mod tests {
         let snap = Arc::new(Mutex::new(TurnSnapshot::new()));
         let ctx = ctx_for(dir.path(), snap);
         let out = WriteTool
-            .run(
-                json!({ "file_path": ".env", "contents": "X=1\n" }),
-                &ctx,
-            )
+            .run(json!({ "file_path": ".env", "contents": "X=1\n" }), &ctx)
             .await;
         assert!(out.is_error);
         assert!(!dir.path().join(".env").exists());

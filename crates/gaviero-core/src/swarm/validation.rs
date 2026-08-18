@@ -32,11 +32,7 @@ pub struct BackendError {
 
 impl std::fmt::Display for BackendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "agent '{}': {}",
-            self.unit_id, self.message
-        )
+        write!(f, "agent '{}': {}", self.unit_id, self.message)
     }
 }
 
@@ -327,10 +323,8 @@ mod tests {
         ];
         let narrow = vec![vec!["claude-refine".to_string()]];
         assert_eq!(validate_scopes(&units, &narrow).len(), 1);
-        let expanded = expand_loop_groups_with_roster_init(
-            narrow,
-            &["claude-init", "claude-refine"],
-        );
+        let expanded =
+            expand_loop_groups_with_roster_init(narrow, &["claude-init", "claude-refine"]);
         assert!(validate_scopes(&units, &expanded).is_empty());
     }
 

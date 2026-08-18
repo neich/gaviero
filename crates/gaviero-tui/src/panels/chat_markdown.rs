@@ -52,10 +52,7 @@ impl ChatLine {
     /// Style of the first segment, used as a fallback for whole-line
     /// effects like the browse-mode background highlight.
     pub fn primary_style(&self) -> Style {
-        self.segments
-            .first()
-            .map(|s| s.style)
-            .unwrap_or_default()
+        self.segments.first().map(|s| s.style).unwrap_or_default()
     }
 }
 
@@ -156,14 +153,7 @@ pub fn format_chat_markdown_mapped(
             if trimmed.is_empty() {
                 output.push(ChatLine::single(String::new(), reasoning_style));
             } else {
-                push_inline_wrapped(
-                    &mut output,
-                    trimmed,
-                    "  ",
-                    "  ",
-                    width,
-                    reasoning_style,
-                );
+                push_inline_wrapped(&mut output, trimmed, "  ", "  ", width, reasoning_style);
             }
             i += 1;
             continue;
@@ -703,11 +693,7 @@ fn render_table(
                 wrap_cell_content(cell, *w)
             })
             .collect();
-        let row_height = wrapped_cells
-            .iter()
-            .map(|c| c.len())
-            .max()
-            .unwrap_or(1);
+        let row_height = wrapped_cells.iter().map(|c| c.len()).max().unwrap_or(1);
 
         for line_idx in 0..row_height {
             let line = build_table_row_line(&wrapped_cells, &col_widths, line_idx);
@@ -1056,7 +1042,11 @@ mod tests {
         let width = 30;
         let lines = format_chat_markdown(text, width, style);
 
-        let joined = lines.iter().map(|l| l.text()).collect::<Vec<_>>().join("\n");
+        let joined = lines
+            .iter()
+            .map(|l| l.text())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             joined.contains("JWT tokens"),
             "full cell text must appear, got:\n{joined}"

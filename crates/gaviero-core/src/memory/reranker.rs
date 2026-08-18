@@ -293,7 +293,7 @@ pub fn build_reranker(name: &str, threads: usize) -> Result<Option<Arc<dyn Reran
         "null" => Ok(Some(Arc::new(NullReranker) as Arc<dyn Reranker>)),
         _ => match resolve_reranker_model(name) {
             Some(info) => Ok(Some(
-                Arc::new(ModernBertReranker::from_model(info, threads)?) as Arc<dyn Reranker>
+                Arc::new(ModernBertReranker::from_model(info, threads)?) as Arc<dyn Reranker>,
             )),
             None => Ok(None),
         },
@@ -359,7 +359,6 @@ impl ModernBertReranker {
             model_id: model_id.to_string(),
         })
     }
-
 }
 
 impl RerankerInner {
@@ -402,11 +401,7 @@ impl RerankerInner {
             let batch = chunk.len();
             // Pad only to the longest sequence in *this* chunk, not the
             // whole pool — a chunk of short docs stays cheap.
-            let max_len = chunk
-                .iter()
-                .map(|e| e.get_ids().len())
-                .max()
-                .unwrap_or(0);
+            let max_len = chunk.iter().map(|e| e.get_ids().len()).max().unwrap_or(0);
             let mut input_ids = Array2::<i64>::zeros((batch, max_len));
             let mut attention_mask = Array2::<i64>::zeros((batch, max_len));
             let mut token_type_ids = Array2::<i64>::zeros((batch, max_len));
@@ -597,7 +592,9 @@ mod tests {
     #[test]
     fn resolve_reranker_model_handles_int8_and_minilm_aliases() {
         assert_eq!(
-            resolve_reranker_model("gte-reranker-modernbert-int8").unwrap().id,
+            resolve_reranker_model("gte-reranker-modernbert-int8")
+                .unwrap()
+                .id,
             "gte-reranker-modernbert-base-int8"
         );
         assert_eq!(

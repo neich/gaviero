@@ -299,7 +299,8 @@ mod tests {
 
     fn instance_with_capture() -> (TerminalInstance, CaptureWriter) {
         let config = ShellConfig::with_shell("bash");
-        let mut inst = TerminalInstance::new(TerminalId::next(), config, PathBuf::from("."), 24, 80, 100);
+        let mut inst =
+            TerminalInstance::new(TerminalId::next(), config, PathBuf::from("."), 24, 80, 100);
         let writer = CaptureWriter::default();
         inst.pty_writer = Some(Box::new(writer.clone()));
         (inst, writer)

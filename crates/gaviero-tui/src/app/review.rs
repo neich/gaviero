@@ -7,8 +7,13 @@ use super::*;
 /// another agent's) edit. The caller surfaces this and skips the write.
 enum ApplyOutcome {
     Written,
-    Stale { path: std::path::PathBuf },
-    Failed { path: std::path::PathBuf, error: String },
+    Stale {
+        path: std::path::PathBuf,
+    },
+    Failed {
+        path: std::path::PathBuf,
+        error: String,
+    },
 }
 
 /// Apply a proposal to disk, with stale-check, atomic-ish write, and
@@ -235,9 +240,11 @@ pub(super) fn reject_external_review(app: &mut App) {
             return;
         }
         for buf in &mut app.buffers {
-            if buf.path.as_deref().is_some_and(|p| {
-                crate::editor::buffer::Buffer::paths_refer_to_same_file(p, &path)
-            }) {
+            if buf
+                .path
+                .as_deref()
+                .is_some_and(|p| crate::editor::buffer::Buffer::paths_refer_to_same_file(p, &path))
+            {
                 let _ = buf.reload();
                 break;
             }
@@ -425,12 +432,19 @@ pub(super) fn finalize_current_review(app: &mut App) {
                 "Refusing to apply stale proposal for {} — disk changed since proposal was created",
                 path.display()
             );
-            let msg = format!("⚠ Stale: {} changed on disk; review skipped", path.display());
+            let msg = format!(
+                "⚠ Stale: {} changed on disk; review skipped",
+                path.display()
+            );
             app.chat_state.add_system_message(&msg);
             app.status_message = Some((msg, std::time::Instant::now()));
         }
         ApplyOutcome::Failed { path, error } => {
-            tracing::error!("Failed to write finalized file {}: {}", path.display(), error);
+            tracing::error!(
+                "Failed to write finalized file {}: {}",
+                path.display(),
+                error
+            );
             let msg = format!("✖ Failed to apply {}: {}", path.display(), error);
             app.chat_state.add_system_message(&msg);
             app.status_message = Some((msg, std::time::Instant::now()));
@@ -464,13 +478,14 @@ fn push_finalized_frame(app: &mut App, proposal: &WriteProposal) {
         gaviero_remote::dto::ProposalOutcome::PartiallyAccepted
     };
     let path = crate::app::projection::relative_path(app, &proposal.file_path);
-    app.remote.push_frame(gaviero_remote::envelope::ServerFrame::ProposalFinalized(
-        gaviero_remote::envelope::ProposalFinalized {
-            proposal_id: proposal.id,
-            path,
-            outcome,
-        },
-    ));
+    app.remote
+        .push_frame(gaviero_remote::envelope::ServerFrame::ProposalFinalized(
+            gaviero_remote::envelope::ProposalFinalized {
+                proposal_id: proposal.id,
+                path,
+                outcome,
+            },
+        ));
     app.remote.retire_proposal(proposal.id);
     app.remote.bump_global();
     app.remote.snapshot_dirty = true;
@@ -510,12 +525,19 @@ pub(crate) fn finalize_gate_proposal(app: &mut App, mut proposal: WriteProposal)
                 "Refusing to apply stale proposal for {} — disk changed since proposal was created",
                 path.display()
             );
-            let msg = format!("⚠ Stale: {} changed on disk; review skipped", path.display());
+            let msg = format!(
+                "⚠ Stale: {} changed on disk; review skipped",
+                path.display()
+            );
             app.chat_state.add_system_message(&msg);
             app.status_message = Some((msg, std::time::Instant::now()));
         }
         ApplyOutcome::Failed { path, error } => {
-            tracing::error!("Failed to write finalized file {}: {}", path.display(), error);
+            tracing::error!(
+                "Failed to write finalized file {}: {}",
+                path.display(),
+                error
+            );
             let msg = format!("✖ Failed to apply {}: {}", path.display(), error);
             app.chat_state.add_system_message(&msg);
             app.status_message = Some((msg, std::time::Instant::now()));
@@ -798,11 +820,7 @@ fn unique_filter_sources(proposals: &[ReviewProposal]) -> Vec<String> {
 
 /// Cycle the active filter through `[None, source_0, source_1, ...]`.
 /// `forward = true` follows Alt+o (next), `false` follows Alt+i (previous).
-fn cycle_filter_source(
-    current: Option<&str>,
-    sources: &[String],
-    forward: bool,
-) -> Option<String> {
+fn cycle_filter_source(current: Option<&str>, sources: &[String], forward: bool) -> Option<String> {
     if sources.is_empty() {
         return None;
     }
@@ -1214,7 +1232,10 @@ pub(super) fn render_review_file_list(app: &mut App, frame: &mut Frame, area: Re
 
     let multi_root = app.workspace.folders().len() > 1;
     let rows = build_review_rows(
-        app.batch_review.as_ref().map(|r| r.proposals.as_slice()).unwrap_or(&[]),
+        app.batch_review
+            .as_ref()
+            .map(|r| r.proposals.as_slice())
+            .unwrap_or(&[]),
         &app.workspace,
     );
 
@@ -1337,10 +1358,7 @@ pub(super) fn render_review_file_list(app: &mut App, frame: &mut Frame, area: Re
                 let prefix = if multi_root { "  " } else { "" };
                 let spans = vec![
                     Span::raw(prefix),
-                    Span::styled(
-                        format!(" {} ", status_char),
-                        Style::default().fg(status_fg),
-                    ),
+                    Span::styled(format!(" {} ", status_char), Style::default().fg(status_fg)),
                     Span::styled(badge_text, Style::default().fg(badge_color)),
                     Span::styled(filename.to_string(), name_style),
                     Span::styled(adds, Style::default().fg(theme::SUCCESS)),
@@ -1445,9 +1463,7 @@ fn apply_span_style(
 }
 
 /// Look up the language name + `Language` for a file path's extension.
-fn language_for_path(
-    path: &std::path::Path,
-) -> (Option<String>, Option<gaviero_core::Language>) {
+fn language_for_path(path: &std::path::Path) -> (Option<String>, Option<gaviero_core::Language>) {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     (
         gaviero_core::tree_sitter::language_name_for_extension(ext).map(str::to_string),
@@ -1508,7 +1524,9 @@ pub(super) fn render_batch_review_diff(app: &mut App, frame: &mut Frame, area: R
         let new_lines: Vec<&str> = new.lines().collect();
         let cached_diff = build_simple_diff(&old_lines, &new_lines);
         let highlights = match (
-            lang_name.as_deref().and_then(|n| app.highlight_configs.get(n)),
+            lang_name
+                .as_deref()
+                .and_then(|n| app.highlight_configs.get(n)),
             language.as_ref(),
         ) {
             (Some(cfg), Some(lang)) => compute_diff_highlights(&cached_diff, lang, cfg, &app.theme),
@@ -1546,7 +1564,9 @@ pub(super) fn render_batch_review_diff(app: &mut App, frame: &mut Frame, area: R
         format!(" {} ", proposal.path.display())
     };
     let header_style = if proposal.is_deletion {
-        Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(theme::ERROR)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
             .fg(theme::FOCUS_BORDER)
@@ -1678,7 +1698,11 @@ pub(super) fn refresh_git_changes(app: &mut App) {
 
     let workdir = repo.workdir().unwrap_or(&root).to_path_buf();
 
-    let unmerged: std::collections::HashSet<String> = repo.unmerged_paths().unwrap_or_default().into_iter().collect();
+    let unmerged: std::collections::HashSet<String> = repo
+        .unmerged_paths()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
 
     let git_entries: Vec<ChangesEntry> = entries
         .into_iter()
@@ -1692,14 +1716,20 @@ pub(super) fn refresh_git_changes(app: &mut App) {
 
             let (additions, deletions) = if is_conflict {
                 use gaviero_core::git_conflict::ConflictLineKind;
-                let annotated = gaviero_core::git_conflict::build_conflict_annotated_lines(&new_content);
+                let annotated =
+                    gaviero_core::git_conflict::build_conflict_annotated_lines(&new_content);
                 let adds = annotated
                     .iter()
                     .filter(|(k, _)| matches!(k, ConflictLineKind::Theirs | ConflictLineKind::Ours))
                     .count();
                 let dels = annotated
                     .iter()
-                    .filter(|(k, _)| matches!(k, ConflictLineKind::Start | ConflictLineKind::End | ConflictLineKind::Sep))
+                    .filter(|(k, _)| {
+                        matches!(
+                            k,
+                            ConflictLineKind::Start | ConflictLineKind::End | ConflictLineKind::Sep
+                        )
+                    })
                     .count();
                 (adds, dels)
             } else {
@@ -1906,7 +1936,9 @@ pub(super) fn render_changes_file_list(
             'M' => Style::default().fg(theme::WARNING),
             'A' | '?' => Style::default().fg(theme::SUCCESS),
             'D' => Style::default().fg(theme::ERROR),
-            'U' => Style::default().fg(theme::PROPERTY_RED).add_modifier(Modifier::BOLD),
+            'U' => Style::default()
+                .fg(theme::PROPERTY_RED)
+                .add_modifier(Modifier::BOLD),
             _ => Style::default().fg(theme::TEXT_DIM),
         };
 
@@ -1974,7 +2006,9 @@ pub(super) fn render_changes_diff(app: &mut App, frame: &mut Frame, area: Rect) 
             if entry.is_conflict {
                 let cached_diff = crate::editor::diff::build_conflict_diff(&new_content);
                 let highlights = match (
-                    lang_name.as_deref().and_then(|n| app.highlight_configs.get(n)),
+                    lang_name
+                        .as_deref()
+                        .and_then(|n| app.highlight_configs.get(n)),
                     language.as_ref(),
                 ) {
                     (Some(cfg), Some(lang)) => {
@@ -1995,7 +2029,13 @@ pub(super) fn render_changes_diff(app: &mut App, frame: &mut Frame, area: Rect) 
                 .and_then(|repo| repo.head_file_content(&entry.rel_path).ok())
                 .unwrap_or_default();
             let (lang_name, language) = language_for_path(&entry.abs_path);
-            Some((old_content, new_content, cs.selected_index, lang_name, language))
+            Some((
+                old_content,
+                new_content,
+                cs.selected_index,
+                lang_name,
+                language,
+            ))
         } else {
             None
         }
@@ -2015,7 +2055,9 @@ pub(super) fn render_changes_diff(app: &mut App, frame: &mut Frame, area: Rect) 
         let new_lines: Vec<&str> = new.lines().collect();
         let cached_diff = build_simple_diff(&old_lines, &new_lines);
         let highlights = match (
-            lang_name.as_deref().and_then(|n| app.highlight_configs.get(n)),
+            lang_name
+                .as_deref()
+                .and_then(|n| app.highlight_configs.get(n)),
             language.as_ref(),
         ) {
             (Some(cfg), Some(lang)) => compute_diff_highlights(&cached_diff, lang, cfg, &app.theme),
@@ -2439,7 +2481,12 @@ mod tests {
             .filter_map(|e| e.ok())
             .map(|e| e.file_name())
             .collect();
-        assert_eq!(entries.len(), 1, "expected only the target file, got {:?}", entries);
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected only the target file, got {:?}",
+            entries
+        );
     }
 
     #[test]

@@ -129,8 +129,7 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
 
         app.layout.preview_area = None;
 
-        let md_active =
-            app.is_current_buffer_markdown() && app.preview_mode.is_active();
+        let md_active = app.is_current_buffer_markdown() && app.preview_mode.is_active();
 
         let (actual_editor_area, preview_area) = match app.preview_mode {
             MarkdownPreviewMode::Off => (editor_content, None),
@@ -302,7 +301,13 @@ pub(super) fn render_tab_bar(app: &App, frame: &mut Frame, area: Rect) {
     let titles: Vec<(String, bool, bool)> = app
         .buffers
         .iter()
-        .map(|b| (b.display_name().to_string(), b.modified, b.diff_view.is_some()))
+        .map(|b| {
+            (
+                b.display_name().to_string(),
+                b.modified,
+                b.diff_view.is_some(),
+            )
+        })
         .collect();
     let tab_bar = TabBar {
         titles: &titles,
@@ -1523,7 +1528,9 @@ fn draw_modal_box(
         for col in 0..dialog_w {
             let (cx, cy) = (x + col, y + row);
             if cx < frame.area().right() && cy < frame.area().bottom() {
-                frame.buffer_mut()[(cx, cy)].set_char(' ').set_style(bg_style);
+                frame.buffer_mut()[(cx, cy)]
+                    .set_char(' ')
+                    .set_style(bg_style);
             }
         }
     }
@@ -1539,11 +1546,15 @@ fn draw_modal_box(
         };
         if cx < frame.area().right() {
             if y < frame.area().bottom() {
-                frame.buffer_mut()[(cx, y)].set_char(top_ch).set_style(title_style);
+                frame.buffer_mut()[(cx, y)]
+                    .set_char(top_ch)
+                    .set_style(title_style);
             }
             let by = y + dialog_h - 1;
             if by < frame.area().bottom() {
-                frame.buffer_mut()[(cx, by)].set_char(bot_ch).set_style(title_style);
+                frame.buffer_mut()[(cx, by)]
+                    .set_char(bot_ch)
+                    .set_style(title_style);
             }
         }
     }
@@ -1552,11 +1563,15 @@ fn draw_modal_box(
         let cy = y + row;
         if cy < frame.area().bottom() {
             if x < frame.area().right() {
-                frame.buffer_mut()[(x, cy)].set_char('│').set_style(title_style);
+                frame.buffer_mut()[(x, cy)]
+                    .set_char('│')
+                    .set_style(title_style);
             }
             let rx = x + dialog_w - 1;
             if rx < frame.area().right() {
-                frame.buffer_mut()[(rx, cy)].set_char('│').set_style(title_style);
+                frame.buffer_mut()[(rx, cy)]
+                    .set_char('│')
+                    .set_style(title_style);
             }
         }
     }
@@ -1645,7 +1660,15 @@ pub(super) fn render_bulk_op_dialog(app: &App, frame: &mut Frame, area: Rect) {
         _ => "",
     };
 
-    draw_modal_box(frame, area, &lines, title_tag, bg_style, title_style, hint_style);
+    draw_modal_box(
+        frame,
+        area,
+        &lines,
+        title_tag,
+        bg_style,
+        title_style,
+        hint_style,
+    );
 }
 
 /// Info hint bar shown at the bottom of the file-tree panel while the user
@@ -1664,7 +1687,9 @@ pub(super) fn render_bulk_dest_hint(app: &App, frame: &mut Frame, tree_area: Rec
     let width = tree_area.width.saturating_sub(1);
 
     let bg_style = Style::default().fg(theme::TEXT_BRIGHT).bg(theme::INPUT_BG);
-    let sep_style = Style::default().fg(theme::NUMERIC_ORANGE).bg(theme::INPUT_BG);
+    let sep_style = Style::default()
+        .fg(theme::NUMERIC_ORANGE)
+        .bg(theme::INPUT_BG);
     let label_style = Style::default()
         .fg(theme::NUMERIC_ORANGE)
         .bg(theme::INPUT_BG)
@@ -1675,7 +1700,9 @@ pub(super) fn render_bulk_dest_hint(app: &App, frame: &mut Frame, tree_area: Rec
         for col in 0..width {
             let (cx, cy) = (tree_area.x + col, y + row);
             if cx < frame.area().right() && cy < frame.area().bottom() {
-                frame.buffer_mut()[(cx, cy)].set_char(' ').set_style(bg_style);
+                frame.buffer_mut()[(cx, cy)]
+                    .set_char(' ')
+                    .set_style(bg_style);
             }
         }
     }
@@ -1683,7 +1710,9 @@ pub(super) fn render_bulk_dest_hint(app: &App, frame: &mut Frame, tree_area: Rec
     for col in 0..width {
         let cx = tree_area.x + col;
         if cx < frame.area().right() && y < frame.area().bottom() {
-            frame.buffer_mut()[(cx, y)].set_char('─').set_style(sep_style);
+            frame.buffer_mut()[(cx, y)]
+                .set_char('─')
+                .set_style(sep_style);
         }
     }
 
@@ -1696,15 +1725,14 @@ pub(super) fn render_bulk_dest_hint(app: &App, frame: &mut Frame, tree_area: Rec
     let mut write = |text: &str, style: Style| {
         for ch in text.chars() {
             if cx < tree_area.x + width && cx < frame.area().right() {
-                frame.buffer_mut()[(cx, input_y)].set_char(ch).set_style(style);
+                frame.buffer_mut()[(cx, input_y)]
+                    .set_char(ch)
+                    .set_style(style);
                 cx += 1;
             }
         }
     };
 
     write(&format!("MOVE {}  ", paths.len()), label_style);
-    write(
-        "Navigate, Enter: select folder  Esc: cancel",
-        dim_style,
-    );
+    write("Navigate, Enter: select folder  Esc: cancel", dim_style);
 }

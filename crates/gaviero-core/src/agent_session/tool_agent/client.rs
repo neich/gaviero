@@ -269,7 +269,9 @@ async fn drive_sse_stream(
 
             // Final chunk (with include_usage) carries usage and empty choices.
             if let Some(usage) = value.get("usage").filter(|u| !u.is_null()) {
-                let _ = tx.send(Ok(ApiEvent::Usage(usage_from(usage, pricing)))).await;
+                let _ = tx
+                    .send(Ok(ApiEvent::Usage(usage_from(usage, pricing))))
+                    .await;
             }
 
             let Some(choice) = value.pointer("/choices/0") else {

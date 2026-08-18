@@ -78,7 +78,10 @@ impl WrapLayout {
     /// Only that row may hold the one-past-the-last-char cursor position; on an
     /// earlier row `end_col` is already drawn on the row below.
     pub fn is_last_of_line(&self, visual_line: usize) -> bool {
-        match (self.segments.get(visual_line), self.segments.get(visual_line + 1)) {
+        match (
+            self.segments.get(visual_line),
+            self.segments.get(visual_line + 1),
+        ) {
             (Some(seg), Some(next)) => next.logical_line != seg.logical_line,
             _ => true,
         }
@@ -86,7 +89,11 @@ impl WrapLayout {
 }
 
 /// Split one rope line into wrapped (start_col, end_col) char ranges.
-pub fn wrap_line_segments(text: &str, tab_width: usize, content_width: usize) -> Vec<(usize, usize)> {
+pub fn wrap_line_segments(
+    text: &str,
+    tab_width: usize,
+    content_width: usize,
+) -> Vec<(usize, usize)> {
     let chars: Vec<char> = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
     if chars.is_empty() {
         return vec![(0, 0)];

@@ -213,8 +213,10 @@ impl AgentBackend for CodexBackend {
                             .send(Ok(UnifiedStreamEvent::Done(StopReason::EndTurn)))
                             .await;
                     } else {
-                        let msg =
-                            format_exit_error(&exit_status, &merge_diagnostics(&outcome, &stderr_text));
+                        let msg = format_exit_error(
+                            &exit_status,
+                            &merge_diagnostics(&outcome, &stderr_text),
+                        );
                         let _ = tx_clone.send(Ok(UnifiedStreamEvent::Error(msg))).await;
                         let _ = tx_clone
                             .send(Ok(UnifiedStreamEvent::Done(StopReason::Error)))
@@ -430,7 +432,11 @@ impl CodexJsonParser {
 
         self.outcome.saw_json = true;
         let mut out = Vec::new();
-        match value.get("type").and_then(Value::as_str).unwrap_or_default() {
+        match value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        {
             "item.started" => self.push_item(&value, ItemPhase::Started, &mut out),
             "item.completed" => self.push_item(&value, ItemPhase::Completed, &mut out),
             "turn.completed" => {
@@ -858,8 +864,8 @@ url = "https://example/mcp/"
         let args = codex_exec_args("gpt-5.5", None, &[], &[], dir.path());
         // Each server table is replayed as `--config mcp_servers.X.Y=value` pairs.
         assert!(
-            args.windows(2)
-                .any(|w| w[0] == "--config" && w[1] == r#"mcp_servers.gaviero.command="gaviero-mcp-shim""#),
+            args.windows(2).any(|w| w[0] == "--config"
+                && w[1] == r#"mcp_servers.gaviero.command="gaviero-mcp-shim""#),
             "missing gaviero.command override in {args:?}",
         );
         assert!(
@@ -900,7 +906,9 @@ url = "https://example/mcp/"
         // The old per-MCP sandbox knobs are now redundant — the bypass flag
         // covers both approvals and sandbox in one move.
         assert!(
-            !args.windows(2).any(|w| w == ["--sandbox", "workspace-write"]),
+            !args
+                .windows(2)
+                .any(|w| w == ["--sandbox", "workspace-write"]),
             "stale --sandbox workspace-write override leaked into {args:?}",
         );
         assert!(
@@ -947,20 +955,38 @@ url = "https://example/mcp/"
     #[test]
     fn test_map_effort_to_codex_known_values() {
         assert_eq!(map_effort_to_codex(Some("low"), "gpt-5.5"), Some("low"));
-        assert_eq!(map_effort_to_codex(Some("medium"), "gpt-5.5"), Some("medium"));
+        assert_eq!(
+            map_effort_to_codex(Some("medium"), "gpt-5.5"),
+            Some("medium")
+        );
         assert_eq!(map_effort_to_codex(Some("high"), "gpt-5.5"), Some("high"));
-        assert_eq!(map_effort_to_codex(Some("minimal"), "gpt-5.5"), Some("minimal"));
+        assert_eq!(
+            map_effort_to_codex(Some("minimal"), "gpt-5.5"),
+            Some("minimal")
+        );
         assert_eq!(map_effort_to_codex(Some("xhigh"), "gpt-5.5"), Some("xhigh"));
     }
 
     #[test]
     fn test_map_effort_to_codex_gpt56_passes_max_and_ultra() {
-        assert_eq!(map_effort_to_codex(Some("xhigh"), "gpt-5.6-sol"), Some("xhigh"));
+        assert_eq!(
+            map_effort_to_codex(Some("xhigh"), "gpt-5.6-sol"),
+            Some("xhigh")
+        );
         assert_eq!(map_effort_to_codex(Some("max"), "gpt-5.6-sol"), Some("max"));
-        assert_eq!(map_effort_to_codex(Some("ultra"), "gpt-5.6-sol"), Some("ultra"));
-        assert_eq!(map_effort_to_codex(Some("ultra"), "gpt-5.6-terra"), Some("ultra"));
+        assert_eq!(
+            map_effort_to_codex(Some("ultra"), "gpt-5.6-sol"),
+            Some("ultra")
+        );
+        assert_eq!(
+            map_effort_to_codex(Some("ultra"), "gpt-5.6-terra"),
+            Some("ultra")
+        );
         assert_eq!(map_effort_to_codex(Some("ultra"), "gpt-5.6"), Some("ultra"));
-        assert_eq!(map_effort_to_codex(Some("max"), "codex:gpt-5.6-luna"), Some("max"));
+        assert_eq!(
+            map_effort_to_codex(Some("max"), "codex:gpt-5.6-luna"),
+            Some("max")
+        );
     }
 
     #[test]
@@ -969,7 +995,10 @@ url = "https://example/mcp/"
         assert_eq!(map_effort_to_codex(Some("max"), "gpt-5.5"), Some("xhigh"));
         assert_eq!(map_effort_to_codex(Some("ultra"), "gpt-5.5"), Some("xhigh"));
         // Luna advertises through max, not ultra.
-        assert_eq!(map_effort_to_codex(Some("ultra"), "gpt-5.6-luna"), Some("max"));
+        assert_eq!(
+            map_effort_to_codex(Some("ultra"), "gpt-5.6-luna"),
+            Some("max")
+        );
     }
 
     #[test]
@@ -981,9 +1010,18 @@ url = "https://example/mcp/"
 
     #[test]
     fn test_map_effort_to_codex_case_insensitive() {
-        assert_eq!(map_effort_to_codex(Some("HIGH"), "gpt-5.6-sol"), Some("high"));
-        assert_eq!(map_effort_to_codex(Some("Medium"), "gpt-5.6-sol"), Some("medium"));
-        assert_eq!(map_effort_to_codex(Some("ULTRA"), "gpt-5.6-sol"), Some("ultra"));
+        assert_eq!(
+            map_effort_to_codex(Some("HIGH"), "gpt-5.6-sol"),
+            Some("high")
+        );
+        assert_eq!(
+            map_effort_to_codex(Some("Medium"), "gpt-5.6-sol"),
+            Some("medium")
+        );
+        assert_eq!(
+            map_effort_to_codex(Some("ULTRA"), "gpt-5.6-sol"),
+            Some("ultra")
+        );
     }
 
     #[test]
@@ -1032,9 +1070,15 @@ url = "https://example/mcp/"
         // The observability contract depends on this flag: without it stdout
         // carries only the final message and all progress goes to stderr.
         let args = codex_exec_args("gpt-5.5", None, &[], &[], std::path::Path::new(""));
-        assert!(args.iter().any(|a| a == "--json"), "missing --json in {args:?}");
+        assert!(
+            args.iter().any(|a| a == "--json"),
+            "missing --json in {args:?}"
+        );
         // Must be an argument of the `exec` subcommand, not the top-level one.
-        let exec_pos = args.iter().position(|a| a == "exec").expect("exec subcommand");
+        let exec_pos = args
+            .iter()
+            .position(|a| a == "exec")
+            .expect("exec subcommand");
         let json_pos = args.iter().position(|a| a == "--json").expect("--json");
         assert!(json_pos > exec_pos, "--json must follow `exec` in {args:?}");
     }
@@ -1279,7 +1323,9 @@ url = "https://example/mcp/"
     #[test]
     fn missing_usage_yields_zeroed_counts() {
         let (_, outcome) = parse_lines(&[r#"{"type":"turn.completed"}"#]);
-        let usage = outcome.usage.expect("usage present even when absent in JSON");
+        let usage = outcome
+            .usage
+            .expect("usage present even when absent in JSON");
         assert_eq!(usage.input_tokens, 0);
         assert_eq!(usage.output_tokens, 0);
     }

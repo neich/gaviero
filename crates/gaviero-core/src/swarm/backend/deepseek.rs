@@ -82,7 +82,11 @@ impl AcpObserver for StreamBridge {
     }
 
     fn on_tool_call_started(&self, summary: &str) {
-        let name = summary.split_whitespace().next().unwrap_or("tool").to_string();
+        let name = summary
+            .split_whitespace()
+            .next()
+            .unwrap_or("tool")
+            .to_string();
         self.emit(Ok(UnifiedStreamEvent::ToolCallStart {
             id: String::new(),
             name,
@@ -112,9 +116,9 @@ impl AgentBackend for DeepseekBackend {
         &self,
         request: CompletionRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<UnifiedStreamEvent>> + Send>>> {
-        let system = request
-            .system_prompt
-            .unwrap_or_else(|| super::shared::default_editor_system_prompt(&Self::capabilities_for_swarm()));
+        let system = request.system_prompt.unwrap_or_else(|| {
+            super::shared::default_editor_system_prompt(&Self::capabilities_for_swarm())
+        });
         let (tx, rx) = mpsc::channel::<Result<UnifiedStreamEvent>>(256);
         let bridge = Arc::new(StreamBridge { tx: tx.clone() });
         let model = self.model.clone();

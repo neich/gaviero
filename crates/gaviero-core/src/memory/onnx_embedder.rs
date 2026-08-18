@@ -328,10 +328,9 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires ONNX model to be downloaded
     async fn test_jina_code_embedder() {
-        let embedder = OnnxEmbedder::from_model(
-            &super::super::model_manager::JINA_EMBEDDINGS_V2_BASE_CODE,
-        )
-        .expect("Failed to load jina-embeddings-v2-base-code model");
+        let embedder =
+            OnnxEmbedder::from_model(&super::super::model_manager::JINA_EMBEDDINGS_V2_BASE_CODE)
+                .expect("Failed to load jina-embeddings-v2-base-code model");
 
         assert!(embedder.prefix_query.is_none(), "jina uses no query prefix");
         assert!(

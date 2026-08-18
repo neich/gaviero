@@ -32,7 +32,10 @@ impl TurnSnapshot {
 
     /// Export `(path, pre-turn content)` pairs for the TUI revert path.
     pub fn edits(&self) -> Vec<(PathBuf, Option<String>)> {
-        self.originals.iter().map(|(p, c)| (p.clone(), c.clone())).collect()
+        self.originals
+            .iter()
+            .map(|(p, c)| (p.clone(), c.clone()))
+            .collect()
     }
 
     /// Pre-turn on-disk content for `path` after the first snapshot capture.

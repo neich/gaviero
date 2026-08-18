@@ -74,10 +74,7 @@ mod preview_mode_tests {
 
     #[test]
     fn cycle_off_split_preview_only_off() {
-        assert_eq!(
-            MarkdownPreviewMode::Off.cycle(),
-            MarkdownPreviewMode::Split
-        );
+        assert_eq!(MarkdownPreviewMode::Off.cycle(), MarkdownPreviewMode::Split);
         assert_eq!(
             MarkdownPreviewMode::Split.cycle(),
             MarkdownPreviewMode::PreviewOnly
@@ -262,7 +259,10 @@ pub enum BulkOpState {
     /// User is navigating the file tree to pick a destination directory.
     SelectingDest { paths: Vec<PathBuf> },
     /// Waiting for [y/n] to confirm moving the listed paths to `dest_dir`.
-    ConfirmMove { paths: Vec<PathBuf>, dest_dir: PathBuf },
+    ConfirmMove {
+        paths: Vec<PathBuf>,
+        dest_dir: PathBuf,
+    },
 }
 
 impl TreeDialog {

@@ -45,16 +45,45 @@ pub(crate) const DEFAULT_CURSOR_MODEL: &str = "composer-2.5";
 
 /// Per-prompt argv budget. The Cursor CLI takes its prompt as a positional
 /// argv (no `--prompt-file` or stdin fallback — re-probed against
-/// `agent --help` 2026.07.16). Unix: Linux's `MAX_ARG_STRLEN` is 128 KB per
-/// argument; 96 KB leaves headroom for the rest of the argv (flags,
-/// `--workspace`, model spec, etc.). Windows: `CreateProcess` caps the
-/// *whole* command line — program path plus every argument — at 32,767
-/// UTF-16 units, so the prompt budget is 30 KB (byte length over-counts
-/// non-ASCII text relative to UTF-16, keeping the check conservative).
-/// Prompts above the budget are rejected with an explicit error rather
-/// than truncated.
+/// `agent --help` 2026.08.11, version `2026.08.11-e8db854`). Unix: Linux's
+/// `MAX_ARG_STRLEN` is 128 KB per argument; 96 KB leaves headroom for the
+/// rest of the argv (flags, `--workspace`, model spec, etc.). Windows:
+/// `CreateProcess` caps the *whole* command line — program path plus every
+/// argument — at 32,767 UTF-16 units, so the prompt budget is 30 KB (byte
+/// length over-counts non-ASCII text relative to UTF-16, keeping the check
+/// conservative). Prompts at or above the budget are spilled to a
+/// workspace-local tempfile and replaced on argv by a short `@`-wrapper
+/// (same channel as Claude) — they are not rejected and not truncated.
+/// This is an OS argv ceiling, not the model's context window.
 pub(crate) fn cursor_argv_limit() -> usize {
     if cfg!(windows) { 30 * 1024 } else { 96 * 1024 }
+}
+
+/// True when `prompt_len` bytes would overflow [`cursor_argv_limit`].
+pub(crate) fn would_spill_cursor_prompt(prompt_len: usize) -> bool {
+    prompt_len >= cursor_argv_limit()
+}
+
+/// argv to hand the Cursor CLI, plus an optional tempfile that must stay
+/// alive until the subprocess exits. Oversized prompts are written under
+/// `{cwd}/.gaviero/tmp/prompt-*.md` via the shared Claude spill helper;
+/// the argv becomes the short "Read the full prompt at @<rel>" wrapper.
+pub(crate) fn prepare_cursor_prompt(
+    cwd: &Path,
+    combined_prompt: &str,
+) -> Result<(Option<tempfile::NamedTempFile>, String)> {
+    if !would_spill_cursor_prompt(combined_prompt.len()) {
+        return Ok((None, combined_prompt.to_string()));
+    }
+    let (file, wrapper) = crate::acp::session::spill_prompt_to_tempfile(cwd, combined_prompt)?;
+    tracing::info!(
+        target: "backend.cursor",
+        path = %file.path().display(),
+        prompt_len = combined_prompt.len(),
+        argv_limit = cursor_argv_limit(),
+        "spilling cursor prompt to tempfile (`agent` CLI has no stdin/--prompt-file)"
+    );
+    Ok((Some(file), wrapper))
 }
 
 /// Backend that spawns the Cursor CLI as a subprocess.
@@ -95,17 +124,8 @@ impl AgentBackend for CursorBackend {
         );
 
         let combined_prompt = format!("{system_prompt}\n\n{user_prompt}");
-
-        if combined_prompt.len() >= cursor_argv_limit() {
-            anyhow::bail!(
-                "cursor prompt is {} bytes which exceeds the {}-byte argv limit. \
-                 The `agent` CLI has no stdin or `--prompt-file` fallback, so \
-                 trim the user message, the context bundle, or switch to a provider \
-                 with stdin support (claude, codex, ollama).",
-                combined_prompt.len(),
-                cursor_argv_limit(),
-            );
-        }
+        let (prompt_tempfile, argv_prompt) =
+            prepare_cursor_prompt(&request.workspace_root, &combined_prompt)?;
 
         let mut cmd = crate::util::spawn::agent_command("agent");
         let mcp_json = request.workspace_root.join(".cursor/mcp.json");
@@ -120,7 +140,7 @@ impl AgentBackend for CursorBackend {
         for arg in cursor_argv(&self.model, &request.workspace_root, None) {
             cmd.arg(arg);
         }
-        cmd.arg(&combined_prompt);
+        cmd.arg(&argv_prompt);
 
         cmd.current_dir(&request.workspace_root)
             .env("NO_COLOR", "1")
@@ -130,6 +150,7 @@ impl AgentBackend for CursorBackend {
             .kill_on_drop(true);
 
         let prompt_len = combined_prompt.len();
+        let spilled = prompt_tempfile.is_some();
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 anyhow::anyhow!(
@@ -149,8 +170,9 @@ impl AgentBackend for CursorBackend {
                 )
             } else {
                 anyhow::anyhow!(
-                    "spawning cursor `agent` subprocess (prompt {} bytes): {e}",
+                    "spawning cursor `agent` subprocess (prompt {} bytes via {}): {e}",
                     prompt_len,
+                    if spilled { "tempfile" } else { "argv" },
                 )
             }
         })?;
@@ -170,6 +192,9 @@ impl AgentBackend for CursorBackend {
 
         let tx_clone = tx.clone();
         tokio::spawn(async move {
+            // Keep the spilled tempfile on disk until `agent` has exited
+            // (NamedTempFile::drop unlinks it).
+            let _prompt_tempfile = prompt_tempfile;
             let start = std::time::Instant::now();
             let result = drive_cursor_stdout_unified(stdout, tx_clone.clone()).await;
             let exit_status = child.wait().await;
@@ -368,7 +393,11 @@ fn cursor_event_to_unified(event: CursorEvent) -> Vec<UnifiedStreamEvent> {
         CursorEvent::AssistantSegment(_) => vec![],
         CursorEvent::ThinkingDelta(text) => vec![UnifiedStreamEvent::ThinkingDelta(text)],
         CursorEvent::ThinkingCompleted => vec![],
-        CursorEvent::ToolCallStarted { id, name, args_json } => {
+        CursorEvent::ToolCallStarted {
+            id,
+            name,
+            args_json,
+        } => {
             let args = serde_json::from_str::<Value>(&args_json).unwrap_or(Value::Null);
             vec![UnifiedStreamEvent::ToolCallStart {
                 id,
@@ -676,10 +705,7 @@ fn parse_result(value: &Value) -> Option<CursorEvent> {
 
 fn parse_usage(value: &Value) -> Option<TokenUsage> {
     let obj = value.as_object()?;
-    let input = obj
-        .get("inputTokens")
-        .and_then(|n| n.as_u64())
-        .unwrap_or(0);
+    let input = obj.get("inputTokens").and_then(|n| n.as_u64()).unwrap_or(0);
     let output = obj
         .get("outputTokens")
         .and_then(|n| n.as_u64())
@@ -815,6 +841,42 @@ mod tests {
     }
 
     #[test]
+    fn small_prompt_stays_on_argv() {
+        assert!(!would_spill_cursor_prompt(0));
+        assert!(!would_spill_cursor_prompt(1_000));
+        assert!(!would_spill_cursor_prompt(cursor_argv_limit() - 1));
+    }
+
+    #[test]
+    fn large_prompt_spills_to_tempfile() {
+        assert!(would_spill_cursor_prompt(cursor_argv_limit()));
+        assert!(would_spill_cursor_prompt(cursor_argv_limit() + 8_000));
+    }
+
+    #[test]
+    fn prepare_cursor_prompt_passes_small_prompts_through() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (file, argv) = prepare_cursor_prompt(dir.path(), "hello").expect("argv");
+        assert!(file.is_none());
+        assert_eq!(argv, "hello");
+    }
+
+    #[test]
+    fn prepare_cursor_prompt_spills_over_limit_and_keeps_argv_tiny() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let big = "x".repeat(cursor_argv_limit());
+        let (file, argv) = prepare_cursor_prompt(dir.path(), &big).expect("spill");
+        let file = file.expect("should hold tempfile");
+        assert!(argv.len() < 500, "wrapper must fit CreateProcess: {argv}");
+        assert!(
+            argv.contains('@'),
+            "wrapper should @-reference the tempfile"
+        );
+        let on_disk = std::fs::read_to_string(file.path()).expect("read");
+        assert_eq!(on_disk, big);
+    }
+
+    #[test]
     fn parse_system_init() {
         let line = r#"{"type":"system","subtype":"init","apiKeySource":"login","cwd":"/tmp","session_id":"s-1","model":"Auto","permissionMode":"default"}"#;
         let ev = parse_cursor_event(line).expect("should parse");
@@ -844,19 +906,28 @@ mod tests {
     #[test]
     fn parse_thinking_delta_and_completed() {
         let delta = r#"{"type":"thinking","subtype":"delta","text":"reasoning","session_id":"s-1","timestamp_ms":1}"#;
-        let done = r#"{"type":"thinking","subtype":"completed","session_id":"s-1","timestamp_ms":1}"#;
+        let done =
+            r#"{"type":"thinking","subtype":"completed","session_id":"s-1","timestamp_ms":1}"#;
         assert_eq!(
             parse_cursor_event(delta),
             Some(CursorEvent::ThinkingDelta("reasoning".into()))
         );
-        assert_eq!(parse_cursor_event(done), Some(CursorEvent::ThinkingCompleted));
+        assert_eq!(
+            parse_cursor_event(done),
+            Some(CursorEvent::ThinkingCompleted)
+        );
     }
 
     #[test]
     fn parse_tool_call_started_carries_args() {
         let line = r#"{"type":"tool_call","subtype":"started","call_id":"c-1","tool_call":{"editToolCall":{"args":{"path":"/tmp/x.txt","streamContent":"hello\n"}}},"session_id":"s-1","timestamp_ms":1}"#;
         let ev = parse_cursor_event(line).expect("should parse");
-        let CursorEvent::ToolCallStarted { id, name, args_json } = ev else {
+        let CursorEvent::ToolCallStarted {
+            id,
+            name,
+            args_json,
+        } = ev
+        else {
             panic!("expected ToolCallStarted");
         };
         assert_eq!(id, "c-1");
@@ -873,7 +944,12 @@ mod tests {
     fn parse_result_success_extracts_usage_and_text() {
         let line = r#"{"type":"result","subtype":"success","duration_ms":7948,"duration_api_ms":7948,"is_error":false,"result":"done","session_id":"s-1","request_id":"r-1","usage":{"inputTokens":10,"outputTokens":3,"cacheReadTokens":0,"cacheWriteTokens":0}}"#;
         let ev = parse_cursor_event(line).expect("should parse");
-        let CursorEvent::ResultSuccess { text, usage, session_id } = ev else {
+        let CursorEvent::ResultSuccess {
+            text,
+            usage,
+            session_id,
+        } = ev
+        else {
             panic!("expected ResultSuccess");
         };
         assert_eq!(text, "done");
@@ -885,7 +961,8 @@ mod tests {
 
     #[test]
     fn parse_result_error_uses_result_text_or_default_message() {
-        let with_text = r#"{"type":"result","is_error":true,"result":"bad model","session_id":"s-1"}"#;
+        let with_text =
+            r#"{"type":"result","is_error":true,"result":"bad model","session_id":"s-1"}"#;
         let CursorEvent::ResultError { message, .. } =
             parse_cursor_event(with_text).expect("should parse")
         else {
@@ -1017,6 +1094,9 @@ mod tests {
         // Error event must precede Done so the executor records the
         // failure message before short-circuiting on Done(Error).
         assert!(matches!(out[0], UnifiedStreamEvent::Error(_)));
-        assert!(matches!(out[1], UnifiedStreamEvent::Done(StopReason::Error)));
+        assert!(matches!(
+            out[1],
+            UnifiedStreamEvent::Done(StopReason::Error)
+        ));
     }
 }

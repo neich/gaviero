@@ -64,16 +64,12 @@ pub fn preflight_plan_models(
     fallback_model: &str,
     ollama_base_url: Option<&str>,
 ) -> Result<()> {
-    shared::validate_model_spec(fallback_model)
-        .context("invalid swarm fallback model")?;
+    shared::validate_model_spec(fallback_model).context("invalid swarm fallback model")?;
 
     for op in &plan.fanout_ops {
         if let Some(ref model) = op.default_model {
             shared::validate_model_spec(model).with_context(|| {
-                format!(
-                    "invalid fan-out default_model after '{}'",
-                    op.after_unit
-                )
+                format!("invalid fan-out default_model after '{}'", op.after_unit)
             })?;
         }
     }
@@ -82,10 +78,7 @@ pub fn preflight_plan_models(
     let ordered = plan
         .work_units_ordered()
         .map_err(|e| anyhow::anyhow!("plan graph error: {}", e))?;
-    let units: Vec<&WorkUnit> = ordered
-        .iter()
-        .chain(plan.loop_judge_units.iter())
-        .collect();
+    let units: Vec<&WorkUnit> = ordered.iter().chain(plan.loop_judge_units.iter()).collect();
     let errors = validation::validate_backends(&units, &router);
     if !errors.is_empty() {
         let msg = errors
@@ -293,8 +286,7 @@ pub async fn execute(
     } else {
         false
     };
-    let tier_router =
-        tier_router_for_model(&config.model, config.ollama_base_url.as_deref());
+    let tier_router = tier_router_for_model(&config.model, config.ollama_base_url.as_deref());
     let git_coordinator = Arc::new(GitCoordinator::new());
     let memory_writer = config.memory_writer.clone().or_else(|| {
         memory.as_ref().map(|stores| {
@@ -589,8 +581,7 @@ pub async fn execute(
     // round, advance the loop's `iter_start` past it so the panel continues
     // instead of overwriting its own earlier work. `max_iterations` keeps its
     // meaning: a budget of rounds for *this* run, counted from the new start.
-    let mut effective_loop_configs: Vec<crate::swarm::plan::LoopConfig> =
-        plan.loop_configs.clone();
+    let mut effective_loop_configs: Vec<crate::swarm::plan::LoopConfig> = plan.loop_configs.clone();
     if config.resume_from_artifacts {
         for lc in effective_loop_configs.iter_mut() {
             let Some(resume) = loop_resume::detect(&config.workspace_root, lc, &unit_map) else {
@@ -939,12 +930,7 @@ pub async fn execute(
                         let owned_c = unit.scope.owned_paths.clone();
                         let changed = git_coord
                             .lock_git(move || {
-                                commit_agent_changes(
-                                    &agent_root_c,
-                                    &unit_id_c,
-                                    &summary,
-                                    &owned_c,
-                                )
+                                commit_agent_changes(&agent_root_c, &unit_id_c, &summary, &owned_c)
                             })
                             .await
                             .unwrap_or_else(|e| {
@@ -1293,8 +1279,8 @@ pub async fn execute(
                     workspace_root: &config.workspace_root,
                     iter_abs: current_iter_abs,
                 });
-                let whole_panel_silent =
-                    !loop_config.agent_ids.is_empty() && silent.len() == loop_config.agent_ids.len();
+                let whole_panel_silent = !loop_config.agent_ids.is_empty()
+                    && silent.len() == loop_config.agent_ids.len();
                 silent_streak = if whole_panel_silent {
                     silent_streak.saturating_add(1)
                 } else {
@@ -1447,7 +1433,9 @@ pub async fn execute(
                                 &config.workspace_root,
                                 loop_config.verdict_output_dir.as_deref(),
                                 current_iter_abs,
-                                &format!("same disagreement reported {repeat_streak} times running"),
+                                &format!(
+                                    "same disagreement reported {repeat_streak} times running"
+                                ),
                                 &report,
                                 &loop_config.agent_ids,
                             );
@@ -3216,9 +3204,7 @@ async fn run_agent_inner(
         let unit_id_c = unit.id.clone();
         let owned_c = unit.scope.owned_paths.clone();
         let changed = git_coordinator
-            .lock_git(move || {
-                commit_agent_changes(&agent_root_c, &unit_id_c, &summary, &owned_c)
-            })
+            .lock_git(move || commit_agent_changes(&agent_root_c, &unit_id_c, &summary, &owned_c))
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!("Failed to commit worktree changes for {}: {}", unit.id, e);
@@ -3988,7 +3974,10 @@ fn agent_findings_transcript(
 
     let annotations = parsed.annotations.and_then(|mut ann| {
         for f in &mut ann.flags {
-            if matches!(f.scope.to_ascii_lowercase().as_str(), "workspace" | "global") {
+            if matches!(
+                f.scope.to_ascii_lowercase().as_str(),
+                "workspace" | "global"
+            ) {
                 tracing::debug!(
                     target: "memory_annotations",
                     work_unit_id = %manifest.work_unit_id,
@@ -4784,13 +4773,7 @@ mod tests {
         ];
 
         let err = assert_loop_agents_produced_output(delivery_check(
-            &ids,
-            &unit_map,
-            &manifests,
-            &before,
-            &after,
-            root,
-            2,
+            &ids, &unit_map, &manifests, &before, &after, root, 2,
         ))
         .expect_err("codex wrote nothing");
         let msg = format!("{err:#}");
@@ -4823,13 +4806,7 @@ mod tests {
             completed("codex-refine", &[]),
         ];
         assert_loop_agents_produced_output(delivery_check(
-            &ids,
-            &unit_map,
-            &manifests,
-            &before,
-            &after,
-            root,
-            2,
+            &ids, &unit_map, &manifests, &before, &after, root, 2,
         ))
         .expect("both delivered");
     }
@@ -4849,13 +4826,7 @@ mod tests {
         let manifests = vec![completed("codex-refine", &["out/codex-summary-v2.md"])];
 
         assert_loop_agents_produced_output(delivery_check(
-            &ids,
-            &unit_map,
-            &manifests,
-            &snap,
-            &snap,
-            root,
-            2,
+            &ids, &unit_map, &manifests, &snap, &snap, root, 2,
         ))
         .expect("manifest reports the commit");
     }
@@ -4873,13 +4844,7 @@ mod tests {
         let manifests = vec![completed("analyst", &[])];
 
         assert_loop_agents_produced_output(delivery_check(
-            &ids,
-            &unit_map,
-            &manifests,
-            &snap,
-            &snap,
-            root,
-            2,
+            &ids, &unit_map, &manifests, &snap, &snap, root, 2,
         ))
         .expect("no declared deliverables to assert on");
     }
@@ -5018,8 +4983,7 @@ mod tests {
         assert!(md.contains("did not attribute a blocking position"));
         assert!(md.contains("test trigger"));
 
-        let json =
-            std::fs::read_to_string(root.join("out/consensus-verdict.json")).unwrap();
+        let json = std::fs::read_to_string(root.join("out/consensus-verdict.json")).unwrap();
         assert!(json.contains("\"irreconcilable\""), "got: {json}");
         assert!(json.contains("\"iter\": 4"), "got: {json}");
     }
@@ -5076,14 +5040,7 @@ mod tests {
             reason: String::new(),
             blockers: vec![blocker("ghost", "framing", "claude")],
         };
-        write_irreconcilable_report(
-            root,
-            Some("out"),
-            2,
-            "t",
-            &report,
-            &["claude".to_string()],
-        );
+        write_irreconcilable_report(root, Some("out"), 2, "t", &report, &["claude".to_string()]);
         let md = std::fs::read_to_string(root.join("out/consensus-irreconcilable.md")).unwrap();
         assert!(md.contains("Unattributed blockers"), "got: {md}");
         assert!(md.contains("ghost"), "got: {md}");
@@ -5258,7 +5215,10 @@ mod tests {
         // `all_manifests` accumulates across iterations; a failure from
         // an earlier pass must not condemn a later successful one.
         let ids = vec!["alpha".to_string()];
-        let manifests = vec![failed("alpha", "transient"), completed("alpha", &["out/a.md"])];
+        let manifests = vec![
+            failed("alpha", "transient"),
+            completed("alpha", &["out/a.md"]),
+        ];
 
         assert_loop_pass_was_not_a_total_failure(&ids, &manifests, 3)
             .expect("the latest pass succeeded");
@@ -5301,13 +5261,7 @@ mod tests {
         let manifests = vec![completed("codex-refine", &[])];
 
         let err = assert_loop_agents_produced_output(delivery_check(
-            &ids,
-            &unit_map,
-            &manifests,
-            &before,
-            &after,
-            root,
-            4,
+            &ids, &unit_map, &manifests, &before, &after, root, 4,
         ))
         .expect_err("v4 was never written");
         let msg = format!("{err:#}");
@@ -5338,13 +5292,7 @@ mod tests {
         let manifests = vec![completed("codex-refine", &[])];
 
         assert_loop_agents_produced_output(delivery_check(
-            &ids,
-            &unit_map,
-            &manifests,
-            &snap,
-            &snap,
-            root,
-            4,
+            &ids, &unit_map, &manifests, &snap, &snap, root, 4,
         ))
         .expect("both declared artefacts exist");
     }
@@ -5370,13 +5318,7 @@ mod tests {
         let manifests = vec![completed("codex-refine", &[])];
 
         let err = assert_loop_agents_produced_output(delivery_check(
-            &ids,
-            &unit_map,
-            &manifests,
-            &snap,
-            &snap,
-            root,
-            4,
+            &ids, &unit_map, &manifests, &snap, &snap, root, 4,
         ))
         .expect_err("empty file is not a deliverable");
         assert!(
@@ -5405,13 +5347,7 @@ mod tests {
         let manifests = vec![completed("codex-refine", &["out/scratch.md"])];
 
         assert_loop_agents_produced_output(delivery_check(
-            &ids,
-            &unit_map,
-            &manifests,
-            &snap,
-            &snap,
-            root,
-            4,
+            &ids, &unit_map, &manifests, &snap, &snap, root, 4,
         ))
         .expect_err("declared artefact is still missing");
     }
@@ -5555,38 +5491,37 @@ async fn evaluate_verify_condition(
     index: usize,
     ctx: &mut LoopConditionContext<'_>,
 ) -> Result<Option<GateFailure>> {
-        // Bind the config reference out of `ctx` so the closure below
-        // borrows the SwarmConfig, not the context we mutate.
-        let cfg = ctx.config;
+    // Bind the config reference out of `ctx` so the closure below
+    // borrows the SwarmConfig, not the context we mutate.
+    let cfg = ctx.config;
 
-        let failure = evaluate_deterministic_gate(
-            ctx.probe_dedup,
-            index,
-            VERIFY_DEDUP_KEY,
-            &cfg.workspace_root,
-            || async {
-                // A verify block that cannot be run at all is a broken
-                // gate, not a failing one — propagate instead of reading
-                // it as "not converged yet" and burning every remaining
-                // iteration.
-                let outcome =
-                    run_verification_checks(config, &cfg.workspace_root, &cfg.excludes, None)
-                        .await
-                        .context("loop `until` verification checks could not be run")?;
+    let failure = evaluate_deterministic_gate(
+        ctx.probe_dedup,
+        index,
+        VERIFY_DEDUP_KEY,
+        &cfg.workspace_root,
+        || async {
+            // A verify block that cannot be run at all is a broken
+            // gate, not a failing one — propagate instead of reading
+            // it as "not converged yet" and burning every remaining
+            // iteration.
+            let outcome = run_verification_checks(config, &cfg.workspace_root, &cfg.excludes, None)
+                .await
+                .context("loop `until` verification checks could not be run")?;
 
-                Ok(match outcome {
-                    VerificationOutcome::Passed => None,
-                    VerificationOutcome::Failed { check, output } => Some(GateFailure {
-                        probe: check,
-                        status: "verification check failed".to_string(),
-                        output,
-                    }),
-                })
-            },
-        )
-        .await?;
+            Ok(match outcome {
+                VerificationOutcome::Passed => None,
+                VerificationOutcome::Failed { check, output } => Some(GateFailure {
+                    probe: check,
+                    status: "verification check failed".to_string(),
+                    output,
+                }),
+            })
+        },
+    )
+    .await?;
 
-        Ok(failure)
+    Ok(failure)
 }
 
 /// Run an `until command` probe. `Ok(None)` means it passed.
@@ -5596,29 +5531,29 @@ async fn evaluate_command_condition(
     current_iter_abs: u32,
     ctx: &mut LoopConditionContext<'_>,
 ) -> Result<Option<GateFailure>> {
-        // Substitute {{ITER}}/{{PREV_ITER}} so iteration-aware probes
-        // (e.g. `git show gaviero/foo-iter{{ITER}}:path/file.md`) can be
-        // expressed without going through an LLM judge.
-        let iter_str = current_iter_abs.to_string();
-        let prev_str = current_iter_abs.saturating_sub(1).to_string();
-        let expanded = cmd
-            .replace("{{ITER}}", &iter_str)
-            .replace("{{PREV_ITER}}", &prev_str);
-        let cfg = ctx.config;
+    // Substitute {{ITER}}/{{PREV_ITER}} so iteration-aware probes
+    // (e.g. `git show gaviero/foo-iter{{ITER}}:path/file.md`) can be
+    // expressed without going through an LLM judge.
+    let iter_str = current_iter_abs.to_string();
+    let prev_str = current_iter_abs.saturating_sub(1).to_string();
+    let expanded = cmd
+        .replace("{{ITER}}", &iter_str)
+        .replace("{{PREV_ITER}}", &prev_str);
+    let cfg = ctx.config;
 
-        // The expanded command is part of the dedup key: an
-        // iteration-aware probe addresses a different target each
-        // pass, so an unchanged workspace does not make it redundant.
-        let failure = evaluate_deterministic_gate(
-            ctx.probe_dedup,
-            index,
-            &expanded,
-            &cfg.workspace_root,
-            || run_command_probe(&expanded, &cfg.workspace_root),
-        )
-        .await?;
+    // The expanded command is part of the dedup key: an
+    // iteration-aware probe addresses a different target each
+    // pass, so an unchanged workspace does not make it redundant.
+    let failure = evaluate_deterministic_gate(
+        ctx.probe_dedup,
+        index,
+        &expanded,
+        &cfg.workspace_root,
+        || run_command_probe(&expanded, &cfg.workspace_root),
+    )
+    .await?;
 
-        Ok(failure)
+    Ok(failure)
 }
 
 /// Dispatch the judge agent and turn its verdict into a loop outcome.
@@ -5645,196 +5580,192 @@ async fn evaluate_agent_condition(
     })?;
 
     let agent_id = &agent_id.to_string();
-        let Some(unit_template) = ctx.loop_judge_map.get(agent_id.as_str()).copied() else {
-            tracing::warn!(
-                "loop judge agent '{}' not found in compiled plan (judges must be declared distinct from workflow agents)",
+    let Some(unit_template) = ctx.loop_judge_map.get(agent_id.as_str()).copied() else {
+        tracing::warn!(
+            "loop judge agent '{}' not found in compiled plan (judges must be declared distinct from workflow agents)",
+            agent_id
+        );
+        return Ok(LoopConditionOutcome::Continue(JudgeReport::default()));
+    };
+
+    // Build a compact digest of the most recent worker manifests for
+    // this loop, substituted into `{{ITER_EVIDENCE}}` if the judge's
+    // `coordinator_instructions` template references it. Authors who
+    // already supply their own evidence text (or omit the placeholder)
+    // are unaffected — the placeholder is only replaced when present.
+    let evidence = if unit_template
+        .coordinator_instructions
+        .contains("{{ITER_EVIDENCE}}")
+    {
+        build_iter_evidence(ctx.all_manifests, ctx.loop_agent_ids, current_iter_abs)
+    } else {
+        String::new()
+    };
+    let unit = apply_iter_vars_with_evidence(unit_template, current_iter_abs, &evidence);
+    invalidate_stale_sources(ctx.memory, &unit, &ctx.config.workspace_root).await;
+
+    let effective_read_ns = effective_read_namespaces(&unit, ctx.config, ctx.memory);
+    let analysis = WorkspaceAnalysis {
+        repo_map: ctx.repo_map.clone(),
+        impact_texts: ctx.impact_texts.clone(),
+    };
+    let agent_ctx = AgentRunContext::for_run(
+        ctx.config,
+        ctx.context_files,
+        &effective_read_ns,
+        ctx.observer,
+        ctx.memory.clone(),
+        ctx.git_coordinator.clone(),
+        ctx.validation.clone(),
+        Some(ctx.shared_board.clone()),
+        &analysis,
+        ctx.pre_fetched_memory.clone(),
+    );
+
+    // Judges run in read-only mode: the write gate rejects any write
+    // proposals the backend tries to emit. See `run_readonly_agent`.
+    let run_future = run_readonly_agent(
+        &unit,
+        &agent_ctx,
+        ctx.tier_router,
+        ctx.iteration_config,
+        (ctx.make_observer)(agent_id),
+    );
+
+    // Apply judge timeout if configured (0 = disabled).
+    let manifest_result = if ctx.judge_timeout_secs > 0 {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(ctx.judge_timeout_secs as u64),
+            run_future,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(anyhow::anyhow!(
+                "judge agent '{}' timed out after {}s",
+                agent_id,
+                ctx.judge_timeout_secs
+            )),
+        }
+    } else {
+        run_future.await
+    };
+
+    let mut manifest = match manifest_result {
+        Ok(manifest) => manifest,
+        Err(e) => AgentManifest {
+            work_unit_id: agent_id.clone(),
+            status: AgentStatus::Failed(e.to_string()),
+            modified_files: vec![],
+            branch: None,
+            summary: Some(format!("Judge evaluation error: {}", e)),
+            output: None,
+            cost_usd: 0.0,
+        },
+    };
+
+    if !manifest.modified_files.is_empty() {
+        tracing::warn!(
+            "loop judge agent '{}' modified files during evaluation: {:?}",
+            agent_id,
+            manifest.modified_files
+        );
+    }
+
+    let verdict = manifest.output.as_deref().and_then(parse_judge_verdict);
+    let report = manifest
+        .output
+        .as_deref()
+        .map(parse_judge_report)
+        .unwrap_or_default();
+    manifest.summary = Some(match (verdict, &manifest.status) {
+        (Some(JudgeVerdict::Pass), _) => "Judge verdict: PASS".into(),
+        (Some(JudgeVerdict::Fail), _) => "Judge verdict: FAIL".into(),
+        (Some(JudgeVerdict::Partial), _) => "Judge verdict: PARTIAL".into(),
+        (Some(JudgeVerdict::Irreconcilable), _) => "Judge verdict: IRRECONCILABLE".into(),
+        (None, AgentStatus::Failed(msg)) => format!("Judge failed: {}", msg),
+        (None, _) => "Judge verdict: unparseable".into(),
+    });
+
+    // Under strict mode, an unparseable verdict on an otherwise completed
+    // run is promoted to a hard failure so it surfaces in the manifest/UI
+    // instead of silently being treated as FAIL.
+    if verdict.is_none() && matches!(manifest.status, AgentStatus::Completed) {
+        if ctx.strict_judge {
+            tracing::error!(
+                "loop judge agent '{}' returned unparseable output (strict mode)",
                 agent_id
             );
-            return Ok(LoopConditionOutcome::Continue(JudgeReport::default()));
-        };
-
-        // Build a compact digest of the most recent worker manifests for
-        // this loop, substituted into `{{ITER_EVIDENCE}}` if the judge's
-        // `coordinator_instructions` template references it. Authors who
-        // already supply their own evidence text (or omit the placeholder)
-        // are unaffected — the placeholder is only replaced when present.
-        let evidence = if unit_template
-            .coordinator_instructions
-            .contains("{{ITER_EVIDENCE}}")
-        {
-            build_iter_evidence(ctx.all_manifests, ctx.loop_agent_ids, current_iter_abs)
-        } else {
-            String::new()
-        };
-        let unit = apply_iter_vars_with_evidence(unit_template, current_iter_abs, &evidence);
-        invalidate_stale_sources(ctx.memory, &unit, &ctx.config.workspace_root).await;
-
-        let effective_read_ns = effective_read_namespaces(&unit, ctx.config, ctx.memory);
-        let analysis = WorkspaceAnalysis {
-            repo_map: ctx.repo_map.clone(),
-            impact_texts: ctx.impact_texts.clone(),
-        };
-        let agent_ctx = AgentRunContext::for_run(
-            ctx.config,
-            ctx.context_files,
-            &effective_read_ns,
-            ctx.observer,
-            ctx.memory.clone(),
-            ctx.git_coordinator.clone(),
-            ctx.validation.clone(),
-            Some(ctx.shared_board.clone()),
-            &analysis,
-            ctx.pre_fetched_memory.clone(),
-        );
-
-        // Judges run in read-only mode: the write gate rejects any write
-        // proposals the backend tries to emit. See `run_readonly_agent`.
-        let run_future = run_readonly_agent(
-            &unit,
-            &agent_ctx,
-            ctx.tier_router,
-            ctx.iteration_config,
-            (ctx.make_observer)(agent_id),
-        );
-
-        // Apply judge timeout if configured (0 = disabled).
-        let manifest_result = if ctx.judge_timeout_secs > 0 {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(ctx.judge_timeout_secs as u64),
-                run_future,
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(_) => Err(anyhow::anyhow!(
-                    "judge agent '{}' timed out after {}s",
-                    agent_id,
-                    ctx.judge_timeout_secs
-                )),
-            }
-        } else {
-            run_future.await
-        };
-
-        let mut manifest = match manifest_result {
-            Ok(manifest) => manifest,
-            Err(e) => AgentManifest {
-                work_unit_id: agent_id.clone(),
-                status: AgentStatus::Failed(e.to_string()),
-                modified_files: vec![],
-                branch: None,
-                summary: Some(format!("Judge evaluation error: {}", e)),
-                output: None,
-                cost_usd: 0.0,
-            },
-        };
-
-        if !manifest.modified_files.is_empty() {
-            tracing::warn!(
-                "loop judge agent '{}' modified files during evaluation: {:?}",
-                agent_id,
-                manifest.modified_files
-            );
-        }
-
-        let verdict = manifest.output.as_deref().and_then(parse_judge_verdict);
-        let report = manifest
-            .output
-            .as_deref()
-            .map(parse_judge_report)
-            .unwrap_or_default();
-        manifest.summary = Some(match (verdict, &manifest.status) {
-            (Some(JudgeVerdict::Pass), _) => "Judge verdict: PASS".into(),
-            (Some(JudgeVerdict::Fail), _) => "Judge verdict: FAIL".into(),
-            (Some(JudgeVerdict::Partial), _) => "Judge verdict: PARTIAL".into(),
-            (Some(JudgeVerdict::Irreconcilable), _) => {
-                "Judge verdict: IRRECONCILABLE".into()
-            }
-            (None, AgentStatus::Failed(msg)) => format!("Judge failed: {}", msg),
-            (None, _) => "Judge verdict: unparseable".into(),
-        });
-
-        // Under strict mode, an unparseable verdict on an otherwise completed
-        // run is promoted to a hard failure so it surfaces in the manifest/UI
-        // instead of silently being treated as FAIL.
-        if verdict.is_none() && matches!(manifest.status, AgentStatus::Completed) {
-            if ctx.strict_judge {
-                tracing::error!(
-                    "loop judge agent '{}' returned unparseable output (strict mode)",
-                    agent_id
-                );
-                manifest.status = AgentStatus::Failed(
+            manifest.status = AgentStatus::Failed(
                     "judge returned unparseable verdict (enable strict_judge=false for legacy behaviour)"
                         .into(),
                 );
-            } else {
-                tracing::warn!(
-                    "loop judge agent '{}' completed without a parseable PASS/FAIL verdict",
-                    agent_id
+        } else {
+            tracing::warn!(
+                "loop judge agent '{}' completed without a parseable PASS/FAIL verdict",
+                agent_id
+            );
+        }
+    }
+
+    if matches!(manifest.status, AgentStatus::Completed) {
+        {
+            let b = ctx.bus.lock().await;
+            b.broadcast(
+                &manifest.work_unit_id,
+                &format!("completed: {}", manifest.summary.as_deref().unwrap_or("")),
+            );
+        }
+        let worker_ns = unit
+            .write_namespace
+            .as_deref()
+            .unwrap_or(&ctx.config.write_namespace);
+        // Route judge artefacts to a dedicated sub-namespace so they do
+        // not pollute worker memory. The store's namespace is treated as
+        // an opaque key by callers, so the `judge/` prefix is a pure
+        // convention the consolidator and TUI can key off.
+        let judge_ns = format!("judge/{}", worker_ns);
+        store_agent_result(
+            ctx.memory,
+            ctx.memory_writer,
+            &judge_ns,
+            &manifest,
+            &unit,
+            ctx.run_id,
+            &ctx.config.workspace_root,
+            ctx.config.extract_agent_findings,
+        )
+        .await;
+    }
+
+    let outcome = match verdict {
+        Some(JudgeVerdict::Pass) => LoopConditionOutcome::Pass,
+        // The judge itself ruled the disagreement structural. Honour
+        // it in every consensus mode: continuing would spend the
+        // remaining budget re-deriving a conclusion the judge has
+        // already read and rejected as unreachable.
+        Some(JudgeVerdict::Irreconcilable) => LoopConditionOutcome::Irreconcilable(report),
+        Some(JudgeVerdict::Partial)
+            if ctx.consensus_mode == crate::swarm::plan::ConsensusMode::PartialOk =>
+        {
+            if let Some(dir) = ctx.verdict_output_dir {
+                write_consensus_verdict_file(
+                    &ctx.config.workspace_root,
+                    dir,
+                    current_iter_abs,
+                    "partial",
+                    manifest.summary.as_deref().unwrap_or(""),
+                    &ctx.loop_agent_ids,
                 );
             }
+            LoopConditionOutcome::Partial
         }
+        Some(JudgeVerdict::Partial) => LoopConditionOutcome::Continue(report),
+        _ => LoopConditionOutcome::Continue(report),
+    };
 
-        if matches!(manifest.status, AgentStatus::Completed) {
-            {
-                let b = ctx.bus.lock().await;
-                b.broadcast(
-                    &manifest.work_unit_id,
-                    &format!("completed: {}", manifest.summary.as_deref().unwrap_or("")),
-                );
-            }
-            let worker_ns = unit
-                .write_namespace
-                .as_deref()
-                .unwrap_or(&ctx.config.write_namespace);
-            // Route judge artefacts to a dedicated sub-namespace so they do
-            // not pollute worker memory. The store's namespace is treated as
-            // an opaque key by callers, so the `judge/` prefix is a pure
-            // convention the consolidator and TUI can key off.
-            let judge_ns = format!("judge/{}", worker_ns);
-            store_agent_result(
-                ctx.memory,
-                ctx.memory_writer,
-                &judge_ns,
-                &manifest,
-                &unit,
-                ctx.run_id,
-                &ctx.config.workspace_root,
-                ctx.config.extract_agent_findings,
-            )
-            .await;
-        }
-
-        let outcome = match verdict {
-            Some(JudgeVerdict::Pass) => LoopConditionOutcome::Pass,
-            // The judge itself ruled the disagreement structural. Honour
-            // it in every consensus mode: continuing would spend the
-            // remaining budget re-deriving a conclusion the judge has
-            // already read and rejected as unreachable.
-            Some(JudgeVerdict::Irreconcilable) => {
-                LoopConditionOutcome::Irreconcilable(report)
-            }
-            Some(JudgeVerdict::Partial)
-                if ctx.consensus_mode == crate::swarm::plan::ConsensusMode::PartialOk =>
-            {
-                if let Some(dir) = ctx.verdict_output_dir {
-                    write_consensus_verdict_file(
-                        &ctx.config.workspace_root,
-                        dir,
-                        current_iter_abs,
-                        "partial",
-                        manifest.summary.as_deref().unwrap_or(""),
-                        &ctx.loop_agent_ids,
-                    );
-                }
-                LoopConditionOutcome::Partial
-            }
-            Some(JudgeVerdict::Partial) => LoopConditionOutcome::Continue(report),
-            _ => LoopConditionOutcome::Continue(report),
-        };
-
-        ctx.all_manifests.push(manifest);
-        Ok(outcome)
+    ctx.all_manifests.push(manifest);
+    Ok(outcome)
 }
 
 /// Evaluate `until … and …`: every condition must pass.

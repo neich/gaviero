@@ -482,9 +482,9 @@ impl ClaudeSession {
                                     &input,
                                     tx,
                                 );
-                                let decision = rx
-                                    .await
-                                    .unwrap_or_else(|_| crate::observer::PermissionDecision::deny());
+                                let decision = rx.await.unwrap_or_else(|_| {
+                                    crate::observer::PermissionDecision::deny()
+                                });
                                 tracing::info!(
                                     "Permission request for '{}': {}",
                                     tool_name,
@@ -494,11 +494,7 @@ impl ClaudeSession {
                                         "denied"
                                     }
                                 );
-                                session.respond_permission_decision(
-                                    &decision,
-                                    &request_id,
-                                    &input,
-                                );
+                                session.respond_permission_decision(&decision, &request_id, &input);
                                 idle_count = 0;
                             }
                             StreamEvent::SystemInit { session_id, .. } => {
@@ -870,10 +866,7 @@ mod tests {
     #[test]
     fn embed_attachment_refs_appends_paths_and_read_tool_hint() {
         let msg = "what is in the screenshots?";
-        let attachments = vec![
-            PathBuf::from("/tmp/a.png"),
-            PathBuf::from("/var/foo/b.jpg"),
-        ];
+        let attachments = vec![PathBuf::from("/tmp/a.png"), PathBuf::from("/var/foo/b.jpg")];
         let out = embed_attachment_refs(msg, &attachments);
         assert!(out.contains("what is in the screenshots?"));
         assert!(out.contains("<attached_files>"));
@@ -890,16 +883,13 @@ mod tests {
         let attachments = vec![
             PathBuf::from("/work/proj/notes.md"), // under workspace → skip
             PathBuf::from("/tmp/a.png"),
-            PathBuf::from("/tmp/b.png"),          // dedup
-            PathBuf::from("/work/lib/c.png"),     // already in additional → skip
+            PathBuf::from("/tmp/b.png"),      // dedup
+            PathBuf::from("/work/lib/c.png"), // already in additional → skip
             PathBuf::from("/home/me/d.png"),
         ];
         let parents = collect_attachment_parents(&attachments, &workspace, &additional);
         let parents: Vec<&Path> = parents.iter().map(|p| p.as_path()).collect();
-        assert_eq!(
-            parents,
-            vec![Path::new("/tmp"), Path::new("/home/me")]
-        );
+        assert_eq!(parents, vec![Path::new("/tmp"), Path::new("/home/me")]);
     }
 
     #[test]

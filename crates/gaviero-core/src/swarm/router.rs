@@ -531,7 +531,11 @@ mod tests {
     #[test]
     fn test_cursor_blocked_under_local_only() {
         let router = TierRouter::new(TierConfig::default(), true);
-        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::LocalOnly, Some("cursor:auto"));
+        let unit = test_unit(
+            ModelTier::Cheap,
+            PrivacyLevel::LocalOnly,
+            Some("cursor:auto"),
+        );
         // Privacy check fires before the override resolves to a backend.
         assert!(matches!(
             router.resolve(&unit),
@@ -541,7 +545,11 @@ mod tests {
 
     #[test]
     fn test_validate_privacy_rejects_cursor_on_local_only_units() {
-        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::LocalOnly, Some("cursor:auto"));
+        let unit = test_unit(
+            ModelTier::Cheap,
+            PrivacyLevel::LocalOnly,
+            Some("cursor:auto"),
+        );
         let err = validate_privacy(&unit).expect_err("cursor override must be rejected");
         assert!(err.contains("Cursor"));
         assert!(err.contains("cursor:auto"));
@@ -550,7 +558,11 @@ mod tests {
     #[test]
     fn test_local_only_model_override_blocked() {
         let router = TierRouter::new(TierConfig::default(), true);
-        let unit = test_unit(ModelTier::Cheap, PrivacyLevel::LocalOnly, Some("claude:sonnet"));
+        let unit = test_unit(
+            ModelTier::Cheap,
+            PrivacyLevel::LocalOnly,
+            Some("claude:sonnet"),
+        );
         assert!(matches!(
             router.resolve(&unit),
             ResolvedBackend::Blocked { .. }

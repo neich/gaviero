@@ -208,11 +208,10 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             // the overlay takes ownership of the proposal.
             let revision = app.remote.proposal_revision(proposal.id);
             let dto = crate::app::projection::proposal_dto(app, &proposal, revision);
-            app.remote.push_frame(
-                gaviero_remote::envelope::ServerFrame::ProposalCreated(
+            app.remote
+                .push_frame(gaviero_remote::envelope::ServerFrame::ProposalCreated(
                     gaviero_remote::envelope::ProposalEvent { proposal: dto },
-                ),
-            );
+                ));
             app.remote.bump_global();
             app.enter_review_mode(*proposal, DiffSource::Acp);
         }
@@ -232,11 +231,10 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 }
             };
             if let Some(dto) = dto {
-                app.remote.push_frame(
-                    gaviero_remote::envelope::ServerFrame::ProposalUpdated(
+                app.remote
+                    .push_frame(gaviero_remote::envelope::ServerFrame::ProposalUpdated(
                         gaviero_remote::envelope::ProposalEvent { proposal: dto },
-                    ),
-                );
+                    ));
             }
             app.remote.bump_global();
         }
@@ -838,8 +836,8 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                     .clone()
                     .unwrap_or_default();
                 app.chat_state.conversations[idx].bump_revision();
-                app.remote.push_frame(
-                    gaviero_remote::envelope::ServerFrame::StreamingEnded(
+                app.remote
+                    .push_frame(gaviero_remote::envelope::ServerFrame::StreamingEnded(
                         gaviero_remote::envelope::StreamingEnded {
                             conv_id: conv_id.clone(),
                             turn_id,
@@ -847,8 +845,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                             error: error.clone(),
                             proposal_count: proposal_count as u32,
                         },
-                    ),
-                );
+                    ));
             }
 
             if cancelled {
@@ -933,7 +930,9 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 );
                 // Remote projection (A4): mirror the parked request. Built
                 // from reducer state so it carries the generated request_id.
-                if let Some(perm) = app.chat_state.conversations[idx].pending_permission.as_ref()
+                if let Some(perm) = app.chat_state.conversations[idx]
+                    .pending_permission
+                    .as_ref()
                 {
                     app.remote.push_frame(
                         gaviero_remote::envelope::ServerFrame::PermissionRequest(
@@ -1415,36 +1414,37 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 // Synthesize provider configs for either path below
                 // (hosting or reusing). Agents address the endpoint, not
                 // which process owns the accept loop.
-                let synthesize_mcp_configs = |app: &App, endpoint: &gaviero_core::mcp::McpEndpoint| {
-                    let codex_trust = match app
-                        .workspace
-                        .resolve_setting(
-                            gaviero_core::workspace::settings::MCP_GAVIERO_CODEX_TRUST,
-                            Some(&workspace_root_for_mcp),
-                        )
-                        .as_str()
-                        .unwrap_or("unknown")
-                    {
-                        "granted" | "trusted" => gaviero_core::mcp::TrustConsent::Granted,
-                        "denied" | "untrusted" => gaviero_core::mcp::TrustConsent::Denied,
-                        _ => gaviero_core::mcp::TrustConsent::Unknown,
-                    };
-                    let mut overrides = gaviero_core::mcp::McpConfigOverrides::default();
-                    overrides.codex_trust = Some(codex_trust);
-                    let synth = gaviero_core::mcp::resolve_mcp_config_synth(
-                        &app.workspace,
-                        &workspace_root_for_mcp,
-                        endpoint.clone(),
-                        &overrides,
-                    );
-                    if let Err(e) = gaviero_core::mcp::synthesize_for_worktree(&synth) {
-                        tracing::warn!(
-                            target: "mcp_server",
-                            error = %e,
-                            "failed to synthesize workspace MCP config"
+                let synthesize_mcp_configs =
+                    |app: &App, endpoint: &gaviero_core::mcp::McpEndpoint| {
+                        let codex_trust = match app
+                            .workspace
+                            .resolve_setting(
+                                gaviero_core::workspace::settings::MCP_GAVIERO_CODEX_TRUST,
+                                Some(&workspace_root_for_mcp),
+                            )
+                            .as_str()
+                            .unwrap_or("unknown")
+                        {
+                            "granted" | "trusted" => gaviero_core::mcp::TrustConsent::Granted,
+                            "denied" | "untrusted" => gaviero_core::mcp::TrustConsent::Denied,
+                            _ => gaviero_core::mcp::TrustConsent::Unknown,
+                        };
+                        let mut overrides = gaviero_core::mcp::McpConfigOverrides::default();
+                        overrides.codex_trust = Some(codex_trust);
+                        let synth = gaviero_core::mcp::resolve_mcp_config_synth(
+                            &app.workspace,
+                            &workspace_root_for_mcp,
+                            endpoint.clone(),
+                            &overrides,
                         );
-                    }
-                };
+                        if let Err(e) = gaviero_core::mcp::synthesize_for_worktree(&synth) {
+                            tracing::warn!(
+                                target: "mcp_server",
+                                error = %e,
+                                "failed to synthesize workspace MCP config"
+                            );
+                        }
+                    };
                 // Another gaviero process (typically a first TUI, or a
                 // headless CLI) may already own this workspace endpoint.
                 // Rebinding fails on Windows (`first_pipe_instance`) and

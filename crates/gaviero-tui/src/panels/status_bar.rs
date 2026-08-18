@@ -41,7 +41,11 @@ impl<'a> StatusBar<'a> {
                 editor_buf.cursor.line + 1,
                 editor_buf.cursor.col + 1
             );
-            let wrap = if editor_buf.word_wrap { " │ Wrap" } else { "" };
+            let wrap = if editor_buf.word_wrap {
+                " │ Wrap"
+            } else {
+                ""
+            };
             let lang = editor_buf.lang_name.as_deref().unwrap_or("Plain Text");
             let right = format!("{} │ {}{} │ {} ", cursor, lang, wrap, self.model_info);
 

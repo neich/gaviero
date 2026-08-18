@@ -18,7 +18,9 @@ use tokio::sync::Mutex;
 
 use gaviero_core::acp::session::AgentOptions;
 use gaviero_core::agent_session::registry::{SessionConstruction, create_session};
-use gaviero_core::context_planner::{ContinuityMode, ModelSpec, RuntimeConfig, build_provider_profile};
+use gaviero_core::context_planner::{
+    ContinuityMode, ModelSpec, RuntimeConfig, build_provider_profile,
+};
 use gaviero_core::observer::AcpObserver;
 use gaviero_core::write_gate::{WriteGatePipeline, WriteMode};
 

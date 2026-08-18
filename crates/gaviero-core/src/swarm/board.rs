@@ -306,9 +306,7 @@ impl SharedBoard {
         let arts = self.artifacts.read().await;
         arts.iter()
             .rev()
-            .find(|a| {
-                a.from_agent == from_agent && matches!(a.kind, ArtifactKind::SpawnManifest)
-            })
+            .find(|a| a.from_agent == from_agent && matches!(a.kind, ArtifactKind::SpawnManifest))
             .map(|a| Self::path_for(&root, a))
             .or_else(|| {
                 // Convention: artifacts/spawn_manifest/from-<unit>.json

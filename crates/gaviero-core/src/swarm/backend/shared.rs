@@ -22,8 +22,15 @@ pub const DEEPSEEK_API_MODELS: &[&str] = &["deepseek-v4-pro", "deepseek-v4-flash
 /// top to surface full model names. Mirrors the documented `/model` aliases;
 /// the `[1m]` long-context variants are valid specs (context-window sizing
 /// strips the suffix before matching).
-pub const CLAUDE_MODEL_ALIASES: &[&str] =
-    &["fable", "sonnet", "opus", "haiku", "opusplan", "sonnet[1m]", "opus[1m]"];
+pub const CLAUDE_MODEL_ALIASES: &[&str] = &[
+    "fable",
+    "sonnet",
+    "opus",
+    "haiku",
+    "opusplan",
+    "sonnet[1m]",
+    "opus[1m]",
+];
 
 /// Canonical Codex model ids the `/model` picker always offers, without the
 /// `codex:` prefix. Codex has no CLI discovery path in Gaviero (unlike Claude
@@ -593,20 +600,14 @@ pub fn render_graph_block(
         .collect();
     let pre_rendered: Vec<&crate::context_planner::GraphSelection> = graph_selections
         .iter()
-        .filter(|g| {
-            g.path.is_none()
-                && g.kind != GraphSelectionKind::Topology
-        })
+        .filter(|g| g.path.is_none() && g.kind != GraphSelectionKind::Topology)
         .collect();
 
     let mut chunks: Vec<String> = Vec::new();
 
     for g in topology {
         if !g.content.is_empty() {
-            chunks.push(format!(
-                "<repo_topology>\n{}\n</repo_topology>",
-                g.content
-            ));
+            chunks.push(format!("<repo_topology>\n{}\n</repo_topology>", g.content));
         }
     }
 
@@ -617,7 +618,10 @@ pub fn render_graph_block(
             .map(|g| g.content.clone())
             .collect();
         if !lines.is_empty() {
-            chunks.push(format!("<repo_outline>\n{}\n</repo_outline>", lines.join("\n")));
+            chunks.push(format!(
+                "<repo_outline>\n{}\n</repo_outline>",
+                lines.join("\n")
+            ));
         }
     }
     for g in pre_rendered {
@@ -679,12 +683,7 @@ pub fn render_skill_block(
     }
     let blocks: Vec<String> = skill_selections
         .iter()
-        .map(|s| {
-            format!(
-                "<skill name=\"{}\">\n{}\n</skill>",
-                s.name, s.rendered_body
-            )
-        })
+        .map(|s| format!("<skill name=\"{}\">\n{}\n</skill>", s.name, s.rendered_body))
         .collect();
     Some(blocks.join("\n\n"))
 }
@@ -762,24 +761,21 @@ mod tests {
             skill_selections: vec![SkillSelection {
                 name: "migrate-component".to_string(),
                 scope_level: 2,
-                rendered_body: "Migrate the SearchBar component from React to Vue."
-                    .to_string(),
+                rendered_body: "Migrate the SearchBar component from React to Vue.".to_string(),
             }],
             ..PlannerSelections::default()
         };
 
-        let skill_xml = render_skill_block(&selections.skill_selections)
-            .expect("skill block");
+        let skill_xml = render_skill_block(&selections.skill_selections).expect("skill block");
         let swarm = render_swarm_prompt(&selections, &FileScope::default(), "do it");
-        let chat = format!(
-            "do it\n\n{}",
-            skill_xml
-        );
+        let chat = format!("do it\n\n{}", skill_xml);
 
         assert!(swarm.contains(&skill_xml));
         assert!(chat.contains(&skill_xml));
         assert_eq!(
-            swarm.find(&skill_xml).map(|p| &swarm[p..p + skill_xml.len()]),
+            swarm
+                .find(&skill_xml)
+                .map(|p| &swarm[p..p + skill_xml.len()]),
             chat.find(&skill_xml).map(|p| &chat[p..p + skill_xml.len()])
         );
     }
@@ -796,7 +792,9 @@ mod tests {
         // fences) stays inside so the agent can distinguish injected context
         // from the user's actual request without paying for verbose markers.
         assert!(prompt.contains("<prev_conv>\nU: first question\n</prev_conv>"));
-        assert!(prompt.contains("<file_refs>\n@src/lib.rs\nfn demo() {}\n/@src/lib.rs\n</file_refs>"));
+        assert!(
+            prompt.contains("<file_refs>\n@src/lib.rs\nfn demo() {}\n/@src/lib.rs\n</file_refs>")
+        );
         // Prompt at TOP, not appended after context.
         assert!(prompt.starts_with("Implement it"));
     }
@@ -821,7 +819,10 @@ mod tests {
             format!("{SONNET_ALIAS_CLI_MODEL}[1m]")
         );
         // Surrounding whitespace is trimmed before matching.
-        assert_eq!(resolve_claude_cli_model("  sonnet  "), SONNET_ALIAS_CLI_MODEL);
+        assert_eq!(
+            resolve_claude_cli_model("  sonnet  "),
+            SONNET_ALIAS_CLI_MODEL
+        );
     }
 
     #[test]
@@ -982,16 +983,31 @@ mod tests {
         // `/model codex:` and bare `gpt` fragments only surface Cursor's
         // proxied gpt models — Codex looks unavailable.
         let hits = model_spec_completions("codex:", &[]);
-        assert!(hits.contains(&"codex:gpt-5.6-sol".to_string()), "got {hits:?}");
-        assert!(hits.contains(&"codex:gpt-5.6-terra".to_string()), "got {hits:?}");
-        assert!(hits.contains(&"codex:gpt-5.6-luna".to_string()), "got {hits:?}");
+        assert!(
+            hits.contains(&"codex:gpt-5.6-sol".to_string()),
+            "got {hits:?}"
+        );
+        assert!(
+            hits.contains(&"codex:gpt-5.6-terra".to_string()),
+            "got {hits:?}"
+        );
+        assert!(
+            hits.contains(&"codex:gpt-5.6-luna".to_string()),
+            "got {hits:?}"
+        );
         assert!(hits.contains(&"codex:gpt-5.5".to_string()), "got {hits:?}");
         assert!(hits.contains(&"codex:gpt-5.4".to_string()), "got {hits:?}");
         assert!(hits.contains(&"codex:gpt-5.2".to_string()), "got {hits:?}");
 
         let family = model_spec_completions("codex:gpt-5.6", &[]);
-        assert!(family.contains(&"codex:gpt-5.6-sol".to_string()), "got {family:?}");
-        assert!(family.contains(&"codex:gpt-5.6-luna".to_string()), "got {family:?}");
+        assert!(
+            family.contains(&"codex:gpt-5.6-sol".to_string()),
+            "got {family:?}"
+        );
+        assert!(
+            family.contains(&"codex:gpt-5.6-luna".to_string()),
+            "got {family:?}"
+        );
 
         let gpt_hits = model_spec_completions("gpt", &[]);
         assert!(
@@ -1003,9 +1019,15 @@ mod tests {
     #[test]
     fn test_model_spec_completions_claude_filters_by_fragment() {
         let hits = model_spec_completions("claude:op", &[]);
-        assert!(hits.iter().all(|h| h.starts_with("claude:op")), "got {hits:?}");
+        assert!(
+            hits.iter().all(|h| h.starts_with("claude:op")),
+            "got {hits:?}"
+        );
         assert!(hits.contains(&"claude:opus".to_string()), "got {hits:?}");
-        assert!(hits.contains(&"claude:opusplan".to_string()), "got {hits:?}");
+        assert!(
+            hits.contains(&"claude:opusplan".to_string()),
+            "got {hits:?}"
+        );
     }
 
     #[test]
@@ -1045,7 +1067,10 @@ mod tests {
         // with the provider prefix filled in.
         let hits = model_spec_completions("opu", &[]);
         assert!(hits.contains(&"claude:opus".to_string()), "got {hits:?}");
-        assert!(hits.contains(&"claude:opusplan".to_string()), "got {hits:?}");
+        assert!(
+            hits.contains(&"claude:opusplan".to_string()),
+            "got {hits:?}"
+        );
 
         let discovered = vec!["cursor:composer-2.5".to_string()];
         let hits = model_spec_completions("comp", &discovered);

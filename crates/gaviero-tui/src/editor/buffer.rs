@@ -6,7 +6,7 @@ use gaviero_core::{InputEdit, Language, Parser, Point, Tree};
 use ropey::Rope;
 use unicode_width::UnicodeWidthChar;
 
-use super::wrap::{char_display_width, VisualSegment};
+use super::wrap::{VisualSegment, char_display_width};
 
 #[derive(Clone, Debug)]
 pub struct Cursor {
@@ -210,8 +210,7 @@ impl Buffer {
         // prefix components — a bare canonicalize returns verbatim `\\?\`
         // paths on Windows, which fail every strip_prefix-relativization
         // against the simplified root (git status, path labels).
-        gaviero_core::util::fs::canonicalize_simplified(path)
-            .unwrap_or_else(|_| path.to_path_buf())
+        gaviero_core::util::fs::canonicalize_simplified(path).unwrap_or_else(|_| path.to_path_buf())
     }
 
     /// Record that the buffer now matches what is on disk.
@@ -254,8 +253,8 @@ impl Buffer {
     /// Open a file from disk.
     pub fn open(path: &Path) -> Result<Self> {
         let path = Self::resolve_editor_path(path);
-        let content =
-            std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
         let text = Rope::from_str(&content);
 
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -383,8 +382,8 @@ impl Buffer {
     pub fn refresh_conflict_metadata(&mut self, git_unmerged: bool) {
         let content = self.text.to_string();
         self.conflict_regions = gaviero_core::git_conflict::find_conflict_regions(&content);
-        self.git_unmerged = git_unmerged
-            || gaviero_core::git_conflict::file_has_conflict_markers(&content);
+        self.git_unmerged =
+            git_unmerged || gaviero_core::git_conflict::file_has_conflict_markers(&content);
         if self.conflict_index >= self.conflict_regions.len() {
             self.conflict_index = 0;
         }
@@ -852,7 +851,9 @@ impl Buffer {
             (self.cursor.line + 1).min(self.text.len_lines().saturating_sub(1))
         };
         if target != self.cursor.line {
-            let col = self.visual_to_char_col(target, goal).min(self.line_len(target));
+            let col = self
+                .visual_to_char_col(target, goal)
+                .min(self.line_len(target));
             self.cursor.line = target;
             self.cursor.col = col;
         }
@@ -1125,7 +1126,8 @@ impl Buffer {
             let goal = self.goal_visual_col(self.cursor_visual_col(&layout, vline));
             let target = vline.saturating_sub(viewport_height);
             if let Some(seg) = layout.segment_at(target) {
-                let col = self.segment_visual_to_char_col(seg, goal, layout.is_last_of_line(target));
+                let col =
+                    self.segment_visual_to_char_col(seg, goal, layout.is_last_of_line(target));
                 self.cursor.line = seg.logical_line;
                 self.cursor.col = col;
             }
@@ -1152,7 +1154,8 @@ impl Buffer {
             let max_v = layout.len().saturating_sub(1);
             let target = (vline + viewport_height).min(max_v);
             if let Some(seg) = layout.segment_at(target) {
-                let col = self.segment_visual_to_char_col(seg, goal, layout.is_last_of_line(target));
+                let col =
+                    self.segment_visual_to_char_col(seg, goal, layout.is_last_of_line(target));
                 self.cursor.line = seg.logical_line;
                 self.cursor.col = col;
             }
@@ -1207,7 +1210,8 @@ impl Buffer {
             self.scroll.left_col = visual_col;
         }
         if visual_col >= self.scroll.left_col + content_width.saturating_sub(h_margin) {
-            self.scroll.left_col = visual_col.saturating_sub(content_width.saturating_sub(h_margin + 1));
+            self.scroll.left_col =
+                visual_col.saturating_sub(content_width.saturating_sub(h_margin + 1));
         }
     }
 
@@ -1772,7 +1776,9 @@ impl Buffer {
 
         // Keep the beginning of the paste on-screen when it scrolled above the
         // viewport, without undoing the end-cursor position.
-        let paste_line = self.text.char_to_line(paste_start.min(self.text.len_chars()));
+        let paste_line = self
+            .text
+            .char_to_line(paste_start.min(self.text.len_chars()));
         if paste_line < self.scroll.top_line {
             self.scroll.top_line = paste_line;
         }
@@ -2954,11 +2960,7 @@ fn save_temp_sibling_path(target: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
-    fn collect_numbers(
-        node: gaviero_core::Node,
-        source: &[u8],
-        out: &mut Vec<String>,
-    ) {
+    fn collect_numbers(node: gaviero_core::Node, source: &[u8], out: &mut Vec<String>) {
         if node.kind() == "number" {
             if let Ok(s) = std::str::from_utf8(&source[node.start_byte()..node.end_byte()]) {
                 out.push(s.to_string());

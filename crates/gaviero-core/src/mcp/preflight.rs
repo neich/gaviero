@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use crate::swarm::backend::shared::{is_codex_model, is_cursor_model};
 use crate::swarm::plan::CompiledPlan;
 
-use super::config_synth::{host_from_mcp_url, synth_has_remote_url_servers, McpConfigSynth};
+use super::config_synth::{McpConfigSynth, host_from_mcp_url, synth_has_remote_url_servers};
 use super::{ExtraMcpTransport, TrustConsent};
 
 /// Whether any unit in the plan (including loop judges) resolves to a Codex backend.
@@ -23,10 +23,7 @@ pub fn plan_uses_codex(plan: &CompiledPlan, fallback_model: &str) -> bool {
     units.any(|u| unit_uses_codex(u, fallback_model))
 }
 
-fn unit_uses_codex(
-    unit: &crate::swarm::models::WorkUnit,
-    fallback_model: &str,
-) -> bool {
+fn unit_uses_codex(unit: &crate::swarm::models::WorkUnit, fallback_model: &str) -> bool {
     unit.model
         .as_deref()
         .map(is_codex_model)
@@ -53,7 +50,11 @@ pub fn validate_codex_trust_for_extras(
         TrustConsent::Denied => "denied",
         TrustConsent::Granted => unreachable!(),
     };
-    let names: Vec<_> = synth.extra_servers.iter().map(|s| s.name.as_str()).collect();
+    let names: Vec<_> = synth
+        .extra_servers
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
     bail!(
         "extra MCP server(s) [{names}] are configured but Codex trust is `{trust_state}` — \
          Codex agents in this plan will not load them (no `.codex/config.toml` is written).\n\
@@ -95,7 +96,10 @@ pub fn preflight_mcp(synth: &McpConfigSynth, opts: PreflightOpts) -> Result<()> 
             ExtraMcpTransport::Url { url } => validate_remote_url(&extra.name, url)?,
             ExtraMcpTransport::Stdio { command, args } => {
                 if command.trim().is_empty() {
-                    bail!("MCP server {:?}: stdio command must be non-empty", extra.name);
+                    bail!(
+                        "MCP server {:?}: stdio command must be non-empty",
+                        extra.name
+                    );
                 }
                 ensure_stdio_command_resolvable(command, args)?;
             }
@@ -116,9 +120,7 @@ pub fn preflight_mcp(synth: &McpConfigSynth, opts: PreflightOpts) -> Result<()> 
 fn validate_remote_url(name: &str, url: &str) -> Result<()> {
     let url = url.trim();
     if !(url.starts_with("https://") || url.starts_with("http://")) {
-        bail!(
-            "MCP server {name:?}: url must start with http:// or https:// (got {url:?})",
-        );
+        bail!("MCP server {name:?}: url must start with http:// or https:// (got {url:?})",);
     }
     if host_from_mcp_url(url).is_none() {
         bail!("MCP server {name:?}: url has no parseable host ({url:?})");

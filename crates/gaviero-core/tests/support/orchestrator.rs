@@ -227,18 +227,8 @@ pub async fn run_turn(
     };
 
     let started = Instant::now();
-    let mut session = AcpSession::spawn(
-        model,
-        cwd,
-        user_prompt,
-        "",
-        &[],
-        &[],
-        &options,
-        &[],
-        &[],
-    )
-    .context("spawning AcpSession")?;
+    let mut session = AcpSession::spawn(model, cwd, user_prompt, "", &[], &[], &options, &[], &[])
+        .context("spawning AcpSession")?;
 
     use gaviero_core::observer::AcpObserver as _;
     let deadline = Instant::now() + PER_TURN_TIMEOUT;

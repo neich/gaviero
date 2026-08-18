@@ -90,17 +90,17 @@ const WRAPPER_MAX_BYTES: usize = 256;
 /// detection is a literal substring search for the open tag followed by
 /// its matching close tag.
 const TAG_TABLE: &[(SectionKind, &str, &str)] = &[
-    (SectionKind::UserMessage, "<user_message>", "</user_message>"),
+    (
+        SectionKind::UserMessage,
+        "<user_message>",
+        "</user_message>",
+    ),
     (
         SectionKind::MemorySelections,
         "<project_memory>",
         "</project_memory>",
     ),
-    (
-        SectionKind::Topology,
-        "<repo_topology>",
-        "</repo_topology>",
-    ),
+    (SectionKind::Topology, "<repo_topology>", "</repo_topology>"),
     (
         SectionKind::GraphSelections,
         "<repo_outline>",
@@ -203,9 +203,7 @@ fn sha_hex(s: &str) -> String {
 fn fill_gaps_with_user_or_other(prompt: &str, sections: &mut Vec<Section>) {
     sections.sort_by_key(|s| s.byte_range.0);
 
-    let has_user_message = sections
-        .iter()
-        .any(|s| s.kind == SectionKind::UserMessage);
+    let has_user_message = sections.iter().any(|s| s.kind == SectionKind::UserMessage);
 
     let total = prompt.len();
     let mut cursor = 0usize;
@@ -271,7 +269,8 @@ mod tests {
 
     #[test]
     fn classify_wrapper_prompt_short_circuits() {
-        let prompt = "Read the full prompt at @.gaviero/tmp/prompt-abc.md and follow its instructions.";
+        let prompt =
+            "Read the full prompt at @.gaviero/tmp/prompt-abc.md and follow its instructions.";
         let d = classify("t-wrapper", prompt);
         assert_eq!(kinds(&d), vec![SectionKind::Wrapper]);
         assert_eq!(d.total_bytes, prompt.len());
@@ -284,15 +283,17 @@ mod tests {
         let mut prompt = String::from("Read the full prompt at @x.md and follow its instructions.");
         prompt.push_str(&"x".repeat(WRAPPER_MAX_BYTES));
         let d = classify("t-long", &prompt);
-        assert!(!matches!(d.sections.first().map(|s| s.kind), Some(SectionKind::Wrapper)));
+        assert!(!matches!(
+            d.sections.first().map(|s| s.kind),
+            Some(SectionKind::Wrapper)
+        ));
     }
 
     #[test]
     fn classify_untagged_user_then_memory_block() {
         // Test-harness path: prompt assembled manually without a
         // <user_message> wrapper. Leading text falls back to UserMessage.
-        let prompt =
-            "User question?\n<project_memory>\n[repo] decision: x|s0.9\n</project_memory>";
+        let prompt = "User question?\n<project_memory>\n[repo] decision: x|s0.9\n</project_memory>";
         let d = classify("t-mem", prompt);
         assert_eq!(
             kinds(&d),
@@ -334,7 +335,8 @@ mod tests {
 
     #[test]
     fn classify_repo_topology_tag_recognised() {
-        let prompt = "<user_message>\nask\n</user_message>\n\n<repo_topology>\n  crates/\n</repo_topology>";
+        let prompt =
+            "<user_message>\nask\n</user_message>\n\n<repo_topology>\n  crates/\n</repo_topology>";
         let d = classify("t-topo", prompt);
         assert!(kinds(&d).contains(&SectionKind::Topology));
     }
@@ -383,8 +385,16 @@ mod tests {
     fn sha_changes_when_body_changes() {
         let a = classify("t", "<project_memory>\nA\n</project_memory>");
         let b = classify("t", "<project_memory>\nB\n</project_memory>");
-        let mem_a = a.sections.iter().find(|s| s.kind == SectionKind::MemorySelections).unwrap();
-        let mem_b = b.sections.iter().find(|s| s.kind == SectionKind::MemorySelections).unwrap();
+        let mem_a = a
+            .sections
+            .iter()
+            .find(|s| s.kind == SectionKind::MemorySelections)
+            .unwrap();
+        let mem_b = b
+            .sections
+            .iter()
+            .find(|s| s.kind == SectionKind::MemorySelections)
+            .unwrap();
         assert_ne!(mem_a.sha256, mem_b.sha256);
     }
 }

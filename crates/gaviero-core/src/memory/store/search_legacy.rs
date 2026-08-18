@@ -93,12 +93,7 @@ impl MemoryStore {
     /// Search across namespaces and format results as a prompt-ready string.
     ///
     /// Returns an empty string on error or if no results are found.
-    pub async fn search_context(
-        &self,
-        namespaces: &[String],
-        query: &str,
-        limit: usize,
-    ) -> String {
+    pub async fn search_context(&self, namespaces: &[String], query: &str, limit: usize) -> String {
         match self.search_multi(namespaces, query, limit).await {
             Ok(results) if !results.is_empty() => {
                 // M0 instrumentation: expose selected memory IDs + scores so

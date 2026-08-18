@@ -12,9 +12,9 @@ use crate::types::FileScope;
 use super::client::DeepseekClient;
 use super::policy::ToolPolicy;
 use super::replay::build_messages;
+use super::resolve_api_config;
 use super::snapshot::TurnSnapshot;
 use super::tools::{ToolCtx, ToolRegistry};
-use super::resolve_api_config;
 
 /// Inputs for one swarm work-unit turn through the tool-agent harness.
 pub struct SwarmTurnRequest {

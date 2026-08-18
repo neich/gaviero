@@ -52,9 +52,7 @@ struct Cli {
 /// - `n`, `no`, anything else → decline
 /// - EOF (e.g., `</dev/null`) → decline (treat headless TUI invocation
 ///   as "no consent" rather than silently migrating).
-fn prompt_c1_consent(
-    proposals: &[gaviero_core::memory::C1MigrationProposal],
-) -> Result<bool> {
+fn prompt_c1_consent(proposals: &[gaviero_core::memory::C1MigrationProposal]) -> Result<bool> {
     use std::io::{BufRead, Write};
 
     let mut stderr = std::io::stderr().lock();
@@ -315,8 +313,7 @@ async fn main() -> Result<()> {
     // Bracketed paste and VT mouse passthrough are platform-dependent —
     // see `platform` for why each is gated the way it is.
     platform::set_bracketed_paste(&mut stdout, true).context("enabling bracketed paste")?;
-    platform::enable_vt_mouse_passthrough(&mut stdout)
-        .context("enabling VT mouse passthrough")?;
+    platform::enable_vt_mouse_passthrough(&mut stdout).context("enabling VT mouse passthrough")?;
 
     // RAII guard: if anything below returns Err via `?`, the terminal
     // is still restored when `_guard` is dropped.
@@ -432,8 +429,8 @@ async fn main() -> Result<()> {
                 match remote_setup::check_availability(&config) {
                     Ok(availability) => match remote_setup::load_or_create_token(&config) {
                         Ok(token) => {
-                            let instance_id = gaviero_remote::pairing::generate_token()[..16]
-                                .to_string();
+                            let instance_id =
+                                gaviero_remote::pairing::generate_token()[..16].to_string();
                             match remote_setup::start(
                                 &config,
                                 availability,

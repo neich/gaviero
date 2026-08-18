@@ -415,7 +415,11 @@ impl MemoryPanelState {
                 _ => 0,
             }
         };
-        let new_idx = if forward { (idx + 1) % 4 } else { (idx + 3) % 4 };
+        let new_idx = if forward {
+            (idx + 1) % 4
+        } else {
+            (idx + 3) % 4
+        };
         match new_idx {
             0 => {
                 self.leave_deletions_tab();

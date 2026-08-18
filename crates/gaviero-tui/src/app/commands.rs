@@ -71,12 +71,8 @@ pub(super) fn resynthesize_mcp_configs(app: &App) {
     };
     let mut overrides = gaviero_core::mcp::McpConfigOverrides::default();
     overrides.codex_trust = Some(codex_trust);
-    let synth = gaviero_core::mcp::resolve_mcp_config_synth(
-        &app.workspace,
-        &root,
-        endpoint,
-        &overrides,
-    );
+    let synth =
+        gaviero_core::mcp::resolve_mcp_config_synth(&app.workspace, &root, endpoint, &overrides);
     if let Err(e) = gaviero_core::mcp::synthesize_for_worktree(&synth) {
         tracing::warn!(target: "mcp_server", error = %e, "codex-trust resynthesis failed");
     }
@@ -485,13 +481,18 @@ pub(super) fn handle_coordinated_swarm_command(app: &mut App) {
         let mut enriched = task_desc.clone();
         let mut ctx_files: Vec<(String, String)> = Vec::new();
         let all_roots: Vec<std::path::PathBuf> = {
-            let r: Vec<_> = app.workspace.roots().iter().map(|p| p.to_path_buf()).collect();
+            let r: Vec<_> = app
+                .workspace
+                .roots()
+                .iter()
+                .map(|p| p.to_path_buf())
+                .collect();
             if r.is_empty() { vec![root.clone()] } else { r }
         };
         for rel_path in &refs {
-            let found = all_roots.iter().find_map(|r| {
-                std::fs::read_to_string(r.join(rel_path)).ok()
-            });
+            let found = all_roots
+                .iter()
+                .find_map(|r| std::fs::read_to_string(r.join(rel_path)).ok());
             if let Some(content) = found {
                 let tag = format!("@{}", rel_path);
                 let replacement = format!(
@@ -1116,7 +1117,9 @@ fn format_forget_report(
     dry_run: bool,
 ) -> String {
     if report.candidates.is_empty() {
-        return format!("{header}\nNothing matched. (Records and summaries only — history is excluded by design.)");
+        return format!(
+            "{header}\nNothing matched. (Records and summaries only — history is excluded by design.)"
+        );
     }
     let kinds: Vec<String> = report
         .kind_breakdown
@@ -1173,7 +1176,10 @@ pub(super) fn handle_forget_history_command(app: &mut App) {
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let allow = app
         .workspace
-        .resolve_setting(S::MEMORY_FORGET_ALLOW_HISTORY_REDACTION, Some(&workspace_root))
+        .resolve_setting(
+            S::MEMORY_FORGET_ALLOW_HISTORY_REDACTION,
+            Some(&workspace_root),
+        )
         .as_bool()
         .unwrap_or(true);
     if !allow {
@@ -1393,7 +1399,11 @@ fn parse_restore_since_window(spec: &str) -> Result<String, String> {
         "minute" | "min" => "minutes",
         "hour" | "hr" => "hours",
         "day" => "days",
-        other => return Err(format!("unsupported unit `{other}` (use minutes / hours / days)")),
+        other => {
+            return Err(format!(
+                "unsupported unit `{other}` (use minutes / hours / days)"
+            ));
+        }
     };
     Ok(format!("-{n} {unit}"))
 }
@@ -1404,9 +1414,9 @@ fn format_restore_outcome(o: &gaviero_core::memory::RestoreOutcome) -> String {
         Inserted {
             deletion_id,
             new_memory_id,
-        } => format!(
-            "✓ /restore: audit {deletion_id} reinstated as new memory id {new_memory_id}."
-        ),
+        } => {
+            format!("✓ /restore: audit {deletion_id} reinstated as new memory id {new_memory_id}.")
+        }
         Deduplicated {
             deletion_id,
             surviving_memory_id,

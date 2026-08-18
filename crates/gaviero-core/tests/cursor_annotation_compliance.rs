@@ -149,10 +149,9 @@ async fn cursor_emits_parseable_turn_annotations_sidecar() {
     let turn = build_turn(
         empty_planner_selections(),
         TransportContext {
-            user_message:
-                "Reply with one sentence acknowledging this: 'water is wet'. \
+            user_message: "Reply with one sentence acknowledging this: 'water is wet'. \
                  Then end your reply with the required <turn_annotations> JSON sidecar."
-                    .into(),
+                .into(),
             effort: None,
             auto_approve: false,
         },

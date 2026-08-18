@@ -71,7 +71,9 @@ pub fn parse_skill(path: &Path, contents: &str) -> Result<Skill, SkillWarning> {
     };
 
     if skill_name_from_path(path).is_none() {
-        return Err(warn("skill definition must be SKILL.md inside a named folder"));
+        return Err(warn(
+            "skill definition must be SKILL.md inside a named folder",
+        ));
     }
 
     if !valid_stem(stem) {
@@ -79,9 +81,7 @@ pub fn parse_skill(path: &Path, contents: &str) -> Result<Skill, SkillWarning> {
     }
 
     let (fm_opt, body) = frontmatter::split_frontmatter(contents);
-    let fm_map = fm_opt
-        .map(frontmatter::parse_lines)
-        .unwrap_or_default();
+    let fm_map = fm_opt.map(frontmatter::parse_lines).unwrap_or_default();
 
     let description = fm_map
         .get("description")
@@ -168,5 +168,4 @@ mod tests {
         assert!(rendered.contains("React"));
         assert!(rendered.contains("Vue"));
     }
-
 }

@@ -65,7 +65,9 @@ impl Tool for ReadTool {
             out.push_str(&format!("{:>6}\t{}\n", i + 1, line));
         }
         if out.is_empty() {
-            return ToolOutcome::ok(format!("(file '{file_path}' is empty or offset is past end)"));
+            return ToolOutcome::ok(format!(
+                "(file '{file_path}' is empty or offset is past end)"
+            ));
         }
         ToolOutcome::ok(out)
     }
@@ -96,7 +98,10 @@ mod tests {
         let ctx = ctx_for(dir.path());
 
         let out = ReadTool
-            .run(json!({ "file_path": "a.txt", "offset": 2, "limit": 2 }), &ctx)
+            .run(
+                json!({ "file_path": "a.txt", "offset": 2, "limit": 2 }),
+                &ctx,
+            )
             .await;
         assert!(!out.is_error);
         assert!(out.content.contains("     2\ttwo"));

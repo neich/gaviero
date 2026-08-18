@@ -190,9 +190,7 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("f.txt"), "x").unwrap();
         let ctx = bash_ctx(dir.path(), true);
-        let out = BashTool
-            .run(json!({ "command": "echo hello" }), &ctx)
-            .await;
+        let out = BashTool.run(json!({ "command": "echo hello" }), &ctx).await;
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("hello"));
         assert!(out.content.contains("exit code: 0"));
@@ -207,9 +205,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut ctx = bash_ctx(dir.path(), true);
         ctx.policy.timeout = Duration::from_millis(200);
-        let out = BashTool
-            .run(json!({ "command": "sleep 5" }), &ctx)
-            .await;
+        let out = BashTool.run(json!({ "command": "sleep 5" }), &ctx).await;
         assert!(out.is_error);
         assert!(out.content.contains("timed out"));
     }
@@ -226,9 +222,7 @@ mod tests {
     async fn denylist_blocks_without_auto_approve_bypass() {
         let dir = tempdir().unwrap();
         let ctx = bash_ctx(dir.path(), true);
-        let out = BashTool
-            .run(json!({ "command": "sudo id" }), &ctx)
-            .await;
+        let out = BashTool.run(json!({ "command": "sudo id" }), &ctx).await;
         assert!(out.is_error);
         assert!(out.content.contains("sudo"));
     }

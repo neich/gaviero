@@ -38,7 +38,10 @@ fn workspace_root() -> PathBuf {
             return p;
         }
     }
-    panic!("could not find workspace root from {}", env!("CARGO_MANIFEST_DIR"));
+    panic!(
+        "could not find workspace root from {}",
+        env!("CARGO_MANIFEST_DIR")
+    );
 }
 
 #[test]
@@ -53,7 +56,9 @@ fn c24_drop_history_immutable_triggers_call_form_callsites() {
         let Ok(src) = std::fs::read_to_string(f) else {
             continue;
         };
-        let n = src.matches("schema::drop_history_immutable_triggers(").count();
+        let n = src
+            .matches("schema::drop_history_immutable_triggers(")
+            .count();
         if n > 0 {
             hits.push((f.clone(), n));
         }

@@ -7,9 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::models::WorkUnit;
-use super::plan::{
-    CompiledPlan, ExecutionMode, FanoutOp, LoopConfig, VerificationConfig,
-};
+use super::plan::{CompiledPlan, ExecutionMode, FanoutOp, LoopConfig, VerificationConfig};
 use crate::iteration::IterationConfig;
 
 /// Versioned document consumed by `gaviero-cli --plan`.

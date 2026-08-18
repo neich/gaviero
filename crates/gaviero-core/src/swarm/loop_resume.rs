@@ -46,9 +46,8 @@ use super::plan::LoopConfig;
 const MAX_SCAN_DEPTH: usize = 8;
 
 /// Trailing `-v<N>` version marker, with or without a file extension.
-static VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"-v(\d+)(?:\.[A-Za-z0-9]+)?$").expect("version regex is valid")
-});
+static VERSION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"-v(\d+)(?:\.[A-Za-z0-9]+)?$").expect("version regex is valid"));
 
 /// A resume point derived from artefacts already on disk.
 #[derive(Debug, Clone)]
@@ -165,7 +164,9 @@ pub fn detect(
                 entry.counts.resize(globs.len(), 0);
             }
             if *len == 0 {
-                notes.push(format!("{rel} is empty — iteration v{version} treated as partial"));
+                notes.push(format!(
+                    "{rel} is empty — iteration v{version} treated as partial"
+                ));
             } else {
                 entry.counts[idx] += 1;
                 entry.files.push(rel.clone());
@@ -194,7 +195,9 @@ pub fn detect(
             continue;
         }
         let mut vectors = per_agent.values().map(|c| &c.counts);
-        let Some(first) = vectors.next() else { continue };
+        let Some(first) = vectors.next() else {
+            continue;
+        };
         if first.iter().sum::<usize>() == 0 {
             continue;
         }
@@ -472,7 +475,10 @@ mod tests {
                             &format!("research/{r}-evidence-v*.md"),
                         ],
                     ),
-                    unit(&format!("{r}-init"), &[&format!("research/{r}-conclusion-v*.md")]),
+                    unit(
+                        &format!("{r}-init"),
+                        &[&format!("research/{r}-conclusion-v*.md")],
+                    ),
                 ]
             })
             .collect();
@@ -497,7 +503,10 @@ mod tests {
             "plans/x",
             1,
         );
-        assert!(detect(tmp.path(), &lc, &map(&units)).is_none(), "missing dir");
+        assert!(
+            detect(tmp.path(), &lc, &map(&units)).is_none(),
+            "missing dir"
+        );
 
         std::fs::create_dir_all(tmp.path().join("plans/x")).unwrap();
         assert!(detect(tmp.path(), &lc, &map(&units)).is_none(), "empty dir");
@@ -525,7 +534,11 @@ mod tests {
         // A script with `iter_start 2` whose only artefacts are the v1 baseline.
         for r in ["claude", "codex", "cursor"] {
             write(tmp.path(), &format!("plans/x/{r}-refine-plan-v1.md"), "p");
-            write(tmp.path(), &format!("plans/x/{r}-refine-summary-v1.md"), "s");
+            write(
+                tmp.path(),
+                &format!("plans/x/{r}-refine-summary-v1.md"),
+                "s",
+            );
         }
         let units = plan_refinement_units();
         let lc = loop_config(

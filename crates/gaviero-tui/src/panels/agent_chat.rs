@@ -940,7 +940,10 @@ impl AgentChatState {
                     for (qi, (question, selection)) in
                         ask.questions.iter().zip(answers.iter()).enumerate()
                     {
-                        if selection.iter().any(|&i| i as usize >= question.options.len()) {
+                        if selection
+                            .iter()
+                            .any(|&i| i as usize >= question.options.len())
+                        {
                             return Err(PermissionAnswerError::Invalid(format!(
                                 "answer index out of range for question {}",
                                 qi + 1
@@ -1173,9 +1176,7 @@ impl AgentChatState {
         }
     }
 
-    fn format_bootstrap_layers(
-        arms: gaviero_core::context_planner::BootstrapArms,
-    ) -> String {
+    fn format_bootstrap_layers(arms: gaviero_core::context_planner::BootstrapArms) -> String {
         let mut parts = Vec::new();
         if arms.topology {
             parts.push("topology");
@@ -1302,11 +1303,17 @@ impl AgentChatState {
             // an explicit /inject outline|all uses the full push. Mirror
             // estimate_bootstrap_tokens so the breakdown total stays consistent.
             let (projected, ceiling) = if arms.explicit {
-                (hints.outline_tokens.unwrap_or(budgets.outline), budgets.outline)
+                (
+                    hints.outline_tokens.unwrap_or(budgets.outline),
+                    budgets.outline,
+                )
             } else {
                 (budgets.anchor, budgets.anchor)
             };
-            lines.push(format!("  outline: ≈{} tok (ceiling {})", projected, ceiling));
+            lines.push(format!(
+                "  outline: ≈{} tok (ceiling {})",
+                projected, ceiling
+            ));
         }
         if arms.memory {
             let projected = hints.memory_tokens.unwrap_or(budgets.memory);
@@ -1325,8 +1332,7 @@ impl AgentChatState {
                 projected, budgets.impact
             ));
         }
-        let total =
-            gaviero_core::context_planner::estimate_bootstrap_tokens(arms, budgets, hints);
+        let total = gaviero_core::context_planner::estimate_bootstrap_tokens(arms, budgets, hints);
         lines.push(format!("  total bootstrap: ≈{} tok", total));
         lines.join("\n")
     }
@@ -1437,12 +1443,15 @@ impl AgentChatState {
                     } else {
                         options.join(", ")
                     };
-                    self.add_system_message_at(idx, &format!(
-                        "Current model: {}\nAvailable: {}\nUsage: /model <provider:model>\n\
+                    self.add_system_message_at(
+                        idx,
+                        &format!(
+                            "Current model: {}\nAvailable: {}\nUsage: /model <provider:model>\n\
                          Specs require a provider prefix: `claude:`, `codex:`, `cursor:`, \
                          `deepseek:`, `ollama:`, or `local:`.",
-                        current, list
-                    ));
+                            current, list
+                        ),
+                    );
                 } else {
                     let model = normalize_model_spec(arg);
                     if let Err(err) =
@@ -1460,8 +1469,10 @@ impl AgentChatState {
             "/thinking" | "/effort" => {
                 if arg.is_empty() {
                     let current = self.effective_effort_at(idx);
-                    self.add_system_message_at(idx, &format!(
-                        "Effort level: {}.\n\
+                    self.add_system_message_at(
+                        idx,
+                        &format!(
+                            "Effort level: {}.\n\
                          Usage: /effort <off|auto|low|medium|high|xhigh|max|ultra>\n\
                          Applies to Claude and Codex sessions (Ollama ignores it).\n\
                          `xhigh` applies on Opus 4.7 (falls back to `high` on older \
@@ -1469,8 +1480,9 @@ impl AgentChatState {
                          GPT-5.6 Sol/Terra; Luna caps at `max`; older models at `xhigh`.\n\
                          `off`/`auto` omit the reasoning hint entirely.\n\
                          `max`/`ultra` are session-only on Claude.",
-                        current
-                    ));
+                            current
+                        ),
+                    );
                 } else {
                     let level = match arg {
                         "off" | "0" | "none" => "off",
@@ -1504,10 +1516,10 @@ impl AgentChatState {
                 let conv = &mut self.conversations[idx];
                 let total = conv.messages.len();
                 if total <= keep {
-                    self.add_system_message_at(idx, &format!(
-                        "Nothing to compact ({} messages, keeping {})",
-                        total, keep
-                    ));
+                    self.add_system_message_at(
+                        idx,
+                        &format!("Nothing to compact ({} messages, keeping {})", total, keep),
+                    );
                 } else {
                     let removed = total - keep;
                     // Summarize removed messages into a single system note.
@@ -1533,15 +1545,18 @@ impl AgentChatState {
                     if idx == self.active_conv {
                         let (_tokens, pct) =
                             self.estimate_context(&self.fallback_bootstrap_estimate_context());
-                        self.add_system_message_at(idx, &format!(
-                            "Compacted: removed {} messages, kept {}. Context: ~{}% of limit",
-                            removed, keep, pct
-                        ));
+                        self.add_system_message_at(
+                            idx,
+                            &format!(
+                                "Compacted: removed {} messages, kept {}. Context: ~{}% of limit",
+                                removed, keep, pct
+                            ),
+                        );
                     } else {
-                        self.add_system_message_at(idx, &format!(
-                            "Compacted: removed {} messages, kept {}.",
-                            removed, keep
-                        ));
+                        self.add_system_message_at(
+                            idx,
+                            &format!("Compacted: removed {} messages, kept {}.", removed, keep),
+                        );
                     }
                 }
                 true
@@ -1551,27 +1566,36 @@ impl AgentChatState {
                     let mode_str = mode_arg.trim();
                     let conv = &mut self.conversations[idx];
                     if mode_str.is_empty() {
-                        self.add_system_message_at(idx, &format!(
-                            "Bootstrap mode: {} (workspace default: {})\n\
+                        self.add_system_message_at(
+                            idx,
+                            &format!(
+                                "Bootstrap mode: {} (workspace default: {})\n\
                              Usage: /context mode auto|minimal|manual|none\n\
                              /context mode reset — clear per-conversation override",
-                            self.effective_bootstrap_mode_at(idx).as_str(),
-                            self.agent_settings.bootstrap_mode.as_str(),
-                        ));
+                                self.effective_bootstrap_mode_at(idx).as_str(),
+                                self.agent_settings.bootstrap_mode.as_str(),
+                            ),
+                        );
                     } else if mode_str == "reset" {
                         conv.context_mode_override = None;
-                        self.add_system_message_at(idx, &format!(
-                            "Bootstrap mode reset to workspace default: {}",
-                            self.agent_settings.bootstrap_mode.as_str()
-                        ));
+                        self.add_system_message_at(
+                            idx,
+                            &format!(
+                                "Bootstrap mode reset to workspace default: {}",
+                                self.agent_settings.bootstrap_mode.as_str()
+                            ),
+                        );
                     } else if let Some(mode) =
                         gaviero_core::context_planner::BootstrapMode::parse(mode_str)
                     {
                         conv.context_mode_override = Some(mode);
-                        self.add_system_message_at(idx, &format!(
-                            "Bootstrap mode set to: {} (this conversation)",
-                            mode.as_str()
-                        ));
+                        self.add_system_message_at(
+                            idx,
+                            &format!(
+                                "Bootstrap mode set to: {} (this conversation)",
+                                mode.as_str()
+                            ),
+                        );
                     } else {
                         self.add_system_message_at(
                             idx,
@@ -1659,9 +1683,8 @@ impl AgentChatState {
                     .and_then(|c| c.last_token_usage.as_ref())
                 {
                     let prefix = u.prefix_tokens() as usize;
-                    let total = u.input_tokens
-                        + u.cache_creation_input_tokens
-                        + u.cache_read_input_tokens;
+                    let total =
+                        u.input_tokens + u.cache_creation_input_tokens + u.cache_read_input_tokens;
                     let cache_hit_pct = if total > 0 {
                         (u.cache_read_input_tokens * 100 / total) as usize
                     } else {
@@ -1685,7 +1708,8 @@ impl AgentChatState {
                 let conv = &mut self.conversations[idx];
                 let layer = arg.to_ascii_lowercase();
                 if layer.is_empty() {
-                    self.add_system_message_at(idx,
+                    self.add_system_message_at(
+                        idx,
                         "Inject bootstrap layers on the next prompt:\n\
                          /inject memory    — <project_memory>\n\
                          /inject outline   — <repo_outline> (alias: graph)\n\
@@ -1729,9 +1753,10 @@ impl AgentChatState {
                             conv.inject_arms_next.explicit = true;
                             Self::format_bootstrap_layers(conv.inject_arms_next)
                         };
-                        self.add_system_message_at(idx, &format!(
-                            "Inject armed for next prompt: {layers}"
-                        ));
+                        self.add_system_message_at(
+                            idx,
+                            &format!("Inject armed for next prompt: {layers}"),
+                        );
                     } else {
                         self.add_system_message_at(
                             idx,
@@ -1767,20 +1792,17 @@ impl AgentChatState {
                         SlashOrigin::Remote => {
                             // Interactive rename is a desktop focus
                             // affordance; remote must not open it.
-                            self.add_system_message_at(
-                                idx,
-                                "Usage: /rename <new title>",
-                            );
+                            self.add_system_message_at(idx, "Usage: /rename <new title>");
                         }
                     }
                 } else {
                     let old = self.conversations[idx].title.clone();
                     self.conversations[idx].title = arg.to_string();
                     self.conversations[idx].bump_revision();
-                    self.add_system_message_at(idx, &format!(
-                        "Renamed conversation: \"{}\" → \"{}\"",
-                        old, arg
-                    ));
+                    self.add_system_message_at(
+                        idx,
+                        &format!("Renamed conversation: \"{}\" → \"{}\"", old, arg),
+                    );
                 }
                 true
             }
@@ -1804,17 +1826,20 @@ impl AgentChatState {
                         })
                         .collect::<Vec<_>>()
                         .join(", ");
-                    self.add_system_message_at(idx, &format!(
-                        "Write namespace: {}\nRead namespaces: [{}]",
-                        write, read_str
-                    ));
+                    self.add_system_message_at(
+                        idx,
+                        &format!(
+                            "Write namespace: {}\nRead namespaces: [{}]",
+                            write, read_str
+                        ),
+                    );
                 } else {
                     self.conversations[idx].namespace_override = Some(arg.to_string());
                     self.conversations[idx].bump_revision();
-                    self.add_system_message_at(idx, &format!(
-                        "Write namespace set to: {} (for this conversation)",
-                        arg
-                    ));
+                    self.add_system_message_at(
+                        idx,
+                        &format!("Write namespace set to: {} (for this conversation)", arg),
+                    );
                 }
                 true
             }
@@ -1853,9 +1878,9 @@ impl AgentChatState {
                 // Per-turn one-shot. Same toggle pattern as `/workspace`:
                 // arms the next dispatched turn to skip every bootstrap
                 // context block (graph, memory, impact). Self-clears on
-                // dispatch. Use this when the provider has a hard argv
-                // limit (cursor: 96 KB) and the default graph budget
-                // still pushes the prompt over.
+                // dispatch. Use this to shrink token spend; Cursor first
+                // turns that exceed the OS argv budget now spill to a
+                // tempfile instead of failing (see cursor_argv_limit).
                 let conv = &mut self.conversations[idx];
                 conv.lite_next = !conv.lite_next;
                 let msg = if conv.lite_next {
@@ -1938,12 +1963,15 @@ impl AgentChatState {
                 true
             }
             _ => {
-                self.add_system_message_at(idx, &format!(
-                    "Unknown command: {}. Type /help for available commands. \
+                self.add_system_message_at(
+                    idx,
+                    &format!(
+                        "Unknown command: {}. Type /help for available commands. \
                      Prefix with `//` to send a slash command directly to the agent \
                      (e.g. `//init` for Claude Code skills).",
-                    cmd
-                ));
+                        cmd
+                    ),
+                );
                 true
             }
         }
@@ -2215,13 +2243,11 @@ impl AgentChatState {
         // deliberately NOT cleared here. They are forward-looking one-shot
         // arms for the *next* dispatch, orthogonal to dropping past session
         // state — exactly like `workspace_wide_next`, which reset already
-        // leaves alone. Clearing them was a footgun for providers with a
-        // hard prompt ceiling: `/reset` re-arms a fresh first turn whose
-        // full bootstrap (`<repo_outline>` ~48 KB + impact + memory) can blow
-        // Cursor's 96 KB argv limit, and `/lite` is the documented escape
+        // leaves alone. Clearing them was a footgun: `/reset` re-arms a
+        // fresh first turn whose full bootstrap (`<repo_outline>` + impact
+        // + memory) is large, and `/lite` is the documented token-saving
         // hatch (see the `/lite` handler). Wiping `lite_next` on `/reset`
-        // meant arming `/lite` then `/reset` silently disarmed that hatch,
-        // so the post-reset prompt failed with "input prompt too big".
+        // meant arming `/lite` then `/reset` silently disarmed that hatch.
         // Suppress the visible transcript on the next first-turn dispatch.
         // Bootstrap context (graph + memory) still flows; only the
         // re-inlining of prior user/assistant turns is skipped, matching
@@ -2710,8 +2736,7 @@ impl AgentChatState {
         }
 
         let lines = self.build_visual_lines(text_width, area.width as usize);
-        let (cursor_line, _) =
-            Self::find_cursor_in_visual_lines(&lines, self.text_input.cursor);
+        let (cursor_line, _) = Self::find_cursor_in_visual_lines(&lines, self.text_input.cursor);
         let total_rows = area.height as usize;
         let scroll = if cursor_line >= total_rows {
             cursor_line - total_rows + 1
@@ -3120,7 +3145,10 @@ impl AgentChatState {
         self.autocomplete.matches = hits
             .iter()
             .map(|skill| {
-                let siblings = by_name.get(skill.name.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
+                let siblings = by_name
+                    .get(skill.name.as_str())
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
                 skill_autocomplete_insert(catalog, skill, siblings)
             })
             .take(10)
@@ -3135,11 +3163,10 @@ impl AgentChatState {
         if !self.autocomplete.active || self.autocomplete.mode != AutocompleteMode::ModelSpec {
             return;
         }
-        self.autocomplete.matches =
-            gaviero_core::swarm::backend::shared::model_spec_completions(
-                &self.autocomplete.query,
-                discovered,
-            );
+        self.autocomplete.matches = gaviero_core::swarm::backend::shared::model_spec_completions(
+            &self.autocomplete.query,
+            discovered,
+        );
         if self.autocomplete.selected >= self.autocomplete.matches.len() {
             self.autocomplete.selected = 0;
         }
@@ -3470,7 +3497,11 @@ impl AgentChatState {
         // Always apply `clean` (even when empty) so an annotations-only reply
         // cannot leave the streamed sidecar behind.
         if chat_role == ChatRole::Assistant {
-            if let Some(msg) = msgs.iter_mut().rev().find(|m| m.role == ChatRole::Assistant) {
+            if let Some(msg) = msgs
+                .iter_mut()
+                .rev()
+                .find(|m| m.role == ChatRole::Assistant)
+            {
                 msg.content = clean;
             } else if !clean.is_empty() {
                 self.conversations[idx].push_message(chat_role, clean, Vec::new());
@@ -3588,7 +3619,10 @@ impl AgentChatState {
                 // Restored messages are renumbered sequentially; the
                 // counter continues past them. Remote clients resnapshot
                 // on connect, so pre-restart cursors never survive anyway.
-                let next_message_seq = messages.last().map(|m: &ChatMessage| m.seq + 1).unwrap_or(1);
+                let next_message_seq = messages
+                    .last()
+                    .map(|m: &ChatMessage| m.seq + 1)
+                    .unwrap_or(1);
                 self.conversations.push(Conversation {
                     id: stored.id,
                     conv_revision: 1,
@@ -3927,8 +3961,10 @@ impl AgentChatState {
         // Each rendered visual line is a sequence of styled segments so that
         // inline markdown styling (bold, italic, code, links) can be preserved
         // across the whole line — not just per-line.
-        let mut lines: Vec<(Vec<crate::panels::chat_markdown::StyledSegment>, Option<usize>)> =
-            Vec::new();
+        let mut lines: Vec<(
+            Vec<crate::panels::chat_markdown::StyledSegment>,
+            Option<usize>,
+        )> = Vec::new();
 
         for (msg_idx, msg) in self.messages().iter().enumerate() {
             let (prefix, base_style) = match msg.role {
@@ -4027,7 +4063,9 @@ impl AgentChatState {
         let viewport = area.height as usize;
         if self.browse_mode {
             // Find first and last line belonging to the browsed message
-            let first_line = lines.iter().position(|(_, mi)| *mi == Some(self.browsed_msg));
+            let first_line = lines
+                .iter()
+                .position(|(_, mi)| *mi == Some(self.browsed_msg));
             let last_line = lines
                 .iter()
                 .rposition(|(_, mi)| *mi == Some(self.browsed_msg));
@@ -4231,7 +4269,14 @@ impl AgentChatState {
             };
 
             if let Some(ref ask) = perm.ask {
-                write_text(buf, area.x, area.y, x_max, " ❓ Agent question ", warn_style);
+                write_text(
+                    buf,
+                    area.x,
+                    area.y,
+                    x_max,
+                    " ❓ Agent question ",
+                    warn_style,
+                );
                 let hint = if ask.questions.len() > 1 {
                     format!(
                         " [1-9] select  ↑↓ question ({}/{})  Enter submit  n deny ",
@@ -4481,11 +4526,8 @@ impl AgentChatState {
             }
 
             if x < area.x + area.width && x < buf.area().right() {
-                self.attachment_close_hits.push(AttachmentCloseHit {
-                    x,
-                    y,
-                    index,
-                });
+                self.attachment_close_hits
+                    .push(AttachmentCloseHit { x, y, index });
                 buf[(x, y)].set_char('x').set_style(x_style);
                 x += 1;
             }
@@ -4546,9 +4588,7 @@ fn normalize_model_spec(arg: &str) -> String {
     // return verbatim so validation surfaces the real error instead of
     // rewriting to `claude:deepseek:…`.
     if let Some((prefix, _)) = trimmed.split_once(':') {
-        if gaviero_core::swarm::backend::shared::SUPPORTED_PROVIDER_PREFIXES
-            .contains(&prefix)
-        {
+        if gaviero_core::swarm::backend::shared::SUPPORTED_PROVIDER_PREFIXES.contains(&prefix) {
             return trimmed.to_string();
         }
     }
@@ -4879,11 +4919,7 @@ mod tests {
         arguments: &[&str],
     ) -> (gaviero_core::skills::SkillCatalog, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
-        let skill_dir = tmp
-            .path()
-            .join(".gaviero")
-            .join("skills")
-            .join(name);
+        let skill_dir = tmp.path().join(".gaviero").join("skills").join(name);
         std::fs::create_dir_all(&skill_dir).unwrap();
         let args_line = if arguments.is_empty() {
             String::new()
@@ -4912,8 +4948,7 @@ mod tests {
     fn parse_skill_invocations_strips_known_skill() {
         let (catalog, _tmp) =
             test_skill_catalog("lint", "Lint the code.", "Run the linter on changed files");
-        let (cleaned, resolved, warnings) =
-            parse_skill_invocations("please $lint", &catalog, None);
+        let (cleaned, resolved, warnings) = parse_skill_invocations("please $lint", &catalog, None);
         assert!(warnings.is_empty());
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].name, "lint");
@@ -5065,7 +5100,11 @@ mod tests {
         let handled = state.process_slash_command();
 
         assert!(handled);
-        assert!(state.conversations[state.active_conv].model_override.is_none());
+        assert!(
+            state.conversations[state.active_conv]
+                .model_override
+                .is_none()
+        );
         let last = state.conversations[state.active_conv]
             .messages
             .last()
@@ -5377,8 +5416,7 @@ mod tests {
         state.text_input.text = "/reset".to_string();
         assert!(state.process_slash_command());
 
-        let last = state
-            .conversations[state.active_conv]
+        let last = state.conversations[state.active_conv]
             .messages
             .last()
             .expect("reset emits a system message");
@@ -5414,8 +5452,7 @@ mod tests {
         state.text_input.text = "/reset".to_string();
         assert!(state.process_slash_command());
 
-        let last = state
-            .conversations[state.active_conv]
+        let last = state.conversations[state.active_conv]
             .messages
             .last()
             .expect("reset emits a system message");
@@ -5433,11 +5470,10 @@ mod tests {
 
     #[test]
     fn reset_preserves_armed_lite_one_shot() {
-        // Regression: `/lite` is the documented escape hatch for providers
-        // with a hard prompt ceiling (Cursor's 96 KB argv limit). Arming
-        // `/lite` then `/reset` must NOT disarm it — otherwise the post-reset
-        // first turn re-injects the full bootstrap and Cursor bails with
-        // "input prompt too big".
+        // Regression: `/lite` is a one-shot bootstrap arm, orthogonal to
+        // `/reset` session-state clearing. Arming `/lite` then `/reset`
+        // must NOT disarm it — otherwise the post-reset first turn
+        // silently re-injects the full bootstrap.
         let mut state = AgentChatState::new();
 
         state.text_input.text = "/lite".to_string();
@@ -5484,13 +5520,19 @@ mod tests {
         state.text_input.text = "/inject memory".to_string();
         state.text_input.cursor = state.text_input.text.len();
         assert!(state.process_slash_command());
-        assert!(state.conversations[state.active_conv].inject_arms_next.memory);
+        assert!(
+            state.conversations[state.active_conv]
+                .inject_arms_next
+                .memory
+        );
 
         state.text_input.text = "/reset".to_string();
         state.text_input.cursor = state.text_input.text.len();
         assert!(state.process_slash_command());
         assert!(
-            state.conversations[state.active_conv].inject_arms_next.memory,
+            state.conversations[state.active_conv]
+                .inject_arms_next
+                .memory,
             "an armed /inject layer must survive /reset"
         );
     }
@@ -5574,10 +5616,7 @@ mod tests {
     #[test]
     fn update_autocomplete_recognises_detach_argument() {
         let mut state = AgentChatState::new();
-        state.add_attachment(
-            PathBuf::from("/tmp/shot.png"),
-            AttachmentKind::Image,
-        );
+        state.add_attachment(PathBuf::from("/tmp/shot.png"), AttachmentKind::Image);
         state.text_input.text = "/detach sh".to_string();
         state.text_input.cursor = state.text_input.text.chars().count();
         state.update_autocomplete();
@@ -5586,10 +5625,7 @@ mod tests {
         assert!(state.autocomplete.active);
         assert_eq!(state.autocomplete.mode, AutocompleteMode::DetachName);
         assert_eq!(state.autocomplete.query, "sh");
-        assert_eq!(
-            state.autocomplete.matches,
-            vec!["shot.png".to_string()]
-        );
+        assert_eq!(state.autocomplete.matches, vec!["shot.png".to_string()]);
 
         state.autocomplete.query.clear();
         state.update_detach_autocomplete_matches();
@@ -5754,7 +5790,12 @@ mod tests {
         for i in 0..8 {
             state.add_user_message(&format!("msg {i}"));
         }
-        let before: Vec<u64> = state.active_conversation().messages.iter().map(|m| m.seq).collect();
+        let before: Vec<u64> = state
+            .active_conversation()
+            .messages
+            .iter()
+            .map(|m| m.seq)
+            .collect();
         assert_eq!(before, (1..=8).collect::<Vec<u64>>());
 
         // Compact keeps the last 3; kept messages retain their seq and the
@@ -5782,24 +5823,37 @@ mod tests {
         let background_id = state.active_conversation_id().to_string();
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         state.set_pending_permission(&background_id, ask_permission_with(tx));
-        let request_id = state.active_conversation().pending_permission.as_ref().unwrap().request_id.clone();
+        let request_id = state
+            .active_conversation()
+            .pending_permission
+            .as_ref()
+            .unwrap()
+            .request_id
+            .clone();
 
         // Desktop switches to a NEW tab; the request stays on the old one.
         state.new_conversation();
         assert_ne!(state.active_conversation_id(), background_id);
 
-        let idx = state.find_permission_conv(&request_id).expect("request findable by id");
+        let idx = state
+            .find_permission_conv(&request_id)
+            .expect("request findable by id");
         let info = state
             .respond_permission_at(idx, true, Some(&[vec![1], vec![0, 2]]), None)
             .expect("valid answers accepted");
-        assert_eq!(info.conv_id, background_id, "answered the conversation OWNING the request, not the active tab");
+        assert_eq!(
+            info.conv_id, background_id,
+            "answered the conversation OWNING the request, not the active tab"
+        );
         assert!(info.allowed);
 
         // The rebuilt input went through the same answers_map path the
         // desktop uses: labels, not indices.
         let decision = rx.try_recv().expect("decision delivered");
         match decision {
-            gaviero_core::observer::PermissionDecision::Allow { updated_input: Some(v) } => {
+            gaviero_core::observer::PermissionDecision::Allow {
+                updated_input: Some(v),
+            } => {
                 let answers = v.get("answers").expect("answers inserted");
                 assert_eq!(answers.get("Which serializer?").unwrap(), "simd-json");
                 assert_eq!(answers.get("Which suites?").unwrap(), "unit, fuzz");
@@ -5818,14 +5872,23 @@ mod tests {
 
         // answers on a wrong shape: count mismatch, out-of-range index,
         // multi-select violation — all rejected, request stays parked.
-        for bad in [vec![vec![0u32]], vec![vec![9], vec![0]], vec![vec![0, 1], vec![0]]] {
+        for bad in [
+            vec![vec![0u32]],
+            vec![vec![9], vec![0]],
+            vec![vec![0, 1], vec![0]],
+        ] {
             let err = state.respond_permission_at(idx, true, Some(&bad), None);
-            assert!(matches!(err, Err(PermissionAnswerError::Invalid(_))), "{bad:?}");
+            assert!(
+                matches!(err, Err(PermissionAnswerError::Invalid(_))),
+                "{bad:?}"
+            );
             assert!(state.active_conversation().pending_permission.is_some());
         }
 
         // First valid answer wins; the second finds nothing (stale_request).
-        state.respond_permission_at(idx, true, Some(&[vec![0], vec![1]]), None).unwrap();
+        state
+            .respond_permission_at(idx, true, Some(&[vec![0], vec![1]]), None)
+            .unwrap();
         let second = state.respond_permission_at(idx, true, Some(&[vec![0], vec![1]]), None);
         assert!(matches!(second, Err(PermissionAnswerError::NoPending)));
     }
@@ -5846,8 +5909,10 @@ mod tests {
         );
         let idx = state.active_conv;
         let err = state.respond_permission_at(idx, true, Some(&[vec![0]]), None);
-        assert!(matches!(err, Err(PermissionAnswerError::Invalid(_))),
-            "a permission decision must not be able to smuggle answers into a non-ask tool");
+        assert!(
+            matches!(err, Err(PermissionAnswerError::Invalid(_))),
+            "a permission decision must not be able to smuggle answers into a non-ask tool"
+        );
         assert!(state.active_conversation().pending_permission.is_some());
     }
 
@@ -5865,8 +5930,14 @@ mod tests {
             Some("claude:opus"),
             "the TARGET conversation got the override"
         );
-        assert!(state.conversations[1].model_override.is_none(), "the active tab is untouched");
-        assert!(state.conversations[target].conv_revision > rev_before, "summary change bumped conv_revision");
+        assert!(
+            state.conversations[1].model_override.is_none(),
+            "the active tab is untouched"
+        );
+        assert!(
+            state.conversations[target].conv_revision > rev_before,
+            "summary change bumped conv_revision"
+        );
 
         // Remote bare /rename must not start the desktop interactive
         // rename (focus affordance).
@@ -5915,11 +5986,7 @@ mod tests {
         let mut state = AgentChatState::new();
         state.add_user_message("edit the file");
         // Synthetic push without inline `[tool]` marker — only `content` counts.
-        push_assistant(
-            &mut state,
-            "done it",
-            vec!["Write src/main.rs".to_string()],
-        );
+        push_assistant(&mut state, "done it", vec!["Write src/main.rs".to_string()]);
 
         let (input, output) = state.count_transcript_words();
         assert_eq!(input, 3);

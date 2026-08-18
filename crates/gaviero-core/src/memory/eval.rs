@@ -65,7 +65,6 @@ pub struct EvalCase {
     pub tags: Vec<String>,
 
     // ── T1.3 additive ──────────────────────────────────────────────
-
     /// Optional code-prompt taxonomy: refactor / bugfix / feature / explain.
     #[serde(default)]
     pub kind: Option<CaseKind>,
@@ -174,7 +173,6 @@ pub struct EvalReport {
     pub outcomes: Vec<CaseOutcome>,
 
     // ── T1.3 additive ──────────────────────────────────────────────
-
     #[serde(default)]
     pub precision_at_5: f32,
     #[serde(default)]
@@ -332,10 +330,7 @@ pub fn build_report(outcomes: Vec<CaseOutcome>) -> EvalReport {
 /// Cases without gold sets contribute 0.0 to the gold-set numerators
 /// and are still counted in the denominator — the metric semantics are
 /// "mean across all cases", consistent with how Recall@K aggregates.
-pub fn build_report_with_pools(
-    cases: &[EvalCase],
-    pools: &[Vec<ScoredMemory>],
-) -> EvalReport {
+pub fn build_report_with_pools(cases: &[EvalCase], pools: &[Vec<ScoredMemory>]) -> EvalReport {
     let outcomes: Vec<CaseOutcome> = cases
         .iter()
         .zip(pools.iter())
@@ -438,10 +433,7 @@ fn precision_at_k(case: &EvalCase, pool: &[ScoredMemory], k: usize) -> f32 {
 fn relevance_for(case: &EvalCase, m: &ScoredMemory) -> u8 {
     // Per-item override wins.
     let candidate_keys: Vec<String> = match m.tag.as_deref() {
-        Some(t) => vec![
-            format!("Memory:{}", m.id),
-            format!("MemoryTag:{t}"),
-        ],
+        Some(t) => vec![format!("Memory:{}", m.id), format!("MemoryTag:{t}")],
         None => vec![format!("Memory:{}", m.id)],
     };
     for k in &candidate_keys {
@@ -535,9 +527,7 @@ fn over_retrieval_for(case: &EvalCase, pool: &[ScoredMemory]) -> f32 {
     }
     let outside = pool
         .iter()
-        .filter(|m| {
-            !membership_test(&case.gold_must, m) && !membership_test(&case.gold_neutral, m)
-        })
+        .filter(|m| !membership_test(&case.gold_must, m) && !membership_test(&case.gold_neutral, m))
         .count();
     outside as f32 / pool.len() as f32
 }
@@ -549,7 +539,11 @@ fn under_retrieval_for(case: &EvalCase, pool: &[ScoredMemory]) -> f32 {
     let missed = case
         .gold_must
         .iter()
-        .filter(|r| !pool.iter().any(|m| membership_test(std::slice::from_ref(*r), m)))
+        .filter(|r| {
+            !pool
+                .iter()
+                .any(|m| membership_test(std::slice::from_ref(*r), m))
+        })
         .count();
     missed as f32 / case.gold_must.len() as f32
 }
@@ -595,7 +589,6 @@ pub fn parent_scopes(path: &str) -> Vec<String> {
     out
 }
 
-
 /// T1.3: scope-tightening matrix runner.
 ///
 /// For each scope label in `scopes` (e.g. `["repo", "module", "run"]`),
@@ -628,11 +621,10 @@ pub async fn run_scope_matrix(
             let mut adj = case.clone();
             adj.scope = hint.clone();
             let scope = scope_for_eval(&adj.scope, scope_ctx);
-            let result = retrieve_ranked(&stores, &scope, &adj.query, 50, cfg, reranker, rerank_cfg)
-                .await
-                .with_context(|| {
-                    format!("retrieving for case {} at scope `{hint}`", adj.id)
-                })?;
+            let result =
+                retrieve_ranked(&stores, &scope, &adj.query, 50, cfg, reranker, rerank_cfg)
+                    .await
+                    .with_context(|| format!("retrieving for case {} at scope `{hint}`", adj.id))?;
             pools.push(result.items);
             adjusted.push(adj);
         }
@@ -1133,29 +1125,29 @@ pub fn compute_recall_at_k_from_manifest(payload: &str, gold_ids: &[i64], k: usi
     // Prefer the candidate pool (full retrieval surface, score-ranked); fall
     // back to selected_ids (post-budget injection list) when the pool was not
     // captured for this turn.
-    let ranked: Vec<i64> = if let Some(pool) = value.get("candidate_pool").and_then(|v| v.as_array())
-    {
-        let mut entries: Vec<(i64, f64)> = pool
-            .iter()
-            .filter_map(|c| {
-                let id = c.get("memory_id").and_then(|v| v.as_i64())?;
-                let score = c
-                    .get("blended_score")
-                    .and_then(|v| v.as_f64())
-                    .or_else(|| c.get("composite_score").and_then(|v| v.as_f64()))
-                    .unwrap_or(0.0);
-                Some((id, score))
-            })
-            .collect();
-        entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        entries.into_iter().map(|(id, _)| id).collect()
-    } else {
-        value
-            .get("selected_ids")
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(serde_json::Value::as_i64).collect())
-            .unwrap_or_default()
-    };
+    let ranked: Vec<i64> =
+        if let Some(pool) = value.get("candidate_pool").and_then(|v| v.as_array()) {
+            let mut entries: Vec<(i64, f64)> = pool
+                .iter()
+                .filter_map(|c| {
+                    let id = c.get("memory_id").and_then(|v| v.as_i64())?;
+                    let score = c
+                        .get("blended_score")
+                        .and_then(|v| v.as_f64())
+                        .or_else(|| c.get("composite_score").and_then(|v| v.as_f64()))
+                        .unwrap_or(0.0);
+                    Some((id, score))
+                })
+                .collect();
+            entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            entries.into_iter().map(|(id, _)| id).collect()
+        } else {
+            value
+                .get("selected_ids")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(serde_json::Value::as_i64).collect())
+                .unwrap_or_default()
+        };
 
     let top: std::collections::HashSet<i64> = ranked.into_iter().take(k).collect();
     let found = gold_ids.iter().filter(|id| top.contains(id)).count();
@@ -1691,11 +1683,7 @@ mod tests {
 
         // Every case must carry at least one gold_must reference.
         for c in &cases {
-            assert!(
-                !c.gold_must.is_empty(),
-                "case {} has empty gold_must",
-                c.id
-            );
+            assert!(!c.gold_must.is_empty(), "case {} has empty gold_must", c.id);
         }
     }
 
@@ -1734,8 +1722,7 @@ mod tests {
         let path = manifest.join("eval").join("code_prompts.jsonl");
         let cases = load_fixture(&path).expect("code_prompts.jsonl loads");
 
-        let mut symbols: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
+        let mut symbols: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for c in &cases {
             for r in c.gold_must.iter().chain(c.gold_neutral.iter()) {
                 if let GoldRef::Symbol(s) = r {
@@ -1815,9 +1802,7 @@ mod tests {
             assert!(ids.insert(case.id.clone()), "duplicate case id {}", case.id);
             assert!(!case.query.trim().is_empty(), "{}: empty query", case.id);
             assert!(
-                case.gold_must
-                    .iter()
-                    .any(|g| matches!(g, GoldRef::File(_))),
+                case.gold_must.iter().any(|g| matches!(g, GoldRef::File(_))),
                 "{}: no gold_must File ref — case would seed nothing",
                 case.id
             );
@@ -2028,7 +2013,10 @@ mod tests {
         case.gold_must.push(GoldRef::Symbol("Foo".into()));
         case.gold_must.push(GoldRef::Symbol("missing".into()));
 
-        assert_eq!(primary_gold_file(&case).as_deref(), Some("crates/x/src/a.rs"));
+        assert_eq!(
+            primary_gold_file(&case).as_deref(),
+            Some("crates/x/src/a.rs")
+        );
 
         // All items: 2 files + 3 symbols = 5; covered = a.rs, b.rs, bar, Foo = 4.
         assert_eq!(

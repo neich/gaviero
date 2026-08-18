@@ -27,9 +27,7 @@ pub fn refactor_session(id: &str, marker: &str) -> ScriptedSession {
             Step::User(t1.clone()),
             Step::Barrier(SHARED_BARRIER_AFTER_TURN_1),
             Step::User("List every callsite of retrieve_for_chat.".into()),
-            Step::User(
-                "Propose a refactor extracting the rerank blend into a helper.".into(),
-            ),
+            Step::User("Propose a refactor extracting the rerank blend into a helper.".into()),
             Step::Reset,
             Step::User(t1),
             Step::User("Summarise once more in two bullet points.".into()),
@@ -46,13 +44,10 @@ pub fn bugfix_session(id: &str, marker: &str) -> ScriptedSession {
                 "Inspect ARGV_THRESHOLD usage in crates/gaviero-core/src/acp/session.rs. Tag your reply with marker {marker}."
             )),
             Step::Barrier(SHARED_BARRIER_AFTER_TURN_1),
-            Step::User(
-                "What happens when prompt + system_prompt straddle the threshold?".into(),
-            ),
+            Step::User("What happens when prompt + system_prompt straddle the threshold?".into()),
             Step::Reset,
             Step::User(
-                "Switching topics. Where does the writer task live and how is it shut down?"
-                    .into(),
+                "Switching topics. Where does the writer task live and how is it shut down?".into(),
             ),
             Step::Sleep(Duration::from_millis(50)),
             Step::User("Briefly: how does TurnComplete enqueue propagate?".into()),

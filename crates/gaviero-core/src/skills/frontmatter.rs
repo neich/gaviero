@@ -70,10 +70,7 @@ pub fn parse_arguments(raw: &str) -> Vec<String> {
             .filter(|s| !s.is_empty())
             .collect();
     }
-    trimmed
-        .split_whitespace()
-        .map(|s| s.to_string())
-        .collect()
+    trimmed.split_whitespace().map(|s| s.to_string()).collect()
 }
 
 #[cfg(test)]
@@ -107,7 +104,10 @@ mod tests {
 
     #[test]
     fn parse_space_separated_arguments() {
-        assert_eq!(parse_arguments("one two three"), vec!["one", "two", "three"]);
+        assert_eq!(
+            parse_arguments("one two three"),
+            vec!["one", "two", "three"]
+        );
     }
 
     #[test]

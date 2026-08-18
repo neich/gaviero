@@ -262,9 +262,7 @@ impl Keymap {
             // AltGr chords insert text (see `platform::altgr_char`). Reached
             // only after every specific Ctrl/Alt shortcut above has had its
             // chance.
-            KeyCode::Char(c) if crate::platform::altgr_char(key).is_some() => {
-                Action::InsertChar(c)
-            }
+            KeyCode::Char(c) if crate::platform::altgr_char(key).is_some() => Action::InsertChar(c),
 
             _ => Action::None,
         }
