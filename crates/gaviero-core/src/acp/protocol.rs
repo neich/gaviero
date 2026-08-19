@@ -12,6 +12,44 @@ use std::path::PathBuf;
 pub struct ToolUseInfo {
     pub name: String,
     pub input: Value,
+    /// Claude's `tool_use` id (`toolu_…`). Empty when the block omitted it.
+    pub id: String,
+}
+
+/// Claude `Task`/`Agent` and Cursor `taskToolCall`/`agentToolCall` display names.
+pub fn is_subagent_tool_name(name: &str) -> bool {
+    matches!(name, "Task" | "Agent")
+}
+
+/// True when this tool call is a Task/Agent launched in the background —
+/// the parent turn can emit `result` before the subagent finishes.
+///
+/// Accepts both Claude's `run_in_background` and Cursor's `runInBackground`.
+pub fn is_background_subagent_tool(name: &str, input: &Value) -> bool {
+    is_subagent_tool_name(name) && subagent_runs_in_background(input)
+}
+
+fn subagent_runs_in_background(input: &Value) -> bool {
+    ["run_in_background", "runInBackground", "background"]
+        .iter()
+        .any(|key| input.get(*key).and_then(|v| v.as_bool()).unwrap_or(false))
+}
+
+/// One-line label for a Task/Agent spawn (description, else truncated prompt).
+pub fn subagent_description(input: &Value) -> String {
+    for key in ["description", "task", "title", "prompt"] {
+        if let Some(d) = input.get(key).and_then(|v| v.as_str()) {
+            let d = d.trim();
+            if !d.is_empty() {
+                let mut s: String = d.chars().take(80).collect();
+                if d.chars().count() > 80 {
+                    s.push('…');
+                }
+                return s;
+            }
+        }
+    }
+    "subagent".to_string()
 }
 
 /// Token usage for one chat turn, normalised to a single-iteration view.
@@ -77,7 +115,30 @@ pub enum StreamEvent {
         text: String,
         /// Tool calls in this message (Write, Edit, etc. with their inputs).
         tool_uses: Vec<ToolUseInfo>,
+        /// Set on forwarded subagent messages (`--forward-subagent-text`).
+        /// `None` for the parent conversation.
+        parent_tool_use_id: Option<String>,
     },
+
+    /// Background / subagent task began (`type: system`, `subtype: task_started`).
+    TaskStarted {
+        task_id: String,
+        tool_use_id: String,
+        description: String,
+    },
+
+    /// Background / subagent task reached a terminal state
+    /// (`type: system`, `subtype: task_notification`).
+    TaskNotification {
+        task_id: String,
+        tool_use_id: String,
+        status: String,
+        summary: String,
+    },
+
+    /// User message carrying `tool_result` blocks. In `--print` mode this is
+    /// often the only completion signal for a subagent (no `task_notification`).
+    UserToolResults { tool_use_ids: Vec<String> },
 
     /// Final result (type: "result").
     ResultEvent {
@@ -121,6 +182,14 @@ fn required_str(v: &Value, key: &str) -> Result<String> {
 /// Used for dispatch/discriminant fields where "unknown" is a valid fallback.
 fn opt_str<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(|t| t.as_str()).unwrap_or("")
+}
+
+fn nonempty_opt_str(v: &Value, key: &str) -> Option<String> {
+    v.get(key)
+        .and_then(|t| t.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 /// Parse a Claude Code `usage` object into a single-iteration
@@ -183,6 +252,26 @@ pub fn parse_stream_line(line: &str) -> Result<StreamEvent> {
                     session_id: required_str(&v, "session_id")?,
                     model: required_str(&v, "model")?,
                 })
+            } else if subtype == "task_started" {
+                Ok(StreamEvent::TaskStarted {
+                    task_id: opt_str(&v, "task_id").to_string(),
+                    tool_use_id: opt_str(&v, "tool_use_id").to_string(),
+                    description: {
+                        let d = opt_str(&v, "description");
+                        if d.is_empty() {
+                            "subagent".to_string()
+                        } else {
+                            d.to_string()
+                        }
+                    },
+                })
+            } else if subtype == "task_notification" {
+                Ok(StreamEvent::TaskNotification {
+                    task_id: opt_str(&v, "task_id").to_string(),
+                    tool_use_id: opt_str(&v, "tool_use_id").to_string(),
+                    status: opt_str(&v, "status").to_string(),
+                    summary: opt_str(&v, "summary").to_string(),
+                })
             } else {
                 Ok(StreamEvent::Unknown(v))
             }
@@ -238,6 +327,8 @@ pub fn parse_stream_line(line: &str) -> Result<StreamEvent> {
         "assistant" => {
             let message = v.get("message").cloned().unwrap_or(Value::Null);
             let content = message.get("content").and_then(|c| c.as_array());
+            let parent_tool_use_id = nonempty_opt_str(&v, "parent_tool_use_id")
+                .or_else(|| nonempty_opt_str(&message, "parent_tool_use_id"));
 
             let mut text = String::new();
             let mut tool_uses = Vec::new();
@@ -258,14 +349,46 @@ pub fn parse_stream_line(line: &str) -> Result<StreamEvent> {
                                 .unwrap_or("")
                                 .to_string();
                             let input = block.get("input").cloned().unwrap_or(Value::Null);
-                            tool_uses.push(ToolUseInfo { name, input });
+                            let id = block
+                                .get("id")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            tool_uses.push(ToolUseInfo { name, input, id });
                         }
                         _ => {}
                     }
                 }
             }
 
-            Ok(StreamEvent::AssistantMessage { text, tool_uses })
+            Ok(StreamEvent::AssistantMessage {
+                text,
+                tool_uses,
+                parent_tool_use_id,
+            })
+        }
+
+        // User message: we only need tool_result ids (subagent completion in
+        // --print mode). Other user lines pass through as Unknown.
+        "user" => {
+            let message = v.get("message").cloned().unwrap_or(Value::Null);
+            let content = message.get("content").and_then(|c| c.as_array());
+            let mut tool_use_ids = Vec::new();
+            if let Some(blocks) = content {
+                for block in blocks {
+                    if opt_str(block, "type") == "tool_result"
+                        && let Some(id) = block.get("tool_use_id").and_then(|t| t.as_str())
+                        && !id.is_empty()
+                    {
+                        tool_use_ids.push(id.to_string());
+                    }
+                }
+            }
+            if tool_use_ids.is_empty() {
+                Ok(StreamEvent::Unknown(v))
+            } else {
+                Ok(StreamEvent::UserToolResults { tool_use_ids })
+            }
         }
 
         // Final result. The top-level `usage` is summed across the
@@ -778,6 +901,84 @@ mod tests {
             }
             _ => panic!("Expected SystemInit, got {:?}", event),
         }
+    }
+
+    #[test]
+    fn test_parse_task_started() {
+        let line = r#"{"type":"system","subtype":"task_started","task_id":"task_abc","tool_use_id":"toolu_abc","description":"Running background analysis","task_type":"background"}"#;
+        let event = parse_stream_line(line).unwrap();
+        match event {
+            StreamEvent::TaskStarted {
+                task_id,
+                tool_use_id,
+                description,
+            } => {
+                assert_eq!(task_id, "task_abc");
+                assert_eq!(tool_use_id, "toolu_abc");
+                assert_eq!(description, "Running background analysis");
+            }
+            _ => panic!("Expected TaskStarted, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_task_notification() {
+        let line = r#"{"type":"system","subtype":"task_notification","task_id":"task_abc","tool_use_id":"toolu_abc","status":"completed","summary":"done","output_file":""}"#;
+        let event = parse_stream_line(line).unwrap();
+        match event {
+            StreamEvent::TaskNotification {
+                task_id,
+                status,
+                summary,
+                ..
+            } => {
+                assert_eq!(task_id, "task_abc");
+                assert_eq!(status, "completed");
+                assert_eq!(summary, "done");
+            }
+            _ => panic!("Expected TaskNotification, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_user_tool_results() {
+        let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_abc","content":"ok"}]}}"#;
+        let event = parse_stream_line(line).unwrap();
+        match event {
+            StreamEvent::UserToolResults { tool_use_ids } => {
+                assert_eq!(tool_use_ids, vec!["toolu_abc"]);
+            }
+            _ => panic!("Expected UserToolResults, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_assistant_task_tool_use() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Task","input":{"description":"search papers","run_in_background":true,"prompt":"go"}}]}}"#;
+        let event = parse_stream_line(line).unwrap();
+        match event {
+            StreamEvent::AssistantMessage { tool_uses, .. } => {
+                assert_eq!(tool_uses.len(), 1);
+                assert_eq!(tool_uses[0].id, "toolu_1");
+                assert!(is_background_subagent_tool(
+                    &tool_uses[0].name,
+                    &tool_uses[0].input
+                ));
+                assert_eq!(subagent_description(&tool_uses[0].input), "search papers");
+            }
+            _ => panic!("Expected AssistantMessage, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn cursor_run_in_background_camel_case() {
+        let input = serde_json::json!({
+            "description": "scan docs",
+            "runInBackground": true
+        });
+        assert!(is_subagent_tool_name("Task"));
+        assert!(is_background_subagent_tool("Task", &input));
+        assert_eq!(subagent_description(&input), "scan docs");
     }
 
     #[test]

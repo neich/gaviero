@@ -484,6 +484,14 @@ pub fn format_tool_summary(
                 "Bash".into()
             }
         }
+        "Task" | "Agent" => {
+            let desc = crate::acp::protocol::subagent_description(input);
+            if crate::acp::protocol::is_background_subagent_tool(tool_name, input) {
+                format!("Task (background): {desc}")
+            } else {
+                format!("Task: {desc}")
+            }
+        }
         _ => tool_name.into(),
     }
 }
