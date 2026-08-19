@@ -280,9 +280,15 @@ fn synth_server_names(synth: &McpConfigSynth) -> Vec<String> {
 ///   *not* caught by the provider. The in-process tool-agent still applies
 ///   the full substring rule, and gaviero's built-in denylist is unaffected.
 /// * **Cursor** (`.cursor/cli.json`) — `Shell(<prefix>*)`, same caveat.
-/// * **Codex** has no per-command permission surface at all; its shell
-///   gating is the sandbox/approval policy, so nothing is emitted and the
-///   policy simply does not reach it.
+///   When `agent.availableTools` is set and omits `Bash`, synth also writes
+///   `Shell(*)` to `deny` so `--force` cannot re-enable the shell. Write
+///   tools are denied the same way via `Write(**)` when none of
+///   Write/Edit/MultiEdit are listed.
+/// * **Codex** has no per-command permission surface in `config.toml`; chat
+///   sessions apply the same lists at `item/commandExecution/requestApproval`
+///   (and decline file changes when write tools are absent). Swarm `codex exec`
+///   still uses `--dangerously-bypass-approvals-and-sandbox` for MCP, so that
+///   path cannot honour per-command rules.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BashPermissions {
     /// Command prefixes that run without a prompt.
@@ -367,6 +373,12 @@ pub struct McpConfigSynth {
     /// translated into each provider's native config. Default (empty) leaves
     /// provider shell rules alone.
     pub bash: BashPermissions,
+    /// `agent.availableTools` from workspace settings. `None` when the
+    /// key is absent (do not invent a restriction). `Some` even when empty
+    /// means the operator configured a (possibly empty) tool surface —
+    /// Cursor synth then denies native tools that are not on the list so
+    /// Restricted profiles drop Shell the same way Claude drops `--tools Bash`.
+    pub available_tools: Option<Vec<String>>,
 }
 
 impl Default for McpConfigSynth {
@@ -382,6 +394,7 @@ impl Default for McpConfigSynth {
             extra_servers: Vec::new(),
             permissions: McpPermissions::default(),
             bash: BashPermissions::default(),
+            available_tools: None,
         }
     }
 }
@@ -642,8 +655,20 @@ fn expand_claude_patterns(pattern: &str, servers: &[String]) -> Vec<String> {
 /// `Mcp(server:tool)` for `mcp.permissions` and `Shell(prefix*)` for
 /// `agent.permissions.bash`. Cursor supports a `*` server segment natively
 /// (`Mcp(*:*)`), so MCP patterns translate without expansion.
+///
+/// When `available_tools` is `Some` and omits `Bash` / write tools, native
+/// Cursor tools are denied so `--force` cannot re-open them. Bash allow
+/// prefixes are omitted in that case (deny `Shell(*)` already wins).
 fn cursor_permission_rules(synth: &McpConfigSynth) -> (Vec<String>, Vec<String>) {
-    let (bash_allow, bash_deny) = synth.bash.cursor_rules();
+    let bash_on_surface = match &synth.available_tools {
+        None => true,
+        Some(list) => list.iter().any(|t| t == "Bash"),
+    };
+    let (bash_allow, bash_deny) = if bash_on_surface {
+        synth.bash.cursor_rules()
+    } else {
+        (Vec::new(), synth.bash.cursor_rules().1)
+    };
     let allow = synth
         .permissions
         .allow
@@ -657,8 +682,30 @@ fn cursor_permission_rules(synth: &McpConfigSynth) -> (Vec<String>, Vec<String>)
         .iter()
         .map(|p| cursor_rule(p))
         .chain(bash_deny)
+        .chain(cursor_surface_deny_rules(synth.available_tools.as_deref()))
         .collect();
     (allow, deny)
+}
+
+/// Cursor `permissions.deny` entries that hide native tools not in
+/// `agent.availableTools`. `None` means the setting was absent — emit
+/// nothing so a workspace that never configured the list keeps today's
+/// `--force` posture.
+fn cursor_surface_deny_rules(available: Option<&[String]>) -> Vec<String> {
+    let Some(list) = available else {
+        return Vec::new();
+    };
+    let mut deny = Vec::new();
+    if !list.iter().any(|t| t == "Bash") {
+        deny.push("Shell(*)".to_string());
+    }
+    if !list
+        .iter()
+        .any(|t| matches!(t.as_str(), "Write" | "Edit" | "MultiEdit"))
+    {
+        deny.push("Write(**)".to_string());
+    }
+    deny
 }
 
 fn cursor_rule(pattern: &str) -> String {
@@ -1460,6 +1507,7 @@ mod tests {
             extra_servers: Vec::new(),
             permissions: McpPermissions::default(),
             bash: BashPermissions::default(),
+            available_tools: None,
         }
     }
 
@@ -2322,6 +2370,61 @@ mod tests {
             .collect();
         assert!(allow.contains(&"Mcp(gaviero:*)"));
         assert!(deny.contains(&"Mcp(gaviero:write_*)"));
+    }
+
+    #[test]
+    fn cursor_cli_json_denies_shell_when_bash_not_on_available_tools() {
+        let dir = tempdir().unwrap();
+        let mut synth = fixture_resolvable_shim(dir.path().to_path_buf());
+        synth.bash = bash_fixture();
+        synth.available_tools = Some(vec![
+            "Read".into(),
+            "Write".into(),
+            "Edit".into(),
+            "MultiEdit".into(),
+        ]);
+        synthesize_for_worktree(&synth).unwrap();
+
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".cursor/cli.json")).unwrap(),
+        )
+        .unwrap();
+        let allow: Vec<&str> = v["permissions"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect();
+        let deny: Vec<&str> = v["permissions"]["deny"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect();
+        assert!(
+            deny.contains(&"Shell(*)"),
+            "restricted availableTools must deny all Shell under --force: {deny:?}"
+        );
+        assert!(
+            !allow.iter().any(|r| r.starts_with("Shell(")),
+            "bash allow prefixes must not be emitted when Bash is off the surface: {allow:?}"
+        );
+        assert!(!deny.iter().any(|r| r.starts_with("Write(")));
+    }
+
+    #[test]
+    fn cursor_surface_deny_rules_follow_available_tools() {
+        assert!(cursor_surface_deny_rules(None).is_empty());
+        let restricted = cursor_surface_deny_rules(Some(&[
+            "Read".into(),
+            "Write".into(),
+            "Edit".into(),
+        ]));
+        assert!(restricted.contains(&"Shell(*)".to_string()));
+        assert!(!restricted.iter().any(|r| r.starts_with("Write(")));
+        let no_write = cursor_surface_deny_rules(Some(&["Read".into(), "Bash".into()]));
+        assert!(no_write.contains(&"Write(**)".to_string()));
+        assert!(!no_write.iter().any(|r| r.starts_with("Shell(")));
     }
 
     #[test]

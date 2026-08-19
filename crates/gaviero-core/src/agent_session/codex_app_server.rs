@@ -47,7 +47,11 @@ use crate::swarm::backend::{
 };
 use crate::write_gate::WriteGatePipeline;
 
+use super::background::{
+    PendingBg, finish_all_pending_killed, finish_pending_bg, register_pending_bg,
+};
 use super::registry::SessionConstruction;
+use super::tool_surface::{AgentToolSurface, CommandDecision};
 use super::{AgentSession, Turn};
 
 static NEXT_RPC_ID: AtomicU64 = AtomicU64::new(1);
@@ -252,6 +256,7 @@ struct ActiveTurn {
     seen_file_items: HashSet<String>,
     declined_file_items: HashSet<String>,
     item_paths: HashMap<String, Vec<PathBuf>>,
+    pending_bg: Vec<PendingBg>,
 }
 
 impl ActiveTurn {
@@ -262,6 +267,7 @@ impl ActiveTurn {
             seen_file_items: HashSet::new(),
             declined_file_items: HashSet::new(),
             item_paths: HashMap::new(),
+            pending_bg: Vec::new(),
         }
     }
 }
@@ -274,6 +280,7 @@ struct ReviewContext {
     allowed_roots: Vec<PathBuf>,
     agent_id: String,
     conv_id: Option<String>,
+    tool_surface: AgentToolSurface,
 }
 
 impl ReviewContext {
@@ -363,6 +370,9 @@ impl CodexAppServerSession {
             }
         }
 
+        let tool_surface =
+            AgentToolSurface::from_agent_options(&args.options, &args.workspace_root);
+
         let review = ReviewContext {
             write_gate: args.write_gate,
             observer,
@@ -370,6 +380,7 @@ impl CodexAppServerSession {
             allowed_roots,
             agent_id: args.agent_id,
             conv_id: args.conv_id,
+            tool_surface,
         };
 
         Self {
@@ -720,6 +731,21 @@ async fn route_app_server_line(
             let (events, _) = parse_rpc_event(line);
             send_to_active(active_turn, events).await;
         }
+        "item/started"
+            if value
+                .pointer("/params/item/type")
+                .and_then(|kind| kind.as_str())
+                .is_some_and(is_codex_subagent_item) =>
+        {
+            track_codex_subagent_start(&value, active_turn, review).await;
+            let (events, _) = parse_rpc_event(line);
+            send_to_active(active_turn, events).await;
+        }
+        "item/completed" => {
+            track_codex_subagent_finish(&value, active_turn, review).await;
+            let (events, _) = parse_rpc_event(line);
+            send_to_active(active_turn, events).await;
+        }
         "item/fileChange/requestApproval" => {
             let id = value
                 .get("id")
@@ -740,7 +766,7 @@ async fn route_app_server_line(
             let id = value
                 .get("id")
                 .context("command approval request missing id")?;
-            let accept = cargo_verification_is_safe_to_approve(&value, active_turn, review).await;
+            let accept = command_execution_is_safe_to_approve(&value, active_turn, review).await;
             let decision = if accept { "accept" } else { "decline" };
             write_shared(
                 stdin,
@@ -751,7 +777,8 @@ async fn route_app_server_line(
         "turn/completed" => {
             let active = { active_turn.lock().await.take() };
             let (events, _) = parse_rpc_event(line);
-            if let Some(active) = active {
+            if let Some(mut active) = active {
+                let _ = finish_all_pending_killed(&mut active.pending_bg, review.observer.as_ref());
                 if let Err(e) = finalize_native_edits(review, active.snapshot).await {
                     let _ = active
                         .tx
@@ -770,6 +797,122 @@ async fn route_app_server_line(
     }
 
     Ok(())
+}
+
+/// Codex app-server item types that represent a spawned collaborator /
+/// subagent rather than a host tool. Names collected from the protocol's
+/// `item.type` field; unknown variants are ignored.
+fn is_codex_subagent_item(kind: &str) -> bool {
+    matches!(
+        kind,
+        "collab" | "agent" | "subAgent" | "subagent" | "task" | "spawnedAgent" | "agentTurn"
+    )
+}
+
+async fn track_codex_subagent_start(
+    value: &serde_json::Value,
+    active_turn: &SharedActiveTurn,
+    review: &ReviewContext,
+) {
+    let item = value
+        .pointer("/params/item")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let id = item
+        .get("id")
+        .and_then(|id| id.as_str())
+        .unwrap_or("")
+        .to_string();
+    if id.is_empty() {
+        return;
+    }
+    let desc = crate::acp::protocol::subagent_description(&item);
+    let mut active = active_turn.lock().await;
+    let Some(active) = active.as_mut() else {
+        return;
+    };
+    register_pending_bg(
+        &mut active.pending_bg,
+        &id,
+        &id,
+        &desc,
+        review.observer.as_ref(),
+    );
+}
+
+async fn track_codex_subagent_finish(
+    value: &serde_json::Value,
+    active_turn: &SharedActiveTurn,
+    review: &ReviewContext,
+) {
+    let item = value
+        .pointer("/params/item")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let kind = item.get("type").and_then(|k| k.as_str()).unwrap_or("");
+    if !is_codex_subagent_item(kind) {
+        return;
+    }
+    let id = item.get("id").and_then(|id| id.as_str()).unwrap_or("");
+    let mut active = active_turn.lock().await;
+    let Some(active) = active.as_mut() else {
+        return;
+    };
+    finish_pending_bg(
+        &mut active.pending_bg,
+        id,
+        id,
+        "completed",
+        "",
+        review.observer.as_ref(),
+    );
+}
+
+fn approval_command_line(value: &serde_json::Value) -> Option<String> {
+    let command = value.pointer("/params/command")?;
+    match command {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(arr) => Some(
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        _ => None,
+    }
+}
+
+async fn command_execution_is_safe_to_approve(
+    value: &serde_json::Value,
+    active_turn: &SharedActiveTurn,
+    review: &ReviewContext,
+) -> bool {
+    let Some(command) = approval_command_line(value) else {
+        tracing::debug!("declining Codex command: missing command payload");
+        return false;
+    };
+    match review.tool_surface.decide_command(&command) {
+        CommandDecision::Deny => {
+            tracing::debug!(command, "declining Codex command: tool surface or denylist");
+            false
+        }
+        CommandDecision::Allow => {
+            if parse_cargo_verification_request(value, review).is_ok() {
+                return cargo_verification_is_safe_to_approve(value, active_turn, review).await;
+            }
+            if let Err(e) = validate_additional_permissions(value, review) {
+                tracing::debug!(error = %e, command, "declining Codex command: extra permissions");
+                return false;
+            }
+            if active_turn.lock().await.is_none() {
+                return false;
+            }
+            true
+        }
+        CommandDecision::UnattendedFallback => {
+            cargo_verification_is_safe_to_approve(value, active_turn, review).await
+        }
+    }
 }
 
 async fn cargo_verification_is_safe_to_approve(
@@ -1248,6 +1391,10 @@ async fn file_change_is_safe_to_approve(
     active_turn: &SharedActiveTurn,
     review: &ReviewContext,
 ) -> bool {
+    if !review.tool_surface.write_available() {
+        tracing::debug!("declining Codex file change: write tools not on the surface");
+        return false;
+    }
     let mut active = active_turn.lock().await;
     let Some(active) = active.as_mut() else {
         return false;
@@ -1593,6 +1740,14 @@ fn parse_rpc_event(line: &str) -> (Vec<UnifiedStreamEvent>, bool) {
                     }],
                     false,
                 ),
+                Some(kind) if is_codex_subagent_item(kind) => (
+                    vec![UnifiedStreamEvent::ToolCallStart {
+                        id,
+                        name: "Task".to_string(),
+                        args: item.clone(),
+                    }],
+                    false,
+                ),
                 _ => (vec![], false),
             }
         }
@@ -1624,6 +1779,14 @@ fn parse_rpc_event(line: &str) -> (Vec<UnifiedStreamEvent>, bool) {
             let item = params.get("item").unwrap_or(&serde_json::Value::Null);
             match item.get("type").and_then(|kind| kind.as_str()) {
                 Some("commandExecution") | Some("fileChange") => {
+                    let id = item
+                        .get("id")
+                        .and_then(|id| id.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    (vec![UnifiedStreamEvent::ToolCallEnd { id }], false)
+                }
+                Some(kind) if is_codex_subagent_item(kind) => {
                     let id = item
                         .get("id")
                         .and_then(|id| id.as_str())
@@ -1750,6 +1913,7 @@ mod tests {
             allowed_roots: vec![root.to_path_buf()],
             agent_id: "codex-test".to_string(),
             conv_id: None,
+            tool_surface: AgentToolSurface::unrestricted_unattended(),
         }
     }
 
@@ -2191,6 +2355,25 @@ url = "https://example/mcp/"
     }
 
     #[test]
+    fn parse_subagent_item_lifecycle() {
+        let (events, _) = parse(
+            r#"{"method":"item/started","params":{"item":{"type":"task","id":"ag1","description":"scan docs"}}}"#,
+        );
+        assert!(matches!(
+            &events[0],
+            UnifiedStreamEvent::ToolCallStart { id, name, .. }
+                if id == "ag1" && name == "Task"
+        ));
+        let (events, _) = parse(
+            r#"{"method":"item/completed","params":{"item":{"type":"task","id":"ag1","status":"completed"}}}"#,
+        );
+        assert_eq!(
+            events,
+            vec![UnifiedStreamEvent::ToolCallEnd { id: "ag1".into() }]
+        );
+    }
+
+    #[test]
     fn parse_command_output_delta_decodes_base64() {
         let encoded = base64::engine::general_purpose::STANDARD.encode("ls\n");
         let line = format!(
@@ -2355,5 +2538,44 @@ url = "https://example/mcp/"
         assert_eq!(gate.active_proposal_ids().len(), 1);
         let proposal = gate.proposal_for_path(&source).unwrap();
         assert_eq!(proposal.proposed_content, "fn after() {}\n");
+    }
+
+    #[tokio::test]
+    async fn restricted_tool_surface_declines_all_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut review = review_context(dir.path(), test_write_gate());
+        review.tool_surface = AgentToolSurface::restricted_no_bash();
+        let (tx, _rx) = mpsc::channel(1);
+        let active_turn = Arc::new(Mutex::new(Some(ActiveTurn::new(tx))));
+        let request = command_request(serde_json::json!("cargo test"), dir.path());
+        assert!(
+            !command_execution_is_safe_to_approve(&request, &active_turn, &review).await,
+            "Bash off the surface must decline even cargo verification"
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_bash_allows_non_denied_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut review = review_context(dir.path(), test_write_gate());
+        review.tool_surface = AgentToolSurface::full_bash_approved();
+        let (tx, _rx) = mpsc::channel(1);
+        let active_turn = Arc::new(Mutex::new(Some(ActiveTurn::new(tx))));
+        let allowed = command_request(serde_json::json!("git status"), dir.path());
+        assert!(command_execution_is_safe_to_approve(&allowed, &active_turn, &review).await);
+        let denied = command_request(serde_json::json!("git push --force origin main"), dir.path());
+        assert!(!command_execution_is_safe_to_approve(&denied, &active_turn, &review).await);
+    }
+
+    #[tokio::test]
+    async fn unattended_fallback_still_approves_cargo_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let review = review_context(dir.path(), test_write_gate());
+        let (tx, _rx) = mpsc::channel(1);
+        let active_turn = Arc::new(Mutex::new(Some(ActiveTurn::new(tx))));
+        let request = command_request(serde_json::json!("cargo test"), dir.path());
+        assert!(command_execution_is_safe_to_approve(&request, &active_turn, &review).await);
+        let other = command_request(serde_json::json!("git status"), dir.path());
+        assert!(!command_execution_is_safe_to_approve(&other, &active_turn, &review).await);
     }
 }
