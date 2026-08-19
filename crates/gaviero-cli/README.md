@@ -248,6 +248,8 @@ independent of `--resume`, which restores the node-level checkpoint.
 | `--manifest-turn` | `<id>` | Print manifest for a specific turn id |
 | `--deletions-last` | `<n>` | List N most recent soft-deletions |
 | `--restore-id` | `<id>` | Restore a soft-deleted memory by audit id |
+| `--consolidate-history` | `[n]` | List recent consolidator batches (default 10) and exit |
+| `--consolidate-rollback` | `<batch_id>` | Undo one consolidator batch through the writer |
 | `--restore-since` | `<when>` | Restore deletions newer than duration (`7 days`) |
 | `--forget-query` | `<text>` | Bulk-forget by fuzzy content match |
 | `--forget-scope` | `<path>` | Bulk-forget at a canonical scope path |

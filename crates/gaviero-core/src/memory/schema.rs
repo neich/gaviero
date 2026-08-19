@@ -851,8 +851,8 @@ fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &st
 ///   consolidation that is the operation itself, so no separate
 ///   `op_json` column is added.
 /// - `before_json` / `after_json` — structured snapshots either side of
-///   the change. Rollback composes its inverse from these, which is why
-///   they are columns rather than nested inside `payload`.
+///   the change. Rollback restores MERGE trust from `before_json` only;
+///   `after_json` is kept for inspection and is not an OCC token.
 /// - `applied` — did the operation actually land. Defaults to 1:
 ///   existing sleeptime rows all describe applied work, and a dry run is
 ///   already recorded by `dry_run`.

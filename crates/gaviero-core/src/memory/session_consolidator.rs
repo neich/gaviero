@@ -7,7 +7,7 @@
 //! parses the response, and applies the operations through the
 //! Tier S2 writer task. **The LLM proposes; the writer applies.**
 //!
-//! The prompt is version-pinned (see `PROMPT_V4`); future revisions
+//! The prompt is version-pinned (see `PROMPT_V5`); future revisions
 //! bump the version so the audit trail can identify which rubric
 //! produced a given operation. Every applied operation records its
 //! prompt version, so a revision can be judged against the op quality
@@ -36,11 +36,17 @@ use serde::{Deserialize, Serialize};
 /// row's trust to `MERGE_TRUST`). Across five live runs the consolidator
 /// emitted zero MERGE and zero SUPERSEDE while repeatedly seeing
 /// candidates identical to stored rows.
-pub const PROMPT_VERSION: &str = "session_v4";
+///
+/// `session_v5` strips `promotions` from the prompt. The parser still
+/// accepts a leftover `promotions` array (`#[serde(default)]`); apply
+/// records each as `kind=promotion` `applied=0` and writes nothing.
+/// Real promotion stays on `Consolidator::consolidate_run` /
+/// `promote_frequent_cross_scope`.
+pub const PROMPT_VERSION: &str = "session_v5";
 
 /// Verbatim consolidator prompt. Kept as a single &'static so the
 /// prompt and its version travel together.
-pub const PROMPT_V4: &str = r#"
+pub const PROMPT_V5: &str = r#"
 You are Gaviero's session consolidator. Read the chat transcript and the
 list of CANDIDATE memories that were extracted from it. For each candidate,
 decide whether to ADD it as-is, MERGE it into a similar existing memory,
@@ -59,9 +65,6 @@ Reply with ONE JSON object:
     {"op": "MERGE", "candidate_index": <int>, "into_memory_id": <int>, "expected_outcome": "..."},
     {"op": "SUPERSEDE", "candidate_index": <int>, "supersedes_memory_id": <int>, "expected_outcome": "..."},
     {"op": "DROP", "candidate_index": <int>, "reason": "...", "expected_outcome": "..."}
-  ],
-  "promotions": [
-    {"memory_id": <int>, "to_scope": "module"|"repo"|"workspace"|"global"}
   ]
 }
 
@@ -89,7 +92,6 @@ Rules:
     this same batch → DROP.
 - DROP is for candidates not worth storing at all. It is not the safe
   default for "already known" — MERGE is.
-- Promotions are optional; only include rows you actively want widened.
 - `expected_outcome` is one short sentence saying what should be true of
   the memory store after the operation lands, e.g. "the older tokio
   decision is replaced by the mutex one". It is optional but strongly
@@ -247,7 +249,8 @@ pub fn parse_response(raw: &str) -> Result<ConsolidatorResponse> {
 ///
 /// Twenty rows at a typical memory length lands comfortably under the
 /// 1500-token budget the plan allows, and the rows are ordered by
-/// importance so the cap keeps the ones most worth reconciling.
+/// relevance to this session's candidates so the cap keeps the ones
+/// most worth reconciling.
 pub const MAX_EXISTING_MEMORIES: usize = 20;
 
 /// Character budget for the existing-memories section (H-OD7).
@@ -322,7 +325,7 @@ pub fn build_prompt(
     // again.
     let transcript = truncate_transcript(transcript);
     let mut body = String::with_capacity(transcript.len() + 2048);
-    body.push_str(PROMPT_V4.trim_start());
+    body.push_str(PROMPT_V5.trim_start());
     body.push_str("\n\nTRANSCRIPT (most recent turns; earlier ones may be elided):\n");
     body.push_str(&transcript);
     body.push_str("\n\nCANDIDATES (extracted this session):\n");
@@ -523,9 +526,13 @@ Hope that helps."#;
     }
 
     #[test]
-    fn the_prompt_version_is_v4() {
-        assert_eq!(PROMPT_VERSION, "session_v4");
-        assert!(PROMPT_V4.contains("expected_outcome"));
+    fn the_prompt_version_is_v5() {
+        assert_eq!(PROMPT_VERSION, "session_v5");
+        assert!(PROMPT_V5.contains("expected_outcome"));
+        assert!(
+            !PROMPT_V5.to_ascii_lowercase().contains("promotions"),
+            "session_v5 must not ask the model for promotions"
+        );
     }
 
     /// The v4 rubric change. A candidate restating a known memory is a
@@ -535,19 +542,31 @@ Hope that helps."#;
     #[test]
     fn the_prompt_routes_reconfirmation_to_merge_not_drop() {
         assert!(
-            !PROMPT_V4.contains("Prefer DROP over MERGE"),
+            !PROMPT_V5.contains("Prefer DROP over MERGE"),
             "the rule that suppressed every MERGE is back"
         );
-        assert!(PROMPT_V4.contains("reconfirmation"));
-        assert!(PROMPT_V4.contains("It is not the safe"));
+        assert!(PROMPT_V5.contains("reconfirmation"));
+        assert!(PROMPT_V5.contains("It is not the safe"));
     }
 
     /// The rubric change that earned the v3 bump. Pinned so a future
     /// prompt edit that drops it has to bump the version deliberately.
     #[test]
     fn the_prompt_forbids_adding_raw_conversation() {
-        assert!(PROMPT_V4.contains("verbatim"));
-        assert!(PROMPT_V4.contains("narrated work log"));
+        assert!(PROMPT_V5.contains("verbatim"));
+        assert!(PROMPT_V5.contains("narrated work log"));
+    }
+
+    #[test]
+    fn a_response_that_still_contains_promotions_parses() {
+        let raw = r#"{
+            "session_summary": "ok",
+            "operations": [],
+            "promotions": [{"memory_id": 8, "to_scope": "repo"}]
+        }"#;
+        let parsed = parse_response(raw).unwrap();
+        assert_eq!(parsed.promotions.len(), 1);
+        assert_eq!(parsed.promotions[0].memory_id, 8);
     }
 
     // ── Transcript truncation ────────────────────────────────────────

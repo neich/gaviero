@@ -519,6 +519,23 @@ struct Cli {
     /// the session).
     #[arg(long = "remember-scope", default_value = "repo")]
     remember_scope: String,
+
+    /// List recent session-consolidator runs and exit. Optional count;
+    /// omitting the value (bare `--consolidate-history`) defaults to 10.
+    /// A store read — does not go through the writer.
+    #[arg(
+        long = "consolidate-history",
+        num_args = 0..=1,
+        default_missing_value = "10",
+        value_name = "N"
+    )]
+    consolidate_history: Option<usize>,
+
+    /// Undo one consolidator batch by the id shown as the first column
+    /// of `--consolidate-history` / `/consolidate history`. Goes through
+    /// the writer task. The id is the confirmation (no `--yes`).
+    #[arg(long = "consolidate-rollback", value_name = "BATCH_ID")]
+    consolidate_rollback: Option<String>,
 }
 
 /// CLI observer that prints agent events to stderr.
@@ -1545,6 +1562,87 @@ async fn run_remember_cli(repo: &std::path::Path, text: &str, scope: &str) -> Re
         scope,
         trimmed.len(),
     );
+    Ok(())
+}
+
+async fn open_memory_services(
+    repo: &std::path::Path,
+    what: &str,
+) -> Result<std::sync::Arc<gaviero_core::memory::MemoryServices>> {
+    let repo_buf = repo.to_path_buf();
+    tokio::task::spawn_blocking({
+        let repo_buf = repo_buf.clone();
+        move || -> anyhow::Result<std::sync::Arc<gaviero_core::memory::MemoryServices>> {
+            let workspace = gaviero_core::workspace::Workspace::single_folder(repo_buf.clone());
+            gaviero_core::memory::MemoryServices::open(
+                &repo_buf,
+                &workspace,
+                gaviero_core::memory::ServicesOpts::default(),
+            )
+        }
+    })
+    .await
+    .with_context(|| format!("init MemoryServices ({what})"))?
+}
+
+/// `--consolidate-history [n]`: print the same columns as TUI history.
+async fn run_consolidate_history_cli(repo: &std::path::Path, n: usize) -> Result<()> {
+    let services = open_memory_services(repo, "consolidate-history").await?;
+    let runs = services
+        .stores
+        .workspace()
+        .recent_consolidation_runs(n.max(1))
+        .await
+        .context("reading consolidation history")?;
+    if runs.is_empty() {
+        println!("[gaviero-consolidate-history] no consolidation runs recorded yet.");
+        return Ok(());
+    }
+    println!("Consolidation history (newest first):");
+    for r in runs {
+        println!(
+            "  {}  {}/{} applied{}{}  {}  (session {})",
+            r.batch_id,
+            r.applied,
+            r.ops,
+            r.scope
+                .as_deref()
+                .map(|s| format!("  [{s}]"))
+                .unwrap_or_default(),
+            if r.rolled_back { "  (rolled back)" } else { "" },
+            r.started_at,
+            r.run_id,
+        );
+    }
+    println!("\nUndo one with: gaviero-cli --consolidate-rollback <id>");
+    Ok(())
+}
+
+/// `--consolidate-rollback <batch_id>`: inverse ops through the writer.
+async fn run_consolidate_rollback_cli(repo: &std::path::Path, batch_id: &str) -> Result<()> {
+    let services = open_memory_services(repo, "consolidate-rollback").await?;
+    let outcome = services
+        .writer
+        .consolidation_rollback(batch_id.to_string())
+        .await
+        .with_context(|| format!("consolidation_rollback {batch_id}"))?;
+    let mut out = format!(
+        "[gaviero-consolidate-rollback] {}: {} operation(s) reversed",
+        outcome.batch_id, outcome.reversed
+    );
+    if outcome.skipped > 0 {
+        out.push_str(&format!(", {} skipped (never applied)", outcome.skipped));
+    }
+    if !outcome.failed.is_empty() {
+        out.push_str(&format!(
+            ".\n{} inverse operation(s) failed:\n  {}",
+            outcome.failed.len(),
+            outcome.failed.join("\n  ")
+        ));
+    } else {
+        out.push('.');
+    }
+    println!("{out}");
     Ok(())
 }
 
@@ -3410,6 +3508,13 @@ async fn main() -> Result<()> {
         return run_remember_cli(&repo, text, &cli.remember_scope).await;
     }
 
+    if let Some(n) = cli.consolidate_history {
+        return run_consolidate_history_cli(&repo, n.max(1)).await;
+    }
+    if let Some(batch_id) = cli.consolidate_rollback.as_deref() {
+        return run_consolidate_rollback_cli(&repo, batch_id).await;
+    }
+
     // ── Tier B / B5: sleeptime hygiene ───────────────────────────
     if cli.sleep {
         return run_sleeptime_cli(&repo, cli.sleep_dry_run).await;
@@ -4523,6 +4628,21 @@ mod tests {
         ])
         .unwrap_err();
         assert!(err.to_string().contains("--workflow"));
+    }
+
+    #[test]
+    fn cli_accepts_consolidate_history_flag() {
+        let bare = Cli::try_parse_from(["gaviero-cli", "--consolidate-history"]).unwrap();
+        assert_eq!(bare.consolidate_history, Some(10));
+
+        let counted = Cli::try_parse_from(["gaviero-cli", "--consolidate-history", "3"]).unwrap();
+        assert_eq!(counted.consolidate_history, Some(3));
+    }
+
+    #[test]
+    fn cli_accepts_consolidate_rollback_flag() {
+        let cli = Cli::try_parse_from(["gaviero-cli", "--consolidate-rollback", "abc"]).unwrap();
+        assert_eq!(cli.consolidate_rollback.as_deref(), Some("abc"));
     }
 
     #[test]

@@ -703,7 +703,7 @@ impl App {
     }
 
     /// Handle `/consolidate history [n]` and
-    /// `/consolidate rollback <run_id>` — Tier H / H1 audit surface.
+    /// `/consolidate rollback <batch_id>` — Tier H / H1 audit surface.
     fn handle_consolidate_command(&mut self) {
         commands::handle_consolidate_command(self);
     }

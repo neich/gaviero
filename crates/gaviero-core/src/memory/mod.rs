@@ -26,6 +26,7 @@ pub mod stores;
 pub mod telemetry;
 pub mod trust_defaults;
 pub mod writer;
+pub(crate) mod writer_session;
 
 pub use annotations::{
     AnnotationFlag, ParsedResponse, TurnAnnotations, apply_short_turn_cap, parse_and_strip,
