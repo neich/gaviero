@@ -34,6 +34,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::acp::client::{propose_delete, propose_write};
+use crate::acp::protocol::{is_subagent_tool_name, subagent_description};
 use crate::context_planner::{ContinuityHandle, ContinuityMode, ProviderProfile};
 use crate::observer::AcpObserver;
 use crate::swarm::backend::cursor::{
@@ -44,6 +45,9 @@ use crate::swarm::backend::shared;
 use crate::swarm::backend::{Capabilities, RetrievalToolset, UnifiedStreamEvent};
 use crate::write_gate::WriteGatePipeline;
 
+use super::background::{
+    PendingBg, bg_status, finish_all_pending_killed, finish_pending_bg, register_pending_bg,
+};
 use super::registry::SessionConstruction;
 use super::{AgentSession, Turn};
 
@@ -288,6 +292,9 @@ impl CursorSession {
         let mut idle_count: u32 = 0;
         let mut cancelled = false;
         let mut session_id_captured: Option<String> = None;
+        let mut pending_bg: Vec<PendingBg> = Vec::new();
+        let mut result_seen = false;
+        let mut killed_bg: Option<usize> = None;
 
         loop {
             let next = tokio::select! {
@@ -308,12 +315,19 @@ impl CursorSession {
                             "cursor subprocess exited during idle wait at {}s",
                             elapsed_secs
                         );
+                        if !pending_bg.is_empty() {
+                            killed_bg = Some(finish_all_pending_killed(
+                                &mut pending_bg,
+                                self.observer.as_ref(),
+                            ));
+                        }
                         break;
                     }
-                    self.observer.on_streaming_status(&format!(
-                        "Working... ({}s elapsed, tools running)",
-                        elapsed_secs
-                    ));
+                    self.observer.on_streaming_status(&if pending_bg.is_empty() {
+                        format!("Working... ({}s elapsed, tools running)", elapsed_secs)
+                    } else {
+                        format!("{} ({}s elapsed)", bg_status(&pending_bg), elapsed_secs)
+                    });
                     continue;
                 }
                 Ok(Ok(Some(line))) => {
@@ -331,6 +345,8 @@ impl CursorSession {
                             &mut pending_writes,
                             &mut error_msg,
                             &mut session_id_captured,
+                            &mut pending_bg,
+                            &mut result_seen,
                         )
                         .await
                     {
@@ -339,6 +355,12 @@ impl CursorSession {
                 }
                 Ok(Ok(None)) => {
                     // EOF without a `result` event — surface stderr if any.
+                    if !pending_bg.is_empty() {
+                        killed_bg = Some(finish_all_pending_killed(
+                            &mut pending_bg,
+                            self.observer.as_ref(),
+                        ));
+                    }
                     break;
                 }
                 Ok(Err(e)) => {
@@ -346,6 +368,13 @@ impl CursorSession {
                     break;
                 }
             }
+        }
+
+        if !pending_bg.is_empty() && killed_bg.is_none() {
+            killed_bg = Some(finish_all_pending_killed(
+                &mut pending_bg,
+                self.observer.as_ref(),
+            ));
         }
 
         if in_thinking {
@@ -552,6 +581,18 @@ impl CursorSession {
             );
         }
 
+        if let Some(n) = killed_bg
+            && !cancelled
+        {
+            self.observer.on_message_complete(
+                "system",
+                &format!(
+                    "Cursor ended the turn while {n} background agent(s) were still running. \
+                     Those agents were stopped with the session and their findings were not returned."
+                ),
+            );
+        }
+
         if error_msg.is_some() && !cancelled {
             anyhow::bail!("cursor turn failed");
         }
@@ -560,7 +601,7 @@ impl CursorSession {
 
     /// Dispatch a single parsed [`CursorEvent`] against the streaming
     /// state. Returns `true` when the caller should break out of the
-    /// streaming loop (terminal `result` event).
+    /// streaming loop (terminal `result` with no in-flight Task/Agent).
     #[allow(clippy::too_many_arguments)]
     async fn dispatch_event(
         &mut self,
@@ -572,6 +613,8 @@ impl CursorSession {
         pending_writes: &mut HashMap<String, (PathBuf, String)>,
         error_msg: &mut Option<String>,
         session_id_captured: &mut Option<String>,
+        pending_bg: &mut Vec<PendingBg>,
+        result_seen: &mut bool,
     ) -> bool {
         match event {
             CursorEvent::SystemInit { session_id, .. } => {
@@ -623,6 +666,18 @@ impl CursorSession {
                 self.observer
                     .on_streaming_status(&format!("Using {}...", tool_label));
 
+                if is_subagent_tool_name(&tool_label) {
+                    let args: serde_json::Value =
+                        serde_json::from_str(&args_json).unwrap_or(serde_json::Value::Null);
+                    register_pending_bg(
+                        pending_bg,
+                        "",
+                        &id,
+                        &subagent_description(&args),
+                        self.observer.as_ref(),
+                    );
+                }
+
                 // Snapshot the target file BEFORE the tool finishes. The
                 // CLI runs the tool concurrently with NDJSON emission, so
                 // by the time we see `completed` the file may already
@@ -663,13 +718,21 @@ impl CursorSession {
                 }
                 false
             }
-            CursorEvent::ToolCallCompleted { id, .. } => {
-                // We only track pending writes for snapshot bookkeeping;
-                // the actual content comparison happens against on-disk
-                // state after the stream ends so racy mid-stream reads
-                // don't matter. Drop the pending entry so the map stays
-                // bounded.
+            CursorEvent::ToolCallCompleted { id, name, .. } => {
                 pending_writes.remove(&id);
+                if is_subagent_tool_name(&tool_display_name(&name)) {
+                    finish_pending_bg(
+                        pending_bg,
+                        "",
+                        &id,
+                        "completed",
+                        "",
+                        self.observer.as_ref(),
+                    );
+                    if *result_seen && pending_bg.is_empty() {
+                        return true;
+                    }
+                }
                 false
             }
             CursorEvent::ResultSuccess { text, usage, .. } => {
@@ -692,7 +755,13 @@ impl CursorSession {
                 if full_text.is_empty() && !text.is_empty() {
                     *full_text = text;
                 }
-                true
+                *result_seen = true;
+                if pending_bg.is_empty() {
+                    true
+                } else {
+                    self.observer.on_streaming_status(&bg_status(pending_bg));
+                    false
+                }
             }
             CursorEvent::ResultError { message, usage } => {
                 if let Some(u) = usage.as_ref() {
