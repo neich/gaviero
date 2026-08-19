@@ -287,6 +287,12 @@ pub fn map_acp_event(event: &StreamEvent) -> Vec<UnifiedStreamEvent> {
         StreamEvent::SystemInit { .. } => {
             // Filtered out — not meaningful for the unified stream
         }
+        StreamEvent::TaskStarted { .. }
+        | StreamEvent::TaskNotification { .. }
+        | StreamEvent::UserToolResults { .. } => {
+            // Chat-path background-agent lifecycle. Swarm units run to
+            // `result` on the parent; these events are informational.
+        }
         StreamEvent::Unknown(_) => {
             // Filtered out — forward-compatibility passthrough
         }
@@ -412,7 +418,9 @@ mod tests {
             tool_uses: vec![ToolUseInfo {
                 name: "Read".into(),
                 input: input.clone(),
+                id: "toolu_1".into(),
             }],
+            parent_tool_use_id: None,
         });
         assert_eq!(events.len(), 2);
         assert_eq!(

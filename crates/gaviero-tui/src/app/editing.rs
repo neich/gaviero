@@ -655,7 +655,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
 
                     if app.side_panel == SidePanelMode::AgentChat {
                         // Prompt input: place cursor / start drag-select.
-                        if !app.chat_state.active_conv_streaming()
+                        if !app.chat_state.active_conv_busy()
                             && app
                                 .chat_state
                                 .input_area_cache
@@ -952,7 +952,7 @@ fn scroll_chat_output(app: &mut App, delta: i32) {
     } else {
         app.chat_state.scroll_offset = app.chat_state.scroll_offset.saturating_add(delta as usize);
     }
-    if app.chat_state.active_conv_streaming() {
+    if app.chat_state.active_conv_busy() {
         app.chat_state.user_scrolled_during_stream = true;
     }
 }
@@ -1161,7 +1161,7 @@ fn scroll_side_panel(app: &mut App, up: bool, col: u16, row: u16) {
             if chat_wheel_prefers_input(
                 over_conv,
                 app.chat_state.input_overflows_viewport(panel_w),
-                app.chat_state.active_conv_streaming(),
+                app.chat_state.active_conv_busy(),
             ) {
                 let delta = theme::MOUSE_SCROLL_DELTA as i32;
                 let moved = app
@@ -1180,7 +1180,7 @@ fn scroll_side_panel(app: &mut App, up: bool, col: u16, row: u16) {
                     .scroll_offset
                     .saturating_add(theme::MOUSE_SCROLL_DELTA)
             };
-            if app.chat_state.active_conv_streaming() {
+            if app.chat_state.active_conv_busy() {
                 app.chat_state.user_scrolled_during_stream = true;
             }
         }

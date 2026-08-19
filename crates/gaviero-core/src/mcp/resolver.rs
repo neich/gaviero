@@ -362,7 +362,21 @@ pub fn resolve_mcp_config_synth(
         extra_servers,
         permissions: resolve_mcp_permissions(workspace, Some(root)),
         bash: resolve_bash_permissions(workspace, Some(root)),
+        available_tools: resolve_available_tools(workspace, Some(root)),
     }
+}
+
+/// `agent.availableTools` after the workspace cascade (hardcoded default
+/// is the Claude fallback set: Read/Glob/Grep/Write/Edit/MultiEdit, no
+/// Bash). Always `Some` unless the resolved value is not an array.
+fn resolve_available_tools(workspace: &Workspace, root: Option<&Path>) -> Option<Vec<String>> {
+    let val = workspace.resolve_setting(S::AGENT_AVAILABLE_TOOLS, root);
+    val.as_array().map(|arr| {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()))
+            .map(String::from)
+            .collect()
+    })
 }
 
 #[cfg(test)]
@@ -396,6 +410,35 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::single_folder(dir.path().to_path_buf());
         assert!(resolve_bash_permissions(&ws, Some(dir.path())).is_empty());
+    }
+
+    #[test]
+    fn resolve_available_tools_defaults_without_bash() {
+        // Hardcoded default matches Claude's DEFAULT_AVAILABLE_TOOLS (no
+        // Bash). Synth uses this same list so Cursor `--force` cannot
+        // reopen Shell when the workspace never opted in.
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::single_folder(dir.path().to_path_buf());
+        let tools = resolve_available_tools(&ws, Some(dir.path())).expect("default is an array");
+        assert!(tools.contains(&"Read".to_string()));
+        assert!(tools.contains(&"Write".to_string()));
+        assert!(!tools.contains(&"Bash".to_string()));
+    }
+
+    #[test]
+    fn resolve_available_tools_reads_settings_array() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".gaviero")).unwrap();
+        std::fs::write(
+            dir.path().join(".gaviero/settings.json"),
+            r#"{"agent":{"availableTools":["Read","Edit"]}}"#,
+        )
+        .unwrap();
+        let ws = Workspace::single_folder(dir.path().to_path_buf());
+        assert_eq!(
+            resolve_available_tools(&ws, Some(dir.path())).as_deref(),
+            Some(["Read".to_string(), "Edit".to_string()].as_slice())
+        );
     }
 
     #[test]

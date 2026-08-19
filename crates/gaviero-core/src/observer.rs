@@ -150,6 +150,18 @@ pub trait AcpObserver: Send + Sync {
     /// cost (sum of per-round API usage). Drives the chat status-bar cost
     /// indicator for DeepSeek and future API providers.
     fn on_turn_cost_usd(&self, _cost: f64) {}
+
+    /// Claude Code Task/Agent, Cursor Task, or Codex collab item launched
+    /// in the background (or a `task_started` system event arrived). The
+    /// parent turn may emit `result` before this agent finishes — hosts
+    /// should keep the conversation busy and show the description until
+    /// [`Self::on_background_task_finished`].
+    fn on_background_task_started(&self, _task_id: &str, _description: &str) {}
+
+    /// A previously started background Task/Agent reached a terminal state
+    /// (`completed` / `failed` / `stopped`) or the parent process exited
+    /// while it was still running (`killed`).
+    fn on_background_task_finished(&self, _task_id: &str, _status: &str, _summary: &str) {}
 }
 
 /// One file touched by the in-process tool-agent harness this turn.

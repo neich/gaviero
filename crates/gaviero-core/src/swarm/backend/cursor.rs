@@ -30,6 +30,8 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::acp::protocol::is_subagent_tool_name;
+
 use super::shared::{build_enriched_prompt, default_editor_system_prompt};
 use super::{
     AgentBackend, Capabilities, CompletionRequest, RetrievalToolset, StopReason, TokenUsage,
@@ -357,6 +359,8 @@ async fn drive_cursor_stdout_unified(
     tx: tokio::sync::mpsc::Sender<Result<UnifiedStreamEvent>>,
 ) -> Result<()> {
     let mut lines = BufReader::new(stdout).lines();
+    let mut pending_subagents: u32 = 0;
+    let mut deferred_result: Option<CursorEvent> = None;
     loop {
         // See the codex driver: `closed()` is the only signal that arrives
         // when the subprocess has gone silent, so it is what lets a dropped
@@ -370,10 +374,46 @@ async fn drive_cursor_stdout_unified(
         let Some(event) = parse_cursor_event(&line) else {
             continue;
         };
+        match &event {
+            CursorEvent::ToolCallStarted { name, .. }
+                if is_subagent_tool_name(&tool_display_name(name)) =>
+            {
+                pending_subagents += 1;
+            }
+            CursorEvent::ToolCallCompleted { name, .. }
+                if is_subagent_tool_name(&tool_display_name(name)) =>
+            {
+                pending_subagents = pending_subagents.saturating_sub(1);
+            }
+            _ => {}
+        }
+        let defer_result = pending_subagents > 0
+            && matches!(
+                &event,
+                CursorEvent::ResultSuccess { .. } | CursorEvent::ResultError { .. }
+            );
+        if defer_result {
+            deferred_result = Some(event);
+            continue;
+        }
         for unified in cursor_event_to_unified(event) {
             if tx.send(Ok(unified)).await.is_err() {
                 return Ok(()); // receiver dropped
             }
+        }
+        if pending_subagents == 0
+            && let Some(deferred) = deferred_result.take()
+        {
+            for unified in cursor_event_to_unified(deferred) {
+                if tx.send(Ok(unified)).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    if let Some(deferred) = deferred_result.take() {
+        for unified in cursor_event_to_unified(deferred) {
+            let _ = tx.send(Ok(unified)).await;
         }
     }
     Ok(())
@@ -941,6 +981,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_task_tool_call_started() {
+        let line = r#"{"type":"tool_call","subtype":"started","call_id":"t-1","tool_call":{"taskToolCall":{"args":{"description":"search papers","runInBackground":true,"prompt":"go"}}},"session_id":"s-1","timestamp_ms":1}"#;
+        let ev = parse_cursor_event(line).expect("should parse");
+        let CursorEvent::ToolCallStarted {
+            id,
+            name,
+            args_json,
+        } = ev
+        else {
+            panic!("expected ToolCallStarted");
+        };
+        assert_eq!(id, "t-1");
+        assert_eq!(name, "taskToolCall");
+        assert_eq!(tool_display_name(&name), "Task");
+        let parsed: Value = serde_json::from_str(&args_json).unwrap();
+        assert!(crate::acp::protocol::is_background_subagent_tool(
+            "Task",
+            &parsed
+        ));
+        assert_eq!(
+            crate::acp::protocol::subagent_description(&parsed),
+            "search papers"
+        );
+    }
+
+    #[test]
     fn parse_result_success_extracts_usage_and_text() {
         let line = r#"{"type":"result","subtype":"success","duration_ms":7948,"duration_api_ms":7948,"is_error":false,"result":"done","session_id":"s-1","request_id":"r-1","usage":{"inputTokens":10,"outputTokens":3,"cacheReadTokens":0,"cacheWriteTokens":0}}"#;
         let ev = parse_cursor_event(line).expect("should parse");
@@ -1003,6 +1069,8 @@ mod tests {
         assert_eq!(tool_display_name("editToolCall"), "Edit");
         assert_eq!(tool_display_name("bashToolCall"), "Bash");
         assert_eq!(tool_display_name("searchToolCall"), "Search");
+        assert_eq!(tool_display_name("taskToolCall"), "Task");
+        assert_eq!(tool_display_name("agentToolCall"), "Agent");
     }
 
     #[test]

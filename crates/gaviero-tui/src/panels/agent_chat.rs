@@ -513,6 +513,10 @@ pub struct Conversation {
     pub streaming_status: String,
     /// When streaming started, for elapsed time display.
     pub streaming_started_at: Option<Instant>,
+    /// Provider Task/Agent subagents still running after the parent
+    /// turn emitted `result`. Shown in the chat transcript; also keeps
+    /// the prompt locked via [`AgentChatState::active_conv_busy`].
+    pub background_agents: Vec<BackgroundAgent>,
     /// Persistent auto-approve for this conversation (toggled via `/autoapprove`).
     pub auto_approve: bool,
     /// Pending permission request waiting for user approval (y/n).
@@ -608,6 +612,18 @@ impl Conversation {
     pub fn bump_revision(&mut self) {
         self.conv_revision += 1;
     }
+
+    pub fn has_running_background_agents(&self) -> bool {
+        self.background_agents.iter().any(|a| !a.finished)
+    }
+}
+
+/// One Claude Code background Task/Agent attached to a conversation.
+#[derive(Debug, Clone)]
+pub struct BackgroundAgent {
+    pub id: String,
+    pub description: String,
+    pub finished: bool,
 }
 
 /// Context-window pressure shown in the status bar and `/context`.
@@ -752,6 +768,7 @@ impl AgentChatState {
             is_streaming: false,
             streaming_status: String::new(),
             streaming_started_at: None,
+            background_agents: Vec::new(),
             auto_approve: false,
             pending_permission: None,
             pending_turn_id: None,
@@ -868,6 +885,13 @@ impl AgentChatState {
     /// Is the active conversation currently streaming?
     pub fn active_conv_streaming(&self) -> bool {
         self.active_conversation().is_streaming
+    }
+
+    /// Streaming or waiting on background Task/Agent subagents.
+    /// Used to lock the prompt so a second user turn cannot race the first.
+    pub fn active_conv_busy(&self) -> bool {
+        let conv = self.active_conversation();
+        conv.is_streaming || conv.has_running_background_agents()
     }
 
     /// Is the active conversation waiting for a permission decision?
@@ -2189,6 +2213,7 @@ impl AgentChatState {
             is_streaming: false,
             streaming_status: String::new(),
             streaming_started_at: None,
+            background_agents: Vec::new(),
             auto_approve: false,
             pending_permission: None,
             pending_turn_id: None,
@@ -2401,7 +2426,7 @@ impl AgentChatState {
     pub fn input_prompt_label(&self) -> &'static str {
         if self.renaming {
             "Rename: "
-        } else if self.active_conv_streaming() {
+        } else if self.active_conv_busy() {
             "Ctrl+C to cancel"
         } else if self.effective_auto_approve() {
             "[auto-approve] > "
@@ -3443,6 +3468,49 @@ impl AgentChatState {
         conv.push_message(ChatRole::Assistant, marker, vec![tool_name.to_string()]);
     }
 
+    pub fn background_task_started_to(&mut self, conv_id: &str, task_id: &str, description: &str) {
+        let Some(idx) = self.find_conv_idx(conv_id) else {
+            return;
+        };
+        let conv = &mut self.conversations[idx];
+        if let Some(existing) = conv.background_agents.iter_mut().find(|a| a.id == task_id) {
+            existing.description = description.to_string();
+            existing.finished = false;
+        } else {
+            conv.background_agents.push(BackgroundAgent {
+                id: task_id.to_string(),
+                description: description.to_string(),
+                finished: false,
+            });
+        }
+        conv.streaming_status = background_status_label(&conv.background_agents);
+        conv.bump_revision();
+        if idx == self.active_conv {
+            self.auto_scroll_during_stream();
+        }
+    }
+
+    pub fn background_task_finished_to(
+        &mut self,
+        conv_id: &str,
+        task_id: &str,
+        _status: &str,
+        _summary: &str,
+    ) {
+        let Some(idx) = self.find_conv_idx(conv_id) else {
+            return;
+        };
+        let conv = &mut self.conversations[idx];
+        if let Some(agent) = conv.background_agents.iter_mut().find(|a| a.id == task_id) {
+            agent.finished = true;
+        }
+        conv.streaming_status = background_status_label(&conv.background_agents);
+        conv.bump_revision();
+        if idx == self.active_conv {
+            self.auto_scroll_during_stream();
+        }
+    }
+
     /// Append a compact file proposal summary to the assistant's current streaming message.
     /// Displayed as `[wrote path/to/file.rs +N -M]` inline in the chat output.
     pub fn append_deferred_summary(
@@ -3502,13 +3570,27 @@ impl AgentChatState {
                 .rev()
                 .find(|m| m.role == ChatRole::Assistant)
             {
-                msg.content = clean;
+                if clean.is_empty() {
+                    // Keep streamed tool markers / subagent text when the
+                    // model produced no prose (background-Task-only turns).
+                    // Still strip a trailing annotations sidecar so that
+                    // case does not leave JSON on screen.
+                    let stripped = gaviero_core::memory::parse_and_strip(&msg.content).stripped;
+                    if stripped.trim().is_empty() {
+                        msg.content = clean;
+                    } else {
+                        msg.content = stripped;
+                    }
+                } else {
+                    msg.content = clean;
+                }
             } else if !clean.is_empty() {
                 self.conversations[idx].push_message(chat_role, clean, Vec::new());
             }
             self.conversations[idx].is_streaming = false;
             self.conversations[idx].streaming_status.clear();
             self.conversations[idx].streaming_started_at = None;
+            self.conversations[idx].background_agents.clear();
             if idx == self.active_conv {
                 self.scroll_to_bottom();
             }
@@ -3523,6 +3605,7 @@ impl AgentChatState {
                 self.conversations[idx].is_streaming = false;
                 self.conversations[idx].streaming_status.clear();
                 self.conversations[idx].streaming_started_at = None;
+                self.conversations[idx].background_agents.clear();
                 if idx == self.active_conv {
                     self.scroll_to_bottom();
                 }
@@ -3537,6 +3620,7 @@ impl AgentChatState {
         self.conversations[idx].is_streaming = false;
         self.conversations[idx].streaming_status.clear();
         self.conversations[idx].streaming_started_at = None;
+        self.conversations[idx].background_agents.clear();
         if idx == self.active_conv {
             self.scroll_to_bottom();
         }
@@ -3635,6 +3719,7 @@ impl AgentChatState {
                     is_streaming: false,
                     streaming_status: String::new(),
                     streaming_started_at: None,
+                    background_agents: Vec::new(),
                     auto_approve: false,
                     pending_permission: None,
                     pending_turn_id: None,
@@ -3893,11 +3978,12 @@ impl AgentChatState {
 
             let bullet_style = Style::default().fg(theme::SUCCESS).bg(bg);
             for (idx, ch) in label.chars().enumerate() {
-                let (out_ch, out_style) = if idx == 0 && conv.is_streaming {
-                    ('●', bullet_style)
-                } else {
-                    (ch, style)
-                };
+                let (out_ch, out_style) =
+                    if idx == 0 && (conv.is_streaming || conv.has_running_background_agents()) {
+                        ('●', bullet_style)
+                    } else {
+                        (ch, style)
+                    };
                 if x < area.x + area.width && x < buf.area().right() {
                     buf[(x, area.y)].set_char(out_ch).set_style(out_style);
                     x += 1;
@@ -4016,12 +4102,17 @@ impl AgentChatState {
             lines.push((Vec::new(), None));
         }
 
-        // Streaming indicator with animated spinner
-        if self.active_conv_streaming() {
+        // Streaming / background-agent indicator with animated spinner
+        if self.active_conv_busy() {
             let spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
             // Advance every ~6 ticks (~200ms at 33ms/tick)
             let frame = spinner_frames[(self.tick_count / 6) as usize % spinner_frames.len()];
             let conv = &self.conversations[self.active_conv];
+            let running: Vec<&BackgroundAgent> = conv
+                .background_agents
+                .iter()
+                .filter(|a| !a.finished)
+                .collect();
             let status = &conv.streaming_status;
             let label = if status.is_empty() {
                 "Thinking..."
@@ -4047,6 +4138,16 @@ impl AgentChatState {
                 }],
                 None,
             ));
+            let agent_style = Style::default().fg(theme::TEXT_DIM);
+            for agent in running {
+                lines.push((
+                    vec![crate::panels::chat_markdown::StyledSegment {
+                        text: format!("  • {}", agent.description),
+                        style: agent_style,
+                    }],
+                    None,
+                ));
+            }
         }
 
         // Cache rendered line texts + message index for mouse text selection
@@ -4076,11 +4177,11 @@ impl AgentChatState {
                     self.scroll_offset = last.saturating_sub(viewport - 1);
                 }
             }
-        } else if self.active_conv_streaming() && !self.user_scrolled_during_stream {
+        } else if self.active_conv_busy() && !self.user_scrolled_during_stream {
             // During streaming, keep the bottom visible unless the user
             // manually scrolled away to read earlier output.
             self.scroll_offset = total.saturating_sub(viewport);
-        } else if self.active_conv_streaming() && self.user_scrolled_during_stream {
+        } else if self.active_conv_busy() && self.user_scrolled_during_stream {
             // User scrolled away during streaming — if they've scrolled back
             // near the bottom, re-engage auto-scroll.
             if self.scroll_offset + viewport >= total {
@@ -4319,7 +4420,7 @@ impl AgentChatState {
         let text_width = (area.width as usize).saturating_sub(prompt_len);
         let total_rows = area.height as usize;
 
-        if self.text_input.text.is_empty() && !self.active_conv_streaming() {
+        if self.text_input.text.is_empty() && !self.active_conv_busy() {
             // Hint text
             let hint = "Type a message, Enter to send";
             let hint_style = Style::default().fg(theme::TEXT_DIM).bg(bg);
@@ -4388,7 +4489,7 @@ impl AgentChatState {
             }
 
             // Position cursor
-            if focused && !self.active_conv_streaming() {
+            if focused && !self.active_conv_busy() {
                 let visible_cursor_line = cursor_line.saturating_sub(scroll);
                 if visible_cursor_line < total_rows {
                     let y = area.y + visible_cursor_line as u16;
@@ -4898,6 +4999,15 @@ fn filter_file_blocks_for_display(text: &str) -> String {
 fn filter_assistant_for_display(text: &str) -> String {
     let collapsed = filter_file_blocks_for_display(text);
     gaviero_core::memory::parse_and_strip(&collapsed).stripped
+}
+
+fn background_status_label(agents: &[BackgroundAgent]) -> String {
+    let running: Vec<&BackgroundAgent> = agents.iter().filter(|a| !a.finished).collect();
+    match running.len() {
+        0 => String::new(),
+        1 => format!("Background agent: {}", running[0].description),
+        n => format!("{n} background agents running"),
+    }
 }
 
 #[cfg(test)]
@@ -5719,6 +5829,54 @@ mod tests {
                 .filter(|m| m.role == ChatRole::Assistant)
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn finalize_empty_keeps_streamed_tool_markers() {
+        let mut state = AgentChatState::new();
+        let conv_id = state.active_conversation_id().to_string();
+        state.add_tool_call_to(&conv_id, "Task (background): search papers");
+        state.finalize_message_to(&conv_id, "assistant", "");
+        let assistant = state.conversations[state.active_conv]
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == ChatRole::Assistant)
+            .expect("assistant message");
+        assert!(
+            assistant
+                .content
+                .contains("Task (background): search papers"),
+            "empty model result must not wipe streamed tool markers: {:?}",
+            assistant.content
+        );
+    }
+
+    #[test]
+    fn background_agents_lock_the_prompt() {
+        let mut state = AgentChatState::new();
+        let conv_id = state.active_conversation_id().to_string();
+        assert!(!state.active_conv_busy());
+        assert_eq!(state.input_prompt_label(), "> ");
+
+        state.background_task_started_to(&conv_id, "task_1", "search papers");
+        state.background_task_started_to(&conv_id, "task_2", "scan patents");
+        assert!(state.active_conv_busy());
+        assert_eq!(state.input_prompt_label(), "Ctrl+C to cancel");
+        assert_eq!(
+            state.conversations[state.active_conv].streaming_status,
+            "2 background agents running"
+        );
+
+        state.background_task_finished_to(&conv_id, "task_1", "completed", "");
+        assert!(state.active_conv_busy());
+        state.background_task_finished_to(&conv_id, "task_2", "completed", "");
+        assert!(!state.active_conv_busy());
+        assert!(
+            state.conversations[state.active_conv]
+                .streaming_status
+                .is_empty()
         );
     }
 

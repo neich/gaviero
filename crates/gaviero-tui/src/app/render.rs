@@ -1199,7 +1199,7 @@ pub(super) fn render_quit_confirm(app: &App, frame: &mut Frame, area: Rect) {
         .chat_state
         .conversations
         .iter()
-        .filter(|c| c.is_streaming)
+        .filter(|c| c.is_streaming || c.has_running_background_agents())
         .map(|c| c.title.clone())
         .collect();
 

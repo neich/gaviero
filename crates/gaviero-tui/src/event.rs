@@ -50,6 +50,19 @@ pub enum Event {
         conv_id: String,
         status: String,
     },
+    /// Claude / Cursor / Codex Task/Agent launched in the background.
+    BackgroundTaskStarted {
+        conv_id: String,
+        task_id: String,
+        description: String,
+    },
+    /// Background Task/Agent reached a terminal state (or was killed on parent exit).
+    BackgroundTaskFinished {
+        conv_id: String,
+        task_id: String,
+        status: String,
+        summary: String,
+    },
     MessageComplete {
         conv_id: String,
         role: String,

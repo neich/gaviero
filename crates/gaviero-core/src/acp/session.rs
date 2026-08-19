@@ -475,6 +475,11 @@ impl AcpSession {
         if options.suppress_hooks {
             cmd.env("CLAUDE_QUIET", "1");
         }
+        // Forward nested Task/Agent transcripts into stream-json so the
+        // host can show background-agent progress. Env form is ignored by
+        // CLIs that predate the flag (v2.1.211+); an argv flag would fail
+        // spawn on older builds.
+        cmd.env("CLAUDE_CODE_FORWARD_SUBAGENT_TEXT", "1");
 
         tracing::info!(
             "Spawning claude: model={}, cwd={}, prompt_len={}, via_tempfile={}",

@@ -553,7 +553,7 @@ impl App {
         if self.focus != Focus::SidePanel || self.side_panel != SidePanelMode::AgentChat {
             return;
         }
-        if self.chat_state.active_conv_streaming() {
+        if self.chat_state.active_conv_busy() {
             return;
         }
         let _ = side_panel::try_attach_clipboard_image(self);
@@ -580,7 +580,7 @@ impl App {
     }
 
     pub fn active_agent_chat_stream_visible(&self) -> bool {
-        self.agent_chat_visible() && self.chat_state.active_conv_streaming()
+        self.agent_chat_visible() && self.chat_state.active_conv_busy()
     }
 
     /// Workspace-aware bootstrap projection inputs for the context indicator.

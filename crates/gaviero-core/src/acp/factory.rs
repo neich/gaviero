@@ -292,7 +292,8 @@ fn spawn_persistent(
         .stdout(Stdio::piped())
         .stderr(Stdio::null()) // Persistent sessions don't capture stderr
         .stdin(Stdio::piped())
-        .kill_on_drop(true);
+        .kill_on_drop(true)
+        .env("CLAUDE_CODE_FORWARD_SUBAGENT_TEXT", "1");
 
     tracing::info!(
         "Spawning persistent claude session: model={}, cwd={}",

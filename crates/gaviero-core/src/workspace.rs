@@ -48,9 +48,11 @@ pub mod settings {
     /// through the Write Gate; opt in per-workspace to enable shell.
     pub const AGENT_AVAILABLE_TOOLS: &str = "agent.availableTools";
     /// Subset of `agent.availableTools` auto-approved without a permission
-    /// prompt (passed via `--allowedTools` for Claude; in-process tool-agent
-    /// backends honor the same list). Anything available but not approved
-    /// triggers a `PermissionRequest` that the host must answer.
+    /// prompt (passed via `--allowedTools` for Claude; Cursor/Codex and
+    /// in-process tool-agent backends honor the same list). Anything available
+    /// but not approved triggers a `PermissionRequest` that the host must
+    /// answer (Codex cannot prompt, so unapproved commands fall back to
+    /// cargo-verification only).
     pub const AGENT_APPROVED_TOOLS: &str = "agent.approvedTools";
     /// Shell permission policy, defined once here and applied to every
     /// backend. Sub-keys: `denylist`, `allowlist`, `timeoutSecs`,
@@ -882,10 +884,12 @@ impl Workspace {
 
     /// Resolve the agent tool surface for the given workspace root.
     ///
-    /// Returns `(available, approved)`. `available` becomes `--tools`
-    /// on the Claude subprocess; `approved` becomes `--allowedTools`
-    /// (auto-approved). Anything in `approved` not also in `available`
-    /// is dropped — Claude rejects unknown tools in `--allowedTools`.
+    /// Returns `(available, approved)`. `available` is the host-owned tool
+    /// list every provider must honour: Claude `--tools`, Cursor
+    /// `.cursor/cli.json` deny rules, Codex command/file approval, and the
+    /// in-process tool-agent registry. `approved` is the auto-approve
+    /// subset (Claude `--allowedTools`, Codex host-side allow). Anything
+    /// in `approved` not also in `available` is dropped.
     pub fn resolve_agent_tools(&self, root: Option<&Path>) -> (Vec<String>, Vec<String>) {
         let available: Vec<String> = self
             .resolve_setting(settings::AGENT_AVAILABLE_TOOLS, root)
