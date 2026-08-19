@@ -449,7 +449,9 @@ pub fn apply_remote_prompt(
             "unknown conversation",
         ));
     };
-    if app.chat_state.conversations[idx].is_streaming {
+    if app.chat_state.conversations[idx].is_streaming
+        || app.chat_state.conversations[idx].has_running_background_agents()
+    {
         return Err(CommandFailure::new(
             ErrorCode::ConversationStreaming,
             "conversation is already streaming",

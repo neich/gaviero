@@ -101,7 +101,7 @@ pub(crate) fn conversation_summary_dto(app: &App, idx: usize) -> rdto::Conversat
         model: conv.model_override.clone(),
         effort: conv.effort_override.clone(),
         namespace: conv.namespace_override.clone(),
-        is_streaming: conv.is_streaming,
+        is_streaming: conv.is_streaming || conv.has_running_background_agents(),
         pending_turn_id: conv.pending_turn_id.clone(),
         context_pressure: context_pressure_dto(app, idx),
         auto_approve: conv.auto_approve,
@@ -492,6 +492,7 @@ pub fn project_hot_event(app: &App, event: &Event) -> Option<ServerFrame> {
                 status: status.clone(),
             }))
         }
+        Event::BackgroundTaskStarted { .. } | Event::BackgroundTaskFinished { .. } => None,
         Event::TurnTokenUsage { conv_id, usage } => {
             Some(ServerFrame::TokenUsage(renv::TokenUsageEvent {
                 conv_id: conv_id.clone(),

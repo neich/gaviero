@@ -404,7 +404,7 @@ pub(super) fn try_quit(app: &mut App) {
         .chat_state
         .conversations
         .iter()
-        .filter(|c| c.is_streaming)
+        .filter(|c| c.is_streaming || c.has_running_background_agents())
         .count();
 
     let running_swarm = app

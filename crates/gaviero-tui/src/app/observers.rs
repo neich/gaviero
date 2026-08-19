@@ -125,6 +125,23 @@ impl AcpObserver for TuiAcpObserver {
         });
     }
 
+    fn on_background_task_started(&self, task_id: &str, description: &str) {
+        let _ = self.tx.send(Event::BackgroundTaskStarted {
+            conv_id: self.conv_id.clone(),
+            task_id: task_id.to_string(),
+            description: description.to_string(),
+        });
+    }
+
+    fn on_background_task_finished(&self, task_id: &str, status: &str, summary: &str) {
+        let _ = self.tx.send(Event::BackgroundTaskFinished {
+            conv_id: self.conv_id.clone(),
+            task_id: task_id.to_string(),
+            status: status.to_string(),
+            summary: summary.to_string(),
+        });
+    }
+
     fn on_permission_request(
         &self,
         tool_name: &str,

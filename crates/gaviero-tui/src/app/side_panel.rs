@@ -50,7 +50,7 @@ fn chat_panel_content_width(app: &App) -> u16 {
 
 /// Up in chat: move within wrapped/multiline input, else message history, else scroll output.
 pub(super) fn handle_chat_cursor_up(app: &mut App) {
-    if app.chat_state.active_conv_streaming() {
+    if app.chat_state.active_conv_busy() {
         app.chat_state.scroll_chat_up();
         app.chat_state.user_scrolled_during_stream = true;
         return;
@@ -70,7 +70,7 @@ pub(super) fn handle_chat_cursor_up(app: &mut App) {
 
 /// Down in chat: move within wrapped/multiline input, else message history, else scroll output.
 pub(super) fn handle_chat_cursor_down(app: &mut App) {
-    if app.chat_state.active_conv_streaming() {
+    if app.chat_state.active_conv_busy() {
         app.chat_state.scroll_chat_down();
         app.chat_state.user_scrolled_during_stream = true;
         return;
@@ -231,8 +231,7 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
             return;
         }
         Action::Enter => {
-            if !app.chat_state.text_input.text.is_empty() && !app.chat_state.active_conv_streaming()
-            {
+            if !app.chat_state.text_input.text.is_empty() && !app.chat_state.active_conv_busy() {
                 if app.batch_review.is_some() {
                     app.status_message = Some((
                         "Exit review first (f: apply, Esc: discard)".to_string(),
@@ -345,7 +344,7 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
             ));
         }
         Action::InsertChar(ch) => {
-            if !app.chat_state.active_conv_streaming() {
+            if !app.chat_state.active_conv_busy() {
                 app.chat_state.insert_char(ch);
                 app.refresh_chat_autocomplete();
             }
@@ -376,28 +375,28 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
         Action::CursorDown => handle_chat_cursor_down(app),
         Action::PageUp => {
             let panel_w = chat_panel_content_width(app);
-            if !app.chat_state.active_conv_streaming()
+            if !app.chat_state.active_conv_busy()
                 && app.chat_state.input_overflows_viewport(panel_w)
                 && app.chat_state.scroll_input_by_visual_lines(-10, panel_w)
             {
                 // Prompt taller than the input box — page within it first.
             } else {
                 app.chat_state.scroll_offset = app.chat_state.scroll_offset.saturating_sub(20);
-                if app.chat_state.active_conv_streaming() {
+                if app.chat_state.active_conv_busy() {
                     app.chat_state.user_scrolled_during_stream = true;
                 }
             }
         }
         Action::PageDown => {
             let panel_w = chat_panel_content_width(app);
-            if !app.chat_state.active_conv_streaming()
+            if !app.chat_state.active_conv_busy()
                 && app.chat_state.input_overflows_viewport(panel_w)
                 && app.chat_state.scroll_input_by_visual_lines(10, panel_w)
             {
                 // Prompt taller than the input box — page within it first.
             } else {
                 app.chat_state.scroll_offset = app.chat_state.scroll_offset.saturating_add(20);
-                if app.chat_state.active_conv_streaming() {
+                if app.chat_state.active_conv_busy() {
                     app.chat_state.user_scrolled_during_stream = true;
                 }
             }
@@ -411,13 +410,13 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
             }
         }
         Action::Paste => {
-            if !app.chat_state.active_conv_streaming() {
+            if !app.chat_state.active_conv_busy() {
                 app.clear_windows_ctrl_v_pending();
                 app.chat_paste_from_clipboard();
             }
         }
         Action::Copy => {
-            if app.chat_state.active_conv_streaming() {
+            if app.chat_state.active_conv_busy() {
                 app.cancel_agent();
             } else if had_output_selection {
                 // Copy the mouse/keyboard-selected text from the chat output
@@ -436,7 +435,7 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
             }
         }
         Action::SelectUp => {
-            if !app.chat_state.active_conv_streaming() {
+            if !app.chat_state.active_conv_busy() {
                 let panel_w = chat_panel_content_width(app);
                 if !app.chat_state.select_up_in_input(panel_w) {
                     app.chat_state.select_up_in_output();
@@ -444,7 +443,7 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
             }
         }
         Action::SelectDown => {
-            if !app.chat_state.active_conv_streaming() {
+            if !app.chat_state.active_conv_busy() {
                 let panel_w = chat_panel_content_width(app);
                 if !app.chat_state.select_down_in_input(panel_w) {
                     app.chat_state.select_down_in_output();
@@ -1846,7 +1845,9 @@ pub(crate) fn dispatch_prompt_core(
         return Err("unknown conversation".to_string());
     };
     let conv_id = conv_id.to_string();
-    if app.chat_state.conversations[conv_idx].is_streaming {
+    if app.chat_state.conversations[conv_idx].is_streaming
+        || app.chat_state.conversations[conv_idx].has_running_background_agents()
+    {
         return Err("conversation is already streaming".to_string());
     }
     // Remote dispatch cannot grant codex MCP trust — that consent dialog is
@@ -2855,6 +2856,7 @@ pub(crate) fn cancel_agent_conv(app: &mut App, conv_id: &str) {
                 let conv = &mut app.chat_state.conversations[idx];
                 conv.is_streaming = false;
                 conv.streaming_started_at = None;
+                conv.background_agents.clear();
                 conv.bump_revision();
             }
         } else {

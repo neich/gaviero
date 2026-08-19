@@ -273,6 +273,23 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 app.chat_state.conversations[idx].streaming_status = status;
             }
         }
+        Event::BackgroundTaskStarted {
+            conv_id,
+            task_id,
+            description,
+        } => {
+            app.chat_state
+                .background_task_started_to(&conv_id, &task_id, &description);
+        }
+        Event::BackgroundTaskFinished {
+            conv_id,
+            task_id,
+            status,
+            summary,
+        } => {
+            app.chat_state
+                .background_task_finished_to(&conv_id, &task_id, &status, &summary);
+        }
         Event::MessageComplete {
             conv_id,
             role,
@@ -1646,7 +1663,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 app.note_windows_ctrl_v();
             }
             app.maybe_windows_image_paste_fallback();
-            if app.chat_state.active_conv_streaming() {
+            if app.chat_state.active_conv_busy() {
                 app.chat_state.tick_count = app.chat_state.tick_count.wrapping_add(1);
             }
         }
@@ -1682,14 +1699,14 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
             match action {
                 Action::PageUp => {
                     app.chat_state.scroll_offset = app.chat_state.scroll_offset.saturating_sub(20);
-                    if app.chat_state.active_conv_streaming() {
+                    if app.chat_state.active_conv_busy() {
                         app.chat_state.user_scrolled_during_stream = true;
                     }
                     return;
                 }
                 Action::PageDown => {
                     app.chat_state.scroll_offset = app.chat_state.scroll_offset.saturating_add(20);
-                    if app.chat_state.active_conv_streaming() {
+                    if app.chat_state.active_conv_busy() {
                         app.chat_state.user_scrolled_during_stream = true;
                     }
                     return;
@@ -1904,7 +1921,7 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
         }
         Action::ToggleTerminal => {
             if app.focus == Focus::SidePanel && matches!(app.side_panel, SidePanelMode::AgentChat) {
-                if !app.chat_state.active_conv_streaming() {
+                if !app.chat_state.active_conv_busy() {
                     app.chat_state.insert_char('\n');
                 }
                 return;

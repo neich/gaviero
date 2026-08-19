@@ -138,7 +138,9 @@ impl RenderScheduler {
         match event {
             event::Event::StreamChunk { conv_id, .. }
             | event::Event::ToolCallStarted { conv_id, .. }
-            | event::Event::StreamingStatus { conv_id, .. } => {
+            | event::Event::StreamingStatus { conv_id, .. }
+            | event::Event::BackgroundTaskStarted { conv_id, .. }
+            | event::Event::BackgroundTaskFinished { conv_id, .. } => {
                 self.should_render_chat_stream_event(conv_id, app)
             }
             event::Event::Tick => self.should_render_tick(app),
