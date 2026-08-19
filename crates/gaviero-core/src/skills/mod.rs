@@ -38,6 +38,10 @@ pub struct SkillWarning {
     pub message: String,
 }
 
+/// `SkillWarning::name` when a configured `skills.extraRoots` path is
+/// missing, unreadable, or not an array.
+pub const EXTRA_ROOT_WARNING_NAME: &str = "skills.extraRoots";
+
 impl Skill {
     pub fn render(&self, args: &[String], raw_arguments: &str) -> String {
         template::substitute(&self.body, args, raw_arguments, &self.arguments)

@@ -107,11 +107,14 @@ Settings cascade (highest priority first):
     "ollamaBaseUrl": "http://localhost:11434",
     "coordinator": { "model": "claude:opus" }
   },
-  "memory": { "namespace": "my-project" }
+  "memory": { "namespace": "my-project" },
+  "skills": { "extraRoots": ["~/.claude/skills", "~/.codex/skills"] }
 }
 ```
 
 Language-specific overrides: `"[rust]": { "editor.tabSize": 4 }`.
+
+`skills.extraRoots` is an optional array of extra skill directories (default `[]`, `~`/`~/` expanded). Typical values are `"~/.claude/skills"` and `"~/.codex/skills"`. A configured path that does not exist or is unreadable is shown as a chat system message. Unqualified `$name` still prefers a workspace/repo/global skill over a foreign one; collisions complete as `$source/name`.
 
 ### Agent notifications
 

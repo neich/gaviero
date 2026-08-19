@@ -1633,7 +1633,7 @@ pub(super) fn handle_skills_command(app: &mut App) {
     } else {
         let skills = app.skill_catalog.all_skills();
         let body = if skills.is_empty() {
-            "No skills found. Add skill folders under `.gaviero/skills/<name>/SKILL.md` (repo, workspace, or `~/.gaviero/skills/`).".to_string()
+            "No skills found. Add skill folders under `.gaviero/skills/<name>/SKILL.md` (repo, workspace, or `~/.gaviero/skills/`), or set `skills.extraRoots` (e.g. `~/.claude/skills`).".to_string()
         } else {
             skills
                 .iter()

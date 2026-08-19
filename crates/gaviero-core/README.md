@@ -74,6 +74,7 @@ Reads `.gaviero/settings.json` (cascade documented in [gaviero-tui](../gaviero-t
 | `memory.retrieval.mode` | merged | `merged` (multi-scope RRF) or `cascade` (legacy) |
 | `memory.reranker.enabled` | `true` | Cross-encoder reranker |
 | `repoMap.symbolEnrichment.enabled` | `false` | Enables `symbol_search` / `symbol_doc` MCP tools |
+| `skills.extraRoots` | `[]` | Extra skill directories (`~` expanded); missing roots warn in the TUI |
 
 ## API
 
