@@ -32,7 +32,7 @@ use crate::acp::client::{
     PROCESS_WAIT_TIMEOUT, STREAM_IDLE_TIMEOUT, format_tool_summary, is_auth_error, propose_delete,
     propose_write,
 };
-use crate::acp::protocol::StreamEvent;
+use crate::acp::protocol::{StreamEvent, is_background_subagent_tool, subagent_description};
 use crate::acp::session::{AcpSession, AgentOptions};
 use crate::context_planner::{ContinuityHandle, ContinuityMode, ProviderProfile};
 use crate::observer::AcpObserver;
@@ -41,6 +41,9 @@ use crate::swarm::backend::UnifiedStreamEvent;
 use crate::swarm::backend::shared;
 use crate::write_gate::WriteGatePipeline;
 
+use super::background::{
+    PendingBg, bg_status, finish_all_pending_killed, finish_pending_bg, register_pending_bg,
+};
 use super::registry::SessionConstruction;
 use super::{AgentSession, Turn};
 
@@ -301,6 +304,8 @@ impl ClaudeSession {
         let mut read_count: usize = 0;
         let mut idle_count: u32 = 0;
         let mut cancelled = false;
+        let mut pending_bg: Vec<PendingBg> = Vec::new();
+        let mut result_seen = false;
 
         loop {
             // Cancellation is checked first (`biased`) so a token fired while
@@ -334,10 +339,12 @@ impl ClaudeSession {
                         self.observer.on_message_complete("system", &msg);
                         break;
                     }
-                    self.observer.on_streaming_status(&format!(
-                        "Working... ({}s elapsed, tools running)",
-                        elapsed_secs
-                    ));
+                    self.observer
+                        .on_streaming_status(&if pending_bg.is_empty() {
+                            format!("Working... ({}s elapsed, tools running)", elapsed_secs)
+                        } else {
+                            format!("{} ({}s elapsed)", bg_status(&pending_bg), elapsed_secs)
+                        });
                     tracing::debug!(
                         "Stream idle for {}s, subprocess still alive — sending keepalive",
                         elapsed_secs
@@ -371,8 +378,25 @@ impl ClaudeSession {
                                     .on_streaming_status(&format!("Using {}...", tool_name));
                             }
                             StreamEvent::ToolInputDelta(_) => {}
-                            StreamEvent::AssistantMessage { text, tool_uses } => {
-                                if full_text.is_empty() && !text.is_empty() {
+                            StreamEvent::AssistantMessage {
+                                text,
+                                tool_uses,
+                                parent_tool_use_id,
+                            } => {
+                                if let Some(parent) = parent_tool_use_id.as_deref() {
+                                    if !text.is_empty() {
+                                        let label = pending_bg
+                                            .iter()
+                                            .find(|p| {
+                                                p.tool_use_id == parent || p.task_id == parent
+                                            })
+                                            .map(|p| p.description.as_str())
+                                            .unwrap_or("agent");
+                                        let chunk = format!("\n[{label}] {text}");
+                                        full_text.push_str(&chunk);
+                                        self.observer.on_stream_chunk(&chunk);
+                                    }
+                                } else if full_text.is_empty() && !text.is_empty() {
                                     full_text = text;
                                 }
                                 for tu in &tool_uses {
@@ -382,6 +406,15 @@ impl ClaudeSession {
                                         &self.workspace_root,
                                     );
                                     self.observer.on_tool_call_started(&summary);
+                                    if is_background_subagent_tool(&tu.name, &tu.input) {
+                                        register_pending_bg(
+                                            &mut pending_bg,
+                                            "",
+                                            &tu.id,
+                                            &subagent_description(&tu.input),
+                                            self.observer.as_ref(),
+                                        );
+                                    }
                                 }
                                 for tu in &tool_uses {
                                     if matches!(tu.name.as_str(), "Write" | "Edit" | "MultiEdit") {
@@ -430,6 +463,54 @@ impl ClaudeSession {
                                     }
                                 }
                             }
+                            StreamEvent::TaskStarted {
+                                task_id,
+                                tool_use_id,
+                                description,
+                            } => {
+                                register_pending_bg(
+                                    &mut pending_bg,
+                                    &task_id,
+                                    &tool_use_id,
+                                    &description,
+                                    self.observer.as_ref(),
+                                );
+                            }
+                            StreamEvent::TaskNotification {
+                                task_id,
+                                tool_use_id,
+                                status,
+                                summary,
+                            } => {
+                                finish_pending_bg(
+                                    &mut pending_bg,
+                                    &task_id,
+                                    &tool_use_id,
+                                    &status,
+                                    &summary,
+                                    self.observer.as_ref(),
+                                );
+                                if result_seen && pending_bg.is_empty() {
+                                    self.observer.on_message_complete("assistant", &full_text);
+                                    break;
+                                }
+                            }
+                            StreamEvent::UserToolResults { tool_use_ids } => {
+                                for id in &tool_use_ids {
+                                    finish_pending_bg(
+                                        &mut pending_bg,
+                                        "",
+                                        id,
+                                        "completed",
+                                        "",
+                                        self.observer.as_ref(),
+                                    );
+                                }
+                                if result_seen && pending_bg.is_empty() {
+                                    self.observer.on_message_complete("assistant", &full_text);
+                                    break;
+                                }
+                            }
                             StreamEvent::ResultEvent {
                                 is_error,
                                 result_text,
@@ -459,13 +540,21 @@ impl ClaudeSession {
                                         format!("Error: {}", result_text)
                                     };
                                     self.observer.on_message_complete("system", &msg);
-                                } else {
-                                    if full_text.is_empty() && !result_text.is_empty() {
-                                        full_text = result_text.clone();
-                                    }
-                                    self.observer.on_message_complete("assistant", &full_text);
+                                    break;
                                 }
-                                break;
+                                if full_text.is_empty() && !result_text.is_empty() {
+                                    full_text = result_text.clone();
+                                }
+                                result_seen = true;
+                                if pending_bg.is_empty() {
+                                    self.observer.on_message_complete("assistant", &full_text);
+                                    break;
+                                }
+                                // Parent ended its turn after launching
+                                // background Task agents. Stay on the stream
+                                // until they finish or the subprocess exits —
+                                // dropping now would kill_on_drop those children.
+                                self.observer.on_streaming_status(&bg_status(&pending_bg));
                             }
                             StreamEvent::PermissionRequest {
                                 tool_name,
@@ -522,7 +611,22 @@ impl ClaudeSession {
                             StreamEvent::Unknown(_) => {}
                         },
                         Ok(None) => {
-                            if !full_text.is_empty() {
+                            if !pending_bg.is_empty() {
+                                let n = finish_all_pending_killed(
+                                    &mut pending_bg,
+                                    self.observer.as_ref(),
+                                );
+                                if !full_text.is_empty() {
+                                    self.observer.on_message_complete("assistant", &full_text);
+                                }
+                                self.observer.on_message_complete(
+                                    "system",
+                                    &format!(
+                                        "Claude ended the turn while {n} background agent(s) were still running. \
+                                         Those agents were stopped with the session and their findings were not returned."
+                                    ),
+                                );
+                            } else if !full_text.is_empty() {
                                 self.observer.on_message_complete("assistant", &full_text);
                             } else {
                                 let exit_status = match tokio::time::timeout(
