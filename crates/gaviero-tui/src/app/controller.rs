@@ -193,7 +193,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
         }
         Event::FileChanged(path) => {
             invalidate_repo_map(app);
-            if gaviero_core::skills::SkillCatalog::needs_rebuild(&path) {
+            if app.skill_catalog.needs_rebuild_for(&path) {
                 app.rebuild_skill_catalog();
             }
             app.handle_file_changed(&path);

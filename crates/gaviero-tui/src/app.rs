@@ -372,7 +372,7 @@ impl App {
             Box::new(observer),
         )));
 
-        Self {
+        let mut app = Self {
             workspace,
             buffers: Vec::new(),
             active_buffer: 0,
@@ -473,7 +473,9 @@ impl App {
             last_clipboard_image_attach: None,
             last_text_paste: None,
             windows_paste_settle_until: None,
-        }
+        };
+        emit_extra_root_skill_warnings(&mut app, &skill_load_warnings);
+        app
     }
 
     /// Handle an incoming event.
@@ -557,7 +559,7 @@ impl App {
         let _ = side_panel::try_attach_clipboard_image(self);
     }
 
-    /// Rescan skill roots after a `.gaviero/skills/` file change.
+    /// Rescan skill roots after a `.gaviero/skills/` or extra-root file change.
     pub fn rebuild_skill_catalog(&mut self) {
         let global = gaviero_core::skills::SkillCatalog::global_skills_dir();
         let (fresh, warnings) = gaviero_core::skills::SkillCatalog::scan(&self.workspace, &global);
@@ -565,6 +567,7 @@ impl App {
             tracing::warn!("skill catalog rebuild: {} — {}", w.name, w.message);
         }
         self.skill_catalog = Arc::new(fresh);
+        emit_extra_root_skill_warnings(self, &warnings);
     }
 
     pub fn agent_chat_visible(&self) -> bool {
@@ -1263,6 +1266,15 @@ fn parse_git_allow_list(workspace: &Workspace) -> Vec<String> {
 ///   3 → code+notes   [ 0, 60, 40]
 fn parse_layout_presets(workspace: &Workspace) -> Vec<LayoutPreset> {
     layout::parse_layout_presets(workspace)
+}
+
+fn emit_extra_root_skill_warnings(app: &mut App, warnings: &[gaviero_core::skills::SkillWarning]) {
+    for w in warnings {
+        if w.name == gaviero_core::skills::EXTRA_ROOT_WARNING_NAME {
+            app.chat_state
+                .add_system_message(&format!("Skill warning ({}): {}", w.name, w.message));
+        }
+    }
 }
 
 /// List files in a workspace directory (up to `limit`), for the task planner.

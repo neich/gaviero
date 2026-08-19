@@ -108,7 +108,7 @@ workflow review_and_fix {
 gaviero-cli --script review.gaviero --prompt "the auth module"
 ```
 
-**Skills** — turn-scoped instruction templates under `.gaviero/skills/<name>/SKILL.md`, invoked in chat with `$skill-name`. Use `/skills` to list or `/skills search <query>` for semantic discovery.
+**Skills** — turn-scoped instruction templates under `.gaviero/skills/<name>/SKILL.md`, invoked in chat with `$skill-name`. Use `/skills` to list or `/skills search <query>` for semantic discovery. Optional `skills.extraRoots` (array of paths, default `[]`, `~` expanded) adds foreign roots such as `~/.claude/skills` or `~/.codex/skills`; a missing configured root is a chat warning, not a silent skip.
 
 ## Configuration
 

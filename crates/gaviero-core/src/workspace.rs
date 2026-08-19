@@ -280,6 +280,13 @@ pub mod settings {
     pub const REMOTE_MAX_FRAME_BYTES: &str = "remote.maxFrameBytes";
     pub const REMOTE_MAX_PROMPT_BYTES: &str = "remote.maxPromptBytes";
     pub const REMOTE_COMMAND_RATE_PER_SECOND: &str = "remote.commandRatePerSecond";
+
+    /// Extra skill roots scanned in addition to `.gaviero/skills` and
+    /// `~/.gaviero/skills`. JSON array of paths (a lone string is also
+    /// accepted); `~` / `~/…` / `~\…` expanded. Default `[]` — no extra
+    /// filesystem reads. Typical entries: `"~/.claude/skills"`,
+    /// `"~/.codex/skills"`.
+    pub const SKILLS_EXTRA_ROOTS: &str = "skills.extraRoots";
 }
 
 /// Canonical workspace identity (Plan A §3.3) — the ONE portable helper
@@ -753,6 +760,22 @@ impl Workspace {
             return val;
         }
         self.resolve_setting(key, root)
+    }
+
+    /// Resolve `skills.extraRoots` as tilde-expanded paths.
+    ///
+    /// Empty default: no extra filesystem reads. A lone JSON string is
+    /// treated as a one-element array. Non-array/non-string values yield
+    /// an empty vec (the catalog emits a `SkillWarning`).
+    pub fn resolve_skill_extra_roots(&self, root: Option<&Path>) -> Vec<PathBuf> {
+        extra_root_paths_from_value(&self.resolve_setting(settings::SKILLS_EXTRA_ROOTS, root))
+    }
+
+    /// True when `skills.extraRoots` is set to something that is neither
+    /// an array, a string, nor null.
+    pub fn skill_extra_roots_is_malformed(&self, root: Option<&Path>) -> bool {
+        let val = self.resolve_setting(settings::SKILLS_EXTRA_ROOTS, root);
+        !val.is_array() && !val.is_null() && val.as_str().is_none()
     }
 
     /// Resolve the write namespace (where new memories are stored).
@@ -1271,8 +1294,45 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::REMOTE_MAX_PROMPT_BYTES => serde_json::json!(131_072),
         settings::REMOTE_COMMAND_RATE_PER_SECOND => serde_json::json!(10),
 
+        // H3 PR-9 — opt-in foreign skill roots (empty = no extra FS reads).
+        settings::SKILLS_EXTRA_ROOTS => serde_json::json!([]),
+
         _ => serde_json::Value::Null,
     }
+}
+
+/// Expand a leading `~` / `~/` / `~\` to the user's home directory.
+pub fn expand_tilde_path(raw: &str) -> PathBuf {
+    let raw = raw.trim();
+    if raw == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+    }
+    let rest = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\"));
+    if let Some(rest) = rest
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
+    }
+    PathBuf::from(raw)
+}
+
+fn extra_root_paths_from_value(val: &serde_json::Value) -> Vec<PathBuf> {
+    if let Some(s) = val.as_str() {
+        let s = s.trim();
+        if s.is_empty() {
+            return Vec::new();
+        }
+        return vec![expand_tilde_path(s)];
+    }
+    let Some(arr) = val.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(expand_tilde_path)
+        .collect()
 }
 
 fn canonicalize_path(p: &Path) -> PathBuf {
@@ -1354,6 +1414,56 @@ mod tests {
         assert_eq!(
             ws.resolve_setting("editor.tabSize", None),
             serde_json::json!(4)
+        );
+    }
+
+    #[test]
+    fn extra_roots_default_empty() {
+        let ws = Workspace::single_folder(PathBuf::from("/tmp/test"));
+        assert_eq!(
+            ws.resolve_setting(settings::SKILLS_EXTRA_ROOTS, None),
+            serde_json::json!([])
+        );
+        assert!(ws.resolve_skill_extra_roots(None).is_empty());
+        assert!(!ws.skill_extra_roots_is_malformed(None));
+    }
+
+    #[test]
+    fn extra_roots_tilde_and_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let gaviero_dir = dir.path().join(".gaviero");
+        fs::create_dir_all(&gaviero_dir).unwrap();
+        fs::write(
+            gaviero_dir.join("settings.json"),
+            r#"{ "skills": { "extraRoots": ["~/.claude/skills", "  ", "C:/abs/codex"] } }"#,
+        )
+        .unwrap();
+        let ws = Workspace::single_folder(dir.path().to_path_buf());
+        let roots = ws.resolve_skill_extra_roots(None);
+        assert_eq!(roots.len(), 2);
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(roots[0], home.join(".claude").join("skills"));
+        }
+        assert_eq!(roots[1], PathBuf::from("C:/abs/codex"));
+    }
+
+    #[test]
+    fn extra_roots_accepts_lone_string() {
+        let val = serde_json::json!("~/.codex/skills");
+        let roots = extra_root_paths_from_value(&val);
+        assert_eq!(roots.len(), 1);
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(roots[0], home.join(".codex").join("skills"));
+        }
+    }
+
+    #[test]
+    fn expand_tilde_path_identity_for_absolute() {
+        let p = expand_tilde_path(" /tmp/skills ");
+        assert_eq!(p, PathBuf::from("/tmp/skills"));
+        assert_eq!(
+            expand_tilde_path("~"),
+            dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"))
         );
     }
 
