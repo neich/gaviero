@@ -96,12 +96,14 @@
 //! approvals must run with `approvalPolicy: "never"` until a future event
 //! variant is added.
 
+pub(crate) mod background;
 pub mod claude;
 pub mod codex_app_server;
 pub mod codex_exec;
 pub mod cursor;
 pub mod ollama;
 pub mod registry;
+pub(crate) mod tool_surface;
 pub mod tool_agent;
 
 use std::path::PathBuf;
