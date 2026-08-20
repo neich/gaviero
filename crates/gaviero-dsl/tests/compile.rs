@@ -348,7 +348,7 @@ fn example_codebase_review() {
     assert_eq!(plan.loop_judge_units[0].id, "halt_judge");
     assert_eq!(
         plan.loop_judge_units[0].model.as_deref(),
-        Some("claude:sonnet-5")
+        Some("claude:sonnet")
     );
     assert!(plan.loop_judge_units[0].produces.is_empty());
     assert!(
@@ -378,16 +378,19 @@ fn example_codebase_review() {
             .model
             .clone()
     };
-    assert_eq!(model_of("inventory").as_deref(), Some("claude:sonnet-5"));
+    assert_eq!(model_of("inventory").as_deref(), Some("claude:sonnet"));
     assert_eq!(model_of("review_module").as_deref(), Some("claude:opus"));
-    assert_eq!(model_of("synthesize").as_deref(), Some("claude:sonnet-5"));
+    assert_eq!(model_of("synthesize").as_deref(), Some("claude:sonnet"));
 
     let inventory = units.iter().find(|u| u.id == "inventory").unwrap();
     assert_eq!(
         inventory.produces,
         vec!["reviews/latest/inventory.md".to_string()]
     );
-    assert!(inventory.extra_allowed_tools.is_empty());
+    assert_eq!(
+        inventory.extra_allowed_tools,
+        vec!["WebSearch".to_string(), "WebFetch".to_string()]
+    );
 
     let review = units.iter().find(|u| u.id == "review_module").unwrap();
     assert_eq!(review.depends_on, vec!["inventory"]);
@@ -407,7 +410,10 @@ fn example_codebase_review() {
         !review.coordinator_instructions.contains("HALTED:"),
         "review body must not own loop halt via a HALTED token"
     );
-    assert!(review.extra_allowed_tools.is_empty());
+    assert_eq!(
+        review.extra_allowed_tools,
+        vec!["WebSearch".to_string(), "WebFetch".to_string()]
+    );
     assert!(
         review
             .scope
@@ -438,11 +444,80 @@ fn example_codebase_review() {
         vec!["reviews/latest/summary.md".to_string()]
     );
     assert_eq!(
+        synthesize.extra_allowed_tools,
+        vec!["WebSearch".to_string(), "WebFetch".to_string()]
+    );
+    assert_eq!(
+        plan.loop_judge_units[0].extra_allowed_tools,
+        vec!["WebSearch".to_string(), "WebFetch".to_string()]
+    );
+    assert_eq!(
         synthesize.write_namespace.as_deref(),
         Some("review-history")
     );
     assert_eq!(synthesize.memory_importance, Some(0.9));
     assert!(synthesize.memory_write_content.is_some());
+}
+
+#[test]
+fn codebase_review_param_overrides_reviewer() {
+    let path = std::path::PathBuf::from(format!(
+        "{}/examples/codebase_review.gaviero",
+        env!("CARGO_MANIFEST_DIR")
+    ));
+    let plan = gaviero_dsl::compile_file(
+        &path,
+        None,
+        None,
+        &[],
+        &[],
+        &[("reviewer".to_string(), "codex:gpt-5.6-sol@high".to_string())],
+    )
+    .expect("compile codebase_review with --param reviewer");
+    let units = plan.work_units_ordered().expect("toposort");
+    let model_of = |id: &str| -> Option<String> {
+        units
+            .iter()
+            .chain(plan.loop_judge_units.iter())
+            .find(|u| u.id == id)
+            .unwrap_or_else(|| panic!("agent {id} not found"))
+            .model
+            .clone()
+    };
+    assert_eq!(
+        model_of("review_module").as_deref(),
+        Some("codex:gpt-5.6-sol")
+    );
+    assert_eq!(model_of("inventory").as_deref(), Some("claude:sonnet"));
+    assert_eq!(model_of("halt_judge").as_deref(), Some("claude:sonnet"));
+    assert_eq!(model_of("synthesize").as_deref(), Some("claude:sonnet"));
+}
+
+#[test]
+fn codebase_review_param_overrides_both_roles() {
+    let path = std::path::PathBuf::from(format!(
+        "{}/examples/codebase_review.gaviero",
+        env!("CARGO_MANIFEST_DIR")
+    ));
+    let plan = gaviero_dsl::compile_file(
+        &path,
+        None,
+        None,
+        &[],
+        &[],
+        &[
+            ("reviewer".to_string(), "codex:gpt-5.6-sol@high".to_string()),
+            ("judge".to_string(), "codex:gpt-5.6-luna@medium".to_string()),
+        ],
+    )
+    .expect("compile codebase_review with both --param overrides");
+    let units = plan.work_units_ordered().expect("toposort");
+    let review = units.iter().find(|u| u.id == "review_module").unwrap();
+    let inventory = units.iter().find(|u| u.id == "inventory").unwrap();
+    assert_eq!(review.model.as_deref(), Some("codex:gpt-5.6-sol"));
+    assert_eq!(review.effort.as_deref(), Some("high"));
+    assert_eq!(inventory.model.as_deref(), Some("codex:gpt-5.6-luna"));
+    assert_eq!(inventory.effort.as_deref(), Some("medium"));
 }
 
 #[test]
@@ -507,6 +582,47 @@ fn compile_example_plan(filename: &str) -> gaviero_core::swarm::plan::CompiledPl
         .unwrap_or_else(|e| panic!("compiling {}:\n{:?}", filename, e))
 }
 
+#[test]
+fn codebase_review_var_relocates_out_dir() {
+    let path = std::path::PathBuf::from(format!(
+        "{}/examples/codebase_review.gaviero",
+        env!("CARGO_MANIFEST_DIR")
+    ));
+    let plan = gaviero_dsl::compile_file(
+        &path,
+        None,
+        None,
+        &[("OUT_DIR".to_string(), "reviews/opus".to_string())],
+        &[],
+        &[],
+    )
+    .expect("compile codebase_review with --var OUT_DIR");
+    let units = plan.work_units_ordered().expect("toposort");
+    let inventory = units.iter().find(|u| u.id == "inventory").unwrap();
+    assert_eq!(
+        inventory.produces,
+        vec!["reviews/opus/inventory.md".to_string()]
+    );
+    assert!(
+        inventory
+            .coordinator_instructions
+            .contains("reviews/opus/inventory.md"),
+        "prompt must use the overridden OUT_DIR, got {}",
+        inventory.coordinator_instructions
+    );
+    assert!(
+        !inventory
+            .coordinator_instructions
+            .contains("reviews/latest/inventory.md"),
+        "default OUT_DIR must not remain in the inventory prompt"
+    );
+    let review = units.iter().find(|u| u.id == "review_module").unwrap();
+    assert_eq!(
+        review.produces,
+        vec!["reviews/opus/review-{{ITER}}.md".to_string()]
+    );
+}
+
 // ── Template compilation tests ─────────────────────────────────────
 
 #[test]
@@ -514,7 +630,10 @@ fn template_update_docs() {
     let plan = compile_example_plan("update_docs.gaviero");
     let units = plan.work_units_ordered().expect("toposort");
     assert_eq!(units.len(), 5);
-    let inventory = units.iter().find(|u| u.id == "inventory").expect("inventory");
+    let inventory = units
+        .iter()
+        .find(|u| u.id == "inventory")
+        .expect("inventory");
     // Default profile is doc-cursor.gaviero (inventory → grok). The Cursor CLI
     // id embeds the effort level, so `clients.gaviero` pins the full id.
     assert_eq!(
@@ -558,8 +677,8 @@ fn update_docs_tiers_file_overrides_profile() {
     let examples = std::path::PathBuf::from(format!("{}/examples", env!("CARGO_MANIFEST_DIR")));
     let entry = examples.join("update_docs.gaviero");
     let codex_profile = examples.join("profiles/doc-codex.gaviero");
-    let overrides = gaviero_dsl::load_tier_overrides(&codex_profile)
-        .expect("load codex tiers profile");
+    let overrides =
+        gaviero_dsl::load_tier_overrides(&codex_profile).expect("load codex tiers profile");
     let plan = gaviero_dsl::compile_file(&entry, None, None, &[], &overrides, &[])
         .expect("compile with --tiers-file overrides");
     let inventory = plan
@@ -608,7 +727,9 @@ fn template_plan_refinement() {
     );
 
     assert!(
-        crefine.coordinator_instructions.contains("providers in this panel"),
+        crefine
+            .coordinator_instructions
+            .contains("providers in this panel"),
         "claude-refine should mention peer panel"
     );
     assert!(
@@ -620,7 +741,9 @@ fn template_plan_refinement() {
         "claude-refine should list cursor as a peer"
     );
     assert!(
-        crefine.coordinator_instructions.contains("PREV_ITER}}` = 0"),
+        crefine
+            .coordinator_instructions
+            .contains("PREV_ITER}}` = 0"),
         "claude-refine should document round-1 behaviour"
     );
     assert!(
@@ -711,8 +834,8 @@ fn template_plan_refinement() {
 
 #[test]
 fn plan_refinement_three_provider_roster() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("examples/plan_refinement.gaviero");
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/plan_refinement.gaviero");
     let plan = gaviero_dsl::compile_file(
         &path,
         Some("feature-plan-refinement"),
@@ -797,8 +920,8 @@ fn template_phased_plan() {
     assert_eq!(model_of("analyse_plan").as_deref(), Some("claude:opus"));
     assert_eq!(model_of("phase_executor").as_deref(), Some("claude:opus"));
     assert_eq!(model_of("final_audit").as_deref(), Some("claude:opus"));
-    assert_eq!(model_of("phase_gate").as_deref(), Some("claude:sonnet-5"));
-    assert_eq!(model_of("phase_judge").as_deref(), Some("claude:sonnet-5"));
+    assert_eq!(model_of("phase_gate").as_deref(), Some("claude:sonnet"));
+    assert_eq!(model_of("phase_judge").as_deref(), Some("claude:sonnet"));
 
     // Dependency chain: phase_executor → analyse_plan; phase_gate →
     // phase_executor; final_audit → phase_gate (loop exit).
@@ -867,8 +990,8 @@ fn template_phased_plan() {
 
 #[test]
 fn compile_file_generic_consensus_with_reviewers() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("examples/generic_consensus.gaviero");
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/generic_consensus.gaviero");
     let plan = gaviero_dsl::compile_file(
         &path,
         Some("generic-consensus"),
@@ -894,12 +1017,11 @@ fn compile_file_generic_consensus_with_reviewers() {
 
 #[test]
 fn generic_consensus_param_roster_override_swaps_to_three_reviewers() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("examples/generic_consensus.gaviero");
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/generic_consensus.gaviero");
     let overrides = vec![(
         "roster".to_string(),
-        "claude=claude:opus@max,codex=codex:gpt-5.5@high,cursor=cursor:composer-2.5"
-            .to_string(),
+        "claude=claude:opus@max,codex=codex:gpt-5.5@high,cursor=cursor:composer-2.5".to_string(),
     )];
     let plan = gaviero_dsl::compile_file(
         &path,
@@ -1093,8 +1215,8 @@ fn scientific_research_judge_uses_client_param_default() {
 
 #[test]
 fn client_param_override_swaps_judge_model() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("examples/generic_consensus.gaviero");
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/generic_consensus.gaviero");
     let overrides = vec![("judge".to_string(), "claude:haiku@low".to_string())];
     let plan = gaviero_dsl::compile_file(
         &path,
@@ -1105,7 +1227,10 @@ fn client_param_override_swaps_judge_model() {
         &overrides,
     )
     .expect("judge param override should compile");
-    assert_eq!(plan.loop_judge_units[0].model.as_deref(), Some("claude:haiku"));
+    assert_eq!(
+        plan.loop_judge_units[0].model.as_deref(),
+        Some("claude:haiku")
+    );
     assert_eq!(plan.loop_judge_units[0].effort.as_deref(), Some("low"));
 }
 
@@ -1119,9 +1244,8 @@ fn client_param_without_default_requires_cli() {
         "  steps [ judge ]\n",
         "}\n",
     );
-    let err =
-        gaviero_dsl::compile_with_vars(src, "inline.gaviero", Some("w"), None, &[], &[], &[])
-            .expect_err("required client param must fail");
+    let err = gaviero_dsl::compile_with_vars(src, "inline.gaviero", Some("w"), None, &[], &[], &[])
+        .expect_err("required client param must fail");
     let msg = format!("{err:?}");
     assert!(
         msg.contains("gate") && (msg.contains("model") || msg.contains("CLI")),
@@ -1131,9 +1255,12 @@ fn client_param_without_default_requires_cli() {
 
 #[test]
 fn generic_consensus_param_roster_missing_provider_is_rejected() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("examples/generic_consensus.gaviero");
-    let overrides = vec![("roster".to_string(), "claude=opus,codex=gpt-5.5".to_string())];
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/generic_consensus.gaviero");
+    let overrides = vec![(
+        "roster".to_string(),
+        "claude=opus,codex=gpt-5.5".to_string(),
+    )];
     let err = gaviero_dsl::compile_file(
         &path,
         Some("generic-consensus"),

@@ -119,7 +119,11 @@ fn dsl_does_not_catch_scope_overlap_swarm_validator_does() {
         !errors.is_empty(),
         "swarm runtime must reject what the DSL silently accepts; got no errors"
     );
-    let msg: String = errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ");
+    let msg: String = errors
+        .iter()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
     assert!(
         msg.to_lowercase().contains("overlap") || msg.to_lowercase().contains("scope"),
         "swarm error must reference scope/overlap; got: {msg}"
@@ -265,8 +269,8 @@ fn coordinator_dsl_independent_agents_collapse_to_one_tier() {
         }
     "##;
 
-    let plan = gaviero_dsl::compile(src, "coordinator-parallel.gaviero", None, None)
-        .expect("DSL compile");
+    let plan =
+        gaviero_dsl::compile(src, "coordinator-parallel.gaviero", None, None).expect("DSL compile");
     let units = plan.work_units_ordered().expect("toposort");
     let tiers = validation::dependency_tiers(&units).expect("tiers");
     assert_eq!(

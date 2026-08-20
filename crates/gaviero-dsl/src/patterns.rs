@@ -44,10 +44,7 @@ fn expand_map_reduce(mr: &MapReducePattern) -> Result<Vec<FanoutOp>, PatternExpa
         });
     }
 
-    let max_spawn = mr
-        .max_spawn
-        .map(|(n, _)| n)
-        .unwrap_or(DEFAULT_MAX_SPAWN);
+    let max_spawn = mr.max_spawn.map(|(n, _)| n).unwrap_or(DEFAULT_MAX_SPAWN);
 
     Ok(vec![FanoutOp {
         after_unit: mr.discover.0.clone(),
