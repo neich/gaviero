@@ -178,12 +178,7 @@ mod tests {
 
     #[test]
     fn available_but_not_approved_uses_allowlist_then_fallback() {
-        let s = surface(
-            Some(&["Read", "Bash"]),
-            &["Read"],
-            &["git status"],
-            &[],
-        );
+        let s = surface(Some(&["Read", "Bash"]), &["Read"], &["git status"], &[]);
         assert_eq!(s.decide_command("git status"), CommandDecision::Allow);
         assert_eq!(
             s.decide_command("npm publish"),
@@ -201,5 +196,4 @@ mod tests {
             CommandDecision::UnattendedFallback
         );
     }
-
 }

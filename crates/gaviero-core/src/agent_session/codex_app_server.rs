@@ -2563,7 +2563,10 @@ url = "https://example/mcp/"
         let active_turn = Arc::new(Mutex::new(Some(ActiveTurn::new(tx))));
         let allowed = command_request(serde_json::json!("git status"), dir.path());
         assert!(command_execution_is_safe_to_approve(&allowed, &active_turn, &review).await);
-        let denied = command_request(serde_json::json!("git push --force origin main"), dir.path());
+        let denied = command_request(
+            serde_json::json!("git push --force origin main"),
+            dir.path(),
+        );
         assert!(!command_execution_is_safe_to_approve(&denied, &active_turn, &review).await);
     }
 

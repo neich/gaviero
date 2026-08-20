@@ -323,11 +323,12 @@ impl CursorSession {
                         }
                         break;
                     }
-                    self.observer.on_streaming_status(&if pending_bg.is_empty() {
-                        format!("Working... ({}s elapsed, tools running)", elapsed_secs)
-                    } else {
-                        format!("{} ({}s elapsed)", bg_status(&pending_bg), elapsed_secs)
-                    });
+                    self.observer
+                        .on_streaming_status(&if pending_bg.is_empty() {
+                            format!("Working... ({}s elapsed, tools running)", elapsed_secs)
+                        } else {
+                            format!("{} ({}s elapsed)", bg_status(&pending_bg), elapsed_secs)
+                        });
                     continue;
                 }
                 Ok(Ok(Some(line))) => {
@@ -721,14 +722,7 @@ impl CursorSession {
             CursorEvent::ToolCallCompleted { id, name, .. } => {
                 pending_writes.remove(&id);
                 if is_subagent_tool_name(&tool_display_name(&name)) {
-                    finish_pending_bg(
-                        pending_bg,
-                        "",
-                        &id,
-                        "completed",
-                        "",
-                        self.observer.as_ref(),
-                    );
+                    finish_pending_bg(pending_bg, "", &id, "completed", "", self.observer.as_ref());
                     if *result_seen && pending_bg.is_empty() {
                         return true;
                     }

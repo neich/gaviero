@@ -71,7 +71,10 @@ fn remember_rejects_invalid_scope() {
         .arg("module")
         .output()
         .expect("spawn gaviero-cli");
-    assert!(!output.status.success(), "module scope should fail headless");
+    assert!(
+        !output.status.success(),
+        "module scope should fail headless"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("/remember-here") || stderr.contains("/remember-module"),
