@@ -405,7 +405,20 @@ pub fn parse_stream_line(line: &str) -> Result<StreamEvent> {
         //                   "cache_read_input_tokens":..,"output_tokens":..}, ...]
         //  }}
         "result" => {
-            let is_error = v.get("subtype").and_then(|s| s.as_str()) == Some("error");
+            // The top-level `is_error` flag is authoritative. Claude Code
+            // reports an API failure with that flag set while `subtype` still
+            // reads "success" — verified on 2.1.235, where an unknown
+            // `--model` yields
+            //   {"type":"result","is_error":true,"subtype":"success",
+            //    "api_error_status":404,"result":"There's an issue with the
+            //    selected model (…)","total_cost_usd":0}
+            // Deriving the flag from `subtype` alone parsed those as clean
+            // turns: the swarm runner saw an empty transcript, fell through to
+            // the `produces` check, and blamed the agent for not writing its
+            // declared output. `subtype == "error"` is kept as a fallback for
+            // CLI versions that only set that.
+            let is_error = v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false)
+                || v.get("subtype").and_then(|s| s.as_str()) == Some("error");
             let result_text = required_str(&v, "result")?;
             let duration_ms = v.get("duration_ms").and_then(|d| d.as_u64());
             let cost_usd = v.get("cost_usd").and_then(|c| c.as_f64());
@@ -1000,6 +1013,37 @@ mod tests {
                 assert!(usage.is_none(), "no usage object in line → None");
             }
             _ => panic!("Expected ResultEvent, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_result_honours_top_level_is_error_over_subtype() {
+        // Real Claude Code 2.1.235 line for `--model sonnet-5` (unknown id):
+        // `is_error` is true while `subtype` still says "success". Reading
+        // only `subtype` made this parse as a successful, empty turn.
+        let line = r#"{"is_error":true,"subtype":"success","api_error_status":404,
+            "result":"There's an issue with the selected model (sonnet-5).",
+            "total_cost_usd":0,"type":"result","duration_ms":1737}"#;
+        match parse_stream_line(line).unwrap() {
+            StreamEvent::ResultEvent {
+                is_error,
+                result_text,
+                ..
+            } => {
+                assert!(is_error, "top-level is_error must win over subtype");
+                assert!(result_text.contains("sonnet-5"));
+            }
+            other => panic!("expected ResultEvent, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_result_error_subtype_still_recognised() {
+        // Fallback path for CLI versions that signal only through `subtype`.
+        let line = r#"{"type":"result","subtype":"error","result":"boom"}"#;
+        match parse_stream_line(line).unwrap() {
+            StreamEvent::ResultEvent { is_error, .. } => assert!(is_error),
+            other => panic!("expected ResultEvent, got {:?}", other),
         }
     }
 

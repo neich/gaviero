@@ -8,6 +8,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::observer::AcpObserver;
+use crate::scope_enforcer::SensitivePolicy;
 use crate::swarm::backend::{CompletionRequest, executor, shared};
 use crate::write_gate::{AutoAcceptAction, WriteGatePipeline};
 
@@ -205,6 +206,19 @@ pub(crate) async fn propose_write(
 ) -> Result<()> {
     let abs_path = workspace_root.join(rel_path);
 
+    // 0. Sensitive-path rail. Deliberately ahead of — and independent of —
+    // the scope check: `owned_paths` is agent-supplied and routinely `.`, so
+    // it must not be the only thing between a model and `.env`.
+    if let Some(reason) = SensitivePolicy::resolve(workspace_root).refusal(rel_path) {
+        tracing::warn!(
+            "Blocked write by agent '{}' to sensitive path '{}': {}",
+            agent_id,
+            rel_path.display(),
+            reason
+        );
+        return Ok(());
+    }
+
     // 1. Scope check + collect conflict peers + allocate ID. Same-path
     // collisions now pair into a conflict set rather than dropping the
     // later proposal silently.
@@ -336,6 +350,18 @@ pub(crate) async fn propose_delete(
     original_content: &str,
 ) -> Result<()> {
     let abs_path = workspace_root.join(rel_path);
+
+    // Same rail as `propose_write`: deleting a secret is destroying it, so the
+    // block-list applies to removals too.
+    if let Some(reason) = SensitivePolicy::resolve(workspace_root).refusal(rel_path) {
+        tracing::warn!(
+            "Blocked delete by agent '{}' of sensitive path '{}': {}",
+            agent_id,
+            rel_path.display(),
+            reason
+        );
+        return Ok(());
+    }
 
     let (id, is_deferred, conflict_peers) = {
         let mut gate = write_gate.lock().await;

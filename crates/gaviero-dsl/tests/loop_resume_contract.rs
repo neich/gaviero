@@ -64,12 +64,18 @@ fn compiler_populates_the_fields_resume_depends_on() {
         Some("plans/research-consensus-ux"),
         "OUT_DIR must reach LoopConfig or resume cannot find the artefacts"
     );
-    assert_eq!(lc.agent_ids.len(), 3, "one loop body agent per roster entry");
+    assert_eq!(
+        lc.agent_ids.len(),
+        3,
+        "one loop body agent per roster entry"
+    );
 
     let units = plan.work_units_unordered();
     let map = unit_map(&units);
     for agent_id in &lc.agent_ids {
-        let unit = map.get(agent_id.as_str()).expect("loop agent is a work unit");
+        let unit = map
+            .get(agent_id.as_str())
+            .expect("loop agent is a work unit");
         assert!(
             !unit.scope.owned_paths.is_empty(),
             "{agent_id} has no owned paths — resume cannot attribute artefacts"

@@ -81,7 +81,8 @@ pub(crate) fn finish_pending_bg(
 ) {
     let idx = pending.iter().position(|p| {
         (!task_id.is_empty() && (p.task_id == task_id || p.host_id == task_id))
-            || (!tool_use_id.is_empty() && (p.tool_use_id == tool_use_id || p.host_id == tool_use_id))
+            || (!tool_use_id.is_empty()
+                && (p.tool_use_id == tool_use_id || p.host_id == tool_use_id))
     });
     let Some(idx) = idx else {
         return;

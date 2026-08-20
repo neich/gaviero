@@ -997,8 +997,7 @@ mod tests {
         assert_eq!(tool_display_name(&name), "Task");
         let parsed: Value = serde_json::from_str(&args_json).unwrap();
         assert!(crate::acp::protocol::is_background_subagent_tool(
-            "Task",
-            &parsed
+            "Task", &parsed
         ));
         assert_eq!(
             crate::acp::protocol::subagent_description(&parsed),

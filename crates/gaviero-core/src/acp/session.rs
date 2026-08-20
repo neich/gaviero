@@ -212,6 +212,10 @@ pub struct AcpSession {
     line_buf: String,
     /// Captured stderr lines (shared with drain task).
     stderr_buf: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// Handle for the stderr drain task. Awaited by
+    /// [`Self::stderr_output_final`] so a caller reading stderr right after
+    /// the child exits sees every line instead of racing the drain.
+    stderr_task: Option<tokio::task::JoinHandle<()>>,
     /// Held only so the tempfile survives until the subprocess exits.
     /// `NamedTempFile::drop` removes the file from disk automatically.
     _prompt_tempfile: Option<tempfile::NamedTempFile>,
@@ -549,7 +553,7 @@ impl AcpSession {
 
         // Spawn a task to drain stderr to a shared buffer + tracing
         let stderr_buf = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        if let Some(stderr) = child.stderr.take() {
+        let stderr_task = child.stderr.take().map(|stderr| {
             let buf = stderr_buf.clone();
             tokio::spawn(async move {
                 let reader = BufReader::new(stderr);
@@ -558,8 +562,8 @@ impl AcpSession {
                     tracing::debug!(target: "claude_stderr", "{}", line);
                     buf.lock().await.push(line);
                 }
-            });
-        }
+            })
+        });
 
         Ok(Self {
             child,
@@ -567,6 +571,7 @@ impl AcpSession {
             stdin_tx,
             line_buf: String::new(),
             stderr_buf,
+            stderr_task,
             _prompt_tempfile: prompt_tempfile,
         })
     }
@@ -689,6 +694,19 @@ impl AcpSession {
     pub async fn stderr_output(&self) -> String {
         let lines = self.stderr_buf.lock().await;
         lines.join("\n")
+    }
+
+    /// Like [`Self::stderr_output`], but first waits for the drain task to
+    /// finish reading the pipe. Call this after [`Self::wait`]: the child
+    /// exiting closes the pipe, but the drain task still has to consume what
+    /// is buffered in it, so reading the shared buffer directly can return
+    /// empty on exactly the crash we want to report. Bounded so a wedged
+    /// drain can never hang the caller.
+    pub async fn stderr_output_final(&mut self) -> String {
+        if let Some(handle) = self.stderr_task.take() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        }
+        self.stderr_output().await
     }
 }
 

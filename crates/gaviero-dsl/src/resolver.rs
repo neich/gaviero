@@ -52,7 +52,12 @@ pub fn resolve(entry_path: &Path) -> Result<(Script, Vec<(String, String)>), Dsl
     if !errors.is_empty() {
         return Err(DslErrors::new(errors));
     }
-    Ok((Script { items: merged_items }, sources))
+    Ok((
+        Script {
+            items: merged_items,
+        },
+        sources,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -76,7 +81,11 @@ fn visit_file(
                 parent_file_id,
                 sources,
                 raw_path,
-                format!("cannot resolve include `{}`: {}", raw_path.display(), io_err),
+                format!(
+                    "cannot resolve include `{}`: {}",
+                    raw_path.display(),
+                    io_err
+                ),
             ));
             return;
         }
@@ -283,16 +292,8 @@ mod tests {
     #[test]
     fn detects_cycle() {
         let tmp = tempfile::tempdir().unwrap();
-        write_file(
-            tmp.path(),
-            "a.gaviero",
-            r#"include "b.gaviero""#,
-        );
-        write_file(
-            tmp.path(),
-            "b.gaviero",
-            r#"include "a.gaviero""#,
-        );
+        write_file(tmp.path(), "a.gaviero", r#"include "b.gaviero""#);
+        write_file(tmp.path(), "b.gaviero", r#"include "a.gaviero""#);
         let entry = tmp.path().join("a.gaviero");
         let err = resolve(&entry).unwrap_err();
         let any_cycle = err
@@ -311,7 +312,11 @@ mod tests {
             r#"include "does_not_exist.gaviero""#,
         );
         let err = resolve(&entry).unwrap_err();
-        assert!(err.errors.iter().any(|e| matches!(e, DslError::Include { .. })));
+        assert!(
+            err.errors
+                .iter()
+                .any(|e| matches!(e, DslError::Include { .. }))
+        );
     }
 
     #[test]
@@ -322,16 +327,8 @@ mod tests {
             "common.gaviero",
             r#"client base { tier cheap model "claude:sonnet" }"#,
         );
-        write_file(
-            tmp.path(),
-            "lib1.gaviero",
-            r#"include "common.gaviero""#,
-        );
-        write_file(
-            tmp.path(),
-            "lib2.gaviero",
-            r#"include "common.gaviero""#,
-        );
+        write_file(tmp.path(), "lib1.gaviero", r#"include "common.gaviero""#);
+        write_file(tmp.path(), "lib2.gaviero", r#"include "common.gaviero""#);
         let entry = write_file(
             tmp.path(),
             "main.gaviero",
@@ -372,11 +369,7 @@ mod tests {
             // outer.gaviero is in lib/, so "inner.gaviero" resolves to lib/inner.gaviero
             r#"include "inner.gaviero""#,
         );
-        let entry = write_file(
-            tmp.path(),
-            "main.gaviero",
-            r#"include "lib/outer.gaviero""#,
-        );
+        let entry = write_file(tmp.path(), "main.gaviero", r#"include "lib/outer.gaviero""#);
         let (script, _) = resolve(&entry).unwrap();
         let client_count = script
             .items

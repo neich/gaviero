@@ -656,20 +656,7 @@ fn render_table(
     // Total: borders (num_cols + 1) + padding (num_cols * 2) + content
     let overhead = num_cols + 1 + num_cols * 2;
     let content_budget = max_width.saturating_sub(overhead);
-    let total_content: usize = col_widths.iter().sum();
-    if total_content > content_budget {
-        if content_budget > 0 {
-            // Proportionally shrink columns
-            for w in &mut col_widths {
-                *w = (*w * content_budget / total_content).max(1);
-            }
-        } else {
-            // Panel too narrow for the table overhead — force minimal columns.
-            for w in &mut col_widths {
-                *w = 1;
-            }
-        }
-    }
+    let col_widths = fit_column_widths(&col_widths, content_budget);
 
     // Build box-drawing lines
     let top = build_table_border(&col_widths, '┌', '┬', '┐', '─');
@@ -706,6 +693,61 @@ fn render_table(
     }
 
     output.push(ChatLine::single(bot, border_style));
+}
+
+/// Fit columns whose natural (unwrapped) widths are `natural` into `budget`
+/// display columns of cell content.
+///
+/// Shrinking every column by the same proportion starves the narrow ones: a
+/// 4-wide `#` column beside a 700-wide prose column collapses to a single
+/// character and wraps `D-01` one letter per line, while the prose column still
+/// keeps hundreds of columns it does not need. Instead this water-fills —
+/// walking columns narrowest first, every column that already fits under the
+/// running fair share keeps its natural width, and only the columns wider than
+/// their share split whatever is left over.
+fn fit_column_widths(natural: &[usize], budget: usize) -> Vec<usize> {
+    let num_cols = natural.len();
+    if num_cols == 0 {
+        return Vec::new();
+    }
+    // Too narrow to give every column even one cell (the table will overflow
+    // the panel either way) — fall back to minimal columns.
+    if budget < num_cols {
+        return vec![1; num_cols];
+    }
+    if natural.iter().sum::<usize>() <= budget {
+        return natural.to_vec();
+    }
+
+    let mut order: Vec<usize> = (0..num_cols).collect();
+    order.sort_by_key(|&j| natural[j]);
+
+    let mut widths = vec![0usize; num_cols];
+    let mut remaining = budget;
+    for (k, &j) in order.iter().enumerate() {
+        let cols_left = num_cols - k;
+        let share = remaining / cols_left;
+        if natural[j] <= share {
+            widths[j] = natural[j];
+            remaining -= natural[j];
+            continue;
+        }
+        // Every column from here on is wider than its share: split the rest
+        // evenly and hand the division remainder to the widest ones.
+        let mut extra = remaining % cols_left;
+        for &wide in &order[k..] {
+            widths[wide] = share;
+        }
+        for &wide in order[k..].iter().rev() {
+            if extra == 0 {
+                break;
+            }
+            widths[wide] += 1;
+            extra -= 1;
+        }
+        break;
+    }
+    widths
 }
 
 /// Word-wrap cell text to `col_width` display columns; empty cells yield one blank line.
@@ -1047,17 +1089,68 @@ mod tests {
             .map(|l| l.text())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(
-            joined.contains("JWT tokens"),
-            "full cell text must appear, got:\n{joined}"
-        );
-        assert!(
-            joined.contains("rotation"),
-            "wrapped continuation must appear, got:\n{joined}"
-        );
+        // Every word of the long cell survives; where it wraps depends on the
+        // column width, so assert on the words rather than on a phrase.
+        for word in ["Supports", "JWT", "tokens", "refresh", "rotation"] {
+            assert!(
+                joined.contains(word),
+                "full cell text must appear, {word:?} missing from:\n{joined}"
+            );
+        }
         assert!(
             !joined.contains('…'),
             "tables must not truncate cells with ellipsis"
+        );
+
+        for line in &lines {
+            if is_table_rendered_line(&line.text()) {
+                assert!(
+                    UnicodeWidthStr::width(line.text().as_str()) <= width,
+                    "table line {:?} exceeds width {}",
+                    line.text(),
+                    width
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fit_column_widths_only_shrinks_the_columns_that_are_too_wide() {
+        // Natural widths already fit — nothing moves.
+        assert_eq!(fit_column_widths(&[3, 4], 20), vec![3, 4]);
+        // A narrow index column and a narrow label column keep their full
+        // width; the prose column absorbs the whole deficit.
+        assert_eq!(fit_column_widths(&[4, 18, 700], 240), vec![4, 18, 218]);
+        // When every column is over its share they split evenly, remainder to
+        // the widest.
+        assert_eq!(fit_column_widths(&[50, 50], 21), vec![10, 11]);
+        // Budget below one cell per column degrades to minimal columns.
+        assert_eq!(fit_column_widths(&[9, 9, 9], 2), vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn test_table_narrow_columns_are_not_starved_by_a_prose_column() {
+        let prose = "Two claims, one system: isomorphic generation of exercises \
+                     with increasing difficulty and automatic grading built from \
+                     generated behavioural tests plus static and dynamic analysis \
+                     enforcing the taught architecture over one deployment.";
+        let text = format!(
+            "| # | Topic | Decision |\n|---|-------|----------|\n| D-01 | Thesis | {prose} |"
+        );
+        let style = Style::default();
+        let width = 100;
+        let lines = format_chat_markdown(&text, width, style);
+
+        let row = lines
+            .iter()
+            .map(|l| l.text())
+            .find(|t| t.contains("D-01"))
+            .expect("first data row should render");
+        // Both narrow columns fit on the row's first visual line instead of
+        // wrapping a character at a time.
+        assert!(
+            row.contains("D-01") && row.contains("Thesis"),
+            "narrow columns must keep their natural width, got {row:?}"
         );
 
         for line in &lines {

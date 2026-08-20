@@ -57,9 +57,8 @@ fn extract_tier_overrides(
                         inc.span.end.saturating_sub(inc.span.start).max(1),
                     )
                         .into(),
-                    reason:
-                        "unexpected `include` after resolution in tiers profile — file a bug"
-                            .into(),
+                    reason: "unexpected `include` after resolution in tiers profile — file a bug"
+                        .into(),
                 });
             }
             other => {

@@ -155,6 +155,12 @@ fn star_can_consume(star: Tok, other: Tok) -> bool {
 
 /// Does `path` satisfy `pattern`?
 pub fn matches(pattern: &str, path: &str) -> bool {
+    // Scope declarations use `.` for the workspace root. As an ownership
+    // pattern it therefore covers every relative path in the workspace.
+    if pattern.trim() == "." {
+        return true;
+    }
+
     let (pat, dir_trail) = compile(pattern);
     let target = path_tokens(path);
 

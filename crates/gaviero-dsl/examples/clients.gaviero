@@ -19,7 +19,7 @@ client opus {
 }
 
 client sonnet {
-    model "claude:sonnet-5"
+    model "claude:sonnet"
     privacy public
     // The judge emits a short JSON verdict — no deep reasoning needed.
     effort medium

@@ -219,10 +219,9 @@ pub fn compile_ast_with_sources(
                         inc.span.end.saturating_sub(inc.span.start).max(1),
                     )
                         .into(),
-                    reason:
-                        "`include` is only supported when compiling from a file path; \
+                    reason: "`include` is only supported when compiling from a file path; \
                          use `gaviero_dsl::compile_file` (or `gaviero-cli --script`)"
-                            .to_string(),
+                        .to_string(),
                 });
             }
         }
@@ -508,10 +507,7 @@ pub fn compile_ast_with_sources(
                             };
                             errors.push(DslError::Compile {
                                 src: src_for(wf.file_id),
-                                span: (
-                                    span.start,
-                                    span.end.saturating_sub(span.start).max(1),
-                                )
+                                span: (span.start, span.end.saturating_sub(span.start).max(1))
                                     .into(),
                                 reason: format!(
                                     "`pattern map_reduce` discover agent `{}` is not defined",
@@ -545,11 +541,7 @@ pub fn compile_ast_with_sources(
                 Err(e) => {
                     errors.push(DslError::Compile {
                         src: src_for(wf.file_id),
-                        span: (
-                            e.span.start,
-                            e.span.end.saturating_sub(e.span.start).max(1),
-                        )
-                            .into(),
+                        span: (e.span.start, e.span.end.saturating_sub(e.span.start).max(1)).into(),
                         reason: e.reason,
                     });
                 }
@@ -913,55 +905,54 @@ fn compile_agent(
     //   2. `tier <name>`   — resolve through tier alias → `ClientDecl`.
     //   3. top-level `default` client.
     //   4. no client — fall through to defaults + warning.
-    let resolved_client: Option<&ClientDecl> = if let Some((client_name, client_span)) =
-        &decl.client
-    {
-        let cd = client_map
-            .get(client_name.as_str())
-            .copied()
-            .ok_or_else(|| DslError::Compile {
-                src: src(),
-                span: (
-                    client_span.start,
-                    client_span.end.saturating_sub(client_span.start).max(1),
-                )
-                    .into(),
-                reason: format!("undefined client `{}`", client_name),
-            })?;
-        Some(cd)
-    } else if let Some((tier_name, tier_span)) = &decl.tier_ref {
-        let client_ref = effective_tier_bindings
-            .get(tier_name.as_str())
-            .ok_or_else(|| DslError::Compile {
-                src: src(),
-                span: (
-                    tier_span.start,
-                    tier_span.end.saturating_sub(tier_span.start).max(1),
-                )
-                    .into(),
-                reason: format!(
-                    "agent `{}` references undefined tier alias `{}`",
-                    decl.name, tier_name
-                ),
-            })?;
-        let cd = client_map.get(client_ref.as_str()).ok_or_else(|| {
-            DslError::Compile {
-                src: src(),
-                span: (
-                    tier_span.start,
-                    tier_span.end.saturating_sub(tier_span.start).max(1),
-                )
-                    .into(),
-                reason: format!(
-                    "tier alias `{}` references undefined client `{}`",
-                    tier_name, client_ref
-                ),
-            }
-        })?;
-        Some(*cd)
-    } else {
-        default_client
-    };
+    let resolved_client: Option<&ClientDecl> =
+        if let Some((client_name, client_span)) = &decl.client {
+            let cd = client_map
+                .get(client_name.as_str())
+                .copied()
+                .ok_or_else(|| DslError::Compile {
+                    src: src(),
+                    span: (
+                        client_span.start,
+                        client_span.end.saturating_sub(client_span.start).max(1),
+                    )
+                        .into(),
+                    reason: format!("undefined client `{}`", client_name),
+                })?;
+            Some(cd)
+        } else if let Some((tier_name, tier_span)) = &decl.tier_ref {
+            let client_ref = effective_tier_bindings
+                .get(tier_name.as_str())
+                .ok_or_else(|| DslError::Compile {
+                    src: src(),
+                    span: (
+                        tier_span.start,
+                        tier_span.end.saturating_sub(tier_span.start).max(1),
+                    )
+                        .into(),
+                    reason: format!(
+                        "agent `{}` references undefined tier alias `{}`",
+                        decl.name, tier_name
+                    ),
+                })?;
+            let cd = client_map
+                .get(client_ref.as_str())
+                .ok_or_else(|| DslError::Compile {
+                    src: src(),
+                    span: (
+                        tier_span.start,
+                        tier_span.end.saturating_sub(tier_span.start).max(1),
+                    )
+                        .into(),
+                    reason: format!(
+                        "tier alias `{}` references undefined client `{}`",
+                        tier_name, client_ref
+                    ),
+                })?;
+            Some(*cd)
+        } else {
+            default_client
+        };
 
     let (tier, model, effort, extra, privacy) = if let Some(cd) = resolved_client {
         let tier = cd
@@ -1354,9 +1345,7 @@ fn extract_loop_configs(
                     judge_timeout_secs: lb.judge_timeout_secs,
                     irreconcilable_after: lb.irreconcilable_after,
                     branch_chain: match lb.branch_chain {
-                        BranchChainLit::None => {
-                            gaviero_core::swarm::plan::BranchChainMode::None
-                        }
+                        BranchChainLit::None => gaviero_core::swarm::plan::BranchChainMode::None,
                         BranchChainLit::Stacked => {
                             gaviero_core::swarm::plan::BranchChainMode::Stacked
                         }
@@ -1484,7 +1473,10 @@ mod tests {
         let units = compile_str(src).expect("should compile");
         assert_eq!(
             units[0].produces,
-            vec!["plans/out/report-v{{ITER}}.md", "plans/out/log-v{{ITER}}.md"]
+            vec![
+                "plans/out/report-v{{ITER}}.md",
+                "plans/out/log-v{{ITER}}.md"
+            ]
         );
     }
 

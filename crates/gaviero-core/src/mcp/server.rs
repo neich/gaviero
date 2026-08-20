@@ -1251,28 +1251,56 @@ impl McpServerHandle {
 }
 
 /// Serve one accepted connection on its own task: per-connection
-/// clone (fresh first-tool-call latch, shared warm caches), rmcp over
-/// split `AsyncRead + AsyncWrite` halves.
+/// clone (fresh first-tool-call latch, shared warm caches), absorb
+/// dual-era `server/discover` probes, then rmcp over the remaining
+/// `AsyncRead + AsyncWrite` halves.
 fn spawn_connection<S>(server: &GavieroMcpServer, stream: S)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
 {
     let server_clone = server.clone_for_connection();
     tokio::spawn(async move {
-        let (rx, tx) = tokio::io::split(stream);
-        match server_clone.serve((rx, tx)).await {
-            Ok(svc) => {
-                let _ = svc.waiting().await;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "mcp_server",
-                    error = %e,
-                    "rmcp serve failed"
-                );
-            }
-        }
+        serve_connection(server_clone, stream).await;
     });
+}
+
+async fn serve_connection<S>(server: GavieroMcpServer, stream: S)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+{
+    let (mut rx, mut tx) = tokio::io::split(stream);
+    let prefix = match super::legacy_handshake::absorb_discover_probes(&mut rx, &mut tx).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                target: "mcp_server",
+                error = %e,
+                "legacy MCP handshake failed"
+            );
+            return;
+        }
+    };
+    if prefix.is_empty() {
+        tracing::debug!(
+            target: "mcp_server",
+            "MCP connection closed during server/discover probe"
+        );
+        return;
+    }
+    use tokio::io::AsyncReadExt as _;
+    let rx = std::io::Cursor::new(prefix).chain(rx);
+    match server.serve((rx, tx)).await {
+        Ok(svc) => {
+            let _ = svc.waiting().await;
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "mcp_server",
+                error = %e,
+                "rmcp serve failed"
+            );
+        }
+    }
 }
 
 /// Spawn the MCP server accept loop on the workspace endpoint —
@@ -1800,6 +1828,61 @@ mod tests {
             }))
             .await;
         assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn serve_survives_discover_then_initialize() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (client, server_end) = tokio::io::duplex(8192);
+        spawn_connection(&fixture(), server_end);
+        let (client_r, mut client_w) = tokio::io::split(client);
+        let mut client_r = BufReader::new(client_r);
+
+        client_w
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":"server-discover-probe-1","method":"server/discover","params":{}}
+"#,
+            )
+            .await
+            .unwrap();
+        client_w.flush().await.unwrap();
+
+        let mut probe = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client_r.read_line(&mut probe),
+        )
+        .await
+        .expect("timed out waiting for discover error")
+        .unwrap();
+        let probe_json: serde_json::Value = serde_json::from_str(probe.trim()).unwrap();
+        assert_eq!(probe_json["id"], "server-discover-probe-1");
+        assert_eq!(probe_json["error"]["code"], -32601);
+
+        client_w
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"gaviero-test","version":"0"}}}
+"#,
+            )
+            .await
+            .unwrap();
+        client_w.flush().await.unwrap();
+
+        let mut init = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client_r.read_line(&mut init),
+        )
+        .await
+        .expect("timed out waiting for initialize result")
+        .unwrap();
+        let init_json: serde_json::Value = serde_json::from_str(init.trim()).unwrap();
+        assert!(
+            init_json.get("result").is_some(),
+            "initialize must succeed after discover probe, got {init_json}"
+        );
+        assert_eq!(init_json["id"], 1);
     }
 
     #[cfg(unix)]

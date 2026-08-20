@@ -17,6 +17,7 @@ use crate::context_planner::{
 use crate::memory::MemoryStores;
 use crate::observer::AcpObserver;
 use crate::repo_map::{RepoMap, TopologyConfig, build_folder_topology};
+use crate::scope_enforcer::SensitivePolicy;
 use crate::swarm::board::{SharedBoard, parse_discoveries};
 use crate::validation_gate::ValidationPipeline;
 use crate::write_gate::{AutoAcceptAction, WriteGatePipeline};
@@ -216,6 +217,22 @@ async fn run_backend_inner(
     {
         let mut gate = write_gate.lock().await;
         gate.register_agent_scope(&agent_id, &work_unit.scope);
+    }
+
+    // Agents that `produces` a file under a new {{OUT_DIR}} need the parent
+    // on disk before the Write tool (or a last-chance file-block salvage)
+    // can land. Missing parents are a silent produce-check failure, not a
+    // model error.
+    for rel in &work_unit.produces {
+        if rel.contains("{{") {
+            continue;
+        }
+        let path = workspace_root.join(rel);
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent).await.ok();
+        }
     }
 
     // 2. Build base prompt (memory + scope + task + optional repo context + impact analysis)
@@ -648,7 +665,48 @@ async fn run_backend_inner(
         // modified_files either way — all three end here as `Completed` with
         // the artefact absent. Checking the declared paths is the only signal
         // that distinguishes them, so it decides the manifest status.
-        let missing = work_unit.missing_declared_artifacts(workspace_root);
+        let mut missing = work_unit.missing_declared_artifacts(workspace_root);
+        if !missing.is_empty() && !full_text.is_empty() {
+            // Claude swarm writes go through native Write/Edit tools, not
+            // `FileBlock` events. Models still dump `<file path="…">` in the
+            // assistant text (the system prompt tells them not to). When a
+            // declared artefact is missing, apply matching in-band blocks
+            // through the Write Gate so a narrated inventory.md counts.
+            // Bare prose ("Both files written.") still fails — see the
+            // missing-output test.
+            let blocks = crate::acp::protocol::parse_file_blocks(&full_text);
+            for rel in missing.iter() {
+                let want = crate::types::normalize_path(rel);
+                let Some((_, content)) = blocks
+                    .iter()
+                    .find(|(p, _)| crate::types::normalize_path(&p.to_string_lossy()) == want)
+                else {
+                    continue;
+                };
+                match propose_write(
+                    &agent_id,
+                    Some(&agent_id),
+                    std::path::Path::new(rel),
+                    content,
+                    workspace_root,
+                    &write_gate,
+                    observer,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        all_modified.insert(workspace_root.join(rel));
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            "failed to apply in-band file block for declared output {rel}: {e:#}"
+                        );
+                    }
+                }
+            }
+            missing = work_unit.missing_declared_artifacts(workspace_root);
+        }
         if !missing.is_empty() {
             let next_attempt = attempt + 1;
             if next_attempt < max_attempts {
@@ -718,7 +776,7 @@ async fn run_backend_inner(
 /// Create a write proposal through the Write Gate.
 ///
 /// Returns `Ok(true)` if a proposal was created, `Ok(false)` if skipped
-/// (scope rejected, duplicate, unchanged content, empty diff).
+/// (sensitive path, scope rejected, duplicate, unchanged content, empty diff).
 pub(crate) async fn propose_write(
     agent_id: &str,
     conv_id: Option<&str>,
@@ -729,6 +787,19 @@ pub(crate) async fn propose_write(
     observer: &dyn AcpObserver,
 ) -> Result<bool> {
     let abs_path = workspace_root.join(rel_path);
+
+    // Sensitive paths are a separate authorization rail from the agent's
+    // declared scope. A scope commonly owns `.`, which must not authorize
+    // credentials unless the workspace explicitly exempts the path.
+    if let Some(reason) = SensitivePolicy::resolve(workspace_root).refusal(rel_path) {
+        tracing::warn!(
+            "Blocked write by agent '{}' to sensitive path '{}': {}",
+            agent_id,
+            rel_path.display(),
+            reason
+        );
+        return Ok(false);
+    }
 
     // 1. Scope check + collect conflict peers + allocate ID. Same-path
     // collisions used to drop the later proposal; now we pair the two so
@@ -1282,6 +1353,60 @@ mod tests {
             AgentStatus::Failed(msg) => assert!(msg.contains("src/report.md"), "got: {msg}"),
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_run_backend_salvages_in_band_file_block_for_declared_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+
+        let events = vec![
+            UnifiedStreamEvent::TextDelta(
+                "# Repository inventory\n\n\
+                 <file path=\"src/report.md\">\n\
+                 MODULE_COUNT: 1\n\
+                 VERDICT: PROCEED\n\
+                 </file>\n"
+                    .into(),
+            ),
+            UnifiedStreamEvent::Done(StopReason::EndTurn),
+        ];
+        let backend = MockBackend::new("test", events);
+        let write_gate = Arc::new(Mutex::new(WriteGatePipeline::new(
+            WriteMode::AutoAccept,
+            Box::new(NoopWriteGateObserver),
+        )));
+        let observer = TestObserver::new();
+        let mut unit = test_work_unit();
+        unit.max_retries = 0;
+        unit.produces = vec!["src/report.md".into()];
+
+        let manifest = run_backend(
+            &backend,
+            &unit,
+            write_gate,
+            workspace,
+            None,
+            &["default".to_string()],
+            &observer,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(manifest.status, AgentStatus::Completed),
+            "got {:?}",
+            manifest.status
+        );
+        let written = std::fs::read_to_string(workspace.join("src/report.md")).unwrap();
+        assert!(written.contains("MODULE_COUNT: 1"), "got: {written}");
     }
 
     #[tokio::test]

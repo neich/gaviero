@@ -154,7 +154,9 @@ pub fn expand_workflow_params_in_script(
         kinds_by_workflow.insert(wf.name.clone(), resolved_kinds.clone());
 
         for (param_name, kind) in &resolved_kinds {
-            let ParamKind::Client(spec) = kind else { continue };
+            let ParamKind::Client(spec) = kind else {
+                continue;
+            };
             if static_client_names.contains(param_name) {
                 errors.push(DslError::Compile {
                     src: miette::NamedSource::new("script", String::new()),
@@ -248,11 +250,8 @@ pub fn expand_workflow_params_in_script(
                             None => {
                                 errors.push(DslError::Compile {
                                     src: miette::NamedSource::new("script", String::new()),
-                                    span: (
-                                        span.start,
-                                        span.end.saturating_sub(span.start).max(1),
-                                    )
-                                    .into(),
+                                    span: (span.start, span.end.saturating_sub(span.start).max(1))
+                                        .into(),
                                     reason: format!(
                                         "template_init `{name}` is not a defined agent"
                                     ),
@@ -290,7 +289,7 @@ pub fn expand_workflow_params_in_script(
                                     refine_span.start,
                                     refine_span.end.saturating_sub(refine_span.start).max(1),
                                 )
-                                .into(),
+                                    .into(),
                                 reason: format!(
                                     "template_refine `{}` is not a defined agent",
                                     refine_name
@@ -334,8 +333,7 @@ pub fn expand_workflow_params_in_script(
                             entry,
                             &refine_client_name,
                         );
-                        let refine_agent =
-                            inject_peer_vars(refine_agent, &entry.id, &peer_ids);
+                        let refine_agent = inject_peer_vars(refine_agent, &entry.id, &peer_ids);
                         refine_agent_names
                             .push((refine_agent.name.clone(), refine_agent.name_span));
                         new_agents.push(refine_agent);
@@ -442,9 +440,12 @@ fn resolve_param_kind(
                 src: miette::NamedSource::new("script", String::new()),
                 span: (
                     decl.name_span.start,
-                    decl.name_span.end.saturating_sub(decl.name_span.start).max(1),
+                    decl.name_span
+                        .end
+                        .saturating_sub(decl.name_span.start)
+                        .max(1),
                 )
-                .into(),
+                    .into(),
                 reason: format!(
                     "workflow param `{name}` is used as both a roster (`reviewers {name}`) \
                      and a client (`client {name}`) — use distinct param names or add \
@@ -463,9 +464,12 @@ fn resolve_param_kind(
                 src: miette::NamedSource::new("script", String::new()),
                 span: (
                     decl.name_span.start,
-                    decl.name_span.end.saturating_sub(decl.name_span.start).max(1),
+                    decl.name_span
+                        .end
+                        .saturating_sub(decl.name_span.start)
+                        .max(1),
                 )
-                .into(),
+                    .into(),
                 reason: format!(
                     "workflow param `{name}` is never referenced — use `reviewers {name}`, \
                      `client {name}` on an agent, or remove the declaration"
@@ -498,9 +502,12 @@ fn resolve_client_spec(
         src: miette::NamedSource::new("script", String::new()),
         span: (
             decl.name_span.start,
-            decl.name_span.end.saturating_sub(decl.name_span.start).max(1),
+            decl.name_span
+                .end
+                .saturating_sub(decl.name_span.start)
+                .max(1),
         )
-        .into(),
+            .into(),
         reason: format!(
             "workflow client param `{name}` has no `model` default and was not \
              supplied on the CLI — pass `--param {name}=provider:model[@effort]`"
@@ -558,9 +565,12 @@ fn resolve_roster(
                     src: miette::NamedSource::new("script", String::new()),
                     span: (
                         decl.name_span.start,
-                        decl.name_span.end.saturating_sub(decl.name_span.start).max(1),
+                        decl.name_span
+                            .end
+                            .saturating_sub(decl.name_span.start)
+                            .max(1),
                     )
-                    .into(),
+                        .into(),
                     reason: format!(
                         "workflow roster param `{name}` has no default and was not \
                          supplied on the CLI — pass `--param {name}=id=provider:model[@effort],...`"
@@ -580,10 +590,7 @@ fn synth_client_from_spec(name: &str, spec: &ClientParamSpec) -> ClientDecl {
         model: spec.model.clone(),
         effort: spec.effort.clone(),
         extra: spec.extra.clone(),
-        privacy: spec
-            .privacy
-            .clone()
-            .or(Some((PrivacyLit::Public, span))),
+        privacy: spec.privacy.clone().or(Some((PrivacyLit::Public, span))),
         is_default: false,
         span,
         file_id: 0,
@@ -664,11 +671,7 @@ fn clone_agent_shell(template: &AgentDecl) -> AgentDecl {
 fn rewrite_agent_client_param(script: &mut Script, param_name: &str, synth_name: &str) {
     for item in &mut script.items {
         let Item::Agent(agent) = item else { continue };
-        if agent
-            .client
-            .as_ref()
-            .is_some_and(|(n, _)| n == param_name)
-        {
+        if agent.client.as_ref().is_some_and(|(n, _)| n == param_name) {
             let span = agent.client.as_ref().unwrap().1;
             agent.client = Some((synth_name.to_string(), span));
         }
@@ -683,7 +686,9 @@ fn inject_peer_vars(mut agent: AgentDecl, self_id: &str, peer_ids: &[String]) ->
         .collect();
     agent.vars.push(("REVIEWER_ID".into(), self_id.to_string()));
     agent.vars.push(("PEER_IDS".into(), others.join(",")));
-    agent.vars.push(("PEER_COUNT".into(), others.len().to_string()));
+    agent
+        .vars
+        .push(("PEER_COUNT".into(), others.len().to_string()));
     agent
         .vars
         .push(("PEER_READ_BLOCK".into(), build_peer_read_block(&others)));
@@ -691,9 +696,8 @@ fn inject_peer_vars(mut agent: AgentDecl, self_id: &str, peer_ids: &[String]) ->
 }
 
 fn build_peer_read_block(peers: &[&str]) -> String {
-    let mut s = String::from(
-        "    Peer documents to read (all other providers for this iteration):\n",
-    );
+    let mut s =
+        String::from("    Peer documents to read (all other providers for this iteration):\n");
     for peer in peers {
         // `{{{{OUT_DIR}}}}` is the format-string escape for a literal
         // `{{OUT_DIR}}` — the double-brace form the var substituter looks for.
@@ -732,8 +736,7 @@ mod tests {
 
     #[test]
     fn parse_simple_two_reviewers() {
-        let entries =
-            parse_reviewers_override("claude=claude:opus,codex=codex:gpt-5.5").unwrap();
+        let entries = parse_reviewers_override("claude=claude:opus,codex=codex:gpt-5.5").unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, "claude");
         assert_eq!(entries[0].model, "claude:opus");
@@ -742,8 +745,7 @@ mod tests {
     #[test]
     fn parse_with_effort() {
         let entries =
-            parse_reviewers_override("claude=claude:opus@max,codex=codex:gpt-5.5@high")
-                .unwrap();
+            parse_reviewers_override("claude=claude:opus@max,codex=codex:gpt-5.5@high").unwrap();
         assert_eq!(entries[0].effort.as_ref().unwrap().0, "max");
         assert_eq!(entries[1].effort.as_ref().unwrap().0, "high");
     }

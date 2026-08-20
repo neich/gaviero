@@ -53,6 +53,7 @@
 
 pub mod config_synth;
 pub mod external_memory;
+mod legacy_handshake;
 pub mod observer;
 pub mod preflight;
 pub mod resolver;

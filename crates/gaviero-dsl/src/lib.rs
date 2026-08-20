@@ -1,17 +1,17 @@
 pub mod ast;
 pub mod compiler;
-pub mod reviewers;
-pub mod workflow_params;
 pub mod error;
 pub mod lexer;
 pub mod parser;
 pub mod patterns;
 pub mod resolver;
+pub mod reviewers;
 pub mod tiers;
+pub mod workflow_params;
 
 // Re-export `CompiledPlan` as the primary output type.
-pub use gaviero_core::swarm::plan::{CompiledPlan, ExecutionMode};
 pub use compiler::peek_workflow_execution_mode;
+pub use gaviero_core::swarm::plan::{CompiledPlan, ExecutionMode};
 // Backward-compat alias — existing code using `CompiledScript` keeps compiling.
 #[allow(deprecated)]
 pub use compiler::CompiledScript;

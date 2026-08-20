@@ -836,8 +836,7 @@ where
                 };
             }
             let (id_value, id_span) = id.unwrap_or_else(|| (String::new(), e.span()));
-            let (model_value, model_span) =
-                model.unwrap_or_else(|| (String::new(), e.span()));
+            let (model_value, model_span) = model.unwrap_or_else(|| (String::new(), e.span()));
             ReviewerEntry {
                 id: id_value,
                 id_span,
@@ -1016,9 +1015,7 @@ where
         .collect::<Vec<_>>()
         .delimited_by(just(Token::LBrace), just(Token::RBrace));
     let param_body = choice((
-        reviewer_literal_list
-            .clone()
-            .map(ParamShape::Roster),
+        reviewer_literal_list.clone().map(ParamShape::Roster),
         param_client_block.map_with(|fields, e| {
             let mut spec = ClientParamSpec {
                 span: e.span(),

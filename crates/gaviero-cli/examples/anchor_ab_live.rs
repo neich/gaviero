@@ -181,7 +181,11 @@ async fn main() -> Result<()> {
             let arm = score_arm(case, label, budget, answer.as_deref(), &pulls);
             eprintln!(
                 "      {label:<6} pulls={:<2} pulled_gold={}/{} ans_cov={:.2} answered={}",
-                arm.pull_count, arm.pulled_gold_files, arm.gold_files_total, arm.answer_coverage, arm.answered
+                arm.pull_count,
+                arm.pulled_gold_files,
+                arm.gold_files_total,
+                arm.answer_coverage,
+                arm.answered
             );
             arm_answers.push(answer.unwrap_or_default());
             arms.push(arm);
@@ -215,11 +219,7 @@ async fn main() -> Result<()> {
     let done = repo.join("plans/pull_bootstrap/phase1-anchor-ab-live.DONE");
     let _ = std::fs::write(
         &done,
-        format!(
-            "completed {} cases at {}\n",
-            results.len(),
-            chrono_now()
-        ),
+        format!("completed {} cases at {}\n", results.len(), chrono_now()),
     );
     eprintln!("[ab-live] ALL DONE — sentinel → {}", done.display());
     Ok(())
@@ -255,7 +255,11 @@ fn append_case_ndjson(path: &Path, cr: &CaseResult) {
         })).collect::<Vec<_>>(),
     });
     if let Ok(line) = serde_json::to_string(&doc) {
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
             let _ = writeln!(f, "{line}");
         }
     }
@@ -270,9 +274,16 @@ fn select_cases(cases: &[EvalCase], offset: usize, limit: usize) -> Vec<(EvalCas
             .filter(|g| matches!(g, GoldRef::File(_)))
             .count()
     };
-    let mut multi: Vec<EvalCase> = cases.iter().filter(|c| file_count(c) >= 2).cloned().collect();
-    let mut single: Vec<EvalCase> =
-        cases.iter().filter(|c| file_count(c) == 1).cloned().collect();
+    let mut multi: Vec<EvalCase> = cases
+        .iter()
+        .filter(|c| file_count(c) >= 2)
+        .cloned()
+        .collect();
+    let mut single: Vec<EvalCase> = cases
+        .iter()
+        .filter(|c| file_count(c) == 1)
+        .cloned()
+        .collect();
     multi.truncate(MAX_MULTI);
     single.truncate(MAX_CONTROLS);
     let mut out: Vec<(EvalCase, bool)> = Vec::new();
@@ -289,7 +300,8 @@ fn primary_gold_file(case: &EvalCase) -> Option<String> {
 }
 
 fn build_outline(repo_map: &RepoMap, seed: &str, budget: usize) -> String {
-    let candidates = repo_map.rank_for_agent_structured(std::slice::from_ref(&seed.to_string()), budget);
+    let candidates =
+        repo_map.rank_for_agent_structured(std::slice::from_ref(&seed.to_string()), budget);
     let lines: Vec<String> = candidates.iter().map(|c| c.rendered_line.clone()).collect();
     format!("<repo_outline>\n{}\n</repo_outline>", lines.join("\n"))
 }
@@ -315,7 +327,10 @@ fn ndjson_new_pulls(path: &Path, before: usize) -> Vec<String> {
         if let Some(p) = input.and_then(|i| i.get("path")).and_then(|p| p.as_str()) {
             out.push(p.replace('\\', "/"));
         }
-        if let Some(arr) = input.and_then(|i| i.get("paths")).and_then(|p| p.as_array()) {
+        if let Some(arr) = input
+            .and_then(|i| i.get("paths"))
+            .and_then(|p| p.as_array())
+        {
             for p in arr.iter().filter_map(|p| p.as_str()) {
                 out.push(p.replace('\\', "/"));
             }
@@ -416,7 +431,16 @@ async fn run_claude_with_tools(prompt: &str, cwd: &Path, mcp_cfg: &Path) -> Opti
 
 /// Plain claude call with no tools (used for judging).
 async fn claude_plain(prompt: &str, cwd: &Path) -> Option<String> {
-    claude_json(prompt, cwd, &["--disallowedTools", "Write,Edit,MultiEdit,Bash,Read,Glob,Grep"], "You are a strict grader. Reply exactly PASS or FAIL on the first line.").await
+    claude_json(
+        prompt,
+        cwd,
+        &[
+            "--disallowedTools",
+            "Write,Edit,MultiEdit,Bash,Read,Glob,Grep",
+        ],
+        "You are a strict grader. Reply exactly PASS or FAIL on the first line.",
+    )
+    .await
 }
 
 /// Spawn `claude -p --output-format json`, prompt via stdin, return `.result`.
@@ -495,7 +519,10 @@ fn report(results: &[CaseResult], repo: &Path, fixture: &Path) {
     println!("\n─── LIVE thin-anchor A/B (claude:{MODEL}, gaviero MCP tools only) ───");
     println!("repo    : {}", repo.display());
     println!("fixture : {}", fixture.display());
-    println!("A = anchor {ANCHOR} tok   B = push {PUSH} tok   cases = {}", results.len());
+    println!(
+        "A = anchor {ANCHOR} tok   B = push {PUSH} tok   cases = {}",
+        results.len()
+    );
     println!();
 
     let agg = |label: &str| {
@@ -512,7 +539,11 @@ fn report(results: &[CaseResult], repo: &Path, fixture: &Path) {
                 .iter()
                 .map(|a| (a.pulled_gold_files, a.gold_files_total))
                 .fold((0, 0), |(x, y), (p, t)| (x + p, y + t));
-            if den == 0 { 0.0 } else { num as f32 / den as f32 }
+            if den == 0 {
+                0.0
+            } else {
+                num as f32 / den as f32
+            }
         };
         let mean_cov = arms.iter().map(|a| a.answer_coverage).sum::<f32>() / n;
         let judged: Vec<bool> = arms.iter().filter_map(|a| a.judge_pass).collect();
@@ -526,16 +557,39 @@ fn report(results: &[CaseResult], repo: &Path, fixture: &Path) {
 
     let (aa, ap, apr, ac, aj) = agg("anchor");
     let (ba, bp, bpr, bc, bj) = agg("push");
-    println!("{:<8} {:>8} {:>9} {:>11} {:>9} {:>9}", "arm", "answered", "mean_pull", "pull_recall", "ans_cov", "judge");
-    println!("{:<8} {:>8} {:>9.1} {:>11.3} {:>9.3} {:>9.3}", "anchor", format!("{aa}/{}", results.len()), ap, apr, ac, aj);
-    println!("{:<8} {:>8} {:>9.1} {:>11.3} {:>9.3} {:>9.3}", "push", format!("{ba}/{}", results.len()), bp, bpr, bc, bj);
+    println!(
+        "{:<8} {:>8} {:>9} {:>11} {:>9} {:>9}",
+        "arm", "answered", "mean_pull", "pull_recall", "ans_cov", "judge"
+    );
+    println!(
+        "{:<8} {:>8} {:>9.1} {:>11.3} {:>9.3} {:>9.3}",
+        "anchor",
+        format!("{aa}/{}", results.len()),
+        ap,
+        apr,
+        ac,
+        aj
+    );
+    println!(
+        "{:<8} {:>8} {:>9.1} {:>11.3} {:>9.3} {:>9.3}",
+        "push",
+        format!("{ba}/{}", results.len()),
+        bp,
+        bpr,
+        bc,
+        bj
+    );
     println!();
     let margin = 0.10_f32;
     let judge_ni = aj.is_nan() || bj.is_nan() || aj >= bj - margin;
     let cov_ni = ac >= bc - margin;
     println!(
         "VERDICT: {} (judge Δ={:+.3}, ans_cov Δ={:+.3}, margin {margin})",
-        if judge_ni && cov_ni { "anchor NON-INFERIOR" } else { "anchor REGRESSES" },
+        if judge_ni && cov_ni {
+            "anchor NON-INFERIOR"
+        } else {
+            "anchor REGRESSES"
+        },
         aj - bj,
         ac - bc
     );

@@ -117,8 +117,13 @@ impl IterationEngine {
 
     /// Execute the strategy loop, returning the best result across all attempts.
     ///
-    /// * `SinglePass` — one attempt with `max_retries=1` in the inner loop.
-    /// * `Refine` — one attempt with `max_retries` from the config.
+    /// * `SinglePass` — one outer attempt; inner `WorkUnit::max_retries` is
+    ///   capped at 1 (CLI `--no-iterate`).
+    /// * `Refine` — one outer attempt; inner retries come from
+    ///   `WorkUnit::max_retries` (DSL `agent { max_retries }` or the CLI
+    ///   `--task` synthetic unit). The engine must not clobber that with
+    ///   `IterationConfig.max_retries` — that default of 5 is what turned a
+    ///   script's `max_retries 1` into six produce-check dispatches.
     /// * `BestOfN { n }` — `n` independent attempts; returns the first that fully
     ///   passes validation, or the one with the most modified files if none do.
     #[allow(clippy::too_many_arguments)]
@@ -408,8 +413,8 @@ impl IterationEngine {
         let mut unit = work_unit.clone();
 
         unit.max_retries = match &self.config.strategy {
-            Strategy::SinglePass => 1,
-            _ => self.config.max_retries.min(u8::MAX as u32) as u8,
+            Strategy::SinglePass => work_unit.max_retries.min(1),
+            _ => work_unit.max_retries,
         };
 
         // Respect DSL-pinned models. When the WorkUnit already has a concrete
@@ -690,5 +695,34 @@ mod tests {
             "DSL-pinned model must be preserved on every attempt, not clobbered \
              by cheap/expensive_model defaults"
         );
+    }
+
+    #[test]
+    fn unit_for_attempt_preserves_dsl_max_retries_under_refine() {
+        let engine = IterationEngine::new(IterationConfig {
+            strategy: Strategy::Refine,
+            max_retries: 5,
+            ..Default::default()
+        });
+        let mut unit = make_unit("t");
+        unit.max_retries = 1;
+        let prepared = engine.unit_for_attempt(&unit, 0);
+        assert_eq!(
+            prepared.max_retries, 1,
+            "IterationConfig.max_retries must not clobber a DSL agent max_retries"
+        );
+    }
+
+    #[test]
+    fn unit_for_attempt_caps_inner_retries_on_single_pass() {
+        let engine = IterationEngine::new(IterationConfig {
+            strategy: Strategy::SinglePass,
+            max_retries: 5,
+            ..Default::default()
+        });
+        let mut unit = make_unit("t");
+        unit.max_retries = 5;
+        let prepared = engine.unit_for_attempt(&unit, 0);
+        assert_eq!(prepared.max_retries, 1);
     }
 }

@@ -2415,11 +2415,8 @@ mod tests {
     #[test]
     fn cursor_surface_deny_rules_follow_available_tools() {
         assert!(cursor_surface_deny_rules(None).is_empty());
-        let restricted = cursor_surface_deny_rules(Some(&[
-            "Read".into(),
-            "Write".into(),
-            "Edit".into(),
-        ]));
+        let restricted =
+            cursor_surface_deny_rules(Some(&["Read".into(), "Write".into(), "Edit".into()]));
         assert!(restricted.contains(&"Shell(*)".to_string()));
         assert!(!restricted.iter().any(|r| r.starts_with("Write(")));
         let no_write = cursor_surface_deny_rules(Some(&["Read".into(), "Bash".into()]));

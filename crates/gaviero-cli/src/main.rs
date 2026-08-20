@@ -3857,7 +3857,7 @@ async fn main() -> Result<()> {
             privacy: Default::default(),
             coordinator_instructions: String::new(),
             estimated_tokens: 0,
-            max_retries: 1,
+            max_retries: cli.max_retries.min(u8::MAX as u32) as u8,
             timeout_secs: 3600,
             escalation_tier: None,
             read_namespaces: None,

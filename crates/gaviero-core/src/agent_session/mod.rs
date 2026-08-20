@@ -103,8 +103,8 @@ pub mod codex_exec;
 pub mod cursor;
 pub mod ollama;
 pub mod registry;
-pub(crate) mod tool_surface;
 pub mod tool_agent;
+pub(crate) mod tool_surface;
 
 use std::path::PathBuf;
 use std::pin::Pin;

@@ -38,9 +38,14 @@
 //   never wrote is Failed, not Completed. {{ITER}} in produces is
 //   substituted per pass.
 //
-// Usage:
-//   gaviero-cli --script codebase_review.gaviero
-//   gaviero-cli --script codebase_review.gaviero --var OUT_DIR=reviews/2026-05
+// Models: two workflow params — `reviewer` (expensive) and `judge`
+// (cheap: inventory, halt_judge, synthesize). Pass a model spec on the
+// CLI; no tiers file required. `@effort` is optional.
+//
+//   gaviero-cli --script crates/gaviero-dsl/examples/codebase_review.gaviero \
+//     --var OUT_DIR=reviews/opus
+//   gaviero-cli --script crates/gaviero-dsl/examples/codebase_review.gaviero \
+//     --param reviewer=codex:gpt-5.6-sol@high --var OUT_DIR=reviews/gpt-5.6-sol
 
 include "clients.gaviero"
 
@@ -98,9 +103,17 @@ prompt inventory-body #"
 
         VERDICT: PROCEED
 
-    The `MODULE_COUNT` line is parsed by halt_judge — be exact.
-    Each module heading must be `## Module <N> — <name>`, numbered from 1.
+    The `MODULE_COUNT` line is parsed by the runtime (and by halt_judge)
+    — be exact. Write this file at the exact path {{OUT_DIR}}/inventory.md
+    (already substituted). Do not write a sibling directory such as
+    reviews/latest/ unless that is the substituted path. Each module
+    heading must be `## Module <N> — <name>`, numbered from 1.
     Always emit MODULE_COUNT, including when you STOP (use 0).
+
+    You MUST create that file with the Write tool (or Edit). Printing the
+    markdown only in the assistant message does not count — the runtime
+    checks that the path exists on disk. Do not wrap the body in a
+    `<file>` tag unless you also Write the file.
 
     If the repo isn't reviewable in this shape (no recognisable modules,
     workspace is empty, etc.), replace the final line with:
@@ -112,7 +125,10 @@ prompt review-body #"
     findings. You do not edit source, tests, config, or lockfiles.
 
     STEP 0 — skip if there is no module for this iteration.
-      Read {{OUT_DIR}}/inventory.md.
+      Read {{OUT_DIR}}/inventory.md (exact substituted path). If it does
+      not exist, look for a sibling `latest/inventory.md` only to decide
+      skip-vs-review — then still write this iteration's file under
+      {{OUT_DIR}}/.
       If its last line is `VERDICT: STOP: …`, or if {{ITER}} > MODULE_COUNT,
       write {{OUT_DIR}}/review-{{ITER}}.md as:
 
@@ -179,10 +195,17 @@ prompt judge-body #"
     You decide whether the review loop is complete. Cheap: read two facts,
     emit a verdict. Do not review code.
 
+    The runtime also parses MODULE_COUNT from inventory.md and may halt
+    without calling you. If you do run, your fenced JSON must appear in
+    the assistant text — never inside <turn_annotations> (that sidecar
+    is stripped before the verdict parser runs).
+
     {{ITER_EVIDENCE}}
 
     Read {{OUT_DIR}}/inventory.md — parse `MODULE_COUNT: <N>` and the last
-    `VERDICT:` line.
+    `VERDICT:` line. If that path does not exist, do not invent a skip
+    essay: still emit the JSON verdict from whatever inventory you can
+    find (or FAIL if you cannot parse MODULE_COUNT).
 
     Return PASS (loop exits) when ANY of:
       1. Iteration {{ITER}} >= MODULE_COUNT. The last listed module was
@@ -193,7 +216,8 @@ prompt judge-body #"
     {{ITER}} < MODULE_COUNT — the next iteration should review module
     {{ITER}}+1.
 
-    Output format — emit exactly one fenced JSON object as your last output:
+    Output format — your entire reply should be exactly one fenced JSON
+    object (no sidecar):
 
     ```json
     {"verdict": "pass" | "fail", "reason": "<one short paragraph>"}
@@ -227,9 +251,14 @@ prompt synthesize-body #"
 
 // ── Agents ───────────────────────────────────────────────────────────────────
 
+// Explicit `tools` overrides workspace `agent.availableTools`. An empty
+// list would inherit Bash (and AskUserQuestion / Agent / …), which
+// bypasses Write Gate scope checks. MCP tools are not in this list —
+// they arrive through synthesized `.mcp.json`, not `--tools`.
 agent inventory {
     description "Inventory modules in leaf-to-root order"
-    client sonnet
+    client judge
+    tools ["WebSearch" "WebFetch"]
     scope {
         owned     ["{{OUT_DIR}}/inventory.md"]
         read_only ["src/" "crates/" "Cargo.toml" "package.json" "README.md" "ARCHITECTURE.md" "CLAUDE.md"]
@@ -247,7 +276,8 @@ agent inventory {
 
 agent review_module {
     description "Review module {{ITER}} — findings only, no edits"
-    client opus
+    client reviewer
+    tools ["WebSearch" "WebFetch"]
     depends_on [inventory]
     scope {
         owned     ["{{OUT_DIR}}/review-*.md"]
@@ -260,7 +290,8 @@ agent review_module {
 
 agent halt_judge {
     description "Exit the review loop when MODULE_COUNT is covered or inventory STOP"
-    client sonnet
+    client judge
+    tools ["WebSearch" "WebFetch"]
     scope {
         read_only ["{{OUT_DIR}}/"]
     }
@@ -269,7 +300,8 @@ agent halt_judge {
 
 agent synthesize {
     description "Roll up per-module reviews into one summary"
-    client sonnet
+    client judge
+    tools ["WebSearch" "WebFetch"]
     // depends_on a loop body agent — post-loop dispatch waits until the
     // loop has finished every iteration, so synthesize sees every
     // review-N.md (not the pre-loop empty state).
@@ -302,6 +334,14 @@ agent synthesize {
 // No compile/clippy/test verify — this workflow writes markdown only.
 
 workflow codebase_review {
+    param reviewer {
+        model "claude:opus"
+        effort max
+    }
+    param judge {
+        model "claude:sonnet"
+        effort medium
+    }
     steps [
         inventory
         loop {
