@@ -5,6 +5,24 @@ use std::path::PathBuf;
 // ── FileScope ────────────────────────────────────────────────────
 
 /// Defines which paths an agent is allowed to write to.
+///
+/// **Empty `owned_paths` has one meaning, split across two questions.** The
+/// list is a *restriction* an agent may widen (the DSL compiles a missing
+/// `scope {}` to `owned ["."]`), so:
+///
+/// - *Authorization* — "may this agent write here?" — reads an empty list as
+///   **no restriction declared**, i.e. allow. Both authorization sites agree:
+///   [`crate::write_gate::WriteGatePipeline::is_scope_allowed`] and
+///   [`crate::scope_enforcer::ScopeEnforcer::check_write`]. This is also why a
+///   scope is never the rail that protects secrets — that is the
+///   block-list in [`crate::scope_enforcer`], which runs independently.
+/// - *Membership* — "does this unit own this file?", used for merge
+///   attribution and verification — reads an empty list as the empty set, i.e.
+///   owns nothing. That is [`FileScope::is_owned`], and an empty scope
+///   claiming every file would be wrong there.
+///
+/// Authorization callers must therefore branch on `owned_paths.is_empty()`
+/// themselves rather than relying on `is_owned`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct FileScope {
     #[serde(default)]
@@ -23,6 +41,10 @@ impl FileScope {
     /// file entries use exact matching; entries with `*`/`?`/`**` use
     /// glob-style matching (see `path_pattern`).
     /// Paths are normalized: leading `./` is stripped, whitespace is trimmed.
+    ///
+    /// This is set *membership*: an empty `owned_paths` owns nothing. It is
+    /// **not** the authorization predicate — see the type-level note on
+    /// [`FileScope`] for why the two read an empty list differently.
     pub fn is_owned(&self, path: &str) -> bool {
         self.owned_paths
             .iter()

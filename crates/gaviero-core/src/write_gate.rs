@@ -88,11 +88,22 @@ impl WriteGatePipeline {
     ///
     /// Scopes are restriction lists used by swarm agents to limit which files
     /// they can touch. A normal (non-swarm) prompt has no registered scope, which
-    /// means no restrictions — all paths are allowed.
+    /// means no restrictions — all paths are allowed. A registered scope with an
+    /// empty `owned_paths` means the same thing: no restriction was declared, so
+    /// nothing is restricted. (See the note on [`FileScope`]: membership and
+    /// authorization read an empty list differently, and this is the
+    /// authorization side, matching `ScopeEnforcer::check_write`.)
+    ///
+    /// This predicate is *not* the rail that protects secrets. `owned_paths` is
+    /// agent-supplied and may legitimately be `.`, so the sensitive-path
+    /// block-list ([`crate::scope_enforcer::SensitivePolicy`]) is enforced
+    /// separately, before this check, at every `propose_write` entry point.
     pub fn is_scope_allowed(&self, agent_id: &str, path: &str) -> bool {
         match self.agent_scopes.get(agent_id) {
+            // No scope registered = no restrictions (swarm agents always register one)
+            None => true,
+            Some(scope) if scope.owned_paths.is_empty() => true,
             Some(scope) => scope.is_owned(path),
-            None => true, // No scope registered = no restrictions (swarm agents always register one)
         }
     }
 
@@ -1195,6 +1206,18 @@ mod tests {
         assert!(pipeline.is_scope_allowed("agent-1", "src/editor/buffer.rs"));
         assert!(!pipeline.is_scope_allowed("agent-1", "src/main.rs"));
         assert!(pipeline.is_scope_allowed("unknown-agent", "anything")); // no scope = allowed
+    }
+
+    #[test]
+    fn empty_owned_paths_declares_no_write_restriction() {
+        // Same reading as `ScopeEnforcer::check_write`: an empty restriction
+        // list restricts nothing. Secrets are held back by the block-list
+        // rail in `scope_enforcer`, not by this predicate.
+        let (mut pipeline, _c, _u, _f) = make_pipeline(WriteMode::Interactive);
+        pipeline.register_agent_scope("agent-1", &FileScope::default());
+
+        assert!(pipeline.is_scope_allowed("agent-1", "src/main.rs"));
+        assert!(pipeline.is_scope_allowed("agent-1", "docs/README.md"));
     }
 
     #[test]
