@@ -376,6 +376,87 @@ async fn a_panel_that_cannot_run_stops_instead_of_burning_iterations() {
     );
 }
 
+/// Prompt marker only the loop body carries, so the request log shows
+/// whether the body was ever dispatched.
+const BODY_MARKER: &str = "BODY-PROMPT-MARKER";
+
+#[tokio::test]
+async fn a_loop_whose_dependency_failed_skips_without_aborting_the_run() {
+    // The `codebase_review` shape: a pre-loop `inventory` fails, so the
+    // body can never start. That is a skip, not a broken panel — the
+    // total-failure guard must not fire here, because the body never ran.
+    // Bailing would cut the run short of the per-agent summary that tells
+    // the operator which agent actually broke and which were collateral.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let workspace = tmp.path();
+    std::fs::create_dir_all(workspace.join("out")).unwrap();
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("provider exploded"))
+        .mount(&server)
+        .await;
+
+    let inventory = loop_unit("inventory", &["out/inventory.md"]);
+    let mut writer = loop_unit("writer", &["out/review-*.md"]);
+    writer.depends_on = vec!["inventory".to_string()];
+    writer.coordinator_instructions = format!("{BODY_MARKER} review iteration {{{{ITER}}}}");
+
+    let mut plan = CompiledPlan::from_work_units(vec![inventory, writer], Some(1));
+    plan.execution_mode = ExecutionMode::Document;
+    plan.loop_configs = vec![command_loop("writer", FAILING_PROBE, 6)];
+
+    let observer = RecordingObserver::default();
+    let make_obs = |_id: &str| -> Box<dyn AcpObserver> { Box::new(NoopAcpObserver) };
+
+    let result = execute(
+        &plan,
+        &config_for(workspace, &server.uri()),
+        None,
+        None,
+        &observer,
+        make_obs,
+    )
+    .await
+    .expect("a dependency skip must not abort the run");
+
+    // The run is a failure, but a *reported* one: both agents appear.
+    assert!(!result.success, "the run must not claim success");
+    let named: Vec<&str> = result
+        .manifests
+        .iter()
+        .map(|m| m.work_unit_id.as_str())
+        .collect();
+    assert!(
+        named.contains(&"inventory") && named.contains(&"writer"),
+        "every agent must be accounted for, got {named:?}"
+    );
+
+    let writer_status = result
+        .manifests
+        .iter()
+        .find(|m| m.work_unit_id == "writer")
+        .map(|m| m.status.clone())
+        .expect("writer manifest");
+    match writer_status {
+        gaviero_core::swarm::models::AgentStatus::Failed(msg) => assert!(
+            msg.contains("inventory"),
+            "the skip must name the dependency, got: {msg}"
+        ),
+        other => panic!("expected a dependency-skip failure, got {other:?}"),
+    }
+
+    // And the body was never dispatched — no tokens spent on a loop that
+    // had nothing to read.
+    let body_dispatches = prompts_seen(&server)
+        .await
+        .iter()
+        .filter(|p| p.contains(BODY_MARKER))
+        .count();
+    assert_eq!(body_dispatches, 0, "the loop body must not have run");
+}
+
 /// Prompt marker only the judge's instructions carry, so the mock
 /// server's request log tells us whether the judge was ever dispatched.
 const JUDGE_MARKER: &str = "JUDGE-PROMPT-MARKER";

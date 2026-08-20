@@ -195,6 +195,81 @@ pub struct SwarmConfig {
     pub run_timeout_secs: u64,
 }
 
+/// True when workspace `agent.availableTools` includes Bash **and** at
+/// least one unit has empty `extra_allowed_tools` (so it will inherit
+/// that list). Units with a non-empty DSL `tools [...]` override the
+/// workspace extras and must not trip the warning.
+fn workspace_bash_inherited(
+    swarm_extra_tools: &[String],
+    work_units: &[WorkUnit],
+    loop_judges: &[WorkUnit],
+) -> bool {
+    if !swarm_extra_tools
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case("Bash"))
+    {
+        return false;
+    }
+    work_units
+        .iter()
+        .chain(loop_judges.iter())
+        .any(|u| u.extra_allowed_tools.is_empty())
+}
+
+/// `depends_on` ids whose latest status is not a success.
+///
+/// Pending/Blocked/HardFailure all count as unmet. Tiers are supposed to
+/// have already run those deps; if they have not, dispatching the child is
+/// the bug that let `review_module` start after `inventory` Failed.
+fn unmet_dependency_ids(unit: &WorkUnit, exec_state: &ExecutionState) -> Vec<String> {
+    unit.depends_on
+        .iter()
+        .filter(|d| !exec_state.status(d).is_success())
+        .cloned()
+        .collect()
+}
+
+fn skipped_for_unmet_deps(unit_id: &str, deps: &[String]) -> AgentManifest {
+    let listed = deps
+        .iter()
+        .map(|d| format!("'{d}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let msg = format!("skipped: dependency {listed} did not complete");
+    AgentManifest {
+        work_unit_id: unit_id.to_string(),
+        status: AgentStatus::Failed(msg),
+        modified_files: vec![],
+        branch: None,
+        summary: Some("dependency did not complete".into()),
+        output: None,
+        cost_usd: 0.0,
+    }
+}
+
+fn record_unmet_dependency_skip(
+    unit_id: &str,
+    deps: &[String],
+    observer: &dyn SwarmObserver,
+    exec_state: &mut ExecutionState,
+    all_manifests: &mut Vec<AgentManifest>,
+) {
+    let manifest = skipped_for_unmet_deps(unit_id, deps);
+    tracing::warn!(
+        target: "swarm",
+        agent = %unit_id,
+        deps = ?deps,
+        "skipping agent because a depends_on predecessor did not complete"
+    );
+    observer.on_agent_state_changed(
+        unit_id,
+        &manifest.status,
+        manifest.summary.as_deref().unwrap_or(""),
+    );
+    exec_state.record_result(unit_id, manifest.clone());
+    all_manifests.push(manifest);
+}
+
 /// Execute a swarm of work units from a compiled plan.
 ///
 /// 1. Extract work units from plan graph (topological order)
@@ -220,16 +295,21 @@ pub async fn execute(
         "swarm.execute starting"
     );
 
-    // Surface workspace-level Bash grant so the security-sensitive
-    // weakening of "DSL is the sole place Bash can be granted" is
-    // visible in the log every swarm run rather than buried in
-    // settings. DSL grants are already part of the unit's checked-in
-    // declaration so they don't need a runtime warning.
-    if config
-        .swarm_extra_tools
-        .iter()
-        .any(|t| t.eq_ignore_ascii_case("Bash"))
-    {
+    // Extract work units in topological order from the plan graph
+    let work_units = plan
+        .work_units_ordered()
+        .map_err(|e| anyhow::anyhow!("plan graph error: {}", e))?;
+
+    // Surface workspace-level Bash grant only when some unit will
+    // actually inherit it. A non-empty per-unit DSL `tools [...]`
+    // overrides `agent.availableTools`, so warning on the workspace
+    // list alone is a false positive for scripts that opted out.
+    // DSL-declared Bash is already an audit record and is not warned.
+    if workspace_bash_inherited(
+        &config.swarm_extra_tools,
+        &work_units,
+        &plan.loop_judge_units,
+    ) {
         tracing::warn!(
             target: "swarm",
             extras = ?config.swarm_extra_tools,
@@ -238,11 +318,6 @@ pub async fn execute(
              scope validation; remove from settings if unintended."
         );
     }
-
-    // Extract work units in topological order from the plan graph
-    let work_units = plan
-        .work_units_ordered()
-        .map_err(|e| anyhow::anyhow!("plan graph error: {}", e))?;
 
     // Override max_parallel from plan if declared
     let mut effective_max_parallel = plan.max_parallel.unwrap_or(config.max_parallel);
@@ -724,6 +799,18 @@ pub async fn execute(
                     .get(unit_id.as_str())
                     .with_context(|| format!("work unit '{}' not found", unit_id))?;
 
+                let unmet = unmet_dependency_ids(unit, &exec_state);
+                if !unmet.is_empty() {
+                    record_unmet_dependency_skip(
+                        unit_id,
+                        &unmet,
+                        observer,
+                        &mut exec_state,
+                        &mut all_manifests,
+                    );
+                    continue;
+                }
+
                 // Apply {{ITER}}/{{PREV_ITER}} for first pass of loop agents
                 let _iter_unit_seq: Option<WorkUnit>;
                 let unit: &WorkUnit = if let Some(&is) = loop_agent_first_iter.get(unit_id.as_str())
@@ -849,6 +936,18 @@ pub async fn execute(
                     .get(unit_id.as_str())
                     .with_context(|| format!("work unit '{}' not found", unit_id))?)
                 .clone();
+
+                let unmet = unmet_dependency_ids(&unit, &exec_state);
+                if !unmet.is_empty() {
+                    record_unmet_dependency_skip(
+                        unit_id,
+                        &unmet,
+                        observer,
+                        &mut exec_state,
+                        &mut all_manifests,
+                    );
+                    continue;
+                }
 
                 // Apply {{ITER}}/{{PREV_ITER}} for first pass of loop agents
                 let unit = if let Some(&is) = loop_agent_first_iter.get(unit_id.as_str()) {
@@ -1061,6 +1160,71 @@ pub async fn execute(
             loop_config.branch_chain,
             crate::swarm::plan::BranchChainMode::Stacked
         );
+        {
+            // A prerequisite outside the body never ran, so the body has
+            // nothing to work from. Skip quietly: the failed predecessor
+            // already carries its own Failed manifest, and the post-loop
+            // agents still get their dependency-skip records, so the run
+            // reports one coherent per-agent summary.
+            let body: std::collections::HashSet<&str> =
+                loop_config.agent_ids.iter().map(String::as_str).collect();
+            let dep_skip = loop_config.agent_ids.iter().find_map(|id| {
+                let unit = unit_map.get(id.as_str())?;
+                let unmet: Vec<String> = unit
+                    .depends_on
+                    .iter()
+                    .filter(|d| !body.contains(d.as_str()))
+                    .filter(|d| !exec_state.status(d).is_success())
+                    .cloned()
+                    .collect();
+                if unmet.is_empty() {
+                    return None;
+                }
+                Some(format!(
+                    "loop skipped: dependency {} of '{id}' did not complete",
+                    unmet
+                        .iter()
+                        .map(|d| format!("'{d}'"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            });
+            if let Some(reason) = dep_skip {
+                tracing::warn!(target: "swarm", "{reason}");
+                observer.on_phase_changed(&reason);
+                continue;
+            }
+
+            // Dependencies were met, so the panel actually ran. If *every*
+            // member of it hard-failed, that is a broken panel — a bad model
+            // spec, a missing CLI, an unreachable provider — and the run must
+            // stop loudly rather than `continue` past it with a warning the
+            // operator will never see. Same contract the in-loop guard applies
+            // to passes 2..N; iteration 1 runs in the tier dispatch, so
+            // without this call it was the one pass nothing checked.
+            if !stacked {
+                assert_loop_pass_was_not_a_total_failure(
+                    &loop_config.agent_ids,
+                    &all_manifests,
+                    loop_config.iter_start,
+                )?;
+            }
+
+            // Partial failure: iteration 1 already ran in the tier loop and
+            // lost a member. Don't re-dispatch a shrunken panel for 2..N —
+            // but this is not unambiguous enough to abort the whole run.
+            if !stacked
+                && let Some(id) = loop_config
+                    .agent_ids
+                    .iter()
+                    .find(|id| !exec_state.status(id).is_success())
+            {
+                let reason = format!("loop skipped: agent '{id}' did not complete its first pass");
+                tracing::warn!(target: "swarm", "{reason}");
+                observer.on_phase_changed(&reason);
+                continue;
+            }
+        }
         // Iteration 1's chain anchor must include any commits produced by
         // the loop body's transitive non-stacked predecessors (e.g. a
         // pre-loop `inventory` agent whose output the body's prompt expects
@@ -1879,6 +2043,18 @@ pub async fn execute(
                 let unit = unit_map
                     .get(unit_id.as_str())
                     .with_context(|| format!("post-loop unit '{}' not found", unit_id))?;
+
+                let unmet = unmet_dependency_ids(unit, &exec_state);
+                if !unmet.is_empty() {
+                    record_unmet_dependency_skip(
+                        unit_id,
+                        &unmet,
+                        observer,
+                        &mut exec_state,
+                        &mut all_manifests,
+                    );
+                    continue;
+                }
 
                 exec_state.set_status(unit_id, NodeStatus::Running);
                 observer.on_agent_state_changed(unit_id, &AgentStatus::Running, &unit.description);
@@ -4188,6 +4364,147 @@ mod tests {
         }
     }
 
+    #[test]
+    fn workspace_bash_warning_skips_units_with_dsl_tools() {
+        let extras = vec!["Bash".into(), "WebSearch".into()];
+        let mut inheriting = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
+        inheriting.extra_allowed_tools.clear();
+        assert!(workspace_bash_inherited(
+            &extras,
+            &[inheriting.clone()],
+            &[]
+        ));
+
+        let mut opted_out = inheriting;
+        opted_out.extra_allowed_tools = vec!["WebSearch".into()];
+        assert!(!workspace_bash_inherited(
+            &extras,
+            &[opted_out.clone()],
+            &[]
+        ));
+        assert!(workspace_bash_inherited(
+            &extras,
+            &[opted_out],
+            &[test_unit(ModelTier::Cheap, PrivacyLevel::Public, None)]
+        ));
+        assert!(!workspace_bash_inherited(
+            &[],
+            &[test_unit(ModelTier::Cheap, PrivacyLevel::Public, None)],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn unmet_dependency_ids_treats_hard_failure_as_unmet() {
+        let mut child = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
+        child.id = "review_module".into();
+        child.depends_on = vec!["inventory".into()];
+
+        let mut state = ExecutionState::default();
+        state.record_result(
+            "inventory",
+            AgentManifest {
+                work_unit_id: "inventory".into(),
+                status: AgentStatus::Failed("declared output missing".into()),
+                modified_files: vec![],
+                branch: None,
+                summary: Some("missing".into()),
+                output: None,
+                cost_usd: 0.0,
+            },
+        );
+
+        assert_eq!(
+            unmet_dependency_ids(&child, &state),
+            vec!["inventory".to_string()]
+        );
+        let skip = skipped_for_unmet_deps("review_module", &["inventory".into()]);
+        match skip.status {
+            AgentStatus::Failed(msg) => {
+                assert!(msg.contains("inventory"), "got: {msg}");
+                assert!(msg.contains("skipped"), "got: {msg}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unmet_dependency_ids_empty_when_dep_completed() {
+        let mut child = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
+        child.depends_on = vec!["inventory".into()];
+        let mut state = ExecutionState::default();
+        state.record_result(
+            "inventory",
+            AgentManifest {
+                work_unit_id: "inventory".into(),
+                status: AgentStatus::Completed,
+                modified_files: vec![],
+                branch: None,
+                summary: None,
+                output: None,
+                cost_usd: 0.0,
+            },
+        );
+        assert!(unmet_dependency_ids(&child, &state).is_empty());
+    }
+
+    #[test]
+    fn parse_inventory_loop_halt_reads_count_and_stop() {
+        let proceed =
+            "# Repository inventory\n\nMODULE_COUNT: 6\n\n## Module 1\n\nVERDICT: PROCEED\n";
+        assert_eq!(parse_inventory_loop_halt(proceed), Some((6, false)));
+        let stop = "MODULE_COUNT: 0\nVERDICT: STOP: empty workspace\n";
+        assert_eq!(parse_inventory_loop_halt(stop), Some((0, true)));
+        assert_eq!(parse_inventory_loop_halt("no count here"), None);
+    }
+
+    #[test]
+    fn try_module_count_halt_skips_unrelated_judges() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("inventory.md"),
+            "MODULE_COUNT: 2\nVERDICT: PROCEED\n",
+        )
+        .unwrap();
+        let mut unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
+        unit.coordinator_instructions = "say PASS or FAIL".into();
+        unit.scope.read_only_paths = vec![".".into()];
+        assert!(try_module_count_halt(dir.path(), &unit, 2).is_none());
+
+        unit.coordinator_instructions = "parse MODULE_COUNT and emit JSON".into();
+        assert!(matches!(
+            try_module_count_halt(dir.path(), &unit, 1),
+            Some(LoopConditionOutcome::Continue(_))
+        ));
+        assert!(matches!(
+            try_module_count_halt(dir.path(), &unit, 2),
+            Some(LoopConditionOutcome::Pass)
+        ));
+    }
+
+    #[test]
+    fn locate_inventory_md_falls_back_to_sibling_latest() {
+        let dir = tempfile::tempdir().unwrap();
+        let latest = dir.path().join("reviews").join("latest");
+        let opus = dir.path().join("reviews").join("opus");
+        std::fs::create_dir_all(&latest).unwrap();
+        std::fs::create_dir_all(&opus).unwrap();
+        std::fs::write(
+            latest.join("inventory.md"),
+            "MODULE_COUNT: 6\nVERDICT: PROCEED\n",
+        )
+        .unwrap();
+        let mut unit = test_unit(ModelTier::Cheap, PrivacyLevel::Public, None);
+        unit.coordinator_instructions = "MODULE_COUNT".into();
+        unit.scope.read_only_paths = vec!["reviews/opus/".into()];
+        let found = locate_inventory_md(dir.path(), &unit).expect("fallback");
+        assert_eq!(found, latest.join("inventory.md"));
+        assert!(matches!(
+            try_module_count_halt(dir.path(), &unit, 6),
+            Some(LoopConditionOutcome::Pass)
+        ));
+    }
+
     fn manifest_with(output: Option<&str>, summary: Option<&str>) -> AgentManifest {
         AgentManifest {
             work_unit_id: "unit-a".into(),
@@ -5556,6 +5873,104 @@ async fn evaluate_command_condition(
     Ok(failure)
 }
 
+/// Parse `MODULE_COUNT: N` and a trailing `VERDICT: STOP` from an
+/// inventory file. Used to halt a review loop without an LLM turn.
+fn parse_inventory_loop_halt(text: &str) -> Option<(u32, bool)> {
+    let mut count = None;
+    let mut stop = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("MODULE_COUNT:") {
+            count = rest.trim().parse().ok();
+        }
+        if trimmed.starts_with("VERDICT: STOP") {
+            stop = true;
+        }
+    }
+    Some((count?, stop))
+}
+
+/// `{{OUT_DIR}}/inventory.md` under the judge's read_only/owned paths.
+///
+/// When that file is missing, a sibling `latest/inventory.md` is accepted
+/// (same parent as the missing OUT_DIR) so a run that relocated `--var
+/// OUT_DIR` still sees an inventory written under the script default.
+fn locate_inventory_md(
+    workspace_root: &std::path::Path,
+    unit: &WorkUnit,
+) -> Option<std::path::PathBuf> {
+    let mut missing: Vec<std::path::PathBuf> = Vec::new();
+    for p in unit
+        .scope
+        .read_only_paths
+        .iter()
+        .chain(unit.scope.owned_paths.iter())
+    {
+        let joined = workspace_root.join(p.trim_end_matches(['/', '\\']));
+        let candidate = if p.ends_with("inventory.md") {
+            joined
+        } else {
+            joined.join("inventory.md")
+        };
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        missing.push(candidate);
+    }
+    for candidate in &missing {
+        let Some(out_dir) = candidate.parent() else {
+            continue;
+        };
+        let Some(parent) = out_dir.parent() else {
+            continue;
+        };
+        if out_dir.file_name().is_some_and(|n| n == "latest") {
+            continue;
+        }
+        let fallback = parent.join("latest").join("inventory.md");
+        if fallback.is_file() {
+            tracing::warn!(
+                target: "swarm",
+                missing = %candidate.display(),
+                fallback = %fallback.display(),
+                "MODULE_COUNT inventory is not under the judge OUT_DIR; using sibling latest/"
+            );
+            return Some(fallback);
+        }
+    }
+    None
+}
+
+/// If this judge's prompt talks about `MODULE_COUNT`, decide PASS/FAIL
+/// from the inventory file and skip the LLM. Integer comparison does not
+/// need a model; calling one is how this loop burned skip-file iterations
+/// after the judge emitted an unparseable sidecar.
+fn try_module_count_halt(
+    workspace_root: &std::path::Path,
+    unit: &WorkUnit,
+    iter_abs: u32,
+) -> Option<LoopConditionOutcome> {
+    if !unit.coordinator_instructions.contains("MODULE_COUNT") {
+        return None;
+    }
+    let path = locate_inventory_md(workspace_root, unit)?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    let (count, stop) = parse_inventory_loop_halt(&text)?;
+    tracing::info!(
+        target: "swarm",
+        iter = iter_abs,
+        module_count = count,
+        stop,
+        path = %path.display(),
+        "deterministic MODULE_COUNT halt (skipping judge LLM)"
+    );
+    if stop || iter_abs >= count {
+        Some(LoopConditionOutcome::Pass)
+    } else {
+        Some(LoopConditionOutcome::Continue(JudgeReport::default()))
+    }
+}
+
 /// Dispatch the judge agent and turn its verdict into a loop outcome.
 ///
 /// The delivery gate runs here rather than in the loop head: it exists
@@ -5587,6 +6002,12 @@ async fn evaluate_agent_condition(
         );
         return Ok(LoopConditionOutcome::Continue(JudgeReport::default()));
     };
+
+    if let Some(outcome) =
+        try_module_count_halt(&ctx.config.workspace_root, unit_template, current_iter_abs)
+    {
+        return Ok(outcome);
+    }
 
     // Build a compact digest of the most recent worker manifests for
     // this loop, substituted into `{{ITER_EVIDENCE}}` if the judge's
