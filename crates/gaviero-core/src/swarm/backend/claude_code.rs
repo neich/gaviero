@@ -165,6 +165,11 @@ async fn drive_session(
     mut session: AcpSession,
     tx: tokio::sync::mpsc::Sender<Result<UnifiedStreamEvent>>,
 ) -> Result<()> {
+    // Whether the message currently being assembled arrived as
+    // `ContentDelta`s — see `assistant_text_fallback`.
+    let mut streamed_text = false;
+    // Set when stdout hits EOF before any `result` line.
+    let mut eof_without_result = false;
     loop {
         // Abandonment check. `tx.send(...).is_err()` below only fires on the
         // *next* event, which never arrives when a subprocess wedges — the
@@ -179,6 +184,23 @@ async fn drive_session(
         };
         match event {
             Ok(Some(event)) => {
+                if matches!(event, StreamEvent::ContentDelta(_)) {
+                    streamed_text = true;
+                }
+                // Replay a whole assistant message's text when nothing
+                // streamed for it, then reset for the next message.
+                if let Some(text) = assistant_text_fallback(&event, streamed_text)
+                    && tx
+                        .send(Ok(UnifiedStreamEvent::TextDelta(text)))
+                        .await
+                        .is_err()
+                {
+                    return Ok(()); // receiver dropped
+                }
+                if matches!(event, StreamEvent::AssistantMessage { .. }) {
+                    streamed_text = false;
+                }
+
                 let unified = map_acp_event(&event);
                 for ev in unified {
                     if tx.send(Ok(ev)).await.is_err() {
@@ -192,9 +214,10 @@ async fn drive_session(
                 }
             }
             Ok(None) => {
-                let _ = tx
-                    .send(Ok(UnifiedStreamEvent::Done(StopReason::EndTurn)))
-                    .await;
+                // Emitting the terminal event is deferred until after
+                // `wait()` below, which is what tells us whether this EOF
+                // was a clean end of turn or a dead subprocess.
+                eof_without_result = true;
                 break;
             }
             Err(e) => {
@@ -209,8 +232,65 @@ async fn drive_session(
         }
     }
 
-    let _ = session.wait().await;
+    let status = session.wait().await;
+
+    if eof_without_result {
+        // stdout closed before any `result` line: the CLI died before it
+        // could report — bad flag, failed auth, crash. A non-zero exit here
+        // is an error, not a clean end of turn; reporting `EndTurn` gave the
+        // runner an empty, successful transcript and left the operator with
+        // no diagnostic at all. stderr is the only place the reason lives.
+        let failed = status.as_ref().map(|s| !s.success()).unwrap_or(true);
+        if failed {
+            let stderr = session.stderr_output_final().await;
+            let code = match status.as_ref() {
+                Ok(s) => match s.code() {
+                    Some(c) => c.to_string(),
+                    None => "signal".to_string(),
+                },
+                Err(e) => format!("unknown ({e})"),
+            };
+            let detail = if stderr.trim().is_empty() {
+                "no stderr output".to_string()
+            } else {
+                stderr
+            };
+            let msg =
+                format!("claude exited with status {code} before producing a result: {detail}");
+            tracing::error!(target: "backend.claude", "{}", msg);
+            let _ = tx.send(Ok(UnifiedStreamEvent::Error(msg))).await;
+            let _ = tx
+                .send(Ok(UnifiedStreamEvent::Done(StopReason::Error)))
+                .await;
+        } else {
+            let _ = tx
+                .send(Ok(UnifiedStreamEvent::Done(StopReason::EndTurn)))
+                .await;
+        }
+    }
+
     Ok(())
+}
+
+/// Text to replay for `event`, or `None` when there is nothing to recover.
+///
+/// `--include-partial-messages` normally delivers assistant text as
+/// `ContentDelta`s; the trailing `AssistantMessage` repeats it and is mapped
+/// for its `tool_uses` only, so replaying its text would double the
+/// transcript. Synthetic messages carry no deltas at all — an API error
+/// ("There's an issue with the selected model …") arrives as a single
+/// `AssistantMessage` — and dropping their text is how a 404 became a silent
+/// empty turn. Forwarded subagent messages (`parent_tool_use_id`) are left
+/// alone: they belong to a nested transcript, not this one.
+fn assistant_text_fallback(event: &StreamEvent, streamed_text: bool) -> Option<String> {
+    match event {
+        StreamEvent::AssistantMessage {
+            text,
+            parent_tool_use_id: None,
+            ..
+        } if !streamed_text && !text.trim().is_empty() => Some(text.clone()),
+        _ => None,
+    }
 }
 
 /// Map a single ACP protocol event into zero or more unified events.
@@ -451,6 +531,56 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, UnifiedStreamEvent::FileBlock { .. })),
             "Claude path must never emit FileBlock from text"
+        );
+    }
+
+    // ── assistant-text fallback (swallowed-error regression) ────────────
+
+    fn assistant(text: &str, parent: Option<&str>) -> StreamEvent {
+        StreamEvent::AssistantMessage {
+            text: text.into(),
+            tool_uses: vec![],
+            parent_tool_use_id: parent.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn assistant_text_replayed_when_nothing_streamed() {
+        // The exact shape of a model_not_found turn: one synthetic assistant
+        // message, no ContentDelta before it. Its text is the only place the
+        // failure reason exists.
+        let msg = "There's an issue with the selected model (sonnet-5).";
+        assert_eq!(
+            assistant_text_fallback(&assistant(msg, None), false),
+            Some(msg.to_string())
+        );
+    }
+
+    #[test]
+    fn assistant_text_not_replayed_after_deltas() {
+        // Normal streaming turn — replaying would duplicate the transcript.
+        assert_eq!(
+            assistant_text_fallback(&assistant("hello", None), true),
+            None
+        );
+    }
+
+    #[test]
+    fn assistant_text_fallback_skips_subagent_and_empty_messages() {
+        // Forwarded subagent text belongs to a nested transcript.
+        assert_eq!(
+            assistant_text_fallback(&assistant("nested", Some("toolu_1")), false),
+            None
+        );
+        // Tool-only messages carry no text worth replaying.
+        assert_eq!(
+            assistant_text_fallback(&assistant("   ", None), false),
+            None
+        );
+        // Non-assistant events are never a fallback source.
+        assert_eq!(
+            assistant_text_fallback(&StreamEvent::ContentDelta("x".into()), false),
+            None
         );
     }
 
