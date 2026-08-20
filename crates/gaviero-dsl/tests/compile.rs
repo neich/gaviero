@@ -316,74 +316,133 @@ fn example_codebase_review() {
     let plan = compile_example_plan("codebase_review.gaviero");
     let units = plan.work_units_ordered().expect("toposort");
 
-    // Sequential per-module loop with replan + execute, plus inventory
-    // upstream and test_audit + final_verify downstream. The previous
-    // shape included a per-iteration verify_module agent; that proved
-    // fragile (sonnet sometimes never wrote the expected verify-N.md)
-    // and duplicated the workflow-level `verify {compile true ...}`
-    // safety net. The current shape relies on halt-propagation through
-    // apply-{{ITER}}.md instead.
-    // Ordering: inventory → loop body (2 agents) → test_audit → final_verify
-    assert_eq!(units.len(), 5);
+    // Review-only: inventory → loop { review_module } until halt_judge
+    // → synthesize. Apply / verify_module / test_audit / stacked halt
+    // probes are gone — findings are the deliverable.
+    assert_eq!(units.len(), 3);
     let ids: Vec<&str> = units.iter().map(|u| u.id.as_str()).collect();
-    assert!(
-        ids.contains(&"inventory"),
-        "expected inventory in {:?}",
-        ids
-    );
-    assert!(ids.contains(&"replan_module"));
-    assert!(ids.contains(&"execute_module"));
-    assert!(!ids.contains(&"verify_module"), "verify_module was removed");
-    assert!(ids.contains(&"test_audit"));
-    assert!(ids.contains(&"final_verify"));
+    assert_eq!(ids, vec!["inventory", "review_module", "synthesize"]);
+    assert!(!ids.contains(&"execute_module"));
+    assert!(!ids.contains(&"replan_module"));
+    assert!(!ids.contains(&"verify_module"));
+    assert!(!ids.contains(&"test_audit"));
+    assert!(!ids.contains(&"final_verify"));
 
-    // The loop now uses an `until command "..."` shell probe instead of
-    // an LLM judge — no entries in loop_judge_units.
-    assert_eq!(plan.loop_judge_units.len(), 0);
-    assert!(matches!(
-        &plan.loop_configs[0].until,
-        gaviero_core::swarm::plan::LoopUntilCondition::Command(cmd)
-            if cmd.contains("apply-{{ITER}}.md") && cmd.contains("HALTED:")
-    ));
-    // {{OUT_DIR}} should have been substituted at compile time.
-    if let gaviero_core::swarm::plan::LoopUntilCondition::Command(cmd) =
-        &plan.loop_configs[0].until
-    {
-        assert!(
-            cmd.contains("reviews/latest"),
-            "expected OUT_DIR=reviews/latest substituted in command, got: {cmd}"
-        );
-    }
-
-    // Single sequential loop with the two body agents.
     assert_eq!(plan.loop_configs.len(), 1);
+    let lc = &plan.loop_configs[0];
+    assert_eq!(lc.agent_ids, vec!["review_module"]);
+    assert_eq!(lc.max_iterations, 24);
+    assert_eq!(lc.iter_start, 1);
+    assert_eq!(lc.stability, 1);
+    assert_eq!(lc.judge_timeout_secs, 60);
+    assert!(lc.strict_judge);
     assert_eq!(
-        plan.loop_configs[0].agent_ids,
-        vec!["replan_module", "execute_module"]
+        lc.branch_chain,
+        gaviero_core::swarm::plan::BranchChainMode::None
     );
-    assert_eq!(plan.loop_configs[0].max_iterations, 24);
-    assert_eq!(plan.loop_configs[0].iter_start, 1);
-    // max_parallel 1 — sequential is the whole point of this example.
-    assert_eq!(plan.max_parallel, Some(1));
-    // The loop must use stacked mode — without it, iter N's replan_module
-    // doesn't see iter N-1's source edits (chain anchor isn't established).
+    assert!(matches!(
+        &lc.until,
+        gaviero_core::swarm::plan::LoopUntilCondition::Agent(name) if name == "halt_judge"
+    ));
+    assert_eq!(plan.loop_judge_units.len(), 1);
+    assert_eq!(plan.loop_judge_units[0].id, "halt_judge");
     assert_eq!(
-        plan.loop_configs[0].branch_chain,
-        gaviero_core::swarm::plan::BranchChainMode::Stacked
+        plan.loop_judge_units[0].model.as_deref(),
+        Some("claude:sonnet-5")
     );
-
-    // test_audit depends on the loop body so it runs AFTER iterations settle
-    // (gated by the post-loop tier dispatch in `swarm::pipeline`).
-    let test_audit = units.iter().find(|u| u.id == "test_audit").unwrap();
+    assert!(plan.loop_judge_units[0].produces.is_empty());
     assert!(
-        test_audit.depends_on.iter().any(|d| d == "execute_module"),
-        "test_audit should depend on execute_module, got {:?}",
-        test_audit.depends_on
+        plan.loop_judge_units[0]
+            .coordinator_instructions
+            .contains("{{ITER_EVIDENCE}}"),
+        "halt_judge should reference {{{{ITER_EVIDENCE}}}}"
     );
 
-    // final_verify depends on test_audit.
-    let final_verify = units.iter().find(|u| u.id == "final_verify").unwrap();
-    assert!(final_verify.depends_on.contains(&"test_audit".to_string()));
+    // max_parallel 1 — shared checkout so later reviews can read earlier
+    // review-N.md; stacked mode is not used (and would hard-fail here).
+    assert_eq!(plan.max_parallel, Some(1));
+    assert!(
+        !plan.verification_config.compile
+            && !plan.verification_config.clippy
+            && !plan.verification_config.test,
+        "review-only workflow must not run compile/clippy/test verify, got {:?}",
+        plan.verification_config
+    );
+
+    let model_of = |id: &str| -> Option<String> {
+        units
+            .iter()
+            .chain(plan.loop_judge_units.iter())
+            .find(|u| u.id == id)
+            .unwrap_or_else(|| panic!("agent {id} not found"))
+            .model
+            .clone()
+    };
+    assert_eq!(model_of("inventory").as_deref(), Some("claude:sonnet-5"));
+    assert_eq!(model_of("review_module").as_deref(), Some("claude:opus"));
+    assert_eq!(model_of("synthesize").as_deref(), Some("claude:sonnet-5"));
+
+    let inventory = units.iter().find(|u| u.id == "inventory").unwrap();
+    assert_eq!(
+        inventory.produces,
+        vec!["reviews/latest/inventory.md".to_string()]
+    );
+    assert!(inventory.extra_allowed_tools.is_empty());
+
+    let review = units.iter().find(|u| u.id == "review_module").unwrap();
+    assert_eq!(review.depends_on, vec!["inventory"]);
+    assert_eq!(
+        review.produces,
+        vec!["reviews/latest/review-{{ITER}}.md".to_string()]
+    );
+    assert!(
+        review.coordinator_instructions.contains("reviews/latest/"),
+        "OUT_DIR should be compile-time substituted in prompts"
+    );
+    assert!(
+        review.coordinator_instructions.contains("{{ITER}}"),
+        "runtime ITER should survive compile"
+    );
+    assert!(
+        !review.coordinator_instructions.contains("HALTED:"),
+        "review body must not own loop halt via a HALTED token"
+    );
+    assert!(review.extra_allowed_tools.is_empty());
+    assert!(
+        review
+            .scope
+            .owned_paths
+            .iter()
+            .any(|p| p == "reviews/latest/review-*.md"),
+        "OUT_DIR should be compile-time substituted in owned globs, got {:?}",
+        review.scope.owned_paths
+    );
+    assert!(
+        !review
+            .scope
+            .owned_paths
+            .iter()
+            .any(|p| p == "src/" || p == "crates/"),
+        "review_module must not own source paths, got {:?}",
+        review.scope.owned_paths
+    );
+
+    let synthesize = units.iter().find(|u| u.id == "synthesize").unwrap();
+    assert!(
+        synthesize.depends_on.iter().any(|d| d == "review_module"),
+        "synthesize should depend on review_module, got {:?}",
+        synthesize.depends_on
+    );
+    assert_eq!(
+        synthesize.produces,
+        vec!["reviews/latest/summary.md".to_string()]
+    );
+    assert_eq!(
+        synthesize.write_namespace.as_deref(),
+        Some("review-history")
+    );
+    assert_eq!(synthesize.memory_importance, Some(0.9));
+    assert!(synthesize.memory_write_content.is_some());
 }
 
 #[test]

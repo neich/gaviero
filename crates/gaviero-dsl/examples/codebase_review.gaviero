@@ -1,112 +1,73 @@
-// Template: Critical codebase review with rolling per-module replan-then-apply
+// Template: Critical codebase review (findings only — does not apply edits)
 //
 // Shape:
 //
-//   inventory             (opus)         — discovers modules, writes inventory.md
+//   inventory        (sonnet)  — discovers modules, writes inventory.md
 //     ↓
-//   loop {                                — sequential per-module loop
-//     replan_module       (opus)         — RE-reads current state (post any prior
-//                                          iterations' edits) and writes the plan
-//                                          for module {{ITER}}: findings + apply list.
-//                                          Earlier iterations' applied changes are
-//                                          part of the input here, so this iteration's
-//                                          plan reflects the codebase as it now is.
-//     execute_module      (opus)         — applies every accepted finding for
-//                                          THIS module in one focused agent turn.
-//     until command "..."                — deterministic shell probe of the
-//                                          per-iteration apply-N.md branch tip.
-//                                          Exits when the file starts with
-//                                          `HALTED:`. No LLM round-trip — the
-//                                          halt signal is a string-prefix check.
+//   loop {
+//     review_module  (opus)    — findings for module {{ITER}}
+//     until agent halt_judge   — sonnet: ITER >= MODULE_COUNT, or STOP?
 //     max_iterations 24
 //   }
 //     ↓
-//   test_audit            (opus)         — proposes + writes integration tests
-//                                          against the now-settled codebase.
-//     ↓
-//   final_verify          (sonnet)       — full test suite + git-diff summary;
-//                                          writes final-verification.md
+//   synthesize       (sonnet)  — rolls up every review-N.md into summary.md
 //
-// Why this shape vs "plan everything → apply everything":
-//   The user's constraint is that applying a change in module N invalidates
-//   the plan for modules N+1…M. So the only correct order is sequential
-//   replan-apply per module — no precomputed apply manifest. Each
-//   `replan_module` iteration sees the CURRENT codebase (including any
-//   edits from prior iterations), so it can drop findings that are now
-//   obsolete and add findings that the prior iteration uncovered.
+// Review, not apply. Findings are the deliverable. A later, human-gated
+// workflow can apply them; this script must not mutate src/ or tests/.
 //
-//   This costs more tokens than the precomputed-then-apply shape, but
-//   that's the trade — correctness over throughput.
+// Why a loop rather than one giant review:
+//   Module count is unknown at compile time. One opus turn per module
+//   keeps context on that module's entry points instead of stuffing the
+//   whole repo into a single prompt.
 //
-// Why no per-iteration verify_module agent:
-//   The previous version had a `verify_module` agent inside the loop body
-//   that ran `cargo test -p <crate>` and emitted VERDICT: PASS / STOP. It
-//   was a probabilistic failure point (sonnet sometimes didn't write the
-//   expected verify-N.md file at all) AND it duplicated the workflow-level
-//   `verify { compile true clippy true test true }` safety net that runs
-//   at workflow exit. Dropping it simplifies the loop body and removes
-//   the most fragile termination signal.
+// Why sequential (max_parallel 1), not stacked:
+//   max_parallel 1 runs agents on the shared checkout — worktrees only
+//   engage when max_parallel > 1. Sequential lets review N read
+//   review-1.md … review-(N-1).md for cross-module duplication. There
+//   is no source mutation, so branch_chain stacked is neither needed
+//   nor compatible with max_parallel 1.
 //
-// Cross-iteration state propagation:
-//   The `branch_chain stacked` setting on the loop is load-bearing. Without
-//   it, gaviero's worktree provisioner resets each iteration to the workspace's
-//   main HEAD — replan iteration 2 would never see iteration 1's edits and
-//   the rolling-state property would be fictional. With stacked mode,
-//   iteration N's worktree HEAD = iteration N-1's last committed branch tip,
-//   so source mutations carry forward. Each iteration's body agents commit
-//   to per-iteration branches `gaviero/<agent_id>-iter<N>` that survive in
-//   the repo's refs as the deliverable chain.
+// Halt:
+//   halt_judge (sonnet) reads MODULE_COUNT / VERDICT from inventory.md
+//   and exits when this iteration covered the last module, or when
+//   inventory STOPped. Same pattern as phased_plan.gaviero. No HALTED
+//   token, no git-show probe, no extra opus burn after the last module.
 //
-// Tier policy:
-//   * Hard reasoning per iteration (replan, execute, test_audit) — opus.
-//   * Coordination/verdict (module_judge, final_verify) — sonnet.
-//
-// Halt-propagation:
-//   * inventory writes `MODULE_COUNT: <integer>`. If unreviewable, ends with
-//     `VERDICT: STOP: <reason>` and downstream phases short-circuit.
-//   * replan_module's STEP 0 emits `HALTED:` to plan-{{ITER}}.md when
-//     `{{ITER}} > MODULE_COUNT` (or inventory said STOP). execute_module
-//     propagates the HALTED line into apply-{{ITER}}.md. The loop's
-//     `until command` checks that file's branch tip directly — no LLM
-//     judge, no string-format ambiguity.
+// Output contract:
+//   Each writer declares `produces` so a turn that narrates a file it
+//   never wrote is Failed, not Completed. {{ITER}} in produces is
+//   substituted per pass.
 //
 // Usage:
 //   gaviero-cli --script codebase_review.gaviero
 //   gaviero-cli --script codebase_review.gaviero --var OUT_DIR=reviews/2026-05
-//   gaviero-cli --script codebase_review.gaviero --var APPLY_FILTER="critical,high"
 
 include "clients.gaviero"
 
 vars {
-    OUT_DIR        "reviews/latest"
-    // Severity filter applied per-iteration when replan_module decides
-    // which findings to include in this iteration's APPLY_LIST.
-    //   "all"               → every finding for this module
-    //   "critical,high"     → critical and high only (default)
-    //   "critical"          → critical only
-    APPLY_FILTER   "critical,high"
+    OUT_DIR "reviews/latest"
 }
 
 // ── Prompts ──────────────────────────────────────────────────────────────────
 
 prompt inventory-body #"
-    You are producing a structured inventory of a repository for a downstream
-    critical-review pipeline.
+    You are producing a structured inventory of a repository for a
+    downstream critical-review pipeline. You do not review code in depth
+    here — you name modules and how they fit together.
 
     STEP 1 — discover modules.
-      Identify every distinct module/library/crate/app in the workspace. Use
-      whatever signal is most reliable for this language (Cargo workspace
-      members, package.json workspaces, top-level apps/ + libs/ folders, etc.).
-      Do NOT include vendored, generated, or third-party code (target/, dist/,
-      node_modules/, .gaviero/, etc.).
+      Identify every distinct module/library/crate/app in the workspace.
+      Use the most reliable signal for this language (Cargo workspace
+      members, package.json workspaces, top-level apps/ + libs/, etc.).
+      Do NOT include vendored, generated, or third-party code (target/,
+      dist/, node_modules/, .gaviero/, etc.).
 
     STEP 2 — order the modules from leaf to root.
-      The replan-apply loop runs modules in the order you list them. Put
+      The review loop runs modules in the order you list them. Put
       foundational/shared modules first (libraries with no internal deps),
-      then their consumers, then top-level apps. Reasoning: applying a
-      simplification in a leaf module is harmless if it later turns out
-      to be wrong; applying one in a high-fan-out module first risks
-      forcing every downstream replan to re-do work.
+      then their consumers, then top-level apps. Later reviews read
+      earlier review-N.md files; leaf-first means shared-API findings
+      exist before consumers are reviewed.
 
     STEP 3 — write {{OUT_DIR}}/inventory.md with this exact structure:
 
@@ -137,266 +98,143 @@ prompt inventory-body #"
 
         VERDICT: PROCEED
 
-    The `MODULE_COUNT` line is parsed by replan_module's halt check — be exact.
+    The `MODULE_COUNT` line is parsed by halt_judge — be exact.
     Each module heading must be `## Module <N> — <name>`, numbered from 1.
+    Always emit MODULE_COUNT, including when you STOP (use 0).
 
     If the repo isn't reviewable in this shape (no recognisable modules,
     workspace is empty, etc.), replace the final line with:
         VERDICT: STOP: <one paragraph explaining why>
 "#
 
-prompt replan-body #"
-    You are producing the per-module review-and-apply plan for module
-    {{ITER}}, RE-READING the current codebase state. Earlier iterations of
-    this loop may have already modified the workspace; your job is to plan
-    against what's there NOW, not what was there at inventory time.
+prompt review-body #"
+    You are reviewing module {{ITER}} of this repository. You produce
+    findings. You do not edit source, tests, config, or lockfiles.
 
-    STEP 0 — halt check.
-      Read {{OUT_DIR}}/inventory.md. If its last line is `VERDICT: STOP: …`
-      or if iteration {{ITER}} > MODULE_COUNT, write a single line to
-      {{OUT_DIR}}/plan-{{ITER}}.md:
+    STEP 0 — skip if there is no module for this iteration.
+      Read {{OUT_DIR}}/inventory.md.
+      If its last line is `VERDICT: STOP: …`, or if {{ITER}} > MODULE_COUNT,
+      write {{OUT_DIR}}/review-{{ITER}}.md as:
 
-          HALTED: nothing to plan (inventory STOP or module count exceeded)
+          # Review — Module {{ITER}} — skipped
+          Reason: <inventory STOP quote, or module count exceeded>
 
-      and exit without further analysis. The `HALTED:` token is the loop's
-      termination signal — module_judge keys off it.
-
-      If iteration {{ITER}} > 1, also read {{OUT_DIR}}/apply-{{PREV_ITER}}.md.
-      If it starts with `HALTED:`, write `HALTED: <quote prior reason>` to
-      plan-{{ITER}}.md and exit. Halts propagate forward; no iteration may
-      plan against a halted predecessor.
+      and exit. halt_judge owns loop termination; this file only satisfies
+      the output contract.
 
     STEP 1 — locate your module.
       From {{OUT_DIR}}/inventory.md, read the section headed
-      `## Module {{ITER}} — …`. That is your subject for this iteration.
+      `## Module {{ITER}} — …`. That is your subject.
 
-    STEP 2 — read all prior iteration logs (if any).
-      For each k in 1..{{ITER}}-1, read {{OUT_DIR}}/apply-<k>.md and
-      {{OUT_DIR}}/plan-<k>.md. These tell you what changed in earlier
-      modules and what was deferred. Use them to:
-        - Skip findings that are now obsolete (the prior iteration removed
-          the offending code, renamed the API, etc.).
-        - Add findings that the prior iteration UNCOVERED (e.g. removing
-          a leaky abstraction in a leaf module exposes a sibling antipattern
-          in this module).
-        - Reconsider findings that depended on assumptions that no longer
-          hold (the type the proposal restructures was just deleted).
+    STEP 2 — prior reviews (if {{ITER}} > 1).
+      Read {{OUT_DIR}}/review-k.md for each k in 1..{{ITER}}-1.
+      Skip any that are themselves skipped. Use them to:
+        - Avoid restating a finding already filed against an earlier module.
+        - Flag duplication / API mismatch this module shares with an earlier one
+          (cite the earlier F-id).
+        - Note cross-module impact that the earlier review predicted.
 
-    STEP 3 — deep analysis of THIS module's CURRENT state.
-      Read every source file in the module's path AS IT EXISTS NOW.
+    STEP 3 — analyse THIS module.
+      Do not read every source file. Start from the inventory's key entry
+      points, then pull only what you need via blast_radius, node_doc,
+      repo_outline, symbol_search, and symbol_doc. Cite file:line.
+      Length / field-count checklists are not findings.
+
       Form a critical opinion on:
+      - **Antipatterns**: god objects, mutable global state, hidden
+        dependencies, leaky abstractions, copy-paste proliferation.
+      - **Simplification**: types that do too many things, dead code, dead
+        config, dead deps.
+      - **Duplication**: the same idea implemented twice in this module, or
+        vs an earlier module already reviewed.
+      - **Overcomplexity**: control flow or types that hide the actual
+        invariant, not merely "this file is long".
+      - **Test gaps**: public-API or cross-module workflows with no
+        integration coverage. Propose tests; do not write them.
 
-      - **Antipatterns**: god objects, mutable global state, deep inheritance,
-        primitive obsession, hidden dependencies, magic numbers/strings,
-        leaky abstractions, premature optimisation, copy-paste proliferation.
-      - **Code simplification**: functions/classes/types that do too many
-        things, nested control flow that can flatten, dead code, dead
-        config, dead deps. Be specific — name file:line.
-      - **Repetition**: duplicated logic across files (within this module
-        AND with already-modified earlier modules), near-duplicates that
-        differ only in inline parameters, parallel implementations of the
-        same idea. Propose a single consolidation site for each.
-      - **Overcomplexity**: functions longer than ~50 lines, modules longer
-        than ~500 lines, types with >10 fields, match arms with >5 branches
-        each themselves complex. Propose a smaller reshape.
+    STEP 4 — write {{OUT_DIR}}/review-{{ITER}}.md with this exact structure:
 
-    STEP 4 — write {{OUT_DIR}}/plan-{{ITER}}.md with this exact structure:
+        # Review — Module {{ITER}} — <name>
 
-        # Plan — Module {{ITER}} — <name>
-
-        ## Context delta from prior iterations
-        - Findings from inventory time that no longer apply (and why)
-        - New issues uncovered by what earlier iterations changed
-        - Anything in this module that was assumed safe and isn't anymore
-
-        ## Findings (this iteration)
+        ## Findings
         For each finding:
 
             ### F<N>: <short title>
             Severity: critical | high | medium | low
-            Category: antipattern | simplification | duplication | overcomplexity
+            Category: antipattern | simplification | duplication | overcomplexity | test-gap
             Location: <file:line[-line]>
             Problem: <2-3 sentences>
-            Proposed change: <concrete edit, including which files would be
-                touched and roughly how the result would look>
-            Risk: <1 sentence — what could break if applied>
-            Cross-module impact: <what downstream modules might need replanning;
-                empty if local to this module>
+            Proposed change: <concrete edit or test, which files, roughly how>
+            Risk: <1 sentence — what could break if someone later applies this>
+            Cross-module: <downstream modules / earlier F-ids; empty if local>
 
         ## Skipped (judgment calls)
-        Issues you considered but won't flag — one line each, with reason.
-
-        ## Apply list
-
-            APPLY_FILTER: {{APPLY_FILTER}}
-            APPLY_COUNT: <integer>
-
-            APPLY_LIST:
-            1. F<id> — <severity> — <title>
-            2. F<id> — <severity> — <title>
-            ...
-
-        Selection rule:
-          - "all"               → every finding above
-          - "critical,high"     → critical and high severity only (default)
-          - "critical"          → only critical
-        Use APPLY_FILTER="{{APPLY_FILTER}}" to pick the cut. Be opinionated —
-        if a high finding is unsafe to apply without first doing other work
-        flagged here, demote it (move it to Skipped with a reason).
+        Issues you considered but will not flag — one line each, with reason.
 
     Be terse and specific. Vague suggestions ("clean up error handling")
     are not findings.
 "#
 
-prompt execute-body #"
-    You are applying every accepted change for module {{ITER}} in this turn.
+prompt judge-body #"
+    You decide whether the review loop is complete. Cheap: read two facts,
+    emit a verdict. Do not review code.
 
-    STEP 0 — halt check.
-      Read {{OUT_DIR}}/plan-{{ITER}}.md. If it starts with `HALTED:`, write
-      a single line to {{OUT_DIR}}/apply-{{ITER}}.md:
+    {{ITER_EVIDENCE}}
 
-          HALTED: <quote the plan's halt reason>
+    Read {{OUT_DIR}}/inventory.md — parse `MODULE_COUNT: <N>` and the last
+    `VERDICT:` line.
 
-      and exit without modifying any source files. The `HALTED:` token MUST
-      propagate verbatim to apply-{{ITER}}.md — module_judge reads that file
-      to detect loop termination.
+    Return PASS (loop exits) when ANY of:
+      1. Iteration {{ITER}} >= MODULE_COUNT. The last listed module was
+         reviewed this pass (or MODULE_COUNT is 0).
+      2. Inventory ends with `VERDICT: STOP: …`. There is nothing to review.
 
-    STEP 1 — read your apply list.
-      Parse the APPLY_LIST in {{OUT_DIR}}/plan-{{ITER}}.md. Process the
-      findings IN THE ORDER LISTED — earlier findings in the list may
-      simplify code that later findings depend on.
+    Return FAIL (loop continues) when inventory is `VERDICT: PROCEED` and
+    {{ITER}} < MODULE_COUNT — the next iteration should review module
+    {{ITER}}+1.
 
-    STEP 2 — apply, finding by finding.
-      For each finding in APPLY_LIST:
-        a. Re-read the finding's full details from plan-{{ITER}}.md.
-        b. Make the edits. Touch only files within the module's path
-           (consult inventory.md for the path) AND only under src/ or
-           crates/. Tests are off-limits in this phase — the test_audit
-           phase owns tests/.
-        c. If a finding's proposed change requires touching tests/, SKIP
-           it and record the reason in DEVIATIONS ("requires tests/ edits,
-           deferred to test_audit").
-        d. After the edits for this finding, run a targeted compile check
-           (cargo check -p <crate> for Rust, equivalent for the language).
-        e. If the change can't be applied as proposed (the code has moved
-           since planning), DO NOT improvise — skip it and record the
-           reason in DEVIATIONS below.
+    Output format — emit exactly one fenced JSON object as your last output:
 
-    STEP 3 — write {{OUT_DIR}}/apply-{{ITER}}.md with:
-
-        # Apply — Module {{ITER}}
-
-        ## Findings applied
-        - F<id>: <title> — <one line: what was changed>
-        - ...
-
-        ## Findings skipped
-        - F<id>: <title> — <reason: code moved, dep-of-dep failed, etc.>
-        - ...
-
-        ## Files modified
-        <list of paths touched, deduplicated>
-
-        ## DEVIATIONS
-        Anything you did differently from the proposal text in plan-{{ITER}}.md.
-        Empty if everything was applied as written.
-
-        ## DISCOVERIES
-        Anything this iteration revealed that should change downstream
-        modules' plans. The next replan iteration reads this section
-        explicitly. Be specific:
-          - "Removed type X used by module Y" → tells module Y's replan to
-            check call sites.
-          - "Found duplicate of <pattern> in module Z" → replan for module Z
-            should consider consolidating with this module's version.
-          - "" (empty) is fine if nothing crossed module boundaries.
+    ```json
+    {"verdict": "pass" | "fail", "reason": "<one short paragraph>"}
+    ```
 "#
 
-prompt test-audit-body #"
-    You are auditing the test suite for missing integration coverage. The
-    codebase has now settled — every module has been replanned and applied.
-
-    Bias toward integration tests over unit tests. Unit-test gaps are
-    cheap to find and often noise; integration-test gaps are where real
-    behavioural regressions live.
-
-    1. Read {{OUT_DIR}}/inventory.md and every {{OUT_DIR}}/apply-*.md
-       (skip any that start with `HALTED:`). They tell you what each
-       module does and what was just changed.
-    2. Read the existing tests/ directory and any in-crate test modules.
-    3. For each module, identify:
-       - Public-API surface that has no integration coverage.
-       - Cross-module workflows (A → B → C) that exist in code but
-         have no end-to-end test.
-       - Error/edge paths that are reachable but unexercised.
-       - Tests that are unit tests in disguise of integration tests
-         (heavy mocking of the very thing they should be testing).
-       - Tests that became invalid because of the changes just applied.
-
-    4. Write {{OUT_DIR}}/test-audit.md with structure:
-
-        # Test audit
-
-        ## Coverage gaps
-        For each:
-
-            ### T<N>: <short title>
-            Severity: critical | high | medium | low
-            Module: <name>
-            Surface: <function/endpoint/workflow that lacks coverage>
-            Proposed test: <one paragraph — what it would assert and how>
-            Why integration not unit: <1 sentence>
-
-        ## Tests to retire or rewrite
-        Existing tests that aren't pulling weight (over-mocked, tautological,
-        testing private internals, broken by recent applied changes). Same
-        finding format with `Action: retire | rewrite`.
-
-        ## Implementation
-        Write the proposed integration tests now (in tests/ or per-crate
-        test modules). Stick to severity=critical and severity=high — the
-        rest stay as proposals for a future pass. Run them after writing.
-        Record results below as `Tests added: <N> passing, <M> failing`.
-
-    Be terse. Vague suggestions ("add more tests for foo") are not findings.
-"#
-
-prompt final-verify-body #"
-    Final integration audit across every module change that landed plus
-    the integration tests just added.
+prompt synthesize-body #"
+    You are rolling up a completed (or halted) per-module review into one
+    summary. You do not edit source or tests.
 
     Read:
       - {{OUT_DIR}}/inventory.md
-      - Every {{OUT_DIR}}/plan-*.md and apply-*.md
-      - {{OUT_DIR}}/test-audit.md
-      - The full git diff vs the pre-swarm SHA
+      - Every {{OUT_DIR}}/review-*.md (skip any whose heading is skipped)
 
-    Run the complete test suite (cargo test --workspace, npm test, etc.).
-
-    Write {{OUT_DIR}}/final-verification.md with:
-      - Modules processed: which iterations ran, which halted.
-      - Findings landed vs deferred: rough count by severity.
-      - Test results: pass/fail counts; regressions vs pre-swarm baseline.
-      - Lint/clippy diffs: any new warnings introduced.
-      - Cross-module DISCOVERIES that didn't get picked up by a later
-        iteration (potential follow-up review).
+    Write {{OUT_DIR}}/summary.md with:
+      - Modules reviewed vs skipped, and why skipped if any.
+      - Findings by severity (counts, then the critical/high list with
+        module + F-id + location).
+      - Cross-module themes (duplication, layering, API leaks) that span
+        more than one review.
+      - Test-gap proposals worth a follow-up (do not write tests).
+      - Recommended apply order IF someone later applies these findings
+        (leaf to root; call out findings that block others).
 
     End with one of:
 
-        VERDICT: ACCEPT — review applied cleanly, merge as-is
-        VERDICT: REJECT — <which iterations to revert + why>
-        VERDICT: HALTED — <where the loop stopped + what's pending>
+        VERDICT: COMPLETE — every inventoried module was reviewed
+        VERDICT: PARTIAL — <which modules were skipped + why>
+        VERDICT: STOPPED — <inventory STOP reason>
 "#
 
 // ── Agents ───────────────────────────────────────────────────────────────────
 
 agent inventory {
     description "Inventory modules in leaf-to-root order"
-    client opus
+    client sonnet
     scope {
         owned     ["{{OUT_DIR}}/inventory.md"]
-        read_only ["src/" "crates/" "Cargo.toml" "package.json" "README.md" "ARCHITECTURE.md"]
+        read_only ["src/" "crates/" "Cargo.toml" "package.json" "README.md" "ARCHITECTURE.md" "CLAUDE.md"]
     }
+    produces ["{{OUT_DIR}}/inventory.md"]
     prompt inventory-body
     max_retries 1
 
@@ -407,77 +245,48 @@ agent inventory {
     }
 }
 
-// One generic per-module replanner — runs once per outer loop iteration,
-// re-reading the current codebase (post any prior-iteration edits).
-// Owns every plan-N.md slot via a glob; the validator allows overlap with
-// execute_module because they share the same loop group.
-agent replan_module {
-    description "Replan module {{ITER}} against the current codebase state"
+agent review_module {
+    description "Review module {{ITER}} — findings only, no edits"
     client opus
     depends_on [inventory]
     scope {
-        owned     ["{{OUT_DIR}}/plan-*.md"]
-        read_only ["{{OUT_DIR}}/" "src/" "crates/" "tests/" "Cargo.toml" "ARCHITECTURE.md"]
+        owned     ["{{OUT_DIR}}/review-*.md"]
+        read_only ["{{OUT_DIR}}/" "src/" "crates/" "tests/" "Cargo.toml" "ARCHITECTURE.md" "CLAUDE.md"]
     }
-    prompt replan-body
+    produces ["{{OUT_DIR}}/review-{{ITER}}.md"]
+    prompt review-body
     max_retries 2
 }
 
-// One generic per-module executor — applies the entire APPLY_LIST from
-// this iteration's plan in a single agent turn. Wide owned scope is the
-// cost of not knowing the module's path until runtime; the validator
-// accepts overlap with replan_module because they share the same loop group.
-// Owned scope is src/ + crates/ + the per-iteration apply log. Tests/ is
-// deliberately NOT in here even though some findings might touch tests:
-// the test_audit phase owns tests/ end-to-end (test changes belong there,
-// not in the per-module apply pass). If a finding's proposed change
-// requires touching tests, execute_module skips it and records the
-// reason in DEVIATIONS.
-agent execute_module {
-    description "Apply changes for module {{ITER}}"
-    client opus
-    depends_on [replan_module]
-    scope {
-        owned     ["src/" "crates/" "{{OUT_DIR}}/apply-*.md"]
-        read_only ["{{OUT_DIR}}/" "tests/" "Cargo.toml"]
-    }
-    prompt execute-body
-    max_retries 2
-}
-
-agent test_audit {
-    description "Audit tests + add critical/high integration coverage"
-    client opus
-    // depends_on a loop body agent — the runtime defers any tier whose
-    // units transitively depend on a loop body until AFTER the explicit
-    // loop's iterations have all run, so test_audit sees the settled
-    // post-loop state of apply-*.md (not the pre-loop empty state).
-    depends_on [execute_module]
-    scope {
-        owned     ["{{OUT_DIR}}/test-audit.md" "tests/"]
-        read_only ["{{OUT_DIR}}/" "src/" "crates/" "Cargo.toml"]
-    }
-    prompt test-audit-body
-    max_retries 1
-}
-
-agent final_verify {
-    description "Final integration audit across all applied changes"
+agent halt_judge {
+    description "Exit the review loop when MODULE_COUNT is covered or inventory STOP"
     client sonnet
-    depends_on [test_audit]
     scope {
-        owned     ["{{OUT_DIR}}/final-verification.md"]
-        read_only ["{{OUT_DIR}}/" "src/" "crates/" "tests/"]
+        read_only ["{{OUT_DIR}}/"]
     }
-    prompt final-verify-body
+    prompt judge-body
+}
+
+agent synthesize {
+    description "Roll up per-module reviews into one summary"
+    client sonnet
+    // depends_on a loop body agent — post-loop dispatch waits until the
+    // loop has finished every iteration, so synthesize sees every
+    // review-N.md (not the pre-loop empty state).
+    depends_on [review_module]
+    scope {
+        owned     ["{{OUT_DIR}}/summary.md"]
+        read_only ["{{OUT_DIR}}/"]
+    }
+    produces ["{{OUT_DIR}}/summary.md"]
+    prompt synthesize-body
     max_retries 1
 
     memory {
         write_ns      "review-history"
         importance    0.9
         write_content #"
-            Codebase review (replan-per-module) — applied: see
-            {{OUT_DIR}}/final-verification.md
+            Codebase review (findings only) — summary: {{OUT_DIR}}/summary.md
         "#
         staleness_sources ["src/" "crates/"]
     }
@@ -485,59 +294,31 @@ agent final_verify {
 
 // ── Workflow ─────────────────────────────────────────────────────────────────
 //
-// One outer dynamic-count loop: replan_module → execute_module.
+// max_iterations 24 is a safety cap. halt_judge exits when {{ITER}}
+// covers MODULE_COUNT (or inventory STOPs). Raise the cap only if a
+// repo genuinely has more modules than that.
 //
-// iter_start 1 is explicit even though it's the default — surfaces the
-// invariant that {{ITER}} starts at 1 (matching `## Module 1 — …` in
-// inventory.md).
-//
-// max_iterations 24 is a safety cap, not the actual count. Most repos have
-// well under 24 modules; if yours has more, raise this. Loop termination is
-// driven by replan_module's HALTED stamp — once iteration {{ITER}} exceeds
-// MODULE_COUNT, replan emits HALTED, execute propagates it, the `until
-// command` probe matches, and the loop exits well before max_iterations.
-//
-// max_parallel 1 because the whole point is sequential: each iteration
-// MUST see prior iterations' edits. No fan-out.
-//
-// Workflow-level verify { compile true clippy true test true } is the
-// runtime safety net — catches a broken build at workflow exit.
+// stability 1: the judge is reading a counter, not a vibes verdict.
+// No compile/clippy/test verify — this workflow writes markdown only.
 
 workflow codebase_review {
     steps [
         inventory
         loop {
-            agents         [replan_module execute_module]
+            agents         [review_module]
             iter_start     1
             max_iterations 24
-            // branch_chain stacked: each iteration's body agents commit to
-            // their own per-iteration branches `gaviero/{id}-iter{N}`,
-            // chained so iteration N's worktree is provisioned at iteration
-            // N-1's last branch tip. This is the ONLY mode under which
-            // replan_module sees iteration N-1's source edits — without
-            // it, every iteration's worktree is freshly provisioned from
-            // the workspace's main HEAD and prior commits are invisible.
-            //
-            // The chain `iter-1 ← iter-2 ← … ← iter-N` survives in the
-            // repo's refs after the workflow exits (the merge phase
-            // intentionally skips stacked branches). Push them as a
-            // stacked PR series for review, or fast-forward main onto
-            // the last iteration's tip if you want a flat history.
-            branch_chain   stacked
-            // Deterministic loop termination: read the current iteration's
-            // apply-N.md from execute_module's per-iteration branch tip and
-            // exit when the first line starts with `HALTED:`. {{ITER}} is
-            // substituted by the runtime before sh -c. No LLM judge.
-            until command  "git show gaviero/execute_module-iter{{ITER}}:{{OUT_DIR}}/apply-{{ITER}}.md 2>/dev/null | head -n 1 | grep -q '^HALTED:'"
+            stability      1
+            judge_timeout  60
+            strict_judge   true
+            until agent    halt_judge
         }
-        test_audit
-        final_verify
+        synthesize
     ]
     max_parallel 1
-    verify { compile true clippy true test true }
 
     memory {
-        read_ns  ["architecture" "review-history" "refactor-history"]
+        read_ns  ["architecture" "review-history"]
         write_ns "review-history"
     }
 }

@@ -83,7 +83,7 @@ Ten workflow scripts and three tier profiles live in `examples/`:
 | `plan_refinement.gaviero` | Dual-model plan refinement with judge loop |
 | `generic_consensus.gaviero` | N-reviewer consensus via roster expansion |
 | `phased_plan.gaviero` | Dynamic phase extraction |
-| `codebase_review.gaviero` | Rolling replan/apply loop |
+| `codebase_review.gaviero` | Per-module review loop (findings only) |
 | `update_docs.gaviero` | Parallel doc rewrite with `--tiers-file` |
 | `security_audit_memory.gaviero` | `memory {}` overrides, `read_ns`, staleness |
 
