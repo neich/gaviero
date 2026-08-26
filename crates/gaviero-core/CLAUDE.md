@@ -14,7 +14,7 @@ Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presenc
 
 ## Architecture
 
-**25 pub mods** — enumerate from [`src/lib.rs`](src/lib.rs). Orientation (not a substitute for reading the modules):
+**26 pub mods** — enumerate from [`src/lib.rs`](src/lib.rs). Orientation (not a substitute for reading the modules):
 
 | Area | Entry | Notes |
 |---|---|---|
@@ -25,6 +25,7 @@ Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presenc
 | Write path | [`write_gate.rs`](src/write_gate.rs), [`scope_enforcer.rs`](src/scope_enforcer.rs) | Modes: Interactive / AutoAccept / Deferred / RejectAll. |
 | Repo map | [`repo_map/`](src/repo_map) | Graph + [`topology.rs`](src/repo_map/topology.rs) + symbol enrichment/search. |
 | Skills | [`skills/`](src/skills) | Frontmatter, catalog, planner `ResolvedSkill` seam. |
+| Session persistence | [`session_state.rs`](src/session_state.rs), [`session_journal.rs`](src/session_journal.rs) | State + conversations save only on a clean quit; the journal appends each prompt at dispatch (fsync) so a crash can't lose it. All saves are tmp-file + rename. |
 | Other | `acp`, `context_planner`, `validation_gate`, `git`, `git_conflict`, `terminal`, `util`, `workspace`, … | See `lib.rs`. |
 
 `tree-sitter` types are re-exported here; downstream crates **must not** depend on `tree-sitter` directly.

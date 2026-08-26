@@ -9,7 +9,64 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+
+/// Write `content` to `path` atomically: fill a sibling `*.tmp` file, fsync
+/// it, then rename over the target.
+///
+/// Every save on this path used to be a bare `std::fs::write` straight onto
+/// the live file. Because saves only happen at exit, a crash *during* the one
+/// save would leave a truncated conversation — losing sessions that had
+/// previously been persisted just fine. Rename is atomic on both NTFS and
+/// POSIX, so a reader sees either the old file or the new one, never a
+/// half-written one.
+fn write_atomic(path: &Path, content: &str) -> Result<()> {
+    let dir = path
+        .parent()
+        .context("target path has no parent directory")?;
+    let mut tmp_name = path
+        .file_name()
+        .context("target path has no file name")?
+        .to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = dir.join(tmp_name);
+
+    {
+        let mut file = std::fs::File::create(&tmp)
+            .with_context(|| format!("creating temp file {}", tmp.display()))?;
+        file.write_all(content.as_bytes())
+            .with_context(|| format!("writing temp file {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing temp file {}", tmp.display()))?;
+    }
+
+    // Windows can transiently refuse the replace while an indexer or AV
+    // handle is open on the destination. Retry briefly rather than losing the
+    // save; the bound is a few milliseconds, which is acceptable even on the
+    // (synchronous) exit path.
+    let mut last_err = None;
+    for attempt in 0..3 {
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < 2 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        }
+    }
+
+    let _ = std::fs::remove_file(&tmp);
+    Err(last_err.expect("loop records an error before falling through")).with_context(|| {
+        format!(
+            "renaming {} onto {} (destination left untouched)",
+            tmp.display(),
+            path.display()
+        )
+    })
+}
 
 /// Persisted state for one editing session.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -132,7 +189,7 @@ pub fn save_session(workspace_key: &Path, state: &SessionState) -> Result<()> {
 
     let state_path = dir.join("state.json");
     let content = serde_json::to_string_pretty(state)?;
-    std::fs::write(&state_path, content)
+    write_atomic(&state_path, &content)
         .with_context(|| format!("writing state to {}", state_path.display()))?;
     Ok(())
 }
@@ -310,7 +367,7 @@ pub fn save_conversation_index(workspace_key: &Path, index: &ConversationIndex) 
         conversations_dir(workspace_key).context("could not determine conversations directory")?;
     std::fs::create_dir_all(&dir)?;
     let content = serde_json::to_string_pretty(index)?;
-    std::fs::write(dir.join("index.json"), content)?;
+    write_atomic(&dir.join("index.json"), &content)?;
     Ok(())
 }
 
@@ -328,7 +385,7 @@ pub fn save_conversation(workspace_key: &Path, conv: &StoredConversation) -> Res
         conversations_dir(workspace_key).context("could not determine conversations directory")?;
     std::fs::create_dir_all(&dir)?;
     let content = serde_json::to_string_pretty(conv)?;
-    std::fs::write(dir.join(format!("{}.json", conv.id)), content)?;
+    write_atomic(&dir.join(format!("{}.json", conv.id)), &content)?;
     Ok(())
 }
 
@@ -395,6 +452,66 @@ mod tests {
         assert!(loaded.panels.terminal);
         assert_eq!(loaded.tree_expanded.len(), 2);
         assert_eq!(loaded.tree_selected, 3);
+    }
+
+    #[test]
+    fn write_atomic_replaces_existing_content_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thing.json");
+        std::fs::write(&path, "old contents that are much longer").unwrap();
+
+        write_atomic(&path, "new").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert!(
+            !dir.path().join("thing.json.tmp").exists(),
+            "temp file must be renamed away, not left behind"
+        );
+    }
+
+    #[test]
+    fn write_atomic_creates_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh.json");
+        write_atomic(&path, "{}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+    }
+
+    #[test]
+    fn save_conversation_leaves_a_readable_file_after_repeated_saves() {
+        // Guards the truncation failure mode: the second save must never be
+        // observable as a partially written first save.
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path();
+
+        let mut conv = StoredConversation {
+            id: "c1".into(),
+            title: "First".into(),
+            messages: vec![StoredMessage {
+                role: "user".into(),
+                content: "a".repeat(4096),
+                tool_calls: Vec::new(),
+                timestamp: 0,
+            }],
+            created: 1,
+            updated: 2,
+            model_override: None,
+            effort_override: None,
+            session_ledger: None,
+            continuity_handle: None,
+            last_token_usage: None,
+        };
+        save_conversation(key, &conv).unwrap();
+
+        conv.title = "Second".into();
+        conv.messages.clear();
+        save_conversation(key, &conv).unwrap();
+
+        let back = load_conversation(key, "c1").expect("conversation still parses");
+        assert_eq!(back.title, "Second");
+        assert!(back.messages.is_empty());
+
+        let _ = std::fs::remove_dir_all(state_dir_for(key).unwrap());
     }
 
     #[test]

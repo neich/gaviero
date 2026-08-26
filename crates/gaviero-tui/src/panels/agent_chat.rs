@@ -592,6 +592,48 @@ pub struct Conversation {
 }
 
 impl Conversation {
+    /// Fresh conversation with a caller-supplied id and title.
+    ///
+    /// The single construction path for conversations that do not come from
+    /// disk — `new_conversation` generates the id, journal replay reuses the
+    /// id the crashed session had so a later save lines up with the journal
+    /// instead of forking a duplicate.
+    pub fn new(id: String, title: String) -> Self {
+        Self {
+            id,
+            conv_revision: 1,
+            next_message_seq: 1,
+            title,
+            messages: Vec::new(),
+            model_override: None,
+            effort_override: None,
+            namespace_override: None,
+            is_streaming: false,
+            streaming_status: String::new(),
+            streaming_started_at: None,
+            background_agents: Vec::new(),
+            auto_approve: false,
+            pending_permission: None,
+            pending_turn_id: None,
+            pending_module_path: None,
+            pending_focused_folder: None,
+            workspace_wide_next: false,
+            lite_next: false,
+            no_inject_next: false,
+            inject_arms_next: gaviero_core::context_planner::BootstrapArms::none(),
+            context_mode_override: None,
+            claude_session_id: None,
+            session_ledger: None,
+            pending_persisted_ledger: None,
+            transcript_inline_mode: TranscriptInlineMode::Auto,
+            last_token_usage: None,
+            last_turn_cost_usd: 0.0,
+            last_bootstrap_tokens: 0,
+            last_bootstrap_arms: gaviero_core::context_planner::BootstrapArms::none(),
+            last_memory_injection_tokens: 0,
+        }
+    }
+
     /// Push a message, assigning its monotonic `seq` (§2.6). The single
     /// construction path for live messages — direct `ChatMessage {}`
     /// literals outside restore/compact keep-list handling are a bug.
@@ -2201,39 +2243,10 @@ impl AgentChatState {
     }
 
     pub fn new_conversation(&mut self) {
-        let conv = Conversation {
-            id: gaviero_core::session_state::new_conversation_id(),
-            conv_revision: 1,
-            next_message_seq: 1,
-            title: "New Chat".to_string(),
-            messages: Vec::new(),
-            model_override: None,
-            effort_override: None,
-            namespace_override: None,
-            is_streaming: false,
-            streaming_status: String::new(),
-            streaming_started_at: None,
-            background_agents: Vec::new(),
-            auto_approve: false,
-            pending_permission: None,
-            pending_turn_id: None,
-            pending_module_path: None,
-            pending_focused_folder: None,
-            workspace_wide_next: false,
-            lite_next: false,
-            no_inject_next: false,
-            inject_arms_next: gaviero_core::context_planner::BootstrapArms::none(),
-            context_mode_override: None,
-            claude_session_id: None,
-            session_ledger: None,
-            pending_persisted_ledger: None,
-            transcript_inline_mode: TranscriptInlineMode::Auto,
-            last_token_usage: None,
-            last_turn_cost_usd: 0.0,
-            last_bootstrap_tokens: 0,
-            last_bootstrap_arms: gaviero_core::context_planner::BootstrapArms::none(),
-            last_memory_injection_tokens: 0,
-        };
+        let conv = Conversation::new(
+            gaviero_core::session_state::new_conversation_id(),
+            "New Chat".to_string(),
+        );
         self.conversations.push(conv);
         self.active_conv = self.conversations.len() - 1;
         self.scroll_offset = 0;
@@ -3757,6 +3770,17 @@ impl AgentChatState {
             }
         }
 
+        // Splice back anything the previous session failed to save. Runs
+        // *after* `active_id` is applied so a recovered conversation wins:
+        // the last journalled prompt is literally the last thing the user
+        // did before the crash.
+        let recovered = self.replay_prompt_journal(workspace_key);
+        if recovered > 0 {
+            tracing::warn!(
+                "recovered {recovered} prompt(s) from the journal — the previous session did not exit cleanly"
+            );
+        }
+
         // Ensure at least one conversation exists
         if self.conversations.is_empty() {
             self.new_conversation();
@@ -3770,10 +3794,83 @@ impl AgentChatState {
         self.history_stash.clear();
     }
 
+    /// Splice prompts journalled since the last clean save back into the
+    /// loaded conversations.
+    ///
+    /// [`gaviero_core::session_journal`] is checkpointed (truncated) whenever
+    /// [`Self::save_conversations`] succeeds in full, so anything still in it
+    /// is by construction *absent* from the saved JSON. That invariant is
+    /// what lets replay skip de-duplication entirely — it can't lean on
+    /// message `seq`, which is renumbered from 1 on every load, nor on
+    /// timestamps, which `StoredMessage` does not carry.
+    ///
+    /// Only the user's prompts are recovered; the assistant's replies were
+    /// never journalled, so each recovered run is prefixed with a system
+    /// message saying so rather than silently looking like a chat where the
+    /// agent ignored you.
+    ///
+    /// Returns the number of prompts spliced back in.
+    pub fn replay_prompt_journal(&mut self, workspace_key: &std::path::Path) -> usize {
+        let entries = gaviero_core::session_journal::load(workspace_key);
+        if entries.is_empty() {
+            return 0;
+        }
+
+        let mut recovered = 0usize;
+        let mut marked: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut last_idx: Option<usize> = None;
+
+        for entry in entries {
+            // Only user prompts are written today; ignore anything else so a
+            // journal from a future build can't inject unexpected roles.
+            if entry.role != "user" {
+                continue;
+            }
+
+            let idx = match self.find_conv_idx(&entry.conv_id) {
+                Some(idx) => idx,
+                None => {
+                    // Conversation crashed before its first save. Rebuild it
+                    // under the same id so the next save updates it rather
+                    // than creating a duplicate.
+                    let title = if entry.conv_title.is_empty() {
+                        "Recovered Chat".to_string()
+                    } else {
+                        entry.conv_title.clone()
+                    };
+                    self.conversations
+                        .push(Conversation::new(entry.conv_id.clone(), title));
+                    self.conversations.len() - 1
+                }
+            };
+
+            if marked.insert(entry.conv_id.clone()) {
+                self.conversations[idx].push_message(
+                    ChatRole::System,
+                    "Recovered after an unclean shutdown. The prompt(s) below were saved \
+                     at dispatch; the replies were not."
+                        .to_string(),
+                    Vec::new(),
+                );
+            }
+
+            self.conversations[idx].push_message(ChatRole::User, entry.text, Vec::new());
+            self.conversations[idx].bump_revision();
+            recovered += 1;
+            last_idx = Some(idx);
+        }
+
+        if let Some(idx) = last_idx {
+            self.active_conv = idx;
+        }
+        recovered
+    }
+
     /// Save all conversations for a workspace to disk.
     pub fn save_conversations(&self, workspace_key: &std::path::Path) {
         use gaviero_core::session_state as ss;
 
+        let mut all_saved = true;
         let mut summaries = Vec::new();
         for conv in &self.conversations {
             let stored = ss::StoredConversation {
@@ -3818,6 +3915,7 @@ impl AgentChatState {
 
             if let Err(e) = ss::save_conversation(workspace_key, &stored) {
                 tracing::warn!("Failed to save conversation {}: {}", conv.id, e);
+                all_saved = false;
             }
         }
 
@@ -3831,6 +3929,20 @@ impl AgentChatState {
         };
         if let Err(e) = ss::save_conversation_index(workspace_key, &index) {
             tracing::warn!("Failed to save conversation index: {}", e);
+            all_saved = false;
+        }
+
+        // Checkpoint only on a fully successful save. The journal's job is to
+        // hold exactly what the JSON does not — truncating it after a partial
+        // save would discard the very prompts that failed to persist.
+        if all_saved {
+            if let Err(e) = gaviero_core::session_journal::checkpoint(workspace_key) {
+                tracing::warn!("Failed to checkpoint prompt journal: {e:#}");
+            }
+        } else {
+            tracing::warn!(
+                "conversation save was incomplete — keeping the prompt journal for recovery"
+            );
         }
     }
 
@@ -5148,6 +5260,138 @@ mod tests {
             Some("ollama:qwen2.5-coder:7b".to_string());
 
         assert_eq!(state.effective_model(), "ollama:qwen2.5-coder:7b");
+    }
+
+    /// Scratch workspace key for the crash-recovery tests. `state_dir_for`
+    /// hashes the path, so each tempdir gets its own slot under the real data
+    /// directory; `Drop` removes it again.
+    struct JournalScratch {
+        _dir: tempfile::TempDir,
+        key: std::path::PathBuf,
+    }
+
+    impl JournalScratch {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let key = dir.path().to_path_buf();
+            Self { _dir: dir, key }
+        }
+    }
+
+    impl Drop for JournalScratch {
+        fn drop(&mut self) {
+            if let Some(d) = gaviero_core::session_state::state_dir_for(&self.key) {
+                let _ = std::fs::remove_dir_all(d);
+            }
+        }
+    }
+
+    #[test]
+    fn replay_prompt_journal_splices_lost_prompts_into_an_existing_conversation() {
+        let scratch = JournalScratch::new();
+        let mut state = AgentChatState::new();
+        let conv_id = state.conversations[0].id.clone();
+
+        // Two prompts journalled at dispatch, then the process dies before
+        // `save_session` ever runs.
+        gaviero_core::session_journal::append_prompt(&scratch.key, &conv_id, "Chat", "first lost")
+            .unwrap();
+        gaviero_core::session_journal::append_prompt(&scratch.key, &conv_id, "Chat", "second lost")
+            .unwrap();
+
+        let recovered = state.replay_prompt_journal(&scratch.key);
+
+        assert_eq!(recovered, 2);
+        let msgs = &state.conversations[0].messages;
+        assert_eq!(msgs.len(), 3, "one recovery marker plus two prompts");
+        assert_eq!(msgs[0].role, ChatRole::System);
+        assert!(msgs[0].content.contains("unclean shutdown"));
+        assert_eq!(msgs[1].content, "first lost");
+        assert_eq!(msgs[2].content, "second lost");
+        assert_eq!(
+            state.conversations[0].next_message_seq, 4,
+            "recovered messages go through push_message and take real seqs"
+        );
+    }
+
+    #[test]
+    fn replay_prompt_journal_rebuilds_a_conversation_that_never_reached_disk() {
+        // A conversation created and prompted in the same session that
+        // crashed: nothing about it exists in index.json.
+        let scratch = JournalScratch::new();
+        let mut state = AgentChatState::new();
+
+        gaviero_core::session_journal::append_prompt(
+            &scratch.key,
+            "ghost-conv",
+            "Ghost Title",
+            "prompt from a chat that never saved",
+        )
+        .unwrap();
+
+        let recovered = state.replay_prompt_journal(&scratch.key);
+
+        assert_eq!(recovered, 1);
+        let idx = state
+            .find_conv_idx("ghost-conv")
+            .expect("missing conversation is rebuilt under its original id");
+        assert_eq!(
+            state.conversations[idx].title, "Ghost Title",
+            "title the user actually saw is carried in the journal"
+        );
+        assert_eq!(
+            state.active_conv, idx,
+            "the last journalled prompt is where the user left off"
+        );
+    }
+
+    #[test]
+    fn replay_prompt_journal_on_a_clean_start_changes_nothing() {
+        let scratch = JournalScratch::new();
+        let mut state = AgentChatState::new();
+
+        assert_eq!(state.replay_prompt_journal(&scratch.key), 0);
+        assert!(
+            state.conversations[0].messages.is_empty(),
+            "no journal means no recovery marker"
+        );
+    }
+
+    #[test]
+    fn checkpoint_on_clean_save_stops_prompts_being_replayed_twice() {
+        // The load-bearing invariant: because `save_conversations` truncates
+        // the journal on success, a clean exit leaves nothing to replay — so
+        // replay needs no de-duplication against the saved JSON.
+        let scratch = JournalScratch::new();
+        let mut state = AgentChatState::new();
+        let conv_id = state.conversations[0].id.clone();
+
+        gaviero_core::session_journal::append_prompt(&scratch.key, &conv_id, "Chat", "a prompt")
+            .unwrap();
+        state.add_user_message_at(0, "a prompt");
+
+        state.save_conversations(&scratch.key);
+        assert!(
+            gaviero_core::session_journal::is_empty(&scratch.key),
+            "a fully successful save checkpoints the journal"
+        );
+
+        let mut reloaded = AgentChatState::new();
+        reloaded.load_conversations(&scratch.key);
+
+        let idx = reloaded.find_conv_idx(&conv_id).expect("conversation loads");
+        assert_eq!(
+            reloaded.conversations[idx].messages.len(),
+            1,
+            "the prompt is restored from JSON exactly once, not duplicated by replay"
+        );
+        assert!(
+            !reloaded.conversations[idx]
+                .messages
+                .iter()
+                .any(|m| m.role == ChatRole::System && m.content.contains("unclean shutdown")),
+            "a clean exit must not be reported as a crash recovery"
+        );
     }
 
     #[test]
