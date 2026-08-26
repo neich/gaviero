@@ -13,6 +13,7 @@ pub mod path_pattern;
 pub mod query_loader;
 pub mod repo_map;
 pub mod scope_enforcer;
+pub mod session_journal;
 pub mod session_state;
 pub mod skills;
 pub mod swarm;

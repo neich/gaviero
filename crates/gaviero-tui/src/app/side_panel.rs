@@ -1925,6 +1925,23 @@ pub(crate) fn dispatch_prompt_core(
     });
 
     app.chat_state.add_user_message_at(conv_idx, &prompt);
+    // Crash durability: conversations only reach disk on a clean quit
+    // (`main.rs` calls `save_session` once, after the event loop breaks), so
+    // a panic or a killed terminal would otherwise lose every prompt typed
+    // since the last clean exit. Journal it here — before the agent is
+    // spawned — so the prompt survives even a crash mid-turn. Both the
+    // desktop Enter path and the remote `send_prompt` reducer funnel through
+    // this function, so both are covered. Best-effort: a journal failure must
+    // never block the user's turn.
+    {
+        let key = app.workspace_key();
+        let conv = &app.chat_state.conversations[conv_idx];
+        if let Err(e) =
+            gaviero_core::session_journal::append_prompt(&key, &conv.id, &conv.title, &prompt)
+        {
+            tracing::warn!("prompt journal append failed: {e:#}");
+        }
+    }
     {
         let conv = &mut app.chat_state.conversations[conv_idx];
         conv.pending_turn_id = Some(turn_id.clone());
