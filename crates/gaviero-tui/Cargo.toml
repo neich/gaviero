@@ -54,6 +54,8 @@ windows-sys = { version = "0.59", features = [
     # WindowsAndMessaging, so both features are required.
     "Win32_System_Diagnostics_Debug",
     "Win32_UI_WindowsAndMessaging",
+    # ShellExecuteW for markdown-preview URL follow (platform::open_external).
+    "Win32_UI_Shell",
 ] }
 
 [dev-dependencies]

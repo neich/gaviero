@@ -4070,10 +4070,10 @@ impl AgentChatState {
             if msg.role == ChatRole::Assistant && !display_content.is_empty() {
                 // Render assistant messages with markdown formatting
                 lines.push((
-                    vec![crate::panels::chat_markdown::StyledSegment {
-                        text: prefix.to_string(),
-                        style: base_style,
-                    }],
+                    vec![crate::panels::chat_markdown::StyledSegment::new(
+                        prefix.to_string(),
+                        base_style,
+                    )],
                     Some(msg_idx),
                 ));
                 let md_lines = crate::panels::chat_markdown::format_chat_markdown(
@@ -4089,10 +4089,9 @@ impl AgentChatState {
                 let full_text = format!("{}{}", prefix, display_content);
                 for line in crate::widgets::render_utils::word_wrap(&full_text, width) {
                     lines.push((
-                        vec![crate::panels::chat_markdown::StyledSegment {
-                            text: line,
-                            style: base_style,
-                        }],
+                        vec![crate::panels::chat_markdown::StyledSegment::new(
+                            line, base_style,
+                        )],
                         Some(msg_idx),
                     ));
                 }
@@ -4132,19 +4131,19 @@ impl AgentChatState {
                 .unwrap_or_default();
             let stream_style = Style::default().fg(theme::ACCENT);
             lines.push((
-                vec![crate::panels::chat_markdown::StyledSegment {
-                    text: format!("{} {}{}", frame, label, elapsed_str),
-                    style: stream_style,
-                }],
+                vec![crate::panels::chat_markdown::StyledSegment::new(
+                    format!("{} {}{}", frame, label, elapsed_str),
+                    stream_style,
+                )],
                 None,
             ));
             let agent_style = Style::default().fg(theme::TEXT_DIM);
             for agent in running {
                 lines.push((
-                    vec![crate::panels::chat_markdown::StyledSegment {
-                        text: format!("  • {}", agent.description),
-                        style: agent_style,
-                    }],
+                    vec![crate::panels::chat_markdown::StyledSegment::new(
+                        format!("  • {}", agent.description),
+                        agent_style,
+                    )],
                     None,
                 ));
             }
