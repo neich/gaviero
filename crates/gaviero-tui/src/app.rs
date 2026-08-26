@@ -162,6 +162,14 @@ pub struct App {
     /// Updated each preview render; used for PageUp/PageDown in preview-only mode.
     pub preview_viewport_lines: usize,
     pub preview_line_count: usize,
+    /// Last formatted preview lines, used for click/hover hit-testing.
+    pub preview_lines: Vec<crate::panels::chat_markdown::ChatLine>,
+    /// Destination under the pointer, if any. Drives hover paint + status bar.
+    pub preview_hover_href: Option<String>,
+    /// Last mouse cell, so preview scroll can re-hit-test without a move event.
+    pub last_mouse: Option<(u16, u16)>,
+    /// Set by handlers after `RenderScheduler` already ran (preview hover).
+    pub needs_immediate_render: bool,
 
     // Write gate
     pub write_gate: Arc<Mutex<WriteGatePipeline>>,
@@ -428,6 +436,10 @@ impl App {
             preview_synced_top: None,
             preview_viewport_lines: 1,
             preview_line_count: 0,
+            preview_lines: Vec::new(),
+            preview_hover_href: None,
+            last_mouse: None,
+            needs_immediate_render: false,
             write_gate,
             diff_review: None,
             pending_tool_agent_edits: std::collections::HashMap::new(),
@@ -516,6 +528,12 @@ impl App {
         // Same insurance as mouse: mux/ConPTY can drop `?2004h`, and without
         // it Windows Terminal will not emit empty bracketed paste for images.
         let _ = crate::platform::set_bracketed_paste(&mut stdout, true);
+    }
+
+    /// Consume the post-handle redraw flag set by paint-only mutations
+    /// (markdown-preview link hover) that `RenderScheduler` cannot see.
+    pub(crate) fn take_needs_immediate_render(&mut self) -> bool {
+        std::mem::take(&mut self.needs_immediate_render)
     }
 
     /// Record a physical Ctrl+V edge; the tick path may attach a clipboard

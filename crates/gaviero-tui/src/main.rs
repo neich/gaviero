@@ -12,7 +12,10 @@ mod widgets;
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
-    event::{DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture},
+    event::{
+        DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
+        MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -116,9 +119,10 @@ fn restore_terminal() -> std::io::Result<()> {
 }
 
 /// Coalesces expensive Agent Chat streaming redraws while leaving state
-/// updates immediate. Keyboard, mouse, resize, terminal, review, and lifecycle
-/// events still repaint immediately; only visible active chat stream output and
-/// spinner-only ticks are budgeted.
+/// updates immediate. Keyboard, mouse (except pointer-move), resize, terminal,
+/// review, and lifecycle events still repaint immediately; only visible active
+/// chat stream output and spinner-only ticks are budgeted. `MouseEventKind::Moved`
+/// is skipped here and requests a paint only when preview link hover changes.
 struct RenderScheduler {
     last_chat_render: Instant,
     pending_chat_render: bool,
@@ -144,6 +148,7 @@ impl RenderScheduler {
                 self.should_render_chat_stream_event(conv_id, app)
             }
             event::Event::Tick => self.should_render_tick(app),
+            event::Event::Mouse(m) if matches!(m.kind, MouseEventKind::Moved) => false,
             _ => true,
         }
     }
@@ -493,6 +498,9 @@ async fn main() -> Result<()> {
                 needs_render = true;
             }
             app.handle_event(event);
+            if app.take_needs_immediate_render() {
+                needs_render = true;
+            }
         }
 
         // Drain any additional events that arrived while we were rendering/handling.
@@ -505,6 +513,9 @@ async fn main() -> Result<()> {
                         needs_render = true;
                     }
                     app.handle_event(event);
+                    if app.take_needs_immediate_render() {
+                        needs_render = true;
+                    }
                 }
                 Err(_) => break,
             }

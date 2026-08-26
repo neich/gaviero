@@ -30,6 +30,8 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
         app.layout.left_header_area = None;
         app.layout.editor_area = Rect::default();
         app.layout.preview_area = None;
+        app.preview_lines.clear();
+        app.preview_hover_href = None;
         app.layout.side_panel_area = None;
         app.layout.side_header_area = None;
         app.layout.terminal_area = None;
@@ -157,11 +159,16 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
         if let Some(preview_area) = preview_area {
             app.layout.preview_area = Some(preview_area);
             app.render_markdown_preview(frame, preview_area);
+        } else {
+            app.preview_lines.clear();
+            app.preview_hover_href = None;
         }
         panel_idx += 1;
     } else {
         app.layout.editor_area = Rect::default();
         app.layout.preview_area = None;
+        app.preview_lines.clear();
+        app.preview_hover_href = None;
     }
 
     app.layout.side_panel_area = None;
@@ -549,6 +556,19 @@ fn editor_status_key_hints(app: &App, buf: &crate::editor::buffer::Buffer) -> St
     parts.join("  ")
 }
 
+fn preview_hover_status(href: &str) -> String {
+    use crate::editor::markdown::{MarkdownLinkTarget, classify_markdown_link};
+    match classify_markdown_link(href) {
+        Some(MarkdownLinkTarget::External(url)) => format!("Click to open in browser  {url}"),
+        Some(MarkdownLinkTarget::Local { path, fragment }) => match fragment {
+            Some(frag) => format!("Click to open  {}  #{frag}", path.display()),
+            None => format!("Click to open in editor  {}", path.display()),
+        },
+        Some(MarkdownLinkTarget::Fragment(frag)) => format!("Click to jump to  #{frag}"),
+        None => format!("Cannot follow  {href}"),
+    }
+}
+
 /// How long the agent notice banner stays visible (status bar + fullscreen toast).
 const AGENT_FINISH_BANNER_SECS: u64 = 8;
 
@@ -774,6 +794,8 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
 
     let context_info = if let Some(msg) = transient_msg {
         msg.to_string()
+    } else if let Some(href) = app.preview_hover_href.as_deref() {
+        preview_hover_status(href)
     } else {
         match app.focus {
             Focus::FileTree => match app.left_panel {
@@ -1043,6 +1065,16 @@ pub(super) fn render_terminal(app: &mut App, frame: &mut Frame, area: Rect) {
     }
 }
 
+pub(super) fn markdown_preview_inner(area: Rect, mode: MarkdownPreviewMode) -> Rect {
+    use ratatui::widgets::{Block, Borders};
+    let borders = if mode == MarkdownPreviewMode::PreviewOnly {
+        Borders::TOP
+    } else {
+        Borders::LEFT
+    };
+    Block::default().borders(borders).inner(area)
+}
+
 pub(super) fn render_markdown_preview(app: &mut App, frame: &mut Frame, area: Rect) {
     use crate::panels::chat_markdown;
     use ratatui::widgets::{Block, Borders};
@@ -1057,43 +1089,52 @@ pub(super) fn render_markdown_preview(app: &mut App, frame: &mut Frame, area: Re
         .borders(borders)
         .border_style(Style::default().fg(theme::BORDER_DIM))
         .title(format!(" {} ", app.preview_mode.title_label()));
-    let inner = block.inner(area);
     frame.render_widget(block, area);
+    let inner = markdown_preview_inner(area, app.preview_mode);
 
-    if let Some(buf) = app.buffers.get(app.active_buffer) {
-        let source = buf.text.to_string();
-        let editor_top = editor_top_source_line(buf, app.layout.editor_area);
-        let content_width = inner.width.saturating_sub(2) as usize;
-        let (lines, source_map) = chat_markdown::format_chat_markdown_mapped(
-            &source,
-            content_width.max(1),
-            app.theme.default_style(),
-        );
-        app.preview_viewport_lines = inner.height.max(1) as usize;
-        app.preview_line_count = lines.len();
-        sync_preview_to_editor(app, editor_top, &source_map);
-        clamp_preview_scroll(app, lines.len());
+    let (source, editor_top) = match app.buffers.get(app.active_buffer) {
+        Some(buf) => (
+            buf.text.to_string(),
+            editor_top_source_line(buf, app.layout.editor_area),
+        ),
+        None => {
+            app.preview_lines.clear();
+            return;
+        }
+    };
+    let content_width = inner.width.saturating_sub(2) as usize;
+    let (lines, source_map) = chat_markdown::format_chat_markdown_mapped(
+        &source,
+        content_width.max(1),
+        app.theme.default_style(),
+    );
+    app.preview_lines = lines;
+    app.preview_viewport_lines = inner.height.max(1) as usize;
+    app.preview_line_count = app.preview_lines.len();
+    sync_preview_to_editor(app, editor_top, &source_map);
+    clamp_preview_scroll(app, app.preview_lines.len());
 
-        let scrollbar_col = inner.width.saturating_sub(1);
-        let text_area = Rect {
-            width: scrollbar_col.saturating_sub(1),
-            ..inner
-        };
-        chat_markdown::render_lines_to_buffer(
-            &lines,
-            text_area,
-            frame.buffer_mut(),
-            app.preview_scroll,
-            app.theme.default_style(),
-        );
-        crate::widgets::scrollbar::render_scrollbar(
-            inner,
-            frame.buffer_mut(),
-            app.preview_line_count,
-            app.preview_viewport_lines,
-            app.preview_scroll,
-        );
-    }
+    let scrollbar_col = inner.width.saturating_sub(1);
+    let text_area = Rect {
+        width: scrollbar_col.saturating_sub(1),
+        ..inner
+    };
+    let hover = app.preview_hover_href.clone();
+    chat_markdown::render_lines_to_buffer(
+        &app.preview_lines,
+        text_area,
+        frame.buffer_mut(),
+        app.preview_scroll,
+        app.theme.default_style(),
+        hover.as_deref(),
+    );
+    crate::widgets::scrollbar::render_scrollbar(
+        inner,
+        frame.buffer_mut(),
+        app.preview_line_count,
+        app.preview_viewport_lines,
+        app.preview_scroll,
+    );
 }
 
 /// Logical source line at the top of the editor viewport.

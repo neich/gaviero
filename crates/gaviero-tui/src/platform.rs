@@ -24,13 +24,13 @@ use std::io::Write;
 /// press and paints its own unclamped highlight — the same full-window
 /// symptom — and no gaviero-side sequence can override that.
 ///
-/// `?1003h` (any-motion tracking) and `?1015h` (urxvt encoding) that
-/// crossterm's Unix path also emits are deliberately omitted: nothing in the
-/// crate consumes `MouseEventKind::Moved`.
+/// `?1003h` (any-motion tracking) is required so markdown-preview link hover
+/// receives `MouseEventKind::Moved`. `?1015h` (urxvt encoding) that
+/// crossterm's Unix path also emits is still omitted: SGR (`?1006h`) is enough.
 #[cfg(windows)]
-const ENABLE_VT_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const ENABLE_VT_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h";
 #[cfg(windows)]
-const DISABLE_VT_MOUSE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+const DISABLE_VT_MOUSE: &str = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 
 /// Ask the hosting terminal to forward mouse events (Windows-only VT write;
 /// no-op elsewhere, where crossterm's `EnableMouseCapture` already emits the
@@ -276,6 +276,96 @@ pub fn altgr_char(key: &KeyEvent) -> Option<char> {
     }
 }
 
+/// Open `http:`, `https:`, or `mailto:` in the OS default handler.
+///
+/// Refuses control characters and non-web schemes so a crafted markdown dest
+/// cannot be handed to the shell. Fire-and-forget: the child is reaped on a
+/// detached thread so it does not linger as a zombie.
+pub fn open_external(url: &str) -> std::io::Result<()> {
+    if !is_safe_external_url(url) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refused external URL",
+        ));
+    }
+    spawn_external(url)
+}
+
+fn is_safe_external_url(url: &str) -> bool {
+    if url.is_empty() || url.len() > 2048 {
+        return false;
+    }
+    if url.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return false;
+    }
+    let lower = url.to_ascii_lowercase();
+    lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("mailto:")
+}
+
+#[cfg(windows)]
+fn spawn_external(url: &str) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let file: Vec<u16> = std::ffi::OsStr::new(url)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let op: Vec<u16> = std::ffi::OsStr::new("open")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let rc = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            op.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if (rc as isize) > 32 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_external(url: &str) -> std::io::Result<()> {
+    spawn_detached("open", &[url])
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn spawn_external(url: &str) -> std::io::Result<()> {
+    spawn_detached("xdg-open", &[url])
+}
+
+#[cfg(not(any(windows, unix)))]
+fn spawn_external(_url: &str) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no URL handler on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn spawn_detached(bin: &str, args: &[&str]) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,7 +378,10 @@ mod tests {
     fn vt_mouse_passthrough_writes_only_enable_sequences() {
         let mut out: Vec<u8> = Vec::new();
         enable_vt_mouse_passthrough(&mut out).unwrap();
-        assert_eq!(out, b"\x1b[?1000h\x1b[?1002h\x1b[?1006h".to_vec());
+        assert_eq!(
+            out,
+            b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h".to_vec()
+        );
         assert!(!out.contains(&b'l'), "no DECRST (mode-off) bytes");
     }
 
@@ -355,5 +448,18 @@ mod tests {
             KeyModifiers::CONTROL | KeyModifiers::ALT,
         );
         assert_eq!(altgr_char(&key), None);
+    }
+
+    #[test]
+    fn open_external_refuses_unsafe_destinations() {
+        assert!(!is_safe_external_url("javascript:alert(1)"));
+        assert!(!is_safe_external_url("https://example.com/\n"));
+        assert!(!is_safe_external_url("file:///etc/passwd"));
+        assert!(!is_safe_external_url(""));
+        assert!(is_safe_external_url("https://example.com/x"));
+        assert!(is_safe_external_url("http://example.com"));
+        assert!(is_safe_external_url("mailto:a@b.c"));
+        let err = open_external("javascript:alert(1)").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

@@ -19,12 +19,26 @@ use crate::theme;
 pub struct StyledSegment {
     pub text: String,
     pub style: Style,
+    /// Markdown destination for `[text](url)` / autolink runs. Wrapped pieces
+    /// of the same link keep this so preview clicks can follow it.
+    pub href: Option<String>,
+}
+
+impl StyledSegment {
+    pub fn new(text: impl Into<String>, style: Style) -> Self {
+        Self {
+            text: text.into(),
+            style,
+            href: None,
+        }
+    }
 }
 
 /// A single rendered line for the chat panel.
 ///
 /// Holds one or more styled segments so a single visual line can mix inline
 /// styles (bold, italic, inline code, links) on top of the line's base style.
+#[derive(Clone)]
 pub struct ChatLine {
     pub segments: Vec<StyledSegment>,
 }
@@ -39,7 +53,7 @@ impl ChatLine {
             }
         } else {
             Self {
-                segments: vec![StyledSegment { text, style }],
+                segments: vec![StyledSegment::new(text, style)],
             }
         }
     }
@@ -225,18 +239,19 @@ pub fn format_chat_markdown_mapped(
                 .get(level..level + 1)
                 .map_or(true, |c| c == " " || c.is_empty())
             {
-                let content = strip_inline_markers(trimmed[level..].trim());
                 let marker = match level {
                     1 => "█ ",
                     2 => "▌ ",
                     _ => "▎ ",
                 };
-                for wl in crate::widgets::render_utils::word_wrap(
-                    &format!("{}{}", marker, content),
+                push_inline_wrapped(
+                    &mut output,
+                    trimmed[level..].trim(),
+                    marker,
+                    "  ",
                     width,
-                ) {
-                    output.push(ChatLine::single(wl, heading_style));
-                }
+                    heading_style,
+                );
                 i += 1;
                 continue;
             }
@@ -346,8 +361,12 @@ fn reflow_overwide_lines(lines: Vec<ChatLine>, width: usize) -> (Vec<ChatLine>, 
             continue;
         }
         let style = line.primary_style();
-        for wl in crate::widgets::render_utils::word_wrap(&text, width) {
-            out.push(ChatLine::single(wl, style));
+        for wrapped in word_wrap_segments(&line.segments, width, width) {
+            if wrapped.is_empty() {
+                out.push(ChatLine::single(String::new(), style));
+            } else {
+                out.push(ChatLine { segments: wrapped });
+            }
         }
     }
     index_map.push(out.len());
@@ -398,10 +417,7 @@ fn push_inline_wrapped(
         let prefix = if j == 0 { first_prefix } else { cont_prefix };
         let mut segments: Vec<StyledSegment> = Vec::with_capacity(wrapped_segments.len() + 1);
         if !prefix.is_empty() {
-            segments.push(StyledSegment {
-                text: prefix.to_string(),
-                style: base_style,
-            });
+            segments.push(StyledSegment::new(prefix.to_string(), base_style));
         }
         segments.extend(wrapped_segments);
         if segments.is_empty() {
@@ -429,18 +445,25 @@ fn parse_inline_styled(text: &str, base_style: Style) -> Vec<StyledSegment> {
             if seg.text.is_empty() {
                 return None;
             }
-            let style = match seg.kind {
-                SegmentKind::Plain => base_style,
-                SegmentKind::Bold => base_style.fg(BOLD_FG).add_modifier(Modifier::BOLD),
-                SegmentKind::Italic => base_style.fg(ITALIC_FG).add_modifier(Modifier::ITALIC),
-                SegmentKind::Code => Style::default().fg(theme::CODE_GREEN),
-                SegmentKind::Link(_) => base_style
-                    .fg(theme::ACCENT)
-                    .add_modifier(Modifier::UNDERLINED),
+            let (style, href) = match seg.kind {
+                SegmentKind::Plain => (base_style, None),
+                SegmentKind::Bold => (base_style.fg(BOLD_FG).add_modifier(Modifier::BOLD), None),
+                SegmentKind::Italic => (
+                    base_style.fg(ITALIC_FG).add_modifier(Modifier::ITALIC),
+                    None,
+                ),
+                SegmentKind::Code => (Style::default().fg(theme::CODE_GREEN), None),
+                SegmentKind::Link(url) => (
+                    base_style
+                        .fg(theme::ACCENT)
+                        .add_modifier(Modifier::UNDERLINED),
+                    Some(url),
+                ),
             };
             Some(StyledSegment {
                 text: seg.text,
                 style,
+                href,
             })
         })
         .collect()
@@ -457,17 +480,18 @@ fn word_wrap_segments(
     first_width: usize,
     cont_width: usize,
 ) -> Vec<Vec<StyledSegment>> {
-    // Flatten to (char, style) pairs, expanding tabs to 4 spaces to match
-    // `render_utils::word_wrap`'s behaviour.
-    let mut chars: Vec<(char, Style)> = Vec::new();
+    // Flatten to (char, style, href) triples, expanding tabs to 4 spaces to match
+    // `render_utils::word_wrap`'s behaviour. href rides along so two adjacent
+    // links that share a style (both accent+underline) do not merge.
+    let mut chars: Vec<(char, Style, Option<String>)> = Vec::new();
     for seg in segments {
         for ch in seg.text.chars() {
             if ch == '\t' {
                 for _ in 0..4 {
-                    chars.push((' ', seg.style));
+                    chars.push((' ', seg.style, seg.href.clone()));
                 }
             } else {
-                chars.push((ch, seg.style));
+                chars.push((ch, seg.style, seg.href.clone()));
             }
         }
     }
@@ -525,30 +549,34 @@ fn word_wrap_segments(
     result
 }
 
-/// Group consecutive characters with the same style into segments.
-fn coalesce_segments(chars: &[(char, Style)]) -> Vec<StyledSegment> {
+/// Group consecutive characters with the same style and href into segments.
+fn coalesce_segments(chars: &[(char, Style, Option<String>)]) -> Vec<StyledSegment> {
     let mut segments: Vec<StyledSegment> = Vec::new();
     let mut iter = chars.iter();
-    if let Some(&(ch, style)) = iter.next() {
+    if let Some((ch, style, href)) = iter.next() {
         let mut current_text = String::new();
-        let mut current_style = style;
-        current_text.push(ch);
-        for &(ch, style) in iter {
-            if style == current_style {
-                current_text.push(ch);
+        let mut current_style = *style;
+        let mut current_href = href.clone();
+        current_text.push(*ch);
+        for (ch, style, href) in iter {
+            if *style == current_style && *href == current_href {
+                current_text.push(*ch);
             } else {
                 segments.push(StyledSegment {
                     text: std::mem::take(&mut current_text),
                     style: current_style,
+                    href: current_href,
                 });
-                current_text.push(ch);
-                current_style = style;
+                current_text.push(*ch);
+                current_style = *style;
+                current_href = href.clone();
             }
         }
         if !current_text.is_empty() {
             segments.push(StyledSegment {
                 text: current_text,
                 style: current_style,
+                href: current_href,
             });
         }
     }
@@ -556,12 +584,16 @@ fn coalesce_segments(chars: &[(char, Style)]) -> Vec<StyledSegment> {
 }
 
 /// Paint pre-formatted markdown lines into a ratatui buffer (editor preview pane).
+///
+/// When `hovered_href` matches a segment's destination, that run (and any
+/// wrapped continuation of the same link) is painted with [`link_hover_style`].
 pub fn render_lines_to_buffer(
     lines: &[ChatLine],
     area: Rect,
     buf: &mut Buffer,
     scroll_top: usize,
     clear_style: Style,
+    hovered_href: Option<&str>,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -592,13 +624,76 @@ pub fn render_lines_to_buffer(
                 y,
                 area.right(),
                 &seg.text,
-                seg.style,
+                segment_style(seg, hovered_href),
             );
             if cx >= area.right() {
                 break;
             }
         }
     }
+}
+
+/// Highlight used while the pointer is over a followable preview link.
+/// Background colour is the cue — `BOLD` alone is too subtle on many terminals.
+pub fn link_hover_style() -> Style {
+    Style::default()
+        .fg(theme::PANEL_BG)
+        .bg(theme::ACCENT)
+        .add_modifier(Modifier::UNDERLINED | Modifier::BOLD)
+}
+
+fn segment_style(seg: &StyledSegment, hovered_href: Option<&str>) -> Style {
+    if hovered_href.is_some() && seg.href.as_deref() == hovered_href {
+        link_hover_style()
+    } else {
+        seg.style
+    }
+}
+
+/// Display-column hit test: `visual_col` is 0-based from the start of the
+/// rendered line (prefixes like list bullets included).
+pub fn href_at(line: &ChatLine, visual_col: usize) -> Option<&str> {
+    let mut col = 0usize;
+    for seg in &line.segments {
+        let w = UnicodeWidthStr::width(seg.text.as_str());
+        if visual_col < col + w {
+            return seg.href.as_deref();
+        }
+        col += w;
+    }
+    None
+}
+
+/// Map a click in the preview inner rect onto a link destination.
+///
+/// `text_origin_x` is the column where line text starts (`inner.x + 1`, matching
+/// [`render_lines_to_buffer`]).
+pub fn preview_link_at(
+    lines: &[ChatLine],
+    scroll: usize,
+    text_origin_x: u16,
+    inner: Rect,
+    col: u16,
+    row: u16,
+) -> Option<&str> {
+    if !inner.contains((col, row).into()) || col < text_origin_x {
+        return None;
+    }
+    let line_idx = scroll + (row - inner.y) as usize;
+    let line = lines.get(line_idx)?;
+    href_at(line, (col - text_origin_x) as usize)
+}
+
+/// First rendered line whose heading slug matches `fragment`, if any.
+pub fn preview_line_for_fragment(lines: &[ChatLine], fragment: &str) -> Option<usize> {
+    use crate::editor::markdown::{heading_slug, strip_heading_marker};
+    let want = heading_slug(fragment);
+    if want.is_empty() {
+        return None;
+    }
+    lines
+        .iter()
+        .position(|line| heading_slug(strip_heading_marker(&line.text())) == want)
 }
 
 // ── Table formatting ─────────────────────────────────────────
@@ -1184,5 +1279,89 @@ mod tests {
             "tall cell should span multiple │ rows, got {body_rows:?}"
         );
         assert!(body_rows.iter().all(|t| t.starts_with('│')));
+    }
+
+    #[test]
+    fn preview_href_survives_wrap_and_hit_test() {
+        let text = "see [example](https://example.com) here";
+        let lines = format_chat_markdown(text, 80, Style::default());
+        assert_eq!(href_at(&lines[0], 0), None, "plain prefix is not a link");
+        // "see " is 4 cols; the label "example" starts at col 4.
+        assert_eq!(href_at(&lines[0], 4), Some("https://example.com"));
+        assert_eq!(href_at(&lines[0], 10), Some("https://example.com"));
+        assert_eq!(href_at(&lines[0], 12), None);
+
+        let wrapped = format_chat_markdown(
+            "aaa [this-is-a-very-long-link-label](docs/foo.md) bbb",
+            16,
+            Style::default(),
+        );
+        assert!(
+            wrapped.iter().any(|l| {
+                l.segments
+                    .iter()
+                    .any(|s| s.href.as_deref() == Some("docs/foo.md"))
+            }),
+            "wrapped link must keep its href"
+        );
+    }
+
+    #[test]
+    fn preview_link_at_accounts_for_scroll_and_origin() {
+        let lines = format_chat_markdown("plain\nsee [docs](README.md) now", 80, Style::default());
+        let inner = Rect::new(10, 5, 40, 10);
+        let origin = inner.x + 1;
+        // Line 1 is "see docs now"; "docs" starts after "see " (4 cols).
+        assert_eq!(
+            preview_link_at(&lines, 0, origin, inner, origin + 4, inner.y + 1),
+            Some("README.md")
+        );
+        assert_eq!(
+            preview_link_at(&lines, 1, origin, inner, origin + 4, inner.y),
+            Some("README.md")
+        );
+        assert_eq!(
+            preview_link_at(&lines, 0, origin, inner, origin, inner.y),
+            None
+        );
+    }
+
+    #[test]
+    fn preview_line_for_fragment_matches_rendered_heading() {
+        let lines = format_chat_markdown("# Install\n\nbody\n", 40, Style::default());
+        assert_eq!(preview_line_for_fragment(&lines, "install"), Some(0));
+        assert_eq!(preview_line_for_fragment(&lines, "missing"), None);
+    }
+
+    #[test]
+    fn hovered_link_uses_hover_style_for_every_matching_href() {
+        let lines = format_chat_markdown(
+            "see [example](https://example.com) here",
+            80,
+            Style::default(),
+        );
+        let hovered = Some("https://example.com");
+        let styles: Vec<_> = lines[0]
+            .segments
+            .iter()
+            .map(|s| (s.text.as_str(), segment_style(s, hovered)))
+            .collect();
+        assert!(
+            styles
+                .iter()
+                .any(|(t, st)| *t == "example" && *st == link_hover_style()),
+            "hovered label must use link_hover_style, got {styles:?}"
+        );
+        assert!(
+            styles
+                .iter()
+                .any(|(t, st)| *t == "see " && *st != link_hover_style()),
+            "plain prefix must stay unhovered"
+        );
+        assert_eq!(
+            segment_style(&lines[0].segments[0], None),
+            lines[0].segments[0].style,
+            "no hover → original styles"
+        );
     }
 }

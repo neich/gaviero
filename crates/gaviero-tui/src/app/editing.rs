@@ -97,6 +97,9 @@ pub(super) fn scroll_preview_lines(app: &mut App, delta: i32) {
             .saturating_sub(app.preview_viewport_lines);
         app.preview_scroll = (app.preview_scroll + step).min(max);
     }
+    if let Some((col, row)) = app.last_mouse {
+        update_preview_hover(app, col, row);
+    }
 }
 
 pub(super) fn handle_editor_action(app: &mut App, action: Action) {
@@ -393,9 +396,135 @@ pub(super) fn get_clipboard(app: &mut App) -> String {
     app.internal_clipboard.clone()
 }
 
+/// Follow a markdown-preview link under `(col, row)`: http(s)/mailto open in
+/// the OS handler, local paths open in the editor, `#fragment` scrolls the
+/// preview to the matching heading.
+fn follow_preview_link_at(app: &mut App, col: u16, row: u16) {
+    use crate::editor::markdown::{
+        MarkdownLinkTarget, classify_markdown_link, resolve_local_markdown_path,
+    };
+
+    let Some(href) = preview_href_under_pointer(app, col, row).map(str::to_owned) else {
+        return;
+    };
+    let Some(target) = classify_markdown_link(&href) else {
+        app.status_message = Some((
+            format!("Cannot follow link: {href}"),
+            std::time::Instant::now(),
+        ));
+        return;
+    };
+    match target {
+        MarkdownLinkTarget::External(url) => match crate::platform::open_external(&url) {
+            Ok(()) => {
+                app.status_message = Some((format!("Opened {url}"), std::time::Instant::now()));
+            }
+            Err(e) => {
+                app.status_message = Some((
+                    format!("Failed to open {url}: {e}"),
+                    std::time::Instant::now(),
+                ));
+            }
+        },
+        MarkdownLinkTarget::Fragment(frag) => scroll_preview_to_fragment(app, &frag),
+        MarkdownLinkTarget::Local { path, fragment } => {
+            let base_dir = app
+                .buffers
+                .get(app.active_buffer)
+                .and_then(|b| b.path.as_ref())
+                .and_then(|p| p.parent())
+                .map(|p| p.to_path_buf());
+            let resolved = {
+                let roots = app.workspace.roots();
+                resolve_local_markdown_path(&path, base_dir.as_deref(), &roots)
+            };
+            if !resolved.exists() {
+                app.status_message = Some((
+                    format!("Link target not found: {}", resolved.display()),
+                    std::time::Instant::now(),
+                ));
+                return;
+            }
+            if resolved.is_dir() {
+                app.status_message = Some((
+                    format!("Link target is a directory: {}", resolved.display()),
+                    std::time::Instant::now(),
+                ));
+                return;
+            }
+            app.open_file(&resolved);
+            if let Some(frag) = fragment {
+                scroll_preview_to_fragment(app, &frag);
+            }
+        }
+    }
+}
+
+fn preview_href_under_pointer(app: &App, col: u16, row: u16) -> Option<&str> {
+    let preview = app.layout.preview_area?;
+    if !preview.contains((col, row).into()) {
+        return None;
+    }
+    let scrollbar_x = preview.x + preview.width.saturating_sub(1);
+    if col == scrollbar_x {
+        return None;
+    }
+    let inner = super::render::markdown_preview_inner(preview, app.preview_mode);
+    crate::panels::chat_markdown::preview_link_at(
+        &app.preview_lines,
+        app.preview_scroll,
+        inner.x.saturating_add(1),
+        inner,
+        col,
+        row,
+    )
+}
+
+fn update_preview_hover(app: &mut App, col: u16, row: u16) {
+    let href = preview_href_under_pointer(app, col, row).map(str::to_owned);
+    if app.preview_hover_href != href {
+        app.preview_hover_href = href;
+        app.needs_immediate_render = true;
+    }
+}
+
+pub(super) fn clear_preview_link_hover(app: &mut App) {
+    if app.preview_hover_href.is_some() {
+        app.needs_immediate_render = true;
+    }
+    app.preview_hover_href = None;
+    app.preview_lines.clear();
+}
+
+fn scroll_preview_to_fragment(app: &mut App, fragment: &str) {
+    use crate::panels::chat_markdown;
+
+    if !is_current_buffer_markdown(app) {
+        return;
+    }
+    let Some(preview) = app.layout.preview_area else {
+        return;
+    };
+    let inner = super::render::markdown_preview_inner(preview, app.preview_mode);
+    let source = match app.buffers.get(app.active_buffer) {
+        Some(buf) => buf.text.to_string(),
+        None => return,
+    };
+    let content_width = inner.width.saturating_sub(2).max(1) as usize;
+    let lines =
+        chat_markdown::format_chat_markdown(&source, content_width, app.theme.default_style());
+    if let Some(idx) = chat_markdown::preview_line_for_fragment(&lines, fragment) {
+        app.preview_line_count = lines.len();
+        app.preview_scroll = idx;
+        super::render::clamp_preview_scroll(app, lines.len());
+        app.preview_synced_top = None;
+    }
+}
+
 pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
     let col = mouse.column;
     let row = mouse.row;
+    app.last_mouse = Some((col, row));
 
     if app.has_active_review() {
         handle_mouse_review(app, mouse);
@@ -553,6 +682,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                         app.scroll_panel_to_row(ScrollbarTarget::MarkdownPreview, row);
                         return;
                     }
+                    follow_preview_link_at(app, col, row);
                     return;
                 }
             }
@@ -934,6 +1064,9 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             }
             app.mouse_dragging = false;
             app.scrollbar_dragging = None;
+        }
+        MouseEventKind::Moved => {
+            update_preview_hover(app, col, row);
         }
         _ => {}
     }
@@ -1959,6 +2092,7 @@ pub(super) fn sync_preview_mode_for_active_buffer(app: &mut App) {
         app.preview_mode = MarkdownPreviewMode::Off;
         app.preview_scroll = 0;
         app.preview_synced_top = None;
+        clear_preview_link_hover(app);
     }
 }
 

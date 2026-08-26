@@ -4,6 +4,8 @@
 //! We can't use tree-sitter-md because it requires tree-sitter 0.24 while we
 //! use 0.25. Markdown syntax is regular enough that regex works well.
 
+use std::path::{Path, PathBuf};
+
 use super::highlight::StyledSpan;
 use crate::theme::Theme;
 
@@ -253,19 +255,19 @@ pub(crate) fn find_double_closing(line: &str, start: usize, marker: u8) -> Optio
     None
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TextSegment {
     pub text: String,
     pub kind: SegmentKind,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SegmentKind {
     Plain,
     Bold,
     Italic,
     Code,
-    Link(#[allow(dead_code)] String), // URL retained for future link rendering
+    Link(String),
 }
 
 pub(crate) fn parse_inline(text: &str) -> Vec<TextSegment> {
@@ -334,6 +336,36 @@ pub(crate) fn parse_inline(text: &str) -> Vec<TextSegment> {
             }
         }
 
+        // Autolinks: <https://…>, <http://…>, <mailto:…>
+        if bytes[i] == b'<' {
+            if let Some(end) = find_closing(text, i + 1, b'>') {
+                let inner = &text[i + 1..end];
+                if is_autolink_url(inner) {
+                    flush_plain(&mut current, &mut segments);
+                    segments.push(TextSegment {
+                        text: inner.to_string(),
+                        kind: SegmentKind::Link(inner.to_string()),
+                    });
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+
+        // Bare http(s) URLs (not already consumed as a markdown dest).
+        if is_bare_url_start(bytes, i) {
+            let (url, end) = take_bare_url(text, i);
+            if end > i {
+                flush_plain(&mut current, &mut segments);
+                segments.push(TextSegment {
+                    text: url.clone(),
+                    kind: SegmentKind::Link(url),
+                });
+                i = end;
+                continue;
+            }
+        }
+
         // Advance by full UTF-8 character to avoid corrupting multi-byte chars.
         // All markdown markers we check are ASCII, so non-ASCII bytes are always plain text.
         if bytes[i] < 0x80 {
@@ -361,6 +393,252 @@ pub(crate) fn flush_plain(current: &mut String, segments: &mut Vec<TextSegment>)
             text: std::mem::take(current),
             kind: SegmentKind::Plain,
         });
+    }
+}
+
+fn is_autolink_url(inner: &str) -> bool {
+    starts_with_ignore_ascii_case(inner.as_bytes(), b"https://")
+        || starts_with_ignore_ascii_case(inner.as_bytes(), b"http://")
+        || starts_with_ignore_ascii_case(inner.as_bytes(), b"mailto:")
+}
+
+fn starts_with_ignore_ascii_case(hay: &[u8], prefix: &[u8]) -> bool {
+    hay.len() >= prefix.len() && hay[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+fn is_bare_url_start(bytes: &[u8], i: usize) -> bool {
+    if i > 0 && bytes[i - 1].is_ascii_alphanumeric() {
+        return false;
+    }
+    starts_with_ignore_ascii_case(&bytes[i..], b"https://")
+        || starts_with_ignore_ascii_case(&bytes[i..], b"http://")
+}
+
+fn take_bare_url(text: &str, start: usize) -> (String, usize) {
+    let rest = &text[start..];
+    let mut byte_len = 0;
+    for ch in rest.chars() {
+        if ch.is_whitespace() || ch == '<' || ch == '>' {
+            break;
+        }
+        byte_len += ch.len_utf8();
+    }
+    let mut end = start + byte_len;
+    while end > start {
+        let Some(last) = text[..end].chars().next_back() else {
+            break;
+        };
+        if matches!(last, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}') {
+            end -= last.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end <= start + "http://x".len() {
+        return (String::new(), start);
+    }
+    (text[start..end].to_string(), end)
+}
+
+/// Where a markdown link destination should go when followed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MarkdownLinkTarget {
+    External(String),
+    Local {
+        path: PathBuf,
+        fragment: Option<String>,
+    },
+    Fragment(String),
+}
+
+/// Classify `[text](dest)` / autolink destinations. Unknown or unsafe schemes
+/// (`javascript:`, `data:`, …) return `None`.
+pub(crate) fn classify_markdown_link(raw: &str) -> Option<MarkdownLinkTarget> {
+    let dest = normalize_link_dest(raw);
+    if dest.is_empty() {
+        return None;
+    }
+    if dest.starts_with('#') {
+        let frag = dest.trim_start_matches('#');
+        if frag.is_empty() {
+            return None;
+        }
+        return Some(MarkdownLinkTarget::Fragment(percent_decode(frag)));
+    }
+    let lower = dest.to_ascii_lowercase();
+    if lower.starts_with("javascript:")
+        || lower.starts_with("data:")
+        || lower.starts_with("vbscript:")
+    {
+        return None;
+    }
+    if lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("mailto:")
+    {
+        return Some(MarkdownLinkTarget::External(dest.to_string()));
+    }
+    if lower.starts_with("file:") {
+        let (path_str, fragment) = split_fragment(dest);
+        let path = parse_file_url(&path_str)?;
+        return Some(MarkdownLinkTarget::Local { path, fragment });
+    }
+    if url_scheme(dest).is_some_and(|scheme| scheme.len() > 1) {
+        return None;
+    }
+    let (path_str, fragment) = split_fragment(dest);
+    Some(MarkdownLinkTarget::Local {
+        path: PathBuf::from(percent_decode(&path_str)),
+        fragment,
+    })
+}
+
+/// Resolve a relative markdown path against the current file, then workspace
+/// roots if that candidate is missing.
+pub(crate) fn resolve_local_markdown_path(
+    dest: &Path,
+    base_dir: Option<&Path>,
+    workspace_roots: &[&Path],
+) -> PathBuf {
+    let from_file = if dest.is_absolute() {
+        None
+    } else {
+        Some(match base_dir {
+            Some(dir) => dir.join(dest),
+            None => dest.to_path_buf(),
+        })
+    };
+    if let Some(path) = &from_file
+        && path.exists()
+    {
+        return path.clone();
+    }
+    if dest.is_absolute() && dest.exists() {
+        return dest.to_path_buf();
+    }
+    let dest_str = dest.to_string_lossy();
+    let stripped = dest_str.trim_start_matches(['/', '\\']);
+    for root in workspace_roots {
+        let candidate = root.join(stripped);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    from_file.unwrap_or_else(|| dest.to_path_buf())
+}
+
+pub(crate) fn heading_slug(text: &str) -> String {
+    let mut out = String::new();
+    let mut pending_hyphen = false;
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            if pending_hyphen && !out.is_empty() {
+                out.push('-');
+            }
+            pending_hyphen = false;
+            out.push(ch.to_ascii_lowercase());
+        } else if ch == ' ' || ch == '-' {
+            pending_hyphen = true;
+        }
+    }
+    out
+}
+
+pub(crate) fn strip_heading_marker(text: &str) -> &str {
+    text.trim_start()
+        .trim_start_matches(['█', '▌', '▎'])
+        .trim_start()
+}
+
+fn normalize_link_dest(raw: &str) -> &str {
+    let s = raw.trim();
+    if let Some(inner) = s.strip_prefix('<')
+        && let Some(end) = inner.find('>')
+    {
+        return inner[..end].trim();
+    }
+    if let Some(space) = s.find(char::is_whitespace) {
+        let rest = s[space..].trim_start();
+        if rest.starts_with('"') || rest.starts_with('\'') || rest.starts_with('(') {
+            return s[..space].trim();
+        }
+    }
+    s
+}
+
+fn url_scheme(s: &str) -> Option<&str> {
+    let colon = s.find(':')?;
+    let cand = &s[..colon];
+    if cand.is_empty() || !cand.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some(cand)
+}
+
+fn split_fragment(s: &str) -> (String, Option<String>) {
+    match s.find('#') {
+        Some(i) => {
+            let frag = percent_decode(&s[i + 1..]);
+            (
+                s[..i].to_string(),
+                if frag.is_empty() { None } else { Some(frag) },
+            )
+        }
+        None => (s.to_string(), None),
+    }
+}
+
+fn parse_file_url(dest: &str) -> Option<PathBuf> {
+    let rest = dest.strip_prefix("file:")?;
+    let rest = rest.strip_prefix("//").unwrap_or(rest);
+    let path_part = if rest.starts_with('/') {
+        rest
+    } else if let Some(slash) = rest.find('/') {
+        &rest[slash..]
+    } else {
+        rest
+    };
+    let decoded = percent_decode(path_part);
+    #[cfg(windows)]
+    {
+        let t = decoded.trim_start_matches('/');
+        if t.len() >= 2 {
+            let bytes = t.as_bytes();
+            if bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+                return Some(PathBuf::from(t));
+            }
+        }
+    }
+    Some(PathBuf::from(decoded))
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Some(v) = hex_byte(bytes[i + 1], bytes[i + 2])
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_byte(h: u8, l: u8) -> Option<u8> {
+    Some((hex_val(h)? << 4) | hex_val(l)?)
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -401,11 +679,99 @@ mod tests {
     #[test]
     fn test_link_parsing() {
         let segments = parse_inline("see [example](https://example.com) here");
+        let link = segments
+            .iter()
+            .find(|s| matches!(s.kind, SegmentKind::Link(_)))
+            .expect("parsed [text](url)");
+        assert_eq!(link.text, "example");
+        assert_eq!(link.kind, SegmentKind::Link("https://example.com".into()));
+    }
+
+    #[test]
+    fn parse_inline_autolink_and_bare_url() {
+        let auto = parse_inline("go <https://example.com/a> now");
+        assert!(auto.iter().any(|s| {
+            s.kind == SegmentKind::Link("https://example.com/a".into())
+                && s.text == "https://example.com/a"
+        }));
+
+        let bare = parse_inline("see https://example.com/b.");
         assert!(
-            segments
-                .iter()
-                .any(|s| matches!(s.kind, SegmentKind::Link(_)))
+            bare.iter()
+                .any(|s| { s.kind == SegmentKind::Link("https://example.com/b".into()) })
         );
+    }
+
+    #[test]
+    fn classify_http_local_fragment_and_rejects_javascript() {
+        assert_eq!(
+            classify_markdown_link("https://example.com/x"),
+            Some(MarkdownLinkTarget::External("https://example.com/x".into()))
+        );
+        assert_eq!(
+            classify_markdown_link("<docs/foo.md> \"title\""),
+            Some(MarkdownLinkTarget::Local {
+                path: PathBuf::from("docs/foo.md"),
+                fragment: None,
+            })
+        );
+        assert_eq!(
+            classify_markdown_link("README.md#Install"),
+            Some(MarkdownLinkTarget::Local {
+                path: PathBuf::from("README.md"),
+                fragment: Some("Install".into()),
+            })
+        );
+        assert_eq!(
+            classify_markdown_link("#heading-id"),
+            Some(MarkdownLinkTarget::Fragment("heading-id".into()))
+        );
+        assert_eq!(classify_markdown_link("javascript:alert(1)"), None);
+        assert_eq!(classify_markdown_link("data:text/html,x"), None);
+    }
+
+    #[test]
+    fn classify_strips_title_and_percent_decodes_local_paths() {
+        assert_eq!(
+            classify_markdown_link("https://example.com/x \"docs\""),
+            Some(MarkdownLinkTarget::External("https://example.com/x".into()))
+        );
+        assert_eq!(
+            classify_markdown_link("dir%20name/a.md"),
+            Some(MarkdownLinkTarget::Local {
+                path: PathBuf::from("dir name/a.md"),
+                fragment: None,
+            })
+        );
+    }
+
+    #[test]
+    fn heading_slug_github_style() {
+        assert_eq!(heading_slug("Foo Bar!"), "foo-bar");
+        assert_eq!(heading_slug("API"), "api");
+        assert_eq!(strip_heading_marker("█ Title Here"), "Title Here");
+    }
+
+    #[test]
+    fn resolve_local_markdown_path_prefers_file_dir_then_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_dir = tmp.path().join("notes");
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&file_dir).unwrap();
+        std::fs::create_dir_all(ws.join("docs")).unwrap();
+        std::fs::write(file_dir.join("local.md"), "x").unwrap();
+        std::fs::write(ws.join("docs/root.md"), "y").unwrap();
+
+        let hit =
+            resolve_local_markdown_path(Path::new("local.md"), Some(&file_dir), &[ws.as_path()]);
+        assert_eq!(hit, file_dir.join("local.md"));
+
+        let rooted = resolve_local_markdown_path(
+            Path::new("/docs/root.md"),
+            Some(&file_dir),
+            &[ws.as_path()],
+        );
+        assert_eq!(rooted, ws.join("docs/root.md"));
     }
 
     #[test]

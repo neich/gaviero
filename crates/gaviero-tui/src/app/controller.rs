@@ -2084,6 +2084,9 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
                 // Force a re-sync: the editor top may be unchanged, and the
                 // preview must not stay pinned at 0 behind a scrolled source.
                 app.preview_synced_top = None;
+                if !app.preview_mode.is_active() {
+                    super::editing::clear_preview_link_hover(app);
+                }
                 app.status_message = Some((
                     format!("Markdown preview: {}", app.preview_mode.title_label()),
                     std::time::Instant::now(),
