@@ -34,57 +34,9 @@ pub enum LeftPanelMode {
     Changes,
 }
 
-/// Markdown buffer preview layout, cycled with Alt+P.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum MarkdownPreviewMode {
-    /// Source only (no rendered pane).
-    #[default]
-    Off,
-    /// Source and rendered preview side by side.
-    Split,
-    /// Rendered preview only (source hidden).
-    PreviewOnly,
-}
-
-impl MarkdownPreviewMode {
-    pub fn cycle(self) -> Self {
-        match self {
-            Self::Off => Self::Split,
-            Self::Split => Self::PreviewOnly,
-            Self::PreviewOnly => Self::Off,
-        }
-    }
-
-    pub fn is_active(self) -> bool {
-        !matches!(self, Self::Off)
-    }
-
-    pub fn title_label(self) -> &'static str {
-        match self {
-            Self::Off => "Markdown",
-            Self::Split => "Markdown · split (Alt+P)",
-            Self::PreviewOnly => "Markdown · preview (Alt+P)",
-        }
-    }
-}
-
-#[cfg(test)]
-mod preview_mode_tests {
-    use super::MarkdownPreviewMode;
-
-    #[test]
-    fn cycle_off_split_preview_only_off() {
-        assert_eq!(MarkdownPreviewMode::Off.cycle(), MarkdownPreviewMode::Split);
-        assert_eq!(
-            MarkdownPreviewMode::Split.cycle(),
-            MarkdownPreviewMode::PreviewOnly
-        );
-        assert_eq!(
-            MarkdownPreviewMode::PreviewOnly.cycle(),
-            MarkdownPreviewMode::Off
-        );
-    }
-}
+/// Re-exported so `app::*` keeps importing the preview layout from one place;
+/// the definition lives next to the buffer field that owns it.
+pub use crate::editor::markdown::MarkdownPreviewMode;
 
 #[derive(Clone, Debug)]
 pub struct ReviewProposal {

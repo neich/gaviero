@@ -1504,7 +1504,8 @@ impl AgentChatState {
                     let list = if options.is_empty() {
                         "claude:fable, claude:sonnet, claude:opus, claude:haiku, \
                          claude:opusplan, claude:sonnet[1m], claude:opus[1m], \
-                         codex:gpt-5.6-sol, codex:gpt-5.6-luna, ollama:qwen2.5-coder:7b"
+                         codex:gpt-5.6-sol, codex:gpt-5.6-terra, codex:gpt-5.6-luna, \
+                         cursor:composer-2.5, ollama:qwen2.5-coder:7b"
                             .to_string()
                     } else {
                         options.join(", ")

@@ -121,6 +121,12 @@ pub struct TabState {
     /// Top visible line (scroll position).
     #[serde(default)]
     pub scroll_top: usize,
+
+    /// Markdown preview layout this tab was left in: `"split"` or
+    /// `"preview"`. Stored as an opaque string so core carries no UI type;
+    /// absent or unrecognised restores as source-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_mode: Option<String>,
 }
 
 /// Panel visibility state.
@@ -429,6 +435,7 @@ mod tests {
                 cursor_line: 10,
                 cursor_col: 5,
                 scroll_top: 3,
+                preview_mode: Some("split".to_string()),
             }],
             active_tab: 0,
             panels: PanelState {
@@ -448,6 +455,7 @@ mod tests {
         assert_eq!(loaded.tabs.len(), 1);
         assert_eq!(loaded.tabs[0].path, "/tmp/file.rs");
         assert_eq!(loaded.tabs[0].cursor_line, 10);
+        assert_eq!(loaded.tabs[0].preview_mode.as_deref(), Some("split"));
         assert_eq!(loaded.active_tab, 0);
         assert!(loaded.panels.terminal);
         assert_eq!(loaded.tree_expanded.len(), 2);

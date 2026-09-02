@@ -38,18 +38,25 @@ pub const CLAUDE_MODEL_ALIASES: &[&str] = &[
 /// `codex:` or typing a bare `gpt` fragment only surfaces Cursor's proxied
 /// `cursor:gpt-*` entries — Codex looks like it disappeared.
 ///
-/// GPT-5.6 family slugs match Codex `models.json` / OpenAI docs:
-/// `gpt-5.6-sol` (flagship), `gpt-5.6-terra` (balanced), `gpt-5.6-luna`
-/// (fast/affordable). Older `gpt-5.5` / `gpt-5.4` / `gpt-5.2` stay for
-/// compatibility. Free-form ids still pass [`validate_model_spec`]; this
-/// list is picker UX only.
+/// Mirrors the `visibility: "list"` slugs Codex serves in its model catalog
+/// (`~/.codex/models_cache.json`, client 0.146.0, fetched 2026-09-01), in
+/// upstream `priority` order: `gpt-5.6-sol` (flagship), `gpt-5.6-terra`
+/// (balanced), `gpt-5.6-luna` (fast/affordable), then the older `gpt-5.5` /
+/// `gpt-5.4` / `gpt-5.4-mini` and the Codex-CLI-only `gpt-5.3-codex-spark`.
+/// Hidden slugs (`gpt-reserve`, `codex-auto-review`) are deliberately absent.
+///
+/// `gpt-5.2` was dropped when Codex delisted it upstream — free-form ids still
+/// pass [`validate_model_spec`], so an existing `codex:gpt-5.2` pin keeps
+/// working; it just no longer shows up in the picker. This list is picker UX
+/// only.
 pub const CODEX_MODEL_ALIASES: &[&str] = &[
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
     "gpt-5.5",
     "gpt-5.4",
-    "gpt-5.2",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex-spark",
 ];
 
 /// Concrete Claude CLI `--model` id that the bare `sonnet` alias resolves to.
@@ -997,7 +1004,18 @@ mod tests {
         );
         assert!(hits.contains(&"codex:gpt-5.5".to_string()), "got {hits:?}");
         assert!(hits.contains(&"codex:gpt-5.4".to_string()), "got {hits:?}");
-        assert!(hits.contains(&"codex:gpt-5.2".to_string()), "got {hits:?}");
+        assert!(
+            hits.contains(&"codex:gpt-5.4-mini".to_string()),
+            "got {hits:?}"
+        );
+        assert!(
+            hits.contains(&"codex:gpt-5.3-codex-spark".to_string()),
+            "got {hits:?}"
+        );
+        // Delisted upstream, so it is no longer offered — but an explicit pin
+        // must still validate, since the picker list is UX only.
+        assert!(!hits.contains(&"codex:gpt-5.2".to_string()), "got {hits:?}");
+        validate_model_spec("codex:gpt-5.2").unwrap();
 
         let family = model_spec_completions("codex:gpt-5.6", &[]);
         assert!(

@@ -131,9 +131,10 @@ pub(super) fn render(app: &mut App, frame: &mut Frame) {
 
         app.layout.preview_area = None;
 
-        let md_active = app.is_current_buffer_markdown() && app.preview_mode.is_active();
+        let preview_mode = app.preview_mode();
+        let md_active = app.is_current_buffer_markdown() && preview_mode.is_active();
 
-        let (actual_editor_area, preview_area) = match app.preview_mode {
+        let (actual_editor_area, preview_area) = match preview_mode {
             MarkdownPreviewMode::Off => (editor_content, None),
             MarkdownPreviewMode::Split if md_active => {
                 // Keep at least a few columns for the source pane (gutter + scrollbar).
@@ -1079,7 +1080,8 @@ pub(super) fn render_markdown_preview(app: &mut App, frame: &mut Frame, area: Re
     use crate::panels::chat_markdown;
     use ratatui::widgets::{Block, Borders};
 
-    let borders = if app.preview_mode == MarkdownPreviewMode::PreviewOnly {
+    let mode = app.preview_mode();
+    let borders = if mode == MarkdownPreviewMode::PreviewOnly {
         Borders::TOP
     } else {
         Borders::LEFT
@@ -1088,9 +1090,9 @@ pub(super) fn render_markdown_preview(app: &mut App, frame: &mut Frame, area: Re
     let block = Block::default()
         .borders(borders)
         .border_style(Style::default().fg(theme::BORDER_DIM))
-        .title(format!(" {} ", app.preview_mode.title_label()));
+        .title(format!(" {} ", mode.title_label()));
     frame.render_widget(block, area);
-    let inner = markdown_preview_inner(area, app.preview_mode);
+    let inner = markdown_preview_inner(area, mode);
 
     let (source, editor_top) = match app.buffers.get(app.active_buffer) {
         Some(buf) => (
@@ -1120,11 +1122,12 @@ pub(super) fn render_markdown_preview(app: &mut App, frame: &mut Frame, area: Re
         ..inner
     };
     let hover = app.preview_hover_href.clone();
+    let scroll = app.preview_scroll();
     chat_markdown::render_lines_to_buffer(
         &app.preview_lines,
         text_area,
         frame.buffer_mut(),
-        app.preview_scroll,
+        scroll,
         app.theme.default_style(),
         hover.as_deref(),
     );
@@ -1133,7 +1136,7 @@ pub(super) fn render_markdown_preview(app: &mut App, frame: &mut Frame, area: Re
         frame.buffer_mut(),
         app.preview_line_count,
         app.preview_viewport_lines,
-        app.preview_scroll,
+        scroll,
     );
 }
 
@@ -1181,13 +1184,13 @@ fn sync_preview_to_editor(app: &mut App, editor_top: Option<usize>, source_map: 
         return;
     }
     app.preview_synced_top = Some(anchor);
-    app.preview_scroll = source_map.get(top).copied().unwrap_or(0);
+    app.set_preview_scroll(source_map.get(top).copied().unwrap_or(0));
 }
 
 pub(super) fn clamp_preview_scroll(app: &mut App, line_count: usize) {
     let max = line_count.saturating_sub(app.preview_viewport_lines);
-    if app.preview_scroll > max {
-        app.preview_scroll = max;
+    if app.preview_scroll() > max {
+        app.set_preview_scroll(max);
     }
 }
 
