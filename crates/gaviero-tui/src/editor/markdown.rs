@@ -9,6 +9,102 @@ use std::path::{Path, PathBuf};
 use super::highlight::StyledSpan;
 use crate::theme::Theme;
 
+// ── Preview layout ──
+
+/// Markdown buffer preview layout, cycled with Alt+P.
+///
+/// Lives on the [`Buffer`](super::buffer::Buffer), not on `App`: each open
+/// markdown file carries its own layout, so toggling the preview on one tab
+/// leaves every other tab where the user left it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MarkdownPreviewMode {
+    /// Source only (no rendered pane).
+    #[default]
+    Off,
+    /// Source and rendered preview side by side.
+    Split,
+    /// Rendered preview only (source hidden).
+    PreviewOnly,
+}
+
+impl MarkdownPreviewMode {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Off => Self::Split,
+            Self::Split => Self::PreviewOnly,
+            Self::PreviewOnly => Self::Off,
+        }
+    }
+
+    pub fn is_active(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub fn title_label(self) -> &'static str {
+        match self {
+            Self::Off => "Markdown",
+            Self::Split => "Markdown · split (Alt+P)",
+            Self::PreviewOnly => "Markdown · preview (Alt+P)",
+        }
+    }
+
+    /// Stable key for session persistence. `Off` is `None` so the common case
+    /// adds nothing to the session file.
+    pub fn session_key(self) -> Option<&'static str> {
+        match self {
+            Self::Off => None,
+            Self::Split => Some("split"),
+            Self::PreviewOnly => Some("preview"),
+        }
+    }
+
+    /// Inverse of [`session_key`](Self::session_key); anything unrecognised
+    /// (older or newer session files) restores as source-only.
+    pub fn from_session_key(key: Option<&str>) -> Self {
+        match key {
+            Some("split") => Self::Split,
+            Some("preview") => Self::PreviewOnly,
+            _ => Self::Off,
+        }
+    }
+}
+
+#[cfg(test)]
+mod preview_mode_tests {
+    use super::MarkdownPreviewMode;
+
+    #[test]
+    fn cycle_off_split_preview_only_off() {
+        assert_eq!(MarkdownPreviewMode::Off.cycle(), MarkdownPreviewMode::Split);
+        assert_eq!(
+            MarkdownPreviewMode::Split.cycle(),
+            MarkdownPreviewMode::PreviewOnly
+        );
+        assert_eq!(
+            MarkdownPreviewMode::PreviewOnly.cycle(),
+            MarkdownPreviewMode::Off
+        );
+    }
+
+    #[test]
+    fn session_key_roundtrips_and_ignores_unknown() {
+        for mode in [
+            MarkdownPreviewMode::Off,
+            MarkdownPreviewMode::Split,
+            MarkdownPreviewMode::PreviewOnly,
+        ] {
+            assert_eq!(
+                MarkdownPreviewMode::from_session_key(mode.session_key()),
+                mode
+            );
+        }
+        assert_eq!(
+            MarkdownPreviewMode::from_session_key(Some("wat")),
+            MarkdownPreviewMode::Off
+        );
+    }
+}
+
 // ── Regex-based highlighting (produces StyledSpan like tree-sitter) ──
 
 /// Generate StyledSpans for markdown source text within a byte range.

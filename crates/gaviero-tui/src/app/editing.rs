@@ -90,12 +90,12 @@ pub(super) fn ensure_editor_cursor_visible(app: &mut App) {
 pub(super) fn scroll_preview_lines(app: &mut App, delta: i32) {
     let step = delta.unsigned_abs() as usize;
     if delta < 0 {
-        app.preview_scroll = app.preview_scroll.saturating_sub(step);
+        app.set_preview_scroll(app.preview_scroll().saturating_sub(step));
     } else {
         let max = app
             .preview_line_count
             .saturating_sub(app.preview_viewport_lines);
-        app.preview_scroll = (app.preview_scroll + step).min(max);
+        app.set_preview_scroll((app.preview_scroll() + step).min(max));
     }
     if let Some((col, row)) = app.last_mouse {
         update_preview_hover(app, col, row);
@@ -138,7 +138,7 @@ pub(super) fn handle_editor_action(app: &mut App, action: Action) {
         }
     }
 
-    if app.preview_mode == MarkdownPreviewMode::PreviewOnly && is_current_buffer_markdown(app) {
+    if app.preview_mode() == MarkdownPreviewMode::PreviewOnly && is_current_buffer_markdown(app) {
         match action {
             Action::PageUp => {
                 scroll_preview_lines(app, -(app.preview_viewport_lines as i32));
@@ -469,10 +469,10 @@ fn preview_href_under_pointer(app: &App, col: u16, row: u16) -> Option<&str> {
     if col == scrollbar_x {
         return None;
     }
-    let inner = super::render::markdown_preview_inner(preview, app.preview_mode);
+    let inner = super::render::markdown_preview_inner(preview, app.preview_mode());
     crate::panels::chat_markdown::preview_link_at(
         &app.preview_lines,
-        app.preview_scroll,
+        app.preview_scroll(),
         inner.x.saturating_add(1),
         inner,
         col,
@@ -505,7 +505,7 @@ fn scroll_preview_to_fragment(app: &mut App, fragment: &str) {
     let Some(preview) = app.layout.preview_area else {
         return;
     };
-    let inner = super::render::markdown_preview_inner(preview, app.preview_mode);
+    let inner = super::render::markdown_preview_inner(preview, app.preview_mode());
     let source = match app.buffers.get(app.active_buffer) {
         Some(buf) => buf.text.to_string(),
         None => return,
@@ -515,7 +515,7 @@ fn scroll_preview_to_fragment(app: &mut App, fragment: &str) {
         chat_markdown::format_chat_markdown(&source, content_width, app.theme.default_style());
     if let Some(idx) = chat_markdown::preview_line_for_fragment(&lines, fragment) {
         app.preview_line_count = lines.len();
-        app.preview_scroll = idx;
+        app.set_preview_scroll(idx);
         super::render::clamp_preview_scroll(app, lines.len());
         app.preview_synced_top = None;
     }
@@ -835,6 +835,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     if idx < app.buffers.len() && idx != app.active_buffer {
                         app.active_buffer = idx;
                         app.focus = Focus::Editor;
+                        sync_preview_mode_for_active_buffer(app);
                     }
                 }
             }
@@ -1517,9 +1518,9 @@ pub(super) fn scroll_panel_to_row(app: &mut App, target: ScrollbarTarget, row: u
                 .saturating_sub(area.y)
                 .min(area.height.saturating_sub(1)) as usize;
             let fraction = row_in_track as f64 / track_height.saturating_sub(1).max(1) as f64;
-            app.preview_scroll = (fraction * max_scroll as f64)
-                .round()
-                .min(max_scroll as f64) as usize;
+            app.set_preview_scroll(
+                (fraction * max_scroll as f64).round().min(max_scroll as f64) as usize,
+            );
         }
         ScrollbarTarget::Chat => {
             let Some(area) = app.chat_state.conv_area_cache else {
@@ -2087,13 +2088,23 @@ pub(super) fn open_diff_view(app: &mut App, path: &Path, original: String, curre
     }
 }
 
+/// Re-point the preview's *derived* state at the buffer that just became
+/// active.
+///
+/// The mode and scroll offset travel with the buffer, so a tab switch neither
+/// reads nor writes them — the incoming buffer keeps whatever layout it was
+/// last left in. Only the render-scoped state (sync anchor, link hit-boxes)
+/// belongs to the outgoing buffer and has to go; the next preview render
+/// rebuilds it.
 pub(super) fn sync_preview_mode_for_active_buffer(app: &mut App) {
-    if !is_current_buffer_markdown(app) && app.preview_mode != MarkdownPreviewMode::Off {
-        app.preview_mode = MarkdownPreviewMode::Off;
-        app.preview_scroll = 0;
-        app.preview_synced_top = None;
-        clear_preview_link_hover(app);
+    if !is_current_buffer_markdown(app) && app.preview_mode() != MarkdownPreviewMode::Off {
+        // A buffer that stopped being markdown (rename, language change) must
+        // not keep a preview layout no renderer will honour.
+        app.set_preview_mode(MarkdownPreviewMode::Off);
+        app.set_preview_scroll(0);
     }
+    app.preview_synced_top = None;
+    clear_preview_link_hover(app);
 }
 
 pub(super) fn open_file(app: &mut App, path: &Path) {
@@ -2191,6 +2202,9 @@ pub(super) fn close_tab(app: &mut App) {
     if app.active_buffer >= app.buffers.len() && !app.buffers.is_empty() {
         app.active_buffer = app.buffers.len() - 1;
     }
+    // `preview_synced_top` holds a buffer index that now points at a different
+    // (or no) buffer.
+    sync_preview_mode_for_active_buffer(app);
 }
 
 pub(super) fn spawn_active_terminal(app: &mut App) {

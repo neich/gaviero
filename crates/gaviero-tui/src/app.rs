@@ -150,9 +150,10 @@ pub struct App {
     pub find_bar_active: bool,
     pub find_input: crate::widgets::text_input::TextInput,
 
-    // Markdown preview (Alt+P cycles Off → Split → PreviewOnly)
-    pub preview_mode: MarkdownPreviewMode,
-    pub preview_scroll: usize,
+    // Markdown preview (Alt+P cycles Off → Split → PreviewOnly).
+    // The mode and scroll offset live on `Buffer`, reached through
+    // `preview_mode()` / `preview_scroll()`; only the derived render state
+    // below — which always belongs to the active buffer — is held here.
     /// `(active buffer, editor top source line)` the preview was last synced
     /// to (split view). `None` in preview-only mode, or before the first sync.
     /// Re-syncing only when this changes leaves an explicit preview scroll
@@ -431,8 +432,6 @@ impl App {
             bulk_op_state: None,
             find_bar_active: false,
             find_input: crate::widgets::text_input::TextInput::new(),
-            preview_mode: MarkdownPreviewMode::Off,
-            preview_scroll: 0,
             preview_synced_top: None,
             preview_viewport_lines: 1,
             preview_line_count: 0,
@@ -1062,6 +1061,36 @@ impl App {
 
     fn is_current_buffer_markdown(&self) -> bool {
         editing::is_current_buffer_markdown(self)
+    }
+
+    // ── Markdown preview (per-buffer state) ──────────────────────
+
+    /// Preview layout of the active buffer; `Off` when no buffer is open.
+    pub(crate) fn preview_mode(&self) -> MarkdownPreviewMode {
+        self.buffers
+            .get(self.active_buffer)
+            .map(|buf| buf.preview_mode)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn set_preview_mode(&mut self, mode: MarkdownPreviewMode) {
+        if let Some(buf) = self.buffers.get_mut(self.active_buffer) {
+            buf.preview_mode = mode;
+        }
+    }
+
+    /// Preview scroll offset of the active buffer; 0 when no buffer is open.
+    pub(crate) fn preview_scroll(&self) -> usize {
+        self.buffers
+            .get(self.active_buffer)
+            .map(|buf| buf.preview_scroll)
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn set_preview_scroll(&mut self, scroll: usize) {
+        if let Some(buf) = self.buffers.get_mut(self.active_buffer) {
+            buf.preview_scroll = scroll;
+        }
     }
 
     // ── Rendering ────────────────────────────────────────────────

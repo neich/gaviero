@@ -2079,16 +2079,16 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
         Action::Save => app.save_current_buffer(),
         Action::TogglePreview => {
             if app.is_current_buffer_markdown() {
-                app.preview_mode = app.preview_mode.cycle();
-                app.preview_scroll = 0;
+                app.set_preview_mode(app.preview_mode().cycle());
+                app.set_preview_scroll(0);
                 // Force a re-sync: the editor top may be unchanged, and the
                 // preview must not stay pinned at 0 behind a scrolled source.
                 app.preview_synced_top = None;
-                if !app.preview_mode.is_active() {
+                if !app.preview_mode().is_active() {
                     super::editing::clear_preview_link_hover(app);
                 }
                 app.status_message = Some((
-                    format!("Markdown preview: {}", app.preview_mode.title_label()),
+                    format!("Markdown preview: {}", app.preview_mode().title_label()),
                     std::time::Instant::now(),
                 ));
             } else {

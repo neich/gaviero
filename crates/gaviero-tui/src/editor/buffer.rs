@@ -6,6 +6,7 @@ use gaviero_core::{InputEdit, Language, Parser, Point, Tree};
 use ropey::Rope;
 use unicode_width::UnicodeWidthChar;
 
+use super::markdown::MarkdownPreviewMode;
 use super::wrap::{VisualSegment, char_display_width};
 
 #[derive(Clone, Debug)]
@@ -125,6 +126,12 @@ pub struct Buffer {
     parser: Option<Parser>,
     /// When true, long lines wrap to the viewport width instead of horizontal scroll.
     pub word_wrap: bool,
+    /// Markdown preview layout for *this* buffer (Alt+P). Per-buffer so
+    /// previewing one markdown file does not flip every other open one.
+    /// Always `Off` on non-markdown buffers.
+    pub preview_mode: MarkdownPreviewMode,
+    /// Scroll offset of this buffer's rendered preview pane, in preview lines.
+    pub preview_scroll: usize,
     /// Tab display width (from settings, default 4).
     pub tab_width: u8,
     /// String used for one indent level (from settings, default "    ").
@@ -176,6 +183,8 @@ impl Buffer {
             redo_stack: Vec::new(),
             parser: None,
             word_wrap: false,
+            preview_mode: MarkdownPreviewMode::Off,
+            preview_scroll: 0,
             tab_width: 4,
             indent_unit: "    ".to_string(),
             indent_query: None,
@@ -288,6 +297,8 @@ impl Buffer {
             redo_stack: Vec::new(),
             parser,
             word_wrap: false,
+            preview_mode: MarkdownPreviewMode::Off,
+            preview_scroll: 0,
             tab_width: 4,
             indent_unit: "    ".to_string(),
             indent_query: None,
@@ -358,6 +369,8 @@ impl Buffer {
             redo_stack: Vec::new(),
             parser,
             word_wrap: false,
+            preview_mode: MarkdownPreviewMode::Off,
+            preview_scroll: 0,
             tab_width: 4,
             indent_unit: "    ".to_string(),
             indent_query: None,

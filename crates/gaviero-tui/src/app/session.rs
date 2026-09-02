@@ -457,6 +457,11 @@ pub(super) fn restore_session(app: &mut App) {
                 buf.cursor.line = tab.cursor_line.min(max_line);
                 buf.cursor.col = tab.cursor_col;
                 buf.scroll.top_line = tab.scroll_top.min(max_line);
+                if buf.lang_name.as_deref() == Some("markdown") {
+                    buf.preview_mode = MarkdownPreviewMode::from_session_key(
+                        tab.preview_mode.as_deref(),
+                    );
+                }
             }
         }
     }
@@ -500,6 +505,7 @@ pub(super) fn save_session(app: &App) {
                 cursor_line: buf.cursor.line,
                 cursor_col: buf.cursor.col,
                 scroll_top: buf.scroll.top_line,
+                preview_mode: buf.preview_mode.session_key().map(str::to_owned),
             })
         })
         .collect();
