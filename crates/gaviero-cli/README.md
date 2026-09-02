@@ -43,8 +43,8 @@ gaviero-cli --work-units '[{"id":"design","description":"Plan","scope":{"owned_p
 | Provider | Examples |
 |---|---|
 | Claude | `claude:fable`, `claude:sonnet`, `claude:opus` |
-| Codex | `codex:gpt-5.5`, `codex:gpt-5.4` |
-| Cursor | `cursor:claude-4-sonnet` |
+| Codex | `codex:gpt-5.6-sol`, `codex:gpt-5.6-terra`, `codex:gpt-5.6-luna` |
+| Cursor | `cursor:composer-2.5`, `cursor:cursor-grok-4.6-high` (ids embed effort — see `agent --list-models`) |
 | Ollama / local | `ollama:qwen2.5-coder:7b`, `local:qwen2.5-coder:14b` |
 | DeepSeek | `deepseek:deepseek-v4-pro`, `deepseek:deepseek-v4-flash` |
 
@@ -171,7 +171,7 @@ instead of overwriting it** — no flag required:
 gaviero-cli --script crates/gaviero-dsl/examples/plan_refinement.gaviero \
   --workflow feature-plan-refinement \
   --prompt-file brief.md --var OUT_DIR=plans/my-feature \
-  --param roster=claude=claude:opus@max,codex=codex:gpt-5.5@high
+  --param roster=claude=claude:opus@max,codex=codex:gpt-5.6-sol@high
 
 # Same command again: detects v3, resumes at v4 reading the v3 plans
 ```

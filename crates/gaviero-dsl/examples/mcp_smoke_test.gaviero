@@ -51,7 +51,8 @@ client claude_probe {
 }
 
 client codex_probe {
-    model "codex:gpt-5.5"
+    // Luna is the fast/affordable GPT-5.6 tier — right for a connectivity probe.
+    model "codex:gpt-5.6-luna"
     privacy public
     effort low
 }

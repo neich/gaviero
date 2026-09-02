@@ -120,15 +120,16 @@
 //   The reviewer panel is a workflow parameter — supplied via
 //   `--param roster=...`. The in-script default below runs a
 //   three-provider frontier panel at maximum research depth:
-//   Claude Opus + Codex GPT-5.6 Sol + Cursor Grok 4.5. Each roster
+//   Claude Opus + Codex GPT-5.6 Sol + Cursor Grok 4.6. Each roster
 //   entry is `id=provider:model[@effort]`; the id becomes the filename
 //   prefix and the model + effort bind the cloned reviewer agent to an
 //   anonymous client. Use distinct ids per reviewer.
 //
 //   Cursor note: the Cursor backend does not forward `effort`;
-//   reasoning depth rides on the model id itself. `cursor:grok-4.6`
-//   is the canonical id (see clients.gaviero) — check variants with
-//   `agent --list-models` before inventing suffixes.
+//   reasoning depth rides on the model id itself.
+//   `cursor:cursor-grok-4.6-high` is the canonical id (see
+//   clients.gaviero) — check variants with `agent --list-models`
+//   before inventing suffixes.
 //
 //   The judge stays on `claude:sonnet` at `medium` — it only
 //   classifies summaries against a fixed rubric and runs once per
@@ -975,7 +976,7 @@ agent convergence-judge {
 // The `roster` workflow parameter binds the loop's `reviewers` slot to
 // a list of provider entries. Override entirely from the CLI:
 //
-//   --param roster=claude=claude:opus@xhigh,codex=codex:gpt-5.6-sol@xhigh,cursor=cursor:grok-4.6@xhigh
+//   --param roster=claude=claude:opus@xhigh,codex=codex:gpt-5.6-sol@xhigh,cursor=cursor:cursor-grok-4.6-high
 //
 // The in-script default below runs that same three-provider frontier
 // panel (Claude Opus + Codex GPT-5.6 Sol + Cursor Grok 4.6) so the
@@ -1033,7 +1034,7 @@ workflow scientific-research-consensus {
     param roster [
         { id "claude" model "claude:opus"       effort xhigh }
         { id "codex"  model "codex:gpt-5.6-sol" effort xhigh }
-        { id "cursor" model "cursor:grok-4.6"   effort xhigh }
+        { id "cursor" model "cursor:cursor-grok-4.6-high" effort xhigh }
     ]
 
     steps [

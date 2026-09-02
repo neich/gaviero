@@ -11,7 +11,7 @@
 //     --var OUT_DIR=consensus_runs/latest
 //
 // Override the roster from the CLI (each entry is `id=provider:model[@effort]`):
-//   --param roster=claude=claude:opus@max,codex=codex:gpt-5.5@high,cursor=cursor:composer-2.5
+//   --param roster=claude=claude:opus@max,codex=codex:gpt-5.6-sol@high,cursor=cursor:composer-2.5
 //
 // Modes (loop consensus_mode):
 //   strict      — only PASS ends early (after stability)
@@ -155,7 +155,7 @@ workflow generic-consensus {
     // CLI flag. Override via `--param roster=...` for a different panel.
     param roster [
         { id "claude" model "claude:opus" effort max }
-        { id "codex"  model "codex:gpt-5.5" effort high }
+        { id "codex"  model "codex:gpt-5.6-sol" effort high }
     ]
 
     steps [

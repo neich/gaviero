@@ -49,8 +49,8 @@ println!("{}", plan.to_gaviero_script()?);
 | Provider | Examples | Notes |
 |---|---|---|
 | Claude | `claude:fable`, `claude:sonnet`, `claude:opus` | Subprocess (Claude Code) |
-| Codex | `codex:gpt-5.5`, `codex:gpt-5.4` | Subprocess (exec / app-server) |
-| Cursor | `cursor:claude-4-sonnet` | Subprocess (Cursor CLI) |
+| Codex | `codex:gpt-5.6-sol`, `codex:gpt-5.6-terra`, `codex:gpt-5.6-luna` | Subprocess (exec / app-server) |
+| Cursor | `cursor:composer-2.5`, `cursor:cursor-grok-4.6-high` | Subprocess (Cursor CLI); ids embed effort — list them with `agent --list-models` |
 | Ollama / local | `ollama:qwen2.5-coder:7b`, `local:model-name` | Local server |
 | DeepSeek | `deepseek:deepseek-v4-pro` | In-process HTTP (`tool_agent`) |
 

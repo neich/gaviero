@@ -677,10 +677,11 @@ async fn drive_codex_stdout(
 /// `xhigh`, `max`, `ultra`. `None` / `off` / `auto` omit the flag so Codex
 /// uses its model default.
 ///
-/// Supported ceilings follow Codex `models.json` (2026-08):
+/// Supported ceilings follow the Codex model catalog (client 0.146.0, 2026-09):
 /// * `gpt-5.6-sol` / `gpt-5.6-terra` / bare `gpt-5.6` → up to `ultra`
 /// * `gpt-5.6-luna` → up to `max` (no `ultra`)
-/// * older models (`gpt-5.5`, `gpt-5.4`, `gpt-5.2`, …) → up to `xhigh`
+/// * older models (`gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`,
+///   `gpt-5.3-codex-spark`, `gpt-5.2`, …) → up to `xhigh`
 ///
 /// Requests above the active model's ceiling are clamped down (not dropped).
 fn map_effort_to_codex(effort: Option<&str>, model: &str) -> Option<&'static str> {
@@ -721,7 +722,8 @@ fn codex_effort_ceiling(model: &str) -> &'static str {
         // Unknown 5.6 variant — allow the common Sol/Terra ceiling.
         "ultra"
     } else {
-        // gpt-5.5 / gpt-5.4 / gpt-5.2 / legacy: Codex lists through xhigh.
+        // gpt-5.5 / gpt-5.4 / gpt-5.4-mini / gpt-5.3-codex-spark / gpt-5.2 /
+        // legacy: Codex lists these through xhigh.
         "xhigh"
     }
 }

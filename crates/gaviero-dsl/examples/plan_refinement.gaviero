@@ -30,7 +30,7 @@
 //     --var OUT_DIR=plans/research-consensus-ux
 //
 // Default roster is Claude + Codex + Cursor (own models). Override with:
-//   --param roster=claude=claude:opus@max,codex=codex:gpt-5.5@high,cursor=cursor:composer-2.5@medium
+//   --param roster=claude=claude:opus@max,codex=codex:gpt-5.6-sol@high,cursor=cursor:composer-2.5@medium
 // Grok (Cursor CLI id embeds effort — omit @effort):
 //   --param roster=...,cursor=cursor:cursor-grok-4.6-high
 //
