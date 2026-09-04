@@ -24,15 +24,23 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use super::scope::{MemoryScope, SCOPE_GLOBAL, SCOPE_MODULE, SCOPE_REPO, SCOPE_WORKSPACE};
+use super::scope::{
+    MemoryScope, MemoryType, SCOPE_GLOBAL, SCOPE_MODULE, SCOPE_REPO, SCOPE_WORKSPACE,
+};
 use super::scoring::{ScoredMemory, SearchConfig};
 use super::stores::MemoryStores;
+use super::trust_defaults::MemorySource;
+
+/// Footer line appended to a constitution `<project_memory>` block so
+/// subprocess agents know the archive is MCP `memory_search`.
+pub const CONSTITUTION_ARCHIVE_HINT: &str =
+    "# archive → memory_search; code → repo_outline / node_doc. Skip grepable facts.\n";
 
 /// Settings block for chat-turn memory injection.
 ///
 /// Parsed from `.gaviero/settings.json` key `memory.chatInjection`. Defaults
-/// match the Tier S plan: Workspace ∪ Repo ∪ Module, Global off, 8 items,
-/// 1000-token budget, similarity floor 0.3.
+/// match constitution injection: Workspace ∪ Repo ∪ Module, Global off,
+/// 5 items, 400-token budget, similarity floor 0.3.
 #[derive(Debug, Clone)]
 pub struct ChatInjectionConfig {
     /// Master switch. When false, `retrieve_for_chat` returns `None` without
@@ -49,6 +57,12 @@ pub struct ChatInjectionConfig {
     /// Similarity floor; items below are dropped with
     /// `exclusion_reason = "below_min_similarity"`.
     pub min_similarity: f32,
+    /// When true (default), only constitution-admitted rows enter the
+    /// first-turn prompt. MCP `memory_search` remains the archive.
+    pub constitution_only: bool,
+    /// Types admitted when `constitution_only` is set, in addition to
+    /// `UserRemember` / `UserPanel` sources. Empty still admits user sources.
+    pub constitution_types: Vec<MemoryType>,
 }
 
 impl Default for ChatInjectionConfig {
@@ -57,10 +71,54 @@ impl Default for ChatInjectionConfig {
             enabled: true,
             scopes: ScopeMix::default(),
             max_items: 5,
-            token_budget: 1000,
+            token_budget: 400,
             min_similarity: 0.3,
+            constitution_only: true,
+            constitution_types: Self::default_constitution_types(),
         }
     }
+}
+
+impl ChatInjectionConfig {
+    pub fn default_constitution_types() -> Vec<MemoryType> {
+        vec![
+            MemoryType::Decision,
+            MemoryType::Convention,
+            MemoryType::Invariant,
+            MemoryType::Preference,
+        ]
+    }
+
+    /// Parse constitution type names from settings. Unknown names are ignored.
+    pub fn types_from_names(names: &[String]) -> Vec<MemoryType> {
+        names
+            .iter()
+            .filter_map(|n| match n.to_ascii_lowercase().as_str() {
+                "decision" => Some(MemoryType::Decision),
+                "convention" => Some(MemoryType::Convention),
+                "invariant" => Some(MemoryType::Invariant),
+                "preference" => Some(MemoryType::Preference),
+                "factual" => Some(MemoryType::Factual),
+                "procedural" => Some(MemoryType::Procedural),
+                "pattern" => Some(MemoryType::Pattern),
+                "gotcha" => Some(MemoryType::Gotcha),
+                "lesson" => Some(MemoryType::Lesson),
+                "error" => Some(MemoryType::Error),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// Constitution admission (D1). Used by chat injection and the swarm bundle.
+pub fn admit_constitution(m: &ScoredMemory, cfg: &ChatInjectionConfig) -> bool {
+    if !cfg.constitution_only {
+        return true;
+    }
+    matches!(
+        m.source,
+        MemorySource::UserRemember | MemorySource::UserPanel
+    ) || cfg.constitution_types.contains(&m.memory_type)
 }
 
 /// Which scope levels participate in chat injection.
@@ -461,7 +519,7 @@ pub async fn retrieve_for_chat_with_reranker(
 
     // Pull a pool large enough to survive the chat filters; the engine
     // caps at `max_merged_pool` so we never blow up unbounded.
-    let engine_limit = (config.max_items * 4).max(20);
+    let engine_limit = (config.max_items * 4).max(40);
     let out = retrieve_ranked(
         stores,
         memory_scope,
@@ -490,12 +548,17 @@ pub async fn retrieve_for_chat_with_reranker(
             filter_reasons.insert(m.id, "below_min_similarity");
             continue;
         }
+        if !admit_constitution(&m, config) {
+            filter_reasons.insert(m.id, "constitution_filter");
+            continue;
+        }
         kept.push(m);
     }
 
     // Apply max_items first, then token budget via render_block.
     kept.truncate(config.max_items);
-    let (block, items, tokens_used) = render_block(&kept, config.token_budget);
+    let (block, items, tokens_used) =
+        render_block(&kept, config.token_budget, config.constitution_only);
 
     // Reflect chat filters / budget trims in the pool trace so the
     // S4 manifest matches what the caller actually saw.
@@ -522,7 +585,11 @@ pub async fn retrieve_for_chat_with_reranker(
 /// Render the `<project_memory>` block, stopping once the token budget is
 /// exhausted. Returns the block text, the items actually emitted, and the
 /// approximate tokens consumed.
-fn render_block(kept: &[ScoredMemory], token_budget: usize) -> (String, Vec<ScoredMemory>, usize) {
+fn render_block(
+    kept: &[ScoredMemory],
+    token_budget: usize,
+    constitution_only: bool,
+) -> (String, Vec<ScoredMemory>, usize) {
     if kept.is_empty() {
         return (String::new(), Vec::new(), 0);
     }
@@ -531,6 +598,11 @@ fn render_block(kept: &[ScoredMemory], token_budget: usize) -> (String, Vec<Scor
 
     let header = "<project_memory>\n";
     let footer = "</project_memory>";
+    let hint = if constitution_only {
+        CONSTITUTION_ARCHIVE_HINT
+    } else {
+        ""
+    };
     let mut body = String::new();
     let mut emitted: Vec<ScoredMemory> = Vec::new();
     let overhead = header.len() + footer.len();
@@ -542,7 +614,8 @@ fn render_block(kept: &[ScoredMemory], token_budget: usize) -> (String, Vec<Scor
             m.memory_type.as_str(),
             m.content.trim()
         );
-        if overhead + body.len() + line.len() > char_budget && !emitted.is_empty() {
+        let hint_len = if emitted.is_empty() { 0 } else { hint.len() };
+        if overhead + body.len() + line.len() + hint_len > char_budget && !emitted.is_empty() {
             break;
         }
         body.push_str(&line);
@@ -553,9 +626,13 @@ fn render_block(kept: &[ScoredMemory], token_budget: usize) -> (String, Vec<Scor
         return (String::new(), Vec::new(), 0);
     }
 
-    let mut out = String::with_capacity(overhead + body.len());
+    let include_hint = !hint.is_empty() && overhead + body.len() + hint.len() <= char_budget;
+    let mut out = String::with_capacity(overhead + body.len() + hint.len());
     out.push_str(header);
     out.push_str(&body);
+    if include_hint {
+        out.push_str(hint);
+    }
     out.push_str(footer);
     let tokens_used = out.len().div_ceil(CHARS_PER_TOKEN);
     (out, emitted, tokens_used)
@@ -603,7 +680,7 @@ mod tests {
 
     #[test]
     fn render_block_empty_when_no_items() {
-        let (block, items, tokens) = render_block(&[], 1000);
+        let (block, items, tokens) = render_block(&[], 1000, false);
         assert!(block.is_empty());
         assert!(items.is_empty());
         assert_eq!(tokens, 0);
@@ -635,5 +712,160 @@ mod tests {
         assert!(matches!(c.mode, RetrievalMode::Merged));
         assert_eq!(c.per_scope_top_k, 20);
         assert_eq!(c.max_merged_pool, 50);
+    }
+
+    fn scored(
+        id: i64,
+        memory_type: MemoryType,
+        source: MemorySource,
+        content: &str,
+    ) -> ScoredMemory {
+        ScoredMemory {
+            id,
+            content: content.to_string(),
+            content_hash: format!("h{id}"),
+            scope_level: SCOPE_WORKSPACE,
+            scope_path: "workspace".into(),
+            repo_id: None,
+            module_path: None,
+            memory_type,
+            trust: crate::memory::scope::Trust::Medium,
+            importance: 0.8,
+            access_count: 0,
+            created_at: String::new(),
+            updated_at: String::new(),
+            accessed_at: None,
+            tag: None,
+            namespace: "ws".into(),
+            key: format!("k{id}"),
+            source,
+            trust_score: 0.8,
+            raw_similarity: 0.9,
+            fts_rank: None,
+            final_score: 0.9,
+        }
+    }
+
+    #[test]
+    fn admit_constitution_keeps_user_factual_and_typed_decisions() {
+        let cfg = ChatInjectionConfig::default();
+        assert!(cfg.constitution_only);
+        let extracted = scored(1, MemoryType::Factual, MemorySource::LlmExtracted, "fact");
+        let user = scored(2, MemoryType::Factual, MemorySource::UserRemember, "user");
+        let decision = scored(3, MemoryType::Decision, MemorySource::LlmAnnotated, "dec");
+        assert!(!admit_constitution(&extracted, &cfg));
+        assert!(admit_constitution(&user, &cfg));
+        assert!(admit_constitution(&decision, &cfg));
+        let mut open = cfg.clone();
+        open.constitution_only = false;
+        assert!(admit_constitution(&extracted, &open));
+    }
+
+    #[test]
+    fn render_block_includes_archive_hint_under_constitution() {
+        let kept = vec![scored(
+            1,
+            MemoryType::Decision,
+            MemorySource::LlmAnnotated,
+            "use the write gate",
+        )];
+        let (block, items, tokens) = render_block(&kept, 400, true);
+        assert_eq!(items.len(), 1);
+        assert!(block.contains(CONSTITUTION_ARCHIVE_HINT.trim_end()));
+        assert!(block.contains("</project_memory>"));
+        assert!(tokens <= 400);
+    }
+
+    #[tokio::test]
+    async fn retrieve_for_chat_applies_constitution_filter() {
+        use crate::memory::{MemoryServices, WriteMeta, WriteScope, hash_path};
+
+        let services = MemoryServices::for_tests_in_memory().unwrap();
+        let root = std::path::Path::new("/tmp/ws-constitution");
+        let repo_id = hash_path(root);
+        let scope = WriteScope::Repo {
+            repo_id: repo_id.clone(),
+        };
+        services
+            .stores
+            .store_scoped(
+                &scope,
+                "extracted factual about hashing",
+                &WriteMeta::for_source(MemorySource::LlmExtracted).with_type(MemoryType::Factual),
+            )
+            .await
+            .unwrap();
+        services
+            .stores
+            .store_scoped(
+                &scope,
+                "user remembered hashing convention",
+                &WriteMeta::user_remember().with_type(MemoryType::Factual),
+            )
+            .await
+            .unwrap();
+        services
+            .stores
+            .store_scoped(
+                &scope,
+                "we decided hashing is sha256",
+                &WriteMeta::for_source(MemorySource::LlmAnnotated).with_type(MemoryType::Decision),
+            )
+            .await
+            .unwrap();
+
+        let memory_scope = crate::memory::MemoryScope::from_context(root, Some(root), None, None);
+        let mut cfg = ChatInjectionConfig {
+            min_similarity: 0.0,
+            ..ChatInjectionConfig::default()
+        };
+        let injection = retrieve_for_chat(&services.stores, &memory_scope, "hashing", &cfg)
+            .await
+            .unwrap()
+            .expect("enabled retrieval returns Some");
+        assert!(
+            injection
+                .items
+                .iter()
+                .all(|m| m.content != "extracted factual about hashing"),
+            "extracted factual must be constitution-filtered"
+        );
+        assert!(
+            injection
+                .items
+                .iter()
+                .any(|m| m.content.contains("user remembered")),
+            "UserRemember factual must be kept"
+        );
+        assert!(
+            injection.items.iter().any(|m| m.content.contains("sha256")),
+            "Decision must be kept"
+        );
+        assert!(
+            injection
+                .pool
+                .iter()
+                .any(|e| e.exclusion_reason.as_deref() == Some("constitution_filter")),
+            "manifest must record constitution_filter"
+        );
+        assert!(
+            injection
+                .block
+                .contains(CONSTITUTION_ARCHIVE_HINT.trim_end())
+        );
+        assert!(injection.tokens_used <= 400);
+
+        cfg.constitution_only = false;
+        let open = retrieve_for_chat(&services.stores, &memory_scope, "hashing", &cfg)
+            .await
+            .unwrap()
+            .expect("enabled retrieval returns Some");
+        assert!(
+            open.items
+                .iter()
+                .any(|m| m.content.contains("extracted factual")),
+            "kill switch false keeps extracted factual"
+        );
+        assert!(!open.block.contains(CONSTITUTION_ARCHIVE_HINT.trim_end()));
     }
 }

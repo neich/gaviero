@@ -631,6 +631,63 @@ mod tests {
         assert!(!sel.metadata.is_first_turn);
     }
 
+    #[tokio::test]
+    async fn empty_pre_fetched_memory_skips_retrieve_ranked() {
+        use crate::memory::{MemoryServices, WriteMeta, WriteScope, hash_path};
+
+        let services = MemoryServices::for_tests_in_memory().unwrap();
+        let root = std::path::PathBuf::from("/tmp/ws-empty-prefetch");
+        let repo_id = hash_path(&root);
+        services
+            .stores
+            .store_scoped(
+                &WriteScope::Repo { repo_id },
+                "seeded constitution decision that retrieve_ranked would find",
+                &WriteMeta::user_remember().with_type(crate::memory::MemoryType::Decision),
+            )
+            .await
+            .unwrap();
+
+        let profile = fixture_profile();
+        let fp = PlannerFingerprint::from_profile(&profile);
+        let mut ledger = SessionLedger::new(&profile, fp);
+        let mut planner = ContextPlanner {
+            memory: Some(&services.stores),
+            repo_map: None,
+            ledger: &mut ledger,
+            workspace_root: &root,
+        };
+        let input = PlannerInput {
+            user_message: "seeded constitution decision",
+            explicit_refs: &[],
+            seed_paths: &[],
+            provider_profile: &profile,
+            read_namespaces: &["workspace".to_string()],
+            graph_budget_tokens: 0,
+            memory_query_override: None,
+            memory_limit: 5,
+            file_ref_blobs: &[],
+            pre_fetched_impact_text: None,
+            pre_fetched_graph_context: None,
+            pre_fetched_memory_context: Some(""),
+            extra_folder_paths: &[],
+            extra_repo_maps: &[],
+            topology_config: crate::repo_map::TopologyConfig {
+                enabled: false,
+                ..crate::repo_map::TopologyConfig::default()
+            },
+            pre_fetched_topology: None,
+            extra_topology_blocks: &[],
+            resolved_skills: &[],
+            bootstrap_arms: BootstrapArms::all(),
+        };
+        let sel = planner.plan(&input).await.unwrap();
+        assert!(
+            sel.memory_selections.is_empty(),
+            "empty pre-fetch must skip retrieve_ranked even when the store is seeded"
+        );
+    }
+
     /// Workspace-wide opt-in: planner ranks against primary + extras and
     /// merges by `rank_score`. Pin the contract so a future refactor of
     /// `collect_graph` doesn't silently drop one half of the merge.
