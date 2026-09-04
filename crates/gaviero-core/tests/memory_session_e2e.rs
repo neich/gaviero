@@ -313,6 +313,7 @@ async fn e2e_subsequent_session_injects_memory() -> Result<()> {
         max_items: 5,
         token_budget: 2000,
         min_similarity: 0.0,
+        ..ChatInjectionConfig::default()
     };
     let memory_scope = MemoryScope::from_context(&env.repo, Some(&env.repo), None, None);
     let injection = retrieve_for_chat(
@@ -433,6 +434,7 @@ async fn e2e_spilled_prompt_is_minimal() -> Result<()> {
             max_items: 5,
             token_budget: 2000,
             min_similarity: 0.0,
+            ..ChatInjectionConfig::default()
         },
     )
     .await?
@@ -764,6 +766,8 @@ async fn e2e_full_dev_session_simulation() -> Result<()> {
         max_items: 5,
         token_budget: 2000,
         min_similarity: 0.0,
+        constitution_only: false,
+        ..ChatInjectionConfig::default()
     };
     let memory_scope = MemoryScope::from_context(&env.repo, Some(&env.repo), None, None);
     let injection = retrieve_for_chat(&env.services.stores, &memory_scope, q4, &cfg)

@@ -121,6 +121,7 @@ async fn e2e_reset_residual_zero() -> Result<()> {
         max_items: 5,
         token_budget: 2000,
         min_similarity: 0.0,
+        ..ChatInjectionConfig::default()
     };
     let retrieval_cfg = RetrievalConfig::default();
     let memory_scope = MemoryScope::from_context(&env.repo, Some(&env.repo), None, None);

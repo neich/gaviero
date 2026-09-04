@@ -1120,43 +1120,48 @@ async fn process_message(
         }
         WriterMessage::Sleeptime { payload } => {
             let cfg = parse_sleeptime_payload(&payload);
-            // Sleeptime currently runs against the workspace store only.
-            // Step 7 fans out to per-folder stores.
-            let store = stores.workspace().clone();
-            match super::sleeptime::run_sleeptime(&store, &cfg, None).await {
-                Ok(report) => {
-                    tracing::info!(
-                        target: "memory_sleeptime",
-                        run_id = %report.run_id,
-                        dry_run = report.dry_run,
-                        decay_flagged = report.decay_flagged,
-                        near_dup_merged = report.near_dup_merged,
-                        promoted = report.promoted,
-                        trust_adjusted = report.trust_adjusted,
-                        telemetry_pruned = report.telemetry_pruned,
-                        "sleeptime complete"
-                    );
-                    // Phase 2 (Tier B / B5): stamp `last_sleeptime_at`
-                    // so the scheduler honours the 24h gating across
-                    // process restarts. Live runs only — dry-runs
-                    // intentionally don't update the timestamp so
-                    // exploratory `--sleep-dry-run` invocations don't
-                    // suppress real passes.
-                    if !report.dry_run
-                        && let Err(e) = store
-                            .set_meta_value("last_sleeptime_at", &chrono::Utc::now().to_rfc3339())
-                            .await
-                    {
-                        tracing::warn!(
-                            target: "memory_sleeptime",
-                            error = %e,
-                            "failed to stamp last_sleeptime_at"
-                        );
-                    }
-                    Ok(WriteResult::Skipped)
+            let _ = stores.open_all_folders().await;
+            let mut targets: Vec<Arc<MemoryStore>> = Vec::new();
+            let workspace_store = stores.workspace().clone();
+            targets.push(workspace_store.clone());
+            for store in stores.opened_folder_stores().await {
+                if !targets.iter().any(|s| Arc::ptr_eq(s, &store)) {
+                    targets.push(store);
                 }
-                Err(e) => Err(anyhow!("sleeptime: {e}")),
             }
+            let mut last_report = None;
+            for store in &targets {
+                match super::sleeptime::run_sleeptime(store, &cfg, None).await {
+                    Ok(report) => {
+                        tracing::info!(
+                            target: "memory_sleeptime",
+                            run_id = %report.run_id,
+                            dry_run = report.dry_run,
+                            decay_flagged = report.decay_flagged,
+                            near_dup_merged = report.near_dup_merged,
+                            promoted = report.promoted,
+                            trust_adjusted = report.trust_adjusted,
+                            telemetry_pruned = report.telemetry_pruned,
+                            "sleeptime complete"
+                        );
+                        last_report = Some(report);
+                    }
+                    Err(e) => return Err(anyhow!("sleeptime: {e}")),
+                }
+            }
+            if let Some(report) = last_report
+                && !report.dry_run
+                && let Err(e) = workspace_store
+                    .set_meta_value("last_sleeptime_at", &chrono::Utc::now().to_rfc3339())
+                    .await
+            {
+                tracing::warn!(
+                    target: "memory_sleeptime",
+                    error = %e,
+                    "failed to stamp last_sleeptime_at"
+                );
+            }
+            Ok(WriteResult::Skipped)
         }
         WriterMessage::SessionConsolidate {
             session_id,

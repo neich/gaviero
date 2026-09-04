@@ -121,6 +121,7 @@ pub(super) fn swarm_graph_budget(
 /// `Failed` manifest rather than an error, so the caller's normal
 /// failure handling (delivery gate, loop verdict, merge skip) applies instead
 /// of the run unwinding.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_backend(
     backend: &dyn AgentBackend,
     work_unit: &WorkUnit,
@@ -136,6 +137,7 @@ pub async fn run_backend(
     pre_fetched_memory: Option<&str>,
     workspace_extra_tools: &[String],
     skip_repo_context: bool,
+    skill_catalog: Option<&crate::skills::SkillCatalog>,
 ) -> Result<AgentManifest> {
     let inner = run_backend_inner(
         backend,
@@ -152,6 +154,7 @@ pub async fn run_backend(
         pre_fetched_memory,
         workspace_extra_tools,
         skip_repo_context,
+        skill_catalog,
     );
     if work_unit.timeout_secs == 0 {
         return inner.await;
@@ -210,6 +213,7 @@ async fn run_backend_inner(
     // audit record of which tools it can use.
     workspace_extra_tools: &[String],
     skip_repo_context: bool,
+    skill_catalog: Option<&crate::skills::SkillCatalog>,
 ) -> Result<AgentManifest> {
     let agent_id = format!("agent-{}", work_unit.id);
 
@@ -287,6 +291,12 @@ async fn run_backend_inner(
         None
     };
 
+    let path_lazy_skills = if let Some(catalog) = skill_catalog {
+        crate::skills::union_path_lazy_skills(catalog, &work_unit.scope.owned_paths, Vec::new())
+    } else {
+        Vec::new()
+    };
+
     let planner_input = PlannerInput {
         user_message: &work_unit.description,
         explicit_refs: &[],
@@ -310,7 +320,7 @@ async fn run_backend_inner(
         topology_config,
         pre_fetched_topology: topology_body.as_deref(),
         extra_topology_blocks: &[],
-        resolved_skills: &[],
+        resolved_skills: &path_lazy_skills,
         bootstrap_arms: crate::context_planner::BootstrapArms::swarm_first_turn(),
     };
 
@@ -1098,6 +1108,7 @@ mod tests {
             None,
             &[],
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1139,6 +1150,7 @@ mod tests {
             None,
             &[],
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1189,6 +1201,7 @@ mod tests {
             None,
             &[],
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1243,6 +1256,7 @@ mod tests {
             None,
             &[],
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1293,6 +1307,7 @@ mod tests {
             None,
             &[],
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1345,6 +1360,7 @@ mod tests {
             None,
             &[],
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1396,6 +1412,7 @@ mod tests {
             None,
             &[],
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1446,6 +1463,7 @@ mod tests {
             None,
             &[],
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1495,6 +1513,7 @@ mod tests {
                 None,
                 &[],
                 false,
+                None,
             ),
         )
         .await
@@ -1542,6 +1561,7 @@ mod tests {
             None,
             &[],
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1576,6 +1596,7 @@ mod tests {
             None,
             &[],
             false,
+            None,
         )
         .await
         .unwrap();

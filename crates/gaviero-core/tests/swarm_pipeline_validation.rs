@@ -104,6 +104,8 @@ fn make_config(workspace: &std::path::Path) -> SwarmConfig {
         resume_from_artifacts: false,
         knowledge_invalidation: None,
         run_timeout_secs: 0,
+        chat_injection: Default::default(),
+        skill_catalog: None,
     }
 }
 

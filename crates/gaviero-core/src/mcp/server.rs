@@ -394,10 +394,10 @@ impl GavieroMcpServer {
     // ── memory_search ───────────────────────────────────────────────
     #[tool(
         name = "memory_search",
-        description = "Call this when you need a fact a prior session or the user already \
-                       established — conventions, decisions, past bugs, project context — \
-                       before reading code to rediscover it. Merged multi-scope hybrid \
-                       search (repo + workspace + global, RRF) over Gaviero's memory store; \
+        description = "Call when you need a project fact that is not in the turn-1 \
+                       <project_memory> constitution (lessons, gotchas, errors, extracted \
+                       factuals). Default `kind=record`. Merged multi-scope hybrid search \
+                       (repo + workspace + global, RRF) over Gaviero's memory store; \
                        returns up to `limit` scored memories (id, scope, type, text, \
                        importance, trust). Read-only. Token cost: roughly 50-150 tokens \
                        per result.",

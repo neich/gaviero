@@ -736,9 +736,43 @@ mod tests {
         let sym = default_editor_system_prompt(&caps);
         assert!(sym.contains("symbol_search(query)"));
         assert!(sym.contains("symbol_doc(qualified_name)"));
-
         // The annotations convention still terminates the prompt (cache tail).
         assert!(sym.trim_end().ends_with("no trailing commentary."));
+    }
+
+    #[test]
+    fn render_memory_block_concatenates_structured_and_pre_rendered() {
+        use crate::context_planner::MemorySelection;
+        let mixed = vec![
+            MemorySelection {
+                id: Some(1),
+                namespace: Some("ws".into()),
+                scope_label: None,
+                score: Some(0.9),
+                trust: None,
+                content: "structured hit".into(),
+                source_hash: None,
+                updated_at: None,
+            },
+            MemorySelection {
+                id: None,
+                namespace: None,
+                scope_label: None,
+                score: None,
+                trust: None,
+                content: "<project_memory>\n- [ws] decision: pre-rendered\n</project_memory>"
+                    .into(),
+                source_hash: None,
+                updated_at: None,
+            },
+        ];
+        let block = render_memory_block(&mixed).expect("mixed selections still concatenate");
+        assert!(block.contains("structured hit"));
+        assert!(block.contains("pre-rendered"));
+        assert!(
+            block.matches("<project_memory>").count() >= 2,
+            "documents the double-inject trap: structured + pre-rendered both emit"
+        );
     }
 
     #[test]

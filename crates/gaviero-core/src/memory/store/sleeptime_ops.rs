@@ -10,7 +10,9 @@
 use anyhow::{Context, Result};
 
 use super::{MemoryStore, blob_to_embedding, cosine_similarity, days_since_iso};
-use crate::memory::scope::MemoryType;
+use crate::memory::scope::{
+    MemoryType, SCOPE_MODULE, SCOPE_REPO, StoreResult, WriteMeta, WriteScope,
+};
 use crate::memory::sleeptime::{SleeptimeConfig, SleeptimeOperation, pick_merge_winner};
 use crate::memory::trust_defaults::MemorySource;
 
@@ -288,15 +290,60 @@ impl MemoryStore {
         Ok(ops)
     }
 
-    /// B5 step 3: cross-scope promotion. The pre-existing consolidator
-    /// already handles "3+ run-scope hits → repo"; this stub promotes
-    /// `decision|convention|invariant` types after a single hit so
-    /// high-value reference rows widen sooner. Returns the operations
-    /// applied. Currently a no-op skeleton — wiring to the existing
-    /// promotion path is a follow-up; the sleeptime caller still gets
-    /// a structured empty result.
-    pub async fn sleeptime_promote(&self, _dry_run: bool) -> Result<Vec<SleeptimeOperation>> {
-        Ok(Vec::new())
+    /// Cross-scope promotion: copy module-level Decision / Convention /
+    /// Invariant rows that have at least one cross-module access-log hit
+    /// to repo scope. Source rows are never deleted. User-authored rows
+    /// are skipped — the user already chose the scope.
+    pub async fn sleeptime_promote(&self, dry_run: bool) -> Result<Vec<SleeptimeOperation>> {
+        let candidates = self.find_promotion_candidates(1).await?;
+        let mut ops = Vec::new();
+        for mem in candidates {
+            if !matches!(
+                mem.memory_type,
+                MemoryType::Decision | MemoryType::Convention | MemoryType::Invariant
+            ) {
+                continue;
+            }
+            let Some(repo_id) = mem.repo_id.clone() else {
+                continue;
+            };
+            if matches!(
+                mem.source,
+                MemorySource::UserRemember | MemorySource::UserPanel
+            ) {
+                continue;
+            }
+            let op = SleeptimeOperation::Promoted {
+                memory_id: mem.id,
+                from_scope_level: SCOPE_MODULE,
+                to_scope_level: SCOPE_REPO,
+                memory_type: mem.memory_type,
+            };
+            if dry_run {
+                ops.push(op);
+                continue;
+            }
+            let meta = WriteMeta::for_source(mem.source)
+                .with_trust_score(mem.trust_score)
+                .with_importance((mem.importance * 1.2).min(1.0))
+                .with_type(mem.memory_type)
+                .with_tag(format!("promotion:module_to_repo:{}", mem.id));
+            match self
+                .store_scoped(&WriteScope::Repo { repo_id }, &mem.content, &meta)
+                .await
+            {
+                Ok(StoreResult::Inserted(_)) => ops.push(op),
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        memory_id = mem.id,
+                        "sleeptime promotion failed"
+                    );
+                }
+            }
+        }
+        Ok(ops)
     }
 
     /// B5 step 4: trust re-scoring driven by retrieval-use telemetry

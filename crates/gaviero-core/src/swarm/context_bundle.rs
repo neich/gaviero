@@ -14,7 +14,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::context_planner::types::MemoryCandidate;
-use crate::memory::{MemoryScope, MemoryStores, RetrievalConfig, retrieve_ranked};
+use crate::memory::{
+    CONSTITUTION_ARCHIVE_HINT, ChatInjectionConfig, MemoryScope, MemoryStores, RetrievalConfig,
+    admit_constitution, retrieve_ranked,
+};
 use crate::repo_map::store::ImpactSummary;
 
 /// Swarm-wide context bundle built once by the pipeline before running any
@@ -35,6 +38,9 @@ pub struct SwarmContextBundle {
     /// Keyed by `work_unit_id`.  Built alongside `impact_texts` in the
     /// pipeline so the data is structured, not just a pre-rendered string.
     pub per_unit_graph: HashMap<String, GraphSlice>,
+    /// When true, [`Self::memory_text_for_prompt`] appends the constitution
+    /// archive hint so swarm agents know to pull lessons via MCP.
+    pub constitution_only: bool,
 }
 
 /// Per-unit graph context slice passed from the pipeline to each runner.
@@ -56,6 +62,9 @@ impl SwarmContextBundle {
             return None;
         }
         let mut block = String::from("Mem:\n");
+        if self.constitution_only {
+            block.push_str(CONSTITUTION_ARCHIVE_HINT);
+        }
         for m in &self.shared_memory {
             block.push_str(&format!("{}|{}|s{:.2}\n", m.namespace, m.content, m.score));
         }
@@ -79,6 +88,7 @@ pub async fn build_bundle(
     workspace_root: &Path,
     read_namespaces: &[String],
     memory_limit: usize,
+    injection: &ChatInjectionConfig,
 ) -> SwarmContextBundle {
     let shared_memory: Vec<MemoryCandidate> =
         if let Some(mem) = memory.filter(|_| !architectural_intent.trim().is_empty()) {
@@ -95,18 +105,25 @@ pub async fn build_bundle(
             // intent: cross-cutting workspace knowledge, not
             // folder-specific).
             let scope = MemoryScope::from_context(workspace_root, None, None, None);
+            let engine_limit = (memory_limit * 4).max(40);
             match retrieve_ranked(
                 mem,
                 &scope,
                 architectural_intent,
-                memory_limit,
+                engine_limit,
                 &RetrievalConfig::default(),
                 None,
                 None,
             )
             .await
             {
-                Ok(out) => out.items.iter().map(MemoryCandidate::from_scored).collect(),
+                Ok(out) => out
+                    .items
+                    .iter()
+                    .filter(|m| admit_constitution(m, injection))
+                    .take(memory_limit)
+                    .map(MemoryCandidate::from_scored)
+                    .collect(),
                 Err(e) => {
                     tracing::warn!("swarm bundle retrieval failed: {e}");
                     Vec::new()
@@ -120,12 +137,16 @@ pub async fn build_bundle(
         architectural_intent: architectural_intent.to_string(),
         shared_memory,
         per_unit_graph: HashMap::new(),
+        constitution_only: injection.constitution_only,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::{
+        MemoryServices, MemoryType, WriteMeta, WriteScope, trust_defaults::MemorySource,
+    };
 
     fn make_candidate(ns: &str, content: &str, score: f32) -> MemoryCandidate {
         MemoryCandidate {
@@ -146,6 +167,7 @@ mod tests {
             architectural_intent: "test".to_string(),
             shared_memory: Vec::new(),
             per_unit_graph: HashMap::new(),
+            constitution_only: true,
         };
         assert!(bundle.memory_text_for_prompt().is_none());
     }
@@ -156,9 +178,11 @@ mod tests {
             architectural_intent: "test".to_string(),
             shared_memory: vec![make_candidate("ws", "use anyhow", 0.85)],
             per_unit_graph: HashMap::new(),
+            constitution_only: true,
         };
         let text = bundle.memory_text_for_prompt().unwrap();
         assert!(text.starts_with("Mem:\n"));
+        assert!(text.contains(CONSTITUTION_ARCHIVE_HINT.trim_end()));
         assert!(text.contains("ws|"));
         assert!(text.contains("use anyhow"));
         assert!(text.contains("s0.85"));
@@ -184,7 +208,15 @@ mod tests {
     #[tokio::test]
     async fn build_bundle_empty_when_no_memory() {
         let root = std::path::PathBuf::from("/tmp");
-        let bundle = build_bundle("do something", None, &root, &["ws".to_string()], 5).await;
+        let bundle = build_bundle(
+            "do something",
+            None,
+            &root,
+            &["ws".to_string()],
+            5,
+            &ChatInjectionConfig::default(),
+        )
+        .await;
         assert!(bundle.shared_memory.is_empty());
         assert_eq!(bundle.architectural_intent, "do something");
     }
@@ -194,7 +226,66 @@ mod tests {
         // memory = None is the only option in unit tests; verify the
         // namespace-empty guard also short-circuits (no panic).
         let root = std::path::PathBuf::from("/tmp");
-        let bundle = build_bundle("do something", None, &root, &[], 5).await;
+        let bundle = build_bundle(
+            "do something",
+            None,
+            &root,
+            &[],
+            5,
+            &ChatInjectionConfig::default(),
+        )
+        .await;
         assert!(bundle.shared_memory.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_bundle_serializes_only_constitution_rows() {
+        let services = MemoryServices::for_tests_in_memory().unwrap();
+        let root = std::path::PathBuf::from("/tmp/ws-bundle-constitution");
+        let scope = WriteScope::Workspace;
+        services
+            .stores
+            .store_scoped(
+                &scope,
+                "extracted hashing factual for archive only",
+                &WriteMeta::for_source(MemorySource::LlmExtracted).with_type(MemoryType::Factual),
+            )
+            .await
+            .unwrap();
+        services
+            .stores
+            .store_scoped(
+                &scope,
+                "decision: hashing uses sha256 in this repo",
+                &WriteMeta::for_source(MemorySource::LlmAnnotated).with_type(MemoryType::Decision),
+            )
+            .await
+            .unwrap();
+
+        let bundle = build_bundle(
+            "hashing sha256",
+            Some(&services.stores),
+            &root,
+            &["ws".to_string()],
+            5,
+            &ChatInjectionConfig::default(),
+        )
+        .await;
+        assert!(
+            bundle
+                .shared_memory
+                .iter()
+                .all(|m| !m.content.contains("archive only")),
+            "extracted factuals must not enter the swarm bundle"
+        );
+        assert!(
+            bundle
+                .shared_memory
+                .iter()
+                .any(|m| m.content.contains("sha256")),
+            "Decision rows must serialize"
+        );
+        let text = bundle.memory_text_for_prompt().unwrap();
+        assert!(text.contains(CONSTITUTION_ARCHIVE_HINT.trim_end()));
     }
 }

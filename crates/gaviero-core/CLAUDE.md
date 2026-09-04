@@ -41,7 +41,7 @@ Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presenc
 - Lock discipline: never hold `Mutex` across I/O, parsing, or embedding. The memory writer task is the **single** owner of SQLite writes.
 - `AgentBackend` is object-safe; every backend in [`swarm/backend/`](src/swarm/backend) implements it.
 - Memory writes require explicit `WriteScope` — never infer. All writes flow through the writer task.
-- Scoring ([`memory/scoring.rs`](src/memory/scoring.rs)): 50% similarity + 20% importance + 15% recency + 15% base, scaled by scope/trust. Decay-exempt types: `Decision` / `Convention` / `Invariant` / `Preference`.
+- Scoring ([`memory/scoring.rs`](src/memory/scoring.rs)): 50% similarity + 20% importance + 15% recency + 15% base, scaled by scope/trust. Decay-exempt types: `Decision` / `Convention` / `Invariant` / `Preference` / `Gotcha`.
 - Model spec is `provider:model`. `validate_model_spec` ([`swarm/backend/shared.rs`](src/swarm/backend/shared.rs)) rejects bare names. Prefixes: `claude`, `codex`, `cursor`, `ollama`, `local`, `deepseek` (`SUPPORTED_PROVIDER_PREFIXES`).
 - Tree-sitter access goes through `gaviero_core::{Language, Parser, Query, …}` re-exports.
 

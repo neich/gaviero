@@ -110,6 +110,10 @@ pub mod settings {
     pub const MEMORY_CHAT_INJECTION_MAX_ITEMS: &str = "memory.chatInjection.maxItems";
     pub const MEMORY_CHAT_INJECTION_TOKEN_BUDGET: &str = "memory.chatInjection.tokenBudget";
     pub const MEMORY_CHAT_INJECTION_MIN_SIM: &str = "memory.chatInjection.minSimilarity";
+    pub const MEMORY_CHAT_INJECTION_CONSTITUTION_ONLY: &str =
+        "memory.chatInjection.constitutionOnly";
+    pub const MEMORY_CHAT_INJECTION_CONSTITUTION_TYPES: &str =
+        "memory.chatInjection.constitutionTypes";
 
     // Retrieval-manifest persistence (Tier S / S4)
     pub const MEMORY_MANIFESTS_ENABLED: &str = "memory.manifests.enabled";
@@ -863,15 +867,32 @@ impl Workspace {
         let max_items = self
             .resolve_setting(settings::MEMORY_CHAT_INJECTION_MAX_ITEMS, root)
             .as_u64()
-            .unwrap_or(8) as usize;
+            .unwrap_or(5) as usize;
         let token_budget = self
             .resolve_setting(settings::MEMORY_CHAT_INJECTION_TOKEN_BUDGET, root)
             .as_u64()
-            .unwrap_or(1000) as usize;
+            .unwrap_or(400) as usize;
         let min_similarity = self
             .resolve_setting(settings::MEMORY_CHAT_INJECTION_MIN_SIM, root)
             .as_f64()
             .unwrap_or(0.3) as f32;
+        let constitution_only = self
+            .resolve_setting(settings::MEMORY_CHAT_INJECTION_CONSTITUTION_ONLY, root)
+            .as_bool()
+            .unwrap_or(true);
+        let constitution_types = match self
+            .resolve_setting(settings::MEMORY_CHAT_INJECTION_CONSTITUTION_TYPES, root)
+            .as_array()
+        {
+            Some(arr) => {
+                let names: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+                crate::memory::ChatInjectionConfig::types_from_names(&names)
+            }
+            None => crate::memory::ChatInjectionConfig::default_constitution_types(),
+        };
 
         crate::memory::ChatInjectionConfig {
             enabled,
@@ -879,6 +900,8 @@ impl Workspace {
             max_items,
             token_budget,
             min_similarity,
+            constitution_only,
+            constitution_types,
         }
     }
 
@@ -1150,8 +1173,12 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
             serde_json::json!(["workspace", "repo", "module"])
         }
         settings::MEMORY_CHAT_INJECTION_MAX_ITEMS => serde_json::json!(5),
-        settings::MEMORY_CHAT_INJECTION_TOKEN_BUDGET => serde_json::json!(1000),
+        settings::MEMORY_CHAT_INJECTION_TOKEN_BUDGET => serde_json::json!(400),
         settings::MEMORY_CHAT_INJECTION_MIN_SIM => serde_json::json!(0.3),
+        settings::MEMORY_CHAT_INJECTION_CONSTITUTION_ONLY => serde_json::json!(true),
+        settings::MEMORY_CHAT_INJECTION_CONSTITUTION_TYPES => {
+            serde_json::json!(["decision", "convention", "invariant", "preference"])
+        }
 
         // Retrieval manifests (S4)
         settings::MEMORY_MANIFESTS_ENABLED => serde_json::json!(true),

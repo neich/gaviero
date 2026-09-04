@@ -1647,29 +1647,56 @@ async fn run_consolidate_rollback_cli(repo: &std::path::Path, batch_id: &str) ->
 }
 
 async fn run_sleeptime_cli(repo: &std::path::Path, dry_run: bool) -> Result<()> {
-    let store = tokio::task::spawn_blocking({
-        let repo = repo.to_path_buf();
-        move || gaviero_core::memory::init_workspace(&repo)
+    let repo_buf = repo.to_path_buf();
+    let stores = tokio::task::spawn_blocking({
+        let repo = repo_buf.clone();
+        move || {
+            let workspace = gaviero_core::workspace::Workspace::single_folder(repo.clone());
+            gaviero_core::memory::init_workspace_stores(&repo, &workspace)
+        }
     })
     .await
-    .context("init memory (sleeptime)")??;
+    .context("init memory stores (sleeptime)")??;
 
     let mut cfg = gaviero_core::memory::SleeptimeConfig::default();
     cfg.dry_run = dry_run;
+    let _ = stores.open_all_folders().await;
+    let mut targets = vec![stores.workspace().clone()];
+    for store in stores.opened_folder_stores().await {
+        if !targets.iter().any(|s| Arc::ptr_eq(s, &store)) {
+            targets.push(store);
+        }
+    }
     eprintln!(
-        "[gaviero-sleep] {} pass against {}",
+        "[gaviero-sleep] {} pass against {} ({} store{})",
         if dry_run { "dry-run" } else { "live" },
-        repo.display()
+        repo.display(),
+        targets.len(),
+        if targets.len() == 1 { "" } else { "s" }
     );
-    let report = gaviero_core::memory::run_sleeptime(&store, &cfg, None).await?;
+    let mut decay_flagged = 0usize;
+    let mut near_dup_merged = 0usize;
+    let mut promoted = 0usize;
+    let mut trust_adjusted = 0usize;
+    let mut telemetry_pruned = 0usize;
+    let mut last_run_id = String::new();
+    for store in &targets {
+        let report = gaviero_core::memory::run_sleeptime(store, &cfg, None).await?;
+        last_run_id = report.run_id;
+        decay_flagged += report.decay_flagged;
+        near_dup_merged += report.near_dup_merged;
+        promoted += report.promoted;
+        trust_adjusted += report.trust_adjusted;
+        telemetry_pruned += report.telemetry_pruned;
+    }
     println!("─── Sleeptime report ────────────────────────────────");
-    println!("run_id          : {}", report.run_id);
-    println!("dry_run         : {}", report.dry_run);
-    println!("decay_flagged   : {}", report.decay_flagged);
-    println!("near_dup_merged : {}", report.near_dup_merged);
-    println!("promoted        : {}", report.promoted);
-    println!("trust_adjusted  : {}", report.trust_adjusted);
-    println!("telemetry_pruned: {}", report.telemetry_pruned);
+    println!("run_id          : {last_run_id}");
+    println!("dry_run         : {dry_run}");
+    println!("decay_flagged   : {decay_flagged}");
+    println!("near_dup_merged : {near_dup_merged}");
+    println!("promoted        : {promoted}");
+    println!("trust_adjusted  : {trust_adjusted}");
+    println!("telemetry_pruned: {telemetry_pruned}");
     Ok(())
 }
 
@@ -4043,6 +4070,12 @@ async fn main() -> Result<()> {
         resume_from_artifacts: !cli.fresh,
         knowledge_invalidation: None,
         run_timeout_secs: cli.run_timeout,
+        chat_injection: workspace.resolve_chat_injection_config(Some(&repo)),
+        skill_catalog: {
+            let global = gaviero_core::skills::SkillCatalog::global_skills_dir();
+            let (catalog, _) = gaviero_core::skills::SkillCatalog::scan(&workspace, &global);
+            Some(std::sync::Arc::new(catalog))
+        },
     };
 
     // --coordinated: produce a DSL plan file for review, then exit.

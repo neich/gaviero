@@ -182,6 +182,8 @@ UnifiedStreamEvent::FileBlock (or Cursor snapshot+revert / tool_agent PathsModif
 WRITE     WriterHandle::send → writer task: embed (no lock) → brief DB lock → optional ack (ACK_TIMEOUT_MS, 30s)
 RETRIEVE  retrieve_ranked: embed → MemoryStores::search_scoped (merged RRF default | cascade kill-switch)
           → score → optional rerank → injection_manifests
+          Chat/swarm first-turn injection is a constitution filter (user-authored
+          + Decision/Convention/Invariant/Preference); the archive is MCP `memory_search`.
 ```
 
 DBs: global `~/.config/gaviero/memory.db`; workspace+run `<workspace>/.gaviero/memory.db`; repo+module `<folder>/.gaviero/memory.db`.

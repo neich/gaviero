@@ -193,6 +193,11 @@ pub struct SwarmConfig {
     /// where it is and returns the manifests collected so far, so partial
     /// artefacts stay usable and `--resume` can pick up from them.
     pub run_timeout_secs: u64,
+    /// Constitution filter for the shared memory bundle. Resolved from
+    /// `Workspace::resolve_chat_injection_config` by TUI / CLI.
+    pub chat_injection: crate::memory::ChatInjectionConfig,
+    /// Optional skill catalog for path-lazy attachment on work-unit owned paths.
+    pub skill_catalog: Option<Arc<crate::skills::SkillCatalog>>,
 }
 
 /// True when workspace `agent.availableTools` includes Bash **and** at
@@ -613,6 +618,7 @@ pub async fn execute(
         &config.workspace_root,
         &config.read_namespaces,
         10,
+        &config.chat_injection,
     )
     .await;
     let pre_fetched_memory: Arc<Option<String>> = Arc::new(bundle.memory_text_for_prompt());
@@ -975,6 +981,7 @@ pub async fn execute(
                 let pfm = pre_fetched_memory.clone();
                 let swarm_extras = config.swarm_extra_tools.clone();
                 let skip_repo_context = config.execution_mode == ExecutionMode::Document;
+                let skill_catalog = config.skill_catalog.clone();
                 if let Ok(backend) = resolve_backend_for_unit(&router, &unit) {
                     observer.on_tier_dispatch(unit_id, unit.tier, backend.name());
                 }
@@ -1013,6 +1020,7 @@ pub async fn execute(
                             (*pfm).as_deref(),
                             &swarm_extras,
                             skip_repo_context,
+                            skill_catalog.as_deref(),
                             |candidate| resolve_backend_for_unit(&router, candidate),
                         )
                         .await
@@ -1704,6 +1712,7 @@ pub async fn execute(
                     let pfm = pre_fetched_memory.clone();
                     let swarm_extras = config.swarm_extra_tools.clone();
                     let skip_repo_context = config.execution_mode == ExecutionMode::Document;
+                    let skill_catalog = config.skill_catalog.clone();
                     let in_worktree = worktree_mgr.is_some();
                     let override_branch_name = branch_override.as_ref().map(|ov| ov.branch.clone());
 
@@ -1733,6 +1742,7 @@ pub async fn execute(
                                     (*pfm).as_deref(),
                                     &swarm_extras,
                                     skip_repo_context,
+                                    skill_catalog.as_deref(),
                                     |candidate| resolve_backend_for_unit(&router, candidate),
                                 )
                                 .await
@@ -2277,6 +2287,7 @@ struct AgentRunContext<'a> {
     swarm_extras: &'a [String],
     /// When true, omit repo-map, topology, and code-graph context from prompts.
     skip_repo_context: bool,
+    skill_catalog: Option<Arc<crate::skills::SkillCatalog>>,
 }
 
 impl<'a> AgentRunContext<'a> {
@@ -2313,6 +2324,7 @@ impl<'a> AgentRunContext<'a> {
             mcp_config: config.mcp_config.clone(),
             swarm_extras: &config.swarm_extra_tools,
             skip_repo_context: config.execution_mode == ExecutionMode::Document,
+            skill_catalog: config.skill_catalog.clone(),
         }
     }
 }
@@ -3353,6 +3365,7 @@ async fn run_agent_inner(
             pre_fetched_memory_text.as_deref(),
             ctx.swarm_extras,
             ctx.skip_repo_context,
+            ctx.skill_catalog.as_deref(),
             |candidate| {
                 let backend = resolve_backend_for_unit(tier_router, candidate)?;
                 swarm_observer.on_tier_dispatch(&candidate.id, candidate.tier, backend.name());

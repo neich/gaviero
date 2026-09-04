@@ -42,8 +42,9 @@ pub use reranker::{
     apply_reranker_blend, blend_rerank, build_reranker, resolve_reranker_model, sigmoid_calibrate,
 };
 pub use retrieval::{
-    CandidatePoolEntry, ChatInjection, ChatInjectionConfig, RetrievalConfig, RetrievalMode,
-    RetrievalOutput, ScopeMix, retrieve_for_chat, retrieve_for_chat_with_reranker, retrieve_ranked,
+    CONSTITUTION_ARCHIVE_HINT, CandidatePoolEntry, ChatInjection, ChatInjectionConfig,
+    RetrievalConfig, RetrievalMode, RetrievalOutput, ScopeMix, admit_constitution,
+    retrieve_for_chat, retrieve_for_chat_with_reranker, retrieve_ranked,
     retrieve_ranked_with_levels,
 };
 pub use scope::{

@@ -143,6 +143,7 @@ impl IterationEngine {
         pre_fetched_memory: Option<&str>,
         workspace_extra_tools: &[String],
         skip_repo_context: bool,
+        skill_catalog: Option<&crate::skills::SkillCatalog>,
     ) -> IterationResult {
         let n_attempts = match &self.config.strategy {
             Strategy::SinglePass => 1,
@@ -195,6 +196,7 @@ impl IterationEngine {
                 pre_fetched_memory,
                 workspace_extra_tools,
                 skip_repo_context,
+                skill_catalog,
             )
             .await
             {
@@ -271,6 +273,7 @@ impl IterationEngine {
         pre_fetched_memory: Option<&str>,
         workspace_extra_tools: &[String],
         skip_repo_context: bool,
+        skill_catalog: Option<&crate::skills::SkillCatalog>,
         resolve_backend: F,
     ) -> IterationResult
     where
@@ -341,6 +344,7 @@ impl IterationEngine {
                     pre_fetched_memory,
                     workspace_extra_tools,
                     skip_repo_context,
+                    skill_catalog,
                 )
                 .await
                 {
@@ -543,6 +547,7 @@ mod tests {
                 None,
                 &[],
                 false,
+                None,
             )
             .await;
         assert_eq!(result.attempts_run, 1);
@@ -574,6 +579,7 @@ mod tests {
                 None,
                 &[],
                 false,
+                None,
             )
             .await;
         assert_eq!(result.attempts_run, 1);
@@ -606,6 +612,7 @@ mod tests {
                 None,
                 &[],
                 false,
+                None,
                 {
                     let seen_models = Arc::clone(&seen_models);
                     move |unit| {
@@ -668,6 +675,7 @@ mod tests {
                 None,
                 &[],
                 false,
+                None,
                 {
                     let seen_models = Arc::clone(&seen_models);
                     move |unit| {

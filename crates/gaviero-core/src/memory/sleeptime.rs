@@ -10,12 +10,9 @@
 //!    cosine ≥ 0.92 same-type pairs and merge them. **Source-aware**:
 //!    `user_remember` is ground truth and never silently merged
 //!    *into*.
-//! 3. **Cross-scope promotion** — **not implemented.**
-//!    [`super::store::MemoryStore::sleeptime_promote`] is a stub that
-//!    returns an empty vec. The design was the existing consolidator's
-//!    "3+ module hits → repo" lift, with the threshold lowered to 1 hit
-//!    for `decision|convention|invariant`; nothing auto-promotes into a
-//!    broader scope today.
+//! 3. **Cross-scope promotion** — copy module-level Decision / Convention /
+//!    Invariant rows that have a cross-module access-log hit to repo scope.
+//!    Source rows stay; user-authored rows are never auto-widened.
 //! 4. **Trust re-scoring** — uses B6 `retrieval_use` rates when
 //!    available; falls back to raw injection counts (manifest hits)
 //!    until B6 has produced enough rows.
@@ -559,5 +556,155 @@ mod tests {
         };
         assert_eq!(op.memory_id(), Some(5));
         assert_eq!(op.related_id(), Some(6));
+    }
+
+    async fn in_memory_store() -> std::sync::Arc<super::MemoryStore> {
+        use crate::memory::embedder::NullEmbedder;
+        use crate::memory::store::MemoryStore;
+        std::sync::Arc::new(
+            MemoryStore::in_memory(std::sync::Arc::new(NullEmbedder::default())).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn sleeptime_promote_copies_module_decision_and_keeps_source() {
+        use crate::memory::scope::{MemoryType, StoreResult, WriteMeta, WriteScope, hash_path};
+        use crate::memory::trust_defaults::MemorySource;
+
+        let store = in_memory_store().await;
+        let repo_id = hash_path(std::path::Path::new("/tmp/promo-repo"));
+        let inserted = store
+            .store_scoped(
+                &WriteScope::Module {
+                    repo_id: repo_id.clone(),
+                    module_path: "crates/foo/src".into(),
+                },
+                "decision: use the write gate for every file change",
+                &WriteMeta::for_source(MemorySource::LlmAnnotated).with_type(MemoryType::Decision),
+            )
+            .await
+            .unwrap();
+        let StoreResult::Inserted(id) = inserted else {
+            panic!("expected insert, got {inserted:?}");
+        };
+        store
+            .log_access_for_test(&[id], &repo_id, "crates/bar/src")
+            .await
+            .unwrap();
+
+        let ops = store.sleeptime_promote(false).await.unwrap();
+        assert_eq!(ops.len(), 1);
+        assert!(store.get_memory_row(id).await.unwrap().is_some());
+
+        let again = store
+            .store_scoped(
+                &WriteScope::Repo {
+                    repo_id: repo_id.clone(),
+                },
+                "decision: use the write gate for every file change",
+                &WriteMeta::for_source(MemorySource::LlmAnnotated).with_type(MemoryType::Decision),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                again,
+                StoreResult::Deduplicated(_) | StoreResult::AlreadyCovered
+            ),
+            "repo copy must already exist after promotion, got {again:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sleeptime_promote_skips_factual_and_user_remember() {
+        use crate::memory::scope::{MemoryType, StoreResult, WriteMeta, WriteScope, hash_path};
+        use crate::memory::trust_defaults::MemorySource;
+
+        let store = in_memory_store().await;
+        let repo_id = hash_path(std::path::Path::new("/tmp/promo-skip"));
+        let factual = store
+            .store_scoped(
+                &WriteScope::Module {
+                    repo_id: repo_id.clone(),
+                    module_path: "crates/foo/src".into(),
+                },
+                "extracted factual about hashing",
+                &WriteMeta::for_source(MemorySource::LlmExtracted).with_type(MemoryType::Factual),
+            )
+            .await
+            .unwrap();
+        let user = store
+            .store_scoped(
+                &WriteScope::Module {
+                    repo_id: repo_id.clone(),
+                    module_path: "crates/foo/src".into(),
+                },
+                "user decided hashing is sha256",
+                &WriteMeta::user_remember().with_type(MemoryType::Decision),
+            )
+            .await
+            .unwrap();
+        let StoreResult::Inserted(fid) = factual else {
+            panic!("{factual:?}");
+        };
+        let StoreResult::Inserted(uid) = user else {
+            panic!("{user:?}");
+        };
+        store
+            .log_access_for_test(&[fid, uid], &repo_id, "crates/bar/src")
+            .await
+            .unwrap();
+        let ops = store.sleeptime_promote(false).await.unwrap();
+        assert!(ops.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sleeptime_promote_dry_run_writes_nothing() {
+        use crate::memory::scope::{MemoryType, StoreResult, WriteMeta, WriteScope, hash_path};
+        use crate::memory::trust_defaults::MemorySource;
+
+        let store = in_memory_store().await;
+        let repo_id = hash_path(std::path::Path::new("/tmp/promo-dry"));
+        let inserted = store
+            .store_scoped(
+                &WriteScope::Module {
+                    repo_id: repo_id.clone(),
+                    module_path: "crates/foo/src".into(),
+                },
+                "convention: rustfmt on save",
+                &WriteMeta::for_source(MemorySource::LlmAnnotated)
+                    .with_type(MemoryType::Convention),
+            )
+            .await
+            .unwrap();
+        let StoreResult::Inserted(id) = inserted else {
+            panic!("{inserted:?}");
+        };
+        store
+            .log_access_for_test(&[id], &repo_id, "crates/bar/src")
+            .await
+            .unwrap();
+        let ops = store.sleeptime_promote(true).await.unwrap();
+        assert_eq!(ops.len(), 1);
+        let again = store
+            .store_scoped(
+                &WriteScope::Repo { repo_id },
+                "convention: rustfmt on save",
+                &WriteMeta::for_source(MemorySource::LlmAnnotated)
+                    .with_type(MemoryType::Convention),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(again, StoreResult::Inserted(_)),
+            "dry_run must not write the repo copy, got {again:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sleeptime_promote_empty_workspace_is_ok() {
+        let store = in_memory_store().await;
+        let ops = store.sleeptime_promote(false).await.unwrap();
+        assert!(ops.is_empty());
     }
 }

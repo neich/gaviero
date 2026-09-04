@@ -1,10 +1,9 @@
 //! Tier S / S1 + S4: provider-agnostic chat memory injection.
 //!
-//! This module encapsulates the per-turn chat retrieval + manifest
-//! persistence logic that previously lived inlined in the TUI side
-//! panel. Lifting it out of `gaviero-tui` lets every chat-style call
-//! site — TUI, `gaviero-cli`, future headless callers — reach the
-//! foundation work that Tier S put in place.
+//! Chat retrieval is bootstrap-gated (first turn or `/inject`); follow-ups
+//! rely on provider resume + MCP `memory_search`. This module owns that
+//! retrieval + manifest persistence so TUI, `gaviero-cli`, and headless
+//! callers share one path.
 //!
 //! The helper is deliberately *not* an observer or a WriterMessage
 //! producer beyond the manifest enqueue: callers fire whatever their
@@ -368,8 +367,9 @@ mod tests {
                 global: false,
             },
             max_items: 5,
-            token_budget: 1000,
+            token_budget: 400,
             min_similarity: 0.0,
+            ..ChatInjectionConfig::default()
         }
     }
 
@@ -402,7 +402,7 @@ mod tests {
         .await;
         assert!(outcome.injection.is_none());
         assert_eq!(outcome.summary.items_injected, 0);
-        assert_eq!(outcome.summary.token_budget, 1000);
+        assert_eq!(outcome.summary.token_budget, 400);
     }
 
     #[tokio::test]
@@ -421,7 +421,7 @@ mod tests {
                     module_path: module_path.to_string(),
                 },
                 content,
-                &WriteMeta::default(),
+                &WriteMeta::user_remember(),
             )
             .await
             .unwrap();
