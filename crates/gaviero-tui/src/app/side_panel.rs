@@ -1972,7 +1972,7 @@ pub(crate) fn dispatch_prompt_core(
     let active_repo_id = focused_folder
         .as_ref()
         .map(|p| gaviero_core::memory::scope::hash_path(p));
-    let (task_text, resolved_skills_buf, skill_warnings) =
+    let (task_text, mut resolved_skills_buf, skill_warnings) =
         crate::panels::agent_chat::parse_skill_invocations(
             &prompt,
             &app.skill_catalog,
@@ -2032,6 +2032,23 @@ pub(crate) fn dispatch_prompt_core(
                 cli_file_attachments.push(attach.path.clone());
             }
         }
+    }
+
+    {
+        let mut candidate_paths: Vec<String> = Vec::new();
+        if let (Some(folder), Some(buf)) = (focused_folder.as_ref(), active_buffer_path.as_ref())
+            && let Ok(rel) = buf.strip_prefix(folder)
+        {
+            candidate_paths.push(rel.to_string_lossy().replace('\\', "/"));
+        }
+        for (path, _) in &file_refs {
+            candidate_paths.push(path.replace('\\', "/"));
+        }
+        resolved_skills_buf = gaviero_core::skills::union_path_lazy_skills(
+            &app.skill_catalog,
+            &candidate_paths,
+            resolved_skills_buf,
+        );
     }
 
     // Claude session reuse: on the first turn of a conversation,
@@ -2518,7 +2535,15 @@ pub(crate) fn dispatch_prompt_core(
             file_ref_blobs: &[],
             pre_fetched_impact_text: impact_text.as_deref(),
             pre_fetched_graph_context: None,
-            pre_fetched_memory_context: None,
+            pre_fetched_memory_context: if bootstrap_memory && chat_injection_config.enabled {
+                // Chat injection owns turn-1 memory. An empty Some short-circuits
+                // ContextPlanner::collect_memory so render_memory_block does not
+                // concatenate planner retrieve + <project_memory>. Swarm keeps a
+                // real pre-fetched bundle string.
+                Some("")
+            } else {
+                None
+            },
             extra_folder_paths: &extra_folder_path_refs,
             extra_repo_maps: &extra_repo_map_refs,
             topology_config: topology_config.clone(),

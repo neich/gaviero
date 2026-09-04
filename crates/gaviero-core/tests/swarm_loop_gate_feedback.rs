@@ -145,6 +145,8 @@ fn config_for(workspace: &Path, ollama_url: &str) -> SwarmConfig {
         // Bound the whole run: a wiring bug that loops forever should
         // fail this test, not hang CI.
         run_timeout_secs: 120,
+        chat_injection: Default::default(),
+        skill_catalog: None,
     }
 }
 

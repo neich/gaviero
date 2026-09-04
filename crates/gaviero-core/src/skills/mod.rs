@@ -21,6 +21,8 @@ pub struct Skill {
     pub body: String,
     pub scope_level: i32,
     pub source_path: PathBuf,
+    /// Opt-in path globs. Empty = never auto-attach; only `$name` invokes.
+    pub paths: Vec<String>,
 }
 
 /// A skill resolved and rendered for a single chat turn.
@@ -112,6 +114,10 @@ pub fn parse_skill(path: &Path, contents: &str) -> Result<Skill, SkillWarning> {
     }
 
     let argument_hint = fm_map.get("argument-hint").cloned();
+    let paths = fm_map
+        .get("paths")
+        .map(|s| frontmatter::parse_arguments(s))
+        .unwrap_or_default();
 
     Ok(Skill {
         name: stem.to_string(),
@@ -121,7 +127,51 @@ pub fn parse_skill(path: &Path, contents: &str) -> Result<Skill, SkillWarning> {
         body: body.to_string(),
         scope_level: SCOPE_REPO,
         source_path: path.to_path_buf(),
+        paths,
     })
+}
+
+/// Auto-attach cap for path-lazy skills (explicit `$name` does not count).
+pub const PATH_LAZY_SKILL_CAP: usize = 2;
+
+/// Union explicit `$skill` resolutions with up to [`PATH_LAZY_SKILL_CAP`]
+/// path-matched catalog skills. Catalog order is name-sorted; already-resolved
+/// names are not duplicated.
+pub fn union_path_lazy_skills(
+    catalog: &SkillCatalog,
+    candidate_paths: &[String],
+    explicit: Vec<ResolvedSkill>,
+) -> Vec<ResolvedSkill> {
+    let mut out = explicit;
+    let mut seen: std::collections::HashSet<String> = out.iter().map(|s| s.name.clone()).collect();
+    if candidate_paths.is_empty() {
+        return out;
+    }
+    let mut auto = 0usize;
+    for skill in catalog.all_skills() {
+        if auto >= PATH_LAZY_SKILL_CAP {
+            break;
+        }
+        if skill.paths.is_empty() || seen.contains(&skill.name) {
+            continue;
+        }
+        let hits = skill.paths.iter().any(|pat| {
+            candidate_paths
+                .iter()
+                .any(|p| crate::path_pattern::matches(pat, p))
+        });
+        if !hits {
+            continue;
+        }
+        seen.insert(skill.name.clone());
+        out.push(ResolvedSkill {
+            name: skill.name.clone(),
+            scope_level: skill.scope_level,
+            rendered_body: skill.render(&[], ""),
+        });
+        auto += 1;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -171,5 +221,104 @@ mod tests {
         let rendered = skill.render(&args, "React Vue");
         assert!(rendered.contains("React"));
         assert!(rendered.contains("Vue"));
+    }
+
+    #[test]
+    fn parse_skill_reads_paths_frontmatter() {
+        let path = Path::new("memory-notes/SKILL.md");
+        let src = "---\n\
+                   description: Memory module notes\n\
+                   paths: [crates/gaviero-core/src/memory/**]\n\
+                   ---\n\
+                   Remember the writer task.\n";
+        let skill = parse_skill(path, src).unwrap();
+        assert_eq!(
+            skill.paths,
+            vec!["crates/gaviero-core/src/memory/**".to_string()]
+        );
+    }
+
+    fn write_skill(root: &Path, name: &str, paths: &str, body: &str) {
+        let dir = root.join(".gaviero").join("skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\ndescription: {name} skill\npaths: {paths}\n---\n{body}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn path_lazy_matches_memory_glob_not_tui_and_caps_at_two() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            tmp.path(),
+            "memory-notes",
+            "crates/gaviero-core/src/memory/**",
+            "memory notes body",
+        );
+        write_skill(
+            tmp.path(),
+            "alpha-mem",
+            "crates/gaviero-core/src/memory/**",
+            "alpha body",
+        );
+        write_skill(
+            tmp.path(),
+            "beta-mem",
+            "crates/gaviero-core/src/memory/**",
+            "beta body",
+        );
+        write_skill(tmp.path(), "other", "crates/gaviero-tui/**", "other body");
+        let ws = crate::workspace::Workspace::single_folder(tmp.path().to_path_buf());
+        let (catalog, _) = SkillCatalog::scan(&ws, Path::new("/nonexistent"));
+
+        let hit = union_path_lazy_skills(
+            &catalog,
+            &["crates/gaviero-core/src/memory/writer.rs".into()],
+            Vec::new(),
+        );
+        assert!(
+            hit.iter().any(|s| s.name == "alpha-mem"),
+            "memory glob should attach for writer.rs; got {:?}",
+            hit.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(hit.len(), PATH_LAZY_SKILL_CAP);
+        assert!(
+            !hit.iter().any(|s| s.name == "memory-notes"),
+            "third matching skill is dropped by the cap of 2"
+        );
+
+        let miss = union_path_lazy_skills(
+            &catalog,
+            &["crates/gaviero-tui/src/app.rs".into()],
+            Vec::new(),
+        );
+        assert!(
+            miss.iter().all(|s| s.name != "memory-notes"),
+            "memory glob must not attach for TUI app.rs"
+        );
+        assert!(miss.iter().any(|s| s.name == "other"));
+
+        let explicit = vec![ResolvedSkill {
+            name: "other".into(),
+            scope_level: SCOPE_REPO,
+            rendered_body: "explicit other".into(),
+        }];
+        let mixed = union_path_lazy_skills(
+            &catalog,
+            &["crates/gaviero-core/src/memory/writer.rs".into()],
+            explicit,
+        );
+        assert!(mixed.iter().any(|s| s.name == "other"));
+        assert!(mixed.iter().any(|s| s.name != "other"));
+        assert_eq!(
+            mixed.iter().filter(|s| s.name == "other").count(),
+            1,
+            "explicit $other must not be duplicated"
+        );
+        // explicit does not count against the cap of 2 auto skills
+        let auto = mixed.iter().filter(|s| s.name != "other").count();
+        assert_eq!(auto, PATH_LAZY_SKILL_CAP);
     }
 }

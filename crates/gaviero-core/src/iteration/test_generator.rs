@@ -116,6 +116,7 @@ impl TestGenerator {
             None, // no pre-fetched memory for test generation
             &[],  // workspace tool extras: not applicable to test generator
             false,
+            None,
         )
         .await
         {

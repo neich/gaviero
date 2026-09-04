@@ -144,6 +144,8 @@ pub(crate) fn run_swarm(app: &mut App, task_desc: String) {
         )
         .as_bool()
         .unwrap_or(true);
+    let chat_injection = app.workspace.resolve_chat_injection_config(Some(&root));
+    let skill_catalog = Some(app.skill_catalog.clone());
 
     tokio::spawn(async move {
         use gaviero_core::swarm::{pipeline, planner};
@@ -206,6 +208,8 @@ pub(crate) fn run_swarm(app: &mut App, task_desc: String) {
             resume_from_artifacts: true,
             knowledge_invalidation: None,
             run_timeout_secs: 0,
+            chat_injection: chat_injection.clone(),
+            skill_catalog: skill_catalog.clone(),
         };
 
         let observer = TuiSwarmObserver { tx: tx.clone() };
@@ -379,6 +383,8 @@ pub(super) fn handle_run_script_command(app: &mut App) {
         .as_bool()
         .unwrap_or(true);
     let plan_execution_mode = compiled.execution_mode;
+    let chat_injection = app.workspace.resolve_chat_injection_config(Some(&root));
+    let skill_catalog = Some(app.skill_catalog.clone());
 
     tokio::spawn(async move {
         use gaviero_core::swarm::pipeline;
@@ -406,6 +412,8 @@ pub(super) fn handle_run_script_command(app: &mut App) {
             resume_from_artifacts: true,
             knowledge_invalidation: None,
             run_timeout_secs: 0,
+            chat_injection: chat_injection.clone(),
+            skill_catalog: skill_catalog.clone(),
         };
 
         let observer = TuiSwarmObserver { tx: tx.clone() };
@@ -542,6 +550,8 @@ pub(super) fn handle_coordinated_swarm_command(app: &mut App) {
         )
         .as_bool()
         .unwrap_or(true);
+    let chat_injection = app.workspace.resolve_chat_injection_config(Some(&root));
+    let skill_catalog = Some(app.skill_catalog.clone());
 
     tokio::spawn(async move {
         use gaviero_core::swarm::{coordinator, pipeline};
@@ -566,6 +576,8 @@ pub(super) fn handle_coordinated_swarm_command(app: &mut App) {
             resume_from_artifacts: true,
             knowledge_invalidation: None,
             run_timeout_secs: 0,
+            chat_injection: chat_injection.clone(),
+            skill_catalog: skill_catalog.clone(),
         };
 
         let coord_config = coordinator::CoordinatorConfig {
