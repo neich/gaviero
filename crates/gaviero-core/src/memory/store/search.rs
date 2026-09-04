@@ -675,6 +675,25 @@ impl MemoryStore {
         }
     }
 
+    /// Test helper: insert access-log rows so promotion candidates can be seeded.
+    #[cfg(test)]
+    pub async fn log_access_for_test(
+        &self,
+        ids: &[i64],
+        repo_id: &str,
+        module_path: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().await;
+        for id in ids {
+            conn.execute(
+                "INSERT INTO memory_access_log (memory_id, repo_id, module_path)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![id, repo_id, module_path],
+            )?;
+        }
+        Ok(())
+    }
+
     /// List all memories at a level without embedding search.
     pub(super) fn list_at_level(
         &self,
