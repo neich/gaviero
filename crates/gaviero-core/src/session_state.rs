@@ -558,6 +558,48 @@ mod tests {
     }
 
     #[test]
+    fn stored_message_without_a_timestamp_defaults_to_zero() {
+        // Conversations saved before message timestamps were persisted must
+        // still load. `0` is the "unknown" sentinel the TUI renders as no
+        // stamp at all, rather than as the epoch.
+        let json = r#"{
+            "id": "c1",
+            "title": "Old",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "created": 1000,
+            "updated": 2000
+        }"#;
+        let stored: StoredConversation = serde_json::from_str(json).unwrap();
+        assert_eq!(stored.messages[0].timestamp, 0);
+        assert_eq!(stored.messages[0].content, "hi");
+    }
+
+    #[test]
+    fn stored_message_timestamp_round_trips() {
+        let stored = StoredConversation {
+            id: "c1".into(),
+            title: "T".into(),
+            messages: vec![StoredMessage {
+                role: "assistant".into(),
+                content: "answer".into(),
+                tool_calls: Vec::new(),
+                timestamp: 1_757_000_042,
+            }],
+            created: 1000,
+            updated: 2000,
+            model_override: None,
+            effort_override: None,
+            session_ledger: None,
+            continuity_handle: None,
+            last_token_usage: None,
+        };
+
+        let json = serde_json::to_string(&stored).unwrap();
+        let back: StoredConversation = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.messages[0].timestamp, 1_757_000_042);
+    }
+
+    #[test]
     fn m4_stored_conversation_round_trips_with_ledger() {
         // Explicit variant tag on ContinuityHandle must survive the round-trip.
         use crate::context_planner::ledger::{PersistedLedger, PlannerFingerprint};

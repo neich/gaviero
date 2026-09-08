@@ -83,6 +83,7 @@ Chat input supports `$skill` invocation with `$`-prefix autocomplete. Full slash
 | Ctrl+S / Ctrl+Z / Ctrl+Y | Save / undo / redo |
 | Ctrl+F / F3 | Find in file / workspace search |
 | F5 / F7 | Format buffer / toggle word wrap |
+| F10 / Shift+F10 | Fold block at cursor / fold all — or click the `▾` in the gutter |
 | Ctrl+T / Ctrl+W | New tab / close tab |
 | Alt+Up/Down (Ctrl+Up/Down fallback) | Resize terminal split / chat input height |
 | Ctrl+Alt+Left/Right | Resize explorer / editor / side panel widths |

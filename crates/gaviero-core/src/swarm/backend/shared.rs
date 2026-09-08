@@ -39,22 +39,28 @@ pub const CLAUDE_MODEL_ALIASES: &[&str] = &[
 /// `cursor:gpt-*` entries — Codex looks like it disappeared.
 ///
 /// Mirrors the `visibility: "list"` slugs Codex serves in its model catalog
-/// (`~/.codex/models_cache.json`, client 0.146.0, fetched 2026-09-01), in
-/// upstream `priority` order: `gpt-5.6-sol` (flagship), `gpt-5.6-terra`
-/// (balanced), `gpt-5.6-luna` (fast/affordable), then the older `gpt-5.5` /
-/// `gpt-5.4` / `gpt-5.4-mini` and the Codex-CLI-only `gpt-5.3-codex-spark`.
-/// Hidden slugs (`gpt-reserve`, `codex-auto-review`) are deliberately absent.
+/// (`~/.codex/models_cache.json`, client 0.153.4, fetched 2026-09-07), in
+/// upstream `priority` order: `gpt-6-astra` (flagship, priority 1),
+/// `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna`, then the older `gpt-5.5` /
+/// `gpt-5.4-mini` and the Codex-CLI-only `gpt-5.3-codex-spark`. Hidden slugs
+/// (`gpt-reserve`, `codex-auto-review`) are deliberately absent.
 ///
-/// `gpt-5.2` was dropped when Codex delisted it upstream — free-form ids still
-/// pass [`validate_model_spec`], so an existing `codex:gpt-5.2` pin keeps
-/// working; it just no longer shows up in the picker. This list is picker UX
-/// only.
+/// `gpt-6-astra` is gated on the Codex client version: a 0.146.0 CLI is served
+/// a catalog without it. Listing it unconditionally is deliberate — this list
+/// is host-side picker UX, and the spec is forwarded verbatim to whichever CLI
+/// is installed, so an outdated CLI fails at dispatch rather than silently
+/// substituting a model.
+///
+/// `gpt-5.2` and `gpt-5.4` were dropped as Codex delisted them upstream —
+/// free-form ids still pass [`validate_model_spec`], so an existing
+/// `codex:gpt-5.4` pin keeps working; it just no longer shows up in the picker.
+/// This list is picker UX only.
 pub const CODEX_MODEL_ALIASES: &[&str] = &[
+    "gpt-6-astra",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
     "gpt-5.5",
-    "gpt-5.4",
     "gpt-5.4-mini",
     "gpt-5.3-codex-spark",
 ];
@@ -1025,6 +1031,10 @@ mod tests {
         // proxied gpt models — Codex looks unavailable.
         let hits = model_spec_completions("codex:", &[]);
         assert!(
+            hits.contains(&"codex:gpt-6-astra".to_string()),
+            "got {hits:?}"
+        );
+        assert!(
             hits.contains(&"codex:gpt-5.6-sol".to_string()),
             "got {hits:?}"
         );
@@ -1037,7 +1047,6 @@ mod tests {
             "got {hits:?}"
         );
         assert!(hits.contains(&"codex:gpt-5.5".to_string()), "got {hits:?}");
-        assert!(hits.contains(&"codex:gpt-5.4".to_string()), "got {hits:?}");
         assert!(
             hits.contains(&"codex:gpt-5.4-mini".to_string()),
             "got {hits:?}"
@@ -1046,10 +1055,18 @@ mod tests {
             hits.contains(&"codex:gpt-5.3-codex-spark".to_string()),
             "got {hits:?}"
         );
-        // Delisted upstream, so it is no longer offered — but an explicit pin
-        // must still validate, since the picker list is UX only.
-        assert!(!hits.contains(&"codex:gpt-5.2".to_string()), "got {hits:?}");
-        validate_model_spec("codex:gpt-5.2").unwrap();
+        // Delisted upstream, so they are no longer offered — but an explicit
+        // pin must still validate, since the picker list is UX only.
+        for delisted in ["codex:gpt-5.2", "codex:gpt-5.4"] {
+            assert!(!hits.contains(&delisted.to_string()), "got {hits:?}");
+            validate_model_spec(delisted).unwrap();
+        }
+
+        let astra = model_spec_completions("codex:gpt-6", &[]);
+        assert!(
+            astra.contains(&"codex:gpt-6-astra".to_string()),
+            "got {astra:?}"
+        );
 
         let family = model_spec_completions("codex:gpt-5.6", &[]);
         assert!(

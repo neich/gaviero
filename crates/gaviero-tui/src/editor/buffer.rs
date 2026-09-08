@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -6,6 +8,7 @@ use gaviero_core::{InputEdit, Language, Parser, Point, Tree};
 use ropey::Rope;
 use unicode_width::UnicodeWidthChar;
 
+use super::fold::{FoldMap, FoldMarker, HiddenLines};
 use super::markdown::MarkdownPreviewMode;
 use super::wrap::{VisualSegment, char_display_width};
 
@@ -156,6 +159,17 @@ pub struct Buffer {
     pub conflict_regions: Vec<gaviero_core::git_conflict::ConflictRegion>,
     /// Index into `conflict_regions` for F8 / F9 navigation.
     pub conflict_index: usize,
+    /// Header lines of the currently collapsed fold regions.
+    ///
+    /// Kept as plain line numbers so an edit only has to shift them (see
+    /// [`Buffer::shift_folds_for_change`]); a header that no longer starts a
+    /// region is inert rather than wrong.
+    folded: BTreeSet<usize>,
+    /// Foldable regions for the current text, recomputed on first use after
+    /// each edit. `RefCell` because every consumer — the wrap layout, the
+    /// gutter, the scroll bounds — reaches it through `&self` on the render
+    /// path, and the TUI is single-threaded by construction.
+    fold_cache: RefCell<Option<FoldMap>>,
     /// Last known on-disk content for this buffer (after open, save, or reload).
     /// Used to ignore file-watcher noise from the editor's own writes.
     disk_snapshot: Option<String>,
@@ -196,6 +210,8 @@ impl Buffer {
             git_unmerged: false,
             conflict_regions: Vec::new(),
             conflict_index: 0,
+            folded: BTreeSet::new(),
+            fold_cache: RefCell::new(None),
             disk_snapshot: None,
             last_self_write: None,
             opened_at: std::time::Instant::now(),
@@ -310,6 +326,8 @@ impl Buffer {
             git_unmerged: false,
             conflict_regions: Vec::new(),
             conflict_index: 0,
+            folded: BTreeSet::new(),
+            fold_cache: RefCell::new(None),
             disk_snapshot: Some(content.clone()),
             last_self_write: None,
             opened_at: std::time::Instant::now(),
@@ -385,6 +403,8 @@ impl Buffer {
             git_unmerged: false,
             conflict_regions: Vec::new(),
             conflict_index: 0,
+            folded: BTreeSet::new(),
+            fold_cache: RefCell::new(None),
             disk_snapshot: None,
             last_self_write: None,
             opened_at: std::time::Instant::now(),
@@ -442,6 +462,7 @@ impl Buffer {
         }
         for change in &transaction.changes {
             self.notify_tree_edit(change);
+            self.shift_folds_for_change(change);
             match change {
                 Change::Insert { pos, text } => {
                     self.text.insert(*pos, text);
@@ -457,6 +478,7 @@ impl Buffer {
         self.undo_stack.push(transaction);
         self.search_highlight = None; // Clear search highlight on any edit
         self.reparse();
+        self.invalidate_folds();
         let content = self.text.to_string();
         self.conflict_regions = gaviero_core::git_conflict::find_conflict_regions(&content);
         if self.conflict_index >= self.conflict_regions.len() {
@@ -491,6 +513,7 @@ impl Buffer {
                 },
             };
             self.notify_tree_edit(&inverse);
+            self.shift_folds_for_change(&inverse);
             match change {
                 Change::Insert { pos, text } => {
                     let char_len = text.chars().count();
@@ -509,6 +532,7 @@ impl Buffer {
             cursor_before: cursor_before,
         });
         self.reparse();
+        self.invalidate_folds();
         true
     }
 
@@ -523,6 +547,7 @@ impl Buffer {
 
         for change in &transaction.changes {
             self.notify_tree_edit(change);
+            self.shift_folds_for_change(change);
             match change {
                 Change::Insert { pos, text } => {
                     self.text.insert(*pos, text);
@@ -540,6 +565,7 @@ impl Buffer {
             cursor_before: cursor_before,
         });
         self.reparse();
+        self.invalidate_folds();
         true
     }
 
@@ -728,6 +754,190 @@ impl Buffer {
         super::wrap::WrapLayout::build(self, content_width)
     }
 
+    // ── Code folding ────────────────────────────────────────────────────────
+
+    /// Run `f` against this buffer's fold regions, computing them if the text
+    /// changed since the last call.
+    ///
+    /// Folding is disabled on diff-view buffers: their rope concatenates the
+    /// old and new sides, so the tree is a field of ERROR nodes and every
+    /// "region" it yields would be an artifact of the splice.
+    fn with_fold_map<R>(&self, f: impl FnOnce(&FoldMap) -> R) -> R {
+        if self.diff_view.is_some() {
+            return f(&FoldMap::default());
+        }
+        {
+            let mut slot = self.fold_cache.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(FoldMap::compute(
+                    &self.text,
+                    self.tree.as_ref(),
+                    self.lang_name.as_deref(),
+                ));
+            }
+        }
+        let slot = self.fold_cache.borrow();
+        f(slot.as_ref().expect("fold map populated above"))
+    }
+
+    /// Lines hidden by the currently collapsed regions.
+    ///
+    /// Empty whenever nothing is collapsed, which is the fast path every
+    /// layout, scroll and cursor computation takes.
+    pub fn hidden_lines(&self) -> HiddenLines {
+        if self.folded.is_empty() {
+            return HiddenLines::default();
+        }
+        self.with_fold_map(|map| map.hidden_lines(&self.folded))
+    }
+
+    /// What the gutter should draw in the fold column of `line`.
+    pub fn fold_marker(&self, line: usize) -> FoldMarker {
+        let has_region = self.with_fold_map(|map| map.region_at(line).is_some());
+        if !has_region {
+            FoldMarker::None
+        } else if self.folded.contains(&line) {
+            FoldMarker::Collapsed
+        } else {
+            FoldMarker::Expanded
+        }
+    }
+
+    /// Whether any region is collapsed right now.
+    pub fn has_collapsed_folds(&self) -> bool {
+        !self.folded.is_empty()
+    }
+
+    /// Collapse or expand the region at `line`, or the innermost region that
+    /// contains it. Returns the header line that changed.
+    pub fn toggle_fold(&mut self, line: usize) -> Option<usize> {
+        let region = self.with_fold_map(|map| map.enclosing_region(line))?;
+        if !self.folded.insert(region.header) {
+            self.folded.remove(&region.header);
+        }
+        self.prune_stale_folds();
+        self.pull_cursor_out_of_folds();
+        Some(region.header)
+    }
+
+    /// Collapse every region (`collapse`) or expand all of them.
+    /// Returns the number of regions affected.
+    pub fn set_all_folds(&mut self, collapse: bool) -> usize {
+        if !collapse {
+            let n = self.folded.len();
+            self.folded.clear();
+            return n;
+        }
+        let headers: BTreeSet<usize> = self.with_fold_map(|map| map.headers().collect());
+        let added = headers.difference(&self.folded).count();
+        self.folded = headers;
+        self.pull_cursor_out_of_folds();
+        added
+    }
+
+    /// Drop collapsed headers that no longer start a region, so an edit that
+    /// reshapes a block cannot leave a permanently inert arrow behind.
+    fn prune_stale_folds(&mut self) {
+        let live: BTreeSet<usize> = self.with_fold_map(|map| {
+            self.folded
+                .iter()
+                .copied()
+                .filter(|line| map.region_at(*line).is_some())
+                .collect()
+        });
+        self.folded = live;
+    }
+
+    /// Move the cursor to the nearest visible line when a collapse hid it.
+    fn pull_cursor_out_of_folds(&mut self) {
+        let hidden = self.hidden_lines();
+        if !hidden.contains(self.cursor.line) {
+            return;
+        }
+        let header = self
+            .with_fold_map(|map| map.enclosing_region(self.cursor.line))
+            .map(|r| r.header)
+            .unwrap_or(0);
+        self.cursor.line = header;
+        self.cursor.col = self.cursor.col.min(self.line_len(header));
+        self.cursor.anchor = None;
+        self.reset_goal_col();
+    }
+
+    /// Forget the cached regions; the next reader recomputes them.
+    fn invalidate_folds(&mut self) {
+        *self.fold_cache.borrow_mut() = None;
+    }
+
+    /// Keep collapsed headers pointing at their block across an edit.
+    ///
+    /// Called *before* the rope is mutated, like [`Buffer::notify_tree_edit`],
+    /// so `pos` still resolves against the pre-edit text.
+    ///
+    /// Folds track *content*, not line indices, which is why the column of the
+    /// edit matters: text inserted at column 0 pushes that line's own content
+    /// down, whereas text inserted mid-line leaves the line where it was. An
+    /// agent prepending to a file hits the first case every time.
+    fn shift_folds_for_change(&mut self, change: &Change) {
+        if self.folded.is_empty() {
+            return;
+        }
+        match change {
+            Change::Insert { pos, text } => {
+                let added = text.matches('\n').count();
+                if added == 0 {
+                    return;
+                }
+                let at = self.text.char_to_line(*pos);
+                let first_moved = if *pos == self.text.line_to_char(at) {
+                    at
+                } else {
+                    at + 1
+                };
+                self.folded = self
+                    .folded
+                    .iter()
+                    .map(|&line| {
+                        if line >= first_moved {
+                            line + added
+                        } else {
+                            line
+                        }
+                    })
+                    .collect();
+            }
+            Change::Delete { pos, deleted, .. } => {
+                let removed = deleted.matches('\n').count();
+                if removed == 0 {
+                    return;
+                }
+                let at = self.text.char_to_line(*pos);
+                let end_line = at + removed;
+                // Deleting from column 0 takes line `at` with it and slides
+                // `end_line` up into its place; deleting mid-line leaves `at`
+                // in place and merges `end_line`'s tail into it.
+                let first_gone = if *pos == self.text.line_to_char(at) {
+                    at
+                } else {
+                    at + 1
+                };
+                self.folded = self
+                    .folded
+                    .iter()
+                    .filter_map(|&line| {
+                        if line < first_gone {
+                            Some(line)
+                        } else if line < end_line || (line == end_line && first_gone > at) {
+                            None // this header's content was deleted
+                        } else {
+                            Some(line - removed)
+                        }
+                    })
+                    .collect();
+            }
+        }
+    }
+
     /// Byte range covering logical source needed to highlight the visible viewport.
     ///
     /// `scroll.top_line` is a visual row index when [`word_wrap`](Self::word_wrap) is on,
@@ -760,15 +970,22 @@ impl Buffer {
             return Some((start_byte, end_byte));
         }
 
-        let bottom = bottom.min(self.line_count());
-        if top >= self.line_count() {
+        // Folds make the row space shorter than the line space, so the first
+        // and last drawn rows have to be resolved back to file lines. The
+        // resulting byte range spans any hidden lines in between, which costs
+        // nothing: highlighting text that is not drawn is harmless.
+        let hidden = self.hidden_lines();
+        let visible_count = self.line_count() - hidden.total();
+        if top >= visible_count {
             return None;
         }
-        let start_byte = self.text.line_to_byte(top);
-        let end_byte = if bottom >= self.line_count() {
+        let first_line = hidden.line_at_row(top);
+        let last_line = hidden.line_at_row(bottom.min(visible_count).saturating_sub(1));
+        let start_byte = self.text.line_to_byte(first_line);
+        let end_byte = if last_line + 1 >= self.line_count() {
             self.text.len_bytes()
         } else {
-            self.text.line_to_byte(bottom)
+            self.text.line_to_byte(last_line + 1)
         };
         Some((start_byte, end_byte))
     }
@@ -778,7 +995,7 @@ impl Buffer {
         if self.word_wrap && content_width > 0 {
             self.wrap_layout(content_width).len()
         } else {
-            self.line_count()
+            self.line_count() - self.hidden_lines().total()
         }
     }
 
@@ -856,12 +1073,18 @@ impl Buffer {
     }
 
     /// Vertical movement across logical lines (word wrap off).
+    ///
+    /// One step moves one *drawn* row, so a collapsed block is stepped over in
+    /// a single press instead of walking invisibly through its body.
     fn move_cursor_vertical_plain(&mut self, delta: i32) {
         let goal = self.goal_visual_col(self.char_col_to_visual(self.cursor.line, self.cursor.col));
+        let hidden = self.hidden_lines();
+        let row = hidden.visual_row_of(self.cursor.line);
+        let max_row = (self.text.len_lines() - hidden.total()).saturating_sub(1);
         let target = if delta < 0 {
-            self.cursor.line.saturating_sub(1)
+            hidden.line_at_row(row.saturating_sub(1))
         } else {
-            (self.cursor.line + 1).min(self.text.len_lines().saturating_sub(1))
+            hidden.line_at_row((row + 1).min(max_row))
         };
         if target != self.cursor.line {
             let col = self
@@ -1150,7 +1373,9 @@ impl Buffer {
             return;
         }
         let goal = self.goal_visual_col(self.char_col_to_visual(self.cursor.line, self.cursor.col));
-        self.cursor.line = self.cursor.line.saturating_sub(viewport_height);
+        let hidden = self.hidden_lines();
+        let row = hidden.visual_row_of(self.cursor.line);
+        self.cursor.line = hidden.line_at_row(row.saturating_sub(viewport_height));
         self.cursor.col = self
             .visual_to_char_col(self.cursor.line, goal)
             .min(self.line_len(self.cursor.line));
@@ -1179,14 +1404,16 @@ impl Buffer {
             return;
         }
         let goal = self.goal_visual_col(self.char_col_to_visual(self.cursor.line, self.cursor.col));
-        let max_line = self.text.len_lines().saturating_sub(1);
-        self.cursor.line = (self.cursor.line + viewport_height).min(max_line);
+        let hidden = self.hidden_lines();
+        let max_row = (self.text.len_lines() - hidden.total()).saturating_sub(1);
+        let row = hidden.visual_row_of(self.cursor.line);
+        self.cursor.line = hidden.line_at_row((row + viewport_height).min(max_row));
         self.cursor.col = self
             .visual_to_char_col(self.cursor.line, goal)
             .min(self.line_len(self.cursor.line));
         self.cursor.anchor = None;
         self.remember_goal_col(goal);
-        self.scroll.top_line = (self.scroll.top_line + viewport_height).min(max_line);
+        self.scroll.top_line = (self.scroll.top_line + viewport_height).min(max_row);
     }
 
     /// Ensure the cursor is visible in the viewport.
@@ -1209,11 +1436,13 @@ impl Buffer {
             return;
         }
 
-        if self.cursor.line < self.scroll.top_line + margin {
-            self.scroll.top_line = self.cursor.line.saturating_sub(margin);
+        // `top_line` counts drawn rows, which folds make shorter than the file.
+        let cursor_row = self.hidden_lines().visual_row_of(self.cursor.line);
+        if cursor_row < self.scroll.top_line + margin {
+            self.scroll.top_line = cursor_row.saturating_sub(margin);
         }
-        if self.cursor.line + margin >= self.scroll.top_line + viewport_height {
-            self.scroll.top_line = (self.cursor.line + margin + 1).saturating_sub(viewport_height);
+        if cursor_row + margin >= self.scroll.top_line + viewport_height {
+            self.scroll.top_line = (cursor_row + margin + 1).saturating_sub(viewport_height);
         }
 
         const HORIZONTAL_SCROLL_MARGIN: usize = 8;
@@ -1226,6 +1455,18 @@ impl Buffer {
             self.scroll.left_col =
                 visual_col.saturating_sub(content_width.saturating_sub(h_margin + 1));
         }
+    }
+
+    /// Clamp the scroll offset to the rows that still exist.
+    ///
+    /// Collapsing a block shortens the row space under a viewport that may
+    /// already be scrolled past the new end. Unlike `ensure_cursor_visible`
+    /// this keeps the view where it is, which is what a click on a fold arrow
+    /// far from the cursor should do.
+    pub fn clamp_scroll_top(&mut self, viewport_height: usize, content_width: usize) {
+        let total = self.scroll_line_count(content_width);
+        let max_scroll = total.saturating_sub(viewport_height.max(1));
+        self.scroll.top_line = self.scroll.top_line.min(max_scroll);
     }
 
     /// Clamp cursor and scroll positions to be within the current content bounds.
@@ -1255,6 +1496,10 @@ impl Buffer {
         if let Some(parser) = &mut self.parser {
             self.tree = parser.parse(&content, None);
         }
+        // Line numbers mean nothing across a wholesale replacement, so the
+        // collapsed set is dropped rather than shifted.
+        self.folded.clear();
+        self.invalidate_folds();
         // Clamp cursor/scroll to new content bounds (file may have shrunk)
         self.clamp_cursor();
         Ok(())
@@ -2074,6 +2319,10 @@ impl Buffer {
             let source = self.text.to_string();
             self.tree = parser.parse(&source, None);
         }
+        // A reformat rewrites the whole file; old header lines no longer mean
+        // anything, so start from everything expanded.
+        self.folded.clear();
+        self.invalidate_folds();
 
         // Clamp cursor
         let max_line = self.text.len_lines().saturating_sub(1);
@@ -3381,6 +3630,190 @@ mod tests {
         buf.insert_char('X');
         assert_eq!(buf.text.to_string(), "X\n");
         assert_eq!(buf.cursor.col, 1);
+    }
+
+    /// A buffer with a real tree-sitter tree, the way `open` builds one.
+    fn parsed_buffer(ext: &str, source: &str) -> Buffer {
+        let lang = gaviero_core::tree_sitter::language_for_extension(ext).unwrap();
+        let mut buf = Buffer::empty();
+        buf.text = Rope::from_str(source);
+        buf.lang_name =
+            gaviero_core::tree_sitter::language_name_for_extension(ext).map(|s| s.to_string());
+        buf.parser = Some({
+            let mut p = Parser::new();
+            p.set_language(&lang).unwrap();
+            p
+        });
+        buf.language = Some(lang);
+        buf.reparse();
+        buf
+    }
+
+    fn markdown_buffer(source: &str) -> Buffer {
+        let mut buf = Buffer::empty();
+        buf.text = Rope::from_str(source);
+        buf.lang_name = Some("markdown".to_string());
+        buf
+    }
+
+    #[test]
+    fn json_objects_fold_from_their_opening_line() {
+        let src = "{\n  \"a\": {\n    \"b\": 1,\n    \"c\": 2\n  },\n  \"d\": 3\n}\n";
+        let mut buf = parsed_buffer("json", src);
+
+        assert_eq!(buf.fold_marker(0), FoldMarker::Expanded);
+        assert_eq!(buf.fold_marker(1), FoldMarker::Expanded);
+        // A leaf line has nothing to fold.
+        assert_eq!(buf.fold_marker(5), FoldMarker::None);
+
+        assert_eq!(buf.toggle_fold(1), Some(1));
+        assert_eq!(buf.fold_marker(1), FoldMarker::Collapsed);
+
+        // The body hides; the line closing the object stays on screen.
+        let hidden = buf.hidden_lines();
+        assert!(hidden.contains(2));
+        assert!(hidden.contains(3));
+        assert!(!hidden.contains(4));
+        assert!(!hidden.contains(1));
+    }
+
+    #[test]
+    fn rust_folds_items_but_never_the_whole_file_from_line_one() {
+        let src = "use std::fmt;\n\nfn main() {\n    let x = 1;\n    println!(\"{x}\");\n}\n";
+        let mut buf = parsed_buffer("rs", src);
+
+        // The root node spans the file; an arrow there would just be "fold all".
+        assert_eq!(buf.fold_marker(0), FoldMarker::None);
+        assert_eq!(buf.fold_marker(1), FoldMarker::None);
+        assert_eq!(buf.fold_marker(2), FoldMarker::Expanded);
+
+        buf.toggle_fold(2);
+        let hidden = buf.hidden_lines();
+        assert!(hidden.contains(3));
+        assert!(hidden.contains(4));
+        // The closing brace stays on screen.
+        assert!(!hidden.contains(5));
+    }
+
+    #[test]
+    fn markdown_sections_fold_without_a_grammar() {
+        // Markdown has a language name but no tree-sitter grammar, so this
+        // exercises the line-scan provider rather than the tree walk.
+        let mut buf = markdown_buffer("# One\nbody\nmore\n\n# Two\ntail\n");
+        assert!(buf.tree.is_none());
+
+        assert_eq!(buf.fold_marker(0), FoldMarker::Expanded);
+        assert_eq!(buf.fold_marker(1), FoldMarker::None);
+
+        buf.toggle_fold(0);
+        let hidden = buf.hidden_lines();
+        assert!(hidden.contains(1));
+        assert!(hidden.contains(2));
+        // The blank separator before `# Two` is not swallowed.
+        assert!(!hidden.contains(3));
+        assert!(!hidden.contains(4));
+    }
+
+    #[test]
+    fn collapsing_hides_rows_from_the_layout_and_the_scroll_bounds() {
+        // Seven content lines plus the empty line after the trailing newline.
+        let mut buf = markdown_buffer("# One\na\nb\nc\n\n# Two\nd\n");
+        assert_eq!(buf.scroll_line_count(0), 8);
+
+        buf.toggle_fold(0);
+        // Lines 1..=3 are gone from both the row count and the layout.
+        assert_eq!(buf.scroll_line_count(0), 5);
+        let rows: Vec<usize> = buf
+            .wrap_layout(0)
+            .segments
+            .iter()
+            .map(|s| s.logical_line)
+            .collect();
+        assert_eq!(rows, vec![0, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn cursor_steps_over_a_collapsed_block_in_one_press() {
+        let mut buf = markdown_buffer("# One\na\nb\nc\n\n# Two\nd\n");
+        buf.toggle_fold(0);
+        buf.cursor.line = 0;
+        buf.cursor.col = 0;
+
+        buf.move_cursor_down(0);
+        assert_eq!(buf.cursor.line, 4, "one step lands past the hidden body");
+        buf.move_cursor_up(0);
+        assert_eq!(buf.cursor.line, 0);
+    }
+
+    #[test]
+    fn collapsing_the_block_under_the_cursor_moves_it_to_the_header() {
+        let mut buf = markdown_buffer("# One\nbody\nmore\n\n# Two\n");
+        buf.cursor.line = 2;
+        buf.cursor.col = 1;
+
+        // The cursor is inside the section, not on its heading.
+        assert_eq!(buf.toggle_fold(2), Some(0));
+        assert_eq!(buf.cursor.line, 0);
+        assert!(!buf.hidden_lines().contains(buf.cursor.line));
+    }
+
+    #[test]
+    fn an_edit_above_a_fold_keeps_it_on_the_same_block() {
+        let mut buf = markdown_buffer("# One\nbody\nmore\n\n# Two\ntail\n");
+        buf.toggle_fold(0);
+        assert!(buf.hidden_lines().contains(1));
+
+        // Insert two lines above everything.
+        buf.cursor.line = 0;
+        buf.cursor.col = 0;
+        buf.insert_text("x\ny\n");
+
+        // The heading moved to line 2 and its fold moved with it.
+        assert_eq!(buf.text.line(2).to_string().trim_end(), "# One");
+        assert_eq!(buf.fold_marker(2), FoldMarker::Collapsed);
+        let hidden = buf.hidden_lines();
+        assert!(hidden.contains(3));
+        assert!(!hidden.contains(0));
+        assert!(!hidden.contains(2));
+    }
+
+    #[test]
+    fn unfolding_restores_every_row() {
+        let mut buf = markdown_buffer("# One\na\nb\n\n# Two\nc\n");
+        buf.toggle_fold(0);
+        assert!(buf.has_collapsed_folds());
+
+        buf.toggle_fold(0);
+        assert!(!buf.has_collapsed_folds());
+        assert_eq!(buf.hidden_lines().total(), 0);
+        assert_eq!(buf.scroll_line_count(0), buf.line_count());
+    }
+
+    #[test]
+    fn fold_all_then_expand_all_round_trips() {
+        let mut buf = markdown_buffer("# One\na\n\n## Sub\nb\n\n# Two\nc\n");
+        let collapsed = buf.set_all_folds(true);
+        assert!(collapsed >= 2);
+        assert!(buf.hidden_lines().total() > 0);
+
+        buf.set_all_folds(false);
+        assert!(!buf.has_collapsed_folds());
+        assert_eq!(buf.hidden_lines().total(), 0);
+    }
+
+    #[test]
+    fn diff_view_buffers_never_fold() {
+        // Their rope splices the old and new sides together, so every region a
+        // tree would report is an artifact of the splice.
+        let mut buf = parsed_buffer("json", "{\n  \"a\": {\n    \"b\": 1\n  }\n}\n");
+        assert_eq!(buf.fold_marker(0), FoldMarker::Expanded);
+
+        buf.diff_view = Some(DiffView {
+            kinds: vec![crate::editor::diff::DiffKind::Context; buf.line_count()],
+            original_text: String::new(),
+        });
+        assert_eq!(buf.fold_marker(0), FoldMarker::None);
+        assert_eq!(buf.toggle_fold(0), None);
     }
 
     #[test]

@@ -677,7 +677,8 @@ async fn drive_codex_stdout(
 /// `xhigh`, `max`, `ultra`. `None` / `off` / `auto` omit the flag so Codex
 /// uses its model default.
 ///
-/// Supported ceilings follow the Codex model catalog (client 0.146.0, 2026-09):
+/// Supported ceilings follow the Codex model catalog (client 0.153.4, 2026-09):
+/// * `gpt-6-astra` / any `gpt-6` variant → up to `ultra`
 /// * `gpt-5.6-sol` / `gpt-5.6-terra` / bare `gpt-5.6` → up to `ultra`
 /// * `gpt-5.6-luna` → up to `max` (no `ultra`)
 /// * older models (`gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`,
@@ -714,7 +715,11 @@ fn codex_effort_ceiling(model: &str) -> &'static str {
         .unwrap_or(model)
         .trim()
         .to_ascii_lowercase();
-    if m == "gpt-5.6" || m.starts_with("gpt-5.6-sol") || m.starts_with("gpt-5.6-terra") {
+    if m.starts_with("gpt-6") {
+        // gpt-6-astra advertises the full ladder through `ultra`; future
+        // gpt-6 variants inherit that ceiling until the catalog says otherwise.
+        "ultra"
+    } else if m == "gpt-5.6" || m.starts_with("gpt-5.6-sol") || m.starts_with("gpt-5.6-terra") {
         "ultra"
     } else if m.starts_with("gpt-5.6-luna") {
         "max"
@@ -988,6 +993,24 @@ url = "https://example/mcp/"
         assert_eq!(
             map_effort_to_codex(Some("max"), "codex:gpt-5.6-luna"),
             Some("max")
+        );
+    }
+
+    #[test]
+    fn test_map_effort_to_codex_gpt6_astra_passes_ultra() {
+        // Regression: an unrecognised family falls through to the `xhigh`
+        // branch, silently downgrading the flagship's top two levels.
+        assert_eq!(
+            map_effort_to_codex(Some("ultra"), "gpt-6-astra"),
+            Some("ultra")
+        );
+        assert_eq!(
+            map_effort_to_codex(Some("max"), "codex:gpt-6-astra"),
+            Some("max")
+        );
+        assert_eq!(
+            map_effort_to_codex(Some("high"), "gpt-6-astra"),
+            Some("high")
         );
     }
 

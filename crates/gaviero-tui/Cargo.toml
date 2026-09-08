@@ -36,6 +36,9 @@ streaming-iterator = "0.1"
 portable-pty = "0.9"
 vt100 = "0.16"
 unicode-width = "0.2"
+# Local-timezone formatting for chat message timestamps. Pinned to the same
+# version gaviero-core uses so the graph stays on one chrono.
+chrono = "0.4.44"
 # `/remote` pairing QR rendered into the chat panel (Plan A A6).
 qrcode = { version = "0.14", default-features = false }
 

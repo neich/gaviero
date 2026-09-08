@@ -697,6 +697,16 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     return;
                 }
 
+                // Fold arrow: leftmost gutter column, and only when the row
+                // actually carries one. Otherwise fall through so a click on
+                // the gutter of a non-foldable line still places the cursor.
+                if app.diff_review.is_none()
+                    && col == app.layout.editor_area.x + crate::editor::view::FOLD_COLUMN_OFFSET
+                    && toggle_fold_at_screen_row(app, row)
+                {
+                    return;
+                }
+
                 if app.diff_review.is_none() {
                     let is_double_click = app
                         .last_click
@@ -1677,8 +1687,10 @@ pub(super) fn set_cursor_from_mouse(app: &mut App, col: u16, row: u16) {
                 buf.cursor.col = char_col.min(buf.line_len(seg.logical_line));
             }
         } else {
-            let max_line = buf.line_count().saturating_sub(1);
-            buf.cursor.line = click_row.min(max_line);
+            // Rows and file lines only coincide while nothing is folded.
+            let hidden = buf.hidden_lines();
+            let max_row = (buf.line_count() - hidden.total()).saturating_sub(1);
+            buf.cursor.line = hidden.line_at_row(click_row.min(max_row));
             let char_col = buf.visual_to_char_col(buf.cursor.line, visual_col);
             let line_len = buf.line_len(buf.cursor.line);
             buf.cursor.col = char_col.min(line_len);
@@ -1687,6 +1699,95 @@ pub(super) fn set_cursor_from_mouse(app: &mut App, col: u16, row: u16) {
         // the cursor already occupied.
         buf.reset_goal_col();
     }
+}
+
+/// Logical line drawn on screen row `row` of the editor area.
+fn editor_line_at_screen_row(app: &App, row: u16) -> Option<usize> {
+    let area = app.layout.editor_area;
+    let buf = app.buffers.get(app.active_buffer)?;
+    if row < area.y || row >= area.bottom() {
+        return None;
+    }
+    let visual_row = (row - area.y) as usize + buf.scroll.top_line;
+    let (_, content_w) = editor_viewport(buf.line_count(), area);
+
+    if buf.word_wrap && content_w > 0 {
+        let layout = buf.wrap_layout(content_w);
+        let seg = layout.segment_at(visual_row)?;
+        // Only the first row of a wrapped line carries a number and an arrow.
+        if seg.start_col != 0 {
+            return None;
+        }
+        return Some(seg.logical_line);
+    }
+
+    let hidden = buf.hidden_lines();
+    if visual_row >= buf.line_count() - hidden.total() {
+        return None;
+    }
+    Some(hidden.line_at_row(visual_row))
+}
+
+/// Collapse or expand the block whose arrow sits on screen row `row`.
+/// Returns `false` when that row has no arrow, so the caller can fall through
+/// to ordinary cursor placement.
+fn toggle_fold_at_screen_row(app: &mut App, row: u16) -> bool {
+    let Some(line) = editor_line_at_screen_row(app, row) else {
+        return false;
+    };
+    let Some(buf) = app.buffers.get_mut(app.active_buffer) else {
+        return false;
+    };
+    if buf.fold_marker(line) == crate::editor::fold::FoldMarker::None {
+        return false;
+    }
+    let toggled = buf.toggle_fold(line).is_some();
+    if toggled {
+        // Deliberately not `ensure_editor_cursor_visible`: clicking an arrow
+        // far from the cursor must not scroll the view to the cursor.
+        clamp_editor_scroll(app);
+    }
+    toggled
+}
+
+/// Pull the editor's scroll offset back inside the rows that still exist.
+fn clamp_editor_scroll(app: &mut App) {
+    let area = app.layout.editor_area;
+    if let Some(buf) = app.buffers.get_mut(app.active_buffer) {
+        let (vp_h, vp_w) = editor_viewport(buf.line_count(), area);
+        buf.clamp_scroll_top(vp_h, vp_w);
+    }
+}
+
+/// Fold or unfold the innermost block around the cursor (F10).
+pub(super) fn toggle_fold_at_cursor(app: &mut App) {
+    let Some(buf) = app.buffers.get_mut(app.active_buffer) else {
+        return;
+    };
+    let line = buf.cursor.line;
+    let message = match buf.toggle_fold(line) {
+        Some(header) => format!("Fold toggled at line {}", header + 1),
+        None => "No foldable block here".to_string(),
+    };
+    app.status_message = Some((message, std::time::Instant::now()));
+    app.ensure_editor_cursor_visible();
+}
+
+/// Collapse every block, or expand all of them when something is collapsed
+/// already (Shift+F10).
+pub(super) fn toggle_all_folds(app: &mut App) {
+    let Some(buf) = app.buffers.get_mut(app.active_buffer) else {
+        return;
+    };
+    let collapse = !buf.has_collapsed_folds();
+    let count = buf.set_all_folds(collapse);
+    let message = if collapse {
+        format!("Collapsed {count} block(s)")
+    } else {
+        format!("Expanded {count} block(s)")
+    };
+    app.status_message = Some((message, std::time::Instant::now()));
+    app.ensure_editor_cursor_visible();
 }
 
 /// How long to ignore a follow-up text paste after one just landed.

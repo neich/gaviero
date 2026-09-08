@@ -26,7 +26,7 @@ Workspace dispatch: directory → `Workspace::single_folder`; `*.gaviero-workspa
 - [`keymap.rs`](src/keymap.rs) — Ctrl = editor, Alt = workspace. **F7** = word-wrap primary (`Alt+Shift+Z` fallback — NVIDIA steals plain `Alt+Z`). `Ctrl+Up/Down` when hosts steal `Alt+arrows`. `Ctrl+Alt+Left/Right` resize explorer/editor/side widths (`Alt+Left/Right` reserved for tmux/psmux).
 - [`platform.rs`](src/platform.rs) — all platform quirks (ConPTY mouse, AltGr, Ctrl+C forwarder). New quirks go here, not inline.
 - [`setup.rs`](src/setup.rs) — pre-TUI first-run wizard; writes `.gaviero/settings.json`, the `.gaviero-workspace` file, and (opt-in) the Claude/Codex/Cursor MCP configs. Runs before `App` exists, so it holds no `App` state.
-- [`editor/`](src/editor) — buffer, view, highlight, markdown, diff overlay, LCS diff, wrap.
+- [`editor/`](src/editor) — buffer, view, highlight, markdown, diff overlay, LCS diff, wrap, [`fold`](src/editor/fold.rs).
 - [`panels/`](src/panels) — file tree, agent chat, swarm dashboard, git, terminal, search, memory, status bar.
 - [`widgets/`](src/widgets), [`theme.rs`](src/theme.rs).
 
@@ -42,6 +42,7 @@ Workspace dispatch: directory → `Workspace::single_folder`; `*.gaviero-workspa
 - Diff overlay: `]h`/`[h` navigate; `a`/`r` accept/reject; `A`/`R` all; `f` finalize; `q` exit.
 - Merge conflicts: F8/F9 next/previous region; save stages when markers are gone ([`gaviero_core::git_conflict`](../gaviero-core/src/git_conflict.rs)).
 - Wrapped-layout editing receives viewport width via [`app/editing.rs`](src/app/editing.rs); never compute visual position outside the editor module.
+- **`WrapLayout` is the only line↔row map.** Folds hide lines by omitting their segments, so anything converting between file lines and screen rows goes through the layout or `Buffer::hidden_lines()` — never `cursor.line == scroll.top_line` arithmetic ([`editor/fold.rs`](src/editor/fold.rs)).
 
 ## Rules
 

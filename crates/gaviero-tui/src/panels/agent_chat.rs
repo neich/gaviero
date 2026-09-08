@@ -75,6 +75,19 @@ pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
     pub tool_calls: Vec<String>,
+    /// Wall-clock time the message entered the transcript, as Unix seconds.
+    /// Persisted through `StoredMessage.timestamp`, so it survives restart.
+    ///
+    /// For an assistant message this is when the *first* stream chunk landed
+    /// (`append_stream_chunk_to` creates the message and then appends into it),
+    /// i.e. when the answer started rather than when it finished. Either way
+    /// it is monotonic within a conversation, which is what makes it usable
+    /// as an ordering signal.
+    ///
+    /// `0` means "unknown" — records written before timestamps were stored
+    /// deserialize to it via `#[serde(default)]`, and the renderer omits the
+    /// stamp entirely rather than claiming 1970.
+    pub timestamp: u64,
 }
 
 fn chat_render_trace_enabled() -> bool {
@@ -638,6 +651,25 @@ impl Conversation {
     /// construction path for live messages — direct `ChatMessage {}`
     /// literals outside restore/compact keep-list handling are a bug.
     pub fn push_message(&mut self, role: ChatRole, content: String, tool_calls: Vec<String>) {
+        self.push_message_at(
+            role,
+            content,
+            tool_calls,
+            gaviero_core::session_state::now_unix(),
+        );
+    }
+
+    /// Push a message carrying an explicit `timestamp` (Unix seconds) instead
+    /// of stamping it "now". Used by journal replay, where the prompt was
+    /// actually issued before the crash — stamping it at replay time would
+    /// date every recovered prompt to the restart.
+    pub fn push_message_at(
+        &mut self,
+        role: ChatRole,
+        content: String,
+        tool_calls: Vec<String>,
+        timestamp: u64,
+    ) {
         let seq = self.next_message_seq;
         self.next_message_seq += 1;
         self.messages.push(ChatMessage {
@@ -645,6 +677,7 @@ impl Conversation {
             role,
             content,
             tool_calls,
+            timestamp,
         });
     }
 
@@ -1504,7 +1537,8 @@ impl AgentChatState {
                     let list = if options.is_empty() {
                         "claude:fable, claude:sonnet, claude:opus, claude:haiku, \
                          claude:opusplan, claude:sonnet[1m], claude:opus[1m], \
-                         codex:gpt-5.6-sol, codex:gpt-5.6-terra, codex:gpt-5.6-luna, \
+                         codex:gpt-6-astra, codex:gpt-5.6-sol, codex:gpt-5.6-terra, \
+                         codex:gpt-5.6-luna, \
                          cursor:composer-2.5, ollama:qwen2.5-coder:7b"
                             .to_string()
                     } else {
@@ -1603,6 +1637,7 @@ impl AgentChatState {
                         role: ChatRole::System,
                         content: summary,
                         tool_calls: Vec::new(),
+                        timestamp: gaviero_core::session_state::now_unix(),
                     });
                     conv.messages.extend(kept);
 
@@ -3678,6 +3713,9 @@ impl AgentChatState {
                         },
                         content: m.content,
                         tool_calls: m.tool_calls,
+                        // `0` for records written before timestamps were
+                        // persisted; the renderer omits the stamp for those.
+                        timestamp: m.timestamp,
                     })
                     .collect();
                 // V9 §11 M4: restore the planner ledger and legacy
@@ -3802,8 +3840,11 @@ impl AgentChatState {
     /// [`Self::save_conversations`] succeeds in full, so anything still in it
     /// is by construction *absent* from the saved JSON. That invariant is
     /// what lets replay skip de-duplication entirely — it can't lean on
-    /// message `seq`, which is renumbered from 1 on every load, nor on
-    /// timestamps, which `StoredMessage` does not carry.
+    /// message `seq`, which is renumbered from 1 on every load, and
+    /// `StoredMessage.timestamp` is only second-granular (and `0` on records
+    /// written before timestamps were persisted), so it is not an identity
+    /// key either. Recovered prompts are stamped with the journal entry's
+    /// own `ts`, i.e. when they were dispatched, not when they were replayed.
     ///
     /// Only the user's prompts are recovered; the assistant's replies were
     /// never journalled, so each recovered run is prefixed with a system
@@ -3846,16 +3887,22 @@ impl AgentChatState {
             };
 
             if marked.insert(entry.conv_id.clone()) {
-                self.conversations[idx].push_message(
+                self.conversations[idx].push_message_at(
                     ChatRole::System,
                     "Recovered after an unclean shutdown. The prompt(s) below were saved \
                      at dispatch; the replies were not."
                         .to_string(),
                     Vec::new(),
+                    entry.ts,
                 );
             }
 
-            self.conversations[idx].push_message(ChatRole::User, entry.text, Vec::new());
+            self.conversations[idx].push_message_at(
+                ChatRole::User,
+                entry.text,
+                Vec::new(),
+                entry.ts,
+            );
             self.conversations[idx].bump_revision();
             recovered += 1;
             last_idx = Some(idx);
@@ -3888,7 +3935,7 @@ impl AgentChatState {
                         },
                         content: m.content.clone(),
                         tool_calls: m.tool_calls.clone(),
-                        timestamp: 0,
+                        timestamp: m.timestamp,
                     })
                     .collect(),
                 created: 0,
@@ -4166,10 +4213,18 @@ impl AgentChatState {
         )> = Vec::new();
 
         for (msg_idx, msg) in self.messages().iter().enumerate() {
-            let (prefix, base_style) = match msg.role {
-                ChatRole::User => ("You: ", Style::default().fg(theme::ACCENT)),
-                ChatRole::Assistant => ("Assistant: ", Style::default().fg(theme::TEXT_FG)),
-                ChatRole::System => ("System: ", Style::default().fg(theme::WARNING)),
+            let (role_label, base_style) = match msg.role {
+                ChatRole::User => ("You", Style::default().fg(theme::ACCENT)),
+                ChatRole::Assistant => ("Assistant", Style::default().fg(theme::TEXT_FG)),
+                ChatRole::System => ("System", Style::default().fg(theme::WARNING)),
+            };
+            // Stamp goes in the header so the transcript reads in wall-clock
+            // order after a restart, where `seq` alone only tells you the
+            // order within one conversation. Omitted for timestamp `0`
+            // (pre-timestamp records) rather than rendering the epoch.
+            let prefix = match format_message_timestamp(msg.timestamp) {
+                Some(stamp) => format!("{} [{}]: ", role_label, stamp),
+                None => format!("{}: ", role_label),
             };
 
             // Filter <file> blocks and strip `<turn_annotations>` from display
@@ -4184,8 +4239,7 @@ impl AgentChatState {
                 // Render assistant messages with markdown formatting
                 lines.push((
                     vec![crate::panels::chat_markdown::StyledSegment::new(
-                        prefix.to_string(),
-                        base_style,
+                        prefix, base_style,
                     )],
                     Some(msg_idx),
                 ));
@@ -5113,6 +5167,21 @@ fn filter_assistant_for_display(text: &str) -> String {
     gaviero_core::memory::parse_and_strip(&collapsed).stripped
 }
 
+/// Render a [`ChatMessage::timestamp`] for the transcript header, in the
+/// machine's local timezone — the stamp is read against the user's own clock,
+/// not UTC.
+///
+/// Returns `None` for `0` (unknown: conversations saved before timestamps were
+/// persisted) so the caller can drop the stamp instead of printing the epoch.
+fn format_message_timestamp(timestamp: u64) -> Option<String> {
+    if timestamp == 0 {
+        return None;
+    }
+    let utc = chrono::DateTime::from_timestamp(timestamp as i64, 0)?;
+    let local: chrono::DateTime<chrono::Local> = utc.into();
+    Some(local.format("%Y-%m-%d %H:%M:%S").to_string())
+}
+
 fn background_status_label(agents: &[BackgroundAgent]) -> String {
     let running: Vec<&BackgroundAgent> = agents.iter().filter(|a| !a.finished).collect();
     match running.len() {
@@ -5393,6 +5462,102 @@ mod tests {
                 .any(|m| m.role == ChatRole::System && m.content.contains("unclean shutdown")),
             "a clean exit must not be reported as a crash recovery"
         );
+    }
+
+    #[test]
+    fn message_timestamps_survive_a_save_load_round_trip() {
+        // The whole point of persisting the stamp: after a restart the
+        // transcript must still say when each turn happened.
+        let scratch = JournalScratch::new();
+        let mut state = AgentChatState::new();
+        let conv_id = state.conversations[0].id.clone();
+
+        state.conversations[0].push_message_at(
+            ChatRole::User,
+            "when did I ask this?".to_string(),
+            Vec::new(),
+            1_757_000_000,
+        );
+        state.conversations[0].push_message_at(
+            ChatRole::Assistant,
+            "at the time shown".to_string(),
+            Vec::new(),
+            1_757_000_042,
+        );
+
+        state.save_conversations(&scratch.key);
+
+        let mut reloaded = AgentChatState::new();
+        reloaded.load_conversations(&scratch.key);
+        let idx = reloaded.find_conv_idx(&conv_id).expect("conversation loads");
+        let msgs = &reloaded.conversations[idx].messages;
+
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].timestamp, 1_757_000_000);
+        assert_eq!(
+            msgs[1].timestamp, 1_757_000_042,
+            "each message keeps its own stamp, not the conversation's"
+        );
+    }
+
+    #[test]
+    fn push_message_stamps_now_and_preserves_ordering() {
+        let before = gaviero_core::session_state::now_unix();
+        let mut conv = Conversation::new("c1".to_string(), "Chat".to_string());
+        conv.push_message(ChatRole::User, "hi".to_string(), Vec::new());
+        let after = gaviero_core::session_state::now_unix();
+
+        let ts = conv.messages[0].timestamp;
+        assert!(
+            ts >= before && ts <= after,
+            "live messages are stamped at push time ({ts} not in {before}..={after})"
+        );
+    }
+
+    #[test]
+    fn replay_prompt_journal_stamps_prompts_with_their_dispatch_time() {
+        // A recovered prompt was typed before the crash. Stamping it "now"
+        // would date the whole recovered run to the restart instead.
+        let scratch = JournalScratch::new();
+        let mut state = AgentChatState::new();
+        let conv_id = state.conversations[0].id.clone();
+
+        gaviero_core::session_journal::append_prompt(&scratch.key, &conv_id, "Chat", "lost prompt")
+            .unwrap();
+        let journalled_ts = gaviero_core::session_journal::load(&scratch.key)[0].ts;
+
+        assert_eq!(state.replay_prompt_journal(&scratch.key), 1);
+
+        let msgs = &state.conversations[0].messages;
+        assert_eq!(
+            msgs[1].timestamp, journalled_ts,
+            "the prompt carries the journal's dispatch time"
+        );
+        assert_eq!(
+            msgs[0].timestamp, journalled_ts,
+            "the recovery marker is dated with the run it introduces"
+        );
+    }
+
+    #[test]
+    fn format_message_timestamp_omits_an_unknown_stamp() {
+        assert_eq!(
+            format_message_timestamp(0),
+            None,
+            "0 means 'not recorded' — rendering it would claim 1970"
+        );
+    }
+
+    #[test]
+    fn format_message_timestamp_renders_date_and_time() {
+        let rendered = format_message_timestamp(1_757_000_000).expect("a real instant formats");
+
+        // Local timezone, so assert the shape rather than a fixed instant.
+        assert_eq!(rendered.len(), 19, "YYYY-MM-DD HH:MM:SS");
+        let (date, time) = rendered.split_once(' ').expect("date and time are both present");
+        assert_eq!(date.matches('-').count(), 2);
+        assert_eq!(time.matches(':').count(), 2);
+        assert!(date.starts_with("2025") || date.starts_with("2026"));
     }
 
     #[test]

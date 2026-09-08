@@ -1152,7 +1152,9 @@ fn editor_top_source_line(buf: &crate::editor::buffer::Buffer, editor_area: Rect
     }
     let top = buf.scroll.top_line;
     if !buf.word_wrap {
-        return Some(top);
+        // Collapsed folds shorten the row space the same way wrapping lengthens
+        // it, so the row still has to be resolved back to a file line.
+        return Some(buf.hidden_lines().line_at_row(top));
     }
     let (_, content_width) = super::editing::editor_viewport(buf.line_count(), editor_area);
     if content_width == 0 {
