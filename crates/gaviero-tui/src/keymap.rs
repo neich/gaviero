@@ -65,6 +65,10 @@ pub enum Action {
     FormatBuffer,
     CycleFormatLevel,
     ToggleWordWrap,
+    /// Collapse/expand the innermost foldable block around the cursor.
+    ToggleFold,
+    /// Collapse every block, or expand all of them when any is collapsed.
+    ToggleAllFolds,
     FindInBuffer,
     SearchInWorkspace,
     /// Next git merge-conflict region (editor) or file (Changes panel).
@@ -206,6 +210,10 @@ impl Keymap {
             KeyCode::F(7) => Action::ToggleWordWrap,
             KeyCode::F(8) => Action::NextConflict,
             KeyCode::F(9) => Action::PrevConflict,
+            // Code folding. The arrow in the gutter is the primary control;
+            // F10 is the keyboard equivalent for the block under the cursor.
+            KeyCode::F(10) if shift => Action::ToggleAllFolds,
+            KeyCode::F(10) => Action::ToggleFold,
             KeyCode::F(11) => Action::ToggleFullscreen,
 
             // ── Tab character ────────────────────────────────────
@@ -430,6 +438,18 @@ mod tests {
         assert_eq!(
             Keymap::resolve(&key(KeyCode::F(7), KeyModifiers::NONE)),
             Action::ToggleWordWrap
+        );
+    }
+
+    #[test]
+    fn test_f10_folds_block_and_shift_f10_folds_all() {
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::F(10), KeyModifiers::NONE)),
+            Action::ToggleFold
+        );
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::F(10), KeyModifiers::SHIFT)),
+            Action::ToggleAllFolds
         );
     }
 

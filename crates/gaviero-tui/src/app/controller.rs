@@ -2108,6 +2108,8 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
                 app.ensure_editor_cursor_visible();
             }
         }
+        Action::ToggleFold => super::editing::toggle_fold_at_cursor(app),
+        Action::ToggleAllFolds => super::editing::toggle_all_folds(app),
         Action::ToggleFullscreen => app.toggle_fullscreen(),
         Action::SwitchLayout(n) => app.switch_layout(n),
         Action::FindInBuffer => {

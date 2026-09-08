@@ -19,10 +19,18 @@ pub struct WrapLayout {
 }
 
 impl WrapLayout {
-    /// Build visual segments for every logical line in `buffer`.
+    /// Build visual segments for every *visible* logical line in `buffer`.
+    ///
+    /// Lines hidden by a collapsed fold get no segment at all, which is what
+    /// makes the layout the single mapping between file lines and screen rows:
+    /// rendering, hit-testing and scroll bounds all go through it, so none of
+    /// them needs its own notion of folding.
     pub fn build(buffer: &Buffer, content_width: usize) -> Self {
+        let hidden = buffer.hidden_lines();
+
         if !buffer.word_wrap || content_width == 0 {
             let segments = (0..buffer.line_count())
+                .filter(|line| !hidden.contains(*line))
                 .map(|line| VisualSegment {
                     logical_line: line,
                     start_col: 0,
@@ -35,6 +43,9 @@ impl WrapLayout {
         let tab_width = buffer.tab_width as usize;
         let mut segments = Vec::new();
         for line in 0..buffer.line_count() {
+            if hidden.contains(line) {
+                continue;
+            }
             let text = buffer.text.line(line).to_string();
             for (start, end) in wrap_line_segments(&text, tab_width, content_width) {
                 segments.push(VisualSegment {
@@ -57,6 +68,9 @@ impl WrapLayout {
     /// the next; the later row wins, because that is where the character under
     /// the cursor is drawn (the earlier row has no cell left for it). Positions
     /// past the last segment's `end_col` (end of line) fall back to that row.
+    ///
+    /// A line hidden inside a collapsed fold has no row of its own; it resolves
+    /// to the last row at or above it, i.e. the fold header still on screen.
     pub fn cursor_segment(&self, line: usize, col: usize) -> usize {
         for (idx, seg) in self.segments.iter().enumerate() {
             if seg.logical_line == line && col >= seg.start_col && col < seg.end_col {
@@ -65,7 +79,7 @@ impl WrapLayout {
         }
         self.segments
             .iter()
-            .rposition(|s| s.logical_line == line)
+            .rposition(|s| s.logical_line <= line)
             .unwrap_or(0)
     }
 

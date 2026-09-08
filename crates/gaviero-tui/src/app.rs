@@ -1221,14 +1221,10 @@ fn osc52_copy(text: &str) -> bool {
         .is_ok()
 }
 
-fn gutter_width(line_count: usize) -> u16 {
-    let digits = if line_count == 0 {
-        1
-    } else {
-        ((line_count as f64).log10().floor() as u16) + 1
-    };
-    digits + 2
-}
+// Single source of truth for the gutter geometry: the renderer owns it, and
+// the hit-testing in `app/editing.rs` reads the same function through the
+// module glob. A second copy here once drifted from it by a column.
+pub(crate) use crate::editor::view::gutter_width;
 
 /// Replace `<file path="...">...</file>` blocks with a short summary for chat display.
 pub(crate) fn collapse_file_blocks(text: &str) -> String {

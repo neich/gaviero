@@ -5,6 +5,7 @@ use crate::theme::{CURRENT_LINE_BG, SEARCH_HIGHLIGHT_BG, SELECTION_BG};
 
 use super::buffer::Buffer;
 use super::diff::DiffKind;
+use super::fold::FoldMarker;
 use super::highlight::{HighlightConfig, StyledSpan, run_highlights};
 use crate::theme::Theme;
 
@@ -13,6 +14,16 @@ const DIFF_ADD_BG: Color = Color::Rgb(40, 65, 42);
 const DIFF_REM_BG: Color = Color::Rgb(65, 40, 40);
 const DIFF_ADD_GUTTER_FG: Color = Color::Rgb(80, 200, 80);
 const DIFF_REM_GUTTER_FG: Color = Color::Rgb(220, 80, 80);
+
+/// Column of the gutter that carries the clickable fold arrow, relative to the
+/// editor area's left edge. The mouse handler hit-tests against this.
+pub const FOLD_COLUMN_OFFSET: u16 = 0;
+/// Arrow for a region whose body is on screen.
+const FOLD_EXPANDED: char = '▾';
+/// Arrow for a region whose body is hidden.
+const FOLD_COLLAPSED: char = '▸';
+/// Drawn after the text of a collapsed header line.
+const FOLD_ELLIPSIS: &str = "⋯";
 
 pub struct EditorView<'a> {
     pub buffer: &'a Buffer,
@@ -160,30 +171,43 @@ impl<'a> EditorView<'a> {
             _ => self.theme.ui_style("line_number"),
         };
 
-        let num_str = if !show_line_number {
-            " ".repeat(gutter_width as usize)
-        } else {
-            match diff_kind {
-                Some(DiffKind::Added) => format!(
-                    "{:>width$}+",
-                    line_idx + 1,
-                    width = (gutter_width as usize) - 1
-                ),
-                Some(DiffKind::Removed) => format!(
-                    "{:>width$}-",
-                    line_idx + 1,
-                    width = (gutter_width as usize) - 1
-                ),
-                _ => format!(
-                    "{:>width$} ",
-                    line_idx + 1,
-                    width = (gutter_width as usize) - 1
-                ),
-            }
-        };
         let x_max = (x + gutter_width).min(buf.area().right());
+        if !show_line_number {
+            // Continuation row of a wrapped line: no number, no arrow.
+            for cx in x..x_max {
+                buf[(cx, y)].set_char(' ').set_style(style);
+            }
+            return;
+        }
+
+        // The arrow owns the leftmost cell; the number is right-aligned in what
+        // is left once the trailing separator is reserved.
+        let marker = self.buffer.fold_marker(line_idx);
+        let (arrow, arrow_style) = match marker {
+            FoldMarker::None => (' ', style),
+            FoldMarker::Expanded => (FOLD_EXPANDED, style),
+            // A collapsed block is the one gutter state worth spotting from
+            // across the screen, so it borrows the active line-number colour.
+            FoldMarker::Collapsed => (FOLD_COLLAPSED, self.theme.ui_style("line_number.active")),
+        };
+        if x < x_max {
+            buf[(x + FOLD_COLUMN_OFFSET, y)]
+                .set_char(arrow)
+                .set_style(arrow_style);
+        }
+
+        let separator = match diff_kind {
+            Some(DiffKind::Added) => '+',
+            Some(DiffKind::Removed) => '-',
+            _ => ' ',
+        };
+        let num_str = format!(
+            "{:>width$}{separator}",
+            line_idx + 1,
+            width = (gutter_width as usize) - 2
+        );
         for (i, ch) in num_str.chars().enumerate() {
-            let cx = x + i as u16;
+            let cx = x + FOLD_COLUMN_OFFSET + 1 + i as u16;
             if cx < x_max {
                 buf[(cx, y)].set_char(ch).set_style(style);
             }
@@ -336,6 +360,27 @@ impl<'a> EditorView<'a> {
 
             char_idx += 1;
         }
+
+        // Mark a collapsed header so the hidden body is visible as content, not
+        // just as a gutter state. Only on the row that ends the logical line.
+        if self.buffer.fold_marker(line_idx) == FoldMarker::Collapsed
+            && segment_end >= self.buffer.line_len(line_idx)
+        {
+            let ellipsis_col = visual_col + 1;
+            if ellipsis_col >= left_col {
+                let display_col = (ellipsis_col - left_col) as u16;
+                if display_col < width {
+                    let cell_x = x + display_col;
+                    if cell_x < buf.area().right() {
+                        let style = self
+                            .theme
+                            .ui_style("line_number.active")
+                            .bg(line_bg.unwrap_or(Color::Reset));
+                        buf[(cell_x, y)].set_symbol(FOLD_ELLIPSIS).set_style(style);
+                    }
+                }
+            }
+        }
     }
 
     fn render_cursor(&self, code_area: Rect, layout: &super::wrap::WrapLayout, buf: &mut RataBuf) {
@@ -459,13 +504,17 @@ impl<'a> EditorView<'a> {
 }
 
 /// Calculate gutter width based on total line count.
-fn gutter_width(line_count: usize) -> u16 {
+///
+/// Layout is `[fold arrow][line number][separator]`. The arrow column is always
+/// reserved, even for a buffer with nothing foldable, so the code area never
+/// shifts sideways as the user edits.
+pub fn gutter_width(line_count: usize) -> u16 {
     let digits = if line_count == 0 {
         1
     } else {
         ((line_count as f64).log10().floor() as u16) + 1
     };
-    digits + 2 // digits + space + separator
+    digits + 3 // arrow + digits + space + separator
 }
 
 #[cfg(test)]
@@ -474,11 +523,20 @@ mod tests {
 
     #[test]
     fn test_gutter_width() {
-        assert_eq!(gutter_width(1), 3);
-        assert_eq!(gutter_width(9), 3);
-        assert_eq!(gutter_width(10), 4);
-        assert_eq!(gutter_width(99), 4);
-        assert_eq!(gutter_width(100), 5);
-        assert_eq!(gutter_width(1000), 6);
+        // One column per digit, plus the fold arrow and the separator.
+        assert_eq!(gutter_width(1), 4);
+        assert_eq!(gutter_width(9), 4);
+        assert_eq!(gutter_width(10), 5);
+        assert_eq!(gutter_width(99), 5);
+        assert_eq!(gutter_width(100), 6);
+        assert_eq!(gutter_width(1000), 7);
+    }
+
+    #[test]
+    fn fold_column_is_the_leftmost_gutter_cell() {
+        // The click handler treats `area.x` as the arrow column; that only
+        // holds while the arrow is drawn first.
+        assert_eq!(FOLD_COLUMN_OFFSET, 0);
+        assert!(gutter_width(1) > FOLD_COLUMN_OFFSET + 1);
     }
 }
