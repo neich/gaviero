@@ -43,7 +43,7 @@ gaviero-cli --work-units '[{"id":"design","description":"Plan","scope":{"owned_p
 | Provider | Examples |
 |---|---|
 | Claude | `claude:fable`, `claude:sonnet`, `claude:opus` |
-| Codex | `codex:gpt-5.6-sol`, `codex:gpt-5.6-terra`, `codex:gpt-5.6-luna` |
+| Codex | `codex:gpt-6-astra`, `codex:gpt-5.6-sol`, `codex:gpt-5.6-terra`, `codex:gpt-5.6-luna` |
 | Cursor | `cursor:composer-2.5`, `cursor:cursor-grok-4.6-high` (ids embed effort — see `agent --list-models`) |
 | Ollama / local | `ollama:qwen2.5-coder:7b`, `local:qwen2.5-coder:14b` |
 | DeepSeek | `deepseek:deepseek-v4-pro`, `deepseek:deepseek-v4-flash` |

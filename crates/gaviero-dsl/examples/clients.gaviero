@@ -32,10 +32,18 @@ client codex-5-5 {
     effort high
 }
 
+client codex-6-astra {
+    model "codex:gpt-6-astra"
+    privacy public
+    // Current Codex flagship (catalog priority 1). Needs Codex CLI >= 0.153;
+    // older clients are served a catalog without it.
+    effort high
+}
+
 client codex-5-6-sol {
     model "codex:gpt-5.6-sol"
     privacy public
-    // Sol and Terra are the only Codex models that accept `ultra`.
+    // Astra, Sol and Terra are the Codex models that accept `ultra`.
     effort high
 }
 
@@ -51,8 +59,9 @@ client codex-5-6-luna {
     effort medium
 }
 
-client codex-5-4 {
-    model "codex:gpt-5.4"
+client codex-5-4-mini {
+    // gpt-5.4 was delisted upstream; mini is the surviving 5.4 entry.
+    model "codex:gpt-5.4-mini"
     privacy public
     effort medium
 }
