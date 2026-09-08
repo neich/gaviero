@@ -12,6 +12,12 @@
 //! proposals. This gives Codex the same review semantics as Claude without
 //! forcing whole files through assistant text.
 //!
+//! Approvals are drift-checked against the last content Gaviero observed on
+//! disk, not against the turn-start snapshot: Codex patches the same file
+//! several times per turn, so its own approved writes must not be mistaken for
+//! a concurrent foreign write. The snapshot original stays pinned as the base
+//! every Write Gate proposal diffs against.
+//!
 //! Direct, workspace-scoped `cargo fmt` and `cargo test` commands are approved
 //! through Codex's command-execution approval protocol. Before approving
 //! `cargo fmt`, Gaviero snapshots every Rust source under the configured roots,
@@ -256,6 +262,14 @@ struct ActiveTurn {
     seen_file_items: HashSet<String>,
     declined_file_items: HashSet<String>,
     item_paths: HashMap<String, Vec<PathBuf>>,
+    /// Content Gaviero last observed on disk per path, used as the drift
+    /// baseline when approving a file change. `snapshot.original` stays pinned
+    /// to the turn-start content because that is the base every Write Gate
+    /// proposal diffs against; Codex edits the same file several times per
+    /// turn, so its own approved writes must not read as foreign drift.
+    expected_on_disk: HashMap<PathBuf, Option<String>>,
+    /// Paths with at least one approved file change this turn.
+    approved_paths: HashSet<PathBuf>,
     pending_bg: Vec<PendingBg>,
 }
 
@@ -267,6 +281,8 @@ impl ActiveTurn {
             seen_file_items: HashSet::new(),
             declined_file_items: HashSet::new(),
             item_paths: HashMap::new(),
+            expected_on_disk: HashMap::new(),
+            approved_paths: HashSet::new(),
             pending_bg: Vec::new(),
         }
     }
@@ -742,6 +758,7 @@ async fn route_app_server_line(
             send_to_active(active_turn, events).await;
         }
         "item/completed" => {
+            refresh_file_change_baseline(&value, active_turn).await;
             track_codex_subagent_finish(&value, active_turn, review).await;
             let (events, _) = parse_rpc_event(line);
             send_to_active(active_turn, events).await;
@@ -1373,16 +1390,59 @@ async fn capture_file_change_start(
 
     active.item_paths.insert(item_id.clone(), paths.clone());
     for path in paths {
-        if let Err(e) = active.snapshot.capture_before_write(&path).await {
-            active.declined_file_items.insert(item_id.clone());
-            review.observer.on_message_complete(
-                "system",
-                &format!(
-                    "Declined Codex file change {item_id}: could not snapshot {}: {e:#}",
-                    path.display()
-                ),
-            );
+        match active.snapshot.capture_before_write(&path).await {
+            Ok(()) => {
+                let original = active.snapshot.original(&path).cloned().unwrap_or(None);
+                active.expected_on_disk.entry(path).or_insert(original);
+            }
+            Err(e) => {
+                active.declined_file_items.insert(item_id.clone());
+                review.observer.on_message_complete(
+                    "system",
+                    &format!(
+                        "Declined Codex file change {item_id}: could not snapshot {}: {e:#}",
+                        path.display()
+                    ),
+                );
+            }
         }
+    }
+}
+
+/// Codex applies an approved patch only after we answer its approval request,
+/// so the resulting content first becomes observable when the item completes.
+/// Record it as the drift baseline for later approvals touching the same paths.
+async fn refresh_file_change_baseline(value: &serde_json::Value, active_turn: &SharedActiveTurn) {
+    let item = value
+        .pointer("/params/item")
+        .unwrap_or(&serde_json::Value::Null);
+    if item.get("type").and_then(|kind| kind.as_str()) != Some("fileChange") {
+        return;
+    }
+    let Some(item_id) = item.get("id").and_then(|id| id.as_str()) else {
+        return;
+    };
+
+    let paths = {
+        let active = active_turn.lock().await;
+        let Some(active) = active.as_ref() else {
+            return;
+        };
+        if active.declined_file_items.contains(item_id) {
+            return;
+        }
+        active.item_paths.get(item_id).cloned().unwrap_or_default()
+    };
+
+    for path in paths {
+        let Ok(current) = read_optional_text(&path).await else {
+            continue;
+        };
+        let mut active = active_turn.lock().await;
+        let Some(active) = active.as_mut() else {
+            return;
+        };
+        active.expected_on_disk.insert(path, current);
     }
 }
 
@@ -1406,12 +1466,12 @@ async fn file_change_is_safe_to_approve(
     let Some(paths) = active.item_paths.get(item_id).cloned() else {
         return false;
     };
-    for path in paths {
-        let Some(original) = active.snapshot.original(&path) else {
+    for path in &paths {
+        let Some(original) = active.snapshot.original(path).cloned() else {
             active.declined_file_items.insert(item_id.to_string());
             return false;
         };
-        let current = match read_optional_text(&path).await {
+        let current = match read_optional_text(path).await {
             Ok(current) => current,
             Err(e) => {
                 tracing::warn!(
@@ -1423,7 +1483,20 @@ async fn file_change_is_safe_to_approve(
                 return false;
             }
         };
-        if current.as_deref() != original.as_deref() {
+
+        // Drift is measured against the last content Gaviero observed, not the
+        // turn-start original: a second `apply_patch` on a file Codex already
+        // edited this turn is expected to see the first patch on disk.
+        let baseline = active
+            .expected_on_disk
+            .get(path)
+            .cloned()
+            .unwrap_or(original);
+        if current.as_deref() == baseline.as_deref() {
+            continue;
+        }
+
+        if !active.approved_paths.contains(path) {
             active.declined_file_items.insert(item_id.to_string());
             review.observer.on_message_complete(
                 "system",
@@ -1434,6 +1507,14 @@ async fn file_change_is_safe_to_approve(
             );
             return false;
         }
+
+        // A write we approved earlier this turn landed after the last
+        // observation (no `item/completed` seen yet); adopt it as the baseline.
+        active.expected_on_disk.insert(path.clone(), current);
+    }
+
+    for path in paths {
+        active.approved_paths.insert(path);
     }
 
     true
@@ -2568,6 +2649,82 @@ url = "https://example/mcp/"
             dir.path(),
         );
         assert!(!command_execution_is_safe_to_approve(&denied, &active_turn, &review).await);
+    }
+
+    fn file_change_item(method: &str, item_id: &str, path: &Path) -> serde_json::Value {
+        serde_json::json!({
+            "method": method,
+            "params": {
+                "item": {
+                    "id": item_id,
+                    "type": "fileChange",
+                    "changes": [{ "path": path.to_string_lossy(), "kind": { "type": "update" } }],
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn repeated_edits_to_one_file_stay_approved() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        tokio::fs::write(&source, "one\n").await.unwrap();
+
+        let review = review_context(dir.path(), test_write_gate());
+        let (tx, _rx) = mpsc::channel(1);
+        let active_turn = Arc::new(Mutex::new(Some(ActiveTurn::new(tx))));
+
+        let first = file_change_item("item/started", "file-1", &source);
+        capture_file_change_start(&first, &active_turn, &review).await;
+        assert!(file_change_is_safe_to_approve("file-1", &active_turn, &review).await);
+
+        // Codex applies the approved patch, then completes the item.
+        tokio::fs::write(&source, "two\n").await.unwrap();
+        refresh_file_change_baseline(
+            &file_change_item("item/completed", "file-1", &source),
+            &active_turn,
+        )
+        .await;
+
+        let second = file_change_item("item/started", "file-2", &source);
+        capture_file_change_start(&second, &active_turn, &review).await;
+        assert!(
+            file_change_is_safe_to_approve("file-2", &active_turn, &review).await,
+            "a second patch on a file Codex already edited must not read as foreign drift"
+        );
+
+        // Even without an `item/completed`, an approved path keeps its edits.
+        tokio::fs::write(&source, "three\n").await.unwrap();
+        let third = file_change_item("item/started", "file-3", &source);
+        capture_file_change_start(&third, &active_turn, &review).await;
+        assert!(file_change_is_safe_to_approve("file-3", &active_turn, &review).await);
+
+        // The proposal still diffs against the turn-start content.
+        let active = active_turn.lock().await.take().unwrap();
+        assert_eq!(
+            active.snapshot.original(&source).cloned().unwrap_or(None),
+            Some("one\n".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_write_before_first_approval_is_declined() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        tokio::fs::write(&source, "one\n").await.unwrap();
+
+        let review = review_context(dir.path(), test_write_gate());
+        let (tx, _rx) = mpsc::channel(1);
+        let active_turn = Arc::new(Mutex::new(Some(ActiveTurn::new(tx))));
+
+        let started = file_change_item("item/started", "file-1", &source);
+        capture_file_change_start(&started, &active_turn, &review).await;
+        tokio::fs::write(&source, "concurrent\n").await.unwrap();
+
+        assert!(
+            !file_change_is_safe_to_approve("file-1", &active_turn, &review).await,
+            "drift on a path Codex has not been authorised to write must still decline"
+        );
     }
 
     #[tokio::test]
