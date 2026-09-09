@@ -287,6 +287,12 @@ pub enum Event {
     RemoteSnapshotNeeded,
     RemoteClientConnected,
     RemoteClientDisconnected,
+    /// Plan C §2.2: the background bootstrap finished — the sidecar is
+    /// listening and this carries its handle plus everything `/remote`
+    /// reports. Startup never waits for it (invariant 13).
+    RemoteStarted(Box<crate::app::remote_setup::RemoteStarted>),
+    /// The bootstrap could not start the sidecar; `/remote` shows why.
+    RemoteUnavailable(crate::app::remote_setup::RemoteUnavailable),
 
     // Internal
     Tick,

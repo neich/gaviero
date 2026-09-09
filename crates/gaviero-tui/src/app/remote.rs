@@ -70,13 +70,26 @@ impl CommandFailure {
     }
 }
 
+/// What the background bootstrap (Plan C §2.2) reported, for `/remote`.
+#[derive(Debug, Default)]
+pub enum RemoteStatus {
+    /// Bootstrap still running (or never spawned in tests).
+    #[default]
+    Pending,
+    Running(Box<crate::app::remote_setup::RemoteStarted>),
+    Unavailable(crate::app::remote_setup::RemoteUnavailable),
+}
+
 /// Controller-side remote state: the global snapshot generation, per-
 /// proposal freshness tokens, and the outbound frame buffer the projection
 /// layer drains after each `handle_event` pass (A4).
 pub struct RemoteState {
-    /// Sidecar hub handle once the server is running (A6 spawns it).
-    /// `try_send` only from the event loop (invariant 11).
+    /// Sidecar hub handle once the server is running (the bootstrap task
+    /// delivers it via `Event::RemoteStarted`). `try_send` only from the
+    /// event loop (invariant 11).
     pub handle: Option<gaviero_remote::server::RemoteHandle>,
+    /// Last bootstrap outcome, rendered by `/remote`.
+    pub status: RemoteStatus,
     /// `remote.maxPromptBytes` (§5.2); set from settings when the sidecar
     /// is configured (A6). Default mirrors the wire default.
     pub max_prompt_bytes: usize,
@@ -105,6 +118,7 @@ impl Default for RemoteState {
     fn default() -> Self {
         Self {
             handle: None,
+            status: RemoteStatus::Pending,
             max_prompt_bytes: 128 * 1024,
             revision: 0,
             snapshot_dirty: false,
@@ -213,6 +227,7 @@ pub fn handle_remote_command(app: &mut App, envelope: ClientEnvelope, max_prompt
                 Ok((CommandStatus::Completed, None))
             }
             ClientFrame::RequestMessages(r) => {
+                // 1.1 `latest_page`: an absent cursor means the newest page.
                 crate::app::projection::build_message_page(app, &r.conv_id, r.before_seq, r.limit)
                     .map(|page| {
                         app.remote.push_frame(ServerFrame::MessagePage(page));

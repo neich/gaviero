@@ -25,7 +25,7 @@ use axum::routing::any;
 use subtle::ConstantTimeEq;
 use tokio::sync::mpsc;
 
-use crate::dto::{Limits, WorkspaceInfo};
+use crate::dto::{Limits, MachineInfo, WorkspaceInfo};
 
 pub struct RemoteServerConfig {
     pub bind_addr: SocketAddr,
@@ -44,6 +44,15 @@ pub struct RemoteServerConfig {
     pub confirm_required: Vec<String>,
     pub allowed_slash_commands: Vec<String>,
     pub limits: Limits,
+    /// 1.1 `hello.machine`; `None` keeps the 1.0 shape.
+    pub machine: Option<MachineInfo>,
+    /// Plan C invariant 15: when set, the hub re-reads this file every
+    /// `token_poll_interval` and, if its trimmed content differs from the
+    /// accepted token, performs the `TokenRotated` transition (close 4006).
+    /// This is how a rotation in one TUI reaches every instance sharing the
+    /// machine token.
+    pub token_path: Option<std::path::PathBuf>,
+    pub token_poll_interval: Duration,
     /// Wire defaults: ping 20 s, idle 60 s. Configurable for tests only.
     pub ping_interval: Duration,
     pub idle_timeout: Duration,
@@ -59,6 +68,9 @@ impl RemoteServerConfig {
             Duration::from_secs(10),
         )
     }
+
+    /// Production token-file poll cadence (Plan C §2.2).
+    pub const TOKEN_POLL_INTERVAL: Duration = Duration::from_secs(5);
 }
 
 #[derive(Debug)]

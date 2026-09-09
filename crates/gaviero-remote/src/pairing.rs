@@ -27,7 +27,8 @@ pub fn token_fingerprint(token: &str) -> String {
     format!("{}…{}", &token[..4], &token[token.len() - 4..])
 }
 
-/// The QR payload (§3.4 — frozen shape, also in PROTOCOL.md).
+/// The QR payload (§3.4 — frozen 1.0 shape plus the optional 1.1 keys,
+/// also in PROTOCOL.md). 1.0 apps read named keys only and ignore the rest.
 #[derive(Serialize)]
 pub struct QrPayload<'a> {
     pub kind: &'static str,
@@ -35,15 +36,39 @@ pub struct QrPayload<'a> {
     pub token: &'a str,
     pub workspace: &'a str,
     pub protocol_major: u16,
+    /// 1.1: hex workspace identity, so the app can key instances before
+    /// it has ever connected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<&'a str>,
+    /// 1.1: MagicDNS host — the pairing is per machine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine: Option<&'a str>,
+    /// 1.1: `https://<host>:<directoryPort>/v1/instances`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub directory_url: Option<&'a str>,
 }
 
-pub fn qr_payload_json(url: &str, token: &str, workspace: &str) -> String {
+/// Everything `/remote` knows when it renders the QR.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QrPayloadInput<'a> {
+    pub url: &'a str,
+    pub token: &'a str,
+    pub workspace: &'a str,
+    pub workspace_id: Option<&'a str>,
+    pub machine: Option<&'a str>,
+    pub directory_url: Option<&'a str>,
+}
+
+pub fn qr_payload_json(input: &QrPayloadInput<'_>) -> String {
     serde_json::to_string(&QrPayload {
         kind: "gaviero-remote",
-        url,
-        token,
-        workspace,
+        url: input.url,
+        token: input.token,
+        workspace: input.workspace,
         protocol_major: crate::PROTOCOL_VERSION.major,
+        workspace_id: input.workspace_id,
+        machine: input.machine,
+        directory_url: input.directory_url,
     })
     .expect("QR payload serializes")
 }
@@ -177,13 +202,41 @@ mod tests {
 
     #[test]
     fn qr_payload_shape_matches_the_frozen_contract() {
-        let json = qr_payload_json("wss://host.tail.ts.net:50123/v1/ws", "SECRET", "gaviero");
+        let json = qr_payload_json(&QrPayloadInput {
+            url: "wss://host.tail.ts.net:50123/v1/ws",
+            token: "SECRET",
+            workspace: "gaviero",
+            ..Default::default()
+        });
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["kind"], "gaviero-remote");
         assert_eq!(v["url"], "wss://host.tail.ts.net:50123/v1/ws");
         assert_eq!(v["token"], "SECRET");
         assert_eq!(v["workspace"], "gaviero");
         assert_eq!(v["protocol_major"], 1);
+        // The 1.0 shape is exactly five keys: optional 1.1 keys are omitted,
+        // never emitted as null.
+        assert_eq!(v.as_object().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn qr_payload_carries_the_optional_1_1_keys_when_known() {
+        let json = qr_payload_json(&QrPayloadInput {
+            url: "wss://host.tail.ts.net:50123/v1/ws",
+            token: "SECRET",
+            workspace: "gaviero",
+            workspace_id: Some("4b156f1de41da274"),
+            machine: Some("host.tail.ts.net"),
+            directory_url: Some("https://host.tail.ts.net:49151/v1/instances"),
+        });
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["workspace_id"], "4b156f1de41da274");
+        assert_eq!(v["machine"], "host.tail.ts.net");
+        assert_eq!(
+            v["directory_url"],
+            "https://host.tail.ts.net:49151/v1/instances"
+        );
+        assert_eq!(v["protocol_major"], 1, "still major 1 — the bump is minor");
     }
 
     #[test]

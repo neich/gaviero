@@ -52,6 +52,9 @@ fn test_config(tls: &TestTls) -> RemoteServerConfig {
         tui_version: "0.1.0-test".to_string(),
         workspace: WorkspaceInfo { id: "4b156f1de41da274".into(), display_name: "gaviero".into() },
         capabilities: vec![],
+        machine: None,
+        token_path: None,
+        token_poll_interval: RemoteServerConfig::TOKEN_POLL_INTERVAL,
         confirm_required: vec!["/autoapprove".into(), "/yolo".into(), "/reset".into(), "/clear".into()],
         allowed_slash_commands: vec!["/model".into(), "/help".into()],
         limits: Limits {
@@ -319,6 +322,62 @@ async fn token_rotation_closes_4006_and_old_token_stops_working() {
 }
 
 // ── Ordering and coalescing ──────────────────────────────────────
+
+/// Plan C invariant 15: a rotation that only touches the shared token
+/// file — no `HubInput::TokenRotated` — still closes the live client with
+/// 4006, and afterwards only the new token pairs.
+#[tokio::test(flavor = "multi_thread")]
+async fn token_file_change_rotates_and_closes_4006() {
+    let tls = make_tls();
+    let dir = std::env::temp_dir().join(format!(
+        "gaviero-remote-token-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let token_file = dir.join("token");
+    std::fs::write(&token_file, format!("{TOKEN}\n")).unwrap();
+
+    let mut config = test_config(&tls);
+    config.token_path = Some(token_file.clone());
+    config.token_poll_interval = Duration::from_millis(100);
+    let mut server = spawn(config).await.unwrap();
+    let mut ws = connect_ok(&tls, server.local_addr).await;
+    expect_output(&mut server, "ClientConnected").await;
+    expect_output(&mut server, "SnapshotNeeded").await;
+
+    // Another instance (or the user) rotates: atomic replace of the file.
+    let new_token = "rotated-token-fedcba9876543210fedcba9876543210";
+    let tmp = dir.join("token.tmp");
+    std::fs::write(&tmp, new_token).unwrap();
+    std::fs::rename(&tmp, &token_file).unwrap();
+
+    assert_eq!(next_close_code(&mut ws).await, close_code::TOKEN_ROTATED);
+    expect_output(&mut server, "ClientDisconnected").await;
+
+    // Old token is dead, new token pairs.
+    let err = connect_raw(&tls, server.local_addr, TEST_HOST, Some(TOKEN), Some(SUBPROTOCOL))
+        .await
+        .expect_err("old token must be rejected after a file rotation");
+    assert!(matches!(
+        err,
+        tokio_tungstenite::tungstenite::Error::Http(ref r) if r.status() == 401
+    ));
+    let mut ws2 = connect_raw(&tls, server.local_addr, TEST_HOST, Some(new_token), Some(SUBPROTOCOL))
+        .await
+        .expect("new token pairs");
+    {
+        use futures::SinkExt;
+        ws2.send(Message::Text(client_hello_frame(1).into())).await.unwrap();
+    }
+    let hello = next_frame(&mut ws2).await;
+    assert!(matches!(hello.frame, ServerFrame::Hello(_)));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn interleaved_chunks_coalesce_per_conversation_in_order() {

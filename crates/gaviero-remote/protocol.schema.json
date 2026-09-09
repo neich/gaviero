@@ -76,7 +76,7 @@
         "type": "object"
       },
       "ProtocolVersion": {
-        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1).",
+        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.",
         "properties": {
           "major": {
             "format": "uint16",
@@ -121,9 +121,13 @@
       "RequestMessages": {
         "properties": {
           "before_seq": {
+            "description": "Optional since 1.1 (`latest_page`): absent ⇒ the newest page, as if\n`u64::MAX` had been sent.",
             "format": "uint64",
             "minimum": 0,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "conv_id": {
             "type": "string"
@@ -137,7 +141,6 @@
         },
         "required": [
           "conv_id",
-          "before_seq",
           "limit"
         ],
         "type": "object"
@@ -495,9 +498,122 @@
     "title": "ClientEnvelope",
     "type": "object"
   },
+  "instance_directory": {
+    "$defs": {
+      "InstanceInfo": {
+        "description": "One running instance as listed by the machine registry. Never carries\nan absolute path, a token, or conversation content (Plan C invariant 14).",
+        "properties": {
+          "client_connected": {
+            "description": "A mobile client is currently attached; connecting will replace it.",
+            "type": "boolean"
+          },
+          "instance_id": {
+            "type": "string"
+          },
+          "port": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "started_at": {
+            "description": "RFC 3339.",
+            "type": "string"
+          },
+          "tui_version": {
+            "type": "string"
+          },
+          "url": {
+            "description": "`wss://<host>:<port>/v1/ws`",
+            "type": "string"
+          },
+          "workspace": {
+            "$ref": "#/$defs/WorkspaceInfo"
+          }
+        },
+        "required": [
+          "instance_id",
+          "workspace",
+          "url",
+          "port",
+          "tui_version",
+          "started_at",
+          "client_connected"
+        ],
+        "type": "object"
+      },
+      "ProtocolVersion": {
+        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.",
+        "properties": {
+          "major": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "minor": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "major",
+          "minor"
+        ],
+        "type": "object"
+      },
+      "WorkspaceInfo": {
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "id": {
+            "description": "Hex workspace identity (first 16 lowercase hex chars of the\ncanonical-root SHA-256). Never an absolute path.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "display_name"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Body of `GET /v1/instances`. Only instances with a fresh heartbeat are\nlisted, so \"listed\" means \"running\".",
+    "properties": {
+      "generated_at": {
+        "description": "RFC 3339.",
+        "type": "string"
+      },
+      "host": {
+        "type": "string"
+      },
+      "instances": {
+        "items": {
+          "$ref": "#/$defs/InstanceInfo"
+        },
+        "type": "array"
+      },
+      "protocol_version": {
+        "$ref": "#/$defs/ProtocolVersion"
+      }
+    },
+    "required": [
+      "protocol_version",
+      "host",
+      "generated_at",
+      "instances"
+    ],
+    "title": "InstanceDirectory",
+    "type": "object"
+  },
+  "instances_path": "/v1/instances",
   "protocol_version": {
     "major": 1,
-    "minor": 0
+    "minor": 1
   },
   "server_envelope": {
     "$defs": {
@@ -851,7 +967,7 @@
             "type": "array"
           },
           "capabilities": {
-            "description": "Frozen shape, empty in 1.0. Clients ignore unknown entries.",
+            "description": "Frozen shape, empty in 1.0; 1.1 advertises `latest_page` and\n`instances` (`crate::version::capability`). Clients ignore unknown\nentries.",
             "items": {
               "type": "string"
             },
@@ -868,6 +984,17 @@
           },
           "limits": {
             "$ref": "#/$defs/Limits"
+          },
+          "machine": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/MachineInfo"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "1.1: absent from a 1.0 server."
           },
           "protocol_version": {
             "$ref": "#/$defs/ProtocolVersion"
@@ -1021,6 +1148,24 @@
         "required": [
           "start_line",
           "end_line"
+        ],
+        "type": "object"
+      },
+      "MachineInfo": {
+        "description": "The machine an instance runs on (1.1). `host` is the MagicDNS name the\ncertificate covers; `directory_url` is the machine directory\n(`https://<host>:<directoryPort>/v1/instances`) when enabled.",
+        "properties": {
+          "directory_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "host": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "host"
         ],
         "type": "object"
       },
@@ -1373,7 +1518,7 @@
         "type": "object"
       },
       "ProtocolVersion": {
-        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1).",
+        "description": "Wire protocol version. Deliberately unrelated to any plan-document\nversion: this is the first protocol ever on the wire, so it starts at\nmajor 1 (Plan A V3 §0.1 item 1). Minor 1 (Plan C V1 §4) is additive:\n`hello.machine`, capability strings, optional\n`request_messages.before_seq`, and the `GET /v1/instances` resource.",
         "properties": {
           "major": {
             "format": "uint16",

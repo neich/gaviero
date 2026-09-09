@@ -23,6 +23,12 @@ pub use version::{PROTOCOL_VERSION, ProtocolVersion};
 pub const WS_PATH: &str = "/v1/ws";
 /// Required WebSocket subprotocol.
 pub const SUBPROTOCOL: &str = "gaviero.v1";
+/// HTTPS path of the instance directory (1.1): served on every instance
+/// listener and on the machine directory port.
+pub const INSTANCES_PATH: &str = "/v1/instances";
+/// Default machine directory port — deliberately just below the derived
+/// range `49152–65535` so it can never collide with a workspace port.
+pub const DEFAULT_DIRECTORY_PORT: u16 = 49151;
 
 /// Application close codes (4000–4999). Committed in PROTOCOL.md.
 pub mod close_code {
