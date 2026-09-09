@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, interval};
 
 use super::conn::{CloseSignal, ConnIn, ConnOut, Registration};
-use super::RemoteServerConfig;
+use super::{RegistryConfig, RemoteServerConfig};
 use crate::close_code;
 use crate::dto::{ErrorCode, Hello};
 use crate::envelope::{
@@ -68,6 +68,9 @@ pub(crate) struct RemoteHub {
     /// Plan C invariant 15: machine token file watched for rotation.
     token_path: Option<std::path::PathBuf>,
     token_poll_interval: Duration,
+    registry: Option<RegistryConfig>,
+    heartbeat_interval: Duration,
+    directory_shutdown: Option<watch::Sender<bool>>,
 
     registration_rx: mpsc::Receiver<Registration>,
     inbound_rx: mpsc::Receiver<ConnIn>,
@@ -96,6 +99,7 @@ impl RemoteHub {
         input_rx: mpsc::Receiver<HubInput>,
         output_tx: mpsc::Sender<HubOutput>,
         axum_handles: Vec<axum_server::Handle>,
+        directory_shutdown: Option<watch::Sender<bool>>,
     ) -> Self {
         let rate = config.limits.command_rate_per_second;
         let hello = Hello {
@@ -116,6 +120,9 @@ impl RemoteHub {
             rate_per_second: rate,
             token_path: config.token_path,
             token_poll_interval: config.token_poll_interval,
+            registry: config.registry,
+            heartbeat_interval: config.heartbeat_interval,
+            directory_shutdown,
             registration_rx,
             inbound_rx,
             input_rx,
@@ -141,6 +148,8 @@ impl RemoteHub {
         // The first tick fires immediately; skip it so startup never
         // re-reads a file the host just wrote.
         token_poll.tick().await;
+        let mut heartbeat = interval(self.heartbeat_interval.max(Duration::from_millis(50)));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 reg = self.registration_rx.recv() => {
@@ -162,8 +171,24 @@ impl RemoteHub {
                 _ = token_poll.tick(), if self.token_path.is_some() => {
                     self.poll_token_file().await;
                 }
+                _ = heartbeat.tick(), if self.registry.is_some() => {
+                    self.write_heartbeat();
+                }
             }
         }
+    }
+
+    /// Fire-and-forget: the hub never awaits disk (Plan C §2.3).
+    fn write_heartbeat(&self) {
+        let Some(reg) = &self.registry else { return };
+        let mut entry = reg.entry.clone();
+        entry.client_connected = self.active.is_some();
+        let dir = reg.dir.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = super::registry::write_entry(&dir, &entry) {
+                tracing::warn!(error = %e, "registry heartbeat write failed");
+            }
+        });
     }
 
     /// Plan C invariant 15: a rotation performed by another instance (or by
@@ -350,6 +375,17 @@ impl RemoteHub {
                 .await;
                 for handle in &self.axum_handles {
                     handle.graceful_shutdown(Some(Duration::from_millis(250)));
+                }
+                if let Some(tx) = self.directory_shutdown.take() {
+                    let _ = tx.send(true);
+                }
+                if let Some(reg) = self.registry.take() {
+                    let dir = reg.dir;
+                    let id = reg.entry.instance_id;
+                    let _ = tokio::task::spawn_blocking(move || {
+                        super::registry::delete_entry(&dir, &id);
+                    })
+                    .await;
                 }
                 true
             }
