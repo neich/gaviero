@@ -32,6 +32,8 @@ Workspace dispatch: directory → `Workspace::single_folder`; `*.gaviero-workspa
 
 **Observer bridge:** implements `WriteGateObserver`, `AcpObserver`, `SwarmObserver` from [`gaviero_core::observer`](../gaviero-core/src/observer.rs). Each holds an event-channel sender. **No background task mutates `App` directly.**
 
+**Remote sidecar:** every TUI launch starts a background WSS sidecar (`gaviero-remote`, Plan C) unless `remote.enabled` is false. Host detection, `tailscale cert`, bind, and the machine registry happen off the event loop (`Event::RemoteStarted` / `Event::RemoteUnavailable`). File edits still go through the Write Gate; the phone is a mirror of every conversation tab. Pairing is `/remote` (QR + machine token). See [`crates/gaviero-remote/PROTOCOL.md`](../gaviero-remote/PROTOCOL.md).
+
 **Authoritative slash list:** [`app/commands.rs`](src/app/commands.rs) (and chat helpers in [`panels/agent_chat.rs`](src/panels/agent_chat.rs)). Groups: session (`/model`, `/effort`, `/autoapprove`/`/yolo`, …), context (`/lite`, `/inject`, `/context mode …`), swarm, memory, skills (`/skills`, `$skill`). Do not maintain a second inventory in ARCHITECTURE.md — point here.
 
 ## Conventions
