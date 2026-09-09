@@ -65,6 +65,9 @@ pub(crate) struct RemoteHub {
     hello: Hello,
     token: Arc<Mutex<String>>,
     rate_per_second: u32,
+    /// Plan C invariant 15: machine token file watched for rotation.
+    token_path: Option<std::path::PathBuf>,
+    token_poll_interval: Duration,
 
     registration_rx: mpsc::Receiver<Registration>,
     inbound_rx: mpsc::Receiver<ConnIn>,
@@ -104,12 +107,15 @@ impl RemoteHub {
             confirm_required: config.confirm_required,
             allowed_slash_commands: config.allowed_slash_commands,
             limits: config.limits,
+            machine: config.machine,
         };
         Self {
             instance_id: config.instance_id,
             hello,
             token,
             rate_per_second: rate,
+            token_path: config.token_path,
+            token_poll_interval: config.token_poll_interval,
             registration_rx,
             inbound_rx,
             input_rx,
@@ -130,6 +136,11 @@ impl RemoteHub {
     pub(crate) async fn run(mut self) {
         let mut flush = interval(FLUSH_INTERVAL);
         flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut token_poll = interval(self.token_poll_interval.max(Duration::from_millis(50)));
+        token_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The first tick fires immediately; skip it so startup never
+        // re-reads a file the host just wrote.
+        token_poll.tick().await;
         loop {
             tokio::select! {
                 reg = self.registration_rx.recv() => {
@@ -148,7 +159,39 @@ impl RemoteHub {
                     }
                 }
                 _ = flush.tick() => self.flush_all(),
+                _ = token_poll.tick(), if self.token_path.is_some() => {
+                    self.poll_token_file().await;
+                }
             }
+        }
+    }
+
+    /// Plan C invariant 15: a rotation performed by another instance (or by
+    /// hand) reaches this hub through the shared token file. Content, not
+    /// mtime, is compared — filesystem timestamp granularity is not
+    /// something to depend on for a security transition. `tokio::fs` keeps
+    /// the actor off the blocking path.
+    async fn poll_token_file(&mut self) {
+        let Some(path) = self.token_path.clone() else { return };
+        let Ok(text) = tokio::fs::read_to_string(&path).await else {
+            return; // transient (mid-rename) or removed: keep the current token
+        };
+        let fresh = text.trim();
+        if fresh.is_empty() {
+            return;
+        }
+        let changed = {
+            let current = self.token.lock().expect("token lock");
+            fresh != current.as_str()
+        };
+        if changed {
+            tracing::info!("remote token file changed — rotating and closing the live client");
+            *self.token.lock().expect("token lock") = fresh.to_string();
+            self.close_active(CloseSignal {
+                code: close_code::TOKEN_ROTATED,
+                reason: "token rotated",
+            })
+            .await;
         }
     }
 

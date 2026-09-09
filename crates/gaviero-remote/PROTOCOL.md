@@ -1,18 +1,39 @@
-# Gaviero Remote Protocol — v1.0 (frozen)
+# Gaviero Remote Protocol — v1.1 (1.0 frozen; 1.1 additive)
 
 Normative wire contract between the gaviero TUI sidecar (server) and the mobile client.
-Frozen by Plan A V3 unit A0 on 2026-08-05. The machine-readable form is
+1.0 was frozen by Plan A V3 unit A0 on 2026-08-05; 1.1 was added by Plan C V1 unit C0 on
+2026-09-09 and changes nothing a 1.0 client relies on. The machine-readable form is
 `protocol.schema.json` (generated from the Rust DTOs in this crate — Rust is the source of
 truth); one example fixture per frame lives in [`fixtures/`](fixtures/). Where prose and
 schema disagree, the schema wins.
 
 ```
-PROTOCOL_VERSION  = { major: 1, minor: 0 }
+PROTOCOL_VERSION  = { major: 1, minor: 1 }
 WebSocket path    = /v1/ws
 Subprotocol       = gaviero.v1
+Instances path    = /v1/instances      (HTTPS GET, 1.1)
+Directory port    = 49151 by default   (machine-wide, 1.1)
 ```
 
-The document version of the plan that produced this (V3) is unrelated to the wire version.
+The document version of the plan that produced this (V3 / Plan C V1) is unrelated to the wire
+version.
+
+## 1.1 additions (Plan C V1 §4)
+
+Feature-detect through `hello.capabilities`, never through `minor`.
+
+| Where | Addition | Capability |
+|---|---|---|
+| `hello.capabilities` | contains `"latest_page"` and `"instances"` | — |
+| `hello.machine` | optional `MachineInfo { host, directory_url? }` — the MagicDNS host the certificate covers and, when the machine directory is enabled, `https://<host>:<directoryPort>/v1/instances` | — |
+| `request_messages.before_seq` | **optional**; absent ⇒ the newest page, exactly as if `u64::MAX` had been sent | `latest_page` |
+| `GET /v1/instances` | HTTPS resource on every instance listener **and** on the machine directory port. `Authorization: Bearer` required (`401` otherwise), `Cache-Control: no-store`, `429` above 10 requests/s per listener. Body is `InstanceDirectory` (§DTOs). Only instances with a fresh heartbeat (≤ 90 s) are listed. `/v1/ws` on the directory port is `404`. | `instances` |
+| QR payload | optional `workspace_id`, `machine`, `directory_url` (§QR pairing payload) | — |
+| Token scope | one bearer token per **machine** by default (`~/.gaviero/remote/token`); a workspace may opt out with `remote.tokenScope: "workspace"` and then has its own token. Rotation propagates to every running instance on the machine (each closes its client with `4006`). | — |
+
+Compatibility: a 1.0 client talking to a 1.1 server ignores the new fields and works unchanged. A
+1.1 client talking to a 1.0 server must send `before_seq` (any value ≥ the newest `seq`, e.g.
+`9007199254740991`) and treat the instance as directory-less.
 
 - **major** bumps on incompatible envelope or semantic changes. The server rejects a
   different major.
@@ -124,7 +145,7 @@ holds the current token.
 | `reset_conversation` | `{ conv_id, conv_revision }` |
 | `interrupt` | `{ conv_id, turn_id? }` |
 | `request_snapshot` | `{ }` |
-| `request_messages` | `{ conv_id, before_seq, limit }` — `limit` clamped to 1–200 |
+| `request_messages` | `{ conv_id, before_seq?, limit }` — `limit` clamped to 1–200; `before_seq` optional since 1.1 (absent ⇒ newest page) |
 | `request_proposal` | `{ proposal_id }` |
 
 There is **no** `rotate_token` command. Rotation is desktop-only and reaches the client as
@@ -134,7 +155,7 @@ close 4006.
 
 | type | payload |
 |---|---|
-| `hello` | `{ protocol_version, instance_id, tui_version, workspace: { id, display_name }, capabilities, confirm_required, allowed_slash_commands, limits }` |
+| `hello` | `{ protocol_version, instance_id, tui_version, workspace: { id, display_name }, capabilities, confirm_required, allowed_slash_commands, limits, machine? }` — `machine` since 1.1 |
 | `snapshot` | `{ revision, conversations: [ConversationSummary], active_id, active_conversation: ConversationState, open_permissions: [PermissionRequest], open_proposals: [ProposalSummary], settings: RemoteSettings }` |
 | `conversation_state_changed` | `{ conversation: ConversationSummary, active_id }` — upsert by `conv_id` |
 | `conversation_removed` | `{ conv_id, active_id }` |
@@ -156,12 +177,20 @@ close 4006.
 | `command_error` | `{ command_id, code, message }` |
 
 `hello.capabilities` is an array of strings, **empty in 1.0**; the shape is frozen so
-minor versions can advertise features. Clients ignore unknown entries.
+minor versions can advertise features. 1.1 advertises `latest_page` and `instances`. Clients
+ignore unknown entries.
 
 ## DTOs
 
 ```text
 ProtocolVersion      { major: u16, minor: u16 }
+
+MachineInfo          { host, directory_url? }                                   (1.1)
+InstanceInfo         { instance_id, workspace: { id, display_name }, url, port,
+                       tui_version, started_at, client_connected }             (1.1)
+  url is wss://<host>:<port>/v1/ws; started_at is RFC 3339; never a path or a token.
+InstanceDirectory    { protocol_version, host, generated_at, instances: [InstanceInfo] }  (1.1)
+  Body of GET /v1/instances. Fixture: fixtures/http/instances.json.
 
 ConversationSummary  { conv_id, conv_revision, title, model?, effort?, namespace?,
                        is_streaming, pending_turn_id?, context_pressure?, auto_approve,
@@ -275,15 +304,21 @@ boundary — `/runaway` does not match `/run`.
 
 ```json
 { "kind": "gaviero-remote", "url": "wss://host.tailnet.ts.net:PORT/v1/ws",
-  "token": "SECRET", "workspace": "display-name", "protocol_major": 1 }
+  "token": "SECRET", "workspace": "display-name", "protocol_major": 1,
+  "workspace_id": "0b7d245998c0e8c3", "machine": "host.tailnet.ts.net",
+  "directory_url": "https://host.tailnet.ts.net:49151/v1/instances" }
 ```
 
-The QR is the only intentional display of the token.
+The last three keys are optional (1.1) and omitted when unknown; 1.0 apps ignore them.
+`token` is the machine token unless the workspace opted out (`remote.tokenScope`). The QR is
+the only intentional display of the token.
 
 ## Fixtures
 
 One example per frame type under `fixtures/client/` (13) and `fixtures/server/` (20),
-named `<type>.json`, each a complete envelope. `fixtures/server/message_complete.json`
+named `<type>.json`, each a complete envelope, plus `fixtures/http/instances.json` for the
+1.1 directory body. `fixtures/server/hello.json` shows the 1.1 shape (`machine`, capabilities);
+the test suite also asserts the 1.0 shape (no `machine`) still decodes. `fixtures/server/message_complete.json`
 deliberately contains non-ASCII content (accent + emoji) with hand-verified UTF-8 byte
 offsets — the A1 test suite asserts those offsets land on UTF-8 boundaries and match the
 declared fence positions. Regenerate the schema with the ignored update test documented

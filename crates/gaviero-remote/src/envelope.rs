@@ -114,7 +114,10 @@ pub struct Interrupt {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RequestMessages {
     pub conv_id: String,
-    pub before_seq: u64,
+    /// Optional since 1.1 (`latest_page`): absent ⇒ the newest page, as if
+    /// `u64::MAX` had been sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_seq: Option<u64>,
     /// Clamped server-side to 1–200.
     pub limit: u32,
 }

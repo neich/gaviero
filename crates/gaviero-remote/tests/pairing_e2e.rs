@@ -86,6 +86,9 @@ async fn qr_payload_pairs_a_client_end_to_end() {
             display_name: "gaviero".to_string(),
         },
         capabilities: Vec::new(),
+        machine: None,
+        token_path: None,
+        token_poll_interval: RemoteServerConfig::TOKEN_POLL_INTERVAL,
         confirm_required: ["/autoapprove", "/yolo", "/reset", "/clear"]
             .iter()
             .map(|s| s.to_string())
@@ -110,10 +113,18 @@ async fn qr_payload_pairs_a_client_end_to_end() {
     // 4. Build the QR payload exactly as `/remote` does, then parse it back
     //    the way the app does (Plan B B9 validates kind + protocol_major).
     let url = format!("wss://{MAGIC_DNS_HOST}:{port}/v1/ws");
-    let qr = pairing::qr_payload_json(&url, &token, "gaviero");
+    let qr = pairing::qr_payload_json(&pairing::QrPayloadInput {
+        url: &url,
+        token: &token,
+        workspace: "gaviero",
+        workspace_id: Some("4b156f1de41da274"),
+        machine: Some(MAGIC_DNS_HOST),
+        directory_url: None,
+    });
     let scanned: serde_json::Value = serde_json::from_str(&qr).unwrap();
     assert_eq!(scanned["kind"], "gaviero-remote");
     assert_eq!(scanned["protocol_major"], PROTOCOL_VERSION.major);
+    assert_eq!(scanned["machine"], MAGIC_DNS_HOST);
     let scanned_url = scanned["url"].as_str().unwrap();
     let scanned_token = scanned["token"].as_str().unwrap();
 
@@ -205,6 +216,9 @@ async fn a_stale_qr_token_cannot_pair() {
             display_name: "gaviero".to_string(),
         },
         capabilities: Vec::new(),
+        machine: None,
+        token_path: None,
+        token_poll_interval: RemoteServerConfig::TOKEN_POLL_INTERVAL,
         confirm_required: Vec::new(),
         allowed_slash_commands: Vec::new(),
         limits: Limits {
@@ -266,6 +280,9 @@ async fn a_token_in_the_query_string_is_not_accepted() {
             display_name: "gaviero".to_string(),
         },
         capabilities: Vec::new(),
+        machine: None,
+        token_path: None,
+        token_poll_interval: RemoteServerConfig::TOKEN_POLL_INTERVAL,
         confirm_required: Vec::new(),
         allowed_slash_commands: Vec::new(),
         limits: Limits {

@@ -122,6 +122,86 @@ fn unknown_payload_fields_are_ignored() {
     assert_eq!(h.workspace.id, "4b156f1de41da274");
 }
 
+/// 1.1: `before_seq` is optional. The 1.0 fixture (with the cursor) still
+/// decodes; the cursorless form decodes to `None` and re-encodes without
+/// the key — never as `null`.
+#[test]
+fn request_messages_cursor_is_optional_since_1_1() {
+    let with = fs::read_to_string(fixture_dir("client").join("request_messages.json")).unwrap();
+    let env: ClientEnvelope = serde_json::from_str(&with).unwrap();
+    let gaviero_remote::envelope::ClientFrame::RequestMessages(r) = &env.frame else {
+        panic!("expected request_messages");
+    };
+    assert_eq!(r.before_seq, Some(57));
+
+    let without = r#"{
+        "version": {"major":1,"minor":1},
+        "instance_id": "a3f9c2e14b7d8650",
+        "command_id": "cmd-1013",
+        "type": "request_messages",
+        "payload": { "conv_id": "conv-3", "limit": 50 }
+    }"#;
+    let env: ClientEnvelope = serde_json::from_str(without).expect("cursorless form decodes");
+    let gaviero_remote::envelope::ClientFrame::RequestMessages(r) = &env.frame else {
+        panic!("expected request_messages");
+    };
+    assert_eq!(r.before_seq, None);
+    let back = serde_json::to_value(&env).unwrap();
+    assert!(
+        back["payload"].get("before_seq").is_none(),
+        "absent cursor must be omitted, not null"
+    );
+}
+
+/// 1.1 `hello` carries `machine` and the capability strings; a 1.0 `hello`
+/// (no `machine`, empty capabilities) still decodes.
+#[test]
+fn hello_machine_is_optional() {
+    let text = fs::read_to_string(fixture_dir("server").join("hello.json")).unwrap();
+    let env: ServerEnvelope = serde_json::from_str(&text).unwrap();
+    let gaviero_remote::envelope::ServerFrame::Hello(h) = &env.frame else {
+        panic!("expected hello");
+    };
+    let machine = h.machine.as_ref().expect("1.1 fixture carries machine");
+    assert_eq!(machine.host, "host.tailnet.ts.net");
+    assert!(h.capabilities.iter().any(|c| c == gaviero_remote::version::capability::LATEST_PAGE));
+    assert!(h.capabilities.iter().any(|c| c == gaviero_remote::version::capability::INSTANCES));
+
+    let mut v: Value = serde_json::from_str(&text).unwrap();
+    v["payload"].as_object_mut().unwrap().remove("machine");
+    v["payload"]["capabilities"] = Value::Array(vec![]);
+    let env: ServerEnvelope = serde_json::from_value(v).expect("1.0 hello decodes");
+    let gaviero_remote::envelope::ServerFrame::Hello(h) = &env.frame else {
+        panic!("expected hello");
+    };
+    assert!(h.machine.is_none());
+    let back = serde_json::to_value(&env).unwrap();
+    assert!(back["payload"].get("machine").is_none(), "None is omitted, never null");
+}
+
+/// The `GET /v1/instances` body has its own fixture and round-trips.
+#[test]
+fn instances_fixture_round_trips() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join("http")
+        .join("instances.json");
+    let text = fs::read_to_string(&path).expect("http/instances.json fixture");
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    let dir: gaviero_remote::dto::InstanceDirectory = serde_json::from_str(&text).unwrap();
+    assert_eq!(serde_json::to_value(&dir).unwrap(), parsed);
+    assert_eq!(dir.instances.len(), 2);
+    assert!(dir.instances.iter().any(|i| i.client_connected));
+    for inst in &dir.instances {
+        assert!(inst.url.starts_with("wss://"));
+        assert!(inst.url.ends_with(gaviero_remote::WS_PATH));
+        assert!(
+            !inst.workspace.id.contains('/') && !inst.workspace.id.contains('\\'),
+            "workspace.id is an opaque hash, never a path"
+        );
+    }
+}
+
 #[test]
 fn incompatible_major_is_rejected() {
     let theirs = ProtocolVersion { major: 2, minor: 0 };

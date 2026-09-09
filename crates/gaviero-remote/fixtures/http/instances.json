@@ -1,0 +1,25 @@
+{
+  "protocol_version": { "major": 1, "minor": 1 },
+  "host": "host.tailnet.ts.net",
+  "generated_at": "2026-09-09T12:00:00Z",
+  "instances": [
+    {
+      "instance_id": "a3f9c2e14b7d8650",
+      "workspace": { "id": "4b156f1de41da274", "display_name": "gaviero" },
+      "url": "wss://host.tailnet.ts.net:52093/v1/ws",
+      "port": 52093,
+      "tui_version": "0.1.0",
+      "started_at": "2026-09-09T11:58:03Z",
+      "client_connected": false
+    },
+    {
+      "instance_id": "0c7e5d21b9a4f38e",
+      "workspace": { "id": "9d2b7c41e0f5a6b3", "display_name": "gaviero-flutter" },
+      "url": "wss://host.tailnet.ts.net:61440/v1/ws",
+      "port": 61440,
+      "tui_version": "0.1.0",
+      "started_at": "2026-09-09T11:59:40Z",
+      "client_connected": true
+    }
+  ]
+}

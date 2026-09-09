@@ -5,17 +5,21 @@
 
 use serde_json::{Value, json};
 
-/// The complete machine-readable protocol contract: both envelope schemas
-/// plus the wire version, in one stable document.
+/// The complete machine-readable protocol contract: both envelope schemas,
+/// the `GET /v1/instances` body (1.1), plus the wire version, in one stable
+/// document.
 pub fn protocol_schema() -> Value {
     let client = schemars::schema_for!(crate::envelope::ClientEnvelope);
     let server = schemars::schema_for!(crate::envelope::ServerEnvelope);
+    let directory = schemars::schema_for!(crate::dto::InstanceDirectory);
     json!({
         "$comment": "Generated from gaviero-remote DTOs — do not edit by hand.",
         "protocol_version": crate::version::PROTOCOL_VERSION,
         "ws_path": crate::WS_PATH,
         "subprotocol": crate::SUBPROTOCOL,
+        "instances_path": crate::INSTANCES_PATH,
         "client_envelope": client,
         "server_envelope": server,
+        "instance_directory": directory,
     })
 }

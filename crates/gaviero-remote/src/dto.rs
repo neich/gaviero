@@ -27,17 +27,61 @@ pub struct Limits {
     pub command_rate_per_second: u32,
 }
 
+/// The machine an instance runs on (1.1). `host` is the MagicDNS name the
+/// certificate covers; `directory_url` is the machine directory
+/// (`https://<host>:<directoryPort>/v1/instances`) when enabled.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct MachineInfo {
+    pub host: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_url: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Hello {
     pub protocol_version: ProtocolVersion,
     pub instance_id: String,
     pub tui_version: String,
     pub workspace: WorkspaceInfo,
-    /// Frozen shape, empty in 1.0. Clients ignore unknown entries.
+    /// Frozen shape, empty in 1.0; 1.1 advertises `latest_page` and
+    /// `instances` (`crate::version::capability`). Clients ignore unknown
+    /// entries.
     pub capabilities: Vec<String>,
     pub confirm_required: Vec<String>,
     pub allowed_slash_commands: Vec<String>,
     pub limits: Limits,
+    /// 1.1: absent from a 1.0 server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<MachineInfo>,
+}
+
+// ── Instance directory (1.1, `GET /v1/instances`) ────────────────
+
+/// One running instance as listed by the machine registry. Never carries
+/// an absolute path, a token, or conversation content (Plan C invariant 14).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct InstanceInfo {
+    pub instance_id: String,
+    pub workspace: WorkspaceInfo,
+    /// `wss://<host>:<port>/v1/ws`
+    pub url: String,
+    pub port: u16,
+    pub tui_version: String,
+    /// RFC 3339.
+    pub started_at: String,
+    /// A mobile client is currently attached; connecting will replace it.
+    pub client_connected: bool,
+}
+
+/// Body of `GET /v1/instances`. Only instances with a fresh heartbeat are
+/// listed, so "listed" means "running".
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct InstanceDirectory {
+    pub protocol_version: ProtocolVersion,
+    pub host: String,
+    /// RFC 3339.
+    pub generated_at: String,
+    pub instances: Vec<InstanceInfo>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
