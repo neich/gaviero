@@ -55,6 +55,11 @@ fn test_config(tls: &TestTls) -> RemoteServerConfig {
         machine: None,
         token_path: None,
         token_poll_interval: RemoteServerConfig::TOKEN_POLL_INTERVAL,
+        registry: None,
+        directory_bind_addrs: Vec::new(),
+        heartbeat_interval: gaviero_remote::server::registry::HEARTBEAT_INTERVAL,
+        directory_retry_interval: gaviero_remote::server::registry::DIRECTORY_RETRY_INTERVAL,
+        stale_after: gaviero_remote::server::registry::STALE_AFTER,
         confirm_required: vec!["/autoapprove".into(), "/yolo".into(), "/reset".into(), "/clear".into()],
         allowed_slash_commands: vec!["/model".into(), "/help".into()],
         limits: Limits {
@@ -676,4 +681,294 @@ async fn shutdown_closes_with_4007() {
 
     server.handle.try_send(HubInput::Shutdown).unwrap();
     assert_eq!(next_close_code(&mut ws).await, close_code::SERVER_SHUTDOWN);
+}
+
+// ── Plan C C3: registry + GET /v1/instances + directory port ──────
+
+use gaviero_remote::dto::{InstanceDirectory, InstanceInfo, MachineInfo};
+use gaviero_remote::server::registry::{self, RegistryConfig};
+use gaviero_remote::INSTANCES_PATH;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+fn free_loopback_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.local_addr().unwrap().port()
+}
+
+fn registry_entry(id: &str, name: &str, port: u16) -> InstanceInfo {
+    InstanceInfo {
+        instance_id: id.into(),
+        workspace: WorkspaceInfo {
+            id: format!("ws-{id}"),
+            display_name: name.into(),
+        },
+        url: format!("wss://{TEST_HOST}:{port}{WS_PATH}"),
+        port,
+        tui_version: "0.1.0-test".into(),
+        started_at: "2026-09-09T12:00:00Z".into(),
+        client_connected: false,
+    }
+}
+
+async fn https_get(
+    tls: &TestTls,
+    addr: SocketAddr,
+    host: &str,
+    token: Option<&str>,
+    path: &str,
+) -> (u16, String, String) {
+    let tcp = TcpStream::connect(addr).await.expect("tcp");
+    let connector = tokio_rustls::TlsConnector::from(tls.client_config.clone());
+    let name = rustls::pki_types::ServerName::try_from(host.to_string()).unwrap();
+    let mut stream = connector.connect(name, tcp).await.expect("tls");
+    let auth = match token {
+        Some(t) => format!("Authorization: Bearer {t}\r\n"),
+        None => String::new(),
+    };
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{auth}Connection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_str(), ""));
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (status, head.to_string(), body.to_string())
+}
+
+fn with_registry(mut config: RemoteServerConfig, dir: &std::path::Path, id: &str) -> RemoteServerConfig {
+    let port = 1; // rewritten after bind is unknown; heartbeat uses this until first write after spawn — tests wait for heartbeat and re-check url/port from disk if needed.
+    config.machine = Some(MachineInfo {
+        host: TEST_HOST.into(),
+        directory_url: None,
+    });
+    config.registry = Some(RegistryConfig {
+        dir: dir.to_path_buf(),
+        entry: registry_entry(id, id, port),
+    });
+    config.heartbeat_interval = Duration::from_millis(80);
+    config.stale_after = Duration::from_secs(90);
+    config
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn instances_get_requires_bearer_and_does_not_evict() {
+    let tls = make_tls();
+    let dir = tempfile::tempdir().unwrap();
+    let config = with_registry(test_config(&tls), dir.path(), "alpha");
+    let mut server = spawn(config).await.unwrap();
+    let addr = server.local_addr;
+    let mut ws = connect_ok(&tls, addr).await;
+    expect_output(&mut server, "ClientConnected").await;
+    expect_output(&mut server, "SnapshotNeeded").await;
+
+    let (status, _, body) = https_get(&tls, addr, TEST_HOST, None, INSTANCES_PATH).await;
+    assert_eq!(status, 401);
+    assert!(body.trim().is_empty() || !body.contains("token"));
+
+    // Live client still there: a prompt is accepted.
+    use futures::SinkExt;
+    ws.send(Message::Text(send_prompt_envelope("cmd-still-alive").into()))
+        .await
+        .unwrap();
+    expect_output(&mut server, "Command").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn instances_get_lists_fresh_entries_and_sets_no_store() {
+    let tls = make_tls();
+    let dir = tempfile::tempdir().unwrap();
+    let config = with_registry(test_config(&tls), dir.path(), INSTANCE);
+    let server = spawn(config).await.unwrap();
+    let addr = server.local_addr;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let dir_body = loop {
+        let (status, head, body) =
+            https_get(&tls, addr, TEST_HOST, Some(TOKEN), INSTANCES_PATH).await;
+        assert_eq!(status, 200);
+        assert!(
+            head.to_ascii_lowercase().contains("cache-control: no-store"),
+            "head={head}"
+        );
+        let parsed: InstanceDirectory = serde_json::from_str(&body).unwrap();
+        if parsed.instances.iter().any(|i| i.instance_id == INSTANCE) {
+            break parsed;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("heartbeat never appeared: {body}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(dir_body.host, TEST_HOST);
+    assert!(!dir_body.instances[0].url.contains('\\'));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn instances_get_omits_and_deletes_stale_entry() {
+    let tls = make_tls();
+    let dir = tempfile::tempdir().unwrap();
+    let stale = registry_entry("stale-one", "stale", 9);
+    registry::write_entry(dir.path(), &stale).unwrap();
+    let path = dir.path().join("stale-one.json");
+    let f = std::fs::File::options().write(true).open(&path).unwrap();
+    f.set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
+        .unwrap();
+    drop(f);
+
+    let config = with_registry(test_config(&tls), dir.path(), INSTANCE);
+    let server = spawn(config).await.unwrap();
+    let (status, _, body) =
+        https_get(&tls, server.local_addr, TEST_HOST, Some(TOKEN), INSTANCES_PATH).await;
+    assert_eq!(status, 200);
+    let parsed: InstanceDirectory = serde_json::from_str(&body).unwrap();
+    assert!(
+        parsed.instances.iter().all(|i| i.instance_id != "stale-one"),
+        "{body}"
+    );
+    assert!(!path.exists(), "stale file must be deleted");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_servers_share_a_registry_dir() {
+    let tls = make_tls();
+    let dir = tempfile::tempdir().unwrap();
+    let a = spawn(with_registry(test_config(&tls), dir.path(), "inst-a")).await.unwrap();
+    let mut cfg_b = with_registry(test_config(&tls), dir.path(), "inst-b");
+    cfg_b.instance_id = "inst-b".into();
+    let b = spawn(cfg_b).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let (_, _, body) =
+            https_get(&tls, a.local_addr, TEST_HOST, Some(TOKEN), INSTANCES_PATH).await;
+        let parsed: InstanceDirectory = serde_json::from_str(&body).unwrap();
+        let ids: Vec<_> = parsed.instances.iter().map(|i| i.instance_id.as_str()).collect();
+        if ids.contains(&"inst-a") && ids.contains(&"inst-b") {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("expected both instances, got {ids:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let _ = b;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn client_connected_flips_within_one_heartbeat() {
+    let tls = make_tls();
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = spawn(with_registry(test_config(&tls), dir.path(), INSTANCE))
+        .await
+        .unwrap();
+    let addr = server.local_addr;
+    let _ws = connect_ok(&tls, addr).await;
+    expect_output(&mut server, "ClientConnected").await;
+    expect_output(&mut server, "SnapshotNeeded").await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let (_, _, body) = https_get(&tls, addr, TEST_HOST, Some(TOKEN), INSTANCES_PATH).await;
+        let parsed: InstanceDirectory = serde_json::from_str(&body).unwrap();
+        if parsed
+            .instances
+            .iter()
+            .any(|i| i.instance_id == INSTANCE && i.client_connected)
+        {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("client_connected never flipped: {body}");
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_deletes_registry_entry() {
+    let tls = make_tls();
+    let dir = tempfile::tempdir().unwrap();
+    let server = spawn(with_registry(test_config(&tls), dir.path(), INSTANCE))
+        .await
+        .unwrap();
+    let path = dir.path().join(format!("{INSTANCE}.json"));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !path.exists() {
+        if tokio::time::Instant::now() > deadline {
+            panic!("heartbeat file never appeared");
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    server.handle.try_send(HubInput::Shutdown).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while path.exists() {
+        if tokio::time::Instant::now() > deadline {
+            panic!("heartbeat file survived shutdown");
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_port_ws_is_404_and_leader_handover_works() {
+    let tls = make_tls();
+    let dir_port = free_loopback_port();
+    let dir_addr: SocketAddr = format!("127.0.0.1:{dir_port}").parse().unwrap();
+
+    let mut cfg_a = test_config(&tls);
+    cfg_a.directory_bind_addrs = vec![dir_addr];
+    cfg_a.directory_retry_interval = Duration::from_millis(80);
+    let a = spawn(cfg_a).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !a.directory_leader.load(std::sync::atomic::Ordering::Relaxed) {
+        if tokio::time::Instant::now() > deadline {
+            panic!("A never became directory leader");
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+
+    let mut cfg_b = test_config(&tls);
+    cfg_b.instance_id = "inst-b".into();
+    cfg_b.directory_bind_addrs = vec![dir_addr];
+    cfg_b.directory_retry_interval = Duration::from_millis(80);
+    let b = spawn(cfg_b).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !b.directory_leader.load(std::sync::atomic::Ordering::Relaxed),
+        "B must not be leader while A holds the port"
+    );
+
+    let (status, _, _) = https_get(&tls, dir_addr, TEST_HOST, Some(TOKEN), WS_PATH).await;
+    assert_eq!(status, 404, "/v1/ws on the directory port must 404");
+
+    a.handle.try_send(HubInput::Shutdown).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !b.directory_leader.load(std::sync::atomic::Ordering::Relaxed) {
+        if tokio::time::Instant::now() > deadline {
+            panic!("B did not become leader after A shutdown");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn instances_get_flood_returns_429() {
+    let tls = make_tls();
+    let server = spawn(test_config(&tls)).await.unwrap();
+    let addr = server.local_addr;
+    let mut saw_429 = false;
+    for _ in 0..40 {
+        let (status, _, _) =
+            https_get(&tls, addr, TEST_HOST, Some(TOKEN), INSTANCES_PATH).await;
+        if status == 429 {
+            saw_429 = true;
+            break;
+        }
+    }
+    assert!(saw_429, "flooding GET /v1/instances must hit the 10/s cap");
 }
