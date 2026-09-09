@@ -285,10 +285,12 @@ pub(crate) fn proposal_summary_dto(
 /// `request_messages` reducer: messages with `seq < before_seq`,
 /// newest-first request semantics, `limit` clamped to 1–200, response
 /// capped at 512 KiB. Returns messages in ascending order plus the cursor.
+/// An absent `before_seq` (1.1 `latest_page`) is the newest page — the
+/// contract says "as if `u64::MAX`" and this is literally that.
 pub fn build_message_page(
     app: &App,
     conv_id: &str,
-    before_seq: u64,
+    before_seq: Option<u64>,
     limit: u32,
 ) -> Result<renv::MessagePage, CommandFailure> {
     let Some(idx) = app.chat_state.find_conv_idx(conv_id) else {
@@ -297,6 +299,7 @@ pub fn build_message_page(
             "unknown conversation",
         ));
     };
+    let before_seq = before_seq.unwrap_or(u64::MAX);
     let limit = limit.clamp(1, 200) as usize;
     let conv = &app.chat_state.conversations[idx];
     let mut selected: Vec<rdto::Message> = Vec::new();
@@ -566,6 +569,8 @@ pub fn project_hot_event(app: &App, event: &Event) -> Option<ServerFrame> {
         | Event::RemoteSnapshotNeeded
         | Event::RemoteClientConnected
         | Event::RemoteClientDisconnected
+        | Event::RemoteStarted(_)
+        | Event::RemoteUnavailable(_)
         | Event::Tick => None,
     }
 }

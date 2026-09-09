@@ -1653,6 +1653,27 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
         Event::RemoteClientDisconnected => {
             app.remote.client_connected = false;
         }
+        // Plan C §2.2: the bootstrap task hands the sidecar over here; this
+        // is the only place the handle is installed (invariant 13).
+        Event::RemoteStarted(started) => {
+            app.remote.handle = Some(started.handle.clone());
+            app.remote.max_prompt_bytes = started.max_prompt_bytes;
+            app.remote.snapshot_dirty = true;
+            tracing::info!(
+                port = started.port,
+                host = %started.host,
+                "remote sidecar listening"
+            );
+            app.remote.status = crate::app::remote::RemoteStatus::Running(started);
+        }
+        Event::RemoteUnavailable(reason) => {
+            if matches!(reason, crate::app::remote_setup::RemoteUnavailable::Disabled) {
+                tracing::debug!("remote sidecar disabled by settings");
+            } else {
+                tracing::warn!("remote sidecar unavailable: {reason}");
+            }
+            app.remote.status = crate::app::remote::RemoteStatus::Unavailable(reason);
+        }
         Event::Tick => {
             app.terminal_manager.tick();
             app.maybe_reassert_vt_mouse(false);

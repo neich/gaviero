@@ -425,49 +425,16 @@ async fn main() -> Result<()> {
     // Warm up the code graph in the background (non-blocking).
     crate::app::session::warm_up_repo_map(&app);
 
-    // Remote sidecar (Plan A A6). Disabled by default; a bind failure or a
-    // missing certificate disables the sidecar, never the TUI. `/remote`
-    // reports the same diagnostics on demand.
-    {
-        use crate::app::remote_setup;
-        match remote_setup::resolve_config(&app.workspace) {
-            Ok(config) if config.enabled => {
-                app.remote.max_prompt_bytes = config.max_prompt_bytes as usize;
-                match remote_setup::check_availability(&config) {
-                    Ok(availability) => match remote_setup::load_or_create_token(&config) {
-                        Ok(token) => {
-                            let instance_id =
-                                gaviero_remote::pairing::generate_token()[..16].to_string();
-                            match remote_setup::start(
-                                &config,
-                                availability,
-                                token,
-                                instance_id,
-                                event_loop.tx(),
-                            )
-                            .await
-                            {
-                                Ok(handle) => {
-                                    tracing::info!(
-                                        port = config.port,
-                                        host = %config.magic_dns_host,
-                                        "remote sidecar listening"
-                                    );
-                                    app.remote.handle = Some(handle);
-                                    app.remote.snapshot_dirty = true;
-                                }
-                                Err(e) => tracing::warn!("remote sidecar disabled: {e}"),
-                            }
-                        }
-                        Err(e) => tracing::warn!("remote sidecar disabled: token error: {e}"),
-                    },
-                    Err(e) => tracing::warn!("remote sidecar unavailable: {e}"),
-                }
-            }
-            Ok(_) => tracing::debug!("remote sidecar disabled by settings"),
-            Err(e) => tracing::warn!("remote sidecar not configured: {e}"),
-        }
-    }
+    // Remote sidecar (Plan A A6, Plan C §2.2). Enabled by default; host
+    // detection, certificate provisioning, and binding run in a background
+    // task that reports through `Event::RemoteStarted` /
+    // `Event::RemoteUnavailable` — startup never waits for it (invariant
+    // 13). A failure disables the sidecar, never the TUI; `/remote` shows
+    // the same diagnostics on demand.
+    tokio::spawn(crate::app::remote_setup::bootstrap(
+        app.workspace.clone(),
+        event_loop.tx(),
+    ));
 
     // Main loop — drain all pending events before each render to reduce latency.
     // Without draining, each event triggers a full redraw; during streaming bursts
