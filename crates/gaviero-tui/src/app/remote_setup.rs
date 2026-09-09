@@ -661,6 +661,9 @@ pub struct RemoteStarted {
     pub token_fingerprint: String,
     /// The machine directory port this instance participates in, if enabled.
     pub directory_port: Option<u16>,
+    /// True while this process holds the directory listener. `None` if the
+    /// directory is disabled.
+    pub directory_leader: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub max_prompt_bytes: usize,
 }
 
@@ -702,6 +705,29 @@ pub async fn start(
     for port in candidates {
         let mut addrs = bind_addrs_on(config, &availability.tailnet_addrs, port);
         let primary = addrs.remove(0);
+        let dir_url = directory_url(config);
+        let directory_bind_addrs = if config.directory_enabled {
+            bind_addrs_on(config, &availability.tailnet_addrs, config.directory_port)
+        } else {
+            Vec::new()
+        };
+        let registry = config.machine_state_dir.as_ref().map(|machine| {
+            gaviero_remote::server::RegistryConfig {
+                dir: machine.join("instances"),
+                entry: gaviero_remote::dto::InstanceInfo {
+                    instance_id: instance_id.clone(),
+                    workspace: gaviero_remote::dto::WorkspaceInfo {
+                        id: config.workspace_id.clone(),
+                        display_name: config.workspace_display_name.clone(),
+                    },
+                    url: pairing_url_on(config, port),
+                    port,
+                    tui_version: env!("CARGO_PKG_VERSION").to_string(),
+                    started_at: gaviero_remote::server::registry::utc_now_rfc3339(),
+                    client_connected: false,
+                },
+            }
+        });
         let spawned = gaviero_remote::server::spawn(RemoteServerConfig {
             bind_addr: primary,
             extra_bind_addrs: addrs,
@@ -714,15 +740,21 @@ pub async fn start(
                 id: config.workspace_id.clone(),
                 display_name: config.workspace_display_name.clone(),
             },
-            // 1.1: `latest_page` is served by the reducer; `instances` is
-            // advertised once the directory route exists (C3).
-            capabilities: vec![gaviero_remote::version::capability::LATEST_PAGE.to_string()],
+            capabilities: vec![
+                gaviero_remote::version::capability::LATEST_PAGE.to_string(),
+                gaviero_remote::version::capability::INSTANCES.to_string(),
+            ],
             machine: Some(gaviero_remote::dto::MachineInfo {
                 host: config.magic_dns_host.clone(),
-                directory_url: None,
+                directory_url: dir_url.clone(),
             }),
             token_path: Some(token.path.clone()),
             token_poll_interval: RemoteServerConfig::TOKEN_POLL_INTERVAL,
+            registry,
+            directory_bind_addrs,
+            heartbeat_interval: gaviero_remote::server::registry::HEARTBEAT_INTERVAL,
+            directory_retry_interval: gaviero_remote::server::registry::DIRECTORY_RETRY_INTERVAL,
+            stale_after: gaviero_remote::server::registry::STALE_AFTER,
             confirm_required: crate::app::remote::REMOTE_CONFIRM_REQUIRED
                 .iter()
                 .map(|s| s.to_string())
@@ -782,7 +814,10 @@ pub async fn start(
             tailnet_addrs: availability.tailnet_addrs.clone(),
             token_scope: token.scope,
             token_fingerprint: pairing::token_fingerprint(&token.token),
-            directory_port: None,
+            directory_port: config.directory_enabled.then_some(config.directory_port),
+            directory_leader: config
+                .directory_enabled
+                .then(|| spawned.directory_leader.clone()),
             max_prompt_bytes: config.max_prompt_bytes as usize,
         });
     }
@@ -1028,12 +1063,61 @@ fn status_report(app: &App, config: &RemoteConfig) -> String {
     let token = load_or_create_token(config);
     match &token {
         Ok(loaded) => report.push_str(&format!(
-            "Token: {}-scoped ({}) {}\n",
+            "Token: {}-scoped {}\n",
             loaded.scope.as_str(),
-            loaded.path.display(),
             pairing::token_fingerprint(&loaded.token)
         )),
         Err(e) => report.push_str(&format!("Token: {e}\n")),
+    }
+
+    let dir_role = match &app.remote.status {
+        RemoteStatus::Running(s) if s.directory_port.is_none() => "disabled".to_string(),
+        RemoteStatus::Running(s) => {
+            let leader = s
+                .directory_leader
+                .as_ref()
+                .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed));
+            if leader {
+                format!("leader on {}", s.directory_port.unwrap_or(config.directory_port))
+            } else {
+                format!(
+                    "follower (another instance holds {})",
+                    s.directory_port.unwrap_or(config.directory_port)
+                )
+            }
+        }
+        _ if !config.directory_enabled => "disabled".to_string(),
+        _ => "starting".to_string(),
+    };
+    report.push_str(&format!("Directory: {dir_role}\n"));
+
+    if let Some(machine) = &config.machine_state_dir {
+        let listed = gaviero_remote::server::registry::read_directory(
+            &machine.join("instances"),
+            &config.magic_dns_host,
+            gaviero_remote::server::registry::STALE_AFTER,
+        );
+        let others: Vec<_> = listed
+            .instances
+            .iter()
+            .filter(|i| i.workspace.id != config.workspace_id)
+            .collect();
+        if others.is_empty() {
+            report.push_str("Other instances: none\n");
+        } else {
+            report.push_str("Other instances:\n");
+            for inst in others {
+                let flag = if inst.client_connected {
+                    "in use"
+                } else {
+                    "listening"
+                };
+                report.push_str(&format!(
+                    "  {} ({}) :{} {flag}\n",
+                    inst.workspace.display_name, inst.workspace.id, inst.port
+                ));
+            }
+        }
     }
 
     report.push_str(&format!(
@@ -1183,7 +1267,7 @@ mod tests {
         config.host_detail = Some("tailscale CLI not found".to_string());
         let err = check_availability(&config).expect_err("must refuse to claim availability");
         match err {
-            RemoteUnavailable::NoMagicDnsHost { detail } => {
+            RemoteUnavailable::NoMagicDnsHost { ref detail } => {
                 assert!(detail.contains("tailscale CLI not found"));
             }
             other => panic!("expected NoMagicDnsHost, got {other:?}"),

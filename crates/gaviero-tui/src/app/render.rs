@@ -777,7 +777,18 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
     } else {
         String::new()
     };
-    let model_info = format!("{}|{} ctx:{}{}", model, effort, ctx_size, cost_suffix);
+    let model_info = format!(
+        "{}|{} ctx:{}{}{}",
+        model,
+        effort,
+        ctx_size,
+        cost_suffix,
+        if app.remote.client_connected {
+            " │ remote"
+        } else {
+            ""
+        }
+    );
 
     let current_buffer = if app.focus == Focus::Editor {
         app.buffers.get(app.active_buffer)

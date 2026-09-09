@@ -694,3 +694,96 @@ pub fn apply_review_action(
     app.remote.snapshot_dirty = true;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gaviero_core::workspace::Workspace;
+    use gaviero_remote::envelope::ServerFrame;
+
+    use crate::app::App;
+    use crate::event::Event;
+
+    fn two_tab_app() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".gaviero")).unwrap();
+        std::fs::write(dir.path().join(".gaviero/settings.json"), "{}").unwrap();
+        let ws = Workspace::single_folder(dir.path().to_path_buf());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(ws, tx);
+        app.chat_state.new_conversation();
+        assert_eq!(app.chat_state.active_conv, 1);
+        (dir, app)
+    }
+
+    fn background_id(app: &App) -> String {
+        app.chat_state.conversations[0].id.clone()
+    }
+
+    #[test]
+    fn slash_interrupt_and_page_leave_active_conv_untouched() {
+        let (_dir, mut app) = two_tab_app();
+        let bg = background_id(&app);
+        app.chat_state.add_user_message_at(0, "hello");
+        app.chat_state.add_user_message_at(0, "there");
+        let active_before = app.chat_state.active_conv;
+
+        apply_remote_slash(&mut app, &bg, "/lite", false).unwrap();
+        assert_eq!(app.chat_state.active_conv, active_before);
+        assert!(
+            app.chat_state.conversations[0].lite_next,
+            "slash must land on the named conversation"
+        );
+
+        apply_interrupt(&mut app, &bg, None).unwrap();
+        assert_eq!(app.chat_state.active_conv, active_before);
+
+        let page = crate::app::projection::build_message_page(&app, &bg, None, 50).unwrap();
+        assert_eq!(page.conv_id, bg);
+        assert_eq!(app.chat_state.active_conv, active_before);
+        assert!(page.messages.len() >= 2);
+
+        let oldest = page.messages[0].seq;
+        let page2 =
+            crate::app::projection::build_message_page(&app, &bg, Some(oldest), 50).unwrap();
+        assert!(page2.messages.iter().all(|m| m.seq < oldest));
+        assert_eq!(app.chat_state.active_conv, active_before);
+    }
+
+    #[test]
+    fn message_complete_on_non_active_conversation_is_projected() {
+        let (_dir, mut app) = two_tab_app();
+        let bg = background_id(&app);
+        app.chat_state.add_user_message_at(0, "prompt");
+        let active_before = app.chat_state.active_conv;
+
+        crate::app::controller::handle_event(
+            &mut app,
+            Event::MessageComplete {
+                conv_id: bg.clone(),
+                role: "assistant".into(),
+                content: "done".into(),
+            },
+        );
+        assert_eq!(app.chat_state.active_conv, active_before);
+        assert!(
+            app.remote.pending_frames.iter().any(|f| matches!(
+                f,
+                ServerFrame::MessageComplete(m) if m.conv_id == bg
+            )),
+            "pending={:?}",
+            app.remote.pending_frames
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_prompt_targets_named_conversation_not_active_tab() {
+        let (_dir, mut app) = two_tab_app();
+        let bg = background_id(&app);
+        let active_before = app.chat_state.active_conv;
+        let _ = apply_remote_prompt(&mut app, &bg, "hello from phone", 131_072);
+        assert_eq!(app.chat_state.active_conv, active_before);
+        assert_eq!(app.chat_state.conversations[0].id, bg);
+        let _ = apply_interrupt(&mut app, &bg, None);
+    }
+}
