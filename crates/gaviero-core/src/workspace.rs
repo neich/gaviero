@@ -286,6 +286,15 @@ pub mod settings {
     pub const REMOTE_MAX_FRAME_BYTES: &str = "remote.maxFrameBytes";
     pub const REMOTE_MAX_PROMPT_BYTES: &str = "remote.maxPromptBytes";
     pub const REMOTE_COMMAND_RATE_PER_SECOND: &str = "remote.commandRatePerSecond";
+    // Plan C V1 §3. `remote.enabled` now defaults to true; an empty
+    // `magicDnsHost` means auto-detect; empty cert/key paths mean "explicit
+    // → legacy workspace pair → machine pair"; the token is machine-scoped
+    // unless `tokenScope` is "workspace"; the machine directory listener
+    // is leader-by-bind on `directoryPort` (0 is an error, like `port`).
+    pub const REMOTE_AUTO_CERT: &str = "remote.autoCert";
+    pub const REMOTE_TOKEN_SCOPE: &str = "remote.tokenScope";
+    pub const REMOTE_DIRECTORY_ENABLED: &str = "remote.directoryEnabled";
+    pub const REMOTE_DIRECTORY_PORT: &str = "remote.directoryPort";
 
     /// Extra skill roots scanned in addition to `.gaviero/skills` and
     /// `~/.gaviero/skills`. JSON array of paths (a lone string is also
@@ -1313,23 +1322,38 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::MEMORY_TELEMETRY_TRUST_ADJUST_DELTA => serde_json::json!(0.05),
         settings::MEMORY_TELEMETRY_MIN_RESPONSE_TOKENS => serde_json::json!(20),
 
-        // Remote sidecar (Plan A §3.2). `REMOTE_PORT` deliberately has NO
-        // default: absent/null means "derive from the workspace identity".
-        settings::REMOTE_ENABLED => serde_json::json!(false),
+        // Remote sidecar (Plan A §3.2, Plan C §3). `REMOTE_PORT` deliberately
+        // has NO default: absent/null means "derive from the workspace
+        // identity". Enabled by default since Plan C; an empty host means
+        // auto-detect; empty cert/key paths mean explicit → legacy workspace
+        // pair → `~/.gaviero/remote/tls/`.
+        settings::REMOTE_ENABLED => serde_json::json!(true),
         settings::REMOTE_BIND_MODE => serde_json::json!("loopback+tailnet"),
         settings::REMOTE_MAGIC_DNS_HOST => serde_json::json!(""),
-        settings::REMOTE_CERT_PATH => serde_json::json!(".gaviero/remote/tls/cert.pem"),
-        settings::REMOTE_KEY_PATH => serde_json::json!(".gaviero/remote/tls/key.pem"),
+        settings::REMOTE_CERT_PATH => serde_json::json!(""),
+        settings::REMOTE_KEY_PATH => serde_json::json!(""),
         settings::REMOTE_ALLOW_PUBLIC_BIND => serde_json::json!(false),
         settings::REMOTE_MAX_FRAME_BYTES => serde_json::json!(262_144),
         settings::REMOTE_MAX_PROMPT_BYTES => serde_json::json!(131_072),
         settings::REMOTE_COMMAND_RATE_PER_SECOND => serde_json::json!(10),
+        settings::REMOTE_AUTO_CERT => serde_json::json!(true),
+        settings::REMOTE_TOKEN_SCOPE => serde_json::json!("machine"),
+        settings::REMOTE_DIRECTORY_ENABLED => serde_json::json!(true),
+        settings::REMOTE_DIRECTORY_PORT => serde_json::json!(49151),
 
         // H3 PR-9 — opt-in foreign skill roots (empty = no extra FS reads).
         settings::SKILLS_EXTRA_ROOTS => serde_json::json!([]),
 
         _ => serde_json::Value::Null,
     }
+}
+
+/// Machine-level remote state root (Plan C V1 §2.1): `~/.gaviero/remote/`,
+/// holding the machine bearer token, the shared TLS pair, and the instance
+/// registry. `None` only when no home directory can be determined; callers
+/// then fall back to the workspace root (Plan C invariant 17).
+pub fn remote_machine_state_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".gaviero").join("remote"))
 }
 
 /// Expand a leading `~` / `~/` / `~\` to the user's home directory.
