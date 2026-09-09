@@ -89,6 +89,11 @@ async fn qr_payload_pairs_a_client_end_to_end() {
         machine: None,
         token_path: None,
         token_poll_interval: RemoteServerConfig::TOKEN_POLL_INTERVAL,
+        registry: None,
+        directory_bind_addrs: Vec::new(),
+        heartbeat_interval: gaviero_remote::server::registry::HEARTBEAT_INTERVAL,
+        directory_retry_interval: gaviero_remote::server::registry::DIRECTORY_RETRY_INTERVAL,
+        stale_after: gaviero_remote::server::registry::STALE_AFTER,
         confirm_required: ["/autoapprove", "/yolo", "/reset", "/clear"]
             .iter()
             .map(|s| s.to_string())
@@ -219,6 +224,11 @@ async fn a_stale_qr_token_cannot_pair() {
         machine: None,
         token_path: None,
         token_poll_interval: RemoteServerConfig::TOKEN_POLL_INTERVAL,
+        registry: None,
+        directory_bind_addrs: Vec::new(),
+        heartbeat_interval: gaviero_remote::server::registry::HEARTBEAT_INTERVAL,
+        directory_retry_interval: gaviero_remote::server::registry::DIRECTORY_RETRY_INTERVAL,
+        stale_after: gaviero_remote::server::registry::STALE_AFTER,
         confirm_required: Vec::new(),
         allowed_slash_commands: Vec::new(),
         limits: Limits {
@@ -283,6 +293,11 @@ async fn a_token_in_the_query_string_is_not_accepted() {
         machine: None,
         token_path: None,
         token_poll_interval: RemoteServerConfig::TOKEN_POLL_INTERVAL,
+        registry: None,
+        directory_bind_addrs: Vec::new(),
+        heartbeat_interval: gaviero_remote::server::registry::HEARTBEAT_INTERVAL,
+        directory_retry_interval: gaviero_remote::server::registry::DIRECTORY_RETRY_INTERVAL,
+        stale_after: gaviero_remote::server::registry::STALE_AFTER,
         confirm_required: Vec::new(),
         allowed_slash_commands: Vec::new(),
         limits: Limits {

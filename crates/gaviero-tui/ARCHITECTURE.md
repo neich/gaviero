@@ -49,6 +49,9 @@ gaviero-tui/src/
    ├─ editing.rs        Editor + find-bar (viewport width for wrap)
    ├─ session.rs        session_state bridge + per-folder topology cache
    ├─ chat_memory.rs    Turn transcript + consolidator → WriterHandle
+   ├─ remote.rs         Remote command reducers (every tab by conv_id)
+   ├─ remote_setup.rs   Sidecar bootstrap, `/remote`, machine token
+   ├─ state.rs          Shared enums
    ├─ state.rs          Shared enums
    └─ observers.rs      WriteGate / Acp / Swarm / Memory / Manifest → Event
 ```

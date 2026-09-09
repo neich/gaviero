@@ -117,6 +117,20 @@ Language-specific overrides: `"[rust]": { "editor.tabSize": 4 }`.
 
 `skills.extraRoots` is an optional array of extra skill directories (default `[]`, `~`/`~/` expanded). Typical values are `"~/.claude/skills"` and `"~/.codex/skills"`. A configured path that does not exist or is unreadable is shown as a chat system message. Unqualified `$name` still prefers a workspace/repo/global skill over a foreign one; collisions complete as `$source/name`.
 
+Remote access (on by default) is configured under `remote.*`. Empty `magicDnsHost` auto-detects from Tailscale; the bearer token and TLS pair live in `~/.gaviero/remote/` unless `tokenScope` is `"workspace"`.
+
+```json
+{
+  "remote": {
+    "enabled": true,
+    "autoCert": true,
+    "tokenScope": "machine",
+    "directoryEnabled": true,
+    "directoryPort": 49151
+  }
+}
+```
+
 ### Agent notifications
 
 Two chat milestones announce themselves, each with its own `enabled` / `sound` / `desktop` / `statusBar` switches (all default `true`):
