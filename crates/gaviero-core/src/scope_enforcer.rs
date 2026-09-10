@@ -142,10 +142,7 @@ impl SensitivePolicy {
 
     pub fn new(allow: Vec<String>) -> Self {
         Self {
-            allow: allow
-                .into_iter()
-                .filter(|p| !p.trim().is_empty())
-                .collect(),
+            allow: allow.into_iter().filter(|p| !p.trim().is_empty()).collect(),
         }
     }
 

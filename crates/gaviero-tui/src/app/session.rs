@@ -458,9 +458,8 @@ pub(super) fn restore_session(app: &mut App) {
                 buf.cursor.col = tab.cursor_col;
                 buf.scroll.top_line = tab.scroll_top.min(max_line);
                 if buf.lang_name.as_deref() == Some("markdown") {
-                    buf.preview_mode = MarkdownPreviewMode::from_session_key(
-                        tab.preview_mode.as_deref(),
-                    );
+                    buf.preview_mode =
+                        MarkdownPreviewMode::from_session_key(tab.preview_mode.as_deref());
                 }
             }
         }
