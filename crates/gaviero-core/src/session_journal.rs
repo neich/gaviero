@@ -190,8 +190,7 @@ pub fn checkpoint(workspace_key: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    std::fs::write(&path, b"")
-        .with_context(|| format!("truncating journal {}", path.display()))?;
+    std::fs::write(&path, b"").with_context(|| format!("truncating journal {}", path.display()))?;
     Ok(())
 }
 
@@ -304,7 +303,10 @@ mod tests {
         append_entry(&s.key, &entry("c1", "durable two")).unwrap();
 
         let path = journal_path(&s.key).unwrap();
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         f.write_all(br#"{"ts":1700000000,"conv_id":"c1","conv_ti"#)
             .unwrap();
         drop(f);

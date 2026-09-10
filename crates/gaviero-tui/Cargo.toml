@@ -41,6 +41,9 @@ unicode-width = "0.2"
 chrono = "0.4.44"
 # `/remote` pairing QR rendered into the chat panel (Plan A A6).
 qrcode = { version = "0.14", default-features = false }
+# ntfy HTTP publisher (remote-ntfy v1). Fire-and-forget from the event loop
+# via `tokio::spawn`; never `reqwest::blocking` on that thread.
+reqwest = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # SetConsoleCtrlHandler for the Ctrl+C/Ctrl+Break → key-event forwarder
@@ -65,6 +68,8 @@ windows-sys = { version = "0.59", features = [
 tempfile = "3"
 # A6 tests: self-signed certs for the availability matrix.
 rcgen = "0.13"
+# ntfy publisher tests: mock HTTP, no live POST to ntfy.sh.
+wiremock = "0.6"
 
 [build-dependencies]
 embed-manifest = "1.4"

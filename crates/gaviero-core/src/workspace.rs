@@ -272,6 +272,17 @@ pub mod settings {
     /// `bellStyle: none`) or for muted Windows sound schemes.
     pub const NOTIFICATIONS_SOUND_STYLE: &str = "notifications.sound.style";
 
+    /// Always-on phone alerts via ntfy (Plan remote-ntfy v1). Master switch
+    /// is off by default: ntfy.sh is a third party and a guessable topic is a
+    /// capability URL. Topic is minted to `~/.gaviero/ntfy/topic` on first
+    /// enable when this setting is empty — it is not written back here.
+    pub const NOTIFICATIONS_NTFY_ENABLED: &str = "notifications.ntfy.enabled";
+    pub const NOTIFICATIONS_NTFY_SERVER: &str = "notifications.ntfy.server";
+    pub const NOTIFICATIONS_NTFY_TOPIC: &str = "notifications.ntfy.topic";
+    pub const NOTIFICATIONS_NTFY_TOKEN: &str = "notifications.ntfy.token";
+    pub const NOTIFICATIONS_NTFY_AGENT_FINISHED: &str = "notifications.ntfy.agentFinished";
+    pub const NOTIFICATIONS_NTFY_AGENT_WAITING: &str = "notifications.ntfy.agentWaiting";
+
     // Remote sidecar (Plan A §3.2). `remote.port` absent/null means derived
     // from the workspace identity; `0` is a configuration ERROR (it
     // conventionally means OS-assigned ephemeral, which would break QR
@@ -394,7 +405,8 @@ pub struct Workspace {
     workspace_path: Option<PathBuf>,
     /// Cached per-folder `.gaviero/settings.json` contents (keyed by folder root).
     folder_settings_cache: HashMap<PathBuf, serde_json::Value>,
-    /// Cached user-level `~/.config/gaviero/settings.json`.
+    /// Cached user-level `~/.gaviero/settings.json` (legacy XDG/AppData
+    /// path is read only when that file is missing).
     user_settings_cache: Option<serde_json::Value>,
 }
 
@@ -713,28 +725,13 @@ impl Workspace {
             }
         }
 
-        // Cache user-level settings
-        self.user_settings_cache = dirs::config_dir().and_then(|config_dir| {
-            let user_settings_path = config_dir.join("gaviero").join("settings.json");
-            let content = std::fs::read_to_string(&user_settings_path).ok()?;
-            match serde_json::from_str(&content) {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    tracing::warn!(
-                        "failed to parse user settings {}: {}",
-                        user_settings_path.display(),
-                        e
-                    );
-                    None
-                }
-            }
-        });
+        self.user_settings_cache = load_user_settings();
     }
 
     /// Resolve a setting using the cascade:
     /// 1. Per-folder `.gaviero/settings.json` (if root provided)
     /// 2. Workspace-level settings
-    /// 3. User-level `~/.config/gaviero/settings.json`
+    /// 3. User-level `~/.gaviero/settings.json`
     /// 4. Hardcoded defaults
     pub fn resolve_setting(&self, key: &str, root: Option<&Path>) -> serde_json::Value {
         // 1. Per-folder settings (from cache)
@@ -1305,6 +1302,15 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::NOTIFICATIONS_AGENT_WAITING_STATUS_BAR => serde_json::json!(true),
         settings::NOTIFICATIONS_SOUND_STYLE => serde_json::json!("auto"),
 
+        // Always-on ntfy (TUI publisher). Opt-in; empty topic is minted to
+        // ~/.gaviero/ntfy/topic rather than written into settings.json.
+        settings::NOTIFICATIONS_NTFY_ENABLED => serde_json::json!(false),
+        settings::NOTIFICATIONS_NTFY_SERVER => serde_json::json!("https://ntfy.sh"),
+        settings::NOTIFICATIONS_NTFY_TOPIC => serde_json::json!(""),
+        settings::NOTIFICATIONS_NTFY_TOKEN => serde_json::json!(""),
+        settings::NOTIFICATIONS_NTFY_AGENT_FINISHED => serde_json::json!(true),
+        settings::NOTIFICATIONS_NTFY_AGENT_WAITING => serde_json::json!(true),
+
         // Tier B / B5 — session consolidator + sleeptime
         settings::MEMORY_SESSION_CONSOLIDATE_ON_CLOSE => serde_json::json!(true),
         settings::MEMORY_SESSION_IDLE_TIMEOUT_SEC => serde_json::json!(90),
@@ -1354,6 +1360,68 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
 /// then fall back to the workspace root (Plan C invariant 17).
 pub fn remote_machine_state_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".gaviero").join("remote"))
+}
+
+/// User-wide settings file: `~/.gaviero/settings.json` on every OS
+/// (`%USERPROFILE%\.gaviero\settings.json` on Windows). Same home-dir
+/// tree as `remote/` and `ntfy/`. `None` only when home cannot be resolved.
+pub fn user_settings_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".gaviero").join("settings.json"))
+}
+
+/// Former user-settings location (`dirs::config_dir()/gaviero/settings.json`):
+/// `~/.config/gaviero/settings.json` on Unix, `%APPDATA%\gaviero\settings.json`
+/// on Windows. Read only when [`user_settings_path`] is missing.
+pub fn legacy_user_settings_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("gaviero").join("settings.json"))
+}
+
+fn load_user_settings() -> Option<serde_json::Value> {
+    load_user_settings_from(
+        user_settings_path().as_deref(),
+        legacy_user_settings_path().as_deref(),
+    )
+}
+
+/// Canonical file wins if it exists (including unreadable JSON — that is a
+/// warn + `None`, not a silent legacy fallback). Missing canonical falls
+/// back to the XDG/AppData path so existing installs keep working.
+fn load_user_settings_from(
+    canonical: Option<&Path>,
+    legacy: Option<&Path>,
+) -> Option<serde_json::Value> {
+    if let Some(path) = canonical
+        && path.is_file()
+    {
+        return parse_user_settings_file(path);
+    }
+    if let Some(path) = legacy
+        && path.is_file()
+    {
+        tracing::warn!(
+            "user settings loaded from legacy path {}; move them to ~/.gaviero/settings.json",
+            path.display()
+        );
+        return parse_user_settings_file(path);
+    }
+    None
+}
+
+fn parse_user_settings_file(path: &Path) -> Option<serde_json::Value> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("failed to read user settings {}: {}", path.display(), e);
+            return None;
+        }
+    };
+    match serde_json::from_str(&content) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!("failed to parse user settings {}: {}", path.display(), e);
+            None
+        }
+    }
 }
 
 /// Expand a leading `~` / `~/` / `~\` to the user's home directory.
@@ -1481,6 +1549,113 @@ mod tests {
         );
         assert!(ws.resolve_skill_extra_roots(None).is_empty());
         assert!(!ws.skill_extra_roots_is_malformed(None));
+    }
+
+    #[test]
+    fn ntfy_defaults_are_opt_in_with_ntfy_sh() {
+        let ws = Workspace::single_folder(PathBuf::from("/tmp/test"));
+        assert_eq!(
+            ws.resolve_setting(settings::NOTIFICATIONS_NTFY_ENABLED, None),
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            ws.resolve_setting(settings::NOTIFICATIONS_NTFY_SERVER, None),
+            serde_json::json!("https://ntfy.sh")
+        );
+        assert_eq!(
+            ws.resolve_setting(settings::NOTIFICATIONS_NTFY_TOPIC, None),
+            serde_json::json!("")
+        );
+        assert_eq!(
+            ws.resolve_setting(settings::NOTIFICATIONS_NTFY_TOKEN, None),
+            serde_json::json!("")
+        );
+        assert_eq!(
+            ws.resolve_setting(settings::NOTIFICATIONS_NTFY_AGENT_FINISHED, None),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            ws.resolve_setting(settings::NOTIFICATIONS_NTFY_AGENT_WAITING, None),
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn ntfy_nested_json_overrides_reach_resolve_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let gaviero_dir = dir.path().join(".gaviero");
+        fs::create_dir_all(&gaviero_dir).unwrap();
+        fs::write(
+            gaviero_dir.join("settings.json"),
+            r#"{ "notifications": { "ntfy": { "enabled": true, "server": "https://ntfy.example" } } }"#,
+        )
+        .unwrap();
+        let ws = Workspace::single_folder(dir.path().to_path_buf());
+        assert_eq!(
+            ws.resolve_setting(settings::NOTIFICATIONS_NTFY_ENABLED, None),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            ws.resolve_setting(settings::NOTIFICATIONS_NTFY_SERVER, None),
+            serde_json::json!("https://ntfy.example")
+        );
+        assert_eq!(
+            ws.resolve_setting(settings::NOTIFICATIONS_NTFY_TOPIC, None),
+            serde_json::json!(""),
+            "unset topic stays the empty default — mint is the TUI's job"
+        );
+    }
+
+    #[test]
+    fn user_settings_path_is_home_gaviero_not_xdg() {
+        let path = user_settings_path().expect("home dir");
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("settings.json")
+        );
+        assert_eq!(
+            path.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
+            Some(".gaviero")
+        );
+        if let Some(legacy) = legacy_user_settings_path() {
+            assert_ne!(
+                path, legacy,
+                "user settings must not live under dirs::config_dir()"
+            );
+        }
+    }
+
+    #[test]
+    fn user_settings_canonical_wins_over_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().join("canonical.json");
+        let legacy = dir.path().join("legacy.json");
+        fs::write(&canonical, r#"{ "editor": { "tabSize": 2 } }"#).unwrap();
+        fs::write(&legacy, r#"{ "editor": { "tabSize": 8 } }"#).unwrap();
+        let val = load_user_settings_from(Some(&canonical), Some(&legacy)).unwrap();
+        assert_eq!(dot_get(&val, "editor.tabSize"), Some(&serde_json::json!(2)));
+    }
+
+    #[test]
+    fn user_settings_falls_back_to_legacy_when_canonical_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("canonical.json");
+        let legacy = dir.path().join("legacy.json");
+        fs::write(&legacy, r#"{ "editor": { "tabSize": 8 } }"#).unwrap();
+        let val = load_user_settings_from(Some(&missing), Some(&legacy)).unwrap();
+        assert_eq!(dot_get(&val, "editor.tabSize"), Some(&serde_json::json!(8)));
+    }
+
+    #[test]
+    fn user_settings_malformed_canonical_does_not_fall_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().join("canonical.json");
+        let legacy = dir.path().join("legacy.json");
+        fs::write(&canonical, "not json").unwrap();
+        fs::write(&legacy, r#"{ "editor": { "tabSize": 8 } }"#).unwrap();
+        assert!(load_user_settings_from(Some(&canonical), Some(&legacy)).is_none());
     }
 
     #[test]

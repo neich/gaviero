@@ -2044,6 +2044,11 @@ impl AgentChatState {
                      /forget-history --confirm <id> [REDACT <reason>]\n                              — Redact a history row (one-way; tombstone replaces the transcript)\n\
                      /restore <deletion-id>   — Replay a soft-deleted row through the dedup pipeline\n\
                      /restore --since <N minutes|N hours|N days>\n                              — Replay every soft-deletion in the window\n\n\
+                     Remote:\n\
+                     /remote                  — Pairing QR, MagicDNS host, port, token fingerprint\n\
+                     /remote hide             — Clear the pairing QR from this transcript\n\
+                     /ntfy                    — ntfy subscribe URL + QR (always-on phone alerts)\n\
+                     /ntfy hide               — Clear the ntfy topic QR from this transcript\n\n\
                      Help:\n\
                      /help                    — Show this help\n\n\
                      Pass-through to agent:\n\
@@ -5449,7 +5454,9 @@ mod tests {
         let mut reloaded = AgentChatState::new();
         reloaded.load_conversations(&scratch.key);
 
-        let idx = reloaded.find_conv_idx(&conv_id).expect("conversation loads");
+        let idx = reloaded
+            .find_conv_idx(&conv_id)
+            .expect("conversation loads");
         assert_eq!(
             reloaded.conversations[idx].messages.len(),
             1,
@@ -5489,7 +5496,9 @@ mod tests {
 
         let mut reloaded = AgentChatState::new();
         reloaded.load_conversations(&scratch.key);
-        let idx = reloaded.find_conv_idx(&conv_id).expect("conversation loads");
+        let idx = reloaded
+            .find_conv_idx(&conv_id)
+            .expect("conversation loads");
         let msgs = &reloaded.conversations[idx].messages;
 
         assert_eq!(msgs.len(), 2);
@@ -5554,7 +5563,9 @@ mod tests {
 
         // Local timezone, so assert the shape rather than a fixed instant.
         assert_eq!(rendered.len(), 19, "YYYY-MM-DD HH:MM:SS");
-        let (date, time) = rendered.split_once(' ').expect("date and time are both present");
+        let (date, time) = rendered
+            .split_once(' ')
+            .expect("date and time are both present");
         assert_eq!(date.matches('-').count(), 2);
         assert_eq!(time.matches(':').count(), 2);
         assert!(date.starts_with("2025") || date.starts_with("2026"));

@@ -1526,6 +1526,7 @@ dependencies = [
  "qrcode",
  "ratatui",
  "rcgen",
+ "reqwest",
  "ropey",
  "serde",
  "serde_json",
@@ -1539,6 +1540,7 @@ dependencies = [
  "unicode-width 0.2.2",
  "vt100",
  "windows-sys 0.59.0",
+ "wiremock",
 ]
 
 [[package]]

@@ -116,7 +116,7 @@ Settings cascade (highest priority first):
 
 1. `.gaviero/settings.json` — project-level
 2. `.gaviero-workspace` file — multi-folder workspace
-3. `~/.config/gaviero/settings.json` — user defaults
+3. `~/.gaviero/settings.json` — user defaults (same home-dir path on Windows and Linux). If that file is missing, the previous location is still read (`~/.config/gaviero/settings.json` on Unix, `%APPDATA%\gaviero\settings.json` on Windows).
 4. Built-in defaults
 
 ```json

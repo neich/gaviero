@@ -1529,7 +1529,9 @@ pub(super) fn scroll_panel_to_row(app: &mut App, target: ScrollbarTarget, row: u
                 .min(area.height.saturating_sub(1)) as usize;
             let fraction = row_in_track as f64 / track_height.saturating_sub(1).max(1) as f64;
             app.set_preview_scroll(
-                (fraction * max_scroll as f64).round().min(max_scroll as f64) as usize,
+                (fraction * max_scroll as f64)
+                    .round()
+                    .min(max_scroll as f64) as usize,
             );
         }
         ScrollbarTarget::Chat => {

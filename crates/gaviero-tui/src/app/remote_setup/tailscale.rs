@@ -35,10 +35,7 @@ pub fn tailscale_binary() -> Option<PathBuf> {
         "/usr/local/bin/tailscale",
         "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
     ];
-    fixed
-        .iter()
-        .map(PathBuf::from)
-        .find(|p| p.is_file())
+    fixed.iter().map(PathBuf::from).find(|p| p.is_file())
 }
 
 /// Pull `Self.DNSName` out of `tailscale status --json`, without the
@@ -78,7 +75,11 @@ fn command(binary: &Path) -> tokio::process::Command {
     cmd
 }
 
-async fn run(binary: &Path, args: &[&str], timeout: Duration) -> Result<std::process::Output, String> {
+async fn run(
+    binary: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
     let mut cmd = command(binary);
     cmd.args(args);
     match tokio::time::timeout(timeout, cmd.output()).await {
@@ -106,9 +107,11 @@ fn stderr_tail(output: &std::process::Output) -> String {
 /// The MagicDNS name of this machine, e.g. `host.tailnet.ts.net`.
 pub async fn detect_magic_dns_host() -> Result<String, String> {
     let Some(binary) = tailscale_binary() else {
-        return Err("tailscale CLI not found — install Tailscale or set `remote.magicDnsHost` \
+        return Err(
+            "tailscale CLI not found — install Tailscale or set `remote.magicDnsHost` \
                     in .gaviero/settings.json"
-            .to_string());
+                .to_string(),
+        );
     };
     let output = run(&binary, &["status", "--json"], STATUS_TIMEOUT).await?;
     if !output.status.success() {
@@ -184,17 +187,16 @@ mod tests {
 
     #[test]
     fn missing_dns_name_is_an_actionable_error() {
-        let err = parse_status_json(r#"{"BackendState":"Running","Self":{"HostName":"x"}}"#)
-            .unwrap_err();
+        let err =
+            parse_status_json(r#"{"BackendState":"Running","Self":{"HostName":"x"}}"#).unwrap_err();
         assert!(err.contains("MagicDNS"), "{err}");
     }
 
     #[test]
     fn stopped_backend_is_reported() {
-        let err = parse_status_json(
-            r#"{"BackendState":"NeedsLogin","Self":{"DNSName":"h.t.ts.net."}}"#,
-        )
-        .unwrap_err();
+        let err =
+            parse_status_json(r#"{"BackendState":"NeedsLogin","Self":{"DNSName":"h.t.ts.net."}}"#)
+                .unwrap_err();
         assert!(err.contains("NeedsLogin"), "{err}");
     }
 
