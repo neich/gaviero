@@ -375,7 +375,11 @@ pub fn select_cert(config: &RemoteConfig) -> (CertSource, PathBuf, PathBuf) {
         .clone()
         .unwrap_or_else(|| config.state_dir.clone())
         .join("tls");
-    (CertSource::Machine, dir.join("cert.pem"), dir.join("key.pem"))
+    (
+        CertSource::Machine,
+        dir.join("cert.pem"),
+        dir.join("key.pem"),
+    )
 }
 
 /// Provision or renew the machine pair with `tailscale cert` when it is
@@ -475,7 +479,9 @@ fn load_or_create_at(path: &std::path::Path) -> Result<String, String> {
 }
 
 fn write_token_at(path: &std::path::Path, token: &str) -> Result<(), String> {
-    let dir = path.parent().ok_or_else(|| "token path has no parent".to_string())?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| "token path has no parent".to_string())?;
     std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     // Atomic replace so a concurrent reader (another instance's hub poll)
     // never sees a partial token.
@@ -836,10 +842,7 @@ pub async fn start(
 /// Resolve → detect host → ensure certificate → token → bind, then report
 /// through the event channel. Spawned from `main`; never awaited by the
 /// event loop.
-pub async fn bootstrap(
-    workspace: Workspace,
-    event_tx: tokio::sync::mpsc::UnboundedSender<Event>,
-) {
+pub async fn bootstrap(workspace: Workspace, event_tx: tokio::sync::mpsc::UnboundedSender<Event>) {
     let event = match bootstrap_inner(&workspace, event_tx.clone()).await {
         Ok(started) => Event::RemoteStarted(Box::new(started)),
         Err(e) => Event::RemoteUnavailable(e),
@@ -1012,7 +1015,11 @@ fn status_report(app: &App, config: &RemoteConfig) -> String {
         if config.explicit_port {
             " (fixed by remote.port)".to_string()
         } else if port != config.port {
-            format!(" (derived port {} was busy)", config.port)
+            format!(
+                " (derived port {} was busy — the phone keeps that port until it \
+                 refreshes the directory; pull-to-refresh Instances or reopen the app)",
+                config.port
+            )
         } else {
             " (derived from the workspace identity)".to_string()
         }
@@ -1021,7 +1028,8 @@ fn status_report(app: &App, config: &RemoteConfig) -> String {
         "Host: {}\n",
         match config.host_source {
             HostSource::Setting => format!("{} (remote.magicDnsHost)", config.magic_dns_host),
-            HostSource::Detected => format!("{} (auto-detected via tailscale)", config.magic_dns_host),
+            HostSource::Detected =>
+                format!("{} (auto-detected via tailscale)", config.magic_dns_host),
             HostSource::Unresolved => match &app.remote.status {
                 RemoteStatus::Unavailable(e) => format!("unresolved — {e}"),
                 RemoteStatus::Pending => "detecting…".to_string(),
@@ -1078,7 +1086,10 @@ fn status_report(app: &App, config: &RemoteConfig) -> String {
                 .as_ref()
                 .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed));
             if leader {
-                format!("leader on {}", s.directory_port.unwrap_or(config.directory_port))
+                format!(
+                    "leader on {}",
+                    s.directory_port.unwrap_or(config.directory_port)
+                )
             } else {
                 format!(
                     "follower (another instance holds {})",
@@ -1123,22 +1134,37 @@ fn status_report(app: &App, config: &RemoteConfig) -> String {
     report.push_str(&format!(
         "Status: {}\n",
         match &app.remote.status {
-            RemoteStatus::Pending => "starting (host detection / certificate check in progress)".to_string(),
+            RemoteStatus::Pending =>
+                "starting (host detection / certificate check in progress)".to_string(),
             RemoteStatus::Unavailable(e) => format!("unavailable — {e}"),
-            RemoteStatus::Running(_) if app.remote.client_connected => "client connected".to_string(),
+            RemoteStatus::Running(_) if app.remote.client_connected =>
+                "client connected".to_string(),
             RemoteStatus::Running(_) => "listening, no client connected".to_string(),
         }
     ));
 
-    // Listening but nothing has ever connected is, on Windows, almost
-    // always the host firewall dropping inbound on the tailnet interface —
-    // the phone just reports "instance offline" with no other clue.
-    #[cfg(windows)]
+    {
+        let roots = app.workspace.roots();
+        if crate::notify::ntfy_enabled(&app.workspace, roots.first().copied()) {
+            report.push_str("ntfy: on (run /ntfy)\n");
+        }
+    }
+
+    // Listening with no client is usually the phone off the tailnet, then
+    // (on Windows) the host firewall dropping inbound on the Tailscale NIC.
+    // The app only reports "instance offline" for both.
     if running.is_some() && !app.remote.client_connected {
+        report.push_str(
+            "\nIf the app says \"instance offline\", check `tailscale status` on this PC: \
+             the phone must be listed without \"offline\" (open the Tailscale app on the phone, \
+             same tailnet). Disconnect Proton / other VPNs on the phone — a kill switch \
+             swallows 100.x and MagicDNS.\n",
+        );
+        #[cfg(windows)]
         report.push_str(&format!(
-            "\nIf the app says \"instance offline\", Windows Firewall is probably dropping the \
-             connection. In an ADMIN PowerShell (one rule covers every workspace and the \
-             directory port):\n  \
+            "If the phone is online and still cannot connect, Windows Firewall is dropping \
+             inbound on the tailnet interface. In an ADMIN PowerShell (one rule covers every \
+             workspace and the directory port):\n  \
              New-NetFirewallRule -DisplayName \"Gaviero Remote (tailnet)\" -Direction Inbound \
              -Action Allow -Protocol TCP -LocalPort {},49152-65535 \
              -RemoteAddress 100.64.0.0/10,fd7a:115c:a1e0::/48\n",
@@ -1148,9 +1174,13 @@ fn status_report(app: &App, config: &RemoteConfig) -> String {
 
     if let (Some(started), Ok(loaded)) = (running, &token) {
         let url = pairing_url_on(config, started.port);
-        let dir_url = started
-            .directory_port
-            .map(|p| format!("https://{}:{p}{}", config.magic_dns_host, gaviero_remote::INSTANCES_PATH));
+        let dir_url = started.directory_port.map(|p| {
+            format!(
+                "https://{}:{p}{}",
+                config.magic_dns_host,
+                gaviero_remote::INSTANCES_PATH
+            )
+        });
         let payload = qr_payload_for(config, &url, &loaded.token, dir_url.as_deref());
         match render_qr(&payload) {
             Ok(qr) => report.push_str(&format!(
@@ -1224,8 +1254,7 @@ mod tests {
 
     #[test]
     fn directory_port_zero_is_rejected() {
-        let (_dir, ws) =
-            workspace_with(serde_json::json!({ "remote": { "directoryPort": 0 } }));
+        let (_dir, ws) = workspace_with(serde_json::json!({ "remote": { "directoryPort": 0 } }));
         let err = resolve_config(&ws).expect_err("directory port 0 must be refused");
         assert!(matches!(err, RemoteUnavailable::DirectoryPortZero));
     }
@@ -1304,7 +1333,10 @@ mod tests {
         let (dir, ws) = workspace_with(serde_json::json!({
             "remote": { "magicDnsHost": "host.tailnet.ts.net" }
         }));
-        write_pair(&dir.path().join(".gaviero/remote/tls"), "host.tailnet.ts.net");
+        write_pair(
+            &dir.path().join(".gaviero/remote/tls"),
+            "host.tailnet.ts.net",
+        );
         let machine = tempfile::tempdir().unwrap();
         let config = isolated(&ws, &machine);
         assert!(config.legacy_cert.is_some());
@@ -1318,11 +1350,18 @@ mod tests {
         let (dir, ws) = workspace_with(serde_json::json!({
             "remote": { "magicDnsHost": "wrong.tailnet.ts.net" }
         }));
-        write_pair(&dir.path().join(".gaviero/remote/tls"), "host.tailnet.ts.net");
+        write_pair(
+            &dir.path().join(".gaviero/remote/tls"),
+            "host.tailnet.ts.net",
+        );
         let machine = tempfile::tempdir().unwrap();
         let config = isolated(&ws, &machine);
         let (source, cert, _) = select_cert(&config);
-        assert_eq!(source, CertSource::Machine, "mismatched legacy pair must be ignored");
+        assert_eq!(
+            source,
+            CertSource::Machine,
+            "mismatched legacy pair must be ignored"
+        );
         assert!(cert.starts_with(machine.path()));
         let err = check_availability(&config).expect_err("machine pair does not exist yet");
         match err {
@@ -1357,7 +1396,10 @@ mod tests {
         let (dir, ws) = workspace_with(serde_json::json!({
             "remote": { "magicDnsHost": "host.tailnet.ts.net" }
         }));
-        write_pair(&dir.path().join(".gaviero/remote/tls"), "host.tailnet.ts.net");
+        write_pair(
+            &dir.path().join(".gaviero/remote/tls"),
+            "host.tailnet.ts.net",
+        );
         let machine = tempfile::tempdir().unwrap();
         let config = isolated(&ws, &machine);
         assert!(!ensure_certificate(&config).await.unwrap());
@@ -1366,7 +1408,10 @@ mod tests {
         let mut off = config.clone();
         off.auto_cert = false;
         off.legacy_cert = None;
-        assert!(!ensure_certificate(&off).await.unwrap(), "autoCert off never provisions");
+        assert!(
+            !ensure_certificate(&off).await.unwrap(),
+            "autoCert off never provisions"
+        );
     }
 
     #[test]
@@ -1587,7 +1632,12 @@ mod tests {
         let config = isolated(&ws, &machine);
         let loaded = load_or_create_token(&config).unwrap();
         let dir_url = directory_url(&config);
-        let payload = qr_payload_for(&config, &pairing_url(&config), &loaded.token, dir_url.as_deref());
+        let payload = qr_payload_for(
+            &config,
+            &pairing_url(&config),
+            &loaded.token,
+            dir_url.as_deref(),
+        );
         let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(v["kind"], "gaviero-remote");
         assert_eq!(v["protocol_major"], 1);
@@ -1636,9 +1686,15 @@ mod tests {
         let token = load_or_create_token(&config).unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let started = start(&config, availability(), token.clone(), "inst-test".into(), tx.clone())
-            .await
-            .expect("falls forward to a free port");
+        let started = start(
+            &config,
+            availability(),
+            token.clone(),
+            "inst-test".into(),
+            tx.clone(),
+        )
+        .await
+        .expect("falls forward to a free port");
         assert_ne!(started.port, busy);
         assert!(started.port > busy && started.port < busy + PORT_WINDOW);
         assert_eq!(started.token_scope, TokenScope::Machine);
@@ -1661,14 +1717,13 @@ mod render_preview {
     #[test]
     #[ignore = "visual check: prints a scannable QR to stdout"]
     fn preview_pairing_qr() {
-        let payload = gaviero_remote::pairing::qr_payload_json(
-            &gaviero_remote::pairing::QrPayloadInput {
+        let payload =
+            gaviero_remote::pairing::qr_payload_json(&gaviero_remote::pairing::QrPayloadInput {
                 url: "wss://host.tailnet.ts.net:50123/v1/ws",
                 token: &gaviero_remote::pairing::generate_token(),
                 workspace: "gaviero",
                 ..Default::default()
-            },
-        );
+            });
         let qr = super::render_qr(&payload).unwrap();
         println!("payload {} bytes", payload.len());
         println!(
@@ -1699,7 +1754,10 @@ mod live_diagnostic {
             Ok(mut config) => {
                 resolve_host(&mut config).await;
                 println!("enabled:   {}", config.enabled);
-                println!("port:      {} (explicit: {})", config.port, config.explicit_port);
+                println!(
+                    "port:      {} (explicit: {})",
+                    config.port, config.explicit_port
+                );
                 println!(
                     "host:      {} ({:?}) {}",
                     config.magic_dns_host,
@@ -1712,7 +1770,10 @@ mod live_diagnostic {
                 );
                 let (source, cert, _) = select_cert(&config);
                 println!("cert:      {:?} {}", source, cert.display());
-                println!("token:     {:?} machine dir {:?}", config.token_scope, config.machine_state_dir);
+                println!(
+                    "token:     {:?} machine dir {:?}",
+                    config.token_scope, config.machine_state_dir
+                );
                 match check_availability(&config) {
                     Ok(a) => println!(
                         "AVAILABLE — cert until {}, tailnet {:?}",

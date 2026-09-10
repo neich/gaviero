@@ -1,5 +1,11 @@
 use super::*;
 
+/// `/ntfy` / `/ntfy hide` — desktop-only (the topic is a capability URL).
+/// Not on the remote slash allow-list.
+pub(super) fn handle_ntfy_command(app: &mut App, line: &str) {
+    crate::notify::handle_ntfy_command(app, line);
+}
+
 pub(super) fn handle_swarm_command(app: &mut App) {
     let input = app.chat_state.take_input();
     let task_desc = input

@@ -1,4 +1,4 @@
-//! Agent notifications: sound, desktop toast, status-bar banner.
+//! Agent notifications: sound, desktop toast, status-bar banner, ntfy push.
 //!
 //! Two trigger points, configured independently ([`NotifyEvent`]):
 //!
@@ -7,6 +7,10 @@
 //! - `AgentWaiting` — the agent stopped mid-turn and the run is blocked on a
 //!   permission decision or an `AskUserQuestion` answer
 //!   (`notifications.agentWaiting.*`).
+//!
+//! Phone delivery lives in [`ntfy`]: the TUI POSTs to ntfy when a turn
+//! finishes or blocks; the official ntfy Android app delivers. This module
+//! never holds a subscribe socket.
 //!
 //! **Sound ignores terminal focus.** The whole point of the alert is to reach a
 //! user who has alt-tabbed away, so BEL / the system sound fires whether or not
@@ -18,6 +22,13 @@
 //! same one. A toast exists to reach someone looking at another window; with
 //! gaviero on screen the status-bar banner and the chat panel already carry the
 //! news, so a toast there would be noise over the window being read.
+
+mod ntfy;
+
+pub use ntfy::{
+    handle_ntfy_command, ntfy_click_url, ntfy_enabled, ntfy_title, publish_ntfy,
+    resolve_ntfy_config,
+};
 
 use gaviero_core::workspace::{Workspace, settings};
 use std::path::Path;
@@ -395,7 +406,7 @@ mod tests {
     /// End-to-end guard on the setting *names*: a typo in a key would silently
     /// fall back to `true` and be invisible in every other test here. Only
     /// keys written into the temp workspace are asserted, so the developer's
-    /// own `~/.config/gaviero/settings.json` cannot influence the result.
+    /// own `~/.gaviero/settings.json` cannot influence the result.
     #[test]
     fn settings_file_overrides_reach_the_resolved_config() {
         let dir = tempfile::tempdir().expect("tempdir");

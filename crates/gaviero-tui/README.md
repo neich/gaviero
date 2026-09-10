@@ -96,7 +96,7 @@ Settings cascade (highest priority first):
 
 1. `.gaviero/settings.json`
 2. `.gaviero-workspace` file
-3. `~/.config/gaviero/settings.json`
+3. `~/.gaviero/settings.json` (same on Windows; falls back to the old XDG/AppData path if missing)
 4. Built-in defaults
 
 ```json
@@ -168,6 +168,51 @@ Windows defaults to the system sound because BEL has to survive ConPTY plus any 
   }
 }
 ```
+
+### ntfy (always-on phone alerts)
+
+Local desktop toasts only fire while the terminal is unfocused, and the Flutter app only sees the live WebSocket. For alerts after the phone sleeps, the TUI can POST the same two milestones to [ntfy](https://ntfy.sh). The **official ntfy Android app** delivers them (FCM / its own service). Gaviero Remote does not keep a subscribe socket and does not add Firebase.
+
+Opt-in. Default is off — ntfy.sh is a third party and a guessable topic is a capability URL.
+
+| Setting | Default | Notes |
+|---|---|---|
+| `notifications.ntfy.enabled` | `false` | Master switch |
+| `notifications.ntfy.server` | `"https://ntfy.sh"` | Self-host by changing this; no trailing slash |
+| `notifications.ntfy.topic` | `""` | Empty + enabled ⇒ mint `~/.gaviero/ntfy/topic` (not written back into settings.json) |
+| `notifications.ntfy.token` | `""` | Optional `Authorization: Bearer` |
+| `notifications.ntfy.agentFinished` | `true` | Silence one ntfy event without muting desktop sound |
+| `notifications.ntfy.agentWaiting` | `true` | |
+
+Recommend **user** settings (`~/.gaviero/settings.json`) so every TUI on the laptop shares one topic. Copy the same object onto a second PC.
+
+```json
+{
+  "notifications": {
+    "ntfy": {
+      "enabled": true,
+      "server": "https://ntfy.sh"
+    }
+  }
+}
+```
+
+Then restart gaviero, run `/ntfy`, and subscribe in the ntfy app (scan the QR, or open the `ntfy://ntfy.sh/<topic>` link). `/remote` only prints `ntfy: on (run /ntfy)` — it never leaks the topic. There is no `/ntfy rotate`; delete `~/.gaviero/ntfy/topic` and any `notifications.ntfy.topic` setting, then restart.
+
+Publish JSON (the TUI POSTs this to `{server}/`; never conversation text or diffs):
+
+```json
+{
+  "topic": "<secret>",
+  "title": "gaviero · Agent finished",
+  "message": "Agent finished (claude:sonnet) — no file changes",
+  "tags": ["white_check_mark"],
+  "priority": 3,
+  "click": "gaviero-remote://open?host=…&workspace=…&conv=…"
+}
+```
+
+Tapping the notification opens Gaviero Remote when that deep link is registered. ntfy is still useful if the click URL is ignored — the banner fires either way.
 
 ## API
 
