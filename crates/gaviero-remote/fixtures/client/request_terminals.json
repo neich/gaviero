@@ -1,0 +1,12 @@
+{
+  "version": {
+    "major": 1,
+    "minor": 1
+  },
+  "instance_id": "a3f9c2e14b7d8650",
+  "command_id": "cmd-request_terminals",
+  "type": "request_terminals",
+  "payload": {
+    "terminal_id": 2
+  }
+}

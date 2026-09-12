@@ -747,6 +747,7 @@ pub async fn start(
                 display_name: config.workspace_display_name.clone(),
             },
             capabilities: vec![
+                "shell_sessions".to_string(),
                 gaviero_remote::version::capability::LATEST_PAGE.to_string(),
                 gaviero_remote::version::capability::INSTANCES.to_string(),
             ],

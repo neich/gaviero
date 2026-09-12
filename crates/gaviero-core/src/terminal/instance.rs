@@ -144,10 +144,16 @@ impl TerminalInstance {
 
     /// Send raw bytes to the PTY (user keystrokes).
     pub fn write_input(&mut self, data: &[u8]) {
-        if let Some(writer) = &mut self.pty_writer {
-            let _ = writer.write_all(data);
-            let _ = writer.flush();
-        }
+        let _ = self.try_write_input(data);
+    }
+
+    /// Write input with delivery errors exposed to remote callers.
+    pub fn try_write_input(&mut self, data: &[u8]) -> std::io::Result<()> {
+        let writer = self.pty_writer.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "shell is not running")
+        })?;
+        writer.write_all(data)?;
+        writer.flush()
     }
 
     /// Resize the PTY and vt100 parser.
@@ -329,5 +335,16 @@ mod tests {
         let (mut inst, writer) = instance_with_capture();
         inst.process_output(b"just text\x1b[31mred\x1b[0m");
         assert!(writer.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn remote_input_preserves_utf8_and_control_keys_and_reports_missing_pty() {
+        let (mut inst, writer) = instance_with_capture();
+        let input = "echo café\r\u{3}\u{1b}[A";
+        inst.try_write_input(input.as_bytes()).unwrap();
+        assert_eq!(*writer.0.lock().unwrap(), input.as_bytes());
+        inst.pty_writer = None;
+        assert_eq!(inst.try_write_input(b"x").unwrap_err().kind(),
+            std::io::ErrorKind::NotConnected);
     }
 }

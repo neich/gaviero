@@ -131,6 +131,32 @@ impl Default for RemoteState {
     }
 }
 
+/// On-demand screen projection. Mobile selection never changes desktop focus.
+fn terminal_snapshot(app: &App, requested: Option<u64>) -> serde_json::Value {
+    let manager = &app.terminal_manager;
+    let selected = requested
+        .map(gaviero_core::terminal::TerminalId::from_raw)
+        .filter(|id| manager.instance(*id).is_some())
+        .or_else(|| manager.tab_order().first().copied());
+    let tabs: Vec<_> = manager.tab_order().iter().filter_map(|id| {
+        manager.instance(*id).map(|inst| serde_json::json!({
+            "id": id.raw(),
+            "title": if inst.title.is_empty() {
+                inst.shell_config.shell_path.to_string_lossy().into_owned()
+            } else { inst.title.clone() },
+            "cwd": inst.cwd.to_string_lossy(),
+            "spawned": inst.spawned,
+        }))
+    }).collect();
+    let screen = selected.and_then(|id| manager.instance(id)).map(|inst| {
+        let mut screen = inst.screen().clone();
+        screen.set_scrollback(0);
+        let contents: String = screen.contents().chars().take(16384).collect();
+        serde_json::json!({ "text": contents, "rows": inst.rows, "cols": inst.cols })
+    });
+    serde_json::json!({ "terminals": tabs, "selected_id": selected.map(|id| id.raw()), "screen": screen })
+}
+
 impl RemoteState {
     /// Current freshness token for a proposal.
     pub fn proposal_revision(&self, proposal_id: u64) -> u64 {
@@ -225,6 +251,26 @@ pub fn handle_remote_command(app: &mut App, envelope: ClientEnvelope, max_prompt
             ClientFrame::RequestSnapshot {} => {
                 app.remote.snapshot_dirty = true;
                 Ok((CommandStatus::Completed, None))
+            }
+            ClientFrame::RequestTerminals(r) => Ok((
+                CommandStatus::Completed,
+                Some(terminal_snapshot(app, r.terminal_id)),
+            )),
+            ClientFrame::TerminalInput(input) => {
+                if input.text.is_empty() || input.text.len() > 4096 {
+                    Err(CommandFailure::new(
+                        ErrorCode::InvalidPayload,
+                        "shell input must contain 1-4096 UTF-8 bytes",
+                    ))
+                } else {
+                    app.terminal_manager
+                        .write_input_to(
+                            gaviero_core::terminal::TerminalId::from_raw(input.terminal_id),
+                            input.text.as_bytes(),
+                        )
+                        .map(|()| (CommandStatus::Completed, None))
+                        .map_err(|e| CommandFailure::new(ErrorCode::InvalidPayload, e.to_string()))
+                }
             }
             ClientFrame::RequestMessages(r) => {
                 // 1.1 `latest_page`: an absent cursor means the newest page.
@@ -718,6 +764,41 @@ mod tests {
 
     fn background_id(app: &App) -> String {
         app.chat_state.conversations[0].id.clone()
+    }
+
+    #[test]
+    fn terminal_snapshot_selects_background_shell_without_changing_focus() {
+        use gaviero_core::terminal::TerminalEvent;
+        let (dir, mut app) = two_tab_app();
+        let first = app.terminal_manager.create_tab_lazy(dir.path());
+        let second = app.terminal_manager.create_tab_lazy(dir.path());
+        app.terminal_manager.process_event(TerminalEvent::PtyOutput {
+            id: second, data: "hello café".as_bytes().to_vec(),
+        });
+        let snapshot = terminal_snapshot(&app, Some(second.raw()));
+        assert_eq!(snapshot["selected_id"], second.raw());
+        assert_eq!(snapshot["terminals"].as_array().unwrap().len(), 2);
+        assert_eq!(snapshot["screen"]["text"], "hello café");
+        assert_eq!(app.terminal_manager.active_tab(), Some(first));
+        app.terminal_manager.close_tab(second);
+        assert_eq!(terminal_snapshot(&app, Some(second.raw()))["selected_id"], first.raw());
+        app.terminal_manager.close_tab(first);
+        assert!(terminal_snapshot(&app, None)["selected_id"].is_null());
+    }
+
+    #[test]
+    fn remote_terminal_input_rejects_unknown_tabs_and_oversized_input() {
+        use gaviero_remote::envelope::TerminalInput;
+        let (_dir, mut app) = two_tab_app();
+        for text in ["echo hi\r".to_string(), "é".repeat(2049), String::new()] {
+            handle_remote_command(&mut app, ClientEnvelope {
+                version: gaviero_remote::version::PROTOCOL_VERSION,
+                instance_id: Some("test".into()), command_id: "input".into(),
+                frame: ClientFrame::TerminalInput(TerminalInput { terminal_id: 999, text }),
+            }, 131072);
+            assert!(matches!(app.remote.pending_frames.pop(), Some(ServerFrame::CommandError(_))));
+            assert!(app.terminal_manager.is_empty());
+        }
     }
 
     #[test]

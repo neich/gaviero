@@ -147,6 +147,8 @@ holds the current token.
 | `request_snapshot` | `{ }` |
 | `request_messages` | `{ conv_id, before_seq?, limit }` — `limit` clamped to 1–200; `before_seq` optional since 1.1 (absent ⇒ newest page) |
 | `request_proposal` | `{ proposal_id }` |
+| `request_terminals` | `{ terminal_id? }` — requires `shell_sessions`; lists tabs and reads the selected screen |
+| `terminal_input` | `{ terminal_id, text }` — requires `shell_sessions`; writes UTF-8 input and control keys to the named PTY |
 
 There is **no** `rotate_token` command. Rotation is desktop-only and reaches the client as
 close 4006.
@@ -313,9 +315,38 @@ The last three keys are optional (1.1) and omitted when unknown; 1.0 apps ignore
 `token` is the machine token unless the workspace opted out (`remote.tokenScope`). The QR is
 the only intentional display of the token.
 
+## Shell sessions (`shell_sessions` capability)
+
+Servers advertising `hello.capabilities: ["shell_sessions", ...]` support two
+additional client frames on the existing authenticated WebSocket:
+
+* `request_terminals`: `{ "terminal_id": 2 }`. The ID is optional. The completed
+  `command_result.result` contains `terminals: [{id, title, cwd, spawned}]`,
+  `selected_id` (nullable), and `screen: {text, rows, cols}` (nullable). Tabs are
+  ordered as on the desktop. An absent or removed selection falls back to the
+  first existing tab. This request never creates a shell or changes desktop focus.
+* `terminal_input`: `{ "terminal_id": 2, "text": "echo hello\r" }`. Writes
+  1–4096 UTF-8 bytes to that PTY, spawning an existing lazy tab if necessary.
+  Missing tabs, invalid size, and spawn/write failures return `command_error`.
+  Completion means the input was written, not that the shell command finished.
+
+The Flutter chat toolbar opens **Shell sessions**. Tabs select independently of
+the desktop; Enter submits a command, Type sends text without Enter, and the key
+bar provides Ctrl+C, Esc, Tab, arrows, and Backspace. Tab sends any draft first,
+allowing shell completion. Other control keys act immediately on the PTY.
+The screen polls at 750 ms while visible in the foreground, with at most one
+request outstanding. It shows the current terminal viewport as plain text
+(up to 16,384 Unicode characters), without ANSI styling or scrollback history;
+desktop terminal dimensions remain authoritative. This is access to Gaviero's
+terminal tabs, not unrelated shells elsewhere on the computer.
+
+Input uses the existing instance validation, authentication, command-ID dedupe,
+and rate limits. The client clears shell state and disables input on disconnect;
+it never replays input automatically. Older servers receive no shell requests.
+
 ## Fixtures
 
-One example per frame type under `fixtures/client/` (13) and `fixtures/server/` (20),
+One example per frame type under `fixtures/client/` (15) and `fixtures/server/` (20),
 named `<type>.json`, each a complete envelope, plus `fixtures/http/instances.json` for the
 1.1 directory body. `fixtures/server/hello.json` shows the 1.1 shape (`machine`, capabilities);
 the test suite also asserts the 1.0 shape (no `machine`) still decodes. `fixtures/server/message_complete.json`

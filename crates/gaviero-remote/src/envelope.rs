@@ -28,6 +28,8 @@ pub enum ClientFrame {
     RequestSnapshot {},
     RequestMessages(RequestMessages),
     RequestProposal(RequestProposal),
+    RequestTerminals(RequestTerminals),
+    TerminalInput(TerminalInput),
 }
 
 impl ClientFrame {
@@ -46,6 +48,8 @@ impl ClientFrame {
         "request_snapshot",
         "request_messages",
         "request_proposal",
+        "request_terminals",
+        "terminal_input",
     ];
 }
 
@@ -125,6 +129,19 @@ pub struct RequestMessages {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RequestProposal {
     pub proposal_id: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct RequestTerminals {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TerminalInput {
+    pub terminal_id: u64,
+    /// UTF-8 input, including terminal control keys. Limited to 4096 bytes.
+    pub text: String,
 }
 
 // ── Server frames ────────────────────────────────────────────────

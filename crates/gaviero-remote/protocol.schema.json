@@ -158,6 +158,31 @@
         ],
         "type": "object"
       },
+      "RequestTerminals": {
+        "properties": {
+          "terminal_id": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": ["integer", "null"]
+          }
+        },
+        "type": "object"
+      },
+      "TerminalInput": {
+        "properties": {
+          "terminal_id": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "text": {
+            "description": "UTF-8 input, including terminal control keys. Limited to 4096 bytes.",
+            "type": "string"
+          }
+        },
+        "required": ["terminal_id", "text"],
+        "type": "object"
+      },
       "ResetConversation": {
         "properties": {
           "conv_id": {
@@ -472,6 +497,22 @@
           "type",
           "payload"
         ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": { "$ref": "#/$defs/RequestTerminals" },
+          "type": { "const": "request_terminals", "type": "string" }
+        },
+        "required": ["type", "payload"],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": { "$ref": "#/$defs/TerminalInput" },
+          "type": { "const": "terminal_input", "type": "string" }
+        },
+        "required": ["type", "payload"],
         "type": "object"
       }
     ],

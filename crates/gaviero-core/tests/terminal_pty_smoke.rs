@@ -7,6 +7,40 @@ use gaviero_core::terminal::config::ShellConfig;
 use gaviero_core::terminal::shell_integration;
 use gaviero_core::terminal::types::TerminalId;
 
+#[tokio::test]
+async fn named_shell_input_runs_on_background_tab_without_switching_desktop() {
+    use gaviero_core::terminal::{ShellState, TerminalConfig, TerminalManager};
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = TerminalManager::new(TerminalConfig::default());
+    let mut events = manager.take_event_rx();
+    let desktop = manager.create_tab_lazy(dir.path());
+    let remote = manager.create_tab(dir.path()).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await.expect("shell prompt timeout").expect("terminal events closed");
+        manager.process_event(event);
+        if matches!(manager.instance(remote).unwrap().shell_state, ShellState::Idle) {
+            break;
+        }
+    }
+    manager.write_input_to(remote, b"echo REMOTE_SHELL_OK\r").unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await.expect("command output timeout").expect("terminal events closed");
+        manager.process_event(event);
+        if manager.instance(remote).unwrap().screen().contents()
+            .lines().any(|line| line.trim() == "REMOTE_SHELL_OK") {
+            break;
+        }
+    }
+    assert_eq!(manager.active_tab(), Some(desktop));
+    assert!(!manager.instance(desktop).unwrap().spawned);
+}
+
 #[test]
 fn default_shell_emits_output_through_pty() {
     let mut shell_config = ShellConfig::default_for_user();
