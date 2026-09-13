@@ -142,6 +142,7 @@ impl IterationEngine {
         impact_text: Option<&str>,
         pre_fetched_memory: Option<&str>,
         workspace_extra_tools: &[String],
+        tool_policy: Option<&crate::agent_session::tool_agent::policy::ToolPolicy>,
         skip_repo_context: bool,
         skill_catalog: Option<&crate::skills::SkillCatalog>,
     ) -> IterationResult {
@@ -195,6 +196,7 @@ impl IterationEngine {
                 impact_text,
                 pre_fetched_memory,
                 workspace_extra_tools,
+                tool_policy,
                 skip_repo_context,
                 skill_catalog,
             )
@@ -272,6 +274,7 @@ impl IterationEngine {
         impact_text: Option<&str>,
         pre_fetched_memory: Option<&str>,
         workspace_extra_tools: &[String],
+        tool_policy: Option<&crate::agent_session::tool_agent::policy::ToolPolicy>,
         skip_repo_context: bool,
         skill_catalog: Option<&crate::skills::SkillCatalog>,
         resolve_backend: F,
@@ -343,6 +346,7 @@ impl IterationEngine {
                     impact_text,
                     pre_fetched_memory,
                     workspace_extra_tools,
+                    tool_policy,
                     skip_repo_context,
                     skill_catalog,
                 )
@@ -546,6 +550,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
                 false,
                 None,
             )
@@ -578,6 +583,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
                 false,
                 None,
             )
@@ -611,6 +617,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
                 false,
                 None,
                 {
@@ -674,6 +681,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
                 false,
                 None,
                 {

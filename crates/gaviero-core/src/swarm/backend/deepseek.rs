@@ -133,6 +133,7 @@ impl AgentBackend for DeepseekBackend {
             user_prompt: request.prompt,
             allowed_tools: request.allowed_tools,
             auto_approve: request.auto_approve,
+            tool_policy: request.tool_policy,
         };
 
         tokio::spawn(async move {

@@ -380,6 +380,7 @@ mod tests {
             auto_approve: true,
             suppress_hooks: true,
             file_scope: crate::types::FileScope::default(),
+            tool_policy: None,
         };
 
         let mut stream = backend.stream_completion(req).await.unwrap();
@@ -422,6 +423,7 @@ mod tests {
             auto_approve: true,
             suppress_hooks: true,
             file_scope: crate::types::FileScope::default(),
+            tool_policy: None,
         };
 
         let result = backend.stream_completion(req).await;
@@ -491,6 +493,7 @@ mod tests {
             auto_approve: true,
             suppress_hooks: true,
             file_scope: crate::types::FileScope::default(),
+            tool_policy: None,
         };
 
         let mut stream = backend.stream_completion(req).await.unwrap();

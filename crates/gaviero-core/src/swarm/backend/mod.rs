@@ -191,6 +191,12 @@ pub struct CompletionRequest {
     pub suppress_hooks: bool,
     /// Owned-path scope for in-process tool-agent backends (swarm work units).
     pub file_scope: FileScope,
+    /// Shell policy (`agent.permissions.bash` + approved tools) resolved by
+    /// the host from the workspace cascade. Consumed by in-process
+    /// tool-agent backends; subprocess backends get the same lists through
+    /// the synthesized provider configs. `None` → resolve from
+    /// `workspace_root` (finds nothing inside a swarm worktree).
+    pub tool_policy: Option<crate::agent_session::tool_agent::policy::ToolPolicy>,
 }
 
 // ── Backend Config ──────────────────────────────────────────────────────────
@@ -287,6 +293,7 @@ mod tests {
             auto_approve: true,
             suppress_hooks: true,
             file_scope: FileScope::default(),
+            tool_policy: None,
         };
 
         let mut stream = backend.stream_completion(req).await.unwrap();
@@ -331,6 +338,7 @@ mod tests {
             auto_approve: true,
             suppress_hooks: true,
             file_scope: FileScope::default(),
+            tool_policy: None,
         };
 
         let mut stream = backend.stream_completion(req).await.unwrap();

@@ -139,6 +139,7 @@ fn config_for(workspace: &Path, ollama_url: &str) -> SwarmConfig {
         mcp_config: None,
         specificity: SpecificityConfig::default(),
         swarm_extra_tools: vec![],
+        tool_policy: None,
         extract_agent_findings: false,
         resume_from_artifacts: false,
         knowledge_invalidation: None,
