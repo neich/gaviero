@@ -145,6 +145,20 @@ Language-specific overrides use bracket syntax: `"[rust]": { "editor.tabSize": 4
 
 **Model specs** use `provider:model` — bare names are rejected. Providers: `claude:`, `codex:`, `cursor:`, `ollama:`, `local:`, `deepseek:`.
 
+**Agent permissions** are defined once under `agent` and pushed to every provider. Do not author shell rules in `.claude/settings.json`, `.cursor/cli.json` or `.codex/` — gaviero regenerates those from these keys on every launch and inside every swarm worktree (hand-written entries survive, but they never reach the other providers).
+
+| Key | Meaning | Default |
+|---|---|---|
+| `agent.availableTools` | Hard tool surface. Claude `--tools`; Cursor `Shell(*)` / `Write(**)` deny rules when `Bash` / write tools are absent; Codex chat declines commands and file changes that are off the surface; tool registry of the in-process agent. | `Read, Glob, Grep, Write, Edit, MultiEdit` |
+| `agent.approvedTools` | Subset that never prompts. Claude `--allowedTools`; Cursor gets `--force` only when this contains `Bash`; Codex chat and the in-process agent skip the prompt. | `Read, Glob, Grep` |
+| `agent.permissions.bash.allowlist` | Command prefixes that run without a prompt even when `Bash` is not approved. Claude `Bash(prefix:*)` and Cursor `Shell(prefix*)` allow rules; enforced directly by Codex chat and the in-process agent. Set `[]` to disable. | read-only commands plus `cargo check / test / build / clippy` |
+| `agent.permissions.bash.denylist` | Command token sequences that never run, whatever else is approved. Claude and Cursor deny rules; Codex `.codex/rules/gaviero.rules` (`forbidden`, enforced even under the swarm bypass flag); enforced directly by Codex chat and the in-process agent. | none (a built-in list blocks `sudo`, `rm -rf`, `curl … \| sh`) |
+| `agent.permissions.bash.timeoutSecs` / `outputCapBytes` | Limits for one in-process shell command. | `120` / `30720` |
+
+Matching: an allowlist entry is a prefix on a word boundary, and every segment of a compound command (`&&`, `||`, `;`, `|`) must match one — `cargo test && curl x` is not cleared by `cargo test`. A denylist entry matches as a token sequence anywhere in the command, last token as a prefix — `git push --force` catches `cd x && git push --force-with-lease`; `gh` catches `gh pr create` but not `echo high`. Claude and Cursor only support prefix rules natively, and Codex only token prefixes, so a denied sequence buried mid-segment is caught by gaviero's own gate (Codex chat, DeepSeek) but not by Claude or Cursor.
+
+What happens to a command that is available but neither approved nor allow-listed: Claude, Codex chat and DeepSeek prompt you; headless Cursor auto-rejects it. Swarm agents always run auto-approved, so only the denylist applies there.
+
 Per-crate configuration details: [gaviero-tui](crates/gaviero-tui/README.md#configuration), [gaviero-core](crates/gaviero-core/README.md#configuration), [gaviero-cli](crates/gaviero-cli/README.md#configuration).
 
 ## API

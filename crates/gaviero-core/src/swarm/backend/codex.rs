@@ -28,6 +28,16 @@
 //! exists on the top-level `codex` command, not on `codex exec`, so the approval
 //! policy must be set via the TOML config override.
 //!
+//! `agent.permissions.bash.denylist` reaches this path through the
+//! project-layer execpolicy file `<worktree>/.codex/rules/gaviero.rules`
+//! that `mcp::config_synth::synthesize_for_worktree` writes: Codex loads
+//! `.codex/rules/*.rules` from the cwd and enforces `forbidden` rules even
+//! under `--dangerously-bypass-approvals-and-sandbox` (probed on codex-cli
+//! 0.153.4, 2026-09-12). The allowlist is irrelevant here (every command is
+//! auto-approved) and `agent.availableTools` cannot be expressed to
+//! `codex exec` at all — a unit without `Bash` still gets a shell on this
+//! backend.
+//!
 //! Workspace-mode multi-folder is plumbed via `request.additional_roots`: every
 //! sibling folder beyond the cwd is forwarded as a `--add-dir <path>` flag so
 //! the model can read/write across the whole workspace.
@@ -310,7 +320,9 @@ fn codex_exec_args(
     //   runs in its own per-agent git worktree (read-only branch of
     //   user's repo, cleaned up afterwards) and every file change
     //   merges back through the Write Gate. `--mcp-codex-trust granted`
-    //   is the user-facing opt-in to this trade.
+    //   is the user-facing opt-in to this trade. The synthesized
+    //   `.codex/rules/gaviero.rules` denylist still applies under the
+    //   bypass flag (see the module docs).
     let has_mcp = crate::mcp::codex_synth_has_any_mcp(workspace_root);
     if has_mcp {
         tracing::warn!(
