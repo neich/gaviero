@@ -139,6 +139,12 @@ pub(crate) fn run_swarm(app: &mut App, task_desc: String) {
     let excludes = parse_exclude_patterns(&app.workspace, Some(&root));
     let specificity = app.workspace.resolve_specificity_config(Some(&root));
     let (swarm_extra_tools, _) = app.workspace.resolve_agent_tools(Some(&root));
+    let tool_policy = Some(
+        gaviero_core::agent_session::tool_agent::policy::ToolPolicy::from_workspace(
+            &app.workspace,
+            Some(&root),
+        ),
+    );
     // Route each completed swarm agent's findings through the per-turn
     // memory extractor (same path as a chat turn). The TUI's writer carries
     // the extraction LLM, so this is live whenever `memory.extractor.enabled`.
@@ -210,6 +216,7 @@ pub(crate) fn run_swarm(app: &mut App, task_desc: String) {
             mcp_config: Some(mcp_config),
             specificity,
             swarm_extra_tools,
+            tool_policy,
             extract_agent_findings,
             resume_from_artifacts: true,
             knowledge_invalidation: None,
@@ -377,6 +384,12 @@ pub(super) fn handle_run_script_command(app: &mut App) {
     let mcp_config = mcp_config_for_workspace(app, &root);
     let specificity = app.workspace.resolve_specificity_config(Some(&root));
     let (swarm_extra_tools, _) = app.workspace.resolve_agent_tools(Some(&root));
+    let tool_policy = Some(
+        gaviero_core::agent_session::tool_agent::policy::ToolPolicy::from_workspace(
+            &app.workspace,
+            Some(&root),
+        ),
+    );
     // Route each completed swarm agent's findings through the per-turn
     // memory extractor (same path as a chat turn). The TUI's writer carries
     // the extraction LLM, so this is live whenever `memory.extractor.enabled`.
@@ -414,6 +427,7 @@ pub(super) fn handle_run_script_command(app: &mut App) {
             mcp_config: Some(mcp_config),
             specificity,
             swarm_extra_tools,
+            tool_policy,
             extract_agent_findings,
             resume_from_artifacts: true,
             knowledge_invalidation: None,
@@ -545,6 +559,12 @@ pub(super) fn handle_coordinated_swarm_command(app: &mut App) {
     let mcp_config = mcp_config_for_workspace(app, &root);
     let specificity = app.workspace.resolve_specificity_config(Some(&root));
     let (swarm_extra_tools, _) = app.workspace.resolve_agent_tools(Some(&root));
+    let tool_policy = Some(
+        gaviero_core::agent_session::tool_agent::policy::ToolPolicy::from_workspace(
+            &app.workspace,
+            Some(&root),
+        ),
+    );
     // Route each completed swarm agent's findings through the per-turn
     // memory extractor (same path as a chat turn). The TUI's writer carries
     // the extraction LLM, so this is live whenever `memory.extractor.enabled`.
@@ -578,6 +598,7 @@ pub(super) fn handle_coordinated_swarm_command(app: &mut App) {
             mcp_config: Some(mcp_config),
             specificity,
             swarm_extra_tools,
+            tool_policy,
             extract_agent_findings,
             resume_from_artifacts: true,
             knowledge_invalidation: None,

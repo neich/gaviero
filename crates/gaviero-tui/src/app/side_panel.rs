@@ -2175,6 +2175,15 @@ pub(crate) fn dispatch_prompt_core(
 
     let (agent_available_tools, agent_approved_tools) =
         app.workspace.resolve_agent_tools(Some(&root));
+    // Shell policy from the same cascade, handed to the session so the
+    // in-process tool-agent and the Codex command gate never re-read the
+    // settings file themselves.
+    let tool_policy = Some(
+        gaviero_core::agent_session::tool_agent::policy::ToolPolicy::from_workspace(
+            &app.workspace,
+            Some(&root),
+        ),
+    );
 
     // M6: `resume_session_id` deprecated; ClaudeSession reads it from
     // `ContinuityHandle` instead. This construction site feeds
@@ -2188,6 +2197,7 @@ pub(crate) fn dispatch_prompt_core(
         auto_approve,
         available_tools: Some(agent_available_tools),
         approved_tools: Some(agent_approved_tools),
+        tool_policy,
         resume_session_id,
         ..gaviero_core::acp::session::AgentOptions::default()
     };

@@ -90,12 +90,16 @@ fn codex_native_edit_developer_instructions(cwd: &Path, additional_roots: &[Path
          through shell redirection or helper scripts. Gaviero snapshots each native \
          file change, restores the original after the turn, and sends the intended \
          result to its review queue. Do not print complete files in assistant text.\n\n\
-         You may run direct, workspace-scoped `cargo fmt ...` and `cargo test ...` \
-         verification commands against the temporary edited workspace. Invoke Cargo \
-         directly, without shell chaining, pipes, redirection, command wrappers, \
-         network escalation, or manifests outside the configured workspace roots. \
-         Other write-capable shell commands are declined. Prefer the narrowest \
-         package and test scope that validates the change.\n",
+         Shell command permissions are controlled by Gaviero's resolved settings. \
+         In workspace mode, the authoritative configuration is `.gaviero/settings.json` \
+         beside the `.gaviero-workspace` file, not a member folder's settings or \
+         provider-specific permission files. Its command policy takes precedence \
+         over generic Gaviero command guidance and earlier command-policy text. \
+         Commands allowed by that policy, including non-Cargo tools, may be run. \
+         Submit commands through the command tool; Gaviero evaluates the resolved \
+         allowlist, denylist, and tool availability and requests approval when needed. \
+         A read-only sandbox does not itself mean that command approval is unavailable. \
+         Prefer the narrowest verification scope that validates the change.\n",
     );
 
     if additional_roots.is_empty() {
@@ -927,7 +931,51 @@ async fn command_execution_is_safe_to_approve(
             true
         }
         CommandDecision::UnattendedFallback => {
-            cargo_verification_is_safe_to_approve(value, active_turn, review).await
+            // Bash is on the surface but not auto-approved. Workspace-scoped
+            // cargo verification keeps its prompt-free lane; anything else
+            // asks the user through the same `on_permission_request` channel
+            // Claude's control protocol and the in-process tool-agent use.
+            // Network escalations are never prompted: the prompt shows only
+            // the command line, so the user could not see what they grant.
+            if parse_cargo_verification_request(value, review).is_ok() {
+                return cargo_verification_is_safe_to_approve(value, active_turn, review).await;
+            }
+            if value
+                .pointer("/params/networkApprovalContext")
+                .is_some_and(|context| !context.is_null())
+            {
+                tracing::debug!(command, "declining Codex command: network escalation");
+                return false;
+            }
+            if let Err(e) = validate_additional_permissions(value, review) {
+                tracing::debug!(error = %e, command, "declining Codex command: extra permissions");
+                return false;
+            }
+            if active_turn.lock().await.is_none() {
+                return false;
+            }
+            prompt_for_command(&command, review).await
+        }
+    }
+}
+
+/// Ask the host to approve a command that is available but not
+/// auto-approved. Mirrors `ToolPolicy::gate_bash`: the observer receives a
+/// oneshot; anything but an explicit allow (including a dropped sender when
+/// the turn is cancelled) is a deny. No lock is held across the await.
+async fn prompt_for_command(command: &str, review: &ReviewContext) -> bool {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    review.observer.on_permission_request(
+        "Bash",
+        command,
+        &serde_json::json!({ "command": command }),
+        tx,
+    );
+    match rx.await {
+        Ok(decision) if decision.is_allow() => true,
+        _ => {
+            tracing::debug!(command, "declining Codex command: not approved by user");
+            false
         }
     }
 }
@@ -2085,9 +2133,9 @@ url = "https://example/mcp/"
         assert!(instructions.contains("apply_patch"));
         assert!(instructions.contains("snapshots each native file change"));
         assert!(instructions.contains("Do not print complete files"));
-        assert!(instructions.contains("cargo fmt"));
-        assert!(instructions.contains("cargo test"));
-        assert!(instructions.contains("without shell chaining"));
+        assert!(instructions.contains("authoritative configuration is `.gaviero/settings.json`"));
+        assert!(instructions.contains("including non-Cargo tools, may be run"));
+        assert!(!instructions.contains("Other write-capable shell commands are declined"));
         assert!(!instructions.contains("All code edits must be proposed"));
     }
 
@@ -2098,6 +2146,11 @@ url = "https://example/mcp/"
         assert_eq!(resume["approvalPolicy"], "on-request");
         assert_eq!(resume["sandboxPolicy"]["type"], "readOnly");
         assert_eq!(resume["sandboxPolicy"]["networkAccess"], true);
+        assert_eq!(
+            resume["developerInstructions"],
+            thread_start_params("gpt-5.6-sol", Path::new("/tmp/work"), &[], true)
+                ["developerInstructions"]
+        );
 
         let turn = turn_start_params("thread-1", "hello", false);
         assert_eq!(turn["approvalPolicy"], "on-request");
@@ -2636,6 +2689,53 @@ url = "https://example/mcp/"
     }
 
     #[tokio::test]
+    async fn workspace_flutter_allowlist_controls_command_approval() {
+        use crate::acp::session::AgentOptions;
+        use crate::agent_session::tool_agent::policy::ToolPolicy;
+        use crate::workspace::Workspace;
+
+        let dir = tempfile::tempdir().unwrap();
+        let member = dir.path().join("member");
+        std::fs::create_dir_all(member.join(".gaviero")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".gaviero")).unwrap();
+        std::fs::write(
+            member.join(".gaviero/settings.json"),
+            r#"{"agent.permissions.bash.denylist":["flutter"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".gaviero/settings.json"),
+            r#"{"agent.permissions.bash.allowlist":["flutter"],"agent.permissions.bash.denylist":[],"agent.approvedTools":[]}"#,
+        )
+        .unwrap();
+        let workspace_path = dir.path().join("test.gaviero-workspace");
+        std::fs::write(
+            &workspace_path,
+            r#"{"folders":[{"path":"member"}],"settings":{"agent.permissions.bash.denylist":["flutter"]}}"#,
+        )
+        .unwrap();
+        let workspace = Workspace::load(&workspace_path).unwrap();
+        let options = AgentOptions {
+            available_tools: Some(vec!["Bash".into()]),
+            tool_policy: Some(ToolPolicy::from_workspace(&workspace, Some(&member))),
+            ..AgentOptions::default()
+        };
+        let mut review = review_context(&member, test_write_gate());
+        review.tool_surface = AgentToolSurface::from_agent_options(&options, &member);
+        let (tx, _rx) = mpsc::channel(1);
+        let active_turn = Arc::new(Mutex::new(Some(ActiveTurn::new(tx))));
+        for command in [
+            "flutter pub get",
+            "flutter analyze",
+            "flutter test",
+            "flutter build apk --debug",
+        ] {
+            let request = command_request(serde_json::json!(command), &member);
+            assert!(command_execution_is_safe_to_approve(&request, &active_turn, &review).await);
+        }
+    }
+
+    #[tokio::test]
     async fn approved_bash_allows_non_denied_commands() {
         let dir = tempfile::tempdir().unwrap();
         let mut review = review_context(dir.path(), test_write_gate());
@@ -2729,13 +2829,87 @@ url = "https://example/mcp/"
 
     #[tokio::test]
     async fn unattended_fallback_still_approves_cargo_test() {
+        use crate::agent_session::tool_agent::policy::ScriptingObserver;
+
         let dir = tempfile::tempdir().unwrap();
-        let review = review_context(dir.path(), test_write_gate());
+        let mut review = review_context(dir.path(), test_write_gate());
+        let observer = Arc::new(ScriptingObserver {
+            allow: false,
+            prompted: std::sync::Mutex::new(vec![]),
+        });
+        review.observer = observer.clone();
         let (tx, _rx) = mpsc::channel(1);
         let active_turn = Arc::new(Mutex::new(Some(ActiveTurn::new(tx))));
+
+        // Cargo verification keeps its prompt-free lane.
         let request = command_request(serde_json::json!("cargo test"), dir.path());
         assert!(command_execution_is_safe_to_approve(&request, &active_turn, &review).await);
+        assert!(observer.prompted.lock().unwrap().is_empty());
+
+        // Anything else asks the user; a deny declines the command.
         let other = command_request(serde_json::json!("git status"), dir.path());
         assert!(!command_execution_is_safe_to_approve(&other, &active_turn, &review).await);
+        assert_eq!(
+            observer.prompted.lock().unwrap().as_slice(),
+            ["Bash:git status"]
+        );
+    }
+
+    #[tokio::test]
+    async fn unattended_fallback_prompts_and_honours_user_allow() {
+        use crate::agent_session::tool_agent::policy::ScriptingObserver;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut review = review_context(dir.path(), test_write_gate());
+        let observer = Arc::new(ScriptingObserver {
+            allow: true,
+            prompted: std::sync::Mutex::new(vec![]),
+        });
+        review.observer = observer.clone();
+        let (tx, _rx) = mpsc::channel(1);
+        let active_turn = Arc::new(Mutex::new(Some(ActiveTurn::new(tx))));
+
+        let request = command_request(serde_json::json!("npm install"), dir.path());
+        assert!(command_execution_is_safe_to_approve(&request, &active_turn, &review).await);
+        assert_eq!(
+            observer.prompted.lock().unwrap().as_slice(),
+            ["Bash:npm install"]
+        );
+
+        // Denylist hits never reach the prompt, even with an allowing user.
+        review.tool_surface = AgentToolSurface::full_bash_approved();
+        let denied = command_request(
+            serde_json::json!("git push --force origin main"),
+            dir.path(),
+        );
+        assert!(!command_execution_is_safe_to_approve(&denied, &active_turn, &review).await);
+        assert_eq!(observer.prompted.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unattended_fallback_never_prompts_for_network_escalation() {
+        use crate::agent_session::tool_agent::policy::ScriptingObserver;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut review = review_context(dir.path(), test_write_gate());
+        let observer = Arc::new(ScriptingObserver {
+            allow: true,
+            prompted: std::sync::Mutex::new(vec![]),
+        });
+        review.observer = observer.clone();
+        let (tx, _rx) = mpsc::channel(1);
+        let active_turn = Arc::new(Mutex::new(Some(ActiveTurn::new(tx))));
+
+        let mut network = command_request(serde_json::json!("npm install"), dir.path());
+        network["params"]["networkApprovalContext"] =
+            serde_json::json!({ "host": "example.com", "protocol": "https" });
+        assert!(!command_execution_is_safe_to_approve(&network, &active_turn, &review).await);
+        assert!(observer.prompted.lock().unwrap().is_empty());
+
+        // No active turn → declined without a prompt either.
+        let idle: SharedActiveTurn = Arc::new(Mutex::new(None));
+        let request = command_request(serde_json::json!("npm install"), dir.path());
+        assert!(!command_execution_is_safe_to_approve(&request, &idle, &review).await);
+        assert!(observer.prompted.lock().unwrap().is_empty());
     }
 }

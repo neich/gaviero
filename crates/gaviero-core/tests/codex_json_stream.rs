@@ -46,6 +46,7 @@ fn request(prompt: &str, workspace_root: std::path::PathBuf) -> CompletionReques
         auto_approve: false,
         suppress_hooks: true,
         file_scope: gaviero_core::types::FileScope::default(),
+        tool_policy: None,
     }
 }
 

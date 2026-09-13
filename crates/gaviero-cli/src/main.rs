@@ -4049,6 +4049,14 @@ async fn main() -> Result<()> {
     let swarm_observer = CliSwarmObserver;
     let specificity = workspace.resolve_specificity_config(Some(&repo));
     let (swarm_extra_tools, _) = workspace.resolve_agent_tools(Some(&repo));
+    // Shell policy from the workspace cascade; agents run in worktrees
+    // where `.gaviero/settings.json` does not exist, so it travels here.
+    let tool_policy = Some(
+        gaviero_core::agent_session::tool_agent::policy::ToolPolicy::from_workspace(
+            &workspace,
+            Some(&repo),
+        ),
+    );
     let config = gaviero_core::swarm::pipeline::SwarmConfig {
         execution_mode: plan.execution_mode,
         max_parallel: effective_max_parallel,
@@ -4066,6 +4074,7 @@ async fn main() -> Result<()> {
         mcp_config,
         specificity,
         swarm_extra_tools,
+        tool_policy,
         extract_agent_findings,
         resume_from_artifacts: !cli.fresh,
         knowledge_invalidation: None,

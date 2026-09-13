@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::agent_session::tool_agent::policy as bash_policy;
+
 /// Well-known setting keys. Use these constants instead of raw strings
 /// to get compile-time typo detection.
 pub mod settings {
@@ -56,16 +58,29 @@ pub mod settings {
     pub const AGENT_APPROVED_TOOLS: &str = "agent.approvedTools";
     /// Shell permission policy, defined once here and applied to every
     /// backend. Sub-keys: `denylist`, `allowlist`, `timeoutSecs`,
-    /// `outputCapBytes`.
+    /// `outputCapBytes` — each resolved through the cascade on its own so
+    /// a folder that sets only `denylist` still inherits the default
+    /// `allowlist`.
     ///
-    /// In-process tool-agent backends enforce it directly
-    /// ([`crate::agent_session::tool_agent::policy::ToolPolicy`], which also
-    /// reads `timeoutSecs` / `outputCapBytes`). For subprocess providers the
-    /// `allowlist` / `denylist` are translated into native permission rules
-    /// by [`crate::mcp::synthesize_for_worktree`] — see
+    /// The single reader is
+    /// [`crate::agent_session::tool_agent::policy::ToolPolicy::from_workspace`].
+    /// In-process tool-agent backends and the Codex app-server session
+    /// enforce the result directly; for subprocess providers the same lists
+    /// are translated into native permission rules by
+    /// [`crate::mcp::synthesize_for_worktree`] — see
     /// [`crate::mcp::BashPermissions`] for the per-provider fidelity notes.
-    /// Empty (the default) leaves each provider's own shell rules alone.
     pub const AGENT_PERMISSIONS_BASH: &str = "agent.permissions.bash";
+    /// Command prefixes that run without a prompt. Default:
+    /// [`crate::agent_session::tool_agent::policy::DEFAULT_BASH_ALLOWLIST`].
+    /// An explicit `[]` disables auto-approval.
+    pub const AGENT_PERMISSIONS_BASH_ALLOWLIST: &str = "agent.permissions.bash.allowlist";
+    /// Token-sequence patterns that are always blocked. Default: none.
+    pub const AGENT_PERMISSIONS_BASH_DENYLIST: &str = "agent.permissions.bash.denylist";
+    /// Wall-clock cap for one in-process shell command (seconds).
+    pub const AGENT_PERMISSIONS_BASH_TIMEOUT_SECS: &str = "agent.permissions.bash.timeoutSecs";
+    /// Combined stdout+stderr cap for one in-process shell command (bytes).
+    pub const AGENT_PERMISSIONS_BASH_OUTPUT_CAP_BYTES: &str =
+        "agent.permissions.bash.outputCapBytes";
 
     // Memory settings
     /// The namespace to write memories to.
@@ -394,7 +409,7 @@ impl WorkspaceFolder {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct WorkspaceFile {
     folders: Vec<WorkspaceFolder>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     settings: serde_json::Value,
 }
 
@@ -411,6 +426,18 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    /// Authoritative settings location: beside the workspace file in workspace
+    /// mode, or inside the opened folder in single-folder mode.
+    pub fn settings_path(&self) -> PathBuf {
+        self.workspace_path
+            .as_deref()
+            .and_then(Path::parent)
+            .or_else(|| self.folders.first().map(|folder| folder.path.as_path()))
+            .unwrap_or_else(|| Path::new("."))
+            .join(".gaviero")
+            .join("settings.json")
+    }
+
     /// Root directory for remote-sidecar state (Plan A §3.3): the bearer
     /// token, TLS material, and pairing artifacts. Single-folder:
     /// `<primary-root>/.gaviero/remote`; multi-folder:
@@ -434,7 +461,7 @@ impl Workspace {
 
         let mut ws = Self {
             folders: file.folders,
-            workspace_settings: file.settings,
+            workspace_settings: serde_json::Value::Null,
             workspace_path: Some(path.to_path_buf()),
             folder_settings_cache: HashMap::new(),
             user_settings_cache: None,
@@ -493,10 +520,21 @@ impl Workspace {
         ws
     }
 
-    /// Ensure `.gaviero/settings.json` exists for all workspace roots.
+    /// Ensure the authoritative `.gaviero/settings.json` exists.
     /// Creates the directory and a default settings file if missing.
     pub fn ensure_settings(&mut self) {
-        for folder in &self.folders {
+        let settings_root = self
+            .settings_path()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let settings_folders = vec![WorkspaceFolder {
+            path: settings_root,
+            name: None,
+        }];
+        for folder in &settings_folders {
             let gaviero_dir = folder.path.join(".gaviero");
             let settings_path = gaviero_dir.join("settings.json");
 
@@ -679,14 +717,15 @@ impl Workspace {
             .context("no workspace file path (single-folder mode)")?;
         let file = WorkspaceFile {
             folders: self.folders.clone(),
-            settings: self.workspace_settings.clone(),
+            settings: serde_json::Value::Null,
         };
         let content = serde_json::to_string_pretty(&file)?;
         std::fs::write(path, content).context("writing workspace file")?;
         Ok(())
     }
 
-    /// Persist a dotted-key setting into `<root>/.gaviero/settings.json`.
+    /// Persist a dotted-key setting into the workspace root's settings in
+    /// workspace mode, or `<root>/.gaviero/settings.json` in folder mode.
     /// Creates the file (and parent dir) if missing. Refreshes the
     /// cached folder settings so subsequent `resolve_setting` calls see
     /// the new value without a reload.
@@ -696,10 +735,14 @@ impl Workspace {
         key: &str,
         value: serde_json::Value,
     ) -> Result<()> {
-        let gaviero_dir = root.join(".gaviero");
+        let path = if self.workspace_path.is_some() {
+            self.settings_path()
+        } else {
+            root.join(".gaviero").join("settings.json")
+        };
+        let gaviero_dir = path.parent().unwrap();
         std::fs::create_dir_all(&gaviero_dir)
             .with_context(|| format!("creating {}", gaviero_dir.display()))?;
-        let path = gaviero_dir.join("settings.json");
         let mut doc: serde_json::Value = match std::fs::read_to_string(&path) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({})),
             Err(_) => serde_json::json!({}),
@@ -708,6 +751,7 @@ impl Workspace {
         let content = serde_json::to_string_pretty(&doc)?;
         std::fs::write(&path, content).with_context(|| format!("writing {}", path.display()))?;
         self.folder_settings_cache.insert(root.to_path_buf(), doc);
+        self.reload_settings_cache();
         Ok(())
     }
 
@@ -716,6 +760,19 @@ impl Workspace {
     pub fn reload_settings_cache(&mut self) {
         // Cache per-folder settings
         self.folder_settings_cache.clear();
+        self.workspace_settings = match std::fs::read_to_string(self.settings_path()) {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_else(|error| {
+                tracing::warn!("Invalid settings at {}: {error}", self.settings_path().display());
+                serde_json::Value::Null
+            }),
+            Err(_) => serde_json::Value::Null,
+        };
+        self.user_settings_cache = load_user_settings();
+        // Member settings and embedded workspace settings are not policy sources
+        // in workspace mode, even when the authoritative file omits a key.
+        if self.workspace_path.is_some() {
+            return;
+        }
         for folder in &self.folders {
             let settings_path = folder.path.join(".gaviero").join("settings.json");
             if let Ok(content) = std::fs::read_to_string(&settings_path)
@@ -729,8 +786,9 @@ impl Workspace {
     }
 
     /// Resolve a setting using the cascade:
-    /// 1. Per-folder `.gaviero/settings.json` (if root provided)
-    /// 2. Workspace-level settings
+    /// 1. Workspace root `.gaviero/settings.json` in workspace mode; member
+    ///    files and embedded workspace settings are ignored.
+    /// 2. Per-folder settings in single-folder mode
     /// 3. User-level `~/.gaviero/settings.json`
     /// 4. Hardcoded defaults
     pub fn resolve_setting(&self, key: &str, root: Option<&Path>) -> serde_json::Value {
@@ -756,6 +814,28 @@ impl Workspace {
 
         // 4. Hardcoded defaults
         hardcoded_default(key)
+    }
+
+    /// Same cascade as [`Self::resolve_setting`] but without the
+    /// hardcoded-default step: `None` when no folder, workspace, or user
+    /// level defines `key`. Lets callers distinguish "unset" from "set to
+    /// the default value" (needed for legacy-key fallbacks).
+    pub fn resolve_setting_opt(&self, key: &str, root: Option<&Path>) -> Option<serde_json::Value> {
+        if let Some(root) = root
+            && let Some(settings) = self.folder_settings_cache.get(root)
+            && let Some(val) = dot_get(settings, key)
+        {
+            return Some(val.clone());
+        }
+        if let Some(val) = dot_get(&self.workspace_settings, key) {
+            return Some(val.clone());
+        }
+        if let Some(ref settings) = self.user_settings_cache
+            && let Some(val) = dot_get(settings, key)
+        {
+            return Some(val.clone());
+        }
+        None
     }
 
     /// Resolve a language-specific setting.
@@ -1166,11 +1246,27 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::AGENT_APPROVED_TOOLS => {
             serde_json::json!(["Read", "Glob", "Grep"])
         }
-        // Empty shell policy: only rules the operator wrote explicitly are
-        // translated into provider configs. The in-process tool-agent still
-        // falls back to its own built-in allowlist when this is unset.
-        settings::AGENT_PERMISSIONS_BASH => {
-            serde_json::json!({ "allowlist": [], "denylist": [] })
+        // Shell policy defaults. One definition for every consumer: the
+        // in-process tool-agent, the Codex app-server gate, and the
+        // provider config synth all read these through
+        // `ToolPolicy::from_workspace`, so a workspace with no explicit
+        // policy auto-approves exactly the built-in read-only/cargo set on
+        // every provider and denies nothing beyond the built-in denylist.
+        settings::AGENT_PERMISSIONS_BASH => serde_json::json!({
+            "allowlist": bash_policy::DEFAULT_BASH_ALLOWLIST,
+            "denylist": [],
+            "timeoutSecs": bash_policy::DEFAULT_BASH_TIMEOUT_SECS,
+            "outputCapBytes": bash_policy::DEFAULT_BASH_OUTPUT_CAP,
+        }),
+        settings::AGENT_PERMISSIONS_BASH_ALLOWLIST => {
+            serde_json::json!(bash_policy::DEFAULT_BASH_ALLOWLIST)
+        }
+        settings::AGENT_PERMISSIONS_BASH_DENYLIST => serde_json::json!([]),
+        settings::AGENT_PERMISSIONS_BASH_TIMEOUT_SECS => {
+            serde_json::json!(bash_policy::DEFAULT_BASH_TIMEOUT_SECS)
+        }
+        settings::AGENT_PERMISSIONS_BASH_OUTPUT_CAP_BYTES => {
+            serde_json::json!(bash_policy::DEFAULT_BASH_OUTPUT_CAP)
         }
 
         // Chat memory injection (S1)
@@ -1515,6 +1611,44 @@ mod tests {
     }
 
     #[test]
+    fn workspace_root_settings_are_authoritative_across_reload_and_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let member = dir.path().join("member");
+        fs::create_dir_all(member.join(".gaviero")).unwrap();
+        let member_settings = member.join(".gaviero/settings.json");
+        let conflicting = r#"{"agent.permissions.bash.allowlist":["cargo"],"memberOnly":true}"#;
+        fs::write(&member_settings, conflicting).unwrap();
+        let ws_path = dir.path().join("custom.gaviero-workspace");
+        fs::write(&ws_path, serde_json::to_string(&serde_json::json!({
+            "folders": [{"path": member}],
+            "settings": {"agent.permissions.bash.allowlist": ["git"], "embeddedOnly": true}
+        })).unwrap()).unwrap();
+        fs::create_dir_all(dir.path().join(".gaviero")).unwrap();
+        let settings_path = dir.path().join(".gaviero/settings.json");
+        fs::write(&settings_path, r#"{"agent":{"permissions":{"bash":{"allowlist":["flutter"]}}}}"#).unwrap();
+        let mut ws = Workspace::load(&ws_path).unwrap();
+        assert_eq!(ws.settings_path(), settings_path);
+        for root in [None, Some(member.as_path())] {
+            assert_eq!(ws.resolve_setting(settings::AGENT_PERMISSIONS_BASH_ALLOWLIST, root), serde_json::json!(["flutter"]));
+            assert_eq!(ws.resolve_setting_opt(settings::AGENT_PERMISSIONS_BASH_ALLOWLIST, root), Some(serde_json::json!(["flutter"])));
+            assert_eq!(ws.resolve_setting_opt("memberOnly", root), None);
+            assert_eq!(ws.resolve_setting_opt("embeddedOnly", root), None);
+        }
+        ws.save_folder_setting(&member, settings::AGENT_PERMISSIONS_BASH_ALLOWLIST, serde_json::json!([])).unwrap();
+        ws.save().unwrap();
+        let mut ws = Workspace::load(&ws_path).unwrap();
+        assert_eq!(ws.resolve_setting(settings::AGENT_PERMISSIONS_BASH_ALLOWLIST, Some(&member)), serde_json::json!([]));
+        assert_eq!(fs::read_to_string(member_settings).unwrap(), conflicting);
+        fs::write(&settings_path, "{}").unwrap();
+        ws.reload_settings_cache();
+        ws.user_settings_cache = None;
+        assert_eq!(ws.resolve_setting_opt(settings::AGENT_PERMISSIONS_BASH_ALLOWLIST, Some(&member)), None);
+        fs::remove_file(&settings_path).unwrap();
+        ws.ensure_settings();
+        assert!(settings_path.exists());
+    }
+
+    #[test]
     fn test_resolve_setting_workspace_level() {
         let ws = Workspace {
             folders: vec![],
@@ -1553,7 +1687,9 @@ mod tests {
 
     #[test]
     fn ntfy_defaults_are_opt_in_with_ntfy_sh() {
-        let ws = Workspace::single_folder(PathBuf::from("/tmp/test"));
+        let dir = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::single_folder(dir.path().to_path_buf());
+        ws.user_settings_cache = None;
         assert_eq!(
             ws.resolve_setting(settings::NOTIFICATIONS_NTFY_ENABLED, None),
             serde_json::json!(false)

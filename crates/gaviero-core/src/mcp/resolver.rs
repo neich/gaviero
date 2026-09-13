@@ -240,29 +240,17 @@ pub fn resolve_mcp_permissions(workspace: &Workspace, root: Option<&Path>) -> Mc
 /// Load the gaviero-level shell permission policy from
 /// `agent.permissions.bash`.
 ///
-/// Same object the in-process tool-agent reads, so shell rules are written
-/// once and reach both the built-in backends and the subprocess providers.
-/// Missing / malformed fields resolve to empty lists, which leaves each
-/// provider's own shell rules untouched.
+/// Delegates to [`ToolPolicy::from_workspace`] — the one reader of these
+/// keys — so the lists translated into provider configs are exactly the
+/// lists the in-process tool-agent and the Codex app-server gate enforce,
+/// including the built-in default allowlist when the workspace sets none.
 pub fn resolve_bash_permissions(workspace: &Workspace, root: Option<&Path>) -> BashPermissions {
-    let val = workspace.resolve_setting(S::AGENT_PERMISSIONS_BASH, root);
+    let policy =
+        crate::agent_session::tool_agent::policy::ToolPolicy::from_workspace(workspace, root);
     BashPermissions {
-        allowlist: string_list(&val, "allowlist"),
-        denylist: string_list(&val, "denylist"),
+        allowlist: policy.allowlist,
+        denylist: policy.denylist,
     }
-}
-
-/// Read `val[key]` as a list of non-empty trimmed strings.
-fn string_list(val: &serde_json::Value, key: &str) -> Vec<String> {
-    val.get(key)
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()))
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 fn parse_mcp_permissions_json(val: &serde_json::Value) -> McpPermissions {
@@ -406,10 +394,21 @@ mod tests {
     }
 
     #[test]
-    fn resolve_bash_permissions_defaults_to_empty() {
+    fn resolve_bash_permissions_defaults_to_builtin_allowlist() {
+        // No explicit policy → the same built-in allowlist the in-process
+        // tool-agent applies is translated for every provider, and nothing
+        // is denied beyond the built-in denylist.
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::single_folder(dir.path().to_path_buf());
-        assert!(resolve_bash_permissions(&ws, Some(dir.path())).is_empty());
+        let bash = resolve_bash_permissions(&ws, Some(dir.path()));
+        assert_eq!(
+            bash.allowlist,
+            crate::agent_session::tool_agent::policy::DEFAULT_BASH_ALLOWLIST
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(bash.denylist.is_empty());
     }
 
     #[test]

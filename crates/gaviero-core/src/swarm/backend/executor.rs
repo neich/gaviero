@@ -358,6 +358,7 @@ mod tests {
             auto_approve: true,
             suppress_hooks: true,
             file_scope: crate::types::FileScope::default(),
+            tool_policy: None,
         };
 
         let outcome = complete_to_text(&backend, request, Some(&NoopObserver))
@@ -405,6 +406,7 @@ mod tests {
             auto_approve: true,
             suppress_hooks: true,
             file_scope: crate::types::FileScope::default(),
+            tool_policy: None,
         };
 
         let gate = Arc::new(Mutex::new(WriteGatePipeline::new(
@@ -450,6 +452,7 @@ mod tests {
             auto_approve: true,
             suppress_hooks: true,
             file_scope: crate::types::FileScope::default(),
+            tool_policy: None,
         };
 
         // RejectAll mode: gate discards the proposal (no disk write), but
@@ -492,6 +495,7 @@ mod tests {
             auto_approve: true,
             suppress_hooks: true,
             file_scope: crate::types::FileScope::default(),
+            tool_policy: None,
         };
 
         let err = complete_to_text(&backend, request, Some(&NoopObserver))

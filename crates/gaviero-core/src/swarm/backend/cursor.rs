@@ -139,7 +139,11 @@ impl AgentBackend for CursorBackend {
                 "cursor spawn: remote MCP configured — sandbox disabled, approve-mcps enabled",
             );
         }
-        for arg in cursor_argv(&self.model, &request.workspace_root, None) {
+        // Swarm units run auto-approved, but only a unit whose effective
+        // tool list grants `Bash` gets "Run Everything"; the rest stay in
+        // Cursor's allowlist mode so an undeclared shell auto-rejects.
+        let force_shell = request.auto_approve && request.allowed_tools.iter().any(|t| t == "Bash");
+        for arg in cursor_argv(&self.model, &request.workspace_root, None, force_shell) {
             cmd.arg(arg);
         }
         cmd.arg(&argv_prompt);
@@ -291,10 +295,22 @@ impl AgentBackend for CursorBackend {
 /// positional. Extracted so the chat path (`CursorSession`) can reuse the
 /// exact same flag composition, and so tests can pin the argv without
 /// spawning a subprocess.
+///
+/// `force_shell` maps `agent.approvedTools` onto Cursor's two headless
+/// postures. `true` passes `--force` ("Run Everything": every shell command
+/// runs unless a `.cursor/cli.json` deny rule matches) — used when `Bash` is
+/// approved or the turn is auto-approve. `false` leaves Cursor in allowlist
+/// mode, where only `Shell(<prefix>*)` allow rules (the translated
+/// `agent.permissions.bash.allowlist`) run and every other shell command
+/// auto-rejects. Probed on `agent 2026.09.10`: without `--force`, headless
+/// `-p` still applies file edits (captured by snapshot+revert into the
+/// Write Gate) and still calls MCP servers that carry an `Mcp(name:*)`
+/// allow rule, so nothing but the shell posture changes.
 pub(crate) fn cursor_argv(
     model: &str,
     workspace_root: &Path,
     resume_session_id: Option<&str>,
+    force_shell: bool,
 ) -> Vec<String> {
     let mut args = vec![
         "-p".to_string(),
@@ -309,18 +325,6 @@ pub(crate) fn cursor_argv(
         // (e.g. Semantic Scholar) stay unregistered in `-p` runs — agents
         // report the server id as unavailable. See cursor.com/docs/cli/mcp.
         "--approve-mcps".to_string(),
-        // `--force` ("Run Everything": allow unless explicitly denied) makes
-        // gaviero the single MCP/permission gate — the same posture gaviero
-        // uses for codex (`--dangerously-bypass-approvals-and-sandbox`).
-        // Cursor's global `approvalMode: "allowlist"` otherwise prompts per
-        // MCP tool *call* (`--approve-mcps` only registers the server, it does
-        // not auto-approve calls), and headless `-p` cannot answer that
-        // elicitation, so the call auto-rejects ("User rejected MCP: …").
-        // Safety is preserved elsewhere: the synthesized `.cursor/cli.json`
-        // `deny` rules still apply under `--force`, file writes route through
-        // the Write Gate, and gaviero's in-process MCP server enforces
-        // `mcp.permissions` server-side on every tool call.
-        "--force".to_string(),
         // Streamable HTTP MCP (Wuilder / Semantic Scholar) and WebFetch
         // fallbacks need outbound network. Probed 2026-06: with sandbox
         // enabled, agents report "network calls rejected" even when
@@ -329,6 +333,17 @@ pub(crate) fn cursor_argv(
         "--sandbox".to_string(),
         "disabled".to_string(),
     ];
+    if force_shell {
+        // `--force` only when the host already auto-approves Bash. The
+        // synthesized `.cursor/cli.json` `deny` rules (the translated
+        // denylist, plus `Shell(*)` when Bash is off the surface) still
+        // apply under `--force`; file writes route through the Write Gate;
+        // gaviero's in-process MCP server enforces `mcp.permissions`
+        // server-side on every tool call. `--approve-mcps` only registers
+        // servers, it does not approve calls — the per-server `Mcp(name:*)`
+        // allow rules synth writes cover that in both postures.
+        args.push("--force".to_string());
+    }
     args.extend([
         "--workspace".to_string(),
         workspace_root.to_string_lossy().into_owned(),
@@ -820,7 +835,7 @@ mod tests {
     #[test]
     fn argv_contains_print_stream_trust_and_workspace() {
         let workspace = PathBuf::from("/tmp/wt");
-        let args = cursor_argv("auto", &workspace, None);
+        let args = cursor_argv("auto", &workspace, None, true);
         // Argv pins:
         //   * `-p` / stream-json / --stream-partial-output for the NDJSON
         //     contract the parser depends on,
@@ -831,9 +846,7 @@ mod tests {
         //     postscripts.
         assert!(args.iter().any(|a| a == "-p"));
         assert!(args.iter().any(|a| a == "--approve-mcps"));
-        // `--force` makes gaviero the sole MCP/permission gate; without it
-        // Cursor's global approvalMode=allowlist auto-rejects gaviero MCP
-        // tool calls in headless `-p` mode.
+        // `--force` ("Run Everything") only when the host auto-approves Bash.
         assert!(args.iter().any(|a| a == "--force"));
         assert!(
             args.windows(2)
@@ -847,20 +860,31 @@ mod tests {
     }
 
     #[test]
+    fn argv_omits_force_when_shell_is_not_approved() {
+        // Allowlist posture: only the synthesized `Shell(<prefix>*)` rules
+        // run, everything else auto-rejects. Every other flag is unchanged.
+        let args = cursor_argv("auto", Path::new("/tmp/wt"), None, false);
+        assert!(!args.iter().any(|a| a == "--force"));
+        assert!(args.iter().any(|a| a == "--approve-mcps"));
+        assert!(args.iter().any(|a| a == "--trust"));
+        assert!(args.windows(2).any(|w| w == ["--sandbox", "disabled"]));
+    }
+
+    #[test]
     fn argv_appends_resume_when_session_id_present() {
-        let args = cursor_argv("auto", Path::new("/tmp/wt"), Some("abc-123"));
+        let args = cursor_argv("auto", Path::new("/tmp/wt"), Some("abc-123"), true);
         assert!(args.windows(2).any(|w| w == ["--resume", "abc-123"]));
     }
 
     #[test]
     fn argv_skips_resume_for_empty_session_id() {
-        let args = cursor_argv("auto", Path::new("/tmp/wt"), Some(""));
+        let args = cursor_argv("auto", Path::new("/tmp/wt"), Some(""), true);
         assert!(!args.iter().any(|a| a == "--resume"));
     }
 
     #[test]
     fn argv_always_disables_sandbox_for_remote_mcp_and_webfetch() {
-        let args = cursor_argv("auto", Path::new("/tmp/wt"), None);
+        let args = cursor_argv("auto", Path::new("/tmp/wt"), None, false);
         assert!(args.windows(2).any(|w| w == ["--sandbox", "disabled"]));
     }
 
@@ -870,10 +894,11 @@ mod tests {
             // The whole CreateProcess command line is capped at 32,767
             // UTF-16 units; the prompt budget must leave room for the
             // node.exe path, index.js, and every flag in cursor_argv.
-            let flags: usize = cursor_argv("composer-2.5", Path::new("C:/some/workspace"), None)
-                .iter()
-                .map(|a| a.len() + 3) // quotes + separator
-                .sum();
+            let flags: usize =
+                cursor_argv("composer-2.5", Path::new("C:/some/workspace"), None, true)
+                    .iter()
+                    .map(|a| a.len() + 3) // quotes + separator
+                    .sum();
             assert!(cursor_argv_limit() + flags + 512 < 32_767);
         } else {
             assert_eq!(cursor_argv_limit(), 96 * 1024);

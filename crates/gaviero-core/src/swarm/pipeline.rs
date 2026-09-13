@@ -165,6 +165,13 @@ pub struct SwarmConfig {
     /// ignored entirely for that unit so the DSL remains the audit
     /// record. Empty = no fallback (legacy behaviour).
     pub swarm_extra_tools: Vec<String>,
+    /// Shell policy (`agent.permissions.bash` + approved tools) resolved
+    /// from the workspace cascade by the front end
+    /// (`ToolPolicy::from_workspace`). Handed to every runner explicitly
+    /// because agents run in per-agent worktrees where
+    /// `.gaviero/settings.json` does not exist. `None` = resolve from the
+    /// agent root (legacy; loses the denylist in worktrees).
+    pub tool_policy: Option<crate::agent_session::tool_agent::policy::ToolPolicy>,
     /// When true, each completed agent's findings (task + full text
     /// output) are run through the per-turn memory extractor — the same
     /// `enqueue_post_turn` path as a TUI chat turn — so durable facts are
@@ -980,6 +987,7 @@ pub async fn execute(
                 let iteration_config = plan.iteration_config.clone();
                 let pfm = pre_fetched_memory.clone();
                 let swarm_extras = config.swarm_extra_tools.clone();
+                let tool_policy = config.tool_policy.clone();
                 let skip_repo_context = config.execution_mode == ExecutionMode::Document;
                 let skill_catalog = config.skill_catalog.clone();
                 if let Ok(backend) = resolve_backend_for_unit(&router, &unit) {
@@ -1019,6 +1027,7 @@ pub async fn execute(
                             agent_impact.as_deref(),
                             (*pfm).as_deref(),
                             &swarm_extras,
+                            tool_policy.as_ref(),
                             skip_repo_context,
                             skill_catalog.as_deref(),
                             |candidate| resolve_backend_for_unit(&router, candidate),
@@ -1711,6 +1720,7 @@ pub async fn execute(
                     let iteration_config = plan.iteration_config.clone();
                     let pfm = pre_fetched_memory.clone();
                     let swarm_extras = config.swarm_extra_tools.clone();
+                    let tool_policy = config.tool_policy.clone();
                     let skip_repo_context = config.execution_mode == ExecutionMode::Document;
                     let skill_catalog = config.skill_catalog.clone();
                     let in_worktree = worktree_mgr.is_some();
@@ -1741,6 +1751,7 @@ pub async fn execute(
                                     agent_impact.as_deref(),
                                     (*pfm).as_deref(),
                                     &swarm_extras,
+                                    tool_policy.as_ref(),
                                     skip_repo_context,
                                     skill_catalog.as_deref(),
                                     |candidate| resolve_backend_for_unit(&router, candidate),
@@ -2285,6 +2296,8 @@ struct AgentRunContext<'a> {
     /// `SwarmConfig::swarm_extra_tools`). Borrowed from `SwarmConfig`
     /// for the duration of the swarm run.
     swarm_extras: &'a [String],
+    /// Workspace-resolved shell policy (see `SwarmConfig::tool_policy`).
+    tool_policy: Option<&'a crate::agent_session::tool_agent::policy::ToolPolicy>,
     /// When true, omit repo-map, topology, and code-graph context from prompts.
     skip_repo_context: bool,
     skill_catalog: Option<Arc<crate::skills::SkillCatalog>>,
@@ -2323,6 +2336,7 @@ impl<'a> AgentRunContext<'a> {
             pre_fetched_memory,
             mcp_config: config.mcp_config.clone(),
             swarm_extras: &config.swarm_extra_tools,
+            tool_policy: config.tool_policy.as_ref(),
             skip_repo_context: config.execution_mode == ExecutionMode::Document,
             skill_catalog: config.skill_catalog.clone(),
         }
@@ -3364,6 +3378,7 @@ async fn run_agent_inner(
             impact_text.as_deref(),
             pre_fetched_memory_text.as_deref(),
             ctx.swarm_extras,
+            ctx.tool_policy,
             ctx.skip_repo_context,
             ctx.skill_catalog.as_deref(),
             |candidate| {

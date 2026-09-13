@@ -90,6 +90,7 @@ async fn try_plan(
             auto_approve: true,
             suppress_hooks: true,
             file_scope: crate::types::FileScope::default(),
+            tool_policy: None,
         },
         None,
     )

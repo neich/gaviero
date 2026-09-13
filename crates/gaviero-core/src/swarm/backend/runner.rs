@@ -10,6 +10,7 @@ use anyhow::Result;
 use futures::StreamExt;
 use tokio::sync::Mutex;
 
+use crate::agent_session::tool_agent::policy::ToolPolicy;
 use crate::context_planner::{
     ContextPlanner, ModelSpec, PlannerFingerprint, PlannerInput, RuntimeConfig, SessionLedger,
     build_provider_profile,
@@ -136,6 +137,7 @@ pub async fn run_backend(
     impact_text: Option<&str>,
     pre_fetched_memory: Option<&str>,
     workspace_extra_tools: &[String],
+    tool_policy: Option<&ToolPolicy>,
     skip_repo_context: bool,
     skill_catalog: Option<&crate::skills::SkillCatalog>,
 ) -> Result<AgentManifest> {
@@ -153,6 +155,7 @@ pub async fn run_backend(
         impact_text,
         pre_fetched_memory,
         workspace_extra_tools,
+        tool_policy,
         skip_repo_context,
         skill_catalog,
     );
@@ -183,7 +186,7 @@ pub async fn run_backend(
 }
 
 #[tracing::instrument(
-    skip(backend, write_gate, memory, observer, validation, board, repo_map, impact_text, pre_fetched_memory),
+    skip(backend, write_gate, memory, observer, validation, board, repo_map, impact_text, pre_fetched_memory, tool_policy),
     fields(
         agent_id = %work_unit.id,
         tier = ?work_unit.tier,
@@ -212,6 +215,10 @@ async fn run_backend_inner(
     // when present so the unit's checked-in declaration remains the
     // audit record of which tools it can use.
     workspace_extra_tools: &[String],
+    // Shell policy resolved from the *workspace* cascade by the front end.
+    // Passed explicitly because `workspace_root` here is the agent's
+    // worktree, where no `.gaviero/settings.json` exists.
+    tool_policy: Option<&ToolPolicy>,
     skip_repo_context: bool,
     skill_catalog: Option<&crate::skills::SkillCatalog>,
 ) -> Result<AgentManifest> {
@@ -388,6 +395,7 @@ async fn run_backend_inner(
             auto_approve: true,
             suppress_hooks: true,
             file_scope: work_unit.scope.clone(),
+            tool_policy: tool_policy.cloned(),
         };
 
         // M0 instrumentation: per-attempt dispatch metrics for swarm baselines.
@@ -1107,6 +1115,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             false,
             None,
         )
@@ -1149,6 +1158,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             false,
             None,
         )
@@ -1200,6 +1210,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             false,
             None,
         )
@@ -1255,6 +1266,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             false,
             None,
         )
@@ -1306,6 +1318,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             false,
             None,
         )
@@ -1359,6 +1372,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             false,
             None,
         )
@@ -1411,6 +1425,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             false,
             None,
         )
@@ -1462,6 +1477,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             false,
             None,
         )
@@ -1512,6 +1528,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
                 false,
                 None,
             ),
@@ -1560,6 +1577,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             false,
             None,
         )
@@ -1595,6 +1613,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             false,
             None,
         )

@@ -1,11 +1,32 @@
-//! Bash permission policy for the in-process tool-agent (DeepSeek plan Unit 13).
+//! Shell permission policy shared by every provider.
+//!
+//! The in-process tool-agent (`deepseek:`) enforces it directly; the Codex
+//! app-server session applies it at `item/commandExecution/requestApproval`
+//! (via `AgentToolSurface`); and `mcp::config_synth` translates the same
+//! lists into Claude / Cursor / Codex native rules. There is exactly one
+//! reader of the settings: [`ToolPolicy::from_workspace`], which walks the
+//! workspace cascade (folder → workspace file → user → built-in defaults).
 //!
 //! Decision order for a shell command:
 //! 1. **Built-in denylist** — hard block (never run, no prompt).
 //! 2. **Settings denylist** (`agent.permissions.bash.denylist`) — hard block.
 //! 3. **`auto_approve` turn flag** or **`Bash` in `agent.approvedTools`** — run.
-//! 4. **Allowlist** prefix match (`agent.permissions.bash.allowlist`) — run.
+//! 4. **Allowlist** match (`agent.permissions.bash.allowlist`) — run.
 //! 5. **`on_permission_request`** — await user; deny on `false`/drop.
+//!
+//! Matching semantics (mirrored by the provider translations as closely as
+//! each native syntax allows):
+//! * **Denylist entries are token sequences.** `git push --force` blocks
+//!   `cd x && git push --force origin main` because the tokens `git`, `push`,
+//!   `--force…` appear contiguously; it does *not* block `echo "format"` the
+//!   way a raw substring match of `rm` would. Every token but the last must
+//!   match exactly; the last token is a prefix (`mkfs.` blocks `mkfs.ext4`,
+//!   `dd if=` blocks `dd if=/dev/zero`). Quotes around tokens are ignored.
+//! * **Allowlist entries are command prefixes on a word boundary**, checked
+//!   against *every* segment of a compound command (`&&`, `||`, `;`, `|`,
+//!   newline). `cargo test && curl evil` is not cleared by `cargo test`.
+//!   Commands containing command substitution (`$(`, backticks, `<(`) never
+//!   match the allowlist.
 //!
 //! The Write Gate mutex is never held across the permission await (this module
 //! has no Write Gate dependency).
@@ -14,12 +35,38 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::observer::AcpObserver;
+use crate::workspace::{Workspace, settings};
 
 /// Default wall-clock timeout for Bash (seconds).
 pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
 
 /// Default combined stdout+stderr cap (bytes).
 pub const DEFAULT_BASH_OUTPUT_CAP: usize = 30 * 1024;
+
+/// Built-in `agent.permissions.bash.allowlist` used when no cascade level
+/// sets one. Read-only inspection commands plus the cargo verification
+/// verbs. This is the single definition: the workspace default
+/// (`hardcoded_default`) and every provider translation read it from here.
+pub const DEFAULT_BASH_ALLOWLIST: &[&str] = &[
+    "cargo check",
+    "cargo test",
+    "cargo build",
+    "cargo clippy",
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+    "ls",
+    "cat",
+    "rg",
+    "grep",
+    "find",
+    "head",
+    "tail",
+    "wc",
+    "pwd",
+    "echo",
+];
 
 /// Bash command gating policy.
 #[derive(Clone, Debug)]
@@ -48,99 +95,117 @@ impl Default for ToolPolicy {
 }
 
 impl ToolPolicy {
-    /// Load policy from `<workspace>/.gaviero/settings.json` when present.
+    /// Resolve the policy for a single folder, reading only that folder's
+    /// `.gaviero/settings.json` plus the user-level file and built-in
+    /// defaults.
     ///
-    /// Keys (in order of precedence for overlapping bash settings):
-    /// - `agent.permissions.bash.denylist` — substring patterns, always blocked
-    /// - `agent.permissions.bash.allowlist` — prefix auto-approve
+    /// Fallback for callers that hold no [`Workspace`] (legacy swarm
+    /// constructors, tests). Hosts that have one must use
+    /// [`ToolPolicy::from_workspace`] and hand the result down explicitly:
+    /// inside a swarm worktree there is no `.gaviero/settings.json`
+    /// (`.gaviero/**` is gitignored), so resolving from the worktree path
+    /// silently drops the operator's denylist.
+    pub fn resolve(workspace_root: &Path) -> Self {
+        let ws = Workspace::single_folder(workspace_root.to_path_buf());
+        Self::from_workspace(&ws, Some(workspace_root))
+    }
+
+    /// The one reader of the shell policy settings. Walks the workspace
+    /// cascade for each key so folder-level, workspace-file, and user-level
+    /// settings all apply, then falls back to the built-in defaults.
+    ///
+    /// Keys:
+    /// - `agent.permissions.bash.denylist` — token-sequence patterns, always
+    ///   blocked (default: none)
+    /// - `agent.permissions.bash.allowlist` — command prefixes that run
+    ///   without a prompt (default: [`DEFAULT_BASH_ALLOWLIST`]; an explicit
+    ///   `[]` disables auto-approval)
     /// - `agent.permissions.bash.timeoutSecs` / `outputCapBytes`
     /// - `agent.approvedTools` — tool names; `Bash` auto-approves shell
-    /// - Legacy: `providers.deepseek.bash.*` (allowlist / timeout / output cap)
-    pub fn resolve(workspace_root: &Path) -> Self {
-        let mut policy = Self::default();
-        let path = workspace_root.join(".gaviero").join("settings.json");
-        let Ok(body) = std::fs::read_to_string(&path) else {
-            return policy;
+    ///   (filtered to `agent.availableTools`, like every other consumer)
+    /// - Legacy: `providers.deepseek.bash.*` (allowlist / timeout / output
+    ///   cap), consulted only when the `agent.permissions.bash.*` key is
+    ///   absent at every cascade level
+    pub fn from_workspace(workspace: &Workspace, root: Option<&Path>) -> Self {
+        // New key at any level → legacy key at any level → built-in default.
+        let resolve = |key: &str, legacy: &str| -> serde_json::Value {
+            workspace
+                .resolve_setting_opt(key, root)
+                .or_else(|| workspace.resolve_setting_opt(legacy, root))
+                .unwrap_or_else(|| workspace.resolve_setting(key, root))
         };
-        let Ok(doc) = serde_json::from_str::<serde_json::Value>(&body) else {
-            return policy;
-        };
 
-        if let Some(list) = doc
-            .pointer("/agent/permissions/bash/denylist")
-            .and_then(|v| v.as_array())
-        {
-            policy.denylist = parse_string_array(list);
+        let denylist = string_list(
+            &workspace.resolve_setting(settings::AGENT_PERMISSIONS_BASH_DENYLIST, root),
+        );
+        let allowlist = string_list(&resolve(
+            settings::AGENT_PERMISSIONS_BASH_ALLOWLIST,
+            LEGACY_DEEPSEEK_BASH_ALLOWLIST,
+        ));
+        let timeout = resolve(
+            settings::AGENT_PERMISSIONS_BASH_TIMEOUT_SECS,
+            LEGACY_DEEPSEEK_BASH_TIMEOUT_SECS,
+        )
+        .as_u64()
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(DEFAULT_BASH_TIMEOUT_SECS));
+        let output_cap = resolve(
+            settings::AGENT_PERMISSIONS_BASH_OUTPUT_CAP_BYTES,
+            LEGACY_DEEPSEEK_BASH_OUTPUT_CAP_BYTES,
+        )
+        .as_u64()
+        .filter(|cap| *cap > 0)
+        .map(|cap| cap as usize)
+        .unwrap_or(DEFAULT_BASH_OUTPUT_CAP);
+        let (_, approved_tools) = workspace.resolve_agent_tools(root);
+
+        Self {
+            allowlist,
+            denylist,
+            approved_tools,
+            timeout,
+            output_cap,
         }
-
-        if let Some(list) = doc
-            .pointer("/agent/permissions/bash/allowlist")
-            .and_then(|v| v.as_array())
-        {
-            let parsed = parse_string_array(list);
-            if !parsed.is_empty() {
-                policy.allowlist = parsed;
-            }
-        } else if let Some(list) = doc
-            .pointer("/providers/deepseek/bash/allowlist")
-            .and_then(|v| v.as_array())
-        {
-            let parsed = parse_string_array(list);
-            if !parsed.is_empty() {
-                policy.allowlist = parsed;
-            }
-        }
-
-        if let Some(secs) = doc
-            .pointer("/agent/permissions/bash/timeoutSecs")
-            .or_else(|| doc.pointer("/providers/deepseek/bash/timeoutSecs"))
-            .and_then(|v| v.as_u64())
-            && secs > 0
-        {
-            policy.timeout = Duration::from_secs(secs);
-        }
-
-        if let Some(cap) = doc
-            .pointer("/agent/permissions/bash/outputCapBytes")
-            .or_else(|| doc.pointer("/providers/deepseek/bash/outputCapBytes"))
-            .and_then(|v| v.as_u64())
-            && cap > 0
-        {
-            policy.output_cap = cap as usize;
-        }
-
-        if let Some(list) = doc
-            .pointer("/agent/approvedTools")
-            .and_then(|v| v.as_array())
-        {
-            policy.approved_tools = parse_string_array(list);
-        }
-
-        policy
     }
 
     /// Returns a user-facing reason when the command is blocked.
+    ///
+    /// Settings denylist entries match as token sequences anywhere in the
+    /// command (see the module docs): every token but the last must equal
+    /// the corresponding command token, the last is a prefix match.
     pub fn deny_reason(&self, command: &str) -> Option<String> {
         if let Some(reason) = builtin_deny_reason(command) {
             return Some(reason.to_string());
         }
-        let lower = command.to_lowercase();
+        let tokens = command_tokens(command);
         for pattern in &self.denylist {
-            let p = pattern.trim().to_lowercase();
-            if !p.is_empty() && lower.contains(&p) {
+            if denylist_pattern_matches(pattern, &tokens) {
                 return Some(format!(
-                    "command blocked by permissions denylist (matched '{pattern}')"
+                    "command blocked by permissions denylist (matched '{}')",
+                    pattern.trim()
                 ));
             }
         }
         None
     }
 
+    /// True when every segment of the (possibly compound) command starts
+    /// with an allowlist entry on a word boundary. Commands carrying command
+    /// substitution never match.
     pub fn matches_allowlist(&self, command: &str) -> bool {
-        let trimmed = command.trim();
-        self.allowlist
-            .iter()
-            .any(|prefix| trimmed.starts_with(prefix) || trimmed == prefix.as_str())
+        if self.allowlist.is_empty() || has_command_substitution(command) {
+            return false;
+        }
+        let segments: Vec<&str> = split_shell_segments(command);
+        if segments.is_empty() {
+            return false;
+        }
+        segments.iter().all(|segment| {
+            self.allowlist
+                .iter()
+                .any(|entry| segment_matches_prefix(segment, entry))
+        })
     }
 
     /// `agent.approvedTools` includes `Bash`.
@@ -175,35 +240,106 @@ impl ToolPolicy {
     }
 }
 
-fn parse_string_array(list: &[serde_json::Value]) -> Vec<String> {
-    list.iter()
-        .filter_map(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.to_string())
-        .collect()
+/// Pre-`agent.permissions.bash` keys, still honoured when the new key is
+/// absent at every cascade level.
+const LEGACY_DEEPSEEK_BASH_ALLOWLIST: &str = "providers.deepseek.bash.allowlist";
+const LEGACY_DEEPSEEK_BASH_TIMEOUT_SECS: &str = "providers.deepseek.bash.timeoutSecs";
+const LEGACY_DEEPSEEK_BASH_OUTPUT_CAP_BYTES: &str = "providers.deepseek.bash.outputCapBytes";
+
+/// Non-empty string entries of a JSON array (anything else → empty).
+fn string_list(value: &serde_json::Value) -> Vec<String> {
+    value
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn default_allowlist() -> Vec<String> {
-    vec![
-        "cargo check".into(),
-        "cargo test".into(),
-        "cargo build".into(),
-        "cargo clippy".into(),
-        "git status".into(),
-        "git diff".into(),
-        "git log".into(),
-        "git show".into(),
-        "ls".into(),
-        "cat ".into(),
-        "rg ".into(),
-        "grep ".into(),
-        "find ".into(),
-        "head ".into(),
-        "tail ".into(),
-        "wc ".into(),
-        "pwd".into(),
-        "echo ".into(),
-    ]
+    DEFAULT_BASH_ALLOWLIST
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
+/// Lower-cased command tokens: split on whitespace and on the shell
+/// punctuation `;`, `|`, `&`, `(`, `)`, with surrounding quotes stripped so
+/// `psql -c 'drop database x'` still yields `drop`, `database`, `x`.
+fn command_tokens(command: &str) -> Vec<String> {
+    command
+        .to_lowercase()
+        .split(|c: char| c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')'))
+        .map(|t| t.trim_matches(|c| matches!(c, '"' | '\'' | '`')))
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Token-sequence match for one denylist entry (see module docs).
+fn denylist_pattern_matches(pattern: &str, tokens: &[String]) -> bool {
+    let pat = command_tokens(pattern);
+    let Some((last, head)) = pat.split_last() else {
+        return false;
+    };
+    if tokens.len() < pat.len() {
+        return false;
+    }
+    tokens.windows(pat.len()).any(|window| {
+        window[..head.len()].iter().zip(head).all(|(t, p)| t == p)
+            && window[head.len()].starts_with(last.as_str())
+    })
+}
+
+/// True when the command carries command substitution, which the allowlist
+/// prefix check cannot see through.
+fn has_command_substitution(command: &str) -> bool {
+    command.contains("$(") || command.contains('`') || command.contains("<(")
+}
+
+/// Split a compound command on the control operators `&&`, `||`, `;`, `|`
+/// and newlines. A lone `&` is kept (it appears in `2>&1`).
+fn split_shell_segments(command: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let bytes = command.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let two = i + 1 < bytes.len() && matches!(&bytes[i..i + 2], b"&&" | b"||");
+        let one = matches!(bytes[i], b';' | b'|' | b'\n');
+        if two || one {
+            segments.push(&command[start..i]);
+            i += if two { 2 } else { 1 };
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    segments.push(&command[start..]);
+    segments
+        .into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// `segment` equals `entry` or starts with it followed by whitespace.
+/// Entries are trimmed first, so the historical trailing-space form
+/// (`"cat "`) and the bare form (`"cat"`) behave identically.
+fn segment_matches_prefix(segment: &str, entry: &str) -> bool {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return false;
+    }
+    match segment.strip_prefix(entry) {
+        Some("") => true,
+        Some(rest) => rest.starts_with(char::is_whitespace),
+        None => false,
+    }
 }
 
 /// Safety baseline — always enforced regardless of settings.
@@ -318,14 +454,40 @@ mod tests {
     }
 
     #[test]
-    fn settings_denylist_blocks_substring() {
+    fn settings_denylist_matches_token_sequences() {
         let p = ToolPolicy {
-            denylist: vec!["terraform destroy".into(), "npm publish".into()],
+            denylist: vec![
+                "terraform destroy".into(),
+                "npm publish".into(),
+                "git push --force".into(),
+                "rm".into(),
+                "gh".into(),
+                "mkfs.".into(),
+                "dd if=".into(),
+            ],
             ..ToolPolicy::default()
         };
         assert!(p.deny_reason("terraform destroy -auto-approve").is_some());
         assert!(p.deny_reason("npm publish --access public").is_some());
         assert!(p.deny_reason("npm install").is_none());
+        // Compound commands: the sequence is found past the `&&`.
+        assert!(
+            p.deny_reason("cd x && git push --force origin main")
+                .is_some()
+        );
+        assert!(p.deny_reason("git push --force-with-lease").is_some());
+        // Quotes around tokens do not hide them.
+        assert!(p.deny_reason("psql -c 'drop database prod'").is_none());
+        assert!(p.deny_reason("sh -c \"npm publish\"").is_some());
+        // Token boundaries: `rm` no longer matches inside `format`, and
+        // `gh` no longer matches inside `high`.
+        assert!(p.deny_reason("cargo fmt -- --check format").is_none());
+        assert!(p.deny_reason("echo high score").is_none());
+        assert!(p.deny_reason("rm -r build").is_some());
+        assert!(p.deny_reason("gh pr create").is_some());
+        // Last-token prefix keeps the partial-token entries useful.
+        assert!(p.deny_reason("mkfs.ext4 /dev/sda1").is_some());
+        assert!(p.deny_reason("dd if=/dev/zero of=/dev/sda").is_some());
     }
 
     #[test]
@@ -334,6 +496,69 @@ mod tests {
         assert!(p.matches_allowlist("cargo test -p gaviero-core"));
         assert!(p.matches_allowlist("git status"));
         assert!(!p.matches_allowlist("npm install"));
+        // Word boundary: `ls` clears `ls -la` but not `lsblk`.
+        assert!(p.matches_allowlist("ls -la"));
+        assert!(!p.matches_allowlist("lsblk"));
+        assert!(!p.matches_allowlist("cargo tester"));
+    }
+
+    #[test]
+    fn allowlist_requires_every_segment_to_match() {
+        let p = ToolPolicy::default();
+        assert!(p.matches_allowlist("cargo test 2>&1 | tail -n 20"));
+        assert!(p.matches_allowlist("git status; git diff --stat"));
+        assert!(!p.matches_allowlist("cargo test && npm install"));
+        assert!(!p.matches_allowlist("git status || rm -r target"));
+        assert!(!p.matches_allowlist("echo $(npm whoami)"));
+        assert!(!p.matches_allowlist("echo `npm whoami`"));
+        // Explicit empty allowlist disables auto-approval entirely.
+        let none = ToolPolicy {
+            allowlist: Vec::new(),
+            ..ToolPolicy::default()
+        };
+        assert!(!none.matches_allowlist("git status"));
+    }
+
+    #[test]
+    fn from_workspace_defaults_to_builtin_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = ToolPolicy::resolve(dir.path());
+        assert_eq!(p.allowlist, default_allowlist());
+        assert!(p.denylist.is_empty());
+        assert_eq!(p.timeout, Duration::from_secs(DEFAULT_BASH_TIMEOUT_SECS));
+        assert_eq!(p.output_cap, DEFAULT_BASH_OUTPUT_CAP);
+        assert!(!p.bash_tool_approved());
+    }
+
+    #[test]
+    fn from_workspace_honours_explicit_empty_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let gaviero = dir.path().join(".gaviero");
+        std::fs::create_dir_all(&gaviero).unwrap();
+        std::fs::write(
+            gaviero.join("settings.json"),
+            r#"{ "agent": { "permissions": { "bash": { "allowlist": [] } } } }"#,
+        )
+        .unwrap();
+        let p = ToolPolicy::resolve(dir.path());
+        assert!(p.allowlist.is_empty());
+    }
+
+    #[test]
+    fn legacy_deepseek_keys_apply_when_new_key_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let gaviero = dir.path().join(".gaviero");
+        std::fs::create_dir_all(&gaviero).unwrap();
+        std::fs::write(
+            gaviero.join("settings.json"),
+            r#"{ "providers": { "deepseek": { "bash": {
+                "allowlist": ["make"], "timeoutSecs": 7, "outputCapBytes": 99 } } } }"#,
+        )
+        .unwrap();
+        let p = ToolPolicy::resolve(dir.path());
+        assert_eq!(p.allowlist, vec!["make"]);
+        assert_eq!(p.timeout, Duration::from_secs(7));
+        assert_eq!(p.output_cap, 99);
     }
 
     #[test]
@@ -433,6 +658,7 @@ mod tests {
             gaviero.join("settings.json"),
             r#"{
               "agent": {
+                "availableTools": ["Read", "Bash"],
                 "approvedTools": ["Read", "Bash"],
                 "permissions": {
                   "bash": {
