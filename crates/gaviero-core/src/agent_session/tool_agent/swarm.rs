@@ -26,6 +26,10 @@ pub struct SwarmTurnRequest {
     pub user_prompt: String,
     pub allowed_tools: Vec<String>,
     pub auto_approve: bool,
+    /// Shell policy resolved by the host from the *workspace* cascade.
+    /// `None` falls back to resolving from `workspace_root`, which inside a
+    /// swarm worktree finds no settings file and therefore no denylist.
+    pub tool_policy: Option<ToolPolicy>,
 }
 
 /// Outcome of a swarm harness turn.
@@ -62,12 +66,15 @@ pub async fn run_turn(
 
     let messages = build_messages(&req.system_prompt, None, &req.user_prompt);
     let snapshot = Arc::new(TokioMutex::new(TurnSnapshot::new()));
+    let policy = req
+        .tool_policy
+        .unwrap_or_else(|| ToolPolicy::resolve(&req.workspace_root));
     let ctx = ToolCtx {
         workspace_root: req.workspace_root.clone(),
         additional_roots: req.additional_roots,
         scope: req.scope,
         snapshot: Some(snapshot.clone()),
-        policy: ToolPolicy::resolve(&req.workspace_root),
+        policy,
         auto_approve: req.auto_approve,
         observer: None,
     };

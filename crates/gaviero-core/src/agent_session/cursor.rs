@@ -85,6 +85,10 @@ pub struct CursorSession {
     /// can persist it on the ledger.
     handle: Option<ContinuityHandle>,
     cancel_token: CancellationToken,
+    /// `Bash` is in the workspace's approved (and available) tools. With
+    /// the turn's `auto_approve`, decides whether `agent -p` gets `--force`
+    /// or stays in Cursor's allowlist mode (see `cursor_argv`).
+    bash_approved: bool,
 }
 
 impl CursorSession {
@@ -109,6 +113,10 @@ impl CursorSession {
             .filter(|s| !s.is_empty())
             .map(|id| ContinuityHandle::CursorThreadId(id.to_string()));
 
+        // Same resolution Claude uses for `--allowedTools`: approved tools
+        // filtered to the available surface.
+        let bash_approved = args.options.resolved_tools().1.iter().any(|t| t == "Bash");
+
         Self {
             write_gate: args.write_gate,
             observer: args.observer,
@@ -120,6 +128,7 @@ impl CursorSession {
             profile: args.profile,
             handle,
             cancel_token: args.cancel_token,
+            bash_approved,
         }
     }
 
@@ -226,11 +235,16 @@ impl CursorSession {
             _ => None,
         };
 
+        // `--force` only when Bash is approved for this workspace or the
+        // user pre-approved the turn (`/autoapprove`); otherwise the
+        // translated allowlist is the only shell Cursor will run.
+        let force_shell = turn.auto_approve || self.bash_approved;
         let mut cmd = crate::util::spawn::agent_command("agent");
         for arg in cursor_argv(
             &self.cursor_model,
             &self.workspace_root,
             resume_id.as_deref(),
+            force_shell,
         ) {
             cmd.arg(arg);
         }

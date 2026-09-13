@@ -37,7 +37,13 @@ pub(crate) struct AgentToolSurface {
 
 impl AgentToolSurface {
     pub(crate) fn from_agent_options(options: &AgentOptions, workspace_root: &Path) -> Self {
-        let mut policy = ToolPolicy::resolve(workspace_root);
+        // The host resolves the policy through the workspace cascade and
+        // hands it down; the path-based fallback only covers callers that
+        // never populated `AgentOptions::tool_policy`.
+        let mut policy = options
+            .tool_policy
+            .clone()
+            .unwrap_or_else(|| ToolPolicy::resolve(workspace_root));
         if let Some(approved) = options.approved_tools.as_ref() {
             policy.approved_tools = approved.clone();
         }

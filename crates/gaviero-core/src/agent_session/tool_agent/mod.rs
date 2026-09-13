@@ -145,6 +145,12 @@ impl ToolAgentSession {
             Some(names) if !names.is_empty() => ToolRegistry::from_names(names),
             _ => ToolRegistry::full_chat(),
         };
+        // Host-resolved shell policy (workspace cascade). The path-based
+        // fallback only serves callers that never populated the option.
+        let policy = options
+            .tool_policy
+            .clone()
+            .unwrap_or_else(|| ToolPolicy::resolve(&workspace_root));
         Self {
             client: Box::new(DeepseekClient::new(config)),
             observer: Arc::from(observer),
@@ -160,7 +166,7 @@ impl ToolAgentSession {
             limits: agent_loop::LoopLimits::default(),
             profile,
             compaction: CompactionPolicy::default(),
-            policy: ToolPolicy::resolve(&workspace_root),
+            policy,
             write_gate,
             cancel_token,
         }

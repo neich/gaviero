@@ -51,6 +51,14 @@ pub struct AgentOptions {
     /// `None` keeps the legacy default (`Read,Glob,Grep`, or the full
     /// available set when `auto_approve` is true).
     pub approved_tools: Option<Vec<String>>,
+    /// Shell policy (`agent.permissions.bash` + `agent.approvedTools`)
+    /// resolved by the host through the workspace cascade. Consumed by the
+    /// in-process tool-agent and the Codex app-server command gate. `None`
+    /// makes those sessions resolve it from `workspace_root` alone, which
+    /// misses workspace-file and user-level settings and finds nothing at
+    /// all inside a swarm worktree — hosts that hold a `Workspace` must
+    /// populate it.
+    pub tool_policy: Option<crate::agent_session::tool_agent::policy::ToolPolicy>,
     /// When `Some`, resume the Claude session with the given id (Claude's
     /// `--resume <id>` flag) so model context (prior messages, read file
     /// cache) carries across turns. When `None`, a fresh one-shot session
@@ -92,6 +100,7 @@ impl std::fmt::Debug for AgentOptions {
             .field("auto_approve", &self.auto_approve)
             .field("available_tools", &self.available_tools)
             .field("approved_tools", &self.approved_tools)
+            .field("tool_policy", &self.tool_policy)
             .field("resume_session_id", &self.resume_session_id)
             .field(
                 "prompt_observer",
@@ -114,6 +123,7 @@ impl Default for AgentOptions {
             auto_approve: false,
             available_tools: None,
             approved_tools: None,
+            tool_policy: None,
             resume_session_id: None,
             prompt_observer: None,
             turn_id: None,
