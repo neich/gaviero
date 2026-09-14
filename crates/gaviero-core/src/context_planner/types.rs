@@ -46,6 +46,8 @@ pub enum ContinuityHandle {
     /// milestone; today (phase 1) the field round-trips through persisted
     /// `StoredConversation` records but is not consumed by the session.
     CursorThreadId(String),
+    /// ACP `session/new` id for `dsh:` (and future ACP-native agents).
+    AcpSessionId(String),
     // Future providers: add a variant here.
 }
 
@@ -137,6 +139,7 @@ impl ModelSpec {
             "codex",
             "cursor",
             "deepseek",
+            "dsh",
             "claude",
         ] {
             let with_colon = format!("{}:", prefix);
@@ -164,6 +167,7 @@ impl ModelSpec {
             "codex" => Provider::Codex,
             "cursor" => Provider::Cursor,
             "deepseek" => Provider::Deepseek,
+            "dsh" => Provider::Dsh,
             // Bare or claude-prefixed → Claude.
             _ => Provider::Claude,
         }
@@ -185,6 +189,9 @@ pub enum Provider {
     /// DeepSeek V4 Pro — in-process API tool-agent (`StatelessReplay`, native
     /// function-calling). See docs/plans/deepseek_v4_pro_provider.md.
     Deepseek,
+    /// DeepSeek via `dsh --profile acp` over the Agent Client Protocol
+    /// (`ProcessBound`).
+    Dsh,
 }
 
 /// Runtime config the factory needs.
@@ -293,6 +300,15 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             supports_native_resume: false,
             max_context_tokens: Some(128_000),
             // tool_use + 128k context ⇒ Strong.
+            bootstrap_tier: BootstrapTier::Strong,
+        },
+        Provider::Dsh => ProviderProfile {
+            provider: "dsh".to_string(),
+            model: spec.model.clone(),
+            continuity_mode: ContinuityMode::ProcessBound,
+            supports_tool_use: true,
+            supports_native_resume: true,
+            max_context_tokens: Some(128_000),
             bootstrap_tier: BootstrapTier::Strong,
         },
     }
@@ -568,6 +584,18 @@ mod tests {
                 Provider::Ollama,
             ),
             ("local:llama3.1", "local", "llama3.1", Provider::Ollama),
+            (
+                "deepseek:deepseek-v4-pro",
+                "deepseek",
+                "deepseek-v4-pro",
+                Provider::Deepseek,
+            ),
+            (
+                "dsh:deepseek-v4-flash",
+                "dsh",
+                "deepseek-v4-flash",
+                Provider::Dsh,
+            ),
         ];
         for (raw, prefix, model, provider) in cases {
             let spec = ModelSpec::parse(raw);
@@ -634,6 +662,13 @@ mod tests {
         assert!(!deepseek.supports_native_resume);
         assert_eq!(deepseek.max_context_tokens, Some(128_000));
 
+        let dsh = build_provider_profile(&ModelSpec::parse("dsh:deepseek-v4-flash"), &runtime);
+        assert_eq!(dsh.provider, "dsh");
+        assert_eq!(dsh.continuity_mode, ContinuityMode::ProcessBound);
+        assert!(dsh.supports_tool_use);
+        assert!(dsh.supports_native_resume);
+        assert_eq!(dsh.max_context_tokens, Some(128_000));
+
         let bare = build_provider_profile(&ModelSpec::parse("haiku"), &runtime);
         assert_eq!(bare.continuity_mode, ContinuityMode::NativeResume);
         assert_eq!(bare.provider, "claude");
@@ -656,6 +691,7 @@ mod tests {
             "codex:gpt-5.5",
             "cursor:auto",
             "deepseek:deepseek-v4-pro",
+            "dsh:deepseek-v4-flash",
             "haiku", // bare → claude
         ] {
             let p = build_provider_profile(&ModelSpec::parse(spec), &runtime);
@@ -680,6 +716,7 @@ mod tests {
             "cursor:auto",
             "ollama:llama3.1",
             "deepseek:deepseek-v4-pro",
+            "dsh:deepseek-v4-flash",
         ] {
             let p = build_provider_profile(&ModelSpec::parse(spec), &runtime);
             assert_eq!(

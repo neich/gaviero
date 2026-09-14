@@ -1,6 +1,7 @@
 //! Authorable skill templates for turn-scoped prompt injection.
 
 pub mod catalog;
+pub mod emit;
 pub mod frontmatter;
 pub mod template;
 

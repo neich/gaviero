@@ -116,6 +116,7 @@ impl TestGenerator {
             None, // no pre-fetched memory for test generation
             &[],  // workspace tool extras: not applicable to test generator
             None, // shell policy: test generation never runs shell
+            None, // exposed MCP tools: test generation does not pull
             false,
             None,
         )
