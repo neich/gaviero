@@ -1638,6 +1638,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                     tokio::spawn(async move { warm.warmup().await });
                     match gaviero_core::mcp::spawn_mcp_server(server, &endpoint) {
                         Ok(handle) => {
+                            let handle = handle.with_endpoint_descriptor(&workspace_root_for_mcp);
                             tracing::info!(
                                 target: "mcp_server",
                                 endpoint = %handle.endpoint,

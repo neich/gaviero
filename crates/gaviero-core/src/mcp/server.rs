@@ -1290,9 +1290,31 @@ pub struct McpServerHandle {
     shutdown: tokio::sync::broadcast::Sender<()>,
     join: tokio::task::JoinHandle<()>,
     pub endpoint: super::McpEndpoint,
+    /// Path of `mcp-endpoint.json` when [`Self::with_endpoint_descriptor`]
+    /// ran. Removed on shutdown so `--resolve` does not chase a dead pid.
+    descriptor_path: Option<PathBuf>,
 }
 
 impl McpServerHandle {
+    /// Persist `<root>/.gaviero/mcp-endpoint.json` for shim `--resolve`.
+    /// Write failures are logged; the server still serves on the pipe/socket.
+    pub fn with_endpoint_descriptor(mut self, root: &std::path::Path) -> Self {
+        let desc = super::endpoint_file::McpEndpointDescriptor::from_listener(
+            root,
+            &self.endpoint,
+            std::process::id(),
+        );
+        match super::endpoint_file::write_descriptor(root, &desc) {
+            Ok(path) => self.descriptor_path = Some(path),
+            Err(e) => tracing::warn!(
+                target: "mcp_server",
+                error = %e,
+                "failed to write mcp-endpoint.json"
+            ),
+        }
+        self
+    }
+
     /// Signal the accept loop to stop and await its exit. Idempotent.
     pub async fn shutdown(self) {
         let _ = self.shutdown.send(());
@@ -1300,6 +1322,9 @@ impl McpServerHandle {
         // Best-effort socket-file cleanup. Named pipes vanish with the
         // last open handle — nothing to remove on the pipe arm.
         if let super::McpEndpoint::Unix(path) = &self.endpoint {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(path) = self.descriptor_path {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -1414,6 +1439,7 @@ fn spawn_unix(server: GavieroMcpServer, socket_path: PathBuf) -> Result<McpServe
         shutdown,
         join,
         endpoint: super::McpEndpoint::Unix(socket_path),
+        descriptor_path: None,
     })
 }
 
@@ -1483,6 +1509,7 @@ fn spawn_pipe(server: GavieroMcpServer, pipe_name: String) -> Result<McpServerHa
         shutdown,
         join,
         endpoint: super::McpEndpoint::Pipe(pipe_name),
+        descriptor_path: None,
     })
 }
 
@@ -2008,6 +2035,30 @@ mod tests {
         }
 
         handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn descriptor_written_and_removed_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let stores = MemoryStores::for_tests_in_memory(embedder).unwrap();
+        let server = GavieroMcpServer::with_defaults(stores, dir.path().to_path_buf());
+        #[cfg(windows)]
+        let endpoint = super::super::McpEndpoint::Pipe(format!(
+            r"\\.\pipe\gaviero-desc-{}",
+            std::process::id()
+        ));
+        #[cfg(unix)]
+        let endpoint = super::super::McpEndpoint::Unix(dir.path().join("mcp.sock"));
+        let handle = spawn_mcp_server(server, &endpoint)
+            .unwrap()
+            .with_endpoint_descriptor(dir.path());
+        let path = crate::mcp::endpoint_file::McpEndpointDescriptor::path(dir.path());
+        assert!(path.is_file(), "descriptor should exist at {}", path.display());
+        let desc = crate::mcp::endpoint_file::read_descriptor(&path).unwrap();
+        assert_eq!(desc.pid, std::process::id());
+        handle.shutdown().await;
+        assert!(!path.exists(), "descriptor should be removed on shutdown");
     }
 
     #[tokio::test]

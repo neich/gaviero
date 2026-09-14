@@ -54,6 +54,7 @@
 //! nothing here bypasses the writer task or the Write Gate.
 
 pub mod config_synth;
+pub mod endpoint_file;
 pub mod external_memory;
 mod legacy_handshake;
 pub mod observer;
@@ -68,6 +69,10 @@ pub mod telemetry_sink;
 pub mod tools;
 pub mod transport;
 
+pub use endpoint_file::{
+    McpEndpointDescriptor, find_descriptor_upwards, read_descriptor, remove_descriptor,
+    write_descriptor,
+};
 pub use config_synth::{
     BashPermissions, Context7Config, ExtraMcpServer, ExtraMcpTransport, ManagedRules,
     McpConfigSynth, McpPermissions, TrustConsent, claude_mcp_config_json,

@@ -1447,6 +1447,7 @@ fn prepare_mcp_for_swarm(
                     synth.endpoint
                 )
             })?;
+            let h = h.with_endpoint_descriptor(repo);
             eprintln!("[mcp] gaviero server listening on {}", h.endpoint);
             handle = Some(h);
         }

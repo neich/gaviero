@@ -1180,6 +1180,22 @@ pub fn synthesize_for_worktree(synth: &McpConfigSynth) -> Result<Vec<PathBuf>> {
         written.push(codex_path);
     }
 
+    if synth.gaviero_enabled {
+        let desc = super::endpoint_file::McpEndpointDescriptor::from_listener(
+            &synth.worktree,
+            &synth.endpoint,
+            std::process::id(),
+        );
+        match super::endpoint_file::write_descriptor(&synth.worktree, &desc) {
+            Ok(path) => written.push(path),
+            Err(e) => tracing::warn!(
+                target: "mcp_synth",
+                error = %e,
+                "failed to write worktree mcp-endpoint.json"
+            ),
+        }
+    }
+
     Ok(written)
 }
 
@@ -1487,7 +1503,7 @@ mod tests {
         // Trust unknown → Claude + Cursor configs written, Codex skipped.
         synth.codex_trust = TrustConsent::Unknown;
         let files = synthesize_for_worktree(&synth).unwrap();
-        assert_eq!(files.len(), 2);
+        assert_eq!(files.len(), 3);
         assert!(
             files.iter().any(|p| p.ends_with(".mcp.json")),
             "expected .mcp.json among {:?}",
@@ -1498,12 +1514,17 @@ mod tests {
             "expected .cursor/mcp.json among {:?}",
             files
         );
+        assert!(
+            files.iter().any(|p| p.ends_with("mcp-endpoint.json")),
+            "expected mcp-endpoint.json among {:?}",
+            files
+        );
         assert!(!dir.path().join(".codex/config.toml").exists());
 
         // Trust granted → all three configs.
         synth.codex_trust = TrustConsent::Granted;
         let files = synthesize_for_worktree(&synth).unwrap();
-        assert_eq!(files.len(), 3);
+        assert_eq!(files.len(), 4);
         assert!(dir.path().join(".cursor/mcp.json").exists());
         assert!(dir.path().join(".codex/config.toml").exists());
     }
