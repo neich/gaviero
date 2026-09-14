@@ -155,6 +155,8 @@ impl AcpPipeline {
                 suppress_hooks: false,
                 file_scope: crate::types::FileScope::default(),
                 tool_policy: None,
+                exposed_tools: None,
+                write_gate: None,
             };
             executor::complete_to_write_gate(
                 &*backend,

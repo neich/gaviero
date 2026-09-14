@@ -91,6 +91,9 @@ pub struct AgentOptions {
     /// second pass to declare `gaviero-probe` with an explicit server
     /// reference. `None` omits the flag.
     pub agents_json: Option<String>,
+    /// MCP tools advertised to this session (`mcp.gavieroServer.exposedTools`).
+    /// Drives the retrieval stanza; `None` keeps the backend default.
+    pub exposed_tools: Option<Vec<String>>,
 }
 
 impl std::fmt::Debug for AgentOptions {
@@ -113,6 +116,7 @@ impl std::fmt::Debug for AgentOptions {
             .field("turn_id", &self.turn_id)
             .field("suppress_hooks", &self.suppress_hooks)
             .field("agents_json", &self.agents_json.as_ref().map(|_| "<set>"))
+            .field("exposed_tools", &self.exposed_tools)
             .finish()
     }
 }
@@ -134,6 +138,7 @@ impl Default for AgentOptions {
             turn_id: None,
             suppress_hooks: false,
             agents_json: None,
+            exposed_tools: None,
         }
     }
 }
@@ -421,12 +426,11 @@ impl AcpSession {
         //
         // `mcp__…` entries are stripped first: `--tools` selects from Claude's
         // *built-in* set only, and an unknown name there is not merely
-        // ignored. Verified against Claude Code 2.1.220 — passing `--tools`
-        // restricts the whole session and drops every MCP server with it
-        // (35 tools + context7 reachable without the flag; 4 tools and no
-        // context7 with it). MCP admission is governed by `.mcp.json` /
-        // `--mcp-config` below, so listing servers here only costs the agent
-        // its MCP tools.
+        // ignored. MCP admission is governed by `.mcp.json` / `--mcp-config`
+        // below, so listing servers here only costs the agent its MCP tools.
+        // Claude Code 2.1.269+ keeps `--mcp-config` servers alongside
+        // `--tools` (verified 2026-09-14 from a session spawned with both);
+        // the 2.1.220-era "drops every MCP server" behaviour is gone.
         let mut available_owned = build_available_tools(available_tools, interactive_permissions);
         let reach = crate::mcp::ReachPolicy::for_workspace(cwd);
         if reach.enforce
@@ -935,11 +939,11 @@ mod tests {
     #[test]
     fn agent_options_size_is_bounded() {
         // Sanity: AgentOptions is cloned per turn. The two new fields
-        // (Option<Arc<dyn _>>, Option<String>) plus `agents_json` must
-        // not balloon it past a sensible budget. 288 B leaves slack.
+        // (Option<Arc<dyn _>>, Option<String>) plus `agents_json` and
+        // `exposed_tools` must not balloon it past a sensible budget.
         assert!(
-            std::mem::size_of::<AgentOptions>() <= 288,
-            "AgentOptions = {} B (budget 288 B)",
+            std::mem::size_of::<AgentOptions>() <= 320,
+            "AgentOptions = {} B (budget 320 B)",
             std::mem::size_of::<AgentOptions>()
         );
     }
