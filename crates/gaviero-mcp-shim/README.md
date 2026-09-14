@@ -26,6 +26,9 @@ gaviero-mcp-shim --socket /path/to/.gaviero/mcp.sock
 # Windows
 gaviero-mcp-shim --pipe '\\.\pipe\gaviero-<hash>'
 
+# Cwd-resolving (user-scope / nested worktree): walk up for mcp-endpoint.json
+gaviero-mcp-shim --resolve
+
 # Widen initial connect retry window
 gaviero-mcp-shim --socket /path/to/.gaviero/mcp.sock --connect-timeout-secs 10
 ```

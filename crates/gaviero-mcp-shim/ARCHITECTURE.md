@@ -17,10 +17,10 @@ gaviero-mcp-shim
         │
         ▼  Unix: <workspace>/.gaviero/mcp.sock
            Windows: \\.\pipe\gaviero-<hash>
-gaviero-core::mcp::server  (rmcp, 8 tools: 7 read-only + memory_flag)
+gaviero-core::mcp::server  (rmcp, 9 tools: 8 read-only + memory_flag)
 ```
 
-**Zero workspace deps.** Only `tokio`, `clap`, `anyhow`, `tracing`. Speaks to core exclusively over the endpoint — never links `gaviero-core`.
+**Zero workspace deps.** `tokio`, `clap`, `anyhow`, `tracing`, `serde`/`serde_json`. Speaks to core exclusively over the endpoint — never links `gaviero-core`.
 
 DeepSeek (`deepseek:`) runs in-process via `tool_agent` and does **not** use this shim.
 
@@ -43,6 +43,7 @@ DeepSeek (`deepseek:`) runs in-process via `tool_agent` and does **not** use thi
 struct Cli {
     socket: Option<PathBuf>,          // --socket (Unix)
     pipe: Option<String>,             // --pipe (Windows)
+    resolve: bool,                    // --resolve (cwd walk for mcp-endpoint.json)
     connect_timeout_secs: u64,        // default 5
 }
 ```

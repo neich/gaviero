@@ -27,13 +27,14 @@ Endpoint shape: `<workspace>/.gaviero/mcp.sock` or `\\.\pipe\gaviero-<hash>` ([`
 |---|---|---|
 | `--socket <path>` | required on Unix | Absolute path to `mcp.sock`. |
 | `--pipe <name>` | required on Windows | Named-pipe name (`\\.\pipe\gaviero-…`). |
-| `--connect-timeout-secs <N>` | `5` | Connect retry budget. |
+| `--resolve` | off | Walk up from cwd for `.gaviero/mcp-endpoint.json`; connect to that endpoint. Exit 2 immediately if missing or `pid` is dead. |
+| `--connect-timeout-secs <N>` | `5` | Connect retry budget (not used on `--resolve` fail-fast). |
 
 `tracing-subscriber` at WARN on stderr.
 
 ## Conventions
 
-- **Zero workspace dependencies.** Links only `tokio`, `clap`, `anyhow`, `tracing`, `tracing-subscriber`. No `gaviero-core` / `gaviero-dsl`.
+- **Zero workspace dependencies.** Links `tokio`, `clap`, `anyhow`, `tracing`, `tracing-subscriber`, `serde`, `serde_json`. No `gaviero-core` / `gaviero-dsl`.
 - **Byte-faithful piping.** Never parse, log, or transform MCP traffic.
 - **Stderr-only logging.** Stdout is reserved for MCP responses.
 
@@ -47,7 +48,8 @@ Endpoint shape: `<workspace>/.gaviero/mcp.sock` or `\\.\pipe\gaviero-<hash>` ([`
 ## Dependencies
 
 - `tokio` (full) — async runtime, `UnixStream` / named pipe, stdio.
-- `clap` (derive) — `--socket`, `--pipe`, `--connect-timeout-secs`.
+- `clap` (derive) — `--socket`, `--pipe`, `--resolve`, `--connect-timeout-secs`.
+- `serde` + `serde_json` — parse `.gaviero/mcp-endpoint.json` for `--resolve` (not a gaviero crate).
 - `anyhow` — connect/copy error context.
 - `tracing` + `tracing-subscriber` — stderr WARN logger.
 
