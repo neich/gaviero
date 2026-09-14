@@ -141,10 +141,9 @@ impl CursorSession {
 
     async fn run_cursor_turn(&mut self, turn: &Turn) -> Result<()> {
         if !self.reach_warned.swap(true, Ordering::Relaxed)
-            && let Some(msg) =
-                crate::mcp::reach::cursor_reach_status(&crate::mcp::ReachPolicy::for_workspace(
-                    &self.workspace_root,
-                ))
+            && let Some(msg) = crate::mcp::reach::cursor_reach_status(
+                &crate::mcp::ReachPolicy::for_workspace(&self.workspace_root),
+            )
         {
             self.observer.on_streaming_status(msg);
         }

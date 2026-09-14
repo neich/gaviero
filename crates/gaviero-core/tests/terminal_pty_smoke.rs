@@ -20,20 +20,35 @@ async fn named_shell_input_runs_on_background_tab_without_switching_desktop() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
         let event = tokio::time::timeout_at(deadline, events.recv())
-            .await.expect("shell prompt timeout").expect("terminal events closed");
+            .await
+            .expect("shell prompt timeout")
+            .expect("terminal events closed");
         manager.process_event(event);
-        if matches!(manager.instance(remote).unwrap().shell_state, ShellState::Idle) {
+        if matches!(
+            manager.instance(remote).unwrap().shell_state,
+            ShellState::Idle
+        ) {
             break;
         }
     }
-    manager.write_input_to(remote, b"echo REMOTE_SHELL_OK\r").unwrap();
+    manager
+        .write_input_to(remote, b"echo REMOTE_SHELL_OK\r")
+        .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let event = tokio::time::timeout_at(deadline, events.recv())
-            .await.expect("command output timeout").expect("terminal events closed");
+            .await
+            .expect("command output timeout")
+            .expect("terminal events closed");
         manager.process_event(event);
-        if manager.instance(remote).unwrap().screen().contents()
-            .lines().any(|line| line.trim() == "REMOTE_SHELL_OK") {
+        if manager
+            .instance(remote)
+            .unwrap()
+            .screen()
+            .contents()
+            .lines()
+            .any(|line| line.trim() == "REMOTE_SHELL_OK")
+        {
             break;
         }
     }

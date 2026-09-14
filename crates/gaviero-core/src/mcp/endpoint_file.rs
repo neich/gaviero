@@ -108,8 +108,8 @@ fn descriptor_matches_endpoint(desc: &McpEndpointDescriptor, endpoint: &McpEndpo
 }
 
 pub fn read_descriptor(path: &Path) -> Result<McpEndpointDescriptor> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
@@ -141,14 +141,13 @@ fn write_atomic(path: &Path, content: &str) -> Result<()> {
     tmp_name.push(".tmp");
     let tmp = dir.join(tmp_name);
     {
-        let mut file = std::fs::File::create(&tmp)
-            .with_context(|| format!("creating {}", tmp.display()))?;
+        let mut file =
+            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
     }
-    std::fs::rename(&tmp, path).with_context(|| {
-        format!("renaming {} onto {}", tmp.display(), path.display())
-    })?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("renaming {} onto {}", tmp.display(), path.display()))?;
     Ok(())
 }
 

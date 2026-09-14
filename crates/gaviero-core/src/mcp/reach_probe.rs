@@ -66,9 +66,7 @@ impl ReachTransport {
             "stdio" => Ok(Self::Stdio),
             "http" => Ok(Self::Http),
             "both" => Ok(Self::Both),
-            other => anyhow::bail!(
-                "reach transport {other:?}: expected stdio | http | both"
-            ),
+            other => anyhow::bail!("reach transport {other:?}: expected stdio | http | both"),
         }
     }
 
@@ -292,11 +290,7 @@ pub fn ingest_telemetry_pings(ledger: &ProbeLedger, telemetry_path: &Path, nonce
         if got != nonce {
             continue;
         }
-        let depth = rec
-            .input
-            .get("depth")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u8;
+        let depth = rec.input.get("depth").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
         if ledger_saw_depth(ledger, nonce, depth) {
             continue;
         }
@@ -337,9 +331,7 @@ fn probe_request(
 ) -> CompletionRequest {
     CompletionRequest {
         prompt,
-        system_prompt: Some(
-            "You are a Gaviero MCP reach probe. Do not read or edit files.".into(),
-        ),
+        system_prompt: Some("You are a Gaviero MCP reach probe. Do not read or edit files.".into()),
         workspace_root,
         additional_roots: vec![],
         allowed_tools: allowed_tools_for(provider),
@@ -676,12 +668,15 @@ async fn probe_one_provider(
         version,
         transport_label,
         cfg.depth,
-        explicit_ref_required(first.verdict, classify_verdict(
-            true,
-            true,
-            ledger_saw_depth(ledger, &nonce, 0),
-            ledger_saw_depth(ledger, &nonce, 1),
-        )),
+        explicit_ref_required(
+            first.verdict,
+            classify_verdict(
+                true,
+                true,
+                ledger_saw_depth(ledger, &nonce, 0),
+                ledger_saw_depth(ledger, &nonce, 1),
+            ),
+        ),
     );
     let mut row = second;
     row.explicit_ref_required = explicit_ref_required(first.verdict, row.verdict);
@@ -803,10 +798,8 @@ mod tests {
         for (nonce, present, nested_ok, depths, want) in cases {
             let ledger = ProbeLedger::new();
             seed(&ledger, nonce, depths);
-            let backend = MockBackend::new(
-                nonce,
-                vec![UnifiedStreamEvent::Done(StopReason::EndTurn)],
-            );
+            let backend =
+                MockBackend::new(nonce, vec![UnifiedStreamEvent::Done(StopReason::EndTurn)]);
             drain_backend(&backend, probe_req(), Duration::from_secs(2))
                 .await
                 .unwrap();
@@ -818,14 +811,8 @@ mod tests {
     #[tokio::test]
     async fn nonce_isolation_across_two_concurrent_runs() {
         let ledger = ProbeLedger::new();
-        let backend_a = MockBackend::new(
-            "a",
-            vec![UnifiedStreamEvent::Done(StopReason::EndTurn)],
-        );
-        let backend_b = MockBackend::new(
-            "b",
-            vec![UnifiedStreamEvent::Done(StopReason::EndTurn)],
-        );
+        let backend_a = MockBackend::new("a", vec![UnifiedStreamEvent::Done(StopReason::EndTurn)]);
+        let backend_b = MockBackend::new("b", vec![UnifiedStreamEvent::Done(StopReason::EndTurn)]);
 
         let (ra, rb) = tokio::join!(
             async {

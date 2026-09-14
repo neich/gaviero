@@ -344,7 +344,9 @@ mod tests {
         inst.try_write_input(input.as_bytes()).unwrap();
         assert_eq!(*writer.0.lock().unwrap(), input.as_bytes());
         inst.pty_writer = None;
-        assert_eq!(inst.try_write_input(b"x").unwrap_err().kind(),
-            std::io::ErrorKind::NotConnected);
+        assert_eq!(
+            inst.try_write_input(b"x").unwrap_err().kind(),
+            std::io::ErrorKind::NotConnected
+        );
     }
 }

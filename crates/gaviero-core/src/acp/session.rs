@@ -868,9 +868,15 @@ mod tests {
         let policy = crate::mcp::ReachPolicy::from_parts(
             true,
             30,
-            std::collections::BTreeMap::from([("claude".into(), crate::mcp::NestingPolicy::Unknown)]),
+            std::collections::BTreeMap::from([(
+                "claude".into(),
+                crate::mcp::NestingPolicy::Unknown,
+            )]),
         );
-        assert_eq!(crate::mcp::filter_claude_tools(built.clone(), &policy), built);
+        assert_eq!(
+            crate::mcp::filter_claude_tools(built.clone(), &policy),
+            built
+        );
     }
 
     #[test]
@@ -933,7 +939,12 @@ mod tests {
             agents_json: Some(r#"{"gaviero-probe":{}}"#.into()),
             ..AgentOptions::default()
         };
-        assert!(opts.agents_json.as_deref().unwrap().contains("gaviero-probe"));
+        assert!(
+            opts.agents_json
+                .as_deref()
+                .unwrap()
+                .contains("gaviero-probe")
+        );
     }
 
     #[test]

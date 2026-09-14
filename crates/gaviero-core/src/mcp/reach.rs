@@ -122,14 +122,13 @@ fn write_atomic(path: &Path, content: &str) -> Result<()> {
     tmp_name.push(".tmp");
     let tmp = dir.join(tmp_name);
     {
-        let mut file = std::fs::File::create(&tmp)
-            .with_context(|| format!("creating {}", tmp.display()))?;
+        let mut file =
+            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
     }
-    std::fs::rename(&tmp, path).with_context(|| {
-        format!("renaming {} onto {}", tmp.display(), path.display())
-    })?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("renaming {} onto {}", tmp.display(), path.display()))?;
     Ok(())
 }
 
@@ -449,12 +448,13 @@ mod tests {
         ProviderReachResult {
             cli_version: Some(version.into()),
             transport: "stdio".into(),
-            top_level: matches!(
-                verdict,
-                ReachVerdict::Verified | ReachVerdict::NestedFailed
-            ),
+            top_level: matches!(verdict, ReachVerdict::Verified | ReachVerdict::NestedFailed),
             nested: verdict == ReachVerdict::Verified,
-            nested_depth: if verdict == ReachVerdict::Verified { 1 } else { 0 },
+            nested_depth: if verdict == ReachVerdict::Verified {
+                1
+            } else {
+                0
+            },
             explicit_ref_required: false,
             verdict,
         }
@@ -488,13 +488,12 @@ mod tests {
         let loaded = ReachStore::load(dir.path()).unwrap().unwrap();
         assert_eq!(loaded.v, 1);
         assert_eq!(loaded.workspace_id, "abc");
-        assert_eq!(
-            loaded.providers["claude"].verdict,
-            ReachVerdict::Verified
+        assert_eq!(loaded.providers["claude"].verdict, ReachVerdict::Verified);
+        assert!(
+            !ReachRecord::path(dir.path())
+                .with_file_name("mcp_reach.json.tmp")
+                .exists()
         );
-        assert!(!ReachRecord::path(dir.path())
-            .with_file_name("mcp_reach.json.tmp")
-            .exists());
     }
 
     #[test]
@@ -609,7 +608,10 @@ mod tests {
             NestingPolicy::Blocked("x".into()),
             NestingPolicy::Unknown,
         );
-        assert_eq!(filter_claude_tools(tools, &off), vec!["Read", "Agent", "Task"]);
+        assert_eq!(
+            filter_claude_tools(tools, &off),
+            vec!["Read", "Agent", "Task"]
+        );
     }
 
     #[test]
