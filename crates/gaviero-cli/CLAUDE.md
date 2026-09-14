@@ -27,7 +27,7 @@ Mode families (flags on `Cli`):
 | Graph | `--graph` (+ `--enrich` / `--enrich-no-embed`) |
 | Git hygiene | `--cleanup-branches` (+ `--force`) |
 | Memory admin | `--remember`, `--sleep`, `--utilization-scope`, `--manifest-*`, `--deletions-*` / `--restore-*`, `--forget-*` |
-| MCP | `--mcp-stats` (+ `--mcp-stats-path`); `--mcp-reach-probe` (+ `--reach-providers`, `--reach-depth`, `--reach-transport`, `--reach-json`); runtime: `--no-mcp`, `--mcp-url`, `--mcp-stdio`, `--mcp-codex-trust`, `--skip-mcp-preflight` |
+| MCP | `--mcp-stats` (+ `--mcp-stats-path`); `--mcp-reach-probe` (+ `--reach-providers`, `--reach-depth`, `--reach-transport`, `--reach-json`); `--mcp-register-user` / `--mcp-unregister-user`; runtime: `--no-mcp`, `--mcp-url`, `--mcp-stdio`, `--mcp-codex-trust`, `--skip-mcp-preflight` |
 | Eval | `--eval-fixture` (+ ablation / budget / anchor-ab / scope-matrix / seed-corpus flags) |
 
 Full user-facing flag tables: [README.md](README.md). Do not duplicate every field here.
@@ -35,7 +35,7 @@ Full user-facing flag tables: [README.md](README.md). Do not duplicate every fie
 ## Conventions
 
 - **stdout = results, stderr = telemetry.** Observers always log to stderr.
-- **Model spec:** `provider:model` required. Accepted prefixes include `claude:`, `codex:`, `cursor:`, `ollama:`, `local:`, `deepseek:` ([`validate_model_spec`](../gaviero-core/src/swarm/backend/shared.rs)). Default: workspace `agent.model`, then `claude:sonnet`.
+- **Model spec:** `provider:model` required. Accepted prefixes include `claude:`, `codex:`, `cursor:`, `ollama:`, `local:`, `deepseek:`, `dsh:` ([`validate_model_spec`](../gaviero-core/src/swarm/backend/shared.rs)). Default: workspace `agent.model`, then `claude:sonnet`.
 - **`--repo` vs `--workspace`:** `execution repo` vs `execution document` ([`workflow_execution_mode`](../gaviero-dsl/src/lib.rs)). Conflicts with each other; `--workspace` defaults to the plan file's directory when `--var PLAN_FILE=...` is set.
 - **DSL precedence.** Tiers: `--tiers-file` > script/includes. Vars: agent-level > `--var` > script-level. Params: `--param` (see [`workflow_params`](../gaviero-dsl/src/workflow_params.rs)).
 - **Memory ops open the same `MemoryServices`** as the TUI; never bypass the writer task.
