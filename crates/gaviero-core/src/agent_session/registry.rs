@@ -27,6 +27,7 @@ use crate::observer::AcpObserver;
 use crate::swarm::backend::{StopReason, UnifiedStreamEvent};
 use crate::write_gate::WriteGatePipeline;
 
+use super::agent_client_protocol::AcpClientSession;
 use super::claude::ClaudeSession;
 use super::codex_app_server::CodexAppServerSession;
 use super::cursor::CursorSession;
@@ -245,6 +246,51 @@ fn create_observed_codex_session(args: SessionConstruction) -> Box<dyn AgentSess
     })
 }
 
+fn create_observed_dsh_session(args: SessionConstruction) -> Box<dyn AgentSession> {
+    let SessionConstruction {
+        write_gate,
+        observer,
+        model,
+        ollama_base_url,
+        workspace_root,
+        additional_roots,
+        agent_id,
+        conv_id,
+        options,
+        profile,
+        cancel_token,
+    } = args;
+
+    let observer: Arc<dyn AcpObserver> = Arc::from(observer);
+    let inner_args = SessionConstruction {
+        write_gate: write_gate.clone(),
+        observer: Box::new(NoopAcpObserver),
+        model,
+        ollama_base_url,
+        workspace_root: workspace_root.clone(),
+        additional_roots,
+        agent_id: agent_id.clone(),
+        conv_id: conv_id.clone(),
+        options,
+        profile,
+        cancel_token,
+    };
+
+    Box::new(ObservedStreamSession {
+        inner: Box::new(AcpClientSession::from_parts(
+            inner_args,
+            observer.clone(),
+            crate::types::FileScope::default(),
+        )),
+        observer,
+        write_gate,
+        workspace_root,
+        agent_id,
+        conv_id,
+        scan_text_file_blocks: false,
+    })
+}
+
 pub fn create_session(args: SessionConstruction) -> Box<dyn AgentSession> {
     match args.profile.continuity_mode {
         ContinuityMode::NativeResume => {
@@ -254,7 +300,13 @@ pub fn create_session(args: SessionConstruction) -> Box<dyn AgentSession> {
                 Box::new(ClaudeSession::new(args))
             }
         }
-        ContinuityMode::ProcessBound => create_observed_codex_session(args),
+        ContinuityMode::ProcessBound => {
+            if args.profile.provider == "dsh" {
+                create_observed_dsh_session(args)
+            } else {
+                create_observed_codex_session(args)
+            }
+        }
         ContinuityMode::StatelessReplay => {
             if args.profile.provider == "codex" {
                 create_observed_codex_session(args)

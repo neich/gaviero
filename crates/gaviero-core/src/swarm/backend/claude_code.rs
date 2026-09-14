@@ -141,6 +141,7 @@ impl AgentBackend for ClaudeCodeBackend {
             retrieval: RetrievalToolset {
                 graph_and_memory: true,
                 symbols: false,
+                exposed: vec![],
             },
         }
     }

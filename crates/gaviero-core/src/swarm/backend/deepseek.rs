@@ -116,8 +116,11 @@ impl AgentBackend for DeepseekBackend {
         &self,
         request: CompletionRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<UnifiedStreamEvent>> + Send>>> {
+        let exposed = request.exposed_tools.clone();
         let system = request.system_prompt.unwrap_or_else(|| {
-            super::shared::default_editor_system_prompt(&Self::capabilities_for_swarm())
+            super::shared::default_editor_system_prompt(
+                &Self::capabilities_for_swarm().with_exposed_tools(exposed.as_deref()),
+            )
         });
         let (tx, rx) = mpsc::channel::<Result<UnifiedStreamEvent>>(256);
         let bridge = Arc::new(StreamBridge { tx: tx.clone() });

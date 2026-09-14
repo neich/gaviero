@@ -59,6 +59,8 @@ pub enum ResolvedBackend {
     Ollama { model: String, base_url: String },
     /// Route to the in-process DeepSeek tool-agent harness.
     Deepseek { model: String },
+    /// Route to `dsh --profile acp` over the Agent Client Protocol.
+    Dsh { model: String },
     /// Blocked — cannot dispatch (privacy constraint, unavailable backend).
     Blocked { reason: String },
 }
@@ -119,6 +121,10 @@ impl TierRouter {
             }
             ResolvedBackend::Deepseek { model } => {
                 let model_spec = format!("deepseek:{}", model);
+                shared::create_backend_for_model(&model_spec, None).map_err(|e| e.to_string())
+            }
+            ResolvedBackend::Dsh { model } => {
+                let model_spec = format!("dsh:{}", model);
                 shared::create_backend_for_model(&model_spec, None).map_err(|e| e.to_string())
             }
             ResolvedBackend::Blocked { reason } => Err(reason),
@@ -194,6 +200,13 @@ impl TierRouter {
         if shared::is_deepseek_model(model) {
             let resolved_model = model.strip_prefix("deepseek:").unwrap_or(model).to_string();
             return ResolvedBackend::Deepseek {
+                model: resolved_model,
+            };
+        }
+
+        if shared::is_dsh_model(model) {
+            let resolved_model = model.strip_prefix("dsh:").unwrap_or(model).to_string();
+            return ResolvedBackend::Dsh {
                 model: resolved_model,
             };
         }
@@ -275,6 +288,12 @@ fn api_backend_for_spec(model_spec: &str) -> ResolvedBackend {
             .unwrap_or(model_spec)
             .to_string();
         ResolvedBackend::Deepseek { model: stripped }
+    } else if shared::is_dsh_model(model_spec) {
+        let stripped = model_spec
+            .strip_prefix("dsh:")
+            .unwrap_or(model_spec)
+            .to_string();
+        ResolvedBackend::Dsh { model: stripped }
     } else {
         ResolvedBackend::Claude {
             model: model_spec.to_string(),
@@ -305,6 +324,12 @@ pub fn validate_privacy(unit: &WorkUnit) -> Result<(), String> {
             if shared::is_deepseek_model(model) {
                 return Err(format!(
                     "unit '{}': LocalOnly privacy with DeepSeek API model override '{}'",
+                    unit.id, model
+                ));
+            }
+            if shared::is_dsh_model(model) {
+                return Err(format!(
+                    "unit '{}': LocalOnly privacy with dsh API model override '{}'",
                     unit.id, model
                 ));
             }
@@ -486,6 +511,36 @@ mod tests {
                 model: "deepseek-v4-pro".into()
             }
         );
+    }
+
+    #[test]
+    fn test_dsh_model_override_routes_to_dsh_backend() {
+        let router = TierRouter::new(TierConfig::default(), false);
+        let unit = test_unit(
+            ModelTier::Cheap,
+            PrivacyLevel::Public,
+            Some("dsh:deepseek-v4-pro"),
+        );
+        assert_eq!(
+            router.resolve(&unit),
+            ResolvedBackend::Dsh {
+                model: "deepseek-v4-pro".into()
+            }
+        );
+    }
+
+    #[test]
+    fn test_dsh_blocked_under_local_only() {
+        let router = TierRouter::new(TierConfig::default(), true);
+        let unit = test_unit(
+            ModelTier::Cheap,
+            PrivacyLevel::LocalOnly,
+            Some("dsh:deepseek-v4-pro"),
+        );
+        assert!(matches!(
+            router.resolve(&unit),
+            ResolvedBackend::Blocked { .. }
+        ));
     }
 
     #[test]

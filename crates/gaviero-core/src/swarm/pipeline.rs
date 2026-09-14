@@ -46,9 +46,13 @@ pub fn tier_router_for_model(fallback_model: &str, ollama_base_url: Option<&str>
         tier_config.local.model = local_model.clone();
         tier_config.cheap_model = local_model.clone();
         tier_config.expensive_model = local_model.clone();
-    } else if shared::is_codex_model(fallback_model) {
-        // Codex is API-backed like Claude. Propagate to both tier defaults so
-        // work units without an explicit `model` override stay on Codex.
+    } else if shared::is_codex_model(fallback_model)
+        || shared::is_dsh_model(fallback_model)
+        || shared::is_deepseek_model(fallback_model)
+    {
+        // API-backed like Claude. Propagate to both tier defaults so
+        // work units without an explicit `model` override stay on the
+        // chosen provider.
         tier_config.cheap_model = fallback_model.to_string();
         tier_config.expensive_model = fallback_model.to_string();
     }
@@ -172,6 +176,9 @@ pub struct SwarmConfig {
     /// `.gaviero/settings.json` does not exist. `None` = resolve from the
     /// agent root (legacy; loses the denylist in worktrees).
     pub tool_policy: Option<crate::agent_session::tool_agent::policy::ToolPolicy>,
+    /// MCP tools advertised to swarm agents (`mcp.gavieroServer.exposedTools`).
+    /// `None` keeps the backend default retrieval stanza.
+    pub exposed_tools: Option<Vec<String>>,
     /// When true, each completed agent's findings (task + full text
     /// output) are run through the per-turn memory extractor — the same
     /// `enqueue_post_turn` path as a TUI chat turn — so durable facts are
@@ -203,6 +210,7 @@ pub struct SwarmConfig {
     /// Constitution filter for the shared memory bundle. Resolved from
     /// `Workspace::resolve_chat_injection_config` by TUI / CLI.
     pub chat_injection: crate::memory::ChatInjectionConfig,
+    pub skills_emit: crate::skills::emit::EmitSettings,
     /// Optional skill catalog for path-lazy attachment on work-unit owned paths.
     pub skill_catalog: Option<Arc<crate::skills::SkillCatalog>>,
 }
@@ -988,6 +996,7 @@ pub async fn execute(
                 let pfm = pre_fetched_memory.clone();
                 let swarm_extras = config.swarm_extra_tools.clone();
                 let tool_policy = config.tool_policy.clone();
+                let exposed_tools = config.exposed_tools.clone();
                 let skip_repo_context = config.execution_mode == ExecutionMode::Document;
                 let skill_catalog = config.skill_catalog.clone();
                 if let Ok(backend) = resolve_backend_for_unit(&router, &unit) {
@@ -1028,6 +1037,7 @@ pub async fn execute(
                             (*pfm).as_deref(),
                             &swarm_extras,
                             tool_policy.as_ref(),
+                            exposed_tools.as_deref(),
                             skip_repo_context,
                             skill_catalog.as_deref(),
                             |candidate| resolve_backend_for_unit(&router, candidate),
@@ -1721,6 +1731,7 @@ pub async fn execute(
                     let pfm = pre_fetched_memory.clone();
                     let swarm_extras = config.swarm_extra_tools.clone();
                     let tool_policy = config.tool_policy.clone();
+                    let exposed_tools = config.exposed_tools.clone();
                     let skip_repo_context = config.execution_mode == ExecutionMode::Document;
                     let skill_catalog = config.skill_catalog.clone();
                     let in_worktree = worktree_mgr.is_some();
@@ -1752,6 +1763,7 @@ pub async fn execute(
                                     (*pfm).as_deref(),
                                     &swarm_extras,
                                     tool_policy.as_ref(),
+                                    exposed_tools.as_deref(),
                                     skip_repo_context,
                                     skill_catalog.as_deref(),
                                     |candidate| resolve_backend_for_unit(&router, candidate),
@@ -2240,6 +2252,13 @@ pub async fn execute(
                 tracing::warn!("memory consolidation failed: {}", e);
             }
         }
+        match crate::skills::emit::emit_after_consolidation(&config.workspace_root, mem.as_ref(), &config.skills_emit)
+            .await
+        {
+            Ok(crate::skills::emit::EmitOutcome::Disabled) => {}
+            Ok(out) => tracing::info!(?out, "skills.emit after consolidation"),
+            Err(e) => tracing::warn!("skills.emit failed: {e}"),
+        }
     }
 
     let verification_passed = run_post_execution_verification(
@@ -2298,6 +2317,8 @@ struct AgentRunContext<'a> {
     swarm_extras: &'a [String],
     /// Workspace-resolved shell policy (see `SwarmConfig::tool_policy`).
     tool_policy: Option<&'a crate::agent_session::tool_agent::policy::ToolPolicy>,
+    /// MCP tools advertised to swarm agents (see `SwarmConfig::exposed_tools`).
+    exposed_tools: Option<&'a [String]>,
     /// When true, omit repo-map, topology, and code-graph context from prompts.
     skip_repo_context: bool,
     skill_catalog: Option<Arc<crate::skills::SkillCatalog>>,
@@ -2337,6 +2358,7 @@ impl<'a> AgentRunContext<'a> {
             mcp_config: config.mcp_config.clone(),
             swarm_extras: &config.swarm_extra_tools,
             tool_policy: config.tool_policy.as_ref(),
+            exposed_tools: config.exposed_tools.as_deref(),
             skip_repo_context: config.execution_mode == ExecutionMode::Document,
             skill_catalog: config.skill_catalog.clone(),
         }
@@ -3314,6 +3336,7 @@ async fn run_agent_inner(
         && agent_root != base_mcp.worktree
     {
         let mut synth = base_mcp.clone();
+        crate::mcp::ReachStore::copy_to_worktree(&synth.worktree, &agent_root)?;
         synth.worktree = agent_root.clone();
         match crate::mcp::synthesize_for_worktree(&synth) {
             Ok(paths) if !paths.is_empty() => {
@@ -3379,6 +3402,7 @@ async fn run_agent_inner(
             pre_fetched_memory_text.as_deref(),
             ctx.swarm_extras,
             ctx.tool_policy,
+            ctx.exposed_tools,
             ctx.skip_repo_context,
             ctx.skill_catalog.as_deref(),
             |candidate| {

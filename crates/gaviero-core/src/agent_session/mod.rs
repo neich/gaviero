@@ -64,6 +64,16 @@
 //! tool calls. Replay history is rebuilt from `Turn.replay_history` each turn
 //! with compaction at the session boundary. Used today by `deepseek:`.
 //!
+//! ### Pattern D — Agent Client Protocol client
+//!
+//! Implement `AgentSession` in `agent_session/agent_client_protocol/` over a
+//! hand-rolled JSON-RPC stdio loop. The in-tree module `crate::acp` is the
+//! **legacy Claude NDJSON transport**, not ACP. Used today by `dsh:`. Client
+//! `fs` capability is advertised so `fs/write_text_file` becomes a
+//! `WriteProposal`. Register `ProcessBound` + `provider == "dsh"` in
+//! `registry::create_session`. `deepseek:` remains the in-process fallback
+//! (Pattern C).
+//!
 //! ### Provider checklist
 //!
 //! 1. Emit `UnifiedStreamEvent::TextDelta` for visible reply text and
@@ -97,6 +107,7 @@
 //! variant is added.
 
 pub(crate) mod background;
+pub mod agent_client_protocol;
 pub mod claude;
 pub mod codex_app_server;
 pub mod codex_exec;
