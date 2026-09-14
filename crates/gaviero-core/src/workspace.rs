@@ -262,6 +262,12 @@ pub mod settings {
     /// [`crate::mcp::synthesize_for_worktree`].
     pub const MCP_PERMISSIONS: &str = "mcp.permissions";
 
+    /// When true (default), spawn-time nesting is gated on a fresh
+    /// verified `mcp_reach.json` row for that vendor (P0.4).
+    pub const MCP_REACH_ENFORCE: &str = "mcp.reach.enforce";
+    /// Probe records older than this many days are treated as unknown.
+    pub const MCP_REACH_MAX_AGE_DAYS: &str = "mcp.reach.maxAgeDays";
+
     // TUI memory panel (Tier A / A4)
     pub const UI_MEMORY_PANEL_RECENT_WINDOW_HOURS: &str = "ui.memoryPanel.recentWindowHours";
 
@@ -1381,6 +1387,8 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         // MCP permission policy: empty allow/deny = allow everything (the
         // historical default before the gaviero-level policy existed).
         settings::MCP_PERMISSIONS => serde_json::json!({ "allow": [], "deny": [] }),
+        settings::MCP_REACH_ENFORCE => serde_json::json!(true),
+        settings::MCP_REACH_MAX_AGE_DAYS => serde_json::json!(30),
 
         // Memory panel (A4)
         settings::UI_MEMORY_PANEL_RECENT_WINDOW_HOURS => serde_json::json!(24),

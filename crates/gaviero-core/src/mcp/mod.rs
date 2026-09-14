@@ -59,6 +59,7 @@ mod legacy_handshake;
 pub mod observer;
 pub mod preflight;
 pub mod probe;
+pub mod reach;
 pub mod reach_probe;
 pub mod resolver;
 pub mod server;
@@ -85,6 +86,7 @@ pub use preflight::{
     validate_codex_trust_for_extras, validate_synthesized_cursor_remote_mcp,
 };
 pub use probe::{PingRecord, ProbeLedger, ping_receipt};
+pub use reach::{NestingPolicy, ReachPolicy, ReachRecord, ReachStore};
 pub use reach_probe::{
     ProviderReachResult, ReachProbeConfig, ReachReport, ReachTransport, ReachVerdict,
     classify_verdict, probe_prompt, run_reach_probe,
