@@ -4,7 +4,7 @@
 //! at `.gaviero/mcp.sock` on Unix, a `\\.\pipe\gaviero-…` named pipe
 //! on Windows. Each shim connection is a single MCP session
 //! speaking JSON-RPC 2.0 over `AsyncRead + AsyncWrite` — rmcp handles
-//! framing, initialize, and tools/list. Gaviero owns only the eight
+//! framing, initialize, and tools/list. Gaviero owns only the nine
 //! tool handlers below.
 //!
 //! **The invariant this module enforces is #11: every write goes
@@ -15,7 +15,8 @@
 //! `store_scoped`. Rejected `memory_store` / `memory_update` /
 //! `memory_delete` tools remain unimplementable by construction.
 //!
-//! Seven of the eight tools are strictly read-only. `memory_flag` is
+//! Eight of the nine tools are strictly read-only. `memory_ping` writes
+//! only to an in-memory [`super::probe::ProbeLedger`]. `memory_flag` is
 //! write-adjacent: it emits a signal through
 //! [`super::signal::MemorySignalSink`] — a narrow trait object, not the
 //! writer handle — which the writer task turns into a trust demotion
@@ -40,19 +41,20 @@ use crate::memory::{
 use crate::repo_map::store::BlastRadiusMode;
 
 use super::observer::{McpCallLogEntry, McpToolCallObserver, NoopMcpObserver};
+use super::probe::{PingRecord, ProbeLedger, ping_receipt};
 use super::signal::{MemoryFlagRequest, MemorySignalSink};
 use super::tools::{
     BlastRadiusInput, BlastRadiusOutput, BlastRadiusRelation, MemoryFlagInput, MemoryFlagOutput,
-    MemoryGetInput, MemoryGetOutput, MemoryGetRow, MemorySearchInput, MemorySearchOutput,
-    MemorySearchResult, NodeDoc, NodeDocInput, NodeDocSymbol, RepoOutlineEntry, RepoOutlineInput,
-    RepoOutlineOutput, SYMBOL_DOC_SNIPPET_MAX_CHARS, SymbolDocImpl, SymbolDocInput,
-    SymbolDocOutput, SymbolSearchHit, SymbolSearchInput, SymbolSearchOutput, clamp_blast_depth,
-    clamp_memory_search_limit, clamp_repo_outline_token_cap, clamp_symbol_search_limit,
-    truncate_symbol_snippet,
+    MemoryGetInput, MemoryGetOutput, MemoryGetRow, MemoryPingInput, MemoryPingOutput,
+    MemorySearchInput, MemorySearchOutput, MemorySearchResult, NodeDoc, NodeDocInput,
+    NodeDocSymbol, RepoOutlineEntry, RepoOutlineInput, RepoOutlineOutput,
+    SYMBOL_DOC_SNIPPET_MAX_CHARS, SymbolDocImpl, SymbolDocInput, SymbolDocOutput, SymbolSearchHit,
+    SymbolSearchInput, SymbolSearchOutput, clamp_blast_depth, clamp_memory_search_limit,
+    clamp_repo_outline_token_cap, clamp_symbol_search_limit, truncate_symbol_snippet,
 };
 
 /// Gaviero's MCP server. One instance lives per workspace; it
-/// dispatches tool calls to the eight handlers below (seven read-only
+/// dispatches tool calls to the nine handlers below (eight read-only
 /// plus write-adjacent `memory_flag`).
 ///
 /// `tool_router` is the rmcp-macro-generated dispatch table — see
@@ -136,6 +138,12 @@ pub struct GavieroMcpServer {
     /// without [`Self::with_signal_sink`]) makes `memory_flag` return a
     /// clear error rather than silently no-op.
     signal_sink: Option<Arc<dyn MemorySignalSink>>,
+    /// Optional in-memory ping ledger for `memory_ping`. Unattached
+    /// servers still answer the tool; they just do not record.
+    probe_ledger: Option<ProbeLedger>,
+    /// Instant the server struct was built. Mixed into ping receipts so
+    /// two probe runs cannot collide on the same nonce.
+    started_at: chrono::DateTime<chrono::Utc>,
     #[allow(dead_code)] // populated and dispatched via the `#[tool_router]` macro
     tool_router: ToolRouter<Self>,
 }
@@ -167,6 +175,8 @@ impl GavieroMcpServer {
             permissions: super::McpPermissions::default(),
             first_tool_call_done: Arc::new(AtomicBool::new(false)),
             signal_sink: None,
+            probe_ledger: None,
+            started_at: chrono::Utc::now(),
             tool_router: Self::tool_router(),
         }
     }
@@ -244,6 +254,14 @@ impl GavieroMcpServer {
     /// its three call sites.
     pub fn with_signal_sink(mut self, sink: Arc<dyn MemorySignalSink>) -> Self {
         self.signal_sink = Some(sink);
+        self
+    }
+
+    /// Attach a [`ProbeLedger`] so `memory_ping` records nonce + depth.
+    /// Without it the tool still returns a receipt (needed for nested
+    /// sessions that inherit a server that was not started as a probe).
+    pub fn with_probe_ledger(mut self, ledger: ProbeLedger) -> Self {
+        self.probe_ledger = Some(ledger);
         self
     }
 
@@ -844,6 +862,43 @@ impl GavieroMcpServer {
         };
         self.emit_tool_call(
             super::tools::TOOL_MEMORY_GET,
+            serde_json::to_value(&input).unwrap_or_default(),
+            serde_json::to_value(&out).unwrap_or_default(),
+            started,
+            None,
+        );
+        Ok(Json(out))
+    }
+
+    // ── memory_ping ─────────────────────────────────────────────────
+    #[tool(
+        name = "memory_ping",
+        description = "Record a nested MCP reach ping with nonce and depth; returns a receipt and workspace id. Read-only.",
+        annotations(read_only_hint = true, idempotent_hint = true)
+    )]
+    async fn memory_ping(
+        &self,
+        Parameters(input): Parameters<MemoryPingInput>,
+    ) -> Result<Json<MemoryPingOutput>, ErrorData> {
+        let started = Instant::now();
+        self.ensure_tool_allowed("memory_ping")?;
+        let receipt = ping_receipt(&input.nonce, input.depth, self.started_at);
+        let workspace_id = crate::workspace::identity::workspace_id_hex16(&self.workspace_root);
+        if let Some(ledger) = &self.probe_ledger {
+            ledger.record(PingRecord {
+                nonce: input.nonce.clone(),
+                depth: input.depth,
+                at: chrono::Utc::now(),
+                receipt: receipt.clone(),
+            });
+        }
+        let out = MemoryPingOutput {
+            receipt,
+            depth: input.depth,
+            workspace_id,
+        };
+        self.emit_tool_call(
+            super::tools::TOOL_MEMORY_PING,
             serde_json::to_value(&input).unwrap_or_default(),
             serde_json::to_value(&out).unwrap_or_default(),
             started,
@@ -1966,6 +2021,43 @@ mod tests {
             .unwrap();
         assert_eq!(out.0.path, "src/lib.rs");
         assert_eq!(out.0.qualified_name, "src/lib.rs");
+    }
+
+    #[tokio::test]
+    async fn memory_ping_records_nonce_and_depth() {
+        let ledger = ProbeLedger::new();
+        let s = fixture().with_probe_ledger(ledger.clone());
+        let out = s
+            .memory_ping(Parameters(MemoryPingInput {
+                nonce: "probe-nonce".into(),
+                depth: 1,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(out.depth, 1);
+        assert_eq!(out.receipt.len(), 12);
+        assert!(!out.workspace_id.is_empty());
+        let recs = ledger.records_for_nonce("probe-nonce");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].depth, 1);
+        assert_eq!(recs[0].receipt, out.receipt);
+    }
+
+    #[tokio::test]
+    async fn memory_ping_without_ledger_still_answers() {
+        let s = fixture();
+        let out = s
+            .memory_ping(Parameters(MemoryPingInput {
+                nonce: "no-ledger".into(),
+                depth: 0,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(out.depth, 0);
+        assert_eq!(out.receipt.len(), 12);
+        assert!(!out.workspace_id.is_empty());
     }
 
     /// PR-4: `memory_get` routes by the scope string to the owning

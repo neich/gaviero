@@ -73,7 +73,8 @@ gaviero-core/src/
 ├─ mcp/                   In-process MCP server
 │  ├─ server.rs           spawn_mcp_server, GavieroMcpServer
 │  ├─ signal.rs           MemorySignalSink — the one write-adjacent seam
-│  ├─ tools.rs            Eight tools (see MCP below)
+│  ├─ tools.rs            Nine tools (see MCP below)
+│  ├─ probe.rs            ProbeLedger + memory_ping receipts
 │  ├─ transport.rs        McpEndpoint (Unix socket / Windows named pipe)
 │  ├─ config_synth.rs     Per-worktree .mcp.json / .codex/ / .cursor/
 │  ├─ preflight.rs        Shim PATH + URL checks
@@ -146,7 +147,7 @@ Writes: native edit tools (Claude/Codex/Cursor) or Option-B `<file>` blocks (Oll
 ### Memory / MCP / observers
 
 - [`MemoryStores`](src/memory/stores.rs) + [`WriterHandle`](src/memory/writer.rs) — multi-DB; single writer task.
-- [`GavieroMcpServer`](src/mcp/server.rs) — eight tools (seven read-only + write-adjacent `memory_flag`); **no `WriterHandle`** — `memory_flag` signals through [`mcp/signal.rs`](src/mcp/signal.rs) into the writer task.
+- [`GavieroMcpServer`](src/mcp/server.rs) — nine tools (eight read-only including `memory_ping` + write-adjacent `memory_flag`); **no `WriterHandle`** — `memory_flag` signals through [`mcp/signal.rs`](src/mcp/signal.rs) into the writer task. `memory_ping` records only on an in-memory [`ProbeLedger`](src/mcp/probe.rs).
 - Observers in [`observer.rs`](src/observer.rs) / [`memory/observer.rs`](src/memory/observer.rs) / [`mcp/observer.rs`](src/mcp/observer.rs).
 
 ---
@@ -190,7 +191,7 @@ DBs: global `~/.config/gaviero/memory.db`; workspace+run `<workspace>/.gaviero/m
 
 ### MCP
 
-[`spawn_mcp_server`](src/mcp/server.rs) binds [`McpEndpoint`](src/mcp/transport.rs). Subprocess agents use `gaviero-mcp-shim`. Tools ([`tools.rs`](src/mcp/tools.rs)): `memory_search`, `memory_get`, `blast_radius`, `node_doc`, `repo_outline`, `symbol_search`, `symbol_doc` (last two gated by `repoMap.symbolEnrichment.enabled`).
+[`spawn_mcp_server`](src/mcp/server.rs) binds [`McpEndpoint`](src/mcp/transport.rs). Subprocess agents use `gaviero-mcp-shim`. Tools ([`tools.rs`](src/mcp/tools.rs)): `memory_search`, `memory_get`, `memory_ping`, `blast_radius`, `node_doc`, `repo_outline`, `symbol_search`, `symbol_doc` (last two gated by `repoMap.symbolEnrichment.enabled`).
 
 ### Two-layer graph context
 

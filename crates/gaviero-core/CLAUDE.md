@@ -21,7 +21,7 @@ Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presenc
 | Swarm | [`swarm/`](src/swarm) | Six-phase pipeline; backends in [`swarm/backend/`](src/swarm/backend): `claude_code`, `codex`, `cursor`, `ollama`, `deepseek`, `mock`, `Custom` — all behind [`AgentBackend`](src/swarm/backend/mod.rs). |
 | Agent session | [`agent_session/`](src/agent_session) | `claude`, `codex_exec`, `codex_app_server`, `cursor`, `ollama`, [`tool_agent/`](src/agent_session/tool_agent) (`deepseek:` + future API providers), `registry`. |
 | Memory | [`memory/`](src/memory) | Multi-DB ONNX store; single writer task ([`writer.rs`](src/memory/writer.rs)); merged multi-scope hybrid retrieval (RRF). |
-| MCP | [`mcp/`](src/mcp) | Eight tools — seven read-only + write-adjacent `memory_flag` ([`tools.rs`](src/mcp/tools.rs)); endpoint via [`transport.rs`](src/mcp/transport.rs); signal sink ([`signal.rs`](src/mcp/signal.rs)); config synth / preflight / telemetry. |
+| MCP | [`mcp/`](src/mcp) | Nine tools — eight read-only (incl. `memory_ping`) + write-adjacent `memory_flag` ([`tools.rs`](src/mcp/tools.rs)); endpoint via [`transport.rs`](src/mcp/transport.rs); signal sink ([`signal.rs`](src/mcp/signal.rs)); config synth / preflight / telemetry. |
 | Write path | [`write_gate.rs`](src/write_gate.rs), [`scope_enforcer.rs`](src/scope_enforcer.rs) | Modes: Interactive / AutoAccept / Deferred / RejectAll. |
 | Repo map | [`repo_map/`](src/repo_map) | Graph + [`topology.rs`](src/repo_map/topology.rs) + symbol enrichment/search. |
 | Skills | [`skills/`](src/skills) | Frontmatter, catalog, planner `ResolvedSkill` seam. |

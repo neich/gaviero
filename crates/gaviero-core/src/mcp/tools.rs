@@ -1,8 +1,11 @@
 //! Tool input/output schemas (Tier A / A5).
 //!
-//! Seven read-only tools plus `memory_flag`, which is write-adjacent: it
-//! emits a signal that the S2 writer task turns into a trust demotion. It
-//! creates and deletes nothing. Each input/output struct derives
+//! Nine tools: eight read-only (`memory_search`, `memory_get`,
+//! `memory_ping`, `blast_radius`, `node_doc`, `repo_outline`,
+//! `symbol_search`, `symbol_doc`) plus write-adjacent `memory_flag`,
+//! which emits a signal that the S2 writer task turns into a trust
+//! demotion. It creates and deletes nothing. `memory_ping` writes only
+//! to an in-memory probe ledger. Each input/output struct derives
 //! `schemars::JsonSchema` so rmcp's tool macro can emit the JSON-RPC
 //! schema at server-handshake time.
 
@@ -17,6 +20,7 @@ pub const TOOL_SYMBOL_DOC: &str = "symbol_doc";
 pub const TOOL_REPO_OUTLINE: &str = "repo_outline";
 pub const TOOL_MEMORY_GET: &str = "memory_get";
 pub const TOOL_MEMORY_FLAG: &str = "memory_flag";
+pub const TOOL_MEMORY_PING: &str = "memory_ping";
 
 // ── memory_search ─────────────────────────────────────────────────
 
@@ -239,6 +243,27 @@ pub struct MemoryGetRow {
 pub struct MemoryGetOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemoryGetRow>,
+}
+
+// ── memory_ping ───────────────────────────────────────────────────
+
+/// Input schema for `memory_ping`. Nested reach probes call this with
+/// a run-scoped `nonce` and a nesting `depth` (0 = top-level session).
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
+pub struct MemoryPingInput {
+    /// Opaque probe nonce. Verdicts count only matching ledger rows.
+    pub nonce: String,
+    /// Nesting depth: `0` for the parent session, `1` for a subagent.
+    pub depth: u8,
+}
+
+/// Output of `memory_ping`. `receipt` is derived by the server so a
+/// nested agent that *claims* a ping cannot fake a verified nested hit.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct MemoryPingOutput {
+    pub receipt: String,
+    pub depth: u8,
+    pub workspace_id: String,
 }
 
 // ── memory_flag ───────────────────────────────────────────────────
@@ -478,6 +503,7 @@ mod tests {
         assert_eq!(TOOL_REPO_OUTLINE, "repo_outline");
         assert_eq!(TOOL_MEMORY_GET, "memory_get");
         assert_eq!(TOOL_MEMORY_FLAG, "memory_flag");
+        assert_eq!(TOOL_MEMORY_PING, "memory_ping");
         // C1.6: documented default kind is record.
         assert_eq!(MEMORY_SEARCH_DEFAULT_KIND, "record");
     }

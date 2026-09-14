@@ -1,10 +1,12 @@
 //! Gaviero as an MCP server (Tier A / A5).
 //!
-//! Eight tools for subprocess coding agents — seven read-only:
+//! Nine tools for subprocess coding agents — eight read-only:
 //! * `memory_search` — merged multi-scope hybrid search over memories
 //!   (repo + workspace + global; `module` / `run` need per-file / per-run
 //!   identity that does not cross the shim)
 //! * `memory_get` — full stored row for one `memory_search` hit (id + scope)
+//! * `memory_ping` — reach-probe ping; records nonce+depth on an in-memory
+//!   ledger and never touches the writer
 //! * `blast_radius` — graph impact / callers / tests for file paths
 //! * `node_doc` — per-file symbol signatures (+ `qualified_name` for chaining)
 //! * `repo_outline` — PageRank-ranked code outline (mid-run `<repo_outline>` pull)
@@ -56,6 +58,7 @@ pub mod external_memory;
 mod legacy_handshake;
 pub mod observer;
 pub mod preflight;
+pub mod probe;
 pub mod resolver;
 pub mod server;
 pub mod signal;
@@ -80,6 +83,7 @@ pub use preflight::{
     PreflightOpts, plan_uses_codex, preflight_mcp, shim_binary_resolvable,
     validate_codex_trust_for_extras, validate_synthesized_cursor_remote_mcp,
 };
+pub use probe::{PingRecord, ProbeLedger, ping_receipt};
 pub use resolver::{
     McpConfigOverrides, extra_servers_from_workspace, extra_urls_from_project_mcp_json,
     parse_mcp_codex_trust_flag, parse_mcp_stdio_flag, parse_mcp_url_flag, resolve_bash_permissions,
@@ -92,10 +96,11 @@ pub use telemetry_sink::{
 };
 pub use tools::{
     BlastRadiusInput, BlastRadiusOutput, BlastRadiusRelation, MemoryFlagInput, MemoryFlagOutput,
-    MemoryGetInput, MemoryGetOutput, MemoryGetRow, MemorySearchInput, MemorySearchOutput,
-    MemorySearchResult, NodeDoc, NodeDocInput, NodeDocSymbol, RepoOutlineEntry, RepoOutlineInput,
-    RepoOutlineOutput, SymbolDocInput, SymbolDocOutput, SymbolSearchInput, SymbolSearchOutput,
-    TOOL_BLAST_RADIUS, TOOL_MEMORY_FLAG, TOOL_MEMORY_GET, TOOL_MEMORY_SEARCH, TOOL_NODE_DOC,
-    TOOL_REPO_OUTLINE, TOOL_SYMBOL_DOC, TOOL_SYMBOL_SEARCH,
+    MemoryGetInput, MemoryGetOutput, MemoryGetRow, MemoryPingInput, MemoryPingOutput,
+    MemorySearchInput, MemorySearchOutput, MemorySearchResult, NodeDoc, NodeDocInput,
+    NodeDocSymbol, RepoOutlineEntry, RepoOutlineInput, RepoOutlineOutput, SymbolDocInput,
+    SymbolDocOutput, SymbolSearchInput, SymbolSearchOutput, TOOL_BLAST_RADIUS, TOOL_MEMORY_FLAG,
+    TOOL_MEMORY_GET, TOOL_MEMORY_PING, TOOL_MEMORY_SEARCH, TOOL_NODE_DOC, TOOL_REPO_OUTLINE,
+    TOOL_SYMBOL_DOC, TOOL_SYMBOL_SEARCH,
 };
 pub use transport::McpEndpoint;
