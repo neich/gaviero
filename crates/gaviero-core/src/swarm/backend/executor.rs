@@ -345,20 +345,10 @@ mod tests {
         );
         let request = CompletionRequest {
             prompt: "test".into(),
-            system_prompt: None,
             workspace_root: PathBuf::from("/tmp"),
-            additional_roots: vec![],
-            allowed_tools: vec![],
-            file_attachments: vec![],
-            conversation_history: vec![],
-            file_refs: vec![],
-            effort: None,
-            extra: Vec::new(),
-            max_tokens: None,
             auto_approve: true,
             suppress_hooks: true,
-            file_scope: crate::types::FileScope::default(),
-            tool_policy: None,
+            ..CompletionRequest::default()
         };
 
         let outcome = complete_to_text(&backend, request, Some(&NoopObserver))
@@ -393,20 +383,10 @@ mod tests {
 
         let request = CompletionRequest {
             prompt: "test".into(),
-            system_prompt: None,
             workspace_root: PathBuf::from("/tmp"),
-            additional_roots: vec![],
-            allowed_tools: vec![],
-            file_attachments: vec![],
-            conversation_history: vec![],
-            file_refs: vec![],
-            effort: None,
-            extra: Vec::new(),
-            max_tokens: None,
             auto_approve: true,
             suppress_hooks: true,
-            file_scope: crate::types::FileScope::default(),
-            tool_policy: None,
+            ..CompletionRequest::default()
         };
 
         let gate = Arc::new(Mutex::new(WriteGatePipeline::new(
@@ -439,20 +419,10 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let request = CompletionRequest {
             prompt: "test".into(),
-            system_prompt: None,
             workspace_root: workspace.path().to_path_buf(),
-            additional_roots: vec![],
-            allowed_tools: vec![],
-            file_attachments: vec![],
-            conversation_history: vec![],
-            file_refs: vec![],
-            effort: None,
-            extra: Vec::new(),
-            max_tokens: None,
             auto_approve: true,
             suppress_hooks: true,
-            file_scope: crate::types::FileScope::default(),
-            tool_policy: None,
+            ..CompletionRequest::default()
         };
 
         // RejectAll mode: gate discards the proposal (no disk write), but
@@ -482,20 +452,10 @@ mod tests {
         );
         let request = CompletionRequest {
             prompt: "test".into(),
-            system_prompt: None,
             workspace_root: PathBuf::from("/tmp"),
-            additional_roots: vec![],
-            allowed_tools: vec![],
-            file_attachments: vec![],
-            conversation_history: vec![],
-            file_refs: vec![],
-            effort: None,
-            extra: Vec::new(),
-            max_tokens: None,
             auto_approve: true,
             suppress_hooks: true,
-            file_scope: crate::types::FileScope::default(),
-            tool_policy: None,
+            ..CompletionRequest::default()
         };
 
         let err = complete_to_text(&backend, request, Some(&NoopObserver))

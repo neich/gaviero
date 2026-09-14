@@ -33,20 +33,9 @@ use gaviero_core::swarm::backend::{AgentBackend, CompletionRequest, UnifiedStrea
 fn request(prompt: &str, workspace_root: std::path::PathBuf) -> CompletionRequest {
     CompletionRequest {
         prompt: prompt.to_string(),
-        system_prompt: None,
         workspace_root,
-        additional_roots: vec![],
-        allowed_tools: vec![],
-        file_attachments: vec![],
-        conversation_history: vec![],
-        file_refs: vec![],
-        effort: None,
-        extra: Vec::new(),
-        max_tokens: None,
-        auto_approve: false,
         suppress_hooks: true,
-        file_scope: gaviero_core::types::FileScope::default(),
-        tool_policy: None,
+        ..CompletionRequest::default()
     }
 }
 
