@@ -87,6 +87,13 @@ pub struct AgentOptions {
     /// Claude Code Stop/Notification hooks skip machine turns (memory
     /// extractor, swarm agents, etc.). Interactive chat leaves this false.
     pub suppress_hooks: bool,
+    /// Claude `--agents <json>` payload. Used by the MCP reach probe's
+    /// second pass to declare `gaviero-probe` with an explicit server
+    /// reference. `None` omits the flag.
+    pub agents_json: Option<String>,
+    /// MCP tools advertised to this session (`mcp.gavieroServer.exposedTools`).
+    /// Drives the retrieval stanza; `None` keeps the backend default.
+    pub exposed_tools: Option<Vec<String>>,
 }
 
 impl std::fmt::Debug for AgentOptions {
@@ -108,6 +115,8 @@ impl std::fmt::Debug for AgentOptions {
             )
             .field("turn_id", &self.turn_id)
             .field("suppress_hooks", &self.suppress_hooks)
+            .field("agents_json", &self.agents_json.as_ref().map(|_| "<set>"))
+            .field("exposed_tools", &self.exposed_tools)
             .finish()
     }
 }
@@ -128,6 +137,8 @@ impl Default for AgentOptions {
             prompt_observer: None,
             turn_id: None,
             suppress_hooks: false,
+            agents_json: None,
+            exposed_tools: None,
         }
     }
 }
@@ -415,13 +426,23 @@ impl AcpSession {
         //
         // `mcp__…` entries are stripped first: `--tools` selects from Claude's
         // *built-in* set only, and an unknown name there is not merely
-        // ignored. Verified against Claude Code 2.1.220 — passing `--tools`
-        // restricts the whole session and drops every MCP server with it
-        // (35 tools + context7 reachable without the flag; 4 tools and no
-        // context7 with it). MCP admission is governed by `.mcp.json` /
-        // `--mcp-config` below, so listing servers here only costs the agent
-        // its MCP tools.
-        let available_owned = build_available_tools(available_tools, interactive_permissions);
+        // ignored. MCP admission is governed by `.mcp.json` / `--mcp-config`
+        // below, so listing servers here only costs the agent its MCP tools.
+        // Claude Code 2.1.269+ keeps `--mcp-config` servers alongside
+        // `--tools` (verified 2026-09-14 from a session spawned with both);
+        // the 2.1.220-era "drops every MCP server" behaviour is gone.
+        let mut available_owned = build_available_tools(available_tools, interactive_permissions);
+        let reach = crate::mcp::ReachPolicy::for_workspace(cwd);
+        if reach.enforce
+            && let crate::mcp::NestingPolicy::Blocked(reason) = reach.for_provider("claude")
+        {
+            tracing::warn!(
+                target: "acp.session",
+                %reason,
+                "dropping Claude Agent/Task from --tools; run gaviero-cli --mcp-reach-probe"
+            );
+        }
+        available_owned = crate::mcp::filter_claude_tools(available_owned, &reach);
         if !available_owned.is_empty() {
             cmd.arg("--tools").arg(available_owned.join(","));
         }
@@ -442,6 +463,10 @@ impl AcpSession {
         let mcp_config_path = cwd.join(".mcp.json");
         if mcp_config_path.is_file() {
             cmd.arg("--mcp-config").arg(&mcp_config_path);
+        }
+
+        if let Some(json) = options.agents_json.as_deref().filter(|s| !s.is_empty()) {
+            cmd.arg("--agents").arg(json);
         }
 
         // NOTE: Claude CLI's `--file` flag is for downloading remote file
@@ -822,6 +847,33 @@ mod tests {
     }
 
     #[test]
+    fn build_available_tools_then_reach_policy_drops_agent() {
+        let built = build_available_tools(&["Read", "Agent", "Task", "mcp__gaviero"], false);
+        assert!(built.contains(&"Agent".to_string()));
+        let policy = crate::mcp::ReachPolicy::from_parts(
+            true,
+            30,
+            std::collections::BTreeMap::from([(
+                "claude".into(),
+                crate::mcp::NestingPolicy::Blocked("nested failed".into()),
+            )]),
+        );
+        let filtered = crate::mcp::filter_claude_tools(built, &policy);
+        assert_eq!(filtered, vec!["Read".to_string()]);
+    }
+
+    #[test]
+    fn build_available_tools_unknown_policy_keeps_agent() {
+        let built = build_available_tools(&["Read", "Agent"], false);
+        let policy = crate::mcp::ReachPolicy::from_parts(
+            true,
+            30,
+            std::collections::BTreeMap::from([("claude".into(), crate::mcp::NestingPolicy::Unknown)]),
+        );
+        assert_eq!(crate::mcp::filter_claude_tools(built.clone(), &policy), built);
+    }
+
+    #[test]
     fn build_available_tools_omits_ask_user_question_when_not_interactive() {
         let tools = build_available_tools(&["Read", "mcp__gaviero"], false);
         assert_eq!(tools, vec!["Read".to_string()]);
@@ -874,13 +926,24 @@ mod tests {
     }
 
     #[test]
+    fn agents_json_defaults_off_and_is_optional() {
+        let opts = AgentOptions::default();
+        assert!(opts.agents_json.is_none());
+        let opts = AgentOptions {
+            agents_json: Some(r#"{"gaviero-probe":{}}"#.into()),
+            ..AgentOptions::default()
+        };
+        assert!(opts.agents_json.as_deref().unwrap().contains("gaviero-probe"));
+    }
+
+    #[test]
     fn agent_options_size_is_bounded() {
         // Sanity: AgentOptions is cloned per turn. The two new fields
-        // (Option<Arc<dyn _>>, Option<String>) must not balloon it past
-        // a sensible budget. 256 B leaves slack for future extension.
+        // (Option<Arc<dyn _>>, Option<String>) plus `agents_json` and
+        // `exposed_tools` must not balloon it past a sensible budget.
         assert!(
-            std::mem::size_of::<AgentOptions>() <= 256,
-            "AgentOptions = {} B (budget 256 B)",
+            std::mem::size_of::<AgentOptions>() <= 320,
+            "AgentOptions = {} B (budget 320 B)",
             std::mem::size_of::<AgentOptions>()
         );
     }

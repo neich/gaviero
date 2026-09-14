@@ -10,7 +10,7 @@ use super::{
 const HISTORY_TRUNCATION_CHARS: usize = 2000;
 const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
 pub const SUPPORTED_PROVIDER_PREFIXES: &[&str] =
-    &["claude", "codex", "cursor", "ollama", "local", "deepseek"];
+    &["claude", "codex", "cursor", "ollama", "local", "deepseek", "dsh"];
 
 /// DeepSeek HTTP API model ids (without the `deepseek:` provider prefix).
 pub const DEEPSEEK_API_MODELS: &[&str] = &["deepseek-v4-pro", "deepseek-v4-flash"];
@@ -203,17 +203,56 @@ pub fn default_editor_system_prompt(capabilities: &Capabilities) -> String {
 /// appended only when `symbols` is live, so the stanza never points the model at
 /// `symbol_search`/`symbol_doc` when the enrichment sidecar is absent.
 fn retrieval_protocol_clause(retrieval: &RetrievalToolset) -> String {
-    if !retrieval.graph_and_memory {
+    let node = retrieval.names("node_doc");
+    let blast = retrieval.names("blast_radius");
+    let memory = retrieval.names("memory_search");
+    let symbols = retrieval.names("symbol_search") || retrieval.names("symbol_doc");
+    if !node && !blast && !memory && !symbols {
         return String::new();
     }
+
     let mut s = String::from(
         "You have read-only repository tools. The <repo_outline> you were given is a thin \
          index — file paths with top symbol names, not full code. Before answering questions \
-         that need a definition or body, read it with node_doc(path); use blast_radius(path) \
-         for callers, affected files, and missing tests; use memory_search for prior decisions. \
-         Do not ask the user to paste code you can retrieve.",
+         that need a definition or body, ",
     );
-    if retrieval.symbols {
+    let mut parts: Vec<&str> = Vec::new();
+    if node {
+        parts.push("read it with node_doc(path)");
+    }
+    if blast {
+        parts.push("use blast_radius(path) for callers, affected files, and missing tests");
+    }
+    if memory {
+        parts.push("use memory_search for prior decisions");
+    }
+    if parts.is_empty() && symbols {
+        s.push_str("use the symbol tools below.");
+    } else {
+        match parts.len() {
+            0 => {}
+            1 => {
+                s.push_str(parts[0]);
+                s.push('.');
+            }
+            2 => {
+                s.push_str(parts[0]);
+                s.push_str("; ");
+                s.push_str(parts[1]);
+                s.push('.');
+            }
+            _ => {
+                s.push_str(parts[0]);
+                s.push_str("; ");
+                s.push_str(parts[1]);
+                s.push_str("; ");
+                s.push_str(parts[2]);
+                s.push('.');
+            }
+        }
+    }
+    s.push_str(" Do not ask the user to paste code you can retrieve.");
+    if symbols {
         s.push_str(
             " For a symbol whose file you don't know yet, search by name with \
              symbol_search(query) and expand it with symbol_doc(qualified_name).",
@@ -300,6 +339,12 @@ pub fn backend_config_for_model(model_spec: &str, ollama_base_url: Option<&str>)
         };
     }
 
+    if let Some(model) = trimmed.strip_prefix("dsh:") {
+        return BackendConfig::Dsh {
+            model: model.trim().to_string(),
+        };
+    }
+
     let claude_model = trimmed.strip_prefix("claude:").unwrap_or(trimmed);
 
     BackendConfig::ClaudeCode {
@@ -347,7 +392,8 @@ pub fn validate_model_spec(model_spec: &str) -> Result<()> {
                 anyhow::bail!("model spec '{}' is missing a model name", trimmed);
             }
         }
-        "deepseek" => {
+        // Both DeepSeek routes accept the same model ids.
+        "deepseek" | "dsh" => {
             let model = remainder.trim();
             if model.is_empty() {
                 anyhow::bail!("model spec '{}' is missing a model name", trimmed);
@@ -390,6 +436,7 @@ fn static_model_ids(provider: &str) -> Vec<String> {
         "claude" => CLAUDE_MODEL_ALIASES.iter().map(|s| s.to_string()).collect(),
         "codex" => CODEX_MODEL_ALIASES.iter().map(|s| s.to_string()).collect(),
         "deepseek" => DEEPSEEK_API_MODELS.iter().map(|s| s.to_string()).collect(),
+        "dsh" => DEEPSEEK_API_MODELS.iter().map(|s| s.to_string()).collect(),
         _ => Vec::new(),
     }
 }
@@ -547,6 +594,10 @@ pub fn is_cursor_model(model_spec: &str) -> bool {
 
 pub fn is_deepseek_model(model_spec: &str) -> bool {
     model_spec.trim().starts_with("deepseek:")
+}
+
+pub fn is_dsh_model(model_spec: &str) -> bool {
+    model_spec.trim().starts_with("dsh:")
 }
 
 /// Render planner selections back into the legacy single-string prompt swarm
@@ -730,6 +781,7 @@ mod tests {
         caps.retrieval = RetrievalToolset {
             graph_and_memory: true,
             symbols: false,
+            exposed: vec![],
         };
         let graph = default_editor_system_prompt(&caps);
         assert!(graph.contains("node_doc(path)"));
@@ -744,6 +796,18 @@ mod tests {
         assert!(sym.contains("symbol_doc(qualified_name)"));
         // The annotations convention still terminates the prompt (cache tail).
         assert!(sym.trim_end().ends_with("no trailing commentary."));
+
+        // Lean preset names memory_search only.
+        caps.retrieval = RetrievalToolset::from_exposed(
+            &crate::mcp::LEAN_EXPOSED_TOOLS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<_>>(),
+        );
+        let lean = default_editor_system_prompt(&caps);
+        assert!(lean.contains("memory_search"));
+        assert!(!lean.contains("node_doc"));
+        assert!(!lean.contains("blast_radius"));
     }
 
     #[test]
@@ -920,9 +984,14 @@ mod tests {
             "cursor:claude-4.6-opus-high-thinking",
             "deepseek:deepseek-v4-pro",
             "deepseek:deepseek-v4-flash",
+            "dsh:deepseek-v4-flash",
+            "dsh:deepseek-v4-pro",
         ] {
             validate_model_spec(spec).unwrap();
         }
+        // `dsh:` is as strict as `deepseek:` about model ids.
+        assert!(validate_model_spec("dsh:gpt-4").is_err());
+        assert!(validate_model_spec("dsh:").is_err());
     }
 
     #[test]
@@ -943,6 +1012,24 @@ mod tests {
         assert!(!is_cursor_model("claude:sonnet"));
         assert!(!is_cursor_model("codex:gpt-5"));
         assert!(!is_cursor_model("auto"));
+    }
+
+    #[test]
+    fn test_backend_config_for_model_parses_dsh_prefix() {
+        let config = backend_config_for_model("dsh:deepseek-v4-flash", None);
+        assert_eq!(
+            config,
+            BackendConfig::Dsh {
+                model: "deepseek-v4-flash".into()
+            }
+        );
+    }
+
+    #[test]
+    fn test_is_dsh_model() {
+        assert!(is_dsh_model("dsh:deepseek-v4-flash"));
+        assert!(!is_dsh_model("deepseek:deepseek-v4-flash"));
+        assert!(!is_dsh_model("claude:sonnet"));
     }
 
     #[test]
@@ -1005,6 +1092,13 @@ mod tests {
     fn test_model_spec_completions_provider_prefix() {
         let hits = model_spec_completions("dee", &[]);
         assert!(hits.iter().any(|h| h == "deepseek:"));
+    }
+
+    #[test]
+    fn test_model_spec_completions_dsh_models() {
+        let hits = model_spec_completions("dsh:deep", &[]);
+        assert!(hits.contains(&"dsh:deepseek-v4-pro".to_string()));
+        assert!(hits.contains(&"dsh:deepseek-v4-flash".to_string()));
     }
 
     #[test]

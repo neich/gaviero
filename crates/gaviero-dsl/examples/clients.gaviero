@@ -78,3 +78,11 @@ client grok {
     privacy public
     effort high
 }
+
+client dsh {
+    // DeepSeek via `dsh --profile acp` (npm `@deepseek-ai/dsh`) over the
+    // Agent Client Protocol; needs DEEPSEEK_API_KEY.
+    model "dsh:deepseek-v4-pro"
+    privacy public
+    effort high
+}

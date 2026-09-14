@@ -6,6 +6,39 @@ pub(super) fn handle_ntfy_command(app: &mut App, line: &str) {
     crate::notify::handle_ntfy_command(app, line);
 }
 
+const MCP_PROBE_NOTE: &str = "\
+MCP reach probe runs from the CLI (vendor CLIs are not spawned from the TUI).\n\
+  gaviero-cli --mcp-reach-probe [--reach-providers claude,codex] [--reach-transport stdio|http|both]\n\
+Then type /mcp again to see the recorded table.";
+
+/// `/mcp` status and `/mcp probe` pointer. Shared by desktop and remote.
+pub(crate) fn mcp_command_reply(app: &App, line: &str) -> String {
+    let rest = line.trim().strip_prefix("/mcp").unwrap_or("").trim();
+    if rest == "probe" {
+        return MCP_PROBE_NOTE.to_string();
+    }
+    if !rest.is_empty() {
+        return "Usage: /mcp\n       /mcp probe".to_string();
+    }
+    let Some(root) = app
+        .graph_workspace_root
+        .clone()
+        .or_else(|| app.workspace.roots().first().map(|p| p.to_path_buf()))
+    else {
+        return "No workspace root — cannot read MCP status.".to_string();
+    };
+    let endpoint = gaviero_core::mcp::McpEndpoint::for_workspace(&root);
+    gaviero_core::mcp::format_mcp_status(&root, &endpoint.to_string())
+}
+
+pub(super) fn handle_mcp_command(app: &mut App, line: &str) {
+    app.chat_state.add_user_message(line);
+    app.chat_state.text_input.text.clear();
+    app.chat_state.text_input.cursor = 0;
+    let reply = mcp_command_reply(app, line);
+    app.chat_state.add_system_message(&reply);
+}
+
 pub(super) fn handle_swarm_command(app: &mut App) {
     let input = app.chat_state.take_input();
     let task_desc = input
@@ -157,7 +190,12 @@ pub(crate) fn run_swarm(app: &mut App, task_desc: String) {
         .as_bool()
         .unwrap_or(true);
     let chat_injection = app.workspace.resolve_chat_injection_config(Some(&root));
+    let skills_emit = gaviero_core::skills::emit::EmitSettings::from_workspace(&app.workspace, Some(&root));
     let skill_catalog = Some(app.skill_catalog.clone());
+    let exposed_tools = Some(gaviero_core::mcp::resolve_exposed_tools(
+        &app.workspace,
+        Some(&root),
+    ));
 
     tokio::spawn(async move {
         use gaviero_core::swarm::{pipeline, planner};
@@ -217,11 +255,13 @@ pub(crate) fn run_swarm(app: &mut App, task_desc: String) {
             specificity,
             swarm_extra_tools,
             tool_policy,
+            exposed_tools,
             extract_agent_findings,
             resume_from_artifacts: true,
             knowledge_invalidation: None,
             run_timeout_secs: 0,
             chat_injection: chat_injection.clone(),
+            skills_emit,
             skill_catalog: skill_catalog.clone(),
         };
 
@@ -403,7 +443,12 @@ pub(super) fn handle_run_script_command(app: &mut App) {
         .unwrap_or(true);
     let plan_execution_mode = compiled.execution_mode;
     let chat_injection = app.workspace.resolve_chat_injection_config(Some(&root));
+    let skills_emit = gaviero_core::skills::emit::EmitSettings::from_workspace(&app.workspace, Some(&root));
     let skill_catalog = Some(app.skill_catalog.clone());
+    let exposed_tools = Some(gaviero_core::mcp::resolve_exposed_tools(
+        &app.workspace,
+        Some(&root),
+    ));
 
     tokio::spawn(async move {
         use gaviero_core::swarm::pipeline;
@@ -428,11 +473,13 @@ pub(super) fn handle_run_script_command(app: &mut App) {
             specificity,
             swarm_extra_tools,
             tool_policy,
+            exposed_tools,
             extract_agent_findings,
             resume_from_artifacts: true,
             knowledge_invalidation: None,
             run_timeout_secs: 0,
             chat_injection: chat_injection.clone(),
+            skills_emit,
             skill_catalog: skill_catalog.clone(),
         };
 
@@ -577,7 +624,12 @@ pub(super) fn handle_coordinated_swarm_command(app: &mut App) {
         .as_bool()
         .unwrap_or(true);
     let chat_injection = app.workspace.resolve_chat_injection_config(Some(&root));
+    let skills_emit = gaviero_core::skills::emit::EmitSettings::from_workspace(&app.workspace, Some(&root));
     let skill_catalog = Some(app.skill_catalog.clone());
+    let exposed_tools = Some(gaviero_core::mcp::resolve_exposed_tools(
+        &app.workspace,
+        Some(&root),
+    ));
 
     tokio::spawn(async move {
         use gaviero_core::swarm::{coordinator, pipeline};
@@ -599,11 +651,13 @@ pub(super) fn handle_coordinated_swarm_command(app: &mut App) {
             specificity,
             swarm_extra_tools,
             tool_policy,
+            exposed_tools,
             extract_agent_findings,
             resume_from_artifacts: true,
             knowledge_invalidation: None,
             run_timeout_secs: 0,
             chat_injection: chat_injection.clone(),
+            skills_emit,
             skill_catalog: skill_catalog.clone(),
         };
 

@@ -101,11 +101,13 @@ fn make_config(workspace: &std::path::Path) -> SwarmConfig {
         specificity: SpecificityConfig::default(),
         swarm_extra_tools: vec![],
         tool_policy: None,
+        exposed_tools: None,
         extract_agent_findings: false,
         resume_from_artifacts: false,
         knowledge_invalidation: None,
         run_timeout_secs: 0,
         chat_injection: Default::default(),
+        skills_emit: Default::default(),
         skill_catalog: None,
     }
 }

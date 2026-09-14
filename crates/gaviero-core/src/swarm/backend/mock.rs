@@ -112,20 +112,10 @@ mod tests {
 
         let req = CompletionRequest {
             prompt: "test".into(),
-            system_prompt: None,
             workspace_root: PathBuf::from("/tmp"),
-            additional_roots: vec![],
-            allowed_tools: vec![],
-            file_attachments: vec![],
-            conversation_history: vec![],
-            file_refs: vec![],
-            effort: None,
-            extra: Vec::new(),
-            max_tokens: None,
             auto_approve: true,
             suppress_hooks: true,
-            file_scope: crate::types::FileScope::default(),
-            tool_policy: None,
+            ..CompletionRequest::default()
         };
 
         let mut stream = backend.stream_completion(req).await.unwrap();
@@ -143,20 +133,10 @@ mod tests {
 
         let req = CompletionRequest {
             prompt: "test".into(),
-            system_prompt: None,
             workspace_root: PathBuf::from("/tmp"),
-            additional_roots: vec![],
-            allowed_tools: vec![],
-            file_attachments: vec![],
-            conversation_history: vec![],
-            file_refs: vec![],
-            effort: None,
-            extra: Vec::new(),
-            max_tokens: None,
             auto_approve: true,
             suppress_hooks: true,
-            file_scope: crate::types::FileScope::default(),
-            tool_policy: None,
+            ..CompletionRequest::default()
         };
 
         let mut stream = backend.stream_completion(req).await.unwrap();

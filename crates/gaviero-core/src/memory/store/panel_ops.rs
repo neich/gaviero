@@ -176,6 +176,35 @@ impl MemoryStore {
         Ok(out)
     }
 
+    /// Rows for [`crate::skills::emit`] (workspace constitution dump).
+    /// History is excluded; caller applies the constitution admission filter.
+    pub async fn list_for_skills_emit(&self, limit: usize) -> Result<Vec<(String, String, bool)>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT memory_type, content, source
+                 FROM memories
+                 WHERE memory_kind = 'record' AND superseded_by IS NULL
+                 ORDER BY id DESC
+                 LIMIT ?1",
+            )
+            .context("preparing list_for_skills_emit")?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit as i64], |row| {
+                let ty: String = row.get(0)?;
+                let content: String = row.get(1)?;
+                let source: String = row.get(2)?;
+                let user = matches!(source.as_str(), "user_remember" | "user_panel");
+                Ok((ty, content, user))
+            })
+            .context("running list_for_skills_emit")?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.context("reading skills-emit row")?);
+        }
+        Ok(out)
+    }
+
     /// B5 fix: time-bounded recent memories filtered to a specific
     /// `run_id`. Used by the session consolidator so it can never see
     /// memories from another concurrent (or recent) session, even when

@@ -98,10 +98,12 @@ impl AgentBackend for CodexBackend {
         &self,
         request: CompletionRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<UnifiedStreamEvent>> + Send>>> {
-        let system_prompt = request
-            .system_prompt
-            .clone()
-            .unwrap_or_else(|| default_editor_system_prompt(&self.capabilities()));
+        let system_prompt = request.system_prompt.clone().unwrap_or_else(|| {
+            default_editor_system_prompt(
+                &self.capabilities()
+                    .with_exposed_tools(request.exposed_tools.as_deref()),
+            )
+        });
 
         let user_prompt = build_enriched_prompt(
             &request.prompt,
@@ -131,8 +133,9 @@ impl AgentBackend for CodexBackend {
             cmd.arg(&combined_prompt);
         }
         cmd.current_dir(&request.workspace_root)
-            .env("NO_COLOR", "1")
-            .stdin(if use_stdin {
+            .env("NO_COLOR", "1");
+        crate::mcp::apply_codex_http_token(&mut cmd, &request.workspace_root);
+        cmd.stdin(if use_stdin {
                 Stdio::piped()
             } else {
                 Stdio::null()
@@ -262,6 +265,7 @@ impl AgentBackend for CodexBackend {
             retrieval: RetrievalToolset {
                 graph_and_memory: true,
                 symbols: false,
+                exposed: vec![],
             },
         }
     }
@@ -377,6 +381,11 @@ fn codex_exec_args(
         args.push("--config".to_string());
         args.push(format!("{k}={v}"));
     }
+
+    crate::mcp::push_codex_multi_agent_override(
+        &mut args,
+        &crate::mcp::ReachPolicy::for_workspace(workspace_root),
+    );
 
     args
 }

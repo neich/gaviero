@@ -47,6 +47,7 @@ gaviero-cli --work-units '[{"id":"design","description":"Plan","scope":{"owned_p
 | Cursor | `cursor:composer-2.5`, `cursor:cursor-grok-4.6-high` (ids embed effort — see `agent --list-models`) |
 | Ollama / local | `ollama:qwen2.5-coder:7b`, `local:qwen2.5-coder:14b` |
 | DeepSeek | `deepseek:deepseek-v4-pro`, `deepseek:deepseek-v4-flash` |
+| DeepSeek (ACP) | `dsh:deepseek-v4-pro`, `dsh:deepseek-v4-flash` |
 
 ## Examples
 
@@ -232,6 +233,13 @@ independent of `--resume`, which restores the node-level checkpoint.
 | `--skip-mcp-preflight` | — | Skip shim/URL validation before agents run |
 | `--mcp-stats` | — | Print per-tool MCP telemetry and exit |
 | `--mcp-stats-path` | `<path>` | Override NDJSON path for `--mcp-stats` |
+| `--mcp-reach-probe` | — | Probe vendor CLIs for nested MCP reach and write `.gaviero/mcp_reach.json` |
+| `--reach-providers` | `claude,codex,…` | Providers to probe (default: claude,codex,cursor,dsh) |
+| `--reach-depth` | `<n>` | Nesting depth to verify (default 1) |
+| `--reach-transport` | `stdio\|http\|both` | Transport(s) to probe; `http` needs the loopback listener up, `both` keeps the better verdict per provider (tie → http) |
+| `--reach-json` | — | Print the reach record as JSON instead of the table |
+| `--mcp-register-user` | `[claude,codex]` | Register gaviero MCP in the user-scope vendor config |
+| `--mcp-unregister-user` | `[claude,codex]` | Remove that user-scope registration |
 
 ### Branch cleanup
 

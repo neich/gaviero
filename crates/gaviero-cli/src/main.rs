@@ -506,6 +506,65 @@ struct Cli {
     #[arg(long = "mcp-stats-path", value_name = "PATH", requires = "mcp_stats")]
     mcp_stats_path: Option<PathBuf>,
 
+    /// Layer-4 MCP reach probe: spawn each vendor CLI, ask it to call
+    /// `memory_ping` at depth 0 and (when supported) depth 1, persist
+    /// `<repo>/.gaviero/mcp_reach.json`, print the table, and exit.
+    #[arg(long = "mcp-reach-probe")]
+    mcp_reach_probe: bool,
+
+    /// Comma-separated providers for `--mcp-reach-probe`
+    /// (`claude`, `codex`, `cursor`, `dsh`). Default: all four.
+    #[arg(
+        long = "reach-providers",
+        value_name = "LIST",
+        requires = "mcp_reach_probe"
+    )]
+    reach_providers: Option<String>,
+
+    /// Nesting depth to verify (0 = top-level only). Default 1.
+    #[arg(
+        long = "reach-depth",
+        default_value_t = 1,
+        requires = "mcp_reach_probe"
+    )]
+    reach_depth: u8,
+
+    /// Probe transport label: `stdio` | `http` | `both`. HTTP is recorded
+    /// from P0; the listener lands in P2, so live runs still synthesize
+    /// the stdio shim until then.
+    #[arg(
+        long = "reach-transport",
+        default_value = "stdio",
+        requires = "mcp_reach_probe"
+    )]
+    reach_transport: String,
+
+    /// Print the reach record as JSON on stdout instead of the table.
+    #[arg(long = "reach-json", requires = "mcp_reach_probe")]
+    reach_json: bool,
+
+    /// Register a cwd-resolving `gaviero-memory` MCP server in user-scope
+    /// vendor config via `claude mcp add` / `codex mcp add`. Optional
+    /// comma list (`claude`, `codex`); omit the value for both.
+    #[arg(
+        long = "mcp-register-user",
+        num_args = 0..=1,
+        default_missing_value = "claude,codex",
+        value_name = "VENDORS",
+        conflicts_with = "mcp_unregister_user"
+    )]
+    mcp_register_user: Option<String>,
+
+    /// Remove the user-scope `gaviero-memory` entry. Same vendor list as
+    /// `--mcp-register-user`.
+    #[arg(
+        long = "mcp-unregister-user",
+        num_args = 0..=1,
+        default_missing_value = "claude,codex",
+        value_name = "VENDORS"
+    )]
+    mcp_unregister_user: Option<String>,
+
     /// Tier A / A2: write a `/remember`-style memory from headless
     /// mode and exit. Goes through the writer task (single-consumer
     /// invariant) — opens [`MemoryServices`] under the hood. Pair with
@@ -1231,6 +1290,7 @@ fn prepare_mcp_for_swarm(
     // (extractor off, or no memory) leaves the tool unwired, so a call
     // errors loudly instead of silently no-oping.
     memory_writer: Option<&gaviero_core::memory::WriterHandle>,
+    probe_ledger: Option<gaviero_core::mcp::ProbeLedger>,
 ) -> Result<(
     Option<gaviero_core::mcp::McpConfigSynth>,
     Option<gaviero_core::mcp::McpServerHandle>,
@@ -1253,7 +1313,7 @@ fn prepare_mcp_for_swarm(
             .push((name, normalize_remote_mcp_url(&url)));
     }
     let endpoint = gaviero_core::mcp::McpEndpoint::for_workspace(repo);
-    let synth = resolve_mcp_config_synth(workspace, repo, endpoint, &overrides);
+    let mut synth = resolve_mcp_config_synth(workspace, repo, endpoint, &overrides);
     if !synth.enabled {
         return Ok((None, None));
     }
@@ -1282,12 +1342,25 @@ fn prepare_mcp_for_swarm(
     let mut handle = None;
     if synth.gaviero_enabled {
         if reuse_existing {
-            eprintln!(
-                "[mcp] reusing gaviero MCP server already listening on {} \
-                 (another gaviero instance — e.g. the TUI — serves this workspace; \
-                 keep it open for the duration of this run)",
-                synth.endpoint
-            );
+            if probe_ledger.is_some() {
+                eprintln!(
+                    "[mcp] reach probe: reusing the live workspace MCP server — \
+                     ProbeLedger cannot attach; pings are recovered from \
+                     .gaviero/mcp_calls.ndjson when present. Close the TUI \
+                     (or other gaviero instance) to attach an in-process ledger."
+                );
+            } else {
+                eprintln!(
+                    "[mcp] reusing gaviero MCP server already listening on {} \
+                     (another gaviero instance — e.g. the TUI — serves this workspace; \
+                     keep it open for the duration of this run)",
+                    synth.endpoint
+                );
+            }
+            if let Some(http) = gaviero_core::mcp::reuse_http_endpoint(repo, workspace) {
+                eprintln!("[mcp] reusing gaviero HTTP {}", http.url);
+                synth.http = Some(gaviero_core::mcp::http_synth_from(&http));
+            }
         } else if let Some(stores) = memory {
             let retrieval_cfg = workspace.resolve_retrieval_config(Some(repo));
             let rerank_cfg = workspace.resolve_rerank_config(Some(repo));
@@ -1346,6 +1419,10 @@ fn prepare_mcp_for_swarm(
             .with_specificity(specificity)
             .with_edge_weights(edge_weights)
             .with_permissions(synth.permissions.clone())
+            .with_exposed_tools(gaviero_core::mcp::resolve_exposed_tools(
+                workspace,
+                Some(repo),
+            ))
             .with_symbol_enrichment(
                 workspace
                     .resolve_setting(
@@ -1383,11 +1460,16 @@ fn prepare_mcp_for_swarm(
                 }
                 _ => server,
             };
+            let server = match probe_ledger {
+                Some(ledger) => server.with_probe_ledger(ledger),
+                None => server,
+            };
             // Phase 1: warm the graph cache, repo-map cache, and (when
             // configured) the reranker in the background so the first
             // agent tool call doesn't pay a cold start.
             let warm = server.clone();
             tokio::spawn(async move { warm.warmup().await });
+            let http_server = server.clone();
             let h = spawn_mcp_server(server, &synth.endpoint).with_context(|| {
                 format!(
                     "starting gaviero MCP server at {} — if another gaviero instance \
@@ -1396,6 +1478,23 @@ fn prepare_mcp_for_swarm(
                     synth.endpoint
                 )
             })?;
+            let h = match gaviero_core::mcp::maybe_spawn_http_listener(
+                http_server,
+                repo,
+                workspace,
+            ) {
+                Ok(Some(http)) => {
+                    eprintln!("[mcp] gaviero http {}", http.endpoint.url);
+                    synth.http = Some(gaviero_core::mcp::http_synth_from(&http.endpoint));
+                    h.with_http_listener(http, repo)
+                }
+                Ok(None) => h,
+                Err(e) => {
+                    eprintln!("[mcp] http listener failed: {e}");
+                    h
+                }
+            };
+            let h = h.with_endpoint_descriptor(repo);
             eprintln!("[mcp] gaviero server listening on {}", h.endpoint);
             handle = Some(h);
         }
@@ -3349,6 +3448,110 @@ fn run_mcp_stats(repo: &std::path::Path, path_override: Option<&std::path::Path>
     Ok(())
 }
 
+async fn run_mcp_reach_probe(cli: &Cli, repo: &std::path::Path) -> Result<()> {
+    if cli.no_mcp {
+        anyhow::bail!("--mcp-reach-probe needs the gaviero MCP server; omit --no-mcp");
+    }
+    let workspace = gaviero_core::workspace::Workspace::single_folder(repo.to_path_buf());
+    let memory = open_memory_services(repo, "mcp-reach-probe").await?;
+    let ledger = gaviero_core::mcp::ProbeLedger::new();
+    let (synth, handle) = prepare_mcp_for_swarm(
+        repo,
+        &workspace,
+        cli,
+        &[],
+        &Some(memory.stores.clone()),
+        Some(&memory.writer),
+        Some(ledger.clone()),
+    )?;
+    let Some(synth) = synth else {
+        anyhow::bail!(
+            "MCP is disabled for this workspace — enable mcp.gavieroServer.enabled \
+             or omit --no-mcp"
+        );
+    };
+
+    let mut cfg = gaviero_core::mcp::ReachProbeConfig::default();
+    if let Some(raw) = cli.reach_providers.as_deref() {
+        cfg.providers = raw
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if cfg.providers.is_empty() {
+            anyhow::bail!("--reach-providers is empty");
+        }
+    }
+    cfg.depth = cli.reach_depth;
+    cfg.transport = gaviero_core::mcp::ReachTransport::parse(&cli.reach_transport)?;
+
+    eprintln!(
+        "[mcp] reach probe providers={} depth={} transport={}",
+        cfg.providers.join(","),
+        cfg.depth,
+        cfg.transport.as_str()
+    );
+    let report = gaviero_core::mcp::run_reach_probe(repo, &synth, &ledger, &cfg).await?;
+    let record = gaviero_core::mcp::ReachRecord::from(report);
+    gaviero_core::mcp::ReachStore::merge_save(repo, &record)?;
+    eprintln!(
+        "[mcp] wrote {}",
+        gaviero_core::mcp::ReachRecord::path(repo).display()
+    );
+    if cli.reach_json {
+        println!("{}", serde_json::to_string_pretty(&record)?);
+    } else {
+        print!("{}", gaviero_core::mcp::format_reach_table(&record));
+    }
+    let missing = gaviero_core::mcp::report_user_agent_definitions(repo, "gaviero");
+    if !missing.is_empty() {
+        eprintln!("user agent definitions missing an explicit gaviero server reference:");
+        for p in missing {
+            eprintln!("  {}", p.display());
+        }
+    }
+    if let Some(h) = handle {
+        h.shutdown().await;
+    }
+    Ok(())
+}
+
+fn parse_user_scope_vendors(raw: &str) -> Result<Vec<gaviero_core::mcp::UserScopeVendor>> {
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        out.push(gaviero_core::mcp::UserScopeVendor::parse(part)?);
+    }
+    if out.is_empty() {
+        anyhow::bail!("user-scope vendor list is empty");
+    }
+    Ok(out)
+}
+
+fn run_mcp_user_scope(register: bool, raw: &str) -> Result<()> {
+    let vendors = parse_user_scope_vendors(raw)?;
+    let shim = gaviero_core::mcp::default_shim_abs();
+    if register && !shim.is_absolute() {
+        anyhow::bail!(
+            "gaviero-mcp-shim is not next to this binary ({}); \
+             install it or set mcp.gavieroServer.shimBinary to an absolute path",
+            shim.display()
+        );
+    }
+    for vendor in vendors {
+        let outcome = if register {
+            gaviero_core::mcp::register_user_scope(vendor, &shim)?
+        } else {
+            gaviero_core::mcp::unregister_user_scope(vendor)?
+        };
+        println!("{}: {:?}", vendor.as_str(), outcome);
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -3435,6 +3638,13 @@ async fn main() -> Result<()> {
         return run_mcp_stats(&repo, cli.mcp_stats_path.as_deref());
     }
 
+    if let Some(vendors) = &cli.mcp_register_user {
+        return run_mcp_user_scope(true, vendors);
+    }
+    if let Some(vendors) = &cli.mcp_unregister_user {
+        return run_mcp_user_scope(false, vendors);
+    }
+
     // ── Tier C / C1: enforce explicit consent for the typed-stores
     // migration. Headless invocation cannot prompt; require the
     // `--accept-c1-migration` flag if any reachable memory.db is at a
@@ -3464,6 +3674,10 @@ async fn main() -> Result<()> {
             );
             std::process::exit(2);
         }
+    }
+
+    if cli.mcp_reach_probe {
+        return run_mcp_reach_probe(&cli, &repo).await;
     }
 
     // ── Manifest introspection (Tier S / S4): print and exit ─────
@@ -4021,6 +4235,7 @@ async fn main() -> Result<()> {
         mcp_script_vars,
         &memory,
         swarm_memory_writer.as_ref(),
+        None,
     )?;
     if let Some(ref synth) = mcp_config {
         gaviero_core::mcp::validate_codex_trust_for_extras(synth, &plan, &execution_model)?;
@@ -4075,11 +4290,16 @@ async fn main() -> Result<()> {
         specificity,
         swarm_extra_tools,
         tool_policy,
+        exposed_tools: Some(gaviero_core::mcp::resolve_exposed_tools(
+            &workspace,
+            Some(&repo),
+        )),
         extract_agent_findings,
         resume_from_artifacts: !cli.fresh,
         knowledge_invalidation: None,
         run_timeout_secs: cli.run_timeout,
         chat_injection: workspace.resolve_chat_injection_config(Some(&repo)),
+        skills_emit: gaviero_core::skills::emit::EmitSettings::from_workspace(&workspace, Some(&repo)),
         skill_catalog: {
             let global = gaviero_core::skills::SkillCatalog::global_skills_dir();
             let (catalog, _) = gaviero_core::skills::SkillCatalog::scan(&workspace, &global);
@@ -4578,6 +4798,47 @@ mod tests {
             Some(gaviero_core::mcp::TrustConsent::Granted)
         );
     }
+
+    #[test]
+    fn cli_accepts_mcp_reach_probe_flags() {
+        let cli = Cli::try_parse_from([
+            "gaviero-cli",
+            "--mcp-reach-probe",
+            "--reach-providers",
+            "claude,codex",
+            "--reach-depth",
+            "1",
+            "--reach-transport",
+            "stdio",
+            "--reach-json",
+        ])
+        .unwrap();
+        assert!(cli.mcp_reach_probe);
+        assert_eq!(cli.reach_providers.as_deref(), Some("claude,codex"));
+        assert_eq!(cli.reach_depth, 1);
+        assert_eq!(cli.reach_transport, "stdio");
+        assert!(cli.reach_json);
+
+        let defaults = Cli::try_parse_from(["gaviero-cli", "--mcp-reach-probe"]).unwrap();
+        assert_eq!(defaults.reach_depth, 1);
+        assert_eq!(defaults.reach_transport, "stdio");
+        assert!(!defaults.reach_json);
+        assert!(defaults.reach_providers.is_none());
+    }
+
+    #[test]
+    fn cli_accepts_mcp_register_user_flags() {
+        let both = Cli::try_parse_from(["gaviero-cli", "--mcp-register-user"]).unwrap();
+        assert_eq!(both.mcp_register_user.as_deref(), Some("claude,codex"));
+        let one = Cli::try_parse_from(["gaviero-cli", "--mcp-register-user", "claude"]).unwrap();
+        assert_eq!(one.mcp_register_user.as_deref(), Some("claude"));
+        let off = Cli::try_parse_from(["gaviero-cli", "--mcp-unregister-user", "codex"]).unwrap();
+        assert_eq!(off.mcp_unregister_user.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    #[ignore = "live vendor CLIs; run: cargo run -p gaviero-cli -- --mcp-reach-probe --reach-providers claude"]
+    fn live_mcp_reach_probe_claude() {}
 
     #[test]
     fn cli_accepts_prompt_file_with_script() {

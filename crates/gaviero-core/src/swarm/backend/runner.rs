@@ -138,6 +138,7 @@ pub async fn run_backend(
     pre_fetched_memory: Option<&str>,
     workspace_extra_tools: &[String],
     tool_policy: Option<&ToolPolicy>,
+    exposed_tools: Option<&[String]>,
     skip_repo_context: bool,
     skill_catalog: Option<&crate::skills::SkillCatalog>,
 ) -> Result<AgentManifest> {
@@ -156,6 +157,7 @@ pub async fn run_backend(
         pre_fetched_memory,
         workspace_extra_tools,
         tool_policy,
+        exposed_tools,
         skip_repo_context,
         skill_catalog,
     );
@@ -186,7 +188,7 @@ pub async fn run_backend(
 }
 
 #[tracing::instrument(
-    skip(backend, write_gate, memory, observer, validation, board, repo_map, impact_text, pre_fetched_memory, tool_policy),
+    skip(backend, write_gate, memory, observer, validation, board, repo_map, impact_text, pre_fetched_memory, tool_policy, exposed_tools),
     fields(
         agent_id = %work_unit.id,
         tier = ?work_unit.tier,
@@ -219,6 +221,7 @@ async fn run_backend_inner(
     // Passed explicitly because `workspace_root` here is the agent's
     // worktree, where no `.gaviero/settings.json` exists.
     tool_policy: Option<&ToolPolicy>,
+    exposed_tools: Option<&[String]>,
     skip_repo_context: bool,
     skill_catalog: Option<&crate::skills::SkillCatalog>,
 ) -> Result<AgentManifest> {
@@ -373,7 +376,9 @@ async fn run_backend_inner(
             Some(fix) => format!("{}\n\n{}", base_prompt, fix),
         };
 
-        let capabilities = backend.capabilities();
+        let capabilities = backend
+            .capabilities()
+            .with_exposed_tools(exposed_tools);
         let allowed_tools = if capabilities.tool_use {
             resolve_swarm_tools(&work_unit.extra_allowed_tools, workspace_extra_tools)
         } else {
@@ -396,6 +401,8 @@ async fn run_backend_inner(
             suppress_hooks: true,
             file_scope: work_unit.scope.clone(),
             tool_policy: tool_policy.cloned(),
+            exposed_tools: exposed_tools.map(|s| s.to_vec()),
+            write_gate: Some(super::WriteGateHandle(write_gate.clone())),
         };
 
         // M0 instrumentation: per-attempt dispatch metrics for swarm baselines.
@@ -1116,6 +1123,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
             false,
             None,
         )
@@ -1158,6 +1166,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             false,
             None,
@@ -1210,6 +1219,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             false,
             None,
@@ -1267,6 +1277,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
             false,
             None,
         )
@@ -1318,6 +1329,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             false,
             None,
@@ -1373,6 +1385,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
             false,
             None,
         )
@@ -1426,6 +1439,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
             false,
             None,
         )
@@ -1478,6 +1492,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
             false,
             None,
         )
@@ -1529,6 +1544,7 @@ mod tests {
                 None,
                 &[],
                 None,
+                None,
                 false,
                 None,
             ),
@@ -1578,6 +1594,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
             false,
             None,
         )
@@ -1613,6 +1630,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             false,
             None,

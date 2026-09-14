@@ -140,6 +140,7 @@ fn config_for(workspace: &Path, ollama_url: &str) -> SwarmConfig {
         specificity: SpecificityConfig::default(),
         swarm_extra_tools: vec![],
         tool_policy: None,
+        exposed_tools: None,
         extract_agent_findings: false,
         resume_from_artifacts: false,
         knowledge_invalidation: None,
@@ -147,6 +148,7 @@ fn config_for(workspace: &Path, ollama_url: &str) -> SwarmConfig {
         // fail this test, not hang CI.
         run_timeout_secs: 120,
         chat_injection: Default::default(),
+        skills_emit: Default::default(),
         skill_catalog: None,
     }
 }

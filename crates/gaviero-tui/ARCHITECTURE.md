@@ -109,7 +109,7 @@ Status bar (mode | file | branch | Wrap | agent)
 
 ### Slash commands
 
-Authoritative inventory: [`app/commands.rs`](src/app/commands.rs) + chat helpers in [`panels/agent_chat.rs`](src/panels/agent_chat.rs). Groups: session (`/model`, `/effort`, `/autoapprove`/`/yolo`, …), context (`/lite`, `/inject`, `/no-inject`, `/context mode …`, `/namespace`), swarm (`/run`, `/swarm`, `/cswarm`, `/undo-swarm`), memory (`/remember*`, `/forget*`, `/restore`, `/reembed`, `/sleep`, `/consolidate-session`), skills (`/skills`, `$skill`), attachments (`/attach`, `/detach`). Do not maintain a second full table here — see [CLAUDE.md](CLAUDE.md).
+Authoritative inventory: [`app/commands.rs`](src/app/commands.rs) + chat helpers in [`panels/agent_chat.rs`](src/panels/agent_chat.rs). Groups: session (`/model`, `/effort`, `/autoapprove`/`/yolo`, …), context (`/lite`, `/inject`, `/no-inject`, `/context mode …`, `/namespace`), swarm (`/run`, `/swarm`, `/cswarm`, `/undo-swarm`), memory (`/remember*`, `/forget*`, `/restore`, `/reembed`, `/sleep`, `/consolidate-session`), MCP (`/mcp`, `/mcp probe`), skills (`/skills`, `$skill`), attachments (`/attach`, `/detach`). Do not maintain a second full table here — see [CLAUDE.md](CLAUDE.md).
 
 ### Chat ↔ memory ([`app/chat_memory.rs`](src/app/chat_memory.rs))
 

@@ -63,6 +63,12 @@ fn construction_for(model_spec: &str) -> SessionConstruction {
 }
 
 #[test]
+fn dsh_spec_routes_to_process_bound_session() {
+    let session = create_session(construction_for("dsh:deepseek-v4-pro"));
+    assert_eq!(session.continuity_mode(), ContinuityMode::ProcessBound);
+}
+
+#[test]
 fn claude_spec_routes_to_native_resume_session() {
     let session = create_session(construction_for("claude:sonnet"));
     assert_eq!(session.continuity_mode(), ContinuityMode::NativeResume);

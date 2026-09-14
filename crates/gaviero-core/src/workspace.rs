@@ -234,6 +234,10 @@ pub mod settings {
     pub const MCP_GAVIERO_DISABLE_EXTERNAL: &str = "mcp.gavieroServer.disableExternalMemory";
     pub const MCP_GAVIERO_SHIM_BINARY: &str = "mcp.gavieroServer.shimBinary";
     pub const MCP_GAVIERO_CODEX_TRUST: &str = "mcp.gavieroServer.codexTrust";
+    pub const MCP_GAVIERO_TRANSPORT: &str = "mcp.gavieroServer.transport";
+    pub const MCP_GAVIERO_TRANSPORT_BY_PROVIDER: &str = "mcp.gavieroServer.transportByProvider";
+    pub const MCP_GAVIERO_HTTP_ENABLED: &str = "mcp.gavieroServer.http.enabled";
+    pub const MCP_GAVIERO_HTTP_PORT: &str = "mcp.gavieroServer.http.port";
 
     /// Expose the `memory_flag` MCP tool. Defaults to `true` (D3). When
     /// false the server is built without a signal sink, so the tool is
@@ -261,6 +265,12 @@ pub mod settings {
     /// (default) allows everything; deny wins. Translated per provider by
     /// [`crate::mcp::synthesize_for_worktree`].
     pub const MCP_PERMISSIONS: &str = "mcp.permissions";
+
+    /// When true (default), spawn-time nesting is gated on a fresh
+    /// verified `mcp_reach.json` row for that vendor (P0.4).
+    pub const MCP_REACH_ENFORCE: &str = "mcp.reach.enforce";
+    /// Probe records older than this many days are treated as unknown.
+    pub const MCP_REACH_MAX_AGE_DAYS: &str = "mcp.reach.maxAgeDays";
 
     // TUI memory panel (Tier A / A4)
     pub const UI_MEMORY_PANEL_RECENT_WINDOW_HOURS: &str = "ui.memoryPanel.recentWindowHours";
@@ -328,6 +338,14 @@ pub mod settings {
     /// filesystem reads. Typical entries: `"~/.claude/skills"`,
     /// `"~/.codex/skills"`.
     pub const SKILLS_EXTRA_ROOTS: &str = "skills.extraRoots";
+    /// Opt-in: write constitution memories into vendor skill dirs.
+    pub const SKILLS_EMIT_ENABLED: &str = "skills.emit.enabled";
+    pub const SKILLS_EMIT_MAX_BYTES: &str = "skills.emit.maxBytes";
+
+    /// `dsh --profile acp` launcher (P4). `@deepseek-ai/dsh-acp` is a library.
+    pub const PROVIDERS_DSH_COMMAND: &str = "providers.dsh.command";
+    pub const PROVIDERS_DSH_ARGS: &str = "providers.dsh.args";
+    pub const PROVIDERS_DSH_PROFILE: &str = "providers.dsh.profile";
 }
 
 /// Canonical workspace identity (Plan A §3.3) — the ONE portable helper
@@ -362,6 +380,15 @@ pub mod identity {
         49152 + (u16::from_be_bytes([hash[0], hash[1]]) % 16384)
     }
 
+    /// Loopback MCP HTTP port, derived from different hash bytes than
+    /// [`derive_remote_port`] so the two are independent. A collision is
+    /// still possible (1 in 16384 per workspace); the listener's bind
+    /// fallback window absorbs it, this function does not prevent it.
+    pub fn derive_mcp_http_port(root: &Path) -> u16 {
+        let hash = workspace_id_hash(root);
+        49152 + (u16::from_be_bytes([hash[2], hash[3]]) % 16384)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -387,6 +414,16 @@ pub mod identity {
             assert!((49152..=65535).contains(&a));
             let other = derive_remote_port(Path::new("/nonexistent/gaviero-port-pin-2"));
             assert_ne!(a, other, "distinct workspaces derive distinct ports");
+        }
+
+        #[test]
+        fn mcp_http_port_is_distinct_from_remote_and_in_range() {
+            let root = Path::new("/nonexistent/gaviero-mcp-http-port-pin");
+            let http = derive_mcp_http_port(root);
+            let remote = derive_remote_port(root);
+            assert_eq!(http, derive_mcp_http_port(root));
+            assert!((49152..=65535).contains(&http));
+            assert_ne!(http, remote);
         }
     }
 }
@@ -1358,12 +1395,26 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
 
         // MCP server (A5)
         settings::MCP_GAVIERO_ENABLED => serde_json::json!(true),
-        settings::MCP_GAVIERO_EXPOSED_TOOLS => {
-            serde_json::json!(["memory_search", "blast_radius", "node_doc"])
-        }
+        settings::MCP_GAVIERO_EXPOSED_TOOLS => serde_json::json!([
+            "memory_search",
+            "memory_get",
+            "memory_ping",
+            "blast_radius",
+            "node_doc",
+            "repo_outline",
+            "symbol_search",
+            "symbol_doc",
+            "memory_flag"
+        ]),
         settings::MCP_GAVIERO_DISABLE_EXTERNAL => serde_json::json!(true),
         settings::MCP_GAVIERO_SHIM_BINARY => serde_json::json!("gaviero-mcp-shim"),
         settings::MCP_GAVIERO_CODEX_TRUST => serde_json::json!("unknown"),
+        settings::MCP_GAVIERO_TRANSPORT => serde_json::json!("stdio"),
+        settings::MCP_GAVIERO_TRANSPORT_BY_PROVIDER => serde_json::json!({}),
+        settings::MCP_GAVIERO_HTTP_ENABLED => serde_json::json!(true),
+        // No default on purpose: `Null` means "derive from the workspace
+        // identity" (`identity::derive_mcp_http_port`).
+        settings::MCP_GAVIERO_HTTP_PORT => serde_json::Value::Null,
         // D3: memory_flag ships enabled. The blast radius is bounded —
         // trust never drops below FLAG_TRUST_FLOOR, user and History rows
         // are untouchable, repeat flags are no-ops, and every applied
@@ -1381,6 +1432,8 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         // MCP permission policy: empty allow/deny = allow everything (the
         // historical default before the gaviero-level policy existed).
         settings::MCP_PERMISSIONS => serde_json::json!({ "allow": [], "deny": [] }),
+        settings::MCP_REACH_ENFORCE => serde_json::json!(true),
+        settings::MCP_REACH_MAX_AGE_DAYS => serde_json::json!(30),
 
         // Memory panel (A4)
         settings::UI_MEMORY_PANEL_RECENT_WINDOW_HOURS => serde_json::json!(24),
@@ -1445,6 +1498,11 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
 
         // H3 PR-9 — opt-in foreign skill roots (empty = no extra FS reads).
         settings::SKILLS_EXTRA_ROOTS => serde_json::json!([]),
+        settings::SKILLS_EMIT_ENABLED => serde_json::json!(false),
+        settings::SKILLS_EMIT_MAX_BYTES => serde_json::json!(8192),
+        settings::PROVIDERS_DSH_COMMAND => serde_json::json!("dsh"),
+        settings::PROVIDERS_DSH_ARGS => serde_json::json!([]),
+        settings::PROVIDERS_DSH_PROFILE => serde_json::json!("acp"),
 
         _ => serde_json::Value::Null,
     }

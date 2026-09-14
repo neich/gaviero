@@ -75,15 +75,20 @@ fn codex_native_edit_capabilities() -> Capabilities {
         max_context_tokens: 200_000,
         supports_system_prompt: true,
         supports_file_blocks: false,
-        retrieval: RetrievalToolset {
-            graph_and_memory: true,
-            symbols: false,
-        },
+            retrieval: RetrievalToolset {
+                graph_and_memory: true,
+                symbols: false,
+                exposed: vec![],
+            },
     }
 }
 
 fn codex_native_edit_developer_instructions(cwd: &Path, additional_roots: &[PathBuf]) -> String {
-    let mut instructions = default_editor_system_prompt(&codex_native_edit_capabilities());
+    codex_instructions_with_tools(cwd, additional_roots, None)
+}
+
+fn codex_instructions_with_tools(cwd: &Path, additional_roots: &[PathBuf], exposed: Option<&[String]>) -> String {
+    let mut instructions = default_editor_system_prompt(&codex_native_edit_capabilities().with_exposed_tools(exposed));
     instructions.push_str(
         "\n\nFor Codex, `apply_patch` is the native file-edit tool. Use it for all \
          source-file additions, updates, moves, and deletions. Do not write files \
@@ -336,6 +341,7 @@ struct AppServerInner {
 
 pub struct CodexAppServerSession {
     model: String,
+    exposed_tools: Option<Vec<String>>,
     workspace_root: PathBuf,
     additional_roots: Vec<PathBuf>,
     continuity_mode: ContinuityMode,
@@ -351,6 +357,10 @@ fn codex_app_server_args(workspace_root: &Path) -> Vec<String> {
         args.push("--config".to_string());
         args.push(pair);
     }
+    crate::mcp::push_codex_multi_agent_override(
+        &mut args,
+        &crate::mcp::ReachPolicy::for_workspace(workspace_root),
+    );
     args.push("app-server".to_string());
     args.push("--listen".to_string());
     args.push("stdio://".to_string());
@@ -405,6 +415,7 @@ impl CodexAppServerSession {
 
         Self {
             model,
+            exposed_tools: args.options.exposed_tools,
             workspace_root: args.workspace_root,
             additional_roots: args.additional_roots,
             continuity_mode,
@@ -424,8 +435,9 @@ impl CodexAppServerSession {
             cmd.arg(arg);
         }
         cmd.current_dir(&self.workspace_root)
-            .env("NO_COLOR", "1")
-            .stdin(std::process::Stdio::piped())
+            .env("NO_COLOR", "1");
+        crate::mcp::apply_codex_http_token(&mut cmd, &self.workspace_root);
+        cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
@@ -459,6 +471,7 @@ impl CodexAppServerSession {
                 &self.additional_roots,
                 &self.handle,
                 allow_network,
+                self.exposed_tools.as_deref(),
             ),
         )
         .await
@@ -649,6 +662,7 @@ async fn handshake(
     additional_roots: &[PathBuf],
     existing_handle: &Option<ContinuityHandle>,
     allow_network: bool,
+    exposed_tools: Option<&[String]>,
 ) -> Result<String> {
     let init_id = next_id();
     write_msg(
@@ -664,7 +678,7 @@ async fn handshake(
     )
     .await?;
 
-    let (method, params) = match existing_handle {
+    let (method, mut params) = match existing_handle {
         Some(ContinuityHandle::CodexThreadId(id)) => (
             "thread/resume",
             thread_resume_params(id, cwd, additional_roots, allow_network),
@@ -675,6 +689,7 @@ async fn handshake(
         ),
     };
 
+    params["developerInstructions"] = serde_json::json!(codex_instructions_with_tools(cwd, additional_roots, exposed_tools));
     let request_id = next_id();
     write_msg(stdin, &rpc_request(method, request_id, params)).await?;
     read_thread_id(lines).await
@@ -2119,6 +2134,30 @@ url = "https://example/mcp/"
                 "stdio://".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn codex_app_server_args_disable_multi_agent_when_reach_blocked() {
+        let mut args = vec![
+            "--config".into(),
+            r#"mcp_servers.gaviero.command="shim""#.into(),
+        ];
+        let policy = crate::mcp::ReachPolicy::from_parts(
+            true,
+            30,
+            std::collections::BTreeMap::from([(
+                "codex".into(),
+                crate::mcp::NestingPolicy::Blocked("nested failed".into()),
+            )]),
+        );
+        crate::mcp::push_codex_multi_agent_override(&mut args, &policy);
+        args.push("app-server".into());
+        let app = args.iter().position(|a| a == "app-server").unwrap();
+        let pair = args
+            .windows(2)
+            .position(|w| w[0] == "--config" && w[1] == crate::mcp::reach::CODEX_DISABLE_MULTI_AGENT)
+            .unwrap();
+        assert!(pair < app);
     }
 
     #[test]

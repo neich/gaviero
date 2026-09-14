@@ -114,10 +114,17 @@ impl AgentBackend for CursorBackend {
         &self,
         request: CompletionRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<UnifiedStreamEvent>> + Send>>> {
-        let system_prompt = request
-            .system_prompt
-            .clone()
-            .unwrap_or_else(|| default_editor_system_prompt(&self.capabilities()));
+        if let Some(msg) = crate::mcp::reach::cursor_reach_status(
+            &crate::mcp::ReachPolicy::for_workspace(&request.workspace_root),
+        ) {
+            tracing::warn!(target: "backend.cursor", "{msg}");
+        }
+        let system_prompt = request.system_prompt.clone().unwrap_or_else(|| {
+            default_editor_system_prompt(
+                &self.capabilities()
+                    .with_exposed_tools(request.exposed_tools.as_deref()),
+            )
+        });
 
         let user_prompt = build_enriched_prompt(
             &request.prompt,
@@ -269,6 +276,7 @@ impl AgentBackend for CursorBackend {
             retrieval: RetrievalToolset {
                 graph_and_memory: true,
                 symbols: false,
+                exposed: vec![],
             },
         }
     }

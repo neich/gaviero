@@ -927,6 +927,10 @@ impl AgentChatState {
                 if !options.iter().any(|opt| opt == &spec) {
                     options.push(spec);
                 }
+                let dsh = format!("dsh:{deepseek_model}");
+                if !options.iter().any(|opt| opt == &dsh) {
+                    options.push(dsh);
+                }
             }
             let ollama_example = "ollama:qwen2.5-coder:7b".to_string();
             if !options.iter().any(|opt| opt == &ollama_example) {
@@ -1549,7 +1553,7 @@ impl AgentChatState {
                         &format!(
                             "Current model: {}\nAvailable: {}\nUsage: /model <provider:model>\n\
                          Specs require a provider prefix: `claude:`, `codex:`, `cursor:`, \
-                         `deepseek:`, `ollama:`, or `local:`.",
+                         `deepseek:`, `dsh:`, `ollama:`, or `local:`.",
                             current, list
                         ),
                     );
@@ -1575,7 +1579,8 @@ impl AgentChatState {
                         &format!(
                             "Effort level: {}.\n\
                          Usage: /effort <off|auto|low|medium|high|xhigh|max|ultra>\n\
-                         Applies to Claude and Codex sessions (Ollama ignores it).\n\
+                         Applies to Claude, Codex, and dsh sessions (Ollama ignores it).\n\
+                         On `dsh:`: non-`off`/`auto` maps to ACP thinking=on when the agent exposes it.\n\
                          `xhigh` applies on Opus 4.7 (falls back to `high` on older \
                          Claude models). On Codex: `xhigh`/`max`/`ultra` forward for \
                          GPT-5.6 Sol/Terra; Luna caps at `max`; older models at `xhigh`.\n\
@@ -2002,8 +2007,8 @@ impl AgentChatState {
                 self.add_system_message_at(idx,
                     "Available commands:\n\n\
                      Conversation:\n\
-                     /model <provider:model>  — Set model. Examples: claude:fable, claude:sonnet, claude:opus, claude:haiku, claude:opusplan, claude:sonnet[1m], claude:opus[1m], codex:<model>, ollama:<model>\n\
-                     /effort <level>          — Set effort/reasoning level for Claude + Codex (off, auto, low, medium, high, xhigh, max, ultra). Alias: /thinking\n\
+                     /model <provider:model>  — Set model. Examples: claude:fable, claude:sonnet, claude:opus, claude:haiku, claude:opusplan, claude:sonnet[1m], claude:opus[1m], codex:<model>, dsh:deepseek-v4-pro, ollama:<model>\n\
+                     /effort <level>          — Set effort/reasoning level for Claude, Codex, and dsh (off, auto, low, medium, high, xhigh, max, ultra). Alias: /thinking\n\
                      /namespace <name>        — Set memory namespace (or show current). Alias: /ns\n\
                      /autoapprove             — Toggle auto-approve for this conversation. Alias: /yolo\n\
                      /workspace               — Arm workspace-wide planner scope for the next prompt only (multi-folder workspaces). Default scope follows the active buffer's folder; use this when the prompt genuinely spans folders. Alias: /ws\n\
@@ -2049,6 +2054,9 @@ impl AgentChatState {
                      /remote hide             — Clear the pairing QR from this transcript\n\
                      /ntfy                    — ntfy subscribe URL + QR (always-on phone alerts)\n\
                      /ntfy hide               — Clear the ntfy topic QR from this transcript\n\n\
+                     MCP:\n\
+                     /mcp                     — Reach record, endpoint, transport, exposed tools\n\
+                     /mcp probe               — How to run the CLI reach probe\n\n\
                      Help:\n\
                      /help                    — Show this help\n\n\
                      Pass-through to agent:\n\
@@ -5584,6 +5592,8 @@ mod tests {
             "local:qwen2.5-coder:14b",
             "deepseek:deepseek-v4-pro",
             "deepseek:deepseek-v4-flash",
+            "dsh:deepseek-v4-pro",
+            "dsh:deepseek-v4-flash",
         ] {
             assert_eq!(normalize_model_spec(spec), spec);
         }
@@ -5678,6 +5688,53 @@ mod tests {
                 .as_deref(),
             Some("cursor:composer-2.5")
         );
+    }
+
+    #[test]
+    fn process_slash_command_model_accepts_dsh_prefix() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "/model dsh:deepseek-v4-pro".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+
+        let handled = state.process_slash_command();
+
+        assert!(handled);
+        assert_eq!(
+            state.conversations[state.active_conv]
+                .model_override
+                .as_deref(),
+            Some("dsh:deepseek-v4-pro")
+        );
+    }
+
+    #[test]
+    fn process_slash_command_model_help_lists_dsh_prefix() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "/model".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+
+        let handled = state.process_slash_command();
+        assert!(handled);
+        let last = state.conversations[state.active_conv]
+            .messages
+            .last()
+            .expect("help message");
+        assert!(last.content.contains("`dsh:`"), "{}", last.content);
+    }
+
+    #[test]
+    fn process_slash_command_effort_help_mentions_dsh() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "/effort".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+
+        let handled = state.process_slash_command();
+        assert!(handled);
+        let last = state.conversations[state.active_conv]
+            .messages
+            .last()
+            .expect("help message");
+        assert!(last.content.contains("dsh"), "{}", last.content);
     }
 
     #[test]

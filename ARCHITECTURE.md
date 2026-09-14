@@ -34,7 +34,7 @@ Terminal editor + headless CLI for AI agent orchestration. Rust 2024.
 
 | Crate | Type | Role | Detail |
 |---|---|---|---|
-| [`gaviero-core`](crates/gaviero-core/) | lib (**25** pub mods) | Swarm, memory, MCP, ACP/agent-session (+ DeepSeek `tool_agent`), write gate, repo-map, skills | [ARCHITECTURE](crates/gaviero-core/ARCHITECTURE.md) |
+| [`gaviero-core`](crates/gaviero-core/) | lib (**26** pub mods) | Swarm, memory, MCP (stdio + loopback HTTP), ACP/agent-session (`deepseek:` tool_agent, `dsh:` ACP), write gate, repo-map, skills | [ARCHITECTURE](crates/gaviero-core/ARCHITECTURE.md) |
 | [`gaviero-tui`](crates/gaviero-tui/) | bin `gaviero` | Ratatui UI, observers, slash commands | [ARCHITECTURE](crates/gaviero-tui/ARCHITECTURE.md) |
 | [`gaviero-cli`](crates/gaviero-cli/) | bin `gaviero-cli` | Clap runner (~4000-line `main.rs`), eval/memory admin | [ARCHITECTURE](crates/gaviero-cli/ARCHITECTURE.md) |
 | [`gaviero-dsl`](crates/gaviero-dsl/) | lib (**9** pub mods) | `.gaviero` compiler → `CompiledPlan` | [ARCHITECTURE](crates/gaviero-dsl/ARCHITECTURE.md) |
@@ -74,14 +74,14 @@ Terminal editor + headless CLI for AI agent orchestration. Rust 2024.
 
 ### Provider transport
 
-- [`AgentBackend`](crates/gaviero-core/src/swarm/backend/mod.rs) + [`UnifiedStreamEvent`](crates/gaviero-core/src/swarm/backend/mod.rs) — ClaudeCode, Codex, Cursor, Ollama, **Deepseek**, Mock.
-- [`AgentSession`](crates/gaviero-core/src/agent_session/mod.rs) + [`Turn`](crates/gaviero-core/src/agent_session/mod.rs) — claude, codex_exec, codex_app_server, cursor, ollama, **tool_agent** (DeepSeek), registry.
-- Model spec: `provider:model`. Prefixes in [`SUPPORTED_PROVIDER_PREFIXES`](crates/gaviero-core/src/swarm/backend/shared.rs): `claude`, `codex`, `cursor`, `ollama`, `local`, `deepseek`. Bare names rejected by [`validate_model_spec`](crates/gaviero-core/src/swarm/backend/shared.rs).
+- [`AgentBackend`](crates/gaviero-core/src/swarm/backend/mod.rs) + [`UnifiedStreamEvent`](crates/gaviero-core/src/swarm/backend/mod.rs) — ClaudeCode, Codex, Cursor, Ollama, Deepseek, **Dsh**, Mock.
+- [`AgentSession`](crates/gaviero-core/src/agent_session/mod.rs) + [`Turn`](crates/gaviero-core/src/agent_session/mod.rs) — claude, codex_exec, codex_app_server, cursor, ollama, **tool_agent** (`deepseek:`), **agent_client_protocol** (`dsh:`), registry.
+- Model spec: `provider:model`. Prefixes in [`SUPPORTED_PROVIDER_PREFIXES`](crates/gaviero-core/src/swarm/backend/shared.rs): `claude`, `codex`, `cursor`, `ollama`, `local`, `deepseek`, `dsh`. Bare names rejected by [`validate_model_spec`](crates/gaviero-core/src/swarm/backend/shared.rs).
 
 ### Memory + MCP + write path
 
 - [`MemoryStores`](crates/gaviero-core/src/memory/stores.rs) + [`WriterHandle`](crates/gaviero-core/src/memory/writer.rs) — multi-DB; single writer task.
-- [`GavieroMcpServer`](crates/gaviero-core/src/mcp/server.rs) — eight tools over [`McpEndpoint`](crates/gaviero-core/src/mcp/transport.rs): seven read-only plus write-adjacent `memory_flag` (trust demotion via the writer task; no `WriterHandle` on the server). Subprocess agents use `gaviero-mcp-shim`. DeepSeek does not.
+- [`GavieroMcpServer`](crates/gaviero-core/src/mcp/server.rs) — nine tools over [`McpEndpoint`](crates/gaviero-core/src/mcp/transport.rs) (stdio shim) plus a loopback streamable-HTTP listener ([`mcp/http.rs`](crates/gaviero-core/src/mcp/http.rs)). Eight read-only (including `memory_ping`) plus write-adjacent `memory_flag`. Nested-agent reach is probed (`--mcp-reach-probe`) and recorded in `.gaviero/mcp_reach.json`. `gaviero-mcp-shim --resolve` walks up for `mcp-endpoint.json`. User-scope MCP registration: `--mcp-register-user`. Lean tool list: `mcp.gavieroServer.exposedTools`. DeepSeek `deepseek:` does not use the shim; `dsh:` mounts gaviero MCP on `session/new`.
 - [`WriteGatePipeline`](crates/gaviero-core/src/write_gate.rs) — every agent file change.
 
 ### Observers
@@ -99,7 +99,7 @@ The TUI process hosts an in-process WSS sidecar ([`gaviero-remote`](crates/gavie
 ### Agent write
 
 ```
-Agent stream (ACP / Codex / Cursor / Ollama / DeepSeek tool_agent)
+Agent stream (ACP / Codex / Cursor / Ollama / DeepSeek tool_agent / dsh ACP fs)
   → UnifiedStreamEvent::FileBlock | native tool write | PathsModified
   → scope check (brief lock) → diff + enrich (no lock)
   → WriteGatePipeline::insert_proposal → fs::write when finalized
@@ -151,7 +151,7 @@ CLI exit codes: 0 success, 1 failure, 2 args, 3 setup — [cli ARCHITECTURE](cra
 ## API
 
 ```rust
-// gaviero-core — 25 pub mods (crates/gaviero-core/src/lib.rs)
+// gaviero-core — 26 pub mods (crates/gaviero-core/src/lib.rs)
 pub mod acp; pub mod agent_session; pub mod context_planner;
 pub mod diff_engine; pub mod git; pub mod git_conflict;
 pub mod indent; pub mod iteration; pub mod mcp; pub mod memory;

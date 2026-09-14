@@ -476,6 +476,8 @@ async fn run_coordinator_request(
             suppress_hooks: true,
             file_scope: crate::types::FileScope::default(),
             tool_policy: None,
+            exposed_tools: None,
+            write_gate: None,
         },
         observer,
     )

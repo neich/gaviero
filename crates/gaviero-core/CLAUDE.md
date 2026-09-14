@@ -18,21 +18,21 @@ Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presenc
 
 | Area | Entry | Notes |
 |---|---|---|
-| Swarm | [`swarm/`](src/swarm) | Six-phase pipeline; backends in [`swarm/backend/`](src/swarm/backend): `claude_code`, `codex`, `cursor`, `ollama`, `deepseek`, `mock`, `Custom` — all behind [`AgentBackend`](src/swarm/backend/mod.rs). |
-| Agent session | [`agent_session/`](src/agent_session) | `claude`, `codex_exec`, `codex_app_server`, `cursor`, `ollama`, [`tool_agent/`](src/agent_session/tool_agent) (`deepseek:` + future API providers), `registry`. |
+| Swarm | [`swarm/`](src/swarm) | Six-phase pipeline; backends in [`swarm/backend/`](src/swarm/backend): `claude_code`, `codex`, `cursor`, `ollama`, `deepseek`, `dsh`, `mock`, `Custom` — all behind [`AgentBackend`](src/swarm/backend/mod.rs). |
+| Agent session | [`agent_session/`](src/agent_session) | `claude`, `codex_exec`, `codex_app_server`, `cursor`, `ollama`, [`tool_agent/`](src/agent_session/tool_agent) (`deepseek:`), [`agent_client_protocol/`](src/agent_session/agent_client_protocol) (`dsh:`), `registry`. |
+| MCP | [`mcp/`](src/mcp) | Nine tools — eight read-only (incl. `memory_ping`) + write-adjacent `memory_flag` ([`tools.rs`](src/mcp/tools.rs)); stdio endpoint via [`transport.rs`](src/mcp/transport.rs); loopback HTTP ([`http.rs`](src/mcp/http.rs)); reach probe; user-scope registration; signal sink ([`signal.rs`](src/mcp/signal.rs)). |
 | Memory | [`memory/`](src/memory) | Multi-DB ONNX store; single writer task ([`writer.rs`](src/memory/writer.rs)); merged multi-scope hybrid retrieval (RRF). |
-| MCP | [`mcp/`](src/mcp) | Eight tools — seven read-only + write-adjacent `memory_flag` ([`tools.rs`](src/mcp/tools.rs)); endpoint via [`transport.rs`](src/mcp/transport.rs); signal sink ([`signal.rs`](src/mcp/signal.rs)); config synth / preflight / telemetry. |
 | Write path | [`write_gate.rs`](src/write_gate.rs), [`scope_enforcer.rs`](src/scope_enforcer.rs) | Modes: Interactive / AutoAccept / Deferred / RejectAll. |
 | Repo map | [`repo_map/`](src/repo_map) | Graph + [`topology.rs`](src/repo_map/topology.rs) + symbol enrichment/search. |
-| Skills | [`skills/`](src/skills) | Frontmatter, catalog, planner `ResolvedSkill` seam. |
+| Skills | [`skills/`](src/skills) | Frontmatter, catalog, planner `ResolvedSkill` seam, opt-in constitution emit ([`skills/emit.rs`](src/skills/emit.rs)). |
 | Session persistence | [`session_state.rs`](src/session_state.rs), [`session_journal.rs`](src/session_journal.rs) | State + conversations save only on a clean quit; the journal appends each prompt at dispatch (fsync) so a crash can't lose it. All saves are tmp-file + rename. |
 | Other | `acp`, `context_planner`, `validation_gate`, `git`, `git_conflict`, `terminal`, `util`, `workspace`, … | See `lib.rs`. |
 
 `tree-sitter` types are re-exported here; downstream crates **must not** depend on `tree-sitter` directly.
 
-**DeepSeek path:** `deepseek:<id>` → [`BackendConfig::Deepseek`](src/swarm/backend/mod.rs) → [`DeepseekBackend`](src/swarm/backend/deepseek.rs) → [`tool_agent`](src/agent_session/tool_agent). Writes use Option-B `<file>` blocks through the Write Gate — same parity contract as Ollama stream providers. Allowed model ids: `DEEPSEEK_API_MODELS` in [`shared.rs`](src/swarm/backend/shared.rs).
+**DeepSeek path:** `deepseek:<id>` → [`BackendConfig::Deepseek`](src/swarm/backend/mod.rs) → [`DeepseekBackend`](src/swarm/backend/deepseek.rs) → [`tool_agent`](src/agent_session/tool_agent) (in-process fallback). `dsh:<id>` → [`DshBackend`](src/swarm/backend/dsh.rs) → [`AcpClientSession`](src/agent_session/agent_client_protocol) over `dsh --profile acp` (`@deepseek-ai/dsh`; `@deepseek-ai/dsh-acp` is a library). Writes for `dsh:` go through ACP `fs/write_text_file` when the child asks, otherwise git dirty-set minus gate-written paths (`PathsModified`). Allowed model ids: `DEEPSEEK_API_MODELS` in [`shared.rs`](src/swarm/backend/shared.rs).
 
-**MCP endpoint:** `<workspace>/.gaviero/mcp.sock` (Unix) or `\\.\pipe\gaviero-<hash>` (Windows). Subprocess agents reach it via `gaviero-mcp-shim`. DeepSeek does not use the shim.
+**MCP endpoint:** `<workspace>/.gaviero/mcp.sock` (Unix) or `\\.\pipe\gaviero-<hash>` (Windows), described in `.gaviero/mcp-endpoint.json`. Subprocess agents reach it via `gaviero-mcp-shim` (optionally `--resolve`). Loopback HTTP: `127.0.0.1:<derived-port>/mcp` with a bearer token in `.gaviero/mcp-http-token`. `deepseek:` does not use the shim; `dsh:` mounts gaviero MCP on `session/new`.
 
 **Memory defaults:** embedder `nomic-embed-text-v1.5` (`memory.embedder.model = "nomic"`); symbol vectors `jina-code`; retrieval RRF (vector 0.7 + FTS 0.3); cascade mode is a kill-switch (`memory.retrieval.mode = "cascade"`).
 
@@ -42,7 +42,7 @@ Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presenc
 - `AgentBackend` is object-safe; every backend in [`swarm/backend/`](src/swarm/backend) implements it.
 - Memory writes require explicit `WriteScope` — never infer. All writes flow through the writer task.
 - Scoring ([`memory/scoring.rs`](src/memory/scoring.rs)): 50% similarity + 20% importance + 15% recency + 15% base, scaled by scope/trust. Decay-exempt types: `Decision` / `Convention` / `Invariant` / `Preference` / `Gotcha`.
-- Model spec is `provider:model`. `validate_model_spec` ([`swarm/backend/shared.rs`](src/swarm/backend/shared.rs)) rejects bare names. Prefixes: `claude`, `codex`, `cursor`, `ollama`, `local`, `deepseek` (`SUPPORTED_PROVIDER_PREFIXES`).
+- Model spec is `provider:model`. `validate_model_spec` ([`swarm/backend/shared.rs`](src/swarm/backend/shared.rs)) rejects bare names. Prefixes: `claude`, `codex`, `cursor`, `ollama`, `local`, `deepseek`, `dsh` (`SUPPORTED_PROVIDER_PREFIXES`).
 - Tree-sitter access goes through `gaviero_core::{Language, Parser, Query, …}` re-exports.
 
 ## Rules
@@ -62,7 +62,7 @@ Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presenc
 - `rustdoc-types 0.57` + `syn 2` — rustdoc-JSON symbol enrichment.
 - `petgraph 0.8` — swarm DAG.
 - `portable-pty 0.9` + `vt100 0.16` — terminal emulation.
-- `rmcp 1.5` + `schemars 1.2` — in-process MCP server.
+- `rmcp 1.5` + `schemars 1.2` + `axum 0.8` — in-process MCP server (stdio + streamable HTTP).
 - `zstd 0.13` + `bincode 1.3` — History compression.
 - `windows-sys 0.59` (Windows only) — kill-on-close Job Objects ([`util::spawn`](src/util/spawn.rs)).
 - `reqwest`, `async-trait`, `futures`, `tokio-stream`, `tokio-util`, `chrono`, `regex`, `walkdir`, `toml`, `tempfile`, `ropey`, `similar`, …

@@ -8,6 +8,7 @@ pub mod claude_code;
 pub mod codex;
 pub mod cursor;
 pub mod deepseek;
+pub mod dsh;
 pub mod executor;
 pub mod mock;
 pub mod ollama;
@@ -15,9 +16,11 @@ pub mod runner;
 pub mod shared;
 
 use crate::types::FileScope;
+use crate::write_gate::WriteGatePipeline;
 
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use anyhow::Result;
 use futures::Stream;
@@ -120,6 +123,48 @@ pub struct RetrievalToolset {
     /// sidecar (`repoMap.symbolEnrichment.enabled`, off by default), so this
     /// stays false unless enrichment is on.
     pub symbols: bool,
+    /// Explicit MCP tool names that should appear in the retrieval stanza.
+    /// Empty means "derive names from `graph_and_memory` / `symbols`".
+    pub exposed: Vec<String>,
+}
+
+impl RetrievalToolset {
+    /// Build the stanza flags from `mcp.gavieroServer.exposedTools`.
+    pub fn from_exposed(tools: &[String]) -> Self {
+        let has = |n: &str| tools.iter().any(|t| t == n);
+        Self {
+            graph_and_memory: has("memory_search")
+                || has("blast_radius")
+                || has("node_doc")
+                || has("memory_get")
+                || has("repo_outline"),
+            symbols: has("symbol_search") || has("symbol_doc"),
+            exposed: tools.to_vec(),
+        }
+    }
+
+    fn names(&self, tool: &str) -> bool {
+        if !self.exposed.is_empty() {
+            return self.exposed.iter().any(|t| t == tool);
+        }
+        match tool {
+            "node_doc" | "blast_radius" | "memory_search" => self.graph_and_memory,
+            "symbol_search" | "symbol_doc" => self.symbols,
+            _ => false,
+        }
+    }
+}
+
+impl Capabilities {
+    /// Overlay `mcp.gavieroServer.exposedTools` onto this capability set.
+    pub fn with_exposed_tools(mut self, tools: Option<&[String]>) -> Self {
+        if let Some(t) = tools
+            && (self.retrieval.graph_and_memory || self.retrieval.symbols || !self.retrieval.exposed.is_empty())
+        {
+            self.retrieval = RetrievalToolset::from_exposed(t);
+        }
+        self
+    }
 }
 
 /// Runtime capability flags for a backend.
@@ -155,7 +200,7 @@ impl Default for Capabilities {
 // ── Completion Request ──────────────────────────────────────────────────────
 
 /// Provider-agnostic completion request.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CompletionRequest {
     /// The user/task prompt.
     pub prompt: String,
@@ -197,6 +242,22 @@ pub struct CompletionRequest {
     /// the synthesized provider configs. `None` → resolve from
     /// `workspace_root` (finds nothing inside a swarm worktree).
     pub tool_policy: Option<crate::agent_session::tool_agent::policy::ToolPolicy>,
+    /// MCP tools advertised to the agent (`mcp.gavieroServer.exposedTools`).
+    /// `None` keeps the backend's default retrieval stanza (full graph + memory).
+    pub exposed_tools: Option<Vec<String>>,
+    /// Write gate for backends that propose mid-stream (`dsh:` ACP fs writes).
+    /// `None` for backends that only emit `FileBlock` / `PathsModified`.
+    pub write_gate: Option<WriteGateHandle>,
+}
+
+/// Cloneable write-gate pointer that is `Debug` without dumping pipeline state.
+#[derive(Clone)]
+pub struct WriteGateHandle(pub Arc<tokio::sync::Mutex<WriteGatePipeline>>);
+
+impl std::fmt::Debug for WriteGateHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WriteGateHandle")
+    }
 }
 
 // ── Backend Config ──────────────────────────────────────────────────────────
@@ -221,6 +282,10 @@ pub enum BackendConfig {
     },
     /// In-process API tool-agent harness (`deepseek:` today).
     Deepseek {
+        model: String,
+    },
+    /// Subprocess `dsh-acp` over the Agent Client Protocol (`dsh:`).
+    Dsh {
         model: String,
     },
     Custom {
@@ -249,6 +314,7 @@ pub fn create_backend(config: &BackendConfig) -> Result<Box<dyn AgentBackend>> {
             Ok(Box::new(ollama::OllamaStreamBackend::new(url, model)))
         }
         BackendConfig::Deepseek { model } => Ok(Box::new(deepseek::DeepseekBackend::new(model))),
+        BackendConfig::Dsh { model } => Ok(Box::new(dsh::DshBackend::new(model))),
         BackendConfig::Custom { command, args } => {
             anyhow::bail!(
                 "Custom backend not yet implemented (command={}, args={:?})",
@@ -294,6 +360,8 @@ mod tests {
             suppress_hooks: true,
             file_scope: FileScope::default(),
             tool_policy: None,
+        exposed_tools: None,
+            write_gate: None,
         };
 
         let mut stream = backend.stream_completion(req).await.unwrap();
@@ -339,6 +407,8 @@ mod tests {
             suppress_hooks: true,
             file_scope: FileScope::default(),
             tool_policy: None,
+        exposed_tools: None,
+            write_gate: None,
         };
 
         let mut stream = backend.stream_completion(req).await.unwrap();
@@ -371,6 +441,7 @@ mod tests {
             retrieval: RetrievalToolset {
                 graph_and_memory: true,
                 symbols: true,
+                exposed: vec![],
             },
         };
         assert!(full.tool_use);
@@ -434,6 +505,13 @@ mod tests {
         };
         let ds_backend = create_backend(&ds).unwrap();
         assert!(ds_backend.name().contains("deepseek"));
+
+        let dsh = BackendConfig::Dsh {
+            model: "deepseek-v4-flash".into(),
+        };
+        let dsh_backend = create_backend(&dsh).unwrap();
+        assert!(dsh_backend.name().contains("dsh"));
+        assert!(!dsh_backend.capabilities().supports_file_blocks);
 
         // Custom not yet implemented — returns error
         let custom = BackendConfig::Custom {

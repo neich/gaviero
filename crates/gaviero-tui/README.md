@@ -61,7 +61,7 @@ review src/auth/session.rs for race conditions
 
 | Command | Purpose |
 |---|---|
-| `/model <spec>` | Switch model (`claude:sonnet`, `deepseek:deepseek-v4-pro`, …) |
+| `/model <spec>` | Switch model (`claude:sonnet`, `dsh:deepseek-v4-pro`, `deepseek:deepseek-v4-pro`, …) |
 | `/run <file.gaviero> [prompt]` | Compile and execute a DSL workflow |
 | `/swarm <task>` | Immediate multi-agent swarm |
 | `/cswarm <task>` | Generate a reviewable coordinated plan |
@@ -69,6 +69,7 @@ review src/auth/session.rs for race conditions
 | `/remember <text>` | Store a fact (`-here`, `-module`, `-workspace`, `-global` scope it) |
 | `/forget <query>` | Soft-delete matching memories |
 | `/skills [search <q>]` | List or search loaded skills |
+| `/mcp` / `/mcp probe` | MCP reach record + endpoint; probe pointer (CLI) |
 | `/attach <path>` / `/detach` | Add/remove file context |
 | `/lite` | Minimal-context turn (topology only) |
 | `/compact` / `/clear` | Trim or clear conversation history |

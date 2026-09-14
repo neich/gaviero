@@ -20,6 +20,7 @@
 //! All configs are per-worktree, not per-user, so swarm worktrees
 //! get isolated MCP wiring that cleans up with the worktree itself.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -44,6 +45,52 @@ impl Default for TrustConsent {
     fn default() -> Self {
         Self::Unknown
     }
+}
+
+/// How a vendor is told to reach the gaviero MCP server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpTransportKind {
+    Stdio,
+    Http,
+}
+
+impl Default for McpTransportKind {
+    fn default() -> Self {
+        Self::Stdio
+    }
+}
+
+impl McpTransportKind {
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "http" => Self::Http,
+            _ => Self::Stdio,
+        }
+    }
+}
+
+/// Default transport plus per-vendor overrides (`transportByProvider`).
+#[derive(Debug, Clone, Default)]
+pub struct McpTransportChoice {
+    pub default: McpTransportKind,
+    pub per_vendor: HashMap<String, McpTransportKind>,
+}
+
+impl McpTransportChoice {
+    pub fn for_vendor(&self, vendor: &str) -> McpTransportKind {
+        self.per_vendor
+            .get(vendor)
+            .copied()
+            .unwrap_or(self.default)
+    }
+}
+
+/// Loopback HTTP coordinates filled after the listener binds.
+#[derive(Debug, Clone)]
+pub struct HttpSynthEndpoint {
+    pub url: String,
+    pub token: String,
+    pub token_path: PathBuf,
 }
 
 /// Context7 MCP server defaults (Upstash hosted docs lookup).
@@ -460,6 +507,15 @@ pub struct McpConfigSynth {
     /// Cursor synth then denies native tools that are not on the list so
     /// Restricted profiles drop Shell the same way Claude drops `--tools Bash`.
     pub available_tools: Option<Vec<String>>,
+    /// `<root>/.gaviero/mcp_reach.json` to mirror into the worktree so the
+    /// spawn-time [`super::ReachPolicy`] sees the workspace measurement
+    /// from a worktree cwd. `None` when no record exists or enforcement is off.
+    pub reach_record_source: Option<PathBuf>,
+    /// Per-vendor stdio vs HTTP (P2.3). Defaults stay stdio until P2.4.
+    pub transport: McpTransportChoice,
+    /// Bound loopback HTTP endpoint. `None` forces stdio even when
+    /// `transport` says HTTP.
+    pub http: Option<HttpSynthEndpoint>,
 }
 
 impl Default for McpConfigSynth {
@@ -476,6 +532,9 @@ impl Default for McpConfigSynth {
             permissions: McpPermissions::default(),
             bash: BashPermissions::default(),
             available_tools: None,
+            reach_record_source: None,
+            transport: McpTransportChoice::default(),
+            http: None,
         }
     }
 }
@@ -500,7 +559,10 @@ fn managed_mcp_json_servers(
     // it — a disallowed server is never written, which enforces the policy
     // even for providers that run with blanket tool approval.
     if synth.gaviero_enabled && synth.permissions.server_allowed("gaviero") {
-        servers.insert("gaviero".to_string(), gaviero_server_entry(synth));
+        servers.insert(
+            "gaviero".to_string(),
+            gaviero_server_entry_for(synth, "claude"),
+        );
     }
     if synth.context7.enabled && synth.permissions.server_allowed("context7") {
         servers.insert(
@@ -616,16 +678,20 @@ fn managed_cursor_mcp_json_servers(
 
     let has_remote_extra = synth_has_remote_url_servers(synth);
     let mut servers = serde_json::Map::new();
-    // When a remote URL extra (e.g. semantic-scholar) is configured, keep
-    // Cursor's registry lean — the stdio gaviero shim competes for startup
-    // with streamable HTTP and often leaves ListMcpResources empty. The
-    // permission policy is the outer gate: a disallowed server is dropped.
-    if synth.gaviero_enabled
-        && !has_remote_extra
+    // Omit the stdio gaviero shim when a remote URL extra is configured
+    // (stdio competes with streamable HTTP at Cursor startup). An HTTP
+    // gaviero entry does not have that problem — keep it.
+    let http_entry = synth.transport.for_vendor("cursor") == McpTransportKind::Http
+        && synth.http.is_some();
+    let stdio_entry = !has_remote_extra && shim_binary_resolvable(&synth.shim_binary);
+    let include_gaviero = synth.gaviero_enabled
         && synth.permissions.server_allowed("gaviero")
-        && shim_binary_resolvable(&synth.shim_binary)
-    {
-        servers.insert("gaviero".to_string(), gaviero_server_entry(synth));
+        && (http_entry || stdio_entry);
+    if include_gaviero {
+        servers.insert(
+            "gaviero".to_string(),
+            gaviero_server_entry_for(synth, "cursor"),
+        );
     }
     for extra in &synth.extra_servers {
         if synth.permissions.server_allowed(&extra.name) {
@@ -649,7 +715,18 @@ pub fn cursor_mcp_config_json(synth: &McpConfigSynth) -> Result<String> {
     Ok(serde_json::to_string_pretty(&body).context("serialising .cursor/mcp.json")?)
 }
 
-fn gaviero_server_entry(synth: &McpConfigSynth) -> serde_json::Value {
+fn gaviero_server_entry_for(synth: &McpConfigSynth, vendor: &str) -> serde_json::Value {
+    if synth.transport.for_vendor(vendor) == McpTransportKind::Http
+        && let Some(http) = &synth.http
+    {
+        let headers = serde_json::json!({ "Authorization": format!("Bearer {}", http.token) });
+        // Cursor's schema has no `type` discriminator; Claude's does.
+        return if vendor == "cursor" {
+            serde_json::json!({ "url": http.url, "headers": headers })
+        } else {
+            serde_json::json!({ "type": "http", "url": http.url, "headers": headers })
+        };
+    }
     serde_json::json!({
         "command": synth.shim_binary,
         "args": synth.endpoint.shim_args(),
@@ -968,6 +1045,22 @@ fn toml_quote_key(k: &str) -> String {
     }
 }
 
+fn stdio_gaviero_codex_block(synth: &McpConfigSynth) -> String {
+    let shim_args = synth.endpoint.shim_args();
+    format!(
+        "[mcp_servers.gaviero]\n\
+         command = {command:?}\n\
+         args = [{flag:?}, {value:?}]\n\
+         startup_timeout_sec = {start}\n\
+         tool_timeout_sec = {tool}\n",
+        command = synth.shim_binary,
+        flag = shim_args[0],
+        value = shim_args[1],
+        start = CODEX_MCP_STARTUP_TIMEOUT_SECS,
+        tool = CODEX_MCP_TOOL_TIMEOUT_SECS,
+    )
+}
+
 /// Build the `.codex/config.toml` body for Codex.
 ///
 /// Schema: `[mcp_servers.gaviero]` — one table per server. Codex's CLI
@@ -982,7 +1075,6 @@ fn toml_quote_key(k: &str) -> String {
 pub fn codex_mcp_config_toml(synth: &McpConfigSynth) -> Result<String> {
     // Manually construct the TOML — toml's serializer doesn't like
     // the dotted-header shape Codex expects.
-    let shim_args = synth.endpoint.shim_args();
     let worktree = synth.worktree.to_string_lossy();
     let trust_value = match synth.codex_trust {
         TrustConsent::Granted => "trusted",
@@ -998,18 +1090,20 @@ pub fn codex_mcp_config_toml(synth: &McpConfigSynth) -> Result<String> {
     // written to `.codex/rules/gaviero.rules` (execpolicy) by
     // `synthesize_for_worktree`.
     if synth.gaviero_enabled && synth.permissions.server_allowed("gaviero") {
-        body.push_str(&format!(
-            "[mcp_servers.gaviero]\n\
-             command = {command:?}\n\
-             args = [{flag:?}, {value:?}]\n\
-             startup_timeout_sec = {start}\n\
-             tool_timeout_sec = {tool}\n",
-            command = synth.shim_binary,
-            flag = shim_args[0],
-            value = shim_args[1],
-            start = CODEX_MCP_STARTUP_TIMEOUT_SECS,
-            tool = CODEX_MCP_TOOL_TIMEOUT_SECS,
-        ));
+        match (synth.transport.for_vendor("codex"), &synth.http) {
+            (McpTransportKind::Http, Some(http)) => body.push_str(&format!(
+                "[mcp_servers.gaviero]\n\
+                 url = {url:?}\n\
+                 bearer_token_env_var = {env:?}\n\
+                 startup_timeout_sec = {start}\n\
+                 tool_timeout_sec = {tool}\n",
+                url = http.url,
+                env = super::http::CODEX_HTTP_TOKEN_ENV,
+                start = CODEX_MCP_STARTUP_TIMEOUT_SECS,
+                tool = CODEX_MCP_TOOL_TIMEOUT_SECS,
+            )),
+            _ => body.push_str(&stdio_gaviero_codex_block(synth)),
+        }
     }
     if synth.context7.enabled && synth.permissions.server_allowed("context7") {
         body.push_str(&format!(
@@ -1178,6 +1272,56 @@ pub fn synthesize_for_worktree(synth: &McpConfigSynth) -> Result<Vec<PathBuf>> {
         let codex_body = codex_mcp_config_toml(synth)?;
         write_if_changed(&codex_path, &codex_body)?;
         written.push(codex_path);
+    }
+
+    // Spawn-time reach enforcement reads `<cwd>/.gaviero/mcp_reach.json`.
+    // A swarm worktree has no record of its own, so mirror the root's;
+    // synthesizing into the root itself is a no-op.
+    if let Some(src) = &synth.reach_record_source {
+        let dest = synth
+            .worktree
+            .join(".gaviero")
+            .join(super::reach::REACH_FILENAME);
+        if *src != dest {
+            match std::fs::read_to_string(src) {
+                Ok(body) => {
+                    if let Some(parent) = dest.parent() {
+                        std::fs::create_dir_all(parent)
+                            .with_context(|| format!("creating {}", parent.display()))?;
+                    }
+                    write_if_changed(&dest, &body)?;
+                    written.push(dest);
+                }
+                Err(e) => tracing::debug!(
+                    target: "mcp_synth",
+                    error = %e,
+                    "reach record unreadable; worktree spawns see Unknown"
+                ),
+            }
+        }
+    }
+
+    if synth.gaviero_enabled {
+        let reuse_live = synth.endpoint.has_live_server();
+        let (http_url, http_token) = match &synth.http {
+            Some(http) => (Some(http.url.as_str()), Some(http.token_path.as_path())),
+            None => (None, None),
+        };
+        match super::endpoint_file::write_listener_descriptor(
+            &synth.worktree,
+            &synth.endpoint,
+            http_url,
+            http_token,
+            std::process::id(),
+            reuse_live,
+        ) {
+            Ok(path) => written.push(path),
+            Err(e) => tracing::warn!(
+                target: "mcp_synth",
+                error = %e,
+                "failed to write worktree mcp-endpoint.json"
+            ),
+        }
     }
 
     Ok(written)
@@ -1439,6 +1583,9 @@ mod tests {
             permissions: McpPermissions::default(),
             bash: BashPermissions::default(),
             available_tools: None,
+            reach_record_source: None,
+            transport: McpTransportChoice::default(),
+            http: None,
         }
     }
 
@@ -1466,6 +1613,68 @@ mod tests {
     }
 
     #[test]
+    fn claude_http_entry_has_type_url_and_bearer_header() {
+        let mut synth = fixture(PathBuf::from("/tmp/wt"));
+        synth.transport.default = McpTransportKind::Http;
+        synth.http = Some(HttpSynthEndpoint {
+            url: "http://127.0.0.1:52344/mcp".into(),
+            token: "secret".into(),
+            token_path: PathBuf::from("/tmp/.gaviero/mcp-http-token"),
+        });
+        let v: serde_json::Value =
+            serde_json::from_str(&claude_mcp_config_json(&synth).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["gaviero"]["type"], "http");
+        assert_eq!(
+            v["mcpServers"]["gaviero"]["url"],
+            "http://127.0.0.1:52344/mcp"
+        );
+        assert_eq!(
+            v["mcpServers"]["gaviero"]["headers"]["Authorization"],
+            "Bearer secret"
+        );
+        assert!(v["mcpServers"]["gaviero"].get("command").is_none());
+    }
+
+    #[test]
+    fn cursor_http_gaviero_is_kept_when_a_remote_extra_exists() {
+        let mut synth = fixture_resolvable_shim(PathBuf::from("/tmp/wt"));
+        synth.transport.per_vendor.insert("cursor".into(), McpTransportKind::Http);
+        synth.http = Some(HttpSynthEndpoint {
+            url: "http://127.0.0.1:9/mcp".into(),
+            token: "t".into(),
+            token_path: PathBuf::from("/t"),
+        });
+        synth.extra_servers.push(ExtraMcpServer {
+            name: "semantic-scholar".into(),
+            transport: ExtraMcpTransport::Url {
+                url: "https://example/mcp".into(),
+            },
+        });
+        let v: serde_json::Value =
+            serde_json::from_str(&cursor_mcp_config_json(&synth).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["gaviero"]["url"], "http://127.0.0.1:9/mcp");
+        assert!(v["mcpServers"]["gaviero"].get("command").is_none());
+    }
+
+    #[test]
+    fn codex_http_uses_bearer_token_env_var() {
+        let mut synth = fixture(PathBuf::from("/tmp/wt"));
+        synth.transport.default = McpTransportKind::Http;
+        synth.http = Some(HttpSynthEndpoint {
+            url: "http://127.0.0.1:9/mcp".into(),
+            token: "t".into(),
+            token_path: PathBuf::from("/t"),
+        });
+        let body = codex_mcp_config_toml(&synth).unwrap();
+        assert!(body.contains("url = \"http://127.0.0.1:9/mcp\""));
+        assert!(body.contains("bearer_token_env_var = \"GAVIERO_MCP_TOKEN\""));
+        assert!(
+            !body.contains("[mcp_servers.gaviero]\ncommand"),
+            "gaviero HTTP entry must not be stdio: {body}"
+        );
+    }
+
+    #[test]
     fn codex_config_contains_trust_and_server_blocks() {
         let synth = fixture(PathBuf::from("/tmp/wt"));
         let body = codex_mcp_config_toml(&synth).unwrap();
@@ -1487,7 +1696,7 @@ mod tests {
         // Trust unknown → Claude + Cursor configs written, Codex skipped.
         synth.codex_trust = TrustConsent::Unknown;
         let files = synthesize_for_worktree(&synth).unwrap();
-        assert_eq!(files.len(), 2);
+        assert_eq!(files.len(), 3);
         assert!(
             files.iter().any(|p| p.ends_with(".mcp.json")),
             "expected .mcp.json among {:?}",
@@ -1498,14 +1707,46 @@ mod tests {
             "expected .cursor/mcp.json among {:?}",
             files
         );
+        assert!(
+            files.iter().any(|p| p.ends_with("mcp-endpoint.json")),
+            "expected mcp-endpoint.json among {:?}",
+            files
+        );
         assert!(!dir.path().join(".codex/config.toml").exists());
 
         // Trust granted → all three configs.
         synth.codex_trust = TrustConsent::Granted;
         let files = synthesize_for_worktree(&synth).unwrap();
-        assert_eq!(files.len(), 3);
+        assert_eq!(files.len(), 4);
         assert!(dir.path().join(".cursor/mcp.json").exists());
         assert!(dir.path().join(".codex/config.toml").exists());
+    }
+
+    #[test]
+    fn synth_mirrors_the_reach_record_into_the_worktree() {
+        let root = tempdir().unwrap();
+        let record = root.path().join(".gaviero").join("mcp_reach.json");
+        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+        let body = r#"{"v":1,"workspace_id":"abc","probed_at":"2026-09-14T12:00:00Z","providers":{}}"#;
+        std::fs::write(&record, body).unwrap();
+
+        let wt = tempdir().unwrap();
+        let mut synth = fixture(wt.path().to_path_buf());
+        synth.shim_binary = "gaviero-mcp-shim-not-installed-for-this-test".into();
+        synth.codex_trust = TrustConsent::Unknown;
+        synth.reach_record_source = Some(record.clone());
+        let files = synthesize_for_worktree(&synth).unwrap();
+        let copied = wt.path().join(".gaviero").join("mcp_reach.json");
+        assert!(files.contains(&copied), "{files:?}");
+        assert_eq!(std::fs::read_to_string(&copied).unwrap(), body);
+
+        // Synthesizing into the root itself must not rewrite the source.
+        let mut same = fixture(root.path().to_path_buf());
+        same.shim_binary = "gaviero-mcp-shim-not-installed-for-this-test".into();
+        same.codex_trust = TrustConsent::Unknown;
+        same.reach_record_source = Some(record.clone());
+        let files = synthesize_for_worktree(&same).unwrap();
+        assert!(!files.contains(&record), "{files:?}");
     }
 
     #[test]

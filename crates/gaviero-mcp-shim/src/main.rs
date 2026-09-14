@@ -38,8 +38,16 @@ struct Cli {
     #[arg(long, conflicts_with = "socket")]
     pipe: Option<String>,
 
+    /// Walk up from cwd for `.gaviero/mcp-endpoint.json` and connect
+    /// to that endpoint. Mutually exclusive with `--socket` / `--pipe`.
+    /// Exits 2 immediately when the file is missing or its `pid` is not
+    /// alive (no connect retry).
+    #[arg(long, conflicts_with_all = ["socket", "pipe"])]
+    resolve: bool,
+
     /// Seconds to retry the initial connect. Useful when the
     /// subprocess agent spawns before Gaviero has finished `Workspace::open`.
+    /// Ignored for `--resolve` when the descriptor is missing or dead.
     #[arg(long, default_value = "5")]
     connect_timeout_secs: u64,
 }
@@ -60,9 +68,12 @@ async fn run(cli: Cli) -> Result<()> {
     if cli.pipe.is_some() {
         anyhow::bail!("gaviero-mcp-shim: --pipe is Windows-only; use --socket on this platform");
     }
-    let socket = cli
-        .socket
-        .context("gaviero-mcp-shim: --socket <path> is required on this platform")?;
+    let socket = if cli.resolve {
+        resolve::socket_from_descriptor()?
+    } else {
+        cli.socket
+            .context("gaviero-mcp-shim: --socket <path> is required on this platform")?
+    };
     let stream = unix::connect_with_backoff(&socket, cli.connect_timeout_secs).await?;
     let (rx, tx) = stream.into_split();
     bridge(rx, tx).await
@@ -75,9 +86,12 @@ async fn run(cli: Cli) -> Result<()> {
             "gaviero-mcp-shim: --socket is Unix-only; use --pipe <name> on Windows"
         );
     }
-    let pipe = cli
-        .pipe
-        .context("gaviero-mcp-shim: --pipe <name> is required on Windows")?;
+    let pipe = if cli.resolve {
+        resolve::pipe_from_descriptor()?
+    } else {
+        cli.pipe
+            .context("gaviero-mcp-shim: --pipe <name> is required on Windows")?
+    };
     let client = windows::connect_with_backoff(&pipe, cli.connect_timeout_secs).await?;
     let (rx, tx) = tokio::io::split(client);
     bridge(rx, tx).await
@@ -201,5 +215,155 @@ mod windows {
                 }
             }
         }
+    }
+}
+
+/// Cwd-walk `--resolve` (no gaviero-core: parse the JSON ourselves).
+mod resolve {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)] // `socket` is Unix-only; `pipe` is Windows-only.
+    struct Descriptor {
+        pid: u32,
+        #[serde(default)]
+        pipe: Option<String>,
+        #[serde(default)]
+        socket: Option<PathBuf>,
+    }
+
+    fn find_descriptor_upwards(cwd: &Path) -> Option<PathBuf> {
+        let mut cur = cwd.to_path_buf();
+        for _ in 0..64 {
+            let candidate = cur.join(".gaviero").join("mcp-endpoint.json");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            if !cur.pop() {
+                break;
+            }
+        }
+        None
+    }
+
+    fn load_live_descriptor() -> Descriptor {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let Some(path) = find_descriptor_upwards(&cwd) else {
+            tracing::warn!("gaviero-mcp-shim: no .gaviero/mcp-endpoint.json above {cwd:?}");
+            std::process::exit(2);
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("gaviero-mcp-shim: reading {}: {e}", path.display());
+                std::process::exit(2);
+            }
+        };
+        let desc: Descriptor = match serde_json::from_str(&text) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("gaviero-mcp-shim: parsing {}: {e}", path.display());
+                std::process::exit(2);
+            }
+        };
+        if !pid_alive(desc.pid) {
+            if !transport_live(&desc) {
+                tracing::warn!(
+                    "gaviero-mcp-shim: descriptor pid {} is not alive ({})",
+                    desc.pid,
+                    path.display()
+                );
+                std::process::exit(2);
+            }
+            tracing::warn!(
+                "gaviero-mcp-shim: descriptor pid {} is not alive but the endpoint still accepts a connect ({})",
+                desc.pid,
+                path.display()
+            );
+        }
+        desc
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn socket_from_descriptor() -> Result<PathBuf> {
+        let desc = load_live_descriptor();
+        desc.socket.context("mcp-endpoint.json has no socket field")
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn pipe_from_descriptor() -> Result<String> {
+        let desc = load_live_descriptor();
+        desc.pipe.context("mcp-endpoint.json has no pipe field")
+    }
+
+    #[cfg(windows)]
+    fn transport_live(desc: &Descriptor) -> bool {
+        let Some(name) = desc.pipe.as_deref() else {
+            return false;
+        };
+        const ERROR_PIPE_BUSY: i32 = 231;
+        match std::fs::OpenOptions::new().read(true).write(true).open(name) {
+            Ok(_) => true,
+            Err(e) => e.raw_os_error() == Some(ERROR_PIPE_BUSY),
+        }
+    }
+
+    #[cfg(unix)]
+    fn transport_live(desc: &Descriptor) -> bool {
+        let Some(socket) = desc.socket.as_ref() else {
+            return false;
+        };
+        std::os::unix::net::UnixStream::connect(socket).is_ok()
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn transport_live(_desc: &Descriptor) -> bool {
+        false
+    }
+
+    #[cfg(unix)]
+    fn pid_alive(pid: u32) -> bool {
+        if pid == 0 {
+            return false;
+        }
+        let rc = unsafe { kill(pid as i32, 0) };
+        if rc == 0 {
+            return true;
+        }
+        // EPERM: process exists but we cannot signal it — still alive.
+        std::io::Error::last_os_error().raw_os_error() == Some(1)
+    }
+
+    #[cfg(unix)]
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+
+    #[cfg(windows)]
+    fn pid_alive(pid: u32) -> bool {
+        if pid == 0 {
+            return false;
+        }
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const STILL_ACTIVE: u32 = 259;
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            let mut code = 0u32;
+            let ok = GetExitCodeProcess(handle, &mut code);
+            CloseHandle(handle);
+            ok != 0 && code == STILL_ACTIVE
+        }
+    }
+
+    #[cfg(windows)]
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+        fn GetExitCodeProcess(handle: *mut std::ffi::c_void, exit_code: *mut u32) -> i32;
     }
 }

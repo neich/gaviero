@@ -85,6 +85,7 @@ pub(crate) async fn run_agent_loop(
         };
 
         let mut round_text = String::new();
+        let mut round_reasoning = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut round_err: Option<String> = None;
 
@@ -121,6 +122,7 @@ pub(crate) async fn run_agent_loop(
                         in_thinking = true;
                     }
                     observer.on_stream_chunk(&t);
+                    round_reasoning.push_str(&t);
                 }
                 Ok(ApiEvent::ToolCall(call)) => tool_calls.push(call),
                 Ok(ApiEvent::Usage(usage)) => {
@@ -162,7 +164,11 @@ pub(crate) async fn run_agent_loop(
             };
         }
 
-        messages.push(assistant_tool_call_msg(&round_text, &tool_calls));
+        messages.push(assistant_tool_call_msg(
+            &round_text,
+            &tool_calls,
+            &round_reasoning,
+        ));
         for call in &tool_calls {
             if cancel.is_cancelled() {
                 return LoopOutcome {
@@ -213,7 +219,7 @@ pub(crate) async fn run_agent_loop(
 
 /// Build the assistant message that carries `tool_calls`. OpenAI requires
 /// `function.arguments` to be a JSON *string*.
-fn assistant_tool_call_msg(text: &str, calls: &[ToolCall]) -> Value {
+fn assistant_tool_call_msg(text: &str, calls: &[ToolCall], reasoning: &str) -> Value {
     let tool_calls: Vec<Value> = calls
         .iter()
         .map(|c| {
@@ -224,11 +230,15 @@ fn assistant_tool_call_msg(text: &str, calls: &[ToolCall]) -> Value {
             })
         })
         .collect();
-    json!({
+    let mut msg = json!({
         "role": "assistant",
         "content": if text.is_empty() { Value::Null } else { json!(text) },
         "tool_calls": tool_calls,
-    })
+    });
+    if !reasoning.is_empty() {
+        msg["reasoning_content"] = json!(reasoning);
+    }
+    msg
 }
 
 fn tool_result_msg(call_id: &str, content: &str) -> Value {
@@ -311,6 +321,68 @@ mod tests {
             json!({ "role": "system", "content": "sys" }),
             json!({ "role": "user", "content": "go" }),
         ]
+    }
+
+    /// Client that records each `ApiRequest` then replays scripted events.
+    struct RecordingClient {
+        rounds: Mutex<VecDeque<Vec<ApiEvent>>>,
+        seen: Mutex<Vec<Vec<Value>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ApiClient for RecordingClient {
+        async fn complete(
+            &self,
+            request: ApiRequest,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<ApiEvent>> + Send>>> {
+            self.seen.lock().unwrap().push(request.messages);
+            let batch = self
+                .rounds
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| vec![ApiEvent::Done(StopReason::EndTurn)]);
+            Ok(Box::pin(futures::stream::iter(batch.into_iter().map(Ok))))
+        }
+    }
+
+    #[tokio::test]
+    async fn assistant_tool_call_replay_includes_reasoning_content() {
+        let client = RecordingClient {
+            rounds: Mutex::new(VecDeque::from(vec![
+                vec![
+                    ApiEvent::Reasoning("let me think".into()),
+                    tool_call("echo"),
+                    ApiEvent::Done(StopReason::ToolUse),
+                ],
+                vec![
+                    ApiEvent::Text("ok".into()),
+                    ApiEvent::Done(StopReason::EndTurn),
+                ],
+            ])),
+            seen: Mutex::new(Vec::new()),
+        };
+        let tools = ToolRegistry::new(vec![Box::new(EchoTool)]);
+        let cancel = CancellationToken::new();
+        let outcome = run_agent_loop(
+            &client,
+            &tools,
+            &ctx(),
+            &NoopObserver,
+            "deepseek-v4-pro",
+            initial_messages(),
+            &LoopLimits::default(),
+            &cancel,
+        )
+        .await;
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        let seen = client.seen.lock().unwrap();
+        assert!(seen.len() >= 2, "expected a second request after the tool round");
+        let assistant = seen[1]
+            .iter()
+            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+            .expect("assistant tool-call message on second request");
+        assert_eq!(assistant["reasoning_content"], "let me think");
     }
 
     fn tool_call(name: &str) -> ApiEvent {

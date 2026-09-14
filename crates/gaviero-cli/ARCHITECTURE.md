@@ -72,7 +72,7 @@ parse Cli
   │     --remember / --graph[--enrich] / --cleanup-branches
   │     --manifest-* / --eval-* / --seed-corpus-from-paths
   │     --sleep / --utilization-* / --deletions-* / --restore-*
-  │     --forget-* / --forget-history-id / --mcp-stats
+  │     --forget-* / --forget-history-id / --mcp-stats / --mcp-reach-probe
   │
   ├─ plan input:
   │     --task            → synthetic WorkUnit (owned=["."])
@@ -92,7 +92,7 @@ parse Cli
 [`resolve_model_spec`](src/main.rs) / [`backend_config_for_model`](../gaviero-core/src/swarm/backend/shared.rs):
 
 ```
-claude:…  codex:…  cursor:…  ollama:…  local:…  deepseek:…
+claude:…  codex:…  cursor:…  ollama:…  local:…  deepseek:…  dsh:…
 ```
 
 Bare names rejected. `--coordinator-model` for `--coordinated`. `--ollama-base-url` overrides Ollama endpoint.
@@ -143,6 +143,9 @@ Binary only — no library API. Public surface is the CLI:
 --cleanup-branches [--force]
 --no-mcp --mcp-url --mcp-stdio --mcp-codex-trust
 --skip-mcp-preflight --mcp-stats [--mcp-stats-path]
+--mcp-reach-probe [--reach-providers LIST] [--reach-depth N]
+  [--reach-transport stdio|http|both] [--reach-json]
+--mcp-register-user [claude,codex] --mcp-unregister-user [claude,codex]
 --namespace --read-ns --accept-c1-migration
 --remember [--remember-scope]
 --manifest-last / --manifest-turn

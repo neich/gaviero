@@ -73,6 +73,7 @@ pub struct ClaudeSession {
     /// so per-turn spawn doesn't need to re-resolve workspace settings.
     available_tools: Option<Vec<String>>,
     approved_tools: Option<Vec<String>>,
+    exposed_tools: Option<Vec<String>>,
     profile: ProviderProfile,
     /// Resume handle, initialized from `options.resume_session_id` at
     /// construction. M6: set once and used as input to `AcpSession::spawn`
@@ -116,6 +117,7 @@ impl ClaudeSession {
         let auto_approve = args.options.auto_approve;
         let available_tools = args.options.available_tools.clone();
         let approved_tools = args.options.approved_tools.clone();
+        let exposed_tools = args.options.exposed_tools.clone();
 
         Self {
             write_gate: args.write_gate,
@@ -130,6 +132,7 @@ impl ClaudeSession {
             auto_approve,
             available_tools,
             approved_tools,
+            exposed_tools,
             profile: args.profile,
             handle,
             cancel_token: args.cancel_token,
@@ -246,7 +249,8 @@ impl ClaudeSession {
         // System prompt (same as legacy path — from ClaudeCodeBackend capabilities).
         let system_prompt = shared::default_editor_system_prompt(
             &crate::swarm::backend::claude_code::ClaudeCodeBackend::new(&self.claude_model)
-                .capabilities(),
+                .capabilities()
+                .with_exposed_tools(self.exposed_tools.as_deref()),
         );
 
         // Build `build_enriched_prompt`-equivalent for file refs + history.
