@@ -64,9 +64,10 @@ pub(crate) fn consolidate_conversation(app: &App, conv_id: &str) {
     let run_id = conv_id.to_string();
     let mem = memory.clone();
     let writer = writer.clone();
+    let skills_emit = gaviero_core::skills::emit::EmitSettings::from_workspace(&app.workspace, Some(&workspace_root));
 
     tokio::spawn(async move {
-        let consolidator = Consolidator::with_stores_and_writer(mem, writer);
+        let consolidator = Consolidator::with_stores_and_writer(mem.clone(), writer);
         match consolidator.consolidate_run(&run_id, &repo_id).await {
             Ok(report) => {
                 tracing::info!(
@@ -75,6 +76,9 @@ pub(crate) fn consolidate_conversation(app: &App, conv_id: &str) {
                     report.promoted,
                     report.pruned
                 );
+                if let Err(error) = gaviero_core::skills::emit::emit_after_consolidation(&workspace_root, mem.as_ref(), &skills_emit).await {
+                    tracing::warn!("skills.emit after conversation consolidation failed: {error}");
+                }
             }
             Err(e) => {
                 tracing::warn!("consolidate_run failed for {}: {}", run_id, e);

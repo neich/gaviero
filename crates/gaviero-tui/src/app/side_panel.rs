@@ -2204,6 +2204,10 @@ pub(crate) fn dispatch_prompt_core(
         available_tools: Some(agent_available_tools),
         approved_tools: Some(agent_approved_tools),
         tool_policy,
+        exposed_tools: Some(gaviero_core::mcp::resolve_exposed_tools(
+            &app.workspace,
+            Some(&root),
+        )),
         resume_session_id,
         ..gaviero_core::acp::session::AgentOptions::default()
     };

@@ -1500,37 +1500,39 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 // Synthesize provider configs for either path below
                 // (hosting or reusing). Agents address the endpoint, not
                 // which process owns the accept loop.
-                let synthesize_mcp_configs =
-                    |app: &App, endpoint: &gaviero_core::mcp::McpEndpoint| {
-                        let codex_trust = match app
-                            .workspace
-                            .resolve_setting(
-                                gaviero_core::workspace::settings::MCP_GAVIERO_CODEX_TRUST,
-                                Some(&workspace_root_for_mcp),
-                            )
-                            .as_str()
-                            .unwrap_or("unknown")
-                        {
-                            "granted" | "trusted" => gaviero_core::mcp::TrustConsent::Granted,
-                            "denied" | "untrusted" => gaviero_core::mcp::TrustConsent::Denied,
-                            _ => gaviero_core::mcp::TrustConsent::Unknown,
-                        };
-                        let mut overrides = gaviero_core::mcp::McpConfigOverrides::default();
-                        overrides.codex_trust = Some(codex_trust);
-                        let synth = gaviero_core::mcp::resolve_mcp_config_synth(
-                            &app.workspace,
-                            &workspace_root_for_mcp,
-                            endpoint.clone(),
-                            &overrides,
-                        );
-                        if let Err(e) = gaviero_core::mcp::synthesize_for_worktree(&synth) {
-                            tracing::warn!(
-                                target: "mcp_server",
-                                error = %e,
-                                "failed to synthesize workspace MCP config"
-                            );
-                        }
+                let synthesize_mcp_configs = |app: &App,
+                                              endpoint: &gaviero_core::mcp::McpEndpoint,
+                                              http: Option<gaviero_core::mcp::HttpSynthEndpoint>| {
+                    let codex_trust = match app
+                        .workspace
+                        .resolve_setting(
+                            gaviero_core::workspace::settings::MCP_GAVIERO_CODEX_TRUST,
+                            Some(&workspace_root_for_mcp),
+                        )
+                        .as_str()
+                        .unwrap_or("unknown")
+                    {
+                        "granted" | "trusted" => gaviero_core::mcp::TrustConsent::Granted,
+                        "denied" | "untrusted" => gaviero_core::mcp::TrustConsent::Denied,
+                        _ => gaviero_core::mcp::TrustConsent::Unknown,
                     };
+                    let mut overrides = gaviero_core::mcp::McpConfigOverrides::default();
+                    overrides.codex_trust = Some(codex_trust);
+                    let mut synth = gaviero_core::mcp::resolve_mcp_config_synth(
+                        &app.workspace,
+                        &workspace_root_for_mcp,
+                        endpoint.clone(),
+                        &overrides,
+                    );
+                    synth.http = http;
+                    if let Err(e) = gaviero_core::mcp::synthesize_for_worktree(&synth) {
+                        tracing::warn!(
+                            target: "mcp_server",
+                            error = %e,
+                            "failed to synthesize workspace MCP config"
+                        );
+                    }
+                };
                 // Another gaviero process (typically a first TUI, or a
                 // headless CLI) may already own this workspace endpoint.
                 // Rebinding fails on Windows (`first_pipe_instance`) and
@@ -1542,7 +1544,15 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                         endpoint = %endpoint,
                         "reusing mcp server already listening on workspace endpoint"
                     );
-                    synthesize_mcp_configs(app, &endpoint);
+                    synthesize_mcp_configs(
+                        app,
+                        &endpoint,
+                        gaviero_core::mcp::reuse_http_endpoint(
+                            &workspace_root_for_mcp,
+                            &app.workspace,
+                        )
+                        .map(|e| gaviero_core::mcp::http_synth_from(&e)),
+                    );
                     app.chat_state.add_system_message(&format!(
                         "Reusing gaviero MCP server already listening on {endpoint} \
                          (another gaviero instance serves this workspace). Keep that \
@@ -1591,6 +1601,10 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                         &app.workspace,
                         Some(&workspace_root_for_mcp),
                     ))
+                    .with_exposed_tools(gaviero_core::mcp::resolve_exposed_tools(
+                        &app.workspace,
+                        Some(&workspace_root_for_mcp),
+                    ))
                     .with_symbol_enrichment(
                         app.workspace
                             .resolve_setting(
@@ -1636,8 +1650,34 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                     // connection clone.
                     let warm = server.clone();
                     tokio::spawn(async move { warm.warmup().await });
+                    let http_server = server.clone();
                     match gaviero_core::mcp::spawn_mcp_server(server, &endpoint) {
                         Ok(handle) => {
+                            let (handle, http) = match gaviero_core::mcp::maybe_spawn_http_listener(
+                                http_server,
+                                &workspace_root_for_mcp,
+                                &app.workspace,
+                            ) {
+                                Ok(Some(http)) => {
+                                    let synth =
+                                        gaviero_core::mcp::http_synth_from(&http.endpoint);
+                                    tracing::info!(
+                                        target: "mcp_http",
+                                        url = %http.endpoint.url,
+                                        "mcp http listening"
+                                    );
+                                    (handle.with_http_listener(http), Some(synth))
+                                }
+                                Ok(None) => (handle, None),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        target: "mcp_http",
+                                        error = %e,
+                                        "mcp http listener failed"
+                                    );
+                                    (handle, None)
+                                }
+                            };
                             let handle = handle.with_endpoint_descriptor(&workspace_root_for_mcp);
                             tracing::info!(
                                 target: "mcp_server",
@@ -1645,7 +1685,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                                 "mcp server listening"
                             );
                             app.mcp_server = Some(handle);
-                            synthesize_mcp_configs(app, &endpoint);
+                            synthesize_mcp_configs(app, &endpoint, http);
                         }
                         Err(e) => {
                             // C9: keep the session alive (prompt-time injection
