@@ -4,7 +4,7 @@
 //! merged into every swarm worktree alongside `gaviero` and `context7`.
 //! CLI flags `--mcp-url` / `--mcp-stdio` append or override by name.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
@@ -318,11 +318,12 @@ pub fn resolve_mcp_config_synth(
             .as_bool()
             .unwrap_or(true)
     });
-    let shim_binary = workspace
+    let configured_shim = workspace
         .resolve_setting(S::MCP_GAVIERO_SHIM_BINARY, Some(root))
         .as_str()
         .unwrap_or("gaviero-mcp-shim")
         .to_string();
+    let shim_binary = resolve_shim_binary(&configured_shim, sibling_shim_path());
     let codex_trust = overrides.codex_trust.unwrap_or_else(|| {
         match workspace
             .resolve_setting(S::MCP_GAVIERO_CODEX_TRUST, Some(root))
@@ -351,7 +352,68 @@ pub fn resolve_mcp_config_synth(
         permissions: resolve_mcp_permissions(workspace, Some(root)),
         bash: resolve_bash_permissions(workspace, Some(root)),
         available_tools: resolve_available_tools(workspace, Some(root)),
+        explicit_ref_required: super::reach::ReachStore::load(root)
+            .ok()
+            .flatten()
+            .and_then(|r| r.providers.get("codex").cloned())
+            .is_some_and(|p| p.explicit_ref_required),
+        transport: resolve_transport_choice(workspace, Some(root)),
+        http: None,
     }
+}
+
+fn resolve_transport_choice(
+    workspace: &Workspace,
+    root: Option<&Path>,
+) -> super::config_synth::McpTransportChoice {
+    use super::config_synth::{McpTransportChoice, McpTransportKind};
+    let default = workspace
+        .resolve_setting(S::MCP_GAVIERO_TRANSPORT, root)
+        .as_str()
+        .map(McpTransportKind::parse)
+        .unwrap_or_default();
+    let mut per_vendor = std::collections::HashMap::new();
+    if let Some(obj) = workspace
+        .resolve_setting(S::MCP_GAVIERO_TRANSPORT_BY_PROVIDER, root)
+        .as_object()
+    {
+        for (k, v) in obj {
+            if let Some(s) = v.as_str() {
+                per_vendor.insert(k.clone(), McpTransportKind::parse(s));
+            }
+        }
+    }
+    McpTransportChoice { default, per_vendor }
+}
+
+/// `mcp.gavieroServer.exposedTools` after the workspace cascade.
+/// `memory_ping` is always included even when the setting omits it.
+pub fn resolve_exposed_tools(workspace: &Workspace, root: Option<&Path>) -> Vec<String> {
+    let val = workspace.resolve_setting(S::MCP_GAVIERO_EXPOSED_TOOLS, root);
+    let mut tools: Vec<String> = val
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()))
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            crate::mcp::tools::ALL_MCP_TOOLS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect()
+        });
+    if !workspace.resolve_setting(S::REPO_MAP_SYMBOL_ENRICHMENT_ENABLED, root).as_bool().unwrap_or(false) {
+        tools.retain(|tool| !matches!(tool.as_str(), "symbol_search" | "symbol_doc"));
+    }
+    if !tools
+        .iter()
+        .any(|t| t == crate::mcp::tools::TOOL_MEMORY_PING)
+    {
+        tools.push(crate::mcp::tools::TOOL_MEMORY_PING.to_string());
+    }
+    tools
 }
 
 /// `agent.availableTools` after the workspace cascade (hardcoded default
@@ -365,6 +427,36 @@ fn resolve_available_tools(workspace: &Workspace, root: Option<&Path>) -> Option
             .map(String::from)
             .collect()
     })
+}
+
+/// Bare default names that mean "find the shim yourself".
+fn shim_name_is_default(configured: &str) -> bool {
+    matches!(configured, "gaviero-mcp-shim" | "gaviero-mcp-shim.exe")
+}
+
+/// `current_exe().parent()/gaviero-mcp-shim[.exe]` when that file exists.
+pub fn sibling_shim_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let name = if cfg!(windows) {
+        "gaviero-mcp-shim.exe"
+    } else {
+        "gaviero-mcp-shim"
+    };
+    let candidate = dir.join(name);
+    candidate.is_file().then_some(candidate)
+}
+
+/// Prefer a same-directory shim next to this process when the setting is
+/// still the bare default. An explicit `mcp.gavieroServer.shimBinary` wins.
+pub fn resolve_shim_binary(configured: &str, sibling: Option<PathBuf>) -> String {
+    if !shim_name_is_default(configured) {
+        return configured.to_string();
+    }
+    match sibling {
+        Some(p) => p.to_string_lossy().into_owned(),
+        None => configured.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -512,5 +604,62 @@ mod tests {
             &out[0].transport,
             ExtraMcpTransport::Url { url } if url == "https://from-cli"
         ));
+    }
+
+    #[test]
+    fn resolve_shim_binary_prefers_existing_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let sibling = dir.path().join("gaviero-mcp-shim.exe");
+        std::fs::write(&sibling, b"").unwrap();
+        let resolved = resolve_shim_binary("gaviero-mcp-shim", Some(sibling.clone()));
+        assert_eq!(resolved, sibling.to_string_lossy());
+    }
+
+    #[test]
+    fn resolve_shim_binary_keeps_explicit_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let sibling = dir.path().join("gaviero-mcp-shim.exe");
+        std::fs::write(&sibling, b"").unwrap();
+        let resolved = resolve_shim_binary(r"C:\custom\shim.exe", Some(sibling));
+        assert_eq!(resolved, r"C:\custom\shim.exe");
+    }
+
+    #[test]
+    fn resolve_shim_binary_falls_back_to_bare_name() {
+        assert_eq!(
+            resolve_shim_binary("gaviero-mcp-shim", None),
+            "gaviero-mcp-shim"
+        );
+    }
+
+    #[test]
+    fn resolve_exposed_tools_defaults_to_full_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::single_folder(dir.path().to_path_buf());
+        let tools = resolve_exposed_tools(&ws, Some(dir.path()));
+        for name in crate::mcp::tools::ALL_MCP_TOOLS {
+            assert!(tools.contains(&name.to_string()), "missing {name}");
+        }
+        assert_eq!(tools.len(), crate::mcp::tools::ALL_MCP_TOOLS.len());
+    }
+
+    #[test]
+    fn resolve_exposed_tools_always_includes_memory_ping() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".gaviero")).unwrap();
+        std::fs::write(
+            dir.path().join(".gaviero/settings.json"),
+            r#"{"mcp":{"gavieroServer":{"exposedTools":["memory_search"]}}}"#,
+        )
+        .unwrap();
+        let ws = Workspace::single_folder(dir.path().to_path_buf());
+        let tools = resolve_exposed_tools(&ws, Some(dir.path()));
+        assert_eq!(
+            tools,
+            vec![
+                crate::mcp::tools::TOOL_MEMORY_SEARCH.to_string(),
+                crate::mcp::tools::TOOL_MEMORY_PING.to_string(),
+            ]
+        );
     }
 }

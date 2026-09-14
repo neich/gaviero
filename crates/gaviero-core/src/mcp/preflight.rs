@@ -149,8 +149,10 @@ fn ensure_shim_resolvable(shim_binary: &str) -> Result<()> {
         );
     }
     bail!(
-        "gaviero MCP shim {shim_binary:?} is not on PATH — \
-         run `cargo install --path crates/gaviero-mcp-shim` or set an absolute shimBinary"
+        "gaviero MCP shim {shim_binary:?} is not on PATH and no sibling \
+         gaviero-mcp-shim was found next to this process — \
+         run `cargo install --path crates/gaviero-mcp-shim`, keep the shim next to \
+         gaviero/gaviero-cli, or set mcp.gavieroServer.shimBinary to an absolute path"
     );
 }
 

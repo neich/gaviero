@@ -22,6 +22,23 @@ pub const TOOL_MEMORY_GET: &str = "memory_get";
 pub const TOOL_MEMORY_FLAG: &str = "memory_flag";
 pub const TOOL_MEMORY_PING: &str = "memory_ping";
 
+/// Full in-process surface. Default for `mcp.gavieroServer.exposedTools`
+/// so honoring that setting does not shrink the live product contract.
+pub const ALL_MCP_TOOLS: &[&str] = &[
+    TOOL_MEMORY_SEARCH,
+    TOOL_MEMORY_GET,
+    TOOL_MEMORY_PING,
+    TOOL_BLAST_RADIUS,
+    TOOL_NODE_DOC,
+    TOOL_REPO_OUTLINE,
+    TOOL_SYMBOL_SEARCH,
+    TOOL_SYMBOL_DOC,
+    TOOL_MEMORY_FLAG,
+];
+
+/// Documented lean preset for nested-heavy sessions (P3.2 / README).
+pub const LEAN_EXPOSED_TOOLS: &[&str] = &[TOOL_MEMORY_SEARCH, TOOL_MEMORY_GET, TOOL_MEMORY_PING];
+
 // ── memory_search ─────────────────────────────────────────────────
 
 /// Input schema for the `memory_search` MCP tool.
@@ -504,6 +521,8 @@ mod tests {
         assert_eq!(TOOL_MEMORY_GET, "memory_get");
         assert_eq!(TOOL_MEMORY_FLAG, "memory_flag");
         assert_eq!(TOOL_MEMORY_PING, "memory_ping");
+        assert_eq!(ALL_MCP_TOOLS.len(), 9);
+        assert_eq!(LEAN_EXPOSED_TOOLS, [TOOL_MEMORY_SEARCH, TOOL_MEMORY_GET, TOOL_MEMORY_PING]);
         // C1.6: documented default kind is record.
         assert_eq!(MEMORY_SEARCH_DEFAULT_KIND, "record");
     }

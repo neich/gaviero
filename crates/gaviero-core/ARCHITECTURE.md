@@ -9,7 +9,7 @@ Conventions and rules: [CLAUDE.md](CLAUDE.md). Workspace topology: [../../ARCHIT
 ## Topology
 
 ```
-gaviero-core (lib, 25 pub mods)
+gaviero-core (lib, 26 pub mods)
  ├── swarm/ + agent_session/     orchestration + provider transport
  ├── memory/ + mcp/              scoped store + read-only MCP server
  ├── write_gate/ + scope_*       single write path for all agents
@@ -20,8 +20,9 @@ gaviero-core (lib, 25 pub mods)
          └── McpEndpoint (.gaviero/mcp.sock | \\.\pipe\gaviero-<hash>)
                    ▲
                    │ gaviero-mcp-shim (stdio bridge; not a crate dep)
-         subprocess agents (claude / codex / cursor)
-         DeepSeek: in-process tool_agent — no shim
+         subprocess agents (claude / codex / cursor / dsh-acp)
+         DeepSeek `deepseek:`: in-process tool_agent — no shim
+         HTTP: 127.0.0.1:<derived-port>/mcp (bearer token)
 ```
 
 Depends on: tokio, tree-sitter 0.25 (+ grammars), git2, rusqlite + sqlite-vec, ort + tokenizers, petgraph, portable-pty, rmcp, … — see [CLAUDE.md](CLAUDE.md) Dependencies. Downstream crates must **not** depend on `tree-sitter` directly; use re-exports from [`src/lib.rs`](src/lib.rs).
@@ -30,11 +31,11 @@ Depends on: tokio, tree-sitter 0.25 (+ grammars), git2, rusqlite + sqlite-vec, o
 
 ## Modules
 
-**25 pub mods** from [`src/lib.rs`](src/lib.rs):
+**26 pub mods** from [`src/lib.rs`](src/lib.rs):
 
 ```
 gaviero-core/src/
-├─ lib.rs                 Re-exports tree-sitter types + 25 pub mods
+├─ lib.rs                 Re-exports tree-sitter types + 26 pub mods
 ├─ types.rs               FileScope, WriteProposal, ModelTier, PrivacyLevel, …
 ├─ workspace.rs           Workspace::single_folder / load, settings cascade
 ├─ session_state.rs       SessionState, TabState, StoredConversation, index
@@ -65,10 +66,11 @@ gaviero-core/src/
 │  ├─ mod.rs              Turn, TransportContext, build_turn, LegacyAgentSession
 │  ├─ claude.rs / codex_exec.rs / codex_app_server.rs / cursor.rs / ollama.rs
 │  ├─ registry.rs         SessionConstruction by ProviderProfile
-│  └─ tool_agent/         In-process API harness (deepseek: today)
-│     ├─ mod.rs / client.rs / config.rs / agent_loop.rs / policy.rs
-│     ├─ replay.rs / snapshot.rs / swarm.rs
-│     └─ tools/           read / write / bash / glob / grep
+│  ├─ tool_agent/         In-process API harness (deepseek: today)
+│  │  ├─ mod.rs / client.rs / config.rs / agent_loop.rs / policy.rs
+│  │  ├─ replay.rs / snapshot.rs / swarm.rs
+│  │  └─ tools/           read / write / bash / glob / grep
+│  └─ agent_client_protocol/  Pattern D — ACP client (`dsh:`)
 ├─ context_planner/       Bootstrap / delta / replay → PlannerSelections
 ├─ mcp/                   In-process MCP server
 │  ├─ server.rs           spawn_mcp_server, GavieroMcpServer
@@ -76,6 +78,10 @@ gaviero-core/src/
 │  ├─ tools.rs            Nine tools (see MCP below)
 │  ├─ probe.rs            ProbeLedger + memory_ping receipts
 │  ├─ transport.rs        McpEndpoint (Unix socket / Windows named pipe)
+│  ├─ http.rs             Loopback streamable-HTTP listener
+│  ├─ endpoint_file.rs    mcp-endpoint.json for shim --resolve
+│  ├─ reach_probe.rs      Nested MCP reach (memory_ping)
+│  ├─ user_scope.rs       claude/codex user-scope registration (CLI flags)
 │  ├─ config_synth.rs     Per-worktree .mcp.json / .codex/ / .cursor/
 │  ├─ preflight.rs        Shim PATH + URL checks
 │  ├─ telemetry_sink.rs   NDJSON call metrics (--mcp-stats)
@@ -87,6 +93,7 @@ gaviero-core/src/
 │  └─ backend/            AgentBackend + UnifiedStreamEvent
 │     ├─ claude_code.rs / codex.rs / cursor.rs / ollama.rs
 │     ├─ deepseek.rs      DeepseekBackend → tool_agent
+│     ├─ dsh.rs           DshBackend → AcpClientSession
 │     ├─ mock.rs / executor.rs / runner.rs / shared.rs
 │     └─ mod.rs           BackendConfig (incl. Deepseek)
 ├─ iteration/             IterationEngine (retry, BestOfN, TDD)
@@ -115,7 +122,7 @@ async fn stream_completion(&self, req: CompletionRequest)
 
 Events: `TextDelta | ThinkingDelta | ToolCallStart/Delta/End | FileBlock | PathsModified | Usage | Error | Done`.
 
-[`BackendConfig`](src/swarm/backend/mod.rs): `ClaudeCode | Codex | Cursor | Ollama | Deepseek | Custom` (Custom unimplemented). Materialized by [`create_backend`](src/swarm/backend/mod.rs).
+[`BackendConfig`](src/swarm/backend/mod.rs): `ClaudeCode | Codex | Cursor | Ollama | Deepseek | Dsh | Custom` (Custom unimplemented). Materialized by [`create_backend`](src/swarm/backend/mod.rs).
 
 **Model spec** ([`shared.rs`](src/swarm/backend/shared.rs)):
 
@@ -126,8 +133,9 @@ Events: `TextDelta | ThinkingDelta | ToolCallStart/Delta/End | FileBlock | Paths
 | `cursor:<name>` | `CursorBackend` |
 | `ollama:<name>` / `local:<name>` | `OllamaStreamBackend` |
 | `deepseek:<name>` | `DeepseekBackend` → [`tool_agent`](src/agent_session/tool_agent) |
+| `dsh:<name>` | `DshBackend` → [`AcpClientSession`](src/agent_session/agent_client_protocol) |
 
-[`validate_model_spec`](src/swarm/backend/shared.rs) rejects bare names. Prefixes: `SUPPORTED_PROVIDER_PREFIXES` = `claude`, `codex`, `cursor`, `ollama`, `local`, `deepseek`. DeepSeek ids: `DEEPSEEK_API_MODELS` (`deepseek-v4-pro`, `deepseek-v4-flash`).
+[`validate_model_spec`](src/swarm/backend/shared.rs) rejects bare names. Prefixes: `SUPPORTED_PROVIDER_PREFIXES` = `claude`, `codex`, `cursor`, `ollama`, `local`, `deepseek`, `dsh`. DeepSeek ids: `DEEPSEEK_API_MODELS` (`deepseek-v4-pro`, `deepseek-v4-flash`) for both `deepseek:` and `dsh:`.
 
 ### `AgentSession` + `Turn` ([`agent_session/mod.rs`](src/agent_session/mod.rs))
 
@@ -141,13 +149,14 @@ Events: `TextDelta | ThinkingDelta | ToolCallStart/Delta/End | FileBlock | Paths
 | `codex-app` | ProcessBound | `CodexAppServerSession` |
 | `ollama` / `local` | StatelessReplay | `OllamaSession` |
 | `deepseek` | StatelessReplay | `ToolAgentSession` |
+| `dsh` | ProcessBound | `AcpClientSession` |
 
-Writes: native edit tools (Claude/Codex/Cursor) or Option-B `<file>` blocks (Ollama / DeepSeek) → same [`WriteGatePipeline`](src/write_gate.rs).
+Writes: native edit tools (Claude/Codex/Cursor), ACP `fs/write_text_file` (`dsh:`), or Option-B `<file>` blocks (Ollama / DeepSeek) → same [`WriteGatePipeline`](src/write_gate.rs).
 
 ### Memory / MCP / observers
 
 - [`MemoryStores`](src/memory/stores.rs) + [`WriterHandle`](src/memory/writer.rs) — multi-DB; single writer task.
-- [`GavieroMcpServer`](src/mcp/server.rs) — nine tools (eight read-only including `memory_ping` + write-adjacent `memory_flag`); **no `WriterHandle`** — `memory_flag` signals through [`mcp/signal.rs`](src/mcp/signal.rs) into the writer task. `memory_ping` records only on an in-memory [`ProbeLedger`](src/mcp/probe.rs).
+- [`GavieroMcpServer`](src/mcp/server.rs) — nine tools (eight read-only including `memory_ping` + write-adjacent `memory_flag`); **no `WriterHandle`** — `memory_flag` signals through [`mcp/signal.rs`](src/mcp/signal.rs) into the writer task. `memory_ping` records only on an in-memory [`ProbeLedger`](src/mcp/probe.rs). Loopback HTTP: [`mcp/http.rs`](src/mcp/http.rs). Shim lookup: [`mcp/endpoint_file.rs`](src/mcp/endpoint_file.rs). Lean surface: `mcp.gavieroServer.exposedTools` (default all nine; lean preset `memory_search`/`memory_get`/`memory_ping`).
 - Observers in [`observer.rs`](src/observer.rs) / [`memory/observer.rs`](src/memory/observer.rs) / [`mcp/observer.rs`](src/mcp/observer.rs).
 
 ---
@@ -232,9 +241,9 @@ First turn: `<repo_topology>` ([`topology::build_folder_topology`](src/repo_map/
 ## API
 
 ```rust
-// crates/gaviero-core/src/lib.rs — 25 pub mods
+// crates/gaviero-core/src/lib.rs — 26 pub mods
 pub mod acp;
-pub mod agent_session;   // + tool_agent (deepseek:)
+pub mod agent_session;   // + tool_agent (deepseek:) + agent_client_protocol (dsh:)
 pub mod context_planner;
 pub mod diff_engine;
 pub mod git;

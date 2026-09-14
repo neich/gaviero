@@ -209,7 +209,7 @@ pub fn provider_cli_bin(provider: &str) -> &str {
         "claude" => "claude",
         "codex" => "codex",
         "cursor" => "agent",
-        "dsh" => "dsh-acp",
+        "dsh" => "dsh",
         other => other,
     }
 }
@@ -325,10 +325,8 @@ fn ingest_workspace_telemetry(ledger: &ProbeLedger, workspace_root: &Path, nonce
 }
 
 fn allowed_tools_for(provider: &str) -> Vec<String> {
-    match provider {
-        "claude" => vec!["Agent".into()],
-        _ => Vec::new(),
-    }
+    // Restrict built-ins to delegation; MCP exposure is configured separately.
+    if provider == "claude" { vec!["Agent".into()] } else { Vec::new() }
 }
 
 fn probe_request(
@@ -358,6 +356,8 @@ fn probe_request(
         suppress_hooks: true,
         file_scope: crate::types::FileScope::default(),
         tool_policy: None,
+        exposed_tools: None,
+        write_gate: None,
     }
 }
 
@@ -424,14 +424,20 @@ pub async fn run_reach_probe(
     ledger: &ProbeLedger,
     cfg: &ReachProbeConfig,
 ) -> Result<ReachReport> {
-    let (agent_root, _guard) = prepare_probe_worktree(workspace_root, synth)?;
-    let transport_label = match cfg.transport {
-        ReachTransport::Http => "http",
-        ReachTransport::Both => "stdio", // HTTP listener is P2; stdio until then
-        ReachTransport::Stdio => "stdio",
+    let transports: &[&str] = match cfg.transport {
+        ReachTransport::Http => &["http"],
+        ReachTransport::Both => &["stdio", "http"],
+        ReachTransport::Stdio => &["stdio"],
     };
-
+    if transports.contains(&"http") && synth.http.is_none() {
+        anyhow::bail!("HTTP reach probe requires a live HTTP endpoint; enable mcp.gavieroServer.http.enabled");
+    }
     let mut providers = BTreeMap::new();
+    for transport_label in transports {
+        let mut transport_synth = synth.clone();
+        transport_synth.transport.default = super::config_synth::McpTransportKind::parse(transport_label);
+        transport_synth.transport.per_vendor.clear();
+        let (agent_root, _guard) = prepare_probe_worktree(workspace_root, &transport_synth)?;
     for provider in &cfg.providers {
         let row = probe_one_provider(
             provider,
@@ -443,7 +449,11 @@ pub async fn run_reach_probe(
             LiveBackendFactory,
         )
         .await;
+        if transports.len() > 1 {
+            providers.insert(format!("{provider}@{transport_label}"), row.clone());
+        }
         providers.insert(provider.clone(), row);
+    }
     }
 
     Ok(ReachReport {
@@ -478,13 +488,7 @@ fn prepare_probe_worktree(
             let path = handle.path.clone();
             let mut synth = synth.clone();
             synth.worktree = path.clone();
-            if let Err(e) = super::synthesize_for_worktree(&synth) {
-                tracing::warn!(
-                    target: "mcp_reach",
-                    error = %e,
-                    "probe worktree MCP synth failed; continuing"
-                );
-            }
+            super::synthesize_for_worktree(&synth)?;
             Ok((
                 path,
                 ProbeWorktreeGuard {
@@ -504,7 +508,7 @@ fn prepare_probe_worktree(
             let path = tmp.path().to_path_buf();
             let mut synth = synth.clone();
             synth.worktree = path.clone();
-            let _ = super::synthesize_for_worktree(&synth);
+            super::synthesize_for_worktree(&synth)?;
             Ok((
                 path,
                 ProbeWorktreeGuard {

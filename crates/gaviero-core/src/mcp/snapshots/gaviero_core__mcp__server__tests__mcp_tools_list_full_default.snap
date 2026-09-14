@@ -1,0 +1,779 @@
+---
+source: crates/gaviero-core/src/mcp/server.rs
+expression: "&default_pretty"
+---
+[
+  {
+    "name": "blast_radius",
+    "description": "Graph impact, callers, or tests for file paths. Read-only. Token cost: ~20-40 per relation.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "depth": {
+          "description": "Graph traversal depth. Clamped to [1, 5]. Defaults to 2 —\nmatches the chat-path default.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "mode": {
+          "description": "Relation mode: `\"all\"` (default), `\"impact\"`, `\"callers\"`,\n`\"tests\"`, or `\"implementations\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "paths": {
+          "description": "One or more seed paths (repo-relative). Empty inputs are an\nerror.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "paths"
+      ],
+      "title": "BlastRadiusInput",
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "BlastRadiusRelation": {
+          "properties": {
+            "distance": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "path": {
+              "type": "string"
+            },
+            "purpose": {
+              "description": "Populated when the Tier D1 NodeDoc schema lands; empty today.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "qualified_name": {
+              "description": "Stable graph key for chaining to `symbol_doc` / `symbol_search`.\nFor file-level nodes this equals `path`.",
+              "type": "string"
+            },
+            "relation": {
+              "type": "string"
+            },
+            "score": {
+              "description": "C4: mode-weighted personalized PageRank score for this file.\nHigher = more relevant for the requested `mode`. Optional so\npre-C4 callers ignore it cleanly.",
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "specificity": {
+              "description": "C3: HippoRAG-style file-level node specificity in [0.0, 1.0].\n1.0 = domain-specific, ~0.0 = stop-symbol heavy. Optional so\nagents can ignore it without breaking the schema.",
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "path",
+            "qualified_name",
+            "relation",
+            "distance"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "nodes": {
+          "items": {
+            "$ref": "#/$defs/BlastRadiusRelation"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "nodes"
+      ],
+      "title": "BlastRadiusOutput",
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "memory_flag",
+    "description": "Demote a stale memory's trust by id and scope; never deletes. Token cost: ~40.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Input schema for `memory_flag`. `scope` is required for the same\nreason as [`MemoryGetInput`]: a bare id is ambiguous across the\nphysical DBs (independent rowid spaces — the BUG-1 root cause).",
+      "properties": {
+        "id": {
+          "description": "Row id from a `memory_search` result.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "reason": {
+          "description": "Why the memory is wrong or stale. Recorded verbatim in the audit\nrow so a human can reverse the demotion by hand.",
+          "type": "string"
+        },
+        "scope": {
+          "description": "Owning scope, as returned by `memory_search`: `\"global\"` |\n`\"workspace\"` | `\"run\"` (run rows live in the workspace store).\n`\"repo\"` / `\"module\"` need folder context the MCP surface does\nnot carry and produce an invalid_params error.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "scope",
+        "reason"
+      ],
+      "title": "MemoryFlagInput",
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Outcome of a `memory_flag` call. `accepted: false` is a *successful*\ncall that declined to mutate — user-authored and History rows are not\nagent-flaggable — not a protocol error.",
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        },
+        "detail": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "accepted",
+        "detail"
+      ],
+      "title": "MemoryFlagOutput",
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "memory_get",
+    "description": "Fetch the full stored row for one memory_search hit by id and scope. Read-only. Token cost: ~80-200.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Input schema for `memory_get`. `scope` is required because a bare\nid is ambiguous across the physical DBs (independent rowid spaces —\nthe BUG-1 root cause); pass the `scope` string a `memory_search`\nresult carries.",
+      "properties": {
+        "id": {
+          "description": "Row id from a `memory_search` result.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "scope": {
+          "description": "Owning scope, as returned by `memory_search`: `\"global\"` |\n`\"workspace\"` | `\"run\"` (run rows live in the workspace store).\n`\"repo\"` / `\"module\"` need folder context the MCP surface does\nnot carry and produce an invalid_params error.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "scope"
+      ],
+      "title": "MemoryGetInput",
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "MemoryGetRow": {
+          "description": "Full memory row for one `memory_search` hit.",
+          "properties": {
+            "access_count": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "accessed_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "created_at": {
+              "type": "string"
+            },
+            "id": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "importance": {
+              "format": "float",
+              "type": "number"
+            },
+            "kind": {
+              "description": "Lifecycle class: `record` | `history` | `summary`.",
+              "type": "string"
+            },
+            "scope": {
+              "type": "string"
+            },
+            "tag": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "text": {
+              "type": "string"
+            },
+            "trust": {
+              "format": "float",
+              "type": "number"
+            },
+            "type": {
+              "type": "string"
+            },
+            "updated_at": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "scope",
+            "kind",
+            "type",
+            "text",
+            "importance",
+            "trust",
+            "created_at",
+            "updated_at",
+            "access_count"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "`memory` is `None` on an id/scope miss — a miss is an empty result,\nnot an error.",
+      "properties": {
+        "memory": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryGetRow"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "title": "MemoryGetOutput",
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "memory_ping",
+    "description": "Reach-probe ping; records nonce and depth on an in-memory ledger. Token cost: ~20.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Input schema for `memory_ping`. Nested reach probes call this with\na run-scoped `nonce` and a nesting `depth` (0 = top-level session).",
+      "properties": {
+        "depth": {
+          "description": "Nesting depth: `0` for the parent session, `1` for a subagent.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "nonce": {
+          "description": "Opaque probe nonce. Verdicts count only matching ledger rows.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "nonce",
+        "depth"
+      ],
+      "title": "MemoryPingInput",
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Output of `memory_ping`. `receipt` is derived by the server so a\nnested agent that *claims* a ping cannot fake a verified nested hit.",
+      "properties": {
+        "depth": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "receipt": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "receipt",
+        "depth",
+        "workspace_id"
+      ],
+      "title": "MemoryPingOutput",
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "memory_search",
+    "description": "Hybrid search over Gaviero memories (repo + workspace + global). Read-only. Token cost: ~50-150 per result.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Input schema for the `memory_search` MCP tool.",
+      "properties": {
+        "kind": {
+          "description": "Tier C / C1.6: lifecycle-class filter. One of `\"record\"`\n(default), `\"history\"`, `\"summary\"`, or `\"any\"`. Records are\nthe workhorse facts; History is the immutable raw transcript\nlog (audit data, not normally injected); Summaries are the\nsession consolidator's output. Subprocess agents should default\nto `record` and only opt into `history` or `any` for\naudit/forensic queries.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "description": "Maximum results. Server clamps to [1, 20] to protect token\nbudget in the calling subprocess.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "query": {
+          "description": "Free-form natural-language query. Same shape as a chat prompt's\nretrieval query.",
+          "type": "string"
+        },
+        "scope_hint": {
+          "description": "Optional scope *restriction*. `\"repo\"` searches only memories\nscoped to this repository; `\"workspace\"` only the workspace\nstore; `\"global\"` only the global store. When omitted, retrieval\nmerges all three via multi-scope hybrid search (RRF), not a\nnarrow→wide cascade. `\"module\"` and `\"run\"` need per-file /\nper-run context the MCP surface does not carry and produce an\ninvalid_params error, as do unknown values.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "title": "MemorySearchInput",
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "MemorySearchResult": {
+          "description": "A single `memory_search` result row. Field set is the minimum\nsubprocess agents need to decide whether to quote the memory in\ntheir next tool call.",
+          "properties": {
+            "id": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "importance": {
+              "format": "float",
+              "type": "number"
+            },
+            "scope": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "trust": {
+              "format": "float",
+              "type": "number"
+            },
+            "type": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "scope",
+            "type",
+            "text",
+            "importance",
+            "trust"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "results": {
+          "items": {
+            "$ref": "#/$defs/MemorySearchResult"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "results"
+      ],
+      "title": "MemorySearchOutput",
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "node_doc",
+    "description": "One file's symbol signatures; chain qualified_name into symbol_doc. Read-only. Token cost: ~30-80.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "title": "NodeDocInput",
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "NodeDocSymbol": {
+          "description": "One symbol entry returned by `node_doc`.",
+          "properties": {
+            "doc_snippet": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "qualified_name": {
+              "type": "string"
+            },
+            "signature": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "qualified_name",
+            "signature"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Node documentation for one file. `symbols` carries stable\n`qualified_name` values for chaining to `symbol_doc`.",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "purpose": {
+          "default": "",
+          "type": "string"
+        },
+        "qualified_name": {
+          "description": "File-level graph key (same as `path` for File nodes).",
+          "type": "string"
+        },
+        "signatures": {
+          "default": [],
+          "description": "Legacy flat list — mirrors `symbols[].signature`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "summary": {
+          "default": "",
+          "type": "string"
+        },
+        "symbols": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/NodeDocSymbol"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "path",
+        "qualified_name"
+      ],
+      "title": "NodeDoc",
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "repo_outline",
+    "description": "PageRank-ranked code outline for mid-run orientation. Read-only. Token cost: bounded by token_cap.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "mode": {
+          "description": "Edge-weight intent: `\"all\"` (default), `\"impact\"`, `\"callers\"`,\n`\"tests\"`, or `\"implementations\"` — mirrors `blast_radius.mode`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "seed_paths": {
+          "description": "Seed paths for personalized PageRank (repo-relative, glob-aware\n— same matching as agent `owned_paths`). Omitted or empty →\n`[\".\"]`, i.e. match-all: rank the whole workspace.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "token_cap": {
+          "description": "Token budget for the outline. Server clamps to [100, 8000];\ndefault 2000 to protect the calling subprocess's token budget.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "title": "RepoOutlineInput",
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "RepoOutlineEntry": {
+          "description": "One ranked outline entry. `rendered` is byte-compatible with the\ncorresponding line of the turn-1 `<repo_outline>` injection.",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "rank_score": {
+              "format": "double",
+              "type": "number"
+            },
+            "rendered": {
+              "type": "string"
+            },
+            "specificity": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "required": [
+            "path",
+            "rank_score",
+            "specificity",
+            "rendered"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "entries": {
+          "items": {
+            "$ref": "#/$defs/RepoOutlineEntry"
+          },
+          "type": "array"
+        },
+        "token_estimate": {
+          "description": "Total estimated tokens across `entries` (outline-line cost, the\nsame budgeting the injector charges). Always ≤ the token cap.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "entries",
+        "token_estimate"
+      ],
+      "title": "RepoOutlineOutput",
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "symbol_doc",
+    "description": "Full enrichment for one qualified_name from symbol_search or node_doc. Read-only. Token cost: ~80-200.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "qualified_name": {
+          "description": "Graph `qualified_name` (`{path}::{symbol}`), e.g. from `symbol_search`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "qualified_name"
+      ],
+      "title": "SymbolDocInput",
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "SymbolDocImpl": {
+          "properties": {
+            "doc_snippet": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "qualified_name": {
+              "type": "string"
+            },
+            "signature": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "qualified_name",
+            "signature"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "bounds": {
+          "type": "string"
+        },
+        "doc": {
+          "type": "string"
+        },
+        "file_path": {
+          "type": "string"
+        },
+        "implementations": {
+          "default": [],
+          "description": "Trait impls linked via `Implements` edges (when `qualified_name` is a trait).",
+          "items": {
+            "$ref": "#/$defs/SymbolDocImpl"
+          },
+          "type": "array"
+        },
+        "qualified_name": {
+          "type": "string"
+        },
+        "role_summary": {
+          "type": "string"
+        },
+        "signature": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "qualified_name",
+        "file_path",
+        "signature",
+        "bounds",
+        "doc",
+        "role_summary"
+      ],
+      "title": "SymbolDocOutput",
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "symbol_search",
+    "description": "Semantic search over enriched symbols. Read-only. Token cost: ~40-100 per hit.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "limit": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "query": {
+          "description": "Natural-language query over symbol signatures + docs.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "title": "SymbolSearchInput",
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "SymbolSearchHit": {
+          "properties": {
+            "doc_snippet": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "file_path": {
+              "type": "string"
+            },
+            "qualified_name": {
+              "type": "string"
+            },
+            "score": {
+              "format": "float",
+              "type": "number"
+            },
+            "signature": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "qualified_name",
+            "file_path",
+            "signature",
+            "score"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "results": {
+          "items": {
+            "$ref": "#/$defs/SymbolSearchHit"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "results"
+      ],
+      "title": "SymbolSearchOutput",
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    }
+  }
+]

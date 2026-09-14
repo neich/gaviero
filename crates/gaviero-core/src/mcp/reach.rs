@@ -22,6 +22,19 @@ use crate::workspace::settings;
 pub const REACH_RECORD_VERSION: u32 = 1;
 pub const REACH_FILENAME: &str = "mcp_reach.json";
 
+fn cached_cli_version(bin: &str) -> Option<String> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, Option<String>>>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(version) = cache.lock().ok()?.get(bin).cloned() {
+        return version;
+    }
+    let version = capture_cli_version(bin);
+    if let Ok(mut values) = cache.lock() {
+        values.insert(bin.to_string(), version.clone());
+    }
+    version
+}
+
 /// On-disk reach record. Same body as [`ReachReport`] plus a format version.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReachRecord {
@@ -74,6 +87,30 @@ impl ReachStore {
         let json = serde_json::to_string_pretty(record).context("serialising mcp_reach.json")?;
         write_atomic(&path, &json)
     }
+
+    /// Preserve providers not included in a partial probe without refreshing
+    /// their age. A full probe replaces all rows with its new timestamp.
+    pub fn merge_save(root: &Path, record: &ReachRecord) -> Result<()> {
+        let mut merged = record.clone();
+        if let Some(old) = Self::load(root)?
+            && old.workspace_id == record.workspace_id
+        {
+            for (name, row) in old.providers {
+                if !merged.providers.contains_key(&name) {
+                    merged.probed_at = merged.probed_at.min(old.probed_at);
+                    merged.providers.insert(name, row);
+                }
+            }
+        }
+        Self::save(root, &merged)
+    }
+
+    pub fn copy_to_worktree(root: &Path, worktree: &Path) -> Result<()> {
+        if root != worktree && let Some(record) = Self::load(root)? {
+            Self::save(worktree, &record)?;
+        }
+        Ok(())
+    }
 }
 
 fn write_atomic(path: &Path, content: &str) -> Result<()> {
@@ -115,9 +152,12 @@ pub struct ReachPolicy {
 impl ReachPolicy {
     pub fn for_workspace(root: &Path) -> Self {
         let now = Utc::now();
-        let versions: BTreeMap<String, Option<String>> = ["claude", "codex", "cursor", "dsh"]
-            .into_iter()
-            .map(|p| (p.to_string(), capture_cli_version(provider_cli_bin(p))))
+        let record = ReachStore::load(root).ok().flatten();
+        let versions: BTreeMap<String, Option<String>> = record
+            .iter()
+            .filter(|rec| !is_stale_age(rec.probed_at, now, read_reach_settings(root).1))
+            .flat_map(|rec| rec.providers.keys())
+            .map(|p| (p.to_string(), cached_cli_version(provider_cli_bin(p))))
             .collect();
         Self::for_workspace_at(root, now, &versions)
     }
@@ -273,6 +313,13 @@ pub fn format_mcp_status(root: &Path, endpoint: &str) -> String {
             out.push_str(&format!("\nfailed to read mcp_reach.json: {e}\n"));
         }
     }
+    let missing = super::agent_defs::report_user_agent_definitions(root, "gaviero");
+    if !missing.is_empty() {
+        out.push_str("\nuser agent definitions missing an explicit gaviero server reference:\n");
+        for p in missing {
+            out.push_str(&format!("  {}\n", p.display()));
+        }
+    }
     out
 }
 
@@ -296,7 +343,7 @@ fn read_mcp_status_settings(root: &Path) -> (bool, u32, String, String) {
         .as_ref()
         .and_then(|d| dot_get(d, settings::MCP_GAVIERO_EXPOSED_TOOLS))
         .map(format_exposed_tools)
-        .unwrap_or_else(|| "memory_search, blast_radius, node_doc".into());
+        .unwrap_or_else(|| crate::mcp::tools::ALL_MCP_TOOLS.join(", "));
     let transport = doc
         .as_ref()
         .and_then(|d| dot_get(d, "mcp.gavieroServer.transport"))
@@ -342,9 +389,7 @@ fn policy_for_provider(
         ReachVerdict::NestedFailed => NestingPolicy::Blocked(format!(
             "{name} nested MCP ping failed; run gaviero-cli --mcp-reach-probe"
         )),
-        ReachVerdict::TopLevelFailed => NestingPolicy::Blocked(format!(
-            "{name} top-level MCP ping failed; run gaviero-cli --mcp-reach-probe"
-        )),
+        ReachVerdict::TopLevelFailed => NestingPolicy::Unknown,
         ReachVerdict::Unsupported | ReachVerdict::Skipped => NestingPolicy::Unknown,
     }
 }

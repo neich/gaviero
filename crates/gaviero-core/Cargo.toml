@@ -3,6 +3,12 @@ name = "gaviero-core"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "fake_acp_agent"
+path = "src/bin/fake_acp_agent.rs"
+test = false
+doc = false
+
 [features]
 # C5: opt-in surface for hosted-API embedders (Voyage, Cohere, OpenAI).
 # Disabled by default — local-first is the priority. Until a real
@@ -55,7 +61,7 @@ reqwest = { workspace = true }
 async-trait = "0.1"
 futures = "0.3"
 tokio-stream = "0.1"
-tokio-util = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 sqlite-vec = "0.1.8"
 sha2 = "0.10"
 # Tier C / C1.4: zstd compression for old History rows. Sleeptime
@@ -69,7 +75,7 @@ tempfile = "3"
 base64 = "0.22"
 # Tier A / A5: MCP server for exposing read-only memory + graph tools to
 # subprocess coding agents. `schemars` is for typed tool input schemas.
-rmcp = { version = "1.5", default-features = false, features = ["server", "macros", "transport-async-rw"] }
+rmcp = { version = "1.5", default-features = false, features = ["server", "macros", "transport-async-rw", "transport-streamable-http-server"] }
 schemars = { workspace = true }
 toml = "0.8"
 chrono = "0.4.44"
@@ -77,6 +83,9 @@ regex = "1"
 walkdir = "2"
 rustdoc-types = "0.57"
 syn = { version = "2", features = ["full", "parsing"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+subtle = "2.6"
+rand = "0.9"
 
 [target.'cfg(windows)'.dependencies]
 # Kill-on-close Job Object (util::spawn::kill_tree_on_exit): ties every

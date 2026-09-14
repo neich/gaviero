@@ -33,7 +33,10 @@ use anyhow::{Context as _, Result};
 use rmcp::ServiceExt;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::{ErrorData, tool, tool_router};
+use rmcp::handler::server::tool::ToolCallContext;
+use rmcp::model::{CallToolRequestParams, ListToolsResult};
+use rmcp::service::RequestContext;
+use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 
 use crate::memory::{
     MemoryScope, MemoryStores, RerankConfig, Reranker, RetrievalConfig, retrieve_ranked_with_levels,
@@ -144,11 +147,33 @@ pub struct GavieroMcpServer {
     /// Instant the server struct was built. Mixed into ping receipts so
     /// two probe runs cannot collide on the same nonce.
     started_at: chrono::DateTime<chrono::Utc>,
+    /// `mcp.gavieroServer.exposedTools`. `None` lists the full router
+    /// surface (tests / callers that skip the setting). `Some` is the
+    /// allow-list; `memory_ping` is always listed unless permissions deny it.
+    exposed_tools: Option<Vec<String>>,
     #[allow(dead_code)] // populated and dispatched via the `#[tool_router]` macro
     tool_router: ToolRouter<Self>,
 }
 
-#[tool_router(server_handler)]
+fn strip_schema_descriptions(schema: &mut serde_json::Value) {
+    if let Some(object) = schema.as_object_mut() {
+        object.remove("description");
+        object.remove("title");
+        for (key, value) in object {
+            if matches!(key.as_str(), "properties" | "$defs" | "definitions") {
+                if let Some(properties) = value.as_object_mut() {
+                    for property in properties.values_mut() { strip_schema_descriptions(property); }
+                }
+            } else {
+                strip_schema_descriptions(value);
+            }
+        }
+    } else if let Some(array) = schema.as_array_mut() {
+        for value in array { strip_schema_descriptions(value); }
+    }
+}
+
+#[tool_router]
 impl GavieroMcpServer {
     pub fn new(
         stores: Arc<MemoryStores>,
@@ -177,6 +202,7 @@ impl GavieroMcpServer {
             signal_sink: None,
             probe_ledger: None,
             started_at: chrono::Utc::now(),
+            exposed_tools: None,
             tool_router: Self::tool_router(),
         }
     }
@@ -185,7 +211,7 @@ impl GavieroMcpServer {
     /// first-tool-call latch while sharing the warm caches (`graph_cache`,
     /// reranker) via `Arc`. Each shim connection is one MCP session, so the
     /// latch is per-session rather than process-global.
-    fn clone_for_connection(&self) -> Self {
+    pub(crate) fn clone_for_connection(&self) -> Self {
         let mut s = self.clone();
         s.first_tool_call_done = Arc::new(AtomicBool::new(false));
         s
@@ -215,21 +241,68 @@ impl GavieroMcpServer {
         });
     }
 
-    /// Install the gaviero-level MCP permission policy. Tools this policy
-    /// denies are rejected server-side, the authoritative enforcement point
-    /// for gaviero's own tools (the client-config translation in
-    /// [`super::synthesize_for_worktree`] is best-effort by comparison).
+    /// Install the gaviero-level MCP permission policy. Denied tools are
+    /// omitted from `tools/list` and rejected on call.
     pub fn with_permissions(mut self, permissions: super::McpPermissions) -> Self {
         self.permissions = permissions;
         self
     }
 
-    /// Reject a call to one of this server's tools when the permission
-    /// policy denies it (server name is always `gaviero`). Mirrors the
-    /// `symbol_enrichment_enabled` gate: the tool stays listed but a denied
-    /// call returns a clear error instead of running.
+    /// Restrict `tools/list` to this allow-list. `memory_ping` is still
+    /// listed even when omitted here. `mcp.permissions` denies hide tools
+    /// from the list as well.
+    pub fn with_exposed_tools(mut self, tools: Vec<String>) -> Self {
+        self.exposed_tools = Some(tools);
+        self
+    }
+
+    /// Names currently advertised on `tools/list`.
+    pub fn listed_tool_names(&self) -> Vec<String> {
+        self.listed_tools()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect()
+    }
+
+    fn listed_tools(&self) -> Vec<rmcp::model::Tool> {
+        self.tool_router
+            .list_all()
+            .into_iter()
+            .filter(|t| self.tool_is_listed(t.name.as_ref()))
+            .map(|mut tool| {
+                let mut schema = serde_json::Value::Object((*tool.input_schema).clone());
+                strip_schema_descriptions(&mut schema);
+                tool.input_schema = Arc::new(schema.as_object().expect("schema object").clone());
+                if let Some(output) = &tool.output_schema {
+                    let mut schema = serde_json::Value::Object((**output).clone());
+                    strip_schema_descriptions(&mut schema);
+                    tool.output_schema = Some(Arc::new(schema.as_object().expect("schema object").clone()));
+                }
+                tool
+            })
+            .collect()
+    }
+
+    fn tool_is_listed(&self, tool: &str) -> bool {
+        if !self.symbol_enrichment_enabled && matches!(tool, "symbol_search" | "symbol_doc") {
+            return false;
+        }
+        if !self.permissions.tool_allowed("gaviero", tool) {
+            return false;
+        }
+        if tool == super::tools::TOOL_MEMORY_PING {
+            return true;
+        }
+        match &self.exposed_tools {
+            None => true,
+            Some(list) => list.iter().any(|t| t == tool),
+        }
+    }
+
+    /// Reject a call when the permission policy or the exposed-tool
+    /// allow-list hides the tool.
     fn ensure_tool_allowed(&self, tool: &str) -> Result<(), ErrorData> {
-        if self.permissions.tool_allowed("gaviero", tool) {
+        if self.tool_is_listed(tool) {
             Ok(())
         } else {
             Err(ErrorData::invalid_request(
@@ -412,13 +485,7 @@ impl GavieroMcpServer {
     // ── memory_search ───────────────────────────────────────────────
     #[tool(
         name = "memory_search",
-        description = "Call when you need a project fact that is not in the turn-1 \
-                       <project_memory> constitution (lessons, gotchas, errors, extracted \
-                       factuals). Default `kind=record`. Merged multi-scope hybrid search \
-                       (repo + workspace + global, RRF) over Gaviero's memory store; \
-                       returns up to `limit` scored memories (id, scope, type, text, \
-                       importance, trust). Read-only. Token cost: roughly 50-150 tokens \
-                       per result.",
+        description = "Hybrid search over Gaviero memories (repo + workspace + global). Read-only. Token cost: ~50-150 per result.",
         annotations(read_only_hint = true, idempotent_hint = true)
     )]
     async fn memory_search(
@@ -582,11 +649,7 @@ impl GavieroMcpServer {
     // ── blast_radius ────────────────────────────────────────────────
     #[tool(
         name = "blast_radius",
-        description = "Call this before editing a file to see what else may break: the \
-                       impacted files, callers, and missing tests for one or more source \
-                       paths, ranked by the requested `mode`. Graph-based (repo-map); \
-                       returns {nodes: [{path, relation, distance, score?}]}. Read-only. \
-                       Token cost: roughly 20-40 tokens per returned relation.",
+        description = "Graph impact, callers, or tests for file paths. Read-only. Token cost: ~20-40 per relation.",
         annotations(read_only_hint = true, idempotent_hint = true)
     )]
     async fn blast_radius(
@@ -717,9 +780,7 @@ impl GavieroMcpServer {
     // ── node_doc ────────────────────────────────────────────────────
     #[tool(
         name = "node_doc",
-        description = "Call this when you need one file's symbol signatures. Returns \
-                       {path, qualified_name, symbols[{qualified_name, signature, doc_snippet?}], \
-                       signatures}. Use `qualified_name` to chain into `symbol_doc`. Read-only.",
+        description = "One file's symbol signatures; chain qualified_name into symbol_doc. Read-only. Token cost: ~30-80.",
         annotations(read_only_hint = true, idempotent_hint = true)
     )]
     async fn node_doc(
@@ -800,10 +861,7 @@ impl GavieroMcpServer {
     // ── memory_get ──────────────────────────────────────────────────
     #[tool(
         name = "memory_get",
-        description = "Fetch the full stored row behind one memory_search hit — pass the \
-                       hit's `id` and `scope`. Returns text, kind, type, importance, trust, \
-                       timestamps, tag, and access stats; a miss is an empty result, not an \
-                       error. Read-only.",
+        description = "Fetch the full stored row for one memory_search hit by id and scope. Read-only. Token cost: ~80-200.",
         annotations(read_only_hint = true, idempotent_hint = true)
     )]
     async fn memory_get(
@@ -873,7 +931,7 @@ impl GavieroMcpServer {
     // ── memory_ping ─────────────────────────────────────────────────
     #[tool(
         name = "memory_ping",
-        description = "Record a nested MCP reach ping with nonce and depth; returns a receipt and workspace id. Read-only.",
+        description = "Reach-probe ping; records nonce and depth on an in-memory ledger. Token cost: ~20.",
         annotations(read_only_hint = true, idempotent_hint = true)
     )]
     async fn memory_ping(
@@ -910,12 +968,7 @@ impl GavieroMcpServer {
     // ── memory_flag ─────────────────────────────────────────────────
     #[tool(
         name = "memory_flag",
-        description = "Call this when a memory_search hit is wrong, stale, or contradicted by \
-                       what you just observed — pass the hit's `id` and `scope` plus a short \
-                       `reason`. Halves the memory's trust so it ranks lower; it is never \
-                       deleted and its text is never changed. User-authored and transcript \
-                       rows are refused (`accepted: false`). Flagging the same row twice is a \
-                       no-op.",
+        description = "Demote a stale memory's trust by id and scope; never deletes. Token cost: ~40.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1024,11 +1077,7 @@ impl GavieroMcpServer {
     // ── repo_outline ────────────────────────────────────────────────
     #[tool(
         name = "repo_outline",
-        description = "Call this to pull the PageRank-ranked code outline mid-run — the same \
-                       ranked view injected as <repo_outline> on turn 1 — when you need repo \
-                       orientation without reading files. Optional seed_paths focus the \
-                       ranking on an area; token_cap bounds the output (default 2000, max \
-                       8000); mode weights edges like blast_radius. Read-only.",
+        description = "PageRank-ranked code outline for mid-run orientation. Read-only. Token cost: bounded by token_cap.",
         annotations(read_only_hint = true, idempotent_hint = true)
     )]
     async fn repo_outline(
@@ -1094,11 +1143,7 @@ impl GavieroMcpServer {
     // ── symbol_search ───────────────────────────────────────────────
     #[tool(
         name = "symbol_search",
-        description = "Semantic search over enriched Rust symbols (signatures + docs). \
-                       Returns {results: [{qualified_name, file_path, signature, score, \
-                       doc_snippet?}]} — chain `qualified_name` into `symbol_doc`. Requires \
-                       `repoMap.symbolEnrichment.enabled` and `gaviero-cli --graph --enrich`. \
-                       Read-only.",
+        description = "Semantic search over enriched symbols. Read-only. Token cost: ~40-100 per hit.",
         annotations(read_only_hint = true, idempotent_hint = true)
     )]
     async fn symbol_search(
@@ -1182,9 +1227,7 @@ impl GavieroMcpServer {
     // ── symbol_doc ──────────────────────────────────────────────────
     #[tool(
         name = "symbol_doc",
-        description = "Full symbol enrichment for one `qualified_name` from `symbol_search` \
-                       or `node_doc`. Returns signature, bounds, doc, role_summary, and trait \
-                       `implementations` when applicable. Read-only.",
+        description = "Full enrichment for one qualified_name from symbol_search or node_doc. Read-only. Token cost: ~80-200.",
         annotations(read_only_hint = true, idempotent_hint = true)
     )]
     async fn symbol_doc(
@@ -1260,6 +1303,37 @@ impl GavieroMcpServer {
     }
 }
 
+#[tool_handler]
+impl ServerHandler for GavieroMcpServer {
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        Ok(ListToolsResult {
+            tools: self.listed_tools(),
+            ..Default::default()
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        self.ensure_tool_allowed(&request.name)?;
+        let tcc = ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
+    fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
+        if !self.tool_is_listed(name) {
+            return None;
+        }
+        self.tool_router.get(name).cloned()
+    }
+}
+
 fn symbol_tools_disabled_error() -> ErrorData {
     ErrorData::invalid_params(
         "symbol_search/symbol_doc are disabled: repoMap.symbolEnrichment.enabled was \
@@ -1293,17 +1367,22 @@ pub struct McpServerHandle {
     /// Path of `mcp-endpoint.json` when [`Self::with_endpoint_descriptor`]
     /// ran. Removed on shutdown so `--resolve` does not chase a dead pid.
     descriptor_path: Option<PathBuf>,
+    http: Option<super::http::HttpListenerHandle>,
 }
 
 impl McpServerHandle {
     /// Persist `<root>/.gaviero/mcp-endpoint.json` for shim `--resolve`.
     /// Write failures are logged; the server still serves on the pipe/socket.
     pub fn with_endpoint_descriptor(mut self, root: &std::path::Path) -> Self {
-        let desc = super::endpoint_file::McpEndpointDescriptor::from_listener(
+        let mut desc = super::endpoint_file::McpEndpointDescriptor::from_listener(
             root,
             &self.endpoint,
             std::process::id(),
         );
+        if let Some(http) = &self.http {
+            desc.http_url = Some(http.endpoint.url.clone());
+            desc.http_token_path = Some(http.endpoint.token_path.clone());
+        }
         match super::endpoint_file::write_descriptor(root, &desc) {
             Ok(path) => self.descriptor_path = Some(path),
             Err(e) => tracing::warn!(
@@ -1315,10 +1394,31 @@ impl McpServerHandle {
         self
     }
 
+    /// Attach the loopback HTTP listener (P2). Rewrites the descriptor
+    /// when one was already written.
+    pub fn with_http_listener(
+        mut self,
+        http: super::http::HttpListenerHandle,
+        root: &std::path::Path,
+    ) -> Self {
+        self.http = Some(http);
+        if self.descriptor_path.is_some() {
+            self = self.with_endpoint_descriptor(root);
+        }
+        self
+    }
+
+    pub fn http_endpoint(&self) -> Option<&super::http::HttpEndpoint> {
+        self.http.as_ref().map(|h| &h.endpoint)
+    }
+
     /// Signal the accept loop to stop and await its exit. Idempotent.
     pub async fn shutdown(self) {
         let _ = self.shutdown.send(());
         let _ = self.join.await;
+        if let Some(http) = self.http {
+            http.shutdown().await;
+        }
         // Best-effort socket-file cleanup. Named pipes vanish with the
         // last open handle — nothing to remove on the pipe arm.
         if let super::McpEndpoint::Unix(path) = &self.endpoint {
@@ -1440,6 +1540,7 @@ fn spawn_unix(server: GavieroMcpServer, socket_path: PathBuf) -> Result<McpServe
         join,
         endpoint: super::McpEndpoint::Unix(socket_path),
         descriptor_path: None,
+        http: None,
     })
 }
 
@@ -1510,6 +1611,7 @@ fn spawn_pipe(server: GavieroMcpServer, pipe_name: String) -> Result<McpServerHa
         join,
         endpoint: super::McpEndpoint::Pipe(pipe_name),
         descriptor_path: None,
+        http: None,
     })
 }
 
@@ -2580,5 +2682,105 @@ mod tests {
         }))
         .await
         .expect("memory_search must remain allowed");
+    }
+
+    #[test]
+    fn default_lists_all_nine_tools() {
+        let s = fixture().with_symbol_enrichment(true);
+        let names = s.listed_tool_names();
+        for tool in super::super::tools::ALL_MCP_TOOLS {
+            assert!(names.iter().any(|n| n == tool), "missing {tool} in {names:?}");
+        }
+        assert_eq!(names.len(), 9);
+    }
+
+    #[tokio::test]
+    async fn hidden_tool_absent_from_list_and_rejected_on_call() {
+        let s = fixture().with_exposed_tools(vec![
+            super::super::tools::TOOL_MEMORY_SEARCH.to_string(),
+            super::super::tools::TOOL_MEMORY_PING.to_string(),
+        ]);
+        let names = s.listed_tool_names();
+        assert!(names.contains(&"memory_search".to_string()));
+        assert!(names.contains(&"memory_ping".to_string()));
+        assert!(!names.contains(&"blast_radius".to_string()));
+        assert!(!names.contains(&"node_doc".to_string()));
+
+        match s
+            .blast_radius(Parameters(BlastRadiusInput {
+                paths: vec!["src/lib.rs".into()],
+                depth: None,
+                mode: None,
+            }))
+            .await
+        {
+            Err(err) => assert!(
+                err.message.contains("disabled"),
+                "unexpected error: {}",
+                err.message
+            ),
+            Ok(_) => panic!("hidden blast_radius must be invalid_request"),
+        }
+    }
+
+    #[test]
+    fn memory_ping_stays_listed_when_omitted_from_exposed_set() {
+        let s = fixture().with_exposed_tools(vec!["memory_search".into()]);
+        let names = s.listed_tool_names();
+        assert!(names.contains(&"memory_ping".to_string()));
+        assert!(names.contains(&"memory_search".to_string()));
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn permissions_deny_hides_tool_from_list() {
+        let s = fixture().with_permissions(super::super::McpPermissions {
+            allow: vec![],
+            deny: vec!["gaviero:blast_radius".into()],
+        });
+        let names = s.listed_tool_names();
+        assert!(!names.contains(&"blast_radius".to_string()));
+        assert!(names.contains(&"memory_search".to_string()));
+    }
+
+    fn compact_tools_json(server: &GavieroMcpServer) -> (String, String) {
+        let v = serde_json::json!({ "tools": server.listed_tools() });
+        (
+            serde_json::to_string(&v).unwrap(),
+            serde_json::to_string_pretty(&v).unwrap(),
+        )
+    }
+
+    #[test]
+    fn tools_list_compact_snapshots_and_size_pins() {
+        // Pre-shorten compact (name+description, minified) baseline: 2753 bytes
+        // (2026-09-14). Full tools/list JSON is ~16 KiB because schemars copies
+        // field docs into inputSchema; the 30% / 1200-byte budgets apply to
+        // the compact listed-schema the model actually reads as descriptions.
+        const PRE_SHORTEN_COMPACT_DEFAULT: usize = 14647;
+        let s = fixture().with_symbol_enrichment(true);
+        let (default_min, default_pretty) = compact_tools_json(&s);
+        eprintln!("full MCP tools/list bytes: before={} after={}", serde_json::to_string(&serde_json::json!({"tools": s.tool_router.list_all()})).unwrap().len(), default_min.len());
+        assert!(
+            default_min.len() <= PRE_SHORTEN_COMPACT_DEFAULT * 7 / 10,
+            "default compact tools/list {} B should be ≤ 70% of {PRE_SHORTEN_COMPACT_DEFAULT}",
+            default_min.len()
+        );
+
+        let lean = fixture().with_exposed_tools(
+            super::super::tools::LEAN_EXPOSED_TOOLS
+                .iter()
+                .map(|t| t.to_string())
+                .collect(),
+        );
+        let (lean_min, lean_pretty) = compact_tools_json(&lean);
+        eprintln!("full lean MCP tools/list bytes={}", lean_min.len());
+        insta::assert_snapshot!("mcp_tools_list_default", &default_pretty);
+        insta::assert_snapshot!("mcp_tools_list_lean", &lean_pretty);
+        assert!(
+            lean_min.len() < 1200,
+            "lean compact tools/list {} B should be < 1200",
+            lean_min.len()
+        );
     }
 }

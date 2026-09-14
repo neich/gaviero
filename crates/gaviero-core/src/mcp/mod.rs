@@ -21,7 +21,10 @@
 //! `Workspace::open` time. A small `gaviero-mcp-shim` binary connects
 //! subprocess agents' stdio to the server's workspace endpoint
 //! ([`McpEndpoint`]): the Unix domain socket `<workspace>/.gaviero/mcp.sock`
-//! on Unix, a `\\.\pipe\gaviero-…` named pipe on Windows.
+//! on Unix, a `\\.\pipe\gaviero-…` named pipe on Windows. A loopback
+//! streamable-HTTP listener ([`http`]) binds `127.0.0.1` with a bearer
+//! token; `gaviero-mcp-shim --resolve` finds the live endpoint via
+//! `.gaviero/mcp-endpoint.json`.
 //!
 //! ## The invariant, and the posture
 //!
@@ -56,6 +59,7 @@
 pub mod config_synth;
 pub mod endpoint_file;
 pub mod external_memory;
+pub mod http;
 mod legacy_handshake;
 pub mod observer;
 pub mod preflight;
@@ -68,14 +72,16 @@ pub mod signal;
 pub mod telemetry_sink;
 pub mod tools;
 pub mod transport;
+pub mod user_scope;
 
 pub use endpoint_file::{
     McpEndpointDescriptor, find_descriptor_upwards, read_descriptor, remove_descriptor,
-    write_descriptor,
+    write_descriptor, write_listener_descriptor,
 };
 pub use config_synth::{
-    BashPermissions, Context7Config, ExtraMcpServer, ExtraMcpTransport, ManagedRules,
-    McpConfigSynth, McpPermissions, TrustConsent, claude_mcp_config_json,
+    BashPermissions, Context7Config, ExtraMcpServer, ExtraMcpTransport, HttpSynthEndpoint,
+    ManagedRules, McpConfigSynth, McpPermissions, McpTransportChoice, McpTransportKind,
+    TrustConsent, claude_mcp_config_json,
     claude_settings_permissions, codex_mcp_config_toml, codex_mcp_overrides_from_config_file,
     codex_synth_has_any_mcp, codex_synth_has_remote_mcp, host_from_mcp_url,
     mcp_json_has_remote_urls, synth_has_remote_url_servers, synthesize_for_worktree,
@@ -102,7 +108,8 @@ pub use reach_probe::{
 pub use resolver::{
     McpConfigOverrides, extra_servers_from_workspace, extra_urls_from_project_mcp_json,
     parse_mcp_codex_trust_flag, parse_mcp_stdio_flag, parse_mcp_url_flag, resolve_bash_permissions,
-    resolve_context7_config, resolve_mcp_config_synth, resolve_mcp_permissions,
+    resolve_context7_config, resolve_exposed_tools, resolve_mcp_config_synth,
+    resolve_mcp_permissions, resolve_shim_binary, sibling_shim_path,
 };
 pub use server::{GavieroMcpServer, McpServerHandle, spawn_mcp_server};
 pub use signal::{MemoryFlagOutcome, MemoryFlagRequest, MemorySignalSink};
@@ -110,12 +117,21 @@ pub use telemetry_sink::{
     McpCallRecord, NdjsonTelemetrySink, ToolStats, compute_stats, default_telemetry_path,
 };
 pub use tools::{
-    BlastRadiusInput, BlastRadiusOutput, BlastRadiusRelation, MemoryFlagInput, MemoryFlagOutput,
-    MemoryGetInput, MemoryGetOutput, MemoryGetRow, MemoryPingInput, MemoryPingOutput,
-    MemorySearchInput, MemorySearchOutput, MemorySearchResult, NodeDoc, NodeDocInput,
-    NodeDocSymbol, RepoOutlineEntry, RepoOutlineInput, RepoOutlineOutput, SymbolDocInput,
-    SymbolDocOutput, SymbolSearchInput, SymbolSearchOutput, TOOL_BLAST_RADIUS, TOOL_MEMORY_FLAG,
-    TOOL_MEMORY_GET, TOOL_MEMORY_PING, TOOL_MEMORY_SEARCH, TOOL_NODE_DOC, TOOL_REPO_OUTLINE,
-    TOOL_SYMBOL_DOC, TOOL_SYMBOL_SEARCH,
+    ALL_MCP_TOOLS, BlastRadiusInput, BlastRadiusOutput, BlastRadiusRelation, LEAN_EXPOSED_TOOLS,
+    MemoryFlagInput, MemoryFlagOutput, MemoryGetInput, MemoryGetOutput, MemoryGetRow,
+    MemoryPingInput, MemoryPingOutput, MemorySearchInput, MemorySearchOutput, MemorySearchResult,
+    NodeDoc, NodeDocInput, NodeDocSymbol, RepoOutlineEntry, RepoOutlineInput, RepoOutlineOutput,
+    SymbolDocInput, SymbolDocOutput, SymbolSearchInput, SymbolSearchOutput, TOOL_BLAST_RADIUS,
+    TOOL_MEMORY_FLAG, TOOL_MEMORY_GET, TOOL_MEMORY_PING, TOOL_MEMORY_SEARCH, TOOL_NODE_DOC,
+    TOOL_REPO_OUTLINE, TOOL_SYMBOL_DOC, TOOL_SYMBOL_SEARCH,
+};
+pub use http::{
+    CODEX_HTTP_TOKEN_ENV, HttpEndpoint, HttpListenerHandle, ensure_http_token,
+    http_health_workspace_id, http_synth_from, maybe_spawn_http_listener, resolve_http_port,
+    reuse_http_endpoint, spawn_http_listener, token_path, apply_codex_http_token,
 };
 pub use transport::McpEndpoint;
+pub use user_scope::{
+    USER_SCOPE_SERVER_NAME, UserScopeOutcome, UserScopeVendor, default_shim_path,
+    register_user_scope, unregister_user_scope, user_scope_registered,
+};

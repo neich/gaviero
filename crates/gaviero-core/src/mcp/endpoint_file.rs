@@ -68,6 +68,45 @@ pub fn write_descriptor(root: &Path, desc: &McpEndpointDescriptor) -> Result<Pat
     Ok(path)
 }
 
+/// Write a listener descriptor under `dest_root`.
+///
+/// When `reuse_live` is set and a matching descriptor is already on
+/// disk (same pipe/socket), keep its `pid` / `started_at` / `workspace_id`.
+/// A CLI that reuses the TUI's named pipe must not stamp its own pid —
+/// after it exits, `gaviero-mcp-shim --resolve` would treat the TUI as dead.
+pub fn write_listener_descriptor(
+    dest_root: &Path,
+    endpoint: &McpEndpoint,
+    http_url: Option<&str>,
+    http_token_path: Option<&Path>,
+    our_pid: u32,
+    reuse_live: bool,
+) -> Result<PathBuf> {
+    let path = McpEndpointDescriptor::path(dest_root);
+    let mut desc = if reuse_live && path.is_file() {
+        match read_descriptor(&path) {
+            Ok(existing) if descriptor_matches_endpoint(&existing, endpoint) => existing,
+            _ => McpEndpointDescriptor::from_listener(dest_root, endpoint, our_pid),
+        }
+    } else {
+        McpEndpointDescriptor::from_listener(dest_root, endpoint, our_pid)
+    };
+    if let Some(url) = http_url {
+        desc.http_url = Some(url.to_string());
+    }
+    if let Some(token) = http_token_path {
+        desc.http_token_path = Some(token.to_path_buf());
+    }
+    write_descriptor(dest_root, &desc)
+}
+
+fn descriptor_matches_endpoint(desc: &McpEndpointDescriptor, endpoint: &McpEndpoint) -> bool {
+    match endpoint {
+        McpEndpoint::Pipe(name) => desc.pipe.as_deref() == Some(name.as_str()),
+        McpEndpoint::Unix(path) => desc.socket.as_deref() == Some(path.as_path()),
+    }
+}
+
 pub fn read_descriptor(path: &Path) -> Result<McpEndpointDescriptor> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading {}", path.display()))?;
@@ -168,6 +207,20 @@ mod tests {
         let desc = McpEndpointDescriptor::from_listener(dir.path(), &ep, 1);
         write_descriptor(dir.path(), &desc).unwrap();
         remove_descriptor(dir.path());
-        assert!(!McpEndpointDescriptor::path(dir.path()).exists());
+        assert!(!McpEndpointDescriptor::path(dir.path()).is_file());
+    }
+
+    #[test]
+    fn write_listener_descriptor_preserves_pid_when_reusing_live() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ep = endpoint_for(dir.path());
+        let original = McpEndpointDescriptor::from_listener(dir.path(), &ep, 99);
+        write_descriptor(dir.path(), &original).unwrap();
+        write_listener_descriptor(dir.path(), &ep, None, None, 1234, true).unwrap();
+        let loaded = read_descriptor(&McpEndpointDescriptor::path(dir.path())).unwrap();
+        assert_eq!(loaded.pid, 99);
+        write_listener_descriptor(dir.path(), &ep, None, None, 1234, false).unwrap();
+        let loaded = read_descriptor(&McpEndpointDescriptor::path(dir.path())).unwrap();
+        assert_eq!(loaded.pid, 1234);
     }
 }
