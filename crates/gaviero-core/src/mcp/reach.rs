@@ -157,6 +157,54 @@ impl ReachPolicy {
             .cloned()
             .unwrap_or(NestingPolicy::Unknown)
     }
+
+    /// Test / argv helper: build a policy without reading disk.
+    pub fn from_parts(
+        enforce: bool,
+        max_age_days: u32,
+        providers: BTreeMap<String, NestingPolicy>,
+    ) -> Self {
+        Self {
+            enforce,
+            max_age_days,
+            providers,
+        }
+    }
+}
+
+pub const CODEX_DISABLE_MULTI_AGENT: &str = "features.multi_agent=false";
+pub const CURSOR_REACH_WARNING: &str =
+    "cursor: nested MCP reach not verified; native subagents may miss memory tools";
+
+pub fn is_claude_nesting_tool(name: &str) -> bool {
+    name.eq_ignore_ascii_case("Agent") || name.eq_ignore_ascii_case("Task")
+}
+
+/// Drop Claude `Agent`/`Task` when enforcement is on and nesting is blocked.
+/// `Unknown` and `Allowed` leave the list untouched (today's behaviour).
+pub fn filter_claude_tools(mut tools: Vec<String>, policy: &ReachPolicy) -> Vec<String> {
+    if policy.enforce && matches!(policy.for_provider("claude"), NestingPolicy::Blocked(_)) {
+        tools.retain(|t| !is_claude_nesting_tool(t));
+    }
+    tools
+}
+
+/// Append `--config features.multi_agent=false` when Codex nesting is blocked.
+pub fn push_codex_multi_agent_override(args: &mut Vec<String>, policy: &ReachPolicy) {
+    if policy.enforce && matches!(policy.for_provider("codex"), NestingPolicy::Blocked(_)) {
+        args.push("--config".into());
+        args.push(CODEX_DISABLE_MULTI_AGENT.into());
+    }
+}
+
+pub fn cursor_reach_status(policy: &ReachPolicy) -> Option<&'static str> {
+    if !policy.enforce {
+        return None;
+    }
+    match policy.for_provider("cursor") {
+        NestingPolicy::Allowed => None,
+        _ => Some(CURSOR_REACH_WARNING),
+    }
 }
 
 fn policy_for_provider(
@@ -366,5 +414,85 @@ mod tests {
         let policy = ReachPolicy::for_workspace_at(dir.path(), Utc::now(), &versions("x"));
         assert!(!policy.enforce);
         assert_eq!(policy.max_age_days, 7);
+    }
+
+    fn policy(enforce: bool, claude: NestingPolicy, codex: NestingPolicy) -> ReachPolicy {
+        ReachPolicy::from_parts(
+            enforce,
+            30,
+            BTreeMap::from([
+                ("claude".into(), claude),
+                ("codex".into(), codex),
+                ("cursor".into(), NestingPolicy::Unknown),
+            ]),
+        )
+    }
+
+    #[test]
+    fn claude_tools_drop_agent_only_when_blocked_and_enforced() {
+        let tools = vec!["Read".into(), "Agent".into(), "Task".into()];
+        let blocked = policy(
+            true,
+            NestingPolicy::Blocked("nested failed".into()),
+            NestingPolicy::Unknown,
+        );
+        let filtered = filter_claude_tools(tools.clone(), &blocked);
+        assert_eq!(filtered, vec!["Read".to_string()]);
+
+        let unknown = policy(true, NestingPolicy::Unknown, NestingPolicy::Unknown);
+        assert_eq!(filter_claude_tools(tools.clone(), &unknown), tools);
+
+        let allowed = policy(true, NestingPolicy::Allowed, NestingPolicy::Unknown);
+        assert_eq!(filter_claude_tools(tools.clone(), &allowed), tools);
+
+        let off = policy(
+            false,
+            NestingPolicy::Blocked("x".into()),
+            NestingPolicy::Unknown,
+        );
+        assert_eq!(filter_claude_tools(tools, &off), vec!["Read", "Agent", "Task"]);
+    }
+
+    #[test]
+    fn codex_multi_agent_override_present_only_when_blocked_and_enforced() {
+        let mut args = vec!["exec".into()];
+        let blocked = policy(
+            true,
+            NestingPolicy::Unknown,
+            NestingPolicy::Blocked("nested failed".into()),
+        );
+        push_codex_multi_agent_override(&mut args, &blocked);
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--config", CODEX_DISABLE_MULTI_AGENT])
+        );
+
+        let mut args = vec!["exec".into()];
+        let unknown = policy(true, NestingPolicy::Unknown, NestingPolicy::Unknown);
+        push_codex_multi_agent_override(&mut args, &unknown);
+        assert!(!args.iter().any(|a| a.contains("multi_agent")));
+
+        let mut args = vec!["exec".into()];
+        let off = policy(
+            false,
+            NestingPolicy::Unknown,
+            NestingPolicy::Blocked("x".into()),
+        );
+        push_codex_multi_agent_override(&mut args, &off);
+        assert!(!args.iter().any(|a| a.contains("multi_agent")));
+    }
+
+    #[test]
+    fn cursor_warns_unless_allowed_or_unenforced() {
+        let unknown = policy(true, NestingPolicy::Unknown, NestingPolicy::Unknown);
+        assert_eq!(cursor_reach_status(&unknown), Some(CURSOR_REACH_WARNING));
+        let off = policy(false, NestingPolicy::Unknown, NestingPolicy::Unknown);
+        assert_eq!(cursor_reach_status(&off), None);
+        let allowed = ReachPolicy::from_parts(
+            true,
+            30,
+            BTreeMap::from([("cursor".into(), NestingPolicy::Allowed)]),
+        );
+        assert_eq!(cursor_reach_status(&allowed), None);
     }
 }

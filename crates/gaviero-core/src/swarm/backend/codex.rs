@@ -378,6 +378,11 @@ fn codex_exec_args(
         args.push(format!("{k}={v}"));
     }
 
+    crate::mcp::push_codex_multi_agent_override(
+        &mut args,
+        &crate::mcp::ReachPolicy::for_workspace(workspace_root),
+    );
+
     args
 }
 

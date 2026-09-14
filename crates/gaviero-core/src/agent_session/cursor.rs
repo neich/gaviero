@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -89,6 +90,8 @@ pub struct CursorSession {
     /// the turn's `auto_approve`, decides whether `agent -p` gets `--force`
     /// or stays in Cursor's allowlist mode (see `cursor_argv`).
     bash_approved: bool,
+    /// One-shot Cursor reach warning (plan P0.4: warn-only, no argv switch).
+    reach_warned: AtomicBool,
 }
 
 impl CursorSession {
@@ -129,10 +132,19 @@ impl CursorSession {
             handle,
             cancel_token: args.cancel_token,
             bash_approved,
+            reach_warned: AtomicBool::new(false),
         }
     }
 
     async fn run_cursor_turn(&mut self, turn: &Turn) -> Result<()> {
+        if !self.reach_warned.swap(true, Ordering::Relaxed)
+            && let Some(msg) =
+                crate::mcp::reach::cursor_reach_status(&crate::mcp::ReachPolicy::for_workspace(
+                    &self.workspace_root,
+                ))
+        {
+            self.observer.on_streaming_status(msg);
+        }
         // ── Reconstruct the enriched prompt ─────────────────────────────
         let user_message = embed_workspace_folders(
             &turn.user_message,

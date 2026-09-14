@@ -351,6 +351,10 @@ fn codex_app_server_args(workspace_root: &Path) -> Vec<String> {
         args.push("--config".to_string());
         args.push(pair);
     }
+    crate::mcp::push_codex_multi_agent_override(
+        &mut args,
+        &crate::mcp::ReachPolicy::for_workspace(workspace_root),
+    );
     args.push("app-server".to_string());
     args.push("--listen".to_string());
     args.push("stdio://".to_string());
@@ -2119,6 +2123,30 @@ url = "https://example/mcp/"
                 "stdio://".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn codex_app_server_args_disable_multi_agent_when_reach_blocked() {
+        let mut args = vec![
+            "--config".into(),
+            r#"mcp_servers.gaviero.command="shim""#.into(),
+        ];
+        let policy = crate::mcp::ReachPolicy::from_parts(
+            true,
+            30,
+            std::collections::BTreeMap::from([(
+                "codex".into(),
+                crate::mcp::NestingPolicy::Blocked("nested failed".into()),
+            )]),
+        );
+        crate::mcp::push_codex_multi_agent_override(&mut args, &policy);
+        args.push("app-server".into());
+        let app = args.iter().position(|a| a == "app-server").unwrap();
+        let pair = args
+            .windows(2)
+            .position(|w| w[0] == "--config" && w[1] == crate::mcp::reach::CODEX_DISABLE_MULTI_AGENT)
+            .unwrap();
+        assert!(pair < app);
     }
 
     #[test]

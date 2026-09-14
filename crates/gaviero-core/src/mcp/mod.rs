@@ -86,7 +86,10 @@ pub use preflight::{
     validate_codex_trust_for_extras, validate_synthesized_cursor_remote_mcp,
 };
 pub use probe::{PingRecord, ProbeLedger, ping_receipt};
-pub use reach::{NestingPolicy, ReachPolicy, ReachRecord, ReachStore};
+pub use reach::{
+    NestingPolicy, ReachPolicy, ReachRecord, ReachStore, filter_claude_tools,
+    push_codex_multi_agent_override,
+};
 pub use reach_probe::{
     ProviderReachResult, ReachProbeConfig, ReachReport, ReachTransport, ReachVerdict,
     classify_verdict, probe_prompt, run_reach_probe,

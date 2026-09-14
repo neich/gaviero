@@ -427,7 +427,18 @@ impl AcpSession {
         // context7 with it). MCP admission is governed by `.mcp.json` /
         // `--mcp-config` below, so listing servers here only costs the agent
         // its MCP tools.
-        let available_owned = build_available_tools(available_tools, interactive_permissions);
+        let mut available_owned = build_available_tools(available_tools, interactive_permissions);
+        let reach = crate::mcp::ReachPolicy::for_workspace(cwd);
+        if reach.enforce
+            && let crate::mcp::NestingPolicy::Blocked(reason) = reach.for_provider("claude")
+        {
+            tracing::warn!(
+                target: "acp.session",
+                %reason,
+                "dropping Claude Agent/Task from --tools; run gaviero-cli --mcp-reach-probe"
+            );
+        }
+        available_owned = crate::mcp::filter_claude_tools(available_owned, &reach);
         if !available_owned.is_empty() {
             cmd.arg("--tools").arg(available_owned.join(","));
         }
@@ -829,6 +840,33 @@ mod tests {
         assert!(tools.contains(&"Bash".to_string()));
         assert!(tools.contains(&ASK_USER_QUESTION_TOOL.to_string()));
         assert_eq!(tools.len(), 8, "7 built-ins + AskUserQuestion");
+    }
+
+    #[test]
+    fn build_available_tools_then_reach_policy_drops_agent() {
+        let built = build_available_tools(&["Read", "Agent", "Task", "mcp__gaviero"], false);
+        assert!(built.contains(&"Agent".to_string()));
+        let policy = crate::mcp::ReachPolicy::from_parts(
+            true,
+            30,
+            std::collections::BTreeMap::from([(
+                "claude".into(),
+                crate::mcp::NestingPolicy::Blocked("nested failed".into()),
+            )]),
+        );
+        let filtered = crate::mcp::filter_claude_tools(built, &policy);
+        assert_eq!(filtered, vec!["Read".to_string()]);
+    }
+
+    #[test]
+    fn build_available_tools_unknown_policy_keeps_agent() {
+        let built = build_available_tools(&["Read", "Agent"], false);
+        let policy = crate::mcp::ReachPolicy::from_parts(
+            true,
+            30,
+            std::collections::BTreeMap::from([("claude".into(), crate::mcp::NestingPolicy::Unknown)]),
+        );
+        assert_eq!(crate::mcp::filter_claude_tools(built.clone(), &policy), built);
     }
 
     #[test]

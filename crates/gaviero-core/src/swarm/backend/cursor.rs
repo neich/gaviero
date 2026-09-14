@@ -114,6 +114,11 @@ impl AgentBackend for CursorBackend {
         &self,
         request: CompletionRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<UnifiedStreamEvent>> + Send>>> {
+        if let Some(msg) = crate::mcp::reach::cursor_reach_status(
+            &crate::mcp::ReachPolicy::for_workspace(&request.workspace_root),
+        ) {
+            tracing::warn!(target: "backend.cursor", "{msg}");
+        }
         let system_prompt = request
             .system_prompt
             .clone()
