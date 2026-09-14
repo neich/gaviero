@@ -24,10 +24,10 @@
 //! `mcp/mod.rs`'s header for why read-only is a default posture rather
 //! than a hard constraint.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use rmcp::ServiceExt;
@@ -89,27 +89,30 @@ pub struct GavieroMcpServer {
         crate::repo_map::store::EdgeWeights,
     >,
     /// Cached `GraphStore` for the workspace, lazily populated by the
-    /// first `blast_radius` call and reused thereafter so we don't
-    /// re-run `graph_builder::build_graph` (a workspace-wide scan +
-    /// tree-sitter parse) on every tool invocation. Call
+    /// first graph tool (or [`Self::warmup`]) so we don't re-run
+    /// `graph_builder::build_graph` (a workspace-wide scan + tree-sitter
+    /// parse) on every invocation. The cached connection is a *build
+    /// sentinel* only: query handlers open a fresh WAL connection via
+    /// [`with_graph_store`] so `blast_radius` PageRank cannot serialize
+    /// `node_doc` / `symbol_*` for minutes. Call
     /// [`Self::invalidate_graph_cache`] from the embedding app after a
     /// large workspace change to force the next call to rescan.
     ///
     /// `GraphStore` wraps a `rusqlite::Connection` which is `Send` but
-    /// not `Sync`, so it lives behind a `Mutex` rather than an
-    /// `RwLock`. `blast_radius` calls therefore serialize, but each
-    /// call avoids the workspace-wide rescan + parse — net win for any
-    /// repo larger than a handful of files. A future enhancement can
-    /// split into a snapshotted projection (edges + file list + DF) to
-    /// allow concurrent reads.
+    /// not `Sync`, so the sentinel lives behind a `Mutex`.
     graph_cache: Arc<tokio::sync::Mutex<Option<crate::repo_map::store::GraphStore>>>,
     /// Cached in-memory `RepoMap` backing the `repo_outline` tool,
     /// mirroring `graph_cache`'s lifecycle: lazily built on first use,
     /// shared across per-connection clones via `Arc`, and cleared by
-    /// [`Self::invalidate_graph_cache`]. Kept separate from
-    /// `graph_cache` because the outline renderer / budget admit live
-    /// on `RepoMap`, not on the persisted `GraphStore`.
-    repo_map_cache: Arc<tokio::sync::Mutex<Option<crate::repo_map::RepoMap>>>,
+    /// [`Self::invalidate_graph_cache`]. Stored as `Arc<RepoMap>` so
+    /// ranking can run without holding the mutex (same convoy as
+    /// `blast_radius` / `node_doc`).
+    repo_map_cache: Arc<tokio::sync::Mutex<Option<Arc<crate::repo_map::RepoMap>>>>,
+    /// Extra exclude patterns (from `files.exclude`) applied when this
+    /// process first builds the graph. Scratch dir names in
+    /// `repo_map::builder::SKIP_DIRS` always apply; this list is the
+    /// host's additional skip set.
+    graph_excludes: Vec<String>,
     /// S2.3: when false, `symbol_search` / `symbol_doc` return a clear
     /// error directing the agent to run `--graph --enrich` first.
     symbol_enrichment_enabled: bool,
@@ -173,6 +176,57 @@ fn strip_schema_descriptions(schema: &mut serde_json::Value) {
     }
 }
 
+/// Bound for `blast_radius` so a stuck PageRank cannot hold the chat
+/// spinner for the 10–20 minutes observed in `mcp_calls.ndjson`.
+const GRAPH_QUERY_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Ensure the on-disk graph exists (first call in this process builds
+/// it under `graph_cache`), then open a *fresh* WAL connection for `f`.
+///
+/// Do not run `f` while holding `graph_cache`: `blast_radius` PageRank
+/// used to serialize every other graph tool for minutes.
+fn with_graph_store<T, F>(
+    cache: &tokio::sync::Mutex<Option<crate::repo_map::store::GraphStore>>,
+    workspace_root: &Path,
+    excludes: &[String],
+    f: F,
+) -> anyhow::Result<T>
+where
+    F: FnOnce(&crate::repo_map::store::GraphStore) -> anyhow::Result<T>,
+{
+    {
+        let mut guard = cache.blocking_lock();
+        if guard.is_none() {
+            let (store, _) = crate::repo_map::graph_builder::build_graph(workspace_root, excludes)?;
+            *guard = Some(store);
+        }
+    }
+    let store = crate::repo_map::store::GraphStore::open(
+        &crate::repo_map::graph_builder::graph_db_path(workspace_root),
+    )?;
+    f(&store)
+}
+
+fn with_repo_map<T, F>(
+    cache: &tokio::sync::Mutex<Option<Arc<crate::repo_map::RepoMap>>>,
+    workspace_root: &Path,
+    excludes: &[String],
+    f: F,
+) -> anyhow::Result<T>
+where
+    F: FnOnce(&crate::repo_map::RepoMap) -> anyhow::Result<T>,
+{
+    let map = {
+        let mut guard = cache.blocking_lock();
+        if guard.is_none() {
+            let built = crate::repo_map::RepoMap::build(workspace_root, excludes)?;
+            *guard = Some(Arc::new(built));
+        }
+        Arc::clone(guard.as_ref().expect("repo map populated above"))
+    };
+    f(&map)
+}
+
 #[tool_router]
 impl GavieroMcpServer {
     pub fn new(
@@ -194,6 +248,7 @@ impl GavieroMcpServer {
             edge_weights: std::collections::HashMap::new(),
             graph_cache: Arc::new(tokio::sync::Mutex::new(None)),
             repo_map_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            graph_excludes: Vec::new(),
             symbol_enrichment_enabled: false,
             symbol_embedder_name: None,
             symbol_embedder: Arc::new(tokio::sync::Mutex::new(None)),
@@ -403,6 +458,13 @@ impl GavieroMcpServer {
         self
     }
 
+    /// Extra `files.exclude` patterns for the first graph / repo-map build.
+    /// Scratch names in `repo_map::builder::SKIP_DIRS` always apply.
+    pub fn with_graph_excludes(mut self, excludes: Vec<String>) -> Self {
+        self.graph_excludes = excludes;
+        self
+    }
+
     /// Drop the cached `GraphStore` and `RepoMap` so the next
     /// `blast_radius` / `repo_outline` call rebuilds them from the
     /// current workspace state. Embedding apps (TUI / CLI) should call
@@ -428,13 +490,14 @@ impl GavieroMcpServer {
         let cache = Arc::clone(&self.graph_cache);
         let repo_map_cache = Arc::clone(&self.repo_map_cache);
         let workspace_root = self.workspace_root.clone();
+        let excludes = self.graph_excludes.clone();
         // build_graph is blocking + potentially heavy on a large repo;
         // run it off the async runtime and hold the cache lock only for
         // this build (matching the `blast_radius` pattern).
         let _ = tokio::task::spawn_blocking(move || {
             let mut guard = cache.blocking_lock();
             if guard.is_none() {
-                match crate::repo_map::graph_builder::build_graph(&workspace_root, &[]) {
+                match crate::repo_map::graph_builder::build_graph(&workspace_root, &excludes) {
                     Ok((store, _)) => *guard = Some(store),
                     Err(e) => tracing::warn!(
                         target: "mcp_server",
@@ -448,8 +511,8 @@ impl GavieroMcpServer {
             // outline pull never pays the cold workspace scan.
             let mut rm = repo_map_cache.blocking_lock();
             if rm.is_none() {
-                match crate::repo_map::RepoMap::build(&workspace_root, &[]) {
-                    Ok(map) => *rm = Some(map),
+                match crate::repo_map::RepoMap::build(&workspace_root, &excludes) {
+                    Ok(map) => *rm = Some(Arc::new(map)),
                     Err(e) => tracing::warn!(
                         target: "mcp_server",
                         error = %e,
@@ -675,44 +738,44 @@ impl GavieroMcpServer {
             .copied()
             .unwrap_or_else(|| crate::repo_map::store::EdgeWeights::default_for(mode));
         let cache = Arc::clone(&self.graph_cache);
+        let excludes = self.graph_excludes.clone();
 
-        // Hold the cache mutex across the blocking computation so we
-        // build at most once, reuse the cached `GraphStore` afterwards,
-        // and never race two builders on the first call. Subsequent
-        // calls hit the warm cache and pay only impact-radius +
-        // PageRank cost.
-        let (impact, ranks) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            // `blocking_lock` is required because we're inside
-            // `spawn_blocking`; the surrounding `await` ensures we
-            // hold the cache for the duration of this call only.
-            let mut guard = cache.blocking_lock();
-            if guard.is_none() {
-                let (store, _) = crate::repo_map::graph_builder::build_graph(&workspace_root, &[])?;
-                *guard = Some(store);
-            }
-            let store = guard.as_ref().expect("graph cache populated above");
-            let seed_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-            let impact = store.impact_radius_with_mode(&seed_refs, depth as usize, mode)?;
-            // Rank only the files we'll actually emit so the DiGraph
-            // build stays bounded by graph size, not affected-set size.
-            let mut to_rank: Vec<String> = impact.changed_files.to_vec();
-            for f in &impact.affected_files {
-                if !to_rank.contains(f) {
-                    to_rank.push(f.clone());
+        // Build (if needed) under the sentinel mutex, then rank on a
+        // fresh connection so this call cannot block `node_doc`.
+        let compute = tokio::task::spawn_blocking(move || {
+            with_graph_store(&cache, &workspace_root, &excludes, |store| {
+                let seed_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+                let impact = store.impact_radius_with_mode(&seed_refs, depth as usize, mode)?;
+                let mut to_rank: Vec<String> = impact.changed_files.to_vec();
+                for f in &impact.affected_files {
+                    if !to_rank.contains(f) {
+                        to_rank.push(f.clone());
+                    }
                 }
+                let ranks = crate::repo_map::rank_files_with_weights(
+                    store,
+                    &seed_refs,
+                    &to_rank,
+                    weights,
+                    specificity,
+                )?;
+                Ok((impact, ranks))
+            })
+        });
+        let (impact, ranks) = match tokio::time::timeout(GRAPH_QUERY_TIMEOUT, compute).await {
+            Ok(join) => join
+                .map_err(|e| ErrorData::internal_error(format!("blast_radius join: {e}"), None))?
+                .map_err(|e| ErrorData::internal_error(format!("blast_radius: {e}"), None))?,
+            Err(_) => {
+                return Err(ErrorData::internal_error(
+                    format!(
+                        "blast_radius timed out after {}s. Retry with a single source path.",
+                        GRAPH_QUERY_TIMEOUT.as_secs()
+                    ),
+                    None,
+                ));
             }
-            let ranks = crate::repo_map::rank_files_with_weights(
-                store,
-                &seed_refs,
-                &to_rank,
-                weights,
-                specificity,
-            )?;
-            Ok((impact, ranks))
-        })
-        .await
-        .map_err(|e| ErrorData::internal_error(format!("blast_radius join: {e}"), None))?
-        .map_err(|e| ErrorData::internal_error(format!("blast_radius: {e}"), None))?;
+        };
 
         let lookup = |p: &str| ranks.get(p).copied().unwrap_or((0.0, 1.0));
 
@@ -794,47 +857,44 @@ impl GavieroMcpServer {
         let log_input = serde_json::to_value(&input).unwrap_or_default();
         let cache = Arc::clone(&self.graph_cache);
         let workspace_root = self.workspace_root.clone();
+        let excludes = self.graph_excludes.clone();
         let path_for_graph = path.clone();
 
         let (symbols, signatures) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let mut guard = cache.blocking_lock();
-            if guard.is_none() {
-                let (store, _) = crate::repo_map::graph_builder::build_graph(&workspace_root, &[])?;
-                *guard = Some(store);
-            }
-            let store = guard.as_ref().expect("graph cache populated");
-            let nodes = store.nodes_for_file(&path_for_graph)?;
-            let mut symbols = Vec::new();
-            let mut signatures = Vec::new();
-            for node in nodes {
-                if node.kind == "File" {
-                    continue;
-                }
-                if let Some(doc) = store.symbol_doc(&node.qualified_name)? {
-                    let snippet = if doc.doc.is_empty() {
-                        None
+            with_graph_store(&cache, &workspace_root, &excludes, |store| {
+                let nodes = store.nodes_for_file(&path_for_graph)?;
+                let mut symbols = Vec::new();
+                let mut signatures = Vec::new();
+                for node in nodes {
+                    if node.kind == "File" {
+                        continue;
+                    }
+                    if let Some(doc) = store.symbol_doc(&node.qualified_name)? {
+                        let snippet = if doc.doc.is_empty() {
+                            None
+                        } else {
+                            Some(truncate_symbol_snippet(
+                                &doc.doc,
+                                SYMBOL_DOC_SNIPPET_MAX_CHARS,
+                            ))
+                        };
+                        signatures.push(doc.signature.clone());
+                        symbols.push(NodeDocSymbol {
+                            qualified_name: node.qualified_name.clone(),
+                            signature: doc.signature,
+                            doc_snippet: snippet,
+                        });
                     } else {
-                        Some(truncate_symbol_snippet(
-                            &doc.doc,
-                            SYMBOL_DOC_SNIPPET_MAX_CHARS,
-                        ))
-                    };
-                    signatures.push(doc.signature.clone());
-                    symbols.push(NodeDocSymbol {
-                        qualified_name: node.qualified_name.clone(),
-                        signature: doc.signature,
-                        doc_snippet: snippet,
-                    });
-                } else {
-                    signatures.push(node.name.clone());
-                    symbols.push(NodeDocSymbol {
-                        qualified_name: node.qualified_name.clone(),
-                        signature: node.name.clone(),
-                        doc_snippet: None,
-                    });
+                        signatures.push(node.name.clone());
+                        symbols.push(NodeDocSymbol {
+                            qualified_name: node.qualified_name.clone(),
+                            signature: node.name.clone(),
+                            doc_snippet: None,
+                        });
+                    }
                 }
-            }
-            Ok((symbols, signatures))
+                Ok((symbols, signatures))
+            })
         })
         .await
         .map_err(|e| ErrorData::internal_error(format!("node_doc join: {e}"), None))?
@@ -1096,17 +1156,12 @@ impl GavieroMcpServer {
         };
         let cache = Arc::clone(&self.repo_map_cache);
         let workspace_root = self.workspace_root.clone();
+        let excludes = self.graph_excludes.clone();
 
         let candidates = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let mut guard = cache.blocking_lock();
-            if guard.is_none() {
-                // No exclude source exists server-side (excludes are a
-                // host/TUI/CLI concern); mirror the graph_cache build's
-                // empty exclude set so both caches see the same tree.
-                *guard = Some(crate::repo_map::RepoMap::build(&workspace_root, &[])?);
-            }
-            let map = guard.as_ref().expect("repo map cache populated above");
-            Ok(map.rank_for_agent_structured_with_mode(&seeds, budget, mode))
+            with_repo_map(&cache, &workspace_root, &excludes, |map| {
+                Ok(map.rank_for_agent_structured_with_mode(&seeds, budget, mode))
+            })
         })
         .await
         .map_err(|e| ErrorData::internal_error(format!("repo_outline join: {e}"), None))?
@@ -1172,22 +1227,19 @@ impl GavieroMcpServer {
 
         let cache = Arc::clone(&self.graph_cache);
         let workspace_root = self.workspace_root.clone();
+        let excludes = self.graph_excludes.clone();
         let hits = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let mut guard = cache.blocking_lock();
-            if guard.is_none() {
-                let (store, _) = crate::repo_map::graph_builder::build_graph(&workspace_root, &[])?;
-                *guard = Some(store);
-            }
-            let store = guard.as_ref().expect("graph cache populated");
-            // G2 / OD-2: cross-model cosine is noise — verify the
-            // sidecar's vectors were built by the query embedder.
-            let stamp = store.graph_meta("symbol_embedder")?;
-            crate::repo_map::symbol_search::check_symbol_embedder_stamp(
-                stamp.as_deref(),
-                &query_name,
-                &memory_name,
-            )?;
-            crate::repo_map::symbol_search::search_symbol_docs(store, &query_emb, limit)
+            with_graph_store(&cache, &workspace_root, &excludes, |store| {
+                // G2 / OD-2: cross-model cosine is noise — verify the
+                // sidecar's vectors were built by the query embedder.
+                let stamp = store.graph_meta("symbol_embedder")?;
+                crate::repo_map::symbol_search::check_symbol_embedder_stamp(
+                    stamp.as_deref(),
+                    &query_name,
+                    &memory_name,
+                )?;
+                crate::repo_map::symbol_search::search_symbol_docs(store, &query_emb, limit)
+            })
         })
         .await
         .map_err(|e| ErrorData::internal_error(format!("symbol_search join: {e}"), None))?
@@ -1249,43 +1301,40 @@ impl GavieroMcpServer {
         let qn = input.qualified_name.clone();
         let cache = Arc::clone(&self.graph_cache);
         let workspace_root = self.workspace_root.clone();
+        let excludes = self.graph_excludes.clone();
         let out = tokio::task::spawn_blocking(move || -> anyhow::Result<SymbolDocOutput> {
-            let mut guard = cache.blocking_lock();
-            if guard.is_none() {
-                let (store, _) = crate::repo_map::graph_builder::build_graph(&workspace_root, &[])?;
-                *guard = Some(store);
-            }
-            let store = guard.as_ref().expect("graph cache populated");
-            let Some(doc) = store.symbol_doc(&qn)? else {
-                anyhow::bail!("no symbol_docs row for qualified_name `{qn}`");
-            };
-            let impl_qns = store.implementation_qns_for_trait(&qn)?;
-            let mut implementations = Vec::new();
-            for impl_qn in impl_qns {
-                if let Some(impl_doc) = store.symbol_doc(&impl_qn)? {
-                    let snippet = if impl_doc.doc.is_empty() {
-                        None
-                    } else {
-                        Some(truncate_symbol_snippet(
-                            &impl_doc.doc,
-                            SYMBOL_DOC_SNIPPET_MAX_CHARS,
-                        ))
-                    };
-                    implementations.push(SymbolDocImpl {
-                        qualified_name: impl_qn,
-                        signature: impl_doc.signature,
-                        doc_snippet: snippet,
-                    });
+            with_graph_store(&cache, &workspace_root, &excludes, |store| {
+                let Some(doc) = store.symbol_doc(&qn)? else {
+                    anyhow::bail!("no symbol_docs row for qualified_name `{qn}`");
+                };
+                let impl_qns = store.implementation_qns_for_trait(&qn)?;
+                let mut implementations = Vec::new();
+                for impl_qn in impl_qns {
+                    if let Some(impl_doc) = store.symbol_doc(&impl_qn)? {
+                        let snippet = if impl_doc.doc.is_empty() {
+                            None
+                        } else {
+                            Some(truncate_symbol_snippet(
+                                &impl_doc.doc,
+                                SYMBOL_DOC_SNIPPET_MAX_CHARS,
+                            ))
+                        };
+                        implementations.push(SymbolDocImpl {
+                            qualified_name: impl_qn,
+                            signature: impl_doc.signature,
+                            doc_snippet: snippet,
+                        });
+                    }
                 }
-            }
-            Ok(SymbolDocOutput {
-                qualified_name: doc.qualified_name,
-                file_path: doc.file_path,
-                signature: doc.signature,
-                bounds: doc.bounds,
-                doc: doc.doc,
-                role_summary: doc.role_summary,
-                implementations,
+                Ok(SymbolDocOutput {
+                    qualified_name: doc.qualified_name,
+                    file_path: doc.file_path,
+                    signature: doc.signature,
+                    bounds: doc.bounds,
+                    doc: doc.doc,
+                    role_summary: doc.role_summary,
+                    implementations,
+                })
             })
         })
         .await
@@ -2156,7 +2205,11 @@ mod tests {
             .unwrap()
             .with_endpoint_descriptor(dir.path());
         let path = crate::mcp::endpoint_file::McpEndpointDescriptor::path(dir.path());
-        assert!(path.is_file(), "descriptor should exist at {}", path.display());
+        assert!(
+            path.is_file(),
+            "descriptor should exist at {}",
+            path.display()
+        );
         let desc = crate::mcp::endpoint_file::read_descriptor(&path).unwrap();
         assert_eq!(desc.pid, std::process::id());
         handle.shutdown().await;

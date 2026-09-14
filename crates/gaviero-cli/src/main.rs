@@ -1444,7 +1444,8 @@ fn prepare_mcp_for_swarm(
                     .map(str::trim)
                     .filter(|s| !s.is_empty() && *s != "inherit")
                     .map(str::to_string),
-            );
+            )
+            .with_graph_excludes(parse_workspace_exclude_patterns(&workspace, Some(repo)));
             // D3: memory_flag ships enabled, but it needs a writer to
             // signal. No writer → leave it unwired.
             let flag_enabled = workspace

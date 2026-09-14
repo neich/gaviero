@@ -1626,7 +1626,11 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                             .map(str::trim)
                             .filter(|s| !s.is_empty() && *s != "inherit")
                             .map(str::to_string),
-                    );
+                    )
+                    .with_graph_excludes(crate::app::parse_exclude_patterns(
+                        &app.workspace,
+                        Some(&workspace_root_for_mcp),
+                    ));
                     // D3: memory_flag ships enabled. The sink is the only
                     // seam through which a tool call can cause a write, and
                     // it goes through the S2 writer task like everything else.

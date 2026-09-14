@@ -106,6 +106,11 @@ pub const SKIP_DIRS: &[&str] = &[
     "dist",
     "build",
     "__pycache__",
+    // Scratch trees. `tmp/hermes-agent` in this workspace was 23k of 24k
+    // walked files and made MCP `blast_radius` PageRank take minutes while
+    // holding the graph mutex — chat sat on a spinner with no tokens.
+    "tmp",
+    "temp",
 ];
 
 /// Build a `FileNode` for a single source file, or `None` if unreadable.
@@ -256,5 +261,12 @@ pub trait Baz {}
     fn unknown_extension_returns_empty() {
         let syms = extract_symbols("xyz", "some content");
         assert!(syms.is_empty());
+    }
+
+    #[test]
+    fn skip_dirs_includes_scratch_trees() {
+        assert!(SKIP_DIRS.contains(&"tmp"));
+        assert!(SKIP_DIRS.contains(&"temp"));
+        assert!(SKIP_DIRS.contains(&"target"));
     }
 }

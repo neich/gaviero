@@ -41,14 +41,18 @@ pub struct BuildResult {
 /// Maximum file size to index (1 MB).
 const MAX_FILE_BYTES: u64 = 1_000_000;
 
+/// On-disk graph database for `workspace` (`{workspace}/.gaviero/code_graph.db`).
+pub fn graph_db_path(workspace: &Path) -> PathBuf {
+    workspace.join(".gaviero").join("code_graph.db")
+}
+
 /// Build or incrementally update the code knowledge graph for a workspace.
 ///
-/// The graph database is stored at `{workspace}/.gaviero/code_graph.db`.
+/// The graph database is stored at [`graph_db_path`].
 /// `excludes` is a list of folder names or glob patterns to skip
 /// (see [`crate::repo_map::builder::is_excluded`]).
 pub fn build_graph(workspace: &Path, excludes: &[String]) -> Result<(GraphStore, BuildResult)> {
-    let db_dir = workspace.join(".gaviero");
-    let db_path = db_dir.join("code_graph.db");
+    let db_path = graph_db_path(workspace);
     let store = GraphStore::open(&db_path)
         .with_context(|| format!("opening graph store at {}", db_path.display()))?;
 
