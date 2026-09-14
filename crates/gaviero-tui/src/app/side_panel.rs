@@ -329,6 +329,12 @@ pub(super) fn handle_chat_action(app: &mut App, action: Action) {
                     app.chat_state.text_input.text.clear();
                     app.chat_state.text_input.cursor = 0;
                     super::commands::handle_ntfy_command(app, &line);
+                } else if {
+                    let t = app.chat_state.text_input.text.trim();
+                    t == "/mcp" || t.starts_with("/mcp ")
+                } {
+                    let line = app.chat_state.text_input.text.trim().to_string();
+                    super::commands::handle_mcp_command(app, &line);
                 } else if !app.chat_state.process_slash_command() {
                     app.send_chat_message();
                 }

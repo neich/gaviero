@@ -69,6 +69,7 @@ review src/auth/session.rs for race conditions
 | `/remember <text>` | Store a fact (`-here`, `-module`, `-workspace`, `-global` scope it) |
 | `/forget <query>` | Soft-delete matching memories |
 | `/skills [search <q>]` | List or search loaded skills |
+| `/mcp` / `/mcp probe` | MCP reach record + endpoint; probe pointer (CLI) |
 | `/attach <path>` / `/detach` | Add/remove file context |
 | `/lite` | Minimal-context turn (topology only) |
 | `/compact` / `/clear` | Trim or clear conversation history |

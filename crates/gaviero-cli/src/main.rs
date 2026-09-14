@@ -506,6 +506,43 @@ struct Cli {
     #[arg(long = "mcp-stats-path", value_name = "PATH", requires = "mcp_stats")]
     mcp_stats_path: Option<PathBuf>,
 
+    /// Layer-4 MCP reach probe: spawn each vendor CLI, ask it to call
+    /// `memory_ping` at depth 0 and (when supported) depth 1, persist
+    /// `<repo>/.gaviero/mcp_reach.json`, print the table, and exit.
+    #[arg(long = "mcp-reach-probe")]
+    mcp_reach_probe: bool,
+
+    /// Comma-separated providers for `--mcp-reach-probe`
+    /// (`claude`, `codex`, `cursor`, `dsh`). Default: all four.
+    #[arg(
+        long = "reach-providers",
+        value_name = "LIST",
+        requires = "mcp_reach_probe"
+    )]
+    reach_providers: Option<String>,
+
+    /// Nesting depth to verify (0 = top-level only). Default 1.
+    #[arg(
+        long = "reach-depth",
+        default_value_t = 1,
+        requires = "mcp_reach_probe"
+    )]
+    reach_depth: u8,
+
+    /// Probe transport label: `stdio` | `http` | `both`. HTTP is recorded
+    /// from P0; the listener lands in P2, so live runs still synthesize
+    /// the stdio shim until then.
+    #[arg(
+        long = "reach-transport",
+        default_value = "stdio",
+        requires = "mcp_reach_probe"
+    )]
+    reach_transport: String,
+
+    /// Print the reach record as JSON on stdout instead of the table.
+    #[arg(long = "reach-json", requires = "mcp_reach_probe")]
+    reach_json: bool,
+
     /// Tier A / A2: write a `/remember`-style memory from headless
     /// mode and exit. Goes through the writer task (single-consumer
     /// invariant) — opens [`MemoryServices`] under the hood. Pair with
@@ -1231,6 +1268,7 @@ fn prepare_mcp_for_swarm(
     // (extractor off, or no memory) leaves the tool unwired, so a call
     // errors loudly instead of silently no-oping.
     memory_writer: Option<&gaviero_core::memory::WriterHandle>,
+    probe_ledger: Option<gaviero_core::mcp::ProbeLedger>,
 ) -> Result<(
     Option<gaviero_core::mcp::McpConfigSynth>,
     Option<gaviero_core::mcp::McpServerHandle>,
@@ -1282,12 +1320,21 @@ fn prepare_mcp_for_swarm(
     let mut handle = None;
     if synth.gaviero_enabled {
         if reuse_existing {
-            eprintln!(
-                "[mcp] reusing gaviero MCP server already listening on {} \
-                 (another gaviero instance — e.g. the TUI — serves this workspace; \
-                 keep it open for the duration of this run)",
-                synth.endpoint
-            );
+            if probe_ledger.is_some() {
+                eprintln!(
+                    "[mcp] reach probe: reusing the live workspace MCP server — \
+                     ProbeLedger cannot attach; pings are recovered from \
+                     .gaviero/mcp_calls.ndjson when present. Close the TUI \
+                     (or other gaviero instance) to attach an in-process ledger."
+                );
+            } else {
+                eprintln!(
+                    "[mcp] reusing gaviero MCP server already listening on {} \
+                     (another gaviero instance — e.g. the TUI — serves this workspace; \
+                     keep it open for the duration of this run)",
+                    synth.endpoint
+                );
+            }
         } else if let Some(stores) = memory {
             let retrieval_cfg = workspace.resolve_retrieval_config(Some(repo));
             let rerank_cfg = workspace.resolve_rerank_config(Some(repo));
@@ -1382,6 +1429,10 @@ fn prepare_mcp_for_swarm(
                     server.with_signal_sink(gaviero_core::memory::WriterSignalSink::arc(w.clone()))
                 }
                 _ => server,
+            };
+            let server = match probe_ledger {
+                Some(ledger) => server.with_probe_ledger(ledger),
+                None => server,
             };
             // Phase 1: warm the graph cache, repo-map cache, and (when
             // configured) the reranker in the background so the first
@@ -3349,6 +3400,67 @@ fn run_mcp_stats(repo: &std::path::Path, path_override: Option<&std::path::Path>
     Ok(())
 }
 
+async fn run_mcp_reach_probe(cli: &Cli, repo: &std::path::Path) -> Result<()> {
+    if cli.no_mcp {
+        anyhow::bail!("--mcp-reach-probe needs the gaviero MCP server; omit --no-mcp");
+    }
+    let workspace = gaviero_core::workspace::Workspace::single_folder(repo.to_path_buf());
+    let memory = open_memory_services(repo, "mcp-reach-probe").await?;
+    let ledger = gaviero_core::mcp::ProbeLedger::new();
+    let (synth, handle) = prepare_mcp_for_swarm(
+        repo,
+        &workspace,
+        cli,
+        &[],
+        &Some(memory.stores.clone()),
+        Some(&memory.writer),
+        Some(ledger.clone()),
+    )?;
+    let Some(synth) = synth else {
+        anyhow::bail!(
+            "MCP is disabled for this workspace — enable mcp.gavieroServer.enabled \
+             or omit --no-mcp"
+        );
+    };
+
+    let mut cfg = gaviero_core::mcp::ReachProbeConfig::default();
+    if let Some(raw) = cli.reach_providers.as_deref() {
+        cfg.providers = raw
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if cfg.providers.is_empty() {
+            anyhow::bail!("--reach-providers is empty");
+        }
+    }
+    cfg.depth = cli.reach_depth;
+    cfg.transport = gaviero_core::mcp::ReachTransport::parse(&cli.reach_transport)?;
+
+    eprintln!(
+        "[mcp] reach probe providers={} depth={} transport={}",
+        cfg.providers.join(","),
+        cfg.depth,
+        cfg.transport.as_str()
+    );
+    let report = gaviero_core::mcp::run_reach_probe(repo, &synth, &ledger, &cfg).await?;
+    let record = gaviero_core::mcp::ReachRecord::from(report);
+    gaviero_core::mcp::ReachStore::save(repo, &record)?;
+    eprintln!(
+        "[mcp] wrote {}",
+        gaviero_core::mcp::ReachRecord::path(repo).display()
+    );
+    if cli.reach_json {
+        println!("{}", serde_json::to_string_pretty(&record)?);
+    } else {
+        print!("{}", gaviero_core::mcp::format_reach_table(&record));
+    }
+    if let Some(h) = handle {
+        h.shutdown().await;
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -3464,6 +3576,10 @@ async fn main() -> Result<()> {
             );
             std::process::exit(2);
         }
+    }
+
+    if cli.mcp_reach_probe {
+        return run_mcp_reach_probe(&cli, &repo).await;
     }
 
     // ── Manifest introspection (Tier S / S4): print and exit ─────
@@ -4021,6 +4137,7 @@ async fn main() -> Result<()> {
         mcp_script_vars,
         &memory,
         swarm_memory_writer.as_ref(),
+        None,
     )?;
     if let Some(ref synth) = mcp_config {
         gaviero_core::mcp::validate_codex_trust_for_extras(synth, &plan, &execution_model)?;
@@ -4578,6 +4695,37 @@ mod tests {
             Some(gaviero_core::mcp::TrustConsent::Granted)
         );
     }
+
+    #[test]
+    fn cli_accepts_mcp_reach_probe_flags() {
+        let cli = Cli::try_parse_from([
+            "gaviero-cli",
+            "--mcp-reach-probe",
+            "--reach-providers",
+            "claude,codex",
+            "--reach-depth",
+            "1",
+            "--reach-transport",
+            "stdio",
+            "--reach-json",
+        ])
+        .unwrap();
+        assert!(cli.mcp_reach_probe);
+        assert_eq!(cli.reach_providers.as_deref(), Some("claude,codex"));
+        assert_eq!(cli.reach_depth, 1);
+        assert_eq!(cli.reach_transport, "stdio");
+        assert!(cli.reach_json);
+
+        let defaults = Cli::try_parse_from(["gaviero-cli", "--mcp-reach-probe"]).unwrap();
+        assert_eq!(defaults.reach_depth, 1);
+        assert_eq!(defaults.reach_transport, "stdio");
+        assert!(!defaults.reach_json);
+        assert!(defaults.reach_providers.is_none());
+    }
+
+    #[test]
+    #[ignore = "live vendor CLIs; run: cargo run -p gaviero-cli -- --mcp-reach-probe --reach-providers claude"]
+    fn live_mcp_reach_probe_claude() {}
 
     #[test]
     fn cli_accepts_prompt_file_with_script() {

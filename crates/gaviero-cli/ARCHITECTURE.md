@@ -72,7 +72,7 @@ parse Cli
   │     --remember / --graph[--enrich] / --cleanup-branches
   │     --manifest-* / --eval-* / --seed-corpus-from-paths
   │     --sleep / --utilization-* / --deletions-* / --restore-*
-  │     --forget-* / --forget-history-id / --mcp-stats
+  │     --forget-* / --forget-history-id / --mcp-stats / --mcp-reach-probe
   │
   ├─ plan input:
   │     --task            → synthetic WorkUnit (owned=["."])
@@ -143,6 +143,8 @@ Binary only — no library API. Public surface is the CLI:
 --cleanup-branches [--force]
 --no-mcp --mcp-url --mcp-stdio --mcp-codex-trust
 --skip-mcp-preflight --mcp-stats [--mcp-stats-path]
+--mcp-reach-probe [--reach-providers LIST] [--reach-depth N]
+  [--reach-transport stdio|http|both] [--reach-json]
 --namespace --read-ns --accept-c1-migration
 --remember [--remember-scope]
 --manifest-last / --manifest-turn

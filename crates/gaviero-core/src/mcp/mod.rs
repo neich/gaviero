@@ -88,7 +88,7 @@ pub use preflight::{
 pub use probe::{PingRecord, ProbeLedger, ping_receipt};
 pub use reach::{
     NestingPolicy, ReachPolicy, ReachRecord, ReachStore, filter_claude_tools,
-    push_codex_multi_agent_override,
+    format_mcp_status, format_reach_table, push_codex_multi_agent_override,
 };
 pub use reach_probe::{
     ProviderReachResult, ReachProbeConfig, ReachReport, ReachTransport, ReachVerdict,

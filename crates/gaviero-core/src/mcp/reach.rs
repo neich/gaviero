@@ -207,6 +207,120 @@ pub fn cursor_reach_status(policy: &ReachPolicy) -> Option<&'static str> {
     }
 }
 
+/// Human table for a persisted (or just-written) reach record.
+pub fn format_reach_table(record: &ReachRecord) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "workspace {}  probed {}\n",
+        record.workspace_id,
+        record.probed_at.to_rfc3339()
+    ));
+    out.push_str(&format!(
+        "{:<10} {:<20} {:<10} {:<4} {:<7} {:<16} {:<8}\n",
+        "provider", "version", "transport", "top", "nested", "verdict", "explicit"
+    ));
+    for (name, row) in &record.providers {
+        let version = row.cli_version.as_deref().unwrap_or("-");
+        out.push_str(&format!(
+            "{:<10} {:<20} {:<10} {:<4} {:<7} {:<16} {:<8}\n",
+            name,
+            trunc(version, 20),
+            row.transport,
+            yn(row.top_level),
+            yn(row.nested),
+            row.verdict.as_str(),
+            yn(row.explicit_ref_required),
+        ));
+    }
+    out
+}
+
+fn yn(v: bool) -> &'static str {
+    if v { "yes" } else { "no" }
+}
+
+fn trunc(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// TUI `/mcp` (and CLI human status): endpoint, transport, exposed-tool
+/// setting, reach policy, and the last probe table when present.
+pub fn format_mcp_status(root: &Path, endpoint: &str) -> String {
+    let (enforce, max_age_days, exposed, transport) = read_mcp_status_settings(root);
+    let mut out = String::new();
+    out.push_str(&format!("endpoint:        {endpoint}\n"));
+    out.push_str(&format!("transport:       {transport}\n"));
+    out.push_str(&format!("exposed tools:   {exposed}\n"));
+    out.push_str(&format!(
+        "reach.enforce:   {enforce}   maxAgeDays: {max_age_days}\n"
+    ));
+    match ReachStore::load(root) {
+        Ok(Some(rec)) => {
+            out.push('\n');
+            out.push_str(&format_reach_table(&rec));
+        }
+        Ok(None) => {
+            out.push_str(
+                "\nno mcp_reach.json — run `gaviero-cli --mcp-reach-probe` to measure nesting.\n",
+            );
+        }
+        Err(e) => {
+            out.push_str(&format!("\nfailed to read mcp_reach.json: {e}\n"));
+        }
+    }
+    out
+}
+
+fn read_mcp_status_settings(root: &Path) -> (bool, u32, String, String) {
+    let path = root.join(".gaviero").join("settings.json");
+    let doc = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let enforce = doc
+        .as_ref()
+        .and_then(|d| dot_get(d, settings::MCP_REACH_ENFORCE))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let max_age_days = doc
+        .as_ref()
+        .and_then(|d| dot_get(d, settings::MCP_REACH_MAX_AGE_DAYS))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(30)
+        .min(u32::MAX as u64) as u32;
+    let exposed = doc
+        .as_ref()
+        .and_then(|d| dot_get(d, settings::MCP_GAVIERO_EXPOSED_TOOLS))
+        .map(format_exposed_tools)
+        .unwrap_or_else(|| "memory_search, blast_radius, node_doc".into());
+    let transport = doc
+        .as_ref()
+        .and_then(|d| dot_get(d, "mcp.gavieroServer.transport"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("stdio")
+        .to_string();
+    (enforce, max_age_days, exposed, transport)
+}
+
+fn format_exposed_tools(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Array(arr) => {
+            let names: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+            if names.is_empty() {
+                "(empty — live server lists the full surface)".into()
+            } else {
+                names.join(", ")
+            }
+        }
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
 fn policy_for_provider(
     rec: &ReachRecord,
     name: &str,
@@ -494,5 +608,24 @@ mod tests {
             BTreeMap::from([("cursor".into(), NestingPolicy::Allowed)]),
         );
         assert_eq!(cursor_reach_status(&allowed), None);
+    }
+
+    #[test]
+    fn format_reach_table_lists_verdict() {
+        let rec = record_at(Utc::now(), row(ReachVerdict::NestedFailed, "2.1.269"));
+        let table = format_reach_table(&rec);
+        assert!(table.contains("claude"), "{table}");
+        assert!(table.contains("nested_failed"), "{table}");
+        assert!(table.contains("stdio"), "{table}");
+    }
+
+    #[test]
+    fn format_mcp_status_without_record_points_at_cli() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let text = format_mcp_status(dir.path(), r"\\.\pipe\gaviero-test");
+        assert!(text.contains("no mcp_reach.json"), "{text}");
+        assert!(text.contains("--mcp-reach-probe"), "{text}");
+        assert!(text.contains(r"\\.\pipe\gaviero-test"), "{text}");
+        assert!(text.contains("stdio"), "{text}");
     }
 }

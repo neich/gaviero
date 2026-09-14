@@ -232,6 +232,11 @@ independent of `--resume`, which restores the node-level checkpoint.
 | `--skip-mcp-preflight` | — | Skip shim/URL validation before agents run |
 | `--mcp-stats` | — | Print per-tool MCP telemetry and exit |
 | `--mcp-stats-path` | `<path>` | Override NDJSON path for `--mcp-stats` |
+| `--mcp-reach-probe` | — | Probe vendor CLIs for nested MCP reach and write `.gaviero/mcp_reach.json` |
+| `--reach-providers` | `claude,codex,…` | Providers to probe (default: claude,codex,cursor,dsh) |
+| `--reach-depth` | `<n>` | Nesting depth to verify (default 1) |
+| `--reach-transport` | `stdio\|http\|both` | Probe transport label (live synth is stdio until the HTTP listener lands) |
+| `--reach-json` | — | Print the reach record as JSON instead of the table |
 
 ### Branch cleanup
 

@@ -2049,6 +2049,9 @@ impl AgentChatState {
                      /remote hide             — Clear the pairing QR from this transcript\n\
                      /ntfy                    — ntfy subscribe URL + QR (always-on phone alerts)\n\
                      /ntfy hide               — Clear the ntfy topic QR from this transcript\n\n\
+                     MCP:\n\
+                     /mcp                     — Reach record, endpoint, transport, exposed tools\n\
+                     /mcp probe               — How to run the CLI reach probe\n\n\
                      Help:\n\
                      /help                    — Show this help\n\n\
                      Pass-through to agent:\n\

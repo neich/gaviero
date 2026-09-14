@@ -27,7 +27,7 @@ Mode families (flags on `Cli`):
 | Graph | `--graph` (+ `--enrich` / `--enrich-no-embed`) |
 | Git hygiene | `--cleanup-branches` (+ `--force`) |
 | Memory admin | `--remember`, `--sleep`, `--utilization-scope`, `--manifest-*`, `--deletions-*` / `--restore-*`, `--forget-*` |
-| MCP | `--mcp-stats` (+ `--mcp-stats-path`); runtime: `--no-mcp`, `--mcp-url`, `--mcp-stdio`, `--mcp-codex-trust`, `--skip-mcp-preflight` |
+| MCP | `--mcp-stats` (+ `--mcp-stats-path`); `--mcp-reach-probe` (+ `--reach-providers`, `--reach-depth`, `--reach-transport`, `--reach-json`); runtime: `--no-mcp`, `--mcp-url`, `--mcp-stdio`, `--mcp-codex-trust`, `--skip-mcp-preflight` |
 | Eval | `--eval-fixture` (+ ablation / budget / anchor-ab / scope-matrix / seed-corpus flags) |
 
 Full user-facing flag tables: [README.md](README.md). Do not duplicate every field here.

@@ -19,6 +19,8 @@ use sha2::{Digest, Sha256};
 
 use super::config_synth::McpConfigSynth;
 use super::probe::{PingRecord, ProbeLedger};
+use super::telemetry_sink::{McpCallRecord, default_telemetry_path};
+use super::tools::TOOL_MEMORY_PING;
 use crate::swarm::backend::{
     AgentBackend, CompletionRequest, UnifiedStreamEvent, shared::create_backend_for_model,
 };
@@ -264,6 +266,64 @@ pub fn ledger_saw_depth(ledger: &ProbeLedger, nonce: &str, depth: u8) -> bool {
         .any(|r| r.depth == depth)
 }
 
+/// Fold `memory_ping` rows from the workspace NDJSON telemetry into the
+/// ledger. Used when the probe reuses a live TUI server that has no
+/// in-process [`ProbeLedger`] attached (L2 still holds: the server wrote
+/// the telemetry, not the agent text).
+pub fn ingest_telemetry_pings(ledger: &ProbeLedger, telemetry_path: &Path, nonce: &str) -> usize {
+    let Ok(text) = std::fs::read_to_string(telemetry_path) else {
+        return 0;
+    };
+    let mut n = 0;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(rec) = serde_json::from_str::<McpCallRecord>(line) else {
+            continue;
+        };
+        if rec.tool_name != TOOL_MEMORY_PING {
+            continue;
+        }
+        let Some(got) = rec.input.get("nonce").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if got != nonce {
+            continue;
+        }
+        let depth = rec
+            .input
+            .get("depth")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u8;
+        if ledger_saw_depth(ledger, nonce, depth) {
+            continue;
+        }
+        let at = DateTime::parse_from_rfc3339(&rec.ts)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        let receipt = rec
+            .output
+            .get("receipt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        ledger.record(PingRecord {
+            nonce: nonce.to_string(),
+            depth,
+            at,
+            receipt,
+        });
+        n += 1;
+    }
+    n
+}
+
+fn ingest_workspace_telemetry(ledger: &ProbeLedger, workspace_root: &Path, nonce: &str) {
+    ingest_telemetry_pings(ledger, &default_telemetry_path(workspace_root), nonce);
+}
+
 fn allowed_tools_for(provider: &str) -> Vec<String> {
     match provider {
         "claude" => vec!["Agent".into()],
@@ -375,6 +435,7 @@ pub async fn run_reach_probe(
     for provider in &cfg.providers {
         let row = probe_one_provider(
             provider,
+            workspace_root,
             &agent_root,
             ledger,
             cfg,
@@ -470,6 +531,7 @@ impl BackendFactory for LiveBackendFactory {
 
 async fn probe_one_provider(
     provider: &str,
+    workspace_root: &Path,
     agent_root: &Path,
     ledger: &ProbeLedger,
     cfg: &ReachProbeConfig,
@@ -513,6 +575,7 @@ async fn probe_one_provider(
                         None,
                     );
                     let _ = drain_backend(backend.as_ref(), req, cfg.timeout).await;
+                    ingest_workspace_telemetry(ledger, workspace_root, &nonce);
                 }
                 Err(e) => {
                     tracing::debug!(target: "mcp_reach", provider, error = %e, "backend missing");
@@ -571,6 +634,7 @@ async fn probe_one_provider(
         None,
     );
     let _ = drain_backend(backend.as_ref(), req, cfg.timeout).await;
+    ingest_workspace_telemetry(ledger, workspace_root, &nonce);
 
     let first = result_from_ledger(
         ledger,
@@ -599,6 +663,7 @@ async fn probe_one_provider(
         Some(claude_probe_agents_json("gaviero")),
     );
     let _ = drain_backend(backend.as_ref(), req, cfg.timeout).await;
+    ingest_workspace_telemetry(ledger, workspace_root, &nonce);
     let second = result_from_ledger(
         ledger,
         &nonce,
@@ -790,5 +855,25 @@ mod tests {
         let row = score_from_ledger(&ledger, "hallucinated", true, true, "stdio", 1);
         assert_eq!(row.verdict, ReachVerdict::NestedFailed);
         assert!(!row.nested);
+    }
+
+    #[test]
+    fn ingest_telemetry_pings_folds_matching_nonce() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mcp_calls.ndjson");
+        let line = serde_json::json!({
+            "ts": "2026-09-14T12:00:00Z",
+            "tool_name": "memory_ping",
+            "duration_us": 12,
+            "empty_result": false,
+            "input": { "nonce": "abc123", "depth": 0 },
+            "output": { "receipt": "deadbeefcafe", "depth": 0 }
+        });
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+        let ledger = ProbeLedger::new();
+        assert_eq!(ingest_telemetry_pings(&ledger, &path, "abc123"), 1);
+        assert_eq!(ingest_telemetry_pings(&ledger, &path, "abc123"), 0);
+        assert!(ledger_saw_depth(&ledger, "abc123", 0));
+        assert_eq!(ingest_telemetry_pings(&ledger, &path, "other"), 0);
     }
 }

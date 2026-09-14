@@ -43,6 +43,7 @@ pub const REMOTE_ALLOWED_SLASH: &[&str] = &[
     "/minimal",
     "/help",
     "/skills",
+    "/mcp",
 ];
 
 /// Destructive or approval-bypassing commands require `confirmed: true`.
@@ -590,6 +591,10 @@ pub fn apply_remote_slash(
                 .join("\n")
         };
         app.chat_state.add_user_message_at(idx, line);
+        app.chat_state.add_system_message_at(idx, &listing);
+    } else if command == "/mcp" {
+        app.chat_state.add_user_message_at(idx, line);
+        let listing = super::commands::mcp_command_reply(app, line);
         app.chat_state.add_system_message_at(idx, &listing);
     } else {
         app.chat_state
