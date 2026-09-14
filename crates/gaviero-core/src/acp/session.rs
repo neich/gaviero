@@ -87,6 +87,10 @@ pub struct AgentOptions {
     /// Claude Code Stop/Notification hooks skip machine turns (memory
     /// extractor, swarm agents, etc.). Interactive chat leaves this false.
     pub suppress_hooks: bool,
+    /// Claude `--agents <json>` payload. Used by the MCP reach probe's
+    /// second pass to declare `gaviero-probe` with an explicit server
+    /// reference. `None` omits the flag.
+    pub agents_json: Option<String>,
 }
 
 impl std::fmt::Debug for AgentOptions {
@@ -108,6 +112,7 @@ impl std::fmt::Debug for AgentOptions {
             )
             .field("turn_id", &self.turn_id)
             .field("suppress_hooks", &self.suppress_hooks)
+            .field("agents_json", &self.agents_json.as_ref().map(|_| "<set>"))
             .finish()
     }
 }
@@ -128,6 +133,7 @@ impl Default for AgentOptions {
             prompt_observer: None,
             turn_id: None,
             suppress_hooks: false,
+            agents_json: None,
         }
     }
 }
@@ -442,6 +448,10 @@ impl AcpSession {
         let mcp_config_path = cwd.join(".mcp.json");
         if mcp_config_path.is_file() {
             cmd.arg("--mcp-config").arg(&mcp_config_path);
+        }
+
+        if let Some(json) = options.agents_json.as_deref().filter(|s| !s.is_empty()) {
+            cmd.arg("--agents").arg(json);
         }
 
         // NOTE: Claude CLI's `--file` flag is for downloading remote file
@@ -874,13 +884,24 @@ mod tests {
     }
 
     #[test]
+    fn agents_json_defaults_off_and_is_optional() {
+        let opts = AgentOptions::default();
+        assert!(opts.agents_json.is_none());
+        let opts = AgentOptions {
+            agents_json: Some(r#"{"gaviero-probe":{}}"#.into()),
+            ..AgentOptions::default()
+        };
+        assert!(opts.agents_json.as_deref().unwrap().contains("gaviero-probe"));
+    }
+
+    #[test]
     fn agent_options_size_is_bounded() {
         // Sanity: AgentOptions is cloned per turn. The two new fields
-        // (Option<Arc<dyn _>>, Option<String>) must not balloon it past
-        // a sensible budget. 256 B leaves slack for future extension.
+        // (Option<Arc<dyn _>>, Option<String>) plus `agents_json` must
+        // not balloon it past a sensible budget. 288 B leaves slack.
         assert!(
-            std::mem::size_of::<AgentOptions>() <= 256,
-            "AgentOptions = {} B (budget 256 B)",
+            std::mem::size_of::<AgentOptions>() <= 288,
+            "AgentOptions = {} B (budget 288 B)",
             std::mem::size_of::<AgentOptions>()
         );
     }

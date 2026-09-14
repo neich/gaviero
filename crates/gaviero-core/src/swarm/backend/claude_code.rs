@@ -69,14 +69,21 @@ impl AgentBackend for ClaudeCodeBackend {
             available_tools: None,
             approved_tools: None,
             resume_session_id: None,
+            agents_json: request
+                .extra
+                .iter()
+                .find(|(k, _)| k == "agents_json")
+                .map(|(_, v)| v.clone()),
             ..AgentOptions::default()
         };
 
-        // Claude Code doesn't yet consume `extra { ... }` keys. Log them so
-        // users see their DSL knobs aren't being honoured rather than wondering
-        // silently. Future milestones can promote specific keys (e.g.
-        // `thinking_budget`) into `AgentOptions`.
+        // `agents_json` is consumed above (reach-probe second pass). Other
+        // `extra { ... }` keys are still unused — log them so DSL knobs
+        // aren't silently dropped.
         for (k, v) in &request.extra {
+            if k == "agents_json" {
+                continue;
+            }
             tracing::debug!(
                 target: "backend.claude",
                 key = %k,
