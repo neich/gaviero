@@ -174,3 +174,28 @@ fn build_graph_handles_added_then_removed_file() {
     // Avoid an unused-import warning if `Command` ever becomes needed.
     let _ = Command::new("true");
 }
+
+#[test]
+fn build_graph_skips_tmp_scratch_directory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let workspace = tmp.path();
+    seed_rust_workspace(workspace);
+    let junk = workspace.join("tmp").join("hermes-agent");
+    std::fs::create_dir_all(&junk).unwrap();
+    std::fs::write(junk.join("huge.rs"), "pub fn junk() {}\n").unwrap();
+
+    let (store, _) = build_graph(workspace, &[]).expect("build_graph");
+    let paths = store.all_file_paths().expect("all_file_paths");
+    assert!(
+        paths
+            .iter()
+            .all(|p| !p.replace('\\', "/").starts_with("tmp/")),
+        "tmp/ scratch files must not be indexed: {paths:?}"
+    );
+    assert!(
+        paths
+            .iter()
+            .any(|p| p.replace('\\', "/").contains("src/lib.rs")),
+        "real sources must still be indexed: {paths:?}"
+    );
+}

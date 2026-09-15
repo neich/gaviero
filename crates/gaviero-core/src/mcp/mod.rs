@@ -74,10 +74,6 @@ pub mod tools;
 pub mod transport;
 pub mod user_scope;
 
-pub use endpoint_file::{
-    McpEndpointDescriptor, find_descriptor_upwards, read_descriptor, remove_descriptor,
-    write_descriptor, write_listener_descriptor,
-};
 pub use config_synth::{
     BashPermissions, Context7Config, ExtraMcpServer, ExtraMcpTransport, HttpSynthEndpoint,
     ManagedRules, McpConfigSynth, McpPermissions, McpTransportChoice, McpTransportKind,
@@ -86,6 +82,10 @@ pub use config_synth::{
     codex_synth_has_any_mcp, codex_synth_has_remote_mcp, host_from_mcp_url,
     mcp_json_has_remote_urls, synth_has_remote_url_servers, synthesize_for_worktree,
     worktree_has_remote_mcp_urls,
+};
+pub use endpoint_file::{
+    McpEndpointDescriptor, find_descriptor_upwards, read_descriptor, remove_descriptor,
+    write_descriptor, write_listener_descriptor,
 };
 pub use external_memory::{
     ExternalMemoryServer, detect_external_memory_servers, disable_external_memory_servers,
@@ -98,8 +98,8 @@ pub use preflight::{
 };
 pub use probe::{PingRecord, ProbeLedger, ping_receipt};
 pub use reach::{
-    NestingPolicy, ReachPolicy, ReachRecord, ReachStore, filter_claude_tools,
-    format_mcp_status, format_reach_table, push_codex_multi_agent_override,
+    NestingPolicy, ReachPolicy, ReachRecord, ReachStore, filter_claude_tools, format_mcp_status,
+    format_reach_table, push_codex_multi_agent_override,
 };
 pub use reach_probe::{
     ProviderReachResult, ReachProbeConfig, ReachReport, ReachTransport, ReachVerdict,

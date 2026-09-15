@@ -799,7 +799,10 @@ impl Workspace {
         self.folder_settings_cache.clear();
         self.workspace_settings = match std::fs::read_to_string(self.settings_path()) {
             Ok(content) => serde_json::from_str(&content).unwrap_or_else(|error| {
-                tracing::warn!("Invalid settings at {}: {error}", self.settings_path().display());
+                tracing::warn!(
+                    "Invalid settings at {}: {error}",
+                    self.settings_path().display()
+                );
                 serde_json::Value::Null
             }),
             Err(_) => serde_json::Value::Null,
@@ -1677,30 +1680,56 @@ mod tests {
         let conflicting = r#"{"agent.permissions.bash.allowlist":["cargo"],"memberOnly":true}"#;
         fs::write(&member_settings, conflicting).unwrap();
         let ws_path = dir.path().join("custom.gaviero-workspace");
-        fs::write(&ws_path, serde_json::to_string(&serde_json::json!({
-            "folders": [{"path": member}],
-            "settings": {"agent.permissions.bash.allowlist": ["git"], "embeddedOnly": true}
-        })).unwrap()).unwrap();
+        fs::write(
+            &ws_path,
+            serde_json::to_string(&serde_json::json!({
+                "folders": [{"path": member}],
+                "settings": {"agent.permissions.bash.allowlist": ["git"], "embeddedOnly": true}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         fs::create_dir_all(dir.path().join(".gaviero")).unwrap();
         let settings_path = dir.path().join(".gaviero/settings.json");
-        fs::write(&settings_path, r#"{"agent":{"permissions":{"bash":{"allowlist":["flutter"]}}}}"#).unwrap();
+        fs::write(
+            &settings_path,
+            r#"{"agent":{"permissions":{"bash":{"allowlist":["flutter"]}}}}"#,
+        )
+        .unwrap();
         let mut ws = Workspace::load(&ws_path).unwrap();
         assert_eq!(ws.settings_path(), settings_path);
         for root in [None, Some(member.as_path())] {
-            assert_eq!(ws.resolve_setting(settings::AGENT_PERMISSIONS_BASH_ALLOWLIST, root), serde_json::json!(["flutter"]));
-            assert_eq!(ws.resolve_setting_opt(settings::AGENT_PERMISSIONS_BASH_ALLOWLIST, root), Some(serde_json::json!(["flutter"])));
+            assert_eq!(
+                ws.resolve_setting(settings::AGENT_PERMISSIONS_BASH_ALLOWLIST, root),
+                serde_json::json!(["flutter"])
+            );
+            assert_eq!(
+                ws.resolve_setting_opt(settings::AGENT_PERMISSIONS_BASH_ALLOWLIST, root),
+                Some(serde_json::json!(["flutter"]))
+            );
             assert_eq!(ws.resolve_setting_opt("memberOnly", root), None);
             assert_eq!(ws.resolve_setting_opt("embeddedOnly", root), None);
         }
-        ws.save_folder_setting(&member, settings::AGENT_PERMISSIONS_BASH_ALLOWLIST, serde_json::json!([])).unwrap();
+        ws.save_folder_setting(
+            &member,
+            settings::AGENT_PERMISSIONS_BASH_ALLOWLIST,
+            serde_json::json!([]),
+        )
+        .unwrap();
         ws.save().unwrap();
         let mut ws = Workspace::load(&ws_path).unwrap();
-        assert_eq!(ws.resolve_setting(settings::AGENT_PERMISSIONS_BASH_ALLOWLIST, Some(&member)), serde_json::json!([]));
+        assert_eq!(
+            ws.resolve_setting(settings::AGENT_PERMISSIONS_BASH_ALLOWLIST, Some(&member)),
+            serde_json::json!([])
+        );
         assert_eq!(fs::read_to_string(member_settings).unwrap(), conflicting);
         fs::write(&settings_path, "{}").unwrap();
         ws.reload_settings_cache();
         ws.user_settings_cache = None;
-        assert_eq!(ws.resolve_setting_opt(settings::AGENT_PERMISSIONS_BASH_ALLOWLIST, Some(&member)), None);
+        assert_eq!(
+            ws.resolve_setting_opt(settings::AGENT_PERMISSIONS_BASH_ALLOWLIST, Some(&member)),
+            None
+        );
         fs::remove_file(&settings_path).unwrap();
         ws.ensure_settings();
         assert!(settings_path.exists());

@@ -289,6 +289,11 @@ pub fn rank_files_with_weights(
     //    symbols. Mirrors `compute_specificity_map` but operates on
     //    SQLite-backed metadata so MCP doesn't have to rebuild the
     //    in-memory `RepoMap` graph.
+    //
+    //    Only query `symbols_in_file` for files we will actually emit
+    //    (seeds + affected). Walking every path in the DB was an N+1
+    //    that turned a 24k-file scratch tree into a multi-minute
+    //    `blast_radius` while the MCP graph mutex blocked `node_doc`.
     let specificity_map: HashMap<NodeIndex, f64> = if config.enabled {
         let df = store.symbol_document_frequency()?;
         let n = paths.len().max(1) as f64;
@@ -304,8 +309,19 @@ pub fn rank_files_with_weights(
             max_raw = max_raw.max(raw);
             raw_by_symbol.insert(sym.clone(), raw);
         }
+        let mut detail: HashSet<&str> = seeds.iter().copied().collect();
+        for p in affected {
+            detail.insert(p.as_str());
+        }
         let mut map = HashMap::new();
         for p in &paths {
+            let Some(&idx) = idx_for.get(p) else {
+                continue;
+            };
+            if !detail.contains(p.as_str()) {
+                map.insert(idx, 1.0);
+                continue;
+            }
             let symbols = store.symbols_in_file(p).unwrap_or_default();
             let s = if symbols.is_empty() {
                 1.0
@@ -318,9 +334,7 @@ pub fn rank_files_with_weights(
                     .sum();
                 (sum / symbols.len() as f64 / max_raw).clamp(0.0, 1.0)
             };
-            if let Some(&idx) = idx_for.get(p) {
-                map.insert(idx, s);
-            }
+            map.insert(idx, s);
         }
         map
     } else {

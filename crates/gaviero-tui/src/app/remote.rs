@@ -139,16 +139,22 @@ fn terminal_snapshot(app: &App, requested: Option<u64>) -> serde_json::Value {
         .map(gaviero_core::terminal::TerminalId::from_raw)
         .filter(|id| manager.instance(*id).is_some())
         .or_else(|| manager.tab_order().first().copied());
-    let tabs: Vec<_> = manager.tab_order().iter().filter_map(|id| {
-        manager.instance(*id).map(|inst| serde_json::json!({
-            "id": id.raw(),
-            "title": if inst.title.is_empty() {
-                inst.shell_config.shell_path.to_string_lossy().into_owned()
-            } else { inst.title.clone() },
-            "cwd": inst.cwd.to_string_lossy(),
-            "spawned": inst.spawned,
-        }))
-    }).collect();
+    let tabs: Vec<_> = manager
+        .tab_order()
+        .iter()
+        .filter_map(|id| {
+            manager.instance(*id).map(|inst| {
+                serde_json::json!({
+                    "id": id.raw(),
+                    "title": if inst.title.is_empty() {
+                        inst.shell_config.shell_path.to_string_lossy().into_owned()
+                    } else { inst.title.clone() },
+                    "cwd": inst.cwd.to_string_lossy(),
+                    "spawned": inst.spawned,
+                })
+            })
+        })
+        .collect();
     let screen = selected.and_then(|id| manager.instance(id)).map(|inst| {
         let mut screen = inst.screen().clone();
         screen.set_scrollback(0);
@@ -777,16 +783,21 @@ mod tests {
         let (dir, mut app) = two_tab_app();
         let first = app.terminal_manager.create_tab_lazy(dir.path());
         let second = app.terminal_manager.create_tab_lazy(dir.path());
-        app.terminal_manager.process_event(TerminalEvent::PtyOutput {
-            id: second, data: "hello café".as_bytes().to_vec(),
-        });
+        app.terminal_manager
+            .process_event(TerminalEvent::PtyOutput {
+                id: second,
+                data: "hello café".as_bytes().to_vec(),
+            });
         let snapshot = terminal_snapshot(&app, Some(second.raw()));
         assert_eq!(snapshot["selected_id"], second.raw());
         assert_eq!(snapshot["terminals"].as_array().unwrap().len(), 2);
         assert_eq!(snapshot["screen"]["text"], "hello café");
         assert_eq!(app.terminal_manager.active_tab(), Some(first));
         app.terminal_manager.close_tab(second);
-        assert_eq!(terminal_snapshot(&app, Some(second.raw()))["selected_id"], first.raw());
+        assert_eq!(
+            terminal_snapshot(&app, Some(second.raw()))["selected_id"],
+            first.raw()
+        );
         app.terminal_manager.close_tab(first);
         assert!(terminal_snapshot(&app, None)["selected_id"].is_null());
     }
@@ -796,12 +807,23 @@ mod tests {
         use gaviero_remote::envelope::TerminalInput;
         let (_dir, mut app) = two_tab_app();
         for text in ["echo hi\r".to_string(), "é".repeat(2049), String::new()] {
-            handle_remote_command(&mut app, ClientEnvelope {
-                version: gaviero_remote::version::PROTOCOL_VERSION,
-                instance_id: Some("test".into()), command_id: "input".into(),
-                frame: ClientFrame::TerminalInput(TerminalInput { terminal_id: 999, text }),
-            }, 131072);
-            assert!(matches!(app.remote.pending_frames.pop(), Some(ServerFrame::CommandError(_))));
+            handle_remote_command(
+                &mut app,
+                ClientEnvelope {
+                    version: gaviero_remote::version::PROTOCOL_VERSION,
+                    instance_id: Some("test".into()),
+                    command_id: "input".into(),
+                    frame: ClientFrame::TerminalInput(TerminalInput {
+                        terminal_id: 999,
+                        text,
+                    }),
+                },
+                131072,
+            );
+            assert!(matches!(
+                app.remote.pending_frames.pop(),
+                Some(ServerFrame::CommandError(_))
+            ));
             assert!(app.terminal_manager.is_empty());
         }
     }

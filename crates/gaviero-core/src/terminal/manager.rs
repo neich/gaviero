@@ -191,9 +191,14 @@ impl TerminalManager {
 
     /// Send input to a named tab without changing desktop focus.
     pub fn write_input_to(&mut self, id: TerminalId, data: &[u8]) -> Result<()> {
-        let instance = self.terminals.get_mut(&id).context("unknown shell session")?;
+        let instance = self
+            .terminals
+            .get_mut(&id)
+            .context("unknown shell session")?;
         instance.spawn(self.event_tx.clone())?;
-        instance.try_write_input(data).context("failed to write shell input")
+        instance
+            .try_write_input(data)
+            .context("failed to write shell input")
     }
 
     /// Switch to a specific tab. Lazy-resizes if dimensions mismatch.

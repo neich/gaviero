@@ -2155,7 +2155,9 @@ url = "https://example/mcp/"
         let app = args.iter().position(|a| a == "app-server").unwrap();
         let pair = args
             .windows(2)
-            .position(|w| w[0] == "--config" && w[1] == crate::mcp::reach::CODEX_DISABLE_MULTI_AGENT)
+            .position(|w| {
+                w[0] == "--config" && w[1] == crate::mcp::reach::CODEX_DISABLE_MULTI_AGENT
+            })
             .unwrap();
         assert!(pair < app);
     }
@@ -2187,8 +2189,7 @@ url = "https://example/mcp/"
         assert_eq!(resume["sandboxPolicy"]["networkAccess"], true);
         assert_eq!(
             resume["developerInstructions"],
-            thread_start_params("gpt-5.6-sol", Path::new("/tmp/work"), &[], true)
-                ["developerInstructions"]
+            thread_start_params("gpt-5.6-sol", Path::new("/tmp/work"), &[], true)["developerInstructions"]
         );
 
         let turn = turn_start_params("thread-1", "hello", false);
