@@ -115,6 +115,141 @@ pub enum McpTransport {
     InProcess,
 }
 
+/// Per-provider MCP capability gates — the `context7_allowed` /
+/// `extra_servers_allowed` axes of the capability table, plus the transport
+/// that says whether an MCP-server entry is even meaningful for this provider.
+///
+/// Declared **once** by [`Provider::mcp_capabilities`], which is the single
+/// source for both `build_provider_profile`'s arms and every provider-specific
+/// injection decision (dsh's `session/new`; the config synthesizer's vendors).
+/// Splitting the fact across an arm literal and a consumer is the exact drift
+/// `tool_surface.rs`'s stale header demonstrated (§0 of the parity plan).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McpCapabilities {
+    /// Whether context7 is injected for this provider.
+    pub context7: bool,
+    /// Whether workspace `extraServers` are injected for this provider.
+    pub extra_servers: bool,
+    /// How this provider consumes MCP servers, if at all. The two axes above
+    /// say *what* a provider may use; this says *how* it would receive it, and
+    /// is what stops an MCP-server entry being emitted for a provider that has
+    /// no MCP transport (see [`Self::uses_mcp_servers`]).
+    pub transport: McpTransport,
+}
+
+impl McpCapabilities {
+    /// Permissive default for a config-synthesizer vendor the table does not
+    /// name. A new vendor is added to the table deliberately; until then it is
+    /// not silently muted.
+    ///
+    /// Transport is [`McpTransport::ConfigFileStdio`] because every caller of
+    /// this constructor is a config-file emitter. Use [`Self::permissive_over`]
+    /// where the provider's real transport is known.
+    pub const fn permissive() -> Self {
+        Self::permissive_over(McpTransport::ConfigFileStdio)
+    }
+
+    /// Both axes allowed over a known transport.
+    pub const fn permissive_over(transport: McpTransport) -> Self {
+        Self {
+            context7: true,
+            extra_servers: true,
+            transport,
+        }
+    }
+
+    /// Whether this provider consumes MCP servers over any transport at all.
+    ///
+    /// `false` for the in-process harness, which *links* servers as a live
+    /// value rather than spawning or connecting to them — so a `mcpServers`
+    /// entry is meaningless for it no matter what the two axes say. This is the
+    /// distinction that keeps `context7: true` (Phase 2d: the in-process loop
+    /// reaches context7 as a *native* tool) from also registering a context7
+    /// MCP server for a provider that would never read one.
+    pub const fn uses_mcp_servers(self) -> bool {
+        !matches!(self.transport, McpTransport::InProcess)
+    }
+
+    /// Capability row for a config-synthesizer vendor key (`"claude"`,
+    /// `"codex"`, `"cursor"`) — the reverse of [`Provider::synth_vendor`].
+    ///
+    /// Resolved by searching [`Provider::ALL`] rather than matching on the
+    /// string, so this lookup cannot drift from the forward one: renaming a
+    /// vendor key re-points both directions at once.
+    ///
+    /// An unrecognised vendor gets [`Self::permissive`]. A vendor the table
+    /// does not name is one gaviero has not reasoned about, and silently
+    /// muting it would be the worse failure of the two.
+    pub fn for_synth_vendor(vendor: &str) -> Self {
+        Provider::ALL
+            .iter()
+            .find(|p| p.synth_vendor() == Some(vendor))
+            .map(|p| p.mcp_capabilities())
+            .unwrap_or_else(Self::permissive)
+    }
+}
+
+impl Provider {
+    /// Every provider arm.
+    ///
+    /// Exists so exhaustive iteration cannot silently miss an arm when one is
+    /// added — the reverse lookup in [`McpCapabilities::for_synth_vendor`] and
+    /// the table's own tests both walk this instead of a hand-copied list.
+    pub const ALL: [Provider; 7] = [
+        Provider::Claude,
+        Provider::Codex,
+        Provider::CodexAppServer,
+        Provider::Cursor,
+        Provider::Ollama,
+        Provider::Deepseek,
+        Provider::Dsh,
+    ];
+
+    /// The single source for this provider's MCP capability gates.
+    ///
+    /// **Decision (provider-parity #2): context7 is available to every
+    /// provider.** The in-process loop (`ollama:`/`deepseek:`) still reads
+    /// `false` because its injection path is unwired (Phase 2d), not because
+    /// the provider is excluded.
+    pub const fn mcp_capabilities(self) -> McpCapabilities {
+        match self {
+            Provider::Claude
+            | Provider::Codex
+            | Provider::CodexAppServer
+            | Provider::Cursor => {
+                McpCapabilities::permissive_over(McpTransport::ConfigFileStdio)
+            }
+            Provider::Dsh => McpCapabilities::permissive_over(McpTransport::HttpOnly),
+            // Phase 2d: context7 reaches the in-process loop as a *native* tool
+            // over context7's REST API (`tools/context7.rs`), not as an MCP
+            // server — so `context7` is allowed. `extra_servers` stays `false`
+            // and is not a gap: reaching a *foreign* MCP server would need the
+            // in-process MCP client §2.7-C left unbuilt, and no native adapter
+            // exists for arbitrary servers the way it does for context7.
+            Provider::Ollama | Provider::Deepseek => McpCapabilities {
+                context7: true,
+                extra_servers: false,
+                transport: McpTransport::InProcess,
+            },
+        }
+    }
+
+    /// Config-synthesizer vendor key for this provider, or `None` when it
+    /// reads no generated MCP config file (the in-process loop links a live
+    /// server; dsh receives servers on `session/new` instead).
+    ///
+    /// `codex exec` and `codex app-server` share one key because both load the
+    /// same `<worktree>/.codex/config.toml`.
+    pub const fn synth_vendor(self) -> Option<&'static str> {
+        match self {
+            Provider::Claude => Some("claude"),
+            Provider::Codex | Provider::CodexAppServer => Some("codex"),
+            Provider::Cursor => Some("cursor"),
+            Provider::Ollama | Provider::Deepseek | Provider::Dsh => None,
+        }
+    }
+}
+
 /// How (and whether) `agent.availableTools` is enforced for a provider.
 ///
 /// This is the axis that today has three implementations and one absence; see
@@ -140,6 +275,32 @@ pub enum ToolEnforcement {
     Unenforced,
 }
 
+impl ToolEnforcement {
+    /// The sentence a UI should show when this provider's enforcement is
+    /// absent, or `None` when there is nothing to disclose.
+    ///
+    /// Decision 1 (`plans/provider-parity` §0.1) is that dsh enforcement is
+    /// **declared** absent rather than attempted: gaviero does not synthesize a
+    /// tool list the protocol has no field for. Declaring it in the table is
+    /// only half of that — the user has to be told, or "declared" means
+    /// "recorded where they cannot see it". This is the other half.
+    ///
+    /// Deliberately `None` for every enforced variant: a notice that fires for
+    /// all providers is noise, and noise is how a real warning gets ignored.
+    pub fn ui_disclosure(&self, provider: &str) -> Option<String> {
+        match self {
+            Self::Unenforced => Some(format!(
+                "{provider} runs unenforced: its protocol carries no tool list and no permission \
+                 policy, so gaviero cannot restrict which tools or commands it runs. \
+                 `agent.availableTools` and `agent.permissions` do not apply to this agent."
+            )),
+            Self::Argv | Self::GeneratedConfig | Self::RuntimeHost | Self::RegistryMembership => {
+                None
+            }
+        }
+    }
+}
+
 /// Shape of the mid-turn question a provider can ask the user.
 ///
 /// This collapses the two axes an earlier draft named separately
@@ -157,6 +318,19 @@ pub enum PromptKind {
     YesNo,
     /// Yes/no **and** multi-choice options (Claude `AskUserQuestion`).
     MultiChoice,
+}
+
+impl PromptKind {
+    /// Whether this provider can surface a multi-choice question to the user.
+    ///
+    /// The in-process loop registers its `AskUserQuestion` tool off this
+    /// predicate, so the table — not the registry — decides which providers
+    /// hold an ask tool. `prompt_kind` already collapses "can prompt" and "what
+    /// shape", so a second `bool` beside it would just be a way for the two to
+    /// disagree.
+    pub const fn has_multi_choice(self) -> bool {
+        matches!(self, Self::MultiChoice)
+    }
 }
 
 /// Capability record for a provider, built solely by
@@ -193,6 +367,20 @@ pub struct ProviderProfile {
     pub tool_enforcement: ToolEnforcement,
     /// Strictest mid-turn question this provider can ask (see [`PromptKind`]).
     pub prompt_kind: PromptKind,
+}
+
+impl ProviderProfile {
+    /// The MCP capability gates as a compact value, for consumers that need
+    /// only the injection decision (dsh's `session/new`, the config
+    /// synthesizer). Read straight off the profile so the profile remains the
+    /// single carrier of the table.
+    pub const fn mcp_capabilities(&self) -> McpCapabilities {
+        McpCapabilities {
+            context7: self.context7_allowed,
+            extra_servers: self.extra_servers_allowed,
+            transport: self.mcp_transport,
+        }
+    }
 }
 
 /// Parsed `<prefix>:<model>` model spec.
@@ -296,6 +484,11 @@ pub struct RuntimeConfig {
 /// this function until every provider arm fills it — which is exactly the
 /// guarantee V9 §2 cites as the rationale.
 pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> ProviderProfile {
+    // The MCP capability gates are declared once on `Provider` and copied here,
+    // so an arm cannot drift from what the consumers enforce (dsh's
+    // `session/new`; `Provider::synth_vendor`'s config files). See
+    // `Provider::mcp_capabilities`.
+    let caps = spec.provider().mcp_capabilities();
     match spec.provider() {
         Provider::Claude => ProviderProfile {
             provider: "claude".to_string(),
@@ -309,9 +502,9 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             max_context_tokens: Some(200_000),
             // tool_use + 200k context ⇒ Strong (matches BootstrapTier::derive).
             bootstrap_tier: BootstrapTier::Strong,
-            mcp_transport: McpTransport::ConfigFileStdio,
-            context7_allowed: true,
-            extra_servers_allowed: true,
+            mcp_transport: caps.transport,
+            context7_allowed: caps.context7,
+            extra_servers_allowed: caps.extra_servers,
             // `claude --tools` argv (`acp/session.rs`).
             tool_enforcement: ToolEnforcement::Argv,
             // `AskUserQuestion` + y/n.
@@ -330,9 +523,9 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             // tool_use + unknown (None) context ⇒ Strong (derive treats an
             // unknown window as not-small).
             bootstrap_tier: BootstrapTier::Strong,
-            mcp_transport: McpTransport::ConfigFileStdio,
-            context7_allowed: true,
-            extra_servers_allowed: true,
+            mcp_transport: caps.transport,
+            context7_allowed: caps.context7,
+            extra_servers_allowed: caps.extra_servers,
             // Runtime decisions via `AgentToolSurface` (`tool_surface.rs`).
             tool_enforcement: ToolEnforcement::RuntimeHost,
             // y/n only — `item/commandExecution/requestApproval`.
@@ -352,9 +545,9 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             max_context_tokens: None,
             // tool_use + unknown (None) context ⇒ Strong.
             bootstrap_tier: BootstrapTier::Strong,
-            mcp_transport: McpTransport::ConfigFileStdio,
-            context7_allowed: true,
-            extra_servers_allowed: true,
+            mcp_transport: caps.transport,
+            context7_allowed: caps.context7,
+            extra_servers_allowed: caps.extra_servers,
             // No gaviero-side enforcement wired; `codex exec` carries no tool
             // list to this session (see `codex_exec.rs`). UNVERIFIED against a
             // live codex — Phase 7's parity test must confirm.
@@ -380,15 +573,15 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             max_context_tokens: Some(200_000),
             // tool_use + 200k context ⇒ Strong.
             bootstrap_tier: BootstrapTier::Strong,
-            mcp_transport: McpTransport::ConfigFileStdio,
+            mcp_transport: caps.transport,
             // Delivered (Phase 2, decision #2): Cursor's context7 exclusion is
             // gone. The registration is a `url` entry, so it is not the stdio
             // shape `validate_synthesized_cursor_remote_mcp` rejects; the
             // preflight now keys on transport rather than on the server name.
             // A *stdio* context7 is still withheld from Cursor when a remote
             // URL extra exists — that is the conditional half of decision #2.
-            context7_allowed: true,
-            extra_servers_allowed: true,
+            context7_allowed: caps.context7,
+            extra_servers_allowed: caps.extra_servers,
             // Deny rules baked into the generated `.cursor/mcp.json` /
             // `cli.json` (`config_synth.rs`).
             tool_enforcement: ToolEnforcement::GeneratedConfig,
@@ -414,15 +607,16 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             // full push until per-tier evidence proves a thin bootstrap holds.
             bootstrap_tier: BootstrapTier::SmallLocal,
             // In-process loop: servers are linked, not spawned.
-            mcp_transport: McpTransport::InProcess,
+            mcp_transport: caps.transport,
             // Phase 2 wires context7 for the in-process loop.
-            context7_allowed: false,
-            extra_servers_allowed: false,
+            context7_allowed: caps.context7,
+            extra_servers_allowed: caps.extra_servers,
             // Tool reachability = registry membership (`tools/mod.rs`).
             tool_enforcement: ToolEnforcement::RegistryMembership,
-            // y/n Bash gate only (`tool_agent/policy.rs`). Phase 4 adds a
-            // multi-choice ask tool; this becomes `MultiChoice`.
-            prompt_kind: PromptKind::YesNo,
+            // Delivered (Phase 4): the in-process loop now holds
+            // `AskUserQuestion` (`tools/ask.rs`), riding the same
+            // `on_permission_request` channel as the Bash gate.
+            prompt_kind: PromptKind::MultiChoice,
         },
         Provider::Deepseek => ProviderProfile {
             provider: "deepseek".to_string(),
@@ -436,14 +630,13 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             max_context_tokens: Some(128_000),
             // tool_use + 128k context ⇒ Strong.
             bootstrap_tier: BootstrapTier::Strong,
-            mcp_transport: McpTransport::InProcess,
+            mcp_transport: caps.transport,
             // Phase 2 wires context7 for the in-process loop.
-            context7_allowed: false,
-            extra_servers_allowed: false,
+            context7_allowed: caps.context7,
+            extra_servers_allowed: caps.extra_servers,
             tool_enforcement: ToolEnforcement::RegistryMembership,
-            // y/n Bash gate only (`tool_agent/policy.rs`). Phase 4 adds a
-            // multi-choice ask tool; this becomes `MultiChoice`.
-            prompt_kind: PromptKind::YesNo,
+            // Delivered (Phase 4): `tools/ask.rs`, shared with the Ollama arm.
+            prompt_kind: PromptKind::MultiChoice,
         },
         Provider::Dsh => ProviderProfile {
             provider: "dsh".to_string(),
@@ -459,9 +652,9 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             // the same `mcp.permissions` registration gate the file-based
             // providers apply. A stdio entry — a `command` extra, or context7
             // in stdio-fallback mode — cannot be hosted and is skipped.
-            mcp_transport: McpTransport::HttpOnly,
-            context7_allowed: true,
-            extra_servers_allowed: true,
+            mcp_transport: caps.transport,
+            context7_allowed: caps.context7,
+            extra_servers_allowed: caps.extra_servers,
             // `session/new` carries no tool list and no permission policy —
             // structurally unenforced (decision #1: declared, not attempted).
             tool_enforcement: ToolEnforcement::Unenforced,
@@ -978,8 +1171,10 @@ mod tests {
         let p = profile("cursor:gpt-5");
         assert_eq!(p.tool_enforcement, ToolEnforcement::GeneratedConfig);
         assert_eq!(p.prompt_kind, PromptKind::None);
-        // Phase 2 flips this to `true` (decision #2: context7 for all).
-        assert!(!p.context7_allowed);
+        // Delivered (Phase 2, decision #2): Cursor is no longer excluded from
+        // context7. The registration is a `url` entry, so it is not the stdio
+        // shape `validate_synthesized_cursor_remote_mcp` rejects.
+        assert!(p.context7_allowed);
     }
 
     #[test]
@@ -989,7 +1184,87 @@ mod tests {
         // Decision #1: declared unenforced, not attempted.
         assert_eq!(p.tool_enforcement, ToolEnforcement::Unenforced);
         assert_eq!(p.prompt_kind, PromptKind::YesNo);
-        assert!(!p.extra_servers_allowed);
+        // Delivered (Phase 2, decisions #2/E): `session/new` now carries
+        // context7 and URL-form `extraServers`, each behind the same
+        // `mcp.permissions` registration gate the file-based providers apply.
+        assert!(p.context7_allowed);
+        assert!(p.extra_servers_allowed);
+    }
+
+    /// §D wiring: the arms copy `Provider::mcp_capabilities`, so a consumer
+    /// that reads the table cannot disagree with the profile it is handed.
+    #[test]
+    fn profile_gates_match_the_provider_table() {
+        for (spec, provider) in [
+            ("claude:sonnet", Provider::Claude),
+            ("codex:gpt-5", Provider::Codex),
+            ("codex-app-server:gpt-5", Provider::CodexAppServer),
+            ("cursor:gpt-5", Provider::Cursor),
+            ("ollama:llama3.1", Provider::Ollama),
+            ("deepseek:deepseek-chat", Provider::Deepseek),
+            ("dsh:deepseek-chat", Provider::Dsh),
+        ] {
+            let p = profile(spec);
+            let caps = provider.mcp_capabilities();
+            assert_eq!(p.context7_allowed, caps.context7, "{spec}");
+            assert_eq!(p.extra_servers_allowed, caps.extra_servers, "{spec}");
+            assert_eq!(p.mcp_capabilities(), caps, "{spec}");
+        }
+    }
+
+    /// The synthesizer keys off `synth_vendor`. Providers that read no
+    /// generated MCP config file — the in-process loop links a live server, dsh
+    /// receives servers on `session/new` — must say so rather than being
+    /// assumed to have a vendor key.
+    #[test]
+    fn only_config_file_providers_name_a_synth_vendor() {
+        assert_eq!(Provider::Claude.synth_vendor(), Some("claude"));
+        assert_eq!(Provider::Codex.synth_vendor(), Some("codex"));
+        // One key: both load `<worktree>/.codex/config.toml`.
+        assert_eq!(Provider::CodexAppServer.synth_vendor(), Some("codex"));
+        assert_eq!(Provider::Cursor.synth_vendor(), Some("cursor"));
+        for p in [Provider::Ollama, Provider::Deepseek, Provider::Dsh] {
+            assert_eq!(p.synth_vendor(), None, "{p:?}");
+        }
+    }
+
+    /// §2.7-D: the synthesizer resolves a vendor key back to a table row. The
+    /// reverse lookup must agree with the forward one for **every** provider, so
+    /// renaming a key re-points both directions at once and a new arm cannot be
+    /// added to one side only.
+    #[test]
+    fn synth_vendor_reverse_lookup_matches_the_table() {
+        for p in Provider::ALL {
+            // Only providers with a vendor key are reachable from the
+            // synthesizer; the rest declare `None` by design.
+            let Some(vendor) = p.synth_vendor() else {
+                continue;
+            };
+            assert_eq!(
+                McpCapabilities::for_synth_vendor(vendor),
+                p.mcp_capabilities(),
+                "{p:?} ({vendor}) reverse lookup disagreed with the table"
+            );
+        }
+    }
+
+    /// A vendor the table does not name is permissive, never muted: the
+    /// compatibility direction that cannot silently starve a config file.
+    #[test]
+    fn unknown_synth_vendor_is_permissive() {
+        assert_eq!(
+            McpCapabilities::for_synth_vendor("some-future-vendor"),
+            McpCapabilities::permissive()
+        );
+        // The in-process providers have no vendor key, so their natural names
+        // are unrecognised — they must not resolve to their own restrictive row.
+        for p in [Provider::Ollama, Provider::Deepseek, Provider::Dsh] {
+            assert_eq!(
+                McpCapabilities::for_synth_vendor(&format!("{p:?}").to_lowercase()),
+                McpCapabilities::permissive(),
+                "{p:?} resolved to a restrictive row despite having no vendor key"
+            );
+        }
     }
 
     #[test]
@@ -1002,16 +1277,19 @@ mod tests {
                 ToolEnforcement::RegistryMembership,
                 "{spec}"
             );
-            // Phase 4 raises this to `MultiChoice` for the in-process loop.
-            assert_eq!(p.prompt_kind, PromptKind::YesNo, "{spec}");
+            // Delivered (Phase 4): the in-process loop holds `AskUserQuestion`
+            // (`tools/ask.rs`), so its prompt channel is multi-choice.
+            assert_eq!(p.prompt_kind, PromptKind::MultiChoice, "{spec}");
+            assert!(p.prompt_kind.has_multi_choice(), "{spec}");
         }
     }
 
     /// The whole point of one table: the declared prompt channel matches what
     /// each provider actually offers. Cursor and `codex exec` are the two with
-    /// no channel at all; everything else has at least y/n. If this fails,
-    /// either a real capability changed (update the table deliberately) or the
-    /// table drifted from the code.
+    /// no channel at all; Codex-app-server and dsh have y/n; Claude and the
+    /// in-process loop reach multi-choice. If this fails, either a real
+    /// capability changed (update the table deliberately) or the table drifted
+    /// from the code.
     #[test]
     fn prompt_channels_are_declared_not_assumed() {
         let no_channel = ["cursor:x", "codex:x"].map(|s| profile(s).prompt_kind);
@@ -1019,18 +1297,85 @@ mod tests {
             no_channel.iter().all(|k| *k == PromptKind::None),
             "expected no prompt channel: {no_channel:?}"
         );
+        assert!(no_channel.iter().all(|k| !k.has_multi_choice()));
 
-        let yes_no = ["codex-app-server:gpt-5", "dsh:x", "deepseek:x", "ollama:x"]
-            .map(|s| profile(s).prompt_kind);
+        let yes_no = ["codex-app-server:gpt-5", "dsh:x"].map(|s| profile(s).prompt_kind);
         assert!(
             yes_no.iter().all(|k| *k == PromptKind::YesNo),
             "expected y/n channels: {yes_no:?}"
         );
+        assert!(yes_no.iter().all(|k| !k.has_multi_choice()));
 
-        // Exactly one provider reaches multi-choice today.
-        assert_eq!(
-            profile("claude:sonnet").prompt_kind,
-            PromptKind::MultiChoice
+        // Two providers reach multi-choice: Claude natively, and the in-process
+        // loop via its own ask tool (Phase 4).
+        let multi = ["claude:sonnet", "deepseek:x", "ollama:x"].map(|s| profile(s).prompt_kind);
+        assert!(
+            multi.iter().all(|k| *k == PromptKind::MultiChoice),
+            "expected multi-choice channels: {multi:?}"
         );
+        assert!(multi.iter().all(|k| k.has_multi_choice()));
+    }
+
+    /// `has_multi_choice` is the registration predicate for the in-process ask
+    /// tool, so it must agree with the enum in both directions — a provider that
+    /// gains the tool without the row (or the reverse) is the drift this table
+    /// exists to prevent.
+    #[test]
+    fn has_multi_choice_agrees_with_the_kind_it_is_derived_from() {
+        for kind in [
+            PromptKind::None,
+            PromptKind::YesNo,
+            PromptKind::MultiChoice,
+        ] {
+            assert_eq!(kind.has_multi_choice(), kind == PromptKind::MultiChoice);
+        }
+    }
+
+    /// Phase 6: an unenforced provider discloses; every enforced one stays
+    /// silent, and the disclosed set is exactly the two structurally
+    /// unconfined backends (`codex exec` + dsh).
+    #[test]
+    fn only_structurally_unenforced_providers_disclose() {
+        let mut disclosed: Vec<String> = Vec::new();
+        for spec in [
+            "claude:sonnet",
+            "codex:x",
+            "codex-app-server:gpt-5",
+            "cursor:x",
+            "dsh:x",
+            "deepseek:x",
+            "ollama:x",
+        ] {
+            let profile = build_provider_profile(
+                &ModelSpec::parse(spec),
+                &RuntimeConfig::default(),
+            );
+            if let Some(msg) = profile
+                .tool_enforcement
+                .ui_disclosure(&profile.provider)
+            {
+                assert!(
+                    msg.contains(&profile.provider),
+                    "disclosure must name the provider: {msg}"
+                );
+                assert!(msg.contains("unenforced"), "{msg}");
+                disclosed.push(profile.provider.clone());
+            }
+        }
+        assert_eq!(disclosed, vec!["codex".to_string(), "dsh".to_string()]);
+
+        // A warning that fires for everyone is noise: the enforced variants
+        // must return `None` for the same provider name.
+        for enforced in [
+            ToolEnforcement::Argv,
+            ToolEnforcement::GeneratedConfig,
+            ToolEnforcement::RuntimeHost,
+            ToolEnforcement::RegistryMembership,
+        ] {
+            assert!(
+                enforced.ui_disclosure("dsh").is_none(),
+                "{enforced:?} must not disclose"
+            );
+        }
     }
 }
