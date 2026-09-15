@@ -42,7 +42,7 @@ use crate::write_gate::WriteGatePipeline;
 
 use super::registry::SessionConstruction;
 use super::{AgentSession, Turn};
-use dsh::{DshLaunchSpec, mcp_servers_for_session};
+use dsh::{DshLaunchSpec, mcp_servers_for_session, registers_gaviero};
 use rpc::{IncomingRequest, JsonRpcChild, JsonRpcHandle};
 
 pub struct AcpClientSession {
@@ -193,7 +193,11 @@ impl AcpClientSession {
 
         let cwd = absolute_cwd(&self.workspace_root);
         let servers = mcp_servers_for_session(&self.workspace_root);
-        if servers.is_empty() {
+        // Keyed on gaviero's *own* server, not on the list being empty:
+        // context7 and `extraServers` can be registered while gaviero's
+        // endpoint is down, and `exposedTools` describes gaviero's retrieval
+        // tools. Clearing it otherwise would advertise tools that are absent.
+        if !registers_gaviero(&servers) {
             self.options.exposed_tools = Some(Vec::new());
             self.observer.on_streaming_status("dsh: no MCP endpoint available; retrieval tools disabled");
         }

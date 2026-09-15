@@ -292,8 +292,17 @@ pub fn resolve_context7_config(workspace: &Workspace, root: Option<&Path>) -> Co
         })
         .filter(|v| !v.is_empty())
         .unwrap_or(defaults.args);
+    // An explicit empty string is how an operator forces the stdio fallback;
+    // an absent key keeps the shipped remote-HTTP default. `remote_url()`
+    // trims and rejects empty, so `""` means "register over stdio".
+    let url = workspace
+        .resolve_setting(S::MCP_CONTEXT7_URL, root)
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| defaults.url.clone());
     Context7Config {
         enabled,
+        url,
         command,
         args,
     }

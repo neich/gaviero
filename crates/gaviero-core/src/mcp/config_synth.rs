@@ -95,31 +95,61 @@ pub struct HttpSynthEndpoint {
 
 /// Context7 MCP server defaults (Upstash hosted docs lookup).
 ///
+/// Hosted context7 MCP endpoint (streamable HTTP).
+///
+/// Verified live: `POST initialize` returns HTTP 200 with
+/// `serverInfo.Context7 4.1.1`, and `tools/list` advertises
+/// `resolve-library-id` + `query-docs` — the same two tools the `npx`
+/// stdio server exposes. Preferred over stdio because it needs no Node
+/// install and is the **only** transport the HTTP-only providers accept
+/// (Cursor's streamable-HTTP mode, dsh's `mcpCapabilities.http`).
+pub const CONTEXT7_REMOTE_URL: &str = "https://mcp.context7.com/mcp";
+
 /// When enabled, gaviero injects this server entry alongside the
-/// `gaviero` shim entry so swarm subprocess agents (Claude Code,
-/// Codex) can call `resolve-library-id` / `get-library-docs` against
+/// `gaviero` shim entry so every agent provider (Claude Code, Codex,
+/// Cursor, dsh) can call `resolve-library-id` / `query-docs` against
 /// current docs instead of relying on stale training data. **Opt-in
 /// via `mcp.context7.enabled = true`** (OD-6): the default is off
-/// because it is a network dependency (`npx` fetch on first agent
-/// spawn) that a local-first default must not carry silently.
+/// because it is a network dependency that a local-first default must
+/// not carry silently.
 #[derive(Debug, Clone)]
 pub struct Context7Config {
-    /// When `false`, no context7 entry is written into either the
-    /// Claude `.mcp.json` or the Codex `config.toml`. Existing entries
-    /// the user may have authored manually are preserved by the merge
-    /// step.
+    /// When `false`, no context7 entry is written into the Claude
+    /// `.mcp.json`, the Codex `config.toml`, the Cursor `.cursor/mcp.json`
+    /// or the dsh `session/new` server list. Existing entries the user
+    /// may have authored manually are preserved by the merge step.
     pub enabled: bool,
-    /// Runtime that hosts the context7 MCP server. Default `"npx"`;
-    /// users can swap to `"bunx"`, `"pnpm"`, or an absolute path.
+    /// Remote streamable-HTTP endpoint. **When set — the default — context7
+    /// is registered as a `url` entry for every provider**, which is what
+    /// makes one shared server reachable by Claude, Codex, Cursor and dsh
+    /// alike. Set to `None` (or empty) to fall back to the stdio `npx`
+    /// server, which only the stdio-capable providers can host.
+    pub url: Option<String>,
+    /// Stdio fallback host, used only when [`Self::url`] is empty.
+    /// Default `"npx"`; users can swap to `"bunx"`, `"pnpm"`, or an
+    /// absolute path.
     pub command: String,
-    /// Argv passed to `command`. Default `["-y", "@upstash/context7-mcp"]`.
+    /// Stdio fallback argv. Default `["-y", "@upstash/context7-mcp"]`.
     pub args: Vec<String>,
+}
+
+impl Context7Config {
+    /// The remote URL, when non-empty. `None` means "register over stdio".
+    pub fn remote_url(&self) -> Option<&str> {
+        self.url.as_deref().map(str::trim).filter(|u| !u.is_empty())
+    }
+
+    /// Whether this config registers over streamable HTTP rather than stdio.
+    pub fn is_http(&self) -> bool {
+        self.remote_url().is_some()
+    }
 }
 
 impl Default for Context7Config {
     fn default() -> Self {
         Self {
             enabled: false,
+            url: Some(CONTEXT7_REMOTE_URL.to_string()),
             command: "npx".to_string(),
             args: vec!["-y".into(), "@upstash/context7-mcp".into()],
         }
@@ -566,7 +596,7 @@ fn managed_mcp_json_servers(
     if synth.context7.enabled && synth.permissions.server_allowed("context7") {
         servers.insert(
             "context7".to_string(),
-            context7_server_entry(&synth.context7),
+            context7_server_entry_for(&synth.context7, "claude"),
         );
     }
     for extra in &synth.extra_servers {
@@ -677,6 +707,22 @@ fn managed_cursor_mcp_json_servers(
 
     let has_remote_extra = synth_has_remote_url_servers(synth);
     let mut servers = serde_json::Map::new();
+    // context7 is included whenever it is registered over HTTP, because a
+    // `url` entry is not the failure mode this function guards against: the
+    // documented Cursor breakage is a **stdio** server that fails at startup.
+    // A stdio context7 is therefore still withheld when a remote URL extra is
+    // configured — the conditional compromise decision A asked for — while an
+    // HTTP context7 is unconditional, which is what gives Cursor the same
+    // context7 server as every other provider.
+    let context7_ok = synth.context7.enabled
+        && synth.permissions.server_allowed("context7")
+        && (synth.context7.is_http() || !has_remote_extra);
+    if context7_ok {
+        servers.insert(
+            "context7".to_string(),
+            context7_server_entry_for(&synth.context7, "cursor"),
+        );
+    }
     // Omit the stdio gaviero shim when a remote URL extra is configured
     // (stdio competes with streamable HTTP at Cursor startup). An HTTP
     // gaviero entry does not have that problem — keep it.
@@ -732,7 +778,26 @@ fn gaviero_server_entry_for(synth: &McpConfigSynth, vendor: &str) -> serde_json:
     })
 }
 
-fn context7_server_entry(ctx7: &Context7Config) -> serde_json::Value {
+/// context7 entry for a `{"mcpServers":{…}}` file (Claude `.mcp.json` or
+/// Cursor `.cursor/mcp.json`).
+///
+/// The remote form mirrors gaviero's own HTTP entry exactly: Cursor's schema
+/// has no `type` discriminator, Claude's carries `"type":"http"`. The stdio
+/// form emits `command`/`args`.
+///
+/// Auth: context7's free tier is keyless, so `headers` is emitted empty. An
+/// operator needing a key should point `mcp.context7.url` at their own
+/// endpoint (or register it via `mcp.extraServers`) rather than have a header
+/// contract guessed here.
+fn context7_server_entry_for(ctx7: &Context7Config, vendor: &str) -> serde_json::Value {
+    if let Some(url) = ctx7.remote_url() {
+        let headers = serde_json::json!({});
+        return if vendor == "cursor" {
+            serde_json::json!({ "url": url, "headers": headers })
+        } else {
+            serde_json::json!({ "type": "http", "url": url, "headers": headers })
+        };
+    }
     serde_json::json!({
         "command": ctx7.command,
         "args": ctx7.args,
@@ -1105,17 +1170,7 @@ pub fn codex_mcp_config_toml(synth: &McpConfigSynth) -> Result<String> {
         }
     }
     if synth.context7.enabled && synth.permissions.server_allowed("context7") {
-        body.push_str(&format!(
-            "\n[mcp_servers.context7]\n\
-             command = {command:?}\n\
-             args = {args}\n\
-             startup_timeout_sec = {start}\n\
-             tool_timeout_sec = {tool}\n",
-            command = synth.context7.command,
-            args = toml_string_array(&synth.context7.args),
-            start = CODEX_MCP_STARTUP_TIMEOUT_SECS,
-            tool = CODEX_MCP_TOOL_TIMEOUT_SECS,
-        ));
+        body.push_str(&context7_codex_block(&synth.context7));
     }
     for extra in &synth.extra_servers {
         if synth.permissions.server_allowed(&extra.name) {
@@ -1139,6 +1194,30 @@ pub fn codex_mcp_config_toml(synth: &McpConfigSynth) -> Result<String> {
 /// codex's `startup_timeout_sec` / `tool_timeout_sec` config keys.
 const CODEX_MCP_STARTUP_TIMEOUT_SECS: u32 = 60;
 const CODEX_MCP_TOOL_TIMEOUT_SECS: u32 = 60;
+
+/// `[mcp_servers.context7]` for the Codex `config.toml`.
+///
+/// The remote `url` form is preferred (see [`Context7Config::url`]); Codex
+/// accepts `url` plus the same timeout keys. The stdio form keeps
+/// `command`/`args` for operators who opted back out of HTTP.
+fn context7_codex_block(ctx7: &Context7Config) -> String {
+    let transport = match ctx7.remote_url() {
+        Some(url) => format!("url = {url:?}\n"),
+        None => format!(
+            "command = {command:?}\nargs = {args}\n",
+            command = ctx7.command,
+            args = toml_string_array(&ctx7.args),
+        ),
+    };
+    format!(
+        "\n[mcp_servers.context7]\n\
+         {transport}\
+         startup_timeout_sec = {start}\n\
+         tool_timeout_sec = {tool}\n",
+        start = CODEX_MCP_STARTUP_TIMEOUT_SECS,
+        tool = CODEX_MCP_TOOL_TIMEOUT_SECS,
+    )
+}
 
 fn extra_server_codex_toml(extra: &ExtraMcpServer) -> String {
     let header = format!("\n[mcp_servers.{}]\n", extra.name);
@@ -1677,7 +1756,10 @@ mod tests {
         // Trust unknown → Claude + Cursor configs written, Codex skipped.
         synth.codex_trust = TrustConsent::Unknown;
         let files = synthesize_for_worktree(&synth).unwrap();
-        assert_eq!(files.len(), 3);
+        // 4, not 3: context7 now registers for Cursor over HTTP, so
+        // `.cursor/cli.json` earns a `Mcp(context7:*)` rule and is written
+        // even though the gaviero shim is deliberately unresolvable here.
+        assert_eq!(files.len(), 4);
         assert!(
             files.iter().any(|p| p.ends_with(".mcp.json")),
             "expected .mcp.json among {:?}",
@@ -1689,16 +1771,21 @@ mod tests {
             files
         );
         assert!(
+            files.iter().any(|p| p.ends_with(".cursor/cli.json")),
+            "expected .cursor/cli.json among {:?}",
+            files
+        );
+        assert!(
             files.iter().any(|p| p.ends_with("mcp-endpoint.json")),
             "expected mcp-endpoint.json among {:?}",
             files
         );
         assert!(!dir.path().join(".codex/config.toml").exists());
 
-        // Trust granted → all three configs.
+        // Trust granted → all configs, plus the Codex one.
         synth.codex_trust = TrustConsent::Granted;
         let files = synthesize_for_worktree(&synth).unwrap();
-        assert_eq!(files.len(), 4);
+        assert_eq!(files.len(), 5);
         assert!(dir.path().join(".cursor/mcp.json").exists());
         assert!(dir.path().join(".codex/config.toml").exists());
     }
@@ -1736,15 +1823,70 @@ mod tests {
     }
 
     #[test]
-    fn cursor_config_omits_context7_even_when_enabled() {
+    fn cursor_config_includes_context7_over_http() {
+        // Decision: context7 must reach every provider, Cursor included. It
+        // arrives as a `url` entry — the same hosted server Claude, Codex and
+        // dsh use — rather than the stdio `npx` server that used to poison
+        // Cursor's remote MCP registry.
         let synth = fixture_resolvable_shim(PathBuf::from("/tmp/wt"));
         let claude = claude_mcp_config_json(&synth).unwrap();
         let cursor = cursor_mcp_config_json(&synth).unwrap();
         let claude_v: serde_json::Value = serde_json::from_str(&claude).unwrap();
         let cursor_v: serde_json::Value = serde_json::from_str(&cursor).unwrap();
-        assert!(claude_v["mcpServers"]["context7"].is_object());
-        assert!(cursor_v["mcpServers"].get("context7").is_none());
+        assert_eq!(
+            claude_v["mcpServers"]["context7"]["url"].as_str().unwrap(),
+            CONTEXT7_REMOTE_URL
+        );
+        assert_eq!(
+            claude_v["mcpServers"]["context7"]["type"].as_str().unwrap(),
+            "http"
+        );
+        assert_eq!(
+            cursor_v["mcpServers"]["context7"]["url"].as_str().unwrap(),
+            CONTEXT7_REMOTE_URL
+        );
+        // Cursor's schema has no `type` discriminator; Claude's does.
+        assert!(cursor_v["mcpServers"]["context7"].get("type").is_none());
+        assert!(cursor_v["mcpServers"]["context7"]["headers"].is_object());
         assert_ne!(claude, cursor);
+    }
+
+    #[test]
+    fn cursor_omits_stdio_context7_when_remote_extra_configured() {
+        // The conditional half of decision A survives for the stdio fallback:
+        // a failing `npx` server must never sit next to remote URL servers.
+        let mut synth = fixture_resolvable_shim(PathBuf::from("/tmp/wt"));
+        synth.context7.url = None;
+        synth.extra_servers.push(ExtraMcpServer {
+            name: "semantic-scholar".into(),
+            transport: ExtraMcpTransport::Url {
+                url: "https://example.com/mcp/".into(),
+            },
+        });
+        let body = cursor_mcp_config_json(&synth).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["mcpServers"].get("context7").is_none());
+    }
+
+    #[test]
+    fn stdio_context7_fallback_still_renders_for_stdio_providers() {
+        // `mcp.context7.url = ""` opts back into the local `npx` server; the
+        // stdio-capable providers must still get `command`/`args`.
+        let mut synth = fixture(PathBuf::from("/tmp/wt"));
+        synth.context7.url = None;
+        let v: serde_json::Value =
+            serde_json::from_str(&claude_mcp_config_json(&synth).unwrap()).unwrap();
+        assert_eq!(
+            v["mcpServers"]["context7"]["command"].as_str().unwrap(),
+            "npx"
+        );
+        assert_eq!(
+            v["mcpServers"]["context7"]["args"][1].as_str().unwrap(),
+            "@upstash/context7-mcp"
+        );
+        let codex = codex_mcp_config_toml(&synth).unwrap();
+        assert!(codex.contains("command = \"npx\""));
+        assert!(codex.contains("\"@upstash/context7-mcp\""));
     }
 
     #[test]
@@ -1812,10 +1954,14 @@ mod tests {
         synthesize_for_worktree(&synth).unwrap();
         let body = std::fs::read_to_string(&cursor_path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        // User entry preserved; gaviero added; context7 stays out of Cursor config.
+        // User entry preserved; gaviero added; context7 now present too, as
+        // the same hosted `url` server the other providers register.
         assert!(v["mcpServers"]["user-cursor-server"].is_object());
         assert!(v["mcpServers"]["gaviero"].is_object());
-        assert!(v["mcpServers"].get("context7").is_none());
+        assert_eq!(
+            v["mcpServers"]["context7"]["url"].as_str().unwrap(),
+            CONTEXT7_REMOTE_URL
+        );
         let claude_body = std::fs::read_to_string(dir.path().join(".mcp.json")).unwrap();
         let claude_v: serde_json::Value = serde_json::from_str(&claude_body).unwrap();
         assert!(claude_v["mcpServers"]["context7"].is_object());
@@ -1832,18 +1978,34 @@ mod tests {
     }
 
     #[test]
-    fn claude_config_includes_context7_when_enabled() {
+    fn claude_config_includes_context7_over_http_when_enabled() {
         let synth = fixture(PathBuf::from("/tmp/wt"));
         let body = claude_mcp_config_json(&synth).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
-            v["mcpServers"]["context7"]["command"].as_str().unwrap(),
-            "npx"
+            v["mcpServers"]["context7"]["url"].as_str().unwrap(),
+            CONTEXT7_REMOTE_URL
         );
         assert_eq!(
-            v["mcpServers"]["context7"]["args"][1].as_str().unwrap(),
-            "@upstash/context7-mcp"
+            v["mcpServers"]["context7"]["type"].as_str().unwrap(),
+            "http"
         );
+    }
+
+    #[test]
+    fn context7_defaults_to_the_hosted_http_endpoint() {
+        // The remote endpoint is the default so no Node install is needed and
+        // the HTTP-only providers can register the same server. Opt-out is an
+        // explicit empty `mcp.context7.url`.
+        let default = Context7Config::default();
+        assert!(default.is_http());
+        assert_eq!(default.remote_url(), Some(CONTEXT7_REMOTE_URL));
+        let stdio = Context7Config {
+            url: Some(String::new()),
+            ..Context7Config::default()
+        };
+        assert!(!stdio.is_http());
+        assert!(stdio.remote_url().is_none());
     }
 
     #[test]
@@ -1877,19 +2039,17 @@ mod tests {
     }
 
     #[test]
-    fn codex_config_includes_context7_when_enabled() {
+    fn codex_config_includes_context7_over_http_when_enabled() {
         let synth = fixture(PathBuf::from("/tmp/wt"));
         let body = codex_mcp_config_toml(&synth).unwrap();
         assert!(body.contains("[mcp_servers.context7]"));
-        assert!(body.contains("command = \"npx\""));
-        assert!(body.contains("\"@upstash/context7-mcp\""));
         assert!(body.contains("trust_level = \"trusted\""));
         let parsed: toml::Value = toml::from_str(&body).expect("codex config is valid TOML");
-        let args = parsed["mcp_servers"]["context7"]["args"]
-            .as_array()
-            .unwrap();
-        assert_eq!(args.len(), 2);
-        assert_eq!(args[1].as_str().unwrap(), "@upstash/context7-mcp");
+        assert_eq!(
+            parsed["mcp_servers"]["context7"]["url"].as_str().unwrap(),
+            CONTEXT7_REMOTE_URL
+        );
+        assert!(parsed["mcp_servers"]["context7"].get("command").is_none());
     }
 
     #[test]
@@ -2223,7 +2383,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_cli_json_allows_every_registered_stdio_server() {
+    fn cursor_cli_json_allows_every_registered_server() {
         let dir = tempdir().unwrap();
         let synth = fixture_resolvable_shim(dir.path().to_path_buf());
         synthesize_for_worktree(&synth).unwrap();
@@ -2238,10 +2398,13 @@ mod tests {
             .filter_map(|x| x.as_str())
             .collect();
         // Without `--force` Cursor auto-rejects MCP calls that have no rule,
-        // so the registered gaviero shim gets one; no blanket `Mcp(*:*)`
-        // without a remote server.
+        // so every registered server gets one — the gaviero shim and, now that
+        // context7 registers for Cursor over HTTP, context7 too.
         assert!(allow.contains(&"Mcp(gaviero:*)"), "got {allow:?}");
-        assert!(!allow.contains(&"Mcp(*:*)"));
+        assert!(allow.contains(&"Mcp(context7:*)"), "got {allow:?}");
+        // A registered streamable-HTTP server also earns the remote baseline
+        // Cursor needs for the HTTP MCP handshake in headless `-p` runs.
+        assert!(allow.contains(&"Mcp(*:*)"), "got {allow:?}");
         assert_eq!(allow.iter().filter(|r| **r == "Mcp(gaviero:*)").count(), 1);
     }
 
@@ -2767,8 +2930,9 @@ mod tests {
         assert!(
             pairs
                 .iter()
-                .any(|p| p == r#"mcp_servers.context7.command="npx""#),
-            "missing context7.command in {pairs:?}",
+                .any(|p| p.starts_with("mcp_servers.context7.url=")
+                    && p.contains("mcp.context7.com")),
+            "missing context7.url in {pairs:?}",
         );
         assert!(
             pairs

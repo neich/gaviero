@@ -30,9 +30,10 @@ pub use ledger::{
 };
 pub use types::{
     BootstrapTier, ContinuityHandle, ContinuityMode, FileAttachment, GraphConfidence,
-    GraphSelection, GraphSelectionKind, MemorySelection, ModelSpec, PlannerInput, PlannerMetadata,
-    PlannerSelections, Provider, ProviderProfile, ReplayPayload, RuntimeConfig, SkillSelection,
-    Symbol, build_provider_profile, resolve_bootstrap_tier,
+    GraphSelection, GraphSelectionKind, McpTransport, MemorySelection, ModelSpec, PlannerInput,
+    PlannerMetadata, PlannerSelections, PromptKind, Provider, ProviderProfile, ReplayPayload,
+    RuntimeConfig, SkillSelection, Symbol, ToolEnforcement, build_provider_profile,
+    resolve_bootstrap_tier,
 };
 
 use std::path::Path;
