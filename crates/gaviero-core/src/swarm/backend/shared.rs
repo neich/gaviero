@@ -12,8 +12,18 @@ const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
 pub const SUPPORTED_PROVIDER_PREFIXES: &[&str] =
     &["claude", "codex", "cursor", "ollama", "local", "deepseek", "dsh"];
 
-/// DeepSeek HTTP API model ids (without the `deepseek:` provider prefix).
-pub const DEEPSEEK_API_MODELS: &[&str] = &["deepseek-v4-pro", "deepseek-v4-flash"];
+/// DeepSeek HTTP API model ids (without the `deepseek:` / `dsh:` provider
+/// prefix). Same list for both routes.
+///
+/// Mirrors DeepSeek's Models & Pricing table (fetched 2026-09-15):
+/// `deepseek-flash` is V4.1-Flash (canonical), `deepseek-v4-pro` is still
+/// served as V4-Pro-0813. `deepseek-v4-flash` is a temporary compatibility
+/// alias that DeepSeek routes to V4.1-Flash; keep it so existing
+/// `deepseek:deepseek-v4-flash` / `dsh:deepseek-v4-flash` pins keep working.
+/// The retired `deepseek-v4-flash-vision-exp` alias is omitted from the
+/// picker — use `deepseek-flash` for multimodal.
+pub const DEEPSEEK_API_MODELS: &[&str] =
+    &["deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash"];
 
 /// Canonical Claude model aliases the `/model` picker always offers, without
 /// the `claude:` prefix. Independent of `claude --help` parsing so the picker
@@ -982,8 +992,10 @@ mod tests {
             "cursor:auto",
             "cursor:gpt-5.2",
             "cursor:claude-4.6-opus-high-thinking",
+            "deepseek:deepseek-flash",
             "deepseek:deepseek-v4-pro",
             "deepseek:deepseek-v4-flash",
+            "dsh:deepseek-flash",
             "dsh:deepseek-v4-flash",
             "dsh:deepseek-v4-pro",
         ] {
@@ -1023,6 +1035,13 @@ mod tests {
                 model: "deepseek-v4-flash".into()
             }
         );
+        let flash = backend_config_for_model("dsh:deepseek-flash", None);
+        assert_eq!(
+            flash,
+            BackendConfig::Dsh {
+                model: "deepseek-flash".into()
+            }
+        );
     }
 
     #[test]
@@ -1039,6 +1058,13 @@ mod tests {
             config,
             BackendConfig::Deepseek {
                 model: "deepseek-v4-pro".into()
+            }
+        );
+        let flash = backend_config_for_model("deepseek:deepseek-flash", None);
+        assert_eq!(
+            flash,
+            BackendConfig::Deepseek {
+                model: "deepseek-flash".into()
             }
         );
     }
@@ -1085,7 +1111,9 @@ mod tests {
     fn test_validate_model_spec_rejects_unknown_deepseek_models() {
         let err = validate_model_spec("deepseek:deepseek-v4").unwrap_err();
         assert!(err.to_string().contains("unsupported DeepSeek model"));
+        validate_model_spec("deepseek:deepseek-flash").unwrap();
         validate_model_spec("deepseek:deepseek-v4-flash").unwrap();
+        validate_model_spec("dsh:deepseek-flash").unwrap();
     }
 
     #[test]
@@ -1097,6 +1125,7 @@ mod tests {
     #[test]
     fn test_model_spec_completions_dsh_models() {
         let hits = model_spec_completions("dsh:deep", &[]);
+        assert!(hits.contains(&"dsh:deepseek-flash".to_string()));
         assert!(hits.contains(&"dsh:deepseek-v4-pro".to_string()));
         assert!(hits.contains(&"dsh:deepseek-v4-flash".to_string()));
     }
@@ -1104,6 +1133,7 @@ mod tests {
     #[test]
     fn test_model_spec_completions_deepseek_models() {
         let hits = model_spec_completions("deepseek:deep", &[]);
+        assert!(hits.contains(&"deepseek:deepseek-flash".to_string()));
         assert!(hits.contains(&"deepseek:deepseek-v4-pro".to_string()));
         assert!(hits.contains(&"deepseek:deepseek-v4-flash".to_string()));
     }

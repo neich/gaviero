@@ -61,7 +61,7 @@ review src/auth/session.rs for race conditions
 
 | Command | Purpose |
 |---|---|
-| `/model <spec>` | Switch model (`claude:sonnet`, `dsh:deepseek-v4-pro`, `deepseek:deepseek-v4-pro`, …) |
+| `/model <spec>` | Switch model (`claude:sonnet`, `deepseek:deepseek-flash`, `dsh:deepseek-flash`, …) |
 | `/run <file.gaviero> [prompt]` | Compile and execute a DSL workflow |
 | `/swarm <task>` | Immediate multi-agent swarm |
 | `/cswarm <task>` | Generate a reviewable coordinated plan |

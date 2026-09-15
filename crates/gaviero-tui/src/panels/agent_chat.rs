@@ -2007,7 +2007,7 @@ impl AgentChatState {
                 self.add_system_message_at(idx,
                     "Available commands:\n\n\
                      Conversation:\n\
-                     /model <provider:model>  — Set model. Examples: claude:fable, claude:sonnet, claude:opus, claude:haiku, claude:opusplan, claude:sonnet[1m], claude:opus[1m], codex:<model>, dsh:deepseek-v4-pro, ollama:<model>\n\
+                     /model <provider:model>  — Set model. Examples: claude:fable, claude:sonnet, claude:opus, claude:haiku, claude:opusplan, claude:sonnet[1m], claude:opus[1m], codex:<model>, deepseek:deepseek-flash, dsh:deepseek-flash, ollama:<model>\n\
                      /effort <level>          — Set effort/reasoning level for Claude, Codex, and dsh (off, auto, low, medium, high, xhigh, max, ultra). Alias: /thinking\n\
                      /namespace <name>        — Set memory namespace (or show current). Alias: /ns\n\
                      /autoapprove             — Toggle auto-approve for this conversation. Alias: /yolo\n\
@@ -5590,8 +5590,10 @@ mod tests {
             "cursor:claude-4.6-opus-high-thinking",
             "ollama:qwen2.5-coder:7b",
             "local:qwen2.5-coder:14b",
+            "deepseek:deepseek-flash",
             "deepseek:deepseek-v4-pro",
             "deepseek:deepseek-v4-flash",
+            "dsh:deepseek-flash",
             "dsh:deepseek-v4-pro",
             "dsh:deepseek-v4-flash",
         ] {
@@ -5650,6 +5652,23 @@ mod tests {
             .last()
             .expect("system error message");
         assert!(last.content.contains("Invalid model spec"));
+    }
+
+    #[test]
+    fn process_slash_command_model_accepts_deepseek_flash() {
+        let mut state = AgentChatState::new();
+        state.text_input.text = "/model deepseek:deepseek-flash".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+
+        let handled = state.process_slash_command();
+
+        assert!(handled);
+        assert_eq!(
+            state.conversations[state.active_conv]
+                .model_override
+                .as_deref(),
+            Some("deepseek:deepseek-flash")
+        );
     }
 
     #[test]
