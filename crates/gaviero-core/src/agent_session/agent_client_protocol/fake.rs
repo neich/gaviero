@@ -228,6 +228,27 @@ async fn handle_prompt<W: tokio::io::AsyncWrite + Unpin>(
             )
             .await?;
         }
+        // Like `direct_write`, but against paths a reconciler can classify:
+        // a tracked file, a file created this turn, and a deletion. Every write
+        // bypasses `fs/write_text_file` on purpose — this is the channel real
+        // `dsh` uses for its own edits.
+        "direct_write_multi" => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let _ = std::fs::write(
+                cwd.join("Cargo.toml"),
+                "[package]\nname=\"t\"\nversion=\"9.9.9\"\n",
+            );
+            let _ = std::fs::write(cwd.join("new_file.rs"), "fn fresh() {}\n");
+            let _ = std::fs::remove_file(cwd.join("src").join("obsolete.rs"));
+            emit_update(
+                writer,
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "wrote directly" }
+                }),
+            )
+            .await?;
+        }
         "read" => {
             *next_agent_id += 1;
             write_json(
