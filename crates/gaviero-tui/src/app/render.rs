@@ -253,8 +253,6 @@ pub(super) fn side_panel_title(app: &App, fullscreen: bool) -> &'static str {
     match (app.side_panel, fullscreen) {
         (SidePanelMode::AgentChat, false) => "AGENT CHAT",
         (SidePanelMode::AgentChat, true) => "AGENT CHAT (fullscreen)",
-        (SidePanelMode::SwarmDashboard, false) => "SWARM",
-        (SidePanelMode::SwarmDashboard, true) => "SWARM (fullscreen)",
         (SidePanelMode::GitPanel, false) => "GIT",
         (SidePanelMode::GitPanel, true) => "GIT (fullscreen)",
         (SidePanelMode::MemoryPanel, false) => "MEMORY",
@@ -1203,10 +1201,6 @@ pub(super) fn render_side_panel(app: &mut App, frame: &mut Frame, area: Rect) {
                 &app.theme,
             );
         }
-        SidePanelMode::SwarmDashboard => {
-            app.swarm_dashboard
-                .render(area, frame.buffer_mut(), app.focus == Focus::SidePanel);
-        }
         SidePanelMode::GitPanel => {
             app.git_panel.render(
                 area,
@@ -1229,8 +1223,6 @@ pub(super) fn update_cursor_position(_app: &App, _frame: &mut Frame, _editor_are
 }
 
 pub(super) fn render_quit_confirm(app: &App, frame: &mut Frame, area: Rect) {
-    use gaviero_core::swarm::models::AgentStatus;
-
     let unsaved: Vec<String> = app
         .buffers
         .iter()
@@ -1244,14 +1236,6 @@ pub(super) fn render_quit_confirm(app: &App, frame: &mut Frame, area: Rect) {
         .iter()
         .filter(|c| c.is_streaming || c.has_running_background_agents())
         .map(|c| c.title.clone())
-        .collect();
-
-    let running_swarm: Vec<String> = app
-        .swarm_dashboard
-        .agents
-        .iter()
-        .filter(|a| matches!(a.status, AgentStatus::Running))
-        .map(|a| a.id.clone())
         .collect();
 
     let pending_review = app
@@ -1279,13 +1263,6 @@ pub(super) fn render_quit_confirm(app: &App, frame: &mut Frame, area: Rect) {
         lines.push("  Active agents (streaming):".to_string());
         for name in &streaming {
             lines.push(format!("    • {}", name));
-        }
-        lines.push(String::new());
-    }
-    if !running_swarm.is_empty() {
-        lines.push("  Running swarm agents:".to_string());
-        for id in &running_swarm {
-            lines.push(format!("    • {}", id));
         }
         lines.push(String::new());
     }
@@ -1409,7 +1386,7 @@ pub(super) fn render_quit_confirm(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 /// Render the Codex MCP trust consent modal (Tier A / A5). Fires on
-/// the first `/swarm` run; answering persists to
+/// the first Codex chat turn; answering persists to
 /// `mcp.gavieroServer.codexTrust`.
 pub(super) fn render_codex_trust_dialog(app: &App, frame: &mut Frame, area: Rect) {
     if app.codex_trust_dialog.is_none() {
