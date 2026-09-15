@@ -354,14 +354,17 @@ impl GavieroMcpServer {
         }
     }
 
-    /// Reject a call when the permission policy or the exposed-tool
-    /// allow-list hides the tool.
+    /// Reject a call when the permission policy, the exposed-tool
+    /// allow-list, or the enrichment gate hides the tool.
     fn ensure_tool_allowed(&self, tool: &str) -> Result<(), ErrorData> {
         if self.tool_is_listed(tool) {
             Ok(())
         } else {
             Err(ErrorData::invalid_request(
-                format!("gaviero MCP tool {tool:?} is disabled by mcp.permissions"),
+                format!(
+                    "gaviero MCP tool {tool:?} is disabled (mcp.permissions, \
+                     mcp.gavieroServer.exposedTools, or repoMap.symbolEnrichment.enabled)"
+                ),
                 None,
             ))
         }
@@ -2797,7 +2800,16 @@ mod tests {
     }
 
     fn compact_tools_json(server: &GavieroMcpServer) -> (String, String) {
-        let v = serde_json::json!({ "tools": server.listed_tools() });
+        let v: Vec<serde_json::Value> = server
+            .listed_tools()
+            .into_iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                })
+            })
+            .collect();
         (
             serde_json::to_string(&v).unwrap(),
             serde_json::to_string_pretty(&v).unwrap(),
@@ -2810,10 +2822,10 @@ mod tests {
         // (2026-09-14). Full tools/list JSON is ~16 KiB because schemars copies
         // field docs into inputSchema; the 30% / 1200-byte budgets apply to
         // the compact listed-schema the model actually reads as descriptions.
-        const PRE_SHORTEN_COMPACT_DEFAULT: usize = 14647;
-        let s = fixture().with_symbol_enrichment(true);
+        const PRE_SHORTEN_COMPACT_DEFAULT: usize = 2753;
+        let s = fixture();
         let (default_min, default_pretty) = compact_tools_json(&s);
-        eprintln!("full MCP tools/list bytes: before={} after={}", serde_json::to_string(&serde_json::json!({"tools": s.tool_router.list_all()})).unwrap().len(), default_min.len());
+        insta::assert_snapshot!("mcp_tools_list_default", &default_pretty);
         assert!(
             default_min.len() <= PRE_SHORTEN_COMPACT_DEFAULT * 7 / 10,
             "default compact tools/list {} B should be ≤ 70% of {PRE_SHORTEN_COMPACT_DEFAULT}",
@@ -2827,8 +2839,6 @@ mod tests {
                 .collect(),
         );
         let (lean_min, lean_pretty) = compact_tools_json(&lean);
-        eprintln!("full lean MCP tools/list bytes={}", lean_min.len());
-        insta::assert_snapshot!("mcp_tools_list_default", &default_pretty);
         insta::assert_snapshot!("mcp_tools_list_lean", &lean_pretty);
         assert!(
             lean_min.len() < 1200,

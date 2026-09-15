@@ -56,6 +56,7 @@
 //! What is *not* negotiable: no tool may write to a store directly, and
 //! nothing here bypasses the writer task or the Write Gate.
 
+pub mod agent_defs;
 pub mod config_synth;
 pub mod endpoint_file;
 pub mod external_memory;
@@ -74,6 +75,10 @@ pub mod tools;
 pub mod transport;
 pub mod user_scope;
 
+pub use agent_defs::{
+    claude_agents_json, claude_agents_json_if_required, codex_agent_toml,
+    report_user_agent_definitions,
+};
 pub use config_synth::{
     BashPermissions, Context7Config, ExtraMcpServer, ExtraMcpTransport, HttpSynthEndpoint,
     ManagedRules, McpConfigSynth, McpPermissions, McpTransportChoice, McpTransportKind,
@@ -132,6 +137,6 @@ pub use http::{
 };
 pub use transport::McpEndpoint;
 pub use user_scope::{
-    USER_SCOPE_SERVER_NAME, UserScopeOutcome, UserScopeVendor, default_shim_path,
-    register_user_scope, unregister_user_scope, user_scope_registered,
+    USER_SCOPE_SERVER_NAME, UserScopeOutcome, UserScopeVendor, default_shim_abs,
+    register_user_scope, should_offer_registration, status_user_scope, unregister_user_scope,
 };

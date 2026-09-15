@@ -633,13 +633,29 @@ mod tests {
     }
 
     #[test]
-    fn resolve_exposed_tools_defaults_to_full_surface() {
+    fn resolve_exposed_tools_defaults_to_full_surface_minus_symbol_tools() {
+        use crate::mcp::tools::{ALL_MCP_TOOLS, TOOL_SYMBOL_DOC, TOOL_SYMBOL_SEARCH};
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::single_folder(dir.path().to_path_buf());
         let tools = resolve_exposed_tools(&ws, Some(dir.path()));
-        for name in crate::mcp::tools::ALL_MCP_TOOLS {
-            assert!(tools.contains(&name.to_string()), "missing {name}");
+        for name in ALL_MCP_TOOLS {
+            let expected = *name != TOOL_SYMBOL_SEARCH && *name != TOOL_SYMBOL_DOC;
+            assert_eq!(tools.contains(&name.to_string()), expected, "{name}");
         }
+        assert_eq!(tools.len(), ALL_MCP_TOOLS.len() - 2);
+    }
+
+    #[test]
+    fn resolve_exposed_tools_keeps_symbol_tools_when_enrichment_is_on() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".gaviero")).unwrap();
+        std::fs::write(
+            dir.path().join(".gaviero/settings.json"),
+            r#"{"repoMap":{"symbolEnrichment":{"enabled":true}}}"#,
+        )
+        .unwrap();
+        let ws = Workspace::single_folder(dir.path().to_path_buf());
+        let tools = resolve_exposed_tools(&ws, Some(dir.path()));
         assert_eq!(tools.len(), crate::mcp::tools::ALL_MCP_TOOLS.len());
     }
 

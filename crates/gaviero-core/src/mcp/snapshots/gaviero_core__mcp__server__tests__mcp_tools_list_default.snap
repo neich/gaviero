@@ -1,0 +1,34 @@
+---
+source: crates/gaviero-core/src/mcp/server.rs
+expression: "&default_pretty"
+---
+[
+  {
+    "description": "Graph impact, callers, or tests for file paths. Read-only. Token cost: ~20-40 per relation.",
+    "name": "blast_radius"
+  },
+  {
+    "description": "Demote a stale memory's trust by id and scope; never deletes. Token cost: ~40.",
+    "name": "memory_flag"
+  },
+  {
+    "description": "Fetch the full stored row for one memory_search hit by id and scope. Read-only. Token cost: ~80-200.",
+    "name": "memory_get"
+  },
+  {
+    "description": "Reach-probe ping; records nonce and depth on an in-memory ledger. Token cost: ~20.",
+    "name": "memory_ping"
+  },
+  {
+    "description": "Hybrid search over Gaviero memories (repo + workspace + global). Read-only. Token cost: ~50-150 per result.",
+    "name": "memory_search"
+  },
+  {
+    "description": "One file's symbol signatures; chain qualified_name into symbol_doc. Read-only. Token cost: ~30-80.",
+    "name": "node_doc"
+  },
+  {
+    "description": "PageRank-ranked code outline for mid-run orientation. Read-only. Token cost: bounded by token_cap.",
+    "name": "repo_outline"
+  }
+]

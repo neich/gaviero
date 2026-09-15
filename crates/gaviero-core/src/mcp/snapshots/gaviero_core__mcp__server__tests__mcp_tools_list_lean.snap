@@ -1,0 +1,18 @@
+---
+source: crates/gaviero-core/src/mcp/server.rs
+expression: "&lean_pretty"
+---
+[
+  {
+    "description": "Fetch the full stored row for one memory_search hit by id and scope. Read-only. Token cost: ~80-200.",
+    "name": "memory_get"
+  },
+  {
+    "description": "Reach-probe ping; records nonce and depth on an in-memory ledger. Token cost: ~20.",
+    "name": "memory_ping"
+  },
+  {
+    "description": "Hybrid search over Gaviero memories (repo + workspace + global). Read-only. Token cost: ~50-150 per result.",
+    "name": "memory_search"
+  }
+]

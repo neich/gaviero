@@ -507,10 +507,9 @@ pub struct McpConfigSynth {
     /// Cursor synth then denies native tools that are not on the list so
     /// Restricted profiles drop Shell the same way Claude drops `--tools Bash`.
     pub available_tools: Option<Vec<String>>,
-    /// `<root>/.gaviero/mcp_reach.json` to mirror into the worktree so the
-    /// spawn-time [`super::ReachPolicy`] sees the workspace measurement
-    /// from a worktree cwd. `None` when no record exists or enforcement is off.
-    pub reach_record_source: Option<PathBuf>,
+    /// When the Codex reach row sets `explicit_ref_required`, write
+    /// `<worktree>/.codex/agents/gaviero-worker.toml`.
+    pub explicit_ref_required: bool,
     /// Per-vendor stdio vs HTTP (P2.3). Defaults stay stdio until P2.4.
     pub transport: McpTransportChoice,
     /// Bound loopback HTTP endpoint. `None` forces stdio even when
@@ -532,7 +531,7 @@ impl Default for McpConfigSynth {
             permissions: McpPermissions::default(),
             bash: BashPermissions::default(),
             available_tools: None,
-            reach_record_source: None,
+            explicit_ref_required: false,
             transport: McpTransportChoice::default(),
             http: None,
         }
@@ -1274,31 +1273,13 @@ pub fn synthesize_for_worktree(synth: &McpConfigSynth) -> Result<Vec<PathBuf>> {
         written.push(codex_path);
     }
 
-    // Spawn-time reach enforcement reads `<cwd>/.gaviero/mcp_reach.json`.
-    // A swarm worktree has no record of its own, so mirror the root's;
-    // synthesizing into the root itself is a no-op.
-    if let Some(src) = &synth.reach_record_source {
-        let dest = synth
-            .worktree
-            .join(".gaviero")
-            .join(super::reach::REACH_FILENAME);
-        if *src != dest {
-            match std::fs::read_to_string(src) {
-                Ok(body) => {
-                    if let Some(parent) = dest.parent() {
-                        std::fs::create_dir_all(parent)
-                            .with_context(|| format!("creating {}", parent.display()))?;
-                    }
-                    write_if_changed(&dest, &body)?;
-                    written.push(dest);
-                }
-                Err(e) => tracing::debug!(
-                    target: "mcp_synth",
-                    error = %e,
-                    "reach record unreadable; worktree spawns see Unknown"
-                ),
-            }
-        }
+    if synth.explicit_ref_required {
+        let agents_dir = synth.worktree.join(".codex").join("agents");
+        std::fs::create_dir_all(&agents_dir)
+            .with_context(|| format!("creating {}", agents_dir.display()))?;
+        let agent_path = agents_dir.join("gaviero-worker.toml");
+        write_if_changed(&agent_path, &super::agent_defs::codex_agent_toml("gaviero"))?;
+        written.push(agent_path);
     }
 
     if synth.gaviero_enabled {
@@ -1583,7 +1564,7 @@ mod tests {
             permissions: McpPermissions::default(),
             bash: BashPermissions::default(),
             available_tools: None,
-            reach_record_source: None,
+            explicit_ref_required: false,
             transport: McpTransportChoice::default(),
             http: None,
         }
@@ -1723,30 +1704,23 @@ mod tests {
     }
 
     #[test]
-    fn synth_mirrors_the_reach_record_into_the_worktree() {
-        let root = tempdir().unwrap();
-        let record = root.path().join(".gaviero").join("mcp_reach.json");
-        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
-        let body = r#"{"v":1,"workspace_id":"abc","probed_at":"2026-09-14T12:00:00Z","providers":{}}"#;
-        std::fs::write(&record, body).unwrap();
-
-        let wt = tempdir().unwrap();
-        let mut synth = fixture(wt.path().to_path_buf());
+    fn synth_writes_codex_agent_toml_when_explicit_ref_required() {
+        let dir = tempdir().unwrap();
+        let mut synth = fixture(dir.path().to_path_buf());
         synth.shim_binary = "gaviero-mcp-shim-not-installed-for-this-test".into();
+        synth.explicit_ref_required = true;
         synth.codex_trust = TrustConsent::Unknown;
-        synth.reach_record_source = Some(record.clone());
         let files = synthesize_for_worktree(&synth).unwrap();
-        let copied = wt.path().join(".gaviero").join("mcp_reach.json");
-        assert!(files.contains(&copied), "{files:?}");
-        assert_eq!(std::fs::read_to_string(&copied).unwrap(), body);
-
-        // Synthesizing into the root itself must not rewrite the source.
-        let mut same = fixture(root.path().to_path_buf());
-        same.shim_binary = "gaviero-mcp-shim-not-installed-for-this-test".into();
-        same.codex_trust = TrustConsent::Unknown;
-        same.reach_record_source = Some(record.clone());
-        let files = synthesize_for_worktree(&same).unwrap();
-        assert!(!files.contains(&record), "{files:?}");
+        assert!(
+            files
+                .iter()
+                .any(|p| p.ends_with(".codex/agents/gaviero-worker.toml")),
+            "expected gaviero-worker.toml among {:?}",
+            files
+        );
+        let body = std::fs::read_to_string(dir.path().join(".codex/agents/gaviero-worker.toml"))
+            .unwrap();
+        assert!(body.contains("mcp_servers = [\"gaviero\"]"));
     }
 
     #[test]
