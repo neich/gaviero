@@ -168,8 +168,16 @@ impl ToolAgentSession {
         // array (prompt-cache friendliness). `extend_mcp` returns exactly the
         // names it added, which is what the pull stanza is then built from — so
         // the prompt can only ever name tools this session really holds.
+        //
+        // MCP visibility is the *server's* to decide: `mcp.permissions` and
+        // `mcp.gavieroServer.exposedTools` were applied where the server was
+        // built, and `in_process_tool_specs` returns only what survives them.
+        // It must **not** be filtered by `options.available_tools` — that is the
+        // Claude-shaped fs surface, no MCP tool is a member of it, and passing it
+        // as an allow-list silently removed every retrieval tool. See
+        // `ToolRegistry::extend_mcp`.
         let retrieval_tools = match &mcp_server {
-            Some(server) => tools.extend_mcp(server, options.available_tools.as_deref()),
+            Some(server) => tools.extend_mcp(server),
             None => Vec::new(),
         };
         // context7 for the in-process loop (Phase 2d). A *native* tool over

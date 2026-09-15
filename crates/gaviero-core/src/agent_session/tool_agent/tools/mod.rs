@@ -167,26 +167,27 @@ impl ToolRegistry {
     /// Append the gaviero MCP retrieval tools held by `server`, returning the
     /// names actually added.
     ///
-    /// `allow` is the swarm's `allowedTools` allow-list: when `Some`, an MCP tool
-    /// is only added if the list names it, so an allow-list stays an allow-list.
-    /// The chat path passes `None` and takes the full advertised set.
+    /// Visibility is the *server's* to decide, not the caller's. The server the
+    /// host builds has already had `with_permissions` and `with_exposed_tools`
+    /// applied, and [`GavieroMcpServer::in_process_tool_specs`] returns only what
+    /// survives both.
+    ///
+    /// This used to take an extra `allow: Option<&[String]>` allow-list, and the
+    /// chat path passed `agent.availableTools` for it — a list of Claude-shaped
+    /// *filesystem* tool names (`Read`, `Glob`, `Grep`, …). No MCP tool is named
+    /// `Read`, so every retrieval tool failed that filter and the in-process
+    /// providers reached the filesystem but never memory. The list was removed
+    /// rather than corrected: any caller-side filter built from
+    /// `agent.availableTools` subtracts the whole retrieval set by construction.
+    /// To hide a retrieval tool, use `mcp.gavieroServer.exposedTools` or
+    /// `mcp.permissions` — those apply to every provider alike.
     ///
     /// Returning the added names (rather than having the caller re-derive them
-    /// from the server) is what keeps the system prompt's pull stanza honest: a
-    /// tool skipped by the allow-list is absent from the returned names too, so
-    /// the prompt cannot advertise a tool the model does not hold.
-    pub fn extend_mcp(
-        &mut self,
-        server: &Arc<GavieroMcpServer>,
-        allow: Option<&[String]>,
-    ) -> Vec<String> {
+    /// from the server) is what keeps the system prompt's pull stanza honest: the
+    /// prompt can only ever name tools this session really holds.
+    pub fn extend_mcp(&mut self, server: &Arc<GavieroMcpServer>) -> Vec<String> {
         let mut added = Vec::new();
         for spec in server.in_process_tool_specs() {
-            if let Some(list) = allow
-                && !list.iter().any(|n| n == &spec.name)
-            {
-                continue;
-            }
             added.push(spec.name.clone());
             self.tools
                 .push(Box::new(mcp::McpTool::new(Arc::clone(server), spec)));
@@ -361,5 +362,74 @@ mod tests {
         let re = glob_to_regex("*.rs").unwrap();
         assert!(re.is_match("a.rs"));
         assert!(!re.is_match("src/a.rs"));
+    }
+
+    /// A server carrying `permissions`/`exposedTools` exactly as the host builds
+    /// it — the same object the TUI chat path hands to `deepseek:` / `ollama:`.
+    /// `exposed` of `None` means no `exposedTools` restriction.
+    fn retrieval_server(exposed: Option<Vec<String>>) -> Arc<GavieroMcpServer> {
+        use crate::memory::embedder::{Embedder, NullEmbedder};
+        use crate::memory::stores::MemoryStores;
+        let embedder = Arc::new(NullEmbedder::new(8)) as Arc<dyn Embedder>;
+        let stores = MemoryStores::for_tests_in_memory(embedder).unwrap();
+        let server = GavieroMcpServer::with_defaults(stores, PathBuf::from("/ws"));
+        let server = match exposed {
+            Some(tools) => server.with_exposed_tools(tools),
+            None => server,
+        };
+        Arc::new(server)
+    }
+
+    /// The in-process session builds its registry in exactly two steps:
+    /// `from_names(surface.available())` then `extend_mcp(server)`. The fs
+    /// surface list is Claude-shaped and can never contain an MCP tool name, so
+    /// deriving MCP visibility from it subtracts the whole retrieval set — which
+    /// is what the removed `allow` parameter did. This pins the two-step shape
+    /// against the real chat-path list, so the regression cannot return silently.
+    #[test]
+    fn session_registry_keeps_memory_alongside_the_fs_surface() {
+        let server = retrieval_server(None);
+        let surface: Vec<String> = crate::acp::session::DEFAULT_AVAILABLE_TOOLS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(
+            !surface.iter().any(|n| n == "memory_search"),
+            "precondition: the fs surface names no MCP tool, got {surface:?}"
+        );
+
+        let mut reg = ToolRegistry::from_names(&surface);
+        let added = reg.extend_mcp(&server);
+
+        assert!(
+            added.iter().any(|n| n == "memory_search"),
+            "in-process provider was given no memory tools: added {added:?}"
+        );
+        assert!(
+            reg.names().iter().any(|n| *n == "memory_search"),
+            "memory_search was returned as added but is not dispatchable"
+        );
+        assert!(
+            reg.names().iter().any(|n| *n == "Read"),
+            "dropping the allow-list must not cost the fs surface"
+        );
+    }
+
+    /// Removing the caller-side filter must not over-expose: the server's own
+    /// `exposedTools` is now the only lever, and it still withholds.
+    #[test]
+    fn retrieval_visibility_is_still_decided_by_the_server() {
+        let server = retrieval_server(Some(vec!["memory_search".to_string()]));
+        let mut reg = ToolRegistry::new(Vec::new());
+        let added = reg.extend_mcp(&server);
+
+        assert!(
+            added.iter().any(|n| n == "memory_search"),
+            "the exposed tool was withheld: {added:?}"
+        );
+        assert!(
+            !added.iter().any(|n| n == "repo_outline"),
+            "a tool outside exposedTools leaked: {added:?}"
+        );
     }
 }
