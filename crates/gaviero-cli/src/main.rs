@@ -506,6 +506,43 @@ struct Cli {
     #[arg(long = "mcp-stats-path", value_name = "PATH", requires = "mcp_stats")]
     mcp_stats_path: Option<PathBuf>,
 
+    /// Per-turn history reader: print the most recent turns recorded by the
+    /// TUI in `<repo>/.gaviero/history/turns.ndjson` (current and rotated
+    /// generation) — prompt, tool calls, MCP calls, memory call, token
+    /// totals — then exit. Estimates are `~`-prefixed; exact numbers are
+    /// provider-reported.
+    #[arg(long = "history")]
+    history: bool,
+
+    /// Show at most N turns (the newest). Default 20.
+    #[arg(long = "history-last", value_name = "N", requires = "history")]
+    history_last: Option<usize>,
+
+    /// Only turns of this conversation id.
+    #[arg(long = "history-conv", value_name = "CONV_ID", requires = "history")]
+    history_conv: Option<String>,
+
+    /// Dump every record of one turn.
+    #[arg(long = "history-turn", value_name = "TURN_ID", requires = "history")]
+    history_turn: Option<String>,
+
+    /// Print the selected records as raw NDJSON instead of a report.
+    #[arg(
+        long = "history-json",
+        requires = "history",
+        conflicts_with = "history_stats"
+    )]
+    history_json: bool,
+
+    /// Print per-provider aggregates (turns, tools, MCP, memory, estimated
+    /// vs exact tokens) for the selected turns.
+    #[arg(long = "history-stats", requires = "history")]
+    history_stats: bool,
+
+    /// Override the history NDJSON path (its `.1` generation is read too).
+    #[arg(long = "history-path", value_name = "PATH", requires = "history")]
+    history_path: Option<PathBuf>,
+
     /// Layer-4 MCP reach probe: spawn each vendor CLI, ask it to call
     /// `memory_ping` at depth 0 and (when supported) depth 1, persist
     /// `<repo>/.gaviero/mcp_reach.json`, print the table, and exit.
@@ -3449,6 +3486,349 @@ fn run_mcp_stats(repo: &std::path::Path, path_override: Option<&std::path::Path>
     Ok(())
 }
 
+/// Turns shown by `--history` when `--history-last` is not given.
+const DEFAULT_HISTORY_LAST: usize = 20;
+
+/// Selection and output mode for `--history`.
+struct HistoryQuery<'a> {
+    last: usize,
+    conv: Option<&'a str>,
+    turn: Option<&'a str>,
+    json: bool,
+    stats: bool,
+}
+
+/// `--history` entry point: maps the `--history-*` flags onto a
+/// [`HistoryQuery`]. (Adding these flags overflowed the default 1 MiB
+/// Windows main-thread stack in debug builds; `build.rs` reserves 8 MiB.)
+fn run_history_cli(cli: &Cli, repo: &std::path::Path) -> Result<()> {
+    run_history(
+        repo,
+        cli.history_path.as_deref(),
+        &HistoryQuery {
+            last: cli.history_last.unwrap_or(DEFAULT_HISTORY_LAST),
+            conv: cli.history_conv.as_deref(),
+            turn: cli.history_turn.as_deref(),
+            json: cli.history_json,
+            stats: cli.history_stats,
+        },
+    )
+}
+
+/// Per-turn history reader. Reads both generations of the TUI's history log
+/// through `gaviero_core::history::reader` — the parser the HISTORY panel
+/// uses — so the two show the same turns. A missing log is not an error; an
+/// unknown `--history-turn` is.
+fn run_history(
+    repo: &std::path::Path,
+    path_override: Option<&std::path::Path>,
+    query: &HistoryQuery<'_>,
+) -> Result<()> {
+    let path = path_override
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| gaviero_core::history::history_path(repo));
+    let out = gaviero_core::history::read_records(&path, true);
+    let turns = select_history_turns(gaviero_core::history::group_turns(out.records), query);
+    if let Some(turn_id) = query.turn
+        && turns.is_empty()
+    {
+        anyhow::bail!("no turn `{turn_id}` in {}", path.display());
+    }
+    print!("{}", render_history(&path, &turns, out.skipped, query));
+    Ok(())
+}
+
+/// Apply `--history-conv` / `--history-turn`, then keep the newest
+/// `--history-last` turns (oldest first, like the file).
+fn select_history_turns(
+    turns: Vec<gaviero_core::history::TurnRecords>,
+    query: &HistoryQuery<'_>,
+) -> Vec<gaviero_core::history::TurnRecords> {
+    let mut selected: Vec<_> = turns
+        .into_iter()
+        .filter(|t| query.conv.is_none_or(|c| t.conv_id.as_deref() == Some(c)))
+        .filter(|t| query.turn.is_none_or(|id| t.turn_id.as_deref() == Some(id)))
+        .collect();
+    if selected.len() > query.last {
+        selected.drain(..selected.len() - query.last);
+    }
+    selected
+}
+
+fn render_history(
+    path: &std::path::Path,
+    turns: &[gaviero_core::history::TurnRecords],
+    skipped: usize,
+    query: &HistoryQuery<'_>,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    if query.json {
+        for turn in turns {
+            for event in &turn.records {
+                if let Ok(line) = serde_json::to_string(&event.record) {
+                    let _ = writeln!(out, "{line}");
+                }
+            }
+        }
+        return out;
+    }
+    if turns.is_empty() {
+        let _ = writeln!(out, "No history turns at {}", path.display());
+    } else if query.stats {
+        out.push_str(&render_history_stats(path, turns));
+    } else {
+        let _ = writeln!(
+            out,
+            "History — {} turn(s) at {}",
+            turns.len(),
+            path.display()
+        );
+        for turn in turns {
+            out.push('\n');
+            out.push_str(&render_history_turn_summary(turn));
+            if query.turn.is_some() {
+                for event in &turn.records {
+                    let _ = writeln!(
+                        out,
+                        "\n── #{} {} ──",
+                        event.record.seq,
+                        event.record.payload.kind_str()
+                    );
+                    let _ = writeln!(
+                        out,
+                        "{}",
+                        serde_json::to_string_pretty(&event.record).unwrap_or_default()
+                    );
+                }
+            }
+        }
+    }
+    let _ = writeln!(
+        out,
+        "\n~ = estimate ({} for text, {} for JSON) · exact = provider-reported usage{}",
+        gaviero_core::history::Estimator::WordsX13.label(),
+        gaviero_core::history::Estimator::CharsDiv4.label(),
+        if skipped > 0 {
+            format!(" · {skipped} unreadable line(s) skipped")
+        } else {
+            String::new()
+        },
+    );
+    out
+}
+
+fn render_history_turn_summary(turn: &gaviero_core::history::TurnRecords) -> String {
+    use gaviero_core::history::{HistoryKind, compact_count as est, grouped_count as exact};
+    use std::fmt::Write as _;
+
+    let s = &turn.summary;
+    let mut out = String::new();
+    if !turn.attributed {
+        let _ = writeln!(
+            out,
+            "UNATTRIBUTED · {} MCP call(s) issued while zero or several conversations streamed",
+            s.mcp_count
+        );
+        return out;
+    }
+    let _ = writeln!(
+        out,
+        "turn {} · {} · {} · {}",
+        s.turn_id.as_deref().unwrap_or("?"),
+        s.started_at.as_deref().unwrap_or("?"),
+        s.model.as_deref().unwrap_or("?"),
+        s.status.label(),
+    );
+    let _ = writeln!(
+        out,
+        "  conv    {} ({})",
+        s.conv_title.as_deref().unwrap_or("(untitled)"),
+        s.conv_id.as_deref().unwrap_or("?"),
+    );
+    let _ = writeln!(
+        out,
+        "  prompt  {} B · ~{} tok · {}",
+        s.prompt_bytes,
+        est(s.in_tokens_est),
+        s.prompt_preview,
+    );
+    let _ = writeln!(
+        out,
+        "  tools   {} call(s){} · ~{} in / ~{} out",
+        s.tool_count,
+        if s.summary_only_tools > 0 {
+            format!(" ({} summary-only)", s.summary_only_tools)
+        } else {
+            String::new()
+        },
+        est(s.tool_in_tokens_est),
+        est(s.tool_out_tokens_est),
+    );
+    let _ = writeln!(
+        out,
+        "  mcp     {} call(s) · ~{} in / ~{} out",
+        s.mcp_count,
+        est(s.mcp_in_tokens_est),
+        est(s.mcp_out_tokens_est),
+    );
+    let memory = turn.records.iter().find_map(|e| match &e.record.payload {
+        HistoryKind::MemoryInjection(m) => Some(m),
+        _ => None,
+    });
+    let _ = writeln!(
+        out,
+        "  memory  {}",
+        match memory {
+            Some(m) => format!(
+                "{}/{} item(s) · ~{}/{} tok",
+                m.items_injected,
+                m.pool_size,
+                est(m.tokens_used_est),
+                est(m.token_budget)
+            ),
+            None => "no memory call".to_string(),
+        }
+    );
+    let _ = writeln!(
+        out,
+        "  totals  ~{} out · {} · {}",
+        est(s.out_tokens_est),
+        s.bootstrap_tokens_est
+            .map(|b| format!("~{} boot", est(b)))
+            .unwrap_or_else(|| "no bootstrap".to_string()),
+        match s.exact_usage {
+            Some(u) => format!(
+                "exact {} in / {} out",
+                exact(u.prefix_tokens()),
+                exact(u.output_tokens)
+            ),
+            None => "no exact usage".to_string(),
+        },
+    );
+    out
+}
+
+fn render_history_stats(
+    path: &std::path::Path,
+    turns: &[gaviero_core::history::TurnRecords],
+) -> String {
+    use gaviero_core::history::{
+        HistoryKind, TurnStatus, compact_count as est, grouped_count as exact,
+    };
+    use std::collections::BTreeMap;
+    use std::fmt::Write as _;
+
+    #[derive(Default)]
+    struct Row {
+        turns: usize,
+        tools: usize,
+        summary_only: usize,
+        mcp: usize,
+        memory_calls: usize,
+        prompt_est: usize,
+        output_est: usize,
+        exact_turns: usize,
+        exact_in: u64,
+        exact_out: u64,
+    }
+
+    let mut rows: BTreeMap<String, Row> = BTreeMap::new();
+    let mut statuses: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut unattributed_mcp = 0usize;
+    for turn in turns {
+        let s = &turn.summary;
+        if !turn.attributed {
+            unattributed_mcp += s.mcp_count;
+            continue;
+        }
+        *statuses.entry(s.status.label()).or_default() += 1;
+        let row = rows
+            .entry(s.provider.clone().unwrap_or_else(|| "?".to_string()))
+            .or_default();
+        row.turns += 1;
+        row.tools += s.tool_count;
+        row.summary_only += s.summary_only_tools;
+        row.mcp += s.mcp_count;
+        row.memory_calls += usize::from(
+            turn.records
+                .iter()
+                .any(|e| matches!(e.record.payload, HistoryKind::MemoryInjection(_))),
+        );
+        row.prompt_est += s.in_tokens_est;
+        row.output_est += s.out_tokens_est;
+        if let Some(u) = s.exact_usage {
+            row.exact_turns += 1;
+            row.exact_in += u.prefix_tokens();
+            row.exact_out += u.output_tokens;
+        }
+    }
+
+    let mut out = String::new();
+    let attributed: usize = rows.values().map(|r| r.turns).sum();
+    let _ = writeln!(
+        out,
+        "History stats — {attributed} turn(s) at {}",
+        path.display()
+    );
+    let status_line: Vec<String> = [
+        TurnStatus::Complete,
+        TurnStatus::Cancelled,
+        TurnStatus::Failed,
+        TurnStatus::Incomplete,
+    ]
+    .iter()
+    .map(|st| {
+        format!(
+            "{} {}",
+            statuses.get(st.label()).copied().unwrap_or(0),
+            st.label()
+        )
+    })
+    .collect();
+    let _ = writeln!(out, "status: {}", status_line.join(" · "));
+    if unattributed_mcp > 0 {
+        let _ = writeln!(out, "unattributed MCP calls: {unattributed_mcp}");
+    }
+    let _ = writeln!(
+        out,
+        "{:<10} {:>6} {:>6} {:>7} {:>5} {:>5} {:>9} {:>9} {:>12} {:>10}",
+        "provider",
+        "turns",
+        "tools",
+        "s-only",
+        "mcp",
+        "mem",
+        "~prompt",
+        "~output",
+        "exact-in",
+        "exact-out"
+    );
+    for (provider, r) in &rows {
+        let (exact_in, exact_out) = if r.exact_turns > 0 {
+            (exact(r.exact_in), exact(r.exact_out))
+        } else {
+            ("-".to_string(), "-".to_string())
+        };
+        let _ = writeln!(
+            out,
+            "{:<10} {:>6} {:>6} {:>7} {:>5} {:>5} {:>9} {:>9} {:>12} {:>10}",
+            provider,
+            r.turns,
+            r.tools,
+            r.summary_only,
+            r.mcp,
+            r.memory_calls,
+            format!("~{}", est(r.prompt_est)),
+            format!("~{}", est(r.output_est)),
+            exact_in,
+            exact_out,
+        );
+    }
+    out
+}
+
 async fn run_mcp_reach_probe(cli: &Cli, repo: &std::path::Path) -> Result<()> {
     if cli.no_mcp {
         anyhow::bail!("--mcp-reach-probe needs the gaviero MCP server; omit --no-mcp");
@@ -3637,6 +4017,11 @@ async fn main() -> Result<()> {
     // probe so `--mcp-stats` never forces a migration prompt.
     if cli.mcp_stats {
         return run_mcp_stats(&repo, cli.mcp_stats_path.as_deref());
+    }
+    // Per-turn history: a pure read of the TUI's history log, same placement
+    // rationale as `--mcp-stats`.
+    if cli.history {
+        return run_history_cli(&cli, &repo);
     }
 
     if let Some(vendors) = &cli.mcp_register_user {
@@ -4778,6 +5163,101 @@ mod tests {
         let mut vars: Vec<(String, String)> = vec![];
         reanchor_out_dir_to_workspace(&mut vars, &cwd, &cwd).unwrap();
         assert!(vars.is_empty());
+    }
+
+    #[test]
+    fn cli_accepts_history_flags() {
+        let cli = Cli::try_parse_from([
+            "gaviero-cli",
+            "--history",
+            "--history-last",
+            "5",
+            "--history-conv",
+            "c1",
+            "--history-path",
+            "turns.ndjson",
+        ])
+        .unwrap();
+        assert!(cli.history);
+        assert_eq!(cli.history_last, Some(5));
+        assert_eq!(cli.history_conv.as_deref(), Some("c1"));
+        assert!(Cli::try_parse_from(["gaviero-cli", "--history-stats"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "gaviero-cli",
+                "--history",
+                "--history-json",
+                "--history-stats"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn history_selection_filters_then_keeps_the_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("turns.ndjson");
+        let r = gaviero_core::history::HistoryRecorder::with_path_and_cap(path.clone(), 1 << 20);
+        for (conv, turn) in [
+            ("c1", "c1-1"),
+            ("c2", "c2-1"),
+            ("c1", "c1-2"),
+            ("c1", "c1-3"),
+        ] {
+            r.begin_turn(
+                conv,
+                turn,
+                gaviero_core::history::TurnStart {
+                    provider: "claude".into(),
+                    model: "claude:sonnet".into(),
+                    conv_title: None,
+                    workspace_root: ".".into(),
+                    prompt: format!("prompt {turn}"),
+                    prompt_bytes: 0,
+                    prompt_truncated: false,
+                    input_tokens_est: None,
+                    estimator: None,
+                },
+                false,
+            );
+            r.end_turn(turn, gaviero_core::history::TurnEnd::new(false, None, 0));
+        }
+        let turns = || {
+            gaviero_core::history::group_turns(
+                gaviero_core::history::read_records(&path, true).records,
+            )
+        };
+        let query = |last, conv, turn| HistoryQuery {
+            last,
+            conv,
+            turn,
+            json: false,
+            stats: false,
+        };
+        let ids = |sel: Vec<gaviero_core::history::TurnRecords>| {
+            sel.into_iter()
+                .map(|t| t.turn_id.unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(select_history_turns(turns(), &query(2, Some("c1"), None))),
+            vec!["c1-2", "c1-3"]
+        );
+        assert_eq!(
+            ids(select_history_turns(
+                turns(),
+                &query(20, None, Some("c2-1"))
+            )),
+            vec!["c2-1"]
+        );
+        let report = render_history(
+            &path,
+            &select_history_turns(turns(), &query(20, None, None)),
+            0,
+            &query(20, None, None),
+        );
+        assert!(report.contains("History — 4 turn(s)"));
+        assert!(report.contains("~ = estimate"));
     }
 
     #[test]

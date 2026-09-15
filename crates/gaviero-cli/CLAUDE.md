@@ -11,7 +11,7 @@ cargo test -p gaviero-cli
 cargo clippy -p gaviero-cli
 ```
 
-Integration tests: [`tests/remember_cli.rs`](tests/remember_cli.rs). Live eval example: [`examples/anchor_ab_live.rs`](examples/anchor_ab_live.rs).
+Integration tests: [`tests/remember_cli.rs`](tests/remember_cli.rs), [`tests/history_cli.rs`](tests/history_cli.rs). Live eval example: [`examples/anchor_ab_live.rs`](examples/anchor_ab_live.rs).
 
 ## Architecture
 
@@ -28,6 +28,7 @@ Mode families (flags on `Cli`):
 | Git hygiene | `--cleanup-branches` (+ `--force`) |
 | Memory admin | `--remember`, `--sleep`, `--utilization-scope`, `--manifest-*`, `--deletions-*` / `--restore-*`, `--forget-*` |
 | MCP | `--mcp-stats` (+ `--mcp-stats-path`); `--mcp-reach-probe` (+ `--reach-providers`, `--reach-depth`, `--reach-transport`, `--reach-json`); `--mcp-register-user` / `--mcp-unregister-user`; runtime: `--no-mcp`, `--mcp-url`, `--mcp-stdio`, `--mcp-codex-trust`, `--skip-mcp-preflight` |
+| History | `--history` (+ `--history-last`, `--history-conv`, `--history-turn`, `--history-json`, `--history-stats`, `--history-path`) — reads the TUI's per-turn log via `gaviero_core::history::reader` |
 | Eval | `--eval-fixture` (+ ablation / budget / anchor-ab / scope-matrix / seed-corpus flags) |
 
 Full user-facing flag tables: [README.md](README.md). Do not duplicate every field here.
