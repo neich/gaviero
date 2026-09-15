@@ -4,6 +4,7 @@ pub mod context_planner;
 pub mod diff_engine;
 pub mod git;
 pub mod git_conflict;
+pub mod history;
 pub mod indent;
 pub mod iteration;
 pub mod mcp;
