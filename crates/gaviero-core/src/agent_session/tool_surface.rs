@@ -1,10 +1,14 @@
 //! Provider-agnostic view of `agent.availableTools` / `approvedTools` /
 //! `agent.permissions.bash`.
 //!
-//! Claude consumes these via `--tools` / `--allowedTools`. Cursor and Codex
-//! have no equivalent argv, so the host translates the same lists into
-//! deny rules (Cursor `cli.json`) and approval decisions (Codex
-//! `requestApproval`).
+//! **Current consumer: Codex app-server only.** It decides each command at
+//! runtime via [`AgentToolSurface::decide_command`]. The other providers
+//! translate the same settings through their own paths today — Claude via
+//! `--tools` / `--allowedTools` argv (`acp/session.rs`), Cursor via deny rules
+//! in the generated `.cursor/cli.json` (`config_synth.rs`) — and are intended
+//! to route through this type too (`plans/provider-parity`, Phases 3 and 5).
+//! Until they do, "provider-agnostic" describes the *intent*, not the call
+//! graph; do not read this header as evidence that Cursor is translated here.
 
 use std::path::Path;
 
@@ -19,8 +23,14 @@ pub(crate) enum CommandDecision {
     /// Same auto-approve Claude would grant (`Bash` in approvedTools,
     /// allowlist prefix, or the turn's auto-approve flag).
     Allow,
-    /// Bash is available but not auto-approved — Codex cannot prompt, so
-    /// the caller falls back to its unattended cargo-verification policy.
+    /// Bash is available on the surface but not auto-approved. The *caller*
+    /// chooses what to do: Codex prompts the user (`prompt_for_command`,
+    /// `codex_app_server.rs`), while unattended callers fall back to cargo
+    /// verification.
+    ///
+    /// This arm does **not** mean "the provider cannot prompt" — Codex has a
+    /// working `on_permission_request` channel. An earlier doc comment here
+    /// claimed otherwise and was wrong.
     UnattendedFallback,
 }
 

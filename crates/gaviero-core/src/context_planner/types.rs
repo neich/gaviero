@@ -95,6 +95,77 @@ impl BootstrapTier {
 /// and §9 non-goals. Adding a capability field becomes a compile error at
 /// every unhandled site, which is the whole point of routing through one
 /// constructor.
+/// MCP transport a provider accepts injected servers over.
+///
+/// Recorded per provider because injection is not uniform: Claude/Codex/Cursor
+/// are handed a config file and spawn stdio servers themselves, dsh accepts
+/// only HTTP endpoints, and the in-process loop links a live server rather than
+/// spawning anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpTransport {
+    /// Provider spawns stdio MCP servers itself from a config file written to
+    /// disk (Claude `.mcp.json`, Codex `[mcp_servers.*]`, Cursor
+    /// `.cursor/mcp.json`).
+    ConfigFileStdio,
+    /// Provider accepts HTTP/SSE MCP endpoints only (dsh 0.1.5-rc.1 advertises
+    /// `mcpCapabilities.http`). A stdio entry would be rejected on `session/new`.
+    HttpOnly,
+    /// In-process harness — servers are linked as a live value, not spawned
+    /// over any transport.
+    InProcess,
+}
+
+/// How (and whether) `agent.availableTools` is enforced for a provider.
+///
+/// This is the axis that today has three implementations and one absence; see
+/// `plans/provider-parity` §2.4. Recording it per provider is what makes a
+/// missing enforcement (`Unenforced`) a visible declaration instead of an
+/// accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolEnforcement {
+    /// Build-time, via argv (`claude --tools` / `--allowedTools`).
+    Argv,
+    /// Build-time, via deny rules baked into a generated config file
+    /// (Cursor `.cursor/cli.json`).
+    GeneratedConfig,
+    /// Runtime — the host decides per call through `AgentToolSurface`
+    /// (Codex app-server).
+    RuntimeHost,
+    /// Registry membership: a tool is reachable only if present in the set the
+    /// loop can dispatch (in-process `deepseek:` / `ollama:`).
+    RegistryMembership,
+    /// Structurally unenforced — the protocol or session carries no tool list
+    /// and no permission policy, so gaviero cannot restrict it (dsh
+    /// `session/new`; `codex exec`).
+    Unenforced,
+}
+
+/// Shape of the mid-turn question a provider can ask the user.
+///
+/// This collapses the two axes an earlier draft named separately
+/// (`can_prompt_user` + `prompt_kind`). A `bool` beside a kind invites the two
+/// to disagree, which is the exact drift this table exists to prevent —
+/// [`PromptKind::None`] *is* "cannot prompt".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKind {
+    /// No interactive channel exists. Headless Cursor (`-p` / `--print`) and
+    /// `codex exec` are both non-interactive by construction, so no prompt can
+    /// be synthesised.
+    None,
+    /// Yes/no approval only (Codex command approval; dsh
+    /// `session/request_permission`; the in-process loop's Bash gate).
+    YesNo,
+    /// Yes/no **and** multi-choice options (Claude `AskUserQuestion`).
+    MultiChoice,
+}
+
+/// Capability record for a provider, built solely by
+/// [`build_provider_profile`].
+///
+/// **This struct is the single declared source of truth for what gaviero
+/// contributes to each provider** — see `plans/provider-parity`. Fields after
+/// `bootstrap_tier` describe the parity axes; a field added here becomes a
+/// compile error in every arm of the factory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderProfile {
     pub provider: String,
@@ -106,6 +177,22 @@ pub struct ProviderProfile {
     /// PUSH→PULL bootstrap tier. Filled explicitly in every
     /// [`build_provider_profile`] arm; must match [`BootstrapTier::derive`].
     pub bootstrap_tier: BootstrapTier,
+    /// Transport this provider accepts injected MCP servers over.
+    pub mcp_transport: McpTransport,
+    /// Whether context7 is injected for this provider.
+    ///
+    /// **Decision (provider-parity #2): context7 is available to every
+    /// provider.** Values below still read `false` for Cursor/dsh/in-process
+    /// only because those paths are not yet wired (Phase 2); the intended
+    /// steady state is `true` throughout, and this field exists so a future
+    /// exclusion is a visible edit rather than a silent omission.
+    pub context7_allowed: bool,
+    /// Whether workspace `extraServers` are injected for this provider.
+    pub extra_servers_allowed: bool,
+    /// How `agent.availableTools` is enforced (see [`ToolEnforcement`]).
+    pub tool_enforcement: ToolEnforcement,
+    /// Strictest mid-turn question this provider can ask (see [`PromptKind`]).
+    pub prompt_kind: PromptKind,
 }
 
 /// Parsed `<prefix>:<model>` model spec.
@@ -222,6 +309,13 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             max_context_tokens: Some(200_000),
             // tool_use + 200k context ⇒ Strong (matches BootstrapTier::derive).
             bootstrap_tier: BootstrapTier::Strong,
+            mcp_transport: McpTransport::ConfigFileStdio,
+            context7_allowed: true,
+            extra_servers_allowed: true,
+            // `claude --tools` argv (`acp/session.rs`).
+            tool_enforcement: ToolEnforcement::Argv,
+            // `AskUserQuestion` + y/n.
+            prompt_kind: PromptKind::MultiChoice,
         },
         Provider::CodexAppServer => ProviderProfile {
             provider: "codex".to_string(),
@@ -236,6 +330,13 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             // tool_use + unknown (None) context ⇒ Strong (derive treats an
             // unknown window as not-small).
             bootstrap_tier: BootstrapTier::Strong,
+            mcp_transport: McpTransport::ConfigFileStdio,
+            context7_allowed: true,
+            extra_servers_allowed: true,
+            // Runtime decisions via `AgentToolSurface` (`tool_surface.rs`).
+            tool_enforcement: ToolEnforcement::RuntimeHost,
+            // y/n only — `item/commandExecution/requestApproval`.
+            prompt_kind: PromptKind::YesNo,
         },
         Provider::Codex => ProviderProfile {
             provider: "codex".to_string(),
@@ -251,6 +352,16 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             max_context_tokens: None,
             // tool_use + unknown (None) context ⇒ Strong.
             bootstrap_tier: BootstrapTier::Strong,
+            mcp_transport: McpTransport::ConfigFileStdio,
+            context7_allowed: true,
+            extra_servers_allowed: true,
+            // No gaviero-side enforcement wired; `codex exec` carries no tool
+            // list to this session (see `codex_exec.rs`). UNVERIFIED against a
+            // live codex — Phase 7's parity test must confirm.
+            tool_enforcement: ToolEnforcement::Unenforced,
+            // `codex exec` is non-interactive by construction
+            // (`codex_exec.rs` module doc).
+            prompt_kind: PromptKind::None,
         },
         Provider::Cursor => ProviderProfile {
             provider: "cursor".to_string(),
@@ -269,6 +380,20 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             max_context_tokens: Some(200_000),
             // tool_use + 200k context ⇒ Strong.
             bootstrap_tier: BootstrapTier::Strong,
+            mcp_transport: McpTransport::ConfigFileStdio,
+            // Delivered (Phase 2, decision #2): Cursor's context7 exclusion is
+            // gone. The registration is a `url` entry, so it is not the stdio
+            // shape `validate_synthesized_cursor_remote_mcp` rejects; the
+            // preflight now keys on transport rather than on the server name.
+            // A *stdio* context7 is still withheld from Cursor when a remote
+            // URL extra exists — that is the conditional half of decision #2.
+            context7_allowed: true,
+            extra_servers_allowed: true,
+            // Deny rules baked into the generated `.cursor/mcp.json` /
+            // `cli.json` (`config_synth.rs`).
+            tool_enforcement: ToolEnforcement::GeneratedConfig,
+            // Headless `-p`/`--print`: no interactive channel exists.
+            prompt_kind: PromptKind::None,
         },
         Provider::Ollama => ProviderProfile {
             provider: "ollama".to_string(),
@@ -288,6 +413,16 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             // No reliable tool use (and an 8k window) ⇒ SmallLocal: keep the
             // full push until per-tier evidence proves a thin bootstrap holds.
             bootstrap_tier: BootstrapTier::SmallLocal,
+            // In-process loop: servers are linked, not spawned.
+            mcp_transport: McpTransport::InProcess,
+            // Phase 2 wires context7 for the in-process loop.
+            context7_allowed: false,
+            extra_servers_allowed: false,
+            // Tool reachability = registry membership (`tools/mod.rs`).
+            tool_enforcement: ToolEnforcement::RegistryMembership,
+            // y/n Bash gate only (`tool_agent/policy.rs`). Phase 4 adds a
+            // multi-choice ask tool; this becomes `MultiChoice`.
+            prompt_kind: PromptKind::YesNo,
         },
         Provider::Deepseek => ProviderProfile {
             provider: "deepseek".to_string(),
@@ -301,6 +436,14 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             max_context_tokens: Some(128_000),
             // tool_use + 128k context ⇒ Strong.
             bootstrap_tier: BootstrapTier::Strong,
+            mcp_transport: McpTransport::InProcess,
+            // Phase 2 wires context7 for the in-process loop.
+            context7_allowed: false,
+            extra_servers_allowed: false,
+            tool_enforcement: ToolEnforcement::RegistryMembership,
+            // y/n Bash gate only (`tool_agent/policy.rs`). Phase 4 adds a
+            // multi-choice ask tool; this becomes `MultiChoice`.
+            prompt_kind: PromptKind::YesNo,
         },
         Provider::Dsh => ProviderProfile {
             provider: "dsh".to_string(),
@@ -310,6 +453,20 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             supports_native_resume: true,
             max_context_tokens: Some(128_000),
             bootstrap_tier: BootstrapTier::Strong,
+            // dsh 0.1.5-rc.1 advertises `mcpCapabilities.http` only
+            // (`dsh.rs`). Delivered (Phase 2, decisions #2/E): `session/new`
+            // now carries context7 and URL-form `extraServers`, each behind
+            // the same `mcp.permissions` registration gate the file-based
+            // providers apply. A stdio entry — a `command` extra, or context7
+            // in stdio-fallback mode — cannot be hosted and is skipped.
+            mcp_transport: McpTransport::HttpOnly,
+            context7_allowed: true,
+            extra_servers_allowed: true,
+            // `session/new` carries no tool list and no permission policy —
+            // structurally unenforced (decision #1: declared, not attempted).
+            tool_enforcement: ToolEnforcement::Unenforced,
+            // y/n via `session/request_permission`.
+            prompt_kind: PromptKind::YesNo,
         },
     }
 }
@@ -776,5 +933,104 @@ mod tests {
         assert!(json.contains("ClaudeSessionId"));
         let back: ContinuityHandle = serde_json::from_str(&json).unwrap();
         assert_eq!(h, back);
+    }
+
+    // ── Provider capability table (provider-parity Phase 1) ───────────────────
+    //
+    // These pin the declared matrix so it cannot rot the way `tool_surface.rs`'s
+    // header did. They assert *today's verified* values; the `Phase N` comments
+    // in `build_provider_profile` name the intended changes, and each such
+    // assertion carries the phase that will flip it.
+
+    fn profile(spec: &str) -> ProviderProfile {
+        build_provider_profile(&ModelSpec::parse(spec), &RuntimeConfig::default())
+    }
+
+    #[test]
+    fn claude_is_argv_enforced_with_multi_choice_prompting() {
+        let p = profile("claude:sonnet");
+        assert_eq!(p.mcp_transport, McpTransport::ConfigFileStdio);
+        assert!(p.context7_allowed);
+        assert!(p.extra_servers_allowed);
+        assert_eq!(p.tool_enforcement, ToolEnforcement::Argv);
+        assert_eq!(p.prompt_kind, PromptKind::MultiChoice);
+    }
+
+    #[test]
+    fn codex_app_server_enforces_at_runtime_and_prompts_yesno() {
+        let p = profile("codex-app-server:gpt-5");
+        assert_eq!(p.mcp_transport, McpTransport::ConfigFileStdio);
+        assert_eq!(p.tool_enforcement, ToolEnforcement::RuntimeHost);
+        assert_eq!(p.prompt_kind, PromptKind::YesNo);
+    }
+
+    /// `codex exec` must NOT be conflated with `codex app-server`: it is
+    /// non-interactive and unenforced from gaviero's side.
+    #[test]
+    fn codex_exec_is_unenforced_and_cannot_prompt() {
+        let p = profile("codex:gpt-5");
+        assert_eq!(p.tool_enforcement, ToolEnforcement::Unenforced);
+        assert_eq!(p.prompt_kind, PromptKind::None);
+    }
+
+    #[test]
+    fn cursor_is_build_time_enforced_with_no_prompt_channel() {
+        let p = profile("cursor:gpt-5");
+        assert_eq!(p.tool_enforcement, ToolEnforcement::GeneratedConfig);
+        assert_eq!(p.prompt_kind, PromptKind::None);
+        // Phase 2 flips this to `true` (decision #2: context7 for all).
+        assert!(!p.context7_allowed);
+    }
+
+    #[test]
+    fn dsh_is_http_only_and_structurally_unenforced() {
+        let p = profile("dsh:deepseek-chat");
+        assert_eq!(p.mcp_transport, McpTransport::HttpOnly);
+        // Decision #1: declared unenforced, not attempted.
+        assert_eq!(p.tool_enforcement, ToolEnforcement::Unenforced);
+        assert_eq!(p.prompt_kind, PromptKind::YesNo);
+        assert!(!p.extra_servers_allowed);
+    }
+
+    #[test]
+    fn in_process_loop_is_registry_enforced_over_a_linked_server() {
+        for spec in ["deepseek:deepseek-chat", "ollama:llama3.1"] {
+            let p = profile(spec);
+            assert_eq!(p.mcp_transport, McpTransport::InProcess, "{spec}");
+            assert_eq!(
+                p.tool_enforcement,
+                ToolEnforcement::RegistryMembership,
+                "{spec}"
+            );
+            // Phase 4 raises this to `MultiChoice` for the in-process loop.
+            assert_eq!(p.prompt_kind, PromptKind::YesNo, "{spec}");
+        }
+    }
+
+    /// The whole point of one table: the declared prompt channel matches what
+    /// each provider actually offers. Cursor and `codex exec` are the two with
+    /// no channel at all; everything else has at least y/n. If this fails,
+    /// either a real capability changed (update the table deliberately) or the
+    /// table drifted from the code.
+    #[test]
+    fn prompt_channels_are_declared_not_assumed() {
+        let no_channel = ["cursor:x", "codex:x"].map(|s| profile(s).prompt_kind);
+        assert!(
+            no_channel.iter().all(|k| *k == PromptKind::None),
+            "expected no prompt channel: {no_channel:?}"
+        );
+
+        let yes_no = ["codex-app-server:gpt-5", "dsh:x", "deepseek:x", "ollama:x"]
+            .map(|s| profile(s).prompt_kind);
+        assert!(
+            yes_no.iter().all(|k| *k == PromptKind::YesNo),
+            "expected y/n channels: {yes_no:?}"
+        );
+
+        // Exactly one provider reaches multi-choice today.
+        assert_eq!(
+            profile("claude:sonnet").prompt_kind,
+            PromptKind::MultiChoice
+        );
     }
 }

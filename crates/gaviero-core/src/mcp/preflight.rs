@@ -206,13 +206,22 @@ pub fn validate_synthesized_cursor_remote_mcp(synth: &McpConfigSynth) -> Result<
         .and_then(|s| s.as_object())
         .ok_or_else(|| anyhow::anyhow!(".cursor/mcp.json missing mcpServers object"))?;
 
-    for stale in ["context7", "gaviero"] {
-        if servers.contains_key(stale) {
+    // The failure being guarded is a **stdio** server that dies at Cursor
+    // startup, so the check keys on transport (does the entry carry
+    // `command`?), not on the server's name. Keying on the name instead would
+    // wrongly reject a `url` entry named `context7` — a remote server like any
+    // other — and that is precisely the shape that lets Cursor use the same
+    // hosted context7 endpoint as every other provider.
+    for poison in ["context7", "gaviero"] {
+        let is_stdio = servers
+            .get(poison)
+            .is_some_and(|entry| entry.get("command").is_some());
+        if is_stdio {
             bail!(
-                ".cursor/mcp.json still lists {stale:?} alongside remote MCP URL server(s). \
-                 A failing stdio server prevents Cursor from registering streamable HTTP MCP \
-                 (ListMcpResources empty / network rejected). Delete {path} and re-run, or \
-                 remove {stale} manually.",
+                ".cursor/mcp.json still lists {poison:?} as a stdio server alongside remote MCP \
+                 URL server(s). A failing stdio server prevents Cursor from registering \
+                 streamable HTTP MCP (ListMcpResources empty / network rejected). Delete {path} \
+                 and re-run, or remove {poison} manually.",
                 path = mcp_path.display(),
             );
         }
@@ -390,5 +399,34 @@ mod tests {
         let mut synth = synth_with_extra_url("https://scholar.example/mcp/");
         synth.worktree = dir.path().to_path_buf();
         assert!(validate_synthesized_cursor_remote_mcp(&synth).is_err());
+    }
+
+    #[test]
+    fn validate_synthesized_cursor_remote_mcp_allows_url_context7() {
+        use tempfile::tempdir;
+
+        use super::super::synthesize_for_worktree;
+
+        // The HTTP half of decision A: a `url` context7 is a remote server
+        // like any other and must be allowed to coexist with other remote URL
+        // servers. Only a stdio (`command`) entry is the documented poison,
+        // which is why the guard keys on transport rather than on the name.
+        // Driven through the real synthesis path so `.cursor/mcp.json` and the
+        // `.cursor/cli.json` permission baseline are produced as they are live.
+        let dir = tempdir().unwrap();
+        let mut synth = synth_with_extra_url("https://scholar.example/mcp/");
+        synth.worktree = dir.path().to_path_buf();
+        synth.context7.enabled = true;
+        synthesize_for_worktree(&synth).unwrap();
+
+        let body = std::fs::read_to_string(dir.path().join(".cursor/mcp.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["mcpServers"]["context7"]["url"].as_str().unwrap(),
+            crate::mcp::config_synth::CONTEXT7_REMOTE_URL
+        );
+        assert!(v["mcpServers"]["context7"].get("command").is_none());
+
+        validate_synthesized_cursor_remote_mcp(&synth).unwrap();
     }
 }
