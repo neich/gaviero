@@ -8,15 +8,6 @@ use gaviero_core::types::{HunkStatus, HunkType, WriteProposal};
 
 use crate::theme::Theme;
 
-/// Where the diff originated from.
-#[derive(Clone, Debug, PartialEq)]
-pub enum DiffSource {
-    /// From the AI agent (ACP pipeline) — user can accept/reject/finalize.
-    Acp,
-    /// From an external tool or editor — accept disk version or keep editor copy.
-    External,
-}
-
 /// State for the diff review overlay.
 ///
 /// Owns a local copy of the `WriteProposal` so that rendering and user
@@ -24,8 +15,6 @@ pub enum DiffSource {
 pub struct DiffReviewState {
     /// The proposal being reviewed (owned, lock-free).
     pub proposal: WriteProposal,
-    /// Where this diff came from.
-    pub source: DiffSource,
     /// Index of the currently focused hunk.
     pub current_hunk: usize,
     /// Scroll offset (top visible line in the merged view).
@@ -39,11 +28,10 @@ pub struct DiffReviewState {
 }
 
 impl DiffReviewState {
-    pub fn new(proposal: WriteProposal, source: DiffSource) -> Self {
+    pub fn new(proposal: WriteProposal) -> Self {
         let cached_lines = build_diff_lines(&proposal);
         Self {
             proposal,
-            source,
             current_hunk: 0,
             scroll_top: 0,
             pending_bracket: None,
@@ -117,15 +105,6 @@ impl DiffReviewState {
         }
         update_proposal_status(&mut self.proposal);
         self.invalidate_cache();
-    }
-
-    /// Whether this diff allows interactive accept/reject.
-    pub fn is_interactive(&self) -> bool {
-        matches!(self.source, DiffSource::Acp | DiffSource::External)
-    }
-
-    pub fn is_external(&self) -> bool {
-        self.source == DiffSource::External
     }
 }
 
@@ -495,7 +474,7 @@ mod tests {
     #[test]
     fn test_hunk_navigation() {
         let proposal = make_proposal("aaa\nbbb\nccc\nddd\n", "aaa\nBBB\nccc\nDDD\n");
-        let mut state = DiffReviewState::new(proposal, DiffSource::Acp);
+        let mut state = DiffReviewState::new(proposal);
         assert_eq!(state.current_hunk, 0);
         state.next_hunk();
         assert_eq!(state.current_hunk, 1);
@@ -508,7 +487,7 @@ mod tests {
     #[test]
     fn test_accept_reject_local() {
         let proposal = make_proposal("aaa\nbbb\nccc\nddd\n", "aaa\nBBB\nccc\nDDD\n");
-        let mut state = DiffReviewState::new(proposal, DiffSource::Acp);
+        let mut state = DiffReviewState::new(proposal);
         state.accept_hunk(0);
         assert_eq!(
             state.proposal.structural_hunks[0].status,

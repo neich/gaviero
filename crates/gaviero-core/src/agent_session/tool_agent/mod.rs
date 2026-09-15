@@ -7,9 +7,12 @@
 //! reusable harness over the [`ApiClient`] trait so the next API provider only
 //! implements the trait.
 //!
-//! **PR-6 (this milestone):** cross-turn replay + compaction, API retry/backoff,
-//! cancel-aware streaming, per-turn cost telemetry, and docs. MCP graph tools
-//! remain a follow-up — see `docs/plans/deepseek_v4_pro_provider.md`.
+//! **PR-7 (this milestone):** the gaviero MCP retrieval tools (`memory_search`,
+//! `blast_radius`, `node_doc`, `repo_outline`, `symbol_search`, `symbol_doc`, …)
+//! are callable from the in-process loop — see [`tools::mcp`]. They were
+//! previously a follow-up for API providers, which left `deepseek:` and
+//! `ollama:` reading the filesystem by hand while the system prompt instructed
+//! them to call `blast_radius(path)` they could not reach.
 
 mod agent_loop;
 pub mod client;
@@ -33,7 +36,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::context_planner::compaction::CompactionPolicy;
 use crate::context_planner::{ContinuityHandle, ContinuityMode, ProviderProfile};
-use crate::observer::{AcpObserver, ToolAgentEdit};
+use crate::observer::AcpObserver;
 use crate::swarm::backend::shared::{
     default_editor_system_prompt, render_graph_block, render_memory_block, render_skill_block,
 };
@@ -115,6 +118,10 @@ pub struct ToolAgentSession {
     additional_roots: Vec<PathBuf>,
     scope: FileScope,
     tools: ToolRegistry,
+    /// Names of the gaviero MCP retrieval tools this session holds, in `tools`
+    /// order. Empty when no server was threaded in or the allow-list omitted
+    /// them; drives [`RetrievalToolset`] so the pull stanza matches reality.
+    retrieval_tools: Vec<String>,
     limits: agent_loop::LoopLimits,
     profile: ProviderProfile,
     compaction: CompactionPolicy,
@@ -138,12 +145,22 @@ impl ToolAgentSession {
             profile,
             cancel_token,
             options,
+            mcp_server,
             ..
         } = args;
         let config = resolve_api_config(&workspace_root);
-        let tools = match &options.available_tools {
+        let mut tools = match &options.available_tools {
             Some(names) if !names.is_empty() => ToolRegistry::from_names(names),
             _ => ToolRegistry::full_chat(),
+        };
+        // Gaviero's MCP retrieval tools, adapted to the in-process loop. Appended
+        // after the fs/exec tools so those keep a stable position in the `tools`
+        // array (prompt-cache friendliness). `extend_mcp` returns exactly the
+        // names it added, which is what the pull stanza is then built from — so
+        // the prompt can only ever name tools this session really holds.
+        let retrieval_tools = match &mcp_server {
+            Some(server) => tools.extend_mcp(server, options.available_tools.as_deref()),
+            None => Vec::new(),
         };
         // Host-resolved shell policy (workspace cascade). The path-based
         // fallback only serves callers that never populated the option.
@@ -163,6 +180,7 @@ impl ToolAgentSession {
             // owned_paths in Phase 6.
             scope: FileScope::default(),
             tools,
+            retrieval_tools,
             limits: resolve_loop_limits(&workspace_root),
             profile,
             compaction: CompactionPolicy::default(),
@@ -184,9 +202,11 @@ impl ToolAgentSession {
             max_context_tokens: self.profile.max_context_tokens.unwrap_or(0),
             supports_system_prompt: true,
             supports_file_blocks: false,
-            // The in-process tool agent exposes Read/Grep/Glob/Bash/Write, not
-            // the gaviero MCP retrieval tools → no pull stanza.
-            retrieval: RetrievalToolset::default(),
+            // Names of the gaviero MCP tools this session actually holds (empty
+            // when no server was wired, or when the allow-list excluded them).
+            // Deriving the stanza from live state is what keeps the prompt from
+            // instructing the model to call a tool it cannot reach.
+            retrieval: RetrievalToolset::from_exposed(&self.retrieval_tools),
         }
     }
 
@@ -256,17 +276,11 @@ impl AgentSession for ToolAgentSession {
                 }
             }
         } else if had_edits {
-            let edits: Vec<ToolAgentEdit> = snapshot
-                .lock()
-                .await
-                .edits()
-                .into_iter()
-                .map(|(path, pre_turn_content)| ToolAgentEdit {
-                    path,
-                    pre_turn_content,
-                })
-                .collect();
-            self.observer.as_ref().on_tool_agent_edits(&edits);
+            // Only the paths matter: the host syncs its open buffers to disk and
+            // never undoes an individual file of the set (see the TUI's
+            // `agent_writes.rs`).
+            let paths = snapshot.lock().await.touched_paths();
+            self.observer.as_ref().on_tool_agent_edits(&paths);
         }
 
         // Fire on_message_complete even on error (parity with

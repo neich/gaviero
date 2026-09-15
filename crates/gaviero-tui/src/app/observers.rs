@@ -222,17 +222,10 @@ impl AcpObserver for TuiAcpObserver {
         });
     }
 
-    fn on_tool_agent_edit_captured(&self, path: &std::path::Path, pre_turn_content: Option<&str>) {
-        let _ = self.tx.send(Event::ToolAgentEditCaptured {
-            path: path.to_path_buf(),
-            pre_turn_content: pre_turn_content.map(str::to_string),
-        });
-    }
-
-    fn on_tool_agent_edits(&self, edits: &[gaviero_core::observer::ToolAgentEdit]) {
+    fn on_tool_agent_edits(&self, paths: &[std::path::PathBuf]) {
         let _ = self.tx.send(Event::ToolAgentEditsPending {
             conv_id: self.conv_id.clone(),
-            edits: edits.to_vec(),
+            paths: paths.to_vec(),
         });
     }
 }

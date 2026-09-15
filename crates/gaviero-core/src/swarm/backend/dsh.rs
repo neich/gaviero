@@ -111,6 +111,7 @@ impl AgentBackend for DshBackend {
             options,
             profile,
             cancel_token: CancellationToken::new(),
+            mcp_server: None,
         };
         let mut session =
             AcpClientSession::new_with_scope(args, request.file_scope.clone()).with_extra(extra).with_system_prompt(request.system_prompt);

@@ -4,12 +4,13 @@
 //! Tools mirror Claude Code's schema (names + argument keys) so the chat
 //! "Using X…" summaries and the system prompt reuse with zero new code. PR-3
 //! ships read-only fs tools; PR-4: `Write`/`Edit`/`MultiEdit`; PR-5: `Bash` +
-//! [`crate::agent_session::tool_agent::policy::ToolPolicy`]. MCP graph tools
-//! plug in once `MemoryStores`/`GraphStore` are threaded into the session.
+//! [`crate::agent_session::tool_agent::policy::ToolPolicy`]; PR-7: the gaviero
+//! MCP retrieval tools via [`mcp`].
 
 pub mod bash;
 pub mod glob;
 pub mod grep;
+pub mod mcp;
 pub mod read;
 pub mod write;
 
@@ -23,6 +24,7 @@ use serde_json::Value;
 
 use crate::agent_session::tool_agent::policy::ToolPolicy;
 use crate::agent_session::tool_agent::snapshot::TurnSnapshot;
+use crate::mcp::server::GavieroMcpServer;
 use crate::observer::AcpObserver;
 use crate::scope_enforcer::ScopeEnforcer;
 use crate::types::FileScope;
@@ -160,6 +162,36 @@ impl ToolRegistry {
         Self::new(tools)
     }
 
+    /// Append the gaviero MCP retrieval tools held by `server`, returning the
+    /// names actually added.
+    ///
+    /// `allow` is the swarm's `allowedTools` allow-list: when `Some`, an MCP tool
+    /// is only added if the list names it, so an allow-list stays an allow-list.
+    /// The chat path passes `None` and takes the full advertised set.
+    ///
+    /// Returning the added names (rather than having the caller re-derive them
+    /// from the server) is what keeps the system prompt's pull stanza honest: a
+    /// tool skipped by the allow-list is absent from the returned names too, so
+    /// the prompt cannot advertise a tool the model does not hold.
+    pub fn extend_mcp(
+        &mut self,
+        server: &Arc<GavieroMcpServer>,
+        allow: Option<&[String]>,
+    ) -> Vec<String> {
+        let mut added = Vec::new();
+        for spec in server.in_process_tool_specs() {
+            if let Some(list) = allow
+                && !list.iter().any(|n| n == &spec.name)
+            {
+                continue;
+            }
+            added.push(spec.name.clone());
+            self.tools
+                .push(Box::new(mcp::McpTool::new(Arc::clone(server), spec)));
+        }
+        added
+    }
+
     pub fn schemas(&self) -> Vec<Value> {
         self.tools.iter().map(|t| t.schema()).collect()
     }
@@ -169,6 +201,11 @@ impl ToolRegistry {
             .iter()
             .find(|t| t.name() == name)
             .map(|b| b.as_ref())
+    }
+
+    /// Every tool name in the set, in `tools`-array order.
+    pub fn names(&self) -> Vec<&str> {
+        self.tools.iter().map(|t| t.name()).collect()
     }
 }
 

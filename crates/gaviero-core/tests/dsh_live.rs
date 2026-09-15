@@ -72,6 +72,7 @@ async fn dsh_acp_smoke() {
         },
         profile,
         cancel_token: CancellationToken::new(),
+        mcp_server: None,
     };
     let mut session = AcpClientSession::new_with_scope(args, FileScope::default());
     let mut stream = session

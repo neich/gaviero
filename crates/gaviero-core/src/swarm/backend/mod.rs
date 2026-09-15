@@ -330,6 +330,42 @@ mod tests {
     use super::*;
     use futures::StreamExt;
 
+    /// A session holding no gaviero MCP tools must advertise none, so the
+    /// system-prompt pull stanza cannot name a tool the model cannot reach.
+    ///
+    /// This is the regression that had `deepseek:`/`ollama:` instructed to call
+    /// `blast_radius(path)`: `ToolAgentSession` derives its toolset from the
+    /// names `ToolRegistry::extend_mcp` actually added, and that list is empty
+    /// whenever no in-process server was threaded into the session.
+    #[test]
+    fn empty_exposed_tools_advertise_no_stanza() {
+        let none = RetrievalToolset::from_exposed(&[]);
+        assert!(
+            !none.graph_and_memory,
+            "an empty list must not claim graph tools"
+        );
+        assert!(!none.symbols, "an empty list must not claim symbol tools");
+        assert!(!none.names("blast_radius"));
+        assert_eq!(none, RetrievalToolset::default());
+    }
+
+    /// The positive direction: exactly the names the session holds come back on,
+    /// and nothing else. Symbol tools stay off because `extend_mcp` omits them
+    /// unless the enrichment sidecar is enabled server-side.
+    #[test]
+    fn advertised_tools_enable_only_what_is_held() {
+        let held = vec![
+            "memory_search".to_string(),
+            "blast_radius".to_string(),
+            "node_doc".to_string(),
+        ];
+        let ts = RetrievalToolset::from_exposed(&held);
+        assert!(ts.graph_and_memory);
+        assert!(ts.names("blast_radius"));
+        assert!(!ts.symbols, "enrichment was not part of the held set");
+        assert!(!ts.names("symbol_search"));
+    }
+
     // Test 1: MockBackend event sequence (trait contract)
     #[tokio::test]
     async fn test_mock_backend_event_sequence() {

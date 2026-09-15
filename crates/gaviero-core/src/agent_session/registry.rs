@@ -47,6 +47,20 @@ pub struct SessionConstruction {
     pub options: AgentOptions,
     pub profile: ProviderProfile,
     pub cancel_token: CancellationToken,
+    /// The workspace's in-process gaviero MCP server, when the host holds one.
+    ///
+    /// Threaded as a live handle rather than re-resolved from `workspace_root`
+    /// because the server already carries its warm `GraphStore`/`RepoMap`
+    /// caches, its resolved reranker, and the `exposedTools` /
+    /// `mcp.permissions` / symbol-enrichment gates the host applied at startup.
+    ///
+    /// In-process API providers (`deepseek:`, `ollama:`) run gaviero's own agent
+    /// loop and never speak MCP, so this handle is the *only* route by which they
+    /// reach the retrieval tools — see `tool_agent::tools::mcp`.
+    ///
+    /// `None` (swarm worktrees, CLI one-shots, tests) simply yields no retrieval
+    /// tools, which in turn omits the system-prompt pull stanza by construction.
+    pub mcp_server: Option<Arc<crate::mcp::server::GavieroMcpServer>>,
 }
 
 struct NoopAcpObserver;
@@ -218,6 +232,7 @@ fn create_observed_codex_session(args: SessionConstruction) -> Box<dyn AgentSess
         options,
         profile,
         cancel_token,
+        mcp_server,
     } = args;
 
     let observer: Arc<dyn AcpObserver> = Arc::from(observer);
@@ -233,6 +248,7 @@ fn create_observed_codex_session(args: SessionConstruction) -> Box<dyn AgentSess
         options,
         profile,
         cancel_token,
+        mcp_server,
     };
 
     Box::new(ObservedStreamSession {
@@ -259,6 +275,7 @@ fn create_observed_dsh_session(args: SessionConstruction) -> Box<dyn AgentSessio
         options,
         profile,
         cancel_token,
+        mcp_server,
     } = args;
 
     let observer: Arc<dyn AcpObserver> = Arc::from(observer);
@@ -274,6 +291,7 @@ fn create_observed_dsh_session(args: SessionConstruction) -> Box<dyn AgentSessio
         options,
         profile,
         cancel_token,
+        mcp_server,
     };
 
     Box::new(ObservedStreamSession {

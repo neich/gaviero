@@ -30,18 +30,12 @@ impl TurnSnapshot {
         self.originals.keys().cloned().collect()
     }
 
-    /// Export `(path, pre-turn content)` pairs for the TUI revert path.
+    /// Export `(path, pre-turn content)` pairs for the Codex write gate.
     pub fn edits(&self) -> Vec<(PathBuf, Option<String>)> {
         self.originals
             .iter()
             .map(|(p, c)| (p.clone(), c.clone()))
             .collect()
-    }
-
-    /// Pre-turn on-disk content for `path` after the first snapshot capture.
-    /// `None` means the file did not exist; missing paths were never snapshotted.
-    pub fn pre_turn_content(&self, path: &Path) -> Option<Option<String>> {
-        self.originals.get(path).map(|c| c.clone())
     }
 
     /// Record the pre-write state for `path` if not already captured.

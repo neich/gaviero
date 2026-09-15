@@ -10,7 +10,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 
 use crate::editor::buffer::Buffer;
-use crate::editor::diff_overlay::{self, DiffReviewState, DiffSource};
+use crate::editor::diff_overlay::{self, DiffReviewState};
 use crate::editor::highlight::{HighlightConfig, load_highlight_config};
 use crate::editor::view::EditorView;
 use crate::event::Event;
@@ -28,6 +28,7 @@ use gaviero_core::types::WriteProposal;
 use gaviero_core::workspace::Workspace;
 use gaviero_core::write_gate::{WriteGatePipeline, WriteMode};
 
+mod agent_writes;
 mod chat_memory;
 mod commands;
 mod controller;
@@ -179,9 +180,6 @@ pub struct App {
     pub write_gate: Arc<Mutex<WriteGatePipeline>>,
     /// Unified diff review state — owns the proposal locally (no lock needed).
     pub diff_review: Option<DiffReviewState>,
-    /// Pre-turn on-disk snapshots for in-process tool-agent edits awaiting
-    /// external-change review. Cleared when the user accepts or reverts.
-    pub pending_tool_agent_edits: std::collections::HashMap<std::path::PathBuf, Option<String>>,
     /// Batch review state — entered after agent response with deferred writes.
     pub batch_review: Option<BatchReviewState>,
     /// Git changes panel state — populated when cycling to Changes mode via F7.
@@ -246,6 +244,17 @@ pub struct App {
     /// handle's `shutdown` is awaited so the Unix socket file is
     /// cleaned up.
     pub mcp_server: Option<gaviero_core::mcp::McpServerHandle>,
+
+    /// The live in-process MCP server, handed to API providers that run
+    /// gaviero's own agent loop (`deepseek:`, `ollama:`) so they can call
+    /// `memory_search` / `blast_radius` / `node_doc` without a transport.
+    ///
+    /// Set on `Event::MemoryReady` *before* the socket bind, because the
+    /// in-process route needs no endpoint: if another gaviero instance owns
+    /// the socket, subprocess agents degrade but these providers keep their
+    /// retrieval tools. `None` until then, and sessions then advertise no
+    /// pull stanza rather than naming tools they cannot reach.
+    pub mcp_tool_server: Option<Arc<gaviero_core::mcp::GavieroMcpServer>>,
 
     /// Turn-scoped skill catalog scanned from `.gaviero/skills/` roots.
     pub skill_catalog: Arc<gaviero_core::skills::SkillCatalog>,
@@ -437,7 +446,6 @@ impl App {
             needs_immediate_render: false,
             write_gate,
             diff_review: None,
-            pending_tool_agent_edits: std::collections::HashMap::new(),
             batch_review: None,
             changes_state: None,
             chat_state: {
@@ -469,6 +477,7 @@ impl App {
             git_panel: crate::panels::git_panel::GitPanelState::new(),
             memory_panel: crate::panels::memory_panel::MemoryPanelState::new(),
             mcp_server: None,
+            mcp_tool_server: None,
             skill_catalog,
             git_repos,
             terminal_manager: gaviero_core::terminal::TerminalManager::new(
@@ -797,8 +806,8 @@ impl App {
     }
 
     /// Enter diff review mode with an owned proposal. No lock needed.
-    fn enter_review_mode(&mut self, proposal: WriteProposal, source: DiffSource) {
-        review::enter_review_mode(self, proposal, source);
+    fn enter_review_mode(&mut self, proposal: WriteProposal) {
+        review::enter_review_mode(self, proposal);
     }
 
     // ── Batch review mode ────────────────────────────────────────

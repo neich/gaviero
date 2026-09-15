@@ -2389,6 +2389,12 @@ pub(crate) fn dispatch_prompt_core(
     let bootstrap_memory = bootstrap_arms.memory;
     let bootstrap_impact = bootstrap_arms.impact;
     let bootstrap_topology = bootstrap_arms.topology && topology_config.enabled;
+    // The live in-process MCP server, when `Event::MemoryReady` has spawned one
+    // successfully. Captured before the task because `app` is not moved into
+    // it. In-process API providers (`deepseek:`, `ollama:`) run gaviero's own
+    // agent loop, so this handle is their only route to the retrieval tools;
+    // when it is `None` the session simply advertises no pull stanza.
+    let mcp_tool_server = app.mcp_tool_server.clone();
     let task = tokio::spawn(async move {
         {
             let mut gate = wg.lock().await;
@@ -2751,6 +2757,10 @@ pub(crate) fn dispatch_prompt_core(
                 options,
                 profile: provider_profile_clone,
                 cancel_token: session_cancel,
+                // The live in-process MCP server, when one is up. `deepseek:`
+                // and `ollama:` reach memory_search / blast_radius / node_doc
+                // through this; subprocess providers ignore it.
+                mcp_server: mcp_tool_server,
             },
         );
         // Outer select! is the safety net for transports that don't yet
