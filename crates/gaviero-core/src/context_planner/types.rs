@@ -381,9 +381,13 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             // tool_use + 200k context ⇒ Strong.
             bootstrap_tier: BootstrapTier::Strong,
             mcp_transport: McpTransport::ConfigFileStdio,
-            // Phase 2 flips this to `true`: decision (provider-parity #2)
-            // removes the Cursor exclusion at `config_synth.rs`.
-            context7_allowed: false,
+            // Delivered (Phase 2, decision #2): Cursor's context7 exclusion is
+            // gone. The registration is a `url` entry, so it is not the stdio
+            // shape `validate_synthesized_cursor_remote_mcp` rejects; the
+            // preflight now keys on transport rather than on the server name.
+            // A *stdio* context7 is still withheld from Cursor when a remote
+            // URL extra exists — that is the conditional half of decision #2.
+            context7_allowed: true,
             extra_servers_allowed: true,
             // Deny rules baked into the generated `.cursor/mcp.json` /
             // `cli.json` (`config_synth.rs`).
@@ -450,10 +454,14 @@ pub fn build_provider_profile(spec: &ModelSpec, _runtime: &RuntimeConfig) -> Pro
             max_context_tokens: Some(128_000),
             bootstrap_tier: BootstrapTier::Strong,
             // dsh 0.1.5-rc.1 advertises `mcpCapabilities.http` only
-            // (`dsh.rs`). Phase 2 reaches context7 over that transport.
+            // (`dsh.rs`). Delivered (Phase 2, decisions #2/E): `session/new`
+            // now carries context7 and URL-form `extraServers`, each behind
+            // the same `mcp.permissions` registration gate the file-based
+            // providers apply. A stdio entry — a `command` extra, or context7
+            // in stdio-fallback mode — cannot be hosted and is skipped.
             mcp_transport: McpTransport::HttpOnly,
-            context7_allowed: false,
-            extra_servers_allowed: false,
+            context7_allowed: true,
+            extra_servers_allowed: true,
             // `session/new` carries no tool list and no permission policy —
             // structurally unenforced (decision #1: declared, not attempted).
             tool_enforcement: ToolEnforcement::Unenforced,
