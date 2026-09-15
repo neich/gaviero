@@ -2085,6 +2085,28 @@ pub(crate) fn dispatch_prompt_core(
         &gaviero_core::context_planner::ModelSpec::parse(&model),
         &runtime,
     );
+
+    // Phase 6 (decision 1): a provider whose enforcement is structurally
+    // absent is *declared* absent, not silently unenforced. Disclose it once
+    // per conversation, in the transcript, so the user knows this agent's tool
+    // policy is not gaviero's to enforce. Idempotence is by content — the
+    // notice is a persisted `System` message, so a conversation restored from
+    // disk does not re-announce it on every turn.
+    if let Some(notice) = provider_profile
+        .tool_enforcement
+        .ui_disclosure(&provider_profile.provider)
+    {
+        let announced = app.chat_state.conversations[conv_idx]
+            .messages
+            .iter()
+            .any(|m| {
+                m.role == crate::panels::agent_chat::ChatRole::System && m.content == notice
+            });
+        if !announced {
+            app.chat_state.add_system_message_at(conv_idx, &notice);
+        }
+    }
+
     {
         let conv = &mut app.chat_state.conversations[conv_idx];
         let current_fp =
