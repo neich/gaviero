@@ -12,6 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 
 use super::protocol::{StreamEvent, parse_stream_line};
+use crate::agent_session::tool_surface::AgentToolSurface;
 use crate::observer::{PromptEvent, PromptObserver};
 
 /// If the enriched prompt + system prompt combined exceed
@@ -198,14 +199,15 @@ impl AgentOptions {
     /// approved list defaults to the full available set when
     /// `auto_approve` is true, otherwise to [`DEFAULT_APPROVED_TOOLS`]
     /// filtered to the available set.
+    ///
+    /// The available list is delegated to
+    /// [`AgentToolSurface::resolve_available`], the single resolution of
+    /// `agent.availableTools`. It used to re-derive the same fallback here,
+    /// which is how this function and the surface came to disagree about what
+    /// an unset field means (`plans/provider-parity` §2.4).
     pub fn resolved_tools(&self) -> (Vec<String>, Vec<String>) {
-        let available: Vec<String> = match self.available_tools.as_ref() {
-            Some(list) => list.clone(),
-            None => DEFAULT_AVAILABLE_TOOLS
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-        };
+        let available: Vec<String> =
+            AgentToolSurface::resolve_available(self.available_tools.clone());
         let approved: Vec<String> = match self.approved_tools.as_ref() {
             Some(list) => list
                 .iter()
@@ -806,6 +808,60 @@ mod tests {
         let (available, approved) = opts.resolved_tools();
         assert_eq!(available, DEFAULT_AVAILABLE_TOOLS);
         assert_eq!(approved, DEFAULT_APPROVED_TOOLS);
+    }
+
+    /// Phase 5 equivalence pin: the default surface must reproduce today's
+    /// `--tools` argv exactly — the legacy built-in list, plus
+    /// `AskUserQuestion` on an interactive turn, and nothing else.
+    ///
+    /// This is the guard the plan calls for when routing Claude's argv through
+    /// [`AgentToolSurface`]: the risk of that change is a *narrowing* bug that
+    /// silently drops `Read` from a working agent, so the assertion is
+    /// byte-for-byte on the ordered list rather than a containment check.
+    #[test]
+    fn default_surface_reproduces_the_claude_tools_argv_exactly() {
+        let opts = AgentOptions::default();
+        let (available, _) = opts.resolved_tools();
+
+        let refs: Vec<&str> = available.iter().map(String::as_str).collect();
+        let interactive = build_available_tools(&refs, true);
+        let expected: Vec<String> = DEFAULT_AVAILABLE_TOOLS
+            .iter()
+            .chain(std::iter::once(&ASK_USER_QUESTION_TOOL))
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(interactive, expected);
+
+        // Non-interactive keeps the caller's list untouched.
+        assert_eq!(build_available_tools(&refs, false), available);
+        assert!(!available.iter().any(|t| t == ASK_USER_QUESTION_TOOL));
+    }
+
+    /// `resolved_tools` and the surface must agree on the meaning of an unset
+    /// vs. an explicitly empty list — that disagreement *is* §2.4.
+    #[test]
+    fn resolved_tools_and_the_surface_share_one_resolution() {
+        for case in [
+            None,
+            Some(Vec::new()),
+            Some(vec!["Read".to_string(), "Bash".to_string()]),
+        ] {
+            let opts = AgentOptions {
+                available_tools: case.clone(),
+                ..AgentOptions::default()
+            };
+            let (available, _) = opts.resolved_tools();
+            assert_eq!(available, AgentToolSurface::resolve_available(case));
+        }
+
+        // The two readings that used to diverge: unset is the default list
+        // (*no* Bash), explicit `[]` is an empty surface.
+        assert_eq!(
+            AgentToolSurface::resolve_available(None),
+            DEFAULT_AVAILABLE_TOOLS
+        );
+        assert!(!AgentToolSurface::resolve_available(None).iter().any(|t| t == "Bash"));
+        assert!(AgentToolSurface::resolve_available(Some(Vec::new())).is_empty());
     }
 
     #[test]

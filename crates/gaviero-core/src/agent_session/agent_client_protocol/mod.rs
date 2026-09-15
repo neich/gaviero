@@ -37,6 +37,7 @@ use crate::swarm::backend::shared::{
 use crate::swarm::backend::{
     Capabilities, RetrievalToolset, StopReason, UnifiedStreamEvent,
 };
+use crate::context_planner::types::McpCapabilities;
 use crate::types::FileScope;
 use crate::write_gate::WriteGatePipeline;
 
@@ -54,6 +55,11 @@ pub struct AcpClientSession {
     system_prompt: Option<String>,
     options: AgentOptions,
     file_scope: FileScope,
+    /// Per-provider MCP gates from the capability table
+    /// (`Provider::mcp_capabilities`), resolved once at construction. Threaded
+    /// rather than re-derived at `session/new` so the table stays the single
+    /// source for "can this provider receive context7 / extraServers".
+    capabilities: McpCapabilities,
     write_gate: Arc<Mutex<WriteGatePipeline>>,
     observer: Arc<dyn AcpObserver>,
     cancel_token: CancellationToken,
@@ -86,6 +92,7 @@ impl AcpClientSession {
             conv_id,
             options,
             cancel_token,
+            profile,
             ..
         } = args;
         Self {
@@ -97,6 +104,7 @@ impl AcpClientSession {
             system_prompt: None,
             options,
             file_scope,
+            capabilities: profile.mcp_capabilities(),
             write_gate,
             observer: Arc::from(observer),
             cancel_token,
@@ -121,6 +129,7 @@ impl AcpClientSession {
             conv_id,
             options,
             cancel_token,
+            profile,
             observer: _,
             ..
         } = args;
@@ -133,6 +142,7 @@ impl AcpClientSession {
             system_prompt: None,
             options,
             file_scope,
+            capabilities: profile.mcp_capabilities(),
             write_gate,
             observer,
             cancel_token,
@@ -192,7 +202,7 @@ impl AcpClientSession {
             || config_option_named(&init, "reasoning_effort");
 
         let cwd = absolute_cwd(&self.workspace_root);
-        let servers = mcp_servers_for_session(&self.workspace_root);
+        let servers = mcp_servers_for_session(&self.workspace_root, self.capabilities);
         // Keyed on gaviero's *own* server, not on the list being empty:
         // context7 and `extraServers` can be registered while gaviero's
         // endpoint is down, and `exposedTools` describes gaviero's retrieval

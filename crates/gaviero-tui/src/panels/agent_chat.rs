@@ -225,7 +225,8 @@ pub struct PendingPermission {
     pub input: serde_json::Value,
     /// Send allow/deny (with optional updated input for AskUserQuestion).
     pub respond: tokio::sync::oneshot::Sender<gaviero_core::observer::PermissionDecision>,
-    /// Interactive AskUserQuestion state. `None` for plain y/n tools.
+    /// Interactive multi-choice state, detected from the input's `questions[]`
+    /// array. `None` for plain y/n tools.
     pub ask: Option<AskUserQuestionState>,
     /// First visible body row of the overlay (PgUp/PgDn). The request text is
     /// word-wrapped, so a long question or command can still outgrow the
@@ -240,11 +241,13 @@ impl PendingPermission {
         input: serde_json::Value,
         respond: tokio::sync::oneshot::Sender<gaviero_core::observer::PermissionDecision>,
     ) -> Self {
-        let ask = if tool_name == "AskUserQuestion" {
-            AskUserQuestionState::from_input(&input)
-        } else {
-            None
-        };
+        // Shape, not name. `AskUserQuestionState::from_input` already validates
+        // the `questions[]` array and returns `None` for anything else, so the
+        // overlay is selected by the input the host actually received. This is
+        // what lets the in-process loop's ask tool (Phase 4) reuse this overlay
+        // unchanged — and what stops a future rename on either side from
+        // silently downgrading a multiple-choice question to a y/n prompt.
+        let ask = AskUserQuestionState::from_input(&input);
         Self {
             request_id: next_request_id(),
             tool_name,
@@ -256,6 +259,8 @@ impl PendingPermission {
         }
     }
 
+    /// Whether this parked request is a multi-choice question rather than a
+    /// plain allow/deny. Derived from the input shape (see [`Self::new`]).
     pub fn is_ask_user_question(&self) -> bool {
         self.ask.is_some()
     }

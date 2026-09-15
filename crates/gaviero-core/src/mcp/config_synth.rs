@@ -26,6 +26,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::agent_session::tool_agent::policy::ToolPolicy;
+use crate::agent_session::tool_surface::AgentToolSurface;
+use crate::context_planner::types::McpCapabilities;
+
 /// Trusted-projects consent state for Codex (plan §A5: "one-time user
 /// consent dialog"). TUI-layer opens a prompt; the `Workspace`
 /// persists the answer in `settings.json`.
@@ -105,6 +109,16 @@ pub struct HttpSynthEndpoint {
 /// (Cursor's streamable-HTTP mode, dsh's `mcpCapabilities.http`).
 pub const CONTEXT7_REMOTE_URL: &str = "https://mcp.context7.com/mcp";
 
+/// Base URL of context7's **REST** API, used by the in-process loop's native
+/// context7 tools (`agent_session/tool_agent/tools/context7.rs`).
+///
+/// Deliberately distinct from [`CONTEXT7_REMOTE_URL`]: that is an *MCP* endpoint
+/// (`…/mcp`, spoken by a subprocess provider's client), this is a plain HTTP API
+/// (`…/api/v1`) reached directly by `deepseek:`/`ollama:`. They are different
+/// hosts and different protocols, so deriving one from the other by string
+/// surgery would break the moment either moves.
+pub const CONTEXT7_REST_BASE: &str = "https://context7.com/api/v1";
+
 /// When enabled, gaviero injects this server entry alongside the
 /// `gaviero` shim entry so every agent provider (Claude Code, Codex,
 /// Cursor, dsh) can call `resolve-library-id` / `query-docs` against
@@ -131,6 +145,9 @@ pub struct Context7Config {
     pub command: String,
     /// Stdio fallback argv. Default `["-y", "@upstash/context7-mcp"]`.
     pub args: Vec<String>,
+    /// REST API base for the in-process native tools. Only read by
+    /// `deepseek:`/`ollama:`; the MCP-serving providers never touch it.
+    pub rest_url: Option<String>,
 }
 
 impl Context7Config {
@@ -143,6 +160,21 @@ impl Context7Config {
     pub fn is_http(&self) -> bool {
         self.remote_url().is_some()
     }
+
+    /// REST base for the in-process native tools.
+    ///
+    /// Unlike [`Self::remote_url`], an empty value falls back to the shipped
+    /// default rather than disabling anything: there is no "stdio alternative"
+    /// for a REST call, and a blank string is far more likely to be a blank
+    /// settings field than a deliberate "turn context7 off" — that is what
+    /// [`Self::enabled`] is for.
+    pub fn rest_base(&self) -> &str {
+        self.rest_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .unwrap_or(CONTEXT7_REST_BASE)
+    }
 }
 
 impl Default for Context7Config {
@@ -152,6 +184,7 @@ impl Default for Context7Config {
             url: Some(CONTEXT7_REMOTE_URL.to_string()),
             command: "npx".to_string(),
             args: vec!["-y".into(), "@upstash/context7-mcp".into()],
+            rest_url: Some(CONTEXT7_REST_BASE.to_string()),
         }
     }
 }
@@ -317,21 +350,30 @@ fn wildcard_matches(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
-/// Concrete MCP server names this synth will register, after dropping any
-/// the permission policy disallows. Used to expand `*` server-globs into
-/// the real `mcp__<server>__…` / `Mcp(<server>:…)` permission entries each
+/// Concrete MCP server names this **vendor** will register, after dropping any
+/// the permission policy disallows. Used to expand `*` server-globs into the
+/// real `mcp__<server>__…` / `Mcp(<server>:…)` permission entries each
 /// provider understands, and as the registration gate for managed entries.
-fn synth_server_names(synth: &McpConfigSynth) -> Vec<String> {
+///
+/// Scoped by vendor because the capability table (
+/// [`McpCapabilities::for_synth_vendor`]) can withhold context7 or the extra
+/// servers from one provider without affecting the others — a rule that
+/// expanded `*` over an ungated list would allow-list a server the config file
+/// does not declare.
+fn synth_server_names(synth: &McpConfigSynth, vendor: &str) -> Vec<String> {
+    let caps = McpCapabilities::for_synth_vendor(vendor);
     let mut names = Vec::new();
     if synth.gaviero_enabled && synth.permissions.server_allowed("gaviero") {
         names.push("gaviero".to_string());
     }
-    if synth.context7.enabled && synth.permissions.server_allowed("context7") {
+    if caps.context7 && synth.context7.enabled && synth.permissions.server_allowed("context7") {
         names.push("context7".to_string());
     }
-    for extra in &synth.extra_servers {
-        if synth.permissions.server_allowed(&extra.name) {
-            names.push(extra.name.clone());
+    if caps.extra_servers {
+        for extra in &synth.extra_servers {
+            if synth.permissions.server_allowed(&extra.name) {
+                names.push(extra.name.clone());
+            }
         }
     }
     names
@@ -531,12 +573,14 @@ pub struct McpConfigSynth {
     /// Gaviero-level shell permission policy (`agent.permissions.bash`),
     /// translated into each provider's native config, replacing authored rules.
     pub bash: BashPermissions,
-    /// `agent.availableTools` from workspace settings. `None` when the
-    /// key is absent (do not invent a restriction). `Some` even when empty
-    /// means the operator configured a (possibly empty) tool surface —
-    /// Cursor synth then denies native tools that are not on the list so
-    /// Restricted profiles drop Shell the same way Claude drops `--tools Bash`.
-    pub available_tools: Option<Vec<String>>,
+    /// The resolved tool surface (`agent.availableTools`).
+    ///
+    /// Held as the type that owns the availability question rather than as a
+    /// raw `Option<Vec<String>>`, so Cursor's deny rules and the runtime gates
+    /// cannot answer "is `Bash` on the surface?" differently — the divergence
+    /// §2.4 of `plans/provider-parity` records. `mcp::resolver` builds it from
+    /// the same workspace cascade the host hands to `AgentOptions`.
+    pub(crate) surface: AgentToolSurface,
     /// When the Codex reach row sets `explicit_ref_required`, write
     /// `<worktree>/.codex/agents/gaviero-worker.toml`.
     pub explicit_ref_required: bool,
@@ -560,7 +604,7 @@ impl Default for McpConfigSynth {
             extra_servers: Vec::new(),
             permissions: McpPermissions::default(),
             bash: BashPermissions::default(),
-            available_tools: None,
+            surface: AgentToolSurface::from_parts(None, ToolPolicy::default(), false),
             explicit_ref_required: false,
             transport: McpTransportChoice::default(),
             http: None,
@@ -580,8 +624,19 @@ pub fn claude_mcp_config_json(synth: &McpConfigSynth) -> Result<String> {
     Ok(serde_json::to_string_pretty(&body).context("serialising .mcp.json")?)
 }
 
+/// Claude's managed `.mcp.json` servers, resolved through the provider table.
 fn managed_mcp_json_servers(
     synth: &McpConfigSynth,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    managed_mcp_json_servers_with(synth, McpCapabilities::for_synth_vendor("claude"))
+}
+
+/// Registration gate for `.mcp.json`. `caps` is the provider table's Claude
+/// row, threaded in rather than resolved here so a test can substitute another
+/// row and observe the gate.
+fn managed_mcp_json_servers_with(
+    synth: &McpConfigSynth,
+    caps: McpCapabilities,
 ) -> Result<serde_json::Map<String, serde_json::Value>> {
     let mut servers = serde_json::Map::new();
     // A server is registered only when the gaviero permission policy allows
@@ -593,15 +648,17 @@ fn managed_mcp_json_servers(
             gaviero_server_entry_for(synth, "claude"),
         );
     }
-    if synth.context7.enabled && synth.permissions.server_allowed("context7") {
+    if caps.context7 && synth.context7.enabled && synth.permissions.server_allowed("context7") {
         servers.insert(
             "context7".to_string(),
             context7_server_entry_for(&synth.context7, "claude"),
         );
     }
-    for extra in &synth.extra_servers {
-        if synth.permissions.server_allowed(&extra.name) {
-            servers.insert(extra.name.clone(), extra_server_json_entry(extra));
+    if caps.extra_servers {
+        for extra in &synth.extra_servers {
+            if synth.permissions.server_allowed(&extra.name) {
+                servers.insert(extra.name.clone(), extra_server_json_entry(extra));
+            }
         }
     }
     Ok(servers)
@@ -699,9 +756,21 @@ fn extra_server_json_entry_for_cursor(extra: &ExtraMcpServer) -> serde_json::Val
 /// Cursor's headless MCP registry is fragile when stdio servers fail at
 /// startup — a broken `npx` (context7) or missing shim can prevent URL
 /// servers from registering in `ListMcpResources`. Keep Cursor lean:
-/// remote extras + gaviero (only when the shim resolves), no context7.
+/// remote extras + gaviero (only when the shim resolves), plus a **HTTP**
+/// context7. A stdio context7 stays withheld when a remote URL extra is
+/// configured — see `context7_ok`.
 fn managed_cursor_mcp_json_servers(
     synth: &McpConfigSynth,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    managed_cursor_mcp_json_servers_with(synth, McpCapabilities::for_synth_vendor("cursor"))
+}
+
+/// Registration gate for `.cursor/mcp.json`. `caps` is the provider table's
+/// Cursor row, threaded in rather than resolved here so a test can substitute
+/// another row and observe the gate.
+fn managed_cursor_mcp_json_servers_with(
+    synth: &McpConfigSynth,
+    caps: McpCapabilities,
 ) -> Result<serde_json::Map<String, serde_json::Value>> {
     use super::preflight::shim_binary_resolvable;
 
@@ -714,7 +783,11 @@ fn managed_cursor_mcp_json_servers(
     // configured — the conditional compromise decision A asked for — while an
     // HTTP context7 is unconditional, which is what gives Cursor the same
     // context7 server as every other provider.
-    let context7_ok = synth.context7.enabled
+    //
+    // `caps.context7` is the provider table's row for Cursor; it is the first
+    // gate so flipping the row withholds the entry regardless of transport.
+    let context7_ok = caps.context7
+        && synth.context7.enabled
         && synth.permissions.server_allowed("context7")
         && (synth.context7.is_http() || !has_remote_extra);
     if context7_ok {
@@ -738,12 +811,14 @@ fn managed_cursor_mcp_json_servers(
             gaviero_server_entry_for(synth, "cursor"),
         );
     }
-    for extra in &synth.extra_servers {
-        if synth.permissions.server_allowed(&extra.name) {
-            servers.insert(
-                extra.name.clone(),
-                extra_server_json_entry_for_cursor(extra),
-            );
+    if caps.extra_servers {
+        for extra in &synth.extra_servers {
+            if synth.permissions.server_allowed(&extra.name) {
+                servers.insert(
+                    extra.name.clone(),
+                    extra_server_json_entry_for_cursor(extra),
+                );
+            }
         }
     }
     Ok(servers)
@@ -751,9 +826,12 @@ fn managed_cursor_mcp_json_servers(
 
 /// Build the `.cursor/mcp.json` body for the Cursor CLI.
 ///
-/// Same top-level `{"mcpServers":{...}}` schema as Claude's `.mcp.json`,
-/// but omits context7 and skips the gaviero shim when it is not resolvable
-/// so a poisoned stdio server cannot block remote URL registration.
+/// Same top-level `{"mcpServers":{...}}` schema as Claude's `.mcp.json`.
+/// Diverges in two ways: `gaviero` is skipped when the shim is not resolvable
+/// (so a poisoned stdio server cannot block remote URL registration), and a
+/// **stdio** context7 is withheld when a remote URL extra is present. Both
+/// gates are transport-specific; the provider table's Cursor row is applied
+/// first, in [`managed_cursor_mcp_json_servers`].
 pub fn cursor_mcp_config_json(synth: &McpConfigSynth) -> Result<String> {
     let servers = managed_cursor_mcp_json_servers(synth)?;
     let body = serde_json::json!({ "mcpServers": serde_json::Value::Object(servers) });
@@ -826,7 +904,7 @@ pub fn claude_settings_permissions(synth: &McpConfigSynth) -> Option<serde_json:
     if synth.permissions.is_empty() && synth.bash.is_empty() {
         return None;
     }
-    let servers = synth_server_names(synth);
+    let servers = synth_server_names(synth, "claude");
     let (bash_allow, bash_deny) = synth.bash.claude_rules();
     let allow = sorted_unique(
         synth
@@ -882,10 +960,7 @@ fn expand_claude_patterns(pattern: &str, servers: &[String]) -> Vec<String> {
 /// Cursor tools are denied so `--force` cannot re-open them. Bash allow
 /// prefixes are omitted in that case (deny `Shell(*)` already wins).
 fn cursor_permission_rules(synth: &McpConfigSynth) -> (Vec<String>, Vec<String>) {
-    let bash_on_surface = match &synth.available_tools {
-        None => true,
-        Some(list) => list.iter().any(|t| t == "Bash"),
-    };
+    let bash_on_surface = synth.surface.bash_available();
     let (bash_allow, bash_deny) = if bash_on_surface {
         synth.bash.cursor_rules()
     } else {
@@ -904,27 +979,24 @@ fn cursor_permission_rules(synth: &McpConfigSynth) -> (Vec<String>, Vec<String>)
         .iter()
         .map(|p| cursor_rule(p))
         .chain(bash_deny)
-        .chain(cursor_surface_deny_rules(synth.available_tools.as_deref()))
+        .chain(cursor_surface_deny_rules(&synth.surface))
         .collect();
     (allow, deny)
 }
 
-/// Cursor `permissions.deny` entries that hide native tools not in
-/// `agent.availableTools`. `None` means the setting was absent — emit
-/// nothing so a workspace that never configured the list keeps today's
-/// `--force` posture.
-fn cursor_surface_deny_rules(available: Option<&[String]>) -> Vec<String> {
-    let Some(list) = available else {
-        return Vec::new();
-    };
+/// Cursor `permissions.deny` entries that hide native tools the resolved
+/// tool surface does not permit. Derived from the surface rather than from a
+/// re-scanned list: `None` is no longer a meaningful input here, because
+/// [`AgentToolSurface`] resolves an absent setting to the documented default
+/// at construction. An unfigured workspace therefore keeps the same posture it
+/// always had (the cascade already yields that default), while an operator who
+/// restricts the surface gets `--force` closed off accordingly.
+fn cursor_surface_deny_rules(surface: &AgentToolSurface) -> Vec<String> {
     let mut deny = Vec::new();
-    if !list.iter().any(|t| t == "Bash") {
+    if !surface.bash_available() {
         deny.push("Shell(*)".to_string());
     }
-    if !list
-        .iter()
-        .any(|t| matches!(t.as_str(), "Write" | "Edit" | "MultiEdit"))
-    {
+    if !surface.write_available() {
         deny.push("Write(**)".to_string());
     }
     deny
@@ -1137,6 +1209,13 @@ fn stdio_gaviero_codex_block(synth: &McpConfigSynth) -> String {
 /// still discoverable if Codex ever gains worktree-local config
 /// discovery.
 pub fn codex_mcp_config_toml(synth: &McpConfigSynth) -> Result<String> {
+    codex_mcp_config_toml_with(synth, McpCapabilities::for_synth_vendor("codex"))
+}
+
+/// Registration gate for `.codex/config.toml`. `caps` is the provider table's
+/// Codex row, threaded in rather than resolved here so a test can substitute
+/// another row and observe the gate.
+fn codex_mcp_config_toml_with(synth: &McpConfigSynth, caps: McpCapabilities) -> Result<String> {
     // Manually construct the TOML — toml's serializer doesn't like
     // the dotted-header shape Codex expects.
     let worktree = synth.worktree.to_string_lossy();
@@ -1169,12 +1248,14 @@ pub fn codex_mcp_config_toml(synth: &McpConfigSynth) -> Result<String> {
             _ => body.push_str(&stdio_gaviero_codex_block(synth)),
         }
     }
-    if synth.context7.enabled && synth.permissions.server_allowed("context7") {
+    if caps.context7 && synth.context7.enabled && synth.permissions.server_allowed("context7") {
         body.push_str(&context7_codex_block(&synth.context7));
     }
-    for extra in &synth.extra_servers {
-        if synth.permissions.server_allowed(&extra.name) {
-            body.push_str(&extra_server_codex_toml(extra));
+    if caps.extra_servers {
+        for extra in &synth.extra_servers {
+            if synth.permissions.server_allowed(&extra.name) {
+                body.push_str(&extra_server_codex_toml(extra));
+            }
         }
     }
     body.push_str(&format!(
@@ -1642,7 +1723,11 @@ mod tests {
             extra_servers: Vec::new(),
             permissions: McpPermissions::default(),
             bash: BashPermissions::default(),
-            available_tools: None,
+            // The fixture's old `available_tools: None` meant "no restriction"
+            // for the Cursor path, so it is spelled out explicitly rather than
+            // relying on the `None` arm — which is now the *restricted*
+            // default and would add `Shell(*)` to every Cursor expectation.
+            surface: AgentToolSurface::unrestricted_unattended(),
             explicit_ref_required: false,
             transport: McpTransportChoice::default(),
             http: None,
@@ -2813,12 +2898,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut synth = fixture_resolvable_shim(dir.path().to_path_buf());
         synth.bash = bash_fixture();
-        synth.available_tools = Some(vec![
-            "Read".into(),
-            "Write".into(),
-            "Edit".into(),
-            "MultiEdit".into(),
-        ]);
+        synth.surface = surface_of(Some(&["Read", "Write", "Edit", "MultiEdit"]));
         synthesize_for_worktree(&synth).unwrap();
 
         let v: serde_json::Value = serde_json::from_str(
@@ -2848,16 +2928,37 @@ mod tests {
         assert!(!deny.iter().any(|r| r.starts_with("Write(")));
     }
 
+    /// A surface from an explicit `agent.availableTools` list, for the Cursor
+    /// deny-rule tests.
+    fn surface_of(available: Option<&[&str]>) -> AgentToolSurface {
+        AgentToolSurface::from_parts(
+            available.map(|a| a.iter().map(|s| s.to_string()).collect()),
+            ToolPolicy::default(),
+            false,
+        )
+    }
+
     #[test]
-    fn cursor_surface_deny_rules_follow_available_tools() {
-        assert!(cursor_surface_deny_rules(None).is_empty());
-        let restricted =
-            cursor_surface_deny_rules(Some(&["Read".into(), "Write".into(), "Edit".into()]));
+    fn cursor_surface_deny_rules_follow_the_tool_surface() {
+        let restricted = cursor_surface_deny_rules(&surface_of(Some(&[
+            "Read", "Write", "Edit",
+        ])));
         assert!(restricted.contains(&"Shell(*)".to_string()));
         assert!(!restricted.iter().any(|r| r.starts_with("Write(")));
-        let no_write = cursor_surface_deny_rules(Some(&["Read".into(), "Bash".into()]));
+        let no_write = cursor_surface_deny_rules(&surface_of(Some(&["Read", "Bash"])));
         assert!(no_write.contains(&"Write(**)".to_string()));
         assert!(!no_write.iter().any(|r| r.starts_with("Shell(")));
+    }
+
+    #[test]
+    fn cursor_surface_deny_rules_treat_an_absent_setting_as_the_default() {
+        // `None` is resolved at construction, so the deny rules are computed
+        // from the documented default (no `Bash`) rather than from a second
+        // "absence means unrestricted" rule. This matters because the old
+        // `None` arm was the only place Cursor disagreed with the runtime gate.
+        let unset = cursor_surface_deny_rules(&surface_of(None));
+        assert!(unset.contains(&"Shell(*)".to_string()));
+        assert!(!unset.iter().any(|r| r.starts_with("Write(")));
     }
 
     #[test]
@@ -3052,5 +3153,108 @@ mod tests {
         // parser sees them as literal content.
         assert!(cmd.contains("\\\""), "double quote not escaped in {cmd:?}");
         assert!(cmd.contains("\\n"), "newline not escaped in {cmd:?}");
+    }
+
+    /// §2.7-D: the capability table is consulted, not merely documented.
+    ///
+    /// Every assertion is a **delta** between two calls that differ only in the
+    /// `caps` argument, so it cannot pass by accident of the fixture: if the
+    /// emitters re-derived context7/extras from `mcp.context7.enabled` and
+    /// `extra_servers` alone, both halves would be identical and the
+    /// restrictive half would fail.
+    #[test]
+    fn capability_row_gates_context7_and_extras_in_every_vendor_config_file() {
+        let restrict = McpCapabilities {
+            context7: false,
+            extra_servers: false,
+            transport: crate::context_planner::types::McpTransport::ConfigFileStdio,
+        };
+        let allow = McpCapabilities::permissive();
+
+        let mut synth = fixture_resolvable_shim(PathBuf::from("/tmp/wt"));
+        synth.extra_servers.push(ExtraMcpServer {
+            name: "semantic-scholar".into(),
+            transport: ExtraMcpTransport::Url {
+                url: "https://example.com/mcp".into(),
+            },
+        });
+
+        // Claude — `.mcp.json`.
+        let full = managed_mcp_json_servers_with(&synth, allow).unwrap();
+        let gated = managed_mcp_json_servers_with(&synth, restrict).unwrap();
+        assert!(full.contains_key("context7"), "fixture must register context7");
+        assert!(full.contains_key("semantic-scholar"));
+        assert!(!gated.contains_key("context7"), "claude: context7 leaked");
+        assert!(!gated.contains_key("semantic-scholar"), "claude: extra leaked");
+        assert!(
+            gated.contains_key("gaviero"),
+            "gaviero is the provider-independent integration; the table has no \
+             row for it and must not gate it"
+        );
+
+        // Cursor — `.cursor/mcp.json`, and the HTTP context7 path that is
+        // otherwise unconditional.
+        let full = managed_cursor_mcp_json_servers_with(&synth, allow).unwrap();
+        let gated = managed_cursor_mcp_json_servers_with(&synth, restrict).unwrap();
+        assert!(full.contains_key("context7"));
+        assert!(full.contains_key("semantic-scholar"));
+        assert!(!gated.contains_key("context7"), "cursor: context7 leaked");
+        assert!(!gated.contains_key("semantic-scholar"), "cursor: extra leaked");
+
+        // Codex — `.codex/config.toml`. TOML has no map to inspect, so the
+        // assertion is on the rendered table headers.
+        let full = codex_mcp_config_toml_with(&synth, allow).unwrap();
+        let gated = codex_mcp_config_toml_with(&synth, restrict).unwrap();
+        assert!(full.contains("[mcp_servers.context7]"));
+        assert!(full.contains("[mcp_servers.semantic-scholar]"));
+        assert!(!gated.contains("[mcp_servers.context7]"), "codex: context7 leaked");
+        assert!(
+            !gated.contains("[mcp_servers.semantic-scholar]"),
+            "codex: extra leaked"
+        );
+        assert!(gated.contains("[mcp_servers.gaviero]"));
+    }
+
+    /// Withholding a server must not leak its name into the permission rules:
+    /// a `*`-glob expansion over an ungated list would allow-list a server the
+    /// config file no longer declares.
+    ///
+    /// Asserted as agreement between the two, which is the property that can
+    /// actually drift — `synth_server_names` resolves the vendor row itself, so
+    /// the only way to check it matches the emitter is to compare them.
+    #[test]
+    fn claude_permission_expansion_agrees_with_the_emitted_config() {
+        let mut synth = fixture(PathBuf::from("/tmp/wt"));
+        synth.permissions = McpPermissions {
+            allow: vec!["*".into()],
+            deny: Vec::new(),
+        };
+        synth.extra_servers.push(ExtraMcpServer {
+            name: "semantic-scholar".into(),
+            transport: ExtraMcpTransport::Url {
+                url: "https://example.com/mcp".into(),
+            },
+        });
+
+        let declared = managed_mcp_json_servers(&synth).unwrap();
+        let expanded = synth_server_names(&synth, "claude");
+
+        assert!(declared.contains_key("context7"));
+        assert!(declared.contains_key("semantic-scholar"));
+        for name in &expanded {
+            assert!(
+                declared.contains_key(name),
+                "permission rules expand over {name}, but the config omits it: \
+                 {declared:?}"
+            );
+        }
+
+        // And the row itself is what the expansion is keyed to.
+        let claude_row = McpCapabilities::for_synth_vendor("claude");
+        assert_eq!(
+            expanded.contains(&"context7".to_string()),
+            claude_row.context7,
+            "expansion disagreed with the table row"
+        );
     }
 }

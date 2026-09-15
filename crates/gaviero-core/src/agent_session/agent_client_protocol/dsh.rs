@@ -10,6 +10,7 @@ use std::sync::Mutex as StdMutex;
 use anyhow::{Context, Result, anyhow};
 
 use crate::agent_session::tool_agent::config::ApiClientConfig;
+use crate::context_planner::types::McpCapabilities;
 use crate::mcp::resolver::resolve_shim_binary;
 use crate::util::spawn::{agent_command, resolve_program};
 
@@ -263,7 +264,16 @@ pub fn registers_gaviero(servers: &[serde_json::Value]) -> bool {
 /// policy** (`agent_client_protocol/mod.rs`), so `agent.availableTools` is
 /// *structurally unenforced* for dsh. That is recorded as
 /// `ToolEnforcement::Unenforced` in the capability table, not attempted here.
-pub fn mcp_servers_for_session(root: &Path) -> Vec<serde_json::Value> {
+pub fn mcp_servers_for_session(root: &Path, caps: McpCapabilities) -> Vec<serde_json::Value> {
+    // An in-process provider links servers as a live value; it has no MCP
+    // transport to hang a `mcpServers` entry on. The two capability axes say
+    // *what* a provider may use, not *how* it receives it — so an in-process row
+    // registers nothing even though it now allows context7 (Phase 2d reaches it
+    // as a native tool instead).
+    if !caps.uses_mcp_servers() {
+        return Vec::new();
+    }
+
     let mut servers = Vec::new();
     if let Some(http) = http_mcp_server(root) {
         servers.push(http);
@@ -272,20 +282,28 @@ pub fn mcp_servers_for_session(root: &Path) -> Vec<serde_json::Value> {
     let workspace = crate::workspace::Workspace::single_folder(root.to_path_buf());
     let permissions = crate::mcp::resolve_mcp_permissions(&workspace, Some(root));
 
+    // The capability table gates injection as well as the settings cascade:
+    // `context7_allowed` / `extra_servers_allowed` are the per-provider "can",
+    // `mcp.context7.enabled` / `mcp.extraServers` the per-workspace "wants".
+    // Both must hold, and the table is the single source for the former
+    // (`Provider::mcp_capabilities`).
     let ctx7 = crate::mcp::resolve_context7_config(&workspace, Some(root));
-    if ctx7.enabled
+    if caps.context7
+        && ctx7.enabled
         && let Some(url) = ctx7.remote_url()
         && permissions.server_allowed("context7")
     {
         servers.push(http_entry("context7", url, Vec::new()));
     }
 
-    for extra in crate::mcp::extra_servers_from_workspace(&workspace, Some(root)) {
-        if !permissions.server_allowed(&extra.name) {
-            continue;
-        }
-        if let crate::mcp::ExtraMcpTransport::Url { url } = extra.transport {
-            servers.push(http_entry(&extra.name, &url, Vec::new()));
+    if caps.extra_servers {
+        for extra in crate::mcp::extra_servers_from_workspace(&workspace, Some(root)) {
+            if !permissions.server_allowed(&extra.name) {
+                continue;
+            }
+            if let crate::mcp::ExtraMcpTransport::Url { url } = extra.transport {
+                servers.push(http_entry(&extra.name, &url, Vec::new()));
+            }
         }
     }
 
@@ -364,7 +382,7 @@ mod tests {
     #[test]
     fn mcp_servers_http_only_without_descriptor_is_empty() {
         let dir = tempdir().unwrap();
-        assert!(mcp_servers_for_session(dir.path()).is_empty());
+        assert!(mcp_servers_for_session(dir.path(), dsh_caps()).is_empty());
         let stdio = stdio_mcp_server(dir.path());
         assert_eq!(stdio["name"], "gaviero");
         assert!(stdio.get("command").and_then(|c| c.as_str()).is_some());
@@ -384,6 +402,46 @@ mod tests {
             .collect()
     }
 
+    /// dsh's declared MCP gates, **read from the capability table** so these
+    /// tests fail when the row changes instead of silently pinning a copy.
+    fn dsh_caps() -> crate::context_planner::types::McpCapabilities {
+        crate::context_planner::types::Provider::Dsh.mcp_capabilities()
+    }
+
+    /// §D wiring: injection is gated by the capability table *as well as* the
+    /// settings cascade. The same workspace opt-in must register nothing under
+    /// a row that denies both axes — that is what makes the table a decision
+    /// rather than a comment.
+    #[test]
+    fn capability_table_gates_context7_and_extras() {
+        let dir = tempdir().unwrap();
+        write_settings(
+            dir.path(),
+            r#"{"mcp":{
+                "context7":{"enabled":true},
+                "extraServers":[{"name":"semantic-scholar","url":"https://example.test/mcp"}]
+            }}"#,
+        );
+
+        // dsh's row allows both, so the settings opt-in is sufficient.
+        let allowed = crate::context_planner::types::Provider::Dsh.mcp_capabilities();
+        assert!(allowed.context7 && allowed.extra_servers);
+        assert_eq!(
+            names(&mcp_servers_for_session(dir.path(), allowed)),
+            vec!["context7", "semantic-scholar"]
+        );
+
+        // The in-process row allows context7 as a *native* tool (Phase 2d) but
+        // denies foreign servers — and it has no MCP transport at all, so the
+        // same settings still register no MCP server entry. Gated on transport,
+        // not on `!context7`: every row now allows context7, so asserting that
+        // flag would pin a value the table has deliberately left behind.
+        let in_process = crate::context_planner::types::Provider::Deepseek.mcp_capabilities();
+        assert!(!in_process.extra_servers);
+        assert!(!in_process.uses_mcp_servers());
+        assert!(mcp_servers_for_session(dir.path(), in_process).is_empty());
+    }
+
     /// Decision E: with no gaviero endpoint but context7 on, dsh still gets
     /// context7 — and `registers_gaviero` must say *false*, so the
     /// `exposedTools` gate is not fooled by a non-empty list.
@@ -391,7 +449,7 @@ mod tests {
     fn context7_http_is_registered_without_a_gaviero_endpoint() {
         let dir = tempdir().unwrap();
         write_settings(dir.path(), r#"{"mcp":{"context7":{"enabled":true}}}"#);
-        let servers = mcp_servers_for_session(dir.path());
+        let servers = mcp_servers_for_session(dir.path(), dsh_caps());
         assert_eq!(names(&servers), vec!["context7"]);
         let ctx7 = &servers[0];
         assert_eq!(ctx7["type"], "http");
@@ -411,7 +469,7 @@ mod tests {
             dir.path(),
             r#"{"mcp":{"context7":{"enabled":true,"url":""}}}"#,
         );
-        assert!(mcp_servers_for_session(dir.path()).is_empty());
+        assert!(mcp_servers_for_session(dir.path(), dsh_caps()).is_empty());
     }
 
     /// Disabled by default: no workspace opt-in, no entry.
@@ -419,7 +477,7 @@ mod tests {
     fn context7_is_opt_in() {
         let dir = tempdir().unwrap();
         write_settings(dir.path(), r#"{"mcp":{"context7":{"enabled":false}}}"#);
-        assert!(mcp_servers_for_session(dir.path()).is_empty());
+        assert!(mcp_servers_for_session(dir.path(), dsh_caps()).is_empty());
     }
 
     /// Decision E: URL extras register, stdio extras are skipped.
@@ -433,7 +491,7 @@ mod tests {
                 {"name":"local-thing","command":"some-server","args":["--x"]}
             ]}}"#,
         );
-        let servers = mcp_servers_for_session(dir.path());
+        let servers = mcp_servers_for_session(dir.path(), dsh_caps());
         assert_eq!(names(&servers), vec!["semantic-scholar"]);
         assert_eq!(servers[0]["type"], "http");
     }
@@ -451,7 +509,7 @@ mod tests {
                 "permissions":{"deny":["context7:*","semantic-scholar:*"]}
             }}"#,
         );
-        assert!(mcp_servers_for_session(dir.path()).is_empty());
+        assert!(mcp_servers_for_session(dir.path(), dsh_caps()).is_empty());
     }
 
     /// An `allow` list that never names a server excludes it, matching
@@ -467,6 +525,6 @@ mod tests {
                 "permissions":{"allow":["gaviero:*"]}
             }}"#,
         );
-        assert!(mcp_servers_for_session(dir.path()).is_empty());
+        assert!(mcp_servers_for_session(dir.path(), dsh_caps()).is_empty());
     }
 }

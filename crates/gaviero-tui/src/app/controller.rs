@@ -982,27 +982,28 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             respond,
         } => {
             if let Some(idx) = app.chat_state.find_conv_idx(&conv_id) {
-                let is_ask = tool_name == "AskUserQuestion";
+                // The request is classified by the *input shape* — the same
+                // predicate the overlay uses — rather than by tool name, so a
+                // multi-choice question is announced as one whichever side
+                // raised it (Claude, or the in-process loop's ask tool).
+                let pending = crate::panels::agent_chat::PendingPermission::new(
+                    tool_name,
+                    description,
+                    input,
+                    respond,
+                );
+                let is_ask = pending.is_ask_user_question();
                 app.chat_state.conversations[idx].streaming_status = if is_ask {
                     "Waiting for your answers…".into()
                 } else {
-                    format!("Waiting for permission: {}", tool_name)
+                    format!("Waiting for permission: {}", pending.tool_name)
                 };
-                // Built before the overlay takes ownership of `tool_name`.
                 let notify_body = if is_ask {
                     "Agent is asking a question — answer in the chat panel".to_string()
                 } else {
-                    format!("Agent needs permission: {tool_name}")
+                    format!("Agent needs permission: {}", pending.tool_name)
                 };
-                app.chat_state.set_pending_permission(
-                    &conv_id,
-                    crate::panels::agent_chat::PendingPermission::new(
-                        tool_name,
-                        description,
-                        input,
-                        respond,
-                    ),
-                );
+                app.chat_state.set_pending_permission(&conv_id, pending);
                 // Remote projection (A4): mirror the parked request. Built
                 // from reducer state so it carries the generated request_id.
                 if let Some(perm) = app.chat_state.conversations[idx]
