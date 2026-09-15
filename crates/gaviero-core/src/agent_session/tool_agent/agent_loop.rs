@@ -11,12 +11,32 @@
 
 use futures::StreamExt;
 use serde_json::{Value, json};
+use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
 use crate::observer::AcpObserver;
+use crate::workspace::{Workspace, settings};
 
 use super::tools::{ToolCtx, ToolRegistry};
 use super::{ApiClient, ApiEvent, ApiRequest, ToolCall};
+
+/// Rounds allowed in one turn before the loop stops and hands off.
+///
+/// 40 covers a focused change; broad refactors that legitimately need many
+/// reads can raise it per workspace with `agent.toolAgent.maxRounds`. Every
+/// round is one billed API call, so this is a cost bound as much as a
+/// runaway bound — and hitting it costs one *more* call, the hand-off round.
+pub const DEFAULT_MAX_ROUNDS: u32 = 40;
+
+/// Instruction appended for the post-cap hand-off round only. Never replayed
+/// into the next turn as a user message: it is part of this request's local
+/// `messages` vector, which is dropped when the turn returns.
+const HANDOFF_INSTRUCTION: &str = "You have hit this turn's tool-call budget, so tools are
+now disabled and you cannot continue working. Do not apologise and do not
+restate the plan. Report only what the next turn needs to resume without
+re-deriving it: (1) what you already established or changed, naming the exact
+files and symbols; (2) what you verified and how; (3) the concrete next steps
+that remain. Assume the reader has none of your tool output.";
 
 /// Runaway bounds for one turn.
 pub(crate) struct LoopLimits {
@@ -27,7 +47,28 @@ pub(crate) struct LoopLimits {
 impl Default for LoopLimits {
     fn default() -> Self {
         Self {
-            max_rounds: 40,
+            max_rounds: DEFAULT_MAX_ROUNDS,
+            cost_ceiling_usd: None,
+        }
+    }
+}
+
+impl LoopLimits {
+    /// Resolve the round cap from the workspace cascade.
+    ///
+    /// Key: `agent.toolAgent.maxRounds` (default [`DEFAULT_MAX_ROUNDS`]). An
+    /// unparseable or zero value falls back to the default rather than
+    /// disabling the bound — an unbounded tool loop is never the intent, and
+    /// the plan that introduced this cap makes it mandatory.
+    pub fn from_workspace(workspace: &Workspace, root: Option<&Path>) -> Self {
+        let max_rounds = workspace
+            .resolve_setting(settings::AGENT_TOOL_AGENT_MAX_ROUNDS, root)
+            .as_u64()
+            .filter(|n| *n > 0)
+            .map(|n| n.min(u32::MAX as u64) as u32)
+            .unwrap_or(DEFAULT_MAX_ROUNDS);
+        Self {
+            max_rounds,
             cost_ceiling_usd: None,
         }
     }
@@ -206,15 +247,91 @@ pub(crate) async fn run_agent_loop(
         }
     }
 
-    visible.push_str(&format!(
-        "\n\n[stopped: reached the {}-round tool limit without a final answer]",
+    // The cap is a budget, not a failure. Spend one final tools-disabled round
+    // so the model hands off in prose instead of the transcript ending on a
+    // bare marker: that hand-off is what lets a "continue" resume rather than
+    // re-explore. `messages` currently ends on `tool` results (every round
+    // appends its results before the cap check), so appending a `user`
+    // instruction is valid — an unanswered `assistant` tool_calls message
+    // would be rejected by the API.
+    let marker = format!(
+        "\n\n[stopped: reached the {}-round tool limit; asking for a hand-off]\n\n",
         limits.max_rounds
-    ));
+    );
+    observer.on_stream_chunk(&marker);
+    visible.push_str(&marker);
+
+    if let Some(handoff) = handoff_round(client, observer, model, &messages, cancel).await {
+        visible.push_str(&handoff);
+    }
+
     LoopOutcome {
         visible,
         error: None,
         total_cost_usd: total_cost,
     }
+}
+
+/// Final tools-disabled round after the round cap trips.
+///
+/// Returns the model's hand-off text, or `None` when the call failed, was
+/// cancelled, or produced nothing. Text is streamed to `observer` and also
+/// returned so the caller can fold it into the turn's visible output — that
+/// is what the TUI stores as the assistant transcript and replays next turn.
+async fn handoff_round(
+    client: &dyn ApiClient,
+    observer: &dyn AcpObserver,
+    model: &str,
+    messages: &[Value],
+    cancel: &CancellationToken,
+) -> Option<String> {
+    if cancel.is_cancelled() {
+        return None;
+    }
+    let mut request_messages = messages.to_vec();
+    request_messages.push(json!({ "role": "user", "content": HANDOFF_INSTRUCTION }));
+    let request = ApiRequest {
+        model: model.to_string(),
+        messages: request_messages,
+        // No schemas: the model cannot keep working, only report.
+        tools: Vec::new(),
+        max_tokens: None,
+    };
+    let mut stream = match client.complete(request).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("tool-agent hand-off round failed: {e:#}");
+            return None;
+        }
+    };
+
+    let mut text = String::new();
+    loop {
+        let event = tokio::select! {
+            _ = cancel.cancelled() => return None,
+            e = stream.next() => match e {
+                None => break,
+                Some(ev) => ev,
+            },
+        };
+        match event {
+            Ok(ApiEvent::Text(t)) => {
+                observer.on_stream_chunk(&t);
+                text.push_str(&t);
+            }
+            // A tools-disabled request should not yield calls; ignore any that
+            // arrive rather than inventing tool results for them.
+            Ok(ApiEvent::ToolCall(_) | ApiEvent::Reasoning(_) | ApiEvent::Usage(_)) => {}
+            Ok(ApiEvent::Done(_) | ApiEvent::Error(_)) => break,
+            Err(_) => break,
+        }
+    }
+
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(format!("\n\n{trimmed}"))
 }
 
 /// Build the assistant message that carries `tool_calls`. OpenAI requires
@@ -377,7 +494,10 @@ mod tests {
         .await;
         assert!(outcome.error.is_none(), "{:?}", outcome.error);
         let seen = client.seen.lock().unwrap();
-        assert!(seen.len() >= 2, "expected a second request after the tool round");
+        assert!(
+            seen.len() >= 2,
+            "expected a second request after the tool round"
+        );
         let assistant = seen[1]
             .iter()
             .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
@@ -487,6 +607,119 @@ mod tests {
             outcome.visible.contains("3-round tool limit"),
             "got: {}",
             outcome.visible
+        );
+        // The hand-off round was requested but the scripted client had no
+        // batch left, so it returned no text: the turn must still be a clean
+        // success with the marker intact, not an error.
+        assert!(
+            outcome.visible.trim_end().ends_with("hand-off]"),
+            "got: {}",
+            outcome.visible
+        );
+    }
+
+    /// Hitting the cap must produce a *usable* hand-off, not a bare marker:
+    /// that text is what the next turn replays, so without it a "continue"
+    /// re-derives everything the capped turn had already established.
+    #[tokio::test]
+    async fn cap_trip_runs_a_handoff_round_and_keeps_its_text() {
+        let mut rounds = VecDeque::new();
+        for _ in 0..3 {
+            rounds.push_back(vec![tool_call("echo"), ApiEvent::Done(StopReason::ToolUse)]);
+        }
+        rounds.push_back(vec![
+            ApiEvent::Text("read src/a.rs; edited B::c; next: cargo test".into()),
+            ApiEvent::Done(StopReason::EndTurn),
+        ]);
+        let client = ScriptedClient {
+            rounds: Mutex::new(rounds),
+        };
+        let tools = ToolRegistry::new(vec![Box::new(EchoTool)]);
+        let cancel = CancellationToken::new();
+        let limits = LoopLimits {
+            max_rounds: 3,
+            cost_ceiling_usd: None,
+        };
+        let outcome = run_agent_loop(
+            &client,
+            &tools,
+            &ctx(),
+            &NoopObserver,
+            "m",
+            initial_messages(),
+            &limits,
+            &cancel,
+        )
+        .await;
+        assert!(outcome.error.is_none());
+        assert!(outcome.visible.contains("3-round tool limit"));
+        assert!(
+            outcome.visible.contains("next: cargo test"),
+            "hand-off text must reach the turn output: {}",
+            outcome.visible
+        );
+    }
+
+    /// A cancelled turn must not spend an extra API call on the hand-off.
+    #[tokio::test]
+    async fn cancelled_turn_skips_the_handoff_round() {
+        let client = ScriptedClient {
+            rounds: Mutex::new(VecDeque::new()),
+        };
+        let tools = ToolRegistry::new(vec![Box::new(EchoTool)]);
+        let cancel = CancellationToken::new();
+        let limits = LoopLimits {
+            max_rounds: 0,
+            cost_ceiling_usd: None,
+        };
+        cancel.cancel();
+        let outcome = run_agent_loop(
+            &client,
+            &tools,
+            &ctx(),
+            &NoopObserver,
+            "m",
+            initial_messages(),
+            &limits,
+            &cancel,
+        )
+        .await;
+        assert!(outcome.visible.contains("0-round tool limit"));
+        assert!(!outcome.visible.contains("next: cargo test"));
+    }
+
+    #[test]
+    fn loop_limits_resolve_from_the_workspace_cascade() {
+        let dir = tempfile::tempdir().unwrap();
+        let single =
+            |dir: &std::path::Path| crate::workspace::Workspace::single_folder(dir.to_path_buf());
+        assert_eq!(
+            LoopLimits::from_workspace(&single(dir.path()), Some(dir.path())).max_rounds,
+            DEFAULT_MAX_ROUNDS
+        );
+
+        let gaviero = dir.path().join(".gaviero");
+        std::fs::create_dir_all(&gaviero).unwrap();
+        std::fs::write(
+            gaviero.join("settings.json"),
+            r#"{ "agent": { "toolAgent": { "maxRounds": 120 } } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            LoopLimits::from_workspace(&single(dir.path()), Some(dir.path())).max_rounds,
+            120
+        );
+
+        // Zero must not unbind the loop — an unbounded tool loop is never the
+        // intent, so it falls back to the default cap.
+        std::fs::write(
+            gaviero.join("settings.json"),
+            r#"{ "agent": { "toolAgent": { "maxRounds": 0 } } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            LoopLimits::from_workspace(&single(dir.path()), Some(dir.path())).max_rounds,
+            DEFAULT_MAX_ROUNDS
         );
     }
 
