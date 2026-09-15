@@ -1655,6 +1655,14 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                     let warm = server.clone();
                     tokio::spawn(async move { warm.warmup().await });
                     let http_server = server.clone();
+                    // Hand the live server to in-process API providers
+                    // (`deepseek:`, `ollama:`), which run gaviero's own agent
+                    // loop and so never speak MCP. Done *before* the transport
+                    // bind because `call_tool_in_process` needs no socket: if
+                    // another instance already owns the endpoint, subprocess
+                    // agents degrade but `deepseek:` still keeps its memory
+                    // tools.
+                    app.mcp_tool_server = Some(std::sync::Arc::new(server.clone()));
                     match gaviero_core::mcp::spawn_mcp_server(server, &endpoint) {
                         Ok(handle) => {
                             let (handle, http) = match gaviero_core::mcp::maybe_spawn_http_listener(

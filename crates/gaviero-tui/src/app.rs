@@ -247,6 +247,17 @@ pub struct App {
     /// cleaned up.
     pub mcp_server: Option<gaviero_core::mcp::McpServerHandle>,
 
+    /// The live in-process MCP server, handed to API providers that run
+    /// gaviero's own agent loop (`deepseek:`, `ollama:`) so they can call
+    /// `memory_search` / `blast_radius` / `node_doc` without a transport.
+    ///
+    /// Set on `Event::MemoryReady` *before* the socket bind, because the
+    /// in-process route needs no endpoint: if another gaviero instance owns
+    /// the socket, subprocess agents degrade but these providers keep their
+    /// retrieval tools. `None` until then, and sessions then advertise no
+    /// pull stanza rather than naming tools they cannot reach.
+    pub mcp_tool_server: Option<Arc<gaviero_core::mcp::GavieroMcpServer>>,
+
     /// Turn-scoped skill catalog scanned from `.gaviero/skills/` roots.
     pub skill_catalog: Arc<gaviero_core::skills::SkillCatalog>,
 
@@ -469,6 +480,7 @@ impl App {
             git_panel: crate::panels::git_panel::GitPanelState::new(),
             memory_panel: crate::panels::memory_panel::MemoryPanelState::new(),
             mcp_server: None,
+            mcp_tool_server: None,
             skill_catalog,
             git_repos,
             terminal_manager: gaviero_core::terminal::TerminalManager::new(
