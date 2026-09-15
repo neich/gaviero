@@ -355,6 +355,149 @@ mod tests {
         let out = render_chat_selections(&sel, "do the thing");
         assert_eq!(out, "do the thing\n\n[Graph] outline\n\n[Memory] context");
     }
+
+    /// An `App` over a throwaway workspace, with no session on disk yet.
+    ///
+    /// `App::new` seeds the widths from `.gaviero/settings.json`, so the empty
+    /// object here means the built-in defaults (30 / 40 / 30) are in play and
+    /// any other value in an assertion came from the session.
+    fn session_app(dir: &std::path::Path) -> App {
+        std::fs::create_dir_all(dir.join(".gaviero")).unwrap();
+        std::fs::write(dir.join(".gaviero/settings.json"), "{}").unwrap();
+        let workspace = Workspace::single_folder(dir.to_path_buf());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(workspace, tx)
+    }
+
+    /// Session state lands in the OS data dir, keyed by a hash of the workspace
+    /// path, so a `tempfile` key cannot collide with a real workspace — but the
+    /// directory still has to be removed or the test run litters the user's
+    /// data dir. Mirrors the cleanup in `gaviero_core::session_state`'s tests.
+    fn cleanup_session(dir: &std::path::Path) {
+        if let Some(state_dir) = session_state::state_dir_for(dir) {
+            let _ = std::fs::remove_dir_all(state_dir);
+        }
+    }
+
+    #[test]
+    fn panel_geometry_survives_a_restart() {
+        // The point of the feature: widths and heights the user left behind
+        // come back on the next run, rather than the settings defaults.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = session_app(dir.path());
+        app.file_tree_width = 42;
+        app.side_panel_width = 51;
+        app.terminal_split_percent = 65;
+        save_session(&app);
+
+        let mut restarted = session_app(dir.path());
+        assert_eq!(
+            restarted.file_tree_width,
+            theme::FILE_TREE_DEFAULT_WIDTH,
+            "App::new uses the defaults"
+        );
+
+        restore_session(&mut restarted);
+        assert_eq!(restarted.file_tree_width, 42);
+        assert_eq!(restarted.side_panel_width, 51);
+        assert_eq!(restarted.terminal_split_percent, 65);
+
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn restored_widths_are_clamped_to_the_configured_bounds() {
+        // A `state.json` written on a 4K monitor, hand-edited, or left over
+        // from an older build must not widen a panel past its maximum.
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path();
+        session_state::save_session(
+            key,
+            &SessionState {
+                file_tree_width: Some(9_000),
+                side_panel_width: Some(0),
+                ..SessionState::default()
+            },
+        )
+        .unwrap();
+
+        let mut app = session_app(key);
+        restore_session(&mut app);
+        assert_eq!(app.file_tree_width, theme::FILE_TREE_MAX_WIDTH);
+        assert_eq!(app.side_panel_width, theme::SIDE_PANEL_MIN_WIDTH);
+
+        cleanup_session(key);
+    }
+
+    #[test]
+    fn a_preset_governed_layout_persists_no_absolute_width() {
+        // While a preset is active the widths on screen are percentages, and
+        // `app.file_tree_width` still holds the pre-preset columns. Storing
+        // those would record a width that disagrees with what the user quit on.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = session_app(dir.path());
+        app.switch_layout(1);
+        app.file_tree_width = 42;
+        app.side_panel_width = 51;
+        save_session(&app);
+
+        let state = session_state::load_session(&app.workspace_key());
+        assert_eq!(state.active_preset, Some(1));
+        assert_eq!(state.file_tree_width, None);
+        assert_eq!(state.side_panel_width, None);
+        // The terminal split is orthogonal to a preset, so it still persists.
+        assert_eq!(state.terminal_split_percent, Some(30));
+
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn leaving_a_preset_makes_widths_authoritative_and_persisted_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = session_app(dir.path());
+        app.switch_layout(1);
+        assert!(app.active_preset.is_some());
+
+        // Any manual resize materializes the preset's on-screen sizes into the
+        // absolute widths and drops the preset.
+        super::layout::resize_horizontal(&mut app, 5);
+        assert!(app.active_preset.is_none());
+
+        save_session(&app);
+        let state = session_state::load_session(&app.workspace_key());
+        assert_eq!(state.file_tree_width, Some(app.file_tree_width));
+        assert_eq!(state.side_panel_width, Some(app.side_panel_width));
+
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn a_preset_restored_over_stored_widths_still_wins() {
+        // Belt and braces for the pair above: presets decide the split after
+        // restore, so a stale width in the session cannot survive one.
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path();
+        session_state::save_session(
+            key,
+            &SessionState {
+                active_preset: Some(2),
+                file_tree_width: Some(42),
+                side_panel_width: Some(51),
+                ..SessionState::default()
+            },
+        )
+        .unwrap();
+
+        let mut app = session_app(key);
+        restore_session(&mut app);
+        assert_eq!(app.active_preset, Some(2));
+        // Preset 3 is the explorer-less (0, 100, 0) default, and `switch_layout`
+        // owns visibility, so the stored widths are not what is rendered.
+        assert!(!app.panel_visible.file_tree);
+        assert!(!app.panel_visible.side_panel);
+
+        cleanup_session(key);
+    }
 }
 
 /// Spawn a background task that (re)builds `RepoMap` and writes it into
@@ -469,8 +612,23 @@ pub(super) fn restore_session(app: &mut App) {
         app.active_buffer = state.active_tab;
     }
 
+    // Live geometry is remembered per-session in `state.json` — the same file
+    // that carries panel visibility — so a deleted session resets widths and
+    // visibility together rather than leaving one of them behind. Both apply
+    // before `switch_layout` below, which stays authoritative when a preset
+    // was active at exit: it re-derives the horizontal split from percentages.
+    //
+    // Sanitised through the same helpers that clean the `panels.*` seed, so a
+    // session written on a wider terminal (or hand-edited) lands in range
+    // whether it arrives via `state.json` or via configuration.
+    if let Some(width) = state.file_tree_width {
+        app.file_tree_width = layout::clamp_file_tree_width(width);
+    }
+    if let Some(width) = state.side_panel_width {
+        app.side_panel_width = layout::clamp_side_panel_width(width);
+    }
     if let Some(pct) = state.terminal_split_percent {
-        app.terminal_split_percent = pct.clamp(10, 80);
+        app.terminal_split_percent = layout::clamp_terminal_split_percent(pct);
     }
 
     if let Some(term_state) = &state.terminal_session {
@@ -488,6 +646,29 @@ pub(super) fn restore_session(app: &mut App) {
     } else if app.panel_visible.file_tree {
         app.focus = Focus::FileTree;
     }
+}
+
+/// The explorer width to remember across runs, or `None` while a layout preset
+/// is active.
+///
+/// A preset decides the horizontal split as a percentage of the terminal, so
+/// `app.file_tree_width` is *not* what is on screen while one is selected — it
+/// still holds the pre-preset value. Persisting that would record a width that
+/// disagrees with the layout the user actually quit on, reconciled on the next
+/// run only by the preset re-applying over it. Storing `None` instead keeps a
+/// value the preset owns out of the session entirely.
+///
+/// Leaving a preset is what makes widths authoritative again: every manual
+/// resize runs `layout::materialize_preset_widths`, which copies the preset's
+/// on-screen sizes into the absolute widths and clears `active_preset`. So the
+/// moment widths start being stored is the moment they start being right.
+fn stored_file_tree_width(app: &App) -> Option<u16> {
+    app.active_preset.is_none().then_some(app.file_tree_width)
+}
+
+/// Side-panel sibling of [`stored_file_tree_width`], under the same rule.
+fn stored_side_panel_width(app: &App) -> Option<u16> {
+    app.active_preset.is_none().then_some(app.side_panel_width)
 }
 
 pub(super) fn save_session(app: &App) {
@@ -520,6 +701,8 @@ pub(super) fn save_session(app: &App) {
         tree_expanded: app.file_tree.expanded_paths(),
         tree_selected: app.file_tree.scroll.selected,
         active_preset: app.active_preset,
+        file_tree_width: stored_file_tree_width(app),
+        side_panel_width: stored_side_panel_width(app),
         terminal_split_percent: Some(app.terminal_split_percent),
         terminal_session: Some(app.terminal_manager.save_state()),
     };

@@ -95,6 +95,20 @@ pub struct SessionState {
     #[serde(default)]
     pub active_preset: Option<usize>,
 
+    /// Explorer column width in cells.
+    ///
+    /// `None` while a layout preset governs the horizontal split: the preset's
+    /// percentages decide the widths, so storing the absolute columns here
+    /// would record values that disagree with what was on screen. Also `None`
+    /// for a `state.json` written before panel geometry was persisted here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_tree_width: Option<u16>,
+
+    /// Side panel column width in cells. `None` under exactly the conditions
+    /// described on [`Self::file_tree_width`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side_panel_width: Option<u16>,
+
     /// Terminal panel height as a percentage of the main area (10–80).
     #[serde(default)]
     pub terminal_split_percent: Option<u16>,
@@ -446,6 +460,8 @@ mod tests {
             tree_expanded: vec!["src".to_string(), "src/editor".to_string()],
             tree_selected: 3,
             active_preset: Some(2),
+            file_tree_width: None,
+            side_panel_width: None,
             terminal_split_percent: Some(30),
             terminal_session: None,
         };
@@ -460,6 +476,53 @@ mod tests {
         assert!(loaded.panels.terminal);
         assert_eq!(loaded.tree_expanded.len(), 2);
         assert_eq!(loaded.tree_selected, 3);
+
+        let _ = std::fs::remove_dir_all(state_dir_for(key).unwrap());
+    }
+
+    #[test]
+    fn panel_geometry_round_trips() {
+        // The panel geometry the session remembers is the widths/heights the
+        // user left behind, so it must survive a save/load cycle verbatim.
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path();
+
+        let state = SessionState {
+            active_preset: None,
+            file_tree_width: Some(42),
+            side_panel_width: Some(51),
+            terminal_split_percent: Some(65),
+            ..SessionState::default()
+        };
+
+        save_session(key, &state).unwrap();
+        let loaded = load_session(key);
+        assert_eq!(loaded.file_tree_width, Some(42));
+        assert_eq!(loaded.side_panel_width, Some(51));
+        assert_eq!(loaded.terminal_split_percent, Some(65));
+
+        let _ = std::fs::remove_dir_all(state_dir_for(key).unwrap());
+    }
+
+    #[test]
+    fn absent_panel_widths_are_not_serialized() {
+        // `None` means "no stored width — a preset or the settings default
+        // governs". Writing the key anyway would leave a value on disk that a
+        // later reader could mistake for the user's own choice.
+        let json = serde_json::to_string(&SessionState::default()).unwrap();
+        assert!(!json.contains("file_tree_width"), "got {json}");
+        assert!(!json.contains("side_panel_width"), "got {json}");
+    }
+
+    #[test]
+    fn session_state_written_before_panel_geometry_still_loads() {
+        // A `state.json` from before widths were persisted must parse with both
+        // fields `None` rather than failing the whole session restore.
+        let json = r#"{ "tabs": [], "active_tab": 0, "terminal_split_percent": 30 }"#;
+        let state: SessionState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.file_tree_width, None);
+        assert_eq!(state.side_panel_width, None);
+        assert_eq!(state.terminal_split_percent, Some(30));
     }
 
     #[test]
