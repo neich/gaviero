@@ -268,7 +268,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                     gaviero_remote::envelope::ProposalEvent { proposal: dto },
                 ));
             app.remote.bump_global();
-            app.enter_review_mode(*proposal, DiffSource::Acp);
+            app.enter_review_mode(*proposal);
         }
         Event::ProposalUpdated(id) => {
             review::sync_batch_proposal_from_gate(app, id);
@@ -857,20 +857,16 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 app.chat_state.conversations[idx].last_turn_cost_usd = cost_usd;
             }
         }
-        Event::ToolAgentEditCaptured {
-            path,
-            pre_turn_content,
-        } => {
-            app.pending_tool_agent_edits.insert(path, pre_turn_content);
-        }
-        Event::ToolAgentEditsPending { conv_id: _, edits } => {
-            for edit in &edits {
-                app.pending_tool_agent_edits
-                    .insert(edit.path.clone(), edit.pre_turn_content.clone());
-            }
-            if let Some(first) = edits.first() {
-                super::editing::open_tool_agent_edit_review(app, &first.path);
-            }
+        Event::ToolAgentEditsPending { conv_id: _, paths } => {
+            // The turn's files are already on disk. Sync the editor to them as
+            // one set; nothing here offers to take an individual file back.
+            // `paths` is the full set the turn wrote, so this is the one place
+            // that can also report files the editor does not hold open.
+            super::agent_writes::reconcile_agent_writes(
+                app,
+                paths.iter().map(std::path::PathBuf::as_path),
+                super::agent_writes::WriteOrigin::AgentTurn { source: "agent" },
+            );
         }
         Event::AcpTaskCompleted { conv_id, proposals } => {
             tracing::info!(

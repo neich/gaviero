@@ -664,32 +664,18 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
             .and_then(|n| n.to_str())
             .unwrap_or("?");
 
-        let (status_text, style) = match review.source {
-            DiffSource::External => {
-                let current = review.current_hunk + 1;
-                (
-                    format!(
-                        " CHANGED  {} modified externally [{}/{}]  |  a/A: accept disk  r/R: keep editor  ]h/[h: nav  q: keep editor",
-                        filename, current, total,
-                    ),
-                    Style::default().fg(Color::Black).bg(theme::FOCUS_BORDER),
-                )
-            }
-            DiffSource::Acp => {
-                let accepted = proposal
-                    .structural_hunks
-                    .iter()
-                    .filter(|h| h.status == gaviero_core::types::HunkStatus::Accepted)
-                    .count();
-                (
-                    format!(
-                        " REVIEW  {} [{}/{} accepted] from {}  |  a/r: hunk  A/R: all  ]h/[h: nav  f: finalize  q: dismiss",
-                        filename, accepted, total, proposal.source
-                    ),
-                    Style::default().fg(Color::Black).bg(theme::WARNING),
-                )
-            }
-        };
+        let accepted = proposal
+            .structural_hunks
+            .iter()
+            .filter(|h| h.status == gaviero_core::types::HunkStatus::Accepted)
+            .count();
+        let (status_text, style) = (
+            format!(
+                " REVIEW  {} [{}/{} accepted] from {}  |  a/r: hunk  A/R: all  ]h/[h: nav  f: finalize  q: dismiss",
+                filename, accepted, total, proposal.source
+            ),
+            Style::default().fg(Color::Black).bg(theme::WARNING),
+        );
 
         for (i, ch) in status_text.chars().enumerate() {
             let x = area.x + i as u16;

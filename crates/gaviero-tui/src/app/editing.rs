@@ -534,8 +534,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(ref mut review) = app.diff_review {
-                if review.is_interactive()
-                    && app.layout.editor_area.contains((col, row).into())
+                if app.layout.editor_area.contains((col, row).into())
                     && col < app.layout.editor_area.x + DIFF_GUTTER_WIDTH
                 {
                     let relative_row = (row - app.layout.editor_area.y) as usize;
@@ -1370,8 +1369,7 @@ fn handle_mouse_review(app: &mut App, mouse: crossterm::event::MouseEvent) {
             }
 
             if let Some(ref mut review) = app.diff_review {
-                if review.is_interactive()
-                    && app.layout.editor_area.contains((col, row).into())
+                if app.layout.editor_area.contains((col, row).into())
                     && col < app.layout.editor_area.x + DIFF_GUTTER_WIDTH
                 {
                     let relative_row = (row - app.layout.editor_area.y) as usize;
@@ -2017,133 +2015,21 @@ pub(super) fn goto_next_search_result(app: &mut App) {
     ));
 }
 
-/// Look up a pre-turn snapshot for an Option-B tool-agent edit.
-fn pending_pre_turn_content(
-    pending: &std::collections::HashMap<std::path::PathBuf, Option<String>>,
-    path: &Path,
-) -> Option<Option<String>> {
-    if let Some(content) = pending.get(path) {
-        return Some(content.clone());
-    }
-    pending
-        .iter()
-        .find_map(|(p, content)| Buffer::paths_refer_to_same_file(p, path).then(|| content.clone()))
-}
-
-/// Resolve the "before" side of an external-change diff for a tool-agent edit.
-/// The per-turn snapshot wins over the open buffer so a file-watcher reload
-/// cannot erase the diff.
-fn tool_agent_old_content(app: &App, path: &Path) -> String {
-    if let Some(pre_turn) = pending_pre_turn_content(&app.pending_tool_agent_edits, path) {
-        return pre_turn.unwrap_or_default();
-    }
-    app.buffers
-        .iter()
-        .find(|b| {
-            b.path
-                .as_deref()
-                .is_some_and(|p| Buffer::paths_refer_to_same_file(p, path))
-        })
-        .map(|b| b.text.to_string())
-        .unwrap_or_default()
-}
-
-/// Open external-change review for an in-process tool-agent edit (Option B).
-pub(super) fn open_tool_agent_edit_review(app: &mut App, path: &Path) {
-    if app.diff_review.is_some() {
-        return;
-    }
-
-    let read_path = Buffer::resolve_editor_path(path);
-    let new_content = match std::fs::read_to_string(&read_path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-
-    let old_content = tool_agent_old_content(app, path);
-
-    if old_content == new_content {
-        return;
-    }
-
-    let proposal = gaviero_core::write_gate::WriteGatePipeline::build_proposal(
-        0,
-        "tool-agent",
-        None,
-        &read_path,
-        &old_content,
-        &new_content,
-    );
-
-    if let Some(buf_idx) = app.buffers.iter().position(|b| {
-        b.path
-            .as_deref()
-            .is_some_and(|p| crate::editor::buffer::Buffer::paths_refer_to_same_file(p, path))
-    }) {
-        app.active_buffer = buf_idx;
-    }
-    app.focus = crate::app::Focus::Editor;
-    app.diff_review = Some(crate::editor::diff_overlay::DiffReviewState::new(
-        proposal,
-        crate::editor::diff_overlay::DiffSource::External,
-    ));
-}
-
+/// React to a single path changing on disk.
+///
+/// Every writer that is not holding a write gate lands here: the in-process API
+/// providers (which *also* report their whole turn's file set through
+/// `Event::ToolAgentEditsPending`), Claude/Codex/Cursor, `dsh:`, `git`, and any
+/// other editor. The reaction is deliberately identical for all of them and is
+/// defined in [`super::agent_writes`] — an open, clean buffer is reloaded so the
+/// editor converges on disk, and an open buffer with unsaved edits is left
+/// alone and reported on the status line. Nothing here writes to disk.
 pub(super) fn handle_file_changed(app: &mut App, path: &Path) {
-    if app.diff_review.is_some() {
-        return;
-    }
-
-    let buf_idx = app.buffers.iter().position(|b| {
-        b.path
-            .as_deref()
-            .is_some_and(|buf_path| Buffer::paths_refer_to_same_file(buf_path, path) && !b.modified)
-    });
-    let Some(buf_idx) = buf_idx else {
-        return;
-    };
-
-    let read_path = match app.buffers[buf_idx].path.as_deref() {
-        Some(p) => p.to_path_buf(),
-        None => return,
-    };
-
-    let new_content = match std::fs::read_to_string(&read_path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-
-    let buf = &mut app.buffers[buf_idx];
-    if buf.should_suppress_post_open_watch() {
-        // Watcher often replays stale metadata right after reopen; trust the
-        // content we just loaded until the user edits or the grace window ends.
-        buf.note_disk_sync(buf.text.to_string());
-        return;
-    }
-    if buf.should_ignore_external_change(&new_content) {
-        buf.note_disk_sync(&new_content);
-        return;
-    }
-
-    let old_content = pending_pre_turn_content(&app.pending_tool_agent_edits, path)
-        .map(|pre| pre.unwrap_or_default())
-        .unwrap_or_else(|| buf.text.to_string());
-    if old_content == new_content {
-        buf.note_disk_sync(&new_content);
-        return;
-    }
-
-    let source = if pending_pre_turn_content(&app.pending_tool_agent_edits, path).is_some() {
-        "tool-agent"
-    } else {
-        "external"
-    };
-    let proposal =
-        WriteGatePipeline::build_proposal(0, source, None, &read_path, &old_content, &new_content);
-
-    app.active_buffer = buf_idx;
-    app.focus = Focus::Editor;
-    app.diff_review = Some(DiffReviewState::new(proposal, DiffSource::External));
+    super::agent_writes::reconcile_agent_writes(
+        app,
+        std::iter::once(path),
+        super::agent_writes::WriteOrigin::Unattributed,
+    );
 }
 
 /// Open a read-only diff view of `path` as a regular editor tab. The buffer
@@ -2411,6 +2297,180 @@ mod tests {
             side_panel: true,
             terminal: true,
         }
+    }
+
+    /// An `App` over a throwaway workspace. Mirrors `app::session`'s helper.
+    fn agent_edit_app(dir: &std::path::Path) -> App {
+        std::fs::create_dir_all(dir.join(".gaviero")).unwrap();
+        std::fs::write(dir.join(".gaviero/settings.json"), "{}").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(Workspace::single_folder(dir.to_path_buf()), tx)
+    }
+
+    /// `App::new` reads session state from the OS data dir, keyed by a hash of
+    /// the workspace path, so the directory has to go or the run litters it.
+    fn cleanup_session(dir: &std::path::Path) {
+        if let Some(state_dir) = session_state::state_dir_for(dir) {
+            let _ = std::fs::remove_dir_all(state_dir);
+        }
+    }
+
+    /// Drive the reconciliation the controller runs when a turn reports its
+    /// writes. `AgentTurn` is what makes the post-open grace window inapplicable.
+    fn agent_wrote(app: &mut App, paths: &[&Path]) {
+        super::super::agent_writes::reconcile_agent_writes(
+            app,
+            paths.iter().copied(),
+            super::super::agent_writes::WriteOrigin::AgentTurn { source: "agent" },
+        );
+    }
+
+    fn status_text(app: &App) -> String {
+        app.status_message
+            .as_ref()
+            .map(|(m, _)| m.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn agent_write_to_a_closed_file_does_not_steal_the_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("closed.txt");
+        std::fs::write(&target, "new\n").unwrap();
+
+        let mut app = agent_edit_app(dir.path());
+        app.focus = Focus::SidePanel;
+
+        agent_wrote(&mut app, &[&target]);
+
+        assert!(
+            app.diff_review.is_none(),
+            "a file the user never opened must not take over the editor"
+        );
+        assert_eq!(
+            app.focus,
+            Focus::SidePanel,
+            "focus must not be yanked to the editor"
+        );
+        assert!(
+            status_text(&app).contains("none open"),
+            "the write is still reported, just not as a pop-up: {}",
+            status_text(&app)
+        );
+
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn agent_write_to_an_open_clean_buffer_is_applied_without_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("open.txt");
+        std::fs::write(&target, "old\n").unwrap();
+
+        let mut app = agent_edit_app(dir.path());
+        open_file(&mut app, &target);
+        assert_eq!(app.buffers.len(), 1);
+
+        // The agent's write lands on disk, then the turn completes.
+        std::fs::write(&target, "new\n").unwrap();
+        agent_wrote(&mut app, &[&target]);
+
+        assert!(
+            app.diff_review.is_none(),
+            "an agent write is applied, never offered as a review"
+        );
+        assert_eq!(
+            app.buffers[0].text.to_string(),
+            "new\n",
+            "an open, clean buffer converges on the agent's content"
+        );
+        assert!(!app.buffers[0].modified, "the synced buffer is not dirty");
+
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn agent_write_to_a_modified_buffer_keeps_the_users_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("dirty.txt");
+        std::fs::write(&target, "old\n").unwrap();
+
+        let mut app = agent_edit_app(dir.path());
+        open_file(&mut app, &target);
+        app.buffers[0].text = ropey::Rope::from_str("mine\n");
+        app.buffers[0].modified = true;
+
+        std::fs::write(&target, "new\n").unwrap();
+        agent_wrote(&mut app, &[&target]);
+
+        assert!(
+            app.diff_review.is_none(),
+            "reloading would discard unsaved edits, so no review is offered"
+        );
+        assert_eq!(
+            app.buffers[0].text.to_string(),
+            "mine\n",
+            "unsaved edits survive an agent write"
+        );
+        assert!(
+            status_text(&app).starts_with('⚠'),
+            "the user must be told their copy is now stale: {}",
+            status_text(&app)
+        );
+
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn agent_reconciliation_never_writes_to_disk() {
+        // A turn is all-or-nothing in core (it reverts every edit itself when
+        // the turn fails), so the UI must never partially undo one. This is the
+        // invariant that replaced the old per-file revert.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("dirty.txt");
+        std::fs::write(&target, "old\n").unwrap();
+
+        let mut app = agent_edit_app(dir.path());
+        open_file(&mut app, &target);
+        app.buffers[0].text = ropey::Rope::from_str("mine\n");
+        app.buffers[0].modified = true;
+
+        std::fs::write(&target, "agent\n").unwrap();
+        agent_wrote(&mut app, &[&target]);
+
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "agent\n",
+            "the agent's write must survive reconciliation untouched"
+        );
+
+        cleanup_session(dir.path());
+    }
+
+    #[test]
+    fn an_agent_turn_syncs_every_file_it_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, "a0\n").unwrap();
+        std::fs::write(&b, "b0\n").unwrap();
+
+        let mut app = agent_edit_app(dir.path());
+        open_file(&mut app, &a);
+        open_file(&mut app, &b);
+
+        std::fs::write(&a, "a1\n").unwrap();
+        std::fs::write(&b, "b1\n").unwrap();
+        agent_wrote(&mut app, &[&a, &b]);
+
+        assert_eq!(app.buffers[0].text.to_string(), "a1\n");
+        assert_eq!(app.buffers[1].text.to_string(), "b1\n");
+        assert!(
+            app.diff_review.is_none(),
+            "the turn's set is applied as a whole"
+        );
+
+        cleanup_session(dir.path());
     }
 
     #[test]

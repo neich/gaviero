@@ -36,7 +36,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::context_planner::compaction::CompactionPolicy;
 use crate::context_planner::{ContinuityHandle, ContinuityMode, ProviderProfile};
-use crate::observer::{AcpObserver, ToolAgentEdit};
+use crate::observer::AcpObserver;
 use crate::swarm::backend::shared::{
     default_editor_system_prompt, render_graph_block, render_memory_block, render_skill_block,
 };
@@ -276,17 +276,11 @@ impl AgentSession for ToolAgentSession {
                 }
             }
         } else if had_edits {
-            let edits: Vec<ToolAgentEdit> = snapshot
-                .lock()
-                .await
-                .edits()
-                .into_iter()
-                .map(|(path, pre_turn_content)| ToolAgentEdit {
-                    path,
-                    pre_turn_content,
-                })
-                .collect();
-            self.observer.as_ref().on_tool_agent_edits(&edits);
+            // Only the paths matter: the host syncs its open buffers to disk and
+            // never undoes an individual file of the set (see the TUI's
+            // `agent_writes.rs`).
+            let paths = snapshot.lock().await.touched_paths();
+            self.observer.as_ref().on_tool_agent_edits(&paths);
         }
 
         // Fire on_message_complete even on error (parity with
