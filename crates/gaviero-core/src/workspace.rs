@@ -33,6 +33,13 @@ pub mod settings {
     pub const AGENT_MODEL: &str = "agent.model";
     pub const AGENT_EFFORT: &str = "agent.effort";
     pub const AGENT_MAX_TOKENS: &str = "agent.maxTokens";
+    /// Rounds the in-process tool agent (`deepseek:`) may take in one turn
+    /// before it stops and asks the model to hand off. Default 40; raise it
+    /// for broad refactors that legitimately need many reads. Zero or an
+    /// unparseable value falls back to the default rather than unbinding the
+    /// loop. See [`LoopLimits::from_workspace`] —
+    /// `crates/gaviero-core/src/agent_session/tool_agent/agent_loop.rs`.
+    pub const AGENT_TOOL_AGENT_MAX_ROUNDS: &str = "agent.toolAgent.maxRounds";
     pub const AGENT_OLLAMA_BASE_URL: &str = "agent.ollamaBaseUrl";
     /// Token budget for graph-based source-code context injection in simple chat. 0 disables.
     pub const AGENT_GRAPH_BUDGET_TOKENS: &str = "agent.graphBudgetTokens";
@@ -1278,6 +1285,10 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::AGENT_MODEL => serde_json::json!("claude:sonnet"),
         settings::AGENT_EFFORT => serde_json::json!("off"),
         settings::AGENT_MAX_TOKENS => serde_json::json!(16384),
+        // Mirrors `agent_loop::DEFAULT_MAX_ROUNDS`. Every round is one billed
+        // API call, so this is a cost bound; the cap is mandatory (the plan
+        // that introduced it forbids an unbounded tool loop).
+        settings::AGENT_TOOL_AGENT_MAX_ROUNDS => serde_json::json!(40),
         // 4000 (was 8000, was 12000): PR-8 / G3 of v2 §8, backed by the
         // T1 task-success A/B (2026-07-19, claude:sonnet, 5 tasks × 3
         // runs): success 66.7%±11.5 @4000 vs 46.7%±11.5 @8000 with no

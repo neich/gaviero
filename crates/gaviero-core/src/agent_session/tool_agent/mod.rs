@@ -20,7 +20,7 @@ mod snapshot;
 pub mod swarm;
 pub mod tools;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -163,7 +163,7 @@ impl ToolAgentSession {
             // owned_paths in Phase 6.
             scope: FileScope::default(),
             tools,
-            limits: agent_loop::LoopLimits::default(),
+            limits: resolve_loop_limits(&workspace_root),
             profile,
             compaction: CompactionPolicy::default(),
             policy,
@@ -292,6 +292,20 @@ impl AgentSession for ToolAgentSession {
     }
 
     async fn close(self: Box<Self>) {}
+}
+
+/// Resolve the per-turn tool-round cap for this workspace.
+///
+/// Path-based fallback, mirroring [`ToolPolicy::resolve`]: a host holding a
+/// [`crate::workspace::Workspace`] should hand the resolved value down, but no
+/// [`SessionConstruction`] field carries it — `AgentOptions` has no workspace.
+/// Inside a swarm worktree there is no `.gaviero/settings.json` of its own
+/// (`.gaviero/**` is gitignored), so the cascade is read from
+/// `workspace_root`; falling back to the default is the safe direction, since
+/// an under-tight bound costs one hand-off round while an unbounded loop spins.
+fn resolve_loop_limits(workspace_root: &Path) -> agent_loop::LoopLimits {
+    let ws = crate::workspace::Workspace::single_folder(workspace_root.to_path_buf());
+    agent_loop::LoopLimits::from_workspace(&ws, Some(workspace_root))
 }
 
 /// Resolve DeepSeek API config from workspace settings + env/secrets.
