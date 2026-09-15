@@ -19,13 +19,13 @@
 //! [`compute_stats`].
 
 use std::collections::BTreeMap;
-use std::io::{BufRead as _, Write as _};
+use std::io::BufRead as _;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
 use super::observer::{McpCallLogEntry, McpToolCallObserver};
+use crate::history::ndjson::{NdjsonAppender, rotated_path};
 
 /// Default rotation threshold: 10 MB.
 pub const DEFAULT_MAX_BYTES: u64 = 10 * 1024 * 1024;
@@ -96,7 +96,10 @@ impl McpCallRecord {
 /// for `blast_radius`, `signatures`/`impls` for `node_doc`/symbol
 /// tools). A non-object output, or one with no recognised array, counts
 /// as non-empty.
-fn output_is_empty(output: &serde_json::Value) -> bool {
+///
+/// Public because the history recorder labels an MCP record with the same
+/// verdict (`empty_result`) rather than re-deriving it.
+pub fn output_is_empty(output: &serde_json::Value) -> bool {
     let Some(obj) = output.as_object() else {
         return false;
     };
@@ -110,22 +113,16 @@ fn output_is_empty(output: &serde_json::Value) -> bool {
 
 /// Size-rotated NDJSON telemetry sink. Cheap synchronous append per
 /// tool call; writes from concurrent MCP connections are serialized by
-/// an internal mutex so lines never interleave.
+/// the appender's internal mutex so lines never interleave.
 pub struct NdjsonTelemetrySink {
-    path: PathBuf,
-    max_bytes: u64,
-    /// Serializes concurrent appends. The guarded data is `()` — the
-    /// file itself is the shared resource.
-    lock: Mutex<()>,
+    appender: NdjsonAppender,
 }
 
 impl NdjsonTelemetrySink {
     /// Sink writing to an explicit path.
     pub fn new(path: PathBuf) -> Self {
         Self {
-            path,
-            max_bytes: DEFAULT_MAX_BYTES,
-            lock: Mutex::new(()),
+            appender: NdjsonAppender::new(path, DEFAULT_MAX_BYTES),
         }
     }
 
@@ -136,65 +133,28 @@ impl NdjsonTelemetrySink {
 
     /// Override the rotation threshold (bytes). Clamped to ≥ 1.
     pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
-        self.max_bytes = max_bytes.max(1);
+        self.appender = NdjsonAppender::new(self.appender.path().to_path_buf(), max_bytes);
         self
     }
 
     /// The active NDJSON path.
     pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Append one record. Best-effort: callers swallow the error so a
-    /// telemetry I/O failure never fails the underlying tool call.
-    fn append(&self, record: &McpCallRecord) -> std::io::Result<()> {
-        let mut line = serde_json::to_string(record).unwrap_or_default();
-        line.push('\n');
-
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        self.rotate_if_needed(line.len() as u64)?;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        f.write_all(line.as_bytes())
-    }
-
-    /// Rotate when the current file plus the incoming line would exceed
-    /// `max_bytes`. Keeps exactly one prior generation (`<name>.1`).
-    fn rotate_if_needed(&self, incoming: u64) -> std::io::Result<()> {
-        let cur = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
-        if cur > 0 && cur.saturating_add(incoming) > self.max_bytes {
-            let rotated = rotated_path(&self.path);
-            let _ = std::fs::remove_file(&rotated);
-            std::fs::rename(&self.path, &rotated)?;
-        }
-        Ok(())
+        self.appender.path()
     }
 }
 
 impl McpToolCallObserver for NdjsonTelemetrySink {
     fn on_tool_call(&self, entry: &McpCallLogEntry) {
         let record = McpCallRecord::from_entry(entry);
-        if let Err(e) = self.append(&record) {
+        if let Err(e) = self.appender.append_json(&record) {
             tracing::warn!(
                 target: "mcp_telemetry",
                 error = %e,
-                path = %self.path.display(),
+                path = %self.appender.path().display(),
                 "failed to append MCP tool-call telemetry"
             );
         }
     }
-}
-
-/// `<name>.1` — the single retained prior generation.
-fn rotated_path(path: &Path) -> PathBuf {
-    let mut s = path.as_os_str().to_os_string();
-    s.push(".1");
-    PathBuf::from(s)
 }
 
 /// Per-tool aggregate intrinsic metrics computed from the NDJSON sink.
