@@ -465,13 +465,11 @@ pub fn project_hot_event(app: &App, event: &Event) -> Option<ServerFrame> {
     };
     match event {
         // Streaming events carry complete wire data (§2.1 path 1).
-        Event::StreamChunk { conv_id, text } => {
-            Some(ServerFrame::StreamChunk(renv::StreamChunk {
-                conv_id: conv_id.clone(),
-                turn_id: turn_of(conv_id),
-                text: text.clone(),
-            }))
-        }
+        Event::StreamChunk { conv_id, text } => Some(ServerFrame::StreamChunk(renv::StreamChunk {
+            conv_id: conv_id.clone(),
+            turn_id: turn_of(conv_id),
+            text: text.clone(),
+        })),
         Event::ToolCallStarted { conv_id, tool_name } => {
             Some(ServerFrame::ToolCallStarted(renv::ToolCallStarted {
                 conv_id: conv_id.clone(),
@@ -543,6 +541,7 @@ pub fn project_hot_event(app: &App, event: &Event) -> Option<ServerFrame> {
         | Event::MemoryManifestReady { .. }
         | Event::MemoryScopeSummary { .. }
         | Event::MemoryDeletionsLoaded { .. }
+        | Event::HistoryLoaded(_)
         | Event::MemoryReady(_)
         | Event::RemoteCommand(_)
         | Event::RemoteSnapshotNeeded

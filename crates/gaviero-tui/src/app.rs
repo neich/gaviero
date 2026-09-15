@@ -238,6 +238,9 @@ pub struct App {
     // Memory panel (Tier A / A4)
     pub memory_panel: crate::panels::memory_panel::MemoryPanelState,
 
+    // History panel (per-turn prompt / tools / MCP / memory / totals)
+    pub history_panel: crate::panels::history_panel::HistoryPanelState,
+
     /// MCP server handle (Tier A / A5). Spawned on `Event::MemoryReady`
     /// when `mcp.gavieroServer.enabled` is true. On workspace close the
     /// handle's `shutdown` is awaited so the Unix socket file is
@@ -254,6 +257,11 @@ pub struct App {
     /// retrieval tools. `None` until then, and sessions then advertise no
     /// pull stanza rather than naming tools they cannot reach.
     pub mcp_tool_server: Option<Arc<gaviero_core::mcp::GavieroMcpServer>>,
+
+    /// The single per-turn history recorder for this app instance
+    /// (`<root>/.gaviero/history/turns.ndjson`). Capture points write through
+    /// it; nothing reads through it — the HISTORY panel reads the file.
+    pub history: Arc<gaviero_core::history::HistoryRecorder>,
 
     /// Turn-scoped skill catalog scanned from `.gaviero/skills/` roots.
     pub skill_catalog: Arc<gaviero_core::skills::SkillCatalog>,
@@ -376,6 +384,13 @@ impl App {
 
         // Primary workspace root for code-graph context (first root).
         let graph_workspace_root = workspace.roots().first().map(|p| p.to_path_buf());
+        // History lives beside the MCP telemetry sink, under the same root the
+        // prompt dispatch uses. Constructing the recorder touches no disk.
+        let history = gaviero_core::history::HistoryRecorder::for_workspace(
+            graph_workspace_root
+                .as_deref()
+                .unwrap_or_else(|| Path::new(".")),
+        );
 
         let observer = TuiWriteGateObserver {
             tx: event_tx.clone(),
@@ -474,8 +489,10 @@ impl App {
             graph_workspace_root,
             git_panel: crate::panels::git_panel::GitPanelState::new(),
             memory_panel: crate::panels::memory_panel::MemoryPanelState::new(),
+            history_panel: crate::panels::history_panel::HistoryPanelState::new(),
             mcp_server: None,
             mcp_tool_server: None,
+            history,
             skill_catalog,
             git_repos,
             terminal_manager: gaviero_core::terminal::TerminalManager::new(
@@ -670,6 +687,15 @@ impl App {
     /// Refresh the memory panel from `memory.db` (bootstrap fill).
     fn refresh_memory_panel(&mut self) {
         side_panel::refresh_memory_panel(self);
+    }
+
+    fn handle_history_panel_action(&mut self, action: Action) {
+        side_panel::handle_history_panel_action(self, action);
+    }
+
+    /// Reload the HISTORY panel from `.gaviero/history/turns.ndjson`.
+    fn refresh_history_panel(&mut self) {
+        side_panel::refresh_history_panel(self);
     }
 
     /// Read the HEAD version of a file (for diff display).

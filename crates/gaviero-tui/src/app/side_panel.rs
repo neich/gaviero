@@ -1198,6 +1198,108 @@ pub(super) fn refresh_memory_panel(app: &mut App) {
     });
 }
 
+/// Re-read `.gaviero/history/turns.ndjson` off the event loop and deliver it
+/// as `Event::HistoryLoaded`. Read-only: the panel never writes.
+pub(super) fn refresh_history_panel(app: &mut App) {
+    app.history_panel.active_conv = Some(app.chat_state.active_conversation_id().to_string());
+    if app.history_panel.loading {
+        // A read is in flight and may predate the latest write; read again
+        // when it lands.
+        app.history_panel.reload_pending = true;
+        return;
+    }
+    app.history_panel.loading = true;
+    let path = app.history.path().to_path_buf();
+    let tx = app.event_tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let load = crate::panels::history_panel::load_history(&path);
+        let _ = tx.send(Event::HistoryLoaded(Box::new(load)));
+    });
+}
+
+/// Keys for the HISTORY panel. `Esc` arrives separately (the keymap has no
+/// action for it) through [`handle_history_panel_escape`].
+pub(super) fn handle_history_panel_action(app: &mut App, action: Action) {
+    use crate::panels::history_panel::HistorySection;
+
+    let panel = &mut app.history_panel;
+    if panel.filter_editing {
+        match action {
+            Action::InsertChar(ch) => {
+                panel.filter.push(ch);
+                panel.selected = 0;
+            }
+            Action::Backspace => {
+                panel.filter.pop();
+                panel.selected = 0;
+            }
+            Action::Enter => panel.filter_editing = false,
+            _ => {}
+        }
+        return;
+    }
+
+    match action {
+        Action::CursorUp | Action::InsertChar('k') => panel.select_prev(),
+        Action::CursorDown | Action::InsertChar('j') => panel.select_next(),
+        Action::Home => {
+            panel.selected = 0;
+            panel.section_scroll = 0;
+        }
+        Action::End => {
+            panel.selected = panel.visible().len().saturating_sub(1);
+            panel.section_scroll = 0;
+        }
+        Action::PageUp | Action::InsertChar('K') => panel.scroll_section(-10),
+        Action::PageDown | Action::InsertChar('J') => panel.scroll_section(10),
+        Action::Tab | Action::CycleTabForward => panel.set_section(panel.section.next()),
+        Action::CycleTabBack => panel.set_section(panel.section.prev()),
+        Action::InsertChar(c @ '1'..='5') => {
+            if let Some(section) = HistorySection::from_digit(c) {
+                panel.set_section(section);
+            }
+        }
+        Action::Enter => {
+            if panel.selected_turn().is_some() {
+                panel.expanded = !panel.expanded;
+                panel.section_scroll = 0;
+            }
+        }
+        Action::InsertChar('/') => panel.filter_editing = true,
+        Action::InsertChar('a') => {
+            panel.active_conv = Some(app.chat_state.active_conversation_id().to_string());
+            app.history_panel.toggle_scope();
+        }
+        Action::InsertChar('r') => refresh_history_panel(app),
+        Action::InsertChar('c') => {
+            let Some(ndjson) = panel.focused_records_ndjson() else {
+                app.status_message = Some((
+                    "History: nothing to copy in this section".to_string(),
+                    std::time::Instant::now(),
+                ));
+                return;
+            };
+            let lines = ndjson.lines().count();
+            let label = panel.section.label();
+            let where_to = match app.set_clipboard(&ndjson) {
+                ClipboardResult::System => "clipboard",
+                _ => "internal clipboard",
+            };
+            app.status_message = Some((
+                format!("History: copied {lines} {label} record(s) to the {where_to}"),
+                std::time::Instant::now(),
+            ));
+        }
+        _ => {}
+    }
+}
+
+/// `Esc` in the HISTORY panel: close the expanded view, stop editing the
+/// filter, or clear it. Returns whether the key was consumed.
+pub(super) fn handle_history_panel_escape(app: &mut App) -> bool {
+    app.history_panel.escape()
+}
+
 /// Fire a debounced live-search against `MemoryStore::search_scoped`.
 fn schedule_memory_panel_search(app: &mut App) {
     use crate::panels::memory_panel::SEARCH_DEBOUNCE;
@@ -1596,9 +1698,8 @@ fn display_dir_prefix(query: &str) -> String {
 }
 
 pub(super) fn send_chat_message(app: &mut App) {
-    // Codex needs MCP trust consent the same way `/swarm` does, but that
-    // dialog only ever fired on the first `/swarm` run — so a codex chat turn
-    // would otherwise dispatch *silently* without gaviero MCP tools
+    // Codex needs MCP trust consent before its first turn — without it a codex
+    // chat turn would dispatch *silently* without gaviero MCP tools
     // (`.codex/config.toml` is gated on `codexTrust == granted`). When the
     // active model is codex and trust is still "unknown", open the consent
     // dialog instead. The typed prompt stays in the input buffer (the dialog
@@ -1867,6 +1968,28 @@ pub(crate) fn dispatch_prompt_core(
         &gaviero_core::context_planner::ModelSpec::parse(&model),
         &runtime,
     );
+
+    // History: this is the only place that holds the verbatim prompt before
+    // the agent is spawned. Every later capture point for this turn runs
+    // inside the turn's own task, in order — the provider's usage lands
+    // before the task ends the turn — so no end deferral is needed.
+    app.history.begin_turn(
+        &conv_id,
+        &turn_id,
+        gaviero_core::history::TurnStart {
+            provider: provider_profile.provider.clone(),
+            model: model.clone(),
+            conv_title: Some(app.chat_state.conversations[conv_idx].title.clone()),
+            workspace_root: root.to_string_lossy().replace('\\', "/"),
+            prompt: prompt.clone(),
+            prompt_bytes: 0,
+            prompt_truncated: false,
+            input_tokens_est: None,
+            estimator: None,
+        },
+        false,
+    );
+    let history = app.history.clone();
 
     // Phase 6 (decision 1): a provider whose enforcement is structurally
     // absent is *declared* absent, not silently unenforced. Disclose it once
@@ -2454,6 +2577,25 @@ pub(crate) fn dispatch_prompt_core(
                 tokens_used: outcome.summary.tokens_used,
                 token_budget: outcome.summary.token_budget,
             });
+            // The memory call and its response: the rendered block that goes
+            // into the prompt, plus the manifest the writer task persists.
+            history.push(
+                &turn_id_clone,
+                gaviero_core::history::HistoryKind::MemoryInjection(
+                    gaviero_core::history::memory_injection_record(
+                        outcome.summary.items_injected,
+                        outcome.summary.pool_size,
+                        outcome.summary.tokens_used,
+                        outcome.summary.token_budget,
+                        outcome
+                            .injection
+                            .as_ref()
+                            .map(|inj| inj.block.clone())
+                            .filter(|block| !block.is_empty()),
+                        outcome.manifest_payload,
+                    ),
+                ),
+            );
             (outcome.injection, outcome.summary.tokens_used)
         } else {
             (None, 0)
@@ -2532,6 +2674,9 @@ pub(crate) fn dispatch_prompt_core(
             tokens: bootstrap_measured,
             arms: bootstrap_arms,
         });
+        if bootstrap_arms.any_layer() {
+            history.note_bootstrap_tokens(&turn_id_clone, bootstrap_measured);
+        }
 
         let transport_ctx = gaviero_core::agent_session::TransportContext {
             user_message: task_text.clone(),
@@ -2547,6 +2692,8 @@ pub(crate) fn dispatch_prompt_core(
         let observer = TuiAcpObserver {
             tx: tx.clone(),
             conv_id: conv_id_clone.clone(),
+            turn_id: turn_id_clone.clone(),
+            history: history.clone(),
         };
         let mut session = gaviero_core::agent_session::registry::create_session(
             gaviero_core::agent_session::registry::SessionConstruction {
@@ -2627,6 +2774,13 @@ pub(crate) fn dispatch_prompt_core(
             tracing::info!("No deferred proposals — skipping AcpTaskCompleted");
         }
 
+        // Ends *this* turn by id: the conversation may already have started
+        // its next turn (`is_streaming` clears on the final message, before
+        // this point).
+        history.end_turn(
+            &turn_id_clone,
+            gaviero_core::history::TurnEnd::new(cancelled, send_error.clone(), proposal_count),
+        );
         let _ = tx.send(Event::AgentTurnFinished {
             conv_id: conv_id_clone,
             cancelled,

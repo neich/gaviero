@@ -85,18 +85,8 @@ pub const CONFLICT_THEIRS_BG: Color = Color::Rgb(55, 45, 65);
 pub const CONFLICT_MARKER_BG: Color = Color::Rgb(70, 55, 35);
 /// Numeric / constant orange.
 pub const NUMERIC_ORANGE: Color = Color::Rgb(209, 154, 102);
-/// Medium gray for secondary labels.
-pub const MEDIUM_GRAY: Color = Color::Rgb(140, 145, 155);
 /// Focused list-item selection background.
 pub const FOCUSED_SELECTION_BG: Color = Color::Rgb(55, 100, 180);
-/// Swarm tier badge: Cheap (Haiku / local).
-pub const TIER_CHEAP: Color = Color::Rgb(80, 200, 120);
-/// Swarm tier badge: Expensive (Sonnet / Opus).
-pub const TIER_EXPENSIVE: Color = Color::Rgb(80, 160, 230);
-/// Activity line: tool call.
-pub const ACTIVITY_TOOL_CALL: Color = Color::Rgb(80, 200, 220);
-/// Activity line: status change.
-pub const ACTIVITY_STATUS: Color = Color::Rgb(200, 180, 80);
 /// Terminal cursor foreground (inverted).
 pub const CURSOR_INVERT_FG: Color = Color::Black;
 /// Selected item bright text.

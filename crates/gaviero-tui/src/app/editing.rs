@@ -580,11 +580,10 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     let arrow_zone = hdr.x + hdr.width.saturating_sub(3);
                     if col >= arrow_zone {
                         app.focus = Focus::SidePanel;
-                        app.side_panel = match app.side_panel {
-                            SidePanelMode::AgentChat => SidePanelMode::GitPanel,
-                            SidePanelMode::GitPanel => SidePanelMode::MemoryPanel,
-                            SidePanelMode::MemoryPanel => SidePanelMode::AgentChat,
-                        };
+                        app.side_panel = app.side_panel.next_in_header_cycle();
+                        if app.side_panel == SidePanelMode::HistoryPanel {
+                            app.refresh_history_panel();
+                        }
                         return;
                     }
                     app.focus = Focus::SidePanel;
@@ -732,7 +731,6 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             if let Some(area) = app.layout.side_panel_area {
                 if area.contains((col, row).into()) {
                     app.focus = Focus::SidePanel;
-
 
                     if app.side_panel == SidePanelMode::AgentChat && row == area.y {
                         let tab_area_x = area.x + 1;
@@ -1240,10 +1238,15 @@ fn scroll_editor_group(app: &mut App, up: bool) {
     scroll_editor_content(app, up);
 }
 
-/// One wheel step (3 lines) on the side panel. Every side mode scrolls its
-/// own primary list.
+/// One wheel step (3 lines) on the side panel. The HISTORY panel scrolls its
+/// focused section; every other side mode scrolls the chat transcript.
 fn scroll_side_panel(app: &mut App, up: bool, col: u16, row: u16) {
     match app.side_panel {
+        SidePanelMode::HistoryPanel => {
+            let delta = theme::MOUSE_SCROLL_DELTA as isize;
+            app.history_panel
+                .scroll_section(if up { -delta } else { delta });
+        }
         _ => {
             // Wheel while chat is focused: prefer the overflowing prompt unless
             // the pointer is explicitly over the transcript. Focus-first routing

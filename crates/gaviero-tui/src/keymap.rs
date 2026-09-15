@@ -24,6 +24,8 @@ pub enum Action {
 
     // Side panel modes (Alt+A/H/G/M)
     SetSideModeChat,
+    /// Per-turn history panel.
+    SetSideModeHistory,
     SetSideModeGit,
     /// Tier A / A4: memory inspection panel.
     SetSideModeMemory,
@@ -166,6 +168,7 @@ impl Keymap {
 
             // ── Side panel modes: Alt+letter ─────────────────────
             KeyCode::Char('a') if alt => Action::SetSideModeChat,
+            KeyCode::Char('h') if alt => Action::SetSideModeHistory,
             KeyCode::Char('g') if alt => Action::SetSideModeGit,
             KeyCode::Char('m') if alt => Action::SetSideModeMemory,
             // Alt+Y: toggle auto-approve permissions for next prompt
@@ -378,6 +381,19 @@ mod tests {
         assert_eq!(
             Keymap::resolve(&key(KeyCode::Char('a'), KeyModifiers::ALT)),
             Action::SetSideModeChat
+        );
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::Char('h'), KeyModifiers::ALT)),
+            Action::SetSideModeHistory
+        );
+        // Ctrl+H stays word-delete; the swarm tab's Alt+W is unbound.
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::Char('h'), KeyModifiers::CONTROL)),
+            Action::DeleteWordBack
+        );
+        assert_eq!(
+            Keymap::resolve(&key(KeyCode::Char('w'), KeyModifiers::ALT)),
+            Action::None
         );
     }
 
