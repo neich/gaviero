@@ -3273,21 +3273,7 @@ impl AgentChatState {
         {
             return;
         }
-        let query_lower = self.autocomplete.query.to_lowercase();
-        self.autocomplete.matches = all_files
-            .iter()
-            .filter(|f| {
-                let f_lower = f.to_lowercase();
-                if query_lower.is_empty() {
-                    true // Show all when just '@'
-                } else {
-                    // Match anywhere in the path, or fuzzy on filename
-                    f_lower.contains(&query_lower)
-                }
-            })
-            .take(10) // Limit to 10 suggestions
-            .cloned()
-            .collect();
+        self.autocomplete.matches = match_file_paths(all_files, &self.autocomplete.query, 10);
         if self.autocomplete.selected >= self.autocomplete.matches.len() {
             self.autocomplete.selected = 0;
         }
@@ -5113,6 +5099,19 @@ pub fn skill_autocomplete_insert(
     } else {
         format!("{}()", qualified)
     }
+}
+
+/// `@` completion matches: case-insensitive substring over the whole path,
+/// in listing order; an empty query keeps the first `limit` paths. Shared by
+/// the desktop popup and remote `request_file_completions`.
+pub fn match_file_paths(all_files: &[String], query: &str, limit: usize) -> Vec<String> {
+    let query_lower = query.to_lowercase();
+    all_files
+        .iter()
+        .filter(|f| query_lower.is_empty() || f.to_lowercase().contains(&query_lower))
+        .take(limit)
+        .cloned()
+        .collect()
 }
 
 /// Parse `@path/to/file` references from input text.

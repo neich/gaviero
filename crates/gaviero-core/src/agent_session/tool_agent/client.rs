@@ -170,21 +170,16 @@ impl ToolCallAccumulator {
         }
     }
 
-    /// Drain the accumulated calls, parsing each arguments string into JSON.
-    /// Empty arguments parse to `{}`; a parse failure yields an `Err(message)`
-    /// so the caller can surface it as an [`ApiEvent::Error`]. Draining leaves
-    /// the accumulator empty so a second flush is a harmless no-op.
+    /// Drain the accumulated calls, parsing each arguments string into JSON via
+    /// [`parse_tool_arguments`]. Empty arguments parse to `{}`; a genuine parse
+    /// failure yields an `Err(message)` so the caller can surface it as an
+    /// [`ApiEvent::Error`]. Draining leaves the accumulator empty so a second
+    /// flush is a harmless no-op.
     fn drain(&mut self) -> Vec<std::result::Result<ToolCall, String>> {
         std::mem::take(&mut self.calls)
             .into_values()
             .map(|p| {
-                let args = if p.args.trim().is_empty() {
-                    Value::Object(Default::default())
-                } else {
-                    serde_json::from_str(&p.args).map_err(|e| {
-                        format!("tool '{}' has malformed arguments JSON: {e}", p.name)
-                    })?
-                };
+                let args = parse_tool_arguments(&p.name, &p.args)?;
                 Ok(ToolCall {
                     id: p.id,
                     name: p.name,
@@ -193,6 +188,83 @@ impl ToolCallAccumulator {
             })
             .collect()
     }
+}
+
+/// Parse a tool call's `arguments` string into JSON, tolerating the sloppy
+/// serialization OpenAI-compatible models routinely emit.
+///
+/// `serde_json` is strict about RFC 8259: a raw control character (0x00–0x1F)
+/// inside a string literal is a hard error. But models emit multi-line tool
+/// arguments — most often `MultiEdit` with literal newlines (and tab-indented
+/// Rust) in `old_string`/`new_string` — with the control characters *unescaped*,
+/// which failed the entire turn with "malformed arguments JSON". On a strict
+/// parse failure we retry once with in-string control characters escaped in
+/// place; the decoded string is byte-identical to what the model meant.
+///
+/// Returns `Err(message)` only when the arguments are unparseable even after
+/// that repair, so real model mistakes still surface as [`ApiEvent::Error`].
+fn parse_tool_arguments(name: &str, raw: &str) -> std::result::Result<Value, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Value::Object(Default::default()));
+    }
+    let strict_err = match serde_json::from_str(trimmed) {
+        Ok(value) => return Ok(value),
+        Err(e) => e,
+    };
+    let repaired = escape_control_chars_in_strings(trimmed);
+    if repaired != trimmed
+        && let Ok(value) = serde_json::from_str(&repaired)
+    {
+        return Ok(value);
+    }
+    Err(format!("tool '{name}' has malformed arguments JSON: {strict_err}"))
+}
+
+/// Escape raw control characters that sit *inside* JSON string literals.
+///
+/// Text outside a string is copied verbatim (there a newline or tab is legal
+/// JSON whitespace, and anything else is a different failure that escaping
+/// cannot fix). Already-escaped sequences such as `\n` or `\"` are preserved,
+/// so a correctly serialized payload is returned unchanged.
+fn escape_control_chars_in_strings(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 16);
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if !in_string {
+            if ch == '"' {
+                in_string = true;
+            }
+            out.push(ch);
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            out.push(ch);
+            continue;
+        }
+        match ch {
+            '\\' => {
+                escaped = true;
+                out.push(ch);
+            }
+            '"' => {
+                in_string = false;
+                out.push(ch);
+            }
+            c if (c as u32) < 0x20 => match c {
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\u{08}' => out.push_str("\\b"),
+                '\u{0c}' => out.push_str("\\f"),
+                other => out.push_str(&format!("\\u{:04x}", other as u32)),
+            },
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 async fn flush_tool_calls(acc: &mut ToolCallAccumulator, tx: &mpsc::Sender<Result<ApiEvent>>) {
@@ -437,6 +509,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tolerates_raw_newlines_in_multiedit_arguments() {
+        // Sloppy serialization seen in the wild: `arguments` carries *literal*
+        // newlines inside `new_string` (raw 0x0A, not the escaped `\\n`),
+        // which strict `serde_json` rejects. Before the repair fallback this
+        // killed the whole turn with "tool 'MultiEdit' has malformed arguments
+        // JSON: control character (\u0000-\u001F) found while parsing a string".
+        let body = [
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_me","type":"function","function":{"name":"MultiEdit","arguments":"{\"file_path\":\"src/x.rs\",\"edits\":[{\"old_string\":\"a\",\"new_string\":\"line1\nline2\"}]}"}}]},"finish_reason":null}]}"#,
+            "",
+            r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "",
+            "data: [DONE]",
+        ]
+        .join("\n");
+
+        let events = run_sse(body).await;
+        assert!(
+            !events.iter().any(|e| matches!(e, ApiEvent::Error(_))),
+            "raw newlines in arguments must be repaired, got {events:?}"
+        );
+        let call = events
+            .iter()
+            .find_map(|e| match e {
+                ApiEvent::ToolCall(c) => Some(c),
+                _ => None,
+            })
+            .expect("expected a repaired MultiEdit tool call");
+        assert_eq!(call.id, "call_me");
+        assert_eq!(call.name, "MultiEdit");
+        assert_eq!(call.args["file_path"], "src/x.rs");
+        // The decoded string is exactly what the model meant: one real newline.
+        assert_eq!(call.args["edits"][0]["new_string"], "line1\nline2");
+    }
+
+    #[tokio::test]
     async fn malformed_tool_arguments_emit_error() {
         let body = [
             r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c","type":"function","function":{"name":"Read","arguments":"{not json"}}]},"finish_reason":null}]}"#,
@@ -454,6 +561,43 @@ mod tests {
                 .any(|e| matches!(e, ApiEvent::Error(m) if m.contains("malformed arguments"))),
             "expected a malformed-arguments error, got {events:?}"
         );
+    }
+
+    #[test]
+    fn empty_arguments_parse_to_empty_object() {
+        assert_eq!(parse_tool_arguments("Read", "").unwrap(), json!({}));
+        assert_eq!(parse_tool_arguments("Read", "  \n").unwrap(), json!({}));
+    }
+
+    #[test]
+    fn unrepairable_arguments_still_error() {
+        let err = parse_tool_arguments("Read", "{not json").unwrap_err();
+        assert!(err.contains("malformed arguments"), "{err}");
+        // A raw newline cannot rescue text that is not a JSON document.
+        assert!(parse_tool_arguments("Read", "{no\tjson\n").is_err());
+    }
+
+    #[test]
+    fn clean_arguments_pass_through_untouched() {
+        let raw = r#"{"file_path":"src/x.rs","edits":[{"old_string":"a\nb","new_string":"c"}]}"#;
+        assert_eq!(escape_control_chars_in_strings(raw), raw);
+        assert_eq!(
+            parse_tool_arguments("MultiEdit", raw).unwrap()["edits"][0]["old_string"],
+            "a\nb"
+        );
+    }
+
+    #[test]
+    fn escapes_control_chars_inside_strings_only() {
+        // Raw tab/newline inside a string get escaped; JSON whitespace *outside*
+        // strings is left alone; a pre-escaped `\\n` is not double-escaped.
+        let raw = "{\"a\": \"x\ty\",\n \"b\": \"p\nq\", \"c\": \"keep\\nthis\"}";
+        let repaired = escape_control_chars_in_strings(raw);
+        assert!(repaired.contains("\\t") && repaired.contains("\\n"));
+        let value: Value = serde_json::from_str(&repaired).expect("repaired parses");
+        assert_eq!(value["a"], "x\ty");
+        assert_eq!(value["b"], "p\nq");
+        assert_eq!(value["c"], "keep\nthis");
     }
 
     #[tokio::test]

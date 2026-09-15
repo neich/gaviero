@@ -1718,6 +1718,19 @@ pub(super) fn refresh_chat_autocomplete(app: &mut App) {
         at_pos <= text.len() && text[..at_pos].trim() == "/run"
     };
 
+    let files: Vec<String> = workspace_completion_files(app)
+        .into_iter()
+        .filter(|f| !is_run_path_context || f.ends_with(".gaviero"))
+        .collect();
+
+    app.chat_state.update_autocomplete_matches(&files);
+}
+
+/// Every workspace file `@` completion offers, in the form
+/// [`dispatch_prompt_core`] resolves: root-relative, prefixed with the
+/// folder label in multi-root workspaces. Honors `files.exclude`; capped
+/// at 10 000 paths split across roots.
+pub(crate) fn workspace_completion_files(app: &App) -> Vec<String> {
     let folders = app.workspace.folders();
     let roots: Vec<(String, std::path::PathBuf)> = if folders.is_empty() {
         vec![(String::new(), std::path::PathBuf::from("."))]
@@ -1747,13 +1760,7 @@ pub(super) fn refresh_chat_autocomplete(app: &mut App) {
             }
         }
     }
-
-    let files: Vec<String> = files
-        .into_iter()
-        .filter(|f| !is_run_path_context || f.ends_with(".gaviero"))
-        .collect();
-
-    app.chat_state.update_autocomplete_matches(&files);
+    files
 }
 
 /// List up to 50 directory entries matching the user's typed prefix.
