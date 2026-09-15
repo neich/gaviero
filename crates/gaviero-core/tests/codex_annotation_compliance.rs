@@ -145,6 +145,7 @@ async fn codex_emits_parseable_turn_annotations_sidecar() {
         options: AgentOptions::default(),
         profile,
         cancel_token: tokio_util::sync::CancellationToken::new(),
+        mcp_server: None,
     });
 
     // The system prompt already teaches the <turn_annotations> convention

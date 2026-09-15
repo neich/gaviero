@@ -117,6 +117,7 @@ fn construction(
         },
         profile,
         cancel_token: CancellationToken::new(),
+        mcp_server: None,
     }
 }
 

@@ -144,6 +144,7 @@ async fn cursor_emits_parseable_turn_annotations_sidecar() {
         options: AgentOptions::default(),
         profile,
         cancel_token: tokio_util::sync::CancellationToken::new(),
+        mcp_server: None,
     });
 
     let turn = build_turn(

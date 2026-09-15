@@ -31,9 +31,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use rmcp::ServiceExt;
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::model::{CallToolRequestParams, ListToolsResult};
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
@@ -165,14 +165,18 @@ fn strip_schema_descriptions(schema: &mut serde_json::Value) {
         for (key, value) in object {
             if matches!(key.as_str(), "properties" | "$defs" | "definitions") {
                 if let Some(properties) = value.as_object_mut() {
-                    for property in properties.values_mut() { strip_schema_descriptions(property); }
+                    for property in properties.values_mut() {
+                        strip_schema_descriptions(property);
+                    }
                 }
             } else {
                 strip_schema_descriptions(value);
             }
         }
     } else if let Some(array) = schema.as_array_mut() {
-        for value in array { strip_schema_descriptions(value); }
+        for value in array {
+            strip_schema_descriptions(value);
+        }
     }
 }
 
@@ -331,7 +335,8 @@ impl GavieroMcpServer {
                 if let Some(output) = &tool.output_schema {
                     let mut schema = serde_json::Value::Object((**output).clone());
                     strip_schema_descriptions(&mut schema);
-                    tool.output_schema = Some(Arc::new(schema.as_object().expect("schema object").clone()));
+                    tool.output_schema =
+                        Some(Arc::new(schema.as_object().expect("schema object").clone()));
                 }
                 tool
             })
@@ -558,6 +563,15 @@ impl GavieroMcpServer {
         &self,
         Parameters(input): Parameters<MemorySearchInput>,
     ) -> Result<Json<MemorySearchOutput>, ErrorData> {
+        self.memory_search_impl(input).await
+    }
+
+    /// In-process core of [`Self::memory_search`]. See
+    /// [`Self::call_tool_in_process`] for why the `#[tool]` wrapper is split off.
+    async fn memory_search_impl(
+        &self,
+        input: MemorySearchInput,
+    ) -> Result<Json<MemorySearchOutput>, ErrorData> {
         let started = Instant::now();
         self.ensure_tool_allowed("memory_search")?;
         let limit = clamp_memory_search_limit(input.limit);
@@ -722,6 +736,14 @@ impl GavieroMcpServer {
         &self,
         Parameters(input): Parameters<BlastRadiusInput>,
     ) -> Result<Json<BlastRadiusOutput>, ErrorData> {
+        self.blast_radius_impl(input).await
+    }
+
+    /// In-process core of [`Self::blast_radius`].
+    async fn blast_radius_impl(
+        &self,
+        input: BlastRadiusInput,
+    ) -> Result<Json<BlastRadiusOutput>, ErrorData> {
         let started = Instant::now();
         self.ensure_tool_allowed("blast_radius")?;
         if input.paths.is_empty() {
@@ -853,6 +875,11 @@ impl GavieroMcpServer {
         &self,
         Parameters(input): Parameters<NodeDocInput>,
     ) -> Result<Json<NodeDoc>, ErrorData> {
+        self.node_doc_impl(input).await
+    }
+
+    /// In-process core of [`Self::node_doc`].
+    async fn node_doc_impl(&self, input: NodeDocInput) -> Result<Json<NodeDoc>, ErrorData> {
         let started = Instant::now();
         self.ensure_tool_allowed("node_doc")?;
         let path = input.path.clone();
@@ -931,6 +958,14 @@ impl GavieroMcpServer {
         &self,
         Parameters(input): Parameters<MemoryGetInput>,
     ) -> Result<Json<MemoryGetOutput>, ErrorData> {
+        self.memory_get_impl(input).await
+    }
+
+    /// In-process core of [`Self::memory_get`].
+    async fn memory_get_impl(
+        &self,
+        input: MemoryGetInput,
+    ) -> Result<Json<MemoryGetOutput>, ErrorData> {
         let started = Instant::now();
         self.ensure_tool_allowed("memory_get")?;
         // `scope` names the owning *store* (ids are only unique per
@@ -1001,6 +1036,14 @@ impl GavieroMcpServer {
         &self,
         Parameters(input): Parameters<MemoryPingInput>,
     ) -> Result<Json<MemoryPingOutput>, ErrorData> {
+        self.memory_ping_impl(input).await
+    }
+
+    /// In-process core of [`Self::memory_ping`].
+    async fn memory_ping_impl(
+        &self,
+        input: MemoryPingInput,
+    ) -> Result<Json<MemoryPingOutput>, ErrorData> {
         let started = Instant::now();
         self.ensure_tool_allowed("memory_ping")?;
         let receipt = ping_receipt(&input.nonce, input.depth, self.started_at);
@@ -1041,6 +1084,14 @@ impl GavieroMcpServer {
     async fn memory_flag(
         &self,
         Parameters(input): Parameters<MemoryFlagInput>,
+    ) -> Result<Json<MemoryFlagOutput>, ErrorData> {
+        self.memory_flag_impl(input).await
+    }
+
+    /// In-process core of [`Self::memory_flag`].
+    async fn memory_flag_impl(
+        &self,
+        input: MemoryFlagInput,
     ) -> Result<Json<MemoryFlagOutput>, ErrorData> {
         let started = Instant::now();
         self.ensure_tool_allowed("memory_flag")?;
@@ -1147,6 +1198,14 @@ impl GavieroMcpServer {
         &self,
         Parameters(input): Parameters<RepoOutlineInput>,
     ) -> Result<Json<RepoOutlineOutput>, ErrorData> {
+        self.repo_outline_impl(input).await
+    }
+
+    /// In-process core of [`Self::repo_outline`].
+    async fn repo_outline_impl(
+        &self,
+        input: RepoOutlineInput,
+    ) -> Result<Json<RepoOutlineOutput>, ErrorData> {
         let started = Instant::now();
         self.ensure_tool_allowed("repo_outline")?;
         let budget = clamp_repo_outline_token_cap(input.token_cap) as usize;
@@ -1207,6 +1266,14 @@ impl GavieroMcpServer {
     async fn symbol_search(
         &self,
         Parameters(input): Parameters<SymbolSearchInput>,
+    ) -> Result<Json<SymbolSearchOutput>, ErrorData> {
+        self.symbol_search_impl(input).await
+    }
+
+    /// In-process core of [`Self::symbol_search`].
+    async fn symbol_search_impl(
+        &self,
+        input: SymbolSearchInput,
     ) -> Result<Json<SymbolSearchOutput>, ErrorData> {
         let started = Instant::now();
         self.ensure_tool_allowed("symbol_search")?;
@@ -1289,6 +1356,14 @@ impl GavieroMcpServer {
         &self,
         Parameters(input): Parameters<SymbolDocInput>,
     ) -> Result<Json<SymbolDocOutput>, ErrorData> {
+        self.symbol_doc_impl(input).await
+    }
+
+    /// In-process core of [`Self::symbol_doc`].
+    async fn symbol_doc_impl(
+        &self,
+        input: SymbolDocInput,
+    ) -> Result<Json<SymbolDocOutput>, ErrorData> {
         let started = Instant::now();
         self.ensure_tool_allowed("symbol_doc")?;
         if !self.symbol_enrichment_enabled {
@@ -1353,6 +1428,86 @@ impl GavieroMcpServer {
         );
         Ok(Json(out))
     }
+
+    // ── in-process (non-MCP) dispatch ───────────────────────────────
+
+    /// Names + schemas of every tool this server currently advertises.
+    ///
+    /// Same gates as `tools/list` (`mcp.permissions`, `exposedTools`, symbol
+    /// enrichment), so an embedding app that runs its own loop sees exactly the
+    /// tool surface an MCP client would — including *not* being pointed at
+    /// `symbol_search`/`symbol_doc` while the enrichment sidecar is absent.
+    pub fn in_process_tool_specs(&self) -> Vec<InProcessToolSpec> {
+        self.listed_tools()
+            .into_iter()
+            .map(|t| InProcessToolSpec {
+                name: t.name.to_string(),
+                description: t.description.map(|d| d.to_string()).unwrap_or_default(),
+                input_schema: serde_json::Value::Object((*t.input_schema).clone()),
+            })
+            .collect()
+    }
+
+    /// Invoke one of this server's tools **without an MCP session**.
+    ///
+    /// rmcp's `#[tool]` handlers take a [`ToolCallContext`], whose only
+    /// constructor requires a live `RequestContext<RoleServer>` — unreachable
+    /// for an app that owns the server in-process instead of speaking JSON-RPC
+    /// to it. Each handler is therefore a thin wrapper over a `*_impl` core
+    /// taking the deserialized input directly, which is precisely the
+    /// extraction rmcp's `Parameters<P>` performs (`#[serde(transparent)]` over
+    /// `from_value`).
+    ///
+    /// Gating is unchanged: [`Self::ensure_tool_allowed`] runs here *and* at the
+    /// top of every core, so a tool hidden by `mcp.permissions`,
+    /// `mcp.gavieroServer.exposedTools`, or the symbol-enrichment flag is
+    /// rejected identically over MCP and in-process.
+    ///
+    /// Errors are flattened to `String` through `ErrorData`'s `Display` so
+    /// callers outside this module need no rmcp types.
+    pub async fn call_tool_in_process(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.ensure_tool_allowed(name).map_err(|e| e.to_string())?;
+        // Arity + remapping are identical for all nine tools, so the mapping
+        // table below is the only per-tool code. `tools_are_dispatchable_...`
+        // pins this table against `in_process_tool_specs()`.
+        macro_rules! call {
+            ($tool:literal, $input:ty, $core:ident) => {{
+                let input: $input = serde_json::from_value(args)
+                    .map_err(|e| format!("invalid arguments for {}: {e}", $tool))?;
+                let Json(out) = self.$core(input).await.map_err(|e| e.to_string())?;
+                serde_json::to_value(out)
+                    .map_err(|e| format!("{}: serializing output failed: {e}", $tool))
+            }};
+        }
+        match name {
+            "memory_search" => call!("memory_search", MemorySearchInput, memory_search_impl),
+            "blast_radius" => call!("blast_radius", BlastRadiusInput, blast_radius_impl),
+            "node_doc" => call!("node_doc", NodeDocInput, node_doc_impl),
+            "memory_get" => call!("memory_get", MemoryGetInput, memory_get_impl),
+            "memory_ping" => call!("memory_ping", MemoryPingInput, memory_ping_impl),
+            "memory_flag" => call!("memory_flag", MemoryFlagInput, memory_flag_impl),
+            "repo_outline" => call!("repo_outline", RepoOutlineInput, repo_outline_impl),
+            "symbol_search" => call!("symbol_search", SymbolSearchInput, symbol_search_impl),
+            "symbol_doc" => call!("symbol_doc", SymbolDocInput, symbol_doc_impl),
+            other => Err(format!(
+                "unknown tool {other:?}: not handled by in-process dispatch"
+            )),
+        }
+    }
+}
+
+/// One advertised tool, flattened for callers that drive the server in-process
+/// instead of over MCP (see [`GavieroMcpServer::call_tool_in_process`]).
+#[derive(Clone, Debug)]
+pub struct InProcessToolSpec {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema for the tool's arguments (the MCP `inputSchema`).
+    pub input_schema: serde_json::Value,
 }
 
 #[tool_handler]
@@ -2745,9 +2900,109 @@ mod tests {
         let s = fixture().with_symbol_enrichment(true);
         let names = s.listed_tool_names();
         for tool in super::super::tools::ALL_MCP_TOOLS {
-            assert!(names.iter().any(|n| n == tool), "missing {tool} in {names:?}");
+            assert!(
+                names.iter().any(|n| n == tool),
+                "missing {tool} in {names:?}"
+            );
         }
         assert_eq!(names.len(), 9);
+    }
+
+    // ── in-process dispatch (Route A: the API-provider tool path) ──────
+
+    /// Every advertised tool must be reachable through
+    /// [`GavieroMcpServer::call_tool_in_process`].
+    ///
+    /// The dispatch is a hand-written `match` (rmcp's `ToolCallContext` cannot
+    /// be built without a live session), so a tool added to the router but
+    /// forgotten here would be advertised to the model and then fail as
+    /// "unknown tool" at call time. This pins the two lists together.
+    #[tokio::test]
+    async fn every_advertised_tool_is_dispatchable_in_process() {
+        let s = fixture().with_symbol_enrichment(true);
+        let specs = s.in_process_tool_specs();
+        assert_eq!(specs.len(), 9, "expected the full advertised surface");
+
+        for spec in specs {
+            // Empty args are not universally invalid (`repo_outline`'s inputs are
+            // all optional), so `Ok` is a pass — it proves routing reached the
+            // core. Only the dispatch-table miss is a failure.
+            match s
+                .call_tool_in_process(&spec.name, serde_json::json!({}))
+                .await
+            {
+                Ok(_) => {}
+                Err(err) => assert!(
+                    !err.contains("not handled by in-process dispatch"),
+                    "{} is advertised but missing from the dispatch table: {err}",
+                    spec.name
+                ),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn in_process_specs_agree_with_listed_names() {
+        let s = fixture().with_symbol_enrichment(true);
+        let names: Vec<String> = s.listed_tool_names();
+        let spec_names: Vec<String> = s
+            .in_process_tool_specs()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(names, spec_names);
+    }
+
+    /// The exposure gate must bind the in-process path too, or an API provider
+    /// would reach a tool an MCP client is denied.
+    #[tokio::test]
+    async fn in_process_call_honours_the_exposure_gate() {
+        let s = fixture().with_exposed_tools(vec!["memory_search".into()]);
+        s.call_tool_in_process("memory_search", serde_json::json!({}))
+            .await
+            .expect_err("empty args still fail, but must fail past the gate");
+        let err = s
+            .call_tool_in_process("blast_radius", serde_json::json!({"paths": ["src/lib.rs"]}))
+            .await
+            .expect_err("blast_radius is excluded from the exposed set");
+        assert!(err.contains("disabled"), "unexpected error: {err}");
+    }
+
+    /// Symbol tools require the enrichment sidecar. While it is off they must
+    /// be absent from the specs the in-process loop builds its tool list from —
+    /// otherwise the model is handed a tool that always errors.
+    #[tokio::test]
+    async fn in_process_specs_omit_symbol_tools_without_enrichment() {
+        let s = fixture();
+        let names: Vec<String> = s
+            .in_process_tool_specs()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(!names.iter().any(|n| n == "symbol_search"), "{names:?}");
+        assert!(!names.iter().any(|n| n == "symbol_doc"), "{names:?}");
+        let err = s
+            .call_tool_in_process("symbol_search", serde_json::json!({"query": "x"}))
+            .await
+            .expect_err("enrichment is off");
+        assert!(err.contains("disabled"), "unexpected error: {err}");
+    }
+
+    /// A name the server does not advertise must not resolve silently. With no
+    /// `exposedTools` allow-list the *gate* deliberately passes any name (it
+    /// cannot know the router's contents), so the dispatch table itself is the
+    /// backstop that rejects it.
+    #[tokio::test]
+    async fn in_process_call_rejects_an_unadvertised_name() {
+        let s = fixture();
+        let err = s
+            .call_tool_in_process("definitely_not_a_tool", serde_json::json!({}))
+            .await
+            .expect_err("unknown tool");
+        assert!(
+            err.contains("not handled by in-process dispatch"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

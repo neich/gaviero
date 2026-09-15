@@ -2751,6 +2751,9 @@ pub(crate) fn dispatch_prompt_core(
                 options,
                 profile: provider_profile_clone,
                 cancel_token: session_cancel,
+                // Threaded in a follow-up commit; `None` keeps the in-process
+                // providers on their pre-existing fs-only tool surface.
+                mcp_server: None,
             },
         );
         // Outer select! is the safety net for transports that don't yet

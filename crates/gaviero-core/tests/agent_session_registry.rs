@@ -59,6 +59,7 @@ fn construction_for(model_spec: &str) -> SessionConstruction {
         options: AgentOptions::default(),
         profile,
         cancel_token: tokio_util::sync::CancellationToken::new(),
+        mcp_server: None,
     }
 }
 
