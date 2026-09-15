@@ -205,10 +205,24 @@ pub fn http_mcp_server(root: &Path) -> Option<serde_json::Value> {
     }))
 }
 
+/// MCP servers to hand dsh on `session/new`.
+///
+/// **Declared transport limit (provider-parity decision 1).** Live
+/// `dsh --profile acp` (0.1.5-rc.1, 2026-09-14) advertises
+/// `mcpCapabilities.http` only. A stdio shim entry is therefore omitted so
+/// `session/new` is not rejected for an unadvertised transport. Consequences,
+/// recorded rather than implied:
+///
+/// - gaviero's own MCP is reachable **only** when a live HTTP endpoint exists
+///   (`http_mcp_server`), which is why `.gaviero/mcp-url` + token gate it.
+/// - context7 and `extraServers` are not injected here yet; both need the same
+///   HTTP transport (provider-parity Phase 2).
+///
+/// Separately: dsh's `session/new` carries **no tool list and no permission
+/// policy** (`agent_client_protocol/mod.rs`), so `agent.availableTools` is
+/// *structurally unenforced* for dsh. That is recorded as
+/// `ToolEnforcement::Unenforced` in the capability table, not attempted here.
 pub fn mcp_servers_for_session(root: &Path) -> Vec<serde_json::Value> {
-    // Live `dsh --profile acp` (0.1.5-rc.1, 2026-09-14) advertises
-    // `mcpCapabilities.http` only. A stdio shim entry is omitted so
-    // session/new is not rejected for an unadvertised transport.
     match http_mcp_server(root) {
         Some(http) => vec![http],
         None => Vec::new(),
