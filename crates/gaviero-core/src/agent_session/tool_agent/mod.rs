@@ -149,10 +149,20 @@ impl ToolAgentSession {
             ..
         } = args;
         let config = resolve_api_config(&workspace_root);
-        let mut tools = match &options.available_tools {
-            Some(names) if !names.is_empty() => ToolRegistry::from_names(names),
-            _ => ToolRegistry::full_chat(),
-        };
+        // Registry membership is *derived* from the tool surface rather than
+        // answering "is Bash available?" a second time (Phase 3). Two
+        // behaviour notes, both deliberate:
+        //
+        // * an unpopulated `availableTools` now yields the documented default
+        //   (no `Bash`) instead of `full_chat()`;
+        // * an explicit `"availableTools": []` yields an empty registry — it
+        //   previously fell through to `full_chat()`, handing the most
+        //   permissive tool set to the most restrictive setting.
+        let surface = super::tool_surface::AgentToolSurface::from_agent_options(
+            &options,
+            &workspace_root,
+        );
+        let mut tools = ToolRegistry::from_names(surface.available());
         // Gaviero's MCP retrieval tools, adapted to the in-process loop. Appended
         // after the fs/exec tools so those keep a stable position in the `tools`
         // array (prompt-cache friendliness). `extend_mcp` returns exactly the
@@ -162,12 +172,62 @@ impl ToolAgentSession {
             Some(server) => tools.extend_mcp(server, options.available_tools.as_deref()),
             None => Vec::new(),
         };
-        // Host-resolved shell policy (workspace cascade). The path-based
-        // fallback only serves callers that never populated the option.
-        let policy = options
-            .tool_policy
-            .clone()
-            .unwrap_or_else(|| ToolPolicy::resolve(&workspace_root));
+        // context7 for the in-process loop (Phase 2d). A *native* tool over
+        // context7's REST API rather than an MCP client — `tools/context7.rs`
+        // explains why that leg needs no new dependency.
+        //
+        // The gate is deliberately identical to dsh's `session/new` entry: the
+        // provider's table row (`context7_allowed`), the workspace's
+        // `mcp.context7.enabled`, *and* `mcp.permissions`. Deriving all three
+        // from the same sources is what makes "the same MCPs" a property rather
+        // than three parallel implementations that can drift.
+        //
+        // Names are appended to `tools` but *not* to `retrieval_tools`: the pull
+        // stanza describes gaviero's own memory/kb tools, and context7 is
+        // external documentation. Its tools are discoverable through their own
+        // schema descriptions, as they are for every other provider.
+        let mut context7_tools = Vec::new();
+        if profile.mcp_capabilities().context7 {
+            let workspace = crate::workspace::Workspace::single_folder(workspace_root.clone());
+            let ctx7 = crate::mcp::resolve_context7_config(&workspace, Some(&workspace_root));
+            let permissions =
+                crate::mcp::resolve_mcp_permissions(&workspace, Some(&workspace_root));
+            if ctx7.enabled && permissions.server_allowed("context7") {
+                context7_tools = tools.extend_context7(ctx7.rest_base());
+            }
+        }
+        if !context7_tools.is_empty() {
+            tracing::debug!(
+                tools = ?context7_tools,
+                "in-process session holds context7 native tools"
+            );
+        }
+        // `AskUserQuestion` for the in-process loop (Phase 4). Registered off
+        // the provider's *prompt channel*, not off `agent.availableTools`: the
+        // name is not a member of that list for any provider, it is what a
+        // provider gains by having a multi-choice channel. Mirrors Claude's
+        // `ensure_ask_user_question` injection (`acp/session.rs`), and keeps the
+        // table the single answer to "can this provider ask a question?".
+        //
+        // The tool's answer channel is the observer, which the loop always
+        // passes (`send_turn` builds `ctx.observer` from `self.observer`); a
+        // session constructed without one reports that as a tool error rather
+        // than silently succeeding with no answer.
+        let mut ask_tools = Vec::new();
+        if profile.prompt_kind.has_multi_choice() {
+            ask_tools = tools.extend_ask();
+        }
+        if !ask_tools.is_empty() {
+            tracing::debug!(
+                tools = ?ask_tools,
+                "in-process session holds the ask tool"
+            );
+        }
+        // Host-resolved shell policy (workspace cascade). Read back off the
+        // surface rather than re-resolving: `from_agent_options` already
+        // applied the host's policy, and a second resolution is how the two
+        // views drift apart.
+        let policy = surface.policy().clone();
         Self {
             client: Box::new(DeepseekClient::new(config)),
             observer: Arc::from(observer),

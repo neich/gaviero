@@ -278,6 +278,10 @@ pub mod settings {
     pub const MCP_CONTEXT7_URL: &str = "mcp.context7.url";
     pub const MCP_CONTEXT7_COMMAND: &str = "mcp.context7.command";
     pub const MCP_CONTEXT7_ARGS: &str = "mcp.context7.args";
+    /// REST API base for the in-process native context7 tools. Read only by
+    /// `deepseek:`/`ollama:`; ignored by the MCP-serving providers, which use
+    /// `mcp.context7.url`.
+    pub const MCP_CONTEXT7_REST_URL: &str = "mcp.context7.restUrl";
 
     /// Extra MCP servers merged into every swarm worktree (Claude/Cursor
     /// `.mcp.json`, Codex `config.toml`). JSON array of objects, each with
@@ -1464,6 +1468,9 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         }
         settings::MCP_CONTEXT7_COMMAND => serde_json::json!("npx"),
         settings::MCP_CONTEXT7_ARGS => serde_json::json!(["-y", "@upstash/context7-mcp"]),
+        settings::MCP_CONTEXT7_REST_URL => {
+            serde_json::json!(crate::mcp::config_synth::CONTEXT7_REST_BASE)
+        }
         settings::MCP_EXTRA_SERVERS => serde_json::json!([]),
         // MCP permission policy: empty allow/deny = allow everything (the
         // historical default before the gaviero-level policy existed).

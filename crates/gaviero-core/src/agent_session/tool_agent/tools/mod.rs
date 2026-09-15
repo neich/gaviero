@@ -7,7 +7,9 @@
 //! [`crate::agent_session::tool_agent::policy::ToolPolicy`]; PR-7: the gaviero
 //! MCP retrieval tools via [`mcp`].
 
+pub mod ask;
 pub mod bash;
+pub mod context7;
 pub mod glob;
 pub mod grep;
 pub mod mcp;
@@ -190,6 +192,35 @@ impl ToolRegistry {
                 .push(Box::new(mcp::McpTool::new(Arc::clone(server), spec)));
         }
         added
+    }
+
+    /// Append the context7 documentation tools, returning the names added.
+    ///
+    /// context7 is a *foreign* server, so unlike [`Self::extend_mcp`] there is no
+    /// in-tree `GavieroMcpServer` to advertise it — the native tools in
+    /// [`context7`] speak its REST API directly. Visibility is decided by the
+    /// caller (provider row + `mcp.context7.enabled` + `mcp.permissions`), and
+    /// this method is only reached when all three allow it.
+    pub fn extend_context7(&mut self, base_url: &str) -> Vec<String> {
+        for tool in context7::tools(base_url) {
+            self.tools.push(tool);
+        }
+        context7::tool_names()
+    }
+
+    /// Append the `AskUserQuestion` tool, returning the names added.
+    ///
+    /// Mirrors Claude's `ensure_ask_user_question` injection rather than
+    /// [`Self::from_names`]: the name is not a member of
+    /// `agent.availableTools`, it is what a provider *gains* by having a
+    /// multi-choice prompt channel. The caller gates on
+    /// [`PromptKind::MultiChoice`](crate::context_planner::types::PromptKind),
+    /// so a provider whose row declares no such channel never holds the tool —
+    /// registering it off anything else would let the tool outlive the
+    /// capability it depends on.
+    pub fn extend_ask(&mut self) -> Vec<String> {
+        self.tools.push(Box::new(ask::AskQuestionTool));
+        vec![ask::AskQuestionTool.name().to_string()]
     }
 
     pub fn schemas(&self) -> Vec<Value> {

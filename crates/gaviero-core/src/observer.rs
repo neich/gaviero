@@ -42,6 +42,21 @@ impl PermissionDecision {
     pub fn is_allow(&self) -> bool {
         matches!(self, Self::Allow { .. })
     }
+
+    /// The tool input the host wants executed instead of the original.
+    ///
+    /// `None` means "run the original input" *and* "this host modified
+    /// nothing" — the two cases are indistinguishable by design
+    /// ([`PermissionDecision::allow`] sets it to `None`). A caller that
+    /// *requires* an answer rather than a permission (the in-process
+    /// `AskUserQuestion` tool) must therefore treat `None` as a failure to
+    /// answer, not as "use the original input".
+    pub fn updated_input(&self) -> Option<&serde_json::Value> {
+        match self {
+            Self::Allow { updated_input } => updated_input.as_ref(),
+            Self::Deny { .. } => None,
+        }
+    }
 }
 
 /// Observer trait for write gate lifecycle events.
