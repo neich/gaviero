@@ -52,8 +52,8 @@ println!("{}", plan.to_gaviero_script()?);
 | Codex | `codex:gpt-6-astra`, `codex:gpt-5.6-sol`, `codex:gpt-5.6-terra`, `codex:gpt-5.6-luna` | Subprocess (exec / app-server); `gpt-6-astra` needs Codex CLI ≥ 0.153 |
 | Cursor | `cursor:composer-2.5`, `cursor:cursor-grok-4.6-high` | Subprocess (Cursor CLI); ids embed effort — list them with `agent --list-models` |
 | Ollama / local | `ollama:qwen2.5-coder:7b`, `local:model-name` | Local server |
-| DeepSeek | `deepseek:deepseek-v4-pro` | In-process HTTP (`tool_agent`) |
-| DeepSeek (ACP) | `dsh:deepseek-v4-pro` | Subprocess `dsh --profile acp` (Agent Client Protocol) |
+| DeepSeek | `deepseek:deepseek-flash`, `deepseek:deepseek-v4-pro` | In-process HTTP (`tool_agent`) |
+| DeepSeek (ACP) | `dsh:deepseek-flash`, `dsh:deepseek-v4-pro` | Subprocess `dsh --profile acp` (Agent Client Protocol) |
 
 **Observer traits** — implement to receive execution events:
 

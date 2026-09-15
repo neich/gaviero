@@ -135,7 +135,7 @@ Events: `TextDelta | ThinkingDelta | ToolCallStart/Delta/End | FileBlock | Paths
 | `deepseek:<name>` | `DeepseekBackend` → [`tool_agent`](src/agent_session/tool_agent) |
 | `dsh:<name>` | `DshBackend` → [`AcpClientSession`](src/agent_session/agent_client_protocol) |
 
-[`validate_model_spec`](src/swarm/backend/shared.rs) rejects bare names. Prefixes: `SUPPORTED_PROVIDER_PREFIXES` = `claude`, `codex`, `cursor`, `ollama`, `local`, `deepseek`, `dsh`. DeepSeek ids: `DEEPSEEK_API_MODELS` (`deepseek-v4-pro`, `deepseek-v4-flash`) for both `deepseek:` and `dsh:`.
+[`validate_model_spec`](src/swarm/backend/shared.rs) rejects bare names. Prefixes: `SUPPORTED_PROVIDER_PREFIXES` = `claude`, `codex`, `cursor`, `ollama`, `local`, `deepseek`, `dsh`. DeepSeek ids: `DEEPSEEK_API_MODELS` (`deepseek-flash`, `deepseek-v4-pro`, `deepseek-v4-flash`) for both `deepseek:` and `dsh:`.
 
 ### `AgentSession` + `Turn` ([`agent_session/mod.rs`](src/agent_session/mod.rs))
 

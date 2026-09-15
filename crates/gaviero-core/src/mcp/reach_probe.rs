@@ -217,7 +217,7 @@ pub fn provider_model_spec(provider: &str) -> Option<&'static str> {
         "claude" => Some("claude:sonnet"),
         "codex" => Some("codex:gpt-5.5"),
         "cursor" => Some("cursor:auto"),
-        "dsh" => Some("dsh:deepseek-v4-flash"),
+        "dsh" => Some("dsh:deepseek-flash"),
         _ => None,
     }
 }

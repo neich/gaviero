@@ -81,8 +81,9 @@ client grok {
 
 client dsh {
     // DeepSeek via `dsh --profile acp` (npm `@deepseek-ai/dsh`) over the
-    // Agent Client Protocol; needs DEEPSEEK_API_KEY.
-    model "dsh:deepseek-v4-pro"
+    // Agent Client Protocol; needs DEEPSEEK_API_KEY. `deepseek-flash` is
+    // V4.1-Flash (canonical API id).
+    model "dsh:deepseek-flash"
     privacy public
     effort high
 }
