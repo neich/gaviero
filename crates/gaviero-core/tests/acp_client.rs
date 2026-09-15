@@ -95,14 +95,30 @@ fn construction(
     write_obs: Box<dyn WriteGateObserver>,
     auto_approve: bool,
 ) -> SessionConstruction {
+    construction_with_gate(
+        root,
+        observer,
+        Arc::new(TokioMutex::new(WriteGatePipeline::new(
+            WriteMode::AutoAccept,
+            write_obs,
+        ))),
+        auto_approve,
+    )
+}
+
+/// Same as [`construction`] but with the caller's own gate, so a test can pick
+/// the `WriteMode` and inspect what the gate accumulated.
+fn construction_with_gate(
+    root: &Path,
+    observer: Box<dyn AcpObserver>,
+    write_gate: Arc<TokioMutex<WriteGatePipeline>>,
+    auto_approve: bool,
+) -> SessionConstruction {
     let spec = ModelSpec::parse("dsh:deepseek-v4-flash");
     let profile = build_provider_profile(&spec, &RuntimeConfig::default());
     #[allow(deprecated)]
     SessionConstruction {
-        write_gate: Arc::new(TokioMutex::new(WriteGatePipeline::new(
-            WriteMode::AutoAccept,
-            write_obs,
-        ))),
+        write_gate,
         observer,
         model: "dsh:deepseek-v4-flash".into(),
         ollama_base_url: None,
@@ -120,6 +136,31 @@ fn construction(
         mcp_server: None,
     }
 }
+
+/// Commit the whole workspace, so HEAD exists and a clean path's turn-start
+/// content is recoverable from the index.
+fn commit_all(dir: &Path) {
+    let repo = git2::Repository::open(dir).unwrap();
+    let mut index = repo.index().unwrap();
+    index
+        .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+        .unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    let sig = git2::Signature::now("Test", "test@test.com").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+}
+
+fn deferred_gate() -> Arc<TokioMutex<WriteGatePipeline>> {
+    Arc::new(TokioMutex::new(WriteGatePipeline::new(
+        WriteMode::Deferred,
+        Box::new(RecWrite {
+            paths: Arc::new(Mutex::new(Vec::new())),
+        }),
+    )))
+}
+
 
 fn extra(scenario: &str) -> Vec<(String, String)> {
     vec![
@@ -368,11 +409,12 @@ async fn cancel_token_ends_the_turn() {
 #[tokio::test]
 async fn direct_write_outside_fs_channel_emits_paths_modified() {
     let dir = workspace();
+    let rec = Arc::new(Mutex::new(Vec::new()));
     let args = construction(
         dir.path(),
         Box::new(NoopAcp),
         Box::new(RecWrite {
-            paths: Arc::new(Mutex::new(Vec::new())),
+            paths: rec.clone(),
         }),
         true,
     );
@@ -385,6 +427,115 @@ async fn direct_write_outside_fs_channel_emits_paths_modified() {
             .any(|e| matches!(e, UnifiedStreamEvent::PathsModified(p) if !p.is_empty())),
         "{events:?}"
     );
+    // AutoAccept: the reconcile pass restores the path and the gate writes it
+    // straight back, so a headless turn still leaves the agent's file on disk —
+    // but it is now a finalized proposal instead of an invisible write.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("leaked.txt")).unwrap(),
+        "bypassed fs channel\n"
+    );
+    assert!(
+        rec.lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.ends_with("leaked.txt")),
+        "expected a proposal for the direct write, got {:?}",
+        rec.lock().unwrap()
+    );
+}
+
+/// The complaint this pass exists for: `dsh` edits land on disk with nothing to
+/// review. With a Deferred gate (what the TUI chat sets per conversation) each
+/// direct write must come back as a proposal carrying a real diff, and the tree
+/// must be left at its turn-start state until a human accepts.
+#[tokio::test]
+async fn direct_writes_become_deferred_proposals() {
+    let dir = workspace();
+    std::fs::write(dir.path().join("src").join("obsolete.rs"), "fn gone() {}\n").unwrap();
+    commit_all(dir.path());
+    let committed = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+
+    let gate = deferred_gate();
+    let args = construction_with_gate(dir.path(), Box::new(NoopAcp), gate.clone(), true);
+    let mut session = AcpClientSession::new_with_scope(args, FileScope::default())
+        .with_extra(extra("direct_write_multi"));
+    let events = drain(&mut session, true).await;
+
+    // The agent's bytes are off the tree: Deferred means "hold for review".
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap(),
+        committed
+    );
+    assert!(!dir.path().join("new_file.rs").exists());
+    assert!(dir.path().join("src").join("obsolete.rs").is_file());
+
+    let pending = gate.lock().await.pending_proposals().to_vec();
+    let mut names: Vec<String> = pending
+        .iter()
+        .map(|p| p.file_path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["Cargo.toml", "new_file.rs", "obsolete.rs"]);
+
+    let cargo = pending
+        .iter()
+        .find(|p| p.file_path.ends_with("Cargo.toml"))
+        .expect("proposal for the modified file");
+    assert_eq!(cargo.original_content, committed);
+    assert!(cargo.proposed_content.contains("9.9.9"), "{cargo:?}");
+    assert!(!cargo.structural_hunks.is_empty());
+
+    let fresh = pending
+        .iter()
+        .find(|p| p.file_path.ends_with("new_file.rs"))
+        .expect("proposal for the created file");
+    assert_eq!(fresh.original_content, "");
+    assert_eq!(fresh.proposed_content, "fn fresh() {}\n");
+
+    let gone = pending
+        .iter()
+        .find(|p| p.file_path.ends_with("obsolete.rs"))
+        .expect("proposal for the deleted file");
+    assert!(gone.is_deletion);
+    assert_eq!(gone.original_content, "fn gone() {}\n");
+
+    // Nothing is reported as modified: the gate holds every path.
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, UnifiedStreamEvent::PathsModified(p) if !p.is_empty())),
+        "{events:?}"
+    );
+}
+
+/// A path that was already dirty at turn start has no reconstructible baseline
+/// in git — the pre-turn capture is the only record of those bytes, and it must
+/// be what the reviewer sees as the "before" side of the diff.
+#[tokio::test]
+async fn direct_write_is_restored_to_its_turn_start_dirty_content() {
+    let dir = workspace();
+    commit_all(dir.path());
+    let dirty = "[package]\nname=\"t\"\nversion=\"0.0.0\"\n# uncommitted user line\n";
+    std::fs::write(dir.path().join("Cargo.toml"), dirty).unwrap();
+
+    let gate = deferred_gate();
+    let args = construction_with_gate(dir.path(), Box::new(NoopAcp), gate.clone(), true);
+    let mut session = AcpClientSession::new_with_scope(args, FileScope::default())
+        .with_extra(extra("direct_write_multi"));
+    let _ = drain(&mut session, true).await;
+
+    // Restored to the uncommitted turn-start content, not to HEAD.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap(),
+        dirty
+    );
+    let pending = gate.lock().await.pending_proposals().to_vec();
+    let cargo = pending
+        .iter()
+        .find(|p| p.file_path.ends_with("Cargo.toml"))
+        .expect("proposal for the already-dirty file");
+    assert_eq!(cargo.original_content, dirty);
+    assert!(cargo.proposed_content.contains("9.9.9"), "{cargo:?}");
 }
 
 #[tokio::test]

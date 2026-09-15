@@ -6,6 +6,21 @@
 //! writes go through
 //! [`crate::acp::client::propose_write`] so the Write Gate stays in front
 //! of every disk change.
+//!
+//! # Two write channels, one gate
+//!
+//! The client advertises ACP `fs.writeTextFile` (`initialize`), and a child
+//! that uses it is gated inline: the request blocks on `propose_write` before
+//! the host answers (see [`handle_incoming`]).
+//!
+//! Official `dsh` does **not** call client filesystem ops for its own edits —
+//! it writes them itself — so a second, post-hoc channel exists for the same
+//! intent: [`reconcile_out_of_band_writes`] turns the turn's git dirty-set
+//! into the same `WriteProposal`s by restoring each path to its pre-turn
+//! content and re-submitting the change. Without it, "the Write Gate is in
+//! front of every disk change" would be false for exactly the provider this
+//! module exists for, and a long turn's edits would land with no diff to
+//! review.
 
 pub mod dsh;
 #[cfg(test)]
@@ -13,7 +28,7 @@ pub mod fake;
 pub mod map;
 pub mod rpc;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -26,7 +41,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::acp::client::propose_write;
+use crate::acp::client::{propose_delete, propose_write};
 use crate::acp::session::AgentOptions;
 use crate::context_planner::{ContinuityHandle, ContinuityMode};
 use crate::observer::{AcpObserver, PermissionDecision};
@@ -560,6 +575,294 @@ fn git_dirty(root: &Path) -> HashSet<PathBuf> {
         .collect()
 }
 
+// ── Out-of-band write reconciliation ────────────────────────────────────────
+
+/// Largest file the reconciler will read back for a diff. Beyond this the
+/// content is treated as unreviewable and the path is left where the agent
+/// put it (and reported through `PathsModified` as before).
+const RECONCILE_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Total budget for the pre-turn baseline capture. A workspace with a very
+/// large dirty set (a mass rename, a regenerated tree) would otherwise pay a
+/// full read of every dirty file on every turn; paths past the budget lose
+/// their baseline and are consequently left unreconciled.
+const RECONCILE_BASELINE_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Pre-turn content of the paths that were already dirty when the turn began.
+///
+/// A path that was *clean* at turn start can be reconstructed from git's index.
+/// A path that was already dirty cannot: its turn-start bytes exist nowhere
+/// else, so they are captured here before the prompt is sent.
+///
+/// This is the common case, not an edge case — a chat workspace usually has
+/// uncommitted accepted edits, and every one of them is a potential target for
+/// the next turn.
+#[derive(Debug, Default)]
+struct PreTurnContent {
+    /// `None` = the path did not exist when the turn started.
+    known: HashMap<PathBuf, Option<String>>,
+    /// Paths that were dirty at turn start but could not be read (binary,
+    /// oversized, over budget). A change to one of these has no reconstructible
+    /// baseline, so the reconciler must leave the agent's bytes in place.
+    unknown: HashSet<PathBuf>,
+}
+
+/// Capture the pre-turn content of the currently-dirty paths.
+async fn capture_pre_turn_content(root: &Path, dirty: &HashSet<PathBuf>) -> PreTurnContent {
+    let mut state = PreTurnContent::default();
+    let mut budget = RECONCILE_BASELINE_TOTAL_BYTES;
+    let mut order: Vec<&PathBuf> = dirty.iter().collect();
+    order.sort();
+    for rel in order {
+        let abs = root.join(rel);
+        let size = tokio::fs::metadata(&abs).await.map(|m| m.len()).unwrap_or(0);
+        if size > budget {
+            tracing::debug!(
+                path = %rel.display(),
+                "dsh: pre-turn baseline budget exhausted; this path will not be reconciled"
+            );
+            state.unknown.insert(rel.clone());
+            continue;
+        }
+        budget = budget.saturating_sub(size);
+        match read_text_capped(&abs).await {
+            Ok(content) => {
+                state.known.insert(rel.clone(), content);
+            }
+            Err(e) => {
+                tracing::debug!(
+                    path = %rel.display(),
+                    "dsh: no pre-turn baseline ({e:#}); a change here will be left in place"
+                );
+                state.unknown.insert(rel.clone());
+            }
+        }
+    }
+    state
+}
+
+/// Read a file as UTF-8 text, refusing the cases the reconciler cannot diff:
+/// a missing path (`Ok(None)`), a non-file, a file over
+/// [`RECONCILE_MAX_FILE_BYTES`], or non-UTF-8 bytes.
+async fn read_text_capped(path: &Path) -> Result<Option<String>> {
+    let meta = match tokio::fs::metadata(path).await {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("stat of {}", path.display())),
+    };
+    if !meta.is_file() {
+        anyhow::bail!("{} is not a regular file", path.display());
+    }
+    if meta.len() > RECONCILE_MAX_FILE_BYTES {
+        anyhow::bail!(
+            "{} is {} bytes, over the {RECONCILE_MAX_FILE_BYTES}-byte review limit",
+            path.display(),
+            meta.len()
+        );
+    }
+    let bytes = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("read of {}", path.display()))?;
+    let text = String::from_utf8(bytes).with_context(|| format!("{} is not UTF-8", path.display()))?;
+    Ok(Some(text))
+}
+
+/// Restore `path` to `original`: its content, or absence.
+async fn restore_path(path: &Path, original: Option<&str>) -> Result<()> {
+    match original {
+        Some(content) => tokio::fs::write(path, content)
+            .await
+            .with_context(|| format!("restoring {}", path.display())),
+        None => match tokio::fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+        },
+    }
+}
+
+/// The pre-turn content of `rel` as recorded in git's index (stage 0).
+///
+/// `Some(None)` = not tracked, so the path did not exist in the repository and
+/// must have been created during this turn. `None` = git could not answer
+/// (no repository, non-UTF-8 blob); the caller must not guess.
+fn index_content(root: &Path, rel: &Path) -> Option<Option<String>> {
+    let repo = crate::git::GitRepo::open(root).ok()?;
+    match repo.index_stage_content(&rel.to_string_lossy(), 0) {
+        Ok(found) => Some(found),
+        Err(e) => {
+            tracing::warn!(
+                path = %rel.display(),
+                "dsh: git index lookup failed ({e:#}); leaving the direct write in place"
+            );
+            None
+        }
+    }
+}
+
+/// Route the paths `dsh` wrote *outside* the ACP client `fs` channel through
+/// the Write Gate.
+///
+/// Detection is the turn's git dirty-set (minus what the child asked the host
+/// to write), which says *which* files changed but not *what* changed. To make
+/// the change reviewable, each path is:
+///
+/// 1. mapped to its pre-turn content — the [`PreTurnContent`] baseline for a
+///    path that was already dirty, git's index for one that was clean, absence
+///    for one created during the turn;
+/// 2. restored to that content, so the agent's bytes leave the tree;
+/// 3. re-submitted as a `WriteProposal` carrying the real diff.
+///
+/// The gate then owns the change, which is what makes the mode meaningful:
+/// `AutoAccept` writes it straight back (headless/swarm callers observe the
+/// same tree as before this pass existed), while `Deferred` / `Interactive` /
+/// `RejectAll` leave the tree at its pre-turn state until a human accepts. A
+/// path the gate refuses (sensitive, out of scope) therefore stays restored —
+/// the refusal *is* the rejection.
+///
+/// Returns the paths that still carry the agent's bytes: ones whose baseline
+/// could not be established (binary, oversized, unknown git state), and ones
+/// the gate accepted back onto disk.
+async fn reconcile_out_of_band_writes(
+    write_gate: &Arc<Mutex<WriteGatePipeline>>,
+    observer: &Arc<dyn AcpObserver>,
+    workspace_root: &Path,
+    agent_id: &str,
+    conv_id: Option<&str>,
+    pre_turn: &PreTurnContent,
+    changed: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut ordered: Vec<PathBuf> = changed.to_vec();
+    ordered.sort();
+    ordered.dedup();
+
+    let mut left_in_place = Vec::new();
+    let mut reconciled = Vec::new();
+
+    for rel in ordered {
+        let abs = workspace_root.join(&rel);
+
+        if pre_turn.unknown.contains(&rel) {
+            tracing::warn!(
+                path = %rel.display(),
+                "dsh: no usable pre-turn baseline for a path the agent wrote directly; \
+                 leaving it in place unreviewed"
+            );
+            left_in_place.push(rel);
+            continue;
+        }
+
+        let original = match pre_turn.known.get(&rel) {
+            Some(content) => content.clone(),
+            None => {
+                // Clean at turn start: the index is the turn-start content. Not
+                // in the index at all means the path appeared during the turn.
+                let root = workspace_root.to_path_buf();
+                let key = rel.clone();
+                let looked_up =
+                    tokio::task::spawn_blocking(move || index_content(&root, &key)).await;
+                match looked_up.unwrap_or(None) {
+                    Some(content) => content,
+                    None => {
+                        tracing::warn!(
+                            path = %rel.display(),
+                            "dsh: cannot reconstruct the pre-turn content of a directly written \
+                             path; leaving it in place unreviewed"
+                        );
+                        left_in_place.push(rel);
+                        continue;
+                    }
+                }
+            }
+        };
+
+        let current = match read_text_capped(&abs).await {
+            Ok(content) => content,
+            Err(e) => {
+                tracing::warn!(
+                    path = %rel.display(),
+                    "dsh: direct write to a path that cannot be diffed ({e:#}); leaving it in place"
+                );
+                left_in_place.push(rel);
+                continue;
+            }
+        };
+
+        // No net change (the child rewrote identical bytes, or created and
+        // removed a path): nothing to propose, and nothing to restore.
+        if current == original {
+            continue;
+        }
+
+        // Drift guard, mirroring the Codex finalizer: if the bytes moved
+        // between the read and the restore, a concurrent writer is involved and
+        // the restore would clobber it.
+        match read_text_capped(&abs).await {
+            Ok(again) if again == current => {}
+            _ => {
+                tracing::warn!(
+                    path = %rel.display(),
+                    "dsh: a directly written path drifted while it was being reconciled; \
+                     leaving it in place"
+                );
+                left_in_place.push(rel);
+                continue;
+            }
+        }
+
+        if let Err(e) = restore_path(&abs, original.as_deref()).await {
+            tracing::warn!("dsh: could not restore {} before review: {e:#}", rel.display());
+            left_in_place.push(rel);
+            continue;
+        }
+
+        let result = match (&current, &original) {
+            (Some(proposed), _) => {
+                propose_write(
+                    write_gate,
+                    observer.as_ref(),
+                    workspace_root,
+                    agent_id,
+                    conv_id,
+                    &rel,
+                    proposed,
+                )
+                .await
+            }
+            (None, Some(prior)) => {
+                propose_delete(
+                    write_gate,
+                    observer.as_ref(),
+                    workspace_root,
+                    agent_id,
+                    conv_id,
+                    &rel,
+                    prior,
+                )
+                .await
+            }
+            (None, None) => Ok(()),
+        };
+        match result {
+            Ok(()) => reconciled.push(rel),
+            Err(e) => {
+                tracing::warn!(
+                    "dsh: failed to propose the direct write to {}: {e:#}",
+                    rel.display()
+                );
+                left_in_place.push(rel);
+            }
+        }
+    }
+
+    tracing::info!(
+        reconciled = reconciled.len(),
+        left_in_place = left_in_place.len(),
+        "dsh: routed direct writes through the write gate"
+    );
+    left_in_place
+}
+
 #[async_trait::async_trait]
 impl AgentSession for AcpClientSession {
     async fn send_turn(
@@ -585,6 +888,9 @@ impl AgentSession for AcpClientSession {
 
         let root = self.workspace_root.clone();
         let before_dirty = tokio::task::spawn_blocking(move || git_dirty(&root)).await?;
+        // Baseline for the post-turn reconcile. Captured now because a path that
+        // is already dirty has no other record of its turn-start bytes.
+        let pre_turn = capture_pre_turn_content(&self.workspace_root, &before_dirty).await;
         let started = Instant::now();
 
         let (tx, rx) = mpsc::channel::<Result<UnifiedStreamEvent>>(256);
@@ -676,14 +982,44 @@ impl AgentSession for AcpClientSession {
                         .filter(|p| !live.gate_written.contains(*p))
                         .cloned()
                         .collect();
+                    let mut reported: Vec<PathBuf> = Vec::new();
                     if !extra.is_empty() {
                         tracing::warn!(
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             paths = ?extra,
                             "dsh wrote outside the client fs channel"
                         );
+                        reported = reconcile_out_of_band_writes(
+                            &write_gate,
+                            &observer,
+                            &workspace_root,
+                            &agent_id,
+                            conv_id.as_deref(),
+                            &pre_turn,
+                            &extra,
+                        )
+                        .await;
+                        // What is actually on disk once the gate has had its
+                        // say: `AutoAccept` re-materializes the change, every
+                        // other mode leaves the pre-turn content. Downstream
+                        // consumers (swarm validation, merge, loop judges) read
+                        // this set, so it must not name a path the gate just
+                        // declined to write.
+                        let root = workspace_root.clone();
+                        let now = tokio::task::spawn_blocking(move || git_dirty(&root))
+                            .await
+                            .unwrap_or_default();
+                        for path in now.difference(&before_dirty) {
+                            if !live.gate_written.contains(path) && !reported.contains(path) {
+                                reported.push(path.clone());
+                            }
+                        }
+                    }
+                    reported.sort();
+                    reported.dedup();
+                    if !reported.is_empty() {
                         let _ = tx
-                            .send(Ok(UnifiedStreamEvent::PathsModified(extra)))
+                            .send(Ok(UnifiedStreamEvent::PathsModified(reported)))
                             .await;
                     }
                     let _ = tx
