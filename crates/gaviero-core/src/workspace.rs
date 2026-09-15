@@ -265,10 +265,17 @@ pub mod settings {
     pub const MCP_FLAG_ENABLED: &str = "mcp.flag.enabled";
 
     // context7 docs-lookup MCP server (opt-in, OD-6; when enabled it is
-    // injected into every swarm worktree's .mcp.json +
-    // .codex/config.toml alongside the gaviero shim). Enable with
-    // `mcp.context7.enabled = true`; it needs Node (`npx`) + network.
+    // injected into every worktree's .mcp.json, .cursor/mcp.json,
+    // .codex/config.toml and dsh `session/new` server list alongside the
+    // gaviero shim). Enable with `mcp.context7.enabled = true`.
+    //
+    // Transport: `mcp.context7.url` defaults to the hosted streamable-HTTP
+    // endpoint, so no Node install is required and the HTTP-only providers
+    // (Cursor's remote mode, dsh's `mcpCapabilities.http`) can register the
+    // same server. Set the key to an empty string to fall back to the local
+    // `npx` stdio server, which only stdio-capable providers can host.
     pub const MCP_CONTEXT7_ENABLED: &str = "mcp.context7.enabled";
+    pub const MCP_CONTEXT7_URL: &str = "mcp.context7.url";
     pub const MCP_CONTEXT7_COMMAND: &str = "mcp.context7.command";
     pub const MCP_CONTEXT7_ARGS: &str = "mcp.context7.args";
 
@@ -1447,10 +1454,14 @@ fn hardcoded_default(key: &str) -> serde_json::Value {
         settings::MCP_FLAG_ENABLED => serde_json::json!(true),
 
         // context7 docs-lookup MCP server: opt-in (OD-6). It is a
-        // network dependency (`npx` fetch on first agent spawn), so a
-        // local-first default must not carry it silently — set
-        // `mcp.context7.enabled = true` per workspace to inject it.
+        // network dependency, so a local-first default must not carry it
+        // silently — set `mcp.context7.enabled = true` per workspace to
+        // inject it. `url` defaults to the hosted streamable-HTTP endpoint
+        // (no Node needed); empty string selects the `npx` stdio server.
         settings::MCP_CONTEXT7_ENABLED => serde_json::json!(false),
+        settings::MCP_CONTEXT7_URL => {
+            serde_json::json!(crate::mcp::config_synth::CONTEXT7_REMOTE_URL)
+        }
         settings::MCP_CONTEXT7_COMMAND => serde_json::json!("npx"),
         settings::MCP_CONTEXT7_ARGS => serde_json::json!(["-y", "@upstash/context7-mcp"]),
         settings::MCP_EXTRA_SERVERS => serde_json::json!([]),
