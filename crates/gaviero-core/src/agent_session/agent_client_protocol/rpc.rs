@@ -41,8 +41,8 @@ pub struct RpcError {
 pub struct JsonRpcChild {
     child: Child,
     pub handle: JsonRpcHandle,
-    incoming: Option<mpsc::Receiver<IncomingRequest>>,
-    notifications: Option<mpsc::Receiver<Value>>,
+    pub incoming: mpsc::Receiver<IncomingRequest>,
+    pub notifications: mpsc::Receiver<Value>,
     reader: tokio::task::JoinHandle<()>,
 }
 
@@ -179,23 +179,10 @@ impl JsonRpcChild {
                 pending,
                 next_id: Arc::new(AtomicU64::new(1)),
             },
-            incoming: Some(incoming_rx),
-            notifications: Some(notif_rx),
+            incoming: incoming_rx,
+            notifications: notif_rx,
             reader,
         })
-    }
-
-    /// Move the client-bound receivers out (once). The session keeps the
-    /// child and hands these to each turn task.
-    pub fn take_channels(
-        &mut self,
-    ) -> Option<(mpsc::Receiver<IncomingRequest>, mpsc::Receiver<Value>)> {
-        Some((self.incoming.take()?, self.notifications.take()?))
-    }
-
-    /// `true` while the child process has not exited.
-    pub fn is_alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
     }
 
     pub async fn kill(&mut self) {

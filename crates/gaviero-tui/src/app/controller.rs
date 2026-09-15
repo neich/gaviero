@@ -1670,7 +1670,13 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                                         url = %http.endpoint.url,
                                         "mcp http listening"
                                     );
-                                    (handle.with_http_listener(http), Some(synth))
+                                    (
+                                        handle.with_http_listener(
+                                            http,
+                                            &workspace_root_for_mcp,
+                                        ),
+                                        Some(synth),
+                                    )
                                 }
                                 Ok(None) => (handle, None),
                                 Err(e) => {
