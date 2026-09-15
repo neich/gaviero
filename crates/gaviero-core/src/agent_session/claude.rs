@@ -32,7 +32,9 @@ use crate::acp::client::{
     PROCESS_WAIT_TIMEOUT, STREAM_IDLE_TIMEOUT, format_tool_summary, is_auth_error, propose_delete,
     propose_write,
 };
-use crate::acp::protocol::{StreamEvent, is_background_subagent_tool, subagent_description};
+use crate::acp::protocol::{
+    StreamEvent, ToolResultInfo, ToolUseInfo, is_background_subagent_tool, subagent_description,
+};
 use crate::acp::session::{AcpSession, AgentOptions};
 use crate::context_planner::{ContinuityHandle, ContinuityMode, ProviderProfile};
 use crate::observer::AcpObserver;
@@ -46,6 +48,85 @@ use super::background::{
 };
 use super::registry::SessionConstruction;
 use super::{AgentSession, Turn};
+
+// ── Tool-call pairing ─────────────────────────────────────────────────────────
+
+/// A `tool_use` block still waiting for its `tool_result`.
+struct PendingTool {
+    name: String,
+    input: serde_json::Value,
+    summary: String,
+    started: std::time::Instant,
+}
+
+/// Pairs Claude `tool_use` blocks with their `tool_result`s so the observer
+/// receives each call's raw arguments and result through
+/// [`AcpObserver::on_tool_call_completed`]. The one-line
+/// `on_tool_call_started` summary is emitted by the caller, unchanged.
+#[derive(Default)]
+struct ToolCallTracker {
+    pending: HashMap<String, PendingTool>,
+    /// Pending ids in start order, so [`Self::flush`] reports calls in order.
+    order: Vec<String>,
+}
+
+impl ToolCallTracker {
+    /// Remember a started call. Blocks without an id cannot be paired and
+    /// stay summary-only.
+    fn started(&mut self, tu: &ToolUseInfo, summary: &str) {
+        if tu.id.is_empty() {
+            return;
+        }
+        self.order.push(tu.id.clone());
+        self.pending.insert(
+            tu.id.clone(),
+            PendingTool {
+                name: tu.name.clone(),
+                input: tu.input.clone(),
+                summary: summary.to_string(),
+                started: std::time::Instant::now(),
+            },
+        );
+    }
+
+    /// Report every pending call answered by `results`.
+    fn completed(&mut self, results: &[ToolResultInfo], observer: &dyn AcpObserver) {
+        for result in results {
+            let Some(p) = self.pending.remove(&result.tool_use_id) else {
+                continue;
+            };
+            self.order.retain(|id| id != &result.tool_use_id);
+            observer.on_tool_call_completed(&crate::observer::ToolCallOutcome {
+                name: &p.name,
+                tool_use_id: Some(&result.tool_use_id),
+                summary: Some(&p.summary),
+                input: Some(&p.input),
+                output: Some(crate::observer::ToolOutputOutcome::Full {
+                    content: &result.content,
+                    is_error: result.is_error,
+                }),
+                duration: Some(p.started.elapsed()),
+            });
+        }
+    }
+
+    /// Report calls whose result never arrived (turn ended, cancelled, or
+    /// the subprocess died) with their arguments and no result.
+    fn flush(&mut self, observer: &dyn AcpObserver) {
+        for id in std::mem::take(&mut self.order) {
+            if let Some(p) = self.pending.remove(&id) {
+                observer.on_tool_call_completed(&crate::observer::ToolCallOutcome {
+                    name: &p.name,
+                    tool_use_id: Some(&id),
+                    summary: Some(&p.summary),
+                    input: Some(&p.input),
+                    output: None,
+                    duration: None,
+                });
+            }
+        }
+    }
+}
 
 // ── ClaudeSession ─────────────────────────────────────────────────────────────
 
@@ -309,6 +390,7 @@ impl ClaudeSession {
         let mut idle_count: u32 = 0;
         let mut cancelled = false;
         let mut pending_bg: Vec<PendingBg> = Vec::new();
+        let mut tool_tracker = ToolCallTracker::default();
         let mut result_seen = false;
 
         loop {
@@ -410,6 +492,7 @@ impl ClaudeSession {
                                         &self.workspace_root,
                                     );
                                     self.observer.on_tool_call_started(&summary);
+                                    tool_tracker.started(tu, &summary);
                                     if is_background_subagent_tool(&tu.name, &tu.input) {
                                         register_pending_bg(
                                             &mut pending_bg,
@@ -499,12 +582,13 @@ impl ClaudeSession {
                                     break;
                                 }
                             }
-                            StreamEvent::UserToolResults { tool_use_ids } => {
-                                for id in &tool_use_ids {
+                            StreamEvent::UserToolResults { results } => {
+                                tool_tracker.completed(&results, self.observer.as_ref());
+                                for result in &results {
                                     finish_pending_bg(
                                         &mut pending_bg,
                                         "",
-                                        id,
+                                        &result.tool_use_id,
                                         "completed",
                                         "",
                                         self.observer.as_ref(),
@@ -687,6 +771,7 @@ impl ClaudeSession {
         if in_thinking {
             self.observer.on_stream_chunk("\n</think>\n");
         }
+        tool_tracker.flush(self.observer.as_ref());
 
         if cancelled {
             // Transactional cancel: kill the subprocess immediately so no
@@ -1007,5 +1092,105 @@ mod tests {
         let parents = collect_attachment_parents(&attachments, &workspace, &[]);
         // `Path::parent` returns Some("") for a bare filename → skipped.
         assert!(parents.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tool_tracker_tests {
+    use std::path::Path;
+    use std::sync::Mutex as StdMutex;
+
+    use super::ToolCallTracker;
+    use crate::acp::protocol::{StreamEvent, parse_stream_line};
+    use crate::observer::{AcpObserver, ToolCallOutcome, ToolOutputOutcome};
+
+    /// `(name, id, summary, input, (result text, is_error))`; the result is
+    /// `None` for a flushed call.
+    type Completion = (
+        String,
+        Option<String>,
+        Option<String>,
+        serde_json::Value,
+        Option<(String, bool)>,
+    );
+
+    #[derive(Default)]
+    struct Capture {
+        completed: StdMutex<Vec<Completion>>,
+    }
+
+    impl AcpObserver for Capture {
+        fn on_stream_chunk(&self, _: &str) {}
+        fn on_tool_call_started(&self, _: &str) {}
+        fn on_streaming_status(&self, _: &str) {}
+        fn on_message_complete(&self, _: &str, _: &str) {}
+        fn on_proposal_deferred(&self, _: &Path, _: Option<&str>, _: &str) {}
+        fn on_tool_call_completed(&self, o: &ToolCallOutcome<'_>) {
+            let output = o.output.map(|out| match out {
+                ToolOutputOutcome::Full { content, is_error } => (content.to_string(), is_error),
+                ToolOutputOutcome::Summary(s) => (s.to_string(), false),
+            });
+            self.completed.lock().unwrap().push((
+                o.name.to_string(),
+                o.tool_use_id.map(str::to_string),
+                o.summary.map(str::to_string),
+                o.input.cloned().unwrap_or_default(),
+                output,
+            ));
+        }
+    }
+
+    /// Feed recorded stream-json lines through the parser and the tracker
+    /// the way `run_claude_turn` does.
+    fn drive(lines: &[&str]) -> Vec<Completion> {
+        let observer = Capture::default();
+        let mut tracker = ToolCallTracker::default();
+        for line in lines {
+            match parse_stream_line(line).unwrap() {
+                StreamEvent::AssistantMessage { tool_uses, .. } => {
+                    for tu in &tool_uses {
+                        tracker.started(tu, &format!("{} (summary)", tu.name));
+                    }
+                }
+                StreamEvent::UserToolResults { results } => tracker.completed(&results, &observer),
+                _ => {}
+            }
+        }
+        tracker.flush(&observer);
+        observer.completed.into_inner().unwrap()
+    }
+
+    const TOOL_USE: &str = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"reading"},{"type":"tool_use","id":"toolu_01","name":"Read","input":{"file_path":"src/a.rs","limit":20}}]}}"#;
+    const TOOL_RESULT: &str = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"fn main() {}\n"}]}}"#;
+
+    #[test]
+    fn a_tool_use_and_its_result_report_one_completion_with_raw_payloads() {
+        let got = drive(&[TOOL_USE, TOOL_RESULT]);
+        assert_eq!(got.len(), 1);
+        let (name, id, summary, input, output) = &got[0];
+        assert_eq!(name, "Read");
+        assert_eq!(id.as_deref(), Some("toolu_01"));
+        assert_eq!(summary.as_deref(), Some("Read (summary)"));
+        assert_eq!(
+            input,
+            &serde_json::json!({"file_path": "src/a.rs", "limit": 20})
+        );
+        assert_eq!(output, &Some(("fn main() {}\n".to_string(), false)));
+    }
+
+    #[test]
+    fn a_tool_use_without_a_result_is_flushed_with_its_arguments() {
+        let got = drive(&[TOOL_USE]);
+        assert_eq!(got.len(), 1);
+        let (name, id, _, input, output) = &got[0];
+        assert_eq!(name, "Read");
+        assert_eq!(id.as_deref(), Some("toolu_01"));
+        assert_eq!(input["file_path"], "src/a.rs");
+        assert!(output.is_none());
+    }
+
+    #[test]
+    fn a_result_for_an_unknown_call_reports_nothing() {
+        assert!(drive(&[TOOL_RESULT]).is_empty());
     }
 }

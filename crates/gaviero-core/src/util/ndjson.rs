@@ -7,7 +7,9 @@
 //! (`history/writer.rs`). Both need exactly the same three behaviours —
 //! serialized appends, `create_dir_all` on the parent, and rotation that
 //! keeps exactly one prior generation — so the implementation lives here
-//! once instead of twice.
+//! once instead of twice. It lives in `util` rather than `history` so the
+//! MCP sink does not import the history module (nothing under `mcp/` may
+//! depend on the history log — history plan invariant 1).
 //!
 //! The append path is on the tool-response critical path
 //! (`mcp/observer.rs`: *"implementations MUST be cheap — the tool

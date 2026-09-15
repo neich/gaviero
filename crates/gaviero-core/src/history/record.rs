@@ -144,7 +144,10 @@ pub struct HistoryRecord {
     /// memory manifest, so the two artefacts join on one key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
-    /// Per-turn monotonically increasing sequence number.
+    /// Per-turn sequence number, assigned when the record's slot is taken.
+    /// A tool call reserves its slot when it *starts* but is written when it
+    /// *completes*, so file order can differ from `seq` order; readers sort
+    /// a turn's records by `seq` (file order breaks ties).
     pub seq: u32,
     #[serde(flatten)]
     pub payload: HistoryKind,
@@ -240,6 +243,12 @@ pub struct MemoryInjection {
     /// are enabled. `None` is valid (counts only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest: Option<Value>,
+    /// True when the manifest exceeded the JSON cap. The candidate pool is
+    /// dropped first (`candidate_pool_omitted` records its length); only if
+    /// the rest is still too large is the manifest replaced by the head of
+    /// its serialization as a string.
+    #[serde(default)]
+    pub manifest_truncated: bool,
 }
 
 /// Turn end — exact totals when the provider reports them.
@@ -268,6 +277,25 @@ pub struct TurnEnd {
 }
 
 impl TurnEnd {
+    /// A turn end carrying only what the dispatching task knows. The
+    /// recorder fills the assistant output, its estimate, and the bootstrap
+    /// measurement from what it latched during the turn.
+    pub fn new(cancelled: bool, error: Option<String>, proposal_count: usize) -> Self {
+        Self {
+            cancelled,
+            error,
+            proposal_count,
+            assistant_bytes: 0,
+            assistant_truncated: false,
+            assistant_excerpt: None,
+            output_tokens_est: 0,
+            estimator: Estimator::WordsX13,
+            bootstrap_tokens_est: None,
+            usage: None,
+            usage_source: None,
+        }
+    }
+
     /// Attach provider usage (and its provenance) if not already present.
     pub fn with_usage(mut self, usage: Option<ProviderUsage>) -> Self {
         if let Some(u) = usage {

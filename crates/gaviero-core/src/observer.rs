@@ -81,6 +81,16 @@ pub trait AcpObserver: Send + Sync {
     /// Called when the agent starts executing a tool (enriched summary with details).
     fn on_tool_call_started(&self, tool_name: &str);
 
+    /// Called when a tool call finishes, with the raw arguments and result
+    /// the provider exposed. Fired in addition to — never instead of —
+    /// [`Self::on_tool_call_started`], and carries the same summary string so
+    /// hosts can pair the two.
+    ///
+    /// Only providers that surface raw payloads fire this (Claude Code, and
+    /// the in-process tool agent behind `deepseek:`). A call that started but
+    /// never reports completion is summary-only. Default no-op.
+    fn on_tool_call_completed(&self, _outcome: &ToolCallOutcome<'_>) {}
+
     /// Called to update the streaming status label (shown in the spinner).
     fn on_streaming_status(&self, status: &str);
 
@@ -177,6 +187,34 @@ pub trait AcpObserver: Send + Sync {
     /// (`completed` / `failed` / `stopped`) or the parent process exited
     /// while it was still running (`killed`).
     fn on_background_task_finished(&self, _task_id: &str, _status: &str, _summary: &str) {}
+}
+
+/// Raw payload of a finished tool call, handed to
+/// [`AcpObserver::on_tool_call_completed`].
+#[derive(Debug, Clone, Copy)]
+pub struct ToolCallOutcome<'a> {
+    /// Provider tool name (`Read`, `Bash`, `memory_search`, …).
+    pub name: &'a str,
+    /// Provider call id (`toolu_…`, `call_…`), when the provider has one.
+    pub tool_use_id: Option<&'a str>,
+    /// The one-line summary previously passed to `on_tool_call_started`.
+    pub summary: Option<&'a str>,
+    /// Raw tool arguments.
+    pub input: Option<&'a serde_json::Value>,
+    /// The result. `None` when the call never reported one (e.g. the turn
+    /// ended or was cancelled while it was in flight).
+    pub output: Option<ToolOutputOutcome<'a>>,
+    /// Wall time from the call's start to its result, when measured.
+    pub duration: Option<std::time::Duration>,
+}
+
+/// A tool call's result as the provider reported it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolOutputOutcome<'a> {
+    /// The raw result text and the provider's error flag.
+    Full { content: &'a str, is_error: bool },
+    /// Only a summary of the result exists.
+    Summary(&'a str),
 }
 
 /// Lightweight summary of a chat memory injection decision. Handed to

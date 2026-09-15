@@ -83,6 +83,31 @@ pub fn estimate_json_text_tokens(text: &str) -> usize {
     text.len().div_ceil(4)
 }
 
+/// Compact rendering of an estimate, *without* its `~` prefix (the caller
+/// adds it): `987`, `1.2k`, `11.2k`, `1.3M`. Shared by the HISTORY panel and
+/// the CLI reader.
+pub fn compact_count(n: usize) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=999_949 => format!("{:.1}k", n as f64 / 1_000.0),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
+    }
+}
+
+/// An exact count with thousands separators: `12,345`. Reserved for
+/// provider-reported numbers, which are never abbreviated.
+pub fn grouped_count(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,6 +138,19 @@ mod tests {
         assert_eq!(estimate_json_text_tokens(""), 0);
         assert_eq!(estimate_json_text_tokens("abcd"), 1);
         assert_eq!(estimate_json_text_tokens("abcde"), 2);
+    }
+
+    #[test]
+    fn counts_render_compact_and_grouped() {
+        assert_eq!(compact_count(0), "0");
+        assert_eq!(compact_count(987), "987");
+        assert_eq!(compact_count(1_204), "1.2k");
+        assert_eq!(compact_count(11_240), "11.2k");
+        assert_eq!(compact_count(999_949), "999.9k");
+        assert_eq!(compact_count(999_950), "1.0M");
+        assert_eq!(grouped_count(999), "999");
+        assert_eq!(grouped_count(12_345), "12,345");
+        assert_eq!(grouped_count(1_000_000), "1,000,000");
     }
 
     #[test]

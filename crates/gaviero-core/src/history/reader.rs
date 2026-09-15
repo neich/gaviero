@@ -3,8 +3,8 @@
 //! The log is a write-only audit artefact (plan invariant 1): nothing in
 //! the agent path reads it, and a reader failure degrades to "fewer
 //! turns", never to an error a caller must handle. This reader is shared
-//! by the HISTORY panel and the `gaviero history` CLI so both render the
-//! same thing from the same parser.
+//! by the HISTORY panel and the `gaviero-cli --history` reader so both
+//! render the same thing from the same parser.
 //!
 //! Rules:
 //!
@@ -12,16 +12,19 @@
 //!   may carry a partially written tail or a mid-rotation remnant.
 //! * A turn with no `turn_end` (crash, kill, still streaming) is valid
 //!   and reads back as [`TurnStatus::Incomplete`].
-//! * File order is preserved inside a turn; turns come back in order of
-//!   first appearance, so callers wanting newest-first reverse the list.
+//! * Inside a turn, records are ordered by `seq` (file order breaks ties):
+//!   a tool call reserves its slot when it starts but is written when it
+//!   completes. Turns come back in order of first appearance, so callers
+//!   wanting newest-first reverse the list.
 
+use std::collections::HashMap;
 use std::path::Path;
 
-use super::ndjson::rotated_path;
-use super::record::{HistoryKind, HistoryRecord, ProviderUsage};
+use super::record::{CaptureMode, HistoryKind, HistoryRecord, ProviderUsage};
+use crate::util::ndjson::rotated_path;
 
-/// One parsed line plus its (concatenated-stream) line number, for
-/// diagnostics and the panel's line-jump.
+/// One parsed line plus its 1-based physical line number across the
+/// concatenated generations (rotated first), for diagnostics.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistoryEvent {
     pub record: HistoryRecord,
@@ -51,8 +54,23 @@ pub enum TurnStatus {
     Failed,
 }
 
-/// The cheap per-turn view the turns column renders, without
-/// materialising payloads.
+impl TurnStatus {
+    /// Lower-case label shared by the panel and the CLI.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Incomplete => "incomplete",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// The cheap per-turn view the turns column renders.
+///
+/// Token fields keep each number's perspective explicit rather than summing
+/// across perspectives: a tool's *input* is text the model wrote, while its
+/// *result* is text fed back to the model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnSummary {
     pub conv_id: Option<String>,
@@ -62,26 +80,41 @@ pub struct TurnSummary {
     /// single conversation was streaming).
     pub attributed: bool,
     pub started_at: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
     pub prompt_preview: String,
+    pub prompt_bytes: usize,
     pub tool_count: usize,
+    /// Tool calls for which only the one-line summary was captured.
+    pub summary_only_tools: usize,
     pub mcp_count: usize,
     pub mem_items: usize,
+    /// `~` prompt estimate (`turn_start.input_tokens_est`).
     pub in_tokens_est: usize,
+    /// `~` assistant output estimate (`turn_end.output_tokens_est`).
     pub out_tokens_est: usize,
+    /// `~` tool arguments / tool results, summed over the turn's calls.
+    pub tool_in_tokens_est: usize,
+    pub tool_out_tokens_est: usize,
+    /// `~` MCP requests / responses, summed over the turn's calls.
+    pub mcp_in_tokens_est: usize,
+    pub mcp_out_tokens_est: usize,
+    /// Tokens the memory injection reported using (`words×1.3`).
+    pub memory_tokens_est: usize,
     pub bootstrap_tokens_est: Option<usize>,
     pub exact_usage: Option<ProviderUsage>,
     pub status: TurnStatus,
 }
 
 impl TurnSummary {
-    /// `~in/~out` for the turns column: estimates, always `~`-prefixed by
-    /// the renderer.
+    /// `~in/~out` for the turns column: prompt and assistant output
+    /// estimates, always `~`-prefixed by the renderer.
     pub fn est_pair(&self) -> (usize, usize) {
         (self.in_tokens_est, self.out_tokens_est)
     }
 }
 
-/// One turn's records, in file order, with its derived summary.
+/// One turn's records, in `seq` order, with its derived summary.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnRecords {
     pub conv_id: Option<String>,
@@ -102,18 +135,20 @@ pub fn read_records(path: &Path, include_rotated: bool) -> ReadOutcome {
     }
     files.push(path.to_path_buf());
 
+    let mut line_no: u64 = 0;
     for file in files {
-        let size = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
-        out.bytes = out.bytes.saturating_add(size);
         let Ok(f) = std::fs::File::open(&file) else {
             continue;
         };
+        out.bytes = out
+            .bytes
+            .saturating_add(f.metadata().map(|m| m.len()).unwrap_or(0));
         for line in std::io::BufRead::lines(std::io::BufReader::new(f)) {
+            line_no += 1;
             let Ok(line) = line else {
                 out.skipped += 1;
                 continue;
             };
-            let line_no = out.records.len() as u64 + out.skipped as u64 + 1;
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -135,28 +170,32 @@ pub fn read_records(path: &Path, include_rotated: bool) -> ReadOutcome {
 /// so unattributable MCP calls are visible rather than lost.
 pub fn group_turns(records: Vec<HistoryEvent>) -> Vec<TurnRecords> {
     let mut turns: Vec<TurnRecords> = Vec::new();
+    let mut index: HashMap<Option<String>, usize> = HashMap::new();
     for event in records {
         let turn_id = event.record.turn_id.clone();
-        let attributed = turn_id.is_some();
-        let idx = match turns.iter().position(|t| t.turn_id == turn_id) {
-            Some(i) => i,
-            None => {
-                turns.push(TurnRecords {
-                    conv_id: event.record.conv_id.clone(),
-                    turn_id: turn_id.clone(),
-                    attributed,
-                    records: Vec::new(),
-                    summary: empty_summary(&event.record, turn_id, attributed),
-                });
-                turns.len() - 1
-            }
-        };
+        let idx = *index.entry(turn_id.clone()).or_insert_with(|| {
+            let attributed = turn_id.is_some();
+            turns.push(TurnRecords {
+                conv_id: event.record.conv_id.clone(),
+                turn_id: turn_id.clone(),
+                attributed,
+                records: Vec::new(),
+                summary: empty_summary(&event.record, turn_id, attributed),
+            });
+            turns.len() - 1
+        });
         let turn = &mut turns[idx];
         if turn.conv_id.is_none() {
             turn.conv_id = event.record.conv_id.clone();
         }
         apply_to_summary(&mut turn.summary, &event.record);
         turn.records.push(event);
+    }
+    for turn in &mut turns {
+        if turn.attributed {
+            // Stable: equal seqs keep file order.
+            turn.records.sort_by_key(|e| e.record.seq);
+        }
     }
     turns
 }
@@ -166,7 +205,7 @@ pub fn summarize(turns: &[TurnRecords]) -> Vec<TurnSummary> {
     turns.iter().map(|t| t.summary.clone()).collect()
 }
 
-/// Read a single turn by id (across both generations).
+/// Read a single turn by id (across both generations when asked).
 pub fn read_turn(path: &Path, turn_id: &str, include_rotated: bool) -> Option<TurnRecords> {
     let out = read_records(path, include_rotated);
     group_turns(out.records)
@@ -181,12 +220,21 @@ fn empty_summary(record: &HistoryRecord, turn_id: Option<String>, attributed: bo
         turn_id,
         attributed,
         started_at: Some(record.ts.clone()),
+        provider: None,
+        model: None,
         prompt_preview: String::new(),
+        prompt_bytes: 0,
         tool_count: 0,
+        summary_only_tools: 0,
         mcp_count: 0,
         mem_items: 0,
         in_tokens_est: 0,
         out_tokens_est: 0,
+        tool_in_tokens_est: 0,
+        tool_out_tokens_est: 0,
+        mcp_in_tokens_est: 0,
+        mcp_out_tokens_est: 0,
+        memory_tokens_est: 0,
         bootstrap_tokens_est: None,
         exact_usage: None,
         status: TurnStatus::Incomplete,
@@ -198,37 +246,38 @@ fn apply_to_summary(summary: &mut TurnSummary, record: &HistoryRecord) {
         HistoryKind::TurnStart(s) => {
             summary.started_at = Some(record.ts.clone());
             summary.conv_title = s.conv_title.clone();
+            summary.provider = Some(s.provider.clone());
+            summary.model = Some(s.model.clone());
             summary.prompt_preview = preview(&s.prompt);
-            summary.in_tokens_est = summary
-                .in_tokens_est
-                .saturating_add(s.input_tokens_est.unwrap_or(0));
+            summary.prompt_bytes = s.prompt_bytes;
+            summary.in_tokens_est = s.input_tokens_est.unwrap_or(0);
         }
         HistoryKind::ToolCall(c) => {
             summary.tool_count += 1;
-            summary.in_tokens_est = summary
-                .in_tokens_est
+            if c.capture == CaptureMode::SummaryOnly {
+                summary.summary_only_tools += 1;
+            }
+            summary.tool_in_tokens_est = summary
+                .tool_in_tokens_est
                 .saturating_add(c.input_tokens_est.unwrap_or(0));
-            summary.out_tokens_est = summary
-                .out_tokens_est
+            summary.tool_out_tokens_est = summary
+                .tool_out_tokens_est
                 .saturating_add(c.output_tokens_est.unwrap_or(0));
         }
         HistoryKind::McpCall(m) => {
             summary.mcp_count += 1;
-            summary.in_tokens_est = summary.in_tokens_est.saturating_add(m.input_tokens_est);
-            summary.out_tokens_est = summary.out_tokens_est.saturating_add(m.output_tokens_est);
+            summary.mcp_in_tokens_est =
+                summary.mcp_in_tokens_est.saturating_add(m.input_tokens_est);
+            summary.mcp_out_tokens_est = summary
+                .mcp_out_tokens_est
+                .saturating_add(m.output_tokens_est);
         }
         HistoryKind::MemoryInjection(m) => {
             summary.mem_items = summary.mem_items.max(m.items_injected);
-            // Memory is *measured* by the injection path, not estimated by
-            // us; it is already part of the provider's input, so it counts
-            // towards the input reading but is labelled separately in the
-            // panel.
-            summary.in_tokens_est = summary.in_tokens_est.saturating_add(m.tokens_used_est);
+            summary.memory_tokens_est = summary.memory_tokens_est.saturating_add(m.tokens_used_est);
         }
         HistoryKind::TurnEnd(e) => {
-            summary.out_tokens_est = summary
-                .out_tokens_est
-                .saturating_add(e.output_tokens_est);
+            summary.out_tokens_est = e.output_tokens_est;
             summary.bootstrap_tokens_est = e.bootstrap_tokens_est;
             summary.exact_usage = e.usage;
             summary.status = if e.cancelled {
@@ -257,8 +306,9 @@ fn preview(prompt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::record::{McpCall, TurnEnd, TurnStart, SCHEMA_VERSION};
-    use crate::history::record::{Attribution, ToolOutput};
+    use crate::history::record::{
+        Attribution, McpCall, SCHEMA_VERSION, ToolOutput, TurnEnd, TurnStart,
+    };
     use crate::history::tokens::Estimator;
 
     fn line(conv: &str, turn: &str, seq: u32, payload: HistoryKind) -> String {
@@ -276,7 +326,7 @@ mod tests {
     fn start() -> HistoryKind {
         HistoryKind::TurnStart(TurnStart {
             provider: "claude".into(),
-            model: "sonnet".into(),
+            model: "claude:sonnet".into(),
             conv_title: Some("t".into()),
             workspace_root: "C:/w".into(),
             prompt: "hello\n\n  world".into(),
@@ -288,22 +338,30 @@ mod tests {
     }
 
     fn end(cancelled: bool, error: Option<&str>) -> HistoryKind {
-        HistoryKind::TurnEnd(TurnEnd {
-            cancelled,
-            error: error.map(str::to_string),
-            proposal_count: 0,
-            assistant_bytes: 0,
-            assistant_truncated: false,
-            assistant_excerpt: None,
-            output_tokens_est: 5,
-            estimator: Estimator::WordsX13,
-            bootstrap_tokens_est: Some(100),
-            usage: Some(ProviderUsage {
-                input_tokens: 42,
-                ..Default::default()
-            }),
-            usage_source: Some("provider".into()),
-        })
+        let mut e = TurnEnd::new(cancelled, error.map(str::to_string), 0);
+        e.output_tokens_est = 5;
+        e.bootstrap_tokens_est = Some(100);
+        HistoryKind::TurnEnd(e.with_usage(Some(ProviderUsage {
+            input_tokens: 42,
+            ..Default::default()
+        })))
+    }
+
+    fn tool(input_est: usize, output_est: usize) -> HistoryKind {
+        let mut c = crate::history::writer::tool_call_record(
+            "Read",
+            None,
+            Some(5),
+            Some(serde_json::json!({"file_path": "a"})),
+            ToolOutput::Full {
+                content: "ok".into(),
+                is_error: false,
+            },
+            None,
+        );
+        c.input_tokens_est = Some(input_est);
+        c.output_tokens_est = Some(output_est);
+        HistoryKind::ToolCall(c)
     }
 
     #[test]
@@ -312,22 +370,7 @@ mod tests {
         let path = dir.path().join("turns.ndjson");
         let body = [
             line("c1", "c1-1", 0, start()),
-            line(
-                "c1",
-                "c1-1",
-                1,
-                HistoryKind::ToolCall(crate::history::writer::tool_call_record(
-                    "Read",
-                    None,
-                    Some(5),
-                    Some(serde_json::json!({"file_path": "a"})),
-                    ToolOutput::Full {
-                        content: "ok".into(),
-                        is_error: false,
-                    },
-                    None,
-                )),
-            ),
+            line("c1", "c1-1", 1, tool(7, 11)),
             line("c1", "c1-1", 2, end(false, None)),
         ]
         .join("\n");
@@ -340,13 +383,14 @@ mod tests {
         let s = &turns[0].summary;
         assert_eq!(s.status, TurnStatus::Complete);
         assert_eq!(s.tool_count, 1);
+        assert_eq!(s.summary_only_tools, 0);
         assert_eq!(s.prompt_preview, "hello world");
+        assert_eq!(s.provider.as_deref(), Some("claude"));
         assert_eq!(s.bootstrap_tokens_est, Some(100));
         assert_eq!(s.exact_usage.unwrap().input_tokens, 42);
-        // Estimates only exist once the record went through the recorder's
-        // normalisation; this fixture writes the tool call raw.
-        assert_eq!(s.in_tokens_est, 3);
-        assert_eq!(s.out_tokens_est, 5);
+        // Prompt in / assistant out; tool numbers stay in their own fields.
+        assert_eq!(s.est_pair(), (3, 5));
+        assert_eq!((s.tool_in_tokens_est, s.tool_out_tokens_est), (7, 11));
     }
 
     #[test]
@@ -386,25 +430,30 @@ mod tests {
         std::fs::write(&path, body).unwrap();
         let out = read_records(&path, false);
         assert_eq!(out.records.len(), 1);
+        // Physical line number, counting the malformed line before it.
+        assert_eq!(out.records[0].line, 2);
         // `not json` and the truncated record both fail to parse.
         assert_eq!(out.skipped, 2);
     }
 
     #[test]
-    fn records_order_is_file_order_and_turns_start_in_first_appearance_order() {
+    fn records_inside_a_turn_follow_seq_and_turns_first_appearance() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("turns.ndjson");
+        // A tool call written after the MCP call that followed it.
         let body = format!(
-            "{}\n{}\n{}\n",
+            "{}\n{}\n{}\n{}\n",
             line("c1", "c1-1", 0, start()),
             line("c2", "c2-1", 0, start()),
-            line("c1", "c1-1", 1, end(false, None)),
+            line("c1", "c1-1", 2, tool(1, 1)),
+            line("c1", "c1-1", 1, tool(2, 2)),
         );
         std::fs::write(&path, body).unwrap();
         let turns = group_turns(read_records(&path, false).records);
         assert_eq!(turns[0].turn_id.as_deref(), Some("c1-1"));
         assert_eq!(turns[1].turn_id.as_deref(), Some("c2-1"));
-        assert_eq!(turns[0].records.len(), 2);
+        let seqs: Vec<u32> = turns[0].records.iter().map(|e| e.record.seq).collect();
+        assert_eq!(seqs, vec![0, 1, 2]);
     }
 
     #[test]
@@ -452,6 +501,31 @@ mod tests {
         assert!(read_turn(&path, "old-1", false).is_none());
         assert!(read_turn(&path, "new-1", true).is_some());
         assert!(read_turn(&path, "absent", true).is_none());
+    }
+
+    #[test]
+    fn rotation_through_the_recorder_keeps_both_generations_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("turns.ndjson");
+        // A cap below one record forces a rotation on every append.
+        let r = crate::history::HistoryRecorder::with_path_and_cap(path.clone(), 64);
+        let start = |p: &str| TurnStart {
+            provider: "claude".into(),
+            model: "claude:sonnet".into(),
+            conv_title: None,
+            workspace_root: "C:/w".into(),
+            prompt: p.into(),
+            prompt_bytes: 0,
+            prompt_truncated: false,
+            input_tokens_est: None,
+            estimator: None,
+        };
+        r.begin_turn("c1", "c1-1", start("first"), false);
+        r.begin_turn("c1", "c1-2", start("second"), false);
+        assert!(rotated_path(&path).exists());
+        assert!(read_turn(&path, "c1-1", true).is_some());
+        assert!(read_turn(&path, "c1-2", false).is_some());
+        assert_eq!(read_records(&path, true).skipped, 0);
     }
 
     #[test]

@@ -16,6 +16,40 @@ pub struct ToolUseInfo {
     pub id: String,
 }
 
+/// One `tool_result` block from a user message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResultInfo {
+    /// The `tool_use` id this result answers.
+    pub tool_use_id: String,
+    /// The result text. A `content` array is flattened: text blocks are
+    /// joined with newlines, and non-text blocks become a `[<type>]`
+    /// placeholder so their presence is not silently lost.
+    pub content: String,
+    pub is_error: bool,
+}
+
+/// Flatten a `tool_result.content` value (a string, or an array of content
+/// blocks) into text.
+fn tool_result_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .map(|block| match block.get("text").and_then(|t| t.as_str()) {
+                Some(text) if opt_str(block, "type") == "text" => text.to_string(),
+                _ => format!("[{}]", non_empty_or(opt_str(block, "type"), "block")),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(Value::Null) | None => String::new(),
+        Some(other) => other.to_string(),
+    }
+}
+
+fn non_empty_or<'a>(s: &'a str, fallback: &'a str) -> &'a str {
+    if s.is_empty() { fallback } else { s }
+}
+
 /// Claude `Task`/`Agent` and Cursor `taskToolCall`/`agentToolCall` display names.
 pub fn is_subagent_tool_name(name: &str) -> bool {
     matches!(name, "Task" | "Agent")
@@ -138,7 +172,8 @@ pub enum StreamEvent {
 
     /// User message carrying `tool_result` blocks. In `--print` mode this is
     /// often the only completion signal for a subagent (no `task_notification`).
-    UserToolResults { tool_use_ids: Vec<String> },
+    /// Each result keeps its text and error flag for the history log.
+    UserToolResults { results: Vec<ToolResultInfo> },
 
     /// Final result (type: "result").
     ResultEvent {
@@ -368,26 +403,34 @@ pub fn parse_stream_line(line: &str) -> Result<StreamEvent> {
             })
         }
 
-        // User message: we only need tool_result ids (subagent completion in
-        // --print mode). Other user lines pass through as Unknown.
+        // User message: tool_result blocks (subagent completion in --print
+        // mode, and every tool's result for the history log). Other user
+        // lines pass through as Unknown.
         "user" => {
             let message = v.get("message").cloned().unwrap_or(Value::Null);
             let content = message.get("content").and_then(|c| c.as_array());
-            let mut tool_use_ids = Vec::new();
+            let mut results = Vec::new();
             if let Some(blocks) = content {
                 for block in blocks {
                     if opt_str(block, "type") == "tool_result"
                         && let Some(id) = block.get("tool_use_id").and_then(|t| t.as_str())
                         && !id.is_empty()
                     {
-                        tool_use_ids.push(id.to_string());
+                        results.push(ToolResultInfo {
+                            tool_use_id: id.to_string(),
+                            content: tool_result_text(block.get("content")),
+                            is_error: block
+                                .get("is_error")
+                                .and_then(|b| b.as_bool())
+                                .unwrap_or(false),
+                        });
                     }
                 }
             }
-            if tool_use_ids.is_empty() {
+            if results.is_empty() {
                 Ok(StreamEvent::Unknown(v))
             } else {
-                Ok(StreamEvent::UserToolResults { tool_use_ids })
+                Ok(StreamEvent::UserToolResults { results })
             }
         }
 
@@ -958,10 +1001,39 @@ mod tests {
         let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_abc","content":"ok"}]}}"#;
         let event = parse_stream_line(line).unwrap();
         match event {
-            StreamEvent::UserToolResults { tool_use_ids } => {
-                assert_eq!(tool_use_ids, vec!["toolu_abc"]);
+            StreamEvent::UserToolResults { results } => {
+                assert_eq!(
+                    results,
+                    vec![ToolResultInfo {
+                        tool_use_id: "toolu_abc".into(),
+                        content: "ok".into(),
+                        is_error: false,
+                    }]
+                );
             }
             _ => panic!("Expected UserToolResults, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_user_tool_results_array_content_and_error_flag() {
+        let line = r#"{"type":"user","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"toolu_1","is_error":true,
+             "content":[{"type":"text","text":"line one"},{"type":"text","text":"line two"},
+                        {"type":"image","source":{}}]},
+            {"type":"tool_result","tool_use_id":"toolu_2"},
+            {"type":"tool_result","tool_use_id":"","content":"no id — skipped"}]}}"#;
+        let line = line.replace('\n', "");
+        match parse_stream_line(&line).unwrap() {
+            StreamEvent::UserToolResults { results } => {
+                assert_eq!(results.len(), 2);
+                assert_eq!(results[0].tool_use_id, "toolu_1");
+                assert_eq!(results[0].content, "line one\nline two\n[image]");
+                assert!(results[0].is_error);
+                assert_eq!(results[1].content, "");
+                assert!(!results[1].is_error);
+            }
+            other => panic!("Expected UserToolResults, got {other:?}"),
         }
     }
 

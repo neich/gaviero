@@ -9,7 +9,7 @@ Conventions and rules: [CLAUDE.md](CLAUDE.md). Workspace topology: [../../ARCHIT
 ## Topology
 
 ```
-gaviero-core (lib, 26 pub mods)
+gaviero-core (lib, 27 pub mods)
  ├── swarm/ + agent_session/     orchestration + provider transport
  ├── memory/ + mcp/              scoped store + read-only MCP server
  ├── write_gate/ + scope_*       single write path for all agents
@@ -31,18 +31,19 @@ Depends on: tokio, tree-sitter 0.25 (+ grammars), git2, rusqlite + sqlite-vec, o
 
 ## Modules
 
-**26 pub mods** from [`src/lib.rs`](src/lib.rs):
+**27 pub mods** from [`src/lib.rs`](src/lib.rs):
 
 ```
 gaviero-core/src/
-├─ lib.rs                 Re-exports tree-sitter types + 26 pub mods
+├─ lib.rs                 Re-exports tree-sitter types + 27 pub mods
 ├─ types.rs               FileScope, WriteProposal, ModelTier, PrivacyLevel, …
 ├─ workspace.rs           Workspace::single_folder / load, settings cascade
 ├─ session_state.rs       SessionState, TabState, StoredConversation, index
 ├─ tree_sitter.rs         LANGUAGE_REGISTRY (16 langs), enrich_hunks
 ├─ diff_engine.rs         compute_hunks
 ├─ write_gate.rs          WriteGatePipeline, WriteMode, proposal lifecycle
-├─ observer.rs            WriteGateObserver, AcpObserver, SwarmObserver
+├─ observer.rs            WriteGateObserver, AcpObserver (+ on_tool_call_completed), SwarmObserver
+├─ history/               Per-turn NDJSON log: record / writer (HistoryRecorder) / reader / tokens
 ├─ scope_enforcer.rs      FileScope checks → path_pattern
 ├─ path_pattern.rs        Glob matcher + patterns_overlap
 ├─ git.rs                 GitRepo, WorktreeManager, GitCoordinator (git2)
@@ -52,6 +53,7 @@ gaviero-core/src/
 │  ├─ mod.rs / frontmatter.rs / catalog.rs / template.rs
 ├─ util/                  Shared helpers
 │  ├─ fs.rs               Filesystem helpers
+│  ├─ ndjson.rs           Size-rotated NDJSON appender (MCP telemetry + history)
 │  └─ spawn.rs            Process spawn (+ Windows Job Objects)
 ├─ indent/                compute_indent (tree-sitter / hybrid / bracket)
 ├─ terminal/              PTY (portable-pty) + OSC 133
@@ -241,13 +243,14 @@ First turn: `<repo_topology>` ([`topology::build_folder_topology`](src/repo_map/
 ## API
 
 ```rust
-// crates/gaviero-core/src/lib.rs — 26 pub mods
+// crates/gaviero-core/src/lib.rs — 27 pub mods
 pub mod acp;
 pub mod agent_session;   // + tool_agent (deepseek:) + agent_client_protocol (dsh:)
 pub mod context_planner;
 pub mod diff_engine;
 pub mod git;
 pub mod git_conflict;
+pub mod history;         // per-turn NDJSON log (TUI HISTORY panel, gaviero-cli --history)
 pub mod indent;
 pub mod iteration;
 pub mod mcp;

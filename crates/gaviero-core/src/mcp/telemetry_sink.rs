@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::observer::{McpCallLogEntry, McpToolCallObserver};
-use crate::history::ndjson::{NdjsonAppender, rotated_path};
+use crate::util::ndjson::{NdjsonAppender, rotated_path};
 
 /// Default rotation threshold: 10 MB.
 pub const DEFAULT_MAX_BYTES: u64 = 10 * 1024 * 1024;
