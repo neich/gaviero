@@ -238,6 +238,20 @@ independent of `--resume`, which restores the node-level checkpoint.
 | `--reach-depth` | `<n>` | Nesting depth to verify (default 1) |
 | `--reach-transport` | `stdio\|http\|both` | Transport(s) to probe; `http` needs the loopback listener up, `both` keeps the better verdict per provider (tie → http) |
 | `--reach-json` | — | Print the reach record as JSON instead of the table |
+
+### History (per-turn log written by the TUI)
+
+Reads `<repo>/.gaviero/history/turns.ndjson` and its rotated `.1` generation through the same parser as the TUI HISTORY panel, prints, and exits. Token numbers prefixed `~` are estimates (words×1.3 for text, chars÷4 for JSON); `exact` numbers are provider-reported usage.
+
+| Flag | Argument | Purpose |
+|---|---|---|
+| `--history` | — | Summarize the newest turns: prompt, tool calls, MCP calls, memory call, token totals |
+| `--history-last` | `<n>` | Newest N turns (default 20) |
+| `--history-conv` | `<conv_id>` | Only turns of one conversation |
+| `--history-turn` | `<turn_id>` | Dump every record of one turn (fails if the turn is absent) |
+| `--history-json` | — | Raw NDJSON of the selected records |
+| `--history-stats` | — | Per-provider aggregates: turns, tools, MCP, memory, ~estimated vs exact tokens |
+| `--history-path` | `<path>` | Override the log path |
 | `--mcp-register-user` | `[claude,codex]` | Register gaviero MCP in the user-scope vendor config |
 | `--mcp-unregister-user` | `[claude,codex]` | Remove that user-scope registration |
 

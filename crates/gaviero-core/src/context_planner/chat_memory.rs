@@ -66,6 +66,11 @@ pub struct ChatMemoryRequest<'a> {
 pub struct ChatMemoryOutcome {
     pub injection: Option<ChatInjection>,
     pub summary: ChatInjectionSummary,
+    /// The exact manifest payload enqueued to the writer task, when one was
+    /// built (an injection happened, manifests are enabled, and a writer was
+    /// supplied). Exposed so hosts can show what the memory call returned
+    /// without re-querying `injection_manifests`.
+    pub manifest_payload: Option<JsonValue>,
 }
 
 /// Run S1 retrieval without module context.
@@ -104,6 +109,7 @@ pub async fn perform_injection_with_module(
                 tokens_used: 0,
                 token_budget: req.injection_config.token_budget,
             },
+            manifest_payload: None,
         };
     }
 
@@ -143,6 +149,7 @@ pub async fn perform_injection_with_module(
             .unwrap_or(req.injection_config.token_budget),
     };
 
+    let mut manifest_payload = None;
     if let Some(ref inj) = injection {
         if req.manifests_enabled
             && let Some(writer) = req.writer
@@ -154,6 +161,7 @@ pub async fn perform_injection_with_module(
                 req.embedder_name,
                 req.reranker_name,
             );
+            manifest_payload = Some(payload.clone());
             if let Err(e) = writer.enqueue(WriterMessage::InjectionManifest {
                 turn_id: req.turn_id.to_string(),
                 session_id: req.session_id.to_string(),
@@ -169,7 +177,11 @@ pub async fn perform_injection_with_module(
         }
     }
 
-    ChatMemoryOutcome { injection, summary }
+    ChatMemoryOutcome {
+        injection,
+        summary,
+        manifest_payload,
+    }
 }
 
 /// Tier S / S3 + Tier B / B6: post-turn writer enqueueing.
@@ -401,8 +413,62 @@ mod tests {
         })
         .await;
         assert!(outcome.injection.is_none());
+        assert!(outcome.manifest_payload.is_none());
         assert_eq!(outcome.summary.items_injected, 0);
         assert_eq!(outcome.summary.token_budget, 400);
+    }
+
+    #[tokio::test]
+    async fn outcome_carries_the_manifest_payload_it_enqueued() {
+        let services = MemoryServices::for_tests_in_memory().unwrap();
+        let root = std::path::Path::new("/tmp/wsx");
+        let content = "manifest payload sentinel";
+        services
+            .stores
+            .store_scoped(&WriteScope::Workspace, content, &WriteMeta::user_remember())
+            .await
+            .unwrap();
+
+        let cfg = null_injection_config(true);
+        let rcfg = null_retrieval_config();
+        let request = |manifests_enabled| ChatMemoryRequest {
+            stores: &services.stores,
+            writer: Some(&services.writer),
+            workspace_root: root,
+            folder_root: None,
+            user_prompt: content,
+            turn_id: "t-manifest",
+            session_id: "s-manifest",
+            injection_config: &cfg,
+            retrieval_config: &rcfg,
+            reranker: None,
+            rerank_config: None,
+            manifests_enabled,
+            capture_candidate_pool: true,
+            embedder_name: "null",
+            reranker_name: None,
+        };
+
+        let outcome = perform_injection(request(true)).await;
+        let injection = outcome
+            .injection
+            .as_ref()
+            .expect("stored row is retrievable");
+        let payload = outcome
+            .manifest_payload
+            .expect("manifests enabled with a writer → payload built");
+        assert_eq!(payload["query_text"], content);
+        assert_eq!(
+            payload["selected_ids"].as_array().map(Vec::len),
+            Some(injection.items.len())
+        );
+
+        let outcome = perform_injection(request(false)).await;
+        assert!(outcome.injection.is_some());
+        assert!(
+            outcome.manifest_payload.is_none(),
+            "no manifest → no payload"
+        );
     }
 
     #[tokio::test]

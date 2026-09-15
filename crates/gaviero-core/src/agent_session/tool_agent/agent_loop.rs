@@ -226,10 +226,25 @@ pub(crate) async fn run_agent_loop(
             observer.on_tool_call_started(&summary);
             observer.on_streaming_status(&format!("Using {}...", call.name));
 
-            let content = match tools.get(&call.name) {
-                Some(tool) => tool.run(call.args.clone(), ctx).await.content,
-                None => format!("Error: unknown tool '{}'", call.name),
+            let started = std::time::Instant::now();
+            let (content, is_error) = match tools.get(&call.name) {
+                Some(tool) => {
+                    let outcome = tool.run(call.args.clone(), ctx).await;
+                    (outcome.content, outcome.is_error)
+                }
+                None => (format!("Error: unknown tool '{}'", call.name), true),
             };
+            observer.on_tool_call_completed(&crate::observer::ToolCallOutcome {
+                name: &call.name,
+                tool_use_id: (!call.id.is_empty()).then_some(call.id.as_str()),
+                summary: Some(&summary),
+                input: Some(&call.args),
+                output: Some(crate::observer::ToolOutputOutcome::Full {
+                    content: &content,
+                    is_error,
+                }),
+                duration: Some(started.elapsed()),
+            });
             messages.push(tool_result_msg(&call.id, &content));
         }
 
@@ -574,6 +589,97 @@ mod tests {
         .await;
         assert!(outcome.error.is_none());
         assert!(outcome.visible.contains("recovered"));
+    }
+
+    #[derive(Clone)]
+    struct Completed {
+        name: String,
+        id: Option<String>,
+        summary: Option<String>,
+        input: Value,
+        content: String,
+        is_error: bool,
+    }
+
+    /// Records started summaries and completed tool calls.
+    #[derive(Default)]
+    struct CompletionObserver {
+        started: Mutex<Vec<String>>,
+        completed: Mutex<Vec<Completed>>,
+    }
+    impl AcpObserver for CompletionObserver {
+        fn on_stream_chunk(&self, _t: &str) {}
+        fn on_tool_call_started(&self, t: &str) {
+            self.started.lock().unwrap().push(t.to_string());
+        }
+        fn on_tool_call_completed(&self, o: &crate::observer::ToolCallOutcome<'_>) {
+            let Some(crate::observer::ToolOutputOutcome::Full { content, is_error }) = o.output
+            else {
+                panic!("tool agent always reports a full result");
+            };
+            assert!(o.duration.is_some());
+            self.completed.lock().unwrap().push(Completed {
+                name: o.name.to_string(),
+                id: o.tool_use_id.map(str::to_string),
+                summary: o.summary.map(str::to_string),
+                input: o.input.cloned().unwrap_or(Value::Null),
+                content: content.to_string(),
+                is_error,
+            });
+        }
+        fn on_streaming_status(&self, _t: &str) {}
+        fn on_message_complete(&self, _r: &str, _c: &str) {}
+        fn on_proposal_deferred(&self, _p: &Path, _o: Option<&str>, _n: &str) {}
+    }
+
+    #[tokio::test]
+    async fn tool_completion_reports_raw_args_and_result() {
+        let client = ScriptedClient {
+            rounds: Mutex::new(VecDeque::from(vec![
+                vec![
+                    tool_call("echo"),
+                    ApiEvent::ToolCall(ToolCall {
+                        id: "call_2".into(),
+                        name: "nope".into(),
+                        args: json!({}),
+                    }),
+                    ApiEvent::Done(StopReason::ToolUse),
+                ],
+                vec![
+                    ApiEvent::Text("done".into()),
+                    ApiEvent::Done(StopReason::EndTurn),
+                ],
+            ])),
+        };
+        let tools = ToolRegistry::new(vec![Box::new(EchoTool)]);
+        let observer = CompletionObserver::default();
+        let outcome = run_agent_loop(
+            &client,
+            &tools,
+            &ctx(),
+            &observer,
+            "m",
+            initial_messages(),
+            &LoopLimits::default(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(outcome.error.is_none());
+
+        let started = observer.started.lock().unwrap().clone();
+        let completed = observer.completed.lock().unwrap().clone();
+        assert_eq!(completed.len(), 2);
+        let echo = &completed[0];
+        assert_eq!(echo.name, "echo");
+        assert_eq!(echo.id.as_deref(), Some("call_1"));
+        assert_eq!(echo.summary.as_deref(), Some(started[0].as_str()));
+        assert_eq!(echo.input, json!({ "x": 1 }));
+        assert_eq!(echo.content, "echoed:{\"x\":1}");
+        assert!(!echo.is_error);
+        let unknown = &completed[1];
+        assert_eq!(unknown.name, "nope");
+        assert!(unknown.content.contains("unknown tool"));
+        assert!(unknown.is_error);
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@
 
 ## Overview
 
-Interactive terminal editor and workspace for Gaviero. A multi-tab code editor, file tree, git integration, agent chat, swarm dashboard, and embedded terminal in one full-screen TUI. All execution logic lives in [`gaviero-core`](../gaviero-core/README.md); this crate handles rendering and input only.
+Interactive terminal editor and workspace for Gaviero. A multi-tab code editor, file tree, git integration, agent chat, turn history, and embedded terminal in one full-screen TUI. All execution logic lives in [`gaviero-core`](../gaviero-core/README.md); this crate handles rendering and input only.
 
 ## Installation
 
@@ -25,7 +25,7 @@ gaviero /path/to/workspace.gaviero-workspace   # multi-folder workspace
 
 On first run you may be prompted to create a workspace settings file.
 
-**Panel focus:** Alt+1/2/3/4 (left/editor/side/terminal). **Side panels:** Alt+A (chat), Alt+W (swarm), Alt+G (git), Alt+M (memory). **Left panel:** Alt+E (explorer), Alt+F (find), Alt+C (changes).
+**Panel focus:** Alt+1/2/3/4 (left/editor/side/terminal). **Side panels:** Alt+A (chat), Alt+H (history), Alt+G (git), Alt+M (memory). **Left panel:** Alt+E (explorer), Alt+F (find), Alt+C (changes).
 
 ## Examples
 
@@ -35,18 +35,15 @@ On first run you may be prompted to create a workspace settings file.
 review src/auth/session.rs for race conditions
 ```
 
-**Switch model and run a workflow:**
+**Switch model:**
 
 ```
 /model claude:opus
-/run workflows/refactor.gaviero "extract the token cache into its own module"
 ```
 
-**Ad-hoc multi-agent swarm** (watch on swarm dashboard, Alt+W):
+**Inspect what a turn did** (history panel, Alt+H): pick a turn, then `Tab` / `1`–`5` through PROMPT, TOOLS, MCP, MEMORY, TOTALS; `Enter` expands a section, `/` filters, `a` toggles all / active conversation, `r` reloads, `c` copies the section's records. Token numbers prefixed `~` are estimates (words×1.3 for text, chars÷4 for JSON); `exact` numbers are provider-reported. The same log is readable headless with `gaviero-cli --history`.
 
-```
-/cswarm add end-to-end tests for the billing API
-```
+DSL workflows and multi-agent swarms run from the CLI: `gaviero-cli --script workflows/refactor.gaviero --prompt "…"`.
 
 **Write Gate review** — when an agent proposes changes, a diff overlay opens:
 
@@ -62,10 +59,6 @@ review src/auth/session.rs for race conditions
 | Command | Purpose |
 |---|---|
 | `/model <spec>` | Switch model (`claude:sonnet`, `deepseek:deepseek-flash`, `dsh:deepseek-flash`, …) |
-| `/run <file.gaviero> [prompt]` | Compile and execute a DSL workflow |
-| `/swarm <task>` | Immediate multi-agent swarm |
-| `/cswarm <task>` | Generate a reviewable coordinated plan |
-| `/undo-swarm` | Revert the last swarm result |
 | `/remember <text>` | Store a fact (`-here`, `-module`, `-workspace`, `-global` scope it) |
 | `/forget <query>` | Soft-delete matching memories |
 | `/skills [search <q>]` | List or search loaded skills |
@@ -217,7 +210,7 @@ Tapping the notification opens Gaviero Remote when that deep link is registered.
 
 ## API
 
-The TUI is a binary, not a library. Internally it implements three observer traits from `gaviero-core` — `WriteGateObserver`, `AcpObserver`, `SwarmObserver` — bridging core callbacks into an `mpsc` event channel.
+The TUI is a binary, not a library. Internally it implements the `WriteGateObserver`, `AcpObserver`, memory and MCP observer traits from `gaviero-core`, bridging core callbacks into an `mpsc` event channel.
 
 **Event-loop rule:** `draw → recv event → handle → repeat`. No background task mutates `App` directly.
 
@@ -225,7 +218,7 @@ The TUI is a binary, not a library. Internally it implements three observer trai
 |---|---|
 | `app.rs` + `app/` | `App` struct, layout, focus, slash commands |
 | `editor/` | Ropey buffer, tree-sitter highlight, diff overlay, word wrap |
-| `panels/` | `agent_chat`, `swarm_dashboard`, `git_panel`, `memory_panel`, `terminal`, … |
+| `panels/` | `agent_chat`, `history_panel`, `git_panel`, `memory_panel`, `terminal`, … |
 | `keymap.rs` / `event.rs` | Keybindings and event variants |
 | `platform.rs` | Windows/ConPTY, AltGr, paste coalescing |
 

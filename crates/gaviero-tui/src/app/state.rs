@@ -107,10 +107,25 @@ pub struct ChangesState {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SidePanelMode {
     AgentChat,
+    /// Per-turn history: prompt, tool calls, MCP calls, memory call, token
+    /// totals. Activated via `Alt+h`.
+    HistoryPanel,
     #[allow(dead_code)]
     GitPanel,
     /// Tier A / A4: memory inspection panel. Activated via `Alt+m`.
     MemoryPanel,
+}
+
+impl SidePanelMode {
+    /// The side-panel header arrow's cycle: CHAT → HISTORY → GIT → MEMORY → CHAT.
+    pub fn next_in_header_cycle(self) -> Self {
+        match self {
+            SidePanelMode::AgentChat => SidePanelMode::HistoryPanel,
+            SidePanelMode::HistoryPanel => SidePanelMode::GitPanel,
+            SidePanelMode::GitPanel => SidePanelMode::MemoryPanel,
+            SidePanelMode::MemoryPanel => SidePanelMode::AgentChat,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -289,5 +304,29 @@ impl TreeDialog {
 
     pub(super) fn move_end(&mut self) {
         self.cursor = self.input.len();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SidePanelMode;
+
+    #[test]
+    fn header_cycle_visits_history_between_chat_and_git() {
+        let mut mode = SidePanelMode::AgentChat;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            mode = mode.next_in_header_cycle();
+            seen.push(mode);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                SidePanelMode::HistoryPanel,
+                SidePanelMode::GitPanel,
+                SidePanelMode::MemoryPanel,
+                SidePanelMode::AgentChat,
+            ]
+        );
     }
 }

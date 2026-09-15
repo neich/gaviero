@@ -14,7 +14,7 @@ Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presenc
 
 ## Architecture
 
-**26 pub mods** — enumerate from [`src/lib.rs`](src/lib.rs). Orientation (not a substitute for reading the modules):
+**27 pub mods** — enumerate from [`src/lib.rs`](src/lib.rs). Orientation (not a substitute for reading the modules):
 
 | Area | Entry | Notes |
 |---|---|---|
@@ -25,6 +25,7 @@ Network/model tests (Ollama, embedder downloads, Cursor/Codex/Claude CLI presenc
 | Write path | [`write_gate.rs`](src/write_gate.rs), [`scope_enforcer.rs`](src/scope_enforcer.rs) | Modes: Interactive / AutoAccept / Deferred / RejectAll. |
 | Repo map | [`repo_map/`](src/repo_map) | Graph + [`topology.rs`](src/repo_map/topology.rs) + symbol enrichment/search. |
 | Skills | [`skills/`](src/skills) | Frontmatter, catalog, planner `ResolvedSkill` seam, opt-in constitution emit ([`skills/emit.rs`](src/skills/emit.rs)). |
+| History | [`history/`](src/history) | Per-turn NDJSON log (`.gaviero/history/turns.ndjson`): record model, the single `HistoryRecorder` (keys every capture by `turn_id`), tolerant reader shared by the TUI panel and `gaviero-cli --history`, the one token estimator. Write-only from host capture points; nothing under `memory/`, `context_planner/`, `mcp/`, `agent_session/`, `swarm/` imports it. Size-rotated through [`util::ndjson`](src/util/ndjson.rs), shared with the MCP telemetry sink. |
 | Session persistence | [`session_state.rs`](src/session_state.rs), [`session_journal.rs`](src/session_journal.rs) | State + conversations save only on a clean quit; the journal appends each prompt at dispatch (fsync) so a crash can't lose it. All saves are tmp-file + rename. |
 | Other | `acp`, `context_planner`, `validation_gate`, `git`, `git_conflict`, `terminal`, `util`, `workspace`, … | See `lib.rs`. |
 

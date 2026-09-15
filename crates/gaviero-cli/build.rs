@@ -12,5 +12,12 @@ fn main() {
             .active_code_page(ActiveCodePage::Utf8);
         embed_manifest(manifest).expect("unable to embed manifest file");
     }
+    // Reserve an 8 MiB main-thread stack, matching the Linux default. The
+    // Windows default is 1 MiB, and an unoptimized build of this binary's
+    // clap-derived `Cli` plus its async `main` sits right at that limit: adding
+    // a handful of flags overflowed the stack before any mode ran.
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg-bins=/STACK:8388608");
+    }
     println!("cargo:rerun-if-changed=build.rs");
 }

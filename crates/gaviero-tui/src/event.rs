@@ -235,6 +235,10 @@ pub enum Event {
         rows: Vec<crate::panels::memory_panel::DeletionRow>,
     },
 
+    /// HISTORY panel: the log was read off the event loop. Receiver installs
+    /// it, keeping the selected turn when it still exists.
+    HistoryLoaded(Box<crate::panels::history_panel::HistoryLoad>),
+
     // Memory
     MemoryReady(Arc<gaviero_core::memory::MemoryStores>),
 

@@ -68,11 +68,7 @@ review src/auth/session.rs for race conditions
 /lite
 ```
 
-**Ad-hoc multi-agent swarm:**
-
-```
-/cswarm refactor the authentication module to use JWT tokens
-```
+**Inspect a turn** (history panel, `Alt+H`): the full prompt, every tool call with arguments and result, every MCP request/response, the memory call and its injected block, and token totals (`~` estimates, `exact` provider usage). Headless: `gaviero-cli --history`.
 
 **DSL workflow** (`review.gaviero`):
 

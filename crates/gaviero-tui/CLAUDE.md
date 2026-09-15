@@ -27,14 +27,16 @@ Workspace dispatch: directory → `Workspace::single_folder`; `*.gaviero-workspa
 - [`platform.rs`](src/platform.rs) — all platform quirks (ConPTY mouse, AltGr, Ctrl+C forwarder). New quirks go here, not inline.
 - [`setup.rs`](src/setup.rs) — pre-TUI first-run wizard; writes `.gaviero/settings.json`, the `.gaviero-workspace` file, and (opt-in) the Claude/Codex/Cursor MCP configs. Runs before `App` exists, so it holds no `App` state.
 - [`editor/`](src/editor) — buffer, view, highlight, markdown, diff overlay, LCS diff, wrap, [`fold`](src/editor/fold.rs).
-- [`panels/`](src/panels) — file tree, agent chat, swarm dashboard, git, terminal, search, memory, status bar.
+- [`panels/`](src/panels) — file tree, agent chat, history ([`history_panel.rs`](src/panels/history_panel.rs), `Alt+h`), git, terminal, search, memory, status bar.
 - [`widgets/`](src/widgets), [`theme.rs`](src/theme.rs).
 
-**Observer bridge:** implements `WriteGateObserver`, `AcpObserver`, `SwarmObserver` from [`gaviero_core::observer`](../gaviero-core/src/observer.rs). Each holds an event-channel sender. **No background task mutates `App` directly.**
+**Observer bridge:** implements `WriteGateObserver` and `AcpObserver` from [`gaviero_core::observer`](../gaviero-core/src/observer.rs), plus the memory / manifest / MCP observers. Each holds an event-channel sender. **No background task mutates `App` directly.** The TUI hosts no swarm runtime — `/swarm`, `/cswarm`, `/run`, `/undo-swarm` are gone; swarms run from `gaviero-cli --script`.
+
+**History capture:** one `gaviero_core::history::HistoryRecorder` per `App` (`app.history`). Every capture point keys by `turn_id`, never by conversation — `is_streaming` clears on the final message, before the turn's task finishes, so the next turn can start first. The HISTORY panel reads the NDJSON file; nothing reads through the recorder.
 
 **Remote sidecar:** every TUI launch starts a background WSS sidecar (`gaviero-remote`, Plan C) unless `remote.enabled` is false. Host detection, `tailscale cert`, bind, and the machine registry happen off the event loop (`Event::RemoteStarted` / `Event::RemoteUnavailable`). File edits still go through the Write Gate; the phone is a mirror of every conversation tab. Pairing is `/remote` (QR + machine token). See [`crates/gaviero-remote/PROTOCOL.md`](../gaviero-remote/PROTOCOL.md).
 
-**Authoritative slash list:** [`app/commands.rs`](src/app/commands.rs) (and chat helpers in [`panels/agent_chat.rs`](src/panels/agent_chat.rs)). Groups: session (`/model`, `/effort`, `/autoapprove`/`/yolo`, …), context (`/lite`, `/inject`, `/context mode …`), swarm, memory, MCP (`/mcp`, `/mcp probe` — probe runs from `gaviero-cli --mcp-reach-probe`), skills (`/skills`, `$skill`). Do not maintain a second inventory in ARCHITECTURE.md — point here.
+**Authoritative slash list:** [`app/commands.rs`](src/app/commands.rs) (and chat helpers in [`panels/agent_chat.rs`](src/panels/agent_chat.rs)). Groups: session (`/model`, `/effort`, `/autoapprove`/`/yolo`, …), context (`/lite`, `/inject`, `/context mode …`), memory, MCP (`/mcp`, `/mcp probe` — probe runs from `gaviero-cli --mcp-reach-probe`), skills (`/skills`, `$skill`). Do not maintain a second inventory in ARCHITECTURE.md — point here.
 
 ## Conventions
 

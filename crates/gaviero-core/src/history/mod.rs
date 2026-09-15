@@ -16,7 +16,7 @@
 //! header, so truncation or rotation can never invalidate the rest of the
 //! file). Size-rotated at [`HISTORY_MAX_BYTES`], keeping exactly one
 //! prior generation as `turns.ndjson.1`, through the same
-//! [`ndjson::NdjsonAppender`] the MCP telemetry sink uses.
+//! [`NdjsonAppender`] the MCP telemetry sink uses.
 //!
 //! # Hard invariants (from the plan)
 //!
@@ -42,7 +42,6 @@
 //! reused here rather than invented, so the history log and the memory
 //! manifest join on one key.
 
-pub mod ndjson;
 pub mod reader;
 pub mod record;
 pub mod tokens;
@@ -50,20 +49,20 @@ pub mod writer;
 
 use std::path::{Path, PathBuf};
 
-pub use ndjson::{NdjsonAppender, rotated_path};
+pub use crate::util::ndjson::{NdjsonAppender, rotated_path};
 pub use reader::{
     HistoryEvent, ReadOutcome, TurnRecords, TurnStatus, TurnSummary, group_turns, read_records,
     read_turn, summarize,
 };
 pub use record::{
     Attribution, CaptureMode, HistoryKind, HistoryRecord, McpCall, MemoryInjection, ProviderUsage,
-    SCHEMA_VERSION, ToolCall, ToolOutput, TurnEnd, TurnStart,
+    SCHEMA_VERSION, ToolCall, ToolOutput, TurnEnd, TurnStart, truncate_bytes,
 };
 pub use tokens::{
-    Estimator, count_words, estimate_json_text_tokens, estimate_json_tokens, estimate_text_tokens,
-    words_to_tokens,
+    Estimator, compact_count, count_words, estimate_json_text_tokens, estimate_json_tokens,
+    estimate_text_tokens, grouped_count, words_to_tokens,
 };
-pub use writer::HistoryRecorder;
+pub use writer::{HistoryRecorder, memory_injection_record, tool_call_record};
 
 /// Directory under the workspace root: `<root>/.gaviero/history`.
 pub const HISTORY_DIR: &str = ".gaviero/history";
@@ -91,9 +90,7 @@ pub const HISTORY_MAX_ASSISTANT_BYTES: usize = 8 * 1024;
 
 /// The history log path for a workspace root.
 pub fn history_path(workspace_root: &Path) -> PathBuf {
-    workspace_root
-        .join(HISTORY_DIR)
-        .join(HISTORY_FILENAME)
+    workspace_root.join(HISTORY_DIR).join(HISTORY_FILENAME)
 }
 
 #[cfg(test)]

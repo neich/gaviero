@@ -199,6 +199,16 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 return;
             }
 
+            // The keymap maps no action to Esc, so the HISTORY panel's
+            // close-overlay / clear-filter key is taken here.
+            if key.code == crossterm::event::KeyCode::Esc
+                && app.focus == Focus::SidePanel
+                && app.side_panel == SidePanelMode::HistoryPanel
+                && super::side_panel::handle_history_panel_escape(app)
+            {
+                return;
+            }
+
             let action = Keymap::resolve(&key);
             // Windows: after a clipboard-backed paste, ConPTY may still inject
             // leftover key events from the same gesture (often a lone `\` that
@@ -781,6 +791,13 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             app.memory_panel.deletions_rows = rows;
             app.memory_panel.deletions_cursor = 0;
         }
+        Event::HistoryLoaded(load) => {
+            let again = std::mem::take(&mut app.history_panel.reload_pending);
+            app.history_panel.apply_load(*load);
+            if again {
+                app.refresh_history_panel();
+            }
+        }
         Event::ChatMemoryInjected {
             conv_id,
             items_injected,
@@ -872,6 +889,12 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             proposal_count,
         } => {
             app.acp_tasks.remove(&conv_id);
+
+            // The turn's `turn_end` was written just before this event: a
+            // visible HISTORY panel picks it up without a manual reload.
+            if app.panel_visible.side_panel && app.side_panel == SidePanelMode::HistoryPanel {
+                app.refresh_history_panel();
+            }
 
             // Remote projection (A4): the turn ended — streaming state is a
             // summary-visible change (the pump sweep emits it), and the
@@ -1460,6 +1483,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                         std::sync::Arc::new(gaviero_core::mcp::FanOutMcpObserver::new(vec![
                             std::sync::Arc::new(super::observers::TuiMcpObserver {
                                 tx: app.event_tx.clone(),
+                                history: app.history.clone(),
                             }),
                             std::sync::Arc::new(
                                 gaviero_core::mcp::NdjsonTelemetrySink::for_workspace(
@@ -1917,6 +1941,12 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
             app.side_panel = SidePanelMode::AgentChat;
             app.focus = Focus::SidePanel;
         }
+        Action::SetSideModeHistory => {
+            app.panel_visible.side_panel = true;
+            app.side_panel = SidePanelMode::HistoryPanel;
+            app.focus = Focus::SidePanel;
+            app.refresh_history_panel();
+        }
         Action::SetSideModeGit => {
             app.panel_visible.side_panel = true;
             app.side_panel = SidePanelMode::GitPanel;
@@ -2012,6 +2042,9 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
                     SidePanelMode::MemoryPanel => {
                         app.handle_memory_panel_action(Action::CycleTabForward);
                     }
+                    SidePanelMode::HistoryPanel => {
+                        app.handle_history_panel_action(Action::CycleTabForward);
+                    }
                     SidePanelMode::GitPanel => {
                         app.git_panel.cycle_repo(1);
                         app.refresh_git_panel();
@@ -2031,6 +2064,9 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
                 match app.side_panel {
                     SidePanelMode::MemoryPanel => {
                         app.handle_memory_panel_action(Action::CycleTabBack);
+                    }
+                    SidePanelMode::HistoryPanel => {
+                        app.handle_history_panel_action(Action::CycleTabBack);
                     }
                     SidePanelMode::GitPanel => {
                         app.git_panel.cycle_repo(-1);
@@ -2165,6 +2201,7 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
         }
         _ if app.focus == Focus::SidePanel => match app.side_panel {
             SidePanelMode::AgentChat => app.handle_chat_action(action),
+            SidePanelMode::HistoryPanel => app.handle_history_panel_action(action),
             SidePanelMode::GitPanel => app.handle_git_panel_action(action),
             SidePanelMode::MemoryPanel => app.handle_memory_panel_action(action),
         },

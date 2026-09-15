@@ -34,7 +34,7 @@ Terminal editor + headless CLI for AI agent orchestration. Rust 2024.
 
 | Crate | Type | Role | Detail |
 |---|---|---|---|
-| [`gaviero-core`](crates/gaviero-core/) | lib (**26** pub mods) | Swarm, memory, MCP (stdio + loopback HTTP), ACP/agent-session (`deepseek:` tool_agent, `dsh:` ACP), write gate, repo-map, skills | [ARCHITECTURE](crates/gaviero-core/ARCHITECTURE.md) |
+| [`gaviero-core`](crates/gaviero-core/) | lib (**27** pub mods) | Swarm, memory, MCP (stdio + loopback HTTP), ACP/agent-session (`deepseek:` tool_agent, `dsh:` ACP), write gate, repo-map, skills | [ARCHITECTURE](crates/gaviero-core/ARCHITECTURE.md) |
 | [`gaviero-tui`](crates/gaviero-tui/) | bin `gaviero` | Ratatui UI, observers, slash commands | [ARCHITECTURE](crates/gaviero-tui/ARCHITECTURE.md) |
 | [`gaviero-cli`](crates/gaviero-cli/) | bin `gaviero-cli` | Clap runner (~4000-line `main.rs`), eval/memory admin | [ARCHITECTURE](crates/gaviero-cli/ARCHITECTURE.md) |
 | [`gaviero-dsl`](crates/gaviero-dsl/) | lib (**9** pub mods) | `.gaviero` compiler → `CompiledPlan` | [ARCHITECTURE](crates/gaviero-dsl/ARCHITECTURE.md) |
@@ -50,7 +50,7 @@ Terminal editor + headless CLI for AI agent orchestration. Rust 2024.
 
 ### Core (25) — [`lib.rs`](crates/gaviero-core/src/lib.rs)
 
-`acp`, `agent_session` (+ `tool_agent/`), `context_planner`, `diff_engine`, `git`, `git_conflict`, `indent`, `iteration`, `mcp`, `memory`, `observer`, `path_pattern`, `query_loader`, `repo_map` (+ topology / symbol enrichment), `scope_enforcer`, `session_state`, `skills`, `swarm` (+ backends incl. `deepseek`), `terminal`, `tree_sitter`, `types`, `util`, `validation_gate`, `workspace`, `write_gate`.
+`acp`, `agent_session` (+ `tool_agent/`), `context_planner`, `diff_engine`, `git`, `git_conflict`, `history`, `indent`, `iteration`, `mcp`, `memory`, `observer`, `path_pattern`, `query_loader`, `repo_map` (+ topology / symbol enrichment), `scope_enforcer`, `session_state`, `skills`, `swarm` (+ backends incl. `deepseek`), `terminal`, `tree_sitter`, `types`, `util`, `validation_gate`, `workspace`, `write_gate`.
 
 ### DSL (9) — [`lib.rs`](crates/gaviero-dsl/src/lib.rs)
 
@@ -151,10 +151,10 @@ CLI exit codes: 0 success, 1 failure, 2 args, 3 setup — [cli ARCHITECTURE](cra
 ## API
 
 ```rust
-// gaviero-core — 26 pub mods (crates/gaviero-core/src/lib.rs)
+// gaviero-core — 27 pub mods (crates/gaviero-core/src/lib.rs)
 pub mod acp; pub mod agent_session; pub mod context_planner;
 pub mod diff_engine; pub mod git; pub mod git_conflict;
-pub mod indent; pub mod iteration; pub mod mcp; pub mod memory;
+pub mod history; pub mod indent; pub mod iteration; pub mod mcp; pub mod memory;
 pub mod observer; pub mod path_pattern; pub mod query_loader;
 pub mod repo_map; pub mod scope_enforcer; pub mod session_state;
 pub mod skills; pub mod swarm; pub mod terminal; pub mod tree_sitter;

@@ -39,7 +39,7 @@ gaviero-tui/src/
 ├─ platform.rs          ConPTY / AltGr / Ctrl+C forwarder — all OS quirks
 ├─ theme.rs             Palette + timing
 ├─ editor/              buffer, view, wrap, highlight, markdown, diff, diff_overlay
-├─ panels/              file_tree, agent_chat, swarm_dashboard, git, terminal,
+├─ panels/              file_tree, agent_chat, history_panel, git, terminal,
 │                       search, memory_panel, status_bar, chat_markdown
 ├─ widgets/             tabs, scrollbar, scroll_state, text_input, render_utils
 └─ app/
@@ -52,8 +52,7 @@ gaviero-tui/src/
    ├─ remote.rs         Remote command reducers (every tab by conv_id)
    ├─ remote_setup.rs   Sidecar bootstrap, `/remote`, machine token
    ├─ state.rs          Shared enums
-   ├─ state.rs          Shared enums
-   └─ observers.rs      WriteGate / Acp / Swarm / Memory / Manifest → Event
+   └─ observers.rs      WriteGate / Acp / Memory / Manifest / Mcp → Event (+ history capture)
 ```
 
 ---
@@ -69,12 +68,16 @@ Owns tabs, panels, focus, theme, workspace, optional `MemoryStores` + `WriterHan
 ```rust
 enum Focus { Editor, FileTree, SidePanel, Terminal }
 enum LeftPanelMode  { FileTree, Search, Changes, Review }
-enum SidePanelMode  { AgentChat, SwarmDashboard, GitPanel, Memory }
+enum SidePanelMode  { AgentChat, HistoryPanel, GitPanel, MemoryPanel }
 ```
 
 ### Observer bridge ([`app/observers.rs`](src/app/observers.rs))
 
-Implements core observer traits; each holds `mpsc::UnboundedSender<Event>`. Includes `CursorSessionStarted` → `SessionLedger` continuity.
+Implements core observer traits; each holds `mpsc::UnboundedSender<Event>`. Includes `CursorSessionStarted` → `SessionLedger` continuity. `TuiAcpObserver` (built per turn, carrying its `turn_id`) and `TuiMcpObserver` also write to the app's single `gaviero_core::history::HistoryRecorder` — see History panel below. The TUI no longer implements `SwarmObserver`; swarms run from `gaviero-cli --script`.
+
+### History panel ([`panels/history_panel.rs`](src/panels/history_panel.rs))
+
+`Alt+h`. Per turn: full prompt, tool calls (args + result, or summary-only), MCP calls (request + response), the memory call (manifest + injected block), and token totals. Capture: [`dispatch_prompt_core`](src/app/side_panel.rs) opens the turn with the verbatim prompt; the turn's task records the memory injection, bootstrap size, and turn end **by `turn_id`** (a conversation can start its next turn before the previous task reports finished); `TuiAcpObserver` records tools / assistant output / provider usage; `TuiMcpObserver` records MCP calls (attributed only when one conversation is streaming). The panel reads `<root>/.gaviero/history/turns.ndjson` off the loop (`Event::HistoryLoaded`) and never writes. Per-item token numbers are `~` estimates with the estimator named in the footer; exact numbers are provider-reported.
 
 ### Topology cache ([`app/session.rs`](src/app/session.rs))
 
@@ -109,7 +112,7 @@ Status bar (mode | file | branch | Wrap | agent)
 
 ### Slash commands
 
-Authoritative inventory: [`app/commands.rs`](src/app/commands.rs) + chat helpers in [`panels/agent_chat.rs`](src/panels/agent_chat.rs). Groups: session (`/model`, `/effort`, `/autoapprove`/`/yolo`, …), context (`/lite`, `/inject`, `/no-inject`, `/context mode …`, `/namespace`), swarm (`/run`, `/swarm`, `/cswarm`, `/undo-swarm`), memory (`/remember*`, `/forget*`, `/restore`, `/reembed`, `/sleep`, `/consolidate-session`), MCP (`/mcp`, `/mcp probe`), skills (`/skills`, `$skill`), attachments (`/attach`, `/detach`). Do not maintain a second full table here — see [CLAUDE.md](CLAUDE.md).
+Authoritative inventory: [`app/commands.rs`](src/app/commands.rs) + chat helpers in [`panels/agent_chat.rs`](src/panels/agent_chat.rs). Groups: session (`/model`, `/effort`, `/autoapprove`/`/yolo`, …), context (`/lite`, `/inject`, `/no-inject`, `/context mode …`, `/namespace`), memory (`/remember*`, `/forget*`, `/restore`, `/reembed`, `/sleep`, `/consolidate-session`), MCP (`/mcp`, `/mcp probe`), skills (`/skills`, `$skill`), attachments (`/attach`, `/detach`). Do not maintain a second full table here — see [CLAUDE.md](CLAUDE.md).
 
 ### Chat ↔ memory ([`app/chat_memory.rs`](src/app/chat_memory.rs))
 
@@ -126,7 +129,7 @@ Single-threaded UI + async producers. **No `Mutex` in TUI state.** Observers clo
 ## Error Handling
 
 - User-facing failures → status bar / transient alert.
-- Swarm / ACP errors → `Event::SwarmCompleted` / `AcpTaskCompleted` → side panel.
+- ACP errors → `AcpTaskCompleted` / `AgentTurnFinished` → side panel.
 - Memory errors → `MemoryObserver` events.
 - Panic handler in [`main.rs`](src/main.rs) restores terminal (raw mode off, alt screen off, cursor on) before unwind.
 - Merge conflicts: F8/F9 navigate regions via [`git_conflict`](../gaviero-core/src/git_conflict.rs).
