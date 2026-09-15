@@ -13,8 +13,19 @@ pub mod settings {
     pub const WORD_WRAP: &str = "editor.wordWrap";
     pub const FORMAT_ON_SAVE: &str = "editor.formatOnSave";
     pub const FILES_EXCLUDE: &str = "files.exclude";
+    /// Explorer column width in cells.
+    ///
+    /// This is the *initial* width only. Panel geometry is per-session state:
+    /// once the editor has run, the width the user left behind is stored in
+    /// `state.json` (see [`crate::session_state`]) and takes precedence, so
+    /// this value seeds a first run or a workspace whose session was cleared —
+    /// it is not a live setting that a resize rewrites.
     pub const FILE_TREE_WIDTH: &str = "panels.fileTree.width";
+    /// Side panel column width in cells. Layered exactly like
+    /// [`FILE_TREE_WIDTH`].
     pub const SIDE_PANEL_WIDTH: &str = "panels.sidePanel.width";
+    /// Terminal panel height as a percentage of the main area (10–80). Layered
+    /// exactly like [`FILE_TREE_WIDTH`].
     pub const TERMINAL_SPLIT_PERCENT: &str = "panels.terminal.splitPercent";
     pub const GIT_TREE_ALLOW_LIST: &str = "git.treeAllowList";
 

@@ -107,7 +107,10 @@ pub struct App {
     indent_query_cache: gaviero_core::indent::config::IndentQueryCache,
     layout: LayoutAreas,
 
-    // Configurable panel sizes
+    // Configurable panel sizes. These are the *live* values; they are read
+    // back from the workspace's `panels.*.width` settings as the initial
+    // default and then persisted per-session in `state.json` (see
+    // `app/session.rs`), which is the single source of truth between runs.
     file_tree_width: u16,
     side_panel_width: u16,
     terminal_split_percent: u16,
@@ -293,18 +296,11 @@ impl App {
 
         // Read panel sizes from settings
         use gaviero_core::workspace::settings;
-        let file_tree_width = workspace
-            .resolve_setting(settings::FILE_TREE_WIDTH, None)
-            .as_u64()
-            .unwrap_or(30) as u16;
-        let side_panel_width = workspace
-            .resolve_setting(settings::SIDE_PANEL_WIDTH, None)
-            .as_u64()
-            .unwrap_or(40) as u16;
-        let terminal_split_percent = workspace
-            .resolve_setting(settings::TERMINAL_SPLIT_PERCENT, None)
-            .as_u64()
-            .unwrap_or(30) as u16;
+        // Seed layer only: the sanitised `panels.*` settings, else the built-in
+        // defaults. `state.json` carries the live geometry for a workspace that
+        // already has a session, and `restore_session` layers it over this.
+        let (file_tree_width, side_panel_width, terminal_split_percent) =
+            layout::seed_panel_geometry(&workspace);
 
         let layout_presets = parse_layout_presets(&workspace);
 
