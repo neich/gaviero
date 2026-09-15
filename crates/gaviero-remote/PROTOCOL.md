@@ -149,6 +149,7 @@ holds the current token.
 | `request_proposal` | `{ proposal_id }` |
 | `request_terminals` | `{ terminal_id? }` — requires `shell_sessions`; lists tabs and reads the selected screen |
 | `terminal_input` | `{ terminal_id, text }` — requires `shell_sessions`; writes UTF-8 input and control keys to the named PTY |
+| `request_file_completions` | `{ query, limit? }` — requires `file_completions`; workspace paths for an `@` reference |
 
 There is **no** `rotate_token` command. Rotation is desktop-only and reaches the client as
 close 4006.
@@ -344,9 +345,31 @@ Input uses the existing instance validation, authentication, command-ID dedupe,
 and rate limits. The client clears shell state and disables input on disconnect;
 it never replays input automatically. Older servers receive no shell requests.
 
+## File completions (`file_completions` capability)
+
+Servers advertising `hello.capabilities: ["file_completions", ...]` answer
+`request_file_completions`: `{ "query": "src/ma", "limit": 10 }`. `query` is the
+text after `@` (without the `@`, at most 1024 bytes, else `invalid_payload`);
+`limit` is clamped to 1–50 and defaults to 10. The completed
+`command_result.result` is `{ query, files: [string] }` — `query` echoed so the
+client can drop stale replies.
+
+`files` come from the same list and matcher as the desktop `@` popup: a
+case-insensitive substring match over workspace-relative paths (`/`-separated,
+prefixed with the folder label in multi-root workspaces), honoring
+`files.exclude`, in listing order. An empty query returns the first `limit`
+files. Only files under the workspace roots are offered; directories are not.
+
+Completion is read-only and reveals names, never contents. File contents reach
+the agent only through `send_prompt`, which resolves `@path` references exactly
+as a desktop prompt does. The Flutter composer opens suggestions when the caret
+sits in an `@` token that starts the text or follows whitespace, debounces
+typing, keeps one request in flight, and on tap replaces the token with
+`@<path> `. Older servers receive no completion requests.
+
 ## Fixtures
 
-One example per frame type under `fixtures/client/` (15) and `fixtures/server/` (20),
+One example per frame type under `fixtures/client/` (16) and `fixtures/server/` (20),
 named `<type>.json`, each a complete envelope, plus `fixtures/http/instances.json` for the
 1.1 directory body. `fixtures/server/hello.json` shows the 1.1 shape (`machine`, capabilities);
 the test suite also asserts the 1.0 shape (no `machine`) still decodes. `fixtures/server/message_complete.json`

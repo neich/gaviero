@@ -183,6 +183,22 @@
         "required": ["terminal_id", "text"],
         "type": "object"
       },
+      "RequestFileCompletions": {
+        "properties": {
+          "limit": {
+            "description": "Clamped server-side to 1–50; absent ⇒ 10.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": ["integer", "null"]
+          },
+          "query": {
+            "description": "Text typed after `@`, without the `@`. Limited to 1024 bytes.",
+            "type": "string"
+          }
+        },
+        "required": ["query"],
+        "type": "object"
+      },
       "ResetConversation": {
         "properties": {
           "conv_id": {
@@ -511,6 +527,14 @@
         "properties": {
           "payload": { "$ref": "#/$defs/TerminalInput" },
           "type": { "const": "terminal_input", "type": "string" }
+        },
+        "required": ["type", "payload"],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "payload": { "$ref": "#/$defs/RequestFileCompletions" },
+          "type": { "const": "request_file_completions", "type": "string" }
         },
         "required": ["type", "payload"],
         "type": "object"

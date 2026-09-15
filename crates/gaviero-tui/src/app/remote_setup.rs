@@ -750,6 +750,7 @@ pub async fn start(
                 "shell_sessions".to_string(),
                 gaviero_remote::version::capability::LATEST_PAGE.to_string(),
                 gaviero_remote::version::capability::INSTANCES.to_string(),
+                gaviero_remote::version::capability::FILE_COMPLETIONS.to_string(),
             ],
             machine: Some(gaviero_remote::dto::MachineInfo {
                 host: config.magic_dns_host.clone(),

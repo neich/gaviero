@@ -20,6 +20,8 @@ pub mod capability {
     pub const LATEST_PAGE: &str = "latest_page";
     /// `GET /v1/instances` is served on this listener.
     pub const INSTANCES: &str = "instances";
+    /// `request_file_completions` lists workspace paths for `@` references.
+    pub const FILE_COMPLETIONS: &str = "file_completions";
 }
 
 /// Why a peer's version is unacceptable.

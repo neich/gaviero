@@ -1,0 +1,13 @@
+{
+  "version": {
+    "major": 1,
+    "minor": 1
+  },
+  "instance_id": "a3f9c2e14b7d8650",
+  "command_id": "cmd-request_file_completions",
+  "type": "request_file_completions",
+  "payload": {
+    "query": "src/ma",
+    "limit": 10
+  }
+}

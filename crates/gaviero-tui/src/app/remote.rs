@@ -164,6 +164,25 @@ fn terminal_snapshot(app: &App, requested: Option<u64>) -> serde_json::Value {
     serde_json::json!({ "terminals": tabs, "selected_id": selected.map(|id| id.raw()), "screen": screen })
 }
 
+/// `@` completion for the phone composer: the same file list and matcher
+/// as the desktop popup, so an accepted path resolves in `send_prompt`.
+fn file_completions(
+    app: &App,
+    query: &str,
+    limit: Option<u32>,
+) -> Result<serde_json::Value, CommandFailure> {
+    if query.len() > 1024 {
+        return Err(CommandFailure::new(
+            ErrorCode::InvalidPayload,
+            "completion query exceeds 1024 bytes",
+        ));
+    }
+    let limit = limit.unwrap_or(10).clamp(1, 50) as usize;
+    let files = crate::app::side_panel::workspace_completion_files(app);
+    let matches = crate::panels::agent_chat::match_file_paths(&files, query, limit);
+    Ok(serde_json::json!({ "query": query, "files": matches }))
+}
+
 impl RemoteState {
     /// Current freshness token for a proposal.
     pub fn proposal_revision(&self, proposal_id: u64) -> u64 {
@@ -279,6 +298,8 @@ pub fn handle_remote_command(app: &mut App, envelope: ClientEnvelope, max_prompt
                         .map_err(|e| CommandFailure::new(ErrorCode::InvalidPayload, e.to_string()))
                 }
             }
+            ClientFrame::RequestFileCompletions(r) => file_completions(app, &r.query, r.limit)
+                .map(|result| (CommandStatus::Completed, Some(result))),
             ClientFrame::RequestMessages(r) => {
                 // 1.1 `latest_page`: an absent cursor means the newest page.
                 crate::app::projection::build_message_page(app, &r.conv_id, r.before_seq, r.limit)
@@ -800,6 +821,56 @@ mod tests {
         );
         app.terminal_manager.close_tab(first);
         assert!(terminal_snapshot(&app, None)["selected_id"].is_null());
+    }
+
+    #[test]
+    fn remote_file_completions_match_workspace_paths_and_clamp() {
+        use gaviero_remote::envelope::RequestFileCompletions;
+        let (dir, mut app) = two_tab_app();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        for file in ["src/main.rs", "src/lib.rs", "README.md"] {
+            std::fs::write(dir.path().join(file), "").unwrap();
+        }
+        let mut request = |query: &str, limit: Option<u32>| {
+            handle_remote_command(
+                &mut app,
+                ClientEnvelope {
+                    version: gaviero_remote::version::PROTOCOL_VERSION,
+                    instance_id: Some("test".into()),
+                    command_id: format!("complete-{query}"),
+                    frame: ClientFrame::RequestFileCompletions(RequestFileCompletions {
+                        query: query.to_string(),
+                        limit,
+                    }),
+                },
+                131072,
+            );
+            app.remote.pending_frames.pop()
+        };
+
+        let Some(ServerFrame::CommandResult(done)) = request("SRC/", None) else {
+            panic!("expected command_result");
+        };
+        let result = done.result.unwrap();
+        assert_eq!(result["query"], "SRC/");
+        let mut files: Vec<&str> = result["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f.as_str().unwrap())
+            .collect();
+        files.sort();
+        assert_eq!(files, ["src/lib.rs", "src/main.rs"]);
+
+        let Some(ServerFrame::CommandResult(one)) = request("", Some(0)) else {
+            panic!("expected command_result");
+        };
+        assert_eq!(one.result.unwrap()["files"].as_array().unwrap().len(), 1);
+
+        assert!(matches!(
+            request(&"a".repeat(1025), None),
+            Some(ServerFrame::CommandError(_))
+        ));
     }
 
     #[test]

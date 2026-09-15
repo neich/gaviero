@@ -30,6 +30,7 @@ pub enum ClientFrame {
     RequestProposal(RequestProposal),
     RequestTerminals(RequestTerminals),
     TerminalInput(TerminalInput),
+    RequestFileCompletions(RequestFileCompletions),
 }
 
 impl ClientFrame {
@@ -50,6 +51,7 @@ impl ClientFrame {
         "request_proposal",
         "request_terminals",
         "terminal_input",
+        "request_file_completions",
     ];
 }
 
@@ -142,6 +144,15 @@ pub struct TerminalInput {
     pub terminal_id: u64,
     /// UTF-8 input, including terminal control keys. Limited to 4096 bytes.
     pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct RequestFileCompletions {
+    /// Text typed after `@`, without the `@`. Limited to 1024 bytes.
+    pub query: String,
+    /// Clamped server-side to 1–50; absent ⇒ 10.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
 }
 
 // ── Server frames ────────────────────────────────────────────────
