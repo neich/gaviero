@@ -308,23 +308,13 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             app.refresh_file_tree();
         }
         Event::StreamChunk { conv_id, text } => {
-            if let Some(agent_id) = conv_id.strip_prefix("swarm-") {
-                app.swarm_dashboard.append_stream_chunk(agent_id, &text);
-            } else {
-                app.chat_state.append_stream_chunk_to(&conv_id, &text);
-            }
+            app.chat_state.append_stream_chunk_to(&conv_id, &text);
         }
         Event::ToolCallStarted { conv_id, tool_name } => {
-            if let Some(agent_id) = conv_id.strip_prefix("swarm-") {
-                app.swarm_dashboard.add_tool_call(agent_id, &tool_name);
-            } else {
-                app.chat_state.add_tool_call_to(&conv_id, &tool_name);
-            }
+            app.chat_state.add_tool_call_to(&conv_id, &tool_name);
         }
         Event::StreamingStatus { conv_id, status } => {
-            if let Some(agent_id) = conv_id.strip_prefix("swarm-") {
-                app.swarm_dashboard.set_streaming_status(agent_id, &status);
-            } else if let Some(idx) = app.chat_state.find_conv_idx(&conv_id) {
+            if let Some(idx) = app.chat_state.find_conv_idx(&conv_id) {
                 app.chat_state.conversations[idx].streaming_status = status;
             }
         }
@@ -352,10 +342,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
         } => {
             if conv_id.is_empty() {
                 app.chat_state.add_system_message(&content);
-                if app.swarm_dashboard.phase == "failed" {
-                    app.swarm_dashboard.status_message = content.clone();
-                }
-                tracing::warn!("Swarm message: {}", content);
+                tracing::warn!("Background message: {}", content);
             } else {
                 // A1: for assistant responses, parse + strip the
                 // `<turn_annotations>` sidecar before the text reaches
@@ -513,17 +500,8 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 additions,
                 deletions
             );
-            if let Some(agent_id) = conv_id.strip_prefix("swarm-") {
-                app.swarm_dashboard.add_file_change(
-                    agent_id,
-                    &path.to_string_lossy(),
-                    additions,
-                    deletions,
-                );
-            } else {
-                app.chat_state
-                    .append_deferred_summary(&conv_id, &path, additions, deletions);
-            }
+            app.chat_state
+                .append_deferred_summary(&conv_id, &path, additions, deletions);
         }
         Event::ClaudeSessionStarted {
             conv_id,
@@ -1061,101 +1039,6 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
             } else {
                 let _ = respond.send(gaviero_core::observer::PermissionDecision::deny());
             }
-        }
-        Event::SwarmPhaseChanged(phase) => {
-            app.swarm_dashboard.set_phase(&phase);
-            if phase == "running" || phase == "merging" || phase == "verifying" {
-                app.swarm_dashboard.status_message.clear();
-            } else if phase == "validating" {
-                app.swarm_dashboard.status_message = "Validating scopes and dependencies...".into();
-            } else if phase == "failed" {
-                if app.swarm_dashboard.status_message.is_empty() {
-                    app.swarm_dashboard.status_message =
-                        "Run failed — waiting for error details...".into();
-                }
-            } else if phase == "reverted" {
-                app.swarm_dashboard.result = None;
-                app.swarm_dashboard.diff_agent = None;
-                app.swarm_dashboard.status_message = "Swarm reverted to pre-run state.".into();
-            } else if phase.starts_with("revert failed") || phase.starts_with("revert panicked") {
-                app.swarm_dashboard.status_message =
-                    format!("Undo failed: {}", &phase["revert ".len()..]);
-            }
-        }
-        Event::SwarmAgentStateChanged { id, status, detail } => {
-            app.swarm_dashboard.update_agent(&id, &status, &detail);
-        }
-        Event::SwarmTierStarted { current, total } => {
-            app.swarm_dashboard.set_tier(current, total);
-        }
-        Event::SwarmCompleted(result) => {
-            app.swarm_dashboard.set_phase("completed");
-            app.swarm_dashboard.status_message.clear();
-            app.swarm_dashboard.set_result(*result);
-        }
-        Event::SwarmMergeConflict { branch, files } => {
-            app.status_message = Some((
-                format!("Merge conflict in {}: {}", branch, files.join(", ")),
-                std::time::Instant::now(),
-            ));
-        }
-        Event::SwarmCoordinationStarted(_prompt) => {
-            app.swarm_dashboard.set_phase("coordinating");
-            app.swarm_dashboard.status_message = "Opus is decomposing the task...".into();
-        }
-        Event::SwarmCoordinationComplete {
-            unit_count,
-            summary: _,
-        } => {
-            app.swarm_dashboard
-                .set_phase(&format!("planned ({} agents)", unit_count));
-            app.swarm_dashboard.status_message =
-                format!("Plan ready: {} agents, starting execution...", unit_count);
-        }
-        Event::SwarmTierDispatch {
-            unit_id,
-            tier,
-            backend,
-        } => {
-            app.swarm_dashboard
-                .set_tier_dispatch(&unit_id, tier, &backend);
-        }
-        Event::SwarmLoopGateFailed {
-            probe,
-            status,
-            output,
-        } => {
-            let diagnostic = output.lines().next().unwrap_or_default().trim();
-            app.swarm_dashboard.status_message = if diagnostic.is_empty() {
-                format!("Loop gate failed: {probe} ({status})")
-            } else {
-                format!("Loop gate failed: {probe} ({status}) - {diagnostic}")
-            };
-        }
-        Event::SwarmCostUpdate(estimate) => {
-            app.swarm_dashboard.set_cost(estimate.estimated_usd);
-        }
-        Event::SwarmDslPlanReady(plan_path) => {
-            app.swarm_dashboard.set_phase("plan ready");
-            let workspace_root = app
-                .workspace
-                .roots()
-                .first()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            let rel = plan_path
-                .strip_prefix(&workspace_root)
-                .unwrap_or(&plan_path)
-                .display()
-                .to_string();
-            app.swarm_dashboard.status_message =
-                format!("Plan saved: {} — review and /run it", rel);
-            app.chat_state.add_system_message(&format!(
-                "Plan saved to `{}`.\nReview it (it's open in the editor), then run it with:\n  /run {}",
-                rel, rel,
-            ));
-            app.open_file(&plan_path);
-            app.focus = Focus::Editor;
         }
         Event::MemoryReady(stores) => {
             let workspace_root = app
@@ -2011,17 +1894,7 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
 
     match action {
         Action::Quit => {
-            if app.focus == Focus::SidePanel
-                && matches!(app.side_panel, SidePanelMode::SwarmDashboard)
-                && app.swarm_dashboard.diff_agent.is_some()
-            {
-                app.swarm_dashboard.close_diff();
-            } else if app.focus == Focus::SidePanel
-                && matches!(app.side_panel, SidePanelMode::SwarmDashboard)
-                && app.swarm_dashboard.pending_undo_confirm
-            {
-                app.swarm_dashboard.pending_undo_confirm = false;
-            } else if app.diff_review.is_some() {
+            if app.diff_review.is_some() {
                 app.diff_review = None;
             } else {
                 app.try_quit();
@@ -2039,21 +1912,9 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
                 app.focus = Focus::Editor;
             }
         }
-        Action::ToggleSwarmDashboard => {
-            if !app.panel_visible.side_panel {
-                app.panel_visible.side_panel = true;
-            }
-            app.side_panel = SidePanelMode::SwarmDashboard;
-            app.focus = Focus::SidePanel;
-        }
         Action::SetSideModeChat => {
             app.panel_visible.side_panel = true;
             app.side_panel = SidePanelMode::AgentChat;
-            app.focus = Focus::SidePanel;
-        }
-        Action::SetSideModeSwarm => {
-            app.panel_visible.side_panel = true;
-            app.side_panel = SidePanelMode::SwarmDashboard;
             app.focus = Focus::SidePanel;
         }
         Action::SetSideModeGit => {
@@ -2305,7 +2166,6 @@ pub(super) fn handle_action(app: &mut App, action: Action) {
         _ if app.focus == Focus::SidePanel => match app.side_panel {
             SidePanelMode::AgentChat => app.handle_chat_action(action),
             SidePanelMode::GitPanel => app.handle_git_panel_action(action),
-            SidePanelMode::SwarmDashboard => app.handle_swarm_dashboard_action(action),
             SidePanelMode::MemoryPanel => app.handle_memory_panel_action(action),
         },
         _ => {}

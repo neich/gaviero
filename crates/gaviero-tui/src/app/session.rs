@@ -2,8 +2,8 @@ use super::*;
 
 /// Consume a keystroke while the Codex trust modal is open. Persists
 /// the answer to `.gaviero/settings.json` and replays the pending
-/// `/swarm` regardless of grant/deny — denial just means Gaviero will
-/// skip Codex config synthesis at swarm time.
+/// action regardless of grant/deny — denial just means Gaviero will
+/// skip Codex config synthesis at that point.
 pub(super) fn handle_codex_trust_key(app: &mut App, key: &crossterm::event::KeyEvent) {
     use gaviero_core::workspace::settings as S;
 
@@ -39,11 +39,6 @@ pub(super) fn handle_codex_trust_key(app: &mut App, key: &crossterm::event::KeyE
     }
 
     match dialog.pending {
-        super::state::PendingAfterTrust::Swarm(task) => {
-            app.chat_state
-                .add_system_message(&format!("Codex MCP trust: {decision}. Resuming /swarm…"));
-            super::commands::run_swarm(app, task);
-        }
         super::state::PendingAfterTrust::ChatSend => {
             // On grant, re-synthesize so the next codex-exec turn picks up the
             // gaviero MCP server (fresh subprocess reads .codex/config.toml at
@@ -534,8 +529,6 @@ pub(crate) fn warm_up_repo_map(app: &App) {
 }
 
 pub(super) fn try_quit(app: &mut App) {
-    use gaviero_core::swarm::models::AgentStatus;
-
     let unsaved: Vec<String> = app
         .buffers
         .iter()
@@ -550,16 +543,9 @@ pub(super) fn try_quit(app: &mut App) {
         .filter(|c| c.is_streaming || c.has_running_background_agents())
         .count();
 
-    let running_swarm = app
-        .swarm_dashboard
-        .agents
-        .iter()
-        .filter(|a| matches!(a.status, AgentStatus::Running))
-        .count();
-
     let has_pending_review = app.diff_review.is_some();
 
-    if unsaved.is_empty() && streaming_agents == 0 && running_swarm == 0 && !has_pending_review {
+    if unsaved.is_empty() && streaming_agents == 0 && !has_pending_review {
         app.should_quit = true;
     } else {
         app.quit_confirm = true;

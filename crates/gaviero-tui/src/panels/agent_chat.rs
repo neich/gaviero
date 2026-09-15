@@ -2028,12 +2028,9 @@ impl AgentChatState {
                      Files & scripts:\n\
                      /attach <path>           — Attach a file (text or image)\n\
                      /attach                  — List current attachments\n\
-                     /detach <name|all>       — Remove attachment(s) (Tab completes names)\n\
-                     /run <path>              — Execute a .gaviero DSL script (supports `client { effort ... extra { ... } }` and top-level `tier <name> <client>` aliases)\n\n\
-                     Swarm:\n\
-                     /swarm <task>            — Plan and execute a multi-agent swarm\n\
-                     /cswarm <task>           — Coordinated swarm (provider-aware coordinator planning)\n\
-                     /undo-swarm              — Revert all changes from the last /cswarm run\n\n\
+                     /detach <name|all>       — Remove attachment(s) (Tab completes names)\n\n\
+                     Scripts:\n\
+                     (DSL scripts and multi-agent swarms run from the CLI: `gaviero-cli --script <path.gaviero>`)\n\n\
                      Memory:\n\
                      /remember <text>         — Store a memory at the default scope\n\
                      /remember-here <text>    — Store at run scope (dies with session)\n\
@@ -4831,14 +4828,17 @@ fn hidden_provider_overhead_tokens(model: &str) -> usize {
 /// Count words by splitting on Unicode whitespace. Empty/whitespace-only
 /// input yields 0.
 fn count_words(s: &str) -> usize {
-    s.split_whitespace().count()
+    // Delegates to the single estimator implementation in core
+    // (`gaviero_core::history::tokens`) so the panel, the history log, and
+    // the CLI cannot drift apart.
+    gaviero_core::history::count_words(s)
 }
 
 /// Convert a word count to an approximate token count using the rule of
 /// thumb that an LLM token is ~30% smaller than an English word:
 /// `tokens ≈ words × 1.3`. Integer math: `(words × 13) / 10`.
 fn words_to_tokens(words: usize) -> usize {
-    words.saturating_mul(13) / 10
+    gaviero_core::history::words_to_tokens(words)
 }
 
 /// Normalize a user-typed model spec to canonical `provider:model` form.

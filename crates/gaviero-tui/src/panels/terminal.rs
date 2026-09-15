@@ -448,7 +448,6 @@ fn action_escapes_terminal(action: &Action) -> bool {
             | SetLeftModeFind
             | SetLeftModeChanges
             | SetSideModeChat
-            | SetSideModeSwarm
             | SetSideModeGit
             | SetSideModeMemory
             | ToggleAutoApprove

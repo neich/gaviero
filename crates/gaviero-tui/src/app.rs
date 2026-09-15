@@ -45,7 +45,7 @@ pub(crate) mod session;
 mod side_panel;
 mod state;
 
-use self::observers::{TuiAcpObserver, TuiSwarmObserver, TuiWriteGateObserver};
+use self::observers::{TuiAcpObserver, TuiWriteGateObserver};
 use self::state::{
     BatchReviewState, BulkOpState, ChangesEntry, ChangesState, CodexTrustDialog,
     DiffHighlightCache, DiffKind, Focus, LayoutAreas, LayoutPreset, LeftPanelMode,
@@ -83,7 +83,6 @@ pub struct App {
     pub active_buffer: usize,
     pub file_tree: FileTreeState,
     pub search_panel: crate::panels::search::SearchPanelState,
-    pub swarm_dashboard: crate::panels::swarm_dashboard::SwarmDashboardState,
     pub left_panel: LeftPanelMode,
     pub side_panel: SidePanelMode,
     pub focus: Focus,
@@ -92,7 +91,7 @@ pub struct App {
     /// When true, a quit-confirmation dialog is shown (unsaved files or active agents).
     quit_confirm: bool,
     /// Codex MCP trust prompt. `Some` while the user must answer the
-    /// one-time consent modal before a pending `/swarm` run proceeds.
+    /// one-time consent modal before a pending codex chat turn proceeds.
     pub(crate) codex_trust_dialog: Option<CodexTrustDialog>,
     /// When true, the main loop should call `terminal.clear()` before the next draw
     /// to force a full redraw and fix any terminal state corruption.
@@ -392,7 +391,6 @@ impl App {
             active_buffer: 0,
             file_tree,
             search_panel: crate::panels::search::SearchPanelState::new(),
-            swarm_dashboard: crate::panels::swarm_dashboard::SwarmDashboardState::new(),
             left_panel: LeftPanelMode::FileTree,
             side_panel: SidePanelMode::AgentChat,
             focus: Focus::FileTree,
@@ -661,10 +659,6 @@ impl App {
 
     // ── Git panel actions ────────────────────────────────────
 
-    fn handle_swarm_dashboard_action(&mut self, action: Action) {
-        side_panel::handle_swarm_dashboard_action(self, action);
-    }
-
     fn handle_git_panel_action(&mut self, action: Action) {
         side_panel::handle_git_panel_action(self, action);
     }
@@ -695,26 +689,6 @@ impl App {
 
     fn send_chat_message(&mut self) {
         side_panel::send_chat_message(self);
-    }
-
-    /// Handle `/swarm <task>` command — plan + execute a multi-agent task.
-    fn handle_swarm_command(&mut self) {
-        commands::handle_swarm_command(self);
-    }
-
-    /// Handle `/run <path.gaviero> [prompt]` — compile and execute a DSL script.
-    fn handle_run_script_command(&mut self) {
-        commands::handle_run_script_command(self);
-    }
-
-    /// Handle `/cswarm <task>` — coordinated tier-routed swarm (Opus → Sonnet/Haiku).
-    fn handle_coordinated_swarm_command(&mut self) {
-        commands::handle_coordinated_swarm_command(self);
-    }
-
-    /// Handle `/undo-swarm` — navigate to swarm dashboard and arm undo confirmation.
-    fn handle_undo_swarm_command(&mut self) {
-        commands::handle_undo_swarm_command(self);
     }
 
     /// Handle `/remember <text>` command — store text to semantic memory.
@@ -1431,31 +1405,4 @@ pub(crate) fn matches_exclude(rel_path: &str, excludes: &[String]) -> bool {
         }
     }
     false
-}
-
-/// If `src` is markdown-wrapped (i.e. the LLM emitted ```gaviero fences around the
-/// DSL), extract and return only the content of the first such block.  If no fences
-/// are found, return the original string unchanged.
-///
-/// Uses the *last* bare ``` line as the closing fence, because DSL prompt strings
-/// can contain inner ```cpp / ``` blocks that would otherwise truncate the extraction.
-fn extract_gaviero_block(src: &str) -> String {
-    let lines: Vec<&str> = src.lines().collect();
-    let fence_start = lines.iter().position(|l| {
-        let t = l.trim();
-        t == "```gaviero" || t.starts_with("```gaviero ")
-    });
-    if let Some(start_idx) = fence_start {
-        let content_start = start_idx + 1;
-        // Use the *last* bare ``` in the file as the closing fence so that inner
-        // code blocks inside prompt strings don't cause early termination.
-        if let Some(rel_end) = lines[content_start..]
-            .iter()
-            .rposition(|l| l.trim() == "```")
-        {
-            let content = lines[content_start..content_start + rel_end].join("\n");
-            return content;
-        }
-    }
-    src.to_string()
 }

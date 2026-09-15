@@ -7,7 +7,6 @@ use gaviero_core::terminal::TerminalEvent;
 use gaviero_core::types::WriteProposal;
 
 #[derive(Debug)]
-#[allow(dead_code)] // Swarm variants are wired but not yet launched from TUI
 pub enum Event {
     // Terminal input
     Key(crossterm::event::KeyEvent),
@@ -235,44 +234,6 @@ pub enum Event {
     MemoryDeletionsLoaded {
         rows: Vec<crate::panels::memory_panel::DeletionRow>,
     },
-
-    // Swarm events (constructed by TuiSwarmObserver when swarm is launched)
-    SwarmPhaseChanged(String),
-    SwarmAgentStateChanged {
-        id: String,
-        status: gaviero_core::swarm::models::AgentStatus,
-        detail: String,
-    },
-    SwarmTierStarted {
-        current: usize,
-        total: usize,
-    },
-    SwarmCompleted(Box<gaviero_core::swarm::models::SwarmResult>),
-    SwarmMergeConflict {
-        branch: String,
-        files: Vec<String>,
-    },
-
-    // Coordination lifecycle events
-    SwarmCoordinationStarted(String),
-    SwarmCoordinationComplete {
-        unit_count: usize,
-        summary: String,
-    },
-    SwarmTierDispatch {
-        unit_id: String,
-        tier: gaviero_core::types::ModelTier,
-        backend: String,
-    },
-    SwarmLoopGateFailed {
-        probe: String,
-        status: String,
-        output: String,
-    },
-    SwarmCostUpdate(gaviero_core::swarm::verify::CostEstimate),
-    /// Coordinator produced a `.gaviero` DSL plan file ready for user review.
-    /// The path is absolute. The user should review/edit it, then `/run` it.
-    SwarmDslPlanReady(PathBuf),
 
     // Memory
     MemoryReady(Arc<gaviero_core::memory::MemoryStores>),

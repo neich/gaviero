@@ -581,8 +581,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     if col >= arrow_zone {
                         app.focus = Focus::SidePanel;
                         app.side_panel = match app.side_panel {
-                            SidePanelMode::AgentChat => SidePanelMode::SwarmDashboard,
-                            SidePanelMode::SwarmDashboard => SidePanelMode::GitPanel,
+                            SidePanelMode::AgentChat => SidePanelMode::GitPanel,
                             SidePanelMode::GitPanel => SidePanelMode::MemoryPanel,
                             SidePanelMode::MemoryPanel => SidePanelMode::AgentChat,
                         };
@@ -734,24 +733,6 @@ pub(super) fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 if area.contains((col, row).into()) {
                     app.focus = Focus::SidePanel;
 
-                    if app.side_panel == SidePanelMode::SwarmDashboard {
-                        use crate::panels::swarm_dashboard::DashboardFocus;
-                        let dash = &mut app.swarm_dashboard;
-                        let pos = ratatui::layout::Position::new(col, row);
-                        if dash.table_rect.contains(pos) {
-                            dash.focus = DashboardFocus::Table;
-                            let clicked_row = (row - dash.table_rect.y) as usize;
-                            let idx = dash.scroll.offset + clicked_row;
-                            if idx < dash.agents.len() {
-                                dash.scroll.selected = idx;
-                                dash.detail_scroll = 0;
-                                dash.detail_auto_scroll = true;
-                            }
-                        } else if dash.detail_rect.contains(pos) {
-                            dash.focus = DashboardFocus::Detail;
-                        }
-                        return;
-                    }
 
                     if app.side_panel == SidePanelMode::AgentChat && row == area.y {
                         let tab_area_x = area.x + 1;
@@ -1241,10 +1222,6 @@ fn scroll_editor_content(app: &mut App, up: bool) {
     }
 }
 
-/// One wheel step on the editor group. The markdown preview sub-routes by
-/// pointer position (like the swarm dashboard's detail pane): pointer inside
-/// the preview scrolls it, anywhere else scrolls the source. In PreviewOnly
-/// mode the preview is the whole group, so it always takes the wheel.
 /// One wheel step on the focused editor group.
 ///
 /// Preview-only mode has no source pane, so the wheel drives the preview. In
@@ -1263,34 +1240,10 @@ fn scroll_editor_group(app: &mut App, up: bool) {
     scroll_editor_content(app, up);
 }
 
-/// One wheel step (3 lines) on the side panel. The swarm dashboard sub-routes
-/// by pointer position — the detail pane scrolls only when the pointer is
-/// inside it, anything else scrolls the agent table — so a focus-routed wheel
-/// (pointer outside the panel) still acts on the primary list. All other side
-/// modes scroll the chat transcript.
+/// One wheel step (3 lines) on the side panel. Every side mode scrolls its
+/// own primary list.
 fn scroll_side_panel(app: &mut App, up: bool, col: u16, row: u16) {
     match app.side_panel {
-        SidePanelMode::SwarmDashboard => {
-            let dash = &mut app.swarm_dashboard;
-            let pos = ratatui::layout::Position::new(col, row);
-            if dash.detail_rect.contains(pos) {
-                if up {
-                    dash.detail_auto_scroll = false;
-                    dash.detail_scroll =
-                        dash.detail_scroll.saturating_sub(theme::MOUSE_SCROLL_DELTA);
-                } else if let Some(agent) = dash.agents.get(dash.scroll.selected) {
-                    let w = dash.detail_rect.width.saturating_sub(1) as usize;
-                    let total =
-                        crate::panels::swarm_dashboard::count_display_lines(&agent.activity, w);
-                    dash.detail_scroll = (dash.detail_scroll + theme::MOUSE_SCROLL_DELTA)
-                        .min(total.saturating_sub(1));
-                }
-            } else if up {
-                dash.scroll.scroll_up(1);
-            } else {
-                dash.scroll.scroll_down(1, dash.agents.len());
-            }
-        }
         _ => {
             // Wheel while chat is focused: prefer the overflowing prompt unless
             // the pointer is explicitly over the transcript. Focus-first routing

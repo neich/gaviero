@@ -22,9 +22,8 @@ pub enum Action {
     SetLeftModeFind,
     SetLeftModeChanges,
 
-    // Side panel modes (Alt+A/W/G/M)
+    // Side panel modes (Alt+A/H/G/M)
     SetSideModeChat,
-    SetSideModeSwarm,
     SetSideModeGit,
     /// Tier A / A4: memory inspection panel.
     SetSideModeMemory,
@@ -80,10 +79,6 @@ pub enum Action {
     AltEnter,
     /// Toggle "auto-approve all permissions" for the next prompt only.
     ToggleAutoApprove,
-
-    // Swarm (triggered by /swarm command, not a keybinding)
-    #[allow(dead_code)]
-    ToggleSwarmDashboard,
 
     // Layout
     ToggleFullscreen,
@@ -171,7 +166,6 @@ impl Keymap {
 
             // ── Side panel modes: Alt+letter ─────────────────────
             KeyCode::Char('a') if alt => Action::SetSideModeChat,
-            KeyCode::Char('w') if alt => Action::SetSideModeSwarm,
             KeyCode::Char('g') if alt => Action::SetSideModeGit,
             KeyCode::Char('m') if alt => Action::SetSideModeMemory,
             // Alt+Y: toggle auto-approve permissions for next prompt

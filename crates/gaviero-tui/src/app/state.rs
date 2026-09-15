@@ -108,8 +108,6 @@ pub struct ChangesState {
 pub enum SidePanelMode {
     AgentChat,
     #[allow(dead_code)]
-    SwarmDashboard,
-    #[allow(dead_code)]
     GitPanel,
     /// Tier A / A4: memory inspection panel. Activated via `Alt+m`.
     MemoryPanel,
@@ -164,10 +162,10 @@ pub enum MoveState {
     Confirming(PathBuf, PathBuf),
 }
 
-/// Codex MCP trust prompt. Fires once before the first `/swarm` run
+/// Codex MCP trust prompt. Fires once before the first Codex chat turn
 /// when `mcp.gavieroServer.codexTrust` is still "unknown". Answering
 /// persists the choice to `.gaviero/settings.json` and resumes the
-/// swarm command that was pending.
+/// action that was pending.
 #[derive(Debug, Clone)]
 pub(crate) struct CodexTrustDialog {
     /// What to replay after the consent prompt resolves (grant or deny).
@@ -178,8 +176,6 @@ pub(crate) struct CodexTrustDialog {
 /// once the user answers.
 #[derive(Debug, Clone)]
 pub(crate) enum PendingAfterTrust {
-    /// `/swarm <task>` description to re-dispatch after consent.
-    Swarm(String),
     /// A pending codex chat turn — the typed prompt is still in the chat
     /// input buffer (the dialog captures all keys); on grant we
     /// re-synthesize the codex MCP config and replay `send_chat_message`.

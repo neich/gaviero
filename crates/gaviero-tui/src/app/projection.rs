@@ -466,9 +466,6 @@ pub fn project_hot_event(app: &App, event: &Event) -> Option<ServerFrame> {
     match event {
         // Streaming events carry complete wire data (§2.1 path 1).
         Event::StreamChunk { conv_id, text } => {
-            if conv_id.starts_with("swarm-") {
-                return None; // Swarm activity is not mirrored (scope: chat panel only).
-            }
             Some(ServerFrame::StreamChunk(renv::StreamChunk {
                 conv_id: conv_id.clone(),
                 turn_id: turn_of(conv_id),
@@ -476,9 +473,6 @@ pub fn project_hot_event(app: &App, event: &Event) -> Option<ServerFrame> {
             }))
         }
         Event::ToolCallStarted { conv_id, tool_name } => {
-            if conv_id.starts_with("swarm-") {
-                return None;
-            }
             Some(ServerFrame::ToolCallStarted(renv::ToolCallStarted {
                 conv_id: conv_id.clone(),
                 turn_id: turn_of(conv_id),
@@ -486,9 +480,6 @@ pub fn project_hot_event(app: &App, event: &Event) -> Option<ServerFrame> {
             }))
         }
         Event::StreamingStatus { conv_id, status } => {
-            if conv_id.starts_with("swarm-") {
-                return None;
-            }
             Some(ServerFrame::StreamingStatus(renv::StreamingStatus {
                 conv_id: conv_id.clone(),
                 turn_id: turn_of(conv_id),
@@ -552,17 +543,6 @@ pub fn project_hot_event(app: &App, event: &Event) -> Option<ServerFrame> {
         | Event::MemoryManifestReady { .. }
         | Event::MemoryScopeSummary { .. }
         | Event::MemoryDeletionsLoaded { .. }
-        | Event::SwarmPhaseChanged(_)
-        | Event::SwarmAgentStateChanged { .. }
-        | Event::SwarmTierStarted { .. }
-        | Event::SwarmCompleted(_)
-        | Event::SwarmMergeConflict { .. }
-        | Event::SwarmCoordinationStarted(_)
-        | Event::SwarmCoordinationComplete { .. }
-        | Event::SwarmTierDispatch { .. }
-        | Event::SwarmLoopGateFailed { .. }
-        | Event::SwarmCostUpdate(_)
-        | Event::SwarmDslPlanReady(_)
         | Event::MemoryReady(_)
         | Event::RemoteCommand(_)
         | Event::RemoteSnapshotNeeded
