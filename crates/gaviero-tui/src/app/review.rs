@@ -184,109 +184,11 @@ fn temp_sibling_path(target: &std::path::Path) -> std::path::PathBuf {
     parent.join(name)
 }
 
-/// Apply the on-disk version for an external-change review.
-pub(super) fn accept_external_review(app: &mut App) {
-    let review = match app.diff_review.take() {
-        Some(r) if r.is_external() => r,
-        Some(r) => {
-            app.diff_review = Some(r);
-            return;
-        }
-        None => return,
-    };
-    let path = review.proposal.file_path;
-    app.pending_tool_agent_edits.remove(&path);
-    for buf in &mut app.buffers {
-        if buf
-            .path
-            .as_deref()
-            .is_some_and(|p| crate::editor::buffer::Buffer::paths_refer_to_same_file(p, &path))
-        {
-            let _ = buf.reload();
-            break;
-        }
-    }
-}
-
-/// Keep the in-editor version and dismiss an external-change review.
-pub(super) fn reject_external_review(app: &mut App) {
-    let review = match app.diff_review.take() {
-        Some(r) if r.is_external() => r,
-        Some(r) => {
-            app.diff_review = Some(r);
-            return;
-        }
-        None => return,
-    };
-    let path = review.proposal.file_path;
-
-    // In-process tool-agent edits: revert disk to the pre-turn snapshot.
-    if let Some(pre_turn) = app.pending_tool_agent_edits.remove(&path) {
-        let revert_result = match pre_turn.as_deref() {
-            Some(content) => std::fs::write(&path, content),
-            None => std::fs::remove_file(&path).or_else(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    Ok(())
-                } else {
-                    Err(e)
-                }
-            }),
-        };
-        if let Err(e) = revert_result {
-            app.status_message = Some((
-                format!("Failed to revert {}: {e}", path.display()),
-                std::time::Instant::now(),
-            ));
-            return;
-        }
-        for buf in &mut app.buffers {
-            if buf
-                .path
-                .as_deref()
-                .is_some_and(|p| crate::editor::buffer::Buffer::paths_refer_to_same_file(p, &path))
-            {
-                let _ = buf.reload();
-                break;
-            }
-        }
-        app.status_message = Some((
-            format!("Reverted agent edit to {}", path.display()),
-            std::time::Instant::now(),
-        ));
-        return;
-    }
-
-    let disk_content = review.proposal.proposed_content;
-    for buf in &mut app.buffers {
-        if buf
-            .path
-            .as_deref()
-            .is_some_and(|p| crate::editor::buffer::Buffer::paths_refer_to_same_file(p, &path))
-        {
-            // Editor copy is authoritative; disk is stale until the user saves.
-            buf.modified = buf.text.to_string() != disk_content;
-            if buf.modified {
-                app.status_message = Some((
-                    format!(
-                        "Kept editor version of {} — press Ctrl+S to write it to disk",
-                        path.display()
-                    ),
-                    std::time::Instant::now(),
-                ));
-            }
-            break;
-        }
-    }
-}
-
 pub(super) fn handle_review_action(app: &mut App, action: &Action) -> bool {
     let review = match &mut app.diff_review {
         Some(r) => r,
         None => return false,
     };
-    let is_interactive = review.is_interactive();
-    let is_external = review.is_external();
-
     match action {
         Action::InsertChar(']') => {
             review.pending_bracket = Some(']');
@@ -305,58 +207,34 @@ pub(super) fn handle_review_action(app: &mut App, action: &Action) -> bool {
             }
             true
         }
-        Action::InsertChar('a') if is_interactive => {
+        Action::InsertChar('a') => {
             review.pending_bracket = None;
-            if is_external {
-                accept_external_review(app);
-            } else {
-                let idx = review.current_hunk;
-                review.accept_hunk(idx);
-            }
+            let idx = review.current_hunk;
+            review.accept_hunk(idx);
             true
         }
-        Action::InsertChar('r') if is_interactive => {
+        Action::InsertChar('r') => {
             review.pending_bracket = None;
-            if is_external {
-                reject_external_review(app);
-            } else {
-                let idx = review.current_hunk;
-                review.reject_hunk(idx);
-            }
+            let idx = review.current_hunk;
+            review.reject_hunk(idx);
             true
         }
-        Action::InsertChar('A') if is_interactive => {
+        Action::InsertChar('A') => {
             review.pending_bracket = None;
-            if is_external {
-                accept_external_review(app);
-            } else {
-                review.accept_all();
-            }
+            review.accept_all();
             true
         }
-        Action::InsertChar('R') if is_interactive => {
+        Action::InsertChar('R') => {
             review.pending_bracket = None;
-            if is_external {
-                reject_external_review(app);
-            } else {
-                review.reject_all();
-            }
+            review.reject_all();
             true
         }
-        Action::InsertChar('f') if is_interactive => {
-            if is_external {
-                accept_external_review(app);
-            } else {
-                finalize_current_review(app);
-            }
+        Action::InsertChar('f') => {
+            finalize_current_review(app);
             true
         }
         Action::InsertChar('q') => {
-            if is_external {
-                reject_external_review(app);
-            } else {
-                app.diff_review = None;
-            }
+            app.diff_review = None;
             true
         }
         Action::Quit => {
@@ -553,14 +431,14 @@ pub(crate) fn finalize_gate_proposal(app: &mut App, mut proposal: WriteProposal)
     });
 }
 
-pub(super) fn enter_review_mode(app: &mut App, proposal: WriteProposal, source: DiffSource) {
+pub(super) fn enter_review_mode(app: &mut App, proposal: WriteProposal) {
     if app.diff_review.is_some() {
         return;
     }
     let path = proposal.file_path.clone();
     app.open_file(&path);
     app.focus = Focus::Editor;
-    app.diff_review = Some(DiffReviewState::new(proposal, source));
+    app.diff_review = Some(DiffReviewState::new(proposal));
 }
 
 pub(super) fn enter_batch_review(app: &mut App, proposals: Vec<WriteProposal>) {

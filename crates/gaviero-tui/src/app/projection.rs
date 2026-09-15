@@ -540,7 +540,6 @@ pub fn project_hot_event(app: &App, event: &Event) -> Option<ServerFrame> {
         | Event::CursorSessionStarted { .. }
         | Event::ChatMemoryInjected { .. }
         | Event::TurnBootstrapMeasured { .. }
-        | Event::ToolAgentEditCaptured { .. }
         | Event::ToolAgentEditsPending { .. }
         | Event::MemoryWriteEnqueued { .. }
         | Event::MemoryWriteCommitted { .. }

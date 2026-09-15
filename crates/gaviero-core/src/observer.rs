@@ -136,15 +136,15 @@ pub trait AcpObserver: Send + Sync {
     /// Default no-op so observers without a usage display pay nothing.
     fn on_turn_token_usage(&self, _usage: &crate::acp::protocol::TokenUsage) {}
 
-    /// Fired when an Option-B write tool snapshots a path mid-turn so the host
-    /// can stash pre-turn content before the file watcher fires.
-    fn on_tool_agent_edit_captured(&self, _path: &Path, _pre_turn_content: Option<&str>) {}
-
-    /// Fired after a successful in-process tool-agent turn that wrote files
-    /// to disk (Option B). Carries each touched path and its pre-turn content
-    /// (`None` = file did not exist) so the host can open external-change
-    /// review and revert on reject.
-    fn on_tool_agent_edits(&self, _edits: &[ToolAgentEdit]) {}
+    /// Fired after a successful in-process tool-agent turn that wrote files to
+    /// disk. Carries every path the turn touched, so the host can treat the
+    /// turn's writes as one set.
+    ///
+    /// The files are already written when this fires — the harness reverts them
+    /// itself if the turn fails or is cancelled. Hosts therefore *reconcile*
+    /// their open buffers with disk rather than reviewing the writes, and no
+    /// per-file undo is offered (that would break the turn's atomicity).
+    fn on_tool_agent_edits(&self, _paths: &[std::path::PathBuf]) {}
 
     /// Fired once per in-process tool-agent turn with the accumulated USD
     /// cost (sum of per-round API usage). Drives the chat status-bar cost
@@ -162,14 +162,6 @@ pub trait AcpObserver: Send + Sync {
     /// (`completed` / `failed` / `stopped`) or the parent process exited
     /// while it was still running (`killed`).
     fn on_background_task_finished(&self, _task_id: &str, _status: &str, _summary: &str) {}
-}
-
-/// One file touched by the in-process tool-agent harness this turn.
-#[derive(Debug, Clone)]
-pub struct ToolAgentEdit {
-    pub path: std::path::PathBuf,
-    /// Pre-turn on-disk content. `None` when the file did not exist.
-    pub pre_turn_content: Option<String>,
 }
 
 /// Lightweight summary of a chat memory injection decision. Handed to

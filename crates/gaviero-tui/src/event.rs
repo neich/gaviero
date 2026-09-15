@@ -162,18 +162,15 @@ pub enum Event {
         cost_usd: f64,
     },
 
-    /// Option-B write tool snapshotted a path mid-turn (before the watcher fires).
-    ToolAgentEditCaptured {
-        path: std::path::PathBuf,
-        pre_turn_content: Option<String>,
-    },
-
-    /// In-process tool-agent (DeepSeek) finished a turn with on-disk edits.
-    /// The controller opens external-change review for the first touched file
-    /// and stores pre-turn snapshots for revert-on-reject.
+    /// A tool-agent turn finished; its edits are already on disk.
+    ///
+    /// `paths` is the full set the turn wrote, which is the only point at
+    /// which the editor can learn about files it does not hold open.
+    /// Reconciliation is read-only, so nothing is carried to revert to --
+    /// undoing a turn is the harness's job, not a per-file editor action.
     ToolAgentEditsPending {
         conv_id: String,
-        edits: Vec<gaviero_core::observer::ToolAgentEdit>,
+        paths: Vec<std::path::PathBuf>,
     },
 
     /// A4: writer task enqueued a write. Panel counts events for the
