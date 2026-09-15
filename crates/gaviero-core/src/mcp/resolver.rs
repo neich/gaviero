@@ -300,11 +300,19 @@ pub fn resolve_context7_config(workspace: &Workspace, root: Option<&Path>) -> Co
         .as_str()
         .map(str::to_string)
         .or_else(|| defaults.url.clone());
+    // A blank value falls back to the shipped default rather than disabling the
+    // native tools; `rest_base()` owns that rule.
+    let rest_url = workspace
+        .resolve_setting(S::MCP_CONTEXT7_REST_URL, root)
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| defaults.rest_url.clone());
     Context7Config {
         enabled,
         url,
         command,
         args,
+        rest_url,
     }
 }
 
@@ -360,7 +368,19 @@ pub fn resolve_mcp_config_synth(
         extra_servers,
         permissions: resolve_mcp_permissions(workspace, Some(root)),
         bash: resolve_bash_permissions(workspace, Some(root)),
-        available_tools: resolve_available_tools(workspace, Some(root)),
+        // The same workspace cascade the host hands to `AgentOptions`, wrapped
+        // in the type that owns the availability question. Cursor's synthesized
+        // deny rules read the surface (`config_synth`), so "is Bash on the
+        // tool surface?" has exactly one answer across the subprocess providers
+        // and the in-process loop.
+        surface: crate::agent_session::tool_surface::AgentToolSurface::from_parts(
+            resolve_available_tools(workspace, Some(root)),
+            crate::agent_session::tool_agent::policy::ToolPolicy::from_workspace(
+                workspace,
+                Some(root),
+            ),
+            false,
+        ),
         explicit_ref_required: super::reach::ReachStore::load(root)
             .ok()
             .flatten()
