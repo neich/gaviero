@@ -388,6 +388,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 // state (post-strip, post-collapse) so remote and desktop
                 // show identical content.
                 if let Some(ridx) = app.chat_state.find_conv_idx(&conv_id) {
+                    app.chat_state.restore_transcript_inline_at(ridx);
                     app.chat_state.conversations[ridx].bump_revision();
                     if let Some(last) = app.chat_state.conversations[ridx].messages.last() {
                         let message = crate::app::projection::message_dto(last);
@@ -563,8 +564,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 if conv.transcript_inline_mode
                     == crate::panels::agent_chat::TranscriptInlineMode::Suppress
                 {
-                    conv.transcript_inline_mode =
-                        crate::panels::agent_chat::TranscriptInlineMode::Auto;
+                    conv.restore_transcript_inline();
                 }
                 // M1: keep the planner ledger in sync. `record_continuity_handle`
                 // mirrors `claude_session_id`; `record_turn_dispatched` flips
@@ -643,8 +643,7 @@ pub(super) fn handle_event(app: &mut App, event: Event) {
                 if conv.transcript_inline_mode
                     == crate::panels::agent_chat::TranscriptInlineMode::Suppress
                 {
-                    conv.transcript_inline_mode =
-                        crate::panels::agent_chat::TranscriptInlineMode::Auto;
+                    conv.restore_transcript_inline();
                 }
                 if let Some(ref mut ledger) = conv.session_ledger {
                     ledger.record_continuity_handle(

@@ -9,7 +9,8 @@ use gaviero_core::acp::session::AgentOptions;
 use gaviero_core::agent_session::agent_client_protocol::AcpClientSession;
 use gaviero_core::agent_session::registry::SessionConstruction;
 use gaviero_core::agent_session::{AgentSession, Turn};
-use gaviero_core::context_planner::{PlannerMetadata, RuntimeConfig, build_provider_profile};
+use gaviero_core::context_planner::{PlannerMetadata, ReplayPayload, RuntimeConfig, build_provider_profile};
+use gaviero_core::context_planner::ledger::Role;
 use gaviero_core::context_planner::types::ModelSpec;
 use gaviero_core::observer::{AcpObserver, PermissionDecision, WriteGateObserver};
 use gaviero_core::swarm::backend::{
@@ -187,6 +188,99 @@ async fn consecutive_turns_reuse_child_and_forward_session_configuration() {
         assert_eq!(report["new"]["additionalDirectories"][0], dir.path().join("additional").to_string_lossy().as_ref());
         assert_eq!(report["prompt"][0]["text"], "Return exactly the requested JSON.");
     }
+    Box::new(session).close().await;
+}
+
+async fn drain_turn(
+    session: &mut AcpClientSession,
+    turn: Turn,
+) -> Vec<UnifiedStreamEvent> {
+    let mut stream = session.send_turn(turn).await.expect("send_turn");
+    let mut out = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(15), stream.next()).await {
+            Ok(Some(Ok(ev))) => {
+                let done = matches!(ev, UnifiedStreamEvent::Done(_));
+                out.push(ev);
+                if done {
+                    break;
+                }
+            }
+            Ok(Some(Err(e))) => panic!("stream error: {e:#}"),
+            Ok(None) => break,
+            Err(_) => panic!("ACP fake-agent turn timed out; got {out:?}"),
+        }
+    }
+    out
+}
+
+fn inspect_prompt(events: &[UnifiedStreamEvent]) -> serde_json::Value {
+    events
+        .iter()
+        .find_map(|event| match event {
+            UnifiedStreamEvent::TextDelta(text) => serde_json::from_str(text).ok(),
+            _ => None,
+        })
+        .expect("fake inspection report")
+}
+
+#[tokio::test]
+async fn fresh_session_prompt_carries_host_replay_reused_session_does_not() {
+    let dir = workspace();
+    let paths = Arc::new(Mutex::new(Vec::new()));
+    let args = construction(
+        dir.path(),
+        Box::new(NoopAcp),
+        Box::new(RecWrite { paths }),
+        true,
+    );
+    let mut session = AcpClientSession::new_with_scope(args, FileScope::default())
+        .with_extra(extra("inspect"));
+    let mut first = turn("new question", true);
+    first.replay_history = Some(ReplayPayload {
+        entries: vec![
+            (Role::User, "old q".into()),
+            (Role::Assistant, "old a".into()),
+        ],
+    });
+    let report = inspect_prompt(&drain_turn(&mut session, first).await);
+    let texts: Vec<&str> = report["prompt"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|b| b["text"].as_str())
+        .collect();
+    assert!(
+        texts.iter().any(|t| t.contains("old q")),
+        "fresh session/new must restuff host replay: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("new question")),
+        "{texts:?}"
+    );
+
+    let mut second = turn("follow up", true);
+    second.replay_history = Some(ReplayPayload {
+        entries: vec![
+            (Role::User, "old q".into()),
+            (Role::Assistant, "old a".into()),
+        ],
+    });
+    let report = inspect_prompt(&drain_turn(&mut session, second).await);
+    let texts: Vec<&str> = report["prompt"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|b| b["text"].as_str())
+        .collect();
+    assert!(
+        texts.iter().all(|t| !t.contains("old q")),
+        "reused ACP session must not restuff host replay: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("follow up")),
+        "{texts:?}"
+    );
     Box::new(session).close().await;
 }
 
