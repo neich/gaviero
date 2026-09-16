@@ -2,7 +2,7 @@
 //!
 //! Orchestrates multi-agent execution with git worktree isolation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -213,6 +213,32 @@ pub struct SwarmConfig {
     pub skills_emit: crate::skills::emit::EmitSettings,
     /// Optional skill catalog for path-lazy attachment on work-unit owned paths.
     pub skill_catalog: Option<Arc<crate::skills::SkillCatalog>>,
+    /// Folder whose repo scope receives this run's memory (findings
+    /// extraction, post-run consolidation) and whose root receives
+    /// `skills.emit` output. Must be a folder registered in the memory
+    /// registry. `None` = `workspace_root` — correct whenever the run
+    /// root is itself the workspace folder; front ends that discover a
+    /// `.gaviero/` above the run root set it to that folder.
+    pub memory_root: Option<PathBuf>,
+    /// On-disk code graph for `workspace_root`. `None` =
+    /// `<workspace_root>/.gaviero/code_graph.db`. Must not be shared with
+    /// a graph built from a different scan root (see
+    /// [`crate::repo_map::graph_builder::build_graph_at`]).
+    pub graph_db_path: Option<PathBuf>,
+}
+
+impl SwarmConfig {
+    /// Folder that owns this run's repo-scoped memory.
+    pub fn memory_root(&self) -> &Path {
+        self.memory_root.as_deref().unwrap_or(&self.workspace_root)
+    }
+
+    /// Code graph database for `workspace_root`.
+    pub fn graph_db(&self) -> PathBuf {
+        self.graph_db_path
+            .clone()
+            .unwrap_or_else(|| crate::repo_map::graph_builder::graph_db_path(&self.workspace_root))
+    }
 }
 
 /// True when workspace `agent.availableTools` includes Bash **and** at
@@ -540,8 +566,7 @@ pub async fn execute(
                 &manifest,
                 &unit,
                 &run_id,
-                &config.workspace_root,
-                config.extract_agent_findings,
+                config,
             )
             .await;
         }
@@ -553,6 +578,7 @@ pub async fn execute(
             std::slice::from_ref(&manifest),
             &config.workspace_root,
             &config.excludes,
+            &config.graph_db(),
             observer,
         )
         .await?;
@@ -889,8 +915,7 @@ pub async fn execute(
                         &manifest,
                         unit,
                         &run_id,
-                        &config.workspace_root,
-                        config.extract_agent_findings,
+                        config,
                     )
                     .await;
                 }
@@ -1103,8 +1128,7 @@ pub async fn execute(
                                     &manifest,
                                     unit,
                                     &run_id,
-                                    &config.workspace_root,
-                                    config.extract_agent_findings,
+                                    config,
                                 )
                                 .await;
                             }
@@ -1408,8 +1432,7 @@ pub async fn execute(
                         &manifest,
                         unit,
                         &run_id,
-                        &config.workspace_root,
-                        config.extract_agent_findings,
+                        config,
                     )
                     .await;
                     if let Some(ref branch_name) = manifest.branch {
@@ -1858,8 +1881,7 @@ pub async fn execute(
                             &manifest,
                             &unit,
                             &run_id,
-                            &config.workspace_root,
-                            config.extract_agent_findings,
+                            config,
                         )
                         .await;
                     }
@@ -1942,8 +1964,7 @@ pub async fn execute(
                             &manifest,
                             unit,
                             &run_id,
-                            &config.workspace_root,
-                            config.extract_agent_findings,
+                            config,
                         )
                         .await;
 
@@ -2131,8 +2152,7 @@ pub async fn execute(
                         &manifest,
                         unit,
                         &run_id,
-                        &config.workspace_root,
-                        config.extract_agent_findings,
+                        config,
                     )
                     .await;
                 }
@@ -2238,7 +2258,7 @@ pub async fn execute(
             ),
             None => crate::memory::consolidation::Consolidator::with_stores(Arc::clone(mem)),
         };
-        let repo_id = crate::memory::hash_path(&config.workspace_root);
+        let repo_id = crate::memory::hash_path(config.memory_root());
         match consolidator.consolidate_run(&run_id, &repo_id).await {
             Ok(report) => {
                 tracing::info!(
@@ -2252,8 +2272,12 @@ pub async fn execute(
                 tracing::warn!("memory consolidation failed: {}", e);
             }
         }
-        match crate::skills::emit::emit_after_consolidation(&config.workspace_root, mem.as_ref(), &config.skills_emit)
-            .await
+        match crate::skills::emit::emit_after_consolidation(
+            config.memory_root(),
+            mem.as_ref(),
+            &config.skills_emit,
+        )
+        .await
         {
             Ok(crate::skills::emit::EmitOutcome::Disabled) => {}
             Ok(out) => tracing::info!(?out, "skills.emit after consolidation"),
@@ -2266,6 +2290,7 @@ pub async fn execute(
         &all_manifests,
         &config.workspace_root,
         &config.excludes,
+        &config.graph_db(),
         observer,
     )
     .await?;
@@ -2408,11 +2433,14 @@ impl WorkspaceAnalysis {
         let units_for_graph: Vec<WorkUnit> = units.to_vec();
         let impact_texts: Arc<std::collections::HashMap<String, String>> = {
             let workspace = config.workspace_root.clone();
+            let graph_db = config.graph_db();
             let excludes = config.excludes.clone();
             Arc::new(
                 tokio::task::spawn_blocking(move || {
                     let mut map = std::collections::HashMap::new();
-                    match crate::repo_map::graph_builder::build_graph(&workspace, &excludes) {
+                    match crate::repo_map::graph_builder::build_graph_at(
+                        &workspace, &graph_db, &excludes,
+                    ) {
                         Ok((store, result)) => {
                             tracing::info!(
                                 "code graph: {} nodes, {} edges ({} files changed, {} unchanged)",
@@ -3463,6 +3491,7 @@ async fn run_post_execution_verification(
     manifests: &[AgentManifest],
     workspace_root: &std::path::Path,
     excludes: &[String],
+    graph_db: &std::path::Path,
     observer: &dyn SwarmObserver,
 ) -> Result<bool> {
     if !config.compile && !config.clippy && !config.test && !config.impact_tests {
@@ -3477,6 +3506,7 @@ async fn run_post_execution_verification(
         config,
         workspace_root,
         excludes,
+        graph_db,
         Some(modified_files.as_slice()),
     )
     .await?;
@@ -3522,6 +3552,7 @@ async fn run_verification_checks(
     config: &super::plan::VerificationConfig,
     workspace_root: &std::path::Path,
     excludes: &[String],
+    graph_db: &std::path::Path,
     modified_files: Option<&[std::path::PathBuf]>,
 ) -> Result<VerificationOutcome> {
     if config.compile
@@ -3546,7 +3577,7 @@ async fn run_verification_checks(
         let failure = if let Some(files) = modified_files {
             run_test_verification(workspace_root, files, true).await?
         } else {
-            run_conservative_impact_tests(workspace_root, excludes).await?
+            run_conservative_impact_tests(workspace_root, excludes, graph_db).await?
         };
         if let Some(output) = failure {
             return Ok(VerificationOutcome::Failed {
@@ -3654,8 +3685,9 @@ fn classify_test_report(report: crate::swarm::verify::TestReport) -> Result<Opti
 async fn run_conservative_impact_tests(
     workspace_root: &std::path::Path,
     excludes: &[String],
+    graph_db: &std::path::Path,
 ) -> Result<Option<String>> {
-    match crate::repo_map::graph_builder::build_graph(workspace_root, excludes) {
+    match crate::repo_map::graph_builder::build_graph_at(workspace_root, graph_db, excludes) {
         Ok((store, _)) => {
             let all_src: Vec<String> = store
                 .all_file_hashes()
@@ -3996,8 +4028,7 @@ async fn run_fanout_wave_if_needed(
                 &manifest,
                 unit,
                 run_id,
-                &config.workspace_root,
-                config.extract_agent_findings,
+                config,
             )
             .await;
         }
@@ -4039,8 +4070,7 @@ async fn store_agent_result(
     manifest: &AgentManifest,
     unit: &WorkUnit,
     run_id: &str,
-    workspace_root: &std::path::Path,
-    extract_findings: bool,
+    config: &SwarmConfig,
 ) {
     if memory.is_none() {
         return;
@@ -4048,6 +4078,10 @@ async fn store_agent_result(
     let Some(writer) = writer else {
         return;
     };
+    // Staleness sources are run-root relative; memory identity belongs to
+    // the folder that owns the run's memory.
+    let workspace_root = config.workspace_root.as_path();
+    let extract_findings = config.extract_agent_findings;
 
     let privacy = match unit.privacy {
         PrivacyLevel::LocalOnly => "local_only",
@@ -4137,7 +4171,7 @@ async fn store_agent_result(
         && let Some((transcript, annotations)) = agent_findings_transcript(unit, manifest)
     {
         let turn_id = format!("swarm:{run_id}:{}", manifest.work_unit_id);
-        let repo_id = crate::memory::hash_path(workspace_root);
+        let repo_id = crate::memory::hash_path(config.memory_root());
         crate::context_planner::enqueue_post_turn(crate::context_planner::PostTurnRequest {
             writer,
             session_id: run_id,
@@ -5874,9 +5908,15 @@ async fn evaluate_verify_condition(
             // gate, not a failing one — propagate instead of reading
             // it as "not converged yet" and burning every remaining
             // iteration.
-            let outcome = run_verification_checks(config, &cfg.workspace_root, &cfg.excludes, None)
-                .await
-                .context("loop `until` verification checks could not be run")?;
+            let outcome = run_verification_checks(
+                config,
+                &cfg.workspace_root,
+                &cfg.excludes,
+                &cfg.graph_db(),
+                None,
+            )
+            .await
+            .context("loop `until` verification checks could not be run")?;
 
             Ok(match outcome {
                 VerificationOutcome::Passed => None,
@@ -6205,8 +6245,7 @@ async fn evaluate_agent_condition(
             &manifest,
             &unit,
             ctx.run_id,
-            &ctx.config.workspace_root,
-            ctx.config.extract_agent_findings,
+            ctx.config,
         )
         .await;
     }

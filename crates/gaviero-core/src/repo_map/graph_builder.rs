@@ -52,8 +52,21 @@ pub fn graph_db_path(workspace: &Path) -> PathBuf {
 /// `excludes` is a list of folder names or glob patterns to skip
 /// (see [`crate::repo_map::builder::is_excluded`]).
 pub fn build_graph(workspace: &Path, excludes: &[String]) -> Result<(GraphStore, BuildResult)> {
-    let db_path = graph_db_path(workspace);
-    let store = GraphStore::open(&db_path)
+    build_graph_at(workspace, &graph_db_path(workspace), excludes)
+}
+
+/// Like [`build_graph`], but persists the graph at `db_path` instead of
+/// `{workspace}/.gaviero/code_graph.db`.
+///
+/// One database holds one scan root: an incremental build deletes every
+/// stored file the scan did not see, so two roots must never share a
+/// `db_path`.
+pub fn build_graph_at(
+    workspace: &Path,
+    db_path: &Path,
+    excludes: &[String],
+) -> Result<(GraphStore, BuildResult)> {
+    let store = GraphStore::open(db_path)
         .with_context(|| format!("opening graph store at {}", db_path.display()))?;
 
     let result = incremental_build(&store, workspace, excludes)?;
@@ -280,6 +293,20 @@ mod tests {
         let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
         assert!(names.contains(&"hello"), "nodes: {:?}", names);
         assert!(names.contains(&"internal"), "nodes: {:?}", names);
+    }
+
+    #[test]
+    fn build_graph_at_persists_outside_the_scan_root() {
+        let src = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("lib.rs"), "pub fn hello() {}").unwrap();
+        let db = state.path().join("graphs").join("code_graph.db");
+
+        let (store, result) = build_graph_at(src.path(), &db, &[]).unwrap();
+        assert_eq!(result.files_changed, 1);
+        assert!(!store.nodes_for_file("lib.rs").unwrap().is_empty());
+        assert!(db.is_file());
+        assert!(!src.path().join(".gaviero").exists());
     }
 
     #[test]
