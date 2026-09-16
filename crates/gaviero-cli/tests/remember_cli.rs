@@ -1,10 +1,13 @@
 //! End-to-end CLI tests for the `--remember` headless write path.
 //!
 //! Phase 1.6 (CLI side): spawning `gaviero-cli --remember "..."`
-//! against a fresh tempdir must:
+//! against a configured gaviero workspace must:
 //!   1. exit successfully,
 //!   2. print the inserted-id confirmation,
 //!   3. produce the expected `.gaviero/memory.db` file.
+//!
+//! Against a folder no gaviero workspace covers it must refuse rather than
+//! write into throwaway state.
 //!
 //! These are subprocess tests — slower than the library round-trip in
 //! `gaviero-core/tests/headless_memory_services.rs`, but they prove
@@ -29,6 +32,8 @@ fn gaviero_cli() -> std::path::PathBuf {
 fn remember_repo_scope_inserts_and_reports() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path();
+    std::fs::create_dir_all(repo.join(".gaviero")).unwrap();
+    std::fs::write(repo.join(".gaviero").join("settings.json"), "{}").unwrap();
     let output = Command::new(gaviero_cli())
         .arg("--repo")
         .arg(repo)
@@ -80,6 +85,57 @@ fn remember_rejects_invalid_scope() {
         stderr.contains("/remember-here") || stderr.contains("/remember-module"),
         "expected error to point user at TUI commands, got: {stderr:?}"
     );
+}
+
+/// Mirrors the CLI's workspace marker, so the test can tell whether the
+/// machine running it has a gaviero workspace above the temp directory.
+fn has_workspace_marker(dir: &std::path::Path) -> bool {
+    let gaviero = dir.join(".gaviero");
+    gaviero.join("settings.json").is_file() || gaviero.join("memory.db").is_file()
+}
+
+#[test]
+fn remember_refuses_a_folder_without_a_workspace() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = std::fs::canonicalize(tmp.path()).unwrap();
+    let home = dirs::home_dir().and_then(|h| std::fs::canonicalize(h).ok());
+    if repo
+        .ancestors()
+        .any(|dir| Some(dir) != home.as_deref() && has_workspace_marker(dir))
+    {
+        eprintln!("skipped: a gaviero workspace encloses {}", repo.display());
+        return;
+    }
+    let output = Command::new(gaviero_cli())
+        .arg("--repo")
+        .arg(tmp.path())
+        .arg("--remember")
+        .arg("must not land in throwaway state")
+        .output()
+        .expect("spawn gaviero-cli");
+    assert!(!output.status.success(), "no workspace should fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no gaviero workspace"),
+        "expected the missing-workspace error, got: {stderr:?}"
+    );
+    assert!(
+        !tmp.path().join(".gaviero").exists(),
+        "a refused --remember must not create state"
+    );
+}
+
+#[test]
+fn remember_rejects_isolated() {
+    let output = Command::new(gaviero_cli())
+        .arg("--remember")
+        .arg("anything")
+        .arg("--isolated")
+        .output()
+        .expect("spawn gaviero-cli");
+    assert!(!output.status.success(), "--isolated is for runs only");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--isolated applies to runs"), "{stderr:?}");
 }
 
 #[test]

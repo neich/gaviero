@@ -2,7 +2,7 @@
 
 Headless CLI runner. Thin wrapper around `gaviero-core` + `gaviero-dsl` with stderr observers for agent / swarm / write-gate events.
 
-Binary: `gaviero-cli` ([src/main.rs](src/main.rs), single ~4 KLOC source file).
+Binary: `gaviero-cli` ([src/main.rs](src/main.rs) ~5.8 KLOC, plus [src/state.rs](src/state.rs) for workspace discovery / isolated state).
 
 ## Build & Test
 
@@ -11,11 +11,11 @@ cargo test -p gaviero-cli
 cargo clippy -p gaviero-cli
 ```
 
-Integration tests: [`tests/remember_cli.rs`](tests/remember_cli.rs), [`tests/history_cli.rs`](tests/history_cli.rs). Live eval example: [`examples/anchor_ab_live.rs`](examples/anchor_ab_live.rs).
+Integration tests: [`tests/remember_cli.rs`](tests/remember_cli.rs), [`tests/history_cli.rs`](tests/history_cli.rs), [`tests/state_modes_cli.rs`](tests/state_modes_cli.rs) (shared / isolated runs against a fake Ollama, null embedder). Live eval example: [`examples/anchor_ab_live.rs`](examples/anchor_ab_live.rs).
 
 ## Architecture
 
-[`src/main.rs`](src/main.rs) owns the `Cli` clap struct, mode dispatch, and two observers (`CliAcpObserver`, `CliSwarmObserver` — stderr only).
+[`src/main.rs`](src/main.rs) owns the `Cli` clap struct, mode dispatch, and two observers (`CliAcpObserver`, `CliSwarmObserver` — stderr only). [`src/state.rs`](src/state.rs) decides where a run's gaviero state lives (`RunState`, see Conventions).
 
 **`Cli` is the authoritative flag list.** Read the struct before documenting or inventing flags. There is **no** `--no-memory` flag.
 
@@ -23,7 +23,7 @@ Mode families (flags on `Cli`):
 
 | Family | Entry flags |
 |---|---|
-| Swarm / script | `--task`, `--work-units`, `--script`, `--coordinated`, `--resume` |
+| Swarm / script | `--task`, `--work-units`, `--script`, `--plan`, `--coordinated`, `--resume`, `--isolated` |
 | Graph | `--graph` (+ `--enrich` / `--enrich-no-embed`) |
 | Git hygiene | `--cleanup-branches` (+ `--force`) |
 | Memory admin | `--remember`, `--sleep`, `--utilization-scope`, `--manifest-*`, `--deletions-*` / `--restore-*`, `--forget-*` |
@@ -39,6 +39,8 @@ Full user-facing flag tables: [README.md](README.md). Do not duplicate every fie
 - **Model spec:** `provider:model` required. Accepted prefixes include `claude:`, `codex:`, `cursor:`, `ollama:`, `local:`, `deepseek:`, `dsh:` ([`validate_model_spec`](../gaviero-core/src/swarm/backend/shared.rs)). Default: workspace `agent.model`, then `claude:sonnet`.
 - **`--repo` vs `--workspace`:** `execution repo` vs `execution document` ([`workflow_execution_mode`](../gaviero-dsl/src/lib.rs)). Conflicts with each other; `--workspace` defaults to the plan file's directory when `--var PLAN_FILE=...` is set.
 - **DSL precedence.** Tiers: `--tiers-file` > script/includes. Vars: agent-level > `--var` > script-level. Params: `--param` (see [`workflow_params`](../gaviero-dsl/src/workflow_params.rs)).
+- **State follows the TUI.** [`state::discover`](src/state.rs) walks the run root and its parents for `.gaviero/settings.json` or `.gaviero/memory.db` (never `$HOME`) and honours a `*.gaviero-workspace` listing that folder. Runs share that workspace's memory (`MemoryStores::open` at its state root, configured embedder, repo scope = the member folder containing the run root). `--isolated`, or no workspace found, means throwaway memory/graph/telemetry in a temp dir; settings are still read, skills are off, and synthesized agent configs are restored at exit. Admin commands require a discovered workspace; `--history` / `--mcp-stats` fall back to the run root.
+- **Never build a code graph for one root into another root's DB.** A build deletes every file it did not scan; subfolder runs use `<state_root>/.gaviero/graphs/<hash>/` (`RunState::graph_db`).
 - **Memory ops open the same `MemoryServices`** as the TUI; never bypass the writer task.
 - **Exit codes:** `0` success; non-zero on compile/validation/runtime error; structured failures print `MietteReport` to stderr.
 
@@ -56,6 +58,7 @@ Full user-facing flag tables: [README.md](README.md). Do not duplicate every fie
 - `clap 4` (derive) — flag parsing.
 - `miette` — diagnostics from `gaviero-dsl`.
 - `tokio`, `tracing`, `tracing-subscriber`, `serde_json`, `anyhow`, `dirs`.
+- `tempfile 3` — isolated-run scratch state.
 
 ## See Also
 
