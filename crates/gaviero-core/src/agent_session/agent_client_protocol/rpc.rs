@@ -16,6 +16,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
+/// Handshake / config RPCs (`initialize`, `session/new`, `session/set_*`).
+/// `session/prompt` is a long-running call: streaming `session/update`
+/// notifications do not reset this timer, so that method must use
+/// [`JsonRpcHandle::request_indefinite`].
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug)]
@@ -56,12 +60,43 @@ impl JsonRpcHandle {
             .await
     }
 
+    /// Wait until the child answers or the connection drops. Used for
+    /// `session/prompt`, which stays open for the whole turn.
+    pub async fn request_indefinite(&self, method: &str, params: Value) -> Result<Value> {
+        let (id_key, rx) = self.send_request(method, params).await?;
+        match rx.await {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(anyhow!("ACP RPC {method} error {}: {}", e.code, e.message)),
+            Err(_) => {
+                self.pending.lock().await.remove(&id_key);
+                Err(anyhow!("ACP RPC {method}: caller dropped"))
+            }
+        }
+    }
+
     pub async fn request_timeout(
         &self,
         method: &str,
         params: Value,
         timeout: Duration,
     ) -> Result<Value> {
+        let (id_key, rx) = self.send_request(method, params).await?;
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(Ok(v))) => Ok(v),
+            Ok(Ok(Err(e))) => Err(anyhow!("ACP RPC {method} error {}: {}", e.code, e.message)),
+            Ok(Err(_)) => Err(anyhow!("ACP RPC {method}: caller dropped")),
+            Err(_) => {
+                self.pending.lock().await.remove(&id_key);
+                Err(anyhow!("ACP RPC {method} timed out after {timeout:?}"))
+            }
+        }
+    }
+
+    async fn send_request(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<(String, oneshot::Receiver<Result<Value, RpcError>>)> {
         let id = self.next_id();
         let id_key = id.to_string();
         let (tx, rx) = oneshot::channel();
@@ -76,15 +111,7 @@ impl JsonRpcHandle {
             "params": params,
         });
         self.write_line(&msg).await?;
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(Ok(v))) => Ok(v),
-            Ok(Ok(Err(e))) => Err(anyhow!("ACP RPC {method} error {}: {}", e.code, e.message)),
-            Ok(Err(_)) => Err(anyhow!("ACP RPC {method}: caller dropped")),
-            Err(_) => {
-                self.pending.lock().await.remove(&id_key);
-                Err(anyhow!("ACP RPC {method} timed out after {timeout:?}"))
-            }
-        }
+        Ok((id_key, rx))
     }
 
     pub async fn notify(&self, method: &str, params: Value) -> Result<()> {
