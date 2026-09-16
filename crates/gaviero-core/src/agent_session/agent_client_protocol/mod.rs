@@ -41,8 +41,11 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::acp::client::{propose_delete, propose_write};
+use crate::acp::client::propose_write;
 use crate::acp::session::AgentOptions;
+use crate::agent_session::reconcile::{
+    DirectWrite, reconcile_direct_writes, read_text_capped,
+};
 use crate::context_planner::{ContinuityHandle, ContinuityMode};
 use crate::observer::{AcpObserver, PermissionDecision};
 use crate::scope_enforcer::ScopeEnforcer;
@@ -178,12 +181,12 @@ impl AcpClientSession {
         self
     }
 
-    async fn ensure_running(&mut self) -> Result<&mut LiveSession> {
+    async fn ensure_running(&mut self) -> Result<bool> {
         if let Some(running) = self.running.take() {
             self.inner = running.await.context("joining previous ACP turn")?;
         }
         if self.inner.is_some() {
-            return Ok(self.inner.as_mut().expect("just checked"));
+            return Ok(false);
         }
         let spec = DshLaunchSpec::from_workspace_root(&self.workspace_root, &self.extra);
         let cmd = spec.build_command(&self.workspace_root)?;
@@ -251,7 +254,7 @@ impl AcpClientSession {
             thinking_settable,
             gate_written: HashSet::new(),
         });
-        Ok(self.inner.as_mut().expect("just inserted"))
+        Ok(true)
     }
 
     async fn apply_effort(handle: &JsonRpcHandle, session_id: &str, thinking_settable: bool, effort: &str) {
@@ -364,7 +367,7 @@ fn capabilities(exposed: Option<&[String]>) -> Capabilities {
     }
 }
 
-fn build_prompt_blocks(turn: &Turn, exposed: Option<&[String]>) -> Vec<Value> {
+fn build_prompt_blocks(turn: &Turn, exposed: Option<&[String]>, include_replay: bool) -> Vec<Value> {
     let mut parts: Vec<String> = Vec::new();
     parts.push(default_editor_system_prompt(&capabilities(exposed)));
     if let Some(block) = render_graph_block(&turn.graph_selections) {
@@ -375,6 +378,23 @@ fn build_prompt_blocks(turn: &Turn, exposed: Option<&[String]>) -> Vec<Value> {
     }
     if let Some(block) = render_skill_block(&turn.skill_selections) {
         parts.push(block);
+    }
+    // Chat constructs a new `AcpClientSession` per turn, so the ACP child
+    // starts at `session/new` with empty agent-side history. Host replay is
+    // the only continuity; `/reset` clears it by watermarking the panel
+    // transcript. A reused live child (swarm, consecutive send_turn on one
+    // session) already holds that history — restuffing it would duplicate.
+    if include_replay {
+        if let Some(payload) = &turn.replay_history {
+            for (role, content) in &payload.entries {
+                let tag = match role {
+                    crate::context_planner::ledger::Role::User => "user",
+                    crate::context_planner::ledger::Role::Assistant => "assistant",
+                    crate::context_planner::ledger::Role::System => "system",
+                };
+                parts.push(format!("<{tag}>\n{content}\n</{tag}>"));
+            }
+        }
     }
     parts.push(turn.user_message.clone());
     parts
@@ -577,11 +597,6 @@ fn git_dirty(root: &Path) -> HashSet<PathBuf> {
 
 // ── Out-of-band write reconciliation ────────────────────────────────────────
 
-/// Largest file the reconciler will read back for a diff. Beyond this the
-/// content is treated as unreviewable and the path is left where the agent
-/// put it (and reported through `PathsModified` as before).
-const RECONCILE_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
-
 /// Total budget for the pre-turn baseline capture. A workspace with a very
 /// large dirty set (a mass rename, a regenerated tree) would otherwise pay a
 /// full read of every dirty file on every turn; paths past the budget lose
@@ -641,46 +656,6 @@ async fn capture_pre_turn_content(root: &Path, dirty: &HashSet<PathBuf>) -> PreT
     state
 }
 
-/// Read a file as UTF-8 text, refusing the cases the reconciler cannot diff:
-/// a missing path (`Ok(None)`), a non-file, a file over
-/// [`RECONCILE_MAX_FILE_BYTES`], or non-UTF-8 bytes.
-async fn read_text_capped(path: &Path) -> Result<Option<String>> {
-    let meta = match tokio::fs::metadata(path).await {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("stat of {}", path.display())),
-    };
-    if !meta.is_file() {
-        anyhow::bail!("{} is not a regular file", path.display());
-    }
-    if meta.len() > RECONCILE_MAX_FILE_BYTES {
-        anyhow::bail!(
-            "{} is {} bytes, over the {RECONCILE_MAX_FILE_BYTES}-byte review limit",
-            path.display(),
-            meta.len()
-        );
-    }
-    let bytes = tokio::fs::read(path)
-        .await
-        .with_context(|| format!("read of {}", path.display()))?;
-    let text = String::from_utf8(bytes).with_context(|| format!("{} is not UTF-8", path.display()))?;
-    Ok(Some(text))
-}
-
-/// Restore `path` to `original`: its content, or absence.
-async fn restore_path(path: &Path, original: Option<&str>) -> Result<()> {
-    match original {
-        Some(content) => tokio::fs::write(path, content)
-            .await
-            .with_context(|| format!("restoring {}", path.display())),
-        None => match tokio::fs::remove_file(path).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
-        },
-    }
-}
-
 /// The pre-turn content of `rel` as recorded in git's index (stage 0).
 ///
 /// `Some(None)` = not tracked, so the path did not exist in the repository and
@@ -736,23 +711,25 @@ async fn reconcile_out_of_band_writes(
     ordered.sort();
     ordered.dedup();
 
+    // Resolve each path's turn-start baseline from whichever source this
+    // pattern actually has. Everything after that point — read the agent's
+    // bytes, restore, re-propose — is shared with Pattern C
+    // (`agent_session::reconcile`), so the two DeepSeek paths cannot drift
+    // into two different review models.
     let mut left_in_place = Vec::new();
-    let mut reconciled = Vec::new();
+    let mut writes = Vec::new();
 
     for rel in ordered {
-        let abs = workspace_root.join(&rel);
-
         if pre_turn.unknown.contains(&rel) {
             tracing::warn!(
                 path = %rel.display(),
-                "dsh: no usable pre-turn baseline for a path the agent wrote directly; \
-                 leaving it in place unreviewed"
+                "dsh: no usable pre-turn baseline for a path the agent wrote directly;                  leaving it in place unreviewed"
             );
             left_in_place.push(rel);
             continue;
         }
 
-        let original = match pre_turn.known.get(&rel) {
+        let before = match pre_turn.known.get(&rel) {
             Some(content) => content.clone(),
             None => {
                 // Clean at turn start: the index is the turn-start content. Not
@@ -766,8 +743,7 @@ async fn reconcile_out_of_band_writes(
                     None => {
                         tracing::warn!(
                             path = %rel.display(),
-                            "dsh: cannot reconstruct the pre-turn content of a directly written \
-                             path; leaving it in place unreviewed"
+                            "dsh: cannot reconstruct the pre-turn content of a directly written                              path; leaving it in place unreviewed"
                         );
                         left_in_place.push(rel);
                         continue;
@@ -776,90 +752,20 @@ async fn reconcile_out_of_band_writes(
             }
         };
 
-        let current = match read_text_capped(&abs).await {
-            Ok(content) => content,
-            Err(e) => {
-                tracing::warn!(
-                    path = %rel.display(),
-                    "dsh: direct write to a path that cannot be diffed ({e:#}); leaving it in place"
-                );
-                left_in_place.push(rel);
-                continue;
-            }
-        };
-
-        // No net change (the child rewrote identical bytes, or created and
-        // removed a path): nothing to propose, and nothing to restore.
-        if current == original {
-            continue;
-        }
-
-        // Drift guard, mirroring the Codex finalizer: if the bytes moved
-        // between the read and the restore, a concurrent writer is involved and
-        // the restore would clobber it.
-        match read_text_capped(&abs).await {
-            Ok(again) if again == current => {}
-            _ => {
-                tracing::warn!(
-                    path = %rel.display(),
-                    "dsh: a directly written path drifted while it was being reconciled; \
-                     leaving it in place"
-                );
-                left_in_place.push(rel);
-                continue;
-            }
-        }
-
-        if let Err(e) = restore_path(&abs, original.as_deref()).await {
-            tracing::warn!("dsh: could not restore {} before review: {e:#}", rel.display());
-            left_in_place.push(rel);
-            continue;
-        }
-
-        let result = match (&current, &original) {
-            (Some(proposed), _) => {
-                propose_write(
-                    write_gate,
-                    observer.as_ref(),
-                    workspace_root,
-                    agent_id,
-                    conv_id,
-                    &rel,
-                    proposed,
-                )
-                .await
-            }
-            (None, Some(prior)) => {
-                propose_delete(
-                    write_gate,
-                    observer.as_ref(),
-                    workspace_root,
-                    agent_id,
-                    conv_id,
-                    &rel,
-                    prior,
-                )
-                .await
-            }
-            (None, None) => Ok(()),
-        };
-        match result {
-            Ok(()) => reconciled.push(rel),
-            Err(e) => {
-                tracing::warn!(
-                    "dsh: failed to propose the direct write to {}: {e:#}",
-                    rel.display()
-                );
-                left_in_place.push(rel);
-            }
-        }
+        writes.push(DirectWrite { rel_path: rel, before });
     }
 
-    tracing::info!(
-        reconciled = reconciled.len(),
-        left_in_place = left_in_place.len(),
-        "dsh: routed direct writes through the write gate"
-    );
+    let outcome = reconcile_direct_writes(
+        write_gate,
+        observer.as_ref(),
+        workspace_root,
+        agent_id,
+        conv_id,
+        writes,
+    )
+    .await;
+
+    left_in_place.extend(outcome.left_in_place);
     left_in_place
 }
 
@@ -874,9 +780,9 @@ impl AgentSession for AcpClientSession {
             .effort
             .clone()
             .unwrap_or_else(|| self.options.effort.clone());
-        self.ensure_running().await?;
+        let include_replay = self.ensure_running().await?;
         let exposed = self.options.exposed_tools.clone();
-        let mut prompt = build_prompt_blocks(&turn, exposed.as_deref());
+        let mut prompt = build_prompt_blocks(&turn, exposed.as_deref(), include_replay);
         if let Some(system) = &self.system_prompt {
             prompt[0] = json!({ "type": "text", "text": system });
         }
@@ -1087,5 +993,64 @@ mod tests {
         ));
         assert!(session_new_mcp_rejected("MCP server declaration not allowed"));
         assert!(!session_new_mcp_rejected("cwd must be absolute"));
+    }
+
+    fn sample_turn_with_replay() -> Turn {
+        Turn {
+            user_message: "now".into(),
+            memory_selections: vec![],
+            graph_selections: vec![],
+            file_refs: vec![],
+            skill_selections: vec![],
+            replay_history: Some(crate::context_planner::ReplayPayload {
+                entries: vec![
+                    (crate::context_planner::ledger::Role::User, "old q".into()),
+                    (
+                        crate::context_planner::ledger::Role::Assistant,
+                        "old a".into(),
+                    ),
+                ],
+            }),
+            effort: None,
+            auto_approve: false,
+            metadata: Default::default(),
+        }
+    }
+
+    fn prompt_texts(blocks: &[Value]) -> Vec<&str> {
+        blocks
+            .iter()
+            .filter_map(|v| v.get("text").and_then(Value::as_str))
+            .collect()
+    }
+
+    #[test]
+    fn fresh_session_prompt_includes_host_replay() {
+        let turn = sample_turn_with_replay();
+        let blocks = build_prompt_blocks(&turn, None, true);
+        let texts = prompt_texts(&blocks);
+        assert!(
+            texts.iter().any(|t| t.contains("<user>\nold q\n</user>")),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("<assistant>\nold a\n</assistant>")),
+            "{texts:?}"
+        );
+        assert_eq!(*texts.last().unwrap(), "now");
+    }
+
+    #[test]
+    fn reused_session_prompt_skips_host_replay() {
+        let turn = sample_turn_with_replay();
+        let blocks = build_prompt_blocks(&turn, None, false);
+        let texts = prompt_texts(&blocks);
+        assert!(
+            texts.iter().all(|t| !t.contains("old q")),
+            "{texts:?}"
+        );
+        assert_eq!(*texts.last().unwrap(), "now");
     }
 }

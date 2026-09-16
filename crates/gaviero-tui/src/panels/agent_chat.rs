@@ -480,9 +480,10 @@ impl std::fmt::Debug for PendingPermission {
 ///   work yet).
 /// * `Suppress` — skip transcript inlining on the next first turn, even
 ///   when bootstrap context is needed. Set by `/reset` and `/clear`.
-///   Cleared back to `Auto` once Claude opens a fresh session
-///   (handled in the SystemInit event path) so subsequent resets behave
-///   the same way.
+///   Cleared back to `Auto` once a provider turn completes (Claude/Cursor
+///   SystemInit, and `MessageComplete` for `deepseek:` / `dsh:` which never
+///   emit SystemInit) so subsequent resets behave the same way. Pre-reset
+///   turns stay out of replay via [`Conversation::replay_from_seq`].
 /// * `Force` — reserved for callers that always want the transcript in;
 ///   not wired up today, but the explicit variant keeps the semantics
 ///   readable.
@@ -592,6 +593,12 @@ pub struct Conversation {
     /// Controls whether the visible chat transcript is re-inlined into the
     /// next first-turn prompt. See [`TranscriptInlineMode`].
     pub transcript_inline_mode: TranscriptInlineMode,
+    /// Inclusive lower bound on [`ChatMessage::seq`] for host-side replay.
+    /// `/reset` sets this to [`Self::next_message_seq`] so the visible
+    /// pre-reset transcript stays in the panel but is never re-inlined —
+    /// required for `deepseek:` (StatelessReplay) and `dsh:` (fresh ACP
+    /// `session/new` each chat turn) after `Suppress` flips back to `Auto`.
+    pub replay_from_seq: u64,
     /// Latest server-reported token usage for this conversation (Claude
     /// `result.usage` today). Updated once per turn from
     /// `Event::TurnTokenUsage`. `None` before the first turn completes,
@@ -644,11 +651,21 @@ impl Conversation {
             session_ledger: None,
             pending_persisted_ledger: None,
             transcript_inline_mode: TranscriptInlineMode::Auto,
+            replay_from_seq: 0,
             last_token_usage: None,
             last_turn_cost_usd: 0.0,
             last_bootstrap_tokens: 0,
             last_bootstrap_arms: gaviero_core::context_planner::BootstrapArms::none(),
             last_memory_injection_tokens: 0,
+        }
+    }
+
+    /// Claude/Cursor restore `Auto` from SystemInit. `deepseek:` and `dsh:`
+    /// never emit that event, so the first completed post-reset turn is what
+    /// re-arms follow-up replay (still gated by [`Self::replay_from_seq`]).
+    pub fn restore_transcript_inline(&mut self) {
+        if self.transcript_inline_mode == TranscriptInlineMode::Suppress {
+            self.transcript_inline_mode = TranscriptInlineMode::Auto;
         }
     }
 
@@ -863,6 +880,7 @@ impl AgentChatState {
             session_ledger: None,
             pending_persisted_ledger: None,
             transcript_inline_mode: TranscriptInlineMode::Auto,
+            replay_from_seq: 0,
             last_token_usage: None,
             last_turn_cost_usd: 0.0,
             last_bootstrap_tokens: 0,
@@ -2203,7 +2221,7 @@ impl AgentChatState {
         }
         let mut input = 0usize;
         let mut output = 0usize;
-        for msg in &conv.messages {
+        for msg in conv.messages.iter().filter(|m| m.seq >= conv.replay_from_seq) {
             match msg.role {
                 ChatRole::User => input += count_words(&msg.content),
                 ChatRole::Assistant => {
@@ -2317,6 +2335,12 @@ impl AgentChatState {
         conv.claude_session_id = None;
         conv.session_ledger = None;
         conv.pending_persisted_ledger = None;
+        // Host-side replay watermark: visible pre-reset turns stay in the
+        // panel but must not re-enter `Turn.replay_history` once
+        // `transcript_inline_mode` returns to `Auto`. `deepseek:` keeps
+        // `is_first_turn` true (no SystemInit), so without this the next
+        // Auto dispatch would restuff the whole transcript.
+        conv.replay_from_seq = conv.next_message_seq;
         conv.pending_turn_id = None;
         conv.pending_module_path = None;
         conv.pending_focused_folder = None;
@@ -2340,9 +2364,10 @@ impl AgentChatState {
         // Suppress the visible transcript on the next first-turn dispatch.
         // Bootstrap context (graph + memory) still flows; only the
         // re-inlining of prior user/assistant turns is skipped, matching
-        // the user-facing meaning of "/reset". The SystemInit handler in
-        // controller.rs flips this back to `Auto` once Claude opens the
-        // fresh session, so subsequent /reset invocations behave the same.
+        // the user-facing meaning of "/reset". Claude/Cursor flip this back
+        // to `Auto` on SystemInit; `deepseek:` / `dsh:` flip it on the first
+        // post-reset `MessageComplete`. Pre-reset turns stay excluded from
+        // replay via `replay_from_seq` either way.
         conv.transcript_inline_mode = TranscriptInlineMode::Suppress;
         conv.bump_revision();
         if idx == self.active_conv {
@@ -2356,6 +2381,16 @@ impl AgentChatState {
             // state; a background reset gets the plain confirmation.
             self.add_system_message_at(idx, "Context reset — next turn bootstraps fresh.");
         }
+    }
+
+    /// Claude/Cursor restore `Auto` from SystemInit. `deepseek:` and `dsh:`
+    /// never emit that event, so the first completed post-reset turn is what
+    /// re-arms follow-up replay (still gated by [`Conversation::replay_from_seq`]).
+    pub fn restore_transcript_inline_at(&mut self, idx: usize) {
+        let Some(conv) = self.conversations.get_mut(idx) else {
+            return;
+        };
+        conv.restore_transcript_inline();
     }
 
     /// Close the active conversation. If it's the last one, replace it with a fresh one.
@@ -2437,9 +2472,10 @@ impl AgentChatState {
     /// core (§2.2). Indexed because a remote prompt can target a
     /// conversation that is not the active tab.
     pub fn context_messages_at(&self, idx: usize) -> Vec<(&str, &str)> {
-        self.conversations[idx]
-            .messages
+        let conv = &self.conversations[idx];
+        conv.messages
             .iter()
+            .filter(|m| m.seq >= conv.replay_from_seq)
             .filter(|m| m.role == ChatRole::User || m.role == ChatRole::Assistant)
             .map(|m| {
                 let role = match m.role {
@@ -3794,6 +3830,7 @@ impl AgentChatState {
                     // server-side session may be gone, and `--resume` may
                     // refuse the stale id. Default `Auto` preserves that.
                     transcript_inline_mode: TranscriptInlineMode::Auto,
+                    replay_from_seq: 0,
                     last_token_usage: pending_usage,
                     last_turn_cost_usd: 0.0,
                     last_bootstrap_tokens: 0,
@@ -6008,6 +6045,54 @@ mod tests {
             state.conversations[state.active_conv]
                 .session_ledger
                 .is_none()
+        );
+        // apply_slash_line records `/reset` as a user message (seq 3) before
+        // reset_conversation_at snapshots next_message_seq (4).
+        assert_eq!(
+            state.conversations[state.active_conv].replay_from_seq,
+            4
+        );
+    }
+
+    #[test]
+    fn reset_excludes_pre_reset_turns_from_replay_after_auto_restored() {
+        let mut state = AgentChatState::new();
+        state.add_user_message("old user");
+        push_assistant(&mut state, "old assistant", Vec::new());
+
+        state.text_input.text = "/reset".to_string();
+        assert!(state.process_slash_command());
+        assert!(
+            state
+                .context_messages_at(state.active_conv)
+                .iter()
+                .all(|(_, c)| !c.contains("old")),
+            "pre-reset turns must not be replayed: {:?}",
+            state.context_messages_at(state.active_conv)
+        );
+
+        // `deepseek:` / `dsh:` never emit SystemInit; MessageComplete restores Auto.
+        state.restore_transcript_inline_at(state.active_conv);
+        assert_eq!(
+            state.conversations[state.active_conv].transcript_inline_mode,
+            TranscriptInlineMode::Auto
+        );
+
+        state.add_user_message("new user");
+        push_assistant(&mut state, "new assistant", Vec::new());
+        let ctx = state.context_messages_at(state.active_conv);
+        assert!(
+            ctx.iter().any(|(_, c)| *c == "new user"),
+            "post-reset turns must replay: {ctx:?}"
+        );
+        assert!(
+            ctx.iter().any(|(_, c)| *c == "new assistant"),
+            "post-reset turns must replay: {ctx:?}"
+        );
+        assert!(
+            ctx.iter()
+                .all(|(_, c)| *c != "old user" && *c != "old assistant"),
+            "pre-reset turns must stay out of replay: {ctx:?}"
         );
     }
 
