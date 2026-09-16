@@ -150,6 +150,8 @@ fn config_for(workspace: &Path, ollama_url: &str) -> SwarmConfig {
         chat_injection: Default::default(),
         skills_emit: Default::default(),
         skill_catalog: None,
+        memory_root: None,
+        graph_db_path: None,
     }
 }
 

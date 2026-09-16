@@ -66,6 +66,13 @@ use super::tools::{
 pub struct GavieroMcpServer {
     stores: Arc<MemoryStores>,
     workspace_root: PathBuf,
+    /// Folder whose repo scope `memory_search` reaches. Defaults to
+    /// `workspace_root`; differs when the host serves a run root below the
+    /// folder that owns the workspace memory ([`Self::with_memory_root`]).
+    memory_root: PathBuf,
+    /// Code graph database for `workspace_root`. Defaults to
+    /// `<workspace_root>/.gaviero/code_graph.db` ([`Self::with_graph_db_path`]).
+    graph_db_path: PathBuf,
     observer: Arc<dyn McpToolCallObserver>,
     /// B3: retrieval-engine config shared with chat injection. Cloned
     /// per call so per-tool latency budgets stay independent.
@@ -192,6 +199,7 @@ const GRAPH_QUERY_TIMEOUT: Duration = Duration::from_secs(12);
 fn with_graph_store<T, F>(
     cache: &tokio::sync::Mutex<Option<crate::repo_map::store::GraphStore>>,
     workspace_root: &Path,
+    graph_db: &Path,
     excludes: &[String],
     f: F,
 ) -> anyhow::Result<T>
@@ -201,13 +209,12 @@ where
     {
         let mut guard = cache.blocking_lock();
         if guard.is_none() {
-            let (store, _) = crate::repo_map::graph_builder::build_graph(workspace_root, excludes)?;
+            let (store, _) =
+                crate::repo_map::graph_builder::build_graph_at(workspace_root, graph_db, excludes)?;
             *guard = Some(store);
         }
     }
-    let store = crate::repo_map::store::GraphStore::open(
-        &crate::repo_map::graph_builder::graph_db_path(workspace_root),
-    )?;
+    let store = crate::repo_map::store::GraphStore::open(graph_db)?;
     f(&store)
 }
 
@@ -243,6 +250,8 @@ impl GavieroMcpServer {
     ) -> Self {
         Self {
             stores,
+            memory_root: workspace_root.clone(),
+            graph_db_path: crate::repo_map::graph_builder::graph_db_path(&workspace_root),
             workspace_root,
             observer,
             retrieval_cfg,
@@ -473,6 +482,23 @@ impl GavieroMcpServer {
         self
     }
 
+    /// Reach repo-scoped memory through `root` instead of the served
+    /// `workspace_root`. For hosts serving a run root below the folder
+    /// that owns the workspace memory; `root` must be a registered folder
+    /// for repo scope to be searched.
+    pub fn with_memory_root(mut self, root: PathBuf) -> Self {
+        self.memory_root = root;
+        self
+    }
+
+    /// Persist the code graph at `path` instead of
+    /// `<workspace_root>/.gaviero/code_graph.db`. The file must hold no
+    /// graph of a different scan root.
+    pub fn with_graph_db_path(mut self, path: PathBuf) -> Self {
+        self.graph_db_path = path;
+        self
+    }
+
     /// Drop the cached `GraphStore` and `RepoMap` so the next
     /// `blast_radius` / `repo_outline` call rebuilds them from the
     /// current workspace state. Embedding apps (TUI / CLI) should call
@@ -498,6 +524,7 @@ impl GavieroMcpServer {
         let cache = Arc::clone(&self.graph_cache);
         let repo_map_cache = Arc::clone(&self.repo_map_cache);
         let workspace_root = self.workspace_root.clone();
+        let graph_db = self.graph_db_path.clone();
         let excludes = self.graph_excludes.clone();
         // build_graph is blocking + potentially heavy on a large repo;
         // run it off the async runtime and hold the cache lock only for
@@ -505,7 +532,11 @@ impl GavieroMcpServer {
         let _ = tokio::task::spawn_blocking(move || {
             let mut guard = cache.blocking_lock();
             if guard.is_none() {
-                match crate::repo_map::graph_builder::build_graph(&workspace_root, &excludes) {
+                match crate::repo_map::graph_builder::build_graph_at(
+                    &workspace_root,
+                    &graph_db,
+                    &excludes,
+                ) {
                     Ok((store, _)) => *guard = Some(store),
                     Err(e) => tracing::warn!(
                         target: "mcp_server",
@@ -615,7 +646,7 @@ impl GavieroMcpServer {
 
         // Repo scope is where the bulk of a mature workspace's memory
         // lives, so the folder identity is supplied from the server's own
-        // `workspace_root` rather than left as `None` — otherwise
+        // `memory_root` rather than left as `None` — otherwise
         // `MemoryScope::levels()` emits only [Workspace, Global] and every
         // repo-scoped memory is invisible to subprocess agents.
         //
@@ -629,17 +660,17 @@ impl GavieroMcpServer {
         // `module` is deliberately still out of reach: it derives from
         // `owned_paths`, which is per-file context the shim does not carry.
         let repo_folder = {
-            let repo_id = crate::memory::hash_path(&self.workspace_root);
+            let repo_id = crate::memory::hash_path(&self.memory_root);
             match self
                 .stores
                 .get(&crate::memory::StoreKind::Folder { repo_id })
                 .await
             {
-                Ok(_) => Some(self.workspace_root.as_path()),
+                Ok(_) => Some(self.memory_root.as_path()),
                 Err(_) => None,
             }
         };
-        let scope = MemoryScope::from_context(&self.workspace_root, repo_folder, None, None);
+        let scope = MemoryScope::from_context(&self.memory_root, repo_folder, None, None);
         let reranker_ref: Option<&dyn Reranker> = self.reranker.as_deref();
         // C1.6: when filtering to a non-default kind, over-fetch so the
         // post-filter can still return up to `limit` results. Cheap
@@ -756,6 +787,7 @@ impl GavieroMcpServer {
         let mode = BlastRadiusMode::from_str(input.mode.as_deref().unwrap_or("all"));
         let paths = input.paths.clone();
         let workspace_root = self.workspace_root.clone();
+        let graph_db = self.graph_db_path.clone();
         let specificity = self.specificity;
         let weights = self
             .edge_weights
@@ -768,7 +800,7 @@ impl GavieroMcpServer {
         // Build (if needed) under the sentinel mutex, then rank on a
         // fresh connection so this call cannot block `node_doc`.
         let compute = tokio::task::spawn_blocking(move || {
-            with_graph_store(&cache, &workspace_root, &excludes, |store| {
+            with_graph_store(&cache, &workspace_root, &graph_db, &excludes, |store| {
                 let seed_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
                 let impact = store.impact_radius_with_mode(&seed_refs, depth as usize, mode)?;
                 let mut to_rank: Vec<String> = impact.changed_files.to_vec();
@@ -887,11 +919,12 @@ impl GavieroMcpServer {
         let log_input = serde_json::to_value(&input).unwrap_or_default();
         let cache = Arc::clone(&self.graph_cache);
         let workspace_root = self.workspace_root.clone();
+        let graph_db = self.graph_db_path.clone();
         let excludes = self.graph_excludes.clone();
         let path_for_graph = path.clone();
 
         let (symbols, signatures) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            with_graph_store(&cache, &workspace_root, &excludes, |store| {
+            with_graph_store(&cache, &workspace_root, &graph_db, &excludes, |store| {
                 let nodes = store.nodes_for_file(&path_for_graph)?;
                 let mut symbols = Vec::new();
                 let mut signatures = Vec::new();
@@ -1297,9 +1330,10 @@ impl GavieroMcpServer {
 
         let cache = Arc::clone(&self.graph_cache);
         let workspace_root = self.workspace_root.clone();
+        let graph_db = self.graph_db_path.clone();
         let excludes = self.graph_excludes.clone();
         let hits = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            with_graph_store(&cache, &workspace_root, &excludes, |store| {
+            with_graph_store(&cache, &workspace_root, &graph_db, &excludes, |store| {
                 // G2 / OD-2: cross-model cosine is noise — verify the
                 // sidecar's vectors were built by the query embedder.
                 let stamp = store.graph_meta("symbol_embedder")?;
@@ -1379,9 +1413,10 @@ impl GavieroMcpServer {
         let qn = input.qualified_name.clone();
         let cache = Arc::clone(&self.graph_cache);
         let workspace_root = self.workspace_root.clone();
+        let graph_db = self.graph_db_path.clone();
         let excludes = self.graph_excludes.clone();
         let out = tokio::task::spawn_blocking(move || -> anyhow::Result<SymbolDocOutput> {
-            with_graph_store(&cache, &workspace_root, &excludes, |store| {
+            with_graph_store(&cache, &workspace_root, &graph_db, &excludes, |store| {
                 let Some(doc) = store.symbol_doc(&qn)? else {
                     anyhow::bail!("no symbol_docs row for qualified_name `{qn}`");
                 };
@@ -2594,6 +2629,83 @@ mod tests {
         assert!(
             only_repo.iter().all(|r| r.scope == "repo"),
             "scope_hint=repo must return only repo rows; got {only_repo:?}"
+        );
+    }
+
+    /// `with_graph_db_path` keeps the graph out of the served root — the
+    /// isolated headless mode relies on it to leave the repo's
+    /// `.gaviero/` untouched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warmup_builds_the_graph_at_the_configured_path() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("lib.rs"), "pub fn hello() {}").unwrap();
+        let db = state.path().join("code_graph.db");
+        let embedder = Arc::new(MockEmbedder) as Arc<dyn Embedder>;
+        let stores = MemoryStores::for_tests_in_memory(embedder).unwrap();
+        let s = GavieroMcpServer::with_defaults(stores, root.path().to_path_buf())
+            .with_graph_db_path(db.clone());
+
+        s.warmup().await;
+
+        assert!(db.is_file(), "graph must be persisted at the override path");
+        assert!(
+            !root.path().join(".gaviero").exists(),
+            "the served root must not gain a .gaviero/ directory"
+        );
+    }
+
+    /// A server rooted below the memory folder (headless run root inside a
+    /// discovered workspace) reaches that folder's repo scope through
+    /// `with_memory_root`; the served root alone is not a registered folder.
+    #[tokio::test]
+    async fn memory_search_reaches_repo_scope_through_memory_root() {
+        use crate::memory::scope::{MemoryType, WriteMeta, WriteScope};
+        use crate::memory::trust_defaults::MemorySource;
+
+        let root = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let run_root = root.path().join("plans").join("x");
+        std::fs::create_dir_all(&run_root).unwrap();
+        let base = folder_fixture(root.path(), global.path());
+        base.stores
+            .store_scoped(
+                &WriteScope::Repo {
+                    repo_id: crate::memory::hash_path(root.path()),
+                },
+                "teal heron repo-scoped convention",
+                &WriteMeta::for_source(MemorySource::UserRemember).with_type(MemoryType::Decision),
+            )
+            .await
+            .unwrap();
+        let search = |s: &GavieroMcpServer| {
+            let s = s.clone();
+            async move {
+                s.memory_search(Parameters(MemorySearchInput {
+                    query: "teal heron convention".into(),
+                    scope_hint: None,
+                    limit: Some(10),
+                    kind: None,
+                }))
+                .await
+                .unwrap()
+                .0
+                .results
+            }
+        };
+
+        let unrooted = GavieroMcpServer::with_defaults(base.stores.clone(), run_root.clone());
+        assert!(
+            !search(&unrooted).await.iter().any(|r| r.scope == "repo"),
+            "an unregistered run root must not reach repo scope on its own"
+        );
+
+        let rooted = GavieroMcpServer::with_defaults(base.stores.clone(), run_root)
+            .with_memory_root(root.path().to_path_buf());
+        let out = search(&rooted).await;
+        assert!(
+            out.iter().any(|r| r.scope == "repo"),
+            "memory_root must expose the owning folder's repo scope; got {out:?}"
         );
     }
 

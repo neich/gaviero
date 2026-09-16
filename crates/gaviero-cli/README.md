@@ -78,9 +78,29 @@ gaviero-cli --remember "Auth uses bcrypt" --remember-scope repo
 gaviero-cli --task "Refactor schema" --attempts 3 --format json > results.json 2> progress.log
 ```
 
+## Workspace state
+
+A run shares memory with the TUI by default. The CLI searches the run root (`--repo`, `--workspace`, or the `PLAN_FILE` folder) and its parent folders for the workspace `gaviero` would open there:
+
+- A folder counts once it has `.gaviero/settings.json` or `.gaviero/memory.db`. A bare `.gaviero/` holding only worktrees, run state or spilled prompts does not. The home directory is skipped (`~/.gaviero/` holds user settings).
+- A `*.gaviero-workspace` file in that folder, or in a parent folder that lists it, selects multi-folder mode, as `gaviero --workspace` does.
+- Found: the run opens that workspace's memory (global, workspace and per-folder DBs, configured `memory.embedder.model`). It writes findings and consolidation into the repo scope of the workspace folder containing the run root. A run root below the workspace root gets its own MCP server and a code graph under `<workspace>/.gaviero/graphs/`. At the workspace root, a live TUI server is reused.
+
+`--isolated` runs against throwaway state instead. A run also falls back to isolated mode when the search finds nothing.
+
+| Isolated run | |
+|---|---|
+| Memory, code graph, MCP telemetry | temp directory, removed at exit |
+| Settings (`.gaviero/settings.json`, `~/.gaviero/settings.json`) | still read |
+| Skills catalog / `skills.emit` | not read / off |
+| Agent MCP configs at the run root | written for the run, restored at exit |
+| Run files (`.gaviero/worktrees`, `state`, `tmp`, `injected`) | under the run root, as usual |
+
+An isolated run refuses a folder another gaviero process serves: rewriting its agent configs would strand that process's agents. Close it, drop `--isolated`, or pass `--no-mcp`. Memory and admin commands (`--remember`, `--forget-*`, `--sleep`, `--consolidate-*`, `--graph`, `--eval-*`, `--manifest-*`, `--mcp-reach-probe`, …) always use the discovered workspace and fail when there is none. `--history` and `--mcp-stats` only read, so they fall back to the run root instead.
+
 ## Configuration
 
-Reads the same `.gaviero/settings.json` cascade as the editor (see [gaviero-tui](../gaviero-tui/README.md#configuration)).
+Reads the same `.gaviero/settings.json` cascade as the editor (see [gaviero-tui](../gaviero-tui/README.md#configuration)), from the discovered workspace.
 
 **MCP extra servers** — merged into every agent worktree (`--mcp-url` overrides same-named entries):
 
@@ -146,6 +166,7 @@ No public library API. The `Cli` struct in `src/main.rs` is authoritative; this 
 | `--no-iterate` | — | Single pass only (overrides `--max-retries`) |
 | `--resume` | — | Resume from `.gaviero/state/<plan-hash>.json` |
 | `--fresh` | — | Ignore artefacts in a `loop` block's `OUT_DIR`; restart every loop at its script `iter_start` |
+| `--isolated` | — | Throwaway memory/graph/telemetry instead of the discovered workspace (see [Workspace state](#workspace-state)) |
 | `--run-timeout` | `<secs>` | Wall-clock cap on the whole run (default `0` = no cap) |
 
 ### Bounding a run
@@ -211,7 +232,7 @@ independent of `--resume`, which restores the node-level checkpoint.
 | `--namespace` | `<ns>` | Memory write namespace |
 | `--read-ns` | `<ns>` | Additional read namespaces (repeatable) |
 | `--remember` | `<text>` | Store a memory and exit |
-| `--remember-scope` | `<scope>` | Scope for `--remember`: `run\|module\|repo\|workspace\|global` |
+| `--remember-scope` | `<scope>` | Scope for `--remember`: `repo\|workspace\|global` (`run` / `module` need the TUI); `repo` = the workspace folder containing the run root |
 
 ### Repo-map
 
@@ -241,7 +262,7 @@ independent of `--resume`, which restores the node-level checkpoint.
 
 ### History (per-turn log written by the TUI)
 
-Reads `<repo>/.gaviero/history/turns.ndjson` and its rotated `.1` generation through the same parser as the TUI HISTORY panel, prints, and exits. Token numbers prefixed `~` are estimates (words×1.3 for text, chars÷4 for JSON); `exact` numbers are provider-reported usage.
+Reads `.gaviero/history/turns.ndjson` of the discovered workspace (else the run root) and its rotated `.1` generation through the same parser as the TUI HISTORY panel, prints, and exits. Token numbers prefixed `~` are estimates (words×1.3 for text, chars÷4 for JSON); `exact` numbers are provider-reported usage.
 
 | Flag | Argument | Purpose |
 |---|---|---|

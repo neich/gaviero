@@ -30,9 +30,12 @@ Intentionally thin: parse flags, select a mode, wire [`CliAcpObserver`](src/main
 
 ```
 gaviero-cli/src/
-└─ main.rs          ~4000 lines — Cli, observers, mode dispatch, helpers
+├─ main.rs          ~5.8 KLOC — Cli, observers, mode dispatch, helpers
+└─ state.rs         workspace discovery, isolated state, agent-config restore
 tests/
-└─ remember_cli.rs  --remember integration tests
+├─ remember_cli.rs     --remember integration tests
+├─ history_cli.rs      --history integration tests
+└─ state_modes_cli.rs  shared / --isolated / fallback runs against a fake Ollama
 examples/
 └─ anchor_ab_live.rs  live A/B harness for eval-anchor-ab
 ```
@@ -58,22 +61,40 @@ Stdout stays clean for `--format json`.
 
 Helpers (`prepare_swarm_workspace`, `materialize_external_vars_for_repo`, `mcp_overrides_from_cli`, …) anchor `--repo` / `--workspace`, copy external var files into worktrees, and synthesize MCP overrides before `pipeline::execute`.
 
+### Workspace state ([`src/state.rs`](src/state.rs))
+
+The run root (`--repo` / `--workspace` / `PLAN_FILE` folder) is not necessarily where gaviero state lives. [`discover`](src/state.rs) walks the run root and its parent folders for the workspace the TUI would open. The marker is `.gaviero/settings.json` or `.gaviero/memory.db`; `$HOME` is skipped. A `*.gaviero-workspace` file listing that folder loads multi-folder mode. `Discovered` separates three roots:
+
+| Root | Meaning |
+|---|---|
+| `marker_root` | folder where the search stopped |
+| `state_root` | where the TUI keeps workspace state (its first folder): workspace memory DB, telemetry, history, graph |
+| `memory_root` | workspace folder containing the run root; receives the run's repo-scoped memory |
+
+`RunState::Shared` opens `MemoryStores::open(state_root, …)` with the configured embedder. It passes `SwarmConfig::memory_root` / `graph_db_path` and serves MCP at the run root with `GavieroMcpServer::with_memory_root` / `with_graph_db_path`. A run root below `state_root` gets its graph under `state_root/.gaviero/graphs/<hash>/`, because a graph build deletes every file it did not scan.
+
+`RunState::Isolated` (`--isolated`, or nothing discovered) keeps memory, graph and telemetry in a `Scratch` temp dir (single store via `from_single_store`), serves MCP on an endpoint derived from that dir, disables skills, and wraps config synthesis in `ConfigRestore`. It refuses a run root with a live gaviero server. Memory/admin commands require a discovered workspace (`require_workspace`); `--history` / `--mcp-stats` fall back to the run root.
+
 ---
 
 ## Data Flow
 
 ```
 parse Cli
-  ├─ open Workspace + settings
-  ├─ probe C1 migration (refuse without --accept-c1-migration)
-  ├─ init MemoryStores (best-effort; failure is non-fatal)
+  ├─ resolve run root; --mcp-register-user / --mcp-unregister-user exit here
+  ├─ state::discover(run root)            (--isolated + admin flag → error)
+  ├─ --mcp-stats / --history              (discovered state root, else run root)
+  ├─ probe C1 migration on the discovered workspace (skipped for isolated runs)
   │
-  ├─ one-shot admin modes (exit before agents):
-  │     --remember / --graph[--enrich] / --cleanup-branches
+  ├─ one-shot admin modes (require a discovered workspace; exit before agents):
+  │     --remember / --graph[--enrich]
   │     --manifest-* / --eval-* / --seed-corpus-from-paths
   │     --sleep / --utilization-* / --deletions-* / --restore-*
-  │     --forget-* / --forget-history-id / --mcp-stats / --mcp-reach-probe
-  │     --history[-last|-conv|-turn|-json|-stats|-path]
+  │     --forget-* / --forget-history-id / --mcp-reach-probe
+  ├─ --cleanup-branches (run root, git only)
+  │
+  ├─ RunState: Shared(discovered) | Isolated(scratch)
+  ├─ open memory (best-effort; failure is non-fatal unless gaviero MCP is on)
   │
   ├─ plan input:
   │     --task            → synthetic WorkUnit (owned=["."])
@@ -85,7 +106,8 @@ parse Cli
   │
   ├─ iteration overlays (--max-retries, --attempts, --test-first, --no-iterate)
   ├─ --coordinated? → plan_coordinated → write .gaviero → exit
-  └─ else → pipeline::execute → print SwarmResult → exit(0|1|2|3)
+  └─ else → pipeline::execute → [isolated: stop MCP, restore agent
+            configs, remove scratch] → print SwarmResult → exit(0|1|2|3)
 ```
 
 ### Model resolution
@@ -131,7 +153,7 @@ Binary only — no library API. Public surface is the CLI:
 --workflow --prompt --prompt-file
 --var KEY=VALUE --param NAME=VALUE --tiers-file
 --model --coordinator-model --ollama-base-url
---auto-accept --resume --max-parallel
+--auto-accept --resume --fresh --isolated --max-parallel
 --max-retries --attempts --test-first --no-iterate
 --coordinated --output
 --format text|json --trace --verbose/-v

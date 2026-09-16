@@ -1,3 +1,5 @@
+mod state;
+
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -130,6 +132,21 @@ struct Cli {
     /// `--fresh` to start the panel over — existing files are then replaced.
     #[arg(long)]
     fresh: bool,
+
+    /// Run against throwaway state instead of the workspace the TUI would
+    /// open here.
+    ///
+    /// By default a run searches its root and the parent folders for a
+    /// gaviero workspace — a folder with `.gaviero/settings.json` or
+    /// `.gaviero/memory.db`, loaded through a `*.gaviero-workspace` file
+    /// when one lists it — and reads and writes that workspace's memory.
+    /// With `--isolated`, or when the search finds nothing, memory, the code
+    /// graph and MCP telemetry live in a temp directory removed at exit;
+    /// settings are still read. Refused while another gaviero process
+    /// serves the run root (close it or pass `--no-mcp`). Runs only:
+    /// memory and admin commands always use the discovered workspace.
+    #[arg(long)]
+    isolated: bool,
 
     /// Wall-clock cap for the whole run, in seconds (0 = no cap).
     ///
@@ -1310,15 +1327,48 @@ fn mcp_overrides_from_cli(
     Ok(overrides)
 }
 
+/// Where the headless MCP host lives for one run (see [`state::RunState`]).
+struct McpHost<'a> {
+    /// Agent root: synthesized configs, served workspace root, graph scan root.
+    run_root: &'a std::path::Path,
+    /// Root the endpoint, HTTP port and token derive from.
+    endpoint_root: &'a std::path::Path,
+    /// Root whose `.gaviero/mcp_calls.ndjson` receives tool telemetry.
+    telemetry_root: &'a std::path::Path,
+    /// Folder whose repo-scoped memory `memory_search` reaches.
+    memory_root: &'a std::path::Path,
+    /// Code graph database for `run_root`.
+    graph_db: PathBuf,
+    /// Isolated run: never adopt another process's server, and hand the
+    /// synthesized agent configs back afterwards.
+    isolated: bool,
+}
+
+impl<'a> McpHost<'a> {
+    /// Host for a run whose root is the workspace state root itself.
+    fn shared_at(root: &'a std::path::Path) -> Self {
+        Self {
+            run_root: root,
+            endpoint_root: root,
+            telemetry_root: root,
+            memory_root: root,
+            graph_db: gaviero_core::repo_map::graph_builder::graph_db_path(root),
+            isolated: false,
+        }
+    }
+}
+
 /// Start the in-process MCP server (when memory is available), synthesize
-/// per-worktree provider configs at the repo root, and return the synth
+/// per-worktree provider configs at the run root, and return the synth
 /// struct for the swarm pipeline (cloned per agent worktree).
 ///
 /// When another gaviero process (e.g. the TUI) already serves the
-/// workspace endpoint, no server is spawned — the live endpoint is reused
-/// and the returned handle is `None`.
+/// endpoint, no server is spawned — the live endpoint is reused and the
+/// returned handle is `None`. Isolated hosts never reuse, refuse to
+/// repoint a folder another process serves, and return a
+/// [`state::ConfigRestore`] that puts the synthesized configs back.
 fn prepare_mcp_for_swarm(
-    repo: &std::path::Path,
+    host: &McpHost<'_>,
     workspace: &gaviero_core::workspace::Workspace,
     cli: &Cli,
     script_vars: &[(String, String)],
@@ -1331,6 +1381,7 @@ fn prepare_mcp_for_swarm(
 ) -> Result<(
     Option<gaviero_core::mcp::McpConfigSynth>,
     Option<gaviero_core::mcp::McpServerHandle>,
+    Option<state::ConfigRestore>,
 )> {
     use std::sync::Arc;
 
@@ -1339,6 +1390,7 @@ fn prepare_mcp_for_swarm(
         resolve_mcp_config_synth, spawn_mcp_server, synthesize_for_worktree,
     };
 
+    let repo = host.run_root;
     let mut overrides = mcp_overrides_from_cli(cli, script_vars)?;
     for (name, url) in gaviero_core::mcp::extra_urls_from_project_mcp_json(repo) {
         if overrides.extra_urls.iter().any(|(n, _)| n == &name) {
@@ -1349,17 +1401,37 @@ fn prepare_mcp_for_swarm(
             .extra_urls
             .push((name, normalize_remote_mcp_url(&url)));
     }
-    let endpoint = gaviero_core::mcp::McpEndpoint::for_workspace(repo);
+    let endpoint = gaviero_core::mcp::McpEndpoint::for_workspace(host.endpoint_root);
     let mut synth = resolve_mcp_config_synth(workspace, repo, endpoint, &overrides);
     if !synth.enabled {
-        return Ok((None, None));
+        return Ok((None, None, None));
     }
+    // An isolated run points the run root's agent configs at its own
+    // server. A TUI serving the same folder wrote those files once, at
+    // startup, so repointing them would strand its agents on a server that
+    // dies with this run.
+    if host.isolated
+        && synth.gaviero_enabled
+        && gaviero_core::mcp::McpEndpoint::for_workspace(repo).has_live_server()
+    {
+        anyhow::bail!(
+            "--isolated: another gaviero process (e.g. the TUI) serves {} and its agents \
+             use the MCP configs there — close it, drop --isolated, or pass --no-mcp",
+            repo.display()
+        );
+    }
+    let config_restore = if host.isolated {
+        Some(state::ConfigRestore::capture(repo)?)
+    } else {
+        None
+    };
     // Another gaviero process (typically the TUI editing this workspace)
     // may already be serving the endpoint. Rebinding would fail on
     // Windows (`first_pipe_instance`) and orphan the other listener on
     // Unix, so reuse it: synthesized configs address the endpoint, not a
     // process, and the served tools are identical for the same root.
-    let reuse_existing = synth.gaviero_enabled && synth.endpoint.has_live_server();
+    let reuse_existing =
+        !host.isolated && synth.gaviero_enabled && synth.endpoint.has_live_server();
     // F3: memory being unavailable used to silently disable the gaviero
     // MCP server, downgrading every headless agent below the runtime
     // parity contract. Loud error instead; --no-mcp is the opt-out. A
@@ -1394,7 +1466,9 @@ fn prepare_mcp_for_swarm(
                     synth.endpoint
                 );
             }
-            if let Some(http) = gaviero_core::mcp::reuse_http_endpoint(repo, workspace) {
+            if let Some(http) =
+                gaviero_core::mcp::reuse_http_endpoint(host.endpoint_root, workspace)
+            {
                 eprintln!("[mcp] reusing gaviero HTTP {}", http.url);
                 synth.http = Some(gaviero_core::mcp::http_synth_from(&http));
             }
@@ -1446,13 +1520,15 @@ fn prepare_mcp_for_swarm(
                 stores.clone(),
                 repo.to_path_buf(),
                 // Phase 1: persist tool-call telemetry to
-                // `<repo>/.gaviero/mcp_calls.ndjson` (read back by
+                // `<telemetry root>/.gaviero/mcp_calls.ndjson` (read back by
                 // `--mcp-stats`). Size-rotated, never via the writer.
-                Arc::new(NdjsonTelemetrySink::for_workspace(repo)),
+                Arc::new(NdjsonTelemetrySink::for_workspace(host.telemetry_root)),
                 retrieval_cfg,
                 rerank_cfg,
                 reranker,
             )
+            .with_memory_root(host.memory_root.to_path_buf())
+            .with_graph_db_path(host.graph_db.clone())
             .with_specificity(specificity)
             .with_edge_weights(edge_weights)
             .with_permissions(synth.permissions.clone())
@@ -1518,7 +1594,7 @@ fn prepare_mcp_for_swarm(
             })?;
             let h = match gaviero_core::mcp::maybe_spawn_http_listener(
                 http_server,
-                repo,
+                host.endpoint_root,
                 workspace,
             ) {
                 Ok(Some(http)) => {
@@ -1577,16 +1653,21 @@ fn prepare_mcp_for_swarm(
         .context("validating Cursor MCP config for remote URL server(s)")?;
     if !paths.is_empty() {
         eprintln!(
-            "[mcp] synthesized config at {}",
+            "[mcp] synthesized config at {}{}",
             paths
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            if config_restore.is_some() {
+                " (restored when the run ends)"
+            } else {
+                ""
+            }
         );
     }
 
-    Ok((Some(synth), handle))
+    Ok((Some(synth), handle, config_restore))
 }
 
 fn parse_param_overrides(raw: &[String]) -> Result<Vec<(String, String)>> {
@@ -1631,6 +1712,36 @@ fn print_manifests(rows: &[gaviero_core::memory::store::InjectionManifestRow]) {
     }
 }
 
+/// Scope levels `--remember` can write without TUI context.
+enum RememberScope {
+    Repo,
+    Workspace,
+    Global,
+}
+
+/// Validate `--remember` / `--remember-scope` before any store is opened.
+fn parse_remember_args<'a>(text: &'a str, scope: &str) -> Result<(&'a str, RememberScope)> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("--remember: empty text");
+    }
+    // The CLI is headless — it has no focused buffer (so no Module
+    // scope) and no chat session (so no Run scope). Restrict to the
+    // three persistent levels callers can express without extra
+    // context. The TUI handles `module` / `run` via /remember-here.
+    let level = match scope.to_ascii_lowercase().as_str() {
+        "repo" => RememberScope::Repo,
+        "workspace" => RememberScope::Workspace,
+        "global" => RememberScope::Global,
+        other @ ("run" | "module") => anyhow::bail!(
+            "--remember-scope {other} requires session/file context only the TUI supplies; \
+             use the `/remember-here` or `/remember-module` chat commands instead",
+        ),
+        other => anyhow::bail!("--remember-scope: expected repo|workspace|global, got {other}"),
+    };
+    Ok((trimmed, level))
+}
+
 /// Tier B / B5: drive the sleeptime hygiene pass from the CLI. Reuses
 /// the same `run_sleeptime` engine the writer task invokes, so the
 /// output matches what the TUI would surface during interactive use.
@@ -1643,43 +1754,18 @@ fn print_manifests(rows: &[gaviero_core::memory::store::InjectionManifestRow]) {
 /// `scope` is one of `run | module | repo | workspace | global`. The
 /// CLI defaults to `repo` (the plan's recommended default — Run-scoped
 /// writes die with the session, which is wrong for `/remember`).
-async fn run_remember_cli(repo: &std::path::Path, text: &str, scope: &str) -> Result<()> {
+async fn run_remember_cli(ws: &state::Discovered, text: &str, scope: &str) -> Result<()> {
     use gaviero_core::memory::scope::WriteScope;
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("--remember: empty text");
-    }
-    // The CLI is headless — it has no focused buffer (so no Module
-    // scope) and no chat session (so no Run scope). Restrict to the
-    // three persistent levels callers can express without extra
-    // context. The TUI handles `module` / `run` via /remember-here.
-    let derived = match scope.to_ascii_lowercase().as_str() {
-        "repo" => WriteScope::Repo {
-            repo_id: gaviero_core::memory::hash_path(repo),
+    let (trimmed, level) = parse_remember_args(text, scope)?;
+    let derived = match level {
+        RememberScope::Repo => WriteScope::Repo {
+            repo_id: gaviero_core::memory::hash_path(&ws.memory_root),
         },
-        "workspace" => WriteScope::Workspace,
-        "global" => WriteScope::Global,
-        other @ ("run" | "module") => anyhow::bail!(
-            "--remember-scope {other} requires session/file context only the TUI supplies; \
-             use the `/remember-here` or `/remember-module` chat commands instead",
-        ),
-        other => anyhow::bail!("--remember-scope: expected repo|workspace|global, got {other}"),
+        RememberScope::Workspace => WriteScope::Workspace,
+        RememberScope::Global => WriteScope::Global,
     };
 
-    let repo_buf = repo.to_path_buf();
-    let services = tokio::task::spawn_blocking({
-        let repo_buf = repo_buf.clone();
-        move || -> anyhow::Result<std::sync::Arc<gaviero_core::memory::MemoryServices>> {
-            let workspace = gaviero_core::workspace::Workspace::single_folder(repo_buf.clone());
-            gaviero_core::memory::MemoryServices::open(
-                &repo_buf,
-                &workspace,
-                gaviero_core::memory::ServicesOpts::default(),
-            )
-        }
-    })
-    .await
-    .context("init MemoryServices (remember)")??;
+    let services = open_memory_services(ws, "remember").await?;
 
     let result = services
         .writer
@@ -1702,29 +1788,121 @@ async fn run_remember_cli(repo: &std::path::Path, text: &str, scope: &str) -> Re
     Ok(())
 }
 
+/// `memory.embedder.model` resolved at `root`, else `GAVIERO_EMBEDDER_MODEL`
+/// (the headless fallback `MemoryServices::open` applies). Empty = default.
+fn resolve_embedder_name(
+    workspace: &gaviero_core::workspace::Workspace,
+    root: &std::path::Path,
+) -> String {
+    workspace
+        .resolve_setting(
+            gaviero_core::workspace::settings::MEMORY_EMBEDDER_MODEL,
+            Some(root),
+        )
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| std::env::var("GAVIERO_EMBEDDER_MODEL").unwrap_or_default())
+}
+
+/// The discovered workspace's memory registry and writer, opened the way
+/// the TUI opens them (same folders, same embedder).
 async fn open_memory_services(
-    repo: &std::path::Path,
+    ws: &state::Discovered,
     what: &str,
 ) -> Result<std::sync::Arc<gaviero_core::memory::MemoryServices>> {
-    let repo_buf = repo.to_path_buf();
-    tokio::task::spawn_blocking({
-        let repo_buf = repo_buf.clone();
-        move || -> anyhow::Result<std::sync::Arc<gaviero_core::memory::MemoryServices>> {
-            let workspace = gaviero_core::workspace::Workspace::single_folder(repo_buf.clone());
-            gaviero_core::memory::MemoryServices::open(
-                &repo_buf,
-                &workspace,
-                gaviero_core::memory::ServicesOpts::default(),
-            )
-        }
+    let root = ws.state_root.clone();
+    let workspace = ws.workspace.clone();
+    let embedder_name = resolve_embedder_name(&workspace, &root);
+    tokio::task::spawn_blocking(move || {
+        gaviero_core::memory::MemoryServices::open(
+            &root,
+            &workspace,
+            gaviero_core::memory::ServicesOpts {
+                embedder_name: Some(embedder_name),
+                ..Default::default()
+            },
+        )
     })
     .await
     .with_context(|| format!("init MemoryServices ({what})"))?
 }
 
+/// The discovered workspace's own memory DB, embedded like the TUI embeds it.
+async fn open_workspace_store(
+    ws: &state::Discovered,
+    what: &str,
+) -> Result<Arc<gaviero_core::memory::MemoryStore>> {
+    let root = ws.state_root.clone();
+    let embedder_name = resolve_embedder_name(&ws.workspace, &root);
+    tokio::task::spawn_blocking(move || {
+        gaviero_core::memory::init_workspace_with_embedder_name(&root, &embedder_name)
+    })
+    .await
+    .with_context(|| format!("init memory ({what})"))?
+}
+
+/// The discovered workspace, or an error for commands that must not run
+/// against throwaway state.
+fn require_workspace<'a>(
+    discovered: &'a Option<state::Discovered>,
+    start: &std::path::Path,
+    flag: &str,
+) -> Result<&'a state::Discovered> {
+    discovered.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{flag}: no gaviero workspace at or above {} (looked for \
+             .gaviero/settings.json or .gaviero/memory.db) — open the folder \
+             with `gaviero` once, or point --repo at the workspace",
+            start.display()
+        )
+    })
+}
+
+/// The memory/admin flag this invocation selected, if any. These always
+/// operate on the discovered workspace.
+fn admin_flag(cli: &Cli) -> Option<&'static str> {
+    [
+        (cli.mcp_stats, "--mcp-stats"),
+        (cli.history, "--history"),
+        (cli.mcp_reach_probe, "--mcp-reach-probe"),
+        (
+            cli.manifest_last.is_some() || cli.manifest_turn.is_some(),
+            "--manifest-*",
+        ),
+        (
+            cli.eval_fixture.is_some() || cli.eval_bootstrap_from_manifests.is_some(),
+            "--eval-*",
+        ),
+        (cli.remember.is_some(), "--remember"),
+        (
+            cli.consolidate_history.is_some() || cli.consolidate_rollback.is_some(),
+            "--consolidate-*",
+        ),
+        (cli.sleep, "--sleep"),
+        (
+            cli.deletions_last.is_some() || cli.restore_id.is_some() || cli.restore_since.is_some(),
+            "--deletions-last / --restore-*",
+        ),
+        (
+            cli.forget_history_id.is_some()
+                || cli.forget_query.is_some()
+                || cli.forget_scope.is_some()
+                || cli.forget_type.is_some()
+                || cli.forget_source.is_some(),
+            "--forget-*",
+        ),
+        (cli.utilization_scope.is_some(), "--utilization-scope"),
+        (cli.graph, "--graph"),
+    ]
+    .into_iter()
+    .find_map(|(selected, flag)| selected.then_some(flag))
+}
+
 /// `--consolidate-history [n]`: print the same columns as TUI history.
-async fn run_consolidate_history_cli(repo: &std::path::Path, n: usize) -> Result<()> {
-    let services = open_memory_services(repo, "consolidate-history").await?;
+async fn run_consolidate_history_cli(ws: &state::Discovered, n: usize) -> Result<()> {
+    let services = open_memory_services(ws, "consolidate-history").await?;
     let runs = services
         .stores
         .workspace()
@@ -1756,8 +1934,8 @@ async fn run_consolidate_history_cli(repo: &std::path::Path, n: usize) -> Result
 }
 
 /// `--consolidate-rollback <batch_id>`: inverse ops through the writer.
-async fn run_consolidate_rollback_cli(repo: &std::path::Path, batch_id: &str) -> Result<()> {
-    let services = open_memory_services(repo, "consolidate-rollback").await?;
+async fn run_consolidate_rollback_cli(ws: &state::Discovered, batch_id: &str) -> Result<()> {
+    let services = open_memory_services(ws, "consolidate-rollback").await?;
     let outcome = services
         .writer
         .consolidation_rollback(batch_id.to_string())
@@ -1783,13 +1961,18 @@ async fn run_consolidate_rollback_cli(repo: &std::path::Path, batch_id: &str) ->
     Ok(())
 }
 
-async fn run_sleeptime_cli(repo: &std::path::Path, dry_run: bool) -> Result<()> {
-    let repo_buf = repo.to_path_buf();
+async fn run_sleeptime_cli(ws: &state::Discovered, dry_run: bool) -> Result<()> {
+    let repo = ws.state_root.as_path();
     let stores = tokio::task::spawn_blocking({
-        let repo = repo_buf.clone();
+        let root = ws.state_root.clone();
+        let workspace = ws.workspace.clone();
+        let embedder_name = resolve_embedder_name(&workspace, &root);
         move || {
-            let workspace = gaviero_core::workspace::Workspace::single_folder(repo.clone());
-            gaviero_core::memory::init_workspace_stores(&repo, &workspace)
+            gaviero_core::memory::init_workspace_stores_with_embedder_name(
+                &root,
+                &workspace,
+                &embedder_name,
+            )
         }
     })
     .await
@@ -1841,13 +2024,8 @@ async fn run_sleeptime_cli(repo: &std::path::Path, dry_run: bool) -> Result<()> 
 /// workspace memory.db. Output mirrors the columns the TUI Deletions
 /// tab will surface (C2.6); use it to pick an audit id for
 /// `--restore-id`.
-async fn run_deletions_last_cli(repo: &std::path::Path, n: usize) -> Result<()> {
-    let store = tokio::task::spawn_blocking({
-        let repo = repo.to_path_buf();
-        move || gaviero_core::memory::init_workspace(&repo)
-    })
-    .await
-    .context("init memory (deletions list)")??;
+async fn run_deletions_last_cli(ws: &state::Discovered, n: usize) -> Result<()> {
+    let store = open_workspace_store(ws, "deletions list").await?;
     let rows = store
         .recent_deletions(n)
         .await
@@ -1878,14 +2056,9 @@ async fn run_deletions_last_cli(repo: &std::path::Path, n: usize) -> Result<()> 
 /// Replays the captured row through `MemoryStore::store_scoped` so the
 /// dedup pipeline decides whether the row reinserts cleanly, dedups
 /// against a newer row, or is already covered.
-async fn run_restore_id_cli(repo: &std::path::Path, audit_id: i64) -> Result<()> {
+async fn run_restore_id_cli(ws: &state::Discovered, audit_id: i64) -> Result<()> {
     use gaviero_core::memory::RestoreOutcome;
-    let store = tokio::task::spawn_blocking({
-        let repo = repo.to_path_buf();
-        move || gaviero_core::memory::init_workspace(&repo)
-    })
-    .await
-    .context("init memory (restore)")??;
+    let store = open_workspace_store(ws, "restore").await?;
     let outcome = store
         .restore_deletion(audit_id)
         .await
@@ -1921,15 +2094,10 @@ async fn run_restore_id_cli(repo: &std::path::Path, audit_id: i64) -> Result<()>
 
 /// Tier C / C2.2: restore every pending deletion newer than the given
 /// human-readable duration (e.g. `2 hours`, `7 days`).
-async fn run_restore_since_cli(repo: &std::path::Path, window: &str) -> Result<()> {
+async fn run_restore_since_cli(ws: &state::Discovered, window: &str) -> Result<()> {
     use gaviero_core::memory::RestoreOutcome;
     let since_offset = parse_restore_since_window(window)?;
-    let store = tokio::task::spawn_blocking({
-        let repo = repo.to_path_buf();
-        move || gaviero_core::memory::init_workspace(&repo)
-    })
-    .await
-    .context("init memory (restore-since)")??;
+    let store = open_workspace_store(ws, "restore-since").await?;
     let outcomes = store
         .restore_deletions_since(&since_offset)
         .await
@@ -1989,18 +2157,13 @@ fn parse_restore_since_window(spec: &str) -> Result<String> {
 /// set, so an accidental `gaviero-cli --forget-source llm_extracted`
 /// can't silently flatten the workspace.
 async fn run_forget_cli(
-    repo: &std::path::Path,
+    ws: &state::Discovered,
     filter: gaviero_core::memory::ForgetFilter,
     dry_run: bool,
     reason: Option<&str>,
 ) -> Result<()> {
     use gaviero_core::memory::deletions::DeletedBy;
-    let store = tokio::task::spawn_blocking({
-        let repo = repo.to_path_buf();
-        move || gaviero_core::memory::init_workspace(&repo)
-    })
-    .await
-    .context("init memory (forget)")??;
+    let store = open_workspace_store(ws, "forget").await?;
     let report = store
         .bulk_forget(&filter, dry_run, reason, DeletedBy::UserCommand)
         .await
@@ -2033,17 +2196,12 @@ async fn run_forget_cli(
 /// + a non-empty `--redact-reason`. Without both, the call aborts
 /// with a preview of the row.
 async fn run_forget_history_cli(
-    repo: &std::path::Path,
+    ws: &state::Discovered,
     memory_id: i64,
     redact_confirm: Option<&str>,
     redact_reason: Option<&str>,
 ) -> Result<()> {
-    let store = tokio::task::spawn_blocking({
-        let repo = repo.to_path_buf();
-        move || gaviero_core::memory::init_workspace(&repo)
-    })
-    .await
-    .context("init memory (forget-history)")??;
+    let store = open_workspace_store(ws, "forget-history").await?;
 
     let body = store
         .read_history_content(memory_id)
@@ -2079,17 +2237,12 @@ async fn run_forget_history_cli(
 
 /// Tier B / B6: per-scope utilization report from the CLI.
 async fn run_utilization_cli(
-    repo: &std::path::Path,
+    ws: &state::Discovered,
     scope_level: i32,
     top: usize,
     ascending: bool,
 ) -> Result<()> {
-    let store = tokio::task::spawn_blocking({
-        let repo = repo.to_path_buf();
-        move || gaviero_core::memory::init_workspace(&repo)
-    })
-    .await
-    .context("init memory (utilization)")??;
+    let store = open_workspace_store(ws, "utilization").await?;
 
     let rows = store
         .top_utilization_in_scope(scope_level, ascending, top)
@@ -3829,16 +3982,16 @@ fn render_history_stats(
     out
 }
 
-async fn run_mcp_reach_probe(cli: &Cli, repo: &std::path::Path) -> Result<()> {
+async fn run_mcp_reach_probe(cli: &Cli, ws: &state::Discovered) -> Result<()> {
     if cli.no_mcp {
         anyhow::bail!("--mcp-reach-probe needs the gaviero MCP server; omit --no-mcp");
     }
-    let workspace = gaviero_core::workspace::Workspace::single_folder(repo.to_path_buf());
-    let memory = open_memory_services(repo, "mcp-reach-probe").await?;
+    let repo = ws.state_root.as_path();
+    let memory = open_memory_services(ws, "mcp-reach-probe").await?;
     let ledger = gaviero_core::mcp::ProbeLedger::new();
-    let (synth, handle) = prepare_mcp_for_swarm(
-        repo,
-        &workspace,
+    let (synth, handle, _) = prepare_mcp_for_swarm(
+        &McpHost::shared_at(repo),
+        &ws.workspace,
         cli,
         &[],
         &Some(memory.stores.clone()),
@@ -3933,6 +4086,231 @@ fn run_mcp_user_scope(register: bool, raw: &str) -> Result<()> {
     Ok(())
 }
 
+/// Dispatch a memory/admin command (see [`admin_flag`]) against the
+/// discovered workspace. `--mcp-stats` and `--history` are handled earlier.
+async fn run_admin_command(cli: &Cli, ws: &state::Discovered) -> Result<()> {
+    let repo = ws.state_root.clone();
+
+    if cli.mcp_reach_probe {
+        return run_mcp_reach_probe(cli, ws).await;
+    }
+
+    // ── Manifest introspection (Tier S / S4): print and exit ─────
+    if cli.manifest_last.is_some() || cli.manifest_turn.is_some() {
+        let store = open_workspace_store(ws, "manifest introspection").await?;
+
+        if let Some(turn_id) = &cli.manifest_turn {
+            let rows = store
+                .manifests_for_turn(turn_id)
+                .await
+                .context("fetching manifests for turn")?;
+            print_manifests(&rows);
+        }
+        if let Some(n) = cli.manifest_last {
+            let rows = store
+                .recent_manifests(n.max(1))
+                .await
+                .context("fetching recent manifests")?;
+            print_manifests(&rows);
+        }
+        return Ok(());
+    }
+
+    // ── Tier B / T0: bootstrap a fixture from existing manifests ─
+    if let Some(n) = cli.eval_bootstrap_from_manifests {
+        return bootstrap_eval_fixture(&repo, n, cli.eval_fixture.as_deref()).await;
+    }
+
+    // ── Tier B / T0: Tier 1 retrieval smoke test ─────────────────
+    if let Some(fixture_path) = cli.eval_fixture.clone() {
+        if let Some(n) = cli.eval_from_manifests {
+            return run_eval_from_manifests(&repo, &fixture_path, n).await;
+        }
+        if cli.eval_embedder_ablation {
+            return run_eval_embedder_ablation(&repo, &fixture_path).await;
+        }
+        if cli.eval_rerank_ablation {
+            return run_eval_rerank_ablation(&repo, &fixture_path).await;
+        }
+        if cli.seed_corpus_from_paths {
+            return run_seed_corpus_from_paths(
+                &repo,
+                &fixture_path,
+                cli.seed_corpus_doc_chars,
+                None,
+            )
+            .await;
+        }
+        if cli.eval_scope_matrix {
+            return run_eval_scope_matrix(&repo, &fixture_path, &cli.eval_scope_matrix_scopes)
+                .await;
+        }
+        if cli.eval_budget_sweep {
+            return run_eval_budget_sweep(&repo, &fixture_path, cli).await;
+        }
+        if cli.eval_anchor_ab {
+            return run_eval_anchor_ab(&repo, &fixture_path, cli).await;
+        }
+        return run_eval_smoke_test(&repo, &fixture_path, cli).await;
+    }
+
+    // ── Tier A / A2: headless `/remember` ────────────────────────
+    if let Some(text) = cli.remember.as_deref() {
+        return run_remember_cli(ws, text, &cli.remember_scope).await;
+    }
+
+    if let Some(n) = cli.consolidate_history {
+        return run_consolidate_history_cli(ws, n.max(1)).await;
+    }
+    if let Some(batch_id) = cli.consolidate_rollback.as_deref() {
+        return run_consolidate_rollback_cli(ws, batch_id).await;
+    }
+
+    // ── Tier B / B5: sleeptime hygiene ───────────────────────────
+    if cli.sleep {
+        return run_sleeptime_cli(ws, cli.sleep_dry_run).await;
+    }
+
+    // ── Tier C / C2.2: deletions list / restore ──────────────────
+    if let Some(n) = cli.deletions_last {
+        return run_deletions_last_cli(ws, n.max(1)).await;
+    }
+    if let Some(audit_id) = cli.restore_id {
+        return run_restore_id_cli(ws, audit_id).await;
+    }
+    if let Some(window) = cli.restore_since.as_deref() {
+        return run_restore_since_cli(ws, window).await;
+    }
+
+    // ── Tier C / C2.4: /forget-history ───────────────────────────
+    if let Some(id) = cli.forget_history_id {
+        return run_forget_history_cli(
+            ws,
+            id,
+            cli.redact_confirm.as_deref(),
+            cli.redact_reason.as_deref(),
+        )
+        .await;
+    }
+
+    // ── Tier C / C2.3: bulk forget ───────────────────────────────
+    {
+        use gaviero_core::memory::ForgetFilter;
+        use gaviero_core::memory::scope::MemoryType;
+        use gaviero_core::memory::trust_defaults::MemorySource;
+        let dry_run = cli.forget_dry_run || !cli.forget_yes;
+        let reason = cli.forget_reason.as_deref();
+        if let Some(q) = cli.forget_query.as_deref() {
+            return run_forget_cli(ws, ForgetFilter::ByQuery(q.to_string()), dry_run, reason).await;
+        }
+        if let Some(scope_path) = cli.forget_scope.as_deref() {
+            let scope_level = if scope_path == "global" {
+                gaviero_core::memory::scope::SCOPE_GLOBAL
+            } else if scope_path == "workspace" {
+                gaviero_core::memory::scope::SCOPE_WORKSPACE
+            } else if scope_path.contains("/run:") {
+                gaviero_core::memory::scope::SCOPE_RUN
+            } else if scope_path.contains("/module:") {
+                gaviero_core::memory::scope::SCOPE_MODULE
+            } else {
+                gaviero_core::memory::scope::SCOPE_REPO
+            };
+            return run_forget_cli(
+                ws,
+                ForgetFilter::ByScope {
+                    scope_level,
+                    scope_path: scope_path.to_string(),
+                },
+                dry_run,
+                reason,
+            )
+            .await;
+        }
+        if let Some(t) = cli.forget_type.as_deref() {
+            return run_forget_cli(
+                ws,
+                ForgetFilter::ByType(MemoryType::parse_str(&t.to_lowercase())),
+                dry_run,
+                reason,
+            )
+            .await;
+        }
+        if let Some(s) = cli.forget_source.as_deref() {
+            return run_forget_cli(
+                ws,
+                ForgetFilter::BySource(MemorySource::parse_str(&s.to_lowercase())),
+                dry_run,
+                reason,
+            )
+            .await;
+        }
+    }
+
+    // ── Tier B / B6: per-scope utilization report ────────────────
+    if let Some(scope_level) = cli.utilization_scope {
+        return run_utilization_cli(
+            ws,
+            scope_level,
+            cli.utilization_top.max(1),
+            cli.utilization_asc,
+        )
+        .await;
+    }
+
+    // ── --graph: build/update the workspace code knowledge graph ──
+    if cli.graph {
+        eprintln!(
+            "[graph] building code knowledge graph for {}...",
+            repo.display()
+        );
+        let (store, result) =
+            gaviero_core::repo_map::graph_builder::build_graph(&repo, &cli.exclude)
+                .context("building code knowledge graph")?;
+        let (nodes, edges) = store.stats()?;
+        eprintln!("[graph] done");
+        eprintln!("  files scanned:   {}", result.files_scanned);
+        eprintln!("  files changed:   {}", result.files_changed);
+        eprintln!("  files unchanged: {}", result.files_unchanged);
+        eprintln!("  files removed:   {}", result.files_removed);
+        eprintln!("  total nodes:     {}", nodes);
+        eprintln!("  total edges:     {}", edges);
+
+        if cli.enrich {
+            use gaviero_core::repo_map::symbol_enrichment::{SymbolEnrichOpts, enrich_graph};
+            use gaviero_core::workspace::settings;
+
+            let embedder_setting = ws
+                .workspace
+                .resolve_setting(settings::REPO_MAP_EMBEDDER_MODEL, Some(&repo))
+                .as_str()
+                .map(str::to_string)
+                .filter(|s| !s.is_empty() && s != "inherit");
+            let embed = !cli.enrich_no_embed;
+            let opts = SymbolEnrichOpts {
+                embed,
+                embedder_name: embedder_setting,
+            };
+            eprintln!("[graph] enriching symbols (rustdoc JSON)…");
+            let enrich_result = enrich_graph(&store, &repo, &opts).await?;
+            eprintln!("[graph] enrich done");
+            eprintln!("  crates processed: {}", enrich_result.crates_processed);
+            eprintln!("  symbols written:  {}", enrich_result.symbols_written);
+            eprintln!("  unmatched:        {}", enrich_result.symbols_unmatched);
+            eprintln!("  skipped (hash):   {}", enrich_result.symbols_skipped_hash);
+            eprintln!("  symbol_docs rows: {}", store.symbol_doc_count()?);
+            if !enrich_result.rustdoc_failures.is_empty() {
+                eprintln!("  rustdoc failures:");
+                for f in &enrich_result.rustdoc_failures {
+                    eprintln!("    - {f}");
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    anyhow::bail!("internal error: no handler for the selected admin command")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -4012,18 +4390,6 @@ async fn main() -> Result<()> {
         )
     })?;
 
-    // ── KB-efficiency Phase 1: MCP telemetry report ──────────────
-    // A pure read of the NDJSON sink. Placed before the C1 migration
-    // probe so `--mcp-stats` never forces a migration prompt.
-    if cli.mcp_stats {
-        return run_mcp_stats(&repo, cli.mcp_stats_path.as_deref());
-    }
-    // Per-turn history: a pure read of the TUI's history log, same placement
-    // rationale as `--mcp-stats`.
-    if cli.history {
-        return run_history_cli(&cli, &repo);
-    }
-
     if let Some(vendors) = &cli.mcp_register_user {
         return run_mcp_user_scope(true, vendors);
     }
@@ -4031,16 +4397,63 @@ async fn main() -> Result<()> {
         return run_mcp_user_scope(false, vendors);
     }
 
+    // The workspace a TUI would open here. Admin commands require it; runs
+    // share its memory unless `--isolated` (or nothing is found).
+    let admin = admin_flag(&cli);
+    if cli.isolated
+        && let Some(flag) = admin
+    {
+        anyhow::bail!(
+            "--isolated applies to runs (--task, --work-units, --script, --plan); \
+             {flag} always uses the workspace found at or above the run root"
+        );
+    }
+    let discovered = state::discover(&repo)?;
+    if let Some(d) = &discovered {
+        for note in &d.notes {
+            eprintln!("[state] {note}");
+        }
+    }
+
+    // Pure reads (`--mcp-stats`, `--history`) look where the discovered
+    // workspace keeps its logs and otherwise fall back to the run root: a
+    // missing log is "nothing recorded", not an error, and nothing is
+    // written that could be lost.
+    let read_root = discovered
+        .as_ref()
+        .map_or_else(|| repo.clone(), |d| d.state_root.clone());
+
+    // ── KB-efficiency Phase 1: MCP telemetry report ──────────────
+    // A pure read of the NDJSON sink. Placed before the C1 migration
+    // probe so `--mcp-stats` never forces a migration prompt.
+    if cli.mcp_stats {
+        return run_mcp_stats(&read_root, cli.mcp_stats_path.as_deref());
+    }
+    // Per-turn history: a pure read of the TUI's history log, same placement
+    // rationale as `--mcp-stats`.
+    if cli.history {
+        return run_history_cli(&cli, &read_root);
+    }
+
+    // Reject malformed `--remember` input before requiring a workspace.
+    if let Some(text) = cli.remember.as_deref() {
+        parse_remember_args(text, &cli.remember_scope)?;
+    }
+
     // ── Tier C / C1: enforce explicit consent for the typed-stores
     // migration. Headless invocation cannot prompt; require the
     // `--accept-c1-migration` flag if any reachable memory.db is at a
     // pre-v10 schema. Plan §"Anti-patterns to avoid": no silent
-    // migration on first run.
+    // migration on first run. Isolated runs open no existing store.
+    if let Some(d) = discovered
+        .as_ref()
+        .filter(|_| admin.is_some() || !cli.isolated)
     {
-        let workspace = gaviero_core::workspace::Workspace::single_folder(repo.clone());
-        let pending =
-            gaviero_core::memory::MemoryStores::probe_pending_c1_migrations(&repo, &workspace)
-                .context("probing for pending C1 typed-stores migration")?;
+        let pending = gaviero_core::memory::MemoryStores::probe_pending_c1_migrations(
+            &d.state_root,
+            &d.workspace,
+        )
+        .context("probing for pending C1 typed-stores migration")?;
         if !pending.is_empty() && !cli.accept_c1_migration {
             eprintln!("Gaviero's memory schema requires a one-time typed-stores upgrade (C1).");
             eprintln!("Affected databases:");
@@ -4062,176 +4475,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    if cli.mcp_reach_probe {
-        return run_mcp_reach_probe(&cli, &repo).await;
-    }
-
-    // ── Manifest introspection (Tier S / S4): print and exit ─────
-    if cli.manifest_last.is_some() || cli.manifest_turn.is_some() {
-        let store = tokio::task::spawn_blocking({
-            let repo = repo.clone();
-            move || gaviero_core::memory::init_workspace(&repo)
-        })
-        .await
-        .context("init memory (manifest introspection)")??;
-
-        if let Some(turn_id) = &cli.manifest_turn {
-            let rows = store
-                .manifests_for_turn(turn_id)
-                .await
-                .context("fetching manifests for turn")?;
-            print_manifests(&rows);
-        }
-        if let Some(n) = cli.manifest_last {
-            let rows = store
-                .recent_manifests(n.max(1))
-                .await
-                .context("fetching recent manifests")?;
-            print_manifests(&rows);
-        }
-        return Ok(());
-    }
-
-    // ── Tier B / T0: bootstrap a fixture from existing manifests ─
-    if let Some(n) = cli.eval_bootstrap_from_manifests {
-        return bootstrap_eval_fixture(&repo, n, cli.eval_fixture.as_deref()).await;
-    }
-
-    // ── Tier B / T0: Tier 1 retrieval smoke test ─────────────────
-    if let Some(fixture_path) = cli.eval_fixture.clone() {
-        if let Some(n) = cli.eval_from_manifests {
-            return run_eval_from_manifests(&repo, &fixture_path, n).await;
-        }
-        if cli.eval_embedder_ablation {
-            return run_eval_embedder_ablation(&repo, &fixture_path).await;
-        }
-        if cli.eval_rerank_ablation {
-            return run_eval_rerank_ablation(&repo, &fixture_path).await;
-        }
-        if cli.seed_corpus_from_paths {
-            return run_seed_corpus_from_paths(
-                &repo,
-                &fixture_path,
-                cli.seed_corpus_doc_chars,
-                None,
-            )
-            .await;
-        }
-        if cli.eval_scope_matrix {
-            return run_eval_scope_matrix(&repo, &fixture_path, &cli.eval_scope_matrix_scopes)
-                .await;
-        }
-        if cli.eval_budget_sweep {
-            return run_eval_budget_sweep(&repo, &fixture_path, &cli).await;
-        }
-        if cli.eval_anchor_ab {
-            return run_eval_anchor_ab(&repo, &fixture_path, &cli).await;
-        }
-        return run_eval_smoke_test(&repo, &fixture_path, &cli).await;
-    }
-
-    // ── Tier A / A2: headless `/remember` ────────────────────────
-    if let Some(text) = cli.remember.as_deref() {
-        return run_remember_cli(&repo, text, &cli.remember_scope).await;
-    }
-
-    if let Some(n) = cli.consolidate_history {
-        return run_consolidate_history_cli(&repo, n.max(1)).await;
-    }
-    if let Some(batch_id) = cli.consolidate_rollback.as_deref() {
-        return run_consolidate_rollback_cli(&repo, batch_id).await;
-    }
-
-    // ── Tier B / B5: sleeptime hygiene ───────────────────────────
-    if cli.sleep {
-        return run_sleeptime_cli(&repo, cli.sleep_dry_run).await;
-    }
-
-    // ── Tier C / C2.2: deletions list / restore ──────────────────
-    if let Some(n) = cli.deletions_last {
-        return run_deletions_last_cli(&repo, n.max(1)).await;
-    }
-    if let Some(audit_id) = cli.restore_id {
-        return run_restore_id_cli(&repo, audit_id).await;
-    }
-    if let Some(window) = cli.restore_since.as_deref() {
-        return run_restore_since_cli(&repo, window).await;
-    }
-
-    // ── Tier C / C2.4: /forget-history ───────────────────────────
-    if let Some(id) = cli.forget_history_id {
-        return run_forget_history_cli(
-            &repo,
-            id,
-            cli.redact_confirm.as_deref(),
-            cli.redact_reason.as_deref(),
-        )
-        .await;
-    }
-
-    // ── Tier C / C2.3: bulk forget ───────────────────────────────
-    {
-        use gaviero_core::memory::ForgetFilter;
-        use gaviero_core::memory::scope::MemoryType;
-        use gaviero_core::memory::trust_defaults::MemorySource;
-        let dry_run = cli.forget_dry_run || !cli.forget_yes;
-        let reason = cli.forget_reason.as_deref();
-        if let Some(q) = cli.forget_query.as_deref() {
-            return run_forget_cli(&repo, ForgetFilter::ByQuery(q.to_string()), dry_run, reason)
-                .await;
-        }
-        if let Some(scope_path) = cli.forget_scope.as_deref() {
-            let scope_level = if scope_path == "global" {
-                gaviero_core::memory::scope::SCOPE_GLOBAL
-            } else if scope_path == "workspace" {
-                gaviero_core::memory::scope::SCOPE_WORKSPACE
-            } else if scope_path.contains("/run:") {
-                gaviero_core::memory::scope::SCOPE_RUN
-            } else if scope_path.contains("/module:") {
-                gaviero_core::memory::scope::SCOPE_MODULE
-            } else {
-                gaviero_core::memory::scope::SCOPE_REPO
-            };
-            return run_forget_cli(
-                &repo,
-                ForgetFilter::ByScope {
-                    scope_level,
-                    scope_path: scope_path.to_string(),
-                },
-                dry_run,
-                reason,
-            )
-            .await;
-        }
-        if let Some(t) = cli.forget_type.as_deref() {
-            return run_forget_cli(
-                &repo,
-                ForgetFilter::ByType(MemoryType::parse_str(&t.to_lowercase())),
-                dry_run,
-                reason,
-            )
-            .await;
-        }
-        if let Some(s) = cli.forget_source.as_deref() {
-            return run_forget_cli(
-                &repo,
-                ForgetFilter::BySource(MemorySource::parse_str(&s.to_lowercase())),
-                dry_run,
-                reason,
-            )
-            .await;
-        }
-    }
-
-    // ── Tier B / B6: per-scope utilization report ────────────────
-    if let Some(scope_level) = cli.utilization_scope {
-        return run_utilization_cli(
-            &repo,
-            scope_level,
-            cli.utilization_top.max(1),
-            cli.utilization_asc,
-        )
-        .await;
+    if let Some(flag) = admin {
+        let ws = require_workspace(&discovered, &repo, flag)?;
+        return run_admin_command(&cli, ws).await;
     }
 
     // ── --cleanup-branches: delete leftover gaviero/* branches and exit ──
@@ -4271,61 +4517,25 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // ── --graph: build/update code knowledge graph and exit ──────
-    if cli.graph {
-        eprintln!(
-            "[graph] building code knowledge graph for {}...",
-            repo.display()
-        );
-        let (store, result) =
-            gaviero_core::repo_map::graph_builder::build_graph(&repo, &cli.exclude)
-                .context("building code knowledge graph")?;
-        let (nodes, edges) = store.stats()?;
-        eprintln!("[graph] done");
-        eprintln!("  files scanned:   {}", result.files_scanned);
-        eprintln!("  files changed:   {}", result.files_changed);
-        eprintln!("  files unchanged: {}", result.files_unchanged);
-        eprintln!("  files removed:   {}", result.files_removed);
-        eprintln!("  total nodes:     {}", nodes);
-        eprintln!("  total edges:     {}", edges);
-
-        if cli.enrich {
-            use gaviero_core::repo_map::symbol_enrichment::{SymbolEnrichOpts, enrich_graph};
-            use gaviero_core::workspace::settings;
-
-            let mut workspace = gaviero_core::workspace::Workspace::single_folder(repo.clone());
-            workspace.ensure_settings();
-            let embedder_setting = workspace
-                .resolve_setting(settings::REPO_MAP_EMBEDDER_MODEL, Some(&repo))
-                .as_str()
-                .map(str::to_string)
-                .filter(|s| !s.is_empty() && s != "inherit");
-            let embed = !cli.enrich_no_embed;
-            let opts = SymbolEnrichOpts {
-                embed,
-                embedder_name: embedder_setting,
-            };
-            eprintln!("[graph] enriching symbols (rustdoc JSON)…");
-            let enrich_result = enrich_graph(&store, &repo, &opts).await?;
-            eprintln!("[graph] enrich done");
-            eprintln!("  crates processed: {}", enrich_result.crates_processed);
-            eprintln!("  symbols written:  {}", enrich_result.symbols_written);
-            eprintln!("  unmatched:        {}", enrich_result.symbols_unmatched);
-            eprintln!("  skipped (hash):   {}", enrich_result.symbols_skipped_hash);
-            eprintln!("  symbol_docs rows: {}", store.symbol_doc_count()?);
-            if !enrich_result.rustdoc_failures.is_empty() {
-                eprintln!("  rustdoc failures:");
-                for f in &enrich_result.rustdoc_failures {
-                    eprintln!("    - {f}");
-                }
+    // Where this run's state lives: the discovered workspace, or throwaway
+    // state for `--isolated` and for folders no gaviero workspace covers.
+    let run_state = match discovered {
+        Some(d) if !cli.isolated => state::RunState::Shared(d),
+        discovered => {
+            if discovered.is_none() && !cli.isolated {
+                eprintln!(
+                    "[state] no gaviero workspace at or above {} (no .gaviero/settings.json \
+                     or .gaviero/memory.db) — running isolated",
+                    repo.display()
+                );
             }
+            state::RunState::isolated(discovered, &repo)?
         }
-        return Ok(());
-    }
-
-    // Load workspace for settings
-    let mut workspace = gaviero_core::workspace::Workspace::single_folder(repo.clone());
-    workspace.ensure_settings();
+    };
+    eprintln!("[state] {}", run_state.describe());
+    // Settings cascade of the discovered workspace (also for isolated runs,
+    // which only swap out memory, graph and telemetry).
+    let workspace = run_state.workspace().clone();
 
     // Resolve namespaces: CLI flags override settings, which override folder name
     let write_ns = cli
@@ -4374,24 +4584,36 @@ async fn main() -> Result<()> {
         eprintln!("[model] execution={}", execution_model);
     }
 
-    // Initialize memory store at `<repo>/.gaviero/memory.db` (graceful if it
-    // fails — offline, corrupt model, etc.). The CLI is headless and operates
-    // on a single repo argument (no `.gaviero-workspace`), so we wrap the
-    // workspace-local single store with `from_single_store` for the registry
-    // interface that swarm / pipeline expect. Every other CLI handler (eval,
-    // sleep, forget, deletions, remember) already initialises through
-    // `init_workspace`; this site previously used `init(None)` which silently
-    // routed memory to the global default DB, ignoring `--repo`.
+    // Open memory (graceful if it fails — offline, corrupt model, etc.).
+    // Shared: the discovered workspace's registry — global, workspace and
+    // per-folder DBs with the configured embedder, exactly as the TUI opens
+    // it. Isolated: one throwaway DB standing in for every scope.
     let memory: Option<Arc<gaviero_core::memory::MemoryStores>> = {
-        let repo_for_init = repo.clone();
-        match tokio::task::spawn_blocking(move || {
-            gaviero_core::memory::init_workspace(&repo_for_init)
-        })
-        .await
-        {
-            Ok(Ok(store)) => {
+        let embedder_name = resolve_embedder_name(&workspace, run_state.settings_root(&repo));
+        let init = match &run_state {
+            state::RunState::Shared(d) => {
+                let root = d.state_root.clone();
+                let registry_workspace = d.workspace.clone();
+                tokio::task::spawn_blocking(move || {
+                    gaviero_core::memory::MemoryStores::open(
+                        &root,
+                        &registry_workspace,
+                        &embedder_name,
+                    )
+                })
+            }
+            state::RunState::Isolated { scratch, .. } => {
+                let db = scratch.memory_db();
+                tokio::task::spawn_blocking(move || {
+                    gaviero_core::memory::init_with_embedder_name(Some(&db), &embedder_name)
+                        .map(gaviero_core::memory::MemoryStores::from_single_store)
+                })
+            }
+        };
+        match init.await {
+            Ok(Ok(stores)) => {
                 eprintln!("[memory] ready");
-                Some(gaviero_core::memory::MemoryStores::from_single_store(store))
+                Some(stores)
             }
             Ok(Err(e)) => {
                 eprintln!("[memory] disabled: {}", e);
@@ -4614,8 +4836,16 @@ async fn main() -> Result<()> {
 
     // MCP: synthesize per-worktree provider configs + optional in-process server.
     let mcp_script_vars = swarm_workspace.override_vars.as_deref().unwrap_or(&[]);
-    let (mcp_config, _mcp_server_guard) = prepare_mcp_for_swarm(
-        &repo,
+    let mcp_host = McpHost {
+        run_root: &repo,
+        endpoint_root: run_state.endpoint_root(&repo),
+        telemetry_root: run_state.telemetry_root(),
+        memory_root: run_state.mcp_memory_root(&repo),
+        graph_db: run_state.graph_db(&repo),
+        isolated: run_state.is_isolated(),
+    };
+    let (mcp_config, mcp_server, config_restore) = prepare_mcp_for_swarm(
+        &mcp_host,
         &workspace,
         &cli,
         mcp_script_vars,
@@ -4685,12 +4915,20 @@ async fn main() -> Result<()> {
         knowledge_invalidation: None,
         run_timeout_secs: cli.run_timeout,
         chat_injection: workspace.resolve_chat_injection_config(Some(&repo)),
-        skills_emit: gaviero_core::skills::emit::EmitSettings::from_workspace(&workspace, Some(&repo)),
-        skill_catalog: {
+        // Isolated runs neither read the skill catalogs nor emit into them.
+        skills_emit: {
+            let mut emit =
+                gaviero_core::skills::emit::EmitSettings::from_workspace(&workspace, Some(&repo));
+            emit.enabled &= !run_state.is_isolated();
+            emit
+        },
+        skill_catalog: (!run_state.is_isolated()).then(|| {
             let global = gaviero_core::skills::SkillCatalog::global_skills_dir();
             let (catalog, _) = gaviero_core::skills::SkillCatalog::scan(&workspace, &global);
-            Some(std::sync::Arc::new(catalog))
-        },
+            std::sync::Arc::new(catalog)
+        }),
+        memory_root: run_state.swarm_memory_root(),
+        graph_db_path: run_state.swarm_graph_db(&repo),
     };
 
     // --coordinated: produce a DSL plan file for review, then exit.
@@ -4829,6 +5067,29 @@ async fn main() -> Result<()> {
         && let Err(e) = w.flush().await
     {
         eprintln!("[memory] swarm extractor flush failed: {e}");
+    }
+
+    // Isolated: stop our MCP server, hand the agent configs back, then
+    // delete the throwaway state once the writer and server have let go of
+    // its databases (`config` and the drain handle hold the last writer
+    // handles).
+    if run_state.is_isolated() {
+        drop(config);
+        drop(swarm_writer_drain);
+        if let Some(server) = mcp_server {
+            server.shutdown().await;
+        }
+        if let Some(mut restore) = config_restore {
+            for error in restore.restore() {
+                eprintln!("[state] could not restore agent config {error}");
+            }
+        }
+        if let Some(scratch) = run_state.into_scratch() {
+            let path = scratch.root().to_path_buf();
+            if let Err(e) = scratch.remove().await {
+                eprintln!("[state] isolated state left at {}: {e}", path.display());
+            }
+        }
     }
 
     // Output results
