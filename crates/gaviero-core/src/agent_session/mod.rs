@@ -113,6 +113,7 @@ pub mod codex_app_server;
 pub mod codex_exec;
 pub mod cursor;
 pub mod ollama;
+pub mod reconcile;
 pub mod registry;
 pub mod tool_agent;
 pub(crate) mod tool_surface;
