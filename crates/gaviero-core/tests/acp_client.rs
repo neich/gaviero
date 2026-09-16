@@ -63,6 +63,19 @@ impl AcpObserver for DenyAcp {
     }
 }
 
+struct RecStatus {
+    status: Arc<Mutex<Vec<String>>>,
+}
+impl AcpObserver for RecStatus {
+    fn on_stream_chunk(&self, _text: &str) {}
+    fn on_tool_call_started(&self, _tool_name: &str) {}
+    fn on_streaming_status(&self, status: &str) {
+        self.status.lock().unwrap().push(status.to_string());
+    }
+    fn on_message_complete(&self, _role: &str, _content: &str) {}
+    fn on_proposal_deferred(&self, _path: &Path, _old: Option<&str>, _new: &str) {}
+}
+
 fn fake_bin() -> String {
     option_env!("CARGO_BIN_EXE_fake_acp_agent")
         .map(str::to_string)
@@ -188,6 +201,151 @@ async fn consecutive_turns_reuse_child_and_forward_session_configuration() {
         assert_eq!(report["new"]["additionalDirectories"][0], dir.path().join("additional").to_string_lossy().as_ref());
         assert_eq!(report["prompt"][0]["text"], "Return exactly the requested JSON.");
     }
+    Box::new(session).close().await;
+}
+
+#[tokio::test]
+async fn session_new_retries_when_additional_directories_unsupported() {
+    let dir = workspace();
+    let paths = Arc::new(Mutex::new(Vec::new()));
+    let status = Arc::new(Mutex::new(Vec::new()));
+    let mut args = construction(
+        dir.path(),
+        Box::new(RecStatus {
+            status: status.clone(),
+        }),
+        Box::new(RecWrite { paths }),
+        true,
+    );
+    args.additional_roots = vec![dir.path().join("additional")];
+    let mut session = AcpClientSession::new_with_scope(args, FileScope::default())
+        .with_extra(extra("reject_extra_dirs"));
+    let events = drain(&mut session, true).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, UnifiedStreamEvent::TextDelta(_))),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, UnifiedStreamEvent::Done(StopReason::EndTurn))),
+        "{events:?}"
+    );
+    let status = status.lock().unwrap().clone();
+    assert!(
+        status
+            .iter()
+            .all(|s| !s.contains("sibling folders are not mounted")),
+        "nested extra dir is already inside cwd, so it is mounted: {status:?}"
+    );
+    Box::new(session).close().await;
+}
+
+fn sibling_workspace() -> (TempDir, PathBuf, PathBuf) {
+    let parent = tempfile::tempdir().unwrap();
+    let primary = parent.path().join("gaviero");
+    let sibling = parent.path().join("gaviero-flutter");
+    std::fs::create_dir_all(primary.join("src")).unwrap();
+    std::fs::write(
+        primary.join("Cargo.toml"),
+        "[package]\nname=\"t\"\nversion=\"0.0.0\"\n",
+    )
+    .unwrap();
+    let _ = git2::Repository::init(&primary);
+    std::fs::create_dir_all(&sibling).unwrap();
+    std::fs::write(sibling.join("pubspec.yaml"), "name: flutter\n").unwrap();
+    (parent, primary, sibling)
+}
+
+fn path_key(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+#[tokio::test]
+async fn session_new_uses_enclosing_cwd_for_sibling_folders() {
+    let (parent, primary, sibling) = sibling_workspace();
+    let paths = Arc::new(Mutex::new(Vec::new()));
+    let status = Arc::new(Mutex::new(Vec::new()));
+    let mut args = construction(
+        &primary,
+        Box::new(RecStatus {
+            status: status.clone(),
+        }),
+        Box::new(RecWrite { paths }),
+        true,
+    );
+    args.additional_roots = vec![sibling.clone()];
+    let mut session = AcpClientSession::new_with_scope(args, FileScope::default())
+        .with_extra(extra("inspect"));
+    let report = inspect_prompt(&drain(&mut session, true).await);
+    let cwd = PathBuf::from(report["new"]["cwd"].as_str().expect("cwd"));
+    assert_eq!(
+        path_key(&cwd),
+        path_key(parent.path()),
+        "session/new cwd should be the enclosing parent, got {cwd:?}"
+    );
+    let extra_dirs = report["new"]["additionalDirectories"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        extra_dirs.is_empty(),
+        "lifted cwd must not send additionalDirectories: {extra_dirs:?}"
+    );
+    let texts: Vec<&str> = report["prompt"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|b| b["text"].as_str())
+        .collect();
+    assert!(
+        texts.iter().any(|t| t.contains("<workspace_folders>")
+            && t.contains("gaviero-flutter")
+            && t.contains("Do not assume the primary folder is cwd")),
+        "{texts:?}"
+    );
+    let status = status.lock().unwrap().clone();
+    assert!(
+        status
+            .iter()
+            .any(|s| s.contains("enclosing cwd") && s.contains("additionalDirectories")),
+        "{status:?}"
+    );
+    Box::new(session).close().await;
+}
+
+#[tokio::test]
+async fn session_set_config_option_uses_advertised_opaque_model_value() {
+    let dir = workspace();
+    let paths = Arc::new(Mutex::new(Vec::new()));
+    let mut args = construction(
+        dir.path(),
+        Box::new(NoopAcp),
+        Box::new(RecWrite { paths }),
+        true,
+    );
+    args.model = "dsh:deepseek-flash".into();
+    let mut session = AcpClientSession::new_with_scope(args, FileScope::default())
+        .with_extra(extra("model_catalog"));
+    let events = drain(&mut session, true).await;
+    let report = events
+        .iter()
+        .find_map(|event| match event {
+            UnifiedStreamEvent::TextDelta(text) => serde_json::from_str::<serde_json::Value>(text).ok(),
+            _ => None,
+        })
+        .expect("fake catalog report");
+    assert_eq!(report["model"]["configId"], "model");
+    assert_eq!(
+        report["model"]["value"],
+        r#"["deepseek-official","deepseek-v4-flash"]"#
+    );
+    assert!(report["model"].get("modelId").is_none());
     Box::new(session).close().await;
 }
 

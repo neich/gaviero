@@ -29,7 +29,7 @@ pub mod map;
 pub mod rpc;
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
@@ -90,6 +90,10 @@ pub struct AcpClientSession {
 struct LiveSession {
     rpc: JsonRpcChild,
     session_id: String,
+    /// ACP `session/new.cwd`. Equal to the primary workspace unless sibling
+    /// folders forced an enclosing parent (live dsh rejects
+    /// `additionalDirectories`).
+    session_cwd: PathBuf,
     thinking_settable: bool,
     gate_written: HashSet<PathBuf>,
 }
@@ -219,7 +223,20 @@ impl AcpClientSession {
             || config_option_named(&init, "effort")
             || config_option_named(&init, "reasoning_effort");
 
-        let cwd = absolute_cwd(&self.workspace_root);
+        let primary_cwd = absolute_cwd(&self.workspace_root);
+        let session_cwd = enclosing_workspace_cwd(&self.workspace_root, &self.additional_roots)
+            .unwrap_or_else(|| PathBuf::from(&primary_cwd));
+        let lifted = !paths_eq(&session_cwd, Path::new(&primary_cwd));
+        // Live dsh rejects a non-empty `additionalDirectories` list. When the
+        // session cwd already contains every sibling (enclosing parent), skip
+        // the field so `session/new` succeeds on the first try. Nested extras
+        // stay inside the primary cwd and are still forwarded for agents that
+        // accept the field (in-tree fake).
+        let extra_dirs = if lifted {
+            Vec::new()
+        } else {
+            self.additional_roots.clone()
+        };
         let servers = mcp_servers_for_session(&self.workspace_root, self.capabilities);
         // Keyed on gaviero's *own* server, not on the list being empty:
         // context7 and `extraServers` can be registered while gaviero's
@@ -229,7 +246,32 @@ impl AcpClientSession {
             self.options.exposed_tools = Some(Vec::new());
             self.observer.on_streaming_status("dsh: no MCP endpoint available; retrieval tools disabled");
         }
-        let new = session_new(&rpc.handle, &cwd, &self.additional_roots, servers).await?;
+        let new = session_new(
+            &rpc.handle,
+            &session_cwd.to_string_lossy(),
+            &extra_dirs,
+            servers,
+        )
+        .await?;
+        if lifted {
+            self.observer.on_streaming_status(&format!(
+                "dsh: additionalDirectories unsupported; sibling folders mounted via enclosing cwd {}",
+                session_cwd.display()
+            ));
+        } else if new.additional_dirs_dropped
+            && !additional_roots_covered(&session_cwd, &self.additional_roots)
+        {
+            self.observer.on_streaming_status(
+                "dsh: additionalDirectories is not supported; sibling folders are not mounted",
+            );
+        }
+        if new.mcp_dropped {
+            self.options.exposed_tools = Some(Vec::new());
+            self.observer.on_streaming_status(
+                "dsh: session/new rejected mcpServers; retrieval tools disabled",
+            );
+        }
+        let new = new.value;
         let session_id = new
             .get("sessionId")
             .or_else(|| new.get("session_id"))
@@ -237,11 +279,18 @@ impl AcpClientSession {
             .context("ACP session/new omitted sessionId")?
             .to_string();
         let model = self.model.strip_prefix("dsh:").unwrap_or(&self.model);
-        let model_option = new.get("configOptions").and_then(Value::as_array).and_then(|options| options.iter().find(|option| option["category"] == "model" || option["id"] == "model")).and_then(|option| option["id"].as_str());
-        if let Some(config_id) = model_option {
-            rpc.handle.request("session/set_config_option", json!({ "sessionId": session_id, "configId": config_id, "value": model })).await.context("selecting requested dsh model")?;
-        } else {
-            rpc.handle.request("session/set_model", json!({ "sessionId": session_id, "modelId": model })).await.context("selecting requested dsh model (legacy ACP)")?;
+        // dsh advertises opaque select values (`JSON.stringify([provider, model])`),
+        // not the bare API id. Sending `deepseek-flash` verbatim is
+        // `unknown model option` and aborts the turn.
+        if let Err(e) = apply_session_model(&rpc.handle, &session_id, &new, model).await {
+            tracing::warn!(
+                error = %e,
+                requested = %model,
+                "dsh: could not select requested model; continuing with session default"
+            );
+            self.observer.on_streaming_status(&format!(
+                "dsh: could not select {model}; using the session default"
+            ));
         }
         let thinking_settable = thinking_settable
             || config_option_named(&new, "thinking")
@@ -251,6 +300,7 @@ impl AcpClientSession {
         self.inner = Some(LiveSession {
             rpc,
             session_id,
+            session_cwd,
             thinking_settable,
             gate_written: HashSet::new(),
         });
@@ -287,37 +337,214 @@ impl AcpClientSession {
     }
 }
 
-async fn session_new(handle: &JsonRpcHandle, cwd: &str, additional_roots: &[PathBuf], servers: Vec<Value>) -> Result<Value> {
-    let params = json!({
-        "cwd": cwd,
-        "mcpServers": servers,
-        "additionalDirectories": additional_roots,
-    });
-    match handle.request("session/new", params).await {
-        Ok(v) => Ok(v),
-        Err(e) if session_new_mcp_rejected(&format!("{e:#}")) => {
-            tracing::warn!(
-                error = %e,
-                "dsh session/new rejected mcpServers; retrying with none"
-            );
-            handle
-                .request(
-                    "session/new",
-                    json!({
-                        "cwd": cwd,
-                        "mcpServers": [],
-                        "additionalDirectories": additional_roots,
-                    }),
-                )
-                .await
+struct SessionNew {
+    value: Value,
+    mcp_dropped: bool,
+    additional_dirs_dropped: bool,
+}
+
+async fn session_new(
+    handle: &JsonRpcHandle,
+    cwd: &str,
+    additional_roots: &[PathBuf],
+    mut servers: Vec<Value>,
+) -> Result<SessionNew> {
+    // Live `dsh --profile acp` accepts `additionalDirectories: []` and
+    // rejects a non-empty list (`Invalid params: additionalDirectories is
+    // not supported`). Callers that can mount siblings by lifting `cwd` to
+    // an enclosing parent pass an empty list. Nested extras (still inside
+    // the primary cwd) are forwarded, and this retry strips them if the
+    // child refuses. The same strip-and-retry applies to `mcpServers`.
+    let mut extra_dirs = additional_roots.to_vec();
+    let mut mcp_dropped = false;
+    let mut additional_dirs_dropped = false;
+    loop {
+        let params = json!({
+            "cwd": cwd,
+            "mcpServers": servers,
+            "additionalDirectories": extra_dirs,
+        });
+        match handle.request("session/new", params).await {
+            Ok(value) => {
+                return Ok(SessionNew {
+                    value,
+                    mcp_dropped,
+                    additional_dirs_dropped,
+                });
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                if !extra_dirs.is_empty() && session_new_additional_dirs_rejected(&msg) {
+                    tracing::warn!(
+                        error = %e,
+                        "dsh session/new rejected additionalDirectories; retrying with none"
+                    );
+                    extra_dirs.clear();
+                    additional_dirs_dropped = true;
+                    continue;
+                }
+                if !servers.is_empty() && session_new_mcp_rejected(&msg) {
+                    tracing::warn!(
+                        error = %e,
+                        "dsh session/new rejected mcpServers; retrying with none"
+                    );
+                    servers = Vec::new();
+                    mcp_dropped = true;
+                    continue;
+                }
+                return Err(e);
+            }
         }
-        Err(e) => Err(e),
     }
 }
 
 fn session_new_mcp_rejected(err: &str) -> bool {
     let l = err.to_ascii_lowercase();
     l.contains("mcpserver") || l.contains("mcp server") || l.contains("mcp_server")
+}
+
+fn session_new_additional_dirs_rejected(err: &str) -> bool {
+    let l = err.to_ascii_lowercase();
+    l.contains("additionaldirectories") || l.contains("additional directories")
+}
+
+async fn apply_session_model(
+    handle: &JsonRpcHandle,
+    session_id: &str,
+    session_new: &Value,
+    requested: &str,
+) -> Result<()> {
+    if let Some(option) = find_model_config_option(session_new) {
+        let config_id = config_option_id(option).unwrap_or("model");
+        if option_already_selects_model(option, requested) {
+            return Ok(());
+        }
+        let value = match_advertised_model(option, requested).ok_or_else(|| {
+            anyhow::anyhow!("dsh catalog has no option for {requested}")
+        })?;
+        handle
+            .request(
+                "session/set_config_option",
+                json!({
+                    "sessionId": session_id,
+                    "configId": config_id,
+                    "value": value,
+                }),
+            )
+            .await
+            .with_context(|| format!("selecting dsh model {requested}"))?;
+        return Ok(());
+    }
+    handle
+        .request(
+            "session/set_model",
+            json!({
+                "sessionId": session_id,
+                "modelId": requested,
+            }),
+        )
+        .await
+        .context("selecting requested dsh model (legacy ACP)")?;
+    Ok(())
+}
+
+fn find_model_config_option(session_new: &Value) -> Option<&Value> {
+    session_new
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|option| {
+            option.get("category").and_then(Value::as_str) == Some("model")
+                || config_option_id(option) == Some("model")
+        })
+}
+
+fn config_option_id(option: &Value) -> Option<&str> {
+    option
+        .get("configId")
+        .or_else(|| option.get("id"))
+        .and_then(Value::as_str)
+}
+
+fn option_already_selects_model(option: &Value, requested: &str) -> bool {
+    option
+        .get("currentValue")
+        .and_then(Value::as_str)
+        .is_some_and(|value| model_ids_equivalent(&model_id_from_option_value(value), requested))
+}
+
+/// Pick the advertised select value for `requested`.
+///
+/// Live `dsh --profile acp` (0.1.5-rc.1) keys choices by
+/// `JSON.stringify([provider, model])`, grouped under `options`. Bare API ids
+/// such as `deepseek-flash` are not in that map. `deepseek-v4-flash` is the
+/// catalog alias DeepSeek still serves for V4.1 Flash.
+fn match_advertised_model(option: &Value, requested: &str) -> Option<String> {
+    let mut best: Option<(u8, u8, String)> = None;
+    for value in collect_select_values(option.get("options").unwrap_or(&Value::Null)) {
+        let (provider, model) = split_option_route(&value);
+        let exact = model == requested;
+        if !exact && !model_ids_equivalent(&model, requested) {
+            continue;
+        }
+        let exact_rank = u8::from(!exact);
+        let official_rank = u8::from(provider != "deepseek-official" && !provider.is_empty());
+        let candidate = (exact_rank, official_rank, value);
+        if best.as_ref().is_none_or(|current| candidate < *current) {
+            best = Some(candidate);
+        }
+    }
+    best.map(|(_, _, value)| value)
+}
+
+fn collect_select_values(node: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_select_values_into(node, &mut out);
+    out
+}
+
+fn collect_select_values_into(node: &Value, out: &mut Vec<String>) {
+    match node {
+        Value::Array(items) => {
+            for item in items {
+                collect_select_values_into(item, out);
+            }
+        }
+        Value::Object(obj) => {
+            if let Some(value) = obj.get("value").and_then(Value::as_str) {
+                out.push(value.to_string());
+            }
+            if let Some(nested) = obj.get("options") {
+                collect_select_values_into(nested, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn split_option_route(value: &str) -> (String, String) {
+    if let Ok(parts) = serde_json::from_str::<Vec<String>>(value)
+        && parts.len() >= 2
+    {
+        return (parts[0].clone(), parts[1].clone());
+    }
+    (String::new(), value.to_string())
+}
+
+fn model_id_from_option_value(value: &str) -> String {
+    split_option_route(value).1
+}
+
+fn model_ids_equivalent(left: &str, right: &str) -> bool {
+    equivalent_dsh_model_ids(left).iter().any(|id| *id == right)
+}
+
+fn equivalent_dsh_model_ids(id: &str) -> Vec<&str> {
+    match id {
+        "deepseek-flash" | "deepseek-v4-flash" => vec!["deepseek-flash", "deepseek-v4-flash"],
+        other => vec![other],
+    }
 }
 
 fn absolute_cwd(root: &Path) -> String {
@@ -329,6 +556,160 @@ fn absolute_cwd(root: &Path) -> String {
         .unwrap_or_else(|_| root.to_path_buf())
         .to_string_lossy()
         .into_owned()
+}
+
+fn normalize_path_key(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn paths_eq(a: &Path, b: &Path) -> bool {
+    normalize_path_key(a) == normalize_path_key(b)
+}
+
+fn path_is_under(root: &Path, path: &Path) -> bool {
+    if path == root || path.starts_with(root) {
+        return true;
+    }
+    let root_s = normalize_path_key(root);
+    let path_s = normalize_path_key(path);
+    path_s == root_s || path_s.starts_with(&format!("{root_s}/"))
+}
+
+fn is_filesystem_root(path: &Path) -> bool {
+    let comps: Vec<_> = path.components().collect();
+    matches!(
+        comps.as_slice(),
+        [] | [Component::RootDir]
+            | [Component::Prefix(_)]
+            | [Component::Prefix(_), Component::RootDir]
+    )
+}
+
+fn component_eq(a: Component<'_>, b: Component<'_>) -> bool {
+    a == b || a.as_os_str().eq_ignore_ascii_case(b.as_os_str())
+}
+
+/// Longest shared prefix of `paths` that is not the drive / filesystem root.
+fn common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
+    if paths.is_empty() {
+        return None;
+    }
+    let mut prefix: Vec<Component<'_>> = paths[0].components().collect();
+    for p in &paths[1..] {
+        let comps: Vec<_> = p.components().collect();
+        let mut i = 0;
+        while i < prefix.len() && i < comps.len() && component_eq(prefix[i], comps[i]) {
+            i += 1;
+        }
+        prefix.truncate(i);
+        if prefix.is_empty() {
+            return None;
+        }
+    }
+    let ancestor: PathBuf = prefix.into_iter().collect();
+    if ancestor.as_os_str().is_empty() || is_filesystem_root(&ancestor) {
+        return None;
+    }
+    Some(ancestor)
+}
+
+/// When live dsh cannot take `additionalDirectories`, the nearest common
+/// parent of the primary folder and every sibling is used as `session/new.cwd`
+/// so tools stay inside one sandbox that still contains the whole workspace.
+fn enclosing_workspace_cwd(primary: &Path, additional_roots: &[PathBuf]) -> Option<PathBuf> {
+    if additional_roots.is_empty() {
+        return None;
+    }
+    let mut paths = Vec::with_capacity(additional_roots.len() + 1);
+    paths.push(PathBuf::from(absolute_cwd(primary)));
+    for r in additional_roots {
+        if r.as_os_str().is_empty() {
+            continue;
+        }
+        paths.push(PathBuf::from(absolute_cwd(r)));
+    }
+    if paths.len() < 2 {
+        return None;
+    }
+    common_ancestor(&paths)
+}
+
+fn additional_roots_covered(session_cwd: &Path, additional_roots: &[PathBuf]) -> bool {
+    !additional_roots.is_empty()
+        && additional_roots.iter().all(|r| {
+            if r.as_os_str().is_empty() {
+                return true;
+            }
+            path_is_under(session_cwd, Path::new(&absolute_cwd(r)))
+        })
+}
+
+fn rel_under(root: &Path, path: &Path) -> Option<PathBuf> {
+    if let Ok(rel) = path.strip_prefix(root) {
+        if rel.as_os_str().is_empty() {
+            return None;
+        }
+        return Some(rel.to_path_buf());
+    }
+    let rel = rel_to_workspace(root, path);
+    if rel.as_os_str().is_empty() || rel.is_absolute() {
+        None
+    } else {
+        Some(rel)
+    }
+}
+
+/// Prompt hint listing sibling folders. When `session_cwd` is an enclosing
+/// parent, tools resolve relative paths against that parent, not the primary.
+fn workspace_folders_hint(
+    workspace_root: &Path,
+    additional_roots: &[PathBuf],
+    session_cwd: &Path,
+) -> Option<String> {
+    if additional_roots.is_empty() {
+        return None;
+    }
+    let mut hint = String::from("<workspace_folders>\n");
+    hint.push_str(&format!("cwd: {}\n", session_cwd.display()));
+    hint.push_str(&format!("primary: {}\n", workspace_root.display()));
+    if let Some(rel) = rel_under(session_cwd, workspace_root) {
+        hint.push_str(&format!("primary_rel: {}\n", rel.display()));
+    }
+    for r in additional_roots {
+        if r.as_os_str().is_empty() || r == workspace_root {
+            continue;
+        }
+        hint.push_str(&format!("sibling: {}\n", r.display()));
+        if let Some(rel) = rel_under(session_cwd, r) {
+            hint.push_str(&format!("sibling_rel: {}\n", rel.display()));
+        }
+    }
+    hint.push_str("</workspace_folders>\n");
+    if paths_eq(session_cwd, workspace_root) {
+        hint.push_str(
+            "Read freely from any folder above. File edits land in the primary cwd by default.",
+        );
+    } else {
+        let primary_rel = rel_under(session_cwd, workspace_root)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| {
+                workspace_root
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            });
+        hint.push_str(&format!(
+            "The ACP working directory is {} so tools can reach every folder above. \
+             Use paths relative to that cwd (for example `{primary_rel}/src/lib.rs`). \
+             Do not assume the primary folder is cwd.",
+            session_cwd.display()
+        ));
+    }
+    Some(hint)
 }
 
 fn config_option_named(value: &Value, name: &str) -> bool {
@@ -367,7 +748,14 @@ fn capabilities(exposed: Option<&[String]>) -> Capabilities {
     }
 }
 
-fn build_prompt_blocks(turn: &Turn, exposed: Option<&[String]>, include_replay: bool) -> Vec<Value> {
+fn build_prompt_blocks(
+    turn: &Turn,
+    exposed: Option<&[String]>,
+    include_replay: bool,
+    workspace_root: &Path,
+    additional_roots: &[PathBuf],
+    session_cwd: &Path,
+) -> Vec<Value> {
     let mut parts: Vec<String> = Vec::new();
     parts.push(default_editor_system_prompt(&capabilities(exposed)));
     if let Some(block) = render_graph_block(&turn.graph_selections) {
@@ -395,6 +783,9 @@ fn build_prompt_blocks(turn: &Turn, exposed: Option<&[String]>, include_replay: 
                 parts.push(format!("<{tag}>\n{content}\n</{tag}>"));
             }
         }
+    }
+    if let Some(hint) = workspace_folders_hint(workspace_root, additional_roots, session_cwd) {
+        parts.push(hint);
     }
     parts.push(turn.user_message.clone());
     parts
@@ -425,12 +816,34 @@ fn abs_in_workspace(root: &Path, raw: &str) -> PathBuf {
     if p.is_absolute() { p } else { root.join(p) }
 }
 
+/// Resolve an ACP `fs/*` path. Relative paths are against `session_cwd`
+/// (which may be an enclosing parent). If that miss would hide a file that
+/// still lives under the primary folder, fall back so a model that still
+/// thinks cwd is the primary can read/edit existing files.
+fn resolve_acp_path(session_cwd: &Path, workspace_root: &Path, raw: &str) -> PathBuf {
+    let p = PathBuf::from(raw);
+    if p.is_absolute() {
+        return p;
+    }
+    let from_session = abs_in_workspace(session_cwd, raw);
+    if paths_eq(session_cwd, workspace_root) || from_session.exists() {
+        return from_session;
+    }
+    let from_primary = abs_in_workspace(workspace_root, raw);
+    if from_primary.exists() {
+        return from_primary;
+    }
+    from_session
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_incoming(
     req: IncomingRequest,
     handle: &JsonRpcHandle,
     write_gate: &Arc<Mutex<WriteGatePipeline>>,
     observer: &Arc<dyn AcpObserver>,
     workspace_root: &Path,
+    session_cwd: &Path,
     agent_id: &str,
     conv_id: Option<&str>,
     file_scope: &FileScope,
@@ -444,7 +857,7 @@ async fn handle_incoming(
                 .get("path")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let abs = abs_in_workspace(workspace_root, raw);
+            let abs = resolve_acp_path(session_cwd, workspace_root, raw);
             let rel = rel_to_workspace(workspace_root, &abs);
             let enforcer = ScopeEnforcer::new(file_scope.clone());
             if let Err(e) = enforcer.check_read(&rel) {
@@ -489,7 +902,7 @@ async fn handle_incoming(
                 .get("content")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let abs = abs_in_workspace(workspace_root, raw);
+            let abs = resolve_acp_path(session_cwd, workspace_root, raw);
             let rel = rel_to_workspace(workspace_root, &abs);
             let enforcer = ScopeEnforcer::new(file_scope.clone());
             if let Err(e) = enforcer.check_write(&rel) {
@@ -510,7 +923,7 @@ async fn handle_incoming(
             .await
             {
                 Ok(()) => {
-                    gate_written.insert(norm_rel(&rel));
+                    gate_written.insert(norm_rel(&abs));
                     let _ = handle.respond(req.id, json!({})).await;
                 }
                 Err(e) => {
@@ -591,8 +1004,33 @@ fn git_dirty(root: &Path) -> HashSet<PathBuf> {
     };
     statuses
         .iter()
-        .filter_map(|e| e.path().map(|p| norm_rel(Path::new(p))))
+        .filter_map(|e| {
+            let p = e.path()?;
+            let rel = Path::new(p);
+            let abs = if rel.is_absolute() {
+                rel.to_path_buf()
+            } else {
+                root.join(rel)
+            };
+            Some(norm_rel(&abs))
+        })
         .collect()
+}
+
+fn git_dirty_roots(roots: &[PathBuf]) -> HashSet<PathBuf> {
+    let mut out = HashSet::new();
+    let mut seen = HashSet::new();
+    for root in roots {
+        if root.as_os_str().is_empty() {
+            continue;
+        }
+        let key = normalize_path_key(root);
+        if !seen.insert(key) {
+            continue;
+        }
+        out.extend(git_dirty(root));
+    }
+    out
 }
 
 // ── Out-of-band write reconciliation ────────────────────────────────────────
@@ -629,7 +1067,11 @@ async fn capture_pre_turn_content(root: &Path, dirty: &HashSet<PathBuf>) -> PreT
     let mut order: Vec<&PathBuf> = dirty.iter().collect();
     order.sort();
     for rel in order {
-        let abs = root.join(rel);
+        let abs = if rel.is_absolute() {
+            rel.clone()
+        } else {
+            root.join(rel)
+        };
         let size = tokio::fs::metadata(&abs).await.map(|m| m.len()).unwrap_or(0);
         if size > budget {
             tracing::debug!(
@@ -662,8 +1104,24 @@ async fn capture_pre_turn_content(root: &Path, dirty: &HashSet<PathBuf>) -> PreT
 /// must have been created during this turn. `None` = git could not answer
 /// (no repository, non-UTF-8 blob); the caller must not guess.
 fn index_content(root: &Path, rel: &Path) -> Option<Option<String>> {
-    let repo = crate::git::GitRepo::open(root).ok()?;
-    match repo.index_stage_content(&rel.to_string_lossy(), 0) {
+    let abs = if rel.is_absolute() {
+        rel.to_path_buf()
+    } else {
+        root.join(rel)
+    };
+    let start = if abs.exists() {
+        abs.clone()
+    } else {
+        abs.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(root)
+            .to_path_buf()
+    };
+    let repo = crate::git::GitRepo::open(&start).ok()?;
+    let workdir = repo.workdir()?;
+    let index_rel = abs.strip_prefix(workdir).ok()?;
+    let key = index_rel.to_string_lossy().replace('\\', "/");
+    match repo.index_stage_content(&key, 0) {
         Ok(found) => Some(found),
         Err(e) => {
             tracing::warn!(
@@ -782,7 +1240,20 @@ impl AgentSession for AcpClientSession {
             .unwrap_or_else(|| self.options.effort.clone());
         let include_replay = self.ensure_running().await?;
         let exposed = self.options.exposed_tools.clone();
-        let mut prompt = build_prompt_blocks(&turn, exposed.as_deref(), include_replay);
+        let session_cwd = self
+            .inner
+            .as_ref()
+            .expect("ensure_running")
+            .session_cwd
+            .clone();
+        let mut prompt = build_prompt_blocks(
+            &turn,
+            exposed.as_deref(),
+            include_replay,
+            &self.workspace_root,
+            &self.additional_roots,
+            &session_cwd,
+        );
         if let Some(system) = &self.system_prompt {
             prompt[0] = json!({ "type": "text", "text": system });
         }
@@ -792,8 +1263,11 @@ impl AgentSession for AcpClientSession {
         let thinking_settable = live.thinking_settable;
         Self::apply_effort(&handle, &session_id, thinking_settable, &effort).await;
 
-        let root = self.workspace_root.clone();
-        let before_dirty = tokio::task::spawn_blocking(move || git_dirty(&root)).await?;
+        let mut dirty_roots = Vec::with_capacity(1 + self.additional_roots.len());
+        dirty_roots.push(self.workspace_root.clone());
+        dirty_roots.extend(self.additional_roots.iter().cloned());
+        let before_dirty =
+            tokio::task::spawn_blocking(move || git_dirty_roots(&dirty_roots)).await?;
         // Baseline for the post-turn reconcile. Captured now because a path that
         // is already dirty has no other record of its turn-start bytes.
         let pre_turn = capture_pre_turn_content(&self.workspace_root, &before_dirty).await;
@@ -803,6 +1277,7 @@ impl AgentSession for AcpClientSession {
         let write_gate = self.write_gate.clone();
         let observer = self.observer.clone();
         let workspace_root = self.workspace_root.clone();
+        let additional_roots = self.additional_roots.clone();
         let file_scope = self.file_scope.clone();
         let cancel = self.cancel_token.clone();
         let agent_id = self.agent_id.clone();
@@ -813,7 +1288,7 @@ impl AgentSession for AcpClientSession {
         live.gate_written.clear();
 
         self.running = Some(tokio::spawn(async move {
-            let prompt_fut = handle.request(
+            let prompt_fut = handle.request_indefinite(
                 "session/prompt",
                 json!({
                     "sessionId": session_id,
@@ -836,6 +1311,7 @@ impl AgentSession for AcpClientSession {
                             &write_gate,
                             &observer,
                             &workspace_root,
+                            &live.session_cwd,
                             &agent_id,
                             conv_id.as_deref(),
                             &file_scope,
@@ -865,6 +1341,7 @@ impl AgentSession for AcpClientSession {
                     &write_gate,
                     &observer,
                     &workspace_root,
+                    &live.session_cwd,
                     &agent_id,
                     conv_id.as_deref(),
                     &file_scope,
@@ -881,8 +1358,14 @@ impl AgentSession for AcpClientSession {
             let reusable = matches!(&prompt_result, Some(Ok(_)));
             match prompt_result {
                 Some(Ok(result)) => {
-                    let root = workspace_root.clone();
-                    let after = tokio::task::spawn_blocking(move || git_dirty(&root)).await.unwrap_or_default();
+                    let dirty_roots_after = {
+                        let mut roots = vec![workspace_root.clone()];
+                        roots.extend(additional_roots.iter().cloned());
+                        roots
+                    };
+                    let after = tokio::task::spawn_blocking(move || git_dirty_roots(&dirty_roots_after))
+                        .await
+                        .unwrap_or_default();
                     let extra: Vec<PathBuf> = after
                         .difference(&before_dirty)
                         .filter(|p| !live.gate_written.contains(*p))
@@ -911,8 +1394,12 @@ impl AgentSession for AcpClientSession {
                         // consumers (swarm validation, merge, loop judges) read
                         // this set, so it must not name a path the gate just
                         // declined to write.
-                        let root = workspace_root.clone();
-                        let now = tokio::task::spawn_blocking(move || git_dirty(&root))
+                        let dirty_roots_now = {
+                            let mut roots = vec![workspace_root.clone()];
+                            roots.extend(additional_roots.iter().cloned());
+                            roots
+                        };
+                        let now = tokio::task::spawn_blocking(move || git_dirty_roots(&dirty_roots_now))
                             .await
                             .unwrap_or_default();
                         for path in now.difference(&before_dirty) {
@@ -993,6 +1480,96 @@ mod tests {
         ));
         assert!(session_new_mcp_rejected("MCP server declaration not allowed"));
         assert!(!session_new_mcp_rejected("cwd must be absolute"));
+        assert!(!session_new_mcp_rejected(
+            "ACP RPC session/new error -32602: Invalid params: additionalDirectories is not supported"
+        ));
+    }
+
+    #[test]
+    fn session_new_additional_dirs_rejected_detects_live_dsh_error() {
+        assert!(session_new_additional_dirs_rejected(
+            "ACP RPC session/new error -32602: Invalid params: additionalDirectories is not supported"
+        ));
+        assert!(session_new_additional_dirs_rejected(
+            "additional directories are not supported"
+        ));
+        assert!(!session_new_additional_dirs_rejected("cwd must be absolute"));
+        assert!(!session_new_additional_dirs_rejected(
+            "ACP RPC session/new error -32602: non-empty mcpServers rejected"
+        ));
+    }
+
+    fn grouped_dsh_model_option() -> Value {
+        json!({
+            "id": "model",
+            "name": "Model",
+            "category": "model",
+            "type": "select",
+            "currentValue": "[\"deepseek-official\",\"deepseek-v4-pro\"]",
+            "options": [{
+                "group": "deepseek-official",
+                "name": "DeepSeek",
+                "options": [
+                    {
+                        "value": "[\"deepseek-official\",\"deepseek-v4-flash\"]",
+                        "name": "DeepSeek-V4-Flash"
+                    },
+                    {
+                        "value": "[\"deepseek-official\",\"deepseek-v4-pro\"]",
+                        "name": "DeepSeek-V4-Pro"
+                    },
+                    {
+                        "value": "[\"deepseek-official\",\"deepseek-flash\"]",
+                        "name": "DeepSeek-V4.1-Flash"
+                    }
+                ]
+            }]
+        })
+    }
+
+    #[test]
+    fn match_advertised_model_prefers_exact_flash_id() {
+        let option = grouped_dsh_model_option();
+        assert_eq!(
+            match_advertised_model(&option, "deepseek-flash").as_deref(),
+            Some(r#"["deepseek-official","deepseek-flash"]"#)
+        );
+    }
+
+    #[test]
+    fn match_advertised_model_maps_flash_alias_when_v41_absent() {
+        let mut option = grouped_dsh_model_option();
+        option["options"][0]["options"] = json!([
+            {
+                "value": "[\"deepseek-official\",\"deepseek-v4-flash\"]",
+                "name": "DeepSeek-V4-Flash"
+            },
+            {
+                "value": "[\"deepseek-official\",\"deepseek-v4-pro\"]",
+                "name": "DeepSeek-V4-Pro"
+            }
+        ]);
+        assert_eq!(
+            match_advertised_model(&option, "deepseek-flash").as_deref(),
+            Some(r#"["deepseek-official","deepseek-v4-flash"]"#)
+        );
+        assert!(option_already_selects_model(&option, "deepseek-v4-pro"));
+        assert!(!option_already_selects_model(&option, "deepseek-flash"));
+    }
+
+    #[test]
+    fn find_model_config_option_accepts_config_id() {
+        let new = json!({
+            "sessionId": "s",
+            "configOptions": [{
+                "configId": "model",
+                "category": "model",
+                "options": [{"value": "m1"}]
+            }]
+        });
+        let option = find_model_config_option(&new).expect("model option");
+        assert_eq!(config_option_id(option), Some("model"));
+        assert_eq!(match_advertised_model(option, "m1").as_deref(), Some("m1"));
     }
 
     fn sample_turn_with_replay() -> Turn {
@@ -1027,7 +1604,14 @@ mod tests {
     #[test]
     fn fresh_session_prompt_includes_host_replay() {
         let turn = sample_turn_with_replay();
-        let blocks = build_prompt_blocks(&turn, None, true);
+        let blocks = build_prompt_blocks(
+            &turn,
+            None,
+            true,
+            Path::new("."),
+            &[],
+            Path::new("."),
+        );
         let texts = prompt_texts(&blocks);
         assert!(
             texts.iter().any(|t| t.contains("<user>\nold q\n</user>")),
@@ -1045,11 +1629,93 @@ mod tests {
     #[test]
     fn reused_session_prompt_skips_host_replay() {
         let turn = sample_turn_with_replay();
-        let blocks = build_prompt_blocks(&turn, None, false);
+        let blocks = build_prompt_blocks(
+            &turn,
+            None,
+            false,
+            Path::new("."),
+            &[],
+            Path::new("."),
+        );
         let texts = prompt_texts(&blocks);
         assert!(
             texts.iter().all(|t| !t.contains("old q")),
             "{texts:?}"
+        );
+        assert_eq!(*texts.last().unwrap(), "now");
+    }
+
+    #[test]
+    fn enclosing_cwd_none_without_siblings() {
+        assert!(enclosing_workspace_cwd(Path::new("/work/proj"), &[]).is_none());
+    }
+
+    #[test]
+    fn enclosing_cwd_is_common_parent_of_siblings() {
+        let parent = tempfile::tempdir().unwrap();
+        let a = parent.path().join("gaviero");
+        let b = parent.path().join("gaviero-flutter");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let cwd = enclosing_workspace_cwd(&a, &[b.clone()]).expect("enclosing cwd");
+        assert!(path_is_under(&cwd, &a), "cwd={cwd:?} a={a:?}");
+        assert!(path_is_under(&cwd, &b), "cwd={cwd:?} b={b:?}");
+        assert!(!is_filesystem_root(&cwd));
+        assert!(paths_eq(&cwd, parent.path()));
+    }
+
+    #[test]
+    fn enclosing_cwd_nested_extra_stays_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let extra = dir.path().join("additional");
+        std::fs::create_dir_all(&extra).unwrap();
+        let cwd = enclosing_workspace_cwd(dir.path(), &[extra]).expect("cwd");
+        assert!(paths_eq(&cwd, &PathBuf::from(absolute_cwd(dir.path()))));
+    }
+
+    #[test]
+    fn enclosing_cwd_rejects_filesystem_root() {
+        #[cfg(windows)]
+        {
+            let a = PathBuf::from(r"C:\alpha");
+            let b = PathBuf::from(r"C:\beta");
+            assert!(enclosing_workspace_cwd(&a, &[b]).is_none());
+        }
+        #[cfg(not(windows))]
+        {
+            let a = PathBuf::from("/alpha");
+            let b = PathBuf::from("/beta");
+            assert!(enclosing_workspace_cwd(&a, &[b]).is_none());
+        }
+    }
+
+    #[test]
+    fn workspace_folders_hint_lists_siblings_and_enclosing_cwd() {
+        let parent = tempfile::tempdir().unwrap();
+        let primary = parent.path().join("gaviero");
+        let sibling = parent.path().join("gaviero-flutter");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let turn = sample_turn_with_replay();
+        let blocks = build_prompt_blocks(
+            &turn,
+            None,
+            false,
+            &primary,
+            &[sibling],
+            parent.path(),
+        );
+        let texts = prompt_texts(&blocks);
+        let hint = texts
+            .iter()
+            .copied()
+            .find(|t| t.contains("<workspace_folders>"))
+            .expect("workspace_folders block");
+        assert!(hint.contains("gaviero-flutter"), "{hint}");
+        assert!(hint.contains("primary_rel:"), "{hint}");
+        assert!(
+            hint.contains("Do not assume the primary folder is cwd"),
+            "{hint}"
         );
         assert_eq!(*texts.last().unwrap(), "now");
     }

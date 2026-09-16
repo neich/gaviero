@@ -66,21 +66,69 @@ where
             }
             "session/new" => {
                 session_params = msg["params"].clone();
-                write_json(
-                    &mut writer,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "sessionId": "sess_test",
-                            "configOptions": [{ "id": "thinking", "type": "boolean" }]
-                        }
-                    }),
-                )
-                .await?;
+                let extra_nonempty = session_params
+                    .get("additionalDirectories")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| !a.is_empty());
+                if scenario == "reject_extra_dirs" && extra_nonempty {
+                    write_json(
+                        &mut writer,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": -32602,
+                                "message": "Invalid params: additionalDirectories is not supported"
+                            }
+                        }),
+                    )
+                    .await?;
+                } else {
+                    let config_options = if scenario == "model_catalog" {
+                        json!([{
+                            "id": "model",
+                            "name": "Model",
+                            "category": "model",
+                            "type": "select",
+                            "currentValue": "[\"deepseek-official\",\"deepseek-v4-pro\"]",
+                            "options": [{
+                                "group": "deepseek-official",
+                                "name": "DeepSeek",
+                                "options": [
+                                    {
+                                        "value": "[\"deepseek-official\",\"deepseek-v4-flash\"]",
+                                        "name": "DeepSeek-V4-Flash"
+                                    },
+                                    {
+                                        "value": "[\"deepseek-official\",\"deepseek-v4-pro\"]",
+                                        "name": "DeepSeek-V4-Pro"
+                                    }
+                                ]
+                            }]
+                        }])
+                    } else {
+                        json!([{ "id": "thinking", "type": "boolean" }])
+                    };
+                    write_json(
+                        &mut writer,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "sessionId": "sess_test",
+                                "configOptions": config_options
+                            }
+                        }),
+                    )
+                    .await?;
+                }
             }
             "session/set_config_option" | "session/set_model" => {
-                if method == "session/set_model" { model_params = msg["params"].clone(); }
+                if method == "session/set_model"
+                    || msg["params"]["configId"] == "model"
+                {
+                    model_params = msg["params"].clone();
+                }
                 write_json(
                     &mut writer,
                     &json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
@@ -89,7 +137,7 @@ where
             }
             "session/prompt" => {
                 turn_count += 1;
-                if scenario == "inspect" {
+                if scenario == "inspect" || scenario == "model_catalog" {
                     emit_update(&mut writer, json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": json!({ "turn": turn_count, "new": session_params, "model": model_params, "prompt": msg["params"]["prompt"] }).to_string() } })).await?;
                 }
                 handle_prompt(&mut writer, id, scenario, &mut next_agent_id).await?;
