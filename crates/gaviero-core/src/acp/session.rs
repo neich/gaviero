@@ -374,9 +374,10 @@ impl AcpSession {
             // impose below.
         }
         cmd.arg("--model")
-            // Resolve alias→concrete id (e.g. `sonnet` → Sonnet 5) so the
-            // `sonnet` alias pins to a specific model rather than the CLI's
-            // drifting "latest sonnet". Every Claude spawn funnels through here.
+            // Resolve alias→concrete id (e.g. `opus` → Opus 5.5, `sonnet` →
+            // Sonnet 5) so those aliases pin to a specific model rather than
+            // the CLI's drifting "latest" and its lagging alias table. Every
+            // one-shot / interactive Claude spawn funnels through here.
             .arg(crate::swarm::backend::shared::resolve_claude_cli_model(
                 model,
             ));

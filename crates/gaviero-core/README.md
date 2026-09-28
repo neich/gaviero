@@ -48,9 +48,9 @@ println!("{}", plan.to_gaviero_script()?);
 
 | Provider | Examples | Notes |
 |---|---|---|
-| Claude | `claude:fable`, `claude:sonnet`, `claude:opus` | Subprocess (Claude Code) |
-| Codex | `codex:gpt-6-astra`, `codex:gpt-5.6-sol`, `codex:gpt-5.6-terra`, `codex:gpt-5.6-luna` | Subprocess (exec / app-server); `gpt-6-astra` needs Codex CLI ≥ 0.153 |
-| Cursor | `cursor:composer-2.5`, `cursor:cursor-grok-4.6-high` | Subprocess (Cursor CLI); ids embed effort — list them with `agent --list-models` |
+| Claude | `claude:fable`, `claude:sonnet`, `claude:opus`, `claude:claude-fable-5-1`, `claude:claude-opus-5-5` | Subprocess (Claude Code); `fable` → Fable 5.1, `opus` → Opus 5.5, `sonnet` → Sonnet 5 — the bare `opus`/`sonnet` aliases are pinned to those ids at dispatch, so Opus 5.5 needs Claude Code ≥ 2.1.280 |
+| Codex | `codex:gpt-6-astra`, `codex:gpt-5.6-sol`, `codex:gpt-5.6-terra`, `codex:gpt-5.6-luna`, `codex:gpt-5.5` | Subprocess (exec / app-server); `gpt-6-astra` needs Codex CLI ≥ 0.153 |
+| Cursor | `cursor:composer-2.5`, `cursor:grok-4.7-high` | Subprocess (Cursor CLI); ids embed effort — list them with `agent --list-models` |
 | Ollama / local | `ollama:qwen2.5-coder:7b`, `local:model-name` | Local server |
 | DeepSeek | `deepseek:deepseek-flash`, `deepseek:deepseek-v4-pro` | In-process HTTP (`tool_agent`) |
 | DeepSeek (ACP) | `dsh:deepseek-flash`, `dsh:deepseek-v4-pro` | Subprocess `dsh --profile acp` (Agent Client Protocol) |

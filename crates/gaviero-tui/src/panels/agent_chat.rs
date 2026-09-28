@@ -1564,9 +1564,11 @@ impl AgentChatState {
                     let list = if options.is_empty() {
                         "claude:fable, claude:sonnet, claude:opus, claude:haiku, \
                          claude:opusplan, claude:sonnet[1m], claude:opus[1m], \
+                         claude:claude-fable-5-1, claude:claude-opus-5-5, \
                          codex:gpt-6-astra, codex:gpt-5.6-sol, codex:gpt-5.6-terra, \
-                         codex:gpt-5.6-luna, \
-                         cursor:composer-2.5, ollama:qwen2.5-coder:7b"
+                         codex:gpt-5.6-luna, codex:gpt-5.5, \
+                         cursor:composer-2.5, cursor:grok-4.7-high, \
+                         ollama:qwen2.5-coder:7b"
                             .to_string()
                     } else {
                         options.join(", ")

@@ -272,7 +272,12 @@ fn spawn_persistent(
         .arg("--verbose")
         .arg("--include-partial-messages")
         .arg("--model")
-        .arg(model);
+        // Same alias→concrete-id resolution as `AcpSession::spawn`, so a
+        // persistent session honours `opus`/`sonnet` exactly like a one-shot
+        // turn. The struct keeps the raw alias for display.
+        .arg(crate::swarm::backend::shared::resolve_claude_cli_model(
+            model,
+        ));
 
     if !options.effort.is_empty() && options.effort != "off" && options.effort != "auto" {
         cmd.arg("--effort").arg(&options.effort);

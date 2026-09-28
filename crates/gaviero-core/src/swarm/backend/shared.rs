@@ -25,13 +25,31 @@ pub const SUPPORTED_PROVIDER_PREFIXES: &[&str] =
 pub const DEEPSEEK_API_MODELS: &[&str] =
     &["deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash"];
 
-/// Canonical Claude model aliases the `/model` picker always offers, without
-/// the `claude:` prefix. Independent of `claude --help` parsing so the picker
+/// Canonical Claude model ids the `/model` picker always offers, without the
+/// `claude:` prefix. Independent of `claude --help` parsing so the picker
 /// stays populated even when the CLI is absent or its help text drifts; CLI
 /// discovery ([`crate::acp::session::discover_model_options`]) is merged on
-/// top to surface full model names. Mirrors the documented `/model` aliases;
-/// the `[1m]` long-context variants are valid specs (context-window sizing
-/// strips the suffix before matching).
+/// top to surface the full names the help text happens to name. Mirrors the
+/// documented `/model` aliases; the `[1m]` long-context variants are valid
+/// specs (context-window sizing strips the suffix before matching).
+///
+/// Aliases first, then the concrete ids of the models the Claude Code model
+/// catalog currently promotes (surface `cc`, `~/.claude/cache/model-catalog`;
+/// the cached `cc` surface was fetched 2026-09-28 and already selects
+/// `claude-opus-5-5`). The catalog maps the aliases onto those ids — `fable` →
+/// `claude-fable-5-1`, `sonnet` → `claude-sonnet-5`, `haiku` →
+/// `claude-haiku-4-5-20251001`, and `opus` → `claude-opus-5` in the last
+/// published `provider_alias_targets` (a document still dated 2026-09-12).
+/// Listing the promoted full names lets the picker show Fable 5.1 and Opus 5.5
+/// explicitly, and [`resolve_claude_cli_model`] independently pins the bare
+/// `opus` alias to Opus 5.5, so neither surface depends on the installed CLI's
+/// alias table (which points `opus` at older ids on some providers). Sonnet 5
+/// and Haiku 4.5 stay alias-only: their aliases are unambiguous.
+/// `claude-opus-5-5` carries
+/// `min_claude_code_version` 2.1.280, and its arrival moved `claude-opus-5` to
+/// the catalog's `overflow` section, so the picker lists 5.5 instead — both ids
+/// still validate as explicit pins. [`is_preferred_claude_model`] keeps the
+/// aliases ahead of the full ids when completions are truncated.
 pub const CLAUDE_MODEL_ALIASES: &[&str] = &[
     "fable",
     "sonnet",
@@ -40,6 +58,8 @@ pub const CLAUDE_MODEL_ALIASES: &[&str] = &[
     "opusplan",
     "sonnet[1m]",
     "opus[1m]",
+    "claude-fable-5-1",
+    "claude-opus-5-5",
 ];
 
 /// Canonical Codex model ids the `/model` picker always offers, without the
@@ -49,11 +69,10 @@ pub const CLAUDE_MODEL_ALIASES: &[&str] = &[
 /// `cursor:gpt-*` entries — Codex looks like it disappeared.
 ///
 /// Mirrors the `visibility: "list"` slugs Codex serves in its model catalog
-/// (`~/.codex/models_cache.json`, client 0.153.4, fetched 2026-09-07), in
-/// upstream `priority` order: `gpt-6-astra` (flagship, priority 1),
-/// `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna`, then the older `gpt-5.5` /
-/// `gpt-5.4-mini` and the Codex-CLI-only `gpt-5.3-codex-spark`. Hidden slugs
-/// (`gpt-reserve`, `codex-auto-review`) are deliberately absent.
+/// (`~/.codex/models_cache.json`, client 0.153.4, fetched 2026-09-14), in
+/// upstream `priority` order: `gpt-6-astra` (flagship, priority 1), then
+/// `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` and the older `gpt-5.5`.
+/// Hidden slugs (`gpt-reserve`, `codex-auto-review`) are deliberately absent.
 ///
 /// `gpt-6-astra` is gated on the Codex client version: a 0.146.0 CLI is served
 /// a catalog without it. Listing it unconditionally is deliberate — this list
@@ -61,18 +80,17 @@ pub const CLAUDE_MODEL_ALIASES: &[&str] = &[
 /// is installed, so an outdated CLI fails at dispatch rather than silently
 /// substituting a model.
 ///
-/// `gpt-5.2` and `gpt-5.4` were dropped as Codex delisted them upstream —
-/// free-form ids still pass [`validate_model_spec`], so an existing
-/// `codex:gpt-5.4` pin keeps working; it just no longer shows up in the picker.
-/// This list is picker UX only.
+/// `gpt-5.2` / `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.3-codex-spark` were
+/// dropped as Codex delisted them upstream (the 2026-09-14 catalog lists none
+/// of them). Free-form ids still pass [`validate_model_spec`], so an existing
+/// `codex:gpt-5.4-mini` pin keeps working; it just no longer shows up in the
+/// picker. This list is picker UX only.
 pub const CODEX_MODEL_ALIASES: &[&str] = &[
     "gpt-6-astra",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
     "gpt-5.5",
-    "gpt-5.4-mini",
-    "gpt-5.3-codex-spark",
 ];
 
 /// Concrete Claude CLI `--model` id that the bare `sonnet` alias resolves to.
@@ -88,26 +106,49 @@ pub const CODEX_MODEL_ALIASES: &[&str] = &[
 /// change needed.
 pub const SONNET_ALIAS_CLI_MODEL: &str = "claude-sonnet-5";
 
-/// Resolve a prefix-stripped Claude model alias/name into the concrete CLI
-/// `--model` argument. Only the `sonnet` alias is remapped (to
-/// [`SONNET_ALIAS_CLI_MODEL`]); the optional `[1m]` long-context suffix is
-/// preserved. Every other alias (`opus`, `haiku`, `fable`, `opusplan`, …) and
-/// every explicit full model id (e.g. `claude-sonnet-4-6`) passes through
-/// unchanged so a deliberate pin is always honoured.
+/// Concrete Claude CLI `--model` id that the bare `opus` alias resolves to.
 ///
-/// Expects the `claude:` provider prefix to have already been stripped — the
-/// single call site is [`crate::acp::session::AcpSession::spawn`], which is the
-/// one place every Claude backend builds its `--model` argv.
+/// Same rationale as [`SONNET_ALIAS_CLI_MODEL`]: forwarding the alias alone
+/// leaves the choice to the installed CLI, whose `provider_alias_targets`
+/// table lags its own model catalog — the last published document (issued
+/// 2026-09-12) still maps `opus` → `claude-opus-5`, while the CLI's cached
+/// `cc` surface already selects `claude-opus-5-5` as the global default.
+/// Pinning the CLI argument makes `opus` mean Opus 5.5 regardless of which
+/// alias table the installed CLI happens to carry. Host-side display keeps the
+/// `opus` alias, so the provider profiler still recognises the opus family for
+/// context sizing.
+///
+/// `claude-opus-5-5` carries `min_claude_code_version` 2.1.280. Like the Codex
+/// catalog ids, it is applied unconditionally rather than version-gated: an
+/// older CLI fails at dispatch instead of silently substituting a model.
+///
+/// If Anthropic ships a different Opus 5.x id, this one line is the only
+/// change needed.
+pub const OPUS_ALIAS_CLI_MODEL: &str = "claude-opus-5-5";
+
+/// Resolve a prefix-stripped Claude model alias/name into the concrete CLI
+/// `--model` argument. The bare `sonnet` and `opus` aliases are remapped (to
+/// [`SONNET_ALIAS_CLI_MODEL`] / [`OPUS_ALIAS_CLI_MODEL`]); the optional `[1m]`
+/// long-context suffix is preserved. Every other alias (`haiku`, `fable`,
+/// `opusplan`, …) and every explicit full model id (e.g. `claude-sonnet-4-6`,
+/// `claude-opus-4-7`) passes through unchanged so a deliberate pin is always
+/// honoured. `opusplan` is a distinct alias (plan mode), not an `opus` variant,
+/// so it is never rewritten.
+///
+/// Expects the `claude:` provider prefix to have already been stripped. Call
+/// sites: [`crate::acp::session::AcpSession::spawn`] (every one-shot /
+/// interactive Claude turn) and the persistent-session spawn in
+/// [`crate::acp::factory`].
 pub fn resolve_claude_cli_model(model: &str) -> String {
     let trimmed = model.trim();
     let (base, suffix) = match trimmed.strip_suffix("[1m]") {
         Some(base) => (base, "[1m]"),
         None => (trimmed, ""),
     };
-    if base == "sonnet" {
-        format!("{SONNET_ALIAS_CLI_MODEL}{suffix}")
-    } else {
-        trimmed.to_string()
+    match base {
+        "sonnet" => format!("{SONNET_ALIAS_CLI_MODEL}{suffix}"),
+        "opus" => format!("{OPUS_ALIAS_CLI_MODEL}{suffix}"),
+        _ => trimmed.to_string(),
     }
 }
 
@@ -460,14 +501,26 @@ fn is_preferred_cursor_model(model: &str) -> bool {
     m.starts_with("composer") || m.starts_with("grok")
 }
 
+/// Claude's stable aliases (`fable`, `sonnet`, `opus`, `haiku`, `opusplan`,
+/// and the `[1m]` long-context variants) are digit-free, while concrete model
+/// ids (`claude-fable-5-1`, `claude-opus-5-5`, …) always carry a version digit.
+/// Ranking aliases first keeps [`CLAUDE_MODEL_ALIASES`]'s concrete entries from
+/// crowding the aliases out of the 10-candidate completion window.
+fn is_preferred_claude_model(model: &str) -> bool {
+    !model.chars().any(|c| c.is_ascii_digit())
+}
+
 /// Completion ordering: providers alphabetical, models alphabetical within a
 /// provider — except `cursor:`, whose own models
-/// ([`is_preferred_cursor_model`]) form a band ahead of the proxied rest.
+/// ([`is_preferred_cursor_model`]) form a band ahead of the proxied rest, and
+/// `claude:`, whose aliases ([`is_preferred_claude_model`]) rank ahead of the
+/// concrete catalog ids.
 fn spec_sort_key(spec: &str) -> (String, u8, String) {
     match spec.split_once(':') {
         Some((provider, model)) => {
             let provider = provider.to_lowercase();
-            let demoted = provider == "cursor" && !is_preferred_cursor_model(model);
+            let demoted = (provider == "cursor" && !is_preferred_cursor_model(model))
+                || (provider == "claude" && !is_preferred_claude_model(model));
             (provider, u8::from(demoted), model.to_lowercase())
         }
         None => (spec.to_lowercase(), 0, String::new()),
@@ -947,9 +1000,27 @@ mod tests {
     }
 
     #[test]
+    fn resolve_claude_cli_model_pins_opus_alias_to_opus_5_5() {
+        assert_eq!(resolve_claude_cli_model("opus"), OPUS_ALIAS_CLI_MODEL);
+        // The `[1m]` long-context suffix is preserved on the resolved id.
+        assert_eq!(
+            resolve_claude_cli_model("opus[1m]"),
+            format!("{OPUS_ALIAS_CLI_MODEL}[1m]")
+        );
+        // Surrounding whitespace is trimmed before matching.
+        assert_eq!(resolve_claude_cli_model("  opus  "), OPUS_ALIAS_CLI_MODEL);
+        // An explicit pin inside the opus family is a deliberate choice — the
+        // alias remap must not drag it forward to Opus 5.5.
+        for pinned in ["claude-opus-5", "claude-opus-4-7", "claude-opus-4-6"] {
+            assert_eq!(resolve_claude_cli_model(pinned), pinned);
+        }
+    }
+
+    #[test]
     fn resolve_claude_cli_model_passes_through_other_specs() {
-        // Other aliases are untouched — only `sonnet` is remapped.
-        for alias in ["opus", "haiku", "fable", "opusplan", "opus[1m]"] {
+        // Only the `sonnet` and `opus` aliases are remapped. `opusplan` is a
+        // distinct alias (plan mode), not an `opus` variant.
+        for alias in ["haiku", "fable", "opusplan"] {
             assert_eq!(resolve_claude_cli_model(alias), alias);
         }
         // An explicit full model id is a deliberate pin — never rewritten,
@@ -958,11 +1029,13 @@ mod tests {
             resolve_claude_cli_model("claude-sonnet-4-6"),
             "claude-sonnet-4-6"
         );
-        // Idempotent: the resolved id resolves to itself.
-        assert_eq!(
-            resolve_claude_cli_model(SONNET_ALIAS_CLI_MODEL),
-            SONNET_ALIAS_CLI_MODEL
-        );
+        // Idempotent: each resolved id resolves to itself, with and without
+        // the long-context suffix.
+        for resolved in [SONNET_ALIAS_CLI_MODEL, OPUS_ALIAS_CLI_MODEL] {
+            assert_eq!(resolve_claude_cli_model(resolved), resolved);
+            let long = format!("{resolved}[1m]");
+            assert_eq!(resolve_claude_cli_model(&long), long);
+        }
     }
 
     #[test]
@@ -1171,17 +1244,14 @@ mod tests {
             "got {hits:?}"
         );
         assert!(hits.contains(&"codex:gpt-5.5".to_string()), "got {hits:?}");
-        assert!(
-            hits.contains(&"codex:gpt-5.4-mini".to_string()),
-            "got {hits:?}"
-        );
-        assert!(
-            hits.contains(&"codex:gpt-5.3-codex-spark".to_string()),
-            "got {hits:?}"
-        );
         // Delisted upstream, so they are no longer offered — but an explicit
         // pin must still validate, since the picker list is UX only.
-        for delisted in ["codex:gpt-5.2", "codex:gpt-5.4"] {
+        for delisted in [
+            "codex:gpt-5.2",
+            "codex:gpt-5.4",
+            "codex:gpt-5.4-mini",
+            "codex:gpt-5.3-codex-spark",
+        ] {
             assert!(!hits.contains(&delisted.to_string()), "got {hits:?}");
             validate_model_spec(delisted).unwrap();
         }
@@ -1225,9 +1295,48 @@ mod tests {
 
     #[test]
     fn test_model_spec_completions_merges_discovered_with_statics() {
+        // `claude --help` currently names only `claude-fable-5`; the static
+        // list contributes the newer Fable 5.1 / Opus 5.5 catalog ids. Both are
+        // offered alongside the discovered full name.
         let discovered = vec!["claude:claude-fable-5".to_string()];
         let hits = model_spec_completions("claude:claude", &discovered);
-        assert_eq!(hits, vec!["claude:claude-fable-5".to_string()]);
+        assert_eq!(
+            hits,
+            vec![
+                "claude:claude-fable-5".to_string(),
+                "claude:claude-fable-5-1".to_string(),
+                "claude:claude-opus-5-5".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_model_spec_completions_claude_ranks_aliases_ahead_of_catalog_ids() {
+        // Adding concrete catalog ids must not push the stable aliases out of
+        // the 10-candidate window.
+        let hits = model_spec_completions("claude:", &[]);
+        let alias_end = hits
+            .iter()
+            .position(|h| h.contains("claude-5"))
+            .unwrap_or(hits.len());
+        for alias in ["claude:fable", "claude:sonnet", "claude:opus"] {
+            let pos = hits
+                .iter()
+                .position(|h| h == alias)
+                .unwrap_or_else(|| panic!("{alias} missing from {hits:?}"));
+            assert!(
+                pos < alias_end,
+                "{alias} ranked after the concrete catalog ids: {hits:?}"
+            );
+        }
+        assert!(
+            hits.contains(&"claude:claude-fable-5-1".to_string()),
+            "got {hits:?}"
+        );
+        assert!(
+            hits.contains(&"claude:claude-opus-5-5".to_string()),
+            "got {hits:?}"
+        );
     }
 
     #[test]
@@ -1273,7 +1382,8 @@ mod tests {
     #[test]
     fn test_model_spec_completions_bare_fragment_lists_providers_before_models() {
         // `c` is both a provider fragment (claude/codex/cursor) and a model
-        // fragment — providers stay on top, model specs follow.
+        // fragment — providers stay on top, model specs follow. The Claude
+        // catalog ids start with `c` too, so they join the model band.
         let discovered = vec!["cursor:claude-4.6-sonnet".to_string()];
         let hits = model_spec_completions("c", &discovered);
         assert_eq!(
@@ -1282,6 +1392,8 @@ mod tests {
                 "claude:".to_string(),
                 "codex:".to_string(),
                 "cursor:".to_string(),
+                "claude:claude-fable-5-1".to_string(),
+                "claude:claude-opus-5-5".to_string(),
                 "cursor:claude-4.6-sonnet".to_string(),
             ]
         );

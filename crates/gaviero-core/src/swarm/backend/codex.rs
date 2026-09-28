@@ -702,8 +702,8 @@ async fn drive_codex_stdout(
 /// * `gpt-6-astra` / any `gpt-6` variant → up to `ultra`
 /// * `gpt-5.6-sol` / `gpt-5.6-terra` / bare `gpt-5.6` → up to `ultra`
 /// * `gpt-5.6-luna` → up to `max` (no `ultra`)
-/// * older models (`gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`,
-///   `gpt-5.3-codex-spark`, `gpt-5.2`, …) → up to `xhigh`
+/// * older models (`gpt-5.5` and the delisted `gpt-5.4` / `gpt-5.4-mini` /
+///   `gpt-5.3-codex-spark` / `gpt-5.2`, …) → up to `xhigh`
 ///
 /// Requests above the active model's ceiling are clamped down (not dropped).
 fn map_effort_to_codex(effort: Option<&str>, model: &str) -> Option<&'static str> {
