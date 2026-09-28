@@ -638,7 +638,7 @@ fn template_update_docs() {
     // id embeds the effort level, so `clients.gaviero` pins the full id.
     assert_eq!(
         inventory.model.as_deref(),
-        Some("cursor:cursor-grok-4.6-high")
+        Some("cursor:grok-4.7-high")
     );
     let readme = units
         .iter()
@@ -723,7 +723,7 @@ fn template_plan_refinement() {
     assert_eq!(xrefine.model.as_deref(), Some("codex:gpt-5.6-sol"));
     assert_eq!(
         urefine.model.as_deref(),
-        Some("cursor:cursor-grok-4.6-high")
+        Some("cursor:grok-4.7-high")
     );
 
     assert!(
