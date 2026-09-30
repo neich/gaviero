@@ -212,6 +212,32 @@ fn next_request_id() -> String {
     format!("req-{millis:x}-{n:x}")
 }
 
+/// Tool names that say what *kind* of action is asked, not what it does:
+/// `Bash` runs any command (Claude, Codex, the in-process loop) and `acp` is
+/// every `dsh:` prompt. A session grant on one of them would be a blanket
+/// yes, so they are asked every time.
+const SESSION_UNGRANTABLE_TOOLS: &[&str] = &["Bash", "acp"];
+
+fn session_grantable(tool_name: &str) -> bool {
+    !SESSION_UNGRANTABLE_TOOLS.contains(&tool_name)
+}
+
+/// Server segment of a Claude-style `mcp__<server>__<tool>` name.
+pub fn mcp_server_of(tool_name: &str) -> Option<&str> {
+    let (server, tool) = tool_name.strip_prefix("mcp__")?.split_once("__")?;
+    (!server.is_empty() && !tool.is_empty()).then_some(server)
+}
+
+/// Whether `rules` (see [`Conversation::session_allowed_tools`]) cover
+/// `tool_name`. A rule ending in `*` matches by prefix, anything else exactly.
+pub fn session_rules_allow(rules: &[String], tool_name: &str) -> bool {
+    session_grantable(tool_name)
+        && rules.iter().any(|rule| match rule.strip_suffix('*') {
+            Some(prefix) => tool_name.starts_with(prefix),
+            None => rule == tool_name,
+        })
+}
+
 /// A pending permission request from the agent subprocess.
 /// Held in `Conversation::pending_permission` while the user decides.
 pub struct PendingPermission {
@@ -263,6 +289,20 @@ impl PendingPermission {
     /// plain allow/deny. Derived from the input shape (see [`Self::new`]).
     pub fn is_ask_user_question(&self) -> bool {
         self.ask.is_some()
+    }
+
+    /// The rule `a` (`server_wide = false`) or `A` grants for the session,
+    /// or `None` when this request can't be granted that way — questions
+    /// need an answer each time, and `A` needs an `mcp__<server>__` name.
+    pub fn session_rule(&self, server_wide: bool) -> Option<String> {
+        if self.is_ask_user_question() || !session_grantable(&self.tool_name) {
+            return None;
+        }
+        if server_wide {
+            mcp_server_of(&self.tool_name).map(|server| format!("mcp__{server}__*"))
+        } else {
+            Some(self.tool_name.clone())
+        }
     }
 
     /// Word-wrapped body rows of the overlay: `(text, is_selected_option)`.
@@ -540,6 +580,11 @@ pub struct Conversation {
     pub auto_approve: bool,
     /// Pending permission request waiting for user approval (y/n).
     pub pending_permission: Option<PendingPermission>,
+    /// Tool rules the user granted with `a` / `A` on a permission prompt —
+    /// an exact tool name, or `mcp__<server>__*` for a whole MCP server.
+    /// Matching requests are answered without parking. In memory only, like
+    /// `auto_approve`; kept across `/reset`, cleared by `/permissions clear`.
+    pub session_allowed_tools: Vec<String>,
     /// Turn id assigned when the user message is dispatched. The same id
     /// ties prompt-time injection manifests to the completion extractor.
     pub pending_turn_id: Option<String>,
@@ -639,6 +684,7 @@ impl Conversation {
             background_agents: Vec::new(),
             auto_approve: false,
             pending_permission: None,
+            session_allowed_tools: Vec::new(),
             pending_turn_id: None,
             pending_module_path: None,
             pending_focused_folder: None,
@@ -868,6 +914,7 @@ impl AgentChatState {
             background_agents: Vec::new(),
             auto_approve: false,
             pending_permission: None,
+            session_allowed_tools: Vec::new(),
             pending_turn_id: None,
             pending_module_path: None,
             pending_focused_folder: None,
@@ -1006,6 +1053,37 @@ impl AgentChatState {
         if let Some(idx) = self.find_conv_idx(conv_id) {
             self.conversations[idx].pending_permission = Some(perm);
         }
+    }
+
+    /// Whether conversation `idx` already granted `tool_name` for the
+    /// session. Never true for an `AskUserQuestion`-shaped input — a
+    /// question needs its answers, not a standing yes.
+    pub fn session_allows_at(
+        &self,
+        idx: usize,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> bool {
+        self.conversations.get(idx).is_some_and(|conv| {
+            AskUserQuestionState::from_input(input).is_none()
+                && session_rules_allow(&conv.session_allowed_tools, tool_name)
+        })
+    }
+
+    /// Record the `a` / `A` grant for the active conversation's pending
+    /// request and return the rule, or `None` when it can't be granted for
+    /// the session. Answering the request stays with the caller, through
+    /// the shared reducer.
+    pub fn grant_active_permission_for_session(&mut self, server_wide: bool) -> Option<String> {
+        let conv = self.active_conversation_mut();
+        let rule = conv
+            .pending_permission
+            .as_ref()?
+            .session_rule(server_wide)?;
+        if !conv.session_allowed_tools.contains(&rule) {
+            conv.session_allowed_tools.push(rule.clone());
+        }
+        Some(rule)
     }
 
     // NOTE: there is deliberately no `respond_active_permission` helper.
@@ -1986,6 +2064,32 @@ impl AgentChatState {
                 );
                 true
             }
+            "/permissions" => {
+                let conv = &mut self.conversations[idx];
+                let msg = match arg {
+                    "" if conv.session_allowed_tools.is_empty() => {
+                        "No tools allowed for this session. Press `a` on a permission \
+                         prompt to allow that tool, or `A` to allow its whole MCP server."
+                            .to_string()
+                    }
+                    "" => format!(
+                        "Allowed for this session (no prompt):\n{}\n\n/permissions clear revokes them.",
+                        conv.session_allowed_tools
+                            .iter()
+                            .map(|rule| format!("  {rule}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ),
+                    "clear" => {
+                        let n = conv.session_allowed_tools.len();
+                        conv.session_allowed_tools.clear();
+                        format!("Revoked {n} session permission(s); those tools will ask again.")
+                    }
+                    _ => "Usage: /permissions [clear]".to_string(),
+                };
+                self.add_system_message_at(idx, &msg);
+                true
+            }
             "/workspace" | "/ws" => {
                 // Per-turn one-shot. Mirrors `auto_approve_next`: toggling
                 // the flag arms the next dispatched turn to use workspace-
@@ -2036,6 +2140,7 @@ impl AgentChatState {
                      /effort <level>          — Set effort/reasoning level for Claude, Codex, and dsh (off, auto, low, medium, high, xhigh, max, ultra). Alias: /thinking\n\
                      /namespace <name>        — Set memory namespace (or show current). Alias: /ns\n\
                      /autoapprove             — Toggle auto-approve for this conversation. Alias: /yolo\n\
+                     /permissions [clear]     — List (or revoke) tools allowed for this session with `a` / `A` on a permission prompt\n\
                      /workspace               — Arm workspace-wide planner scope for the next prompt only (multi-folder workspaces). Default scope follows the active buffer's folder; use this when the prompt genuinely spans folders. Alias: /ws\n\
                      /lite                    — Arm minimal-context for the next prompt: skips <repo_outline>, <project_memory>, and impact; keeps <repo_topology>. Alias: /minimal\n\
                      /inject <layer|all>      — Arm bootstrap layers for the next prompt (memory, outline, topology, impact, all)\n\
@@ -3813,6 +3918,7 @@ impl AgentChatState {
                     background_agents: Vec::new(),
                     auto_approve: false,
                     pending_permission: None,
+                    session_allowed_tools: Vec::new(),
                     pending_turn_id: None,
                     pending_module_path: None,
                     pending_focused_folder: None,
@@ -4134,7 +4240,9 @@ impl AgentChatState {
             let popup_area = Rect {
                 x: inner.x,
                 y: popup_y,
-                width: inner.width.min(50),
+                // Span the agent panel. A 50-column cap clipped long paths
+                // before the filename; rows that still overflow keep the tail.
+                width: inner.width,
                 height: popup_height,
             };
             self.render_autocomplete(popup_area, buf);
@@ -4605,6 +4713,19 @@ impl AgentChatState {
                 hx = write_text(buf, hx, hint_y, x_max, "] Allow  [", text_style);
                 hx = write_text(buf, hx, hint_y, x_max, "n", key_style);
                 hx = write_text(buf, hx, hint_y, x_max, "] Deny ", text_style);
+                if perm.session_rule(false).is_some() {
+                    hx = write_text(buf, hx, hint_y, x_max, " [", text_style);
+                    hx = write_text(buf, hx, hint_y, x_max, "a", key_style);
+                    hx = write_text(buf, hx, hint_y, x_max, "] Allow for session ", text_style);
+                }
+                if perm.session_rule(true).is_some()
+                    && let Some(server) = mcp_server_of(&perm.tool_name)
+                {
+                    hx = write_text(buf, hx, hint_y, x_max, " [", text_style);
+                    hx = write_text(buf, hx, hint_y, x_max, "A", key_style);
+                    let label = format!("] All {server} tools ");
+                    hx = write_text(buf, hx, hint_y, x_max, &label, text_style);
+                }
                 write_text(buf, hx, hint_y, x_max, &scroll_hint, muted);
             }
             return;
@@ -4764,6 +4885,7 @@ impl AgentChatState {
                 }
                 AutocompleteMode::SkillRef => path.clone(),
             };
+            let display = fit_autocomplete_label(&display, area.width as usize);
             for (ci, ch) in display.chars().enumerate() {
                 let cx = area.x + ci as u16;
                 if cx < area.x + area.width && cx < buf.area().right() && y < buf.area().bottom() {
@@ -4850,6 +4972,36 @@ impl AgentChatState {
             }
         }
     }
+}
+
+/// Fit an autocomplete row into `cols` cells.
+///
+/// Labels that fit are returned unchanged. Overflow drops the prefix and
+/// keeps the tail — the filename — starting at a `/` or `\` when one falls
+/// inside the window, so a long path stays identifiable.
+fn fit_autocomplete_label(label: &str, cols: usize) -> String {
+    let chars: Vec<char> = label.chars().collect();
+    if cols == 0 || chars.len() <= cols {
+        return if cols == 0 {
+            String::new()
+        } else {
+            label.to_string()
+        };
+    }
+    if cols == 1 {
+        return "…".to_string();
+    }
+    let budget = cols - 1;
+    let mut start = chars.len() - budget;
+    if let Some(rel) = chars[start..].iter().position(|c| *c == '/' || *c == '\\') {
+        let boundary = start + rel;
+        if boundary + 1 < chars.len() && chars.len() - boundary <= budget {
+            start = boundary;
+        }
+    }
+    let mut out = String::from("…");
+    out.extend(chars[start..].iter().copied());
+    out
 }
 
 /// Hidden provider context (built-in system prompt, tool schemas, auto-loaded
@@ -6368,6 +6520,29 @@ mod tests {
     }
 
     #[test]
+    fn fit_autocomplete_label_keeps_short_paths() {
+        assert_eq!(fit_autocomplete_label(" @src/lib.rs", 40), " @src/lib.rs");
+    }
+
+    #[test]
+    fn fit_autocomplete_label_keeps_filename_when_path_overflows() {
+        let label = " @crates/gaviero-tui/src/panels/agent_chat.rs";
+        let fitted = fit_autocomplete_label(label, 20);
+        assert!(fitted.starts_with('…'));
+        assert!(fitted.ends_with("agent_chat.rs"));
+        assert!(fitted.contains('/'));
+        assert!(fitted.chars().count() <= 20);
+    }
+
+    #[test]
+    fn fit_autocomplete_label_truncates_a_filename_longer_than_the_popup() {
+        let fitted = fit_autocomplete_label(" @supercalifragilisticexpialidocious.rs", 12);
+        assert!(fitted.starts_with('…'));
+        assert!(fitted.ends_with(".rs"));
+        assert_eq!(fitted.chars().count(), 12);
+    }
+
+    #[test]
     fn update_autocomplete_at_accept_keeps_at_prefix_and_trailing_space() {
         let mut state = AgentChatState::new();
         state.text_input.text = "@src/li".to_string();
@@ -6659,6 +6834,101 @@ mod tests {
             "a permission decision must not be able to smuggle answers into a non-ask tool"
         );
         assert!(state.active_conversation().pending_permission.is_some());
+    }
+
+    fn park_plain_permission(state: &mut AgentChatState, tool: &str) {
+        let conv_id = state.active_conversation_id().to_string();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        state.set_pending_permission(
+            &conv_id,
+            PendingPermission::new(tool.to_string(), String::new(), serde_json::json!({}), tx),
+        );
+    }
+
+    #[test]
+    fn session_grant_covers_exact_tool_only() {
+        let mut state = AgentChatState::new();
+        let idx = state.active_conv;
+        let price = "mcp__claude_ai_YFinance__yfinance_get_price_history";
+        park_plain_permission(&mut state, price);
+        assert_eq!(
+            state.grant_active_permission_for_session(false).as_deref(),
+            Some(price)
+        );
+        let empty = serde_json::json!({});
+        assert!(state.session_allows_at(idx, price, &empty));
+        assert!(!state.session_allows_at(
+            idx,
+            "mcp__claude_ai_YFinance__yfinance_get_financials",
+            &empty
+        ));
+        // A second grant of the same rule doesn't duplicate it.
+        state.grant_active_permission_for_session(false);
+        assert_eq!(state.active_conversation().session_allowed_tools.len(), 1);
+    }
+
+    #[test]
+    fn session_grant_server_wide_covers_that_server_only() {
+        let mut state = AgentChatState::new();
+        let idx = state.active_conv;
+        park_plain_permission(
+            &mut state,
+            "mcp__claude_ai_YFinance__yfinance_get_price_history",
+        );
+        assert_eq!(
+            state.grant_active_permission_for_session(true).as_deref(),
+            Some("mcp__claude_ai_YFinance__*")
+        );
+        let empty = serde_json::json!({});
+        assert!(state.session_allows_at(idx, "mcp__claude_ai_YFinance__yfinance_search", &empty));
+        assert!(!state.session_allows_at(idx, "mcp__context7__query-docs", &empty));
+        // Grants are per conversation.
+        state.new_conversation();
+        assert!(!state.session_allows_at(
+            state.active_conv,
+            "mcp__claude_ai_YFinance__yfinance_search",
+            &empty
+        ));
+    }
+
+    #[test]
+    fn session_grant_refuses_shell_questions_and_non_mcp_server_wide() {
+        let mut state = AgentChatState::new();
+        for tool in ["Bash", "acp"] {
+            park_plain_permission(&mut state, tool);
+            assert_eq!(
+                state.grant_active_permission_for_session(false),
+                None,
+                "{tool}"
+            );
+        }
+        park_plain_permission(&mut state, "WebFetch");
+        assert_eq!(state.grant_active_permission_for_session(true), None);
+
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let conv_id = state.active_conversation_id().to_string();
+        state.set_pending_permission(&conv_id, ask_permission_with(tx));
+        assert_eq!(state.grant_active_permission_for_session(false), None);
+
+        // Even a hand-made rule never answers a shell prompt or a question.
+        let idx = state.active_conv;
+        state.conversations[idx].session_allowed_tools = vec!["*".into()];
+        assert!(!state.session_allows_at(idx, "Bash", &serde_json::json!({})));
+        let question = serde_json::json!({
+            "questions": [{"question": "Which?", "options": [{"label": "A"}]}]
+        });
+        assert!(!state.session_allows_at(idx, "AskUserQuestion", &question));
+    }
+
+    #[test]
+    fn permissions_clear_revokes_session_grants() {
+        let mut state = AgentChatState::new();
+        park_plain_permission(&mut state, "WebFetch");
+        state.grant_active_permission_for_session(false);
+        state.text_input.text = "/permissions clear".to_string();
+        state.text_input.cursor = state.text_input.text.len();
+        assert!(state.process_slash_command());
+        assert!(state.active_conversation().session_allowed_tools.is_empty());
     }
 
     #[test]
