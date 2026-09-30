@@ -149,8 +149,14 @@ pub(super) fn seed_panel_geometry(workspace: &Workspace) -> (u16, u16, u16) {
     };
 
     (
-        clamp_file_tree_width(read(settings::FILE_TREE_WIDTH, theme::FILE_TREE_DEFAULT_WIDTH)),
-        clamp_side_panel_width(read(settings::SIDE_PANEL_WIDTH, theme::SIDE_PANEL_DEFAULT_WIDTH)),
+        clamp_file_tree_width(read(
+            settings::FILE_TREE_WIDTH,
+            theme::FILE_TREE_DEFAULT_WIDTH,
+        )),
+        clamp_side_panel_width(read(
+            settings::SIDE_PANEL_WIDTH,
+            theme::SIDE_PANEL_DEFAULT_WIDTH,
+        )),
         clamp_terminal_split_percent(read(
             settings::TERMINAL_SPLIT_PERCENT,
             theme::TERMINAL_DEFAULT_PERCENT,
@@ -179,7 +185,10 @@ fn stored_panel_widths(app: &App) -> (u16, u16) {
 /// The panel widths before the editor-minimum cap: the active preset's
 /// percentages, else the stored absolute columns.
 fn raw_panel_widths(app: &App, total_width: u16) -> (u16, u16) {
-    if let Some(preset) = app.active_preset.and_then(|idx| app.layout_presets.get(idx)) {
+    if let Some(preset) = app
+        .active_preset
+        .and_then(|idx| app.layout_presets.get(idx))
+    {
         return (
             pct_of(total_width, preset.file_tree_pct),
             pct_of(total_width, preset.side_panel_pct),
